@@ -781,6 +781,71 @@ detects this short of running the program — `javap -p` and the loader check
 both stop at the constant pool — so a large generated method can be wrong with
 no signal at all.
 
+### The 113 that ran and printed the wrong answer, re-classified (2026-09-05)
+
+The `output-mismatch` (84) and `AssertionError` (29) rows above are the pile
+nothing but running the program can see. Taking the diff of all 113 and
+grouping by *cause* rather than by symptom splits them three ways, and the
+split matters because only one third is a defect at all:
+
+| group | count | what it is |
+| --- | ---: | --- |
+| **scalac warnings we do not emit** | 28 | the program's stdout is byte-identical to scalac's; the `.check` also carries a compile-time warning (`match may not be exhaustive`, `unreachable code`, `a pure expression does nothing`, the `N deprecations` summary). partest concatenates the compiler log with the run output before comparing, so these can never pass until the warning exists. Not a wrong answer. |
+| **`@specialized`** | 7 | `t3575`, `t5488`, `t5488-fn`, `t5500`, `t5500b`, `t10277`, `t10277b` print `$mc..$sp` member names. Stage 2; see `docs/specialization.md`. |
+| **genuinely wrong or dead at run time** | 78 | the rest |
+
+Nine roots out of the third group were fixed (the `agent/runwrong` merge),
+taking **11** of the 113 from failing to passing and two more (the
+`blame_eye_triple_eee` pair) from a wrong answer to warnings-only:
+
+| root | tests |
+| --- | ---: |
+| a class with more than 32 `lazy val`s reused bit 0 of `bitmap$0` (`1 << 32` is `1 << 0`), so every `lazy val` past the 32nd returned the field's default | 1 |
+| a trait's `private` member answered member lookups from a subclass, and whichever parent the traversal reached first won | 2 |
+| a case class's `equals` did not end with `that.canEqual(this)` | 1 |
+| `@volatile` on a trait's field was dropped when the field was copied into the class that mixes it in | 2 |
+| `final` on a trait's `val` did not reach the mixin getter/setter | 2 |
+| `@scala.annotation.varargs` emitted no Java-shaped `f(T[])` entry point | 2 |
+| an empty repeated argument was an empty `ArraySeq`, not `Nil` | 1 |
+| `'sym` was emitted as the bare `String`, not `Symbol.apply("sym")` | 0 (both tests are warnings-only) |
+| a stable-identifier pattern naming an *imported classfile member* compiled to no test at all | 2 |
+
+The last one is the one to remember. `import Int.MaxValue; 5 match { case
+MaxValue => a; case _ => b }` evaluated to `a`. The name resolves to the
+`val`'s accessor — a nullary *method* — so the pattern's type was
+`Type::Method`, and `uncurry`'s `eta_if_method` eta-expanded **the pattern
+itself** into `() => Int`. `gen_pattern` has no case for a `Function` tree, so
+it emitted no comparison and the arm became irrefutable. A phase meant for
+expressions reached into pattern position, and the symptom was a silently
+deleted test rather than a crash.
+
+Roots left in the third group, largest first:
+
+* **No `Signature` attribute is ever emitted** (`t7521b`, `t8756`, and every
+  future Java-generics interop question). `getGenericInterfaces` /
+  `toGenericString` see the erased shape.
+* **Constructor-parameter elision** (`t12002`, `t6793b`): nsc drops a
+  `private[this]` parameter field that nothing reads after the constructor,
+  and aliases a parameter passed straight through to a superclass field.
+* **`ClassManifest` / `Manifest` materialisation with type arguments**
+  (`t6329_vanilla`, `t6329_vanilla_bug`, `valueclasses-classmanifest-*`).
+* **Runtime-reflection fidelity of what we pickle** (`reflection-methodsymbol-params`,
+  `t6733`, `reflection-magicsymbols-vanilla`): an empty parameter list is
+  pickled as *no* parameter list, `$init$` is pickled as a constructor.
+* **`Q.super.m` where `Q` is an enclosing class** (`NestedClasses`): nsc
+  synthesises `Q$$super$m` on `Q` and calls it through `$outer`; we emit a
+  plain `invokespecial` on the *inner* class's superclass, so
+  `AAA1.super.f` ran `BBB.f`.
+* **Outer-aware equality for a case class nested in a trait** (`t6911`), and
+  the outer check in a type test generally (`t7171`).
+* **`@SerialVersionUID`** (`t6988`): no `serialVersionUID` field is emitted,
+  which needs a `ConstantValue` attribute the field writer does not have.
+* Singletons: `classOf` with its type argument inferred from the expected type
+  (`t4871`), erasure of `Unit with AnyRef` (`t5568`), a redundant parent left
+  in the interface list (`t8931`), overload resolution between `AnyVal` and
+  `Double` (`t12560`), implicit specificity (`t2509-1`), `Contra[C]`
+  class-tag variance (`t7768`).
+
 ### Pile two: we do not implement it (≈500)
 
 | symptom | count |

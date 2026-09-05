@@ -3,7 +3,8 @@
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool,
     ACC_ABSTRACT, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_NATIVE, ACC_PRIVATE, ACC_PROTECTED,
-    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE, MAX_CODE_LENGTH,
+    ACC_PUBLIC, ACC_STATIC, ACC_SUPER, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VARARGS, ACC_VOLATILE,
+    MAX_CODE_LENGTH,
 };
 use crate::code::{Assembler, Label, StackEntry};
 use crate::companion_fwd::{self, DescSort, Forwarder};
@@ -3550,9 +3551,9 @@ impl<'a> Gen<'a> {
                 });
             }
         }
-        for (name, ty) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
+        for (name, ty, extra) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PUBLIC,
+                access: ACC_PUBLIC | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
@@ -3574,11 +3575,8 @@ impl<'a> Gen<'a> {
             });
         }
         if !lazies.is_empty() || !binary_lazies.is_empty() {
-            b.fields.push(Field {
-                access: ACC_PRIVATE,
-                name: "bitmap$0".into(),
-                desc: "I".into(),
-            });
+            b.fields
+                .extend(self.lazy_bitmap_fields(&lazies, binary_lazies.len()));
         }
         self.emit_class_ctor(&mut b, class_id, vparamss, &impl_.body, &impl_.parents);
         let own_modules = self.member_modules_of(class_id, &impl_.body);
@@ -4366,6 +4364,139 @@ impl<'a> Gen<'a> {
         if let Some(d) = java_deprecated_desc(mods) {
             b.add_java_annot_to_last(d);
         }
+        self.emit_java_varargs_forwarder(b, def, name, &desc, acc);
+    }
+
+    /// `@scala.annotation.varargs` asks for a second, Java-shaped entry point:
+    /// `def f(xs: String*)` erases to `f(Seq)`, and the annotation adds
+    /// `f(String[])` which wraps the array and calls it. Without it the method
+    /// is simply not callable from Java, and `getDeclaredMethods` shows one
+    /// overload where scalac shows two (`run/t5125`, `run/t5125b`).
+    fn emit_java_varargs_forwarder(
+        &self,
+        b: &mut ClassBuilder,
+        def: &Tree,
+        name: &str,
+        desc: &str,
+        acc: u16,
+    ) {
+        let TreeKind::DefDef { mods, vparamss, .. } = &def.kind else {
+            return;
+        };
+        if name == "<init>" || name == "<clinit>" {
+            return;
+        }
+        if !mods.annotations.iter().any(|a| {
+            matches!(
+                a.annotation_path().as_str(),
+                "varargs" | "annotation.varargs" | "scala.annotation.varargs"
+            )
+        }) {
+            return;
+        }
+        // The repeated parameter is the last one of the last clause.
+        let Some(last) = vparamss.last().and_then(|c| c.last()) else {
+            return;
+        };
+        let pty = if last.ty.is_no_type() && !last.sym.is_none() {
+            self.st.get(last.sym).ty.clone()
+        } else {
+            last.ty.clone()
+        };
+        let Type::Repeated(elem) = pty else { return };
+        let elem_desc = jvm_desc_val(self.st, &elem);
+        let array_desc = format!("[{elem_desc}");
+        // `(…Lscala/collection/immutable/Seq;)R` -> `(…[T)R`.
+        let Some(close) = desc.find(')') else { return };
+        let inner = &desc[1..close];
+        let Some(cut) = split_desc_types(inner).last().copied() else {
+            return;
+        };
+        let head: String = inner[..cut].to_string();
+        let ret_desc = desc[close + 1..].to_string();
+        let fwd_desc = format!("({head}{array_desc}){ret_desc}");
+        if b.methods
+            .iter()
+            .any(|m| m.name == name && m.desc == fwd_desc)
+        {
+            return;
+        }
+        let (wrap, wrap_desc) = match elem_desc.as_str() {
+            "I" => ("wrapIntArray", "([I)Lscala/collection/immutable/ArraySeq;"),
+            "J" => ("wrapLongArray", "([J)Lscala/collection/immutable/ArraySeq;"),
+            "D" => (
+                "wrapDoubleArray",
+                "([D)Lscala/collection/immutable/ArraySeq;",
+            ),
+            "F" => (
+                "wrapFloatArray",
+                "([F)Lscala/collection/immutable/ArraySeq;",
+            ),
+            "S" => (
+                "wrapShortArray",
+                "([S)Lscala/collection/immutable/ArraySeq;",
+            ),
+            "B" => ("wrapByteArray", "([B)Lscala/collection/immutable/ArraySeq;"),
+            "C" => ("wrapCharArray", "([C)Lscala/collection/immutable/ArraySeq;"),
+            "Z" => (
+                "wrapBooleanArray",
+                "([Z)Lscala/collection/immutable/ArraySeq;",
+            ),
+            _ => (
+                "wrapRefArray",
+                "([Ljava/lang/Object;)Lscala/collection/immutable/ArraySeq;",
+            ),
+        };
+        let is_static = acc & ACC_STATIC != 0;
+        let head_sorts = desc_param_sorts(&format!("({head})V"));
+        let mut slot: u16 = if is_static { 0 } else { 1 };
+        let loads: Vec<(u16, JvmSort)> = head_sorts
+            .iter()
+            .map(|s| {
+                let at = slot;
+                slot += s.slots();
+                (at, *s)
+            })
+            .collect();
+        let array_slot = slot;
+        let max_locals = slot + 1;
+        let class_name = b.this_name.clone();
+        let target_desc = desc.to_string();
+        let mname = name.to_string();
+        let private = acc & ACC_PRIVATE != 0;
+        let ret = method_ret_ty(def);
+        b.add_code(
+            acc | ACC_VARARGS,
+            name,
+            &fwd_desc,
+            max_locals + 1,
+            move |asm| {
+                if !is_static {
+                    asm.aload(0);
+                }
+                for (at, sort) in &loads {
+                    load(asm, *at, *sort);
+                }
+                asm.getstatic(
+                    "scala/runtime/ScalaRunTime$",
+                    "MODULE$",
+                    "Lscala/runtime/ScalaRunTime$;",
+                );
+                asm.aload(array_slot);
+                if wrap == "wrapRefArray" && array_desc != "[Ljava/lang/Object;" {
+                    asm.checkcast("[Ljava/lang/Object;");
+                }
+                asm.invokevirtual("scala/runtime/ScalaRunTime$", wrap, wrap_desc);
+                if is_static {
+                    asm.invokestatic(&class_name, &mname, &target_desc);
+                } else if private {
+                    asm.invokespecial(&class_name, &mname, &target_desc);
+                } else {
+                    asm.invokevirtual(&class_name, &mname, &target_desc);
+                }
+                emit_return(asm, &ret);
+            },
+        );
     }
 
     fn emit_value_extension(&self, b: &mut ClassBuilder, class_id: SymbolId, def: &Tree) {
@@ -4862,12 +4993,31 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// The extra JVM field flags a mixed-in `val`/`var` keeps from the trait
+    /// that declared it. `@volatile` above all: dropping it turns a field the
+    /// program declared as volatile into a plain one, which is a memory-model
+    /// change no check but `getModifiers` can see (`run/t8087`,
+    /// `run/trait_fields_volatile`).
+    fn mixin_field_extra_access(v: &Tree) -> u16 {
+        let TreeKind::ValDef { mods, .. } = &v.kind else {
+            return 0;
+        };
+        let mut acc = 0;
+        if mods.flags.contains(Flags::VOLATILE) {
+            acc |= ACC_VOLATILE;
+        }
+        if mods.flags.contains(Flags::TRANSIENT) {
+            acc |= ACC_TRANSIENT;
+        }
+        acc
+    }
+
     fn mixin_val_fields(
         &self,
         class_id: SymbolId,
         vparamss: &[Vec<Tree>],
         body: &[Tree],
-    ) -> Vec<(String, Type)> {
+    ) -> Vec<(String, Type, u16)> {
         let mut have = HashSet::new();
         for clause in vparamss {
             for p in clause {
@@ -4899,7 +5049,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     if have.insert(name.clone()) {
-                        out.push((name, ty));
+                        out.push((name, ty, 0));
                     }
                 }
                 continue;
@@ -4909,7 +5059,11 @@ impl<'a> Gen<'a> {
                 if name.is_empty() || !have.insert(name.clone()) {
                     continue;
                 }
-                out.push((name, val_tree_ty(self.st, v)));
+                out.push((
+                    name,
+                    val_tree_ty(self.st, v),
+                    Self::mixin_field_extra_access(v),
+                ));
             }
         }
         out
@@ -5045,7 +5199,7 @@ impl<'a> Gen<'a> {
     }
 
     /// The class's own `lazy val`s followed by the inherited ones: one list so
-    /// they share `bitmap$0` without colliding on a bit.
+    /// they share the `bitmap$N` words without colliding on a bit.
     fn all_lazy_vals(&self, class_id: SymbolId, body: &[Tree]) -> Vec<Tree> {
         let mut out: Vec<Tree> = body
             .iter()
@@ -5061,6 +5215,36 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// The `bitmap$N` fields a class needs for `lazies`.
+    ///
+    /// One `int` holds 32 initialisation bits. A single word used to be
+    /// assumed, and the 33rd `lazy val` in a class then got `1 << 32`, which
+    /// the JVM (and Rust's shift) reduces to `1 << 0`: the value shared bit 0
+    /// with the first `lazy val`, so forcing that one made every later
+    /// accessor report itself initialised and return the field's default.
+    /// `run/t3038c` in scala/scala is exactly that program -- 70 `lazy val`s,
+    /// of which we printed the first 32 and then zeros.
+    fn lazy_bitmap_fields(&self, lazies: &[Tree], binary: usize) -> Vec<Field> {
+        let n = binary
+            + lazies
+                .iter()
+                .filter(|stt| match &stt.kind {
+                    TreeKind::ValDef { mods, rhs, .. } => {
+                        mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
+                    }
+                    _ => false,
+                })
+                .count();
+        let words = n.div_ceil(32).max(1);
+        (0..words)
+            .map(|w| Field {
+                access: ACC_PRIVATE,
+                name: format!("bitmap${w}"),
+                desc: "I".into(),
+            })
+            .collect()
+    }
+
     fn emit_trait_val_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId, body: &[Tree]) {
         if class_id.is_none() {
             return;
@@ -5074,8 +5258,9 @@ impl<'a> Gen<'a> {
         for m in &b.methods {
             skip.insert(m.name.clone());
         }
-        // (name, type, owning trait, is a `var`, first in linearization order)
-        let mut needed: Vec<(String, Type, SymbolId, bool, bool)> = Vec::new();
+        // (name, type, owning trait, is a `var`, first in linearization order,
+        //  the trait declared it `final`)
+        let mut needed: Vec<(String, Type, SymbolId, bool, bool, bool)> = Vec::new();
         let mut seen = HashSet::new();
         let mut from_class: Option<HashSet<String>> = None;
         for parent in linearize(self.st, class_id).into_iter().skip(1) {
@@ -5093,7 +5278,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     let first = seen.insert(name.clone());
-                    needed.push((name, ty, parent, mutable, first));
+                    needed.push((name, ty, parent, mutable, first, false));
                 }
                 continue;
             };
@@ -5112,15 +5297,31 @@ impl<'a> Gen<'a> {
                 // `H2Profile$` failing `RelationalTableComponent.$init$` with
                 // an `AbstractMethodError`.
                 let first = seen.insert(name.clone());
-                let mutable = match &v.kind {
-                    TreeKind::ValDef { mods, .. } => mods.flags.contains(Flags::MUTABLE),
-                    _ => false,
+                let (mutable, is_final) = match &v.kind {
+                    TreeKind::ValDef { mods, .. } => (
+                        mods.flags.contains(Flags::MUTABLE),
+                        mods.flags.contains(Flags::FINAL),
+                    ),
+                    _ => (false, false),
                 };
-                needed.push((name, val_tree_ty(self.st, v), parent, mutable, first));
+                needed.push((
+                    name,
+                    val_tree_ty(self.st, v),
+                    parent,
+                    mutable,
+                    first,
+                    is_final,
+                ));
             }
         }
         let class_name = b.this_name.clone();
-        for (name, ty, owner, mutable, first) in needed {
+        for (name, ty, owner, mutable, first, is_final) in needed {
+            // nsc's mixin phase carries the trait `val`'s `final` onto the
+            // accessors it copies into the class: `trait T { final val v = 1 }`
+            // gives `public final int v()` and a final `T$_setter_$v_$eq`
+            // (`run/trait_fields_bytecode`, `run/trait_fields_final`). A plain
+            // `val` gets neither.
+            let fin = if is_final { ACC_FINAL } else { 0 };
             let fdesc = jvm_desc_val(self.st, &ty);
             let gdesc = format!("(){}", jvm_desc(self.st, &ty));
             let sdesc = format!("({fdesc})V");
@@ -5160,7 +5361,7 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(ACC_PUBLIC, &name, &gdesc, 1, |asm| {
+            b.add_code(ACC_PUBLIC | fin, &name, &gdesc, 1, |asm| {
                 asm.aload(0);
                 emit_getfield(asm, &class_c, &fname, &fdesc_c);
                 emit_return(asm, &ty);
@@ -5168,7 +5369,7 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(ACC_PUBLIC, &setter, &sdesc, 1 + sort.slots(), |asm| {
+            b.add_code(ACC_PUBLIC | fin, &setter, &sdesc, 1 + sort.slots(), |asm| {
                 asm.aload(0);
                 load(asm, 1, sort);
                 asm.putfield(&class_c, &fname, &fdesc_c);
@@ -6069,6 +6270,15 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
+                // SLS 5.3.2 / nsc: the last conjunct is `that.canEqual(this)`,
+                // which is what lets a subclass refuse an equality its
+                // superclass's fields would otherwise accept. Leaving it out
+                // made `case class C1(x: Int)` equal to a subclass that
+                // overrides `canEqual` to say no (`run/caseClassEquality`).
+                asm.aload(2);
+                asm.aload(0);
+                asm.invokevirtual(&cj, "canEqual", "(Ljava/lang/Object;)Z");
+                asm.ifeq(no);
                 asm.mark(yes);
                 asm.iconst(1);
                 asm.ireturn();
@@ -6939,7 +7149,8 @@ impl<'a> Gen<'a> {
     }
 
     /// `lazies` is the class's complete list of `lazy val`s — its own and the
-    /// ones inherited from mixed-in traits — so bits in `bitmap$0` are unique.
+    /// ones inherited from mixed-in traits — so bits are unique. Bit `n` lives
+    /// in `bitmap$(n / 32)`; `lazy_bitmap_fields` declares the same words.
     fn emit_lazy_accessors(
         &self,
         b: &mut ClassBuilder,
@@ -6950,7 +7161,7 @@ impl<'a> Gen<'a> {
         // The class's own `lazy val`s and the ones inherited from *source*
         // traits carry their initialiser as a tree; one inherited from a trait
         // that arrived as a class file is a call to that trait's `d$` static,
-        // which is where nsc put the initialiser. Both share `bitmap$0`.
+        // which is where nsc put the initialiser. Both share the bitmap words.
         let mut items: Vec<(String, Type, LazyInit)> = Vec::new();
         for stt in lazies {
             let TreeKind::ValDef {
@@ -6996,7 +7207,8 @@ impl<'a> Gen<'a> {
             let source = self.source_name;
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
-            let mask = 1i32 << bit;
+            let mask = 1i32 << (bit % 32);
+            let bitmap = format!("bitmap${}", bit / 32);
             let ret_ty = ty.clone();
             let caps = capture_slots(self.st, &self.boxed_vars, class_id);
             b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
@@ -7016,7 +7228,7 @@ impl<'a> Gen<'a> {
                 let try_s = asm.fresh_label();
                 asm.mark(try_s);
                 asm.aload(0);
-                asm.getfield(&class_name, "bitmap$0", "I");
+                asm.getfield(&class_name, &bitmap, "I");
                 asm.iconst(mask);
                 asm.iand();
                 let inited = asm.fresh_label();
@@ -7051,10 +7263,10 @@ impl<'a> Gen<'a> {
                 emit_putfield_from_expr(asm, &class_name, &fname, &fdesc);
                 asm.aload(0);
                 asm.aload(0);
-                asm.getfield(&class_name, "bitmap$0", "I");
+                asm.getfield(&class_name, &bitmap, "I");
                 asm.iconst(mask);
                 asm.ior();
-                asm.putfield(&class_name, "bitmap$0", "I");
+                asm.putfield(&class_name, &bitmap, "I");
                 asm.mark(inited);
                 asm.aload(0);
                 emit_getfield(asm, &class_name, &fname, &fdesc);
@@ -7342,9 +7554,9 @@ impl<'a> Gen<'a> {
                 });
             }
         }
-        for (name, ty) in self.mixin_val_fields(cls, &[], &impl_.body) {
+        for (name, ty, extra) in self.mixin_val_fields(cls, &[], &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PUBLIC,
+                access: ACC_PUBLIC | extra,
                 name,
                 desc: jvm_desc_val(self.st, &ty),
             });
@@ -7366,11 +7578,8 @@ impl<'a> Gen<'a> {
             });
         }
         if !lazies.is_empty() || !binary_lazies.is_empty() {
-            b.fields.push(Field {
-                access: ACC_PRIVATE,
-                name: "bitmap$0".into(),
-                desc: "I".into(),
-            });
+            b.fields
+                .extend(self.lazy_bitmap_fields(&lazies, binary_lazies.len()));
         }
 
         self.emit_module_init(
@@ -9816,7 +10025,20 @@ fn gen_literal(asm: &mut Assembler, lit: &Lit) {
         Lit::Char(c) => asm.iconst(*c as i32),
         Lit::String(s) => asm.ldc_string(s),
         Lit::Null => asm.aconst_null(),
-        Lit::Symbol(s) => asm.ldc_string(s),
+        // `'foo` is a `scala.Symbol`, not its name. Pushing the bare string
+        // type-checked (the literal's type is `Symbol`) and then printed
+        // `foo` where scalac prints `Symbol(foo)`; any actual `Symbol` member
+        // on it would have been a `NoSuchMethodError` at run time.
+        // `Symbol.apply` interns, so `'foo eq 'foo` still holds.
+        Lit::Symbol(s) => {
+            asm.getstatic("scala/Symbol$", "MODULE$", "Lscala/Symbol$;");
+            asm.ldc_string(s);
+            asm.invokevirtual(
+                "scala/Symbol$",
+                "apply",
+                "(Ljava/lang/String;)Lscala/Symbol;",
+            );
+        }
     }
 }
 
@@ -16709,6 +16931,18 @@ fn gen_wrap_varargs(
     elem: &Type,
 ) {
     let n = args.len() as i32;
+    // An *empty* varargs argument is `Nil`, not an empty `ArraySeq`: nsc emits
+    // `scala/collection/immutable/Nil$.MODULE$` and the difference is visible,
+    // because the callee may print what it was handed (`run/t5966` expects
+    // `List()` where we printed `ArraySeq()`).
+    if args.is_empty() {
+        asm.getstatic(
+            "scala/collection/immutable/Nil$",
+            "MODULE$",
+            "Lscala/collection/immutable/Nil$;",
+        );
+        return;
+    }
     let all_int = !args.is_empty()
         && args.iter().all(|a| matches!(a.ty, Type::Int))
         && matches!(
@@ -21960,6 +22194,29 @@ fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
 /// Whether the typer widened this member's access for companion use.
 /// The JVM sorts of a method descriptor's parameters, given `desc` starting at
 /// `(` (anything after the matching `)` is ignored).
+/// Byte offsets at which each field descriptor starts inside a *bare*
+/// parameter list (no parentheses). Used to split off the last parameter --
+/// `rfind('L')` cannot, because a class name may itself contain an `L`
+/// (`Lfoo/BarList;`).
+fn split_desc_types(inner: &str) -> Vec<usize> {
+    let b = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        out.push(i);
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// The parameter part of a method descriptor, parentheses included.
 fn desc_params(desc: &str) -> &str {
     match desc.find(')') {
