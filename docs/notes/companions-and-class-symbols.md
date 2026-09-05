@@ -533,19 +533,29 @@ Two adjacent defects were found and left alone, both pre-existing and
 independent of this fix (reproduce identically on an unpatched binary, in
 both modes):
 
-* **`Wrapped.unapply(w)` called explicitly** still throws
+Both were fixed together in `agent/implicitcast`
+(`docs/notes/codegen-and-stackmap-frames.md`), because they turned out to be
+one defect seen from two sides:
+
+* ~~**`Wrapped.unapply(w)` called explicitly**~~ threw
   `NoSuchMethodError: 'scala.Option Wrapped$.unapply(int)'`. A previous
   slice tried emitting a real, nsc-shaped `unapply` body and reverted it: the
-  *caller's* erasure still hands the pattern the boxed instance, so the
+  *caller's* erasure still handed the pattern the boxed instance, so the
   extractor would have silently rewrapped it (`Some(Wrap(w))`, where scalac
-  says `Some(w)`) rather than failing loudly. `NoSuchMethodError` remains the
-  deliberately accepted state.
-* **`w match { case Wrapped(x) => ... }`** (the pattern-match sugar, as
-  opposed to naming `unapply` directly) throws a `VerifyError: Bad local
-  variable type` in both modes: the match-lowering does
+  says `Some(w)`) rather than failing loudly. That caller was the pattern
+  path below; with it gone, the descriptor in the `NoSuchMethodError` is
+  exactly nsc's own, and the method is now emitted in nsc's shape --
+  `unapply(int)` answering `Some(u)` with the underlying value boxed.
+* ~~**`w match { case Wrapped(x) => ... }`**~~ (the pattern-match sugar, as
+  opposed to naming `unapply` directly) threw a `VerifyError: Bad local
+  variable type` in both modes: the match-lowering did
   `instanceof`/`checkcast`/`getfield` against the scrutinee as though it were
   a real boxed instance, while the scrutinee's own local slot holds the
-  erased `int` (`istore_3` followed by `aload_3` on the same slot). This is a
-  separate bug in pattern-match codegen for a value-class scrutinee, not in
-  erasure of the companion `apply`; flagged for a separate slice rather than
-  fixed here.
+  erased `int` (`istore_3` followed by `aload_3` on the same slot). A box is
+  always a reference, so a scrutinee of *primitive* sort is provably the
+  underlying value: the test is vacuous and the pattern is a binding, which is
+  what nsc emits. A boxed scrutinee keeps the test.
+
+  A value class over a *reference* type stays broken, and for a reason that
+  starts earlier than the match: `m(WS("a"))` for `case class WS(s: String)
+  extends AnyVal` is a `ClassCastException` at the call site.
