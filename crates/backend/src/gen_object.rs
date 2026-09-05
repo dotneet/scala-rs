@@ -219,6 +219,7 @@ impl<'a> Gen<'a> {
         self.emit_binary_parent_bridges(&mut b, cls);
         self.drain_lambdas(&mut b, lambda_wm);
         attach_scala_sig(&mut b, self.st, cls, &self.pickles);
+        b.sign_class(self.sig_of(cls));
 
         let top_level = if cls.is_none() {
             true
@@ -826,6 +827,7 @@ impl<'a> Gen<'a> {
             out.push(Forwarder {
                 name,
                 desc: desc.clone(),
+                signature: None,
             });
         }
         out
@@ -1661,5 +1663,10 @@ pub(crate) fn add_static_forwarders(b: &mut ClassBuilder, module_jvm: &str, meth
                 ret_of_sort(asm, jvm_sort_of(ret));
             },
         );
+        if let Some(sig) = &f.signature {
+            if let Some(m) = b.methods.last_mut() {
+                m.signature = Some(sig.clone());
+            }
+        }
     }
 }

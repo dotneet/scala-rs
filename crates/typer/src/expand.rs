@@ -393,7 +393,8 @@ impl Typer {
             return built;
         }
         let (argss, targs, prefix) = peel_application(tree);
-        let request = self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
+        let (request, placeholders) =
+            self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(why) = &self.macro_engine_error {
             // Starting it costs a `javac` and a JVM; a run whose first attempt
             // failed must not pay that again at every call site.
@@ -420,17 +421,35 @@ impl Typer {
             Some("abort") => {
                 // `c.abort` is the implementation asking for a compile error
                 // at the call site. It is not a gap in this expander, so it is
-                // reported as itself.
+                // reported as itself -- *unless* a placeholder went over, in
+                // which case the implementation was answering a question about
+                // a class it was never shown, and its verdict says nothing
+                // about the program.
                 let msg = at(items, 1)?.text();
+                if let Some(why) = placeholder_verdict(&placeholders, &msg) {
+                    return Err(why);
+                }
                 self.error(tree.span, msg);
                 Err("the macro implementation aborted the expansion".to_string())
             }
-            Some("err") => Err(at(items, 1)?.text()),
+            // An implementation that *threw* while a placeholder was in play
+            // most likely asked it for the info it does not have; the engine
+            // reports the exception, and the reason for it is said here.
+            Some("err") => {
+                let msg = at(items, 1)?.text();
+                if msg.starts_with("the macro implementation threw") {
+                    if let Some(why) = placeholder_verdict(&placeholders, &msg) {
+                        return Err(why);
+                    }
+                }
+                Err(msg)
+            }
             _ => Err(format!("the macro engine replied {reply:?}")),
         }
     }
 
-    /// Serialise one expansion request.
+    /// Serialise one expansion request, and say which of its types went over
+    /// as placeholders ([`Typer::tag_descriptor`]).
     fn expansion_request(
         &mut self,
         binding: &MacroBinding,
@@ -438,7 +457,8 @@ impl Typer {
         targs: &[Type],
         prefix: Option<&Tree>,
         application: &Tree,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<String>), String> {
+        let mut placeholders = Vec::new();
         let mut out = String::from("(expand ");
         quote_into(&mut out, &binding.impl_class);
         out.push(' ');
@@ -467,7 +487,8 @@ impl Typer {
                 if as_expr {
                     // Only an `Expr` carries a tag, and only the tag needs a
                     // type the engine can rebuild.
-                    type_to_wire(&self.st, &a.ty, &mut out)?;
+                    let desc = self.tag_descriptor(&a.ty, &mut placeholders)?;
+                    out.push_str(&desc);
                 } else {
                     out.push_str("(ty \"\")");
                 }
@@ -487,27 +508,9 @@ impl Typer {
                 ));
             }
             for t in targs {
-                let name = static_tag_class(&self.st, t)?;
-                // The engine rebuilds a tag with `mirror.staticClass(name)`,
-                // and its mirror can only see the *classpath* -- there is no
-                // class file yet for a class this run is compiling. slick's
-                // `TableQuery[Issues]` is exactly that shape: the type
-                // argument is the table class defined a few lines above the
-                // call. Refused here, with the reason, rather than left to
-                // come back from the JVM as a bare
-                // `ScalaReflectionException: class Issues not found`.
-                let internal = name.replace('.', "/");
-                if !matches!(self.binary.find_class(&internal), Ok(Some(_))) {
-                    return Err(format!(
-                        "the type argument `{name}` is not on the classpath -- a macro's \
-                         type tag is rebuilt by name in a separate JVM, so a class this \
-                         run is itself compiling cannot be passed to one"
-                    ));
-                }
                 out.push(' ');
-                out.push_str("(ty ");
-                quote_into(&mut out, &name);
-                out.push(')');
+                let desc = self.tag_descriptor(t, &mut placeholders)?;
+                out.push_str(&desc);
             }
         }
         out.push(')');
@@ -573,6 +576,51 @@ impl Typer {
             quote_into(&mut out, setting);
         }
         out.push_str("))");
+        Ok((out, placeholders))
+    }
+
+    /// The wire descriptor for one type the engine has to turn into a tag.
+    ///
+    /// A class the engine's mirror can find on the macro classpath travels as
+    /// its name, `(ty "a.b.C")`, and `mirror.staticClass` rebuilds it.
+    ///
+    /// A class **this run is compiling** has no class file for that mirror to
+    /// find. slick's `TableQuery[Issues]` is exactly that shape -- the type
+    /// argument is the table class declared a few lines from the call -- and
+    /// it used to be refused outright. It now travels as `(syn "a.b.C")`, a
+    /// *placeholder* symbol built in the runtime universe that carries the
+    /// full name and no info at all, and the type it stands for is remembered
+    /// here so that the expansion's own mention of it is read back as the
+    /// type scala-rs already has rather than resolved again by name.
+    ///
+    /// The placeholder is deliberately empty. scala-rs cannot describe the
+    /// class truthfully at this point in its own run: while
+    /// `lazy val Issues = TableQuery[Issues]` is being typed, the members of
+    /// `class Issues` are still un-inferred. An implementation that asks the
+    /// placeholder a real question therefore gets an exception rather than a
+    /// quiet wrong answer, and that becomes a diagnostic
+    /// ([`Typer::macro_expansion`]).
+    fn tag_descriptor(
+        &mut self,
+        ty: &Type,
+        placeholders: &mut Vec<String>,
+    ) -> Result<String, String> {
+        if let Some(sym) = plain_class_of(&self.st, ty) {
+            let jvm = self.st.jvm_internal(sym);
+            if !jvm.is_empty() && !matches!(self.binary.find_class(&jvm), Ok(Some(_))) {
+                let full = scala_full_name(&self.st, sym);
+                self.macro_local_tags.insert(full.clone(), ty.clone());
+                placeholders.push(full.clone());
+                let mut out = String::from("(syn ");
+                quote_into(&mut out, &full);
+                out.push(')');
+                return Ok(out);
+            }
+        }
+        let name = static_tag_class(&self.st, ty)?;
+        let mut out = String::from("(ty ");
+        quote_into(&mut out, &name);
+        out.push(')');
         Ok(out)
     }
 
@@ -710,6 +758,19 @@ impl Typer {
             "TypeTree" => {
                 let items = at(kids, 0)?.list()?;
                 let name = at(items, 1)?.text();
+                // A class this run is compiling went over as a placeholder
+                // carrying only its name (`tag_descriptor`). Coming back it is
+                // that same name, and the type it stands for is the one the
+                // typer already had -- resolving the name again would look for
+                // a path that need not exist at the call site, because a class
+                // nested in a trait has no such path at all.
+                if let Some(ty) = self.macro_local_tags.get(&name) {
+                    let mut t = node(TreeKind::Ident {
+                        name: crate::materialize::RESOLVED_TYPE.to_string(),
+                    });
+                    t.ty = ty.clone();
+                    return Ok(t);
+                }
                 if items.len() > 2 {
                     return Err(format!(
                         "the expansion mentions the type `{name}`, whose type \
@@ -1102,22 +1163,54 @@ fn lit_to_wire(lit: &Lit, out: &mut String) -> Result<(), String> {
     Ok(())
 }
 
-/// A type the engine can rebuild with one `mirror.staticClass` call.
+/// Why an implementation's own verdict may not be repeated to the user.
 ///
-/// The same restriction as `TypeTag` materialisation (`docs/macros.md`
-/// §7.10): a monomorphic class, named, and nothing else -- a wrong tag would
-/// reach the implementation as a wrong `Type` and be discovered only as a
-/// wrong answer at run time.
-fn type_to_wire(
-    st: &crate::symbol::SymbolTable,
-    ty: &Type,
-    out: &mut String,
-) -> Result<(), String> {
-    let name = static_tag_class(st, ty)?;
-    out.push_str("(ty ");
-    quote_into(out, &name);
-    out.push(')');
-    Ok(())
+/// A class this run is compiling goes over as a placeholder that carries its
+/// name and nothing else ([`Typer::tag_descriptor`]). An implementation that
+/// asks such a symbol what it *is* -- slick's `mapToImpl` opens with
+/// `if (!rSym.isClass || !rSym.asClass.isCaseClass) c.abort(...)` -- is
+/// answering about a symbol it was never shown, so neither its `abort` nor an
+/// exception out of it says anything about the program being compiled.
+/// Reporting the implementation's message verbatim would be a wrong error;
+/// this says what actually happened instead.
+fn placeholder_verdict(placeholders: &[String], msg: &str) -> Option<String> {
+    if placeholders.is_empty() {
+        return None;
+    }
+    let names = placeholders
+        .iter()
+        .map(|n| format!("`{n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "the type argument {names} is a class this run is compiling, so the \
+         implementation was handed a placeholder symbol carrying only its \
+         name; it looked the class up and answered \"{msg}\", which says \
+         nothing about this program. nsc has no such limit -- it expands in \
+         its own universe, where the class being compiled is a real symbol"
+    ))
+}
+
+/// The class symbol of a monomorphic class type, if that is what `ty` is.
+///
+/// Only such a type can travel as a placeholder: the placeholder carries a
+/// name, and a name is all a class *is* to the engine.
+fn plain_class_of(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId> {
+    match ty {
+        Type::Class { sym, args } if args.is_empty() => {
+            matches!(st.get(*sym).kind, crate::symbol::SymKind::Class).then_some(*sym)
+        }
+        _ => None,
+    }
+}
+
+/// A class's full Scala name, from the class file name scala-rs would give it.
+///
+/// `a/b/Outer$Inner` is `a.b.Outer.Inner`: the JVM separates an owner from a
+/// nested class with `$` and a package from its contents with `/`, and Scala
+/// spells both with a dot.
+fn scala_full_name(st: &crate::symbol::SymbolTable, sym: SymbolId) -> String {
+    st.jvm_internal(sym).replace(['/', '$'], ".")
 }
 
 /// The class name a type tag is rebuilt from on the engine's side.

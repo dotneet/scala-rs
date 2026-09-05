@@ -24,6 +24,9 @@ fn emit_with_signature(raw: &[u8]) -> Vec<u8> {
         scala_raw: false,
         inner_classes: Vec::new(),
         enclosing_method: None,
+        signature: None,
+        field_signatures: Default::default(),
+        field_constants: Default::default(),
     };
     c.write_with_pool(Pool::new()).expect("write class file")
 }

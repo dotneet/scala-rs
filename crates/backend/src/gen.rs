@@ -58,6 +58,11 @@ pub struct EmitOpts {
     /// class needs against members it only inherits (see [`crate::ifacebridge`]).
     /// `None` skips that pass, which is what the private-runtime ABI wants.
     pub binary_parents: Option<Rc<BinaryParents>>,
+    /// JVMS §4.7.9 `Signature` candidates, read from the symbol table before
+    /// erasure destroyed the types they describe (see [`crate::sig`]). `None`
+    /// emits no `Signature` attribute at all, which is what a caller that
+    /// never ran [`crate::sig::record_generic_signatures`] must get.
+    pub generic_sigs: Option<Rc<crate::sig::GenericSignatures>>,
 }
 
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
@@ -261,6 +266,7 @@ pub fn emit_opts(
             .class_by_name
             .unwrap_or_else(|| Rc::new(build_class_name_index(st))),
         binary_parents: opts.binary_parents,
+        generic_sigs: opts.generic_sigs.unwrap_or_default(),
         companion_fwd: HashMap::new(),
         parked_companions: Vec::new(),
     };
@@ -314,6 +320,9 @@ pub(crate) struct Gen<'a> {
     /// Class files behind the run's binary parents (see
     /// [`Gen::emit_binary_parent_bridges`]).
     pub(crate) binary_parents: Option<Rc<BinaryParents>>,
+    /// Generic signatures taken before erasure, keyed by symbol. Empty when
+    /// the driver did not record any.
+    pub(crate) generic_sigs: Rc<crate::sig::GenericSignatures>,
     /// Static forwarders a top-level `object` owes its companion class,
     /// keyed by that class's JVM internal name. Filled by [`Gen::emit_module`]
     /// and drained by [`Gen::finish_companion_class`] — the two run in source
@@ -920,6 +929,12 @@ pub(crate) struct ClassBuilder {
     /// Class file format limits this class's members turned out not to fit in;
     /// see [`EmittedClass::format_errors`].
     pub(crate) format_errors: Vec<String>,
+    /// JVMS §4.7.9 `Signature` on the class, and on its fields by name.
+    pub(crate) signature: Option<String>,
+    pub(crate) field_signatures: HashMap<String, String>,
+    /// JVMS §4.7.2 `ConstantValue` on a `static final long` field
+    /// (`@SerialVersionUID`).
+    pub(crate) field_constants: HashMap<String, i64>,
 }
 
 impl ClassBuilder {
@@ -936,6 +951,9 @@ impl ClassBuilder {
             scala_signature: None,
             scala_raw: false,
             format_errors: Vec::new(),
+            signature: None,
+            field_signatures: HashMap::default(),
+            field_constants: HashMap::default(),
         }
     }
 
@@ -969,6 +987,7 @@ impl ClassBuilder {
             desc: desc.to_string(),
             code: Some(code),
             java_annots: Vec::new(),
+            signature: None,
         });
     }
 
@@ -979,7 +998,116 @@ impl ClassBuilder {
             desc: desc.to_string(),
             code: None,
             java_annots: Vec::new(),
+            signature: None,
         });
+    }
+
+    /// Attach a JVMS §4.7.9 `Signature` to the method just emitted.
+    ///
+    /// Two conditions, both refusals rather than repairs (see
+    /// [`crate::sig`]): a signature that *is* the descriptor says nothing, and
+    /// one that does not erase back to the descriptor would contradict it.
+    /// Either way the member keeps no attribute, which is what it had before
+    /// this existed.
+    pub(crate) fn sign_last(&mut self, sig: Option<&crate::sig::GenericSignature>) {
+        let Some(g) = sig else { return };
+        let Some(m) = self.methods.last_mut() else {
+            return;
+        };
+        if g.sig == m.desc {
+            return;
+        }
+        if crate::sig::erase_signature(&g.sig, &g.tvars).as_deref() != Some(m.desc.as_str()) {
+            // Refusing is always safe, so a member that quietly loses its
+            // signature leaves no trace. `SCALA_RS_SIG_DEBUG=1` prints the
+            // rejects, which is how one finds the erasure disagreements that
+            // are worth fixing next.
+            if std::env::var_os("SCALA_RS_SIG_DEBUG").is_some() {
+                eprintln!(
+                    "SIGDROP {} {} sig={} erased={:?} tvars={:?}",
+                    m.name,
+                    m.desc,
+                    g.sig,
+                    crate::sig::erase_signature(&g.sig, &g.tvars),
+                    g.tvars
+                );
+            }
+            return;
+        }
+        m.signature = Some(g.sig.clone());
+    }
+
+    /// The same, for a field. `name` is the field's source name.
+    pub(crate) fn sign_field(&mut self, name: &str, sig: Option<&crate::sig::GenericSignature>) {
+        let Some(g) = sig else { return };
+        let Some(f) = self.fields.iter().find(|f| f.name == name) else {
+            return;
+        };
+        if g.sig == f.desc {
+            return;
+        }
+        if crate::sig::erase_signature(&g.sig, &g.tvars).as_deref() != Some(f.desc.as_str()) {
+            return;
+        }
+        self.field_signatures
+            .insert(name.to_string(), g.sig.clone());
+    }
+
+    /// A method whose descriptor is a *prefix-extended* form of the signature's
+    /// -- currently only the getter and setter synthesized for a `val`, whose
+    /// type signature is recorded on the value symbol rather than on a method
+    /// symbol of its own.
+    pub(crate) fn sign_last_accessor(
+        &mut self,
+        sig: Option<&crate::sig::GenericSignature>,
+        setter: bool,
+    ) {
+        let Some(g) = sig else { return };
+        let wrapped = if setter {
+            format!("({})V", g.sig)
+        } else {
+            format!("(){}", g.sig)
+        };
+        let g = crate::sig::GenericSignature {
+            sig: wrapped,
+            tvars: g.tvars.clone(),
+            parents: Vec::new(),
+        };
+        self.sign_last(Some(&g));
+    }
+
+    /// Assemble and attach the class's own `Signature`: the formal type
+    /// parameters recorded before erasure, then this class file's superclass
+    /// and interfaces **in the order it lists them**, since
+    /// `getGenericSuperclass` / `getGenericInterfaces` read them positionally.
+    /// A parent with no recorded signature is written raw, which is what a
+    /// Java class with no generic parent looks like and keeps the count right.
+    pub(crate) fn sign_class(&mut self, sig: Option<&crate::sig::GenericSignature>) {
+        let Some(g) = sig else { return };
+        let mut out = g.sig.clone();
+        let find = |n: &str| {
+            g.parents
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| format!("L{n};"))
+        };
+        out.push_str(&find(&self.super_name));
+        for i in &self.interfaces {
+            out.push_str(&find(i));
+        }
+        // A signature with no formal parameters and no type argument anywhere
+        // repeats the `super_class` / `interfaces` the class file already
+        // states. nsc emits none in that case and neither should this.
+        if !out.contains('<') {
+            return;
+        }
+        let mut want = vec![self.super_name.clone()];
+        want.extend(self.interfaces.iter().cloned());
+        if crate::sig::erase_class_signature(&out, &g.tvars).as_deref() != Some(want.as_slice()) {
+            return;
+        }
+        self.signature = Some(out);
     }
 
     pub(crate) fn add_java_annot_to_last(&mut self, desc: &str) {
@@ -1052,6 +1180,9 @@ impl ClassBuilder {
             scala_raw: self.scala_raw,
             inner_classes,
             enclosing_method,
+            signature: self.signature,
+            field_signatures: self.field_signatures,
+            field_constants: self.field_constants,
         };
         let bytes = class.write_with_pool(self.pool).expect("classfile write");
         EmittedClass {

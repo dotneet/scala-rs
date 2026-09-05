@@ -430,6 +430,10 @@ pub struct Method {
     pub code: Option<Code>,
     /// RuntimeVisible Java annotations (`Ljava/lang/Deprecated;`, …).
     pub java_annots: Vec<String>,
+    /// JVMS §4.7.9 `Signature`: the generic shape `desc` erased away. Set
+    /// through [`crate::gen::ClassBuilder::sign_last`], which refuses any
+    /// string that does not erase back to `desc`.
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -471,6 +475,17 @@ pub struct ClassEmit {
     /// enclosed by a method/constructor rather than by a field initializer —
     /// that method's name and descriptor.
     pub enclosing_method: Option<(String, Option<(String, String)>)>,
+    /// JVMS §4.7.9 `Signature` on the class itself: formal type parameters,
+    /// then the superclass and every interface in `interfaces` order.
+    pub signature: Option<String>,
+    /// JVMS §4.7.9 `Signature` for a field, keyed by the field's source name
+    /// (`fields[i].name`, before `encode_method_name`). A map rather than a
+    /// member of [`Field`] because field names are unique within a class file
+    /// and twenty-odd call sites build `Field` literals.
+    pub field_signatures: std::collections::HashMap<String, String>,
+    /// JVMS §4.7.2 `ConstantValue` for a `static final` field, keyed the same
+    /// way. Only `long` is produced (`@SerialVersionUID`).
+    pub field_constants: std::collections::HashMap<String, i64>,
 }
 
 impl ClassEmit {
@@ -478,6 +493,14 @@ impl ClassEmit {
         let this_i = pool.class(&self.this_name);
         let super_i = pool.class(&self.super_name);
         let ifaces: Vec<u16> = self.interfaces.iter().map(|i| pool.class(i)).collect();
+        // JVMS §4.7.9 / §4.7.2. Interned up front so the name constants exist
+        // whether or not any member turns out to carry one.
+        let needs_sig_attr = self.signature.is_some()
+            || !self.field_signatures.is_empty()
+            || self.methods.iter().any(|m| m.signature.is_some());
+        let sig_attr = needs_sig_attr.then(|| pool.utf8("Signature"));
+        let const_attr = (!self.field_constants.is_empty()).then(|| pool.utf8("ConstantValue"));
+        let class_sig_idx = self.signature.as_deref().map(|s| pool.utf8(s));
         let mut field_idxs = Vec::new();
         for f in &self.fields {
             // A field name is an *unqualified name* (JVMS 4.2.2): `.`, `;`,
@@ -486,10 +509,14 @@ impl ClassEmit {
             // made `slick/ast/Library$` unloadable ("Illegal field name").
             // nsc runs every term name through the same NameTransformer it
             // uses for methods, so `/` is `$div`.
+            let sig = self.field_signatures.get(&f.name).map(|s| pool.utf8(s));
+            let cst = self.field_constants.get(&f.name).map(|v| pool.long(*v));
             field_idxs.push((
                 f.access,
                 pool.utf8(&encode_method_name(&f.name)),
                 pool.utf8(&f.desc),
+                sig,
+                cst,
             ));
         }
         let code_attr = pool.utf8("Code");
@@ -581,7 +608,8 @@ impl ClassEmit {
             let n = pool.utf8(&m.name);
             let d = pool.utf8(&m.desc);
             let annots: Vec<u16> = m.java_annots.iter().map(|a| pool.utf8(a)).collect();
-            methods_data.push((m.access, n, d, m.code.clone(), annots));
+            let sig = m.signature.as_deref().map(|s| pool.utf8(s));
+            methods_data.push((m.access, n, d, m.code.clone(), annots, sig));
         }
         let mut out = Vec::new();
         out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
@@ -596,18 +624,31 @@ impl ClassEmit {
             out.extend_from_slice(&i.to_be_bytes());
         }
         out.extend_from_slice(&(field_idxs.len() as u16).to_be_bytes());
-        for (acc, n, d) in field_idxs {
+        for (acc, n, d, sig, cst) in field_idxs {
             out.extend_from_slice(&acc.to_be_bytes());
             out.extend_from_slice(&n.to_be_bytes());
             out.extend_from_slice(&d.to_be_bytes());
-            out.extend_from_slice(&0u16.to_be_bytes());
+            let n_attrs = u16::from(sig.is_some()) + u16::from(cst.is_some());
+            out.extend_from_slice(&n_attrs.to_be_bytes());
+            if let (Some(a), Some(s)) = (const_attr, cst) {
+                out.extend_from_slice(&a.to_be_bytes());
+                out.extend_from_slice(&2u32.to_be_bytes());
+                out.extend_from_slice(&s.to_be_bytes());
+            }
+            if let (Some(a), Some(s)) = (sig_attr, sig) {
+                out.extend_from_slice(&a.to_be_bytes());
+                out.extend_from_slice(&2u32.to_be_bytes());
+                out.extend_from_slice(&s.to_be_bytes());
+            }
         }
         out.extend_from_slice(&(methods_data.len() as u16).to_be_bytes());
-        for (acc, n, d, code, annots) in methods_data {
+        for (acc, n, d, code, annots, sig) in methods_data {
             out.extend_from_slice(&acc.to_be_bytes());
             out.extend_from_slice(&n.to_be_bytes());
             out.extend_from_slice(&d.to_be_bytes());
-            let n_attrs = u16::from(code.is_some()) + u16::from(!annots.is_empty());
+            let n_attrs = u16::from(code.is_some())
+                + u16::from(!annots.is_empty())
+                + u16::from(sig.is_some());
             out.extend_from_slice(&n_attrs.to_be_bytes());
             if let Some(c) = code {
                 out.extend_from_slice(&code_attr.to_be_bytes());
@@ -647,8 +688,14 @@ impl ClassEmit {
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(&body);
             }
+            if let (Some(a), Some(s)) = (sig_attr, sig) {
+                out.extend_from_slice(&a.to_be_bytes());
+                out.extend_from_slice(&2u32.to_be_bytes());
+                out.extend_from_slice(&s.to_be_bytes());
+            }
         }
         let n_class_attrs = 1u16
+            + if class_sig_idx.is_some() { 1 } else { 0 }
             + if rva_attr.is_some() { 1 } else { 0 }
             + if scala_sig_attr.is_some() { 1 } else { 0 }
             + if scala_raw_attr.is_some() { 1 } else { 0 }
@@ -660,6 +707,11 @@ impl ClassEmit {
                 0
             };
         out.extend_from_slice(&n_class_attrs.to_be_bytes());
+        if let (Some(a), Some(s)) = (sig_attr, class_sig_idx) {
+            out.extend_from_slice(&a.to_be_bytes());
+            out.extend_from_slice(&2u32.to_be_bytes());
+            out.extend_from_slice(&s.to_be_bytes());
+        }
         if let Some(ic) = inner_classes_attr {
             out.extend_from_slice(&ic.to_be_bytes());
             out.extend_from_slice(&((2 + inner_classes_idxs.len() * 8) as u32).to_be_bytes());

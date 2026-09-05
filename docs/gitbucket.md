@@ -840,17 +840,27 @@ macro expansion is not implemented: cannot expand apply
 separate JVM, so a class this run is itself compiling cannot be passed to one.
 ```
 
-which is checked before the JVM is started rather than coming back as a bare
-`ScalaReflectionException: class Issues not found`. `tq_muse_bad.scala` pins
-it. nsc has no such limit, because it expands in its own universe where the
-symbol exists; closing this would mean giving the engine a mirror over the
-symbols of the current run, which is `docs/macros.md` §4.3's open problem and
-not a gitbucket question.
+which was checked before the JVM was started rather than coming back as a bare
+`ScalaReflectionException: class Issues not found`.
+
+**Closed by the `agent/macrotag` slice.** Such a type now travels as a
+*placeholder* symbol built in the runtime universe, carrying the class's full
+name and no info, and scala-rs recognises that name in the tree that comes
+back (`docs/macros.md` §5.1). All 35 expand: gitbucket goes from **981 to 946**
+errors and 112 to 111 files. `tests/fixtures/mg_use.scala` is the dual run
+against real scalac that says the expansion is the right one, and it covers
+gitbucket's actual shape -- a table class nested in a trait, which has no
+`staticClass` path even after it is compiled.
 
 The same change turns the 31 `value mapTo is not a member of …` into 31
 `cannot expand mapTo (…): scala-rs cannot build a type tag for ClassTag, a type
 constructor applied to type arguments` -- same count, accurate message, and a
-named next step.
+named next step. Those 31 are **still open**, and the placeholder does not
+help them: `mapToImpl` does not merely carry its type argument, it asks the
+class what it is (`rSym.asClass.isCaseClass`, `rTag.tpe.decls`,
+`rSym.companion.info.member("tupled")`), and a placeholder cannot answer. See
+`docs/macros.md` §7.18 for why an *honest* answer is not available at that
+point in the run, and for the two things that would have to be built.
 
 ### 19. A view for an argument, with an unrelated open type parameter — 15 errors (typer)
 

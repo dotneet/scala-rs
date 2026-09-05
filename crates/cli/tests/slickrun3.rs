@@ -188,6 +188,11 @@ fn fixtures_slickrun3_erases_compound_bounds_like_nsc() {
         eprintln!("skip slickrun3 javap: no javap");
         return;
     };
+    // This test is about *erasure*, and `javap` prints the generic form of any
+    // member that carries a JVMS 4.7.9 `Signature` (`JdbcType<T>` rather than
+    // `JdbcType`). Compare against the headers with their type arguments
+    // dropped, which is the shape the descriptors actually have.
+    let factory = erase_generics(&factory);
     // `BaseColumnType[T] <: ColumnType[T] with BaseTypedType[T]` erases to the
     // dominator `ColumnType`, hence to *its* bound `TypedType` -- not to
     // `Object`, and not to the shadowed-out `BaseTypedType`.
@@ -200,7 +205,7 @@ fn fixtures_slickrun3_erases_compound_bounds_like_nsc() {
         "and `assertNonNull` at the same erasure:\n{factory}"
     );
 
-    let mapped = javap(&out, "JdbcComponent$MappedJdbcType$").unwrap();
+    let mapped = erase_generics(&javap(&out, "JdbcComponent$MappedJdbcType$").unwrap());
     assert!(
         mapped.contains("JdbcType base(java.lang.String, JdbcType)"),
         "the narrow implementation:\n{mapped}"
@@ -219,4 +224,20 @@ fn fixtures_slickrun3_erases_compound_bounds_like_nsc() {
         "`mkTerm`'s bridge should be at `TermNameApi`:\n{universe}"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+/// Drop every `<...>` group from `javap` output, so a header reads as the
+/// erased descriptor it stands for.
+fn erase_generics(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
