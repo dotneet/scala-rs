@@ -491,8 +491,51 @@ method is a macro, and its implementation is X.y".
      talk to ourselves, a simpler encoding would do. Since there is already a compatibility test in
      which **scalac reads our classfiles** (`scalac_typechecks_against_our_classfiles_if_present`),
      aiming at the nsc-compatible shape is worth it.
-  3. Recover it on the unpickler side.
+  3. Recover it on the unpickler side. **Done** (`agent/tq2`, `docs/gitbucket.md`
+     root 18): `scala_rs_pickle::sym` decodes the `SYMANNOT` holding
+     `@scala.reflect.macros.internal.macroImpl` into `Member::macro_impl`, and
+     `PickleSupply::install_pickled_macro` installs the declaration with that
+     binding. So a macro def **in a published jar** -- slick's
+     `TableQuery.apply[E]`, `ShapedValue.mapTo[R]` -- is now a member with its
+     real type, and its call sites go through the same expansion-or-diagnose
+     path as a source-level one. The implementation in that case is *already
+     compiled*, so §2.3's finding applies directly: `reify` and quasiquotes run
+     as themselves.
+
+     Two fields of the annotation are the whole binding: `className` /
+     `methodName`, and `signature`, which is nsc's per-parameter `Fingerprint`
+     list. The encoding, confirmed against every macro in
+     `slick_2.13-3.4.1.jar`: the first clause is always the implementation's
+     `(c: Context)`; `-1` is an ordinary value, `-2` a `c.Expr[T]`, `-3` a
+     `c.Tree`, and a non-negative value a `WeakTypeTag` for the macro def's
+     type parameter at that position. That gives `expr_args` and `tag_params`
+     without reading the implementation's own signature at all.
+
+     Still open: item 2, the *writing* side. scala-rs's own pickle still does
+     not carry the `MACRO` flag, so a macro def scala-rs compiles cannot be
+     called from a later scala-rs run.
 - **Macro defs emit no method body** (`crates/backend/src/gen.rs`).
+
+### 5.1 The limit a runtime mirror puts on a type tag
+
+A macro implementation reached this way is invoked through the JVM bridge, and
+the bridge rebuilds a `WeakTypeTag` with `mirror.staticClass(name)`. That
+mirror sees the **classpath**, so a type argument that is a class *this run is
+compiling* cannot be passed to one. `Typer::expansion_request` checks the
+`BinaryIndex` before starting the engine and refuses with
+
+```
+the type argument `Issues` is not on the classpath -- a macro's type tag is
+rebuilt by name in a separate JVM, so a class this run is itself compiling
+cannot be passed to one
+```
+
+rather than letting a bare `ScalaReflectionException: class Issues not found`
+come back from the JVM. nsc has no such limit -- it expands in its own
+universe, where the symbol exists. gitbucket's `lazy val Issues =
+TableQuery[Issues]` is exactly this shape, so 35 of its errors are this
+diagnostic; closing it means giving the engine a mirror over the current run's
+symbols, which is §4.3's open problem.
 
 ---
 

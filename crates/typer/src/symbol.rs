@@ -283,6 +283,14 @@ pub struct MacroBinding {
     pub expr_args: Vec<bool>,
 }
 
+impl MacroBinding {
+    /// `Class.method`, the pair that identifies the implementation. Two
+    /// symbols with the same origin stand for the same macro def.
+    pub fn origin(&self) -> String {
+        format!("{}.{}", self.impl_class, self.impl_method)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub id: SymbolId,
@@ -1315,6 +1323,19 @@ impl SymbolTable {
         match self.get(id).ty {
             Type::ModuleRef(c) => c,
             _ => id,
+        }
+    }
+
+    /// Does this method take at least one value parameter?
+    ///
+    /// The question SLS 6.26.3 asks of an overloaded reference read in value
+    /// position: the alternatives that take *no* parameters are the ones that
+    /// survive there. An empty clause (`def f(): T`) counts as taking none,
+    /// which is also how it behaves -- it is auto-applied.
+    pub fn takes_value_params(&self, id: SymbolId) -> bool {
+        match &self.get(id).ty {
+            Type::Method { paramss, .. } => paramss.iter().any(|c| !c.is_empty()),
+            _ => false,
         }
     }
 

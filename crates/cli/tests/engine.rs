@@ -636,7 +636,10 @@ fn sd_unsupported_forms_are_named() {
     );
     for needle in [
         // A row class this run compiles is not on the macro classpath yet.
-        "class SdLocalRow not found",
+        // Said before the JVM is started (`docs/macros.md` §5.1): this used to
+        // come back as the engine's own `ScalaReflectionException: class
+        // SdLocalRow not found`, which named the class but not the reason.
+        "the type argument `SdLocalRow` is not on the classpath",
         // A modifier with no name in the table.
         "a definition marked `DEFERRED`, a modifier scala-rs cannot rebuild yet",
     ] {

@@ -81,7 +81,9 @@ path of your own.**
 | main at `cad281b` | 353 | 1 | **1693** | 186 | 0 |
 | main at `1a494fb` + the merges after it (root 16, the `def` signatures) | 353 | 1 | **1391** | 184 | 0 |
 | main at `e59f56a` | 353 | 1 | **1373** | 184 | 0 |
-| Now (root 17, the function-literal shapes) | 353 | 1 | **1246** | 185 | 0 |
+| root 17, the function-literal shapes | 353 | 1 | **1246** | 185 | 0 |
+| main at `dc6fdc9` | 353 | 1 | **1193** | 184 | 0 |
+| Now (roots 18 and 19, `TableQuery` through its macro) | 353 | 1 | **1736** | 185 | 0 |
 
 Every row after the second was measured on the same tree, with the same
 material, one binary each -- `SCALA_RS=<binary> tests/gitbucket_measure.sh`
@@ -94,19 +96,30 @@ nothing in gitbucket had been typechecked at all. This is exactly what
 honest reading of "35" is "0 files typechecked"; the honest reading of "3261"
 is "353 files typechecked, 97 of them clean".
 
-Of the 1246, **1093** are in 112 hand-written files (of 213 measured) and
-**146** — down from 1038 — are in 73 of the 140 generated templates.
+**The number went up again at roots 18/19, and again that is the progress.**
+1193 → 1736. What root 18 removed was 238 errors that were *wrong*: with
+`TableQuery[X]` typed as an un-applied method type, every query built on it
+was abandoned at its first member selection, and none of what is inside a
+gitbucket query had ever been typechecked. Now it is, and slick's DSL --
+`===`, `&&`, `Shape`, `CanBeQueryCondition` -- reports what it really cannot
+do yet. `files_with_errors` moved by one; no file that was clean broke.
 
-The worst hand-written files are
-`controller/RepositorySettingsController.scala` (104),
-`service/IssuesService.scala` (81),
-`controller/RepositoryViewerController.scala` (63),
-`controller/AccountController.scala` (51) and
-`service/RepositoryService.scala` (43).
+Of the 1736, **1590** are in 113 hand-written files (of 213 measured) and
+**146** are in 73 of the 140 generated templates — the template side is
+unchanged, since nothing there touches slick.
+
+The worst hand-written files are now
+`service/IssuesService.scala` (227),
+`service/RepositoryService.scala` (160),
+`service/WebHookService.scala` (79),
+`controller/RepositoryViewerController.scala` (65) and
+`service/AccountService.scala` (64) — the `service/` layer, which is where
+gitbucket's queries are. Before root 18 the same files reported a fraction of
+that and the head of the table was `controller/`.
 
 ## What was wrong, and what it cost
 
-Seventeen roots. Sixteen are fixed; the counts are what each was worth when it
+Nineteen roots. Eighteen are fixed; the counts are what each was worth when it
 was removed.
 
 ### 1. An operator swallowed the comment that followed it (lexer)
@@ -730,6 +743,139 @@ at the *callers*. Its four errors are root 4's wildcard self type and an
 `tests/slick_subset.sh` was not run: nothing under `crates/backend/` changed,
 and `slick_run.sh` is the check that executes code.
 
+### 18. A macro def in a jar's pickle was not read at all — 238 errors (pickle)
+
+The survey's "next biggest", and the count was right this time. It is also the
+first root here whose fix makes the raw number go **up**: see "The numbers".
+
+```scala
+lazy val Issues = TableQuery[Issues]   // slick.lifted.TableQuery.apply[E]
+Issues.filter(_.byUserName(userName))  // "value filter is not a member of
+                                       //  ((Tag) => Issues)TableQuery[Issues]"
+```
+
+`object TableQuery` declares two `apply`s:
+
+```scala
+def apply[E <: AbstractTable[?]](cons: Tag => E): TableQuery[E] = new TableQuery[E](cons)
+def apply[E <: AbstractTable[?]]: TableQuery[E] = macro TableQueryMacroImpl.apply[E]
+```
+
+`TableQuery[Issues]` means the **second** one. A macro def emits no bytecode at
+all -- nsc's own rule -- so the only record of one in a published jar is the
+`ScalaSignature`: the `MACRO` flag, plus a `SYMANNOT` holding
+`@scala.reflect.macros.internal.macroImpl`, a *typed tree* whose arguments are
+`className` / `methodName` / `isBundle` / `isBlackbox` / `signature`
+assignments. `PickleSupply::complete_named` declined every `MACRO` member
+except a hard-coded pair (`install_known_macro`, for
+`scala.reflect.runtime.currentMirror`), with a comment saying annotations were
+not decoded by this reader. So the companion's only visible `apply` was the one
+taking `cons`, the reference resolved to *it*, and the type of
+`TableQuery[Issues]` was that method's own un-applied type.
+
+Note what that did to the measurement: a query whose receiver is an error is
+abandoned at its first selection, so **nothing inside a gitbucket query had
+ever been typechecked**. The 238 were the outermost selection of 238 queries.
+
+Three pieces:
+
+* **`scala_rs_pickle::sym` now decodes the annotation** (`Member::macro_impl`).
+  Nothing is guessed: a shape that does not match returns `None` and the macro
+  is declined exactly as before. `signature` is nsc's per-parameter
+  `Fingerprint` list -- `-1` an ordinary value (the leading `Context` included),
+  `-2` a `c.Expr[T]`, `-3` a `c.Tree`, and a non-negative value a
+  `WeakTypeTag` for the macro def's type parameter at that position. Reading it
+  is what gives the expander `expr_args` and `tag_params` without ever looking
+  at the implementation's own signature. Checked against every macro in
+  `slick_2.13-3.4.1.jar`: `TableQuery$#apply` is `[[-1], [0]]` for
+  `apply(c)(implicit e: c.WeakTypeTag[E])`, `ShapedValue#mapTo` is
+  `[[-1], [-2], [0, 1]]` for `mapToImpl(c)(rCT: c.Expr[…])(implicit …, …)`.
+* **`PickleSupply::install_pickled_macro`** installs the declaration with the
+  pickle's own type and that binding. Whitebox macros and macro bundles are
+  declined by name, as the source-level path
+  (`crates/typer/src/macros.rs`) declines them.
+* **The two `apply`s are told apart by position.** Explicit type arguments
+  cannot separate them -- both take one -- so SLS 6.26.3 decides: an overloaded
+  reference read in *value* position keeps only the alternatives that take no
+  parameters, and one that is the callee of an `Apply` keeps only the ones that
+  do. `Check::type_expr`'s `Module[T]` → `Module.apply[T]` redirect gave up
+  whenever more than one `apply` had the right number of type parameters;
+  it now applies that rule as a tie-break first, and still gives up if it does
+  not leave exactly one. Without this half, `TableQuery[Issues]` was
+  `TableQuery$` and `TableQuery[Issues](tag => …)` did not resolve either.
+
+**And the macro really is expanded**, through the existing JVM bridge: the
+implementation is *already compiled* in the jar, so the `reify` inside it runs
+as itself against the runtime universe, exactly as `docs/macros.md` §2.3
+predicted. `crates/cli/tests/tqmacro.rs` pins that end to end --
+`tests/fixtures/tq_mdef.scala` is compiled by **real scalac** (only nsc writes
+that flag and that annotation), `tq_muse.scala` by scala-rs against its class
+files, and both programs' output must match.
+
+**What it cannot expand, and says so.** The bridge rebuilds a type tag by name
+through `mirror.staticClass`, and that mirror can only see the classpath. A
+type argument that is a class *this run is compiling* has no class file for it
+to find -- and `TableQuery[Issues]` is exactly that shape, since `Issues` is
+declared a few lines above the call. So gitbucket's 238 become **35** errors,
+one per `TableQuery[X]` site, reading
+
+```
+macro expansion is not implemented: cannot expand apply
+(implementation slick.lifted.TableQueryMacroImpl$.apply): the type argument
+`Issues` is not on the classpath -- a macro's type tag is rebuilt by name in a
+separate JVM, so a class this run is itself compiling cannot be passed to one.
+```
+
+which is checked before the JVM is started rather than coming back as a bare
+`ScalaReflectionException: class Issues not found`. `tq_muse_bad.scala` pins
+it. nsc has no such limit, because it expands in its own universe where the
+symbol exists; closing this would mean giving the engine a mirror over the
+symbols of the current run, which is `docs/macros.md` §4.3's open problem and
+not a gitbucket question.
+
+The same change turns the 31 `value mapTo is not a member of …` into 31
+`cannot expand mapTo (…): scala-rs cannot build a type tag for ClassTag, a type
+constructor applied to type arguments` -- same count, accurate message, and a
+named next step.
+
+### 19. A view for an argument, with an unrelated open type parameter — 15 errors (typer)
+
+Found underneath root 18 and fixed in the same slice, because it is what root
+18 exposed first.
+
+```scala
+def === [P2, R](e: Rep[P2])(implicit om: OptionMapper2[B1, B1, Boolean, P1, P2, R]): Rep[R]
+
+t.id === 1L   // "no matching overload for (Rep[P2])(OptionMapper2[…])Rep[R]
+              //  with arguments (1L)"
+```
+
+`1L` reaches `Rep[P2]` only through slick's `valueToConstColumn` view, and
+`Implicits::search_conversion_open` -- the search that offers a view whose own
+result says what an open type parameter is -- ended with
+
+```rust
+for o in open {
+    binds.push((*o, fold_applied(&u.solved(*o)?)));
+}
+```
+
+`open` is *every* type parameter of the callee. `Rep[P2]` says nothing about
+`R`, which lives only in the implicit clause and the result, so `u.solved(R)`
+was `None` and the whole fit was dropped. Only the type parameters the wanted
+type mentions can be settled by that unification; the rest are settled by the
+implicit clause, or by inference, or not at all. The answer is unchanged --
+a type parameter the wanted type does not mention cannot appear in the
+substitution -- and the result is still required to be free of type parameters.
+
+The reproduction is eight lines with no jar and no slick
+(`tests/fixtures/tq_openview.scala`), and it is a plain-language rule: nsc
+infers the view first and solves `R` from the implicit argument afterwards.
+
+Every `no matching overload for (Rep[P2])(OptionMapper2[…])Rep[R]` in gitbucket
+is gone. It is worth 15 there, which is small; the shape it unblocks is not,
+since it is how every slick comparison is written.
+
 ### The crash: `lub` had no depth cap
 
 `JGitUtil.scala` **aborted the compiler with a stack overflow and no
@@ -767,51 +913,76 @@ in a block inside the lambda, which has no stream for the guard to filter, and
 so diagnoses the shape rather than desugaring it wrongly. Three occurrences,
 one file, held out of the measurement by default.
 
-## Where the remaining 1246 are
+## Where the remaining 1736 are
 
-Counted by message shape, largest first, with the reading. The `…Only` family
-that headed this table is gone (root 17); what it was hiding is most of what
-grew.
+Counted by message shape, largest first, with the reading. The `TableQuery`
+family that headed this table is gone (root 18); **what it was hiding is all of
+what grew**, and it is one thing: slick's DSL, now reached for the first time.
 
 | n | message | reading |
 |---|---|---|
-| **238** | `value filter / insert / join / map … is not a member of ((Tag) => X)TableQuery[X]` | `TableQuery[X]`'s own members behind its `apply`-shaped constructor. Up from ≈70 because root 17 stopped suppressing the calls that reach them, and now the largest single thing by a wide margin. |
-| **137** | `value get / update / getOrElse is not a member of <overload …>` | scalatra, the same overload-set shape as root 12 but between two genuinely different members. Also up, for the same reason. |
-| **100** | `ambiguous implicit: request, objectDatabaseReleasable` / `response, …` / `context, …` | An implicit search that two candidates answer, in `Implicits.scala`'s conversions. |
-| 53 | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
-| 53 | `ambiguous overload for datetimeago with arguments (Date)` | *Not* the `…Only` shape, despite the survey grouping the two: the argument is an ordinary `Date`. A Twirl `object` extends `BaseScalaTemplate` and `TemplateN`, and its `apply` is ambiguous with something inherited. The largest single template symptom. |
+| **187** | `no implicit … CanBeQueryCondition[Any]` | `q.filter(t => …)`: the literal's body did not type, so `filter`'s `T` came out `Any`. Downstream of the two below, not a root of its own. |
+| **70 / 65 / 56 / 47 / 34 / 31** | `value get / update / list / delete / insert / firstOption is not a member of …` | Two different things wearing one shape. `get` / `update` / `getOrElse` on an `<overload …>` is scalatra (see 2 below); `list` / `delete` / `insert` / `firstOption` on a `Query[E, Any, Seq]` is blocking-slick's extension methods, downstream of the `Any`. |
+| **53** | `unimplemented syntax: named arguments (method parameters not resolved)` | Named arguments where the callee did not resolve. |
+| **53** | `ambiguous overload for datetimeago with arguments (Date)` | A Twirl `object` extends `BaseScalaTemplate` and `TemplateN`, and its `apply` is ambiguous with something inherited. The largest single template symptom. |
+| **45** | `value && is not a member of Rep[Boolean]` | slick's `booleanColumnExtensionMethods` conversion is not found for a member selection. A root, and the shortest reproduction of anything left. |
 | 44 | `ambiguous overload for apply$default$N with arguments ()` | A default getter that two overloads both own. |
+| 37 / 28 / 23 | `no implicit … BaseTypedType[AnyRef] / TypedType[Date] / BasicBackend.Session` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. |
+| 35 + 31 | `macro expansion is not implemented: cannot expand apply / mapTo` | Root 18's honest remainder: the type tag the implementation needs names a class this run is compiling (`TableQuery`), or a `ClassTag[T]` the tag builder cannot express (`mapTo`). |
 | 29 | `no matching overload for constructor Constraint with arguments ()` | jgit. |
+| 29 / 16 | `no implicit … OptionMapper2[…] / CanBeQueryCondition[Rep[R]]` | slick again, at comparisons whose operand is an `Option` column. |
 | 22 | `no matching overload for (…)FieldSerializer[A] with arguments ()` | json4s. |
-| 20 / 18 / 13 | `no implicit … BasicBackend.Session / TypedType[Date] / BaseTypedType[AnyRef]` | slick, in `BasicTemplate.scala`'s `self: Table[?] =>`: a wildcard self type does not offer the table's members. |
-| 13 | `missing parameter type for expanded function` | The `_`-placeholder form of a function literal in argument position. |
+| 14 / 13 / 11 | `no implicit … Shape[FlatShapeLevel, ON, UN, _] / Shape[_, Rep[String], T, G] / Shape[_, Rep[Int], T, G]` | `q.map(_.title)`, `q.join(…)`: slick's `Shape` implicits are not found. The single most load-bearing thing left. |
 
 ### What would remove the most next
 
-1. **`TableQuery[X]`'s own members behind its `apply`-shaped constructor**
-   (238). `lazy val Issues = TableQuery[Issues]` is typed as the *function*
-   `(Tag) => Issues` applied to nothing, so `Issues.filter` looks for `filter`
-   on a function type.
-2. **A pickled *declaration* cannot be told from a definition** (the 137
-   `value get / update is not a member of <overload …>`, and whatever else
-   `drop_overridden` cannot separate across two unrelated traits). Root 15
-   works around it with linearization order, which is enough for an implicit
-   but not for an overload set. The bit is in the pickle
+The list is almost entirely slick now, and every entry reproduces in **under
+fifteen lines against the published jar**, with no gitbucket checkout — the
+harness for that is three lines of shell (`scalac`/`scala-rs` over one file with
+`sbt export Compile/dependencyClasspath`'s classpath).
+
+1. **slick's `Shape` implicits are not found** (≈40 directly, and most of the
+   187 `CanBeQueryCondition[Any]` are downstream of them). Two lines:
+   ```scala
+   import slick.jdbc.H2Profile.api._
+   class Issues(tag: Tag) extends Table[(Long, String)](tag, "ISSUES") {
+     def id = column[Long]("ID"); def title = column[String]("TITLE"); def * = (id, title)
+   }
+   val q = TableQuery[Issues](t => new Issues(t))
+   q.map(_.title)   // no implicit: could not find implicit value of type Shape[_, Rep[String], T, G]
+   ```
+   `q.sortBy(_.id)` in the same file works, so it is not the receiver.
+2. **A conversion is not found for a member selection on `Rep[Boolean]`**
+   (45). `(a === b) && (c === d)` needs
+   `ExtensionMethodConversions.booleanColumnExtensionMethods`. Same file as
+   above plus one line.
+3. **A pickled *declaration* cannot be told from a definition** (the
+   `value get / update is not a member of <overload …>` half, ≈137 as before).
+   Root 15 works around it with linearization order, which is enough for an
+   implicit but not for an overload set. The bit is in the pickle
    (`pflags::DEFERRED`); what stops us using it is that the member supply
    collapses same-shaped hits into one symbol without preferring the concrete
    one, so marking the survivor deferred makes
    `check_missing_implementations` fire — measured, 1693 → 2117. Fix the
    collapse first.
-3. **The 100 `ambiguous implicit`**, in gitbucket's own `Implicits.scala`.
-   Unmeasured: nobody has yet checked whether the two candidates are one
-   member reached twice (root 15's shape) or two real ones.
-4. **A wildcard self type offers no members** (≈44). `trait BasicTemplate {
-   self: Table[?] => val userName = column[String]("USER_NAME") }` gives
-   `not found: value column` and then `BaseTypedType[AnyRef]` for everything
-   downstream; writing `self: Table[String] =>` works.
-   Suppressing it would not fix anything, but it would stop 176 errors from
-   hiding what is under them.
-5. **A bare `Ident` in a parameter or result type reports nothing when it
+4. **A wildcard self type offers no members** (≈44 directly, ≈88 downstream).
+   `trait BasicTemplate { self: Table[?] => val userName = column[String]("USER_NAME") }`
+   gives `not found: value column` and then `BaseTypedType[AnyRef]` for
+   everything downstream; writing `self: Table[String] =>` works.
+5. **Inference takes an argument's own type where its base type at the
+   parameter's class is meant.** Not counted, and found while writing root 19's
+   fixture: for `def f[P](e: Rep[P])` and `class Lit[T] extends Rep[T]`,
+   `f(new Lit[Long](9L))` solves `P = Lit[Long]`, not `Long`, and then no
+   implicit for `P` can be found. nsc reduces `Lit[Long] <: Rep[P]` through the
+   base type. `open_conversion_fit` already does this on the view path
+   (`align_to_param_class`); `infer_method_tparams` does not.
+6. **A companion object is shadowed by its class in term position.** Also found
+   while writing root 18's fixture, also uncounted: with `import p._` in scope
+   for a class `C` *and* its companion, `C[Arg]` in a term position resolves to
+   the **class** symbol, and then a `Module[T]` → `Module.apply[T]` redirect
+   never happens. Writing the object's members behind an `api` object (which is
+   what slick does, so gitbucket never hits it) works around it.
+7. **A bare `Ident` in a parameter or result type reports nothing when it
    resolves to nothing.** Not a count of its own — it is what made root 16's
    187 `Session` diagnostics appear at their callers instead of at the
    definitions, and it is why `def oops(x: Missing): Int` is silent while

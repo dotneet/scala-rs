@@ -448,8 +448,27 @@ impl Typer {
                 ));
             }
             for t in targs {
+                let name = static_tag_class(&self.st, t)?;
+                // The engine rebuilds a tag with `mirror.staticClass(name)`,
+                // and its mirror can only see the *classpath* -- there is no
+                // class file yet for a class this run is compiling. slick's
+                // `TableQuery[Issues]` is exactly that shape: the type
+                // argument is the table class defined a few lines above the
+                // call. Refused here, with the reason, rather than left to
+                // come back from the JVM as a bare
+                // `ScalaReflectionException: class Issues not found`.
+                let internal = name.replace('.', "/");
+                if !matches!(self.binary.find_class(&internal), Ok(Some(_))) {
+                    return Err(format!(
+                        "the type argument `{name}` is not on the classpath -- a macro's \
+                         type tag is rebuilt by name in a separate JVM, so a class this \
+                         run is itself compiling cannot be passed to one"
+                    ));
+                }
                 out.push(' ');
-                type_to_wire(&self.st, t, &mut out)?;
+                out.push_str("(ty ");
+                quote_into(&mut out, &name);
+                out.push(')');
             }
         }
         out.push(')');
@@ -1055,18 +1074,23 @@ fn type_to_wire(
     ty: &Type,
     out: &mut String,
 ) -> Result<(), String> {
+    let name = static_tag_class(st, ty)?;
+    out.push_str("(ty ");
+    quote_into(out, &name);
+    out.push(')');
+    Ok(())
+}
+
+/// The class name a type tag is rebuilt from on the engine's side.
+fn static_tag_class(st: &crate::symbol::SymbolTable, ty: &Type) -> Result<String, String> {
     // `f(42)` types its argument as the *constant* type `42`; the tag nsc
     // builds for it is `Int`.
     let widened = match ty {
         Type::Constant(lit) => Type::lit_underlying(lit),
         other => other.clone(),
     };
-    let name = crate::materialize::static_class_name(st, &widened)
-        .map_err(|why| format!("scala-rs cannot build a type tag for {why}"))?;
-    out.push_str("(ty ");
-    quote_into(out, &name);
-    out.push(')');
-    Ok(())
+    crate::materialize::static_class_name(st, &widened)
+        .map_err(|why| format!("scala-rs cannot build a type tag for {why}"))
 }
 
 // ------------------------------------------------------------------- the wire

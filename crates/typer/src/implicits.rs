@@ -1398,8 +1398,27 @@ impl Typer {
         if rest.is_empty() && open.is_empty() && !self.st.is_sub_type(&ret_k, to) {
             return None;
         }
+        // Only the callee's type parameters the *wanted* type mentions can be
+        // settled by this unification; the others are settled by the rest of
+        // the call, or by an implicit clause, or not at all. Demanding a
+        // solution for every one of them threw away every fit for a method
+        // whose signature has a type parameter outside the parameter this
+        // view is for -- slick's
+        //
+        //   def === [P2, R](e: Rep[P2])(implicit om: OptionMapper2[B1, B1, Boolean, P1, P2, R]): Rep[R]
+        //
+        // is the shape: `Rep[P2]` says nothing about `R`, so `column === 1L`
+        // could not reach the `Long => Rep[Long]` view that makes it
+        // applicable at all, and came out `no matching overload for
+        // (Rep[P2])(OptionMapper2[…])Rep[R] with arguments (1L)`. The answer
+        // is unaffected -- a type parameter `to` does not mention cannot
+        // appear in the substitution -- and `solved_to` is still required to
+        // be free of type parameters below.
         let mut binds = Vec::new();
         for o in open {
+            if !crate::check::mentions_tparam(to, std::slice::from_ref(o)) {
+                continue;
+            }
             binds.push((*o, fold_applied(&u.solved(*o)?)));
         }
         let ids: Vec<SymbolId> = binds.iter().map(|(i, _)| *i).collect();
