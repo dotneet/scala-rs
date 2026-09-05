@@ -776,26 +776,98 @@ private-runtime modes), and `nel_newtype_bad.scala` pins that the fix does
 not loosen arity checking (`Widget[Int, String]` is still rejected, in nsc
 and here).
 
-### What is still missing: `Type::TypeMember` still has no prefix
+### `Type::TypeMember` has no prefix: the implicit-scope half (fixed)
 
-None of the three fixes above touch **57** further errors (`value
-toSortedSet`/`toSortedMap`/`reduce`/… `is not a member of Newtype.Type[A]`,
-unchanged before and after — 32 of them in `NonEmptySet.scala` and its
-neighbours, the rest in `NonEmptyMapImpl.scala` and `NonEmptyChainImpl.scala`,
-which use the same encoding). These calls reach the newtype through an
-**implicit conversion** (`implicit def catsNonEmptySetOps[A](value:
-NonEmptySet[A]): NonEmptySetOps[A]`), not a direct member, and `object
-NonEmptySetImpl extends Newtype` never narrows `Type` in its own body — it is
-purely inherited from the shared `private[data] trait Newtype { type Type[A]
-<: Base with Tag }`, unlike `NonEmptyLazyList`, which redeclares `type
-Type[+A] <: Base with Tag` directly. Implicit search for a conversion out of
-an abstract type looks at the type's companion scope, and a `Type::TypeMember`
-here carries only the defining symbol (`Newtype`'s own `Type`), never the
-*prefix* (`NonEmptySetImpl.type`) the source actually selected it through —
-so the search looks in `Newtype`'s companion (there is none) instead of
-`NonEmptySetImpl`'s, and reports the type by the trait's name, not the
+The three fixes above left **57** further errors untouched (`value
+toSortedSet`/`toSortedMap`/`reduce`/… `is not a member of Newtype.Type[A]` --
+32 of them in `NonEmptySet.scala` and its neighbours, the rest in
+`NonEmptyMapImpl.scala` and `NonEmptyChainImpl.scala`, which use the same
+encoding). These calls reach the newtype through an **implicit conversion**
+(`implicit def catsNonEmptySetOps[A](value: NonEmptySet[A]): NonEmptySetOps[A]`),
+not a direct member, and `object NonEmptySetImpl extends Newtype` never
+narrows `Type` in its own body -- it is purely inherited from the shared
+`private[data] trait Newtype { type Type[A] <: Base with Tag }`, unlike
+`NonEmptyLazyList`, which redeclares `type Type[+A] <: Base with Tag`
+directly. Implicit search for a conversion out of an abstract type looks at
+the type's companion scope, and a `Type::TypeMember` here carries only the
+defining symbol (`Newtype`'s own `Type`), never the *prefix*
+(`NonEmptySetImpl.type`) the source actually selected it through -- so the
+search looked in `Newtype`'s companion (there is none) instead of
+`NonEmptySetImpl`'s, and reported the type by the trait's name, not the
 object's, exactly like `value toSortedSet is not a member of Newtype.Type[A]`
-prints. This is the same "`Type::TypeMember` has no prefix" gap already
-recorded above for `Representable#compose`, reached by a different path;
-fixing it needs the type carrying a prefix, not another namespace-resolution
-patch, and is deliberately left for a slice that wants to take that on.
+printed.
+
+**91 further errors.** `tests/cats_measure.sh -Ykind-projector` goes from
+**816 errors / 107 files** to **758 errors / 106 files** (one file --
+`syntax/set.scala` -- cleared entirely); the 58 `Newtype`/`Newtype2` "not a
+member" errors this section is about are all gone, no other file's error set
+grew, and the small remainder of the 91 is later diagnostics in files that
+still had errors (the next wall right behind this one, e.g. `NonEmptySet.scala`
+now reports `type mismatch; found: SortedSet[A]  required: Iterable[A]` where
+it used to stop at the member lookup) -- real progress, not a wash.
+
+The `Representable#compose` half of this gap (`self.Representation` and
+`G.Representation` -- two *value* prefixes of the same defining symbol,
+needing to stay distinct rather than gain a companion) is unrelated to
+implicit search and still open; see
+[the section above](#typetypemember-has-no-prefix-testsfixturesc4_aliasscala).
+
+Fixing this *without* changing what `Type::TypeMember` carries turned out to
+matter. The first attempt did give it a prefix -- wrapping the resolved type
+in the same `Type::Refined` "as-seen-from view" `Checker::projected_class_type`
+already uses to carry a prefix past `Type::Class` (which has no room for one
+either): `Type::Refined { parents: vec![TypeMember(id), ModuleRef(owner)],
+decls: vec![<asSeenFrom>] }`. `SymbolTable::is_sub_type`, `display_type` and
+dealiasing all already unwrap that view to its bare first parent, so on paper
+nothing downstream should have noticed. In practice `WidgetImpl.unwrap(value)`
+-- a generic method call whose own parameter is the *same* abstract member,
+written directly (`def unwrap[A](w: Type[A]): List[A]`) -- broke: inferring
+`A` from a wrapped `value` no longer unified against `unwrap`'s bare
+`Type[A]`, because the type-argument inference that checks a call's arguments
+against a generic method's parameters compares structurally and never
+consults `SymbolTable::as_seen_from_view` the way `is_sub_type` does. Wrapping
+a value used in a hundred places to fix one caller's implicit search is too
+wide a blast radius to carry silently.
+
+The fix that shipped instead never changes the `Type` at all. `Typer` gets a
+side table, `type_member_prefixes: RefCell<HashMap<u32, Vec<SymbolId>>>`,
+keyed by a type member's own defining symbol; `Checker::with_prefix_if_type_member`
+(hooked into `tree_to_type`'s `AppliedTypeTree` case, right where `p.T[args]`
+resolves `p` through `qualified_type_owners`) records the module `p` denotes
+there whenever `T` stays abstract, without touching the type it returns. The
+implicit search's `collect_type_parts` (`crates/typer/src/implicits.rs`) is
+the only reader: its new `Type::TypeMember` arm adds every module ever
+recorded for that member as an extra implicit-scope part, alongside the
+existing upper-bound class. Every other consumer of `Type::TypeMember` --
+subtyping, display, dealiasing, erasure, unification -- sees exactly the type
+it always did.
+
+The trade-off is coarser than a real prefix: `Newtype`'s single shared `Type`
+member means `NonEmptySetImpl`, `NonEmptyMapImpl` and `NonEmptyChainImpl` all
+record themselves against the *same* key, so implicit search for any one of
+them now also offers the other two's conversions as candidates. Harmless when
+an offered candidate's own parameter type fails to unify, the same way an
+unrelated implicit already in scope is harmless -- which is what actually
+happens for cats' own code, and is why the corpus number above only ever goes
+down. It is not a general soundness fix, though: two *independent* newtypes
+sharing one un-overridden abstract member, whose conversions happen to add a
+same-named method, can pick the wrong one and accept a program real scalac
+rejects. (Confirmed with a two-newtype variant of the repro below --
+`WidgetImpl`/`GadgetImpl` both `extends Newtype`, and a `Widget[Int]` calling
+a `.toList` that only `GadgetOps` defines type-checks here and is rejected by
+scalac 2.13.16 as "value toList is not a member of Widget[Int]". cats itself
+does not hit this in the measured corpus.) Closing that needs the same real
+prefix the abandoned `Type::Refined` attempt tried to carry, plus fixing
+generic-method unification to read `as_seen_from_view` the way subtyping
+does -- both still open, and now with a known dead end recorded so the next
+attempt does not re-spend the same slice rediscovering it.
+
+`tests/fixtures/tm_newtype.scala` reduces the shape to one file (`Newtype`
+declared once, `WidgetImpl extends Newtype` without overriding `Type`, and
+the alias reached through a package object that inherits it from a parent
+class -- the same cross-scope indirection `nel_newtype.scala` uses -- so the
+object and the alias-bearing package object are still declared in genuinely
+different namer scopes), dual-run against real scalac 2.13.16 in both the
+library-ABI and private-runtime modes; `tm_newtype_bad.scala` pins that the
+fix does not loosen arity checking (`Widget[Int, String]` is still rejected,
+in nsc and here).
