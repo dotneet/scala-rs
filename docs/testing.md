@@ -691,3 +691,37 @@ About 3 seconds for slick's 1596 classes, so it runs inside both
 It is a **structural** check and nothing more. It says nothing about types,
 stack depth, or whether a branch target carries a stack map frame — a bad frame
 still needs a JVM to find it.
+
+## `tests/verify_all.sh` — the check that was missing (2026-09-06)
+
+Six of the 1490 classes slick compiles to fail JVM verification, and had been
+failing for an unknown number of waves while every measure in the battery
+reported green:
+
+```
+BAD slick.collection.heterogeneous.HList$                          VerifyError: Bad type on operand stack
+BAD slick.jdbc.PositionedResult$$anon$507                          VerifyError: Bad type on operand stack
+BAD slick.jdbc.PostgresProfile$PostgresQueryBuilder                VerifyError: Bad invokespecial instruction
+BAD slick.memory.DistributedProfile                                VerifyError: Bad return type
+BAD slick.memory.MemoryProfile$InsertMappingCompiler$…             VerifyError: Bad type on operand stack
+BAD slick.memory.MemoryQueryingProfile$MemoryCodeGen$…             VerifyError: Bad type on operand stack
+```
+
+Why nothing saw them:
+
+| check | why it missed this |
+| --- | --- |
+| `slick_subset.sh` | `Class.forName(name, **false**, loader)` — not initialising means not linking, and an unlinked class never has its method bodies verified |
+| `slick_run.sh` | runs twelve programs, and verifies only what those programs touch |
+| `classfile_lint.py` | reads structure: branch targets, method sizes. It types nothing |
+| a `javap -p` sweep | stops at the constant pool |
+
+`tests/verify_all.sh <dir> [cp...]` calls `Class.forName(name, **true**,
+loader)` over every class file under a directory and counts `VerifyError` and
+`ClassFormatError`, ignoring anything else a load can throw (a missing
+dependency, a static initialiser wanting a database). It exits non-zero when
+any class fails.
+
+**"slick compiles with zero errors" was true and is not the same claim as "the
+JVM will load what we wrote."** That distinction is the reason this file
+already has a section on what each check proves; this is one more line in it.
