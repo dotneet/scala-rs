@@ -16431,6 +16431,125 @@ impl Typer {
         Some(rhs)
     }
 
+    /// Whether a type has an *erasure* nsc's `ClassTag` materialiser can turn
+    /// into a `classOf`.
+    ///
+    /// `Implicits.manifestOfType` with `full = false` builds the tag out of
+    /// that erasure: a class becomes `classOf[C]` however many type arguments
+    /// it carries. A type whose erasure is not a class has no tag of its own,
+    /// and unless the scope supplies one the implicit search fails — that is
+    /// the whole of `No ClassTag available for T`.
+    ///
+    /// Probed against scalac 2.13.16. Rejected: a method's own type parameter
+    /// (`def f[T] = classTag[T]`), one with an upper bound (`T <: String`), a
+    /// class's type parameter, an abstract `type T` member, `Array[T]`,
+    /// `({ type L = T })#L`, and `CC[A]` for a higher-kinded parameter `CC`.
+    /// Accepted: `Int`, `String`, `Any`, `Null`, `Nothing`, `Unit`,
+    /// `Array[Int]`, `List[T]`, `Map[T, T]`, `List[_]`, `T with AnyRef` and a
+    /// singleton `P.type`.
+    fn classtag_erasable(&self, t: &Type) -> bool {
+        match t {
+            // No erasure of its own: the tag has to come from the scope.
+            Type::TypeParam(_) | Type::TypeMember(_) => false,
+            Type::Class { sym, .. } => !matches!(
+                self.st.get(*sym).kind,
+                SymKind::TypeParam | SymKind::TypeMember
+            ),
+            Type::Array(e)
+            | Type::ByName(e)
+            | Type::Repeated(e)
+            | Type::Annotated { tpe: e, .. } => self.classtag_erasable(e),
+            Type::Applied { ctor, .. } => self.classtag_erasable(ctor),
+            // nsc erases an intersection to `intersectionDominator`, which
+            // prefers a parent that is a class over one that is not — so
+            // `T with AnyRef` is tagged as `Object` and only an intersection
+            // of nothing but abstract types has no tag. (scalac accepts
+            // `classTag[T with AnyRef]`; the first attempt here refused it.)
+            Type::Refined { parents, .. } => {
+                parents.is_empty() || parents.iter().any(|p| self.classtag_erasable(p))
+            }
+            // Everything else — a value type, a function, a tuple, a
+            // singleton, and also an unresolved `Named` or an `Error` — keeps
+            // the old behaviour. Refusing on an error type would only add a
+            // second diagnostic to a program that already has one.
+            _ => true,
+        }
+    }
+
+    /// nsc's `findSubManifest`: the tag for an array's element type, taken
+    /// from the implicit scope first and built only if the scope has none.
+    /// It is a whole implicit search in nsc, which is why a context bound
+    /// two array levels down still answers.
+    fn classtag_sub(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        let want = Type::Class {
+            sym: ct_cls,
+            args: vec![t.clone()],
+        };
+        if let ImplicitSearch::Found(id) = self.search_implicit(&want) {
+            let r = self.ref_implicit(id, span);
+            // A witness that still wants arguments of its own is left to the
+            // caller's `implicit_tree`; only a plain value is spliced here.
+            if !matches!(r.ty, Type::Method { .. }) {
+                return Some(r);
+            }
+        }
+        self.classtag_tree(ct_cls, t, span)
+    }
+
+    /// `<tag>.wrap`, which is `ClassTag(ScalaRunTime.arrayClass(<tag>
+    /// .runtimeClass))` — the same tag nsc's `arrayType` factory builds.
+    fn classtag_wrap(
+        &self,
+        ct_cls: SymbolId,
+        inner: Tree,
+        elem: &Type,
+        span: Span,
+    ) -> Option<Tree> {
+        let wrap = self
+            .st
+            .lookup_member(ct_cls, "wrap")
+            .into_iter()
+            .find(|&id| self.st.get(id).kind == SymKind::Method)?;
+        Some(Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(inner),
+                name: "wrap".into(),
+            },
+            ty: Type::Class {
+                sym: ct_cls,
+                args: vec![Type::Array(Box::new(elem.clone()))],
+            },
+            sym: wrap,
+            postfix: false,
+            scala_ref: false,
+            stable_pat: false,
+        })
+    }
+
+    /// The tree nsc's materialiser builds for `ClassTag[t]`, or `None` when
+    /// it can build none — in which case the search has failed and the caller
+    /// reports `No ClassTag available for t`.
+    fn classtag_tree(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        // `Array[E]` where `E` has no erasure of its own: nsc emits
+        // `arrayType(findSubManifest(E))`, not a `classOf` of the array. The
+        // difference is visible — `def f[T: ClassTag] = classTag[Array[T]]`
+        // must report `[[I` at `T = Int`, and a `classOf` of the array type
+        // reported `int`. `src/library/scala/Array.scala`'s `ofDim` is eleven
+        // of these.
+        if let Type::Array(e) = t {
+            if !self.classtag_erasable(e) {
+                let inner = self.classtag_sub(ct_cls, e, span)?;
+                return self.classtag_wrap(ct_cls, inner, e, span);
+            }
+        }
+        if !self.classtag_erasable(t) {
+            return None;
+        }
+        self.classtag_apply_tree(ct_cls, t, span)
+    }
+
     /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
     /// there is no primitive getter (`ClassTag.Int`, …).
     fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
@@ -16440,8 +16559,12 @@ impl Typer {
         if self.st.get(*sym).name != "ClassTag" || args.is_empty() {
             return None;
         }
-        let elem = args[0].clone();
-        let module = self.st.companion_module(*sym)?;
+        self.classtag_tree(*sym, &args[0], span)
+    }
+
+    fn classtag_apply_tree(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        let elem = t.clone();
+        let module = self.st.companion_module(ct_cls)?;
         let mcls = self.st.module_class_of(module);
         let apply = self
             .st
@@ -16492,7 +16615,10 @@ impl Typer {
                 fun: Box::new(fun),
                 args: vec![class_arg],
             },
-            ty: pt.clone(),
+            ty: Type::Class {
+                sym: ct_cls,
+                args: vec![t.clone()],
+            },
             sym: apply,
             postfix: false,
             scala_ref: false,
@@ -24169,8 +24295,16 @@ impl Typer {
                 self.type_expr_inner(tree, &Type::NoType);
             }
             ImplicitSearch::None => {
-                let diverged = self.diverged_implicit.borrow().clone();
-                self.error(span, self.missing_implicit_message(&ct_ty, diverged));
+                // `new Array[T](0)` is not an implicit search in nsc — it is
+                // `typedNew`'s own check, with its own wording
+                // (`neg/t9401`, `neg/t2775`).
+                self.error(
+                    span,
+                    format!(
+                        "cannot find class tag for element type {}",
+                        self.st.display_type(&elem)
+                    ),
+                );
                 tree.ty = Type::Error;
             }
             ImplicitSearch::Ambiguous(ids) => {
@@ -24642,6 +24776,18 @@ impl Typer {
                 self.st.display_type(&pt),
                 self.st.get(sym).name
             );
+        }
+        // nsc does not report a tag the way it reports any other implicit:
+        // `Implicits.implicitTagOrOfExpectedType` fails with its own message
+        // once the materialiser cannot build one (`neg/classtags_contextbound_a`,
+        // `neg/interop_typetags_arenot_classtags`).
+        if let Type::Class { sym, args } = ty {
+            if self.st.get(*sym).name == "ClassTag" && args.len() == 1 {
+                return format!(
+                    "No ClassTag available for {}",
+                    self.st.display_type(&args[0])
+                );
+            }
         }
         if let Some(msg) = self.implicit_not_found_msg(ty) {
             return msg;

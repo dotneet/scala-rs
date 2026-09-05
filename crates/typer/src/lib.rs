@@ -25,6 +25,7 @@ mod prelude_arrconv;
 mod prelude_boxed;
 mod prelude_bsops;
 mod prelude_buildfrom;
+mod prelude_classtag;
 mod prelude_coll;
 mod prelude_conform;
 mod prelude_dbio;

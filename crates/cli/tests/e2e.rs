@@ -4073,3 +4073,29 @@ fn co_allops_fixture() {
 fn co_allops_bad_is_rejected() {
     compile_fails("co_allops_bad", "incompatible type in overriding type T");
 }
+
+// -------------------------------------------- ClassTag for an abstract type
+
+/// A `ClassTag` is built out of the *erasure* of the type it tags, so a type
+/// whose erasure is not a class has none unless the scope supplies one. The
+/// accepting half: a class however applied, a context bound (including
+/// through any depth of `Array`, where nsc wraps the element's tag rather
+/// than taking a `classOf` of the array), an intersection with a class
+/// parent, and a singleton. Output compared against scalac 2.13.16.
+#[test]
+fn ct_classtag_fixture() {
+    dual_run_fixture("ct_classtag");
+}
+
+/// The refusing half: `classTag[T]` and `implicitly[ClassTag[T]]` for a bare
+/// type parameter, one with an upper bound, a class's own parameter, an
+/// abstract `type` member, and `Array[T]`. All seven diagnostics match
+/// scalac's, at scalac's lines. See docs/scala-corpus.md.
+#[test]
+fn ct_classtag_bad_is_rejected() {
+    compile_fails_lib("ct_classtag_bad", "No ClassTag available for T");
+    compile_fails_lib(
+        "ct_classtag_bad",
+        "cannot find class tag for element type T",
+    );
+}
