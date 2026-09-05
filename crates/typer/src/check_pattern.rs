@@ -21,6 +21,7 @@ impl Typer {
         self.type_expr(sel, &Type::NoType);
         let sel_ty = sel.ty.clone();
         let mut res = Type::Nothing;
+        let mut branch_tys = Vec::new();
         for c in cases.iter_mut() {
             self.st.push_scope();
             self.type_pattern(&mut c.pat, &sel_ty);
@@ -29,10 +30,11 @@ impl Typer {
             }
             self.type_expr(&mut c.body, pt);
             res = self.lub_branches(&res, &c.body.ty);
+            branch_tys.push(c.body.ty.clone());
             self.st.pop_scope();
         }
         let span = tree.span;
-        tree.ty = pt_or_lub(pt, res);
+        tree.ty = self.branch_result_ty(pt, &branch_tys, res);
         if let TreeKind::Match { selector, cases } = &tree.kind {
             // The pattern-matching function a `for` generator desugars to is
             // guarded by the `withFilter` the parser puts in front of it, so
@@ -1358,8 +1360,9 @@ impl Typer {
         let Some(param) = param else {
             return out;
         };
+        let (param, sel) = self.align_for_unify(&param, sel_ty);
         let params = [param];
-        let args = [sel_ty.clone()];
+        let args = [sel];
         let mut ids = Vec::new();
         let mut tys = Vec::new();
         for tp in tps {
@@ -1376,6 +1379,46 @@ impl Typer {
         out.iter()
             .map(|t| crate::symbol::subst_tparams_slice(&ids, &tys, t))
             .collect()
+    }
+
+    /// Line an `unapply`'s parameter type up with the scrutinee before reading
+    /// the extractor's type parameters off it.
+    ///
+    /// [`unify_one`] pairs two class applications by position, which is right
+    /// only when they are applications of the *same* class. A case class whose
+    /// parent reorders or drops type parameters breaks that: cats'
+    ///
+    /// ```scala
+    /// final case class Right[+B](b: B) extends (Nothing Ior B)
+    /// ```
+    ///
+    /// synthesizes `unapply[B](x: Right[B])`, and matching it against a
+    /// scrutinee `Ior[A, B]` paired the extractor's `B` with the scrutinee's
+    /// *first* argument. `case Ior.Right(b)` therefore bound `b: A`, and every
+    /// `IorT` method that matches on its own value reported `type mismatch;
+    /// found: A  required: B`.
+    ///
+    /// Walking one side to the other's class first is what nsc does -- the
+    /// extractor is run against the scrutinee's base type at the extractor's
+    /// class. Either direction may be the one that exists (`Some.unapply[A](x:
+    /// Option[A])` against a `Some[Int]` scrutinee walks the *scrutinee*),
+    /// so both are tried; when neither class is the other's base the pair is
+    /// left alone.
+    fn align_for_unify(&self, param: &Type, sel_ty: &Type) -> (Type, Type) {
+        let (Some(psym), Some(ssym)) = (self.st.class_sym_of(param), self.st.class_sym_of(sel_ty))
+        else {
+            return (param.clone(), sel_ty.clone());
+        };
+        if psym == ssym {
+            return (param.clone(), sel_ty.clone());
+        }
+        if let Some(base) = self.base_type_instance(sel_ty, psym, 0) {
+            return (param.clone(), base);
+        }
+        if let Some(base) = self.base_type_instance(param, ssym, 0) {
+            return (base, sel_ty.clone());
+        }
+        (param.clone(), sel_ty.clone())
     }
 
     /// The type an `x @ Extractor(...)` pattern narrows `x` to: the
@@ -1395,8 +1438,9 @@ impl Typer {
         if tps.is_empty() || sel_ty.is_no_type() {
             return Some(param);
         }
-        let params = [param.clone()];
-        let args = [sel_ty.clone()];
+        let (aligned, sel) = self.align_for_unify(&param, sel_ty);
+        let params = [aligned];
+        let args = [sel];
         let mut ids = Vec::new();
         let mut tys = Vec::new();
         for tp in tps {
