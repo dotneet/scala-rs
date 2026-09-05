@@ -349,6 +349,126 @@ impl Typer {
         self.st.lub(a, b)
     }
 
+    /// The type an `if` or a `match` takes: [`pt_or_lub`], except that an
+    /// expected type which is still a stand-in for an undetermined variable
+    /// ([`pt_is_undecided`]) does not get to be the answer. Adopting `F[_]`
+    /// there is what stopped `F.flatMap(value) { case … }` from ever deciding
+    /// `flatMap`'s `Y` -- the argument that was supposed to decide it said
+    /// `Y = _` instead.
+    ///
+    /// Two ways out, in order:
+    ///
+    /// * fill the stand-in positions from the branches
+    ///   ([`Self::fill_undecided`]) -- this is what nsc's `solve` does, taking
+    ///   the lub of the *lower bounds* a variable collected, rather than a lub
+    ///   of whole types;
+    /// * failing that, the branch lub, when it is a real type that already
+    ///   conforms to `pt`.
+    pub(crate) fn branch_result_ty(&self, pt: &Type, branch_tys: &[Type], joined: Type) -> Type {
+        if pt_is_undecided(pt) {
+            if let Some(filled) = self.fill_undecided(pt, branch_tys) {
+                return filled;
+            }
+            if !joined.is_no_type()
+                && !joined.is_error()
+                && !matches!(joined, Type::Nothing)
+                && self.st.is_sub_type(&joined, pt)
+            {
+                return joined;
+            }
+        }
+        pt_or_lub(pt, joined)
+    }
+
+    /// Replace the `Wildcard` stand-ins in `pt` with the join of what the
+    /// branches put in those positions.
+    ///
+    /// nsc never joins the branch types here: the expected type is a real type
+    /// variable, each branch adds a lower bound to it, and `solve` takes the
+    /// lub of *those*. So cats' `EitherT.orElse`
+    ///
+    /// ```text
+    /// EitherT(F.flatMap(value) {
+    ///   case Left(_)      => default.value          // F[Either[C, BB]]
+    ///   case r @ Right(_) => F.pure(leftCast(r))    // F[Right[C, BB]]
+    /// })
+    /// ```
+    ///
+    /// gives `?Y = Either[C, BB]`, which is what `EitherT`'s constructor then
+    /// takes. Joining the two *applications* cannot reach that answer: `F` is
+    /// an abstract constructor whose parameter is invariant, so the lub of
+    /// `F[Either[…]]` and `F[Right[…]]` is at best an existential, and here it
+    /// was not even that -- `SymbolTable::lub` has no arm for `Type::Applied`
+    /// and walked out to `AnyRef`.
+    ///
+    /// Only the stand-in positions are filled. Whatever `pt` already says
+    /// stays, so the answer is still the expected type, just decided.
+    fn fill_undecided(&self, pt: &Type, branch_tys: &[Type]) -> Option<Type> {
+        let usable =
+            |t: &Type| !t.is_no_type() && !t.is_error() && !matches!(t, Type::Nothing | Type::Null);
+        if matches!(pt, Type::Wildcard) {
+            let mut acc: Option<Type> = None;
+            for b in branch_tys.iter().filter(|t| usable(t)) {
+                acc = Some(match acc {
+                    None => b.clone(),
+                    Some(prev) => self.lub_branches(&prev, b),
+                });
+            }
+            return acc.filter(usable);
+        }
+        if !pt_is_undecided(pt) {
+            return Some(pt.clone());
+        }
+        // Every branch has to be an application of the same constructor, or
+        // there is nothing to read the argument off.
+        let pt_args = match pt {
+            Type::Class { args, .. } | Type::Applied { args, .. } => args,
+            _ => return None,
+        };
+        let same_head = |b: &Type| -> Option<Vec<Type>> {
+            match (pt, b) {
+                (Type::Class { sym: s1, .. }, Type::Class { sym: s2, args }) if s1 == s2 => {
+                    Some(args.clone())
+                }
+                (Type::Applied { ctor: c1, .. }, Type::Applied { ctor: c2, args }) if c1 == c2 => {
+                    Some(args.clone())
+                }
+                _ => None,
+            }
+        };
+        let mut per_branch = Vec::new();
+        for b in branch_tys.iter().filter(|t| usable(t)) {
+            let args = same_head(b)?;
+            if args.len() != pt_args.len() {
+                return None;
+            }
+            per_branch.push(args);
+        }
+        if per_branch.is_empty() {
+            return None;
+        }
+        let mut out_args = Vec::with_capacity(pt_args.len());
+        for (i, a) in pt_args.iter().enumerate() {
+            if !pt_is_undecided(a) && !matches!(a, Type::Wildcard) {
+                out_args.push(a.clone());
+                continue;
+            }
+            let nested: Vec<Type> = per_branch.iter().map(|args| args[i].clone()).collect();
+            out_args.push(self.fill_undecided(a, &nested)?);
+        }
+        Some(match pt {
+            Type::Class { sym, .. } => Type::Class {
+                sym: *sym,
+                args: out_args,
+            },
+            Type::Applied { ctor, .. } => Type::Applied {
+                ctor: ctor.clone(),
+                args: out_args,
+            },
+            _ => return None,
+        })
+    }
+
     pub(crate) fn open_tparams_of(&self, p: &Type, own: Option<&[SymbolId]>) -> Vec<SymbolId> {
         let Some(own) = own else { return Vec::new() };
         own.iter()
@@ -1542,6 +1662,37 @@ impl Typer {
                             out,
                         );
                     }
+                }
+            }
+            // A *compound* result type. `private def instance[F[_] <: Product]
+            // (trav: …): Traverse[F] with Reducible[F]` names `F` nowhere but
+            // in its result, so cats' generated
+            // `catsUnorderedFoldableInstancesForTuple1: Traverse[Tuple1] with
+            // Reducible[Tuple1] = instance(…)` has only the expected type to
+            // read it off; without this the parameter stayed open, the lambda
+            // was typed against `_[Any]`, and every one of the twenty-two
+            // tuple instances reported `value _1 is not a member of _[Any]`
+            // followed by `found: Traverse[F] with Reducible[F]`.
+            //
+            // Components pair by position -- both sides come from the same
+            // declaration whenever this fires -- and a non-compound on either
+            // side is tried against every component, which is how `unify_one`
+            // already reads a parameter out of a compound argument.
+            (Type::Refined { parents: rps, .. }, Type::Refined { parents: pps, .. })
+                if rps.len() == pps.len() =>
+            {
+                for (x, y) in rps.iter().zip(pps) {
+                    self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
+                }
+            }
+            (Type::Refined { parents: rps, .. }, _) => {
+                for x in rps {
+                    self.collect_expected(tps, x, pt, variance, depth + 1, allow_covariant, out);
+                }
+            }
+            (_, Type::Refined { parents: pps, .. }) => {
+                for y in pps {
+                    self.collect_expected(tps, ret, y, variance, depth + 1, allow_covariant, out);
                 }
             }
             _ => {}
