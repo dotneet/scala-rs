@@ -1306,7 +1306,7 @@ forwarder:
   approximated `Query[Accounts, Any, Seq]` type -- `Any` where the real row
   type would be. Every `Query[X, Any, Seq]` receiver checked against a
   compile of gitbucket's own `model/` + `AccountService.scala` traces to a
-  `cannot build a type tag for` X` at that table's own `TableQuery[X]` line in
+  `` cannot build a type tag for `X` `` at that table's own `TableQuery[X]` line in
   the same run. Closing this means giving the macro engine "a mirror over the
   current run's own symbols" -- §4.3's own words for an open problem, not a
   quick fix.
