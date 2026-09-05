@@ -11,22 +11,21 @@
 //!    called only from other members of the same trait.
 //!
 //!    Real nsc keeps a `private` trait method's whole body directly inside
-//!    the interface (a genuine `private` method, not abstract) because it
-//!    compiles traits to Java 8 default methods. This backend instead
-//!    compiles every trait method's body onto a `<Iface>$class` companion
-//!    and declares an abstract signature on the interface for implementing
-//!    classes to forward to. Under that scheme the fix is not to reproduce
-//!    nsc's exact shape but to keep its invariant: nothing outside the
-//!    trait's own body ever needs to name a `private` member, so it gets no
-//!    interface signature and no mixin forwarder at all -- only a `private
-//!    static` method on `$class`, reached by other `$class` methods with a
-//!    same-class `invokestatic` instead of `invokeinterface`.
+//!    the interface, as a genuine `private` *instance* method. Since
+//!    `agent/traitclass` this backend also puts trait bodies on the
+//!    interface, but a `private` one cannot be a `default` method (nothing
+//!    outside may reach it, and a mixin forwarder must not exist for it), so
+//!    it keeps the `$this`-taking shape the other bodies had: a `private
+//!    static <name>$` on the interface, reached from the trait's other
+//!    members with a same-class `invokestatic` instead of
+//!    `invokeinterface`. The invariant is nsc's -- no interface declaration
+//!    and no mixin forwarder -- and only the calling convention differs.
 //!
 //!    See `is_trait_private_def` in `crates/backend/src/gen.rs` and its
-//!    three call sites (the interface's abstract-method loop, the `$class`
-//!    method's own access flags, and the two places that resolve a "next
-//!    implementation in the linearization" -- `next_lin_impl` and
-//!    `emit_mixin_forwarders`).
+//!    four call sites (the interface's abstract-method loop,
+//!    `emit_trait_impl_method`'s access flags and shape, and the two places
+//!    that resolve a "next implementation in the linearization" --
+//!    `next_lin_impl` and `emit_mixin_forwarders`).
 //!
 //! 2. `extends` a generic superclass with a primitive constructor argument
 //!    (`class A1 extends java.util.concurrent.atomic.AtomicReference[Int](1)`,
@@ -250,9 +249,9 @@ fn tp1_trait_private_state_matches_scalac() {
 }
 
 /// The reported shape bug itself: a `private[this]` trait method must not
-/// carry `ACC_ABSTRACT` on the interface -- in fact it must not appear on
-/// the interface at all -- and its real body lives as a `private static`
-/// method on `<Iface>$class`, not a `public static` one.
+/// carry `ACC_ABSTRACT` on the interface -- in fact it must not be *declared*
+/// there at all -- and its real body is a `private static <name>$` on the
+/// interface, not a `public` one and not a `default` method.
 #[test]
 fn tp1_private_method_is_not_abstract_on_the_interface() {
     let out = dual_run("tp1");
@@ -262,16 +261,19 @@ fn tp1_private_method_is_not_abstract_on_the_interface() {
         "`update` must not be declared on the interface at all, got: {:?}",
         iface.methods
     );
-    // The public members are still there, publicly abstract.
+    // The public members are still there: `hasNext` is concrete in the
+    // trait, so it is a public `default` method with its body, plus the
+    // `hasNext$` static every mixin forwarder calls.
     let hn = method_flags(&iface, "hasNext").expect("hasNext missing from interface");
-    assert_eq!(hn & (ACC_PUBLIC | ACC_ABSTRACT), ACC_PUBLIC | ACC_ABSTRACT);
+    assert_eq!(hn & (ACC_PUBLIC | ACC_ABSTRACT | ACC_STATIC), ACC_PUBLIC);
+    let hns = method_flags(&iface, "hasNext$").expect("hasNext$ missing from interface");
+    assert_eq!(hns & (ACC_PUBLIC | ACC_STATIC), ACC_PUBLIC | ACC_STATIC);
 
-    let impl_class = read_class(&out.join("ReadAheadIterator$class.class"));
-    let upd = method_flags(&impl_class, "update").expect("update missing from $class");
+    let upd = method_flags(&iface, "update$").expect("update$ missing from the interface");
     assert_eq!(
         upd & (ACC_PRIVATE | ACC_STATIC | ACC_ABSTRACT),
         ACC_PRIVATE | ACC_STATIC,
-        "update on $class must be `private static`, not abstract or public, got flags {upd:#x}"
+        "update$ must be `private static`, not abstract or public, got flags {upd:#x}"
     );
     let _ = fs::remove_dir_all(&out);
 }
@@ -282,7 +284,7 @@ fn tp2_two_traits_private_same_name_matches_scalac() {
 }
 
 /// Neither trait's private `helper` may get a mixin forwarder on `Both`: a
-/// forwarder there would have to pick one trait's `$class` arbitrarily
+/// forwarder there would have to pick one trait's body arbitrarily
 /// (silently shadowing the other), or collide.
 #[test]
 fn tp2_private_method_gets_no_mixin_forwarder() {
@@ -327,10 +329,14 @@ fn tp3_widened_private_keeps_interface_signature() {
         )
     });
     assert_eq!(
-        flags & (ACC_PUBLIC | ACC_ABSTRACT | ACC_PRIVATE),
-        ACC_PUBLIC | ACC_ABSTRACT,
-        "widened secret must be public abstract, not private, got flags {flags:#x}"
+        flags & (ACC_PUBLIC | ACC_ABSTRACT | ACC_PRIVATE | ACC_STATIC),
+        ACC_PUBLIC,
+        "widened secret must be a public default method, not private and not \
+         abstract, got flags {flags:#x}"
     );
+    let fwd = method_flags(&iface, "Widened$$secret$")
+        .expect("a widened private still gets its `m$` static");
+    assert_eq!(fwd & (ACC_PUBLIC | ACC_STATIC), ACC_PUBLIC | ACC_STATIC);
     let _ = fs::remove_dir_all(&out);
 }
 

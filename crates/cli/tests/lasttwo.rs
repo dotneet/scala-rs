@@ -217,8 +217,8 @@ fn fixtures_lasttwo_nested_object_trait_outer() {
             && acc.contains("InterfaceMethod LtComp2.LtBuilder:()LLtComp2$LtBuilder$;"),
         "the trait's $outer accessor does not go through the module accessor:\n{acc}"
     );
-    let impl_ = javap(&out, "LtComp2$LtBuilder$LtUniqueAsConstraint$class").expect("javap impl");
-    let body = method_body(&impl_, "public static java.lang.String index(");
+    let impl_ = javap(&out, "LtComp2$LtBuilder$LtUniqueAsConstraint").expect("javap impl");
+    let body = method_body(&impl_, "public default java.lang.String index(");
     // Every narrowing to the class the trait extends must sit directly on
     // `this`. Reading it off `$outer` is the shape that threw
     // `ClassCastException`, and offsets move whenever the body does, so this

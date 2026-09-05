@@ -267,7 +267,7 @@ The honest diff.
 - **Primitives**: `+` and friends on `Int` are emitted as JVM instructions
   (`iadd`, …), not as boxed methods on `scala.Int`.
 - **traits**: a trait with only abstract members is a JVM interface. Concrete
-  members become a `T$class` static implementation plus instance forwarders in
+  members become interface `default` methods plus instance forwarders in
   C3 linearization order. Java 8 default methods are not used. A `val` becomes
   getter/setter plus `$init$`. `abstract override` becomes `T$$super$m`.
 - **Named arguments**: reordered at the call site, so `f(b = 2, a = 1)` works.

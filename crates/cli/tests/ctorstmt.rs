@@ -271,9 +271,8 @@ fn fixtures_cs_bad_is_error() {
 /// after the super call and the mixin `$init$`s. Reading `Main$B()` out of
 /// `javap -c` of scalac's own output gives
 /// `invokespecial Main$A.<init>` / `invokestatic Main$T1.$init$` /
-/// `invokestatic Main$T2.$init$` / `invokevirtual Main$.note` — the same order
-/// we emit (we route `$init$` through the `T$class` helper rather than a
-/// static interface method, which is this backend's existing trait ABI).
+/// `invokestatic Main$T2.$init$` / `invokevirtual Main$.note` — which is
+/// exactly what we emit: `$init$` is a `static` method on the interface.
 #[test]
 fn a_class_statement_lands_in_the_primary_constructor() {
     let out = compile("cs", "shape-class", &["--no-scala-library"]);
@@ -283,7 +282,7 @@ fn a_class_statement_lands_in_the_primary_constructor() {
         "Main$A's constructor must call `note`; the body statement was dropped"
     );
     let b = fs::read(out.join("Main$B.class")).expect("Main$B.class");
-    for needle in [&b"Main$T1$class"[..], &b"Main$T2$class"[..], &b"note"[..]] {
+    for needle in [&b"Main$T1"[..], &b"Main$T2"[..], &b"note"[..]] {
         assert!(
             contains(&b, needle),
             "Main$B's constructor must reference {:?}",
@@ -293,17 +292,21 @@ fn a_class_statement_lands_in_the_primary_constructor() {
     let _ = fs::remove_dir_all(&out);
 }
 
-/// A trait whose body holds nothing but a statement still needs a `$init$`:
-/// before the fix `T$class` was only emitted for a trait with concrete methods
-/// or with `val`s, so `trait T1 { note("T1") }` produced no initializer at all
-/// and no implementing class ever called one.
+/// A trait whose body holds nothing but a statement still needs a `$init$`
+/// that runs it: `trait T1 { note("T1") }` once produced no initializer at
+/// all and no implementing class ever called one. `$init$` is a `static`
+/// method on the interface itself, as in nsc 2.13.
 #[test]
 fn a_statement_only_trait_still_gets_an_init() {
     let out = compile("cs", "shape-trait", &["--no-scala-library"]);
-    let t1 = fs::read(out.join("Main$T1$class.class")).expect("Main$T1$class.class");
+    let t1 = fs::read(out.join("Main$T1.class")).expect("Main$T1.class");
     assert!(
         contains(&t1, b"$init$") && contains(&t1, b"note"),
-        "Main$T1$class must hold a `$init$` that calls `note`"
+        "Main$T1 must hold a `$init$` that calls `note`"
+    );
+    assert!(
+        !out.join("Main$T1$class.class").exists(),
+        "no `T$class` holder may be emitted any more"
     );
     let _ = fs::remove_dir_all(&out);
 }

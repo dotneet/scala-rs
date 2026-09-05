@@ -187,7 +187,7 @@ fn fixtures_slickrun_pattern_lambdas_are_hoisted() {
         2,
         "expected exactly two anonymous classes, got {anon:?}"
     );
-    for cls in ["PatLambdas.class", "PatInTrait$class.class"] {
+    for cls in ["PatLambdas.class", "PatInTrait.class"] {
         let bytes = fs::read(out.join(cls)).unwrap_or_else(|e| panic!("{cls}: {e}"));
         let needle = b"$anonfun$";
         assert!(

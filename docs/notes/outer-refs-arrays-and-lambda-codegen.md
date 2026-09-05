@@ -480,7 +480,7 @@ Two axes are checked: **behaviour** and **shape**.
   `Class.forName(initialize=false)`**, so the verifier stays silent even when the
   bootstrap is broken. These two tests, which **actually run**, are the only net.
 * Shape: `indy1` pins that despite having ten lambdas it produces **zero** closure
-  classfiles, that `$anonfun$` methods sit on `Main$` and `Bump$class`, and that
+  classfiles, that `$anonfun$` methods sit on `Main$` and on the `Bump` interface, and that
   `javap -v` shows `BootstrapMethods` and
   `REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory`; `indy2`
   conversely pins **exactly three** (two `PartialFunction` plus one SAM). That

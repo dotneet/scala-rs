@@ -42,9 +42,10 @@ size`), of which 516 MB is `peak memory footprint`. An earlier note put it at
 
 The class file counts still differ. scala-rs lowers plain `FunctionN` literals
 to `invokedynamic` as nsc does, but `PartialFunction` literals remain anonymous
-classes, and traits get `T$class` helpers that nsc 2.13 does not emit at all
-(it uses interface default methods). So scala-rs reaches this time while
-writing about 40% more class files than nsc.
+classes. So scala-rs reaches this time while writing more class files than nsc.
+(The other half of the old gap, one `T$class` helper per trait with a concrete
+member, is gone: `agent/traitclass` moved trait bodies onto the interface, as
+nsc does.)
 
 nsc reports 3 Scala 3 migration errors under `-Xsource:3`, so the runs above
 silence them with `-Wconf:cat=scala3-migration:s` (scala-rs does not implement
@@ -231,8 +232,8 @@ graph rather than the self-time summary):
   only builds a `PartialFunction` class when the expected type really is one;
   a `{ case … }` passed where a `Function1` is wanted becomes an ordinary
   `invokedynamic` lambda whose body is the match. So the count is a typing
-  question, not a code-generation one. A further 106 are `T$class` helpers that
-  scalac 2.13 replaces with interface default methods.
+  question, not a code-generation one. (A further 106 were `T$class` helpers,
+  which are gone: trait bodies are interface default methods now, as in nsc.)
 - The compile is single-threaded. Parsing is trivially parallel; the typer
   shares a mutable symbol table and is not.
 

@@ -1252,13 +1252,15 @@ impl Assembler {
     ///
     /// * `sam_name` / `sam_desc` — the interface's single abstract method.
     /// * `call_desc` — `(<captured types>)L<functional interface>;`.
-    /// * `impl_*` — the static method holding the lambda body. It is always a
-    ///   method of a *class*, never of an interface, because JVMS §4.6 forbids
-    ///   the flags the body carries on an interface method.
+    /// * `impl_*` — the static method holding the lambda body. A trait's
+    ///   bodies live on the interface itself, so this can be an interface
+    ///   method; `impl_owner_is_interface` says which, and JVMS §4.4.8 makes
+    ///   the two different constant-pool entries.
     ///
     /// `samMethodType` and `instantiatedMethodType` are both `sam_desc`: the
     /// body is written at the erased `(Object…)Object` shape, so
     /// `LambdaMetafactory` has nothing to adapt and never needs a bridge.
+    #[allow(clippy::too_many_arguments)]
     pub fn invokedynamic_lambda(
         &mut self,
         sam_name: &str,
@@ -1283,9 +1285,12 @@ Ljava/lang/invoke/CallSite;";
             .pool
             .method_handle_static(MF_OWNER, "metafactory", MF_DESC, false);
         let a0 = self.pool.method_type(sam_desc);
-        let a1 =
-            self.pool
-                .method_handle_static(impl_owner, impl_name, impl_desc, impl_owner_is_interface);
+        let a1 = self.pool.method_handle_static(
+            impl_owner,
+            impl_name,
+            impl_desc,
+            impl_owner_is_interface,
+        );
         let bsm_index = self.pool.bootstrap(bsm, vec![a0, a1, a0]);
         let i = self.pool.invoke_dynamic(bsm_index, sam_name, call_desc);
         self.emit_op(0xba);

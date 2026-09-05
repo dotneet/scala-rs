@@ -197,7 +197,7 @@ fn fixtures_tval_bad_is_error() {
 /// nsc names a trait `val`'s mixin setter after the owning trait
 /// (`Named$_setter_$label_$eq`) and a trait `var`'s setter `n_$eq`. A class
 /// that `override val`s one still implements the mixin setter — as a no-op, so
-/// `Named$class.$init$` cannot clobber the override.
+/// `Named.$init$` cannot clobber the override.
 #[test]
 fn trait_val_setters_follow_nsc_names() {
     let out = compile_fixture_with("tval", &["--no-scala-library"]);
@@ -233,14 +233,14 @@ fn trait_val_setters_follow_nsc_names() {
 
     // A trait `var` is a plain `n_$eq`, called (not `putfield`ed) from the
     // trait's own concrete methods.
-    let counted = javap(&out, "Counted$class");
+    let counted = javap(&out, "Counted");
     assert!(
         counted.contains("count_$eq"),
         "a trait method assigning a `var` must call the setter, got:\n{counted}"
     );
     assert!(
         !counted.contains("putfield"),
-        "a trait's static impl has no field to store into, got:\n{counted}"
+        "a trait body has no field to store into, got:\n{counted}"
     );
 
     let _ = fs::remove_dir_all(&out);

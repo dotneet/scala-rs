@@ -1,6 +1,6 @@
 # Bytecode emission and Java interop
 
-These notes collect three investigations into bugs that live below the typer, in the shape of the bytecode we emit and in how we read Java classfiles. They cover JVM verifier errors caused by a wrong operand-stack shape around `Unit`, nested Java interfaces together with interface `static` methods and the linearization rules that decide whether a Java subclass is concrete, and trait method access flags plus boxing at `extends` argument positions. What the three have in common is that the compiler produced a classfile with no diagnostic at all: the failure only appeared when the JVM verified or ran the code.
+These notes collect four investigations into bugs that live below the typer, in the shape of the bytecode we emit and in how we read Java classfiles. They cover JVM verifier errors caused by a wrong operand-stack shape around `Unit`, nested Java interfaces together with interface `static` methods and the linearization rules that decide whether a Java subclass is concrete, and trait method access flags plus boxing at `extends` argument positions. The fourth is the trait ABI itself: we emitted the Scala 2.11 `T$class` encoding where nsc 2.13 emits interface default methods, so a subclass compiled by real scalac could not find our trait implementations at all. What they have in common is that the compiler produced a classfile with no diagnostic at all: the failure only appeared when the JVM verified or ran the code -- or, in the last case, only when *another* compiler read what we wrote.
 
 ### Comparison operands of type `Unit`, and `scala.Enumeration` (`agent/uniteq`)
 
@@ -419,3 +419,129 @@ are unrelated pre-existing holes.
   (and `X` is not an override chain with the same name as the method itself) has not been
   checked for interactions with the existing `needs_super_accessor` heuristic (we did not
   find it in real code).
+
+### The trait ABI: default methods on the interface (`agent/traitclass`)
+
+The bug: **a subclass compiled by real scalac 2.13.16 could not find any of our trait
+implementations.** scala-rs used the Scala 2.11 trait encoding — an abstract interface plus a
+`<Iface>$class` holder full of `static m($this, …)` methods — while nsc 2.13 puts the body on
+the interface itself. Nothing about a class file *we* compiled was wrong under that scheme,
+which is why every check in the harness was green; the incompatibility only appears when the
+two compilers meet. slick's 106 `T$class` files were the visible symptom, but the class file
+count was never the point.
+
+#### nsc 2.13's shape, read off the library jar
+
+```
+public interface scala.math.Ordered<A> extends java.lang.Comparable<A> {
+  public abstract int compare(A);
+  public static boolean $less$(scala.math.Ordered, java.lang.Object);
+    0: aload_0
+    1: aload_1
+    2: invokespecial #41   // InterfaceMethod $less:(Ljava/lang/Object;)Z
+  public default boolean $less(A);
+    …the body…
+  public static void $init$(scala.math.Ordered);
+}
+```
+
+Three things to copy, and all three matter:
+
+* the **body** is a `default` method;
+* a **`public static m$($this: T, …)`** sits beside it and is what everyone else calls. It
+  cannot be skipped in favour of `invokespecial` on the default method: `invokespecial` on an
+  interface method requires that interface to be the current class or a **direct**
+  superinterface, and a trait several steps up a linearization is neither. nsc's own mixin
+  forwarders are `invokestatic <Iface>.m$` for exactly this reason (`ifacebridge.rs` already
+  relied on that fact when reading the library);
+* **`$init$` is a `static` on the interface, and every trait has one**, empty body included —
+  nsc emits the call from every implementing class without asking whether the body would do
+  anything.
+
+`$anonfun$` bodies for lambdas inside a trait go on the interface too, as `public static`
+(not `final`: JVMS §4.6 forbids `ACC_FINAL` on an interface method).
+
+#### What moved
+
+The method bodies did not change at all. In the old shape slot 0 held `$this`, declared by the
+static's descriptor; in a `default` method slot 0 holds `this`, declared by the class. Both
+give the same verification type, and parameters keep their slots, so `emit_trait_impl_method`
+generates the identical code and only its access flags, name and descriptor differ.
+
+| | before | after |
+|---|---|---|
+| concrete `def m` | `public static m($this, …)` on `<Iface>$class` | `public default m(…)` + `public static m$($this, …)` on the interface |
+| `private def h` | `private static h($this, …)` on `<Iface>$class` | `private static h$($this, …)` on the interface (still no declaration, still no forwarder) |
+| `$init$` | `public static $init$` on `<Iface>$class`, only when there was something to run | `public static $init$` on the interface, always |
+| mixin forwarder | `invokestatic <Iface>$class.m` | `invokestatic <Iface>.m$` (an `InterfaceMethodref`) |
+| `T$$super$m` target, `invoke_super`, a trait-private call | `invokestatic <Iface>$class.…` | `invokestatic <Iface>.…$` |
+| a lambda in a trait body | `$anonfun$` on `<Iface>$class` | `public static $anonfun$` on the interface |
+
+`scala/math/Ordered` in the private runtime (`runtime.rs`) got the same treatment and
+`Ordered$class` is gone.
+
+Two constant-pool details the JVM enforces and the verifier does not: the `m$` forwarder's
+`invokespecial` must name an `InterfaceMethodref` (`Assembler::invokespecial_interface`), and
+so must the `invokedynamic` bootstrap's method handle when the `$anonfun$` body lives on an
+interface. With a plain `Methodref` the JVM refuses the whole class file —
+`IncompatibleClassChangeError: Inconsistent constant pool data … should be
+CONSTANT_InterfaceMethodRef` — at the first call, not at load.
+
+#### Three pickle fixes on the same path
+
+The interop test found each of these in turn, and none of them is about codegen:
+
+1. **`$init$` was not in the pickle.** A trait's primary constructor is
+   `nme.MIXIN_CONSTRUCTOR`, and nsc emits `$init$` calls in a subclass only for traits whose
+   signature declares one. Without it, scalac's `Sub` compiled and verified and ran, and every
+   trait `val` was `null`. `pickle_mixin_ctor` writes `def $init$(): Unit` for every trait.
+2. **A `var`'s pickled accessor was STABLE and had no setter.** Read back as a `val`, a trait
+   `var` made scalac implement the mixin `T$_setter_$v_$eq` protocol — which our `$init$` does
+   not call — instead of the plain `v_$eq` it does: `AbstractMethodError`. `pickle_val` now
+   drops STABLE for a mutable accessor and writes a `v_$eq` beside it.
+3. **`super_accessor_name` used the trait's simple name.** nsc expands it to the whole binary
+   name (`p$q$T$$super$m`), which is what a class scalac compiles implements.
+
+#### One pre-existing codegen bug, newly visible
+
+Moving the bodies onto the interface makes them **verified**, because an interface is verified
+whenever an implementing class loads, while a `T$class` holder is loaded only when something
+calls it. That immediately turned up `String.indexOf:(I)I` being emitted for
+`cln.indexOf("$mc")` in slick's `relational/ResultConverter.scala` — every slick program died
+with `VerifyError: Bad type on operand stack`.
+
+The cause is in the typer, not here. `existing_java_method` (`crates/typer/src/classpath.rs`)
+pairs a class file method with the prelude symbol of the same name, and its fallback matched on
+**arity alone**. `java.lang.String` declares `indexOf(int)` and `indexOf(String)`; the prelude
+declares both; each descriptor was stamped onto whichever symbol `lookup_member` returned
+first, and the two came out swapped. `method_desc_from_sym` prefers `jvm_name` over the
+symbol's own type, so the typer picked the right symbol and the backend wrote the other one's
+descriptor. It now compares parameter types, rejecting only pairings that demonstrably
+disagree.
+
+This is what "the verifier does not check interface types" cuts both ways: the old shape hid a
+bad body from *every* check in the battery, `slick_subset.sh` included —
+`Class.forName(initialize = false)` does not link, so method bodies are never verified there.
+
+#### Verification
+
+The fixture prefix is `tc`; the tests are `crates/cli/tests/traitclass.rs`.
+
+| fixture / test | Contents |
+|---|---|
+| `tc_iface.scala` | A trait `val` set from `$init$`, a `var` with a plain setter, a `private` helper, a lambda in a trait body, `super` into a trait from a class, a stackable `abstract override` chain, and an `object` mixing a trait in. Dual-run in both modes under `-Xverify:all` against scalac 2.13.16's own stdout |
+| `tc_iface_emits_no_impl_class` | No `*$class.class` in either mode |
+| `tc_iface_has_nscs_trait_shape` | `default m` + `static m$` + `static $init$` + `private static punct$` with no `punct()` declaration + `$anonfun$` on the interface; and on the implementing class, `InterfaceMethod Greet.greet$` and `InterfaceMethod Greet.$init$` |
+| `tc_lib.scala` / `tc_app.scala`, `nsc_compiled_subclass_runs_against_our_traits` | **The one that settles it.** scala-rs compiles the traits, real scalac 2.13.16 compiles the subclass against those class files, the pair runs, and its output must equal scalac-on-scalac's |
+
+Numbers, before → after: slick `classes=1596` → **1490** (nsc: 1498) at `errors=0`;
+`slick_subset.sh` `verified=1490 failed=0`; `slick_run.sh` `progs=12 ok=12 attempts=36/36`
+throughout (it went to `ok=1` in between, on the `indexOf` bug above).
+
+#### Remaining
+
+Three known gaps on the interop path, all recorded in `known-gaps-backlog.md` under the
+`T$class` entry: a trait's `private` `val` / `var` keeps its source name where nsc expands it,
+a `super` accessor is not pickled with the `SUPERACCESSOR` flag, and `$init$` is called only
+for traits compiled in the same run (a trait read from `-cp` gets no call, so its `val`s stay
+at their defaults).

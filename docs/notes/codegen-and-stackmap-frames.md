@@ -16,7 +16,7 @@ time, or silently becomes wrong code**.
 **1. Concrete-member collection only walked inside templates.**
 `collect_trait_impls` only traversed the direct children of `PackageDef` / `ClassDef` /
 `ModuleDef`, so a `trait` inside a method body was never registered, and **not a single**
-`T$class` implementation class or mixin forwarder **was emitted**.
+trait body or mixin forwarder **was emitted**.
 
 ```scala
 def main(a: Array[String]): Unit = {
@@ -50,7 +50,7 @@ We do the same thing:
   (riding the existing "a local class's captures become constructor arguments plus fields" machinery),
 - the interface declares an abstract accessor per capture,
 - the implementation class implements that accessor from its own capture field,
-- and the method bodies of `T$class` and `$init$` `invokeinterface` through `$this` at entry
+- and a trait's `default` method bodies and `$init$` `invokeinterface` through the receiver at entry
   and drop the result into an ordinary local slot (`emit_trait_capture_prologue`).
 
 Accessor names are built from the captured symbol's ID (`n$4492`). Numbering by position
@@ -162,7 +162,7 @@ The implementation splits into three parts.
 | `ub_param.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `Unit` parameters: `f(())`, `f(g())`, `middle(Int, Unit, String)` (the arguments after the `Unit` do not shift), two `Unit`s in a row, a constructor `val u: Unit`, a method on a class, a `Nothing` parameter (`never(scala.runtime.Nothing$)`) | `got` `got` `s1` `two` `()` `()` `42` `x7` |
 | `ub_field.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `Unit` fields: `val`/`var`/`lazy val` in a class, an `object` and a trait, getter/setter, a local `var`, assignment to `Any` | `()` ×12 |
 | `ub_case.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `case class K(k: Unit, n: Int)`: `toString` / `equals` / `hashCode` / `copy` / `productElement` / the companion's `apply` and the erased `apply(Object,Object)` bridge / pattern extraction | `K((),3)` `()` `3` `K((),4)` `true` `false` `2` `()` `3` `true` `U(())` `matched` `()` `3` |
-| `ub_mixin.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `Unit` members across a trait / abstract class / value class: interface methods, the mixin forwarder, the static implementation in `T$class`, the erasure bridge, the setter of an abstract `var`, an `Int => Unit` lambda | `()` ×4 `m` `d` `m` `d` `()` `sub` `3` `()` |
+| `ub_mixin.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `Unit` members across a trait / abstract class / value class: interface methods, the mixin forwarder, the interface's `default` method, the erasure bridge, the setter of an abstract `var`, an `Int => Unit` lambda | `()` ×4 `m` `d` `m` `d` `()` `sub` `3` `()` |
 | `ub_call.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | arguments that do not go through the ordinary call path: `this(…)` delegation, a trait's `$init$`, default arguments, named arguments, a second parameter list, a by-name `Unit`, a method taking two `Unit`s in a row, the bodies of `try`/`catch` and `match`, recursion | `9` `()` `()` `0` `7` `()` `()` `iv` `d1` `d3` `d4` `n5` `c6` `by` |
 | `ub_super.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `Unit` arguments to a **super constructor** (`class D extends B((), 5)`, `case object Asc extends Dir(())`), abstract members of a trait, a `def` inside a method | `D5` `()` `5` `()` `E` `l2` |
 | `ub_boxed.scala` (`crates/cli/tests/unitbox.rs`, dual-run in both modes) | `()` is `BoxedUnit.UNIT`, not `null`: `id(())`, `String.valueOf(())`, `== ()`, `case () =>` not matching `null`, `toString` / `hashCode`, `pop`ping an `id(())` in discard position (so the stack height matches on the loop's back edge), `asInstanceOf[Unit]` / `isInstanceOf[Unit]` | `()` `()` `true` `false` `unit` `null` `other` `()` `()` `0` `2` `()` `2` `true` `false` |
@@ -547,7 +547,7 @@ a value-producing expression, so generating `if` / `match` / `try` **in statemen
 
 `trait_vals` is also used to generate accessors and mixin forwarders, and there we only want the
 `val`s, so the sequence that `$init$` actually runs lives in a separate map, `trait_inits`.
-The decision of whether to emit `T$class`, and whether the implementing class calls `$init$`,
+The decision of whether the implementing class calls `$init$`,
 was switched over to `trait_inits` too. Without that, a **trait whose body is only statements**,
 like `trait T1 { note("T1") }`, gets no `$init$` generated in the first place.
 
@@ -587,8 +587,7 @@ and is compared against the output of real scalac 2.13.16.
 
 The shape of real scalac's output as read with `javap -p -c` is locked in too. `Main$B()` goes
 `invokespecial Main$A.<init>` → `T1.$init$` → `T2.$init$` → `Main$.note`, in that order, and
-that is the same as our output (apart from the existing trait-ABI difference that we put a
-trait's `$init$` in `T$class` rather than as a static on the interface).
+that is the same as our output, `$init$` on the interface included.
 
 #### Remaining
 

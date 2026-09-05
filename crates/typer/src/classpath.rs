@@ -1310,7 +1310,10 @@ fn param_matches_desc(ty: &Type, d: &str) -> bool {
         })
     };
     let dc = d.as_bytes().first().copied().unwrap_or(b'?');
-    let d_is_prim = matches!(dc, b'Z' | b'B' | b'S' | b'C' | b'I' | b'J' | b'F' | b'D' | b'V');
+    let d_is_prim = matches!(
+        dc,
+        b'Z' | b'B' | b'S' | b'C' | b'I' | b'J' | b'F' | b'D' | b'V'
+    );
     match (prim_of(ty), d_is_prim) {
         (Some(c), true) => c == dc,
         (Some(_), false) | (None, true) => false,

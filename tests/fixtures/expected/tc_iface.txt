@@ -1,0 +1,9 @@
+hello, world!
+hello, world!1
+hello, world!2
+6,7,8
+hello
+<hello, sub!>
+top(mid(base))
+hello, object!
+world/2

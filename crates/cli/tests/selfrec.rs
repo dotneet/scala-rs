@@ -259,7 +259,10 @@ fn fixtures_selfrec_narrowed_override_gets_a_bridge() {
         let end = rest[1..].find("\n\n").map(|i| i + 1).unwrap_or(rest.len());
         let body = &rest[..end];
         assert!(
-            body.contains(want) && body.contains("checkcast") && !body.contains("StreamBase$class"),
+            body.contains(want)
+                && body.contains("checkcast")
+                && !body.contains("StreamBase.open$")
+                && !body.contains("StreamBase.size$"),
             "{sig} is not a bridge to the override:\n{body}"
         );
     }
