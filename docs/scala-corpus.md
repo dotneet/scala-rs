@@ -899,15 +899,20 @@ The lesson for verification is narrower and sharper: **a change that supplies
 new symbols has to run `neg` in full, not a sample.** A 250-test sample did not
 contain any of these four.
 
-Done the same day — see [the next section](#the-classtag-rule-added-2026-09-05-agentclasstag).
-It moved eight, not four.
+Done the same day — see
+[the next section](#the-classtag-rule-added-2026-09-05-agentclasstag). It moved
+eight, not four.
 
 ## The `ClassTag` rule, added (2026-09-05, `agent/classtag`)
 
-The rule the section above asked for. `neg` 653 → **661**; `pos` 983 and
-`run` 490 are unchanged, the same sets of tests in both columns. The eight are
-`classtags_contextbound_{a,b,c}`, `classtags_dont_use_typetags` and the four
-`interop_{abs,}typetags_arenot_class{tags,manifests}`.
+The rule the section above asked for. Measured on the merged tree against
+`main` at `81b756a` (which already carries stage 1 of `@specialized`, so both
+columns have it): `neg` 647 → **655**; `pos` 1042 and `run` 508 are unchanged,
+the same sets of tests. The eight are `classtags_contextbound_{a,b,c}`,
+`classtags_dont_use_typetags` and the four
+`interop_{abs,}typetags_arenot_class{tags,manifests}`. The same eight, and the
+same "nothing else moved", came out of the earlier A/B against `dc6fdc9`
+(`neg` 653 → 661, `pos` 983, `run` 490).
 
 A `ClassTag` is *built*, out of the **erasure** of the type it tags
 (`Implicits.manifestOfType`, `full = false`), so the rule is about erasure and
@@ -948,8 +953,8 @@ the callee's own `Type::TypeParam` in place instead, and refusing those cost
 existed for the same distinction in argument inference — is the test: the
 enclosing definition's parameters are in the scope, a callee's are not.
 
-The measurements a rejection rule is judged on, `dc6fdc9` against the finished
-branch:
+The measurements a rejection rule is judged on, `main` at `81b756a` against
+the merged branch:
 
 | | before | after |
 |---|---|---|
