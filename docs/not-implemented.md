@@ -145,11 +145,15 @@ Compiler flags (`agent/xflags`):
   measures the gap: over the corpus's 37 `pos/spec-*` tests scalac emits 700
   specialized classes and we emit none. See
   [docs/specialization.md](specialization.md).
-- **The value-class restrictions.** SLS 5.2 / nsc's `checkAnyValSubclass`: a
-  `trait` may not extend `AnyVal`, a value class may not be nested or local,
-  must have exactly one `val` parameter that is not `private[this]`, may not
-  take a `var`, and may not declare a field. None of these is checked, so
-  `test/files/neg/valueclasses.scala` — 30 lines that are nothing but such
-  violations — compiles and emits 33 classfiles. This was hidden until
-  `@specialized` stopped being a parse error, because line 30 of that file
-  carries one.
+- **The value class *implementation restrictions*.** The eight rules
+  `neg/valueclasses.check` records — a `trait` may not extend `AnyVal`, a value
+  class may not be nested or local, must have exactly one `val` parameter that
+  is neither `private[this]` nor `protected[this]`, may not take a `var`, may
+  not declare a field, and may not have a `@specialized` type parameter — are
+  now checked (`crates/typer/src/valueclass.rs`). What is *not* checked is the
+  rest of nsc's `checkEphemeral`, which rejects, all under "implementation
+  restriction: … is not allowed in value class": a nested class, trait or
+  object; a secondary constructor; a redefined `equals` / `hashCode`; a
+  qualified `super` reference; and any body statement that is not a
+  definition. `neg/valueclasses-impl-restrictions` is rejected today for a
+  different reason, not for those.
