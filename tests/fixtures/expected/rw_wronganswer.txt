@@ -1,0 +1,22 @@
+666
+List(33, 34, 35, 36)
+2
+2
+true
+false
+false
+true
+true
+false
+public int VarargsHost.f(java.lang.String[])
+public int VarargsHost.f(scala.collection.immutable.Seq)
+public int VarargsHost.g(int,int[])
+public int VarargsHost.g(int,scala.collection.immutable.Seq)
+2
+3
+List()
+ArraySeq(a)
+Symbol(blubber)
+true
+ok
+ok
