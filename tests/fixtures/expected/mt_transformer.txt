@@ -1,0 +1,14 @@
+Some(Right(7))
+Some(Left(4))
+Some(Right(7))
+Some(Left(true))
+Some(Right(7))
+Some(Left(true))
+Some(Left(1))
+Some(Right(3))
+Some(Both(1,3))
+Some(Left(1))
+Some(Right(2))
+Some(Left(1))
+only
+1
