@@ -3840,28 +3840,38 @@ impl<'a> Parser<'a> {
             let tpt = self.parse_pattern_type();
             // A compound type pattern has to test *every* parent. Erasure
             // keeps only the dominant one, so `case _: TA with TB` matched a
-            // plain `TA`; nest one ascription per parent instead, innermost
-            // first, so each test survives erasure on its own and the bound
-            // variable still ends up at the type erasure would have given it.
-            if let TreeKind::CompoundTypeTree {
-                parents,
-                refinements,
-            } = &tpt.kind
-            {
-                if parents.len() > 1 && refinements.is_empty() {
-                    let span = t.span.merge(tpt.span);
-                    let mut out = t;
-                    for p in parents.clone() {
-                        out = self.alloc(
-                            span,
-                            TreeKind::Typed {
-                                expr: Box::new(out),
-                                tpt: Box::new(p),
-                            },
-                        );
-                    }
-                    return out;
+            // plain `TA`. The ascription itself stays innermost and keeps the
+            // whole compound type -- that is what the pattern *binds* at, and
+            // `case as: AnyStepper[A] with EfficientSplit` is passed on as
+            // one -- with one extra ascription wrapped around it per parent,
+            // each of which survives erasure on its own and contributes its
+            // `instanceof`.
+            let compound_parents = match &tpt.kind {
+                TreeKind::CompoundTypeTree {
+                    parents,
+                    refinements,
+                } if parents.len() > 1 && refinements.is_empty() => parents.clone(),
+                _ => Vec::new(),
+            };
+            if !compound_parents.is_empty() {
+                let span = t.span.merge(tpt.span);
+                let mut out = self.alloc(
+                    span,
+                    TreeKind::Typed {
+                        expr: Box::new(t),
+                        tpt: Box::new(tpt),
+                    },
+                );
+                for p in compound_parents {
+                    out = self.alloc(
+                        span,
+                        TreeKind::Typed {
+                            expr: Box::new(out),
+                            tpt: Box::new(p),
+                        },
+                    );
                 }
+                return out;
             }
             return self.alloc(
                 t.span.merge(tpt.span),

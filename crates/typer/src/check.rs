@@ -9035,14 +9035,22 @@ impl Typer {
             return self.st.lub(a, b);
         }
         let closed = |ty: &Type, other: &Type| -> Type {
-            // A bare type parameter is not its own lower bound. `lub(Unit, A)`
-            // is `Any`; closing `A` to `Nothing` here concluded `Unit`, and a
+            // A bare *class* parameter is a real abstract type, not an
+            // unsolved inference variable: `case List(x) => x` gives `x` the
+            // type `A` of `List`, and `lub(Unit, A)` is `Any`. Closing it to
+            // `Nothing` answered `Unit`, so
             // `def f(h: Any) = h match { case 5 => () ; case List(x) => x }`
-            // came out returning `void` -- every case's value discarded, and
-            // the answer silently `()`. Closing only says something when the
-            // parameter sits *inside* a larger type (`List[A]` vs `List[B]`).
-            if matches!(ty, Type::TypeParam(_)) {
-                return ty.clone();
+            // came out returning `void` with every case's value discarded.
+            //
+            // A bare *method* parameter that reached here is the other thing:
+            // `Iterator.empty.next()` leaves `T` of `def empty[T]` unsolved
+            // where nsc has already minimised it to `Nothing`, and closing it
+            // is how that is recovered. (A method parameter still in lexical
+            // scope is excluded below, by name.)
+            if let Type::TypeParam(tp) = ty {
+                if self.st.get(self.st.get(*tp).owner).kind == SymKind::Class {
+                    return ty.clone();
+                }
             }
             let mut open = Vec::new();
             collect_tparams(ty, &mut open);
