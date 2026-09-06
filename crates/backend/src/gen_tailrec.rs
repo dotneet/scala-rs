@@ -79,7 +79,7 @@ pub(crate) fn begin_tail_loop(
     let unsupported = || {
         annotated.then(|| format!("could not optimize @tailrec annotated method {}: unsupported erased tail-call shape", s.name))
     };
-    if ctx.value_ext.is_some() || ctx.outer.is_some() || ctx.st.is_value_class(ctx.class_sym) {
+    if ctx.outer.is_some() {
         return unsupported();
     }
     let mut calls = HashSet::new();

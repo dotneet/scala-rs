@@ -30,10 +30,11 @@ would make the final value evaluation recurse through the thunk chain even after
 the method body had become a loop.
 
 An annotated method is rejected when an unsupported erased shape or an unhandled
-tail call remains. In particular, tail recursion in a value class `$extension`
-method is unsupported. The current type checker also rejects self recursion in an
-explicit `return`, and recursion inside `try`/`catch`/`finally`. These forms are
-not claimed to be Scala 2.13 compatible.
+tail call remains. The current type checker rejects self recursion in an explicit
+`return`, and recursion inside `try`/`catch`/`finally`. These forms are not
+claimed to be Scala 2.13 compatible. Value class `$extension` methods are
+supported: their underlying receiver remains in slot 0 while the recursive
+parameters are updated in place.
 
 ## Regression test
 
@@ -52,9 +53,12 @@ generated.
 `trc_client.scala` is an interoperability test in which scalac compiles a second
 program against scala-rs classfiles. `trc_bad.scala` and `trc_inputs_bad.scala`
 check that both compilers reject overridable methods, non-tail recursion, calls in
-the receiver, and calls in an earlier argument clause. `trc_valueclass_unsupported.scala`
-is a legal program accepted by scalac; it documents this compiler's unsupported
-case and is not a negative Scala test.
+the receiver, and calls in an earlier argument clause. `trc_valueclass.scala`
+runs primitive, wide, and reference underlying receivers through two million
+calls, compares output with scalac, and checks the emitted `$extension`
+descriptors and loop branches. `trc_valueclass_client.scala` is compiled by
+scalac against scala-rs classfiles to exercise the static extension ABI across a
+compilation boundary.
 
 ## A JIT comparison trap with Zulu 15.0.6
 

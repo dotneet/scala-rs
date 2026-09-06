@@ -1556,6 +1556,8 @@ impl<'a> Gen<'a> {
         let source = self.source_name;
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
+        let method = def.sym;
+        let mut tailrec_error = None;
         b.add_code(
             ACC_PUBLIC | ACC_STATIC,
             &ext_name,
@@ -1577,12 +1579,17 @@ impl<'a> Gen<'a> {
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );
+                ctx.method_sym = method;
                 ctx.value_ext = Some((
                     class_name.clone(),
                     format!("({})V", jvm_desc_val(st, &under)),
                     jvm_sort(&under),
                 ));
+                tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
                 gen_expr(asm, &mut frame, &ctx, rhs);
+                tailrec_error = tailrec_error
+                    .take()
+                    .or_else(|| crate::gen_tailrec::finish_tail_loop(&frame, &ctx));
                 if is_unit_like(&ret_for_body) {
                     pop_if_value(asm, &rhs.ty);
                     asm.vreturn();
@@ -1591,6 +1598,9 @@ impl<'a> Gen<'a> {
                 }
             },
         );
+        if let Some(error) = tailrec_error {
+            b.format_errors.push(error);
+        }
     }
 
     /// nsc's `SyntheticMethods` for a value class. A boxed `Meters(5)` has to
