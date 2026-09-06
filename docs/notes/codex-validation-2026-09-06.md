@@ -435,3 +435,33 @@ Current process and pending-commit state is also recorded in
 `/tmp/scala-rs-codex/integration/current-state.json`. Original branch corpus
 sessions and script/binary revisions are tracked separately in
 `/tmp/scala-rs-codex/slice-validation/result.json`.
+
+
+## Variance accepted; other candidates still under repair
+
+`9beb69b2` merges compiler candidate `629570a8` plus test-only `803be601`.
+Parent full release validation: 2237 passed, zero failed, 199 result rows;
+Slick 0/1490, cats 350/81, GitBucket 912/111, Scala library 1613/171;
+strict verification loaded all 1490 classes; Slick MODE=b 36/36 attempts.
+MODE=a remains 12 compile failures; specialization remains 2 match / 26 differ /
+9 no_compile. All 5324 corpus identities and statuses match the checked-in
+three-column reference. Full six-field comparison to `candidate-4b2f941` found
+only t8199's output path and impconvtimes's first runtime exception. The latter
+was independently investigated: both compilers emit seven byte-identical classes,
+and repeated runs produce both VerifyError and IncompatibleClassChangeError.
+Evidence is `integration/variance-impconvtimes/results.json` under the existing
+`/tmp/scala-rs-codex` root. The full gate, supplemental test and clippy audits
+are in `integration/candidate-629570a/`. Compiler/Cargo inputs are unchanged
+between the full run, test-only follow-up, and merge. Clippy with the historical
+`--workspace --release` scope retains exactly 59 warning messages.
+
+Unaccepted candidates: codegen/constructor `73cc75b2` full workspace returned
+2238 passed / 10 failed. Parent `aa5126ee` fixes the six selfrec failures by
+indexing default parameter types against the remaining method clauses;
+selfrec plus verify_sql gives 10 fresh passes. Four Slick constructor overload
+failures remain assigned for repair. Implicit candidate `fc2ab4cc` passes 15
+focused tests but rejects a parent-confirmed nsc-positive non-generic implicit
+leaf; real GitBucket still timed out at 60 seconds on its preceding candidate.
+Macro `7f2a9be9` passes a success-required hydration test, but independent probes
+expose incomplete flags, owners, parameter metadata and legal class shapes.
+None of these candidates is accepted based on focused tests alone.

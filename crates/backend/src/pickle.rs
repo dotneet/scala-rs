@@ -2323,7 +2323,20 @@ impl<'a> Pickler<'a> {
             }
             info = self.add(POLYTPE, body);
         }
-        let flags = raw_to_pickled((1u64 << 13) | (1u64 << 4)); // PARAM | DEFERRED
+        // Variance is a type-parameter flag, not a property of the JVM
+        // Signature attribute. Preserve it for class parameters, abstract
+        // type-member parameters, and nested parameters of a higher-kinded
+        // parameter (`F[+A]`); the typer clears variance on ordinary method
+        // parameters where Scala forbids it. These bits are above nsc's
+        // raw-to-pickled permutation, so they survive unchanged.
+        let mut raw_flags = (1u64 << 13) | (1u64 << 4); // PARAM | DEFERRED
+        if s.flags.contains(Flags::COVARIANT) {
+            raw_flags |= 1u64 << 16;
+        }
+        if s.flags.contains(Flags::CONTRAVARIANT) {
+            raw_flags |= 1u64 << 17;
+        }
+        let flags = raw_to_pickled(raw_flags);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[idx as usize] = (TYPESYM, body);
         idx
