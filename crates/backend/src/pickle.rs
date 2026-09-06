@@ -2396,11 +2396,21 @@ impl<'a> Pickler<'a> {
             }
             info = self.add(POLYTPE, body);
         }
+        // Variance is a type-parameter flag, not a property of the JVM
+        // Signature attribute. Preserve it for class parameters, abstract
+        // type-member parameters, and nested parameters of a higher-kinded
+        // parameter (`F[+A]`); the typer clears variance on ordinary method
+        // parameters where Scala forbids it. These bits are above nsc's
+        // raw-to-pickled permutation, so they survive unchanged.
         let mut raw_flags = (1u64 << 13) | (1u64 << 4); // PARAM | DEFERRED
-                                                        // nsc's SPECIALIZED bit is outside the low flag remapping table.  A
-                                                        // consumer checks this bit before it interprets the type-parameter's
-                                                        // @specialized SYMANNOT; carrying only the annotation leaves the
-                                                        // source shape visible to reflection but keeps call sites generic.
+        if s.flags.contains(Flags::COVARIANT) {
+            raw_flags |= 1u64 << 16;
+        }
+        if s.flags.contains(Flags::CONTRAVARIANT) {
+            raw_flags |= 1u64 << 17;
+        }
+        // nsc checks SPECIALIZED before interpreting the annotation. Advertise
+        // it only when the corresponding primitive entries will be emitted.
         if advertised_specialization.is_some() {
             raw_flags |= 1u64 << 40;
         }
