@@ -34,6 +34,11 @@ fn run_java(out: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn scala_library_jar() -> Option<PathBuf> {
+    let jar = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    jar.is_file().then_some(jar)
+}
+
 #[test]
 fn parent_default_constructor_is_verified() {
     let out = tmp_dir();
@@ -56,5 +61,51 @@ fn parent_default_constructor_is_verified() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(run_java(&out), "jdbc:test:user:password\n");
+    let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn qualified_library_class_term_uses_companion() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = tmp_dir();
+    fs::create_dir_all(&out).unwrap();
+    let src = fixtures_dir().join("vsql_factory.scala");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compile failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "Main",
+        ])
+        .output()
+        .expect("run java");
+    assert!(
+        run.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "scala.collection.Factory$:scala.collection.immutable.LazyList$\n"
+    );
     let _ = fs::remove_dir_all(&out);
 }

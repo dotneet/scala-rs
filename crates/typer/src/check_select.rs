@@ -248,6 +248,26 @@ impl Typer {
                 found = cand;
             }
         }
+        // A qualified class name in term position denotes its companion
+        // object, just like an unqualified identifier.  Package lookup is
+        // deliberately lazy, so `scala.collection.Factory` used to stop at
+        // the `Factory` class: the generated field then had the trait type
+        // and codegen's unresolved Select path threw `select Factory` while
+        // initializing the package object.  Load the companion before the
+        // final term/class namespace preference below.
+        if !found.is_empty()
+            && recv_ty.is_no_type()
+            && !qual.sym.is_none()
+            && self.st.get(qual.sym).kind == SymKind::Package
+        {
+            let exposed = self.expose_class_companion(&found, &name, tree.span);
+            if exposed
+                .iter()
+                .any(|&s| self.st.get(s).kind == SymKind::Module)
+            {
+                found = exposed;
+            }
+        }
         // A function type is `scala.FunctionN[T1, …, Tn, R]`; `class_sym_of`
         // has no symbol for it, so `f.tupled` / `f.curried` would find nothing.
         if found.is_empty() {
