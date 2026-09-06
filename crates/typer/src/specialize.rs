@@ -354,23 +354,194 @@ fn clone_one_symbol(
         source.flags,
         source.jvm_name.clone(),
     );
+    // A local class is named after its enclosing source owner and receives a
+    // per-owner index during namer (C$1, C$2, ...). A method variant has its
+    // own class body, so reusing that JVM name makes the later clone overwrite
+    // the generic local class on disk. Keep each clone addressable by assigning
+    // the next local index before its body is emitted. Companion module names
+    // carry the same index before their trailing $.
+    let local_jvm = variant_local_jvm_name(st, &source);
     let mut copy = source;
     copy.id = id;
     copy.owner = owner;
+    if let Some(jvm) = local_jvm {
+        copy.jvm_name = jvm;
+    }
+    map.insert(old, id);
     copy.members.clear();
     copy.params.clear();
     copy.paramss.clear();
     copy.tparams.clear();
     copy.ty = st.subst_tparams(original, std::slice::from_ref(primitive), &copy.ty);
+    remap_type_symbols(&mut copy.ty, map);
     copy.bound_lo = copy
         .bound_lo
         .map(|ty| st.subst_tparams(original, std::slice::from_ref(primitive), &ty));
+    if let Some(ty) = &mut copy.bound_lo {
+        remap_type_symbols(ty, map);
+    }
     copy.bound_hi = copy
         .bound_hi
         .map(|ty| st.subst_tparams(original, std::slice::from_ref(primitive), &ty));
+    if let Some(ty) = &mut copy.bound_hi {
+        remap_type_symbols(ty, map);
+    }
     *st.get_mut(id) = copy;
-    map.insert(old, id);
     id
+}
+
+fn variant_local_jvm_name(st: &SymbolTable, source: &crate::symbol::Symbol) -> Option<String> {
+    if !matches!(
+        source.kind,
+        SymKind::Class | SymKind::ModuleClass | SymKind::Module
+    ) || source.jvm_name.is_empty()
+        || st.get(source.owner).kind != SymKind::Method
+    {
+        return None;
+    }
+    let trailing_dollar = source.jvm_name.ends_with('$');
+    let stem = source
+        .jvm_name
+        .strip_suffix('$')
+        .unwrap_or(&source.jvm_name);
+    let (base, index) = stem.rsplit_once('$')?;
+    let index = index.parse::<u32>().ok()?;
+    let mut next = index.saturating_add(1);
+    loop {
+        let candidate = if trailing_dollar {
+            [base, "$", &next.to_string(), "$"].concat()
+        } else {
+            [base, "$", &next.to_string()].concat()
+        };
+        if !st.symbols.iter().any(|sym| sym.jvm_name == candidate) {
+            return Some(candidate);
+        }
+        next = next.saturating_add(1);
+    }
+}
+
+fn remap_type_symbols(ty: &mut Type, map: &FxHashMap<SymbolId, SymbolId>) {
+    match ty {
+        Type::Array(elem) | Type::ByName(elem) | Type::Repeated(elem) => {
+            remap_type_symbols(elem, map)
+        }
+        Type::Tuple(elems) => {
+            for elem in elems {
+                remap_type_symbols(elem, map);
+            }
+        }
+        Type::Function { params, ret } => {
+            for param in params {
+                remap_type_symbols(param, map);
+            }
+            remap_type_symbols(ret, map);
+        }
+        Type::Named { args, .. } => {
+            for arg in args {
+                remap_type_symbols(arg, map);
+            }
+        }
+        Type::Class { sym, args } => {
+            if let Some(id) = map.get(sym) {
+                *sym = *id;
+            }
+            for arg in args {
+                remap_type_symbols(arg, map);
+            }
+        }
+        Type::Method { paramss, ret } => {
+            for clause in paramss {
+                for param in clause {
+                    remap_type_symbols(param, map);
+                }
+            }
+            remap_type_symbols(ret, map);
+        }
+        Type::Overload(alts) => {
+            for alt in alts {
+                remap_type_symbols(alt, map);
+            }
+        }
+        Type::ModuleRef(sym)
+        | Type::TypeParam(sym)
+        | Type::TypeMember(sym)
+        | Type::ThisType(sym) => {
+            if let Some(id) = map.get(sym) {
+                *sym = *id;
+            }
+        }
+        Type::Applied { ctor, args } => {
+            remap_type_symbols(ctor, map);
+            for arg in args {
+                remap_type_symbols(arg, map);
+            }
+        }
+        Type::SingleType { prefix, sym } => {
+            remap_type_symbols(prefix, map);
+            if let Some(id) = map.get(sym) {
+                *sym = *id;
+            }
+        }
+        Type::BoundedWildcard { lo, hi } => {
+            if let Some(lo) = lo {
+                remap_type_symbols(lo, map);
+            }
+            if let Some(hi) = hi {
+                remap_type_symbols(hi, map);
+            }
+        }
+        Type::Annotated { tpe, .. } => remap_type_symbols(tpe, map),
+        Type::Refined { parents, decls } => {
+            for parent in parents {
+                remap_type_symbols(parent, map);
+            }
+            for decl in decls {
+                match decl {
+                    scala_rs_parser::RefineDecl::Type { rhs, lo, hi, .. } => {
+                        if let Some(rhs) = rhs {
+                            remap_type_symbols(rhs, map);
+                        }
+                        if let Some(lo) = lo {
+                            remap_type_symbols(lo, map);
+                        }
+                        if let Some(hi) = hi {
+                            remap_type_symbols(hi, map);
+                        }
+                    }
+                    scala_rs_parser::RefineDecl::Def { paramss, ret, .. } => {
+                        for clause in paramss {
+                            for param in clause {
+                                remap_type_symbols(param, map);
+                            }
+                        }
+                        remap_type_symbols(ret, map);
+                    }
+                    scala_rs_parser::RefineDecl::Val { ty, .. } => {
+                        remap_type_symbols(ty, map);
+                    }
+                }
+            }
+        }
+        Type::NoType
+        | Type::Error
+        | Type::Unit
+        | Type::Boolean
+        | Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::Char
+        | Type::String
+        | Type::Any
+        | Type::AnyRef
+        | Type::AnyVal
+        | Type::Null
+        | Type::Nothing
+        | Type::Wildcard
+        | Type::Constant(_) => {}
+    }
 }
 
 fn collect_variant_symbols(
@@ -544,8 +715,18 @@ fn collect_variant_symbols(
             collect_variant_symbols(cond, st, current_owner, original, primitive, map);
             collect_variant_symbols(body, st, current_owner, original, primitive, map);
         }
-        TreeKind::Return { expr } | TreeKind::Throw { expr } | TreeKind::New { tpt: expr } => {
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => {
             collect_variant_symbols(expr, st, current_owner, original, primitive, map);
+        }
+        TreeKind::New { tpt } => {
+            if !tree.sym.is_none() {
+                let owner = map
+                    .get(&st.get(tree.sym).owner)
+                    .copied()
+                    .unwrap_or(current_owner);
+                clone_one_symbol(tree.sym, owner, st, original, primitive, map);
+            }
+            collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
         }
         TreeKind::Try {
             block,
@@ -578,7 +759,23 @@ fn collect_variant_symbols(
             collect_variant_symbols(expr, st, current_owner, original, primitive, map);
             collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
         }
-        TreeKind::TypeApply { fun, args } | TreeKind::Apply { fun, args } => {
+        TreeKind::TypeApply { fun, args } => {
+            collect_variant_symbols(fun, st, current_owner, original, primitive, map);
+            for arg in args {
+                collect_variant_symbols(arg, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::Apply { fun, args } => {
+            // Constructor symbols live on the Apply around New, rather than
+            // on the New tree itself. Clone them under the cloned local class
+            // so gen_new derives the primitive constructor descriptor.
+            if !tree.sym.is_none() && st.get(tree.sym).name == "<init>" {
+                let owner = map
+                    .get(&st.get(tree.sym).owner)
+                    .copied()
+                    .unwrap_or(current_owner);
+                clone_one_symbol(tree.sym, owner, st, original, primitive, map);
+            }
             collect_variant_symbols(fun, st, current_owner, original, primitive, map);
             for arg in args {
                 collect_variant_symbols(arg, st, current_owner, original, primitive, map);

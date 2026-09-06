@@ -577,3 +577,74 @@ object MethodAbiMain {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A local class belongs to each cloned method body. Reusing its generic JVM
+/// name makes the primitive clone overwrite the generic class and leaves the
+/// clone calling a constructor descriptor that no longer exists.
+#[test]
+fn method_specialization_local_class_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip local-class specialization fixture: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("method-specialization-local-class");
+    let src = root.join("LocalClassAbi.scala");
+    fs::write(
+        &src,
+        r#"import scala.specialized
+
+object LocalClassAbi {
+  def wrap[@specialized(Int, Long) A](a: A): A = {
+    class C(val x: A)
+    new C(a).x
+  }
+}
+
+object LocalClassAbiMain {
+  def main(args: Array[String]): Unit = {
+    println(LocalClassAbi.wrap(7) + ":" + LocalClassAbi.wrap(8L))
+  }
+}
+"#,
+    )
+    .unwrap();
+    let out = root.join("provider");
+    fs::create_dir_all(&out).unwrap();
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs local-class specialization compile");
+    assert!(
+        status.success(),
+        "local-class specialization provider failed"
+    );
+    for suffix in ["$1", "$2", "$3"] {
+        assert!(
+            out.join(format!("LocalClassAbi$C{suffix}.class")).is_file(),
+            "missing local class variant {suffix}"
+        );
+    }
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "LocalClassAbiMain",
+        ])
+        .output()
+        .expect("java local-class specialization fixture");
+    assert!(
+        run.status.success(),
+        "local-class specialization runtime failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7:8\n");
+    let _ = fs::remove_dir_all(&root);
+}
