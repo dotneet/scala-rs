@@ -7,6 +7,9 @@
 # The log is `kind<TAB>name<TAB>status<TAB>symptom`, with the symptom kept
 # verbatim from the compiler. Bucketing happens here rather than in the runner
 # so that a log recorded once can be re-cut a different way.
+# Reference diagnostics can contain arbitrary bytes. This process only
+# reports saved results; it does not change a compiler or JVM locale.
+export LC_ALL=C
 set -e
 LOG=${1:?usage: scala_corpus_report.sh <corpus.tsv> [top-N]}
 TOP=${2:-15}

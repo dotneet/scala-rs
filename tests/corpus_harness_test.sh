@@ -158,6 +158,10 @@ python3 - "$WORK/corpus-byte.tsv" <<'PY'
 import pathlib, sys
 assert b'\xff' in pathlib.Path(sys.argv[1]).read_bytes()
 PY
+env LC_ALL=en_US.UTF-8 tests/scala_corpus_report.sh "$WORK/corpus-byte.tsv" \
+  > "$WORK/report-byte.out" 2> "$WORK/report-byte.err"
+[[ ! -s "$WORK/report-byte.err" ]]
+grep -q 'invalid byte' "$WORK/report-byte.out"
 
 expect_exit 2 "$WORK/corpus-drop.out" env \
   CORPUS_KINDS=pos CORPUS_SIZE=full CORPUS_JOBS=1 \
