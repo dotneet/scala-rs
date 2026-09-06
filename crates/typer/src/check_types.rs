@@ -3054,10 +3054,67 @@ impl Typer {
         if defaults.is_empty() {
             return;
         }
-        for ctor in self.st.lookup_member(class_id, "<init>") {
-            if self.st.get(ctor).owner != class_id {
-                continue;
+        let ctors: Vec<SymbolId> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&ctor| self.st.get(ctor).owner == class_id)
+            .collect();
+        let fields = self.st.get(class_id).ctor_fields.clone();
+        // The JVM name is shared by primary and auxiliary constructors, but
+        // only the primary constructor owns `$lessinit$greater$default$n`.
+        // Constructor fields provide a source-parameter shape for the common
+        // case. A classfile-only constructor may have synthetic parameter
+        // names (`x$0`, ...), so names are preferred but types remain a
+        // fallback. Every selected constructor must also have all defaulted
+        // slots; this rejects a partial pickled view of a curried primary
+        // constructor in favor of its full classfile descriptor. If more than
+        // one constructor remains possible, decline rather than attach a
+        // primary getter to an auxiliary constructor.
+        let highest_default = defaults.iter().copied().max().unwrap_or(0);
+        let matches_fields = |params: &[SymbolId], names: bool| {
+            if params.len() < highest_default {
+                return false;
             }
+            let mut from = 0;
+            fields.iter().all(|&field| {
+                let field_info = self.st.get(field);
+                let Some(offset) = params[from..].iter().position(|&param| {
+                    let param_info = self.st.get(param);
+                    (!names || param_info.name == field_info.name) && param_info.ty == field_info.ty
+                }) else {
+                    return false;
+                };
+                from += offset + 1;
+                true
+            })
+        };
+        let primary: Vec<SymbolId> = if !fields.is_empty() {
+            let named: Vec<SymbolId> = ctors
+                .iter()
+                .copied()
+                .filter(|&ctor| matches_fields(&self.st.get(ctor).params, true))
+                .collect();
+            if named.len() == 1 {
+                named
+            } else {
+                let typed: Vec<SymbolId> = ctors
+                    .iter()
+                    .copied()
+                    .filter(|&ctor| matches_fields(&self.st.get(ctor).params, false))
+                    .collect();
+                if typed.len() == 1 {
+                    typed
+                } else {
+                    Vec::new()
+                }
+            }
+        } else if ctors.len() == 1 {
+            ctors
+        } else {
+            Vec::new()
+        };
+        for ctor in primary {
             let params = self.st.get(ctor).params.clone();
             for n in defaults.iter().copied() {
                 if let Some(&param) = params.get(n.saturating_sub(1)) {

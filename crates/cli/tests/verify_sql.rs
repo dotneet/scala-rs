@@ -273,7 +273,8 @@ fn external_constructor_defaults_are_typed_and_companion_backed() {
     let nsc_base = root.join("nsc-base");
     let rs_child = root.join("rs-child");
     let rs_bad = root.join("rs-bad");
-    for out in [&nsc_base, &rs_child, &rs_bad] {
+    let rs_overload_bad = root.join("rs-overload-bad");
+    for out in [&nsc_base, &rs_child, &rs_bad, &rs_overload_bad] {
         fs::create_dir_all(out).unwrap();
     }
     let fixtures = fixtures_dir();
@@ -319,6 +320,23 @@ fn external_constructor_defaults_are_typed_and_companion_backed() {
     assert!(
         diagnostics.contains("found: Int") && diagnostics.contains("required: String"),
         "unexpected diagnostic: {diagnostics}"
+    );
+
+    let overload_bad = compile_scala_rs_output(
+        &fixtures.join("vsql_external_ctor_overload_bad.scala"),
+        &rs_overload_bad,
+        &[&nsc_base],
+        &jar,
+    );
+    assert!(!overload_bad.status.success());
+    let overload_diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&overload_bad.stdout),
+        String::from_utf8_lossy(&overload_bad.stderr)
+    );
+    assert!(
+        overload_diagnostics.contains("no matching overload for constructor VSqlOverloadedBase"),
+        "unexpected overload diagnostic: {overload_diagnostics}"
     );
     let _ = fs::remove_dir_all(&root);
 }
