@@ -214,3 +214,34 @@ The bounded gitbucket profile captured the compiler at 100% CPU and about
 clone frames, and no `_dyld_start` frame. This particular timeout is compiler
 work, not the separately observed startup delay. A semantics-preserving
 optimization remains isolated in `codex/gb-import`.
+
+
+## Recovery candidate separated from new features
+
+To avoid delaying the original three slices behind newly introduced tail-call
+and diagnostic work, `codex/recovery` at `d9eb5dc` contains the original three
+plus the reviewed parent-constructor, Factory, owner-bound, and Java macro
+fixes. It excludes tail-call lowering and the new backend diagnostic gate.
+The independent full runner is session `28152`, working in
+`.worktrees/codex-recovery`, with logs under
+`/tmp/scala-rs-codex/integration/candidate-d9eb5dc`. It is frozen while the
+runner proceeds through workspace, four measures, strict JVM verification,
+Slick execution, specialization, and corpus. No passing result is implied by
+this dispatch record.
+
+The parallel `e4c99ce` workspace run additionally found the same super-target
+diagnostic in `genrep`, `lastone`, and `mismatch13`. The coordinator reduced
+the issue to `Layer.helper = super.foo`: scalac compiles and prints `base`,
+but the new gate searches for a super implementation of `helper`. Evidence is
+in `/tmp/scala-rs-codex/codegen-review`. Check actual selected super methods,
+not just private-helper exclusion.
+
+Value-class receiver follow-up `f79b75c` now passes the coordinator's original
+Long receiver repro, printing `2000007` under full JVM verification and a
+small stack. The pending tail-call sequence is `42acefd`, `bcd9c20`, then
+`f79b75c`; combined independent gates are still required.
+
+Current process and pending-commit state is also recorded in
+`/tmp/scala-rs-codex/integration/current-state.json`. Original branch corpus
+sessions and script/binary revisions are tracked separately in
+`/tmp/scala-rs-codex/slice-validation/result.json`.
