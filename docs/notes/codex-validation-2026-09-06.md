@@ -596,3 +596,36 @@ The fresh focused gate passes 105 tests (conform 86, fvg 7, mismatch6 12).
 After merging main, frozen candidate `c6a7e8f9` is in its full gate under
 `candidate-c6a7e8f`. Neither candidate is accepted yet. All implementation
 subagents have now stopped with their work preserved.
+
+
+## Accepted method specialization and current parent candidates
+
+`e4d404f1` finished the full independent gate and was merged as `bafdb625`.
+The updated baseline records 2245 tests passed, no failures, 199 result rows,
+unchanged compile measures, strict verification of 1490 classes and Slick
+MODE=b 36/36. All 5324 corpus statuses are unchanged. The two changed diagnostic
+records are the t8199 path and impconvtimes exception order; seven newly compiled
+impconvtimes classes exactly match saved baseline bytes. Clippy passes with
+58 warnings, none newly added. Main compiler sources and Cargo inputs exactly
+match the measured candidate. Class specialization remains red.
+
+For-comprehension `c6a7e8f9` also finished its full gate: 2244 passed, zero failed,
+200 result rows, unchanged compile measures and passing strict/Slick MODE=b
+checks. The corpus loses no previous passes and gains neg/t4163 and run/t6968.
+Parent nsc comparison verifies rejection on the offending for binding and strict
+runtime output `1, 3, 5`. Eight full-field records change; two are known path/
+exception variations, two are first diagnostics reached after guard support,
+one moves the same implicit diagnostic to its actual generator line, and the
+others reflect the corrected syntax rejection/runtime behavior. The code is
+now merged with current main as frozen candidate `0306b030` and is undergoing
+a combined full acceptance gate. It has not been merged into main.
+
+Parent codegen repair `01ece8aa` completes expression-local templates and strips
+macro declarations through all child edges, recovering seven earlier corpus
+losses in focused checks. Its macro implementation JVM execution test uses an
+nsc reflection adapter: direct macro binding metadata and dependent result
+ScalaSignature remain independently proven RED. Saved Object-super repair was
+independently verified with 37 tests at `49bf1a90`; Slick now reports four sql
+selection errors, down from 66, but emits zero classes. After merging main,
+codegen candidate `a95e7d04` passes the release backend check only. The four sql
+errors and four other earlier corpus losses still prevent acceptance.
