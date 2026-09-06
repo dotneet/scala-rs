@@ -649,6 +649,104 @@ object LocalClassAbiMain {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A nested class's JVM prefix includes the enclosing local-class index. Each
+/// method variant therefore needs a matching `Outer$N$Inner` pair; keeping the
+/// generic `Outer$1$Inner` prefix makes the primitive body call a constructor
+/// in a different class file. The nested object case below is intentionally
+/// ours-only: scalac 2.13.16 rejects a local object that mentions the method's
+/// type parameter, while scala-rs already accepts the shape as a static
+/// singleton and must keep its three generated module classes distinct.
+#[test]
+fn method_specialization_nested_local_types_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip nested local specialization fixture: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("method-specialization-nested-local-types");
+    let src = root.join("NestedLocalTypes.scala");
+    fs::write(
+        &src,
+        r#"import scala.specialized
+
+object NestedAbi {
+  def wrap[@specialized(Int, Long) A](a: A): A = {
+    class Outer { class Inner(val x: A) }
+    val o = new Outer
+    new o.Inner(a).x
+  }
+}
+
+object LocalObjectAbi {
+  def wrap[@specialized(Int, Long) A](a: A): A = {
+    object O { def cast(x: Any): A = x.asInstanceOf[A] }
+    O.cast(a)
+  }
+}
+
+object NestedLocalTypesMain {
+  def main(args: Array[String]): Unit = {
+    println(NestedAbi.wrap(7))
+    println(NestedAbi.wrap(8L))
+    println(NestedAbi.wrap("s"))
+    println(LocalObjectAbi.wrap(9))
+    println(LocalObjectAbi.wrap(10L))
+    println(LocalObjectAbi.wrap("t"))
+  }
+}
+"#,
+    )
+    .unwrap();
+    let out = root.join("provider");
+    fs::create_dir_all(&out).unwrap();
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs nested local specialization compile");
+    assert!(
+        status.success(),
+        "nested local specialization provider failed"
+    );
+    for suffix in ["$1", "$2", "$3"] {
+        assert!(
+            out.join(format!("NestedAbi$Outer{suffix}.class")).is_file(),
+            "missing nested Outer variant {suffix}"
+        );
+        assert!(
+            out.join(format!("NestedAbi$Outer{suffix}$Inner.class"))
+                .is_file(),
+            "missing nested Inner variant {suffix}"
+        );
+        assert!(
+            out.join(format!("LocalObjectAbi$O{suffix}$.class"))
+                .is_file(),
+            "missing local object variant {suffix}"
+        );
+    }
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "NestedLocalTypesMain",
+        ])
+        .output()
+        .expect("java nested local specialization fixture");
+    assert!(
+        run.status.success(),
+        "nested local specialization runtime failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n8\ns\n9\n10\nt\n");
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Constructor references inside a variant must be split by ownership. Local
 /// classes and their constructors are cloned, while `String` and a source
 /// class remain external references. The captured local class also checks

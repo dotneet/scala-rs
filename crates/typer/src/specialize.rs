@@ -366,7 +366,7 @@ fn clone_one_symbol(
     // the generic local class on disk. Keep each clone addressable by assigning
     // the next local index before its body is emitted. Companion module names
     // carry the same index before their trailing $.
-    let local_jvm = variant_local_jvm_name(st, &source);
+    let local_jvm = variant_local_jvm_name(st, &source, original, map);
     let mut copy = source;
     copy.id = id;
     copy.owner = owner;
@@ -392,14 +392,49 @@ fn clone_one_symbol(
     id
 }
 
-fn variant_local_jvm_name(st: &SymbolTable, source: &crate::symbol::Symbol) -> Option<String> {
+fn variant_local_jvm_name(
+    st: &SymbolTable,
+    source: &crate::symbol::Symbol,
+    original: SymbolId,
+    map: &FxHashMap<SymbolId, SymbolId>,
+) -> Option<String> {
     if !matches!(
         source.kind,
         SymKind::Class | SymKind::ModuleClass | SymKind::Module
     ) || source.jvm_name.is_empty()
-        || st.get(source.owner).kind != SymKind::Method
+        || !belongs_to_method(st, source.owner, original)
     {
         return None;
+    }
+    // A nested local class inherits the JVM prefix of its cloned enclosing
+    // class.  Reusing the old prefix (`Outer$1$Inner`) makes all primitive
+    // variants overwrite the generic nested class and leaves the caller
+    // naming one prefix while the constructor lives under another.  The
+    // declaration walk maps the owner before visiting its children, so carry
+    // the suffix over to that new prefix.
+    if let Some(&new_owner) = map.get(&source.owner) {
+        let old_owner_jvm = &st.get(source.owner).jvm_name;
+        let new_owner_jvm = &st.get(new_owner).jvm_name;
+        if !old_owner_jvm.is_empty() && !new_owner_jvm.is_empty() {
+            let source_stem = source
+                .jvm_name
+                .strip_suffix('$')
+                .unwrap_or(&source.jvm_name);
+            let owner_stem = old_owner_jvm.strip_suffix('$').unwrap_or(old_owner_jvm);
+            if let Some(suffix) = source_stem.strip_prefix(owner_stem) {
+                let trailing_dollar = source.jvm_name.ends_with('$');
+                let mut candidate = format!(
+                    "{}{}{}",
+                    new_owner_jvm.trim_end_matches('$'),
+                    suffix,
+                    if trailing_dollar { "$" } else { "" }
+                );
+                if !trailing_dollar && new_owner_jvm.ends_with('$') {
+                    candidate = format!("{}{}", new_owner_jvm, suffix.trim_start_matches('$'));
+                }
+                return Some(candidate);
+            }
+        }
     }
     let trailing_dollar = source.jvm_name.ends_with('$');
     let stem = source
@@ -608,16 +643,42 @@ fn collect_variant_symbols(
             }
         }
         TreeKind::ModuleDef { impl_, .. } => {
-            let owner = if tree.sym.is_none() {
+            let body_owner = if tree.sym.is_none() {
                 current_owner
             } else {
-                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map)
+                // A source object has two sibling symbols: the term (`Module`)
+                // carried by this tree and the class (`ModuleClass`) that owns
+                // its members and is used by codegen for `MODULE$`/accessors.
+                // Cloning only the term leaves its `ModuleRef` and every body
+                // member pointed at the generic class.  Clone the pair before
+                // walking the body, then use the class clone as the body owner.
+                let module_class = st.module_class_of(tree.sym);
+                let new_class = if module_class != tree.sym && !module_class.is_none() {
+                    clone_one_symbol(module_class, current_owner, st, original, primitive, map)
+                } else {
+                    current_owner
+                };
+                let module =
+                    clone_one_symbol(tree.sym, current_owner, st, original, primitive, map);
+                if module_class != tree.sym && !module_class.is_none() {
+                    // `Module` and `ModuleClass` intentionally share one JVM
+                    // name.  `clone_one_symbol` cannot know that while it is
+                    // allocating the term, so align it after the class clone.
+                    let class_jvm = st.get(new_class).jvm_name.clone();
+                    st.get_mut(module).jvm_name = class_jvm;
+                }
+                let body_owner = if module_class != tree.sym && !module_class.is_none() {
+                    map.get(&module_class).copied().unwrap_or(new_class)
+                } else {
+                    module
+                };
+                body_owner
             };
             for parent in &impl_.parents {
-                collect_variant_symbols(parent, st, owner, original, primitive, map);
+                collect_variant_symbols(parent, st, body_owner, original, primitive, map);
             }
             for stat in &impl_.body {
-                collect_variant_symbols(stat, st, owner, original, primitive, map);
+                collect_variant_symbols(stat, st, body_owner, original, primitive, map);
             }
         }
         TreeKind::DefDef {
