@@ -11,6 +11,39 @@ their pending-status statements. All new subagents use Luna / xhigh and
 isolated worktrees. They report through collaboration tools, not Codex task
 messages.
 
+Latest independent checks (these supersede the pending descriptions below):
+
+- Specialization candidate `560405fd` completed its full runner: 2234 release
+  workspace tests pass; all four compile measures match the baseline;
+  strict verification loads all 1490 classes; Slick MODE=b passes 36/36.
+  MODE=a and the class-specialization ledger remain red and unchanged.
+  All 5324 corpus statuses match `318c1568`; the only six-field difference
+  is the temporary output path in the existing `run/t8199` diagnostic.
+  Evidence: `candidate-560405f/results.json` and `corpus-parent-audit.json`.
+  This candidate is still held: additional local-class probes require
+  symbol-cloning fixes. Follow-up `e02b8161` is being reviewed for external
+  constructor ownership and complete type-symbol remapping before acceptance.
+- Combined metadata candidate `fbc4ca7e` passes 15 fresh focused release
+  tests (codegen diagnostics, source signatures, constructor defaults).
+  It is held because a separate producer probe rejects ordinary `case class
+  Row(i: Int, s: String)` for missing `Equals.canEqual`, while accepted main
+  compiles it. Do not classify that regression as a pre-existing defect.
+  A different overload probe reveals an existing defect: a case class with
+  `def canEqual(i: Int)` compiles on main but throws `ClassCastException` when
+  called through `Equals`; scalac prints `true`. Both are assigned to the
+  source-signature follow-up. Evidence is under
+  `integration/source-signature-probes/{rows,case-overload}-results.json`.
+- Gitbucket precision candidate `29e38dd1` passes four independently run
+  release tests, including exact negative diagnostics and JVM runtime output.
+  Its performance is not accepted. Candidate `554b4de1` combines this work,
+  accepted main, and the proposed earlier divergence check `4c261de5` for a
+  bounded investigation. Reordering that check alone is not proof of the
+  claimed speedup or a fix for fresh inference variables in recursive rules.
+- Macro snapshot proposal `f4099fd7` is held: a constructor-field-only
+  declaration list is not a complete case-class symbol graph. Generic/active
+  symbols must not lose previously working name-only queries. Permanent
+  reflection comparisons and a safe incomplete-snapshot path are pending.
+
 Tail-call work was independently frozen and tested at `dd5047e0` in
 `codex/tail-validation`, then merged locally as `318c1568`.
 Session `41170` completed the full acceptance sequence; it does not include the
@@ -80,14 +113,26 @@ Its log is `candidate-d9eb5dc/clippy.log`.
 - The derived implicit member correction `b55cb7d2` is staged separately as
   `d34fd8de`. Parent release tests passed 30/30 across `gbimport`,
   `implicitmemo`, `innerclasses`, `outer`, and `slickimpl`. Permanent precise
-  type regressions and three new unreachable-pattern warnings are being
-  addressed before full validation. The timeout above remains unresolved.
+  type regressions are being added before full validation. The three
+  unreachable-pattern warnings in `check_infer.rs` also occur on accepted
+  main; an initial attribution to this slice was incorrect. The timeout
+  above remains unresolved.
 - Method specialization is staged separately as `d80d235c`. Parent review
   found that cloning a specialized method incorrectly changed a recursive
   `f[String]` call into the primitive variant, causing `ClassCastException`.
   The follow-up passes four fresh release tests and the original standalone
   reproduction now prints `ok`, `ok`, `generic`, matching scalac. This is a
   focused result, not full workspace/corpus acceptance or class specialization.
+  The additional ambiguous/unused type-argument correction and accepted tail
+  changes are now frozen together at `560405fd` for the full acceptance runner
+  (session `57064`, `candidate-560405f`). Do not mutate that candidate while it
+  runs. Independent Array/List/Tuple/thunk/cast probes produce the same 15
+  runtime results as scalac. A separate scalac client exposed the existing
+  loss of `Array[A]` arguments in source pickles; it also fails on accepted
+  tail main, so this is assigned to source-signature work, not attributed to
+  specialization. Evidence: `specialization-validation/containers-results.json`
+  and `container-consumer-baseline-results.json` under the common temporary
+  evidence root.
 - Current-run macro metadata now has an executable runtime-universe
   hydration probe and a completed-symbol snapshot design (`3839f888`).
   Incomplete/active symbols remain explicit refusals. Production snapshot
@@ -95,6 +140,10 @@ Its log is `candidate-d9eb5dc/clippy.log`.
 - External constructor default getters (`c74dd7b`, `1140fb6`) remain held.
   Generic and nested cases now have focused evidence, but assigning default
   flags to every overloaded constructor from getter names requires review.
+  Follow-up `50995a4` replaces that heuristic with pickle parameter flags.
+  Parent review requested correct owners for replacement parameter symbols
+  and exact constructor association when a real overload resembles an extra
+  hidden outer parameter. The follow-up is not yet independently accepted.
 
 Machine-readable process/commit state is in
 `/tmp/scala-rs-codex/integration/current-state.json`. Recovery logs are under

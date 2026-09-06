@@ -1432,6 +1432,7 @@ impl Typer {
                 .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
             if let Some(t) = &alias {
                 self.st.get_mut(id).ty = t.clone();
+                self.st.get_mut(id).is_type_alias = true;
             } else {
                 self.st.get_mut(id).ty = Type::TypeMember(id);
             }
@@ -1465,6 +1466,7 @@ impl Typer {
         let rhs_ty = if rhs.is_empty() {
             Type::TypeMember(id)
         } else {
+            self.st.get_mut(id).is_type_alias = true;
             let t = self.tree_to_type(rhs);
             self.check_proper_type(&t, r.span);
             if let Some(h) = &hi_ty {
