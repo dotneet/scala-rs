@@ -24,6 +24,10 @@ makes no claim of conformance to the language specification. What exists today:
   2.13. `PartialFunction` literals and arities above 22 are still compiled to
   anonymous classes.
 
+直接自己末尾呼び出しは `final` / `private` / object / ローカル def でループ化します。
+`@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは
+[docs/tailrec.md](docs/tailrec.md) を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

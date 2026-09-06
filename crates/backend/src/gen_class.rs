@@ -1327,9 +1327,9 @@ impl<'a> Gen<'a> {
         } else {
             CaptureSlots::new()
         };
+        let mut tailrec_error = None;
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
-            emit_capture_prologue(asm, &mut frame, &class_name, &caps);
             let mut ctx = emit_ctx(
                 st,
                 class_id,
@@ -1344,8 +1344,16 @@ impl<'a> Gen<'a> {
                 boxed_vars,
             );
             ctx.method_sym = meth;
+            tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
+            emit_capture_prologue(asm, &mut frame, &class_name, &caps);
             finish_method_body(asm, &mut frame, &ctx, rhs, &ret_for_body);
+            tailrec_error = tailrec_error
+                .take()
+                .or_else(|| crate::gen_tailrec::finish_tail_loop(&frame, &ctx));
         });
+        if let Some(error) = tailrec_error {
+            b.format_errors.push(error);
+        }
         b.sign_last(self.sig_of(def.sym));
         if let Some(d) = java_deprecated_desc(mods) {
             b.add_java_annot_to_last(d);
@@ -1515,6 +1523,7 @@ impl<'a> Gen<'a> {
             next_slot: 0,
             finally_exits: Vec::new(),
             return_slot: None,
+            tail_loop: None,
         };
         if let Some(fid) = field {
             frame.alloc(fid, jvm_sort(&under));
