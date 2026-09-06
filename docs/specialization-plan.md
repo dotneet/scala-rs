@@ -110,6 +110,163 @@ observable without running the full workspace or corpus.
    trait specialization are deliberately next phases rather than hidden
    promises of the method slice.
 
+## Measured class-owned ABI for the next slice
+
+The class boundary was probed separately with `/tmp/scala-2.13.16/bin/scalac`
+and JDK 17 using this fixture:
+
+```scala
+import scala.specialized
+
+class Box[@specialized(Int) A](var value: A) {
+  def get: A = value
+  def set(v: A): Unit = { value = v }
+}
+
+class IntBox extends Box[Int](1)
+class StringBox extends Box[String]("s")
+```
+
+The producer emits `Box.class`, `Box$mcI$sp.class`, `IntBox.class`, and
+`StringBox.class`. The generic `Box<A>` keeps the source field and methods:
+
+```text
+value:Ljava/lang/Object;              // Signature: TA;
+value():Ljava/lang/Object;
+value_$eq(Ljava/lang/Object;)V
+get():Ljava/lang/Object;
+set(Ljava/lang/Object;)V
+<init>(Ljava/lang/Object;)V
+```
+
+It also declares the primitive dispatch surface on the generic owner. These
+methods box/unbox the generic field and return `false` from `specInstance$`:
+
+```text
+value$mcI$sp():I
+value$mcI$sp_$eq(I):V
+get$mcI$sp():I
+set$mcI$sp(I):V
+specInstance$():Z        // false on Box
+```
+
+`Box$mcI$sp` is a real public class, not an annotation-only alias. It extends
+`Box<java.lang.Object>` and owns a separate public primitive field and a
+primitive constructor:
+
+```text
+class Box$mcI$sp extends Box<java.lang.Object>
+value$mcI$sp:I
+<init>(I)V
+specInstance$():Z        // true on Box$mcI$sp
+```
+
+The specialized class implements both the primitive entries and the erased
+bridges required by a value held as `Box[Int]`. Its `value`, `get`, and `set`
+methods have primitive descriptors, while the bridge methods keep the generic
+descriptors and box/unbox at the boundary:
+
+```text
+value$mcI$sp():I                 value$mcI$sp_$eq(I):V
+value():I                        value_$eq(I):V
+get():I                          get$mcI$sp():I
+set(I):V                         set$mcI$sp(I):V
+set(Ljava/lang/Object;)V         get():Ljava/lang/Object;
+value_$eq(Ljava/lang/Object;)V   value():Ljava/lang/Object;
+```
+
+`new Box[Int](1)` is rewritten by scalac to `new Box$mcI$sp` followed by
+`<init>(I)V`; `new Box[String]("s")` stays `new Box` with
+`<init>(Object)V`. A consumer whose static type is `Box[Int]` invokes the
+primitive methods on the *generic* owner (`Box.get$mcI$sp`,
+`Box.value$mcI$sp_$eq`, and so on), allowing virtual dispatch to the
+specialized subclass. `IntBox` therefore extends `Box$mcI$sp` and invokes its
+primitive constructor, while `StringBox` extends `Box<String>` and invokes the
+generic constructor. A separate scalac consumer ran against the producer and
+printed `3:3:u:u:5` after exercising construction, getter, setter, and
+subclass dispatch.
+
+This is also a metadata integrity gate. Copying only `Box.class` (with its
+source pickle still advertising `@specialized(Int)`) lets scalac compile a
+consumer that emits `new Box$mcI$sp` and primitive accessor calls, but running
+that consumer fails with `NoClassDefFoundError: Box$mcI$sp`. A producer must
+therefore publish the specialized class, its constructor, its primitive field,
+the generic-owner primitive declarations, and all bridges as one unit. Keeping
+the generic source pickle while omitting the class is a false ABI.
+
+Only the generic `Box.class` carries the source `ScalaSignature`/`ScalaSig`
+that describes `A` and its specialization annotation. The specialized sibling
+has a JVM `Signature` of `LBox<Ljava/lang/Object;>;` and `ScalaInlineInfo`, but
+no second source pickle declaration. Class-variant metadata therefore belongs
+to the generic class record; emitting a fake pickled `Box$mcI$sp` declaration
+would give consumers a second source type instead of the nsc ABI.
+
+An array-shaped field makes the source/JVM distinction explicit. For
+`class ArrayBox[@specialized(Int) A](var value: Array[A])`, nsc keeps the
+generic field descriptor as `Ljava/lang/Object;` while the specialized sibling
+has `value$mcI$sp:[I`, `get():[I`, `set([I):V`, and `<init>([I)V`. The erased
+bridges use `Object` and checkcast to `[I`; the generic-owner dispatch methods
+also use `()[I` and `([I)V`. A separate consumer constructs `ArrayBox[Int]`
+with `new ArrayBox$mcI$sp(... )` and constructs `ArrayBox[String]` with the
+generic `ArrayBox(Object)` path. The source `Array[A]` shape remains in the
+Scala signature data even though the generic JVM field descriptor is `Object`.
+The class phase must carry source types and JVM descriptors separately rather
+than deriving one from the other.
+
+The class phase should be split into these reviewable steps:
+
+1. **Class symbol and selection metadata.** After the source pickle, create a
+   class variant record for each supported class-owned selection. Keep
+   `Box<A>` and its source pickle intact; the class record carries the
+   primitive tag, variant internal name (`Box$mcI$sp` / `Box$mcJ$sp`), generic
+   owner, and the selected field/accessor symbols. Do not advertise a tag
+   until the complete class and constructor are present.
+2. **Generic-owner dispatch surface.** For every specialized field-backed
+   getter/setter and method whose signature contains the class parameter,
+   emit the `$mcI$sp`/`$mcJ$sp` declarations on the generic class. Their
+   bodies box/unbox through the generic storage and `specInstance$` returns
+   `false`.
+3. **Specialized class materialization.** Emit a public sibling extending
+   `Box<Object>`, copy the class layout with primitive fields, substitute
+   primitive types through constructors and method bodies, and set
+   `specInstance$` to `true`. Emit primitive members plus erased bridges with
+   `ACC_BRIDGE | ACC_SYNTHETIC` where nsc does. The specialized constructor
+   initializes the primitive field and invokes the generic super constructor
+   with the required boxed/null value.
+4. **Construction and inheritance selection.** Rewrite `new Box[Int]` and
+   direct subclasses such as `IntBox extends Box[Int]` to the specialized class
+   and primitive constructor. Keep reference instantiations generic. A class
+   whose specialized parent chain would require coordinated ancestor variants
+   is a later boundary: nsc warns for a specialized class inheriting a generic
+   non-trait parent and keeps that parent generic, so the first implementation
+   must make this choice explicit rather than silently claim full extends
+   specialization.
+5. **Separate-compilation gate.** Compile the provider, compile a fresh
+   scalac consumer against its classfiles, inspect constructor/accessor
+   descriptors with `javap -c -p -s`, and execute with `java -Xverify:all`.
+   Include generic `String`, primitive `Int` (and then `Long`), direct subclass,
+   getter, setter, and the missing-variant metadata negative control.
+
+The first class golden fixture should therefore assert the following exact
+positive and negative conditions before the phase is accepted:
+
+```text
+positive: Box<A>, Box$mcI$sp, IntBox, StringBox are present
+positive: Box$mcI$sp extends Box<Object> and has <init>(I)V
+positive: Box has value/get/set generic and $mcI$sp dispatch methods
+positive: Box$mcI$sp has primitive field, primitive entries, bridges, and specInstance$=true
+positive: scalac consumer selects Box$mcI$sp for Box[Int] and Box for Box[String]
+positive: java -Xverify:all consumer output is 3:3:u:u:5
+negative: no specialized class metadata may be published without Box$mcI$sp.class
+negative: a generic String construction must not target Box$mcI$sp
+```
+
+The follow-up array golden check should add `ArrayBox<A>`,
+`ArrayBox$mcI$sp`, `value$mcI$sp:[I`, `<init>([I)V`, the `[I` dispatch
+methods on `ArrayBox`, and the generic `Object` bridges. It must inspect both
+the Scala source signature and the JVM descriptors; a test that checks only
+the erased `Object` field cannot detect a lost primitive array layout.
+
 Before this slice, the scala-rs output for the first and third shapes had no
 `$sp` variants. The method slice closes the method-owned gap; the class and
 trait gaps remain expected red checks until their own ABI work lands.
