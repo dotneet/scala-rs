@@ -194,6 +194,17 @@ pub(crate) enum ReifyRef {
     /// `reify { TableQuery.apply[E](cons.splice) }` reaches `E` through the
     /// implicit `c.WeakTypeTag[E]`.
     Type(Box<crate::materialize::TagBody>),
+    /// A `val` / parameter / `def` result type that names a monomorphic
+    /// class reachable through `staticClass` alone -- `Int`, `Boolean`, a
+    /// plain user class -- built as `rs.mkIdent($m.staticClass("<full
+    /// name>"))`, the same `Ident`-carrying-a-symbol shape a static `object`
+    /// reference gets, and *not* wrapped in `mkTypeTree`. Measured with
+    /// `-Ymacro-debug-lite` on `reify { def f(y: Int): Int = y + 1; f(1) }`:
+    /// a written *type* (as opposed to a type *argument* at a call site,
+    /// which really is `mkTypeTree` -- see `ReifyRef::Type`) is rebuilt
+    /// structurally, the same way a quasiquote builds one, and only the leaf
+    /// naming a class or a module is resolved by symbol.
+    StaticClass(String),
     /// A type argument whose type scala-rs cannot rebuild, carrying the
     /// reason the tag builder gave. Kept as a classification of its own so
     /// the report says *which* type and why, rather than "a type in a reify
@@ -249,6 +260,11 @@ pub(crate) struct Reifier<'a> {
     /// Set when this is a `reify { … }` body rather than a quasiquote; see
     /// `ReifyCtx`.
     reify: Option<ReifyCtx>,
+    /// Names bound, at the current point of the walk, by a `val` / `def` /
+    /// parameter that the `reify { … }` body itself introduces -- see
+    /// `Reifier::local_bound`. Always empty outside reify mode: a quasiquote
+    /// never refuses an unclassified name to begin with, so nothing reads it.
+    locals: RefCell<Vec<String>>,
 }
 
 impl<'a> Reifier<'a> {
@@ -269,6 +285,7 @@ impl<'a> Reifier<'a> {
             src,
             fresh: RefCell::new(Fresh::default()),
             reify: None,
+            locals: RefCell::new(Vec::new()),
         }
     }
 
@@ -419,11 +436,22 @@ impl<'a> Reifier<'a> {
                 if let Some(t) = self.stats_splice(&elems)? {
                     return Ok(t);
                 }
-                let mut out = Vec::new();
-                for s in &elems {
-                    out.push(self.stat(s)?);
-                }
-                Ok(self.call(self.support_member("SyntacticBlock"), vec![self.list(out)]))
+                // Every `val` / `def` this block itself binds is in scope
+                // for the whole block: nsc lets a `def` see another `def`
+                // declared later (mutual recursion), and the body as a
+                // whole has already been type-checked once
+                // (`Check::try_expand_reify`), so a `val` read before its
+                // own definition would have been rejected there -- this
+                // only has to recognise the names, not re-derive the
+                // ordering rule.
+                let names: Vec<String> = elems.iter().filter_map(local_def_name).collect();
+                self.with_locals(names, || {
+                    let mut out = Vec::new();
+                    for s in &elems {
+                        out.push(self.stat(s)?);
+                    }
+                    Ok(self.call(self.support_member("SyntacticBlock"), vec![self.list(out)]))
+                })
             }
             TreeKind::Function { vparams, body } => self.function(vparams, body),
             TreeKind::Match { selector, cases } => {
@@ -493,6 +521,12 @@ impl<'a> Reifier<'a> {
                 ReifyRef::TypeGap(why) => {
                     return Err(format!("a type argument cannot be rebuilt: {why}"))
                 }
+                // `classify_type_annot` only ever keys this by a *type*
+                // node's id (`Reifier::typ` is where it is read); a term
+                // node is never classified this way.
+                ReifyRef::StaticClass(_) => {
+                    return Err(format!("{} is not reified yet", describe(&t.kind)))
+                }
             }));
         }
         match &t.kind {
@@ -504,6 +538,14 @@ impl<'a> Reifier<'a> {
             | TreeKind::TypeApply { .. }
             | TreeKind::Block { .. }
             | TreeKind::If { .. } => Ok(None),
+            // Bound by a `val` / `def` / parameter this reify body itself
+            // introduces: reified structurally, by name, the same as a
+            // quasiquote would -- `Ok(None)` falls through to `term`'s own
+            // `Ident` handling below. Anything else unclassified really is
+            // free with respect to this body (bound outside it), which is
+            // the shape nsc carries as a free term and this module cannot
+            // build yet.
+            TreeKind::Ident { name } if self.local_bound(name) => Ok(None),
             TreeKind::Ident { name } => Err(format!(
                 "`{name}` is a local, a parameter, or a name that does not stand for \
                  a static `object` or a member of one"
@@ -519,6 +561,19 @@ impl<'a> Reifier<'a> {
             self.support_member("mkIdent"),
             vec![self.call(
                 self.select(self.local(&ctx.mirror_local), "staticModule"),
+                vec![self.lit(Lit::String(full_name.to_string()))],
+            )],
+        )
+    }
+
+    /// `rs.mkIdent($m.staticClass("<full name>"))` -- the same shape, for a
+    /// monomorphic class named in a `val` / parameter / `def` result type;
+    /// see `ReifyRef::StaticClass`.
+    fn static_class_ref(&self, ctx: &ReifyCtx, full_name: &str) -> Tree {
+        self.call(
+            self.support_member("mkIdent"),
+            vec![self.call(
+                self.select(self.local(&ctx.mirror_local), "staticClass"),
                 vec![self.lit(Lit::String(full_name.to_string()))],
             )],
         )
@@ -731,24 +786,47 @@ impl<'a> Reifier<'a> {
     /// Lower one type of the body: the whole of `tq"..."`, and the right-hand
     /// side of an ascription or a type application inside `q"..."`.
     fn typ(&self, t: &Tree) -> Result<Tree, String> {
-        // A type in a reified body has to be rebuilt from its symbol too, and
-        // that is a second reifier (nsc's `reifyType`) scala-rs does not have.
-        // Refused rather than reified as the written name, which would mean
-        // whatever the call site's scope makes of it.
+        // A *written* type in a reified body has to be rebuilt from its
+        // symbol too, and that is a second reifier (nsc's `reifyType`)
+        // scala-rs does not have. Refused rather than reified as the written
+        // name, which would mean whatever the call site's scope makes of it.
+        //
+        // An *omitted* type (`val x = 1`, and every `def`/parameter that
+        // reaches here with an empty `tpt`) is not a reference at all, so it
+        // needs no classification -- `Check::classify_type_annot` never adds
+        // an entry for one, and the match below falls through to the same
+        // `SyntacticEmptyTypeTree()` a quasiquote builds.
         if let Some(ctx) = &self.reify {
-            return match ctx.refs.get(&t.id) {
-                Some(ReifyRef::Type(body)) => Ok(self.call(
-                    self.support_member("mkTypeTree"),
-                    vec![self.rebuild_type(ctx, body)],
-                )),
-                Some(ReifyRef::TypeGap(why)) => {
-                    Err(format!("a type argument cannot be rebuilt: {why}"))
+            match ctx.refs.get(&t.id) {
+                Some(ReifyRef::Type(body)) => {
+                    return Ok(self.call(
+                        self.support_member("mkTypeTree"),
+                        vec![self.rebuild_type(ctx, body)],
+                    ))
                 }
-                _ => Err(format!(
-                    "{} in a `reify` body is not reified yet",
-                    describe_type(&t.kind)
-                )),
-            };
+                Some(ReifyRef::StaticClass(name)) => return Ok(self.static_class_ref(ctx, name)),
+                Some(ReifyRef::TypeGap(why)) => {
+                    return Err(format!("a type argument cannot be rebuilt: {why}"))
+                }
+                // A type position is never classified as one of the term-only
+                // shapes; kept as an arm rather than folded into `_` so a new
+                // `ReifyRef` variant has to be considered here too.
+                Some(ReifyRef::StaticModule(_))
+                | Some(ReifyRef::StaticMember { .. })
+                | Some(ReifyRef::Splice(_)) => {
+                    return Err(format!(
+                        "{} in a `reify` body is not reified yet",
+                        describe_type(&t.kind)
+                    ))
+                }
+                None if !matches!(t.kind, TreeKind::Empty) => {
+                    return Err(format!(
+                        "{} in a `reify` body is not reified yet",
+                        describe_type(&t.kind)
+                    ))
+                }
+                None => {}
+            }
         }
         match &t.kind {
             // Written with the `apply` spelled out: `SyntacticEmptyTypeTree`
@@ -1313,6 +1391,36 @@ impl<'a> Reifier<'a> {
             .map(|(_, local)| local.clone())
     }
 
+    // -- local scope (reify only) -------------------------------------------
+    //
+    // A `val` or `def` this `reify { … }` body binds itself, and a `def`'s
+    // own parameters, need none of the free-term machinery §7.17 of
+    // `docs/macros.md` describes: real scalac 2.13.16 reifies both the
+    // binding and every reference to it structurally, by name, the same way
+    // a quasiquote would (`-Ymacro-debug-lite` on `reify { val x = 1; x + 1
+    // }` prints `$u.ValDef.apply($u.NoMods, $u.TermName("x"), ...)` and
+    // `$u.Ident.apply($u.TermName("x"))` for the reference -- no
+    // `newFreeTerm` anywhere). The free-term shape is needed only for a name
+    // bound *outside* the body being reified, which this tracker never adds.
+
+    /// Whether `name` is bound, at the current point of the walk, by a
+    /// `val` / `def` / parameter this reify body itself introduces.
+    fn local_bound(&self, name: &str) -> bool {
+        self.locals.borrow().iter().any(|n| n == name)
+    }
+
+    /// Bind `names` for the extent of `f`, then restore the outer scope --
+    /// nested the same way `self.fresh.borrow().params` is for a
+    /// placeholder lambda, but keyed by the name as written rather than a
+    /// fresh one, since these are reified by the name itself.
+    fn with_locals<T>(&self, names: Vec<String>, f: impl FnOnce() -> T) -> T {
+        let mark = self.locals.borrow().len();
+        self.locals.borrow_mut().extend(names);
+        let r = f();
+        self.locals.borrow_mut().truncate(mark);
+        r
+    }
+
     // -- building blocks ---------------------------------------------------
 
     fn node(&self, kind: TreeKind) -> Tree {
@@ -1572,6 +1680,18 @@ fn is_parser_placeholder(flags: Flags, name: &str) -> bool {
         && name
             .strip_prefix("x$")
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The name a block statement binds, for `Reifier`'s local-scope tracking.
+///
+/// Only `val` / `var` / `def` bind a name this module can reify by itself;
+/// `class` / `object` stay refused (`Reifier::definition`), so their names
+/// are never added to the scope a bare `Ident` is checked against.
+fn local_def_name(t: &Tree) -> Option<String> {
+    match &t.kind {
+        TreeKind::ValDef { name, .. } | TreeKind::DefDef { name, .. } => Some(name.clone()),
+        _ => None,
+    }
 }
 
 /// Whether `t` is the anonymous `TypeDef` the parser makes for a `_` (or `?`)

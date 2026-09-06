@@ -216,7 +216,22 @@ impl Typer {
             }
             TreeKind::Ident { name } => {
                 // Stable id vs variable: if name is a known module/val, treat as stable.
-                let found = self.st.lookup(name);
+                let mut found = self.st.lookup(name);
+                // A scope that binds the name only in the *type* namespace
+                // does not hide a term of that name further out --
+                // `Typer::type_ident` already applies this rule, and a
+                // stable-id pattern did its own lookup without it. slick's
+                // `object syntax { type HNil = heterogeneous.HNil.type }` is
+                // imported into `HList.scala`, so `case (HNil, _)` picked the
+                // alias, which is not a term at all: `HList$.concat` came out
+                // as `throw new RuntimeException("cannot load HNil")` where
+                // nsc matches the object.
+                if !found.iter().any(|&s| self.st.is_term_namespace_sym(s)) {
+                    let terms = self.st.lookup_term(name);
+                    if !terms.is_empty() {
+                        found = terms;
+                    }
+                }
                 // A backquoted name is stable however it is spelled; the
                 // parser has already marked it.
                 let is_varid = !stable_hint
@@ -232,6 +247,28 @@ impl Typer {
                     .copied()
                     .find(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Module))
                     .or_else(|| found.first().copied());
+                // A name that answers only in the *type* namespace is not a
+                // value, and nsc says so rather than matching against
+                // something: `not found: value X / Identifiers that begin with
+                // uppercase are not pattern variables but match the value in
+                // scope`. Taking it anyway put a symbol the backend has no way
+                // to load into the pattern, and `load_symbol` fell through to
+                // `throw new RuntimeException("cannot load X")` -- a stub in
+                // the middle of a method that compiled without a word.
+                if let Some(sym) = stable.filter(|_| !is_varid) {
+                    if !self.st.is_term_namespace_sym(sym) {
+                        self.error(
+                            pat.span,
+                            format!(
+                                "not found: value {name}\n\
+                                 Identifiers that begin with uppercase are not pattern \
+                                 variables but match the value in scope."
+                            ),
+                        );
+                        pat.ty = Type::Error;
+                        return;
+                    }
+                }
                 if let Some(sym) = stable.filter(|_| !is_varid) {
                     // SLS 8.1.5: the identifier of a stable-id pattern has to
                     // be *stable*. A `var` is not, and nsc rejects it rather

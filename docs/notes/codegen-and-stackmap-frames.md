@@ -835,3 +835,142 @@ together with its presence in the boxed one, and `unapply(int)` with no
   P(s: String)` where `P`'s field is an `Int` is accepted; scalac says
   `scrutinee is incompatible with pattern type`. Not specific to value
   classes, and a typer gap rather than a codegen one.
+
+### Six classes the JVM would not load (`agent/verifyfail`)
+
+`tests/verify_all.sh` — `Class.forName(name, **true**, loader)` over every
+emitted class, i.e. the first check in the battery that *links* what we write —
+reported `verify_classes=1490 verify_failures=6` on slick's output, and had
+since it was written. `slick_measure.sh` reported `errors=0 classes=1490` for
+the same tree; both statements were true. See
+[`../testing.md`](../testing.md) for why nothing else could see them.
+
+Six failures, **four** roots. Grouping by the JVM's message would have given
+three groups and split one root across two of them, so the messages are a way
+in and not a taxonomy.
+
+#### 1. `super.m` resolved through a stale overload group (`Bad invokespecial`)
+
+`Typer::overload_groups` maps a *symbol id* to the alternatives a selection
+found, and `overload_alternatives` hands that back to the application. The key
+is the head symbol alone: it says nothing about the receiver the group was
+computed at. `record_overload_group` also declines to record a set that is
+entirely reachable from the head's own owner — reasonable on its own, and it
+means such a selection silently inherits whatever the previous one left behind.
+
+slick declares `def expr(n: Node)` on seven `QueryBuilder` subclasses, beside
+the inherited `final def expr(n: Node, skipParens: Boolean)`. The unqualified
+`expr(c, true)` written inside `MySQLQueryBuilder` records
+
+```
+overload_groups[QueryBuilder.expr(Node, Boolean)] = [ QueryBuilder.expr(Node, Boolean)
+                                                    , MySQLQueryBuilder.expr(Node) ]
+```
+
+and the next `super.expr(n)` — in *any* profile — resolved against that.
+`PostgresQueryBuilder` came out as
+
+```
+invokespecial slick/jdbc/OracleProfile$OracleQueryBuilder.expr:(Lslick/ast/Node;)V
+```
+
+which the verifier rejects because `PostgresQueryBuilder` is not below
+`OracleQueryBuilder`. **Four other profiles resolved `super.expr(n)` to their
+own `expr`**, which is a legal `invokespecial` on the current class and an
+infinite recursion; nothing in the battery would ever have said so. A `super`
+selection now pins its own member set (`super_this.is_some()` in
+`type_select`), which is what `super` means anyway: the parent linearization,
+and nothing that was found somewhere else.
+
+#### 2 and 3. `Nothing` through a bridge (`Bad return type`, `Bad type on operand stack`)
+
+`Nothing` erases to `scala/runtime/Nothing$`, and unlike every other reference
+it is a subtype of nothing at all — so a bridge can neither hand such a value
+on nor accept `Object` in its place.
+
+* **Result.** nsc's `BCodeBodyBuilder.adapt` follows a call returning `Nothing$`
+  with `athrow`. We emitted `areturn` (or a `checkcast` and a `return`).
+  `DistributedProfile`'s `override lazy val updateCompiler: Nothing = ??`
+  against `def updateCompiler: QueryCompiler` was `Bad return type`.
+  `emit_forwarded_nothing` (`gen_expr.rs`) is that rule for the three
+  hand-assembled bridge emitters, which never build a `Tree` and so never
+  reached `gen_expr`'s own `athrow`-append.
+* **Parameter.** `param_adapt` had a case for `Unit`/`BoxedUnit` and none for
+  `Nothing`, and `checkcast_internal` answers `None` for it, so the bridge
+  passed the parent's `Object` straight into a `(Object, Nothing$)` call.
+  slick's `ResultConverter[…, Updater = Nothing, …]` is implemented twice
+  (`MemoryProfile$InsertMappingCompiler$InsertResultConverter`,
+  `MemoryQueryingProfile$MemoryCodeGen$QueryResultConverter`).
+
+What real scalac 2.13.16 emits, `javap -c`, for both halves at once:
+
+```
+public void update(java.lang.Object, java.lang.Object);
+   aload_0; aload_1; aload_2
+   checkcast     scala/runtime/Nothing$
+   invokevirtual update:(Ljava/lang/Object;Lscala/runtime/Nothing$;)Lscala/runtime/Nothing$;
+   athrow
+```
+
+Note that these two bridges have **no callable form in Scala**: every argument
+expression of type `Nothing` diverges before the call is reached, so running
+the program can never exercise them. Linking the class is the only check there
+is.
+
+#### 4. The enclosing instance in a super-constructor argument (`Bad type on operand stack`)
+
+`new PositionedResult(rs) { … }` written inside `PositionedResult`. The
+argument list belongs to the *enclosing* class, so `rs` means `outer.rs` — and
+in the pre-super region slot 0 is `uninitializedThis`, which JVMS §4.10.1.9
+lets `putfield` take and nothing else. `load_owner_instance` pushed `this`
+anyway, because the anonymous class inherits `rs` too and
+`self_reaches_owner` was the only question it asked. It now also asks whether
+the `$outer` chain can supply the member while `presuper_outer` is set, and
+starts the walk at the constructor's own `$outer` parameter when it can —
+which is both what the verifier requires and what nsc does
+(`aload_1; invokevirtual PositionedResult.rs()`).
+
+`EmitCtx::presuper_outer` and `load_enclosing_this` already existed for the
+`this`-written-out-in-full case; this is the same rule for a bare name.
+
+#### 5. An extractor reached through a `val` alias (`Bad type on operand stack`)
+
+```scala
+object syntax { val :: = HCons }   // slick/collection/heterogeneous/syntax.scala
+```
+
+`case (h1 :: t1, x)` calls `HCons$.unapply`, so the receiver is `HCons$`. We
+pushed `syntax$.MODULE$` — the object the *name* was found in — under
+`invokevirtual HCons$.unapply` (`HList$.concat`). The receiver of
+`owner.unapply` is `owner`'s singleton, full stop.
+
+The same file turned up a second defect that verifies perfectly: `syntax`'s
+`type HNil = heterogeneous.HNil.type` shadowed the *object* `HNil` in
+`case (HNil, _)`, and the backend's fallback for a symbol it cannot load is
+`throw new RuntimeException("cannot load HNil")` — a stub, in the middle of
+`HList$.concat`, in a compile that reported nothing. A scope that binds a name
+only in the type namespace no longer hides a term further out (the rule
+`type_ident` already applied, which a stable-id pattern did its own lookup
+without), and a name that answers *only* there is now the diagnostic real
+scalac gives, `not found: value X`.
+
+#### Verification
+
+`tests/fixtures/vf_super.scala`, `vf_nothing.scala`, `vf_outer.scala`,
+`vf_alias.scala` and the rejecting `vf_alias_bad.scala`, dual-run in both modes
+under `-Xverify:all` (`crates/cli/tests/verifyfail.rs`, 13 tests). Four of
+those read the bytecode back with `javap` rather than only its output, for the
+three things running the program cannot show: the `invokespecial`'s target
+class, the `Nothing$` `checkcast` and `athrow` in a bridge nothing can call,
+that no `getfield`/`invokevirtual` follows an `aload_0` before the super call,
+and the receiver pushed under `HC$.unapply`.
+
+slick: `files=184 errors=0 files_with_errors=0 classes=1490` (unchanged) and
+`verify_classes=1490 verify_failures=0`.
+
+#### Remaining
+
+`tests/scala_corpus.sh`'s `run` kind carries 40 `VerifyError`s. Measured
+before and after this slice the set is identical, so **none of them is one of
+these four roots**. `run/t8803` is a qualified `super[A].m` from inside a
+lambda, which needs a `C$$super$m` accessor; the other 39 are unexamined.

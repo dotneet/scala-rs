@@ -460,6 +460,17 @@ pub(crate) fn gen_unapply_pattern(
     }
     if !owner.is_none() && !is_module_class(ctx.st, owner) {
         gen_expr(asm, frame, ctx, fun);
+    } else if !owner.is_none() {
+        // The `unapply` being called belongs to `owner`, so the receiver is
+        // `owner`'s singleton -- not whatever the *name* in the pattern is
+        // owned by. Those differ when the extractor is reached through a
+        // stable value that aliases the object: slick's
+        // `object syntax { val :: = HCons }`, imported into `HList`, made
+        // `case (h1 :: t1, x)` emit `getstatic syntax$.MODULE$` under
+        // `invokevirtual HCons$.unapply` and the JVM threw the whole method
+        // out (`VerifyError: Bad type on operand stack … 'syntax$' is not
+        // assignable to 'HCons$'`).
+        load_module_instance(asm, ctx, module_class_id(ctx.st, owner));
     } else {
         gen_receiver(asm, frame, ctx, fun);
     }
