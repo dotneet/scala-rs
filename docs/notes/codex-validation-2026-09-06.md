@@ -13,6 +13,30 @@ messages.
 
 Latest independent checks (these supersede the pending descriptions below):
 
+- Bounds and alias declaration metadata are merged as `41375307`. Candidate
+  `4b2f941e` passed 2234 workspace tests, every baseline compile measure,
+  strict verification of all 1490 classes, and Slick MODE=b 36/36. MODE=a and
+  the specialization ledger remain red. All 5324 corpus statuses are
+  unchanged; only the existing `t8199` diagnostic's temporary path differs.
+  Two permanent CLI interop tests were added and independently passed at
+  `2b65cdc9`, with no compiler/Cargo changes after the full gate. These verify
+  valid execution and every invalid existential/forward/F/lower type bound.
+  The resulting main test inventory is 2236 tests / 198 result rows, validated
+  by a full run plus that test-only supplement, not a claimed second full run.
+  Clippy retains the preceding 59 warnings; the added tests introduce none.
+  Evidence: `candidate-4b2f941` and `integration/bounds-parent` below the
+  temporary evidence root. `tests/BASELINE.md` now records this merge.
+- Variance metadata (`+A`/`-A`) independently passes its real-scalac/JVM
+  interop test in metadata candidate `9e522013`, but is not yet on main.
+  The newer specialization candidate `14476f75` combines bounds, variance,
+  and local-symbol clone fixes. Its two bounds tests and six specialization
+  tests pass; a seventh test expects scalac to specialize a lower-bounded
+  call that scalac actually keeps generic once real bounds are pickled.
+  Direct execution still produces the correct result, including the newly
+  exercised `upper("hello")` generic CharSequence call. The agent is aligning
+  specialization eligibility and the test with nsc's actual behavior before
+  a new full gate. The successful old `560405fd` full run is not evidence for
+  this newer candidate.
 - Specialization candidate `560405fd` completed its full runner: 2234 release
   workspace tests pass; all four compile measures match the baseline;
   strict verification loads all 1490 classes; Slick MODE=b passes 36/36.

@@ -8,6 +8,11 @@ and their required fixes were independently validated at `d9eb5dc` and merged
 locally as `4b0568af`. Tail-call and by-name overload fixes were subsequently
 validated at `dd5047e0` and merged as `318c1568`: 2233 workspace tests pass,
 and all 5324 corpus identities are retained with run passes rising to 590.
+Type-parameter bounds and alias declaration metadata were then independently
+validated at `4b2f941e` and merged as `41375307`. The full release suite passed
+2234 tests; two added interop tests passed separately with identical compiler
+sources, giving 2236 tests on main. All corpus statuses and compile measures
+are unchanged. The baseline explains this composed gate explicitly.
 Read the updated `tests/BASELINE.md`, including its
 per-test corpus reference and red MODE=a check. The historical results below
 describe the previous session, not the current baseline. This continuation
