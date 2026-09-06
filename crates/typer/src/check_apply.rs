@@ -1555,17 +1555,28 @@ impl Typer {
                                         && !self.st.get(sym).tparams.is_empty();
                                 // A map can widen its values while preserving
                                 // the key type and its existing Ordering[K].
+                                let result_key = match &ret {
+                                    Type::Class { args, .. } if args.len() == 2 => {
+                                        Some(args[0].clone())
+                                    }
+                                    // Inherited IterableOps represents a map's
+                                    // element as one pair rather than two class
+                                    // arguments. Rebuilding the map unwraps it.
+                                    Type::Class { args, .. } if args.len() == 1 => self
+                                        .pair_args(&args[0])
+                                        .and_then(|pair| pair.first().cloned()),
+                                    _ => None,
+                                };
                                 let preserves_keys = match (
                                     recv_ty
                                         .as_ref()
                                         .and_then(|recv| self.base_type_instance(recv, r, 0)),
-                                    &ret,
+                                    result_key,
                                 ) {
-                                    (
-                                        Some(Type::Class { args: keys, .. }),
-                                        Type::Class { args: result, .. },
-                                    ) if keys.len() == 2 && result.len() == 2 => {
-                                        keys[0] == result[0]
+                                    (Some(Type::Class { args: keys, .. }), Some(key))
+                                        if keys.len() == 2 =>
+                                    {
+                                        keys[0] == key
                                     }
                                     _ => false,
                                 };

@@ -11,4 +11,8 @@ object Main extends App {
     scala.collection.immutable.SortedMap(2 -> "b") ++ List(1 -> 42)
   println(mapped.keys.mkString(","))
   println(mapped(1))
+  val stringKeys: scala.collection.immutable.SortedMap[String, Int] =
+    scala.collection.immutable.SortedMap("b" -> 2) ++ Map("a" -> 1)
+  println(stringKeys.keys.mkString(","))
+  println(stringKeys("a"))
 }
