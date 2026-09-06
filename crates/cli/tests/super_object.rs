@@ -107,10 +107,9 @@ object ClientMain {
 
 #[test]
 fn object_super_accessor_matches_nsc_in_both_interop_directions() {
-    let Some((jar, scalac)) = scala_library_jar().zip(scalac()) else {
-        eprintln!("skip Object super accessor interop: Scala 2.13.16 tools unavailable");
-        return;
-    };
+    let (jar, scalac) = scala_library_jar()
+        .zip(scalac())
+        .expect("Object super accessor interop requires Scala 2.13.16 tools");
     let dir = tmp_dir("interop");
     let source_main = dir.join("Main.scala");
     let provider = dir.join("Provider.scala");
