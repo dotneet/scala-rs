@@ -1,34 +1,30 @@
 # `@specialized`: implementation plan
 
-This note defines the smallest useful specialization slice for Scala 2.13.16.
-It is based on the current compiler tree and on classfiles emitted by the real
-2.13.16 compiler. It does not claim that accepting the annotation is
-specialization: the current tree records the annotation and emits no
-specialized ABI.
+This note defines the smallest useful Scala 2.13.16 specialization slice. It
+is based on the current compiler tree and on classfiles emitted by the real
+2.13.16 compiler with JDK 17. Accepting and retaining an annotation is not
+specialization: a useful slice must emit the primitive method ABI, select it at
+typed call sites, and remain consumable by scalac.
 
 ## Current boundary and evidence
 
-Stage 1 is present in `crates/parser/src/specialization.rs` and
-`crates/typer/src/symbol.rs`. `Symbol::specialized` holds the selected
-`SpecializedTypes`, and `Symbol::unspecialized` records the member opt-out.
-Nothing reads those fields during lowering or code generation. The pickle
-writer intentionally drops both annotations in
-`crates/backend/src/pickle.rs::pickle_symannot`: publishing an annotation that
-claims a specialized member exists would make a separate scalac compilation
-link to a member that scala-rs did not emit.
-
-The existing ledger is the authoritative red check. On the baseline in
-`tests/BASELINE.md` it reports:
+The parser and typer already record `@specialized` selections in
+`crates/parser/src/specialization.rs` and `crates/typer/src/symbol.rs`.
+`Symbol::specialized` holds the selected `SpecializedTypes`, and
+`Symbol::unspecialized` records a member opt-out. Before the method slice,
+nothing used those fields during lowering or code generation. The baseline
+ledger in `tests/BASELINE.md` remains the reference red check; it reports:
 
 ```
 tests=37 match=2 differ=26 no_compile=9
 specialized classes ($sp): scalac=700 scala-rs=0
 ```
 
-The two matching tests select no specialization. The ledger compares names
-only; it does not verify, load, execute, or compare method descriptors.
+That ledger compares names only. It does not verify descriptors, bytecode
+owners, execution, or separate compilation, so a matching name cannot be the
+acceptance condition for this work.
 
-The real compiler reports this phase order with `scalac -Xshow-phases`:
+The real compiler reports this order with `scalac -Xshow-phases`:
 
 ```
 pickler 7
@@ -39,66 +35,28 @@ explicitouter 14
 erasure 15
 ```
 
-The scala-rs driver currently has no specialize step. In
-`crates/driver/src/lib.rs::compile_paths`, `uncurry` and the existing lowering
-passes run at lines 315-326, `pickle_all` runs at line 353, generic signatures
-are recorded at lines 367-373, and `erase` runs at lines 374-376. The new phase
-must be inserted after the source pickle snapshot and before erasure. It must
-retain the generic source declarations and add specialized metadata/trees;
-replacing the generic declaration would break fallback calls and separate
+The specialization pass therefore works while typed method bodies still carry
+their type parameters and before JVM erasure. The driver runs the method slice
+after `pickle_all` and before `erase`: the generic source declarations are
+pickled first, then primitive method symbols and trees are appended for class
+emission. The generic declaration remains available for fallback and separate
 compilation.
 
 The erasure pass in `crates/typer/src/erasure.rs::erase` rewrites type
-parameters to their JVM erasure and records abstract parameter masks used by
-bridge generation. Once it has run, a source `T` no longer carries enough
-information to decide whether a primitive variant is owed. Specialization
-therefore has to substitute a selected primitive while the pre-erasure types
-are still available. Existing substitution helpers such as
-`symbol::subst_tparams_slice` can be reused; an `Any` substitution is not a
-valid implementation of this phase.
+parameters to JVM erasures and records masks used by bridge generation. After
+that point a source `A` no longer carries enough information to decide whether
+an `Int` or `Long` entry is required. Substitution must happen before erasure;
+substituting `Any` or widening the expected result is not an implementation of
+specialization.
 
 ## Three small fixtures and primary measurements
 
-The measurements below used `/tmp/scala-2.13.16/bin/scalac`, the
-`scala-library-2.13.16.jar` ABI, JDK 17, and both `JAVA_HOME` and `PATH`
-pointing at that JDK. The fixture set was deliberately limited to three
-shapes:
+The measurements used `/tmp/scala-2.13.16/bin/scalac`, the 2.13.16
+`scala-library.jar`, JDK 17, and both `JAVA_HOME` and `PATH` pointing at that
+JDK. The fixture set was limited to three shapes so that the ABI boundary is
+observable without running the full workspace or corpus.
 
-1. A class type parameter:
-
-   ```scala
-   class ClassBox[@specialized(Int, Long) A](val value: A) {
-     def get: A = value
-   }
-   object ClassClient {
-     def intBox = new ClassBox[Int](7)
-     def longBox = new ClassBox[Long](7L)
-     def stringBox = new ClassBox[String]("s")
-   }
-   ```
-
-   scalac emits `ClassBox.class`, `ClassBox$mcI$sp.class`, and
-   `ClassBox$mcJ$sp.class`. The generic `ClassBox<A>` keeps
-   `value: Object`, `(Object)V`, `value()Object`, and `get()Object`. It also
-   carries `value$mcI$sp()I`, `value$mcJ$sp()J`, `get$mcI$sp()I`,
-   `get$mcJ$sp()J`, and `specInstance$()Z`; the generic implementation
-   unboxes its `Object` field and returns `false` from `specInstance$`.
-
-   `ClassBox$mcI$sp` extends `ClassBox<Object>`, has a primitive
-   `value$mcI$sp:I` field and `(I)V` constructor, and implements `get()I`,
-   `get$mcI$sp()I`, and `value()I`. It additionally has boxed
-   `get()Object` and `value()Object` methods with
-   `ACC_BRIDGE|ACC_SYNTHETIC`, and `specInstance$()Z` returns `true`. Its
-   constructor stores the primitive and calls `ClassBox.<init>(Object)` with
-   `null`; the specialized accessors are the source of truth for the value.
-   The Long sibling is the same shape with `J` descriptors.
-
-   `ClassClient$` calls `(I)V` and `(J)V` on the specialized constructors for
-   the first two methods. The String method calls the generic
-   `ClassBox.<init>(Object)V`. Thus the fallback is observable in bytecode,
-   not just in a classfile name list.
-
-2. A method type parameter:
+1. A method-owned type parameter:
 
    ```scala
    object MethodOps {
@@ -106,169 +64,203 @@ shapes:
      def twice[@specialized(Int) A](x: A): A = x
      def generic[A](x: A): A = x
    }
+   object MethodClient {
+     def intId: Int = MethodOps.id(7)
+     def longId: Long = MethodOps.id(7L)
+     def stringId: String = MethodOps.id("s")
+     def intTwice: Int = MethodOps.twice(7)
+     def stringGeneric: String = MethodOps.generic("s")
+   }
+   ```
+
+   scalac emits the generic `(Object)Object` entries and the exact primitive
+   siblings `id$mIc$sp(I)I`, `id$mJc$sp(J)J`, and `twice$mIc$sp(I)I`.
+   `MethodClient$` invokes the primitive siblings for `Int` and `Long`, while
+   the String calls use the generic method and a cast. The unannotated
+   `generic` method has no sibling.
+
+2. A method on a non-final class:
+
+   ```scala
    class MethodHost {
      def id[@specialized(Int, Long) A](x: A): A = x
    }
-   object MethodClient {
-     def intId = MethodOps.id(7)
-     def longId = MethodOps.id(7L)
-     def stringId = MethodOps.id("s")
-     def intTwice = MethodOps.twice(7)
-     def stringGeneric = MethodOps.generic("s")
-   }
    ```
 
-   The generic methods retain descriptor `(Object)Object` and the generic
-   `Signature` `<A:Ljava/lang/Object;>(TA;)TA;`. The module method variants are
-   `id$mIc$sp(I)I`, `id$mJc$sp(J)J`, and `twice$mIc$sp(I)I`; `MethodHost` has the
-   same `$mIc$sp`/`$mJc$sp` names. A method's own type parameter uses the
-   `$m<primitive>c$sp` spelling. A member inherited from a specialized class
-   type parameter uses `$mc<primitive>$sp`, as `ClassBox.get$mcI$sp` shows.
+   This is a dispatch boundary, not a first-slice positive case. A method that
+   can be overridden needs coordinated generic and primitive entries,
+   override propagation, and bridges. The first implementation consequently
+   specializes module methods and methods that are explicitly `final` or
+   `private`; an ordinary class method remains generic until override dispatch
+   is implemented and tested.
 
-   `MethodClient$` invokes `id$mIc$sp(I)I` and `id$mJc$sp(J)J` for primitive
-   calls, while `id(Object)Object` followed by a `checkcast` handles String.
-   The unannotated `generic` method has no specialized sibling.
-
-3. A specialized trait ABI:
+3. Class and trait observations for the next phase:
 
    ```scala
-   trait IntReadable[@specialized(Int) A] { def read: A }
-   class IntBox(value: Int) extends IntReadable[Int] {
-     def read: Int = value
+   class ClassBox[@specialized(Int, Long) A](val value: A) {
+     def get: A = value
    }
+   trait IntReadable[@specialized(Int) A] { def read: A }
    ```
 
-   scalac emits `IntReadable$mcI$sp.class` in addition to
-   `IntReadable.class`. The marker interface extends
-   `IntReadable<Object>`. The base interface declares `read()Object`, a
-   synthetic static helper `read$mcI$sp$(IntReadable)I`, and a public default
-   `read$mcI$sp()I`. `IntBox` implements the specialized marker interface and
-   has `read()I`, `read$mcI$sp()I`, and a boxed
-   `read()Object` bridge with `ACC_BRIDGE|ACC_SYNTHETIC`.
+   scalac emits `ClassBox$mcI$sp` and `ClassBox$mcJ$sp` siblings, primitive
+   fields and constructors, boxed bridges, and `specInstance$`. For the
+   trait it emits `IntReadable$mcI$sp`, specialized default/static helpers,
+   and implementation bridges. These are real ABI requirements, but class and
+   trait specialization are deliberately next phases rather than hidden
+   promises of the method slice.
 
-   A Java client that directly constructs `ClassBox$mcI$sp`, invokes
-   `MethodOps$.MODULE$.id$mIc$sp(7)`, and calls
-   `((IntReadable$mcI$sp) new IntBox(7)).read$mcI$sp()` compiles and runs under
-   `java -Xverify:all`, printing `7:7:7`. Against the current scala-rs output,
-   `javac` reports four missing symbols: the specialized class, the method
-   variant, and the specialized trait interface. This is a binary ABI defect,
-   not a performance-only difference.
-
-The same three sources compiled by the current release binary produce 12
-classfiles versus scalac's 15 and no `$sp` classfiles. `javap -p -s` confirms
-that the generic fallback methods are present but every specialized method,
-constructor, marker interface, and primitive bridge above is absent.
+Before this slice, the scala-rs output for the first and third shapes had no
+`$sp` variants. The method slice closes the method-owned gap; the class and
+trait gaps remain expected red checks until their own ABI work lands.
 
 ## Dependency map in the current tree
 
-The first implementation has to cross these existing boundaries.
-
-| Area | Current code | Required specialization work |
+| Area | Current code | Required method-slice work |
 | --- | --- | --- |
-| Annotation selection | `parser/src/specialization.rs`; `Symbol::specialized` and `record_specialization` in `typer/src/symbol.rs` | Reuse the selected `SpecializedType` and its tag. Do not re-parse annotation trees in the backend. |
-| Phase placement | `driver/src/lib.rs::compile_paths` | Add a pre-erasure pass after `pickle_all`. Source pickles must describe only the generic declarations, as in scalac where specialize is after pickler. |
-| Type substitution | `typer/src/symbol.rs::subst_tparams_slice`; `typer/src/erasure.rs` | Clone/retarget selected trees and symbols while their types are still typed. Specialized symbols must retain primitive types until descriptor emission. |
-| Generic signatures | `backend/src/sig.rs`, called before `erase` | Keep generic signatures on the base class/method. Record the specialized class's `C<Object>` superclass signature separately; do not manufacture a generic `T` signature for primitive fields/methods. |
-| Class emission | `backend/src/gen_class.rs::walk_stats`, `emit_class`, `emit_class_ctor`, `emit_def` | Emit sibling `$mcI$sp`/`$mcJ$sp` classes with primitive fields, constructors, methods, `specInstance$`, and boxed bridges. The base class remains emitted. |
-| Method emission | `backend/src/gen_class.rs::emit_def`; `backend/src/gen_desc.rs::jvm_desc` | Emit `$mIc$sp`/`$mJc$sp` siblings in the same owner. Keep the generic `(Object)Object` entry point and select the primitive entry point at statically primitive call sites. |
-| Call/new rewriting | typed `Apply`, `TypeApply`, and `New` trees before `erase` | Rewrite only when the selected type argument is a concrete supported primitive. Generic calls and type-variable calls must remain on the fallback entry point. |
-| Bridges and traits | `backend/src/gen_trait.rs::emit_erasure_bridges`, trait default/mixin emitters | Add specialization bridges as explicit metadata. Existing erasure bridge matching must not guess a specialized method from two erased `Object` types. Emit the specialized trait marker/default/static helper ABI. |
-| Pickle/classpath | `backend/src/pickle.rs::pickle_symannot`; `typer/src/pickle_supply.rs::despecialized` | Keep source annotations out of generated pickles. Preserve `despecialized()` for reading scalac variants: it maps a `$mc...$sp` parent back to the pickled generic parent. Generated variants need classfile `Signature`/marker attributes but no source ScalaSignature. |
+| Annotation selection | `parser/src/specialization.rs`; `Symbol::specialized` and `record_specialization` in `typer/src/symbol.rs` | Reuse the selected primitive tag. Do not re-parse annotation trees in the backend. |
+| Phase placement | `driver/src/lib.rs::compile_paths` | Run after `pickle_all` and before erasure. Keep the generic source declaration and append variants for code generation. |
+| Type substitution | `typer/src/symbol.rs::subst_tparams_slice`; typed tree types | Clone a method body with the selected `Int` or `Long` type, preserving primitive parameter and result types until descriptor emission. |
+| Method symbols | `typer/src/symbol.rs` | Track original-to-variant ownership, exact `$mIc$sp`/`$mJc$sp` names, selected type, and JVM method type. |
+| Method emission | `backend/src/gen_class.rs::emit_def`; `backend/src/gen_desc.rs::jvm_desc` | Emit the primitive sibling in the same owner while retaining the generic `(Object)Object` entry. |
+| Call rewriting | typed `Apply` and `TypeApply` trees before `erase` | Select a variant only for a statically supported primitive argument. Preserve generic calls, boxing, and generic fallback for String or unknown types. |
+| Source pickle | `backend/src/pickle.rs::pickle_typesym` and symbol annotations | Preserve method type-parameter `@specialized` metadata and the nsc `SPECIALIZED` flag. Synthetic variants are post-pickle implementation entries, not source declarations. |
+| Generic signatures | `backend/src/sig.rs` | Keep the generic method signature on the base entry. Primitive siblings have primitive descriptors and no fabricated generic type-parameter signature. |
+| Dispatch boundary | method flags and owner kind | Start with module, `final`, and `private` methods. Do not rewrite an override-capable method until both entries and override dispatch are specified. |
+| Class and trait ABI | `backend/src/gen_class.rs`, `backend/src/gen_trait.rs` | Follow-up work for `$mcI$sp` classes, marker interfaces, default/static helpers, and bridges. It is outside this slice. |
+| Pickle reader | `typer/src/pickle_supply.rs::despecialized` | Retain the existing reader mapping for scalac-produced `$mc...$sp` parents; generated method variants must not masquerade as source declarations. |
 
-`backend/src/gen.rs::Gen::extras` can carry extra emitted classes, but using it
-alone is insufficient: the generated class must also participate in the JVM
-name index, inner/outer metadata, owner/companion ordering, and classpath
-metadata. A variant should therefore be represented by explicit specialization
-metadata consumed by the class emitter, with `extras` used only after those
-relationships are established.
+`backend/src/gen.rs::Gen::extras` alone is insufficient for future class
+variants: generated classes must participate in the JVM name index,
+owner/companion ordering, and classpath metadata. That is why method variants
+are explicit symbols in their existing owner, while class and trait variants
+need a later explicit metadata design.
+
+## Source pickle and consumer metadata
+
+Scala source pickle and generated JVM entries are separate contracts. The
+generic method declaration must remain in the source `ScalaSignature`, while a
+scalac consumer needs the method type parameter to carry both its
+`@specialized(Int, Long)` symbol annotation and the nsc `SPECIALIZED` symbol
+flag. The annotation records the allowed selections; the flag tells the
+consumer that a specialized entry is available. Synthetic `$mIc$sp` and
+`$mJc$sp` symbols are emitted after the source pickle and are not serialized
+as additional source declarations.
+
+This distinction was checked with the method fixture. Against scalac output,
+`javap -c` on a separate scalac consumer shows:
+
+```
+Consumer$.i: bipush 7; invokevirtual MethodOps$.id$mIc$sp:(I)I
+Consumer$.j: ldc2_w 7; invokevirtual MethodOps$.id$mJc$sp:(J)J
+Consumer$.s: invokevirtual MethodOps$.id:(Object)Object; checkcast String
+```
+
+Against scala-rs output, the same scalac consumer selects the same primitive
+owners and descriptors after the method type parameter is pickled with the
+annotation and `SPECIALIZED` flag. A controlled provider with methods named
+`id` and `id$mIc$sp` but without this metadata caused scalac to box the call
+and invoke generic `id(Object)Object`; matching the spelling alone is not an
+ABI implementation.
+
+The current class and trait source annotations remain outside this protection
+until their variants and dispatch ABI exist. Dropping those annotations is
+safer than publishing metadata that promises absent entries. It must not be
+confused with dropping method-owned specialization metadata: the method slice
+preserves that metadata so a consumer can select the entries that are actually
+emitted.
 
 ## First executable slice
 
-The first slice should support one source type parameter at a time and the
-`Int` and `Long` selections used above. It should cover top-level/member
-classes, object/class methods, and one specialized trait with a concrete
-implementing class. It should implement `@unspecialized` as an opt-out for an
-individual member. It should preserve all generic fallback declarations.
+The first slice is method-owned specialization for one type parameter and the
+`Int` and `Long` selections. It is intentionally limited to module methods and
+methods marked `final` or `private`; these boundaries avoid claiming a correct
+override ABI. It must support `@unspecialized` as a member opt-out and retain
+all generic fallback declarations.
 
-For each supported selected primitive:
+For each supported selection:
 
-1. Keep the generic class or method symbol and its erased descriptor.
-2. Create a specialized sibling with the exact nsc name and primitive
-   descriptor. Substitute the selected primitive through fields, parameter
-   types, result types, and method bodies before erasure.
-3. Rewrite `new C[Int](...)` and calls such as `f[Int](...)` only when the
-   type argument is statically that primitive. A String or an unknown type
-   must use the generic constructor/method and its boxing behavior.
-4. For a specialized class, emit the primitive field/constructor and the
-   primitive override/accessor methods, then emit boxed bridge methods for the
-   generic JVM entry points. Set `specInstance$` to false on the base and true
-   on each variant.
-5. For a specialized trait, emit the marker interface and the base interface's
-   specialized default/static helper, make the primitive implementation class
-   implement the marker interface, and emit its primitive method plus the
-   boxed bridge.
-6. Keep generated variants out of `pickle_all`; source readers must still read
-   the generic ScalaSignature. Classfile `Signature` and synthetic/bridge flags
-   must match the measured scalac shape.
+1. Keep the original generic method symbol, descriptor, body, and source
+   pickle entry.
+2. Create a sibling in the same owner with the exact nsc name
+   `$mIc$sp` for `Int` or `$mJc$sp` for `Long`. Substitute the selected
+   primitive through parameter types, result types, and the method body before
+   erasure.
+3. Rewrite a typed `f[Int](...)`, `f[Long](...)`, or inferred primitive call
+   only when its selected type is statically supported. String, type-variable,
+   and unsupported selections continue through the generic entry and its
+   boxing behavior.
+4. Preserve method type-parameter `@specialized` metadata and the nsc
+   `SPECIALIZED` flag in the generic source pickle. Do not add synthetic
+   variants to the source pickle.
+5. Keep a method that can be overridden on the generic path until its
+   specialized override and bridge rules are implemented. A shape being out
+   of this slice is not a reason to reject otherwise legal source or to
+   pretend that generic fallback is specialization.
 
-The first slice should diagnose unsupported shapes at the specialization phase
-with a source location rather than silently treating them as generic. Its
-initial boundary is: selected types other than `Int`/`Long`, more than one
-specialized class type parameter, local/anonymous specialized classes, value
-classes, higher-kinded or dependent bounds, and specialized overload/override
-cases without an explicit bridge plan. These diagnostics are temporary phase
-boundaries; they must not be counted as successful negative tests, and no
-`Any` substitution or relaxed expected output is an acceptable fallback.
+The implementation therefore does not introduce a blanket unsupported
+diagnostic. Unsupported selected primitive tags, class/trait type parameters,
+and override-capable methods retain existing generic behavior. This is a
+temporary capability boundary, with explicit positive and negative tests, and
+not a completion claim for those shapes.
 
 ## Follow-up phases
 
-After the first slice is stable, extend the same metadata and descriptor path
-to the remaining primitive tags (`Byte`, `Short`, `Char`, `Float`, `Double`,
-`Boolean`, `Unit`), `AnyRef`, primitive combinations across multiple type
-parameters, nested/local classes, and the full specialized override and
-overload rules. Add the remaining trait, value-class, bounds, and
-`@unspecialized` interactions only after the single-parameter ABI is verified.
-The full `tests/spec_classfiles.sh` ledger should remain explicitly red until
-the class/method bodies and dispatch behavior are implemented, even if a
-subset of its names starts matching.
+The next phase should add class-owned type parameters and the
+`$mcI$sp`/`$mcJ$sp` class ABI: primitive fields and constructors,
+`specInstance$`, boxed bridges, and constructor/callsite rewriting. The phase
+after that should add specialized trait marker interfaces, default/static
+helpers, implementation bridges, and override dispatch. Both phases need
+source-pickle and separate-compilation checks like the method slice.
+
+Only after those boundaries are verified should the compiler extend the same
+metadata and descriptor path to the remaining primitive tags (`Byte`, `Short`,
+`Char`, `Float`, `Double`, `Boolean`, `Unit`), `AnyRef`, multiple type
+parameters, nested/local classes, value classes, bounds, and the complete
+`@unspecialized` interaction. The full `tests/spec_classfiles.sh` ledger can
+remain red for class and trait cases while the method slice is accepted.
 
 ## Acceptance tests for the first slice
 
-The tests must verify behavior at source, classfile, runtime, and separate
-compilation boundaries.
+The first slice is complete only when the method fixture compiles, executes,
+and passes same-language and Java/scalac separate-compilation checks while the
+generic fallback is still exercised.
 
 Positive checks:
 
-- `ClassBox[Int]` and `ClassBox[Long]` construct the specialized siblings;
-  `ClassBox[String]` constructs the generic class and returns the same result.
-- `MethodOps.id` and `MethodHost.id` use the exact `$mIc$sp`/`$mJc$sp`
-  descriptors for primitive calls, while String and an unconstrained type
-  parameter use `(Object)Object`.
-- The base class has the unbox helpers and `specInstance$ == false`; each
-  primitive sibling has primitive fields/constructors, boxed bridges, and
-  `specInstance$ == true`.
-- A concrete `IntReadable[Int]` implementation links through
-  `IntReadable$mcI$sp.read$mcI$sp()I` and through the boxed `read()Object`
-  view.
-- `@unspecialized` suppresses a member variant without suppressing variants
-  required by the owning class.
-- A Java client compiles against the emitted classfiles and runs with
-  `-Xverify:all`; the result is `7:7:7`. A scalac consumer and a scala-rs
-  consumer should each link against the other's provider output.
+- A module method with `@specialized(Int, Long)` emits the generic entry plus
+  exact `$mIc$sp(I)I` and `$mJc$sp(J)J` entries. An `Int` or `Long` call uses
+  the primitive entry; a String call uses `(Object)Object` and a cast.
+- A method with `@specialized(Int)` emits only `$mIc$sp(I)I`. An unannotated
+  generic method emits no sibling.
+- The same method body returns the correct primitive values at runtime; the
+  variant uses primitive load/return bytecode rather than an `Any` or boxed
+  implementation.
+- `@unspecialized` suppresses that member's variant while leaving its generic
+  method callable.
+- A `final` or `private` method follows the same ABI. An ordinary
+  override-capable class method remains generic until the override phase; a
+  regression test must cover this boundary.
+- A scalac consumer compiled against scala-rs output selects
+  `$mIc$sp`/`$mJc$sp` for primitive calls and generic `id(Object)Object` for
+  String. A scala-rs consumer compiled against scalac output makes the same
+  selections.
+- A Java client can call the exact generated descriptors and the runtime
+  fixture passes `java -Xverify:all`.
 
-Negative checks:
+Negative and preservation checks:
 
-- Unsupported selected types and unsupported class/method shapes produce the
-  specialization diagnostic at the annotation/use site.
-- A specialized override whose selected set is narrower than its parent is
-  rejected for the specialization reason, matching scalac's
-  `spec-overrides` category.
-- The generic fallback remains available; a negative test must not pass merely
-  because an annotation was ignored or because a call was widened to `Any`.
+- `-no-specialization` emits no method variants and preserves generic calls.
+- Unsupported selections and class/trait-owned parameters are not claimed as
+  implemented: they remain on the existing generic path with no fabricated
+  specialized metadata.
+- An override-capable method is not rewritten to a sibling that its subclass
+  cannot implement. Once override specialization is added, tests must require
+  identical behavior through both generic and primitive dispatch entries.
+- A controlled provider with a same-named method but missing specialization
+  metadata must stay a negative ABI case; name matching alone must not make a
+  scalac consumer select a primitive entry.
 
-Required classfile checks are `javap -p -s`, method flags for
-`ACC_BRIDGE|ACC_SYNTHETIC`, `javap -c` call-site owners/descriptors, and
-`java -Xverify:all` execution. Name-only ledger success is not an acceptance
-condition by itself. The first slice is complete only when the three fixture
-families compile, execute, and pass both same-language and Java separate
-compilation checks with the generic fallback still exercised.
+Required evidence is `javap -p -s`, `javap -c` callsite owner/descriptors,
+method flags where applicable, source-pickle inspection, and
+`java -Xverify:all` execution. Name-only ledger success is insufficient.
