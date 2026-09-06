@@ -465,3 +465,78 @@ leaf; real GitBucket still timed out at 60 seconds on its preceding candidate.
 Macro `7f2a9be9` passes a success-required hydration test, but independent probes
 expose incomplete flags, owners, parameter metadata and legal class shapes.
 None of these candidates is accepted based on focused tests alone.
+
+
+## Later independent validation and remaining semantic defects
+
+The accepted baseline remains `9beb69b2`; the following are unaccepted slices.
+
+- Method specialization `5b85263e`: full workspace 2242 passed, zero failed,
+  199 result rows; all four compile measures, strict verification of 1490
+  classes and Slick MODE=b 36/36 remain unchanged. All 5324 corpus identities
+  and statuses agree with the baseline. The six-field comparison against
+  `candidate-629570a` differs only in t8199's temporary output path. Evidence:
+  `integration/candidate-5b85263/{results.json,corpus-parent-audit.json}` under
+  `/tmp/scala-rs-codex`. Acceptance is held for complete traversal of self types,
+  type definitions and annotation subtrees, plus one new clippy warning.
+  Class-owned specialization remains unimplemented; the nsc-only class oracle
+  at `256b9b49` independently passes with output `3:5:su:25:47:sv:3:f` and
+  class-specific descriptor/bridge assertions. It is not a scala-rs pass.
+- Source signature `9144b8fd`: full workspace 2221 passed, 20 failed, 200 result
+  rows, exit 101. Failed targets: buildfrom, cpvalueclass, engine, ifacebridge,
+  mismatch11, rf_reify, twirl and xflags. Failures include wrong collection
+  result types, value-class extension descriptors, macro argument counts,
+  missing primitive boxing and missing Equals.canEqual. No compile measures
+  or corpus followed this failed gate. Evidence: `integration/candidate-9144b8f`.
+- Codegen/constructors: synthetic `$outer` field metadata resolves the previous
+  four Slick constructor failures. A fresh focused run at `dd224fd2` passes
+  31 tests including the earlier ten failures and the user-named `$outer`
+  negative. Parent `765c6cd3` names the super-accessor ABI record, removes an
+  unused tuple component and simplifies constructor-clause traversal. This
+  frozen candidate is undergoing full acceptance; do not reuse the old failed
+  `73cc75b2` numbers as its result.
+- For value guards `02c1465a`: fresh fvg 4 and mismatch6 12 pass. Independent
+  runtime probes still fail against nsc 2.13.16: a custom Box.map sees
+  `((1,2),3)` instead of `(1,2,3)`; 22 value definitions over two List elements
+  execute `21:1;22:1;21:2;22:2;` instead of `21:1;21:2;22:1;22:2;`.
+  All four compiler/runtime invocations in each probe exit zero. nsc groups
+  at most 21 value definitions and emits a flat TupleN (TreeGen.scala:728).
+  Evidence: `integration/for-tuple-shape-probe/results.json` and
+  `integration/for-group-boundary-probe/results.json`. Follow-up repair is active.
+
+The process handles in `/tmp/scala-rs-codex/integration/current-state.json`
+are hints, not proof of liveness; poll each handle before continuing or restarting.
+
+
+## Corpus losses and temporary-directory race
+
+Codegen/constructor `765c6cd3` finished its release workspace with 2249 passed,
+one failed, 200 result rows. The failure was independently traced to two
+`verify_sql` tests receiving the identical timestamp-plus-PID temporary root.
+The instrumented log shows the duplicate paths and the wrong test's Main
+output: `/tmp/scala-rs-codex/verify-sql-race/repeat-instrumented.log:486`.
+One test can delete the other's nsc classpath. Parent isolated rerun passed all
+five tests. The process-local atomic sequence fix was applied to main as
+`72c41271`; parent main's two existing verify_sql tests pass. Compiler/Cargo
+inputs and test counts are unchanged. The original failed workspace result
+remains in the evidence; it has not been rewritten as an all-pass run.
+
+Remaining gates for `765c6cd3` independently establish real compiler regressions:
+Slick reports 66 errors in 18 files and emits zero classes (62 missing super
+implementations for toString, four unsupported sql selections). Its strict
+verification and execution gates consequently fail. Cats remains 350/81,
+GitBucket reports 893/110 and Scala library remains 1613/171. The corpus has
+5324 unique records: pos 1045/469/345, neg 669/367/369, run 588/919/553.
+Eleven old passes are lost, one positive changes to pass, and ten negative
+cases newly reject. Several new rejections are unsupported-codegen diagnostics,
+so the negative count is not a compatibility improvement. Full six-field
+comparison changes 52 rows; evidence is `candidate-765c6cd/corpus-detail-audit.json`
+and `corpus-status-audit.json`. Separate super-implementation and sql-selection
+fixes are active; the candidate remains unaccepted.
+
+For-comprehension `dd86599b` completes workspace with 2242 passed, one failed,
+200 result rows. The only failure is conform::for_comprehensions: a String
+result reaches MapOps.WithFilter.map and is cast to Tuple2. No later gates ran.
+Its prior 18 focused passes and three exact nsc comparisons do not establish
+full acceptance. The Map WithFilter repair and private Tuple1..Tuple22 support
+are independent pending tasks.

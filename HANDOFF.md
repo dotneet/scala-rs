@@ -17,9 +17,19 @@ Variance metadata was independently validated at `629570a8` and merged as
 `9beb69b2`: 2237 release tests pass; all 5324 corpus statuses remain unchanged.
 A stronger test-only follow-up passed at `803be601`. The one changed runtime
 exception was reproduced with byte-identical old/new class files, not a regression.
-Codegen/constructor candidate `73cc75b2` failed 10 workspace tests; parent
-`aa5126ee` fixes six default-clause failures (10 focused tests pass), while
-four Slick constructor failures remain under repair. Do not merge that candidate yet.
+Codegen/constructor candidate `73cc75b2` failed 10 workspace tests. All ten
+now pass in a fresh 31-test focused gate after the default-clause and synthetic
+outer-field fixes; full candidate `765c6cd3` is running and remains unaccepted.
+Method-specialization candidate `5b85263e` completed its independent full gate:
+2242 release tests pass, all 5324 corpus statuses and compile measures are
+unchanged, and Slick MODE=b passes 36/36. Tree traversal omissions and one new
+lint warning still need repair before acceptance. This does not implement
+class-owned specialization; that ledger remains red.
+Source-signature candidate `9144b8fd` failed 20 of 2241 workspace tests; no
+later gates ran. The eight failing targets are recorded in the validation note.
+For-comprehension candidate `02c1465a` passes 16 focused tests, but independent
+execution still proves wrong tuple shape and wrong evaluation order across
+21 value definitions. These candidates must not be merged from focused results.
 Read the updated `tests/BASELINE.md`, including its
 per-test corpus reference and red MODE=a check. The historical results below
 describe the previous session, not the current baseline. This continuation

@@ -18,7 +18,10 @@ is, and both invalidate everything downstream.
 Measured independently at `629570a8`, then merged as `9beb69b2`. The only
 change after the full run was a stronger, portable variance interoperability
 test, independently passed at `803be601`; compiler sources and Cargo inputs
-are identical. Later documentation-only commits may follow this commit.
+are identical. Later documentation and non-Cargo test-artifact commits may
+follow this commit. `0f13cc1a` adds a parent-verified nsc-only class-specialization
+ABI oracle; compiler sources, Cargo inputs and the counted test suites are
+unchanged. It does not turn the scala-rs specialization ledger green.
 Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned; the corpus run
 inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
 Evidence: `/tmp/scala-rs-codex/integration/candidate-629570a/results.json`,
