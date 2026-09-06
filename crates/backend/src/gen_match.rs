@@ -340,17 +340,18 @@ pub(crate) fn gen_ctor_fields_pattern(
     }
 }
 
-pub(crate) fn gen_unapply_pattern(
+fn gen_unapply_pattern(
     asm: &mut Assembler,
     frame: &mut Frame,
     ctx: &EmitCtx,
     pat: &Tree,
-    fun: &Tree,
-    args: &[Tree],
     tmp: u16,
     sel_sort: JvmSort,
     fail: crate::code::Label,
 ) {
+    let TreeKind::UnApply { fun, args } = &pat.kind else {
+        unreachable!("gen_unapply_pattern is only called for UnApply patterns");
+    };
     let uid = if pat.sym.is_none() { fun.sym } else { pat.sym };
     // A `case class`'s companion `unapply` is synthesized as a *symbol* with
     // no body; nothing emits the method, so calling it is a
@@ -979,8 +980,8 @@ pub(crate) fn gen_pattern(
             };
             gen_ctor_fields_pattern(asm, frame, ctx, pat, args, class_id, tmp, sel_sort, fail);
         }
-        TreeKind::UnApply { fun, args } => {
-            gen_unapply_pattern(asm, frame, ctx, pat, fun, args, tmp, sel_sort, fail);
+        TreeKind::UnApply { .. } => {
+            gen_unapply_pattern(asm, frame, ctx, pat, tmp, sel_sort, fail);
         }
         TreeKind::Bind { body, .. } => {
             // `case n @ N(v, _)` binds `n` at the pattern's *own* type, not at

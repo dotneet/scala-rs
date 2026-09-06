@@ -855,7 +855,9 @@ impl Typer {
         let mut solved_ids = Vec::new();
         let mut solved_types = Vec::new();
         for id in ids {
-            let Some(solved) = self.unify_tparam_all(*id, &[base.clone()], &[sel.clone()]) else {
+            let Some(solved) =
+                self.unify_tparam_all(*id, std::slice::from_ref(&base), std::slice::from_ref(sel))
+            else {
                 continue;
             };
             if solved.is_error()
