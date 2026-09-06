@@ -56,6 +56,11 @@ records, from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compare by `(kind, test)` as well as totals. The full six-field diagnostic
 ledger is `candidate-d9eb5dc/corpus.tsv` in the evidence directory above.
 
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-4b0568af.tsv
+<candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
+duplicate identities, lost passes, and newly skipped tests. A zero exit only
+checks statuses; changed diagnostics and runtime evidence still need review.
+
 Compared with the independently checked Null slice ledger (which matches the
 old baseline totals), only `run/t5629` and `run/t12478` changed to pass.
 `t5629` fixes overriding bounds inherited from a generic owner; it does not
