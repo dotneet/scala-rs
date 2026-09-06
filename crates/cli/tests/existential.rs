@@ -37,11 +37,24 @@ fn tmp_dir(tag: &str) -> PathBuf {
 
 fn scalac() -> Option<PathBuf> {
     let cached = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
-    if cached.is_file() {
+    if cached.is_file() && is_scala_21316(&cached) {
         return Some(cached);
     }
-    let output = Command::new("scalac").arg("-version").output().ok()?;
-    output.status.success().then_some(PathBuf::from("scalac"))
+    let path = PathBuf::from("scalac");
+    is_scala_21316(&path).then_some(path)
+}
+
+fn is_scala_21316(scalac: &Path) -> bool {
+    let output = match Command::new(scalac).arg("-version").output() {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+    let version = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.status.success() && version.contains("2.13.16")
 }
 
 fn scala_library_jar() -> Option<PathBuf> {
@@ -107,11 +120,35 @@ fn run_scala_rs(jar: &Path, src: &Path, out: &Path) -> (bool, String) {
     )
 }
 
+fn java_available() -> bool {
+    Command::new("java")
+        .arg("-version")
+        .output()
+        .map(|output| output.status.success() || !output.stderr.is_empty())
+        .unwrap_or(false)
+}
+
+fn run_main(classes: &Path, provider: &Path, jar: &Path) -> String {
+    let classpath = cp(&[classes, provider, jar]);
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", &classpath, "Main"])
+        .output()
+        .expect("run java Main");
+    assert!(
+        output.status.success(),
+        "java Main failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 fn compile_provider_matrix(
     label: &str,
     provider_fixture: &str,
     positive_fixture: &str,
     negative_fixture: &str,
+    negative_patterns: &[&[&str]],
+    expected_stdout: &str,
 ) {
     let Some(scalac) = scalac() else {
         eprintln!("skip {label}: scalac 2.13.16 not obtainable");
@@ -149,6 +186,13 @@ fn compile_provider_matrix(
             ok,
             "{provider_name} provider rejected positive {label} consumer:\n{msgs}"
         );
+        if java_available() {
+            assert_eq!(
+                run_main(&positive_out, provider, &jar),
+                expected_stdout,
+                "stdout mismatch for {provider_name} provider in {label}"
+            );
+        }
         let _ = fs::remove_dir_all(&positive_out);
 
         let negative_out = tmp_dir(&format!("{label}-{provider_name}-negative"));
@@ -163,6 +207,15 @@ fn compile_provider_matrix(
             !ok,
             "{provider_name} provider accepted negative {label} consumer:\n{msgs}"
         );
+        for pattern in negative_patterns {
+            let found = msgs
+                .lines()
+                .any(|line| pattern.iter().all(|needle| line.contains(needle)));
+            assert!(
+                found,
+                "{provider_name} provider negative {label} consumer missed diagnostic containing {pattern:?}:\n{msgs}"
+            );
+        }
         let _ = fs::remove_dir_all(&negative_out);
     }
 
@@ -177,6 +230,12 @@ fn xmeta_bound_provider_matches_nsc_consumer_matrix() {
         "xmeta_existential_provider",
         "xmeta_bound_positive_consumer",
         "xmeta_bound_negative_consumer",
+        &[&[
+            "type arguments [String]",
+            "class TableQuery's type parameter bounds",
+            "AbstractTable[_]",
+        ]],
+        "concrete\n",
     );
 }
 
@@ -187,5 +246,23 @@ fn xmeta_bound_shapes_match_nsc_consumer_matrix() {
         "xmeta_bound_shapes_provider",
         "xmeta_bound_shapes_positive_consumer",
         "xmeta_bound_shapes_negative_consumer",
+        &[
+            &[
+                "type arguments [Any,String]",
+                "class Pair's type parameter bounds",
+                "[A <: B,B]",
+            ],
+            &[
+                "type arguments [Int]",
+                "trait FBound's type parameter bounds",
+                "[A <: Comparable[A]]",
+            ],
+            &[
+                "type arguments [Nothing]",
+                "trait LowerBound's type parameter bounds",
+                "[A >: String]",
+            ],
+        ],
+        "bound-shapes\n",
     );
 }
