@@ -1640,6 +1640,14 @@ impl Typer {
             }
             return None;
         }
+        // `adapt` keeps an existing by-name identifier as `ByName(T)` so the
+        // erasure pass can forward its thunk. Overload applicability still
+        // compares the value yielded by that thunk with the formal value type
+        // (or with another by-name formal), just as it does for the
+        // `Function0[T]` shape produced for a fresh by-name argument.
+        if let Type::ByName(inner) = arg {
+            return self.arg_score(inner, param);
+        }
         // A `xs: _*` argument is already the sequence the parameter wants.
         if let Type::Repeated(inner) = arg {
             return self.arg_score(inner, param);
