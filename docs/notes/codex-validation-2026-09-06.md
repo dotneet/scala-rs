@@ -31,7 +31,9 @@ were recovered rather than reimplemented. Review found additional defects:
 - Tail calls now loop, including deep by-name forwarding. Value-class
   extension methods remain explicitly unsupported; do not call the phase
   complete. Integration exposed two by-name typing regressions in
-  `cats.Monad.untilM` / `untilM_`; `codex/byname-followup` is investigating.
+  `cats.Monad.untilM` / `untilM_`. The follow-up now unwraps the argument
+  value type for overload scoring while retaining the thunk for codegen.
+  Independent focused tests and a fresh cats measurement passed.
 
 ## Independent evidence so far
 
@@ -103,3 +105,62 @@ worktrees and small, independent tasks; keep final integration review with the
 coordinator. Current outstanding work is to resolve the concrete defects
 above, finish branch and integration gates, save a complete per-test corpus
 reference, and only then update the baseline and move main.
+
+## Later coordinator checkpoint
+
+Candidate `b1346e9` is frozen in `codex/integration` for independent full
+validation. The tracked command is exec session `81028`, running
+`/tmp/scala-rs-codex/integration/validate-candidate.py`; outputs are under
+`/tmp/scala-rs-codex/integration/candidate-b1346e9`. It starts with release
+workspace tests and stops if they fail. Later phases cover the four measures,
+strict verification with the pinned PostgreSQL/Oracle dependencies, Slick
+execution modes b and a, specialization, and the complete corpus. Do not
+restart this runner or change the candidate until its process is finished.
+The existence of `run.json` means the job was dispatched, not that it passed.
+
+Additional independently checked changes staged there:
+
+- Parent constructor defaults: the selected overloaded constructor receives
+  its omitted arguments. The minimal program passes JVM verification and
+  agrees with scalac (`jdbc:test:user:password`). At `8347b99`, Slick emitted
+  1490 classes and the old `DatabaseUrlDataSource` verifier failure was gone.
+- By-name overload matching: the combined focused suites passed (6 tests),
+  and cats returned to 350 errors / 81 files. Logs are in `integration/recheck`.
+- Macro cache/startup: compile the bridge to class version 52 and publish a
+  private staging directory atomically. Both tools follow `JAVA_HOME`.
+  Independent review rejected the first Java fallback: Java 15 has no
+  `Lookup(Class,int)` constructor. The corrected helper passed the same
+  proxy invocation on Java 8, 15, and 17; the combined engine suite then passed
+  all 27 tests on Java 15. Evidence is in `integration/macro-review` and
+  `integration/macro-fixed`. The coordinator also fixed staging cleanup when
+  javac cannot start.
+
+The qualified `Factory` companion fix (`607765f`) and generic-owner override
+bound substitution (`25a347b`) have been reviewed and staged; their combined
+independent gates are still in progress. The previous independent strict
+Slick check loaded 1489 of 1490 classes, with no verifier failures and exactly
+one incomplete initializer (`select Factory`). The Oracle jar used to resolve
+optional coverage is the version pinned in Slick's Dependencies.scala:
+`com.oracle.database.jdbc.debug:ojdbc8_g:21.23.0.0`.
+
+The isolated tailrec corpus was recovered from completed worker records:
+5324 unique records, all six fields present; pos 1052/462/345, neg 660/376/369,
+run 572/935/553. This is not an accepted result against the baseline. Its
+Java 15 environment and the observed compiler changes need to be separated.
+The old four workspace runs all stopped at the nine engine startup failures;
+none is a passing full-workspace result. Java 17 reruns of nullcross and
+catstail are tracked by the validation agent in `slice-validation/result.json`.
+
+Further harness checks now cover non-UTF-8 bytes in both the ledger and its
+report, separate compilation rounds, missing worker records, and early
+`System.exit(0)` from a class initializer. The latter used to return success
+before the sweep completed; an explicit completion record now rejects it.
+The measurement harness passes 22 focused checks.
+
+New work remains isolated from the frozen candidate: constructor-default
+separate-compilation follow-up, the deferred blocking-slick import fix and its
+bounded performance experiment, and codegen diagnostics. The codegen audit
+found fourteen fallback sites that emit runtime exceptions for compiler
+unsupported/unresolved states. The next slice will make those compilation
+errors with source positions and prevent classfile publication on emission
+failure, while preserving deliberate user throws, MatchError, and `???`.
