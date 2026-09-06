@@ -519,6 +519,19 @@ impl<'a> Pickler<'a> {
         self.add(TYPEREFTPE, body)
     }
 
+    fn type_ref_this_in(&mut self, owner: u32, name: &str) -> u32 {
+        let pref = self.add(THISTPE, {
+            let mut body = Vec::new();
+            write_nat_to(&mut body, owner);
+            body
+        });
+        let sym = self.ext_ref_owned(name, owner);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        self.add(TYPEREFTPE, body)
+    }
+
     fn type_ref_in_args(&mut self, owner: u32, name: &str, args: &[Type]) -> u32 {
         let pref = self.noprefix;
         let sym = self.ext_ref_owned(name, owner);
@@ -596,6 +609,62 @@ impl<'a> Pickler<'a> {
         for t in arg_refs {
             write_nat_to(&mut body, *t);
         }
+        self.add(TYPEREFTPE, body)
+    }
+
+    /// A bound written by nsc is rooted at the package/class `ThisType` of
+    /// the referenced declaration.  Ordinary signatures in this subset use
+    /// `NoPrefix` for compact primitive refs, but that shape is not equivalent
+    /// in `TYPEBOUNDStpe`: nsc's specialization phase compares the bound's
+    /// resolved symbol with the candidate primitive.  Keep this spelling
+    /// local to bounds so existing signature refs retain their established
+    /// representation.
+    fn pickle_bound_type(&mut self, ty: &Type) -> u32 {
+        let (owner, name): (u32, &str) = match ty {
+            Type::Unit => (self.scala_module(), "Unit"),
+            Type::Boolean => (self.scala_module(), "Boolean"),
+            Type::Byte => (self.scala_module(), "Byte"),
+            Type::Short => (self.scala_module(), "Short"),
+            Type::Int => (self.scala_module(), "Int"),
+            Type::Long => (self.scala_module(), "Long"),
+            Type::Float => (self.scala_module(), "Float"),
+            Type::Double => (self.scala_module(), "Double"),
+            Type::Char => (self.scala_module(), "Char"),
+            Type::Any => (self.scala_module(), "Any"),
+            Type::AnyRef | Type::Wildcard => (self.scala_module(), "AnyRef"),
+            Type::AnyVal => (self.scala_module(), "AnyVal"),
+            Type::Nothing => (self.scala_module(), "Nothing"),
+            Type::Null => (self.scala_module(), "Null"),
+            Type::String => (self.java_lang_module(), "String"),
+            Type::Class { sym, args } => {
+                if args.is_empty() {
+                    let owner = self.external_owner_ref(*sym);
+                    let name = self.st.get(*sym).name.clone();
+                    let pref = self.add(THISTPE, {
+                        let mut b = Vec::new();
+                        write_nat_to(&mut b, owner);
+                        b
+                    });
+                    let sym_ref = self.ext_ref_owned(&name, owner);
+                    let mut b = Vec::new();
+                    write_nat_to(&mut b, pref);
+                    write_nat_to(&mut b, sym_ref);
+                    return self.add(TYPEREFTPE, b);
+                }
+                return self.pickle_type(ty);
+            }
+            Type::Applied { .. } => return self.pickle_type(ty),
+            _ => return self.pickle_type(ty),
+        };
+        let pref = self.add(THISTPE, {
+            let mut b = Vec::new();
+            write_nat_to(&mut b, owner);
+            b
+        });
+        let sym = self.ext_ref_owned(name, owner);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
         self.add(TYPEREFTPE, body)
     }
 
@@ -1029,7 +1098,7 @@ impl<'a> Pickler<'a> {
             // only the imported simple name, so the generic user-annotation
             // fallback would incorrectly pickle `<empty>.specialized`.
             let sc = self.scala_module();
-            self.type_ref_in(sc, "specialized")
+            self.type_ref_this_in(sc, "specialized")
         } else if simple == scala_rs_parser::specialization::UNSPECIALIZED {
             let sc = self.scala_module();
             let ann = self.ext_mod("annotation", Some(sc));
@@ -2365,11 +2434,11 @@ impl<'a> Pickler<'a> {
         let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
         let lo = bound_lo
             .as_ref()
-            .map(|t| self.pickle_type(t))
+            .map(|t| self.pickle_bound_type(t))
             .unwrap_or_else(|| self.type_ref_named("Nothing"));
         let hi = bound_hi
             .as_ref()
-            .map(|t| self.pickle_type(t))
+            .map(|t| self.pickle_bound_type(t))
             .unwrap_or_else(|| self.type_ref_named("Any"));
         let advertised_specialization = if self.st.get(s.owner).kind == SymKind::Method {
             self.st.method_specialization_for_pickle(id)
