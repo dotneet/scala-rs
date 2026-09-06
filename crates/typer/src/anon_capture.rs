@@ -204,6 +204,11 @@ fn free(tree: &Tree, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st: &Sy
 /// Names a pattern introduces: a `Bind`, and an `Ident` that is a variable
 /// rather than a stable identifier -- the same lowercase test the typer uses.
 fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
+    // A stable pattern is an expression, including any lowered accessor
+    // arguments. Its referenced locals are captures, never new binders.
+    if pat.stable_pat {
+        return;
+    }
     match &pat.kind {
         TreeKind::Bind { .. } => {
             if !pat.sym.is_none() {

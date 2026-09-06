@@ -391,3 +391,13 @@ fn private_cells_match_the_library_signatures() {
     }
     let _ = fs::remove_dir_all(&out);
 }
+
+#[test]
+fn local_lazy_stable_pattern_keeps_equality_semantics() {
+    assert!(
+        java_available() && find_scalac().is_some() && scala_library_jar().is_some(),
+        "requires Java and Scala 2.13.16"
+    );
+    check_both_abis("lr_stable_pattern");
+    scalac_dual_run("lr_stable_pattern");
+}

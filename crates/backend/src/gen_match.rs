@@ -950,6 +950,14 @@ pub(crate) fn gen_pattern(
             load(asm, tmp, sel_sort);
             emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
         }
+        TreeKind::Apply { .. } if pat.stable_pat => {
+            // A local lazy stable identifier becomes an accessor call during
+            // lowering. Its arguments belong to that call, not an extractor.
+            gen_expr(asm, frame, ctx, pat);
+            emit_pattern_operand(asm, &pat.ty, sel_sort);
+            load(asm, tmp, sel_sort);
+            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+        }
         TreeKind::Apply { args, .. } => {
             let class_id = if pat.sym.is_none() {
                 ctx.st.class_sym_of(&pat.ty).unwrap_or(SymbolId::NONE)
