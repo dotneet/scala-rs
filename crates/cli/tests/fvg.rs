@@ -109,6 +109,53 @@ fn compile_and_run(name: &str, extra: &[&str], jar: Option<&Path>) -> String {
 }
 
 #[test]
+fn map_with_filter_overloads_match_scalac() {
+    let jar = scala_library_jar().expect("Map WithFilter requires scala-library");
+    let nsc = scalac().expect("Map WithFilter requires scalac 2.13.16");
+    let expected = expected("fvg_map_filter");
+    let out = tmp_dir("map-with-filter-nsc");
+    let control = Command::new(&nsc)
+        .arg(fixtures_dir().join("fvg_map_filter.scala"))
+        .arg("-d")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert_eq!(run(&out, Some(&jar)), expected);
+    assert_eq!(
+        compile_and_run(
+            "fvg_map_filter",
+            &["--scala-library", jar.to_str().unwrap()],
+            Some(&jar)
+        ),
+        expected
+    );
+    let negative = Command::new(nsc)
+        .arg(fixtures_dir().join("fvg_map_filter_bad.scala"))
+        .arg("-d")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(!negative.status.success());
+    assert!(String::from_utf8_lossy(&negative.stderr).contains("type mismatch"));
+    let (ok, diagnostic) = compile(
+        "fvg_map_filter_bad",
+        &out,
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert!(
+        !ok,
+        "flatMap must not inherit the lambda's List constructor"
+    );
+    assert!(diagnostic.contains("type mismatch"), "{diagnostic}");
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
 fn value_definition_guards_match_scalac_in_both_runtime_modes() {
     let exp = expected("fvg_for");
     assert_eq!(
