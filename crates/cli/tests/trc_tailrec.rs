@@ -142,7 +142,7 @@ fn trc_deep_dual_run_and_bytecode() {
             vec!["hop", "count"]
         } {
             let body = dis
-                .split("\n  ")
+                .split("\n\n")
                 .find(|part| {
                     part.lines()
                         .next()
@@ -200,6 +200,17 @@ fn trc_unsupported_valueclass_is_not_silently_accepted() {
     if !prerequisites() {
         return;
     }
+    let reference = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .arg(fixture("trc_valueclass_unsupported.scala"))
+        .arg("-d")
+        .arg(dir("valueclass-reference"))
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "legal Scala: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
         .arg("compile")
         .arg(fixture("trc_valueclass_unsupported.scala"))
