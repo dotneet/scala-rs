@@ -621,10 +621,23 @@ pub(crate) fn gen_function_indy(
     body: &Tree,
     fn_ty: &Type,
 ) {
-    let outer_desc = format!("L{};", ctx.class_name);
+    // Before invokespecial <init>, slot zero is uninitializedThis and
+    // cannot be passed to LambdaMetafactory. The available receiver is the
+    // enclosing instance supplied as the constructor's outer parameter.
+    let (outer_class, outer_sym) =
+        if let Some((_, enclosing, held)) = ctx.presuper_outer.filter(|_| need_outer) {
+            (class_internal(ctx.st, held), enclosing)
+        } else {
+            (ctx.class_name.to_string(), ctx.class_sym)
+        };
+    let outer_desc = format!("L{outer_class};");
     let mut call_desc = String::from("(");
     if need_outer {
-        load_this(asm, ctx);
+        if let Some((slot, _, _)) = ctx.presuper_outer {
+            load(asm, slot, JvmSort::Ref);
+        } else {
+            load_this(asm, ctx);
+        }
         call_desc.push_str(&outer_desc);
     }
     for id in local_caps {
@@ -674,8 +687,8 @@ pub(crate) fn gen_function_indy(
         name: impl_name,
         desc: impl_desc,
         has_outer: need_outer,
-        outer_class: ctx.class_name.to_string(),
-        class_sym: ctx.class_sym,
+        outer_class,
+        class_sym: outer_sym,
         vparams: vparams.to_vec(),
         body: body.clone(),
         local_caps: local_caps.to_vec(),

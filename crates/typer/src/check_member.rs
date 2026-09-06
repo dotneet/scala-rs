@@ -1691,6 +1691,17 @@ impl Typer {
             if a.id == NodeId(0) && !a.ty.is_no_type() {
                 continue;
             }
+            if let TreeKind::Function { vparams, .. } = &a.kind {
+                if !is_annotated_lambda(a) {
+                    // As for `new Base(f)`, an unannotated lambda needs the
+                    // selected constructor's expected parameter type.
+                    a.ty = Type::Function {
+                        params: vec![Type::NoType; vparams.len()],
+                        ret: Box::new(Type::NoType),
+                    };
+                    continue;
+                }
+            }
             self.type_expr(a, &Type::NoType);
         }
         tree.ty = class_ty.clone();
@@ -1730,7 +1741,13 @@ impl Typer {
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
                         if !p.is_no_type() {
-                            self.adapt(a, p);
+                            if matches!(a.kind, TreeKind::Function { .. })
+                                && !is_annotated_lambda(a)
+                            {
+                                self.type_expr(a, p);
+                            } else {
+                                self.adapt(a, p);
+                            }
                         }
                     }
                 }

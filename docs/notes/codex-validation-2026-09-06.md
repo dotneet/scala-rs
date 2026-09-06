@@ -698,3 +698,28 @@ This supersedes the earlier typed-pattern negative failure, but not the split
 compilation failures recorded in `repeated-pattern-interop/results.json`.
 Full acceptance remains pending. Latest accepted main is being merged into
 this candidate; the merge itself needs fresh validation before acceptance.
+
+## Parent repair: generic Dynamic calls and parent argument lambdas
+
+`91b37b20` preserves written type arguments on applyDynamic/applyDynamicNamed
+rather than the receiver. The original t6355pos executes 1/2/3, matching nsc;
+five focused tests cover real-method precedence, receiver evaluation once,
+invalid arguments/bounds, and ordinary generic calls with explicit evidence.
+Slick remains 0 errors / 1490 classes.
+
+The remaining aladdin883 path typed unannotated parent-constructor lambdas
+without the selected constructor's prototype. It now defers those bodies as
+ordinary `new` calls do. Strict runtime then exposed uninitializedThis being
+captured by invokedynamic before super construction. The lambda now captures
+the available enclosing-instance constructor parameter and uses that receiver
+in its hoisted body. Twenty-one related tests pass and Slick remains 0/1490.
+Evidence: `/tmp/scala-rs-codex/integration/aladdin-parent-focused.log`,
+`aladdin-parent-slick.log`, and `aladdin-parent-probe/results.json`.
+
+An expanded probe still cannot instantiate an inherited inner class through
+its concrete outer prefix (`new Numbers.Range(2, 5)` retains the outer A).
+That failure is preserved as `aladdin-parent-probe/inherited-prefix-red.scala`
+and `.json`. The passing runtime fixture constructs Range within Foo[A] and
+executes it through an inherited generic method; it does not prove that prefix
+substitution is fixed. Repeated-case split compilation also remains red.
+These independent compatibility gaps remain open after the candidate's gate.
