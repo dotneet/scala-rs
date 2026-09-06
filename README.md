@@ -40,6 +40,10 @@ makes no claim of conformance to the language specification. What exists today:
 scalac 2.13.16 と比較します。集合の結合も含む
 [修正範囲と検証方法](docs/notes/overload-module-and-set.md) を参照してください。
 
+出力先をクラスパスに含めて object を再コンパイルする場合も、Java 起動用の
+`main` 転送メソッドを再生成します。`incremental_forwarder` テストは同じ出力先への
+2 回のコンパイルと JVM 実行を scalac と比較します。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
