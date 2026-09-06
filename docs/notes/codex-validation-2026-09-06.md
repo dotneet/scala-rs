@@ -80,14 +80,26 @@ Its log is `candidate-d9eb5dc/clippy.log`.
 - The derived implicit member correction `b55cb7d2` is staged separately as
   `d34fd8de`. Parent release tests passed 30/30 across `gbimport`,
   `implicitmemo`, `innerclasses`, `outer`, and `slickimpl`. Permanent precise
-  type regressions and three new unreachable-pattern warnings are being
-  addressed before full validation. The timeout above remains unresolved.
+  type regressions are being added before full validation. The three
+  unreachable-pattern warnings in `check_infer.rs` also occur on accepted
+  main; an initial attribution to this slice was incorrect. The timeout
+  above remains unresolved.
 - Method specialization is staged separately as `d80d235c`. Parent review
   found that cloning a specialized method incorrectly changed a recursive
   `f[String]` call into the primitive variant, causing `ClassCastException`.
   The follow-up passes four fresh release tests and the original standalone
   reproduction now prints `ok`, `ok`, `generic`, matching scalac. This is a
   focused result, not full workspace/corpus acceptance or class specialization.
+  The additional ambiguous/unused type-argument correction and accepted tail
+  changes are now frozen together at `560405fd` for the full acceptance runner
+  (session `57064`, `candidate-560405f`). Do not mutate that candidate while it
+  runs. Independent Array/List/Tuple/thunk/cast probes produce the same 15
+  runtime results as scalac. A separate scalac client exposed the existing
+  loss of `Array[A]` arguments in source pickles; it also fails on accepted
+  tail main, so this is assigned to source-signature work, not attributed to
+  specialization. Evidence: `specialization-validation/containers-results.json`
+  and `container-consumer-baseline-results.json` under the common temporary
+  evidence root.
 - Current-run macro metadata now has an executable runtime-universe
   hydration probe and a completed-symbol snapshot design (`3839f888`).
   Incomplete/active symbols remain explicit refusals. Production snapshot
@@ -95,6 +107,10 @@ Its log is `candidate-d9eb5dc/clippy.log`.
 - External constructor default getters (`c74dd7b`, `1140fb6`) remain held.
   Generic and nested cases now have focused evidence, but assigning default
   flags to every overloaded constructor from getter names requires review.
+  Follow-up `50995a4` replaces that heuristic with pickle parameter flags.
+  Parent review requested correct owners for replacement parameter symbols
+  and exact constructor association when a real overload resembles an extra
+  hidden outer parameter. The follow-up is not yet independently accepted.
 
 Machine-readable process/commit state is in
 `/tmp/scala-rs-codex/integration/current-state.json`. Recovery logs are under
