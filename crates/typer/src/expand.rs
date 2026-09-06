@@ -37,8 +37,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{atomic::AtomicBool, atomic::Ordering as AtomicOrdering, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::{decode_method_name, encode_method_name};
@@ -62,6 +62,7 @@ const ENGINE_CACHE_VERSION: &str = "java8-target-v2";
 
 const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const ENGINE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// nsc's `-Ymacro-expand-depth`. A macro whose expansion calls itself has to
 /// stop somewhere, and stopping with a diagnostic beats a stack overflow.
@@ -75,6 +76,7 @@ pub(crate) struct MacroEngine {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_done: Arc<AtomicBool>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
     /// Set when an expansion timed out and the child was killed: the pipe is
     /// no longer in sync with the requests, so nothing more may be asked.
@@ -228,12 +230,13 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let stderr = child.stderr.take().expect("piped stderr");
-    let (stderr, stderr_thread) = collect_engine_stderr(stderr);
+    let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
     let (stdout, hello_result) = read_engine_hello(stdout);
     let hello = match hello_result {
         Ok(hello) => hello,
         Err(reason) => {
             let status = stop_engine(&mut child, Some(stderr_thread));
+            wait_for_stderr(&stderr_done);
             return Err(startup_failure(&reason, status, &stderr));
         }
     };
@@ -242,6 +245,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         stdin,
         stdout,
         stderr,
+        stderr_done,
         stderr_thread: Some(stderr_thread),
         poisoned: false,
     };
@@ -253,6 +257,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         // Dropped here so the failed child does not outlive the diagnostic.
         let mut engine = engine;
         let status = stop_engine(&mut engine.child, engine.stderr_thread.take());
+        wait_for_stderr(&engine.stderr_done);
         return Err(startup_failure(&why, status, &engine.stderr));
     }
     Ok(engine)
@@ -360,9 +365,15 @@ fn valid_engine_class(path: &Path) -> bool {
 
 fn collect_engine_stderr(
     stderr: ChildStderr,
-) -> (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>) {
+) -> (
+    Arc<Mutex<Vec<u8>>>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let shared = Arc::clone(&captured);
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
     let thread = std::thread::spawn(move || {
         let mut stderr = stderr;
         let mut buf = [0u8; 4096];
@@ -376,8 +387,19 @@ fn collect_engine_stderr(
                 }
             }
         }
+        thread_done.store(true, AtomicOrdering::Release);
     });
-    (captured, thread)
+    (captured, done, thread)
+}
+
+/// Give the collector a short, bounded chance to observe EOF after the child
+/// has exited.  Joining is unsafe here: a macro may leave a descendant holding
+/// the inherited stderr pipe open indefinitely.
+fn wait_for_stderr(done: &AtomicBool) {
+    let deadline = Instant::now() + ENGINE_STDERR_DRAIN_TIMEOUT;
+    while !done.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn append_bounded(output: &mut Vec<u8>, bytes: &[u8]) {
