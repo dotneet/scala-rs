@@ -534,6 +534,32 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
     true
 }
 
+/// The backend's dispatch relation is deliberately stricter than the
+/// diagnostic matcher above.  `same_type` treats unresolved or generic types
+/// as compatible so that an uncertain source comparison does not produce a
+/// false diagnostic.  That is useful for reporting, but it must never choose
+/// a bytecode target: an unrelated `foo(String)` must not be selected for a
+/// resolved `foo(Int)` merely because both declarations contain a type
+/// parameter after erasure.
+fn strict_method_matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> bool {
+    if st.get(child).name != st.get(base).name
+        || st.get(child).tparams.len() != st.get(base).tparams.len()
+    {
+        return false;
+    }
+    let cps = paramss_of(st, child);
+    let bty = base_type_at(st, cls, base, child);
+    let bps = match &bty {
+        Type::Method { paramss, .. } => norm_paramss(paramss),
+        _ => return false,
+    };
+    cps.len() == bps.len()
+        && cps
+            .iter()
+            .zip(bps.iter())
+            .all(|(cp, bp)| cp.len() == bp.len() && cp.iter().zip(bp.iter()).all(|(c, b)| c == b))
+}
+
 /// `cls` and its ancestors, nearest first, **including** the universal classes.
 ///
 /// `lin::linearize` leaves `Any` / `AnyRef` / `Object` out on purpose — the
@@ -589,6 +615,53 @@ fn overridden(st: &SymbolTable, cls: SymbolId, child: SymbolId) -> Vec<SymbolId>
         }
     }
     out
+}
+
+/// Record source method identities that were proven before erasure.  The
+/// relation is computed at each declaration owner, after receiver
+/// substitution and method-type-parameter alignment, and is then frozen in
+/// `SymbolTable`.  Backend code reads this table after erasure; it never calls
+/// the permissive diagnostic matcher to make a dispatch decision.
+pub fn record_method_override_families(st: &mut SymbolTable) {
+    let methods: Vec<SymbolId> = st
+        .symbols
+        .iter()
+        .filter(|s| s.kind == SymKind::Method)
+        .map(|s| s.id)
+        .collect();
+    let mut pairs = Vec::new();
+    for child in methods {
+        if !is_overridable_kind(st, child) {
+            continue;
+        }
+        let owner = st.get(child).owner;
+        if owner.is_none() || !st.get(owner).is_class_like() {
+            continue;
+        }
+        let name = st.get(child).name.clone();
+        for base_owner in strict_bases(st, owner) {
+            for &base in &st.get(base_owner).members {
+                if st.get(base).owner != base_owner
+                    || st.get(base).kind != SymKind::Method
+                    || st.get(base).name != name
+                    || !is_overridable_kind(st, base)
+                    || !is_member_of(st, base_owner, base)
+                    || is_private_to_owner(st, base)
+                {
+                    continue;
+                }
+                if strict_method_matches(st, owner, child, base) {
+                    pairs.push((child, base));
+                }
+            }
+        }
+    }
+    st.method_override_families.extend(pairs);
+}
+
+/// Whether `child` is in the pre-erasure override family of `base`.
+pub fn method_overrides(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
+    child == base || st.method_override_families.contains(&(child, base))
 }
 
 /// Same-named, non-final base members — the "Note:" scalac appends to

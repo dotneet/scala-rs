@@ -114,7 +114,7 @@ pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImp
 pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_super_accessors(tree, &mut found);
-    for (trait_id, name, target) in found {
+    for (trait_id, name, target, selected_params) in found {
         let candidates: Vec<SymbolId> = st
             .get(trait_id)
             .members
@@ -125,24 +125,30 @@ pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
                 s.kind == SymKind::Method && s.name == name
             })
             .collect();
-        let target_desc = method_desc_from_sym(st, target);
+        let target_params = selected_params.unwrap_or_else(|| method_params_from_sym(st, target));
+        let target_desc = jvm_method_desc(st, &target_params, &Type::Unit);
         let own = candidates
             .iter()
             .copied()
-            .find(|&id| method_desc_from_sym(st, id) == target_desc)
-            .or_else(|| (candidates.len() == 1).then(|| candidates[0]));
+            .find(|&id| desc_params(&method_desc_from_sym(st, id)) == desc_params(&target_desc));
         if let Some(id) = own {
             st.get_mut(id).super_accessor = true;
         } else {
             let targets = st.super_accessor_targets.entry(trait_id).or_default();
-            if !targets.contains(&target) {
-                targets.push(target);
+            if !targets
+                .iter()
+                .any(|(id, params)| *id == target && *params == target_params)
+            {
+                targets.push((target, target_params));
             }
         }
     }
 }
 
-pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<(SymbolId, String, SymbolId)>) {
+pub(crate) fn collect_super_accessors(
+    tree: &Tree,
+    out: &mut Vec<(SymbolId, String, SymbolId, Option<Vec<Type>>)>,
+) {
     if let TreeKind::ClassDef { mods, impl_, .. } = &tree.kind {
         if mods.flags.contains(Flags::TRAIT) {
             for stt in &impl_.body {
@@ -152,9 +158,9 @@ pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<(SymbolId, Stri
                     }
                     let mut accesses = Vec::new();
                     collect_super_accesses(rhs, &mut accesses);
-                    for (name, target) in accesses {
+                    for (name, target, selected_params) in accesses {
                         if !target.is_none() && !tree.sym.is_none() {
-                            out.push((tree.sym, name, target));
+                            out.push((tree.sym, name, target, selected_params));
                         }
                     }
                 }
@@ -168,7 +174,10 @@ pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<(SymbolId, Stri
 /// symbols selected by typer. The enclosing method is not necessarily the
 /// target: a private helper such as `superZip` may call `super.zip`, and the
 /// accessor belongs to `zip`.
-pub(crate) fn collect_super_accesses(tree: &Tree, out: &mut Vec<(String, SymbolId)>) {
+pub(crate) fn collect_super_accesses(
+    tree: &Tree,
+    out: &mut Vec<(String, SymbolId, Option<Vec<Type>>)>,
+) {
     if let TreeKind::Select { qual, name } = &tree.kind {
         if matches!(
             qual.kind,
@@ -178,7 +187,12 @@ pub(crate) fn collect_super_accesses(tree: &Tree, out: &mut Vec<(String, SymbolI
             }
         ) && !tree.sym.is_none()
         {
-            out.push((name.clone(), tree.sym));
+            let selected_params = match &tree.ty {
+                Type::Method { paramss, .. } => Some(paramss.iter().flatten().cloned().collect()),
+                Type::Function { params, .. } => Some(params.clone()),
+                _ => None,
+            };
+            out.push((name.clone(), tree.sym, selected_params));
         }
     }
     // A `super` inside a nested class/object belongs to that nested owner;

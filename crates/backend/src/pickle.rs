@@ -47,6 +47,7 @@
 //! - `type T = Int` / `type A = String` is `ALIASsym` (tag 5) with the aliased
 //!   type as info (nsc 2.13 has no `ALIAStpe`; scalac 2.13.16 typechecks `Lib.T`)
 
+use crate::gen_desc::{method_params_from_sym, method_ret_from_sym};
 use scala_rs_parser::{Flags, Lit, RefineDecl, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
 
@@ -673,6 +674,17 @@ impl<'a> Pickler<'a> {
             return self.package_ref_of(&jvm);
         }
         self.owner_chain_ref(class_sym, 0)
+    }
+
+    /// An external term member needs the class symbol as its owner.  This is
+    /// distinct from [`external_owner_ref`], which is the *prefix* used by a
+    /// type reference.  For a top-level `Base.foo`, the latter is `<empty>`;
+    /// the former is `<empty>.Base`.
+    fn external_class_ref(&mut self, class_sym: SymbolId) -> u32 {
+        let jvm = self.st.get(class_sym).jvm_name.clone();
+        let name = jvm.rsplit('/').next().unwrap_or(&jvm).trim_end_matches('$');
+        let prefix = self.external_owner_ref(class_sym);
+        self.ext_ref_owned(name, prefix)
     }
 
     /// The owner a `CLASSsym` names, preferring an entry in *this* pickle.
@@ -1838,7 +1850,7 @@ impl<'a> Pickler<'a> {
                     continue;
                 }
                 let acc = format!("super${}", crate::classfile::encode_method_name(&s.name));
-                self.pickle_super_accessor(m, idx, &acc);
+                self.pickle_super_accessor(m, idx, &acc, None);
             }
             // An unqualified `super.m` may select a concrete method inherited
             // from a parent without the source trait redeclaring `m`. Such a
@@ -1846,12 +1858,12 @@ impl<'a> Pickler<'a> {
             // pre-pickler records the target on the trait and we emit the
             // alias here with the parent's symbol as its referent.
             if let Some(targets) = self.st.super_accessor_targets.get(&class_id).cloned() {
-                for target in targets {
+                for (target, params) in targets {
                     let acc = format!(
                         "super${}",
                         crate::classfile::encode_method_name(&self.st.get(target).name)
                     );
-                    self.pickle_super_accessor(target, idx, &acc);
+                    self.pickle_super_accessor(target, idx, &acc, Some(&params));
                 }
             }
             self.pickle_mixin_ctor(idx);
@@ -2023,20 +2035,35 @@ impl<'a> Pickler<'a> {
     /// `def p$q$T$$super$m: T` — the abstract `SUPERACCESSOR` member a
     /// stackable trait declares and every class mixing it in implements.
     /// Same signature as the method it accesses; see the call site.
-    fn pickle_super_accessor(&mut self, method_id: SymbolId, owner_ref: u32, acc_name: &str) {
+    fn pickle_super_accessor(
+        &mut self,
+        method_id: SymbolId,
+        owner_ref: u32,
+        acc_name: &str,
+        params_override: Option<&[Type]>,
+    ) {
         // No alias, no accessor: nsc's unpickler asserts that every
         // SUPERACCESSOR carries one, and a member whose signature we could not
         // pickle has no entry to point at.
-        let alias = self
+        let method_owner = self.st.get(method_id).owner;
+        let alias = if self
             .sym_index
-            .get(&method_id.0)
-            .copied()
-            .unwrap_or_else(|| self.pickle_term_ref(method_id));
-        let (paramss, ret) = match &self.st.get(method_id).ty {
-            Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
-            other => (Vec::new(), other.clone()),
+            .get(&method_owner.0)
+            .is_some_and(|&owner| owner == owner_ref)
+        {
+            self.sym_index
+                .get(&method_id.0)
+                .copied()
+                .unwrap_or_else(|| self.pickle_term_ref(method_id))
+        } else {
+            let owner = self.external_class_ref(method_owner);
+            let name = self.st.get(method_id).name.clone();
+            self.ext_term_ref(&name, owner)
         };
-        let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+        let ret = method_ret_from_sym(self.st, method_id);
+        let params: Vec<Type> = params_override
+            .map(|params| params.to_vec())
+            .unwrap_or_else(|| method_params_from_sym(self.st, method_id));
         let name_ref = self.term_name(acc_name);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;

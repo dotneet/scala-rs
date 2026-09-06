@@ -170,7 +170,17 @@ pub(crate) fn emit_tail_call(
     if let Some(receiver) = receiver {
         gen_expr(asm, frame, ctx, receiver);
     }
-    gen_call_args(asm, frame, ctx, &args, &types, true, false, ctx.method_sym);
+    gen_call_args(
+        asm,
+        frame,
+        ctx,
+        &args,
+        &types,
+        true,
+        false,
+        ctx.method_sym,
+        false,
+    );
     for ((slot, sort), ty) in params.iter().zip(&types).rev() {
         if is_unit_like(ty) {
             asm.pop();

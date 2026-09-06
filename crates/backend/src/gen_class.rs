@@ -366,12 +366,18 @@ impl<'a> Gen<'a> {
                     }
                     let mut super_accesses = Vec::new();
                     collect_super_accesses(rhs, &mut super_accesses);
-                    for (super_name, super_sym) in super_accesses {
+                    for (super_name, super_sym, selected_params) in super_accesses {
                         let acc_name = super_accessor_name(self.st, class_id, &super_name);
                         let desc = if super_name == name.as_str() {
                             def_method_desc(self.st, stt)
                         } else if !super_sym.is_none() {
-                            method_desc_from_sym(self.st, super_sym)
+                            let params = selected_params
+                                .unwrap_or_else(|| method_params_from_sym(self.st, super_sym));
+                            jvm_method_desc(
+                                self.st,
+                                &params,
+                                &method_ret_from_sym(self.st, super_sym),
+                            )
                         } else {
                             def_method_desc(self.st, stt)
                         };

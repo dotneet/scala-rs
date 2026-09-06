@@ -287,6 +287,127 @@ fn super_accessor_skips_a_wrong_overload_in_linearization() {
 }
 
 #[test]
+fn generic_super_uses_the_receiver_resolved_override_family() {
+    let source = fixtures_dir().join("codegen_diag_super_generic.scala");
+    let out = tmp_dir("super-generic");
+    let output = compile(&[&source], &out);
+    assert!(
+        output.status.success(),
+        "generic super fixture failed to compile: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cp = out.to_str().expect("output path");
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", cp, "GenericMain"])
+        .output()
+        .expect("run generic super fixture");
+    assert!(
+        run.status.success(),
+        "generic super fixture failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let ours = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert_eq!(ours, "base\n");
+
+    if let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) {
+        let reference_out = tmp_dir("super-generic-scalac");
+        let scalac_output = Command::new(&scalac)
+            .args([
+                source.to_str().expect("source path"),
+                "-d",
+                reference_out.to_str().expect("reference path"),
+            ])
+            .output()
+            .expect("run scalac generic super fixture");
+        assert!(
+            scalac_output.status.success(),
+            "scalac oracle failed: {}",
+            String::from_utf8_lossy(&scalac_output.stderr)
+        );
+        let reference_cp = format!("{}:{}", reference_out.display(), jar.display());
+        let reference_run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &reference_cp, "GenericMain"])
+            .output()
+            .expect("run scalac generic super fixture");
+        assert!(
+            reference_run.status.success(),
+            "scalac oracle failed at runtime: {}",
+            String::from_utf8_lossy(&reference_run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&reference_run.stdout), ours);
+        let _ = fs::remove_dir_all(reference_out);
+    }
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
+fn generic_super_accessor_metadata_supports_a_scalac_consumer() {
+    let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip generic scalac consumer: Scala 2.13.16 tools are unavailable");
+        return;
+    };
+    let dir = tmp_dir("super-generic-consumer");
+    let base = dir.join("GenericBaseInterop.scala");
+    let layer = dir.join("GenericLayerInterop.scala");
+    fs::write(
+        &base,
+        "trait GenericBaseInterop[T] { def foo(t: T): String = \"base\" }\n",
+    )
+    .expect("write generic base");
+    fs::write(
+        &layer,
+        "trait GenericMiddleInterop extends GenericBaseInterop[Int] { def foo(s: String): String = \"middle-string\" }\ntrait GenericLayerInterop extends GenericBaseInterop[Int] { def helper: String = super.foo(1) }\n",
+    )
+    .expect("write generic layer");
+    let provider = dir.join("provider");
+    let output = compile(&[&base, &layer], &provider);
+    assert!(
+        output.status.success(),
+        "generic provider failed to compile: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let client = dir.join("GenericClientInterop.scala");
+    fs::write(
+        &client,
+        "class GenericClientInterop extends GenericLayerInterop\nobject GenericInteropMain { def main(args: Array[String]): Unit = println(new GenericClientInterop().helper) }\n",
+    )
+    .expect("write generic scalac consumer");
+    let consumer = dir.join("consumer");
+    fs::create_dir_all(&consumer).expect("create generic consumer directory");
+    let cp = format!("{}:{}", provider.display(), jar.display());
+    let scalac_output = Command::new(&scalac)
+        .args(["-cp", &cp, "-d", consumer.to_str().expect("consumer path")])
+        .arg(&client)
+        .output()
+        .expect("run generic scalac consumer");
+    assert!(
+        scalac_output.status.success(),
+        "generic scalac consumer failed: {}",
+        String::from_utf8_lossy(&scalac_output.stderr)
+    );
+    let java_cp = format!(
+        "{}:{}:{}",
+        consumer.display(),
+        provider.display(),
+        jar.display()
+    );
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &java_cp, "GenericInteropMain"])
+        .output()
+        .expect("run generic scalac consumer");
+    assert!(
+        run.status.success(),
+        "generic scalac consumer failed at runtime: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "base\n");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn qualified_and_nested_super_calls_keep_their_own_scope() {
     let source = fixtures_dir().join("codegen_diag_super_scope.scala");
     let out = tmp_dir("super-scope");

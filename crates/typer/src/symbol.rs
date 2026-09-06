@@ -588,7 +588,12 @@ pub struct SymbolTable {
     /// Source-trait `super` targets that have no declaration in that trait.
     /// The backend pickles these as `SUPERACCESSOR` aliases so scalac's mixin
     /// phase can synthesize the forwarding method in an external subclass.
-    pub super_accessor_targets: rustc_hash::FxHashMap<SymbolId, Vec<SymbolId>>,
+    pub super_accessor_targets: rustc_hash::FxHashMap<SymbolId, Vec<(SymbolId, Vec<Type>)>>,
+    /// Source method identities that were proven to be overrides before
+    /// erasure.  Backend dispatch must not rediscover this relation from the
+    /// erased JVM types: a generic base and an unrelated overload can erase
+    /// to the same descriptor.
+    pub method_override_families: rustc_hash::FxHashSet<(SymbolId, SymbolId)>,
     /// Terms whose pre-erasure type was a user value class, and which one.
     /// Erasure replaces the type with the underlying representation, but the
     /// backend still has to know that `case class Box(m: Meters)` prints its
@@ -783,6 +788,7 @@ impl SymbolTable {
             owner: SymbolId(0),
             this_class: SymbolId(0),
             super_accessor_targets: rustc_hash::FxHashMap::default(),
+            method_override_families: rustc_hash::FxHashSet::default(),
             value_class_terms: rustc_hash::FxHashMap::default(),
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),

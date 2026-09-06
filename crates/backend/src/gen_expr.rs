@@ -1562,7 +1562,14 @@ pub(crate) fn gen_select(
                     }
                 }
                 if matches!(qual.kind, TreeKind::Super { .. }) {
-                    invoke_super(asm, ctx, tree.sym, super_is_qualified(qual));
+                    let selected_params = method_param_types(&tree.ty);
+                    invoke_super(
+                        asm,
+                        ctx,
+                        tree.sym,
+                        super_is_qualified(qual),
+                        selected_params.as_deref(),
+                    );
                 } else if matches!(ic, Intrinsic::AnyHash) {
                     emit_any_hash(asm, &qual.ty);
                 } else if matches!(ic, Intrinsic::GetClass) {
@@ -1961,6 +1968,7 @@ pub(crate) fn gen_new(
             ctx.library_abi,
             java_varargs,
             ctor_sym,
+            false,
         );
     } else {
         for (i, a) in args.iter().enumerate() {
@@ -2654,7 +2662,17 @@ pub(crate) fn gen_apply(
                 "update" => &[Type::Int, Type::Any],
                 _ => &[],
             };
-            gen_call_args(asm, frame, ctx, args, ptys, true, false, SymbolId::NONE);
+            gen_call_args(
+                asm,
+                frame,
+                ctx,
+                args,
+                ptys,
+                true,
+                false,
+                SymbolId::NONE,
+                false,
+            );
             match name.as_str() {
                 "apply" => {
                     let d = "(Ljava/lang/Object;I)Ljava/lang/Object;";
@@ -2723,7 +2741,21 @@ pub(crate) fn gen_apply(
             box_value_class_receiver(asm, ctx, owner, qual);
         }
     }
-    let param_tys: Vec<Type> = if !fun.sym.is_none() {
+    let interface_super =
+        fun_is_super(fun) && !super_is_qualified(fun) && is_interface_sym(ctx.st, ctx.class_sym);
+    let param_tys: Vec<Type> = if interface_super {
+        method_param_types(&fun.ty).unwrap_or_else(|| {
+            if !fun.sym.is_none() {
+                match &ctx.st.get(fun.sym).ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    Type::Function { params, .. } => params.clone(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        })
+    } else if !fun.sym.is_none() {
         match &ctx.st.get(fun.sym).ty {
             Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
             Type::Function { params, .. } => params.clone(),
@@ -2758,6 +2790,7 @@ pub(crate) fn gen_apply(
         value_owner.is_some() || (ctx.library_abi && !array_elem_op),
         java_varargs,
         fun.sym,
+        interface_super,
     );
     if let TreeKind::Select { qual, name } = &fun.kind {
         if name == "apply" && matches!(qual.ty, Type::Array(_)) {
@@ -2821,7 +2854,18 @@ pub(crate) fn gen_apply(
         }
     }
     if fun_is_super(fun) {
-        invoke_super(asm, ctx, fun.sym, super_is_qualified(fun));
+        let selected_params = if interface_super {
+            method_param_types(&fun.ty)
+        } else {
+            None
+        };
+        invoke_super(
+            asm,
+            ctx,
+            fun.sym,
+            super_is_qualified(fun),
+            selected_params.as_deref(),
+        );
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {
@@ -2847,7 +2891,21 @@ pub(crate) fn super_is_qualified(fun: &Tree) -> bool {
     )
 }
 
-pub(crate) fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, qualified: bool) {
+fn method_param_types(ty: &Type) -> Option<Vec<Type>> {
+    match ty {
+        Type::Method { paramss, .. } => Some(paramss.iter().flatten().cloned().collect()),
+        Type::Function { params, .. } => Some(params.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn invoke_super(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    id: SymbolId,
+    qualified: bool,
+    selected_params: Option<&[Type]>,
+) {
     let s = ctx.st.get(id);
     let desc = method_desc_from_sym(ctx.st, id);
     if qualified {
@@ -2870,8 +2928,8 @@ pub(crate) fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, qua
         // inherited `insertAll(Iterable, RowsPerStatement)` from `Rps` to
         // `Rps$One$`; calling the accessor at the parent's descriptor found no
         // such method.
-        let acc_desc = if !ctx.method_sym.is_none() && ctx.st.get(ctx.method_sym).name == s.name {
-            method_desc_from_sym(ctx.st, ctx.method_sym)
+        let acc_desc = if let Some(params) = selected_params {
+            jvm_method_desc(ctx.st, params, &method_ret_from_sym(ctx.st, id))
         } else {
             desc
         };

@@ -12,7 +12,7 @@ use crate::classfile::{
 use crate::gen::*;
 use crate::ifacebridge::BridgeKind;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::SymKind;
+use scala_rs_typer::{method_overrides, SymKind};
 use std::collections::{HashMap, HashSet};
 
 impl<'a> Gen<'a> {
@@ -812,18 +812,33 @@ impl<'a> Gen<'a> {
             // entry per member whose body writes `super.m`; a trait read from
             // `-cp` contributes one per accessor its *interface* declares,
             // which is the same set as far as the class is concerned.
-            let mut owed: Vec<(String, String, String, String, SymbolId, Vec<Type>, Type)> =
-                Vec::new();
+            let mut owed: Vec<(
+                String,
+                String,
+                String,
+                String,
+                SymbolId,
+                Vec<Type>,
+                Vec<Type>,
+                Type,
+            )> = Vec::new();
             match self.traits.impls.get(parent) {
                 Some(methods) => {
                     let mut seen = HashSet::new();
                     for m in methods {
                         let mut accesses = Vec::new();
                         collect_super_accesses(m, &mut accesses);
-                        for (name, target) in accesses {
+                        for (name, target, selected_params) in accesses {
                             if name.is_empty() || target.is_none() {
                                 continue;
                             }
+                            let target_params = selected_params
+                                .unwrap_or_else(|| method_params_from_sym(self.st, target));
+                            let target_desc = jvm_method_desc(
+                                self.st,
+                                &target_params,
+                                &method_ret_from_sym(self.st, target),
+                            );
                             let (desc, pts, ret) = if m.name() == Some(name.as_str()) {
                                 (
                                     def_method_desc(self.st, m),
@@ -832,14 +847,13 @@ impl<'a> Gen<'a> {
                                 )
                             } else if !target.is_none() {
                                 (
-                                    method_desc_from_sym(self.st, target),
-                                    method_params_from_sym(self.st, target),
+                                    target_desc.clone(),
+                                    target_params.clone(),
                                     method_ret_from_sym(self.st, target),
                                 )
                             } else {
                                 continue;
                             };
-                            let target_desc = method_desc_from_sym(self.st, target);
                             if !seen.insert((name.clone(), desc.clone())) {
                                 continue;
                             }
@@ -849,6 +863,7 @@ impl<'a> Gen<'a> {
                                 desc,
                                 target_desc,
                                 target,
+                                target_params,
                                 pts,
                                 ret,
                             ));
@@ -869,12 +884,13 @@ impl<'a> Gen<'a> {
                             desc,
                             acc,
                             method_params_from_sym(self.st, acc),
+                            method_params_from_sym(self.st, acc),
                             method_ret_from_sym(self.st, acc),
                         ));
                     }
                 }
             }
-            for (name, acc, inst_desc, target_desc, target_id, pts, ret) in owed {
+            for (name, acc, inst_desc, target_desc, target_id, _target_params, pts, ret) in owed {
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 for p in &pts {
@@ -891,9 +907,9 @@ impl<'a> Gen<'a> {
                 // refined abstract type member (`type RowsPerStatement =
                 // One.type` over `>: One.type <: RowsPerStatement`) makes the
                 // two differ. Call the target at *its* descriptor.
-                let call_desc = self
+                let (call_desc, call_params) = self
                     .super_target_desc(target, &name, pts.len(), &target_desc, target_id)
-                    .unwrap_or_else(|| inst_c.clone());
+                    .unwrap_or_else(|| (inst_c.clone(), pts.clone()));
                 if target.is_none() {
                     report_emit_error(
                         &self.emit_errors,
@@ -904,8 +920,14 @@ impl<'a> Gen<'a> {
                 let call_c = call_desc.clone();
                 b.add_code(ACC_PUBLIC, &acc_c, &inst_c, locals.max(1), |asm| {
                     asm.aload(0);
-                    for (slot, sort) in &loads {
+                    for (i, (slot, sort)) in loads.iter().enumerate() {
                         load(asm, *slot, *sort);
+                        if let Some(to) = call_params.get(i) {
+                            if jvm_desc(self.st, &pts[i]) != jvm_desc(self.st, to) {
+                                let adapt = param_adapt(self.st, &pts[i], to);
+                                emit_adapt(asm, &adapt);
+                            }
+                        }
                     }
                     match target {
                         Some((next, true)) => {
@@ -941,42 +963,11 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// A type parameter or abstract type member can change the target's
-    /// source parameter type when the receiver is seen through a concrete
-    /// parent instantiation. The erased descriptor may then differ from the
-    /// target symbol's raw descriptor, but that is the only permitted
-    /// descriptor fallback here. A concrete `Int` target must never fall back
-    /// to an unrelated same-name `String` overload.
-    fn super_params_compatible(&self, target_id: SymbolId, candidate: &[Type]) -> bool {
-        let expected = method_params_from_sym(self.st, target_id);
-        let abstract_mask = self
-            .st
-            .erased_abstract_params
-            .get(&target_id)
-            .copied()
-            .unwrap_or(0);
-        expected.len() == candidate.len()
-            && expected
-                .iter()
-                .zip(candidate)
-                .enumerate()
-                .all(|(i, (e, c))| {
-                    e == c
-                        || jvm_desc(self.st, e) == jvm_desc(self.st, c)
-                        || (i < 32 && abstract_mask & (1 << i) != 0)
-                        || matches!(
-                            e,
-                            Type::TypeParam(_)
-                                | Type::TypeMember(_)
-                                | Type::Wildcard
-                                | Type::BoundedWildcard { .. }
-                        )
-                })
-    }
-
     /// The descriptor the `super` target was compiled with, when it can be
     /// found. `arity` disambiguates overloads; the target symbol permits only
-    /// generic receiver substitution as a fallback.
+    /// the selected source declaration (or one of its real overrides) as a
+    /// fallback. The override relation comes from the typer's pre-erasure
+    /// receiver substitution and method type-parameter alignment.
     pub(crate) fn super_target_desc(
         &self,
         target: Option<(SymbolId, bool)>,
@@ -984,7 +975,7 @@ impl<'a> Gen<'a> {
         arity: usize,
         expected_desc: &str,
         target_id: SymbolId,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<Type>)> {
         match target? {
             (next, true) => match self.traits.impls.get(&next) {
                 Some(ms) => ms
@@ -999,13 +990,10 @@ impl<'a> Gen<'a> {
                         ms.iter().find(|m| {
                             m.name() == Some(method)
                                 && def_param_types(self.st, m).len() == arity
-                                && self.super_params_compatible(
-                                    target_id,
-                                    &def_param_types(self.st, m),
-                                )
+                                && method_overrides(self.st, m.sym, target_id)
                         })
                     })
-                    .map(|m| def_method_desc(self.st, m)),
+                    .map(|m| (def_method_desc(self.st, m), def_param_types(self.st, m))),
                 // A trait read from `-cp`: its interface carries the
                 // descriptor the trait was compiled with.
                 None => self
@@ -1030,13 +1018,15 @@ impl<'a> Gen<'a> {
                             mem.name == method
                                 && mem.kind == SymKind::Method
                                 && param_count(self.st, mid) == arity
-                                && self.super_params_compatible(
-                                    target_id,
-                                    &method_params_from_sym(self.st, mid),
-                                )
+                                && method_overrides(self.st, mid, target_id)
                         })
                     })
-                    .map(|mid| method_desc_from_sym(self.st, mid)),
+                    .map(|mid| {
+                        (
+                            method_desc_from_sym(self.st, mid),
+                            method_params_from_sym(self.st, mid),
+                        )
+                    }),
             },
             (next, false) => self
                 .st
@@ -1061,13 +1051,15 @@ impl<'a> Gen<'a> {
                             && mem.kind == SymKind::Method
                             && !mem.flags.contains(Flags::ABSTRACT)
                             && param_count(self.st, mid) == arity
-                            && self.super_params_compatible(
-                                target_id,
-                                &method_params_from_sym(self.st, mid),
-                            )
+                            && method_overrides(self.st, mid, target_id)
                     })
                 })
-                .map(|mid| method_desc_from_sym(self.st, mid)),
+                .map(|mid| {
+                    (
+                        method_desc_from_sym(self.st, mid),
+                        method_params_from_sym(self.st, mid),
+                    )
+                }),
         }
     }
 
@@ -1092,7 +1084,7 @@ impl<'a> Gen<'a> {
                     desc_params(&def_method_desc(self.st, m)) == desc_params(expected_desc)
                 }) || methods
                     .iter()
-                    .any(|m| self.super_params_compatible(target_id, &def_param_types(self.st, m)))
+                    .any(|m| method_overrides(self.st, m.sym, target_id))
                 {
                     return Some((s, true));
                 }
@@ -1113,9 +1105,10 @@ impl<'a> Gen<'a> {
                     .collect();
                 if methods.iter().any(|&mid| {
                     desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
-                }) || methods.iter().any(|&mid| {
-                    self.super_params_compatible(target_id, &method_params_from_sym(self.st, mid))
-                }) {
+                }) || methods
+                    .iter()
+                    .any(|&mid| method_overrides(self.st, mid, target_id))
+                {
                     return Some((s, true));
                 }
             }
@@ -1135,9 +1128,10 @@ impl<'a> Gen<'a> {
                     .collect();
                 if methods.iter().any(|&mid| {
                     desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
-                }) || methods.iter().any(|&mid| {
-                    self.super_params_compatible(target_id, &method_params_from_sym(self.st, mid))
-                }) {
+                }) || methods
+                    .iter()
+                    .any(|&mid| method_overrides(self.st, mid, target_id))
+                {
                     return Some((s, false));
                 }
             }

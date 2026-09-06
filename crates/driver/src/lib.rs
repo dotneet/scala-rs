@@ -344,6 +344,11 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             for u in units.iter() {
                 add_value_class_companions(&u.tree, &mut st);
             }
+            // Freeze source override identities while method types still
+            // carry receiver and method type parameters. Backend mixin
+            // dispatch runs after erasure and reads this table instead of
+            // inferring a family from erased descriptors.
+            scala_rs_typer::record_method_override_families(&mut st);
             // nsc `superaccessors`, likewise before `pickler`: which trait
             // members write `super.m` decides which `T$$super$m` members the
             // signature declares, and a reader implements exactly those.
