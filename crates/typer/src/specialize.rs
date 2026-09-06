@@ -13,6 +13,157 @@ use scala_rs_parser::{Flags, SpecializedType, SymbolId, Tree, TreeKind, Type};
 
 use crate::symbol::{MethodVariant, SymKind, SymbolTable};
 
+#[cfg(test)]
+mod traversal_tests {
+    use super::*;
+
+    fn reference(sym: SymbolId, ty: Type) -> Tree {
+        let mut tree = Tree::dummy(TreeKind::Ident { name: "X".into() });
+        tree.sym = sym;
+        tree.ty = ty;
+        tree
+    }
+
+    fn type_def(name: &str, sym: SymbolId, tparams: Vec<Tree>, rhs: Tree) -> Tree {
+        let mut tree = Tree::dummy(TreeKind::TypeDef {
+            mods: Default::default(),
+            name: name.into(),
+            tparams,
+            rhs: Box::new(rhs),
+            lo: None,
+            hi: None,
+            views: vec![],
+            ctx_bounds: vec![],
+        });
+        tree.sym = sym;
+        tree
+    }
+
+    #[test]
+    fn local_self_type_tree_and_symbol_share_the_cloned_class() {
+        let mut st = SymbolTable::new();
+        let method = st.alloc("f", st.root, SymKind::Method, Flags::EMPTY, "");
+        let variant = st.alloc("f$mIc$sp", st.root, SymKind::Method, Flags::EMPTY, "");
+        let local = st.alloc("Local", method, SymKind::Class, Flags::EMPTY, "Local$1");
+        let self_type = Type::Class {
+            sym: local,
+            args: vec![],
+        };
+        st.get_mut(local).self_type = Some(self_type.clone());
+        let mut tree = Tree::dummy(TreeKind::ClassDef {
+            mods: Default::default(),
+            name: "Local".into(),
+            tparams: vec![],
+            ctor_mods: Default::default(),
+            vparamss: vec![],
+            impl_: scala_rs_parser::Template {
+                parents: vec![],
+                self_name: Some("self".into()),
+                self_tpt: Some(Box::new(reference(local, self_type.clone()))),
+                body: vec![],
+                span: scala_rs_span::Span::DUMMY,
+            },
+        });
+        tree.sym = local;
+        let map = clone_variant_symbols(&tree, &mut st, method, variant, &Type::Int);
+        substitute_tree_types(&mut tree, &st, method, &Type::Int);
+        remap_tree_symbols(&mut tree, &map, method);
+        let cloned = map[&local];
+        let expected = Type::Class {
+            sym: cloned,
+            args: vec![],
+        };
+        assert_eq!(tree.sym, cloned);
+        assert_eq!(st.get(cloned).owner, variant);
+        assert_eq!(st.get(cloned).self_type, Some(expected.clone()));
+        assert_eq!(st.get(local).self_type, Some(self_type));
+        let TreeKind::ClassDef { impl_, .. } = &tree.kind else {
+            panic!("expected class");
+        };
+        let self_tpt = impl_.self_tpt.as_ref().unwrap();
+        assert_eq!(self_tpt.sym, cloned);
+        assert_eq!(self_tpt.ty, expected);
+    }
+
+    // These edges do not all survive erasure. Inspect the typed graph itself,
+    // so a JVM output test cannot conceal references to generic local symbols.
+    #[test]
+    fn local_type_parameter_owners_and_all_bound_edges_are_remapped() {
+        let mut st = SymbolTable::new();
+        let method = st.alloc("f", st.root, SymKind::Method, Flags::EMPTY, "");
+        let a = st.alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(method).tparams = vec![a];
+        let variant = st.alloc("f$mIc$sp", st.root, SymKind::Method, Flags::EMPTY, "");
+        let alias = st.alloc("Higher", method, SymKind::TypeMember, Flags::EMPTY, "");
+        let x = st.alloc("X", alias, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(alias).tparams = vec![x];
+        st.get_mut(alias).ty = Type::TypeParam(x);
+        st.get_mut(x).bound_hi = Some(Type::TypeParam(a));
+        let param = type_def("X", x, vec![], Tree::dummy(TreeKind::Empty));
+        let edge = || reference(x, Type::TypeParam(a));
+        let mut tree = type_def("Higher", alias, vec![param], edge());
+        if let TreeKind::TypeDef {
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            rhs,
+            ..
+        } = &mut tree.kind
+        {
+            *lo = Some(Box::new(edge()));
+            *hi = Some(Box::new(edge()));
+            *views = vec![edge()];
+            *ctx_bounds = vec![edge()];
+            *rhs = Box::new(Tree::dummy(TreeKind::AnnotatedTypeTree {
+                tpt: Box::new(edge()),
+                annot: Box::new(edge()),
+            }));
+        }
+        let map = clone_variant_symbols(&tree, &mut st, method, variant, &Type::Int);
+        substitute_tree_types(&mut tree, &st, method, &Type::Int);
+        remap_tree_symbols(&mut tree, &map, method);
+        let cloned_alias = map[&alias];
+        let cloned_x = map[&x];
+        assert_ne!(cloned_alias, alias);
+        assert_ne!(cloned_x, x);
+        assert_eq!(st.get(cloned_alias).owner, variant);
+        assert_eq!(st.get(cloned_x).owner, cloned_alias);
+        assert_eq!(st.get(cloned_alias).tparams, vec![cloned_x]);
+        assert_eq!(st.get(cloned_alias).ty, Type::TypeParam(cloned_x));
+        assert_eq!(st.get(cloned_x).bound_hi, Some(Type::Int));
+        assert_eq!(st.get(x).bound_hi, Some(Type::TypeParam(a)));
+        assert_eq!(tree.sym, cloned_alias);
+        let TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            ..
+        } = &tree.kind
+        else {
+            panic!("expected alias");
+        };
+        assert_eq!(tparams[0].sym, cloned_x);
+        let TreeKind::AnnotatedTypeTree { tpt, annot } = &rhs.kind else {
+            panic!("expected annotated rhs");
+        };
+        for edge in [
+            tpt.as_ref(),
+            annot.as_ref(),
+            lo.as_deref().unwrap(),
+            hi.as_deref().unwrap(),
+            &views[0],
+            &ctx_bounds[0],
+        ] {
+            assert_eq!(edge.sym, cloned_x);
+            assert_eq!(edge.ty, Type::Int);
+        }
+    }
+}
+
 /// Add eligible primitive method variants to definitions in `tree`.
 ///
 /// This is separate from [`rewrite_specialized_calls`] because a source unit

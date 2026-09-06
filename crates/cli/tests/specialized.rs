@@ -753,10 +753,7 @@ object NestedLocalTypesMain {
 /// descriptor instead of sharing the generic symbols.
 #[test]
 fn method_specialization_type_tree_traversal_fixture() {
-    let Some(jar) = scala_library_jar() else {
-        eprintln!("skip type-tree traversal fixture: scala-library unavailable");
-        return;
-    };
+    let jar = scala_library_jar().expect("type-tree traversal requires scala-library");
     let root = tmp_dir("method-specialization-type-tree-traversal");
     let src = root.join("TraversalAbi.scala");
     fs::write(
@@ -836,7 +833,11 @@ object TraversalAbiMain {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n8\ns\n");
 
     let scalac = Path::new("/tmp/scala-2.13.16/bin/scalac");
-    if scalac.is_file() {
+    assert!(
+        scalac.is_file(),
+        "type-tree traversal requires scalac 2.13.16"
+    );
+    {
         let nsc = root.join("nsc");
         fs::create_dir_all(&nsc).unwrap();
         let status = Command::new(scalac)
