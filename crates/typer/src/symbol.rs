@@ -2383,6 +2383,28 @@ impl SymbolTable {
         None
     }
 
+    /// Repeated element type from the primary constructor, before its
+    /// parameter field is viewed as Seq[T] inside the class.
+    pub fn repeated_case_element(&self, class: SymbolId) -> Option<Type> {
+        let fields = &self.get(class).ctor_fields;
+        let last = *fields.last()?;
+        if let Type::Repeated(elem) = &self.get(last).ty {
+            return Some((**elem).clone());
+        }
+        self.get(class).members.iter().find_map(|&id| {
+            let ctor = self.get(id);
+            if ctor.name != "<init>" || !ctor.params.starts_with(fields) {
+                return None;
+            }
+            if let Type::Method { paramss, .. } = &ctor.ty {
+                if let Some(Type::Repeated(elem)) = paramss.iter().flatten().nth(fields.len() - 1) {
+                    return Some((**elem).clone());
+                }
+            }
+            None
+        })
+    }
+
     /// Base types of `t` (its parents, transitively), most specific first,
     /// with the owning class's type parameters substituted away.
     /// `t` itself is not included.

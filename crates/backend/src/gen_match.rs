@@ -266,7 +266,10 @@ pub(crate) fn gen_ctor_fields_pattern(
     } else {
         ctx.st.get(class_id).ctor_fields.clone()
     };
-    for (i, a) in args.iter().enumerate() {
+    let repeated = !class_id.is_none() && ctx.st.repeated_case_element(class_id).is_some();
+    // Even an empty repeated tail needs a length check on the stored Seq.
+    let count = args.len().max(if repeated { fields.len() } else { 0 });
+    for i in 0..count {
         if let Some(fid) = fields.get(i) {
             let fs = ctx.st.get(*fid);
             let fname = fs.name.clone();
@@ -303,6 +306,16 @@ pub(crate) fn gen_ctor_fields_pattern(
                 Some(a) => asm.invokevirtual(&jvm, &a, &acc_desc),
                 None => emit_getfield(asm, &jvm, &fname, &fdesc),
             }
+            if repeated && i + 1 == fields.len() {
+                let tail = args.get(i..).unwrap_or(&[]);
+                if ctx.library_abi {
+                    gen_unapply_wrapper_bind(asm, frame, ctx, tail, fail, SeqPatShape::SeqOps);
+                } else {
+                    gen_unapply_seq_bind(asm, frame, ctx, tail, fail);
+                }
+                return;
+            }
+            let a = &args[i];
             // A field declared as a type parameter erases to Object, so
             // `case Some(x)` on an `Option[Int]` must unbox before it
             // binds. A sub-pattern that *tests* must not be narrowed

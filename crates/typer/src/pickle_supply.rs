@@ -368,6 +368,34 @@ impl PickleSupply {
         std::mem::take(&mut self.unresolved_refs)
     }
 
+    /// Complete only variance from ScalaSignature. JVM signatures lack it,
+    /// including for parent classes reached without a member lookup.
+    pub fn complete_class_variance(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) {
+        if class_sym.is_none() || st.source_classes.contains(&class_sym) {
+            return;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        let module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, module) else {
+            return;
+        };
+        let Ok(sig) = self.sigs.class_sig(&mut BinSource(bin), &full, module) else {
+            return;
+        };
+        let ids = st.get(class_sym).tparams.clone();
+        if ids.len() != sig.tparams.len() {
+            return;
+        }
+        for (id, tp) in ids.into_iter().zip(&sig.tparams) {
+            st.get_mut(id).flags = st.get(id).flags.with(variance_flags(tp));
+        }
+    }
+
     /// Re-read a class just loaded from a `-cp` classfile from its own pickle.
     ///
     /// `install_java_class_in` builds the symbol out of the JVM *generic

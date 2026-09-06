@@ -482,12 +482,14 @@ impl Typer {
                 // the constructor only wins when its arity fits; otherwise the
                 // extractor branches below get their turn. A repeated last
                 // parameter takes any number.
+                let repeated_elem = class_id.and_then(|c| self.st.repeated_case_element(c));
                 let ctor_fits = class_id.is_some_and(|c| {
                     let fields = &self.st.get(c).ctor_fields;
-                    args.len() == fields.len()
-                        || fields
-                            .last()
-                            .is_some_and(|f| matches!(self.st.get(*f).ty, Type::Repeated(_)))
+                    if repeated_elem.is_some() {
+                        args.len() >= fields.len() - 1
+                    } else {
+                        args.len() == fields.len()
+                    }
                 });
                 let has_extractor = unapply.is_some() || unapply_seq.is_some();
                 // SLS 8.1.6/8.1.7: only a *case* class has a constructor
@@ -502,7 +504,8 @@ impl Typer {
                 // The `ctor_fields`-only arm stays for a class with no
                 // extractor at all, which is where it was needed.
                 let is_case = class_id.is_some_and(|c| self.st.get(c).flags.contains(Flags::CASE));
-                let use_ctor = !has_star
+                let repeated_case = is_case && repeated_elem.is_some();
+                let use_ctor = (!has_star || repeated_case)
                     && class_id.is_some_and(|c| {
                         let s = self.st.get(c);
                         s.flags.contains(Flags::CASE) || !s.ctor_fields.is_empty()
@@ -534,14 +537,28 @@ impl Typer {
                         args: cargs.clone(),
                     };
                     for (i, a) in args.iter_mut().enumerate() {
-                        let ft = fields
-                            .get(i)
-                            .map(|f| self.st.get(*f).ty.clone())
-                            .unwrap_or(Type::Any);
+                        let ft = if i + 1 >= fields.len() && repeated_elem.is_some() {
+                            Type::Repeated(Box::new(repeated_elem.clone().unwrap()))
+                        } else {
+                            fields
+                                .get(i)
+                                .map(|f| self.st.get(*f).ty.clone())
+                                .unwrap_or(Type::Any)
+                        };
                         let ft = if cargs.is_empty() {
                             ft
                         } else {
                             self.st.subst_tparams(class_id, &cargs, &ft)
+                        };
+                        let ft = match ft {
+                            Type::Repeated(elem) if pattern_has_star(a) => {
+                                self.seq_of(&elem).unwrap_or(Type::Class {
+                                    sym: self.st.list_sym,
+                                    args: vec![*elem],
+                                })
+                            }
+                            Type::Repeated(elem) => *elem,
+                            ft => ft,
                         };
                         self.type_pattern(a, &ft);
                     }
@@ -682,6 +699,16 @@ impl Typer {
                 let ty = self.tree_to_type(tpt);
                 self.pattern_tpt = saved;
                 let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
+                if !self.typed_pattern_compatible(&ty, sel_ty) {
+                    self.error(
+                        tpt.span,
+                        format!(
+                            "pattern type {} is incompatible with scrutinee type {}",
+                            self.st.display_type(&ty),
+                            self.st.display_type(sel_ty)
+                        ),
+                    );
+                }
                 self.type_pattern(expr, &ty);
                 pat.ty = ty;
             }
@@ -695,6 +722,104 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
         }
+    }
+
+    /// Decide whether the two types can have a common instance. Unlike an
+    /// assignment, a type test permits narrowing and unrelated open traits.
+    fn typed_pattern_compatible(&mut self, pattern: &Type, scrutinee: &Type) -> bool {
+        fn upper(typer: &Typer, ty: &Type) -> Type {
+            let mut ty = typer.st.dealias(ty).widen_constant();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                ty = match ty {
+                    Type::TypeParam(id) | Type::TypeMember(id) if seen.insert(id) => {
+                        typer.st.get(id).bound_hi.clone().unwrap_or(Type::Any)
+                    }
+                    Type::Annotated { tpe, .. } => *tpe,
+                    _ => return ty,
+                };
+                ty = typer.st.dealias(&ty);
+            }
+        }
+        fn uncertain(ty: &Type) -> bool {
+            sig_has_abstract_type(ty)
+                || type_mentions_wildcard(ty)
+                || type_mentions_unresolved(ty)
+                || matches!(ty, Type::NoType)
+        }
+        fn erased_args(ty: &Type) -> Type {
+            match ty {
+                Type::Class { sym, args } => Type::Class {
+                    sym: *sym,
+                    args: vec![Type::Wildcard; args.len()],
+                },
+                _ => ty.clone(),
+            }
+        }
+        let p = upper(self, pattern);
+        let s = upper(self, scrutinee);
+        if p.is_error() || p.is_no_type() || s.is_error() || s.is_no_type() {
+            return true;
+        }
+        // No instance can inherit the same invariant base twice with
+        // different concrete arguments, even when neither class is final.
+        let mut pb = self.st.base_type_seq(&p);
+        let mut sb = self.st.base_type_seq(&s);
+        pb.push(p.clone());
+        sb.push(s.clone());
+        // JVM signatures cannot encode variance. Parent classes may only
+        // have that provisional metadata until a member is requested.
+        let classes: std::collections::HashSet<_> = pb
+            .iter()
+            .chain(&sb)
+            .filter_map(|t| {
+                if let Type::Class { sym, .. } = t {
+                    Some(*sym)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for class in classes {
+            self.pickle
+                .complete_class_variance(&mut self.st, &mut self.binary, class);
+        }
+        for a in &pb {
+            let Type::Class { sym: ac, args: aa } = a else {
+                continue;
+            };
+            for b in &sb {
+                let Type::Class { sym: bc, args: ba } = b else {
+                    continue;
+                };
+                if ac != bc {
+                    continue;
+                }
+                for ((x, y), tp) in aa.iter().zip(ba).zip(&self.st.get(*ac).tparams) {
+                    let f = self.st.get(*tp).flags;
+                    if !f.contains(Flags::COVARIANT)
+                        && !f.contains(Flags::CONTRAVARIANT)
+                        && !uncertain(x)
+                        && !uncertain(y)
+                        && !(self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        if let (Type::Array(a), Type::Array(b)) = (&p, &s) {
+            if !uncertain(a) && !uncertain(b) {
+                return self.st.is_sub_type(a, b) && self.st.is_sub_type(b, a);
+            }
+            return self.typed_pattern_compatible(a, b);
+        }
+        // Abstract arguments can be instantiated by the pattern. Concrete
+        // arguments must still conform when either class is final; erasure
+        // does not make a fruitless final-class test legal.
+        let p = if uncertain(&p) { erased_args(&p) } else { p };
+        let s = if uncertain(&s) { erased_args(&s) } else { s };
+        self.stable_pattern_compatible(&p, &s)
     }
 
     /// nsc's `inferTypedPattern`: `case a: T[?, …]` keeps whatever the
