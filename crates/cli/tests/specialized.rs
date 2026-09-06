@@ -396,6 +396,8 @@ object MixedOps {
 
   def poly[@specialized(Int, Long) A](a: A, n: Int): String =
     if (n == 0) a.toString else poly[String]("ok", 0)
+
+  def unused[@specialized(Int, Long) A](x: Int): Int = x
 }
 
 class NonFinalHost {
@@ -409,6 +411,7 @@ object MethodAbiMain {
     if (MixedOps.recurse(9) != 9) throw new RuntimeException("recursive")
     if (MixedOps.poly(1, 1) != "ok") throw new RuntimeException("poly-int")
     if (MixedOps.poly(2L, 1) != "ok") throw new RuntimeException("poly-long")
+    if (MixedOps.unused(3) != 3) throw new RuntimeException("unused")
     println("method-specialization-ok")
   }
 }
@@ -446,6 +449,10 @@ object MethodAbiMain {
     assert!(
         module.contains("poly$mIc$sp") && module.contains("poly$mJc$sp"),
         "missing polymorphic-recursion variants: {module}"
+    );
+    assert!(
+        !module.contains("unused$mIc$sp") && !module.contains("unused$mJc$sp"),
+        "unused type parameter unexpectedly specialized: {module}"
     );
     assert!(
         module.contains("<A> A id(A)"),
@@ -492,11 +499,14 @@ object MethodAbiMain {
   def r: Int = MixedOps.recurse(9)
   def p: String = MixedOps.poly(1, 1)
   def q: String = MixedOps.poly(2L, 1)
+  def u: Int = MixedOps.unused(3)
+  def ui: Int = MixedOps.unused[Int](4)
+  def ul: Int = MixedOps.unused[Long](5)
 
   def main(args: Array[String]): Unit = {
-    if (i != 7 || j != 7L || d != 1.0 || r != 9 || p != "ok" || q != "ok")
-      throw new RuntimeException(s"$i:$j:$d:$r:$p:$q")
-    println(s"$i:$j:$d:$r:$p:$q")
+    if (i != 7 || j != 7L || d != 1.0 || r != 9 || p != "ok" || q != "ok" || u != 3 || ui != 4 || ul != 5)
+      throw new RuntimeException(s"$i:$j:$d:$r:$p:$q:$u:$ui:$ul")
+    println(s"$i:$j:$d:$r:$p:$q:$u:$ui:$ul")
   }
 }
 "#,
@@ -533,6 +543,12 @@ object MethodAbiMain {
             !consumer.contains("id$mDc$sp"),
             "scalac selected an unadvertised Double variant: {consumer}"
         );
+        assert!(
+            consumer.contains("MixedOps$.unused:(I)I")
+                && !consumer.contains("unused$mIc$sp")
+                && !consumer.contains("unused$mJc$sp"),
+            "scalac did not retain the unused-parameter generic fallback: {consumer}"
+        );
         let consumer_run = Command::new("java")
             .args([
                 "-Xverify:all",
@@ -554,7 +570,7 @@ object MethodAbiMain {
         );
         assert_eq!(
             String::from_utf8_lossy(&consumer_run.stdout),
-            "7:7:1.0:9:ok:ok\n"
+            "7:7:1.0:9:ok:ok:3:4:5\n"
         );
     } else {
         eprintln!("skip scalac separate consumer: /tmp/scala-2.13.16/bin/scalac unavailable");

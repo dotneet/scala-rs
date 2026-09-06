@@ -237,6 +237,13 @@ fn build_variants(def: &Tree, st: &mut SymbolTable) -> Vec<Tree> {
         return Vec::new();
     }
     let original_ty = method.ty.clone();
+    // nsc does not materialize entries when the type parameter is unused.
+    // Without this guard Int and Long produce the same JVM signature, and an
+    // inferred call with no surviving type argument would accidentally pick
+    // the first entry; the duplicate-signature case is guarded below too.
+    if st.subst_tparams(original, &[Type::Int], &original_ty) == original_ty {
+        return Vec::new();
+    }
     let original_params = method.params.clone();
     let original_paramss = method.paramss.clone();
     let original_flags = method.flags;
@@ -866,10 +873,18 @@ fn variant_for_method_type(
     original: SymbolId,
     method_ty: &Type,
 ) -> Option<MethodVariant> {
-    st.method_variants
-        .get(&original)
-        .and_then(|variants| variants.iter().find(|variant| variant.ty == *method_ty))
-        .cloned()
+    let variants = st.method_variants.get(&original)?;
+    let mut matches = variants.iter().filter(|variant| variant.ty == *method_ty);
+    let first = matches.next()?.clone();
+    // A type argument can be erased before this pass reaches a direct Apply.
+    // If more than one primitive entry has the same method type, there is no
+    // sound way to recover that argument from the call shape; keep the generic
+    // call instead of selecting Int by iteration order.
+    if matches.next().is_some() {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 fn rewrite_tree(tree: &mut Tree, st: &SymbolTable) {
