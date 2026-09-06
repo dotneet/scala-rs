@@ -1,0 +1,1 @@
+sealed trait C[+T]; final class D[T](val value: T) extends C[T]; object Test { def f(a: C[Int]): Int = a match { case b: D[t] => val x: t = 1; x } }

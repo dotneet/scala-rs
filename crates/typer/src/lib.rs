@@ -33,6 +33,7 @@ mod macros;
 mod materialize;
 mod named_eval_order;
 mod override_check;
+pub use override_check::{method_overrides, record_method_override_families};
 mod pickle_supply;
 mod prelude;
 mod prelude_arrconv;
@@ -3024,6 +3025,7 @@ object Main {
                 name: "Rich".into(),
                 param_names: vec!["n".into()],
                 param_types: vec!["Int".into()],
+                param_flags: vec![],
                 ret: "Rich".into(),
                 tparams: vec![],
                 is_val: false,
@@ -3050,6 +3052,7 @@ object Main {
                     name: "<init>".into(),
                     param_names: vec!["n".into()],
                     param_types: vec!["Int".into()],
+                    param_flags: vec![],
                     ret: "Unit".into(),
                     tparams: vec![],
                     is_val: false,
@@ -3062,6 +3065,7 @@ object Main {
                     name: "twice".into(),
                     param_names: vec![],
                     param_types: vec![],
+                    param_flags: vec![],
                     ret: "Int".into(),
                     tparams: vec![],
                     is_val: false,

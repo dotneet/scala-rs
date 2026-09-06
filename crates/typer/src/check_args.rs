@@ -847,6 +847,68 @@ impl Typer {
             // could match it (slick's `slick/basic/ConcurrencyControl.scala`).
             solved = self.undet_solution(&rest_tys, &undet);
         }
+        if solved.is_none()
+            && rest_tys.iter().any(|ty| {
+                matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+            })
+        {
+            // This continuation is needed only for compiler-generated tags.
+            // Ordinary unsuccessful searches must not be repeated here.
+            // Keep bindings obtained from earlier witnesses even when a later
+            // clause needs compiler-generated ClassTag evidence.
+            let mut partial: Vec<(SymbolId, Type)> = Vec::new();
+            let mut ambiguous = false;
+            for ty in &rest_tys {
+                let ids: Vec<_> = partial.iter().map(|(tp, _)| *tp).collect();
+                let vals: Vec<_> = partial.iter().map(|(_, ty)| ty.clone()).collect();
+                let want = crate::symbol::subst_tparams_slice(&ids, &vals, ty);
+                let open: Vec<_> = undet
+                    .iter()
+                    .copied()
+                    .filter(|tp| !ids.contains(tp))
+                    .collect();
+                let (found, bindings) = self.search_implicit_undet(&want, &open, 0);
+                if matches!(found, ImplicitSearch::Ambiguous(_)) {
+                    ambiguous = true;
+                    break;
+                }
+                if found.is_found() {
+                    partial.extend(bindings);
+                } else if matches!(found, ImplicitSearch::None) {
+                    // A function-valued implicit may be supplied by a view.
+                    // Keep its bindings when a later ClassTag is materialized,
+                    // just as the ordinary undet_solution path does.
+                    if let Some(view) = self.view_undet_bindings(&want, &open) {
+                        partial.extend(view);
+                    }
+                }
+            }
+            if !ambiguous {
+                for tp in &undet {
+                    if partial.iter().any(|(id, _)| id == tp)
+                        || self.tparam_in_scope(*tp)
+                        || !self.st.get(*tp).tparams.is_empty()
+                    {
+                        continue;
+                    }
+                    // Failed ordinary evidence must retain its open variables
+                    // in the diagnostic. Minimize only variables occurring
+                    // exclusively in ClassTag requests, before materialization.
+                    let only_tags = rest_tys.iter().filter(|ty| type_mentions_tparam_deep(ty, *tp)).all(|ty| {
+                        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                    });
+                    if only_tags {
+                        let ids: Vec<_> = partial.iter().map(|(tp, _)| *tp).collect();
+                        let vals: Vec<_> = partial.iter().map(|(_, ty)| ty.clone()).collect();
+                        let lo = self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing);
+                        partial.push((*tp, crate::symbol::subst_tparams_slice(&ids, &vals, &lo)));
+                    }
+                }
+                if !partial.is_empty() {
+                    solved = Some(partial);
+                }
+            }
+        }
         let Some(sol) = solved else {
             return rest_tys;
         };
@@ -942,13 +1004,49 @@ impl Typer {
             return None;
         }
         let gname = format!("{mname}$default${index_1based}");
+        // The pickle spells the constructor getter `<init>$default$n`, while
+        // its JVM classfile method is `$lessinit$greater$default$n`.
+        let jvm_ctor_gname = format!("$lessinit$greater$default${index_1based}");
         let owner = self.st.get(meth).owner;
-        let gid = self
-            .st
-            .lookup_member(owner, &gname)
-            .into_iter()
-            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
         let span = fun.span;
+        if mname == "<init>" {
+            self.ensure_classfile_members_loaded(owner, &jvm_ctor_gname, span);
+        }
+        let lookup_getter = |st: &crate::symbol::SymbolTable, owner: SymbolId, name: &str| {
+            st.lookup_member(owner, name)
+                .into_iter()
+                .find(|&id| st.get(id).kind == crate::symbol::SymKind::Method)
+        };
+        let mut getter_owner = owner;
+        let mut companion_module = None;
+        let mut gid = if mname == "<init>" {
+            // Prefer the JVM spelling when the classfile was available. The
+            // pickle spelling is retained as a fallback for a source class
+            // whose getter is synthesized by this compiler.
+            lookup_getter(&self.st, owner, &jvm_ctor_gname)
+                .or_else(|| lookup_getter(&self.st, owner, &gname))
+        } else {
+            lookup_getter(&self.st, owner, &gname)
+        };
+        if gid.is_none() && mname == "<init>" {
+            // `-Xno-forwarders` removes the static bridge from the class, and
+            // nested classes never get that bridge even in an ordinary nsc
+            // build.  Their real getter is an instance method on `C$` (or
+            // `Outer$C$`), so load the companion and select it through its
+            // module value just as Scala source does.
+            self.load_companion_module(owner);
+            if let Some(module) = self.st.companion_module(owner) {
+                let mcls = self.st.module_class_of(module);
+                gid = lookup_getter(&self.st, mcls, &jvm_ctor_gname)
+                    .or_else(|| lookup_getter(&self.st, mcls, &gname));
+                if gid.is_some() {
+                    getter_owner = mcls;
+                    companion_module = Some(module);
+                }
+            }
+        }
+        let gid = gid?;
+        let getter_name = self.st.get(gid).name.clone();
         // An *inserted* `apply` names the receiver itself, not a member of it:
         // `Outer.Inner.Nested(2)` is `Select(Outer.Inner, "Nested")` carrying
         // the companion's `apply` as its symbol, so `method_receiver`'s
@@ -959,7 +1057,62 @@ impl Typer {
         let head = Self::application_head(fun);
         let inserted_apply =
             mname == "apply" && Self::head_name(head).is_some_and(|n| n != "apply");
-        let recv = if inserted_apply {
+        // A separately compiled plain class exposes primary-constructor
+        // defaults as static `$lessinit$greater$default$n` methods on the
+        // class itself.  The synthetic `<init>` tree has no ordinary method
+        // receiver, so `method_receiver` manufactured `this`; typing that
+        // receiver in an `extends Parent(...)` clause is invalid and nsc's
+        // static getter call never needs it.  Qualify the getter with the
+        // class name so selection resolves the static member and codegen
+        // emits `invokestatic` without loading a receiver.
+        let ctor_default_getter = (self.st.get(meth).flags.contains(Flags::CONSTRUCTOR)
+            || self.st.get(meth).name == "<init>")
+            && getter_owner == owner
+            && getter_name.starts_with("$lessinit$greater$default$");
+        // The classfile getter is a static forwarder. Preserve that fact for
+        // selection/codegen even when the pickle supplied its symbol without
+        // JVM access flags.
+        if ctor_default_getter {
+            let f = self.st.get(gid).flags.with(Flags::STATIC);
+            self.st.get_mut(gid).flags = f;
+        }
+        let ctor_static_getter = ctor_default_getter;
+        let ctor_companion_getter = companion_module.is_some();
+        let recv = if ctor_static_getter {
+            let owner_name = self.st.get(owner).name.clone();
+            Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Ident { name: owner_name },
+                ty: Type::Class {
+                    sym: owner,
+                    args: self
+                        .st
+                        .get(owner)
+                        .tparams
+                        .iter()
+                        .map(|&t| Type::TypeParam(t))
+                        .collect(),
+                },
+                sym: owner,
+                postfix: false,
+                scala_ref: false,
+                stable_pat: false,
+            }
+        } else if ctor_companion_getter {
+            let module = companion_module.expect("companion getter has module");
+            let module_name = self.st.get(module).name.clone();
+            Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Ident { name: module_name },
+                ty: Type::ModuleRef(self.st.module_class_of(module)),
+                sym: module,
+                postfix: false,
+                scala_ref: false,
+                stable_pat: false,
+            }
+        } else if inserted_apply {
             let mut r = head.clone();
             r.id = NodeId(0);
             r.ty = Type::NoType;
@@ -982,12 +1135,20 @@ impl Typer {
         let want = self.st.get(gid).paramss.iter().flatten().count();
         preceding.truncate(want);
         let preceding = &preceding[..];
+        let param_ty = self.default_param_type(fun, param);
         let mut gfun = Tree {
             id: NodeId(0),
             span,
+            // Keep the class qualifier on a static constructor getter.  Its
+            // type and symbol are already resolved above, so `type_select`
+            // can inspect the real classfile member without resolving the
+            // class name as its companion object.  Going through Select is
+            // essential: the normal Apply path then checks the getter's
+            // descriptor and adapts its result to the constructor parameter,
+            // instead of trusting the parameter type as the getter result.
             kind: TreeKind::Select {
                 qual: Box::new(recv),
-                name: gname,
+                name: getter_name,
             },
             ty: self.st.get(gid).ty.clone(),
             sym: gid,
@@ -1003,14 +1164,61 @@ impl Typer {
                 fun: Box::new(gfun),
                 args: preceding.to_vec(),
             },
-            ty: self.st.get(param).ty.clone(),
+            ty: param_ty.clone(),
             sym: gid,
             postfix: false,
             scala_ref: false,
             stable_pat: false,
         };
-        self.type_expr(&mut call, &self.st.get(param).ty.clone());
+        self.type_expr(&mut call, &param_ty);
         Some(call)
+    }
+
+    /// The parameter type as seen by this particular call.  A constructor
+    /// selected through `extends Parent[String]` carries `String` in its
+    /// substituted method type even though the parameter symbol itself still
+    /// has the declaration's `T`; using the latter would reject a valid
+    /// numeric default and accept an invalid String default alike.
+    fn default_param_type(&self, fun: &Tree, param: SymbolId) -> Type {
+        let method = fun.sym;
+        if method.is_none() {
+            return self.st.get(param).ty.clone();
+        }
+        let decl = self.st.get(method);
+        let mut flat = 0usize;
+        for (ci, clause) in decl.paramss.iter().enumerate() {
+            for (pi, &pid) in clause.iter().enumerate() {
+                if pid != param {
+                    flat += 1;
+                    continue;
+                }
+                if let Type::Method { paramss, .. } = &fun.ty {
+                    // `fun.ty` contains only the clauses left after earlier
+                    // Apply nodes. Match the declaration's clause index to
+                    // that remaining suffix before reading the expected type.
+                    // For `slice(a)(b = 0)(session)`, the default for b is in
+                    // clause zero of fun.ty after slice(a), not clause one.
+                    let consumed = decl.paramss.len().saturating_sub(paramss.len());
+                    if let Some(ty) = ci
+                        .checked_sub(consumed)
+                        .and_then(|remaining| paramss.get(remaining))
+                        .and_then(|clause| clause.get(pi))
+                    {
+                        return ty.clone();
+                    }
+                    // Constructor matching flattens curried clauses, while
+                    // the stored method type retains them.  Accommodate the
+                    // flattened view used by parent/default filling too.
+                    if paramss.len() == 1 {
+                        if let Some(ty) = paramss[0].get(flat) {
+                            return ty.clone();
+                        }
+                    }
+                }
+                return self.st.get(param).ty.clone();
+            }
+        }
+        self.st.get(param).ty.clone()
     }
 
     /// The arguments of the parameter clauses already applied to `fun`. A
@@ -1383,6 +1591,36 @@ impl Typer {
     /// it can build none — in which case the search has failed and the caller
     /// reports `No ClassTag available for t`.
     fn classtag_tree(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        // Standard tags have canonical values; select them only after the
+        // requested type is known, rather than registering them as implicits.
+        let canonical = match t {
+            Type::Int => Some("Int"),
+            Type::Long => Some("Long"),
+            Type::Double => Some("Double"),
+            Type::Float => Some("Float"),
+            Type::Boolean => Some("Boolean"),
+            Type::Byte => Some("Byte"),
+            Type::Short => Some("Short"),
+            Type::Char => Some("Char"),
+            Type::Unit => Some("Unit"),
+            Type::Any => Some("Any"),
+            Type::AnyRef => Some("AnyRef"),
+            Type::Nothing => Some("Nothing"),
+            Type::Null => Some("Null"),
+            _ => None,
+        };
+        if let Some(name) = canonical {
+            let module = self.st.companion_module(ct_cls)?;
+            let owner = self.st.module_class_of(module);
+            if let Some(id) = self.st.lookup_member(owner, name).into_iter().next() {
+                let mut tree = self.ref_implicit(id, span);
+                tree.ty = Type::Class {
+                    sym: ct_cls,
+                    args: vec![t.clone()],
+                };
+                return Some(tree);
+            }
+        }
         // `Array[E]` where `E` has no erasure of its own: nsc emits
         // `arrayType(findSubManifest(E))`, not a `classOf` of the array. The
         // difference is visible — `def f[T: ClassTag] = classTag[Array[T]]`
@@ -1403,7 +1641,7 @@ impl Typer {
 
     /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
     /// there is no primitive getter (`ClassTag.Int`, …).
-    fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
+    pub(crate) fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
         let Type::Class { sym, args } = pt else {
             return None;
         };

@@ -2486,9 +2486,24 @@ impl Typer {
             .map(|tp| unify_conv_tparam(*tp, param, from))
             .collect();
         self.solve_conv_targs_from_implicits(id, tps, &mut solved);
+        let ret = match &*cand_ty {
+            Type::Method { ret, .. } | Type::Function { ret, .. } => Some(ret.as_ref()),
+            _ => None,
+        };
         solved
             .into_iter()
-            .map(|t| t.unwrap_or(Type::AnyRef))
+            .zip(tps)
+            .map(|(t, tp)| {
+                t.unwrap_or_else(|| {
+                    // A parameter escaping in the view result is still open.
+                    // Replacing it with Object also fabricates ClassTag evidence.
+                    if ret.is_some_and(|r| crate::check::mentions_tparam(r, &[*tp])) {
+                        Type::TypeParam(*tp)
+                    } else {
+                        self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing)
+                    }
+                })
+            })
             .collect()
     }
 
@@ -2502,9 +2517,8 @@ impl Typer {
     /// wrote. The witness in scope (`Async[F] <: MonadError[F, Throwable]`)
     /// says `E = Throwable`, which is exactly how nsc solves it.
     ///
-    /// Only run for a parameter the *result* type mentions: this is on the
-    /// path of every candidate conversion, and an implicit search per
-    /// candidate is not free.
+    /// Search only parameters mentioned by an implicit clause. Even a
+    /// parameter absent from the result can be fixed by an explicit witness.
     fn solve_conv_targs_from_implicits(
         &self,
         id: SymbolId,
@@ -2512,7 +2526,7 @@ impl Typer {
         solved: &mut [Option<Type>],
     ) {
         let cand_ty = self.implicit_candidate_ty(id);
-        let Type::Method { paramss, ret } = &*cand_ty else {
+        let Type::Method { paramss, .. } = &*cand_ty else {
             return;
         };
         if paramss.len() < 2 {
@@ -2521,7 +2535,13 @@ impl Typer {
         let undet: Vec<SymbolId> = tps
             .iter()
             .zip(solved.iter())
-            .filter(|(tp, s)| s.is_none() && crate::check::mentions_tparam(ret, &[**tp]))
+            .filter(|(tp, s)| {
+                s.is_none()
+                    && paramss[1..]
+                        .iter()
+                        .flatten()
+                        .any(|p| crate::check::mentions_tparam(p, &[**tp]))
+            })
             .map(|(tp, _)| *tp)
             .collect();
         if undet.is_empty() {

@@ -380,6 +380,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             if own_outer.is_some() {
                 // nsc rejects a null enclosing instance up front.
@@ -411,6 +412,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             if own_outer.is_some() {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);

@@ -22,6 +22,7 @@ pub use crate::gen_lambda::collect_captured_vars;
 pub(crate) use crate::gen_lambda::*;
 pub(crate) use crate::gen_match::*;
 pub(crate) use crate::gen_object::*;
+use scala_rs_span::Span;
 
 /// Options for [`emit_opts`].
 #[derive(Clone, Debug, Default)]
@@ -65,8 +66,18 @@ pub struct EmitOpts {
     pub generic_sigs: Option<Rc<crate::sig::GenericSignatures>>,
 }
 
+/// A backend limitation discovered while lowering a typed tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmitError {
+    pub span: Span,
+    pub message: String,
+}
+
+/// Result of emitting one compilation unit.
+pub type EmitResult = Result<Vec<EmittedClass>, Vec<EmitError>>;
+
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
-pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClass> {
+pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> EmitResult {
     emit_opts(tree, st, source_name, EmitOpts::default())
 }
 
@@ -100,31 +111,99 @@ pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImp
 /// trait of ours mixed in by real scalac used to run the *base* implementation
 /// and silently drop the trait's own layer.
 ///
-/// Deliberately narrower than [`needs_super_accessor`], which also declares an
-/// accessor for a plain `override def`: nothing calls those, and asking a
-/// reader to implement `T$$super$m` where the overridden member is itself
-/// deferred has no target to forward to.
 pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_super_accessors(tree, &mut found);
-    for id in found {
-        st.get_mut(id).super_accessor = true;
+    for (trait_id, name, target, selected_params) in found {
+        let candidates: Vec<SymbolId> = st
+            .get(trait_id)
+            .members
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let s = st.get(id);
+                s.kind == SymKind::Method && s.name == name
+            })
+            .collect();
+        let target_params = selected_params.unwrap_or_else(|| method_params_from_sym(st, target));
+        let target_desc = jvm_method_desc(st, &target_params, &Type::Unit);
+        let own = candidates
+            .iter()
+            .copied()
+            .find(|&id| desc_params(&method_desc_from_sym(st, id)) == desc_params(&target_desc));
+        if let Some(id) = own {
+            st.get_mut(id).super_accessor = true;
+        } else {
+            let targets = st.super_accessor_targets.entry(trait_id).or_default();
+            if !targets
+                .iter()
+                .any(|(id, params)| *id == target && *params == target_params)
+            {
+                targets.push((target, target_params));
+            }
+        }
     }
 }
 
-pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<SymbolId>) {
+pub(crate) fn collect_super_accessors(
+    tree: &Tree,
+    out: &mut Vec<(SymbolId, String, SymbolId, Option<Vec<Type>>)>,
+) {
     if let TreeKind::ClassDef { mods, impl_, .. } = &tree.kind {
         if mods.flags.contains(Flags::TRAIT) {
             for stt in &impl_.body {
                 if let TreeKind::DefDef { rhs, .. } = &stt.kind {
-                    if !stt.sym.is_none() && needs_super_accessor(stt) && tree_contains_super(rhs) {
-                        out.push(stt.sym);
+                    if rhs.is_empty() {
+                        continue;
+                    }
+                    let mut accesses = Vec::new();
+                    collect_super_accesses(rhs, &mut accesses);
+                    for (name, target, selected_params) in accesses {
+                        if !target.is_none() && !tree.sym.is_none() {
+                            out.push((tree.sym, name, target, selected_params));
+                        }
                     }
                 }
             }
         }
     }
     for_each_term_child(tree, &mut |c| collect_super_accessors(c, out));
+}
+
+/// Collect the methods selected through `super` in a tree, together with the
+/// symbols selected by typer. The enclosing method is not necessarily the
+/// target: a private helper such as `superZip` may call `super.zip`, and the
+/// accessor belongs to `zip`.
+pub(crate) fn collect_super_accesses(
+    tree: &Tree,
+    out: &mut Vec<(String, SymbolId, Option<Vec<Type>>)>,
+) {
+    if let TreeKind::Select { qual, name } = &tree.kind {
+        if matches!(
+            qual.kind,
+            TreeKind::Super {
+                qual: None,
+                mix: None
+            }
+        ) && !tree.sym.is_none()
+        {
+            let selected_params = match &tree.ty {
+                Type::Method { paramss, .. } => Some(paramss.iter().flatten().cloned().collect()),
+                Type::Function { params, .. } => Some(params.clone()),
+                _ => None,
+            };
+            out.push((name.clone(), tree.sym, selected_params));
+        }
+    }
+    // A `super` inside a nested class/object belongs to that nested owner;
+    // it must not make the enclosing trait publish an accessor.
+    if matches!(
+        tree.kind,
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+    ) {
+        return;
+    }
+    for_each_term_child(tree, &mut |child| collect_super_accesses(child, out));
 }
 
 /// Harvest one unit's concrete trait members. A function of the tree alone:
@@ -228,12 +307,7 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
 }
 
 /// Walk a typed compilation unit and emit classes.
-pub fn emit_opts(
-    tree: &Tree,
-    st: &SymbolTable,
-    source_name: &str,
-    opts: EmitOpts,
-) -> Vec<EmittedClass> {
+pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpts) -> EmitResult {
     // A shared map already holds this unit's own trait members: the driver
     // harvests every unit of the run before emitting any, and the harvest is a
     // function of the tree alone, so doing it again here would insert the same
@@ -249,7 +323,9 @@ pub fn emit_opts(
     let mut g = Gen {
         st,
         source_name,
+        unit_span: tree.span,
         out: Vec::new(),
+        emit_errors: Rc::new(RefCell::new(Vec::new())),
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
         traits,
@@ -278,13 +354,20 @@ pub fn emit_opts(
         "a hoisted lambda body was queued but never written to a classfile"
     );
     g.out.append(&mut g.extras.borrow_mut());
-    g.out
+    let errors = g.emit_errors.borrow().clone();
+    if errors.is_empty() {
+        Ok(g.out)
+    } else {
+        Err(errors)
+    }
 }
 
 pub(crate) struct Gen<'a> {
     pub(crate) st: &'a SymbolTable,
     pub(crate) source_name: &'a str,
+    pub(crate) unit_span: Span,
     pub(crate) out: Vec<EmittedClass>,
+    pub(crate) emit_errors: Rc<RefCell<Vec<EmitError>>>,
     pub(crate) extras: RefCell<Vec<EmittedClass>>,
     pub(crate) lambda_n: Cell<u32>,
     /// Lambda bodies hoisted out of closures, waiting to be written as
@@ -391,6 +474,7 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) class_sym: SymbolId,
     pub(crate) class_name: &'a str,
     pub(crate) ret_ty: Type,
+    pub(crate) emit_errors: Rc<RefCell<Vec<EmitError>>>,
     pub(crate) extras: &'a RefCell<Vec<EmittedClass>>,
     pub(crate) lambda_n: &'a Cell<u32>,
     /// Lambda bodies waiting to become static methods of `hoist_owner`.
@@ -442,12 +526,14 @@ pub(crate) fn emit_ctx<'a>(
     source: &'a str,
     library_abi: bool,
     boxed_vars: &'a HashSet<SymbolId>,
+    emit_errors: Rc<RefCell<Vec<EmitError>>>,
 ) -> EmitCtx<'a> {
     EmitCtx {
         st,
         class_sym,
         class_name,
         ret_ty,
+        emit_errors,
         extras,
         lambda_n,
         lambda_bodies,
@@ -461,6 +547,21 @@ pub(crate) fn emit_ctx<'a>(
         boxed_vars,
         value_ext: None,
     }
+}
+
+pub(crate) fn report_emit_error(
+    errors: &Rc<RefCell<Vec<EmitError>>>,
+    span: Span,
+    message: impl Into<String>,
+) {
+    errors.borrow_mut().push(EmitError {
+        span,
+        message: message.into(),
+    });
+}
+
+pub(crate) fn report_ctx_error(ctx: &EmitCtx<'_>, span: Span, message: impl Into<String>) {
+    report_emit_error(&ctx.emit_errors, span, message);
 }
 
 /// The `presuper_outer` an `<init>` of `class_id` needs: the enclosing
@@ -735,6 +836,7 @@ pub(crate) fn load_capture_arg(
     frame: &mut Frame,
     ctx: &EmitCtx,
     id: SymbolId,
+    span: Span,
 ) {
     if let Some((slot, sort)) = frame.get(id) {
         if is_boxed_var(ctx, id) {
@@ -756,6 +858,7 @@ pub(crate) fn load_capture_arg(
         );
         return;
     }
+    report_ctx_error(ctx, span, format!("cannot capture {}", ctx.st.get(id).name));
     throw_runtime(asm, &format!("cannot capture {}", ctx.st.get(id).name));
     asm.aconst_null();
 }
@@ -1479,7 +1582,7 @@ mod tests {
         scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
         let mut classes = crate::runtime::emit_runtime();
-        classes.extend(emit(&tree, &st, "Test.scala"));
+        classes.extend(emit(&tree, &st, "Test.scala").expect("backend emit"));
         classes
     }
 
@@ -1512,6 +1615,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .expect("backend emit")
     }
 
     fn run_main(src: &str) -> Option<String> {

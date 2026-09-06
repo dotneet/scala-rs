@@ -1373,7 +1373,7 @@ impl Typer {
                         // same report in nsc: there is no *type* `Obj` to
                         // build, and letting it through emitted a `new` of the
                         // module class that no constructor answers.
-                        self.expose_unqualified_type(&n);
+                        self.expose_unqualified_type(&n, tree.span);
                         let types = self.st.lookup_type(&n);
                         let only_module = !types.is_empty()
                             && types.iter().all(|&s| {

@@ -421,3 +421,162 @@ fn a_constructor_access_modifier_still_parses() {
          }\n",
     );
 }
+
+#[test]
+fn repeated_case_patterns_match_scalac() {
+    assert!(
+        java_available() && find_scalac().is_some() && scala_library_jar().is_some(),
+        "requires Java and Scala 2.13.16"
+    );
+    real_scalac_dual_run("seqpat_case_repeated");
+}
+
+#[test]
+fn repeated_case_patterns_reject_missing_fixed_and_wrong_element_types() {
+    let scalac = find_scalac().expect("requires Scala 2.13.16");
+    let jar = scala_library_jar().expect("requires scala-library");
+    for (tag, pattern) in [
+        ("missing", "Tagged()"),
+        ("wrong", "Tagged(\"x\", s: String)"),
+        ("star", "Tagged(rest @ _*, 1)"),
+    ] {
+        let root = tmp_dir(tag);
+        let src = root.join("Bad.scala");
+        fs::write(&src, format!("case class Tagged[A](tag: String, xs: A*)\nobject Bad {{ def f(x: Tagged[Int]): Unit = x match {{ case {pattern} => () }} }}\n")).unwrap();
+        let rs = root.join("rs");
+        let ns = root.join("nsc");
+        fs::create_dir_all(&rs).unwrap();
+        fs::create_dir_all(&ns).unwrap();
+        let (ok, msgs) = compile(
+            &rs,
+            &[src.clone()],
+            &["--scala-library", jar.to_str().unwrap()],
+        );
+        assert!(!ok, "accepted {tag}: {msgs}");
+        let output = Command::new(&scalac)
+            .arg(&src)
+            .arg("-d")
+            .arg(&ns)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "nsc accepted {tag}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn typed_patterns_agree_with_scalac_on_bounds_and_invariance() {
+    let scalac = find_scalac().expect("requires Scala 2.13.16");
+    let jar = scala_library_jar().expect("requires scala-library");
+    let cases = [
+        (
+            "int_string",
+            false,
+            r#"object X { def f(x: Int) = x match { case _: String => 1 } }"#,
+        ),
+        (
+            "int_long",
+            false,
+            r#"object X { def f(x: Int) = x match { case _: Long => 1 } }"#,
+        ),
+        (
+            "any_string",
+            true,
+            r#"object X { def f(x: Any) = x match { case _: String => 1 } }"#,
+        ),
+        (
+            "param_string",
+            true,
+            r#"object X { def f[A](x: A) = x match { case _: String => 1 } }"#,
+        ),
+        (
+            "bounded_string",
+            false,
+            r#"object X { def f[A <: java.lang.Number](x: A) = x match { case _: String => 1 } }"#,
+        ),
+        (
+            "invariant",
+            false,
+            r#"final class Box[A]; object X { def f(x: Box[Int]) = x match { case _: Box[String] => 1 } }"#,
+        ),
+        (
+            "open_invariant",
+            false,
+            r#"class Box[A]; object X { def f(x: Box[Int]) = x match { case _: Box[String] => 1 } }"#,
+        ),
+        (
+            "array",
+            false,
+            r#"object X { def f(x: Array[Int]) = x match { case _: Array[String] => 1 } }"#,
+        ),
+        (
+            "open_traits",
+            true,
+            r#"trait A; trait B; object X { def f(x: A) = x match { case _: B => 1 } }"#,
+        ),
+        (
+            "bound_compatible",
+            true,
+            r#"object X { def f[A <: CharSequence](x: A) = x match { case _: String => 1 } }"#,
+        ),
+        (
+            "finalcov",
+            false,
+            r#"final class B[+A]; object X {def f(x:B[Int])=x match {case _: B[String] => 1}}"#,
+        ),
+        (
+            "opencov",
+            true,
+            r#"class B[+A]; object X {def f(x:B[Int])=x match {case _: B[String] => 1}}"#,
+        ),
+        (
+            "wildcard",
+            true,
+            r#"final class B[A]; object X {def f(x:B[_])=x match {case _: B[String] => 1}}"#,
+        ),
+        (
+            "arrayany",
+            false,
+            r#"object X {def f(x:Array[Any])=x match {case _: Array[String] => 1}}"#,
+        ),
+        (
+            "binary_indexed_seq",
+            true,
+            r#"object X { def f[U](x: Iterable[U]) = x match { case _: IndexedSeq[_] => 1 } }"#,
+        ),
+        (
+            "binary_map",
+            true,
+            r#"object X { def f(x: Map[_ <: AnyRef, (Int => Int, String)]) = x match { case _: Map[String, (Int => Int, String)] @unchecked => 1 } }"#,
+        ),
+        (
+            "binary_set",
+            true,
+            r#"object X { def f(x: Set[_ <: AnyRef]) = x match { case _: Set[String] @unchecked => 1 } }"#,
+        ),
+    ];
+    for (name, accepted, source) in cases {
+        let root = tmp_dir(name);
+        let src = root.join("X.scala");
+        fs::write(&src, source).unwrap();
+        let rs = root.join("rs");
+        let ns = root.join("nsc");
+        fs::create_dir_all(&rs).unwrap();
+        fs::create_dir_all(&ns).unwrap();
+        let reference = Command::new(&scalac)
+            .arg(&src)
+            .arg("-d")
+            .arg(&ns)
+            .output()
+            .unwrap();
+        assert_eq!(
+            reference.status.success(),
+            accepted,
+            "nsc {name}: {}",
+            String::from_utf8_lossy(&reference.stderr)
+        );
+        let (ok, msgs) = compile(&rs, &[src], &["--scala-library", jar.to_str().unwrap()]);
+        assert_eq!(ok, accepted, "scala-rs {name}: {msgs}");
+        fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -133,6 +133,11 @@ impl Typer {
     /// parameter of a method this argument has already applied -- one that can
     /// no longer be named here -- is undetermined.
     pub(crate) fn tparam_in_scope(&self, tp: SymbolId) -> bool {
+        // A case-local existential stays rigid after its lexical case scope
+        // is popped; minimising it to Nothing corrupts the join of branches.
+        if self.st.get(tp).is_pattern_skolem {
+            return true;
+        }
         let name = self.st.get(tp).name.clone();
         self.st.lookup_type(&name).contains(&tp)
     }
@@ -324,7 +329,7 @@ impl Typer {
             for tp in open {
                 if type_mentions_tparam(other, tp)
                     || self.st.get(tp).kind != SymKind::TypeParam
-                    || self.st.lookup(&self.st.get(tp).name).contains(&tp)
+                    || self.tparam_in_scope(tp)
                     || self.tparam_variance_in(&out, tp, 1) != Some(1)
                 {
                     continue;
@@ -1239,6 +1244,16 @@ impl Typer {
                 .collect();
             let (found, bindings) = self.search_implicit_undet(&pty, &open, 0);
             if !found.is_found() {
+                // Earlier evidence can fix a tag's element type even when
+                // the tag itself must be materialized by the compiler. It
+                // supplies evidence, not a new constraint on open variables.
+                if matches!(found, ImplicitSearch::None)
+                    && !mentions_tparam(&pty, &open)
+                    && matches!(&pty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                    && self.classtag_apply_fallback(&pty, Span::DUMMY).is_some()
+                {
+                    continue;
+                }
                 // No *value* of that type. A function-typed parameter is a
                 // view request, and the conversion that answers it can pin the
                 // open parameters just as well (`List[Option[A]].flatten`).
@@ -1341,7 +1356,20 @@ impl Typer {
                 other => other,
             };
             let a = &self.align_arg_to_param(p, a);
-            let mut hit = unify_one(tp, p, a);
+            let keep_singleton = self.st.get(tp).bound_hi.as_ref().is_some_and(|hi| {
+                self.st.is_sub_type(
+                    hi,
+                    &Type::Class {
+                        sym: self.st.singleton_sym,
+                        args: vec![],
+                    },
+                )
+            });
+            let mut hit = if keep_singleton {
+                unify_one_precise(tp, p, a)
+            } else {
+                unify_one(tp, p, a)
+            };
             // The same step for a *function* parameter: a `Map[K, V]` is a
             // `K => V`, and that is the shape `def map[B](f: A => B)` reads
             // `B` out of. Only where the argument as written pinned nothing:
@@ -2260,6 +2288,11 @@ impl Typer {
                 };
             }
             return;
+        }
+        if matches!(self.st.dealias(pt), Type::Class { sym, .. } if sym == self.st.singleton_sym)
+            && self.is_stable_path(tree)
+        {
+            tree.ty = self.singleton_to_type(tree.span, tree);
         }
         if self.st.is_sub_type(&tree.ty, pt) {
             // `b.x` with `{ type A <: Int }` stays a TypeMember; pin it to the

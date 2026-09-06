@@ -172,6 +172,8 @@ pub struct ClasspathPickleMethod {
     pub name: String,
     pub param_names: Vec<String>,
     pub param_types: Vec<ClasspathType>,
+    /// Raw pickle flags for each value parameter, including DEFAULTPARAM.
+    pub param_flags: Vec<u64>,
     pub ret: ClasspathType,
     pub tparams: Vec<ClasspathTypeParam>,
     pub is_val: bool,
@@ -2695,20 +2697,24 @@ pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
 }
 
 pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
+    unify_one_precise(tp, pattern, actual).map(|t| t.widen_constant())
+}
+
+pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
     if let Type::Annotated { tpe, .. } = actual {
-        return unify_one(tp, pattern, tpe);
+        return unify_one_precise(tp, pattern, tpe);
     }
     match pattern {
-        Type::Annotated { tpe, .. } => unify_one(tp, tpe, actual),
+        Type::Annotated { tpe, .. } => unify_one_precise(tp, tpe, actual),
         Type::TypeParam(id) if *id == tp => {
             if actual.is_no_type() || actual.is_error() {
                 None
             } else {
-                Some(actual.widen_constant())
+                Some(actual.clone())
             }
         }
         Type::BoundedWildcard { hi: Some(h), .. } | Type::BoundedWildcard { lo: Some(h), .. } => {
-            unify_one(tp, h, actual)
+            unify_one_precise(tp, h, actual)
         }
         Type::Wildcard => None,
         Type::Class { args: pas, .. } => {
@@ -2724,7 +2730,7 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
                 // `U'` is.
                 Type::Refined { parents, .. } => {
                     for a in parents {
-                        if let Some(t) = unify_one(tp, pattern, a) {
+                        if let Some(t) = unify_one_precise(tp, pattern, a) {
                             return Some(t);
                         }
                     }
@@ -2733,7 +2739,7 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
                 _ => return None,
             };
             for (p, a) in pas.iter().zip(aas) {
-                if let Some(t) = unify_one(tp, p, a) {
+                if let Some(t) = unify_one_precise(tp, p, a) {
                     return Some(t);
                 }
             }
@@ -2747,7 +2753,7 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
                 _ => return None,
             };
             for (p, a) in pts.iter().zip(aas) {
-                if let Some(t) = unify_one(tp, p, a) {
+                if let Some(t) = unify_one_precise(tp, p, a) {
                     return Some(t);
                 }
             }
@@ -2758,11 +2764,11 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
                 ctor: ac,
                 args: aas,
             } => {
-                if let Some(t) = unify_one(tp, ctor, ac) {
+                if let Some(t) = unify_one_precise(tp, ctor, ac) {
                     return Some(t);
                 }
                 for (p, a) in pas.iter().zip(aas) {
-                    if let Some(t) = unify_one(tp, p, a) {
+                    if let Some(t) = unify_one_precise(tp, p, a) {
                         return Some(t);
                     }
                 }
@@ -2773,11 +2779,11 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
                     sym: *sym,
                     args: vec![],
                 };
-                if let Some(t) = unify_one(tp, ctor, &unapplied) {
+                if let Some(t) = unify_one_precise(tp, ctor, &unapplied) {
                     return Some(t);
                 }
                 for (p, a) in pas.iter().zip(aas) {
-                    if let Some(t) = unify_one(tp, p, a) {
+                    if let Some(t) = unify_one_precise(tp, p, a) {
                         return Some(t);
                     }
                 }
@@ -2792,11 +2798,11 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
             } = actual
             {
                 for (p, a) in params.iter().zip(aps) {
-                    if let Some(t) = unify_one(tp, p, a) {
+                    if let Some(t) = unify_one_precise(tp, p, a) {
                         return Some(t);
                     }
                 }
-                unify_one(tp, ret, ar)
+                unify_one_precise(tp, ret, ar)
             } else {
                 None
             }
@@ -2813,14 +2819,14 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
             match actual {
                 Type::Refined { parents: aps, .. } if aps.len() == parents.len() => {
                     for (p, a) in parents.iter().zip(aps) {
-                        if let Some(t) = unify_one(tp, p, a) {
+                        if let Some(t) = unify_one_precise(tp, p, a) {
                             return Some(t);
                         }
                     }
                 }
                 _ => {
                     for p in parents {
-                        if let Some(t) = unify_one(tp, p, actual) {
+                        if let Some(t) = unify_one_precise(tp, p, actual) {
                             return Some(t);
                         }
                     }
@@ -2829,20 +2835,20 @@ pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<T
             None
         }
         Type::Array(p) => match actual {
-            Type::Array(a) => unify_one(tp, p, a),
+            Type::Array(a) => unify_one_precise(tp, p, a),
             _ => None,
         },
         Type::ByName(p) => match actual {
-            Type::ByName(a) => unify_one(tp, p, a),
-            _ => unify_one(tp, p, actual),
+            Type::ByName(a) => unify_one_precise(tp, p, a),
+            _ => unify_one_precise(tp, p, actual),
         },
         // `Seq(xs: _*)` hands the parameter a `Repeated` of its *element*
         // type, not of the sequence: unwrapping only the pattern solved
         // `Seq.apply[A](A*)` to `A = Int*` and made `Seq(xs: _*)` a
         // `Seq[Int*]`.
         Type::Repeated(p) => match actual {
-            Type::Repeated(a) => unify_one(tp, p, a),
-            _ => unify_one(tp, p, actual),
+            Type::Repeated(a) => unify_one_precise(tp, p, a),
+            _ => unify_one_precise(tp, p, actual),
         },
         _ => None,
     }

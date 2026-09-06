@@ -280,6 +280,8 @@ fn rewrite_refs(tree: &mut Tree, map: &Rewrite) {
                 args: vec![arg],
             });
             apply.span = span;
+            // Lowering a stable identifier must retain its pattern meaning.
+            apply.stable_pat = tree.stable_pat;
             apply.sym = a.sym;
             apply.ty = ty;
             *tree = apply;

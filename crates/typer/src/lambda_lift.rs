@@ -665,6 +665,11 @@ fn child_trees(t: &Tree) -> Vec<&Tree> {
 /// rather than a stable identifier -- the same lowercase test the typer and
 /// `anon_capture` use.
 fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
+    // A stable pattern is an expression, including any lowered accessor
+    // arguments. Its referenced locals are captures, never new binders.
+    if pat.stable_pat {
+        return;
+    }
     match &pat.kind {
         TreeKind::Bind { .. } => {
             if !pat.sym.is_none() {
@@ -1000,6 +1005,7 @@ fn rewrite_auto_apply(tree: &mut Tree, caps: &HashMap<SymbolId, Vec<SymbolId>>, 
         return;
     }
     let span = tree.span;
+    let stable_pat = tree.stable_pat;
     let mut fun = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
     if let Type::Method { .. } = &st.get(sid).ty {
         fun.ty = st.get(sid).ty.clone();
@@ -1017,7 +1023,7 @@ fn rewrite_auto_apply(tree: &mut Tree, caps: &HashMap<SymbolId, Vec<SymbolId>>, 
         sym: sid,
         postfix: false,
         scala_ref: false,
-        stable_pat: false,
+        stable_pat,
     };
 }
 

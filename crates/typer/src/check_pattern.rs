@@ -482,12 +482,14 @@ impl Typer {
                 // the constructor only wins when its arity fits; otherwise the
                 // extractor branches below get their turn. A repeated last
                 // parameter takes any number.
+                let repeated_elem = class_id.and_then(|c| self.st.repeated_case_element(c));
                 let ctor_fits = class_id.is_some_and(|c| {
                     let fields = &self.st.get(c).ctor_fields;
-                    args.len() == fields.len()
-                        || fields
-                            .last()
-                            .is_some_and(|f| matches!(self.st.get(*f).ty, Type::Repeated(_)))
+                    if repeated_elem.is_some() {
+                        args.len() >= fields.len() - 1
+                    } else {
+                        args.len() == fields.len()
+                    }
                 });
                 let has_extractor = unapply.is_some() || unapply_seq.is_some();
                 // SLS 8.1.6/8.1.7: only a *case* class has a constructor
@@ -502,7 +504,8 @@ impl Typer {
                 // The `ctor_fields`-only arm stays for a class with no
                 // extractor at all, which is where it was needed.
                 let is_case = class_id.is_some_and(|c| self.st.get(c).flags.contains(Flags::CASE));
-                let use_ctor = !has_star
+                let repeated_case = is_case && repeated_elem.is_some();
+                let use_ctor = (!has_star || repeated_case)
                     && class_id.is_some_and(|c| {
                         let s = self.st.get(c);
                         s.flags.contains(Flags::CASE) || !s.ctor_fields.is_empty()
@@ -534,14 +537,28 @@ impl Typer {
                         args: cargs.clone(),
                     };
                     for (i, a) in args.iter_mut().enumerate() {
-                        let ft = fields
-                            .get(i)
-                            .map(|f| self.st.get(*f).ty.clone())
-                            .unwrap_or(Type::Any);
+                        let ft = if i + 1 >= fields.len() && repeated_elem.is_some() {
+                            Type::Repeated(Box::new(repeated_elem.clone().unwrap()))
+                        } else {
+                            fields
+                                .get(i)
+                                .map(|f| self.st.get(*f).ty.clone())
+                                .unwrap_or(Type::Any)
+                        };
                         let ft = if cargs.is_empty() {
                             ft
                         } else {
                             self.st.subst_tparams(class_id, &cargs, &ft)
+                        };
+                        let ft = match ft {
+                            Type::Repeated(elem) if pattern_has_star(a) => {
+                                self.seq_of(&elem).unwrap_or(Type::Class {
+                                    sym: self.st.list_sym,
+                                    args: vec![*elem],
+                                })
+                            }
+                            Type::Repeated(elem) => *elem,
+                            ft => ft,
                         };
                         self.type_pattern(a, &ft);
                     }
@@ -679,10 +696,28 @@ impl Typer {
             }
             TreeKind::Typed { expr, tpt } => {
                 let saved = std::mem::replace(&mut self.pattern_tpt, true);
-                let ty = self.tree_to_type(tpt);
+                let binders = self.enter_pattern_type_binders(tpt);
+                self.inherit_pattern_binder_params(tpt, &binders);
+                let ty = self.with_strict_type_names(|this| this.tree_to_type(tpt));
                 self.pattern_tpt = saved;
+                let ty = self.refine_pattern_type_binders(ty, sel_ty, &binders);
                 let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
+                if !self.typed_pattern_compatible(&ty, sel_ty) {
+                    self.error(
+                        tpt.span,
+                        format!(
+                            "pattern type {} is incompatible with scrutinee type {}",
+                            self.st.display_type(&ty),
+                            self.st.display_type(sel_ty)
+                        ),
+                    );
+                }
                 self.type_pattern(expr, &ty);
+                if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
+                    && !self.st.is_sub_type(sel_ty, &Type::AnyRef)
+                {
+                    pat.sym = self.st.singleton_sym;
+                }
                 pat.ty = ty;
             }
             TreeKind::Alternative { trees } => {
@@ -695,6 +730,285 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
         }
+    }
+
+    /// Lowercase identifiers in a pattern's type arguments introduce types
+    /// in the case scope, even when an outer type alias has the same name.
+    fn enter_pattern_type_binders(&mut self, tree: &Tree) -> Vec<SymbolId> {
+        fn collect(tree: &Tree, argument: bool, names: &mut Vec<String>, source: Option<&str>) {
+            match &tree.kind {
+                TreeKind::Ident { name }
+                    if argument
+                        && name.chars().next().is_some_and(char::is_lowercase)
+                        && source.and_then(|s| s.as_bytes().get(tree.span.lo.0 as usize))
+                            != Some(&b'`') =>
+                {
+                    names.push(name.clone());
+                }
+                TreeKind::AppliedTypeTree { tpt, args } => {
+                    collect(tpt, false, names, source);
+                    for arg in args {
+                        collect(arg, true, names, source);
+                    }
+                }
+                TreeKind::CompoundTypeTree { parents, .. } => {
+                    for parent in parents {
+                        collect(parent, false, names, source);
+                    }
+                }
+                TreeKind::AnnotatedTypeTree { tpt, .. } => collect(tpt, argument, names, source),
+                _ => {}
+            }
+        }
+        let mut names = Vec::new();
+        collect(
+            tree,
+            false,
+            &mut names,
+            self.sources.get(self.file_index).map(|s| s.as_ref()),
+        );
+        let mut ids = Vec::new();
+        for name in names {
+            if ids.iter().any(|id| self.st.get(*id).name == name) {
+                self.error(tree.span, format!("{name} is already defined as a type"));
+                continue;
+            }
+            let id = self.st.alloc(
+                &name,
+                self.st.owner,
+                SymKind::TypeParam,
+                Flags::SYNTHETIC,
+                "",
+            );
+            self.st.get_mut(id).ty = Type::TypeParam(id);
+            self.st.get_mut(id).is_pattern_skolem = true;
+            self.st.get_mut(id).bound_lo = Some(Type::Nothing);
+            self.st.get_mut(id).bound_hi = Some(Type::Any);
+            self.st.enter_in_current(&name, id);
+            ids.push(id);
+        }
+        ids
+    }
+
+    fn inherit_pattern_binder_params(&mut self, tree: &Tree, ids: &[SymbolId]) {
+        match &tree.kind {
+            TreeKind::AppliedTypeTree { tpt, args } => {
+                let ctor = self.tree_to_type(tpt);
+                let params = match &ctor {
+                    Type::Class { sym, .. } | Type::TypeMember(sym) | Type::TypeParam(sym) => {
+                        self.st.get(*sym).tparams.clone()
+                    }
+                    _ => Vec::new(),
+                };
+                let bound = args
+                    .iter()
+                    .zip(&params)
+                    .filter_map(|(arg, param)| {
+                        let TreeKind::Ident { name } = &arg.kind else {
+                            return None;
+                        };
+                        ids.iter()
+                            .find(|id| self.st.get(**id).name == *name)
+                            .map(|id| (*id, *param))
+                    })
+                    .collect::<Vec<_>>();
+                // Populate kinds before reading the actual arguments: f in
+                // B[f], where B[F[_]], must already accept one type argument.
+                for (id, param) in &bound {
+                    let nested = self.st.get(*param).tparams.clone();
+                    let fresh = self.fresh_method_tparams(*id, &nested);
+                    self.st.get_mut(*id).tparams = fresh;
+                }
+                for arg in args {
+                    self.inherit_pattern_binder_params(arg, ids);
+                }
+                let actual = args
+                    .iter()
+                    .map(|arg| self.tree_to_type(arg))
+                    .collect::<Vec<_>>();
+                for (id, param) in bound {
+                    let hi = self.st.get(param).bound_hi.clone().unwrap_or(Type::Any);
+                    let lo = self.st.get(param).bound_lo.clone().unwrap_or(Type::Nothing);
+                    self.st.get_mut(id).bound_hi =
+                        Some(crate::symbol::subst_tparams_slice(&params, &actual, &hi));
+                    self.st.get_mut(id).bound_lo =
+                        Some(crate::symbol::subst_tparams_slice(&params, &actual, &lo));
+                }
+            }
+            TreeKind::CompoundTypeTree { parents, .. } => {
+                for parent in parents {
+                    self.inherit_pattern_binder_params(parent, ids);
+                }
+            }
+            TreeKind::AnnotatedTypeTree { tpt, .. } => self.inherit_pattern_binder_params(tpt, ids),
+            _ => {}
+        }
+    }
+
+    fn refine_pattern_type_binders(&mut self, ty: Type, sel: &Type, ids: &[SymbolId]) -> Type {
+        let Some(sel_class) = self.st.class_sym_of(sel) else {
+            return ty;
+        };
+        let Some(base) = self.base_type_instance(&ty, sel_class, 0) else {
+            return ty;
+        };
+        let mut solved_ids = Vec::new();
+        let mut solved_types = Vec::new();
+        for id in ids {
+            let Some(solved) =
+                self.unify_tparam_all(*id, std::slice::from_ref(&base), std::slice::from_ref(sel))
+            else {
+                continue;
+            };
+            if solved.is_error()
+                || solved.is_no_type()
+                || mentions_tparam(&solved, ids)
+                || type_mentions_wildcard(&solved)
+            {
+                continue;
+            }
+            match self.tparam_variance_in(&base, *id, 1) {
+                Some(1) => {
+                    let hi = self.st.get(*id).bound_hi.clone().unwrap_or(Type::Any);
+                    self.st.get_mut(*id).bound_hi = Some(self.st.glb(&hi, &solved));
+                }
+                Some(-1) => {
+                    let lo = self.st.get(*id).bound_lo.clone().unwrap_or(Type::Nothing);
+                    self.st.get_mut(*id).bound_lo = Some(self.st.lub(&lo, &solved));
+                }
+                Some(0) => {
+                    self.st.get_mut(*id).bound_lo = Some(solved.clone());
+                    self.st.get_mut(*id).bound_hi = Some(solved.clone());
+                    solved_ids.push(*id);
+                    solved_types.push(solved);
+                }
+                _ => {}
+            }
+        }
+        crate::symbol::subst_tparams_slice(&solved_ids, &solved_types, &ty)
+    }
+
+    /// Decide whether the two types can have a common instance. Unlike an
+    /// assignment, a type test permits narrowing and unrelated open traits.
+    fn typed_pattern_compatible(&mut self, pattern: &Type, scrutinee: &Type) -> bool {
+        if matches!(self.st.dealias(pattern), Type::Class { sym, .. } if sym == self.st.singleton_sym)
+        {
+            return true;
+        }
+        fn upper(typer: &Typer, ty: &Type) -> Type {
+            let mut ty = typer.st.dealias(ty).widen_constant();
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                ty = match ty {
+                    Type::TypeParam(id) | Type::TypeMember(id) if seen.insert(id) => {
+                        typer.st.get(id).bound_hi.clone().unwrap_or(Type::Any)
+                    }
+                    Type::Applied { ref ctor, ref args } => {
+                        let Type::TypeMember(id) = ctor.as_ref() else {
+                            return ty;
+                        };
+                        if !seen.insert(*id) {
+                            return ty;
+                        }
+                        let hi = typer.st.get(*id).bound_hi.clone().unwrap_or(Type::Any);
+                        // An applied abstract member's upper bound is written
+                        // in its own type parameters. Test against that bound
+                        // at the actual arguments, e.g. Foo[A] <: A.
+                        typer.st.subst_tparams(*id, args, &hi)
+                    }
+                    Type::Annotated { tpe, .. } => *tpe,
+                    // Function syntax and FunctionN classes denote the same
+                    // type. Use the class form so abstract arguments on both
+                    // sides receive the same instantiation treatment below.
+                    _ => return typer.st.function_class_form(&ty).unwrap_or(ty),
+                };
+                ty = typer.st.dealias(&ty);
+            }
+        }
+        fn uncertain(ty: &Type) -> bool {
+            sig_has_abstract_type(ty)
+                || type_mentions_wildcard(ty)
+                || type_mentions_unresolved(ty)
+                || matches!(ty, Type::NoType)
+        }
+        fn erased_args(ty: &Type) -> Type {
+            match ty {
+                Type::Class { sym, args } => Type::Class {
+                    sym: *sym,
+                    args: vec![Type::Wildcard; args.len()],
+                },
+                _ => ty.clone(),
+            }
+        }
+        let p = upper(self, pattern);
+        let s = upper(self, scrutinee);
+        if p.is_error() || p.is_no_type() || s.is_error() || s.is_no_type() {
+            return true;
+        }
+        // No instance can inherit the same invariant base twice with
+        // different concrete arguments, even when neither class is final.
+        let mut pb = self.st.base_type_seq(&p);
+        let mut sb = self.st.base_type_seq(&s);
+        pb.push(p.clone());
+        sb.push(s.clone());
+        // JVM signatures cannot encode variance. Parent classes may only
+        // have that provisional metadata until a member is requested.
+        let classes: std::collections::HashSet<_> = pb
+            .iter()
+            .chain(&sb)
+            .filter_map(|t| {
+                if let Type::Class { sym, .. } = t {
+                    Some(*sym)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for class in classes {
+            self.pickle
+                .complete_class_pattern_metadata(&mut self.st, &mut self.binary, class);
+        }
+        for a in &pb {
+            let Type::Class { sym: ac, args: aa } = a else {
+                continue;
+            };
+            for b in &sb {
+                let Type::Class { sym: bc, args: ba } = b else {
+                    continue;
+                };
+                if ac != bc {
+                    continue;
+                }
+                for ((x, y), tp) in aa.iter().zip(ba).zip(&self.st.get(*ac).tparams) {
+                    let f = self.st.get(*tp).flags;
+                    if !f.contains(Flags::COVARIANT)
+                        && !f.contains(Flags::CONTRAVARIANT)
+                        && !uncertain(x)
+                        && !uncertain(y)
+                        && !(self.st.is_sub_type(x, y) && self.st.is_sub_type(y, x))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        if let (Type::Array(a), Type::Array(b)) = (&p, &s) {
+            if !uncertain(a) && !uncertain(b) {
+                return self.st.is_sub_type(a, b) && self.st.is_sub_type(b, a);
+            }
+            return self.typed_pattern_compatible(a, b);
+        }
+        // Refined case-local binders can already prove conformance through
+        // their bounds. Preserve that evidence before erasing open arguments.
+        if self.st.is_sub_type(&p, &s) || self.st.is_sub_type(&s, &p) {
+            return true;
+        }
+        // Abstract arguments can be instantiated by the pattern. Concrete
+        // arguments must still conform when either class is final; erasure
+        // does not make a fruitless final-class test legal.
+        let p = if uncertain(&p) { erased_args(&p) } else { p };
+        let s = if uncertain(&s) { erased_args(&s) } else { s };
+        self.stable_pattern_compatible(&p, &s)
     }
 
     /// nsc's `inferTypedPattern`: `case a: T[?, …]` keeps whatever the

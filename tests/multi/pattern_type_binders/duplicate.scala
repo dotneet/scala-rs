@@ -1,0 +1,1 @@
+object Test { def f(a: Any): Int = a match { case b: Tuple2[t,t] => 1; case _ => 0 } }

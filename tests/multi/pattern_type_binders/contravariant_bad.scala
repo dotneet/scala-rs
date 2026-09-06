@@ -1,0 +1,1 @@
+trait A[-T]; final class B[T](val value: T) extends A[T]; object Test { def f(a: A[Int]): Int = a match { case b: B[t] => val x: Int = b.value; x } }

@@ -3044,3 +3044,82 @@ object UseLib {
     let _ = fs::remove_dir_all(&out_lib);
     let _ = fs::remove_dir_all(&probe);
 }
+
+#[test]
+fn dynamic_explicit_type_arguments_select_the_method_overload() {
+    assert!(Path::new("/tmp/scala-rs-lib/scala-library-2.13.16.jar").is_file());
+    dual_run_fixture("dynamic_typeargs");
+    let out = tmp_dir("dynamic-typeargs-nsc");
+    let result = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .arg(fixtures_dir().join("dynamic_typeargs.scala"))
+        .arg("-d")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let cp = format!(
+        "{}:/tmp/scala-rs-lib/scala-library-2.13.16.jar",
+        out.display()
+    );
+    let result = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        expected_stdout("dynamic_typeargs")
+    );
+    fs::remove_dir_all(out).unwrap();
+}
+
+#[test]
+fn dynamic_explicit_type_arguments_reject_invalid_arguments_and_bounds() {
+    for (name, declaration, call) in [
+        (
+            "argument",
+            "def applyDynamic[A](name: String)(x: A): A = x",
+            "d.foo[Int](\"bad\")",
+        ),
+        (
+            "bound",
+            "def applyDynamic[A <: CharSequence](name: String)(x: A): A = x",
+            "d.foo[Int](1)",
+        ),
+    ] {
+        let root = tmp_dir(name);
+        let src = root.join("Bad.scala");
+        fs::write(&src, format!("import scala.language.dynamics\nclass D extends Dynamic {{ {declaration} }}\nobject Bad {{ val d = new D; val bad = {call} }}")).unwrap();
+        for ours in [true, false] {
+            let out = root.join(if ours { "rs" } else { "nsc" });
+            fs::create_dir_all(&out).unwrap();
+            let mut cmd = if ours {
+                let mut c = Command::new(bin());
+                c.args([
+                    "compile",
+                    "--scala-library",
+                    "/tmp/scala-rs-lib/scala-library-2.13.16.jar",
+                ]);
+                c
+            } else {
+                Command::new("/tmp/scala-2.13.16/bin/scalac")
+            };
+            let result = cmd.arg(&src).arg("-d").arg(&out).output().unwrap();
+            assert!(!result.status.success(), "accepted {name}, ours={ours}");
+            assert!(
+                String::from_utf8_lossy(&result.stderr).contains("Bad.scala:3"),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+}

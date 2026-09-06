@@ -28,6 +28,18 @@ makes no claim of conformance to the language specification. What exists today:
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは
 [docs/tailrec.md](docs/tailrec.md) を参照してください。
 
+`Singleton` の型境界は ScalaSignature に保存し、scalac 2.13.16 との
+分割コンパイルを両方向で検査しています。正常な継承の JVM 実行と、不正な
+境界変更の拒否を確認するテストは `singleton_metadata` です。
+[修正の範囲と検証方法](docs/notes/singleton-metadata-parent.md) を参照してください。
+外部 trait の `hashCode` / `toString` と組み込み `Any` の上書き関係も、
+[scalac 相互運用テスト](docs/notes/inherited-universal-override.md) で検査します。
+
+同名メソッドと object の `apply` は両方をオーバーロード候補として比較します。
+単一候補の呼び出し結果と曖昧な呼び出しの拒否は、`overload_module` テストで
+scalac 2.13.16 と比較します。集合の結合も含む
+[修正範囲と検証方法](docs/notes/overload-module-and-set.md) を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

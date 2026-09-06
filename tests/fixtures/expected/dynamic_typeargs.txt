@@ -1,0 +1,9 @@
+apply:1
+apply:2
+apply:3
+foo:2
+real
+ordinary
+bar:1
+1
+explicit

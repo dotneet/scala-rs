@@ -345,6 +345,11 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
             for u in units.iter() {
                 add_value_class_companions(&u.tree, &mut st);
             }
+            // Freeze source override identities while method types still
+            // carry receiver and method type parameters. Backend mixin
+            // dispatch runs after erasure and reads this table instead of
+            // inferring a family from erased descriptors.
+            scala_rs_typer::record_method_override_families(&mut st);
             // nsc `superaccessors`, likewise before `pickler`: which trait
             // members write `super.m` decides which `T$$super$m` members the
             // signature declares, and a reader implements exactly those.
@@ -439,56 +444,75 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         std::rc::Rc::new(scala_rs_backend::BinaryParents::new(p))
     });
 
-    // Emit unit by unit and hand each unit's classes to the writer pool as soon
-    // as they exist, instead of writing all of them after the last unit. The
-    // writers spend nearly all their time blocked in `open`, so the file system
-    // latency overlaps with the code generation that follows rather than being
-    // added to it.
+    // Keep every emitted class in memory until every unit has passed the
+    // backend gate. A backend fallback is a compile error, so publishing the
+    // runtime or an earlier unit before a later unit fails would leave a
+    // partial class tree on disk.
+    let mut emitted_classes = if library_abi {
+        Vec::new()
+    } else {
+        emit_runtime()
+    };
+    for u in &units {
+        let src_name = source_file_name(&sources[u.file_index]);
+        let result = emit_opts(
+            &u.tree,
+            st,
+            src_name,
+            EmitOpts {
+                library_abi,
+                pickles: std::rc::Rc::clone(&u.pickles),
+                trait_members: Some(std::rc::Rc::clone(&trait_members)),
+                jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
+                captured_vars: Some(std::rc::Rc::clone(&captured_vars)),
+                class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
+                binary_parents: binary_parents.clone(),
+                generic_sigs: generic_sigs.clone(),
+            },
+        );
+        let mut classes = match result {
+            Ok(classes) => classes,
+            Err(errors) => {
+                for e in errors {
+                    diags.push(Diagnostic::error(u.file_index, e.span, e.message));
+                }
+                continue;
+            }
+        };
+        // A class that exceeds a class file format limit is reported and
+        // not written: the file would either be rejected by the loader or,
+        // for the offsets that are only `u16`, quietly wrong. nsc reports
+        // it the same way and writes nothing for the class either.
+        classes.retain(|c| {
+            if c.format_errors.is_empty() {
+                return true;
+            }
+            let name = c.internal_name.replace('/', ".");
+            for m in &c.format_errors {
+                diags.push(
+                    Diagnostic::error(
+                        u.file_index,
+                        Span::DUMMY,
+                        format!("Error while emitting {name}"),
+                    )
+                    .note(m.clone()),
+                );
+            }
+            false
+        });
+        emitted_classes.extend(classes);
+    }
+    if has_errors(&diags) {
+        return CompileResult {
+            diags,
+            sources,
+            emitted: Vec::new(),
+            mains,
+        };
+    }
     let (emitted, write_result) = {
         let mut writer = ClassWriter::start(&opts.out_dir);
-        if !library_abi {
-            writer.push(emit_runtime());
-        }
-        for u in &units {
-            let src_name = source_file_name(&sources[u.file_index]);
-            let mut classes = emit_opts(
-                &u.tree,
-                st,
-                src_name,
-                EmitOpts {
-                    library_abi,
-                    pickles: std::rc::Rc::clone(&u.pickles),
-                    trait_members: Some(std::rc::Rc::clone(&trait_members)),
-                    jvm_index: Some(std::rc::Rc::clone(&jvm_index)),
-                    captured_vars: Some(std::rc::Rc::clone(&captured_vars)),
-                    class_by_name: Some(std::rc::Rc::clone(&class_by_name)),
-                    binary_parents: binary_parents.clone(),
-                    generic_sigs: generic_sigs.clone(),
-                },
-            );
-            // A class that exceeds a class file format limit is reported and
-            // not written: the file would either be rejected by the loader or,
-            // for the offsets that are only `u16`, quietly wrong. nsc reports
-            // it the same way and writes nothing for the class either.
-            classes.retain(|c| {
-                if c.format_errors.is_empty() {
-                    return true;
-                }
-                let name = c.internal_name.replace('/', ".");
-                for m in &c.format_errors {
-                    diags.push(
-                        Diagnostic::error(
-                            u.file_index,
-                            Span::DUMMY,
-                            format!("Error while emitting {name}"),
-                        )
-                        .note(m.clone()),
-                    );
-                }
-                false
-            });
-            writer.push(classes);
-        }
+        writer.push(emitted_classes);
         writer.finish()
     };
     if let Err(e) = write_result {
@@ -823,6 +847,7 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                             name: m.name,
                             param_names: m.param_names,
                             param_types: m.param_types.iter().map(cp_type).collect(),
+                            param_flags: m.param_flags,
                             ret: cp_type(&m.ret),
                             tparams: m.tparams.iter().map(cp_tparam).collect(),
                             is_val: m.is_val,

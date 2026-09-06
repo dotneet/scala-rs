@@ -727,11 +727,22 @@ pub(crate) fn invoke_method(
                     return;
                 }
                 "++" => {
-                    asm.invokeinterface(
-                        "scala/collection/IterableOps",
-                        "++",
-                        "(Lscala/collection/IterableOnce;)Ljava/lang/Object;",
-                    );
+                    // SetOps preserves the receiver's collection type; the
+                    // polymorphic IterableOps overload can widen its elements
+                    // and builds an ordinary Set. Keep the typer's choice.
+                    if s.tparams.is_empty() {
+                        asm.invokeinterface(
+                            "scala/collection/SetOps",
+                            "++",
+                            "(Lscala/collection/IterableOnce;)Lscala/collection/SetOps;",
+                        );
+                    } else {
+                        asm.invokeinterface(
+                            "scala/collection/IterableOps",
+                            "++",
+                            "(Lscala/collection/IterableOnce;)Ljava/lang/Object;",
+                        );
+                    }
                     cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }

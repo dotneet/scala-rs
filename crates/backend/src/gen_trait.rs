@@ -6,13 +6,13 @@
 //! and the getters of `val` members.
 
 use crate::classfile::{
-    encode_method_name, Field, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC,
-    ACC_STATIC, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
+    decode_method_name, encode_method_name, Field, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE,
+    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::gen::*;
 use crate::ifacebridge::BridgeKind;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::SymKind;
+use scala_rs_typer::{method_overrides, SymKind};
 use std::collections::{HashMap, HashSet};
 
 impl<'a> Gen<'a> {
@@ -111,6 +111,7 @@ impl<'a> Gen<'a> {
                     source,
                     library_abi,
                     boxed_vars,
+                    std::rc::Rc::clone(&self.emit_errors),
                 );
                 for vd in &inits {
                     if let TreeKind::ValDef {
@@ -221,6 +222,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             ctx.method_sym = meth;
             tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
@@ -784,13 +786,15 @@ impl<'a> Gen<'a> {
             let enc = enc.to_string();
             // The accessor's name holds the *encoded* method name; the
             // interface's own member list is where the source name is.
-            let Some(name) = members.iter().copied().find_map(|m| {
-                let t = self.st.get(m);
-                (t.kind == SymKind::Method && encode_method_name(&t.name) == enc)
-                    .then(|| t.name.clone())
-            }) else {
-                continue;
-            };
+            let name = members
+                .iter()
+                .copied()
+                .find_map(|m| {
+                    let t = self.st.get(m);
+                    (t.kind == SymKind::Method && encode_method_name(&t.name) == enc)
+                        .then(|| t.name.clone())
+                })
+                .unwrap_or_else(|| decode_method_name(&enc));
             out.push((acc, name));
         }
         out
@@ -805,48 +809,112 @@ impl<'a> Gen<'a> {
             if idx == 0 || !is_interface_sym(self.st, *parent) {
                 continue;
             }
-            // `(source name, accessor name, instance descriptor, parameters,
-            // result)`. A trait of this run's own sources contributes one
-            // entry per member whose body writes `super.m`; a trait read from
-            // `-cp` contributes one per accessor its *interface* declares,
-            // which is the same set as far as the class is concerned.
-            let mut owed: Vec<(String, String, String, Vec<Type>, Type)> = Vec::new();
+            // Source super calls and binary interface accessors use the same
+            // record, retaining both the accessor ABI and selected target ABI.
+            struct SuperAccessor {
+                name: String,
+                accessor: String,
+                descriptor: String,
+                target_descriptor: String,
+                target: SymbolId,
+                params: Vec<Type>,
+                result: Type,
+            }
+            let mut owed = Vec::new();
             match self.traits.impls.get(parent) {
                 Some(methods) => {
+                    let mut seen = HashSet::new();
                     for m in methods {
-                        if !needs_super_accessor(m) {
-                            continue;
+                        let mut accesses = Vec::new();
+                        collect_super_accesses(m, &mut accesses);
+                        for (name, target, selected_params) in accesses {
+                            if name.is_empty() || target.is_none() {
+                                continue;
+                            }
+                            let target_params = selected_params
+                                .unwrap_or_else(|| method_params_from_sym(self.st, target));
+                            let target_desc = jvm_method_desc(
+                                self.st,
+                                &target_params,
+                                &method_ret_from_sym(self.st, target),
+                            );
+                            let (desc, pts, ret) = if m.name() == Some(name.as_str()) {
+                                (
+                                    def_method_desc(self.st, m),
+                                    def_param_types(self.st, m),
+                                    method_ret_ty(m),
+                                )
+                            } else if !target.is_none() {
+                                (
+                                    target_desc.clone(),
+                                    target_params.clone(),
+                                    method_ret_from_sym(self.st, target),
+                                )
+                            } else {
+                                continue;
+                            };
+                            if !seen.insert((name.clone(), desc.clone())) {
+                                continue;
+                            }
+                            owed.push(SuperAccessor {
+                                accessor: super_accessor_name(self.st, *parent, &name),
+                                name,
+                                descriptor: desc,
+                                target_descriptor: target_desc,
+                                target,
+                                params: pts,
+                                result: ret,
+                            });
                         }
-                        let name = m.name().unwrap_or("").to_string();
-                        if name.is_empty() {
-                            continue;
-                        }
-                        owed.push((
-                            name.clone(),
-                            super_accessor_name(self.st, *parent, &name),
-                            def_method_desc(self.st, m),
-                            def_param_types(self.st, m),
-                            method_ret_ty(m),
-                        ));
                     }
                 }
                 None => {
                     for (acc, name) in self.binary_trait_super_accessors(*parent) {
                         let aname = self.st.get(acc).name.clone();
-                        if b.methods.iter().any(|m| m.name == aname) {
+                        let desc = method_desc_from_sym(self.st, acc);
+                        if b.methods.iter().any(|m| m.name == aname && m.desc == desc) {
                             continue;
                         }
-                        owed.push((
+                        let object_method =
+                            matches!(name.as_str(), "equals" | "hashCode" | "toString");
+                        let target = if object_method {
+                            self.st
+                                .get(self.st.any_sym)
+                                .members
+                                .iter()
+                                .copied()
+                                .find(|&mid| self.st.get(mid).name == name)
+                                .unwrap_or(acc)
+                        } else {
+                            acc
+                        };
+                        owed.push(SuperAccessor {
                             name,
-                            aname,
-                            method_desc_from_sym(self.st, acc),
-                            method_params_from_sym(self.st, acc),
-                            method_ret_from_sym(self.st, acc),
-                        ));
+                            accessor: aname,
+                            descriptor: desc.clone(),
+                            target_descriptor: desc,
+                            // A binary trait's accessor is the ABI alias for
+                            // its selected `super` member, not that trait's
+                            // own default. Object methods have no declaring
+                            // interface in the classfile hierarchy, so keep
+                            // their Any target for terminal-super fallback.
+                            target,
+                            params: method_params_from_sym(self.st, acc),
+                            result: method_ret_from_sym(self.st, acc),
+                        });
                     }
                 }
             }
-            for (name, acc, inst_desc, pts, ret) in owed {
+            for SuperAccessor {
+                name,
+                accessor: acc,
+                descriptor: inst_desc,
+                target_descriptor: target_desc,
+                target: target_id,
+                params: pts,
+                result: ret,
+            } in owed
+            {
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 for p in &pts {
@@ -854,7 +922,7 @@ impl<'a> Gen<'a> {
                     loads.push((locals, sort));
                     locals += sort.slots();
                 }
-                let target = self.next_lin_impl(&lin, idx, &name);
+                let target = self.next_lin_impl(&lin, idx, &name, &target_desc, target_id);
                 let acc_c = acc.clone();
                 let inst_c = inst_desc.clone();
                 // The accessor's own signature is the *overriding* method's --
@@ -863,14 +931,27 @@ impl<'a> Gen<'a> {
                 // refined abstract type member (`type RowsPerStatement =
                 // One.type` over `>: One.type <: RowsPerStatement`) makes the
                 // two differ. Call the target at *its* descriptor.
-                let call_desc = self
-                    .super_target_desc(target, &name, pts.len())
-                    .unwrap_or_else(|| inst_c.clone());
+                let (call_desc, call_params) = self
+                    .super_target_desc(target, &name, pts.len(), &target_desc, target_id)
+                    .unwrap_or_else(|| (inst_c.clone(), pts.clone()));
+                if target.is_none() {
+                    report_emit_error(
+                        &self.emit_errors,
+                        self.unit_span,
+                        format!("no super implementation for {name}"),
+                    );
+                }
                 let call_c = call_desc.clone();
                 b.add_code(ACC_PUBLIC, &acc_c, &inst_c, locals.max(1), |asm| {
                     asm.aload(0);
-                    for (slot, sort) in &loads {
+                    for (i, (slot, sort)) in loads.iter().enumerate() {
                         load(asm, *slot, *sort);
+                        if let Some(to) = call_params.get(i) {
+                            if jvm_desc(self.st, &pts[i]) != jvm_desc(self.st, to) {
+                                let adapt = param_adapt(self.st, &pts[i], to);
+                                emit_adapt(asm, &adapt);
+                            }
+                        }
                     }
                     match target {
                         Some((next, true)) => {
@@ -907,21 +988,36 @@ impl<'a> Gen<'a> {
     }
 
     /// The descriptor the `super` target was compiled with, when it can be
-    /// found. `arity` disambiguates overloads.
+    /// found. `arity` disambiguates overloads; the target symbol permits only
+    /// the selected source declaration (or one of its real overrides) as a
+    /// fallback. The override relation comes from the typer's pre-erasure
+    /// receiver substitution and method type-parameter alignment.
     pub(crate) fn super_target_desc(
         &self,
         target: Option<(SymbolId, bool)>,
         method: &str,
         arity: usize,
-    ) -> Option<String> {
+        expected_desc: &str,
+        target_id: SymbolId,
+    ) -> Option<(String, Vec<Type>)> {
         match target? {
             (next, true) => match self.traits.impls.get(&next) {
                 Some(ms) => ms
                     .iter()
-                    .find(|m| {
+                    .filter(|m| {
                         m.name() == Some(method) && def_param_types(self.st, m).len() == arity
                     })
-                    .map(|m| def_method_desc(self.st, m)),
+                    .find(|m| {
+                        desc_params(&def_method_desc(self.st, m)) == desc_params(expected_desc)
+                    })
+                    .or_else(|| {
+                        ms.iter().find(|m| {
+                            m.name() == Some(method)
+                                && def_param_types(self.st, m).len() == arity
+                                && method_overrides(self.st, m.sym, target_id)
+                        })
+                    })
+                    .map(|m| (def_method_desc(self.st, m), def_param_types(self.st, m))),
                 // A trait read from `-cp`: its interface carries the
                 // descriptor the trait was compiled with.
                 None => self
@@ -930,13 +1026,31 @@ impl<'a> Gen<'a> {
                     .members
                     .iter()
                     .copied()
-                    .find(|&mid| {
+                    .filter(|&mid| {
                         let mem = self.st.get(mid);
                         mem.name == method
                             && mem.kind == SymKind::Method
                             && param_count(self.st, mid) == arity
                     })
-                    .map(|mid| method_desc_from_sym(self.st, mid)),
+                    .find(|&mid| {
+                        desc_params(&method_desc_from_sym(self.st, mid))
+                            == desc_params(expected_desc)
+                    })
+                    .or_else(|| {
+                        self.st.get(next).members.iter().copied().find(|&mid| {
+                            let mem = self.st.get(mid);
+                            mem.name == method
+                                && mem.kind == SymKind::Method
+                                && param_count(self.st, mid) == arity
+                                && method_overrides(self.st, mid, target_id)
+                        })
+                    })
+                    .map(|mid| {
+                        (
+                            method_desc_from_sym(self.st, mid),
+                            method_params_from_sym(self.st, mid),
+                        )
+                    }),
             },
             (next, false) => self
                 .st
@@ -944,14 +1058,32 @@ impl<'a> Gen<'a> {
                 .members
                 .iter()
                 .copied()
-                .find(|&mid| {
+                .filter(|&mid| {
                     let mem = self.st.get(mid);
                     mem.name == method
                         && mem.kind == SymKind::Method
                         && !mem.flags.contains(Flags::ABSTRACT)
                         && param_count(self.st, mid) == arity
                 })
-                .map(|mid| method_desc_from_sym(self.st, mid)),
+                .find(|&mid| {
+                    desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
+                })
+                .or_else(|| {
+                    self.st.get(next).members.iter().copied().find(|&mid| {
+                        let mem = self.st.get(mid);
+                        mem.name == method
+                            && mem.kind == SymKind::Method
+                            && !mem.flags.contains(Flags::ABSTRACT)
+                            && param_count(self.st, mid) == arity
+                            && method_overrides(self.st, mid, target_id)
+                    })
+                })
+                .map(|mid| {
+                    (
+                        method_desc_from_sym(self.st, mid),
+                        method_params_from_sym(self.st, mid),
+                    )
+                }),
         }
     }
 
@@ -960,15 +1092,23 @@ impl<'a> Gen<'a> {
         lin: &[SymbolId],
         after_idx: usize,
         method: &str,
+        expected_desc: &str,
+        target_id: SymbolId,
     ) -> Option<(SymbolId, bool)> {
         for &s in lin.iter().skip(after_idx + 1) {
             if let Some(ms) = self.traits.impls.get(&s) {
                 // A trait-private method never dispatches through `super`:
                 // it isn't part of the interface's signature, so it can't be
                 // the target of another trait's or class's `super.m()`.
-                if ms
+                let methods: Vec<&Tree> = ms
                     .iter()
-                    .any(|m| m.name() == Some(method) && !is_trait_private_def(self.st, m))
+                    .filter(|m| m.name() == Some(method) && !is_trait_private_def(self.st, m))
+                    .collect();
+                if methods.iter().any(|m| {
+                    desc_params(&def_method_desc(self.st, m)) == desc_params(expected_desc)
+                }) || methods
+                    .iter()
+                    .any(|m| method_overrides(self.st, m.sym, target_id))
                 {
                     return Some((s, true));
                 }
@@ -976,19 +1116,67 @@ impl<'a> Gen<'a> {
                 // A trait read from `-cp` sitting between two stackable layers
                 // of ours: without this the `super` chain skipped it and went
                 // straight to the superclass, dropping its layer silently.
-                return Some((s, true));
+                let methods: Vec<SymbolId> = self
+                    .st
+                    .get(s)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&mid| {
+                        let mem = self.st.get(mid);
+                        mem.kind == SymKind::Method && mem.name == method
+                    })
+                    .collect();
+                if methods.iter().any(|&mid| {
+                    desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
+                }) || methods
+                    .iter()
+                    .any(|&mid| method_overrides(self.st, mid, target_id))
+                {
+                    return Some((s, true));
+                }
             }
             if !is_interface_sym(self.st, s) {
-                let has = self.st.get(s).members.iter().any(|&mid| {
-                    let mem = self.st.get(mid);
-                    mem.name == method
-                        && mem.kind == SymKind::Method
-                        && !mem.flags.contains(Flags::ABSTRACT)
-                });
-                if has {
+                let methods: Vec<SymbolId> = self
+                    .st
+                    .get(s)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&mid| {
+                        let mem = self.st.get(mid);
+                        mem.name == method
+                            && mem.kind == SymKind::Method
+                            && !mem.flags.contains(Flags::ABSTRACT)
+                    })
+                    .collect();
+                if methods.iter().any(|&mid| {
+                    desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
+                }) || methods
+                    .iter()
+                    .any(|&mid| method_overrides(self.st, mid, target_id))
+                {
                     return Some((s, false));
                 }
             }
+        }
+        // `linearize` intentionally omits Any/AnyRef/Object. A trait body
+        // such as `override def toString = super.toString` still selects the
+        // inherited Any member, though, and the class owes an accessor for
+        // it. Resolve that terminal member through the nearest concrete
+        // superclass so `invokespecial` names a legal superclass owner.
+        if self.st.get(target_id).owner == self.st.any_sym
+            && matches!(method, "equals" | "hashCode" | "toString")
+            && desc_params(&method_desc_from_sym(self.st, target_id)) == desc_params(expected_desc)
+        {
+            if let Some(&owner) = lin
+                .iter()
+                .skip(after_idx + 1)
+                .find(|&&s| !is_interface_sym(self.st, s) && !is_top_class(self.st, s))
+            {
+                return Some((owner, false));
+            }
+            return Some((self.st.object_sym, false));
         }
         None
     }
@@ -1430,6 +1618,7 @@ impl<'a> Gen<'a> {
                         self.st.get(id).name,
                         self.st.get(*parent).name
                     );
+                    report_emit_error(&self.emit_errors, self.unit_span, msg.clone());
                     b.add_code(ACC_PUBLIC, &aname, &adesc, 1, |asm| {
                         throw_runtime(asm, &msg);
                     });
@@ -2272,6 +2461,7 @@ impl<'a> Gen<'a> {
                         source,
                         library_abi,
                         boxed_vars,
+                        std::rc::Rc::clone(&self.emit_errors),
                     );
                     gen_expr(asm, &mut frame, &ctx, &rhs);
                     if is_unit_like(&ret_for_body) {
@@ -2337,6 +2527,7 @@ impl<'a> Gen<'a> {
                         source,
                         library_abi,
                         boxed_vars,
+                        std::rc::Rc::clone(&self.emit_errors),
                     );
                     ctx.value_ext = Some((
                         class_name.clone(),
@@ -2513,6 +2704,7 @@ impl<'a> Gen<'a> {
                     source,
                     library_abi,
                     boxed_vars,
+                    std::rc::Rc::clone(&self.emit_errors),
                 );
                 if via_module {
                     load_module_instance(asm, &ctx, o);
@@ -2629,6 +2821,7 @@ impl<'a> Gen<'a> {
                             source,
                             library_abi,
                             boxed_vars,
+                            std::rc::Rc::clone(&self.emit_errors),
                         );
                         gen_expr(asm, &mut frame, &ctx, rhs);
                     }

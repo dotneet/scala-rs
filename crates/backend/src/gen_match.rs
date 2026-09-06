@@ -266,7 +266,10 @@ pub(crate) fn gen_ctor_fields_pattern(
     } else {
         ctx.st.get(class_id).ctor_fields.clone()
     };
-    for (i, a) in args.iter().enumerate() {
+    let repeated = !class_id.is_none() && ctx.st.repeated_case_element(class_id).is_some();
+    // Even an empty repeated tail needs a length check on the stored Seq.
+    let count = args.len().max(if repeated { fields.len() } else { 0 });
+    for i in 0..count {
         if let Some(fid) = fields.get(i) {
             let fs = ctx.st.get(*fid);
             let fname = fs.name.clone();
@@ -303,6 +306,16 @@ pub(crate) fn gen_ctor_fields_pattern(
                 Some(a) => asm.invokevirtual(&jvm, &a, &acc_desc),
                 None => emit_getfield(asm, &jvm, &fname, &fdesc),
             }
+            if repeated && i + 1 == fields.len() {
+                let tail = args.get(i..).unwrap_or(&[]);
+                if ctx.library_abi {
+                    gen_unapply_wrapper_bind(asm, frame, ctx, tail, fail, SeqPatShape::SeqOps);
+                } else {
+                    gen_unapply_seq_bind(asm, frame, ctx, tail, fail);
+                }
+                return;
+            }
+            let a = &args[i];
             // A field declared as a type parameter erases to Object, so
             // `case Some(x)` on an `Option[Int]` must unbox before it
             // binds. A sub-pattern that *tests* must not be narrowed
@@ -321,22 +334,24 @@ pub(crate) fn gen_ctor_fields_pattern(
             };
             bind_subpattern(asm, frame, ctx, a, sort, fail);
         } else {
+            report_ctx_error(ctx, pat.span, "pattern arity");
             throw_runtime(asm, "pattern arity");
         }
     }
 }
 
-pub(crate) fn gen_unapply_pattern(
+fn gen_unapply_pattern(
     asm: &mut Assembler,
     frame: &mut Frame,
     ctx: &EmitCtx,
     pat: &Tree,
-    fun: &Tree,
-    args: &[Tree],
     tmp: u16,
     sel_sort: JvmSort,
     fail: crate::code::Label,
 ) {
+    let TreeKind::UnApply { fun, args } = &pat.kind else {
+        unreachable!("gen_unapply_pattern is only called for UnApply patterns");
+    };
     let uid = if pat.sym.is_none() { fun.sym } else { pat.sym };
     // A `case class`'s companion `unapply` is synthesized as a *symbol* with
     // no body; nothing emits the method, so calling it is a
@@ -503,6 +518,7 @@ pub(crate) fn gen_unapply_pattern(
     if uid.is_none() {
         asm.pop();
         asm.pop();
+        report_ctx_error(ctx, pat.span, "unresolved unapply");
         throw_runtime(asm, "unresolved unapply");
         return;
     }
@@ -948,6 +964,14 @@ pub(crate) fn gen_pattern(
             load(asm, tmp, sel_sort);
             emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
         }
+        TreeKind::Apply { .. } if pat.stable_pat => {
+            // A local lazy stable identifier becomes an accessor call during
+            // lowering. Its arguments belong to that call, not an extractor.
+            gen_expr(asm, frame, ctx, pat);
+            emit_pattern_operand(asm, &pat.ty, sel_sort);
+            load(asm, tmp, sel_sort);
+            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+        }
         TreeKind::Apply { args, .. } => {
             let class_id = if pat.sym.is_none() {
                 ctx.st.class_sym_of(&pat.ty).unwrap_or(SymbolId::NONE)
@@ -956,8 +980,8 @@ pub(crate) fn gen_pattern(
             };
             gen_ctor_fields_pattern(asm, frame, ctx, pat, args, class_id, tmp, sel_sort, fail);
         }
-        TreeKind::UnApply { fun, args } => {
-            gen_unapply_pattern(asm, frame, ctx, pat, fun, args, tmp, sel_sort, fail);
+        TreeKind::UnApply { .. } => {
+            gen_unapply_pattern(asm, frame, ctx, pat, tmp, sel_sort, fail);
         }
         TreeKind::Bind { body, .. } => {
             // `case n @ N(v, _)` binds `n` at the pattern's *own* type, not at
@@ -983,6 +1007,10 @@ pub(crate) fn gen_pattern(
             store(asm, slot, sort);
         }
         TreeKind::Typed { expr, .. } => {
+            if pat.sym == ctx.st.singleton_sym {
+                gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
             // `case x: Meters` on an `Any` tests for the boxed value class and
             // reads the underlying back out of it; erasure stamped the class on
             // the ascription node (`mark_value_class_patterns`).

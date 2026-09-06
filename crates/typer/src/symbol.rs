@@ -345,6 +345,8 @@ pub struct Symbol {
     /// `TypeMember`; the pickle writer must retain that declaration kind
     /// instead of inferring it from the resolved type alone.
     pub is_type_alias: bool,
+    /// A rigid existential type introduced by a pattern, never an inference variable.
+    pub is_pattern_skolem: bool,
     /// For classes defined inside a method: enclosing-method locals the class
     /// reads. Each becomes a private field plus a trailing constructor
     /// parameter (see `anon_capture`).
@@ -580,6 +582,7 @@ pub struct SymbolTable {
     pub root: SymbolId,
     pub scala_pkg: SymbolId,
     pub predef: SymbolId,
+    pub singleton_sym: SymbolId,
     pub any_sym: SymbolId,
     pub anyref_sym: SymbolId,
     pub anyval_sym: SymbolId,
@@ -604,6 +607,15 @@ pub struct SymbolTable {
     /// Enclosing owner while naming/typing.
     pub owner: SymbolId,
     pub this_class: SymbolId,
+    /// Source-trait `super` targets that have no declaration in that trait.
+    /// The backend pickles these as `SUPERACCESSOR` aliases so scalac's mixin
+    /// phase can synthesize the forwarding method in an external subclass.
+    pub super_accessor_targets: rustc_hash::FxHashMap<SymbolId, Vec<(SymbolId, Vec<Type>)>>,
+    /// Source method identities that were proven to be overrides before
+    /// erasure.  Backend dispatch must not rediscover this relation from the
+    /// erased JVM types: a generic base and an unrelated overload can erase
+    /// to the same descriptor.
+    pub method_override_families: rustc_hash::FxHashSet<(SymbolId, SymbolId)>,
     /// Terms whose pre-erasure type was a user value class, and which one.
     /// Erasure replaces the type with the underlying representation, but the
     /// backend still has to know that `case class Box(m: Meters)` prints its
@@ -629,6 +641,9 @@ pub struct SymbolTable {
     /// constructor fields private behind accessors; ours are emitted with the
     /// field public, so the two are read differently.
     pub source_classes: rustc_hash::FxHashSet<SymbolId>,
+    /// Scala classes seeded by the shallow classpath reader. Their complete
+    /// signature must be adopted before type checking uses their members.
+    pub pending_classpath_signatures: rustc_hash::FxHashSet<SymbolId>,
     /// `scala.runtime.LazyRef` & friends, in `prelude_lazyref::CELL_NAMES`
     /// order. The cell classes a method-local `lazy val` is compiled into.
     pub lazy_cells: Vec<SymbolId>,
@@ -761,6 +776,7 @@ impl SymbolTable {
                 bound_lo: None,
                 bound_hi: None,
                 is_type_alias: false,
+                is_pattern_skolem: false,
                 captures: vec![],
                 macro_impl: None,
                 declaring_class: String::new(),
@@ -777,6 +793,7 @@ impl SymbolTable {
             root: SymbolId(0),
             scala_pkg: SymbolId(0),
             predef: SymbolId(0),
+            singleton_sym: SymbolId::NONE,
             any_sym: SymbolId(0),
             anyref_sym: SymbolId(0),
             anyval_sym: SymbolId(0),
@@ -800,10 +817,13 @@ impl SymbolTable {
             object_sym: SymbolId(0),
             owner: SymbolId(0),
             this_class: SymbolId(0),
+            super_accessor_targets: rustc_hash::FxHashMap::default(),
+            method_override_families: rustc_hash::FxHashSet::default(),
             value_class_terms: rustc_hash::FxHashMap::default(),
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),
             source_classes: rustc_hash::FxHashSet::default(),
+            pending_classpath_signatures: rustc_hash::FxHashSet::default(),
             lazy_cells: Vec::new(),
             local_lazy_cells: rustc_hash::FxHashSet::default(),
             local_lazy_accessors: rustc_hash::FxHashMap::default(),
@@ -867,6 +887,7 @@ impl SymbolTable {
             bound_lo: None,
             bound_hi: None,
             is_type_alias: false,
+            is_pattern_skolem: false,
             captures: vec![],
             macro_impl: None,
             declaring_class: String::new(),
@@ -2372,6 +2393,28 @@ impl SymbolTable {
         None
     }
 
+    /// Repeated element type from the primary constructor, before its
+    /// parameter field is viewed as Seq[T] inside the class.
+    pub fn repeated_case_element(&self, class: SymbolId) -> Option<Type> {
+        let fields = &self.get(class).ctor_fields;
+        let last = *fields.last()?;
+        if let Type::Repeated(elem) = &self.get(last).ty {
+            return Some((**elem).clone());
+        }
+        self.get(class).members.iter().find_map(|&id| {
+            let ctor = self.get(id);
+            if ctor.name != "<init>" || !ctor.params.starts_with(fields) {
+                return None;
+            }
+            if let Type::Method { paramss, .. } = &ctor.ty {
+                if let Some(Type::Repeated(elem)) = paramss.iter().flatten().nth(fields.len() - 1) {
+                    return Some((**elem).clone());
+                }
+            }
+            None
+        })
+    }
+
     /// Base types of `t` (its parents, transitively), most specific first,
     /// with the owning class's type parameters substituted away.
     /// `t` itself is not included.
@@ -2796,6 +2839,12 @@ impl SymbolTable {
             (Type::Error, _) | (_, Type::Error) => true,
             (Type::Nothing, _) => true,
             (_, Type::Any) => true,
+            (Type::Class { sym, .. }, Type::AnyRef | Type::AnyVal)
+                if *sym == self.singleton_sym => false,
+            (Type::Constant(lit), Type::Class { sym, .. })
+                if *sym == self.singleton_sym && !matches!(lit, scala_rs_parser::Lit::Unit) => true,
+            (Type::SingleType { .. } | Type::ThisType(_) | Type::ModuleRef(_),
+                Type::Class { sym, .. }) if *sym == self.singleton_sym => true,
             (Type::Constant(a), Type::Constant(b)) => a == b,
             (Type::Constant(a), b) => self.is_sub_type(&Type::lit_underlying(a), b),
             (

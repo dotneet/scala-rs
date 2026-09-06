@@ -597,6 +597,36 @@ After merging main, frozen candidate `c6a7e8f9` is in its full gate under
 subagents have now stopped with their work preserved.
 
 
+## Parent repair: local template completion and macro declaration stripping
+
+On the held codegen/constructor candidate, inferred macro implementations were
+cached during signature inference with untyped local TypeCreator bodies. The
+local class/object/anonymous-class expression entry now completes their bodies,
+while member and top-level templates retain the two-pass entry. Macro declaration
+stripping now follows all child edges, including classes nested below New and
+ValDef, rather than only directly nested templates.
+
+Five lost positive corpus cases pass after the first repair; the two lost runtime
+cases macro-term-declared-in-anonymous and macro-term-declared-in-refinement pass
+after the stripping repair. Evidence is under
+`/tmp/scala-rs-codex/integration/codegen-macro-parent-probe/after-local-template/`:
+`corpus.tsv` and `strip-corpus.tsv`. Existing engine 27, rf_reify 6 and xflags 10
+focused tests pass. The new lazy_template test passes all four compiler producer/
+consumer combinations through an nsc reflection adapter, with strict JVM
+verification and output 7. The adapter deliberately isolates executable bodies
+from the following independently reproduced, still RED ScalaSignature defects:
+
+- Direct scala-rs macro declarations omit MACRO/binding metadata; a scalac client
+  compiles an ordinary call and fails at runtime with NoSuchMethodError.
+- A direct nsc macro facade rejects the scala-rs implementation result because
+  Exprs$Expr[Int] loses its dependent c.Expr[Int] representation. Even a source
+  cast cannot work around the incorrectly named nested class type.
+
+The original unadapted tests and failing logs are retained in the evidence
+folder as direct-macro-signature-red.rs and dependent-result-signature-red.rs.
+The adapted passing test is proof of local body execution, not of the direct
+Scala macro-declaration ABI. These fixes have not passed a full acceptance gate.
+
 ## Accepted method specialization and current parent candidates
 
 `e4d404f1` finished the full independent gate and was merged as `bafdb625`.
@@ -649,3 +679,47 @@ String is wrongly accepted against an Int element. Cross-compilation also
 exposes repeated-parameter and generic case-apply metadata gaps. Do not merge
 this WIP based on its positive test. Reproductions and continuation details are
 in `/tmp/scala-rs-codex/integration/current-state.json`.
+
+
+## Parent repeated-case and typed-pattern repair
+
+Candidate commit `8b8acfda` now emits the repeated constructor field as a
+sequence pattern, including empty tails, nested patterns and fixed prefixes.
+A same-unit runtime fixture agrees with nsc under strict JVM verification.
+The original pos/t3856 compiles six classes. Typed patterns now check concrete
+invariant bases, bounds and final types; 17 small nsc accept/reject controls
+cover primitives, arrays, abstract bounds, variance, wildcards and library
+collections. Incomplete JVM-only parent variance initially caused five false
+Slick errors; completing variance from ScalaSignature removes those errors.
+Related suites pass 36 tests, and Slick compiles 1490 classes with zero errors.
+Evidence: `typed-pattern-variance-focused.log`, `typed-pattern-variance-slick.log`
+and `typed-pattern-variance-compile.log` under the integration evidence root.
+This supersedes the earlier typed-pattern negative failure, but not the split
+compilation failures recorded in `repeated-pattern-interop/results.json`.
+Full acceptance remains pending. Latest accepted main is being merged into
+this candidate; the merge itself needs fresh validation before acceptance.
+
+## Parent repair: generic Dynamic calls and parent argument lambdas
+
+`91b37b20` preserves written type arguments on applyDynamic/applyDynamicNamed
+rather than the receiver. The original t6355pos executes 1/2/3, matching nsc;
+five focused tests cover real-method precedence, receiver evaluation once,
+invalid arguments/bounds, and ordinary generic calls with explicit evidence.
+Slick remains 0 errors / 1490 classes.
+
+The remaining aladdin883 path typed unannotated parent-constructor lambdas
+without the selected constructor's prototype. It now defers those bodies as
+ordinary `new` calls do. Strict runtime then exposed uninitializedThis being
+captured by invokedynamic before super construction. The lambda now captures
+the available enclosing-instance constructor parameter and uses that receiver
+in its hoisted body. Twenty-one related tests pass and Slick remains 0/1490.
+Evidence: `/tmp/scala-rs-codex/integration/aladdin-parent-focused.log`,
+`aladdin-parent-slick.log`, and `aladdin-parent-probe/results.json`.
+
+An expanded probe still cannot instantiate an inherited inner class through
+its concrete outer prefix (`new Numbers.Range(2, 5)` retains the outer A).
+That failure is preserved as `aladdin-parent-probe/inherited-prefix-red.scala`
+and `.json`. The passing runtime fixture constructs Range within Foo[A] and
+executes it through an inherited generic method; it does not prove that prefix
+substitution is fixed. Repeated-case split compilation also remains red.
+These independent compatibility gaps remain open after the candidate's gate.

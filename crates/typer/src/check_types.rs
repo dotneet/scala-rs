@@ -113,7 +113,7 @@ impl Typer {
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
-                self.expose_unqualified_type(name);
+                self.expose_unqualified_type(name, tpt.span);
                 let name = name.clone();
                 let ty = self.resolve_type_name_completing(&name, &[], tpt.span);
                 self.reject_unresolved_type(ty, &name, tpt.span)
@@ -221,27 +221,6 @@ impl Typer {
                     Some("<repeated>") => {
                         Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
-                    // `Option` / `List` / `Some` name the prelude's symbol by
-                    // hand here, whatever prefix they are written with, and
-                    // that survives a source definition of `scala.Option`.
-                    // Making them yield to the source symbol is *not* an
-                    // improvement yet: it takes `src/library` from 2014
-                    // errors to 2251 and from 172 to 205 files, because the
-                    // prelude's `Option` carries members the source one does
-                    // not have working signatures for. See
-                    // `docs/scala-library.md`.
-                    Some("Option") => Type::Class {
-                        sym: self.st.option_sym,
-                        args: as_,
-                    },
-                    Some("List") => Type::Class {
-                        sym: self.st.list_sym,
-                        args: as_,
-                    },
-                    Some("Some") => Type::Class {
-                        sym: self.st.some_sym,
-                        args: as_,
-                    },
                     Some(n)
                         if numbered_arity(n, "Function")
                             .is_some_and(|k| as_.is_empty() || k + 1 == as_.len()) =>
@@ -945,7 +924,7 @@ impl Typer {
         self.project_from_prefix(span, &pty, name)
     }
 
-    fn is_stable_path(&self, t: &Tree) -> bool {
+    pub(crate) fn is_stable_path(&self, t: &Tree) -> bool {
         match &t.kind {
             TreeKind::This { .. } | TreeKind::Super { .. } => true,
             TreeKind::Ident { name } => self.ident_is_stable(name),
@@ -976,7 +955,7 @@ impl Typer {
         }
     }
 
-    fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
+    pub(crate) fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
         self.expose_path_head(ref_);
         match &ref_.kind {
             TreeKind::This { qual } => {
@@ -2102,6 +2081,22 @@ impl Typer {
         for clause in self.conv_implicit_params(conv, from) {
             let mut args = Vec::with_capacity(clause.len());
             for want in &clause {
+                if let Type::Class { sym, args } = want {
+                    if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag" {
+                        if let Some(Type::TypeParam(tp)) = args.first() {
+                            if self.st.get(conv).tparams.contains(tp) {
+                                self.error(
+                                    span,
+                                    format!(
+                                        "type {} is an unresolved spliceable type",
+                                        self.st.get(*tp).name
+                                    ),
+                                );
+                                return tree;
+                            }
+                        }
+                    }
+                }
                 self.warm_implicit_scope(want);
                 let mut search = self.search_implicit(want);
                 // The same completion `fill_implicit_params_in` does for an
@@ -2122,6 +2117,9 @@ impl Typer {
                         let mut a = self.implicit_tree(id, want, span, 0);
                         self.adapt(&mut a, want);
                         args.push(a);
+                    }
+                    ImplicitSearch::None if self.classtag_apply_fallback(want, span).is_some() => {
+                        args.push(self.classtag_apply_fallback(want, span).unwrap());
                     }
                     _ => {
                         let diverged = self.diverged_implicit.borrow().clone();
@@ -2145,6 +2143,11 @@ impl Typer {
                 stable_pat: false,
             };
         }
+        // This application was synthesized rather than passed through
+        // type_apply. Its escaping parameters still belong to the caller's
+        // inference problem, just like a polymorphic receiver written out.
+        let open = self.undetermined_of(&tree);
+        self.undet_tvars.extend(open);
         tree
     }
 
@@ -2889,6 +2892,15 @@ impl Typer {
         if jvm.is_empty() || jvm.starts_with('[') {
             return;
         }
+        // Classpath discovery records only a shallow Scala signature. Adopt
+        // the complete one lazily, without re-reading source/prelude classes.
+        // Remove first because completion can recursively request this class.
+        if self.st.pending_classpath_signatures.remove(&class_id)
+            && !self.st.source_classes.contains(&class_id)
+        {
+            self.pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, class_id);
+        }
         let javaish = self.st.get(class_id).flags.contains(Flags::JAVA)
             || jvm.starts_with("java/")
             || jvm.starts_with("javax/");
@@ -2926,6 +2938,122 @@ impl Typer {
                 );
             }
         }
+    }
+
+    /// Read raw members from a Scala classfile even when its pickle has
+    /// already been adopted.  Most Scala members are supplied from pickles on
+    /// demand; constructor default getters are the one JVM-only exception:
+    /// the pickle spells `<init>$default$n`, while the classfile exposes the
+    /// static `$lessinit$greater$default$n` forwarder.
+    pub(crate) fn ensure_classfile_members_loaded(
+        &mut self,
+        class_id: SymbolId,
+        member_name: &str,
+        span: Span,
+    ) {
+        if class_id.is_none() {
+            return;
+        }
+        // The pickle already supplies the source spelling (`<init>$default$n`)
+        // but not the JVM forwarder.  Once that alias is installed, avoid
+        // reparsing and reinstalling the whole class for every later default.
+        // `install_java_class_in` merges members into the existing symbol and
+        // preserves pickle-only flags, but this guard keeps that merge a
+        // one-time classfile completion rather than making symbol state depend
+        // on the order in which defaults are visited.
+        if !member_name.is_empty()
+            && self
+                .st
+                .lookup_member(class_id, member_name)
+                .iter()
+                .any(|&id| self.st.get(id).kind == SymKind::Method)
+        {
+            return;
+        }
+        let jvm = self.st.get(class_id).jvm_name.clone();
+        if jvm.is_empty() || jvm.starts_with('[') {
+            return;
+        }
+        let Ok(Some(bytes)) = self.binary.find_class(&jvm) else {
+            return;
+        };
+        let Ok(jc) = crate::javaclass::parse_java_classfile(&bytes) else {
+            return;
+        };
+        let owner = self.st.get(class_id).owner;
+        let id = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
+        if jc.is_scala {
+            self.pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, id);
+        }
+        self.complete_java_parents(class_id, span);
+    }
+
+    /// Mark constructor parameters whose JVM getter exists in a separately
+    /// compiled class.  The constructor pickle records the parameter types,
+    /// but `supply_ctors` intentionally does not infer `DEFAULTPARAM` from a
+    /// classfile: the default body lives on the class's companion and the
+    /// classfile has no parameter flag for it.  The forwarder is still a
+    /// precise witness (`$lessinit$greater$default$n`), including for
+    /// `-Xno-forwarders` and nested classes where only `C$` has the method.
+    fn link_existing_nested_companion(&mut self, class_id: SymbolId) {
+        if self.st.companion_module(class_id).is_some() {
+            return;
+        }
+        let class_jvm = self.st.get(class_id).jvm_name.clone();
+        if class_jvm.is_empty() {
+            return;
+        }
+        let module_jvm = format!("{class_jvm}$");
+        let Some(mcls) = crate::classpath::find_by_jvm(&self.st, &module_jvm)
+            .filter(|&id| self.st.get(id).kind == SymKind::ModuleClass)
+        else {
+            return;
+        };
+        let owner = self.st.get(class_id).owner;
+        let module_owner = self.st.get(mcls).owner;
+        let outer_module_owner = if !owner.is_none() {
+            self.st
+                .companion_module(owner)
+                .map(|m| self.st.module_class_of(m))
+        } else {
+            None
+        };
+        if module_owner != owner && Some(module_owner) != outer_module_owner {
+            return;
+        }
+        let name = self.st.get(class_id).name.clone();
+        let Some(module) = self
+            .st
+            .get(module_owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&id| self.st.get(id).kind == SymKind::Module && self.st.get(id).name == name)
+        else {
+            return;
+        };
+        if !self.st.get(owner).members.contains(&module) {
+            self.st.get_mut(owner).members.push(module);
+        }
+    }
+
+    pub(crate) fn ensure_external_ctor_defaults(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        self.ensure_classfile_members_loaded(class_id, "", span);
+        self.load_companion_module(class_id);
+        self.link_existing_nested_companion(class_id);
+        if let Some(module) = self.st.companion_module(class_id) {
+            let mcls = self.st.module_class_of(module);
+            self.ensure_classfile_members_loaded(mcls, "", span);
+        }
+        // Constructor default ownership is source metadata, not a property of
+        // the JVM getter name. Read and merge each pickled constructor against
+        // its real descriptor; this also covers an auxiliary constructor whose
+        // default getter is forwarded from the class.
+        self.supply_binary_ctors(class_id);
     }
 
     /// `resolve_type_name`, after completing any alias the name binds to. A

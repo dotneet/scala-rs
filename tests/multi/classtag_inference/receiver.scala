@@ -1,0 +1,1 @@
+class Yo[T] { def yo():String="" }; object Test { implicit def view[T](a:List[T])(implicit ct:reflect.ClassTag[T]):Yo[T]=new Yo[T]; List(1).yo() }

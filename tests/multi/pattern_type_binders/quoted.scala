@@ -1,0 +1,1 @@
+sealed trait A[T]; final class B[T](val value: T) extends A[T]; object Test { type t = String; def f(a: A[Int]): Int = a match { case b: B[`t`] => 1 } }

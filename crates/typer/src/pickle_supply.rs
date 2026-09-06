@@ -368,6 +368,43 @@ impl PickleSupply {
         std::mem::take(&mut self.unresolved_refs)
     }
 
+    /// Complete variance and finality used by typed pattern compatibility.
+    /// Provisional prelude flags must not make an abstract List look final.
+    pub fn complete_class_pattern_metadata(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) {
+        if class_sym.is_none() || st.source_classes.contains(&class_sym) {
+            return;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        let module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, module) else {
+            return;
+        };
+        let Ok(sig) = self.sigs.class_sig(&mut BinSource(bin), &full, module) else {
+            return;
+        };
+        let flags = st.get(class_sym).flags;
+        st.get_mut(class_sym).flags = Flags(
+            (flags.0 & !Flags::FINAL.0)
+                | if sig.flags & pflags::FINAL != 0 {
+                    Flags::FINAL.0
+                } else {
+                    0
+                },
+        );
+        let ids = st.get(class_sym).tparams.clone();
+        if ids.len() != sig.tparams.len() {
+            return;
+        }
+        for (id, tp) in ids.into_iter().zip(&sig.tparams) {
+            st.get_mut(id).flags = st.get(id).flags.with(variance_flags(tp));
+        }
+    }
+
     /// Re-read a class just loaded from a `-cp` classfile from its own pickle.
     ///
     /// `install_java_class_in` builds the symbol out of the JVM *generic
@@ -759,8 +796,10 @@ impl PickleSupply {
         // conforms to. `RelationalTableComponent$Table` arrived that way --
         // `(Tag, Option[String], String)Unit` with `Tag` unresolved -- and the
         // pickle, which is read with the table open, has the same declaration
-        // with every name resolved. Those are replaced; a constructor that
-        // reads correctly is left alone.
+        // with every name resolved. Those are replaced. Usable constructors
+        // are still read from the pickle so its source-only parameter flags,
+        // especially `DEFAULTPARAM`, can be merged into the descriptor-bearing
+        // symbols already installed from the classfile.
         let broken: Vec<SymbolId> = st
             .get(class_sym)
             .members
@@ -769,15 +808,6 @@ impl PickleSupply {
             .filter(|&m| st.get(m).name == "<init>")
             .filter(|&m| ctor_has_unresolved_param(st, m))
             .collect();
-        let own_ctors = st
-            .get(class_sym)
-            .members
-            .iter()
-            .filter(|&&m| st.get(m).name == "<init>")
-            .count();
-        if own_ctors > broken.len() {
-            return false;
-        }
         if !self.tried.insert((class_sym.0, "<init>".to_string())) {
             return false;
         }
@@ -827,7 +857,7 @@ impl PickleSupply {
         let mut installed = 0usize;
         let mut seen: HashSet<String> = HashSet::new();
         for c in &ctors {
-            if self.install_ctor(st, bin, class_sym, &internal, &scope, c, &mut seen) {
+            if self.install_ctor(st, bin, class_sym, &internal, &scope, c, &mut seen, &broken) {
                 installed += 1;
             }
         }
@@ -859,6 +889,7 @@ impl PickleSupply {
         class_scope: &HashMap<String, Type>,
         member: &scala_rs_pickle::sym::Member,
         seen: &mut HashSet<String>,
+        broken: &[SymbolId],
     ) -> bool {
         let Some(shape) = read_shape(&member.ty) else {
             return false;
@@ -882,15 +913,17 @@ impl PickleSupply {
                 if p.by_name && !matches!(t, Type::ByName(_)) {
                     t = Type::ByName(Box::new(t));
                 }
-                let flags = if clause.implicit {
+                let mut flags = if clause.implicit {
                     Flags::PARAM.with(Flags::IMPLICIT)
                 } else {
                     Flags::PARAM
                 };
-                // A defaulted constructor parameter is not filled in here:
-                // the `$lessinit$greater$default$n` getter lives on the
-                // *companion*, which this repair does not go looking for, so
-                // the parameter stays required rather than silently dropped.
+                // The classfile has no parameter-level default bit. Keep the
+                // source pickle's flag on the constructor symbol so the
+                // caller can resolve the corresponding JVM getter later.
+                if p.flags & pflags::DEFAULTPARAM != 0 {
+                    flags = flags.with(Flags::DEFAULTPARAM);
+                }
                 let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
                 st.get_mut(ps).ty = t.clone();
                 tys.push(t);
@@ -908,17 +941,69 @@ impl PickleSupply {
         if !seen.insert(key) {
             return false;
         }
-        let Some(desc) = self.ctor_desc(bin, internal, &want) else {
+        let Some(desc) = self.ctor_desc(st, bin, class_sym, internal, &want) else {
             trace(format_args!(
                 "{internal}#<init>: no constructor in the class file matches {want:?}"
             ));
             return false;
         };
-        st.set_jvm_name(m, desc);
-        st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();
-        st.get_mut(m).paramss = paramss_sym;
+        // Constructor applications are flattened by the typer (`new C(a)(b)`
+        // and `extends C(a)(b)` both reach overload selection as one argument
+        // list). Keep that same view on the installed symbol while retaining
+        // each source parameter's flags, including DEFAULTPARAM. The default
+        // getter index is global across clauses, so flattening does not lose
+        // the metadata needed to fill a later clause.
+        let source_params: Vec<SymbolId> = paramss_sym.iter().flatten().copied().collect();
+        let source_param_types: Vec<Type> = paramss_ty.iter().flatten().cloned().collect();
+        let source_paramss = vec![source_params.clone()];
+        let hidden_outer = self
+            .java_class(bin, internal)
+            .and_then(|c| hidden_outer_desc(st, class_sym, c));
+        let existing = st.get(class_sym).members.iter().copied().find(|&id| {
+            if broken.contains(&id) {
+                return false;
+            }
+            let s = st.get(id);
+            if s.name != "<init>" || s.owner != class_sym {
+                return false;
+            }
+            s.jvm_name == desc
+                || (s.jvm_name.is_empty()
+                    && ctor_params_match(st, id, &want, hidden_outer.as_deref()))
+        });
+        if let Some(existing) = existing {
+            // Keep the JVM descriptor already read from the classfile, but
+            // replace its erased parameter view with the source-shaped one.
+            // An inner class may have one hidden leading outer parameter in
+            // the descriptor; it is supplied by codegen, not by Scala source.
+            let old_params = st.get(existing).params.clone();
+            st.get_mut(existing)
+                .members
+                .retain(|id| !old_params.contains(id));
+            st.get_mut(m).members.clear();
+            st.get_mut(m).params.clear();
+            st.get_mut(m).paramss.clear();
+            st.get_mut(m).ty = Type::NoType;
+            for &param in &source_params {
+                st.get_mut(param).owner = existing;
+                if !st.get(existing).members.contains(&param) {
+                    st.get_mut(existing).members.push(param);
+                }
+            }
+            st.set_jvm_name(existing, desc);
+            st.get_mut(existing).params = source_params.clone();
+            st.get_mut(existing).paramss = source_paramss.clone();
+            st.get_mut(existing).ty = Type::Method {
+                paramss: vec![source_param_types.clone()],
+                ret: Box::new(Type::Unit),
+            };
+            return true;
+        }
+        st.set_jvm_name(m, desc.clone());
+        st.get_mut(m).params = source_params;
+        st.get_mut(m).paramss = source_paramss;
         st.get_mut(m).ty = Type::Method {
-            paramss: paramss_ty,
+            paramss: vec![source_param_types],
             ret: Box::new(Type::Unit),
         };
         st.get_mut(m).owner = class_sym;
@@ -936,12 +1021,16 @@ impl PickleSupply {
     /// declines.
     fn ctor_desc(
         &mut self,
+        st: &SymbolTable,
         bin: &mut BinaryIndex,
+        class_sym: SymbolId,
         internal: &str,
         want: &[Option<String>],
     ) -> Option<String> {
         let jc = self.java_class(bin, internal)?;
-        let mut hits: Vec<String> = Vec::new();
+        let hidden_outer = hidden_outer_desc(st, class_sym, jc);
+        let mut exact_hits: Vec<String> = Vec::new();
+        let mut hidden_hits: Vec<String> = Vec::new();
         for jm in &jc.methods {
             if jm.name != "<init>" || jm.access & (ACC_BRIDGE | ACC_SYNTHETIC | ACC_STATIC) != 0 {
                 continue;
@@ -949,7 +1038,11 @@ impl PickleSupply {
             let Some(got) = desc_params(&jm.desc) else {
                 continue;
             };
-            if got.len() != want.len() && got.len() != want.len() + 1 {
+            let exact = got.len() == want.len();
+            let hidden = hidden_outer.as_deref().is_some_and(|outer| {
+                got.len() == want.len() + 1 && got.first().is_some_and(|p| p == outer)
+            });
+            if !exact && !hidden {
                 continue;
             }
             let tail = &got[got.len() - want.len()..];
@@ -957,12 +1050,30 @@ impl PickleSupply {
                 Some(w) => g == w,
                 None => g.starts_with('L') || g.starts_with('['),
             });
-            if ok && !hits.contains(&jm.desc) {
-                hits.push(jm.desc.clone());
+            if ok {
+                let hits = if exact {
+                    &mut exact_hits
+                } else {
+                    &mut hidden_hits
+                };
+                if !hits.contains(&jm.desc) {
+                    hits.push(jm.desc.clone());
+                }
             }
         }
+        // A non-inner class can have a legitimate overload whose source
+        // parameters happen to equal the tail of another descriptor. It must
+        // use the exact descriptor; accepting a tail by arity would silently
+        // bind source metadata to the wrong constructor. A non-static nested
+        // class always has the hidden outer slot, so only its tail candidates
+        // are eligible.
+        let hits = if hidden_outer.is_some() {
+            hidden_hits
+        } else {
+            exact_hits
+        };
         if hits.len() == 1 {
-            hits.pop()
+            hits.into_iter().next()
         } else {
             None
         }
@@ -3862,6 +3973,12 @@ impl PickleSupply {
             "scala.Double" => return Some(Type::Double),
             "scala.Char" => return Some(Type::Char),
             "scala.Any" => return Some(Type::Any),
+            "scala.Singleton" => {
+                return Some(Type::Class {
+                    sym: st.singleton_sym,
+                    args: vec![],
+                });
+            }
             "scala.AnyRef" | "java.lang.Object" => return Some(Type::AnyRef),
             "scala.AnyVal" => return Some(Type::AnyVal),
             "scala.Nothing" => return Some(Type::Nothing),
@@ -4579,6 +4696,70 @@ pub(crate) fn desc_arity(desc: &str) -> Option<usize> {
         return None;
     }
     Some(n)
+}
+
+/// The JVM descriptor of `class_sym`'s hidden enclosing-instance parameter.
+/// The classpath symbol owner and the classfile's static-nested flag are both
+/// required: a top-level class whose source name contains `$` is not an inner
+/// class, while a class nested in an object is static and has no `$outer` slot.
+/// Returning the descriptor also prevents an unrelated leading parameter from
+/// being accepted merely because its arity happens to be one larger.
+fn hidden_outer_desc(
+    st: &SymbolTable,
+    class_sym: SymbolId,
+    classfile: &JavaClass,
+) -> Option<String> {
+    if class_sym.is_none()
+        || classfile.nested_static
+        || st.get(class_sym).flags.contains(Flags::STATIC)
+    {
+        return None;
+    }
+    // The JVM's `InnerClasses` owner is the lexical owner, but Scala can
+    // lower a class nested in a component trait with a different enclosing
+    // instance type.  For example Slick's
+    // `RelationalTableComponent.Table` is lexically inside the component but
+    // carries `$outer: RelationalProfile`, and both constructor descriptors
+    // begin with that profile type.  The `$outer` field is the classfile's
+    // exact witness for the hidden constructor slot; prefer it over deriving
+    // a descriptor from the symbol owner.
+    if let Some(outer) = classfile.outer_desc.as_deref() {
+        return Some(outer.to_string());
+    }
+    let owner = st.get(class_sym).owner;
+    if owner.is_none() || !st.get(owner).is_class_like() || owner == class_sym {
+        return None;
+    }
+    let outer = st.get(owner).jvm_name.as_str();
+    (!outer.is_empty()).then(|| format!("L{outer};"))
+}
+
+/// Whether an already-installed constructor has the source shape that a
+/// pickle just resolved. A leading extra parameter is accepted only when the
+/// class metadata proves this is a non-static inner class; arity alone must
+/// never bind a non-inner overload to a source constructor.
+fn ctor_params_match(
+    st: &SymbolTable,
+    ctor: SymbolId,
+    want: &[Option<String>],
+    hidden_outer: Option<&str>,
+) -> bool {
+    let got: Vec<Option<String>> = st
+        .get(ctor)
+        .params
+        .iter()
+        .map(|p| erased_param_desc(st, &st.get(*p).ty))
+        .collect();
+    let tail = if got.len() == want.len() {
+        Some(got.as_slice())
+    } else if hidden_outer.is_some_and(|outer| {
+        got.len() == want.len() + 1 && got.first().and_then(Option::as_deref) == Some(outer)
+    }) {
+        Some(&got[1..])
+    } else {
+        None
+    };
+    tail.is_some_and(|tail| tail == want)
 }
 
 /// Does this constructor symbol carry a parameter whose type never resolved?

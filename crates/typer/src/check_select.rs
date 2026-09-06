@@ -36,7 +36,11 @@ impl Typer {
             TreeKind::Select { qual, name } => (qual, name.clone()),
             _ => return,
         };
-        if qual.ty.is_no_type() {
+        // A parent-constructor expression can be visited before a later
+        // unit's inferred members are complete. Its qualifier may carry the
+        // provisional Error type from that visit even after the symbol's type
+        // has settled. Error is not a completed qualifier to reuse on retry.
+        if qual.ty.is_no_type() || qual.ty.is_error() {
             // The enclosing application's argument count belongs to *this*
             // selection, not to whatever the qualifier turns out to be.
             let saved_arity = self.callee_arity.take();
@@ -798,9 +802,21 @@ impl Typer {
                         sym: oo,
                         args: vec![],
                     };
-                    let parent = Type::Class {
-                        sym: owner,
-                        args: vec![],
+                    // The universal owners occur as primitive Type variants
+                    // in parent lists, not Class nodes. Comparing with a
+                    // synthetic Class(Any) makes every ordinary override of
+                    // Any.hashCode look like an unrelated overload.
+                    let parent = if owner == self.st.any_sym {
+                        Type::Any
+                    } else if owner == self.st.anyref_sym {
+                        Type::AnyRef
+                    } else if owner == self.st.anyval_sym {
+                        Type::AnyVal
+                    } else {
+                        Type::Class {
+                            sym: owner,
+                            args: vec![],
+                        }
                     };
                     self.st.is_sub_type(&child, &parent)
                         // Inheriting is not overriding: nsc keeps `f(Int)`
@@ -1828,68 +1844,95 @@ impl Typer {
     }
 
     pub(crate) fn try_rewrite_dynamic_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
-        let dyn_name = match &tree.kind {
-            TreeKind::Apply { fun, .. } => match &fun.kind {
-                TreeKind::Select { name, .. }
-                    if !matches!(
-                        name.as_str(),
-                        "applyDynamic" | "selectDynamic" | "updateDynamic" | "applyDynamicNamed"
-                    ) =>
-                {
-                    name.clone()
-                }
-                _ => return false,
-            },
+        let TreeKind::Apply { fun, args } = &tree.kind else {
+            return false;
+        };
+        let (base, mut targs) = match &fun.kind {
+            TreeKind::TypeApply { fun, args } => (fun.as_ref(), args.clone()),
+            _ => (fun.as_ref(), Vec::new()),
+        };
+        let (mut qual, dyn_name) = match &base.kind {
+            TreeKind::Select { qual, name } => ((**qual).clone(), name.clone()),
+            _ if !targs.is_empty() => (base.clone(), "apply".into()),
             _ => return false,
         };
+        if matches!(
+            dyn_name.as_str(),
+            "applyDynamic" | "selectDynamic" | "updateDynamic" | "applyDynamicNamed"
+        ) {
+            return false;
+        }
+        // A retry may already have inserted `.apply` around `x[T]`.
+        // Those type arguments belong to the dynamic method, not to x.
+        let mut receiver_type_args = false;
+        if dyn_name == "apply" && targs.is_empty() {
+            if let TreeKind::TypeApply { fun, args } = &qual.kind {
+                receiver_type_args = true;
+                targs = args.clone();
+                qual = (**fun).clone();
+            }
+        }
+        let direct_type_apply = !targs.is_empty() && !matches!(base.kind, TreeKind::Select { .. });
+        // This is a receiver-classification probe. Reuse a completed
+        // qualifier, including its error, rather than recursively typechecking
+        // the same application chain twice at every selection. The ordinary
+        // selection path still retries provisional errors when needed.
+        if qual.ty.is_no_type() {
+            if direct_type_apply {
+                // The reference in f[T](args) is a callee. Value mode would
+                // apply implicit arguments before the written type arguments.
+                let saved = std::mem::replace(&mut self.typing_callee, true);
+                self.type_expr(
+                    &mut qual,
+                    &Type::Method {
+                        paramss: vec![],
+                        ret: Box::new(Type::NoType),
+                    },
+                );
+                self.typing_callee = saved;
+            } else {
+                self.type_expr(&mut qual, &Type::NoType);
+            }
+        }
+        if (direct_type_apply && matches!(qual.ty, Type::Method { .. } | Type::Overload(_)))
+            || !self.is_dynamic_receiver(&qual.ty)
+            || self.receiver_has_term(&qual.ty, &dyn_name)
         {
-            let TreeKind::Apply { fun, .. } = &mut tree.kind else {
-                return false;
-            };
-            let TreeKind::Select { qual, .. } = &mut fun.kind else {
-                return false;
-            };
-            self.type_expr(qual, &Type::NoType);
-            if !self.is_dynamic_receiver(&qual.ty) {
-                return false;
+            // Preserve ordinary qualifier completion; a speculative peel
+            // of receiver type arguments must leave the source shape intact.
+            if !receiver_type_args {
+                if let TreeKind::Apply { fun, .. } = &mut tree.kind {
+                    match &mut fun.kind {
+                        TreeKind::TypeApply { fun, .. } => match &mut fun.kind {
+                            TreeKind::Select { qual: original, .. } => **original = qual,
+                            _ => **fun = qual,
+                        },
+                        TreeKind::Select { qual: original, .. } => **original = qual,
+                        _ => {}
+                    }
+                }
             }
-            if self.receiver_has_term(&qual.ty, &dyn_name) {
-                return false;
-            }
-        }
-        if !self.language_dynamics {
-            self.dynamics_feature_error(
-                tree.span,
-                if has_named_dynamic_args(tree) {
-                    "applyDynamicNamed"
-                } else {
-                    "applyDynamic"
-                },
-            );
-            tree.ty = Type::Error;
-            return true;
-        }
-        let span = tree.span;
-        let TreeKind::Apply { fun, args } = std::mem::replace(&mut tree.kind, TreeKind::Empty)
-        else {
             return false;
-        };
-        let TreeKind::Select { qual, .. } = fun.kind else {
-            tree.kind = TreeKind::Apply { fun, args };
-            return false;
-        };
+        }
         let named = args.iter().any(|a| Self::named_arg_parts(a).is_some());
         let method = if named {
             "applyDynamicNamed"
         } else {
             "applyDynamic"
         };
+        if !self.language_dynamics {
+            self.dynamics_feature_error(tree.span, method);
+            tree.ty = Type::Error;
+            return true;
+        }
+        let span = tree.span;
         let args = if named {
-            args.into_iter()
+            args.iter()
+                .cloned()
                 .map(|a| self.named_dynamic_tuple(a))
                 .collect()
         } else {
-            args
+            args.clone()
         };
         let name_lit = Tree::new(
             NodeId(0),
@@ -1898,32 +1941,32 @@ impl Typer {
                 lit: Lit::String(dyn_name),
             },
         );
-        let sel = Tree {
-            id: fun.id,
-            span: fun.span,
-            kind: TreeKind::Select {
-                qual,
+        let mut sel = Tree::new(
+            fun.id,
+            fun.span,
+            TreeKind::Select {
+                qual: Box::new(qual),
                 name: method.into(),
             },
-            ty: Type::NoType,
-            sym: SymbolId::NONE,
-            postfix: false,
-            scala_ref: false,
-            stable_pat: false,
-        };
-        let inner = Tree {
-            id: fun.id,
-            span: fun.span,
-            kind: TreeKind::Apply {
+        );
+        if !targs.is_empty() {
+            sel = Tree::new(
+                fun.id,
+                fun.span,
+                TreeKind::TypeApply {
+                    fun: Box::new(sel),
+                    args: targs,
+                },
+            );
+        }
+        let inner = Tree::new(
+            fun.id,
+            fun.span,
+            TreeKind::Apply {
                 fun: Box::new(sel),
                 args: vec![name_lit],
             },
-            ty: Type::NoType,
-            sym: SymbolId::NONE,
-            postfix: false,
-            scala_ref: false,
-            stable_pat: false,
-        };
+        );
         tree.kind = TreeKind::Apply {
             fun: Box::new(inner),
             args,

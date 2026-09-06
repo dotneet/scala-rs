@@ -256,6 +256,7 @@ pub(crate) fn gen_call_args(
     box_prims: bool,
     java_varargs: bool,
     method: SymbolId,
+    unbox_typer_boxes: bool,
 ) {
     let param_ids: Vec<SymbolId> = if method.is_none() {
         Vec::new()
@@ -285,8 +286,28 @@ pub(crate) fn gen_call_args(
                 return;
             }
         }
-        gen_expr(asm, frame, ctx, a);
         let pty = param_tys.get(i).unwrap_or(&a.ty);
+        // The typer represents an argument to a generic declaration as
+        // `$box(Int)`, even when receiver substitution has selected a
+        // primitive overload for the call that will actually be emitted.
+        // If the selected JVM parameter is primitive, preserve the inner
+        // value so the invocation sees an `int` rather than an Integer
+        // reference. This is needed by trait super accessors whose source
+        // target is `Base[T]` viewed as `Base[Int]`.
+        let unbox_typer_box = unbox_typer_boxes
+            && is_jvm_primitive(pty)
+            && matches!(
+                &a.kind,
+                TreeKind::Apply { fun, args }
+                    if fun.name() == Some("$box") && args.len() == 1
+            );
+        if unbox_typer_box {
+            if let TreeKind::Apply { args, .. } = &a.kind {
+                gen_expr(asm, frame, ctx, &args[0]);
+            }
+        } else {
+            gen_expr(asm, frame, ctx, a);
+        }
         // A `Unit` parameter is a `scala/runtime/BoxedUnit` on the JVM, so an
         // argument really is pushed: `f(())` and `f(g())` alike leave nothing
         // behind and need the singleton here. Erasure sometimes hands us an

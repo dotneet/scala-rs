@@ -614,6 +614,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         return erase_ty(&a, st);
     }
     match ty {
+        Type::Class { sym, .. } if *sym == st.singleton_sym => Type::Any,
         // A value class erases to what it wraps -- but a value class that
         // wraps itself, directly or through another one, has no such type.
         // The typer rejects that (`value class may not wrap another
@@ -981,6 +982,9 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 }
             };
             for a in args {
+                if matches!(st.dealias(&a.ty), Type::Class { sym, .. } if sym == st.singleton_sym) {
+                    a.sym = st.singleton_sym;
+                }
                 // `classOf[Meters]` / `_: Meters` name the *boxed* class:
                 // `Meters.class`, not `Integer.TYPE`.
                 if let Some(c) = value_class_of(&a.ty, st) {

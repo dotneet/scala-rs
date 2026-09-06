@@ -60,7 +60,21 @@ impl Typer {
         if tpt.sym.is_none() {
             self.namer_class(tpt);
         }
-        self.type_class(tpt);
+        self.type_local_template(tpt);
+    }
+
+    /// Local templates belong to the expression being typed. Even if that
+    /// expression is needed to infer a signature, its cached tree must contain
+    /// completed local bodies: the later template pass does not revisit them.
+    /// Top-level and member templates still use the ordinary two-pass entry.
+    pub(crate) fn type_local_template(&mut self, tree: &mut Tree) {
+        let saved = std::mem::replace(&mut self.sigs_only, false);
+        match &tree.kind {
+            TreeKind::ClassDef { .. } => self.type_class(tree),
+            TreeKind::ModuleDef { .. } => self.type_module(tree),
+            _ => unreachable!("local template must be a class or object"),
+        }
+        self.sigs_only = saved;
     }
 
     pub(crate) fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {
@@ -568,7 +582,11 @@ impl Typer {
     /// "still to be inferred at the call", and nothing downstream can tell the
     /// two apart. Variance is *not* copied: a method's type parameters have
     /// none, and carrying `+T` over would let the variance check read them.
-    fn fresh_method_tparams(&mut self, owner: SymbolId, src: &[SymbolId]) -> Vec<SymbolId> {
+    pub(crate) fn fresh_method_tparams(
+        &mut self,
+        owner: SymbolId,
+        src: &[SymbolId],
+    ) -> Vec<SymbolId> {
         if src.is_empty() {
             return Vec::new();
         }
@@ -1168,6 +1186,12 @@ impl Typer {
             };
             if !seen.insert(pid.0) {
                 continue;
+            }
+            // Inherited signatures must be complete before their symbols enter
+            // this scope: replacing a shallow method afterwards leaves stale
+            // type-parameter bounds in inherited lookups and override checks.
+            if self.st.pending_classpath_signatures.contains(&pid) {
+                self.ensure_java_loaded(pid, Span::DUMMY);
             }
             let alias = self.st.get(pid).self_alias;
             for m in self.st.get(pid).members.clone() {

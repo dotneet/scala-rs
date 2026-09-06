@@ -922,6 +922,17 @@ pub fn pickle_files_for(full_name: &str, module: bool) -> Vec<String> {
             push(format!("{}/{}", parts[..k].join("/"), parts[k]));
         }
     }
+    // A top-level class in the default package has no package segment to
+    // separate from its nested class.  For `Outer.Inner`, the loop above
+    // necessarily treats `Outer` as a package and therefore misses the
+    // `Outer.class` file that carries the pickle for both classes.
+    if parts.len() >= 2 {
+        // The nested class itself is also a candidate in the default
+        // package; unlike the package split above, this spelling maps to the
+        // actual JVM classfile.
+        push(parts.join("$"));
+        push(parts[0].to_string());
+    }
     if parts.len() == 1 {
         push(full_name.to_string());
     }
@@ -1275,5 +1286,21 @@ pub fn render(t: &SigType) -> String {
             this_tpe,
             super_tpe,
         } => format!("{}.super[{}]", render(this_tpe), render(super_tpe)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pickle_files_for;
+
+    #[test]
+    fn default_package_nested_class_uses_outer_pickle() {
+        let class_files = pickle_files_for("Outer.Inner", false);
+        assert!(class_files.contains(&"Outer".to_string()));
+        assert!(class_files.contains(&"Outer$Inner".to_string()));
+
+        let module_files = pickle_files_for("Outer.Inner", true);
+        assert!(module_files.contains(&"Outer$".to_string()));
+        assert!(module_files.contains(&"Outer$Inner$".to_string()));
     }
 }

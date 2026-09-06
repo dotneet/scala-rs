@@ -1,0 +1,1 @@
+object Test { def f[T](x:Any)(implicit ct:reflect.ClassTag[T]):String=ct.toString; val x=f(1) }

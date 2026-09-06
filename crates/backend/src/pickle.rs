@@ -47,6 +47,7 @@
 //! - `type T = Int` / `type A = String` is `ALIASsym` (tag 5) with the aliased
 //!   type as info (nsc 2.13 has no `ALIAStpe`; scalac 2.13.16 typechecks `Lib.T`)
 
+use crate::gen_desc::{method_params_from_sym, method_ret_from_sym};
 use scala_rs_parser::{
     Flags, Lit, RefineDecl, SpecializedType, SpecializedTypes, SymbolId, Tree, TreeKind, Type,
 };
@@ -206,6 +207,11 @@ pub struct PickledMethod {
     pub name: String,
     pub param_names: Vec<String>,
     pub param_types: Vec<PickledType>,
+    /// Raw pickle flags for each value parameter.  The classfile has no
+    /// parameter-level `DEFAULTPARAM` bit, so a classpath reader needs this
+    /// source metadata to attach defaults to the constructor that declared
+    /// them rather than to every JVM overload.
+    pub param_flags: Vec<u64>,
     pub ret: PickledType,
     pub tparams: Vec<PickledTypeParam>,
     pub is_val: bool,
@@ -738,12 +744,28 @@ impl<'a> Pickler<'a> {
     /// says the class really is nested, so a plain top-level class keeps the
     /// package path it had.
     fn external_owner_ref(&mut self, class_sym: SymbolId) -> u32 {
+        // Singleton has no JVM class and erases to Object. Both ordinary
+        // type references and bounds must retain its Scala package identity.
+        if class_sym == self.st.singleton_sym {
+            return self.scala_module();
+        }
         let jvm = self.st.get(class_sym).jvm_name.clone();
         let last = jvm.rsplit('/').next().unwrap_or(&jvm);
         if !last.trim_end_matches('$').contains('$') {
             return self.package_ref_of(&jvm);
         }
         self.owner_chain_ref(class_sym, 0)
+    }
+
+    /// An external term member needs the class symbol as its owner.  This is
+    /// distinct from [`external_owner_ref`], which is the *prefix* used by a
+    /// type reference.  For a top-level `Base.foo`, the latter is `<empty>`;
+    /// the former is `<empty>.Base`.
+    fn external_class_ref(&mut self, class_sym: SymbolId) -> u32 {
+        let jvm = self.st.get(class_sym).jvm_name.clone();
+        let name = jvm.rsplit('/').next().unwrap_or(&jvm).trim_end_matches('$');
+        let prefix = self.external_owner_ref(class_sym);
+        self.ext_ref_owned(name, prefix)
     }
 
     /// The owner a `CLASSsym` names, preferring an entry in *this* pickle.
@@ -2025,7 +2047,21 @@ impl<'a> Pickler<'a> {
                     continue;
                 }
                 let acc = format!("super${}", crate::classfile::encode_method_name(&s.name));
-                self.pickle_super_accessor(m, idx, &acc);
+                self.pickle_super_accessor(m, idx, &acc, None);
+            }
+            // An unqualified `super.m` may select a concrete method inherited
+            // from a parent without the source trait redeclaring `m`. Such a
+            // symbol cannot carry the trait-local SUPERACCESSOR flag, so the
+            // pre-pickler records the target on the trait and we emit the
+            // alias here with the parent's symbol as its referent.
+            if let Some(targets) = self.st.super_accessor_targets.get(&class_id).cloned() {
+                for (target, params) in targets {
+                    let acc = format!(
+                        "super${}",
+                        crate::classfile::encode_method_name(&self.st.get(target).name)
+                    );
+                    self.pickle_super_accessor(target, idx, &acc, Some(&params));
+                }
             }
             self.pickle_mixin_ctor(idx);
         }
@@ -2196,18 +2232,35 @@ impl<'a> Pickler<'a> {
     /// `def p$q$T$$super$m: T` — the abstract `SUPERACCESSOR` member a
     /// stackable trait declares and every class mixing it in implements.
     /// Same signature as the method it accesses; see the call site.
-    fn pickle_super_accessor(&mut self, method_id: SymbolId, owner_ref: u32, acc_name: &str) {
+    fn pickle_super_accessor(
+        &mut self,
+        method_id: SymbolId,
+        owner_ref: u32,
+        acc_name: &str,
+        params_override: Option<&[Type]>,
+    ) {
         // No alias, no accessor: nsc's unpickler asserts that every
         // SUPERACCESSOR carries one, and a member whose signature we could not
         // pickle has no entry to point at.
-        let Some(alias) = self.sym_index.get(&method_id.0).copied() else {
-            return;
+        let method_owner = self.st.get(method_id).owner;
+        let alias = if self
+            .sym_index
+            .get(&method_owner.0)
+            .is_some_and(|&owner| owner == owner_ref)
+        {
+            self.sym_index
+                .get(&method_id.0)
+                .copied()
+                .unwrap_or_else(|| self.pickle_term_ref(method_id))
+        } else {
+            let owner = self.external_class_ref(method_owner);
+            let name = self.st.get(method_id).name.clone();
+            self.ext_term_ref(&name, owner)
         };
-        let (paramss, ret) = match &self.st.get(method_id).ty {
-            Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
-            other => (Vec::new(), other.clone()),
-        };
-        let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
+        let ret = method_ret_from_sym(self.st, method_id);
+        let params: Vec<Type> = params_override
+            .map(|params| params.to_vec())
+            .unwrap_or_else(|| method_params_from_sym(self.st, method_id));
         let name_ref = self.term_name(acc_name);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
@@ -3483,19 +3536,45 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             continue;
         }
         let (tparams, rest) = peel_info(&entries, *info);
-        if let Some(Entry::MethodTpe { ret, params }) = entries.get(rest as usize) {
+        if let Some(Entry::MethodTpe {
+            ret: first_ret,
+            params: first_params,
+        }) = entries.get(rest as usize)
+        {
+            // Constructors are pickled as a method type per source parameter
+            // clause.  The classpath ABI needs the flattened JVM parameter
+            // order, but the old subset reader kept only the first clause;
+            // that dropped defaults from a curried constructor entirely.
+            let mut params = first_params.clone();
+            let mut ret = *first_ret;
+            if mname == "<init>" {
+                while let Some(Entry::MethodTpe {
+                    ret: next_ret,
+                    params: next_params,
+                }) = entries.get(ret as usize)
+                {
+                    params.extend(next_params.iter().copied());
+                    ret = *next_ret;
+                }
+            }
             let mut param_names = Vec::new();
             let mut param_types = Vec::new();
-            for p in params {
+            let mut param_flags = Vec::new();
+            for p in &params {
                 if let Some(Entry::ValSym {
-                    name: pn, info: pt, ..
+                    name: pn,
+                    info: pt,
+                    flags: pf,
+                    ..
                 }) = entries.get(*p as usize)
                 {
                     param_names.push(name_of(&entries, *pn));
                     param_types.push(type_of(&entries, *pt, 0));
+                    param_flags.push(*pf);
                 } else {
                     param_types.push(type_of(&entries, *p, 0));
                     param_names.push(format!("x${}", param_names.len()));
+                    param_flags.push(0);
                 }
             }
             let is_accessor = (*flags & (1u64 << 27)) != 0; // ACCESSOR
@@ -3505,7 +3584,8 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 name: mname.clone(),
                 param_names,
                 param_types,
-                ret: type_of(&entries, *ret, 0),
+                param_flags,
+                ret: type_of(&entries, ret, 0),
                 tparams,
                 is_val: is_accessor,
                 is_ctor: mname == "<init>",
@@ -3522,6 +3602,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 name: mname,
                 param_names: Vec::new(),
                 param_types: Vec::new(),
+                param_flags: Vec::new(),
                 ret: type_of(&entries, rest, 0),
                 tparams,
                 is_val: is_accessor,

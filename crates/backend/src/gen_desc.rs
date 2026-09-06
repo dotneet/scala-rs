@@ -613,9 +613,14 @@ pub(crate) fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option
     if class_id.is_none() {
         return None;
     }
-    // Static nested Java types (`Map$Entry`, `AbstractMap$SimpleEntry`) must
-    // not get an enclosing `this` argument.
-    if st.get(class_id).flags.contains(Flags::JAVA) {
+    // Static nested types (`Map$Entry`, and Scala classes nested in an object)
+    // must not get an enclosing `this` argument.  The classfile reader marks
+    // both forms `STATIC`; checking only `JAVA` made an externally loaded
+    // `object O { class C(...) }` acquire a spurious `O` parameter in emitted
+    // subclasses and fail verification before its real constructor ran.
+    if st.get(class_id).flags.contains(Flags::JAVA)
+        || st.get(class_id).flags.contains(Flags::STATIC)
+    {
         return None;
     }
     // `new T { … }` and local classes are owned by the method (or the `val`)
@@ -759,60 +764,6 @@ pub(crate) fn trait_member_setter_name(
         var_setter_name(field)
     } else {
         trait_val_setter_name(st, trait_id, field)
-    }
-}
-
-pub(crate) fn tree_contains_super(tree: &Tree) -> bool {
-    match &tree.kind {
-        TreeKind::Super { .. } => true,
-        TreeKind::Select { qual, .. } => tree_contains_super(qual),
-        TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
-            tree_contains_super(fun) || args.iter().any(tree_contains_super)
-        }
-        TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
-            tree_contains_super(fun)
-        }
-        TreeKind::Block { stats, expr } => {
-            stats.iter().any(tree_contains_super) || tree_contains_super(expr)
-        }
-        TreeKind::If { cond, thenp, elsep } => {
-            tree_contains_super(cond) || tree_contains_super(thenp) || tree_contains_super(elsep)
-        }
-        TreeKind::Assign { lhs, rhs } => tree_contains_super(lhs) || tree_contains_super(rhs),
-        TreeKind::ValDef { rhs, .. } => tree_contains_super(rhs),
-        TreeKind::Function { body, .. } => tree_contains_super(body),
-        TreeKind::Match { selector, cases } => {
-            tree_contains_super(selector)
-                || cases.iter().any(|c| {
-                    tree_contains_super(&c.pat)
-                        || tree_contains_super(&c.guard)
-                        || tree_contains_super(&c.body)
-                })
-        }
-        TreeKind::Try {
-            block,
-            catches,
-            finalizer,
-        } => {
-            tree_contains_super(block)
-                || catches.iter().any(|c| tree_contains_super(&c.body))
-                || tree_contains_super(finalizer)
-        }
-        _ => false,
-    }
-}
-
-pub(crate) fn needs_super_accessor(def: &Tree) -> bool {
-    match &def.kind {
-        TreeKind::DefDef {
-            name, mods, rhs, ..
-        } => {
-            name != "<init>"
-                && name != "<clinit>"
-                && !rhs.is_empty()
-                && (mods.flags.contains(Flags::OVERRIDE) || tree_contains_super(rhs))
-        }
-        _ => false,
     }
 }
 

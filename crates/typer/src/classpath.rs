@@ -110,6 +110,9 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
     for (i, owner) in &installed {
         let (i, owner) = (*i, *owner);
         let c = &classes[i];
+        if owner.0 >= st.prelude_end {
+            st.pending_classpath_signatures.insert(owner);
+        }
         install_tparams(st, owner, &c.pickle_tparams);
         let accessors = nullary_accessors(c);
         if let Some(p) = &c.pickle {
@@ -394,6 +397,13 @@ fn install_ctor(
         } else {
             add_term(st, owner, &pname, ty)
         };
+        if m.param_flags
+            .get(i)
+            .is_some_and(|f| f & scala_rs_pickle::read::pflags::DEFAULTPARAM != 0)
+        {
+            let flags = st.get(fid).flags.with(Flags::DEFAULTPARAM);
+            st.get_mut(fid).flags = flags;
+        }
         mark_via_accessor(st, fid, &pname, accessors);
         fields.push(fid);
     }
@@ -1669,16 +1679,22 @@ fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
                 Type::String
             } else if inner == "java/lang/Object" {
                 Type::Any
-            } else if inner.contains('/') && !inner.starts_with("scala/") {
-                // A descriptor names one exact class. Looking the simple name
-                // up in scope instead produced a second, unrelated symbol for
-                // `org/slf4j/Logger` whenever it was not already in scope.
+            } else if inner == "scala/runtime/BoxedUnit" {
+                Type::Unit
+            } else if inner == "scala/runtime/Nothing$" {
+                Type::Nothing
+            } else if inner == "scala/runtime/Null$" {
+                Type::Null
+            } else {
+                // A JVM descriptor is an exact binary identity, including
+                // scala packages and the default package. Simple-name lookup
+                // would confuse scala.custom.List with scala.collection's
+                // List, or leave a forward reference such as MainNode as an
+                // unbound name. A stub retains that identity until completion.
                 Type::Class {
                     sym: find_or_stub_java_class(st, inner),
                     args: vec![],
                 }
-            } else {
-                parse_field_ty(st, s).0
             };
             (ty, consumed)
         }

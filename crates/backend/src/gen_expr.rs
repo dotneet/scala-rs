@@ -245,6 +245,7 @@ pub(crate) fn emit_local_lazy_body(
     cell: SymbolId,
 ) {
     let Some((slot, _)) = frame.get(cell) else {
+        report_ctx_error(ctx, rhs.span, "lazy val cell is missing");
         throw_runtime(asm, "lazy val cell is missing");
         push_default(asm, ret);
         emit_return(asm, ret);
@@ -877,7 +878,16 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                         if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
                             emit_box(asm, &qual.ty.widen_constant());
                         }
-                        emit_is_instance_of(asm, ctx, target);
+                        if args.first().is_some_and(|a| a.sym == ctx.st.singleton_sym)
+                            && !ctx.st.is_sub_type(&qual.ty, &Type::AnyRef)
+                        {
+                            // The qualifier still executes, but Singleton has
+                            // no runtime restriction on an Any/AnyVal receiver.
+                            asm.pop();
+                            asm.iconst(1);
+                        } else {
+                            emit_is_instance_of(asm, ctx, target);
+                        }
                         return;
                     }
                 }
@@ -982,6 +992,14 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
         }
         TreeKind::Import { .. } | TreeKind::TypeDef { .. } => {}
         _ => {
+            report_ctx_error(
+                ctx,
+                tree.span,
+                format!(
+                    "unimplemented expression: {}",
+                    tree.name().unwrap_or("<tree>")
+                ),
+            );
             throw_runtime(
                 asm,
                 &format!(
@@ -1100,6 +1118,11 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
     }
     let id = tree.sym;
     if id.is_none() {
+        report_ctx_error(
+            ctx,
+            tree.span,
+            format!("unresolved ident {}", tree.name().unwrap_or("?")),
+        );
         throw_runtime(
             asm,
             &format!("unresolved ident {}", tree.name().unwrap_or("?")),
@@ -1266,12 +1289,14 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
                     asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
                 }
                 None => {
+                    report_ctx_error(ctx, tree.span, format!("cannot load {}", sym.name));
                     throw_runtime(asm, &format!("cannot load {}", sym.name));
                     push_default(asm, &tree.ty);
                 }
             }
         }
         _ => {
+            report_ctx_error(ctx, tree.span, format!("cannot load {}", sym.name));
             throw_runtime(asm, &format!("cannot load {}", sym.name));
             push_default(asm, &tree.ty);
         }
@@ -1546,7 +1571,14 @@ pub(crate) fn gen_select(
                     }
                 }
                 if matches!(qual.kind, TreeKind::Super { .. }) {
-                    invoke_super(asm, ctx, tree.sym);
+                    let selected_params = method_param_types(&tree.ty);
+                    invoke_super(
+                        asm,
+                        ctx,
+                        tree.sym,
+                        super_is_qualified(qual),
+                        selected_params.as_deref(),
+                    );
                 } else if matches!(ic, Intrinsic::AnyHash) {
                     emit_any_hash(asm, &qual.ty);
                 } else if matches!(ic, Intrinsic::GetClass) {
@@ -1654,6 +1686,7 @@ pub(crate) fn gen_select(
         emit_getfield(asm, &owner, name, &desc);
         return;
     }
+    report_ctx_error(ctx, tree.span, format!("select {name}"));
     throw_runtime(asm, &format!("select {name}"));
     push_default(asm, &tree.ty);
 }
@@ -1944,6 +1977,7 @@ pub(crate) fn gen_new(
             ctx.library_abi,
             java_varargs,
             ctor_sym,
+            false,
         );
     } else {
         for (i, a) in args.iter().enumerate() {
@@ -1956,7 +1990,7 @@ pub(crate) fn gen_new(
         }
     }
     for id in class_captures(ctx.st, class_id).to_vec() {
-        load_capture_arg(asm, frame, ctx, id);
+        load_capture_arg(asm, frame, ctx, id, tpt.span);
     }
     asm.invokespecial(&internal, "<init>", &desc);
 }
@@ -2581,6 +2615,7 @@ pub(crate) fn gen_apply(
 
     // regular method / apply
     if fun.sym.is_none() {
+        report_ctx_error(ctx, tree.span, "unresolved apply");
         throw_runtime(asm, "unresolved apply");
         push_default(asm, &tree.ty);
         return;
@@ -2613,6 +2648,11 @@ pub(crate) fn gen_apply(
             && !matches!(qual.ty, Type::Array(_))
         {
             if !ctx.library_abi {
+                report_ctx_error(
+                    ctx,
+                    tree.span,
+                    "generic Array element access needs the scala-library ClassTag runtime",
+                );
                 throw_runtime(
                     asm,
                     "generic Array element access needs the scala-library ClassTag runtime",
@@ -2631,7 +2671,17 @@ pub(crate) fn gen_apply(
                 "update" => &[Type::Int, Type::Any],
                 _ => &[],
             };
-            gen_call_args(asm, frame, ctx, args, ptys, true, false, SymbolId::NONE);
+            gen_call_args(
+                asm,
+                frame,
+                ctx,
+                args,
+                ptys,
+                true,
+                false,
+                SymbolId::NONE,
+                false,
+            );
             match name.as_str() {
                 "apply" => {
                     let d = "(Ljava/lang/Object;I)Ljava/lang/Object;";
@@ -2700,7 +2750,21 @@ pub(crate) fn gen_apply(
             box_value_class_receiver(asm, ctx, owner, qual);
         }
     }
-    let param_tys: Vec<Type> = if !fun.sym.is_none() {
+    let interface_super =
+        fun_is_super(fun) && !super_is_qualified(fun) && is_interface_sym(ctx.st, ctx.class_sym);
+    let param_tys: Vec<Type> = if interface_super {
+        method_param_types(&fun.ty).unwrap_or_else(|| {
+            if !fun.sym.is_none() {
+                match &ctx.st.get(fun.sym).ty {
+                    Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                    Type::Function { params, .. } => params.clone(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        })
+    } else if !fun.sym.is_none() {
         match &ctx.st.get(fun.sym).ty {
             Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
             Type::Function { params, .. } => params.clone(),
@@ -2735,6 +2799,7 @@ pub(crate) fn gen_apply(
         value_owner.is_some() || (ctx.library_abi && !array_elem_op),
         java_varargs,
         fun.sym,
+        interface_super,
     );
     if let TreeKind::Select { qual, name } = &fun.kind {
         if name == "apply" && matches!(qual.ty, Type::Array(_)) {
@@ -2783,6 +2848,11 @@ pub(crate) fn gen_apply(
                     "(Ljava/lang/Object;)Ljava/lang/Object;",
                 );
             } else {
+                report_ctx_error(
+                    ctx,
+                    tree.span,
+                    "Array[T].clone needs the scala-library ScalaRunTime.array_clone",
+                );
                 throw_runtime(
                     asm,
                     "Array[T].clone needs the scala-library ScalaRunTime.array_clone",
@@ -2793,7 +2863,18 @@ pub(crate) fn gen_apply(
         }
     }
     if fun_is_super(fun) {
-        invoke_super(asm, ctx, fun.sym);
+        let selected_params = if interface_super {
+            method_param_types(&fun.ty)
+        } else {
+            None
+        };
+        invoke_super(
+            asm,
+            ctx,
+            fun.sym,
+            super_is_qualified(fun),
+            selected_params.as_deref(),
+        );
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {
@@ -2808,9 +2889,45 @@ pub(crate) fn fun_is_super(fun: &Tree) -> bool {
     }
 }
 
-pub(crate) fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
+pub(crate) fn super_is_qualified(fun: &Tree) -> bool {
+    let super_kind = match &peel_fun(fun).kind {
+        TreeKind::Select { qual, .. } => &qual.kind,
+        other => other,
+    };
+    matches!(
+        super_kind,
+        TreeKind::Super { qual: Some(_), .. } | TreeKind::Super { mix: Some(_), .. }
+    )
+}
+
+fn method_param_types(ty: &Type) -> Option<Vec<Type>> {
+    match ty {
+        Type::Method { paramss, .. } => Some(paramss.iter().flatten().cloned().collect()),
+        Type::Function { params, .. } => Some(params.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn invoke_super(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    id: SymbolId,
+    qualified: bool,
+    selected_params: Option<&[Type]>,
+) {
     let s = ctx.st.get(id);
     let desc = method_desc_from_sym(ctx.st, id);
+    if qualified {
+        let owner_id = s.owner;
+        let owner = class_internal(ctx.st, owner_id);
+        if is_interface_sym(ctx.st, owner_id) {
+            let static_desc = trait_static_desc(&owner, &desc);
+            asm.invokestatic_interface(&owner, &trait_static_name(&s.name), &static_desc);
+        } else {
+            asm.invokespecial(&owner, &s.name, &desc);
+        }
+        return;
+    }
     if is_interface_sym(ctx.st, ctx.class_sym) {
         let acc = super_accessor_name(ctx.st, ctx.class_sym, &s.name);
         let iface = class_internal(ctx.st, ctx.class_sym);
@@ -2820,8 +2937,8 @@ pub(crate) fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
         // inherited `insertAll(Iterable, RowsPerStatement)` from `Rps` to
         // `Rps$One$`; calling the accessor at the parent's descriptor found no
         // such method.
-        let acc_desc = if !ctx.method_sym.is_none() && ctx.st.get(ctx.method_sym).name == s.name {
-            method_desc_from_sym(ctx.st, ctx.method_sym)
+        let acc_desc = if let Some(params) = selected_params {
+            jvm_method_desc(ctx.st, params, &method_ret_from_sym(ctx.st, id))
         } else {
             desc
         };
@@ -3860,11 +3977,6 @@ pub(crate) fn gen_module_member_receiver(
     qual: &Tree,
     mcls: SymbolId,
 ) {
-    let Some(outer) = member_module_outer(ctx.st, mcls) else {
-        let jvm = class_internal(ctx.st, mcls);
-        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
-        return;
-    };
     // A qualifier that is itself a paren-less accessor (`universe.Liftable`,
     // whose symbol is `def Liftable: Liftables$Liftable$`) still carries its
     // *method* type here, which `class_sym_of` has no answer for. Unwidened,
@@ -3880,6 +3992,11 @@ pub(crate) fn gen_module_member_receiver(
         gen_expr(asm, frame, ctx, qual);
         return;
     }
+    let Some(outer) = member_module_outer(ctx.st, mcls) else {
+        let jvm = class_internal(ctx.st, mcls);
+        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+        return;
+    };
     // The qualifier is a *value* of some class: it is the enclosing instance,
     // whether or not the symbol table can see the inheritance. A library
     // class's pickled parents are attached one level at a time, so

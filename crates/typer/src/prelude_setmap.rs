@@ -86,10 +86,9 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
 /// `Set() ++ dbType.map(…) ++ (if(…) Some(…) else None) ++ …` -- came out as
 /// `no matching overload`.
 ///
-/// As long as the monomorphic one is applicable it is strictly more specific, so
-/// having both present picks the same way nsc does. codegen looks up by owner and
-/// name (the `"++"` of `is_stdlib_set` in `gen.rs`), so one branch calling
-/// `IterableOps.++` covers both.
+/// SetOps is a subclass of IterableOps, which resolves equal-domain ties.
+/// Code generation must preserve the selected declaration: SetOps returns C,
+/// whereas IterableOps can widen to an ordinary Set.
 fn add_set_widening_concat(st: &mut SymbolTable) {
     let (Some(set), Some(ioc)) = (
         crate::classpath::find_by_jvm(st, "scala/collection/immutable/Set"),
@@ -109,7 +108,17 @@ fn add_set_widening_concat(st: &mut SymbolTable) {
     if poly_already {
         return;
     }
+    // These alternatives originate in different traits. Keeping both only
+    // under Set loses the declaring-owner specificity relation.
+    for mono in st.get(set).members.clone() {
+        if st.get(mono).name == "++" && st.get(mono).tparams.is_empty() {
+            st.get_mut(mono).declaring_class = "scala/collection/SetOps".into();
+            st.get_mut(mono).declaring_is_interface = true;
+        }
+    }
     let m = st.alloc("++", set, SymKind::Method, Flags::EMPTY, "");
+    st.get_mut(m).declaring_class = "scala/collection/IterableOps".into();
+    st.get_mut(m).declaring_is_interface = true;
     let b = type_param(st, m, "B");
     st.get_mut(b).bound_lo = Some(Type::TypeParam(a));
     let tb = Type::TypeParam(b);

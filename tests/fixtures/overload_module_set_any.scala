@@ -1,0 +1,1 @@
+object Main extends App { val a: Set[Any] = Set(1); println((a ++ List("s")).size) }
