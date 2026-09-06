@@ -21,12 +21,66 @@ fn scala_library() -> PathBuf {
     PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar")
 }
 
-fn scalac() -> PathBuf {
-    PathBuf::from("/tmp/scala-2.13.16/bin/scalac")
+#[derive(Clone, Debug)]
+struct JavaToolchain {
+    home: Option<PathBuf>,
+    java: PathBuf,
 }
 
-fn temurin17() -> PathBuf {
-    PathBuf::from("/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home")
+fn tool_succeeds(tool: &Path, java_home: Option<&Path>) -> bool {
+    let mut cmd = Command::new(tool);
+    cmd.arg("-version");
+    match java_home {
+        Some(home) => {
+            cmd.env("JAVA_HOME", home);
+        }
+        None => {
+            cmd.env_remove("JAVA_HOME");
+        }
+    }
+    cmd.output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn java_toolchain() -> Option<JavaToolchain> {
+    if let Some(home) = std::env::var_os("JAVA_HOME").map(PathBuf::from) {
+        let java = home.join("bin/java");
+        let javac = home.join("bin/javac");
+        if tool_succeeds(&java, Some(&home)) && tool_succeeds(&javac, Some(&home)) {
+            return Some(JavaToolchain {
+                home: Some(home),
+                java,
+            });
+        }
+    }
+
+    let java = Path::new("java");
+    if tool_succeeds(java, None) && tool_succeeds(Path::new("javac"), None) {
+        return Some(JavaToolchain {
+            home: None,
+            java: java.to_path_buf(),
+        });
+    }
+    None
+}
+
+fn scalac(java: &JavaToolchain) -> Option<PathBuf> {
+    let cached = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    let candidates = [cached, PathBuf::from("scalac")];
+    candidates.into_iter().find(|candidate| {
+        if candidate.is_absolute() && !candidate.is_file() {
+            return false;
+        }
+        let mut cmd = Command::new(candidate);
+        cmd.arg("-version");
+        with_java_toolchain(&mut cmd, java);
+        cmd.output()
+            .map(|out| {
+                out.status.success() && diagnostics(&out).contains("Scala compiler version 2.13.16")
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn tmp_dir() -> PathBuf {
@@ -39,18 +93,20 @@ fn tmp_dir() -> PathBuf {
     out
 }
 
-fn with_temurin17(cmd: &mut Command) {
-    let home = temurin17();
-    let old_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = format!(
-        "{}:{}",
-        home.join("bin").display(),
-        old_path.to_string_lossy()
-    );
-    cmd.env("JAVA_HOME", home).env("PATH", path);
+fn with_java_toolchain(cmd: &mut Command, java: &JavaToolchain) {
+    if let Some(home) = &java.home {
+        let mut paths = vec![home.join("bin")];
+        if let Some(old_path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&old_path));
+        }
+        let path = std::env::join_paths(paths).expect("construct Java PATH");
+        cmd.env("JAVA_HOME", home).env("PATH", path);
+    } else {
+        cmd.env_remove("JAVA_HOME");
+    }
 }
 
-fn compile_scala_rs(src: &Path, out: &Path, jar: &Path) -> Output {
+fn compile_scala_rs(src: &Path, out: &Path, jar: &Path, java: &JavaToolchain) -> Output {
     let mut cmd = Command::new(bin());
     cmd.args([
         "compile",
@@ -60,13 +116,20 @@ fn compile_scala_rs(src: &Path, out: &Path, jar: &Path) -> Output {
         "--scala-library",
         jar.to_str().unwrap(),
     ]);
-    with_temurin17(&mut cmd);
+    with_java_toolchain(&mut cmd, java);
     cmd.output().expect("run scala-rs producer")
 }
 
-fn compile_scalac(src: &Path, out: &Path, cp: &Path, jar: &Path) -> Output {
+fn compile_scalac(
+    src: &Path,
+    out: &Path,
+    cp: &Path,
+    jar: &Path,
+    scalac: &Path,
+    java: &JavaToolchain,
+) -> Output {
     let classpath = format!("{}:{}", cp.display(), jar.display());
-    let mut cmd = Command::new(scalac());
+    let mut cmd = Command::new(scalac);
     cmd.args([
         "-Xno-forwarders",
         "-classpath",
@@ -75,7 +138,7 @@ fn compile_scalac(src: &Path, out: &Path, cp: &Path, jar: &Path) -> Output {
         out.to_str().unwrap(),
         src.to_str().unwrap(),
     ]);
-    with_temurin17(&mut cmd);
+    with_java_toolchain(&mut cmd, java);
     cmd.output().expect("run scalac")
 }
 
@@ -87,16 +150,16 @@ fn diagnostics(out: &Output) -> String {
     )
 }
 
-fn run_java(classes: &Path, producer: &Path, jar: &Path) -> String {
+fn run_java(classes: &Path, producer: &Path, jar: &Path, java: &JavaToolchain) -> String {
     let classpath = format!(
         "{}:{}:{}",
         classes.display(),
         producer.display(),
         jar.display()
     );
-    let mut cmd = Command::new(temurin17().join("bin/java"));
+    let mut cmd = Command::new(&java.java);
     cmd.args(["-Xverify:all", "-cp", &classpath, "VarianceExternalGood"]);
-    with_temurin17(&mut cmd);
+    with_java_toolchain(&mut cmd, java);
     let out = cmd.output().expect("run variance consumer");
     assert!(out.status.success(), "java failed: {}", diagnostics(&out));
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -105,8 +168,16 @@ fn run_java(classes: &Path, producer: &Path, jar: &Path) -> String {
 #[test]
 fn nsc_consumers_preserve_class_method_and_hk_variance() {
     let jar = scala_library();
-    if !jar.is_file() || !scalac().is_file() || !temurin17().join("bin/java").is_file() {
-        eprintln!("skip: Scala 2.13.16 or Temurin 17 fixture is unavailable");
+    let Some(java) = java_toolchain() else {
+        eprintln!("skip: Java java/javac is unavailable in JAVA_HOME or PATH");
+        return;
+    };
+    let Some(scalac) = scalac(&java) else {
+        eprintln!("skip: Scala compiler 2.13.16 is unavailable in the cache or PATH");
+        return;
+    };
+    if !jar.is_file() {
+        eprintln!("skip: Scala library 2.13.16 fixture is unavailable");
         return;
     }
     let root = tmp_dir();
@@ -130,13 +201,13 @@ fn nsc_consumers_preserve_class_method_and_hk_variance() {
         fs::create_dir_all(out).unwrap();
     }
 
-    let out = compile_scalac(&producer, &nsc_producer, &root, &jar);
+    let out = compile_scalac(&producer, &nsc_producer, &root, &jar, &scalac, &java);
     assert!(
         out.status.success(),
         "nsc producer failed: {}",
         diagnostics(&out)
     );
-    let out = compile_scala_rs(&producer, &ours_producer, &jar);
+    let out = compile_scala_rs(&producer, &ours_producer, &jar, &java);
     assert!(
         out.status.success(),
         "scala-rs producer failed: {}",
@@ -145,39 +216,55 @@ fn nsc_consumers_preserve_class_method_and_hk_variance() {
 
     // nsc is the reference producer/consumer pair, and must accept the same
     // class variance, method type parameter, and higher-kinded variance shape.
-    let out = compile_scalac(&good, &nsc_good, &nsc_producer, &jar);
+    let out = compile_scalac(&good, &nsc_good, &nsc_producer, &jar, &scalac, &java);
     assert!(
         out.status.success(),
         "nsc consumer failed: {}",
         diagnostics(&out)
     );
-    assert_eq!(run_java(&nsc_good, &nsc_producer, &jar), "dog:dog\n");
+    assert_eq!(run_java(&nsc_good, &nsc_producer, &jar, &java), "dog:dog\n");
 
     // The real interop boundary: nsc reads scala-rs's pickle and must accept
     // both legal assignments and the nested `F[+X]` kind.
-    let out = compile_scalac(&good, &ours_good, &ours_producer, &jar);
+    let out = compile_scalac(&good, &ours_good, &ours_producer, &jar, &scalac, &java);
     assert!(
         out.status.success(),
         "nsc consumer rejected scala-rs producer: {}",
         diagnostics(&out)
     );
-    assert_eq!(run_java(&ours_good, &ours_producer, &jar), "dog:dog\n");
+    assert_eq!(
+        run_java(&ours_good, &ours_producer, &jar, &java),
+        "dog:dog\n"
+    );
 
     for (consumer, producer_out) in [(&nsc_bad, &nsc_producer), (&ours_bad, &ours_producer)] {
-        let out = compile_scalac(&bad, consumer, producer_out, &jar);
+        let out = compile_scalac(&bad, consumer, producer_out, &jar, &scalac, &java);
         let text = diagnostics(&out);
         assert!(
             !out.status.success(),
             "illegal variance was accepted: {text}"
         );
-        for expected in [
-            "VarianceSource[VarianceDog]",
-            "VarianceSink[VarianceAnimal]",
-            "VarianceBox[VarianceDog]",
+        let lines: Vec<&str> = text.lines().collect();
+        for (source_line, expected) in [
+            (2, "VarianceSource[VarianceDog]"),
+            (3, "VarianceSink[VarianceAnimal]"),
+            (4, "VarianceBox[VarianceDog]"),
         ] {
+            let marker =
+                format!("variance_external_consumer_bad.scala:{source_line}: error: type mismatch");
+            let matches = lines.iter().filter(|line| line.contains(&marker)).count();
+            assert_eq!(
+                matches, 1,
+                "expected one type mismatch for source line {source_line}, found {matches}: {text}"
+            );
+            let marker_index = lines
+                .iter()
+                .position(|line| line.contains(&marker))
+                .expect("type mismatch marker was counted");
+            let diagnostic = lines[marker_index..(marker_index + 4).min(lines.len())].join("\n");
             assert!(
-                text.contains(expected),
-                "missing {expected:?} in variance diagnostics: {text}"
+                diagnostic.contains(expected),
+                "missing {expected:?} near source line {source_line}: {text}"
             );
         }
     }
