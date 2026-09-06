@@ -5536,10 +5536,48 @@ fn desugar_for(
         )
     }
     fn tuple_tree(p: &mut Parser, span: Span, args: Vec<Tree>) -> Tree {
+        let mut args = args.into_iter();
+        let Some(mut result) = args.next() else {
+            return p.empty(span);
+        };
+        for arg in args {
+            let mut fun = p.alloc(
+                span,
+                TreeKind::Ident {
+                    name: "Tuple2".into(),
+                },
+            );
+            fun.scala_ref = true;
+            result = p.alloc(
+                span,
+                TreeKind::Apply {
+                    fun: Box::new(fun),
+                    args: vec![result, arg],
+                },
+            );
+        }
+        result
+    }
+
+    /// Build a tuple with the first field on the left and the remaining
+    /// fields on the right. This keeps every field selectable with Tuple2
+    /// even when the value-definition pattern has more than one binding.
+    fn right_tuple_tree(p: &mut Parser, span: Span, mut args: Vec<Tree>) -> Tree {
+        let last = args.pop().expect("right tuple needs at least one field");
+        if args.is_empty() {
+            return last;
+        }
+        let first = args.remove(0);
+        let rest = if args.is_empty() {
+            last
+        } else {
+            args.push(last);
+            right_tuple_tree(p, span, args)
+        };
         let mut fun = p.alloc(
             span,
             TreeKind::Ident {
-                name: format!("Tuple{}", args.len()),
+                name: "Tuple2".into(),
             },
         );
         fun.scala_ref = true;
@@ -5547,13 +5585,47 @@ fn desugar_for(
             span,
             TreeKind::Apply {
                 fun: Box::new(fun),
-                args,
+                args: vec![first, rest],
             },
         )
     }
 
+    fn right_tuple_select(
+        p: &mut Parser,
+        span: Span,
+        base: &str,
+        index: usize,
+        total: usize,
+    ) -> Tree {
+        let mut result = p.alloc(span, TreeKind::Ident { name: base.into() });
+        let mut index = index;
+        let mut total = total;
+        while total > 2 && index > 0 {
+            result = p.alloc(
+                span,
+                TreeKind::Select {
+                    qual: Box::new(result),
+                    name: "_2".into(),
+                },
+            );
+            index -= 1;
+            total -= 1;
+        }
+        result = p.alloc(
+            span,
+            TreeKind::Select {
+                qual: Box::new(result),
+                name: format!("_{}", index + 1),
+            },
+        );
+        result
+    }
+
     /// Return block statements that bind a value-definition pattern and the
-    /// expression carrying the raw value into the next tuple pattern.
+    /// expression carrying the raw value into the next tuple pattern. A
+    /// refutable pattern is matched once, then its bindings are projected from
+    /// the resulting tuple. This is the shape nsc uses and avoids running an
+    /// extractor once per bound name.
     fn value_parts(p: &mut Parser, pat: Tree, rhs: Tree) -> (Vec<Tree>, Tree) {
         let pat_span = pat.span;
         if let TreeKind::Ident { name } = &pat.kind {
@@ -5575,68 +5647,151 @@ fn desugar_for(
         // the downstream tuple has the same arity and pattern shape as nsc's.
         p.placeholder_id += 1;
         let tmp = format!("x$forv{}", p.placeholder_id);
-        let empty_tpt = p.empty(pat.span);
-        let tmp_def = p.alloc(
-            pat.span,
-            TreeKind::ValDef {
-                mods: Modifiers::default(),
-                name: tmp.clone(),
-                tpt: Box::new(empty_tpt),
-                rhs: Box::new(rhs),
-            },
-        );
         let mut names = Vec::new();
         pattern_bound_names(&pat, &mut names);
-        let mut stats = vec![tmp_def];
+        let outer_raw_name = match &pat.kind {
+            TreeKind::Bind { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(raw_name) = &outer_raw_name {
+            // `pattern_bound_names` includes the outer name of `p @ pat`.
+            // That name is the raw value already carried in tuple slot 1;
+            // project each binding exactly once from the remaining slots.
+            if names.first().is_some_and(|name| name == raw_name) {
+                names.remove(0);
+            }
+        }
         if names.is_empty() {
-            let sel = p.alloc(pat.span, TreeKind::Ident { name: tmp.clone() });
+            let raw_name = outer_raw_name
+                .clone()
+                .unwrap_or_else(|| format!("x$forvraw{}", p.placeholder_id));
             let guard = p.empty(pat.span);
-            let match_body = p.alloc(pat.span, TreeKind::Literal { lit: Lit::Unit });
-            let pat_span = pat.span;
+            let match_body = p.alloc(
+                pat_span,
+                TreeKind::Ident {
+                    name: raw_name.clone(),
+                },
+            );
+            let match_pat = if outer_raw_name.is_some() {
+                pat
+            } else {
+                p.alloc(
+                    pat_span,
+                    TreeKind::Bind {
+                        name: raw_name.clone(),
+                        body: Box::new(pat),
+                    },
+                )
+            };
             let m = p.alloc(
                 pat_span,
                 TreeKind::Match {
-                    selector: Box::new(sel),
+                    selector: Box::new(rhs),
                     cases: vec![CaseDef {
-                        pat,
+                        pat: match_pat,
                         guard,
                         body: match_body,
                         span: pat_span,
                     }],
                 },
             );
-            stats.push(m);
-        } else {
-            for name in names {
-                let sel = p.alloc(pat.span, TreeKind::Ident { name: tmp.clone() });
-                let guard = p.empty(pat.span);
-                let match_body = p.alloc(pat.span, TreeKind::Ident { name: name.clone() });
-                let m = p.alloc(
-                    pat.span,
-                    TreeKind::Match {
-                        selector: Box::new(sel),
-                        cases: vec![CaseDef {
-                            pat: pat.clone(),
-                            guard,
-                            body: match_body,
-                            span: pat.span,
-                        }],
-                    },
-                );
-                let empty_tpt = p.empty(pat.span);
-                stats.push(p.alloc(
-                    pat.span,
+            let empty_tpt = p.empty(pat_span);
+            let def = p.alloc(
+                pat_span,
+                TreeKind::ValDef {
+                    mods: Modifiers::default(),
+                    name: tmp.clone(),
+                    tpt: Box::new(empty_tpt),
+                    rhs: Box::new(m),
+                },
+            );
+            if outer_raw_name.is_some() {
+                let tpt = p.empty(pat_span);
+                let tmp_ident = p.alloc(pat_span, TreeKind::Ident { name: tmp });
+                let raw_def = p.alloc(
+                    pat_span,
                     TreeKind::ValDef {
                         mods: Modifiers::default(),
-                        name,
+                        name: raw_name.clone(),
+                        tpt: Box::new(tpt),
+                        rhs: Box::new(tmp_ident),
+                    },
+                );
+                return (
+                    vec![def, raw_def],
+                    p.alloc(pat_span, TreeKind::Ident { name: raw_name }),
+                );
+            }
+            return (vec![def], p.alloc(pat_span, TreeKind::Ident { name: tmp }));
+        } else {
+            let raw_name = outer_raw_name.unwrap_or_else(|| {
+                p.placeholder_id += 1;
+                format!("x$forvraw{}", p.placeholder_id)
+            });
+            let mut bind_args = vec![p.alloc(
+                pat_span,
+                TreeKind::Ident {
+                    name: raw_name.clone(),
+                },
+            )];
+            bind_args.extend(
+                names
+                    .iter()
+                    .map(|name| p.alloc(pat_span, TreeKind::Ident { name: name.clone() })),
+            );
+            let matched = right_tuple_tree(p, pat_span, bind_args);
+            let match_pat = if matches!(&pat.kind, TreeKind::Bind { .. }) {
+                pat
+            } else {
+                p.alloc(
+                    pat_span,
+                    TreeKind::Bind {
+                        name: raw_name.clone(),
+                        body: Box::new(pat),
+                    },
+                )
+            };
+            let guard = p.empty(pat_span);
+            let m = p.alloc(
+                pat_span,
+                TreeKind::Match {
+                    selector: Box::new(rhs),
+                    cases: vec![CaseDef {
+                        pat: match_pat,
+                        guard,
+                        body: matched,
+                        span: pat_span,
+                    }],
+                },
+            );
+            let empty_tpt = p.empty(pat_span);
+            let tmp_def = p.alloc(
+                pat_span,
+                TreeKind::ValDef {
+                    mods: Modifiers::default(),
+                    name: tmp.clone(),
+                    tpt: Box::new(empty_tpt),
+                    rhs: Box::new(m),
+                },
+            );
+            let mut stats = vec![tmp_def];
+            let total = names.len() + 1;
+            for (index, name) in std::iter::once(&raw_name).chain(names.iter()).enumerate() {
+                let sel = right_tuple_select(p, pat_span, &tmp, index, total);
+                let empty_tpt = p.empty(pat_span);
+                stats.push(p.alloc(
+                    pat_span,
+                    TreeKind::ValDef {
+                        mods: Modifiers::default(),
+                        name: name.clone(),
                         tpt: Box::new(empty_tpt),
-                        rhs: Box::new(m),
+                        rhs: Box::new(sel),
                     },
                 ));
             }
+            let raw = p.alloc(pat_span, TreeKind::Ident { name: raw_name });
+            return (stats, raw);
         }
-        let raw = p.alloc(pat_span, TreeKind::Ident { name: tmp });
-        (stats, raw)
     }
 
     fn apply_collection(p: &mut Parser, input: Tree, method: &str, fun: Tree) -> Tree {
@@ -5704,24 +5859,39 @@ fn desugar_for(
         let mut stream = input;
         let mut current_pat = pat;
         let mut next = index;
-        while next < enums.len() && enums[next].is_val {
-            let e = &enums[next];
-            let pat_for_lambda = current_pat.clone();
-            let fun = lambda_with_body(p, pat_for_lambda, |p, capture| {
-                let (stats, raw) = value_parts(p, e.pat.clone(), e.rhs.clone());
+        if next < enums.len() && enums[next].is_val {
+            let start = next;
+            while next < enums.len() && enums[next].is_val {
+                let has_guard = enums[next].guard.is_some();
+                next += 1;
+                if has_guard {
+                    break;
+                }
+            }
+            let group: Vec<Enumerator> = enums[start..next].to_vec();
+            let group_pats: Vec<Tree> = group.iter().map(|e| e.pat.clone()).collect();
+            let group_span = current_pat.span;
+            let fun = lambda_with_body(p, current_pat.clone(), |p, capture| {
+                let mut stats = Vec::new();
+                let mut values = Vec::new();
+                for e in &group {
+                    let (mut defs, raw) = value_parts(p, e.pat.clone(), e.rhs.clone());
+                    stats.append(&mut defs);
+                    values.push(raw);
+                }
                 let mut args = vec![p.alloc(
-                    current_pat.span,
+                    group_span,
                     TreeKind::Ident {
                         name: capture.into(),
                     },
                 )];
-                args.push(raw);
-                let tuple = tuple_tree(p, current_pat.span, args);
+                args.extend(values);
+                let tuple = tuple_tree(p, group_span, args);
                 if stats.is_empty() {
                     tuple
                 } else {
                     p.alloc(
-                        current_pat.span.merge(tuple.span),
+                        group_span.merge(tuple.span),
                         TreeKind::Block {
                             stats,
                             expr: Box::new(tuple),
@@ -5730,18 +5900,14 @@ fn desugar_for(
                 }
             });
             stream = apply_collection(p, stream, "map", fun);
-            current_pat = tuple_tree(
-                p,
-                current_pat.span.merge(e.pat.span),
-                vec![current_pat, e.pat.clone()],
-            );
-            next += 1;
-            if e.guard.is_some() {
-                break;
+            for value_pat in group_pats {
+                current_pat = tuple_tree(
+                    p,
+                    current_pat.span.merge(value_pat.span),
+                    vec![current_pat, value_pat],
+                );
             }
-        }
-        if next > index {
-            if let Some(g) = enums[next - 1].guard.clone() {
+            if let Some(g) = group.last().and_then(|e| e.guard.clone()) {
                 stream = with_filter(p, stream, &current_pat, g);
             }
             return build(p, enums, next, stream, current_pat, body, is_yield);

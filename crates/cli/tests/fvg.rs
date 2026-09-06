@@ -86,6 +86,19 @@ fn run(out: &Path, jar: Option<&Path>) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn run_failure(out: &Path, jar: Option<&Path>) -> String {
+    let cp = match jar {
+        Some(jar) => format!("{}:{}", out.display(), jar.display()),
+        None => out.display().to_string(),
+    };
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("run Main");
+    assert!(!output.status.success(), "java unexpectedly succeeded");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 fn compile_and_run(name: &str, extra: &[&str], jar: Option<&Path>) -> String {
     let out = tmp_dir(name);
     let (ok, messages) = compile(name, &out, extra);
@@ -159,4 +172,54 @@ fn value_definition_before_generator_is_rejected() {
         "unexpected diagnostics:\n{messages}"
     );
     let _ = fs::remove_dir_all(out);
+}
+
+#[test]
+fn refutable_value_definition_failure_matches_scalac() {
+    let src = fixtures_dir().join("fvg_for_match_error.scala");
+
+    let private_out = tmp_dir("fvg_for_match_error-private");
+    let (ok, messages) = compile("fvg_for_match_error", &private_out, &["--no-scala-library"]);
+    assert!(ok, "private runtime compile failed:\n{messages}");
+    let private_error = run_failure(&private_out, None);
+    assert!(
+        private_error.contains("scala.MatchError: 1 (of class java.lang.Integer)"),
+        "private runtime raised the wrong failure:\n{private_error}"
+    );
+    let _ = fs::remove_dir_all(private_out);
+
+    let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip refutable value-definition nsc comparison");
+        return;
+    };
+
+    let ours_out = tmp_dir("fvg_for_match_error-ours");
+    let (ok, messages) = compile(
+        "fvg_for_match_error",
+        &ours_out,
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    assert!(ok, "scala-library compile failed:\n{messages}");
+    let ours_error = run_failure(&ours_out, Some(&jar));
+    assert!(
+        ours_error.contains("scala.MatchError: 1 (of class java.lang.Integer)"),
+        "scala-library raised the wrong failure:\n{ours_error}"
+    );
+    let _ = fs::remove_dir_all(ours_out);
+
+    let nsc_out = tmp_dir("fvg_for_match_error-scalac");
+    let status = Command::new(scalac)
+        .args([src.to_str().unwrap(), "-d", nsc_out.to_str().unwrap()])
+        .status()
+        .expect("run scalac");
+    assert!(
+        status.success(),
+        "real scalac failed to compile fvg_for_match_error"
+    );
+    let nsc_error = run_failure(&nsc_out, Some(&jar));
+    assert!(
+        nsc_error.contains("scala.MatchError: 1 (of class java.lang.Integer)"),
+        "scalac raised the wrong failure:\n{nsc_error}"
+    );
+    let _ = fs::remove_dir_all(nsc_out);
 }
