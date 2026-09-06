@@ -778,6 +778,18 @@ pub(crate) fn discarded_unbox(tree: &Tree) -> Option<&Tree> {
 /// no-op for the same reason.
 pub(crate) fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     gen_expr_inner(asm, frame, ctx, tree);
+    // Null$ is an ABI marker, not a JVM subtype of every reference class.
+    // Preserve evaluation and checked casts, then expose the JVM's null
+    // verification type so a Scala Null can flow to String, arrays or any
+    // other reference type. This also checks values read through erased
+    // generic results before replacing them with the sole valid Null value.
+    if matches!(tree.ty, Type::Null) && asm.top_object().is_some() {
+        if asm.top_object() != Some("scala/runtime/Null$") {
+            asm.checkcast("scala/runtime/Null$");
+        }
+        asm.pop();
+        asm.aconst_null();
+    }
     if matches!(tree.ty, Type::Nothing) {
         // `athrow` only verifies when what is *on the stack* is a `Throwable`.
         // A `Nothing`-typed tree does not always leave one there: a generic

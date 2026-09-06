@@ -394,6 +394,15 @@ Erasure drops type arguments, turns type parameters and unbounded wildcards into
 
 The two bottom types each get their own class, everywhere: `Nothing` is `scala/runtime/Nothing$` and `Null` is `scala/runtime/Null$`, in a result, a parameter, a field and a type argument alike, so `def n: Null` is `()Lscala/runtime/Null$;` and `List[Null]`'s `Signature` is `List<Lscala/runtime/Null$;>`. The single exception, in nsc and here, is an **array element**: `Array[Nothing]` and `Array[Null]` are `[Ljava/lang/Object;`. This only matters across compilation units — a compiler that erases `Null` to `Object` is perfectly consistent with itself, and every one of its signatures then disagrees with scalac's. The private runtime ships a `scala/runtime/Null$` of its own for `--no-scala-library`, as it already did for `Nothing$`. `crates/cli/tests/nullcross.rs` compares the whole set against real scalac 2.13.16 and runs mixed programs both ways round.
 
+The JVM marker `Null$` is not a subtype of every reference class. When an
+expression produces a `Null` value, code generation preserves its evaluation
+and required casts, then materializes JVM `null` before passing it to other
+reference types. Casts from erased generic results and `asInstanceOf[Null]`
+still check `Null$`; a non-null value must throw `ClassCastException` rather
+than disappear. Bottom arrays allocate `Object[]` and collide with
+`Array[AnyRef]` overloads after erasure, including nested arrays. The
+`nx_values` and `nx_arrays_bad` fixtures exercise these cases against scalac.
+
 ### Lambdas as `invokedynamic` (`agent/indy`)
 
 A plain `FunctionN` literal is emitted as an **`invokedynamic`** rather than a closure class. This is the same shape as nsc 2.13's `-Ydelambdafy:method`.

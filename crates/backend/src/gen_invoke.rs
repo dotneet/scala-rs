@@ -2972,13 +2972,13 @@ pub(crate) fn emit_newarray(asm: &mut Assembler, ctx: &EmitCtx, elem: &Type) {
         // `Array[(Int, Int)]` its `[Lscala/Tuple2;` and `Array[Int => Int]`
         // its `[Lscala/Function1;`, both of which scalac also emits.
         _ => {
-            let desc = jvm_desc(ctx.st, elem);
+            let desc = jvm_desc_array_elem(ctx.st, elem);
             if desc.starts_with('[') {
                 asm.anewarray(&desc);
             } else if let Some(inner) = desc.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
                 asm.anewarray(inner);
             } else {
-                // `V`: `Unit` / `Nothing`, which have no element class here.
+                // An unresolved component has no concrete element class.
                 asm.anewarray("java/lang/Object");
             }
         }

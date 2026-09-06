@@ -350,6 +350,7 @@ pub(crate) fn emit_adapt(asm: &mut Assembler, adapt: &Adapt) {
 
 pub(crate) fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
     match ty {
+        Type::Null => Some("scala/runtime/Null$".into()),
         Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(class_internal(st, *sym)),
         Type::String => Some("java/lang/String".into()),
         Type::Function { params, .. } => Some(format!("scala/Function{}", params.len())),

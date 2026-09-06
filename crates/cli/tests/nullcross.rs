@@ -469,3 +469,84 @@ fn nx_separate_compilation_on_the_private_runtime() {
         let _ = fs::remove_dir_all(d);
     }
 }
+
+/// Null's ABI class is not a JVM subtype of String. Keep side effects and
+/// erased-result cast failures while materializing its sole value, null.
+#[test]
+fn nx_null_values_preserve_effects_and_casts() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let reference = tmp_dir("values-nsc");
+    compile_nsc(&scalac, &["nx_values"], &reference, None);
+    let expected = expected("nx_values");
+    assert_eq!(
+        run_main(&format!("{}:{}", reference.display(), jar.display())),
+        expected
+    );
+    for library in [false, true] {
+        let out = tmp_dir("values-rs");
+        let args = if library {
+            vec!["--scala-library", jar.to_str().unwrap()]
+        } else {
+            vec!["--no-scala-library"]
+        };
+        compile_ours(&["nx_values"], &out, &args);
+        let cp = if library {
+            format!("{}:{}", out.display(), jar.display())
+        } else {
+            out.to_string_lossy().into_owned()
+        };
+        assert_eq!(run_main(&cp), expected, "library={library}");
+        let code = javap(&["-p", "-c", "-cp", out.to_str().unwrap(), "Main$"]);
+        assert!(
+            code.lines()
+                .any(|line| line.contains("anewarray") && line.contains("class java/lang/Object")),
+            "Null arrays must allocate Object[]: {code}"
+        );
+        let _ = fs::remove_dir_all(out);
+    }
+    let _ = fs::remove_dir_all(reference);
+}
+
+#[test]
+fn nx_bottom_array_overloads_collide_after_erasure() {
+    let Some((jar, scalac)) = interop_tools() else {
+        return;
+    };
+    let out = tmp_dir("array-overloads");
+    let ours = Command::new(bin())
+        .arg("compile")
+        .arg(fixture("nx_arrays_bad"))
+        .args([
+            "--scala-library",
+            jar.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !ours.status.success(),
+        "bottom-array overloads must be rejected"
+    );
+    let diagnostics = String::from_utf8_lossy(&ours.stderr);
+    assert_eq!(
+        diagnostics.matches("double definition").count(),
+        2,
+        "{diagnostics}"
+    );
+    let theirs = Command::new(scalac)
+        .arg(fixture("nx_arrays_bad"))
+        .args(["-d", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!theirs.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&theirs.stderr)
+            .matches("double definition")
+            .count(),
+        2
+    );
+    let _ = fs::remove_dir_all(out);
+}
