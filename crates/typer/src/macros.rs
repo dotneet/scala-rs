@@ -395,19 +395,19 @@ impl Typer {
             matches!(&t.kind, TreeKind::DefDef { rhs, .. } if matches!(rhs.kind, TreeKind::MacroRhs { .. }))
         };
         match &mut tree.kind {
-            TreeKind::PackageDef { stats, .. } => {
+            TreeKind::PackageDef { stats, .. } | TreeKind::Block { stats, .. } => {
                 stats.retain(|s| !is_macro_def(s));
-                for s in stats {
-                    self.strip_macro_defs(s);
-                }
             }
             TreeKind::ClassDef { impl_, .. } | TreeKind::ModuleDef { impl_, .. } => {
                 impl_.body.retain(|s| !is_macro_def(s));
-                for s in &mut impl_.body {
-                    self.strip_macro_defs(s);
-                }
             }
             _ => {}
+        }
+        // Anonymous classes live below New/ValDef/Apply rather than directly
+        // in a template's statement list. Their macro declarations also have
+        // no runtime method body and must not reach bytecode generation.
+        for child in crate::lazy_local::children_mut(tree) {
+            self.strip_macro_defs(child);
         }
     }
 

@@ -60,7 +60,21 @@ impl Typer {
         if tpt.sym.is_none() {
             self.namer_class(tpt);
         }
-        self.type_class(tpt);
+        self.type_local_template(tpt);
+    }
+
+    /// Local templates belong to the expression being typed. Even if that
+    /// expression is needed to infer a signature, its cached tree must contain
+    /// completed local bodies: the later template pass does not revisit them.
+    /// Top-level and member templates still use the ordinary two-pass entry.
+    pub(crate) fn type_local_template(&mut self, tree: &mut Tree) {
+        let saved = std::mem::replace(&mut self.sigs_only, false);
+        match &tree.kind {
+            TreeKind::ClassDef { .. } => self.type_class(tree),
+            TreeKind::ModuleDef { .. } => self.type_module(tree),
+            _ => unreachable!("local template must be a class or object"),
+        }
+        self.sigs_only = saved;
     }
 
     pub(crate) fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {

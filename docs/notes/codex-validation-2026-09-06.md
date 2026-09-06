@@ -465,3 +465,34 @@ leaf; real GitBucket still timed out at 60 seconds on its preceding candidate.
 Macro `7f2a9be9` passes a success-required hydration test, but independent probes
 expose incomplete flags, owners, parameter metadata and legal class shapes.
 None of these candidates is accepted based on focused tests alone.
+
+
+## Parent repair: local template completion and macro declaration stripping
+
+On the held codegen/constructor candidate, inferred macro implementations were
+cached during signature inference with untyped local TypeCreator bodies. The
+local class/object/anonymous-class expression entry now completes their bodies,
+while member and top-level templates retain the two-pass entry. Macro declaration
+stripping now follows all child edges, including classes nested below New and
+ValDef, rather than only directly nested templates.
+
+Five lost positive corpus cases pass after the first repair; the two lost runtime
+cases macro-term-declared-in-anonymous and macro-term-declared-in-refinement pass
+after the stripping repair. Evidence is under
+`/tmp/scala-rs-codex/integration/codegen-macro-parent-probe/after-local-template/`:
+`corpus.tsv` and `strip-corpus.tsv`. Existing engine 27, rf_reify 6 and xflags 10
+focused tests pass. The new lazy_template test passes all four compiler producer/
+consumer combinations through an nsc reflection adapter, with strict JVM
+verification and output 7. The adapter deliberately isolates executable bodies
+from the following independently reproduced, still RED ScalaSignature defects:
+
+- Direct scala-rs macro declarations omit MACRO/binding metadata; a scalac client
+  compiles an ordinary call and fails at runtime with NoSuchMethodError.
+- A direct nsc macro facade rejects the scala-rs implementation result because
+  Exprs$Expr[Int] loses its dependent c.Expr[Int] representation. Even a source
+  cast cannot work around the incorrectly named nested class type.
+
+The original unadapted tests and failing logs are retained in the evidence
+folder as direct-macro-signature-red.rs and dependent-result-signature-red.rs.
+The adapted passing test is proof of local body execution, not of the direct
+Scala macro-declaration ABI. These fixes have not passed a full acceptance gate.

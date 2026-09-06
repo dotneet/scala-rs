@@ -51,13 +51,13 @@ impl Typer {
                 if tree.sym.is_none() {
                     self.namer_class(tree);
                 }
-                self.type_class(tree);
+                self.type_local_template(tree);
             }
             TreeKind::ModuleDef { .. } => {
                 if tree.sym.is_none() {
                     self.namer_module(tree);
                 }
-                self.type_module(tree);
+                self.type_local_template(tree);
             }
             _ => {
                 self.type_expr(tree, &Type::NoType);
