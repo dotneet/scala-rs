@@ -4,7 +4,9 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=$(mktemp -d /tmp/scala-rs-codex-conformance-audit.XXXXXX)
+LOG_ROOT=${CONFORMANCE_LOG_ROOT:-/tmp/scala-rs-codex/conformance-audit}
+mkdir -p "$LOG_ROOT"
+WORK=$(mktemp -d "$LOG_ROOT/harness.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 BIN="$WORK/bin"
