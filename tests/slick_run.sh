@@ -39,7 +39,7 @@
 # and real scalac, and is published by an atomic rename; everything that
 # depends on *your* compiler or gets rewritten per run lives under $WORK, which
 # is private to your worktree and held under a lock for the duration.
-set -e
+set -eo pipefail
 SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slick
 DIR=${SLICK_RUN_DIR:-/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun}
 ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
@@ -108,13 +108,18 @@ if [[ ${REUSE_RS:-0} != 1 || ! -d $WORK/out-rs ]]; then
   (cd "$ROOT" && cargo build -p scala-rs-cli --release) >/dev/null 2>$WORK/build.log \
     || { cat $WORK/build.log; exit 1; }
   rm -rf $WORK/out-rs; mkdir -p $WORK/out-rs
+  COMPILER_EXIT=0
   "$ROOT/target/release/scala-rs" compile "${FILES[@]}" -d $WORK/out-rs -cp "$DEPS" \
-    -Xsource:3 --scala-library $LIB > $WORK/rs.log 2>&1 || true
+    -Xsource:3 --scala-library $LIB > $WORK/rs.log 2>&1 || COMPILER_EXIT=$?
   E=$(grep -c '^error' $WORK/rs.log || true)
   C=$(find $WORK/out-rs -name '*.class' | wc -l | tr -d ' ')
   # Print files= alongside errors= and classes=: a truncated slick checkout
   # reads as a clean build otherwise.
-  echo "   scala-rs: files=${#FILES[@]} errors=$E classes=$C"
+  echo "   scala-rs: files=${#FILES[@]} errors=$E classes=$C compiler_exit=$COMPILER_EXIT"
+  if (( COMPILER_EXIT != 0 || E != 0 || C == 0 || ${#FILES[@]} == 0 )); then
+    echo "slick compile failed; see $WORK/rs.log" >&2
+    exit 1
+  fi
   # Structural check over *every* class we just wrote, not only the ones the
   # programs below happen to call: a branch offset that wrapped, or a method
   # over the 64 KB the format allows. Neither is visible to the loader check
