@@ -874,6 +874,13 @@ impl Typer {
                 }
                 if found.is_found() {
                     partial.extend(bindings);
+                } else if matches!(found, ImplicitSearch::None) {
+                    // A function-valued implicit may be supplied by a view.
+                    // Keep its bindings when a later ClassTag is materialized,
+                    // just as the ordinary undet_solution path does.
+                    if let Some(view) = self.view_undet_bindings(&want, &open) {
+                        partial.extend(view);
+                    }
                 }
             }
             if !ambiguous {

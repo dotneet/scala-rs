@@ -1244,6 +1244,16 @@ impl Typer {
                 .collect();
             let (found, bindings) = self.search_implicit_undet(&pty, &open, 0);
             if !found.is_found() {
+                // Earlier evidence can fix a tag's element type even when
+                // the tag itself must be materialized by the compiler. It
+                // supplies evidence, not a new constraint on open variables.
+                if matches!(found, ImplicitSearch::None)
+                    && !mentions_tparam(&pty, &open)
+                    && matches!(&pty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                    && self.classtag_apply_fallback(&pty, Span::DUMMY).is_some()
+                {
+                    continue;
+                }
                 // No *value* of that type. A function-typed parameter is a
                 // view request, and the conversion that answers it can pin the
                 // open parameters just as well (`List[Option[A]].flatten`).

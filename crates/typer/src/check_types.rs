@@ -2143,6 +2143,11 @@ impl Typer {
                 stable_pat: false,
             };
         }
+        // This application was synthesized rather than passed through
+        // type_apply. Its escaping parameters still belong to the caller's
+        // inference problem, just like a polymorphic receiver written out.
+        let open = self.undetermined_of(&tree);
+        self.undet_tvars.extend(open);
         tree
     }
 

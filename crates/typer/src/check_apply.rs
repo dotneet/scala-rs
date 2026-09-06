@@ -1112,6 +1112,24 @@ impl Typer {
                                 }
                             }
                             if !ids.is_empty() {
+                                // Receiver variables retain their declaration
+                                // bounds when the member's arguments solve them.
+                                let mut owners: Vec<_> =
+                                    ids.iter().map(|id| self.st.get(*id).owner).collect();
+                                owners.sort_by_key(|id| id.0);
+                                owners.dedup();
+                                for owner in owners {
+                                    if owner.is_none() {
+                                        continue;
+                                    }
+                                    let inst: Vec<_> = ids
+                                        .iter()
+                                        .zip(&vals)
+                                        .filter(|(id, _)| self.st.get(**id).owner == owner)
+                                        .map(|(id, ty)| (*id, ty.clone()))
+                                        .collect();
+                                    self.check_tparam_bounds(owner, &inst, None, a.span, true);
+                                }
                                 p = crate::symbol::subst_tparams_slice(&ids, &vals, &p);
                                 param_tys = param_tys
                                     .iter()
