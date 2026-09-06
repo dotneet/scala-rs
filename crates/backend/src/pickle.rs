@@ -744,6 +744,11 @@ impl<'a> Pickler<'a> {
     /// says the class really is nested, so a plain top-level class keeps the
     /// package path it had.
     fn external_owner_ref(&mut self, class_sym: SymbolId) -> u32 {
+        // Singleton has no JVM class and erases to Object. Both ordinary
+        // type references and bounds must retain its Scala package identity.
+        if class_sym == self.st.singleton_sym {
+            return self.scala_module();
+        }
         let jvm = self.st.get(class_sym).jvm_name.clone();
         let last = jvm.rsplit('/').next().unwrap_or(&jvm);
         if !last.trim_end_matches('$').contains('$') {

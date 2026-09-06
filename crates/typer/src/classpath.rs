@@ -110,6 +110,9 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
     for (i, owner) in &installed {
         let (i, owner) = (*i, *owner);
         let c = &classes[i];
+        if owner.0 >= st.prelude_end {
+            st.pending_classpath_signatures.insert(owner);
+        }
         install_tparams(st, owner, &c.pickle_tparams);
         let accessors = nullary_accessors(c);
         if let Some(p) = &c.pickle {

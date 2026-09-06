@@ -641,6 +641,9 @@ pub struct SymbolTable {
     /// constructor fields private behind accessors; ours are emitted with the
     /// field public, so the two are read differently.
     pub source_classes: rustc_hash::FxHashSet<SymbolId>,
+    /// Scala classes seeded by the shallow classpath reader. Their complete
+    /// signature must be adopted before type checking uses their members.
+    pub pending_classpath_signatures: rustc_hash::FxHashSet<SymbolId>,
     /// `scala.runtime.LazyRef` & friends, in `prelude_lazyref::CELL_NAMES`
     /// order. The cell classes a method-local `lazy val` is compiled into.
     pub lazy_cells: Vec<SymbolId>,
@@ -820,6 +823,7 @@ impl SymbolTable {
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),
             source_classes: rustc_hash::FxHashSet::default(),
+            pending_classpath_signatures: rustc_hash::FxHashSet::default(),
             lazy_cells: Vec::new(),
             local_lazy_cells: rustc_hash::FxHashSet::default(),
             local_lazy_accessors: rustc_hash::FxHashMap::default(),

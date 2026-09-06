@@ -3973,6 +3973,12 @@ impl PickleSupply {
             "scala.Double" => return Some(Type::Double),
             "scala.Char" => return Some(Type::Char),
             "scala.Any" => return Some(Type::Any),
+            "scala.Singleton" => {
+                return Some(Type::Class {
+                    sym: st.singleton_sym,
+                    args: vec![],
+                });
+            }
             "scala.AnyRef" | "java.lang.Object" => return Some(Type::AnyRef),
             "scala.AnyVal" => return Some(Type::AnyVal),
             "scala.Nothing" => return Some(Type::Nothing),

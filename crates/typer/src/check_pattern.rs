@@ -891,7 +891,8 @@ impl Typer {
     /// Decide whether the two types can have a common instance. Unlike an
     /// assignment, a type test permits narrowing and unrelated open traits.
     fn typed_pattern_compatible(&mut self, pattern: &Type, scrutinee: &Type) -> bool {
-        if matches!(self.st.dealias(pattern), Type::Class { sym, .. } if sym == self.st.singleton_sym) {
+        if matches!(self.st.dealias(pattern), Type::Class { sym, .. } if sym == self.st.singleton_sym)
+        {
             return true;
         }
         fn upper(typer: &Typer, ty: &Type) -> Type {

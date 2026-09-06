@@ -1187,6 +1187,12 @@ impl Typer {
             if !seen.insert(pid.0) {
                 continue;
             }
+            // Inherited signatures must be complete before their symbols enter
+            // this scope: replacing a shallow method afterwards leaves stale
+            // type-parameter bounds in inherited lookups and override checks.
+            if self.st.pending_classpath_signatures.contains(&pid) {
+                self.ensure_java_loaded(pid, Span::DUMMY);
+            }
             let alias = self.st.get(pid).self_alias;
             for m in self.st.get(pid).members.clone() {
                 let n = self.st.get(m).name.clone();

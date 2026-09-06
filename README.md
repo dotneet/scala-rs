@@ -28,6 +28,11 @@ makes no claim of conformance to the language specification. What exists today:
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは
 [docs/tailrec.md](docs/tailrec.md) を参照してください。
 
+`Singleton` の型境界は ScalaSignature に保存し、scalac 2.13.16 との
+分割コンパイルを両方向で検査しています。正常な継承の JVM 実行と、不正な
+境界変更の拒否を確認するテストは `singleton_metadata` です。
+[修正の範囲と検証方法](docs/notes/singleton-metadata-parent.md) を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

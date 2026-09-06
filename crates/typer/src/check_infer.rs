@@ -1357,7 +1357,13 @@ impl Typer {
             };
             let a = &self.align_arg_to_param(p, a);
             let keep_singleton = self.st.get(tp).bound_hi.as_ref().is_some_and(|hi| {
-                self.st.is_sub_type(hi, &Type::Class { sym: self.st.singleton_sym, args: vec![] })
+                self.st.is_sub_type(
+                    hi,
+                    &Type::Class {
+                        sym: self.st.singleton_sym,
+                        args: vec![],
+                    },
+                )
             });
             let mut hit = if keep_singleton {
                 unify_one_precise(tp, p, a)

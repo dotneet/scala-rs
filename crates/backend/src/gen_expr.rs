@@ -3977,11 +3977,6 @@ pub(crate) fn gen_module_member_receiver(
     qual: &Tree,
     mcls: SymbolId,
 ) {
-    let Some(outer) = member_module_outer(ctx.st, mcls) else {
-        let jvm = class_internal(ctx.st, mcls);
-        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
-        return;
-    };
     // A qualifier that is itself a paren-less accessor (`universe.Liftable`,
     // whose symbol is `def Liftable: Liftables$Liftable$`) still carries its
     // *method* type here, which `class_sym_of` has no answer for. Unwidened,
@@ -3997,6 +3992,11 @@ pub(crate) fn gen_module_member_receiver(
         gen_expr(asm, frame, ctx, qual);
         return;
     }
+    let Some(outer) = member_module_outer(ctx.st, mcls) else {
+        let jvm = class_internal(ctx.st, mcls);
+        asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
+        return;
+    };
     // The qualifier is a *value* of some class: it is the enclosing instance,
     // whether or not the symbol table can see the inheritance. A library
     // class's pickled parents are attached one level at a time, so

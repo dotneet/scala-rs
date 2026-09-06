@@ -2892,6 +2892,15 @@ impl Typer {
         if jvm.is_empty() || jvm.starts_with('[') {
             return;
         }
+        // Classpath discovery records only a shallow Scala signature. Adopt
+        // the complete one lazily, without re-reading source/prelude classes.
+        // Remove first because completion can recursively request this class.
+        if self.st.pending_classpath_signatures.remove(&class_id)
+            && !self.st.source_classes.contains(&class_id)
+        {
+            self.pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, class_id);
+        }
         let javaish = self.st.get(class_id).flags.contains(Flags::JAVA)
             || jvm.starts_with("java/")
             || jvm.starts_with("javax/");
