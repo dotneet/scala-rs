@@ -3,8 +3,15 @@
 **Codex continuation in progress:** read
 [`docs/notes/codex-validation-2026-09-06.md`](docs/notes/codex-validation-2026-09-06.md)
 for recovered branch checkpoints, newly reproduced defects, Java environment
-requirements, and unfinished validation. The historical results below remain
-the baseline; the continuation has not yet merged the compiler changes.
+requirements, and unfinished validation. The original three pending slices
+and their required fixes were independently validated at `d9eb5dc` and merged
+locally as `4b0568af`. Tail-call and by-name overload fixes were subsequently
+validated at `dd5047e0` and merged as `318c1568`: 2233 workspace tests pass,
+and all 5324 corpus identities are retained with run passes rising to 590.
+Read the updated `tests/BASELINE.md`, including its
+per-test corpus reference and red MODE=a check. The historical results below
+describe the previous session, not the current baseline. This continuation
+has not pushed its commits.
 
 Written 2026-09-06 at the end of a long parallel-development session. Its
 purpose is to let the next session pick up without re-deriving anything.
