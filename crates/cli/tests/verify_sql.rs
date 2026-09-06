@@ -58,6 +58,17 @@ fn jdk17_command(cmd: &mut Command, home: &Path) {
 }
 
 fn compile_scalac(src: &Path, out: &Path, cp: &[&Path], home: &Path, jar: &Path) {
+    compile_scalac_with_flags(src, out, cp, home, jar, &[]);
+}
+
+fn compile_scalac_with_flags(
+    src: &Path,
+    out: &Path,
+    cp: &[&Path],
+    home: &Path,
+    jar: &Path,
+    flags: &[&str],
+) {
     let mut cmd = Command::new(scalac().unwrap());
     let classpath = cp
         .iter()
@@ -65,7 +76,7 @@ fn compile_scalac(src: &Path, out: &Path, cp: &[&Path], home: &Path, jar: &Path)
         .chain(std::iter::once(jar.to_str().unwrap()))
         .collect::<Vec<_>>()
         .join(":");
-    cmd.args([
+    cmd.args(flags).args([
         "-classpath",
         &classpath,
         "-d",
@@ -82,7 +93,12 @@ fn compile_scalac(src: &Path, out: &Path, cp: &[&Path], home: &Path, jar: &Path)
     );
 }
 
-fn compile_scala_rs(src: &Path, out: &Path, cp: &[&Path], jar: &Path) {
+fn compile_scala_rs_output(
+    src: &Path,
+    out: &Path,
+    cp: &[&Path],
+    jar: &Path,
+) -> std::process::Output {
     let mut cmd = Command::new(bin());
     let classpath = cp
         .iter()
@@ -99,7 +115,11 @@ fn compile_scala_rs(src: &Path, out: &Path, cp: &[&Path], jar: &Path) {
         "--scala-library",
         jar.to_str().unwrap(),
     ]);
-    let output = cmd.output().expect("run scala-rs compile");
+    cmd.output().expect("run scala-rs compile")
+}
+
+fn compile_scala_rs(src: &Path, out: &Path, cp: &[&Path], jar: &Path) {
+    let output = compile_scala_rs_output(src, out, cp, jar);
     assert!(
         output.status.success(),
         "scala-rs failed: {}{}",
@@ -240,6 +260,65 @@ fn parent_defaults_interoperate_across_scalac_and_scala_rs() {
     assert_eq!(
         run_java17(&nsc_child, &[&rs_base], &jar, &home),
         "jdbc:rs:user:password\n"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn external_constructor_defaults_are_typed_and_companion_backed() {
+    let (Some(jar), Some(home), Some(_)) = (scala_library_jar(), temurin17_home(), scalac()) else {
+        return;
+    };
+    let root = tmp_dir();
+    let nsc_base = root.join("nsc-base");
+    let rs_child = root.join("rs-child");
+    let rs_bad = root.join("rs-bad");
+    for out in [&nsc_base, &rs_child, &rs_bad] {
+        fs::create_dir_all(out).unwrap();
+    }
+    let fixtures = fixtures_dir();
+    // `-Xno-forwarders` leaves constructor default getters only on the
+    // companion, which also covers a nested class whose classfile has no
+    // ScalaSignature of its own.
+    compile_scalac_with_flags(
+        &fixtures.join("vsql_external_ctor_base.scala"),
+        &nsc_base,
+        &[],
+        &home,
+        &jar,
+        &["-Xno-forwarders"],
+    );
+    compile_scala_rs(
+        &fixtures.join("vsql_external_ctor_child.scala"),
+        &rs_child,
+        &[&nsc_base],
+        &jar,
+    );
+    assert_eq!(
+        run_java17(&rs_child, &[&nsc_base], &jar, &home),
+        "42\n42\ncurried:42\n42\n"
+    );
+
+    // The getter's result is checked against the substituted constructor
+    // parameter type. `Int` must not be silently accepted as `String`.
+    let bad = compile_scala_rs_output(
+        &fixtures.join("vsql_external_ctor_bad.scala"),
+        &rs_bad,
+        &[&nsc_base],
+        &jar,
+    );
+    assert!(
+        !bad.status.success(),
+        "invalid generic default was accepted"
+    );
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&bad.stdout),
+        String::from_utf8_lossy(&bad.stderr)
+    );
+    assert!(
+        diagnostics.contains("found: Int") && diagnostics.contains("required: String"),
+        "unexpected diagnostic: {diagnostics}"
     );
     let _ = fs::remove_dir_all(&root);
 }

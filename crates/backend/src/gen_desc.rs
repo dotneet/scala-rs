@@ -613,9 +613,14 @@ pub(crate) fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option
     if class_id.is_none() {
         return None;
     }
-    // Static nested Java types (`Map$Entry`, `AbstractMap$SimpleEntry`) must
-    // not get an enclosing `this` argument.
-    if st.get(class_id).flags.contains(Flags::JAVA) {
+    // Static nested types (`Map$Entry`, and Scala classes nested in an object)
+    // must not get an enclosing `this` argument.  The classfile reader marks
+    // both forms `STATIC`; checking only `JAVA` made an externally loaded
+    // `object O { class C(...) }` acquire a spurious `O` parameter in emitted
+    // subclasses and fail verification before its real constructor ran.
+    if st.get(class_id).flags.contains(Flags::JAVA)
+        || st.get(class_id).flags.contains(Flags::STATIC)
+    {
         return None;
     }
     // `new T { … }` and local classes are owned by the method (or the `val`)

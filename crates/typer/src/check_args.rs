@@ -948,22 +948,42 @@ impl Typer {
         let owner = self.st.get(meth).owner;
         let span = fun.span;
         if mname == "<init>" {
-            self.ensure_classfile_members_loaded(owner, span);
+            self.ensure_classfile_members_loaded(owner, &jvm_ctor_gname, span);
         }
-        let lookup_getter = |name: &str| {
-            self.st
-                .lookup_member(owner, name)
+        let lookup_getter = |st: &crate::symbol::SymbolTable, owner: SymbolId, name: &str| {
+            st.lookup_member(owner, name)
                 .into_iter()
-                .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)
+                .find(|&id| st.get(id).kind == crate::symbol::SymKind::Method)
         };
-        let gid = if mname == "<init>" {
+        let mut getter_owner = owner;
+        let mut companion_module = None;
+        let mut gid = if mname == "<init>" {
             // Prefer the JVM spelling when the classfile was available. The
             // pickle spelling is retained as a fallback for a source class
             // whose getter is synthesized by this compiler.
-            lookup_getter(&jvm_ctor_gname).or_else(|| lookup_getter(&gname))
+            lookup_getter(&self.st, owner, &jvm_ctor_gname)
+                .or_else(|| lookup_getter(&self.st, owner, &gname))
         } else {
-            lookup_getter(&gname)
-        }?;
+            lookup_getter(&self.st, owner, &gname)
+        };
+        if gid.is_none() && mname == "<init>" {
+            // `-Xno-forwarders` removes the static bridge from the class, and
+            // nested classes never get that bridge even in an ordinary nsc
+            // build.  Their real getter is an instance method on `C$` (or
+            // `Outer$C$`), so load the companion and select it through its
+            // module value just as Scala source does.
+            self.load_companion_module(owner);
+            if let Some(module) = self.st.companion_module(owner) {
+                let mcls = self.st.module_class_of(module);
+                gid = lookup_getter(&self.st, mcls, &jvm_ctor_gname)
+                    .or_else(|| lookup_getter(&self.st, mcls, &gname));
+                if gid.is_some() {
+                    getter_owner = mcls;
+                    companion_module = Some(module);
+                }
+            }
+        }
+        let gid = gid?;
         let getter_name = self.st.get(gid).name.clone();
         // An *inserted* `apply` names the receiver itself, not a member of it:
         // `Outer.Inner.Nested(2)` is `Select(Outer.Inner, "Nested")` carrying
@@ -985,6 +1005,7 @@ impl Typer {
         // emits `invokestatic` without loading a receiver.
         let ctor_default_getter = (self.st.get(meth).flags.contains(Flags::CONSTRUCTOR)
             || self.st.get(meth).name == "<init>")
+            && getter_owner == owner
             && getter_name.starts_with("$lessinit$greater$default$");
         // The classfile getter is a static forwarder. Preserve that fact for
         // selection/codegen even when the pickle supplied its symbol without
@@ -994,6 +1015,7 @@ impl Typer {
             self.st.get_mut(gid).flags = f;
         }
         let ctor_static_getter = ctor_default_getter;
+        let ctor_companion_getter = companion_module.is_some();
         let recv = if ctor_static_getter {
             let owner_name = self.st.get(owner).name.clone();
             Tree {
@@ -1011,6 +1033,19 @@ impl Typer {
                         .collect(),
                 },
                 sym: owner,
+                postfix: false,
+                scala_ref: false,
+                stable_pat: false,
+            }
+        } else if ctor_companion_getter {
+            let module = companion_module.expect("companion getter has module");
+            let module_name = self.st.get(module).name.clone();
+            Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Ident { name: module_name },
+                ty: Type::ModuleRef(self.st.module_class_of(module)),
+                sym: module,
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
@@ -1038,19 +1073,20 @@ impl Typer {
         let want = self.st.get(gid).paramss.iter().flatten().count();
         preceding.truncate(want);
         let preceding = &preceding[..];
+        let param_ty = self.default_param_type(fun, param);
         let mut gfun = Tree {
             id: NodeId(0),
             span,
-            kind: if ctor_static_getter {
-                // The class qualifier is only a source-level spelling for a
-                // static JVM method. Keep the already resolved symbol rather
-                // than retyping `NscBase` as its companion `NscBase$`.
-                TreeKind::Ident { name: getter_name }
-            } else {
-                TreeKind::Select {
-                    qual: Box::new(recv),
-                    name: getter_name,
-                }
+            // Keep the class qualifier on a static constructor getter.  Its
+            // type and symbol are already resolved above, so `type_select`
+            // can inspect the real classfile member without resolving the
+            // class name as its companion object.  Going through Select is
+            // essential: the normal Apply path then checks the getter's
+            // descriptor and adapts its result to the constructor parameter,
+            // instead of trusting the parameter type as the getter result.
+            kind: TreeKind::Select {
+                qual: Box::new(recv),
+                name: getter_name,
             },
             ty: self.st.get(gid).ty.clone(),
             sym: gid,
@@ -1058,9 +1094,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
         };
-        if !ctor_static_getter {
-            self.type_expr(&mut gfun, &Type::NoType);
-        }
+        self.type_expr(&mut gfun, &Type::NoType);
         let mut call = Tree {
             id: NodeId(0),
             span,
@@ -1068,16 +1102,51 @@ impl Typer {
                 fun: Box::new(gfun),
                 args: preceding.to_vec(),
             },
-            ty: self.st.get(param).ty.clone(),
+            ty: param_ty.clone(),
             sym: gid,
             postfix: false,
             scala_ref: false,
             stable_pat: false,
         };
-        if !ctor_static_getter {
-            self.type_expr(&mut call, &self.st.get(param).ty.clone());
-        }
+        self.type_expr(&mut call, &param_ty);
         Some(call)
+    }
+
+    /// The parameter type as seen by this particular call.  A constructor
+    /// selected through `extends Parent[String]` carries `String` in its
+    /// substituted method type even though the parameter symbol itself still
+    /// has the declaration's `T`; using the latter would reject a valid
+    /// numeric default and accept an invalid String default alike.
+    fn default_param_type(&self, fun: &Tree, param: SymbolId) -> Type {
+        let method = fun.sym;
+        if method.is_none() {
+            return self.st.get(param).ty.clone();
+        }
+        let decl = self.st.get(method);
+        let mut flat = 0usize;
+        for (ci, clause) in decl.paramss.iter().enumerate() {
+            for (pi, &pid) in clause.iter().enumerate() {
+                if pid != param {
+                    flat += 1;
+                    continue;
+                }
+                if let Type::Method { paramss, .. } = &fun.ty {
+                    if let Some(ty) = paramss.get(ci).and_then(|c| c.get(pi)) {
+                        return ty.clone();
+                    }
+                    // Constructor matching flattens curried clauses, while
+                    // the stored method type retains them.  Accommodate the
+                    // flattened view used by parent/default filling too.
+                    if paramss.len() == 1 {
+                        if let Some(ty) = paramss[0].get(flat) {
+                            return ty.clone();
+                        }
+                    }
+                }
+                return self.st.get(param).ty.clone();
+            }
+        }
+        self.st.get(param).ty.clone()
     }
 
     /// The arguments of the parameter clauses already applied to `fun`. A

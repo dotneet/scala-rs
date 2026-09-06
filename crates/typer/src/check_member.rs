@@ -1351,6 +1351,7 @@ impl Typer {
         {
             return;
         }
+        self.ensure_external_ctor_defaults(class_id, span);
         let params = self.st.get(ctor).params.clone();
         if args.len() >= params.len() {
             return;
@@ -1710,6 +1711,12 @@ impl Typer {
             Type::Class { args, .. } => args.clone(),
             _ => Vec::new(),
         };
+        // A separately compiled Scala parent may carry its default getter only
+        // on the companion (`-Xno-forwarders`, and nested classes).  Mark its
+        // constructor parameters before overload selection so an omitted
+        // argument is considered applicable and the getter is then type
+        // checked through the normal default-argument path.
+        self.ensure_external_ctor_defaults(class_id, tree.span);
         self.supply_binary_ctors(class_id);
         match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
             OverloadPick::Found(sym, param_tys, _) => {
@@ -1811,7 +1818,7 @@ impl Typer {
         if class_id.is_none() {
             return OverloadPick::None;
         }
-        let alts: Vec<SymbolId> = self
+        let own_ctors: Vec<SymbolId> = self
             .st
             .lookup_member(class_id, "<init>")
             .into_iter()
@@ -1821,6 +1828,19 @@ impl Typer {
             // `<init>` that `lookup_member` walks into is not an alternative
             // of this class's own.
             .filter(|&id| self.st.get(id).owner == class_id)
+            .collect();
+        // A separately compiled curried constructor can be supplied twice:
+        // its pickle exposes the first clause as a source-shaped constructor
+        // without a JVM descriptor, while the classfile/pickle repair supplies
+        // the flattened descriptor.  The descriptor-bearing symbol is the
+        // callable constructor; retaining the descriptorless partial symbol
+        // makes an omitted default look like an ambiguous overload.
+        let has_linked_ctor = own_ctors
+            .iter()
+            .any(|&id| !self.st.get(id).jvm_name.is_empty());
+        let alts: Vec<SymbolId> = own_ctors
+            .into_iter()
+            .filter(|&id| !has_linked_ctor || !self.st.get(id).jvm_name.is_empty())
             .collect();
         if alts.is_empty() {
             return OverloadPick::None;

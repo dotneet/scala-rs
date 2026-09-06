@@ -2931,8 +2931,29 @@ impl Typer {
     /// demand; constructor default getters are the one JVM-only exception:
     /// the pickle spells `<init>$default$n`, while the classfile exposes the
     /// static `$lessinit$greater$default$n` forwarder.
-    pub(crate) fn ensure_classfile_members_loaded(&mut self, class_id: SymbolId, span: Span) {
+    pub(crate) fn ensure_classfile_members_loaded(
+        &mut self,
+        class_id: SymbolId,
+        member_name: &str,
+        span: Span,
+    ) {
         if class_id.is_none() {
+            return;
+        }
+        // The pickle already supplies the source spelling (`<init>$default$n`)
+        // but not the JVM forwarder.  Once that alias is installed, avoid
+        // reparsing and reinstalling the whole class for every later default.
+        // `install_java_class_in` merges members into the existing symbol and
+        // preserves pickle-only flags, but this guard keeps that merge a
+        // one-time classfile completion rather than making symbol state depend
+        // on the order in which defaults are visited.
+        if !member_name.is_empty()
+            && self
+                .st
+                .lookup_member(class_id, member_name)
+                .iter()
+                .any(|&id| self.st.get(id).kind == SymKind::Method)
+        {
             return;
         }
         let jvm = self.st.get(class_id).jvm_name.clone();
@@ -2952,6 +2973,99 @@ impl Typer {
                 .adopt_binary_class(&mut self.st, &mut self.binary, id);
         }
         self.complete_java_parents(class_id, span);
+    }
+
+    /// Mark constructor parameters whose JVM getter exists in a separately
+    /// compiled class.  The constructor pickle records the parameter types,
+    /// but `supply_ctors` intentionally does not infer `DEFAULTPARAM` from a
+    /// classfile: the default body lives on the class's companion and the
+    /// classfile has no parameter flag for it.  The forwarder is still a
+    /// precise witness (`$lessinit$greater$default$n`), including for
+    /// `-Xno-forwarders` and nested classes where only `C$` has the method.
+    fn link_existing_nested_companion(&mut self, class_id: SymbolId) {
+        if self.st.companion_module(class_id).is_some() {
+            return;
+        }
+        let class_jvm = self.st.get(class_id).jvm_name.clone();
+        if class_jvm.is_empty() {
+            return;
+        }
+        let module_jvm = format!("{class_jvm}$");
+        let Some(mcls) = crate::classpath::find_by_jvm(&self.st, &module_jvm)
+            .filter(|&id| self.st.get(id).kind == SymKind::ModuleClass)
+        else {
+            return;
+        };
+        let owner = self.st.get(class_id).owner;
+        let module_owner = self.st.get(mcls).owner;
+        let outer_module_owner = if !owner.is_none() {
+            self.st
+                .companion_module(owner)
+                .map(|m| self.st.module_class_of(m))
+        } else {
+            None
+        };
+        if module_owner != owner && Some(module_owner) != outer_module_owner {
+            return;
+        }
+        let name = self.st.get(class_id).name.clone();
+        let Some(module) = self
+            .st
+            .get(module_owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&id| self.st.get(id).kind == SymKind::Module && self.st.get(id).name == name)
+        else {
+            return;
+        };
+        if !self.st.get(owner).members.contains(&module) {
+            self.st.get_mut(owner).members.push(module);
+        }
+    }
+
+    pub(crate) fn ensure_external_ctor_defaults(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        self.ensure_classfile_members_loaded(class_id, "", span);
+        self.load_companion_module(class_id);
+        self.link_existing_nested_companion(class_id);
+        if let Some(module) = self.st.companion_module(class_id) {
+            let mcls = self.st.module_class_of(module);
+            self.ensure_classfile_members_loaded(mcls, "", span);
+        }
+        let mut defaults = std::collections::HashSet::new();
+        for owner in [Some(class_id), self.st.companion_module(class_id)]
+            .into_iter()
+            .flatten()
+            .map(|id| self.st.module_class_of(id))
+        {
+            for id in self.st.get(owner).members.iter().copied() {
+                let name = &self.st.get(id).name;
+                let Some(n) = name.strip_prefix("$lessinit$greater$default$") else {
+                    continue;
+                };
+                if let Ok(n) = n.parse::<usize>() {
+                    defaults.insert(n);
+                }
+            }
+        }
+        if defaults.is_empty() {
+            return;
+        }
+        for ctor in self.st.lookup_member(class_id, "<init>") {
+            if self.st.get(ctor).owner != class_id {
+                continue;
+            }
+            let params = self.st.get(ctor).params.clone();
+            for n in defaults.iter().copied() {
+                if let Some(&param) = params.get(n.saturating_sub(1)) {
+                    let flags = self.st.get(param).flags.with(Flags::DEFAULTPARAM);
+                    self.st.get_mut(param).flags = flags;
+                }
+            }
+        }
     }
 
     /// `resolve_type_name`, after completing any alias the name binds to. A
