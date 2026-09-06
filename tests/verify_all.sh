@@ -18,12 +18,13 @@
 # So this is the check that was missing: `Class.forName(name, true, loader)`
 # over every class file in a directory, counting `VerifyError` and
 # `ClassFormatError`. Anything else a load can throw -- a missing dependency, a
-# static initialiser that wants a database -- is not this script's business and
-# is ignored.
+# static initialiser that wants a database -- is reported as incomplete. Such
+# a class is not proof of a compiler defect, but cannot count as a clean load.
 #
 #   tests/verify_all.sh <classes-dir> [extra classpath entries...]
 #
-# Exits non-zero when any class fails verification.
+# Exit 1 means a verification failure, 2 means incomplete coverage (including
+# an empty output directory). Only a complete, clean sweep exits 0.
 set -uo pipefail
 
 DIR=${1:?usage: verify_all.sh <classes-dir> [cp...]}
@@ -54,23 +55,27 @@ public class VerifyAll {
       if (!e.isEmpty()) cp.add(new File(e).toURI().toURL());
     URLClassLoader cl = new URLClassLoader(cp.toArray(new URL[0]), null);
 
-    int bad = 0;
+    int bad = 0, loaded = 0, incomplete = 0;
     for (String n : names) {
       try {
         // `true` is the whole point: initialising forces linking, and linking
         // is what runs the verifier over the method bodies.
         Class.forName(n, true, cl);
+        loaded++;
       } catch (VerifyError | ClassFormatError e) {
         bad++;
         String m = String.valueOf(e.getMessage()).split("\n")[0];
         System.out.println("BAD " + n + " :: " + e.getClass().getSimpleName() + ": " + m);
       } catch (Throwable t) {
-        // A missing dependency or a static initialiser with opinions is not
-        // what this script is asking about.
+        incomplete++;
+        String m = String.valueOf(t.getMessage()).split("\n")[0];
+        System.out.println("INCOMPLETE " + n + " :: " + t.getClass().getSimpleName() + ": " + m);
       }
     }
-    System.out.println("verify_classes=" + names.size() + " verify_failures=" + bad);
+    System.out.println("verify_classes=" + names.size() + " verify_failures=" + bad
+        + " verify_loaded=" + loaded + " verify_incomplete=" + incomplete);
     if (bad > 0) System.exit(1);
+    if (incomplete > 0 || names.isEmpty()) System.exit(2);
   }
 }
 JAVA
@@ -79,4 +84,4 @@ javac -d "$WORK" "$WORK/VerifyAll.java" >/dev/null 2>&1 || {
   echo "verify_all: javac failed" >&2
   exit 2
 }
-java -cp "$WORK" VerifyAll "$DIR" "$CP"
+java -Xverify:all -cp "$WORK" VerifyAll "$DIR" "$CP"
