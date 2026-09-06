@@ -17,19 +17,27 @@ Variance metadata was independently validated at `629570a8` and merged as
 `9beb69b2`: 2237 release tests pass; all 5324 corpus statuses remain unchanged.
 A stronger test-only follow-up passed at `803be601`. The one changed runtime
 exception was reproduced with byte-identical old/new class files, not a regression.
-Codegen/constructor candidate `73cc75b2` failed 10 workspace tests. All ten
-now pass in a fresh 31-test focused gate after the default-clause and synthetic
-outer-field fixes; full candidate `765c6cd3` is running and remains unaccepted.
-Method-specialization candidate `5b85263e` completed its independent full gate:
-2242 release tests pass, all 5324 corpus statuses and compile measures are
-unchanged, and Slick MODE=b passes 36/36. Tree traversal omissions and one new
-lint warning still need repair before acceptance. This does not implement
-class-owned specialization; that ledger remains red.
-Source-signature candidate `9144b8fd` failed 20 of 2241 workspace tests; no
-later gates ran. The eight failing targets are recorded in the validation note.
-For-comprehension candidate `02c1465a` passes 16 focused tests, but independent
-execution still proves wrong tuple shape and wrong evaluation order across
-21 value definitions. These candidates must not be merged from focused results.
+Method specialization was repaired and independently validated at `e4d404f1`,
+then merged as `bafdb625`: 2245 release tests pass, all 5324 corpus statuses
+and four compile measures are unchanged, and Slick MODE=b passes 36/36.
+Two parent typed-graph tests cover symbol owners, type parameters, bounds,
+annotations and self types. Clippy has no new warnings (58 versus 59).
+Class-owned specialization is still unaccepted and its ledger remains red.
+
+Core implementation now runs in the parent session. All Luna implementation
+agents saved their work and stopped. Refer to the validation note and
+`/tmp/scala-rs-codex/integration/current-state.json` for their saved commits/WIP;
+do not restart the old delegated implementation tasks from this handoff.
+Codegen/constructor `765c6cd3` finished with real Slick/corpus regressions.
+Parent local-template/macro stripping repair `01ece8aa` recovers seven macro
+corpus losses in focused checks; Object-super repair is under parent validation.
+Direct macro/dependent-result ScalaSignature interoperability remains red.
+Source-signature candidates remain held after full/targeted failures; saved
+follow-ups are not yet independently accepted.
+For-comprehension candidate `c6a7e8f9` passes 2244 release tests, unchanged compile
+measures, strict class validation and Slick MODE=b 36/36. Its corpus is running.
+It predates the method-specialization merge and needs integration with current
+main before acceptance. Poll the recorded live handle before any restart.
 Read the updated `tests/BASELINE.md`, including its
 per-test corpus reference and red MODE=a check. The historical results below
 describe the previous session, not the current baseline. This continuation
