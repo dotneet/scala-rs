@@ -1,0 +1,11 @@
+rhs-1:1
+rhs2:2
+result2
+result2
+result4
+result2
+result4
+result6
+result8
+result3
+result3
