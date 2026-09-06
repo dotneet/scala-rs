@@ -812,7 +812,8 @@ impl<'a> Gen<'a> {
             // entry per member whose body writes `super.m`; a trait read from
             // `-cp` contributes one per accessor its *interface* declares,
             // which is the same set as far as the class is concerned.
-            let mut owed: Vec<(String, String, String, String, Vec<Type>, Type)> = Vec::new();
+            let mut owed: Vec<(String, String, String, String, SymbolId, Vec<Type>, Type)> =
+                Vec::new();
             match self.traits.impls.get(parent) {
                 Some(methods) => {
                     let mut seen = HashSet::new();
@@ -847,6 +848,7 @@ impl<'a> Gen<'a> {
                                 super_accessor_name(self.st, *parent, &name),
                                 desc,
                                 target_desc,
+                                target,
                                 pts,
                                 ret,
                             ));
@@ -865,13 +867,14 @@ impl<'a> Gen<'a> {
                             aname,
                             desc.clone(),
                             desc,
+                            acc,
                             method_params_from_sym(self.st, acc),
                             method_ret_from_sym(self.st, acc),
                         ));
                     }
                 }
             }
-            for (name, acc, inst_desc, target_desc, pts, ret) in owed {
+            for (name, acc, inst_desc, target_desc, target_id, pts, ret) in owed {
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 for p in &pts {
@@ -879,7 +882,7 @@ impl<'a> Gen<'a> {
                     loads.push((locals, sort));
                     locals += sort.slots();
                 }
-                let target = self.next_lin_impl(&lin, idx, &name, &target_desc);
+                let target = self.next_lin_impl(&lin, idx, &name, &target_desc, target_id);
                 let acc_c = acc.clone();
                 let inst_c = inst_desc.clone();
                 // The accessor's own signature is the *overriding* method's --
@@ -889,7 +892,7 @@ impl<'a> Gen<'a> {
                 // One.type` over `>: One.type <: RowsPerStatement`) makes the
                 // two differ. Call the target at *its* descriptor.
                 let call_desc = self
-                    .super_target_desc(target, &name, pts.len(), &target_desc)
+                    .super_target_desc(target, &name, pts.len(), &target_desc, target_id)
                     .unwrap_or_else(|| inst_c.clone());
                 if target.is_none() {
                     report_emit_error(
@@ -938,14 +941,49 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// A type parameter or abstract type member can change the target's
+    /// source parameter type when the receiver is seen through a concrete
+    /// parent instantiation. The erased descriptor may then differ from the
+    /// target symbol's raw descriptor, but that is the only permitted
+    /// descriptor fallback here. A concrete `Int` target must never fall back
+    /// to an unrelated same-name `String` overload.
+    fn super_params_compatible(&self, target_id: SymbolId, candidate: &[Type]) -> bool {
+        let expected = method_params_from_sym(self.st, target_id);
+        let abstract_mask = self
+            .st
+            .erased_abstract_params
+            .get(&target_id)
+            .copied()
+            .unwrap_or(0);
+        expected.len() == candidate.len()
+            && expected
+                .iter()
+                .zip(candidate)
+                .enumerate()
+                .all(|(i, (e, c))| {
+                    e == c
+                        || jvm_desc(self.st, e) == jvm_desc(self.st, c)
+                        || (i < 32 && abstract_mask & (1 << i) != 0)
+                        || matches!(
+                            e,
+                            Type::TypeParam(_)
+                                | Type::TypeMember(_)
+                                | Type::Wildcard
+                                | Type::BoundedWildcard { .. }
+                        )
+                })
+    }
+
     /// The descriptor the `super` target was compiled with, when it can be
-    /// found. `arity` disambiguates overloads.
+    /// found. `arity` disambiguates overloads; the target symbol permits only
+    /// generic receiver substitution as a fallback.
     pub(crate) fn super_target_desc(
         &self,
         target: Option<(SymbolId, bool)>,
         method: &str,
         arity: usize,
         expected_desc: &str,
+        target_id: SymbolId,
     ) -> Option<String> {
         match target? {
             (next, true) => match self.traits.impls.get(&next) {
@@ -954,10 +992,17 @@ impl<'a> Gen<'a> {
                     .filter(|m| {
                         m.name() == Some(method) && def_param_types(self.st, m).len() == arity
                     })
-                    .find(|m| def_method_desc(self.st, m) == expected_desc)
+                    .find(|m| {
+                        desc_params(&def_method_desc(self.st, m)) == desc_params(expected_desc)
+                    })
                     .or_else(|| {
                         ms.iter().find(|m| {
-                            m.name() == Some(method) && def_param_types(self.st, m).len() == arity
+                            m.name() == Some(method)
+                                && def_param_types(self.st, m).len() == arity
+                                && self.super_params_compatible(
+                                    target_id,
+                                    &def_param_types(self.st, m),
+                                )
                         })
                     })
                     .map(|m| def_method_desc(self.st, m)),
@@ -975,13 +1020,20 @@ impl<'a> Gen<'a> {
                             && mem.kind == SymKind::Method
                             && param_count(self.st, mid) == arity
                     })
-                    .find(|&mid| method_desc_from_sym(self.st, mid) == expected_desc)
+                    .find(|&mid| {
+                        desc_params(&method_desc_from_sym(self.st, mid))
+                            == desc_params(expected_desc)
+                    })
                     .or_else(|| {
                         self.st.get(next).members.iter().copied().find(|&mid| {
                             let mem = self.st.get(mid);
                             mem.name == method
                                 && mem.kind == SymKind::Method
                                 && param_count(self.st, mid) == arity
+                                && self.super_params_compatible(
+                                    target_id,
+                                    &method_params_from_sym(self.st, mid),
+                                )
                         })
                     })
                     .map(|mid| method_desc_from_sym(self.st, mid)),
@@ -999,7 +1051,9 @@ impl<'a> Gen<'a> {
                         && !mem.flags.contains(Flags::ABSTRACT)
                         && param_count(self.st, mid) == arity
                 })
-                .find(|&mid| method_desc_from_sym(self.st, mid) == expected_desc)
+                .find(|&mid| {
+                    desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
+                })
                 .or_else(|| {
                     self.st.get(next).members.iter().copied().find(|&mid| {
                         let mem = self.st.get(mid);
@@ -1007,6 +1061,10 @@ impl<'a> Gen<'a> {
                             && mem.kind == SymKind::Method
                             && !mem.flags.contains(Flags::ABSTRACT)
                             && param_count(self.st, mid) == arity
+                            && self.super_params_compatible(
+                                target_id,
+                                &method_params_from_sym(self.st, mid),
+                            )
                     })
                 })
                 .map(|mid| method_desc_from_sym(self.st, mid)),
@@ -1019,6 +1077,7 @@ impl<'a> Gen<'a> {
         after_idx: usize,
         method: &str,
         expected_desc: &str,
+        target_id: SymbolId,
     ) -> Option<(SymbolId, bool)> {
         for &s in lin.iter().skip(after_idx + 1) {
             if let Some(ms) = self.traits.impls.get(&s) {
@@ -1029,10 +1088,11 @@ impl<'a> Gen<'a> {
                     .iter()
                     .filter(|m| m.name() == Some(method) && !is_trait_private_def(self.st, m))
                     .collect();
-                if methods
+                if methods.iter().any(|m| {
+                    desc_params(&def_method_desc(self.st, m)) == desc_params(expected_desc)
+                }) || methods
                     .iter()
-                    .any(|m| def_method_desc(self.st, m) == expected_desc)
-                    || !methods.is_empty()
+                    .any(|m| self.super_params_compatible(target_id, &def_param_types(self.st, m)))
                 {
                     return Some((s, true));
                 }
@@ -1040,7 +1100,24 @@ impl<'a> Gen<'a> {
                 // A trait read from `-cp` sitting between two stackable layers
                 // of ours: without this the `super` chain skipped it and went
                 // straight to the superclass, dropping its layer silently.
-                return Some((s, true));
+                let methods: Vec<SymbolId> = self
+                    .st
+                    .get(s)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&mid| {
+                        let mem = self.st.get(mid);
+                        mem.kind == SymKind::Method && mem.name == method
+                    })
+                    .collect();
+                if methods.iter().any(|&mid| {
+                    desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
+                }) || methods.iter().any(|&mid| {
+                    self.super_params_compatible(target_id, &method_params_from_sym(self.st, mid))
+                }) {
+                    return Some((s, true));
+                }
             }
             if !is_interface_sym(self.st, s) {
                 let methods: Vec<SymbolId> = self
@@ -1056,11 +1133,11 @@ impl<'a> Gen<'a> {
                             && !mem.flags.contains(Flags::ABSTRACT)
                     })
                     .collect();
-                if methods
-                    .iter()
-                    .any(|&mid| method_desc_from_sym(self.st, mid) == expected_desc)
-                    || !methods.is_empty()
-                {
+                if methods.iter().any(|&mid| {
+                    desc_params(&method_desc_from_sym(self.st, mid)) == desc_params(expected_desc)
+                }) || methods.iter().any(|&mid| {
+                    self.super_params_compatible(target_id, &method_params_from_sym(self.st, mid))
+                }) {
                     return Some((s, false));
                 }
             }

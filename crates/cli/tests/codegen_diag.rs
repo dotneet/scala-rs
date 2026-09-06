@@ -229,6 +229,64 @@ fn super_accessors_keep_overload_descriptors_distinct() {
 }
 
 #[test]
+fn super_accessor_skips_a_wrong_overload_in_linearization() {
+    let source = fixtures_dir().join("codegen_diag_super_linearization.scala");
+    let out = tmp_dir("super-linearization");
+    let output = compile(&[&source], &out);
+    assert!(
+        output.status.success(),
+        "linearized overload fixture failed to compile: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cp = out.to_str().expect("output path");
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", cp, "LinearMain"])
+        .output()
+        .expect("run linearized overload fixture");
+    assert!(
+        run.status.success(),
+        "linearized overload fixture failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let ours = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert_eq!(ours, "base-int\n");
+
+    // Keep a scalac 2.13.16 oracle for the exact linearization. The wrong
+    // same-name fallback returns `middle-string` (or fails verification),
+    // while scalac reaches Base.foo(Int).
+    if let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) {
+        let reference_out = tmp_dir("super-linearization-scalac");
+        let scalac_output = Command::new(&scalac)
+            .args([
+                source.to_str().expect("source path"),
+                "-d",
+                reference_out.to_str().expect("reference path"),
+            ])
+            .output()
+            .expect("run scalac linearized overload fixture");
+        assert!(
+            scalac_output.status.success(),
+            "scalac oracle failed: {}",
+            String::from_utf8_lossy(&scalac_output.stderr)
+        );
+        let reference_cp = format!("{}:{}", reference_out.display(), jar.display());
+        let reference_run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &reference_cp, "LinearMain"])
+            .output()
+            .expect("run scalac linearized overload fixture");
+        assert!(
+            reference_run.status.success(),
+            "scalac oracle failed at runtime: {}",
+            String::from_utf8_lossy(&reference_run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&reference_run.stdout), ours);
+        let _ = fs::remove_dir_all(reference_out);
+    }
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
 fn qualified_and_nested_super_calls_keep_their_own_scope() {
     let source = fixtures_dir().join("codegen_diag_super_scope.scala");
     let out = tmp_dir("super-scope");
