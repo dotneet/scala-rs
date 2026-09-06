@@ -736,7 +736,10 @@ impl Typer {
                         typer.st.get(id).bound_hi.clone().unwrap_or(Type::Any)
                     }
                     Type::Annotated { tpe, .. } => *tpe,
-                    _ => return ty,
+                    // Function syntax and FunctionN classes denote the same
+                    // type. Use the class form so abstract arguments on both
+                    // sides receive the same instantiation treatment below.
+                    _ => return typer.st.function_class_form(&ty).unwrap_or(ty),
                 };
                 ty = typer.st.dealias(&ty);
             }

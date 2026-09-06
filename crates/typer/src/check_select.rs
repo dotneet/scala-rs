@@ -1861,20 +1861,26 @@ impl Typer {
             }
         }
         let direct_type_apply = !targs.is_empty() && !matches!(base.kind, TreeKind::Select { .. });
-        if direct_type_apply {
-            // The reference in f[T](args) is a callee. Value mode would
-            // apply implicit arguments before the written type arguments.
-            let saved = std::mem::replace(&mut self.typing_callee, true);
-            self.type_expr(
-                &mut qual,
-                &Type::Method {
-                    paramss: vec![],
-                    ret: Box::new(Type::NoType),
-                },
-            );
-            self.typing_callee = saved;
-        } else {
-            self.type_expr(&mut qual, &Type::NoType);
+        // This is a receiver-classification probe. Reuse a completed
+        // qualifier, including its error, rather than recursively typechecking
+        // the same application chain twice at every selection. The ordinary
+        // selection path still retries provisional errors when needed.
+        if qual.ty.is_no_type() {
+            if direct_type_apply {
+                // The reference in f[T](args) is a callee. Value mode would
+                // apply implicit arguments before the written type arguments.
+                let saved = std::mem::replace(&mut self.typing_callee, true);
+                self.type_expr(
+                    &mut qual,
+                    &Type::Method {
+                        paramss: vec![],
+                        ret: Box::new(Type::NoType),
+                    },
+                );
+                self.typing_callee = saved;
+            } else {
+                self.type_expr(&mut qual, &Type::NoType);
+            }
         }
         if (direct_type_apply && matches!(qual.ty, Type::Method { .. } | Type::Overload(_)))
             || !self.is_dynamic_receiver(&qual.ty)

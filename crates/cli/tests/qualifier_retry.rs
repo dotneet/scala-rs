@@ -100,3 +100,62 @@ object Main { def main(args: Array[String]): Unit = println(new Composer(new Com
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn erroneous_application_chain_does_not_repeat_dynamic_receiver_typing() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-qualifier-growth-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("Main.scala");
+    fs::write(
+        &source,
+        format!("object Main {{ val x = missing{} }}\n", ".f(0)".repeat(80)),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
+        .args([
+            "compile",
+            "--scala-library",
+            "/tmp/scala-rs-lib/scala-library-2.13.16.jar",
+        ])
+        .arg(&source)
+        .arg("-d")
+        .arg(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The repaired release compiler takes less than a second here. The old
+    // repeated traversal already exceeded five seconds at depth 16, so 80
+    // makes this a generous termination check rather than a microbenchmark.
+    let start = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "erroneous qualifier chain did not finish within 20 seconds; source: {}",
+                source.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("not found: value missing"), "{stderr}");
+    assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
+    fs::remove_dir_all(root).unwrap();
+}
