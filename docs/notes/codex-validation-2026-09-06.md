@@ -23,6 +23,13 @@ Latest independent checks (these supersede the pending descriptions below):
   This candidate is still held: additional local-class probes require
   symbol-cloning fixes. Follow-up `e02b8161` is being reviewed for external
   constructor ownership and complete type-symbol remapping before acceptance.
+  An independent bounded-type probe found a second new regression:
+  `size[@specialized(Int) A <: CharSequence](a: A) = a.length` emits an
+  invalid primitive method and fails JVM verification even for a String call.
+  Main and scalac both print `5`; scalac warns that bounds prevent
+  specialization. Variant generation and source annotation advertising must
+  agree on eligible bounds. Evidence: `specialization-validation/bounded`.
+  Clippy exits 0 but adds four warnings (59 to 63); these also remain pending.
 - Combined metadata candidate `fbc4ca7e` passes 15 fresh focused release
   tests (codegen diagnostics, source signatures, constructor defaults).
   It is held because a separate producer probe rejects ordinary `case class
@@ -39,6 +46,9 @@ Latest independent checks (these supersede the pending descriptions below):
   accepted main, and the proposed earlier divergence check `4c261de5` for a
   bounded investigation. Reordering that check alone is not proof of the
   claimed speedup or a fix for fresh inference variables in recursive rules.
+  The independent fresh build passed, but the measurement timed out after
+  60.008 seconds (exit -15) with no diagnostics. Evidence is under
+  `gb-validation/investigation-554b4de`; no error count is inferred.
 - Macro snapshot proposal `f4099fd7` is held: a constructor-field-only
   declaration list is not a complete case-class symbol graph. Generic/active
   symbols must not lose previously working name-only queries. Permanent
