@@ -430,8 +430,75 @@ impl Typer {
                 self.reify_refs_in(thenp, out);
                 self.reify_refs_in(elsep, out);
             }
+            // A `val` / `def` bound *inside* the reify body is reified by
+            // name (`crate::reify_defs::definition`, `Reifier::local_bound`)
+            // and needs no classification of its own -- but its declared
+            // type(s), if any, and its right-hand side are ordinary
+            // sub-positions and have to be walked into just the same as
+            // everywhere else, or a static reference or a splice used only
+            // there would never be recorded.
+            //
+            // The declared type itself is classified by
+            // `classify_value_type`, *not* the type-argument builder just
+            // above: measurement (`docs/macros.md` §7.17) shows nsc rebuilds
+            // a written value type structurally, not as `mkTypeTree(...)`.
+            TreeKind::ValDef { tpt, rhs, .. } => {
+                self.classify_value_type(tpt, out);
+                self.reify_refs_in(rhs, out);
+            }
+            TreeKind::DefDef {
+                vparamss, tpt, rhs, ..
+            } => {
+                for p in vparamss.iter().flatten() {
+                    if let TreeKind::ValDef { tpt, .. } = &p.kind {
+                        self.classify_value_type(tpt, out);
+                    }
+                }
+                self.classify_value_type(tpt, out);
+                self.reify_refs_in(rhs, out);
+            }
             _ => {}
         }
+    }
+
+    /// A `val` / parameter / `def` result type inside a `reify { … }` body.
+    ///
+    /// **Not** the same shape as a type *argument* (`TreeKind::TypeApply`
+    /// above, `ReifyRef::Type`): measured with `-Ymacro-debug-lite` on
+    /// `reify { def f(y: Int): Int = y + 1; f(1) }`, a written value type is
+    /// rebuilt *structurally* -- the same way a quasiquote builds one -- and
+    /// only a leaf naming a class is resolved by symbol, as
+    /// `mkIdent($m.staticClass(...))` rather than `mkTypeTree(...)`. This
+    /// module has no structural type reifier yet (`Reifier::typ`'s ordinary,
+    /// non-reify branch is what a quasiquote uses), so only the single-leaf
+    /// case -- the whole type is one monomorphic class, `Int`, `Boolean`, a
+    /// plain user class -- is classified; anything with its own structure
+    /// (`List[Int]`, a function type, a member of a package object type
+    /// alias) is a `TypeGap`, refused rather than guessed at.
+    ///
+    /// `tpt` being empty (no type was written at all) needs no entry: that
+    /// is not a reference to classify, and `Reifier::typ` reads the absence
+    /// directly.
+    fn classify_value_type(
+        &mut self,
+        tpt: &Tree,
+        out: &mut HashMap<NodeId, crate::reify::ReifyRef>,
+    ) {
+        if tpt.is_empty() {
+            return;
+        }
+        let ty = self.tree_to_type(tpt);
+        if ty.is_no_type() || ty.is_error() {
+            return;
+        }
+        let flat = self.st.dealias(&ty);
+        out.insert(
+            tpt.id,
+            match crate::materialize::static_class_name(&self.st, &flat) {
+                Ok(name) => crate::reify::ReifyRef::StaticClass(name),
+                Err(why) => crate::reify::ReifyRef::TypeGap(why),
+            },
+        );
     }
 
     /// One subtree of a reify body, typed speculatively on a clone: the
