@@ -506,3 +506,78 @@ The accepted baseline remains `9beb69b2`; the following are unaccepted slices.
 
 The process handles in `/tmp/scala-rs-codex/integration/current-state.json`
 are hints, not proof of liveness; poll each handle before continuing or restarting.
+
+
+## Corpus losses and temporary-directory race
+
+Codegen/constructor `765c6cd3` finished its release workspace with 2249 passed,
+one failed, 200 result rows. The failure was independently traced to two
+`verify_sql` tests receiving the identical timestamp-plus-PID temporary root.
+The instrumented log shows the duplicate paths and the wrong test's Main
+output: `/tmp/scala-rs-codex/verify-sql-race/repeat-instrumented.log:486`.
+One test can delete the other's nsc classpath. Parent isolated rerun passed all
+five tests. The process-local atomic sequence fix was applied to main as
+`72c41271`; parent main's two existing verify_sql tests pass. Compiler/Cargo
+inputs and test counts are unchanged. The original failed workspace result
+remains in the evidence; it has not been rewritten as an all-pass run.
+
+Remaining gates for `765c6cd3` independently establish real compiler regressions:
+Slick reports 66 errors in 18 files and emits zero classes (62 missing super
+implementations for toString, four unsupported sql selections). Its strict
+verification and execution gates consequently fail. Cats remains 350/81,
+GitBucket reports 893/110 and Scala library remains 1613/171. The corpus has
+5324 unique records: pos 1045/469/345, neg 669/367/369, run 588/919/553.
+Eleven old passes are lost, one positive changes to pass, and ten negative
+cases newly reject. Several new rejections are unsupported-codegen diagnostics,
+so the negative count is not a compatibility improvement. Full six-field
+comparison changes 52 rows; evidence is `candidate-765c6cd/corpus-detail-audit.json`
+and `corpus-status-audit.json`. Separate super-implementation and sql-selection
+fixes are active; the candidate remains unaccepted.
+
+For-comprehension `dd86599b` completes workspace with 2242 passed, one failed,
+200 result rows. The only failure is conform::for_comprehensions: a String
+result reaches MapOps.WithFilter.map and is cast to Tuple2. No later gates ran.
+Its prior 18 focused passes and three exact nsc comparisons do not establish
+full acceptance. The Map WithFilter repair and private Tuple1..Tuple22 support
+are independent pending tasks.
+
+## Core implementation consolidated in the parent session
+
+After repeated integration regressions, core implementation is now owned by
+the parent session. Luna/xhigh agents have saved their existing work and stopped
+implementation. Any later delegation should be bounded reproduction, test
+execution or read-only review. Do not restart the former implementation tasks
+from stale summaries. Preserve all worktrees, including uncommitted experiments.
+
+The method-specialization traversal repair `93af4b01` was applied independently
+as `de970972`, then merged with main at `11103987` in
+`.worktrees/codex-specialization-validation`. All nine focused specialization
+tests pass in the parent environment. A read-only review found no remaining
+traversal omission in the repaired fields. Parent typed-graph invariant tests
+are being added before the next full gate; this candidate is not accepted yet.
+
+Class-specialization candidate `811c24a0` passes 12 focused tests, but independent
+interop probes prove incorrect packaged/nested JVM names, a VerifyError in an
+accessor unrelated to the specialized type parameter, and an override dispatch
+returning the base implementation's answer. Evidence:
+`/tmp/scala-rs-codex/integration/class-package-probe/results.json` and
+`/tmp/scala-rs-codex/class-specialization-audit/`. It remains unaccepted.
+
+Saved, not independently accepted, follow-ups include:
+
+- `12bec5ce`: terminal Object super accessor resolution.
+- `c04acead`: completed case-class macro metadata fidelity.
+- `43af3d29`: implicit Function lookup and dominance symbol handling.
+- `c1dc7aa8`: prefix-preserving TypeProjection representation.
+- `558b009d`: private Tuple1 through Tuple22 runtime.
+- `40f1afaa`, `a65123a7`: collection result handling and external generic copy.
+
+The implicit performance experiment at `codex-implicit-profile` is explicitly
+not acceptable: its anchorless-child pruning accepts a case where nsc reports
+ambiguity. Keep its profile evidence, not its success count, as the next starting
+point. The sql-selection worktree contains unproven changes and debug output.
+The Map WithFilter patch is preserved in the actual git worktree
+`/tmp/scala-rs-codex/for-map-filter-fix-worktree`; its None-result fallback still
+needs parent review. The live checkpoint index is
+`/tmp/scala-rs-codex/integration/current-state.json`; revalidate tool handles
+before treating any recorded process as running.
