@@ -99,6 +99,18 @@ pub(crate) fn begin_tail_loop(
     if params.len() != types.len() {
         return unsupported();
     }
+    // Tail-call arguments are emitted through the erased call path.  A
+    // constructor or factory used as the next value can therefore be tracked
+    // as `java/lang/Object` even when the parameter's descriptor is a narrower
+    // reference (for example `Option` receiving `Some`).  Declare each
+    // recursive parameter slot before recording the loop head so stores on the
+    // back edge retain the method's erased parameter class in StackMapTable
+    // frames.  Without this, the first iteration enters a branch with the
+    // descriptor type while the back edge reaches it as Object, which the JVM
+    // verifier rejects.
+    for ((slot, _), ty) in params.iter().zip(&types) {
+        declare_local_ty(asm, ctx.st, *slot, ty);
+    }
     let head = asm.fresh_label();
     asm.mark(head);
     frame.tail_loop = Some(TailLoop {
