@@ -924,7 +924,7 @@ impl Typer {
         self.project_from_prefix(span, &pty, name)
     }
 
-    fn is_stable_path(&self, t: &Tree) -> bool {
+    pub(crate) fn is_stable_path(&self, t: &Tree) -> bool {
         match &t.kind {
             TreeKind::This { .. } | TreeKind::Super { .. } => true,
             TreeKind::Ident { name } => self.ident_is_stable(name),
@@ -955,7 +955,7 @@ impl Typer {
         }
     }
 
-    fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
+    pub(crate) fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
         self.expose_path_head(ref_);
         match &ref_.kind {
             TreeKind::This { qual } => {

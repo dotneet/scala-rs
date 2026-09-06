@@ -14,6 +14,9 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     st.any_sym = class(st, st.scala_pkg, "Any", "java/lang/Object", &[]);
     st.anyref_sym = class(st, st.scala_pkg, "AnyRef", "java/lang/Object", &[Type::Any]);
     st.anyval_sym = class(st, st.scala_pkg, "AnyVal", "java/lang/Object", &[Type::Any]);
+    // Compiler-defined marker: no scala/Singleton class exists on the JVM.
+    st.singleton_sym = iface(st, st.scala_pkg, "Singleton", "java/lang/Object");
+    st.get_mut(st.singleton_sym).parents = vec![Type::Any];
     st.object_sym = class(st, java_lang, "Object", "java/lang/Object", &[Type::AnyRef]);
     mark_java(st, st.object_sym);
 

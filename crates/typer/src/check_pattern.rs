@@ -713,6 +713,11 @@ impl Typer {
                     );
                 }
                 self.type_pattern(expr, &ty);
+                if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
+                    && !self.st.is_sub_type(sel_ty, &Type::AnyRef)
+                {
+                    pat.sym = self.st.singleton_sym;
+                }
                 pat.ty = ty;
             }
             TreeKind::Alternative { trees } => {
@@ -884,6 +889,9 @@ impl Typer {
     /// Decide whether the two types can have a common instance. Unlike an
     /// assignment, a type test permits narrowing and unrelated open traits.
     fn typed_pattern_compatible(&mut self, pattern: &Type, scrutinee: &Type) -> bool {
+        if matches!(self.st.dealias(pattern), Type::Class { sym, .. } if sym == self.st.singleton_sym) {
+            return true;
+        }
         fn upper(typer: &Typer, ty: &Type) -> Type {
             let mut ty = typer.st.dealias(ty).widen_constant();
             let mut seen = std::collections::HashSet::new();

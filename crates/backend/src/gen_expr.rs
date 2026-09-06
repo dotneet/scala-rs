@@ -878,7 +878,16 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                         if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
                             emit_box(asm, &qual.ty.widen_constant());
                         }
-                        emit_is_instance_of(asm, ctx, target);
+                        if args.first().is_some_and(|a| a.sym == ctx.st.singleton_sym)
+                            && !ctx.st.is_sub_type(&qual.ty, &Type::AnyRef)
+                        {
+                            // The qualifier still executes, but Singleton has
+                            // no runtime restriction on an Any/AnyVal receiver.
+                            asm.pop();
+                            asm.iconst(1);
+                        } else {
+                            emit_is_instance_of(asm, ctx, target);
+                        }
                         return;
                     }
                 }

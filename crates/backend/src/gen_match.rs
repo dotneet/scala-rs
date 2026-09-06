@@ -1006,6 +1006,10 @@ pub(crate) fn gen_pattern(
             store(asm, slot, sort);
         }
         TreeKind::Typed { expr, .. } => {
+            if pat.sym == ctx.st.singleton_sym {
+                gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
             // `case x: Meters` on an `Any` tests for the boxed value class and
             // reads the underlying back out of it; erasure stamped the class on
             // the ascription node (`mark_value_class_patterns`).

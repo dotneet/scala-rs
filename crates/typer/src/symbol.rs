@@ -582,6 +582,7 @@ pub struct SymbolTable {
     pub root: SymbolId,
     pub scala_pkg: SymbolId,
     pub predef: SymbolId,
+    pub singleton_sym: SymbolId,
     pub any_sym: SymbolId,
     pub anyref_sym: SymbolId,
     pub anyval_sym: SymbolId,
@@ -789,6 +790,7 @@ impl SymbolTable {
             root: SymbolId(0),
             scala_pkg: SymbolId(0),
             predef: SymbolId(0),
+            singleton_sym: SymbolId::NONE,
             any_sym: SymbolId(0),
             anyref_sym: SymbolId(0),
             anyval_sym: SymbolId(0),
@@ -2833,6 +2835,12 @@ impl SymbolTable {
             (Type::Error, _) | (_, Type::Error) => true,
             (Type::Nothing, _) => true,
             (_, Type::Any) => true,
+            (Type::Class { sym, .. }, Type::AnyRef | Type::AnyVal)
+                if *sym == self.singleton_sym => false,
+            (Type::Constant(lit), Type::Class { sym, .. })
+                if *sym == self.singleton_sym && !matches!(lit, scala_rs_parser::Lit::Unit) => true,
+            (Type::SingleType { .. } | Type::ThisType(_) | Type::ModuleRef(_),
+                Type::Class { sym, .. }) if *sym == self.singleton_sym => true,
             (Type::Constant(a), Type::Constant(b)) => a == b,
             (Type::Constant(a), b) => self.is_sub_type(&Type::lit_underlying(a), b),
             (

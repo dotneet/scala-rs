@@ -1346,7 +1346,14 @@ impl Typer {
                 other => other,
             };
             let a = &self.align_arg_to_param(p, a);
-            let mut hit = unify_one(tp, p, a);
+            let keep_singleton = self.st.get(tp).bound_hi.as_ref().is_some_and(|hi| {
+                self.st.is_sub_type(hi, &Type::Class { sym: self.st.singleton_sym, args: vec![] })
+            });
+            let mut hit = if keep_singleton {
+                unify_one_precise(tp, p, a)
+            } else {
+                unify_one(tp, p, a)
+            };
             // The same step for a *function* parameter: a `Map[K, V]` is a
             // `K => V`, and that is the shape `def map[B](f: A => B)` reads
             // `B` out of. Only where the argument as written pinned nothing:
@@ -2265,6 +2272,11 @@ impl Typer {
                 };
             }
             return;
+        }
+        if matches!(self.st.dealias(pt), Type::Class { sym, .. } if sym == self.st.singleton_sym)
+            && self.is_stable_path(tree)
+        {
+            tree.ty = self.singleton_to_type(tree.span, tree);
         }
         if self.st.is_sub_type(&tree.ty, pt) {
             // `b.x` with `{ type A <: Int }` stays a TypeMember; pin it to the
