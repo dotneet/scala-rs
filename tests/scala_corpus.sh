@@ -109,7 +109,7 @@ if [[ $1 == --one ]]; then
         $f =~ s{.*/}{};
       }
       END { flush(); print join("\x1e", @o); }
-    ' "$@" 2>/dev/null | tr '\t' ' '
+    ' "$@" 2>/dev/null | LC_ALL=C tr '\t' ' '
   }
 
   # What the `.check` says scalac reports. The error lines are what a `neg`
@@ -130,7 +130,7 @@ if [[ $1 == --one ]]; then
         }
       }
       END { print join("\x1e", @e ? @e : @w); }
-    ' $1 2>/dev/null | tr '\t' ' '
+    ' $1 2>/dev/null | LC_ALL=C tr '\t' ' '
   }
 
   # --- collect the sources -------------------------------------------------
@@ -209,7 +209,7 @@ if [[ $1 == --one ]]; then
       # Keep the first diagnostic verbatim (minus tabs, which are the field
       # separator). Bucketing happens at report time, so the log stays usable
       # for anything we did not think to bucket by.
-      symptom=$(grep -m1 '^error' $log | tr '\t' ' ' | cut -c1-140)
+      symptom=$(grep -m1 '^error' $log | LC_ALL=C tr '\t' ' ' | cut -c1-140)
       break
     fi
   done
@@ -364,7 +364,9 @@ xargs_rc=$?
 set -e
 parts=($CORPUS_LOG.part/*(N))
 if (( ${#parts} > 0 )); then
-  cat $parts | sort > $CORPUS_LOG
+  # Some reference .check files contain non-UTF-8 diagnostic bytes. Sorting
+  # completed records must not discard a whole run because of the host locale.
+  cat $parts | LC_ALL=C sort > $CORPUS_LOG
 else
   : > $CORPUS_LOG
 fi

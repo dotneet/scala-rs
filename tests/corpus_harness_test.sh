@@ -4,7 +4,9 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-WORK=$(mktemp -d /tmp/scala-rs-codex-conformance-audit.XXXXXX)
+LOG_ROOT=${CONFORMANCE_LOG_ROOT:-/tmp/scala-rs-codex/conformance-audit}
+mkdir -p "$LOG_ROOT"
+WORK=$(mktemp -d "$LOG_ROOT/harness.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 BIN="$WORK/bin"
@@ -139,6 +141,23 @@ run_spec() {
 run_corpus all
 [[ $(wc -l < "$WORK/corpus-all.tsv" | tr -d ' ') == 4 ]]
 grep -q 'pos.*pass' "$WORK/corpus-all.tsv"
+
+# A reference diagnostic can contain bytes outside the host UTF-8 locale.
+# Aggregation must preserve that completed worker record rather than fail in
+# sort after the expensive compilation has already finished.
+mkdir -p "$CORPUS/test/files/neg"
+printf 'class NegativeByte\n' > "$CORPUS/test/files/neg/byte.scala"
+printf 'byte.scala:1: error: invalid byte \377\n' > "$CORPUS/test/files/neg/byte.check"
+expect_exit 0 "$WORK/corpus-byte.out" env \
+  LC_ALL=en_US.UTF-8 CORPUS_KINDS=neg CORPUS_SIZE=full CORPUS_JOBS=1 \
+  CORPUS_LOG="$WORK/corpus-byte.tsv" CORPUS_WORK="$WORK/work-corpus-byte" \
+  CORPUS_NO_REPORT=1 FAKE_GIT_REV=expected FAKE_XARGS_MODE=all \
+  tests/scala_corpus.sh
+[[ $(wc -l < "$WORK/corpus-byte.tsv" | tr -d ' ') == 1 ]]
+python3 - "$WORK/corpus-byte.tsv" <<'PY'
+import pathlib, sys
+assert b'\xff' in pathlib.Path(sys.argv[1]).read_bytes()
+PY
 
 expect_exit 2 "$WORK/corpus-drop.out" env \
   CORPUS_KINDS=pos CORPUS_SIZE=full CORPUS_JOBS=1 \
