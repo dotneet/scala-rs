@@ -72,11 +72,12 @@ LOG=${SCALALIB_LOG:-$SP/measure.txt}
 # <scalaSource>` and, in CI only, `-Werror`. None of them changes what is
 # accepted, so there is nothing to pass on: no -Xsource:3, no -Yrecursion, no
 # -opt (the optimiser is only turned on for the bootstrap and the benchmarks).
+COMPILER_EXIT=0
 if [[ ${SCALALIB_MODE:-nolib} == jar ]]; then
   $BIN compile "${FILES[@]}" -d $OUT -no-specialization \
-    --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || true
+    --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || COMPILER_EXIT=$?
 else
-  $BIN compile "${FILES[@]}" -d $OUT -cp $JAVACP -no-specialization --no-scala-library "$@" > $LOG 2>&1 || true
+  $BIN compile "${FILES[@]}" -d $OUT -cp $JAVACP -no-specialization --no-scala-library "$@" > $LOG 2>&1 || COMPILER_EXIT=$?
 fi
 # `-no-specialization` is nsc's own flag. The library annotates with
 # `@specialized` everywhere, we reject that annotation without the flag, and a
@@ -88,4 +89,6 @@ CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest metric.
 BADFILES=$(grep -A 2 '^error' $LOG | grep -oE 'src/(library|reflect|compiler)/[^:]*' | sort -u | wc -l | tr -d ' ')
 rm -rf $RUN
-echo "files=${#FILES[@]} errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES"
+echo "files=${#FILES[@]} errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES compiler_exit=$COMPILER_EXIT"
+source "$ROOT/tests/measure_result.sh"
+validate_measure_result $COMPILER_EXIT $ERRORS $CLASSES ${#FILES[@]} "$LOG"
