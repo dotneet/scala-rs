@@ -1725,6 +1725,32 @@ and correctly admitting a cake's implicits multiplies that number.
 **Memoizing implicit search by `(wanted type, depth)` is the prerequisite for
 this family**, and it is worth doing on its own account.
 
+**The memo is in the tree now** (`ImplicitMemo`, `crates/typer/src/implicits.rs`;
+see *Memoizing implicit search* in `docs/performance.md` for why the key is
+sound). It is not enough on its own, and the measurement says why. With the
+guard applied it answers **99.3%** of implicit searches from the table, and
+caching `strictly_more_specific` takes `most_specific` — 73% of a profile taken
+inside the deepest search, and quadratic in the number of candidates that
+fitted — out of that profile completely. The guard is still not affordable.
+
+**Where the guard's cost is, exactly.** With the guard, gitbucket's first
+**190** hand-written sources (`find … | sort`, `PullRequestsController.scala`
+held out as usual) compile in 6 s; adding the 191st,
+`util/DatabaseConfig.scala`, takes it past 400 s. The same is true with and
+without the memo, so this one file is a self-contained reproduction and the
+place to start.
+
+What is left is the **0.7% that miss**. Each of those fits every candidate in
+scope to the wanted type before it can answer, and the profile under the guard
+is that: `implicit_fit_open`'s `subst_tparams_slice` and `type_mentions_tparam`,
+and the `Type::clone` / drop-glue churn around them. nsc does not do this work
+either — `isPlausiblyCompatible` is a cheap structural test on the candidate's
+result type that rejects most of the scope before `typedImplicit` unifies
+anything. **That test, not more caching, is what this family needs next**, and
+it is the same idea the *What is left* list in `docs/performance.md` records for
+`search_extension` (and the same hazard: the cheap test must not need the
+result class's pickle, or it costs what it was meant to save).
+
 Two further roots were isolated on the way and are independent of the above;
 both reproduce in the same file
 (`import ...BlockingH2Driver.blockingApi._`, real scalac accepts all of it):

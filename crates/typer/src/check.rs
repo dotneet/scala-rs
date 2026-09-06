@@ -564,6 +564,10 @@ pub struct Typer {
     /// The first expansion cut off as diverging during the current top-level
     /// implicit search, for the diagnostic.
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
+    /// Results of the implicit searches the outermost one in flight has
+    /// already answered (`crate::implicits::ImplicitMemo`). Empty whenever no
+    /// search is running.
+    pub(crate) implicit_memo: std::cell::RefCell<crate::implicits::ImplicitMemo>,
     /// The companion object an implicit was reached *through*, for the ones a
     /// companion only inherits (`object Shape extends RepShapeImplicits`).
     /// Emitting a bare name for those loads `this` and casts it to the trait
@@ -894,6 +898,7 @@ impl Typer {
             pending_defaults: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
             diverged_implicit: std::cell::RefCell::new(None),
+            implicit_memo: std::cell::RefCell::new(Default::default()),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             type_member_prefixes: std::cell::RefCell::new(HashMap::new()),
             implicit_undet_solved: Vec::new(),
