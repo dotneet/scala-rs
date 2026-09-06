@@ -1413,6 +1413,10 @@ impl Typer {
                         }
                     } else if let Some(t) = self.either_map_result(recv_ty.as_ref(), args) {
                         ret = t;
+                    } else if let Some(t) =
+                        self.map_with_filter_non_pair_result(recv_ty.as_ref(), args, false)
+                    {
+                        ret = t;
                     } else if !self.is_with_filter_ty(recv_ty.as_ref()) {
                         // The argument need not be written as a function: a
                         // `Map[K, V]` is one (`on.map(columnIndexes)`), and the
@@ -1604,6 +1608,10 @@ impl Typer {
                                 ret = Type::Array(Box::new(elem.widen_constant()));
                             }
                         }
+                    } else if let Some(t) =
+                        self.map_with_filter_non_pair_result(recv_ty.as_ref(), args, true)
+                    {
+                        ret = t;
                     } else if let Some(a0) = args.first() {
                         // Only where ordinary inference left the result open.
                         // `List.flatMap[B](f: A => IterableOnce[B]): List[B]`
@@ -2362,6 +2370,46 @@ impl Typer {
             || n == "Option$WithFilter"
             || n == "Try$WithFilter"
             || n == "StringOps$WithFilter"
+            || n == "MapOps$WithFilter"
+    }
+
+    // MapOps.WithFilter has two result constructors: CC[K, V] for pair
+    // transformations and IterableCC[B] for the inherited generic overload.
+    // flatMap takes B from IterableOnce[B], never from the lambda's concrete
+    // collection constructor (for example List[B]).
+    fn map_with_filter_non_pair_result(
+        &self,
+        recv: Option<&Type>,
+        args: &[Tree],
+        flatten: bool,
+    ) -> Option<Type> {
+        if !self.library_abi {
+            return None;
+        }
+        let Type::Class { sym, args: wf_args } = recv? else {
+            return None;
+        };
+        if self.st.get(*sym).jvm_name != "scala/collection/MapOps$WithFilter" {
+            return None;
+        }
+        let fun = match &args.first()?.ty {
+            t @ Type::Function { .. } => t.clone(),
+            t => self.function_view(t)?,
+        };
+        let Type::Function { ret, .. } = fun else {
+            return None;
+        };
+        let elem = if flatten { self.elem_type(&ret)? } else { *ret };
+        if self.pair_args(&elem).is_some() {
+            return None;
+        }
+        let Type::Class { sym: ctor, .. } = wf_args.get(2)? else {
+            return None;
+        };
+        Some(Type::Class {
+            sym: *ctor,
+            args: vec![elem.widen_constant()],
+        })
     }
 
     fn is_array_ops_ty(&self, ty: Option<&Type>) -> bool {

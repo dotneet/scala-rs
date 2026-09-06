@@ -7,9 +7,8 @@ Read the updated `tests/BASELINE.md` rather than remeasuring the old tree.
 ## Current decision state
 
 The sections below preserve earlier checkpoints; this section supersedes
-their pending-status statements. All new subagents use Luna / xhigh and
-isolated worktrees. They report through collaboration tools, not Codex task
-messages.
+their pending-status statements. Core implementation now runs in the parent
+session; all Luna implementation agents stopped with their work saved.
 
 Latest independent checks (these supersede the pending descriptions below):
 
@@ -627,3 +626,75 @@ The original unadapted tests and failing logs are retained in the evidence
 folder as direct-macro-signature-red.rs and dependent-result-signature-red.rs.
 The adapted passing test is proof of local body execution, not of the direct
 Scala macro-declaration ABI. These fixes have not passed a full acceptance gate.
+
+## Accepted method specialization and current parent candidates
+
+`e4d404f1` finished the full independent gate and was merged as `bafdb625`.
+The updated baseline records 2245 tests passed, no failures, 199 result rows,
+unchanged compile measures, strict verification of 1490 classes and Slick
+MODE=b 36/36. All 5324 corpus statuses are unchanged. The two changed diagnostic
+records are the t8199 path and impconvtimes exception order; seven newly compiled
+impconvtimes classes exactly match saved baseline bytes. Clippy passes with
+58 warnings, none newly added. Main compiler sources and Cargo inputs exactly
+match the measured candidate. Class specialization remains red.
+
+For-comprehension `c6a7e8f9` also finished its full gate: 2244 passed, zero failed,
+200 result rows, unchanged compile measures and passing strict/Slick MODE=b
+checks. The corpus loses no previous passes and gains neg/t4163 and run/t6968.
+Parent nsc comparison verifies rejection on the offending for binding and strict
+runtime output `1, 3, 5`. Eight full-field records change; two are known path/
+exception variations, two are first diagnostics reached after guard support,
+one moves the same implicit diagnostic to its actual generator line, and the
+others reflect the corrected syntax rejection/runtime behavior. The code is
+now merged with current main as frozen candidate `0306b030` and is undergoing
+a combined full acceptance gate. It has not been merged into main.
+
+Parent codegen repair `01ece8aa` completes expression-local templates and strips
+macro declarations through all child edges, recovering seven earlier corpus
+losses in focused checks. Its macro implementation JVM execution test uses an
+nsc reflection adapter: direct macro binding metadata and dependent result
+ScalaSignature remain independently proven RED. Saved Object-super repair was
+independently verified with 37 tests at `49bf1a90`; Slick now reports four sql
+selection errors, down from 66, but emits zero classes. After merging main,
+codegen candidate `a95e7d04` passes the release backend check only. The four sql
+errors and four other earlier corpus losses still prevent acceptance.
+
+
+## Accepted for-comprehension integration and current parent WIP
+
+Candidate `0306b030` was independently measured and merged as `e12cbdb2`.
+Workspace: 2252 pass / 0 fail, 200 result rows. Four compile measures unchanged;
+strict 1490 classes; Slick MODE=b 36/36; MODE=a and specialization remain red.
+Corpus: 5324 identities, no losses, gains neg/t4163 and run/t6968. Relative to
+previously reviewed c6a7e8f the full six-field ledger differs only at the
+run/t8199 temporary path. Clippy: identical 58 warning messages to e4d404f.
+Evidence: `/tmp/scala-rs-codex/integration/candidate-0306b03/`.
+
+Codegen worktree remains separate: parent commits `7f13470b` (retry provisional
+qualifier errors; Slick restored to 0 errors / 1490 classes) and `de79c86b`
+(stable lazy patterns and capture analysis; 52 focused tests pass) are held
+pending complete acceptance. Uncommitted repeated-case-pattern work matches
+nsc on same-unit positive execution but its typed-pattern negative test fails:
+String is wrongly accepted against an Int element. Cross-compilation also
+exposes repeated-parameter and generic case-apply metadata gaps. Do not merge
+this WIP based on its positive test. Reproductions and continuation details are
+in `/tmp/scala-rs-codex/integration/current-state.json`.
+
+
+## Parent repeated-case and typed-pattern repair
+
+Candidate commit `8b8acfda` now emits the repeated constructor field as a
+sequence pattern, including empty tails, nested patterns and fixed prefixes.
+A same-unit runtime fixture agrees with nsc under strict JVM verification.
+The original pos/t3856 compiles six classes. Typed patterns now check concrete
+invariant bases, bounds and final types; 17 small nsc accept/reject controls
+cover primitives, arrays, abstract bounds, variance, wildcards and library
+collections. Incomplete JVM-only parent variance initially caused five false
+Slick errors; completing variance from ScalaSignature removes those errors.
+Related suites pass 36 tests, and Slick compiles 1490 classes with zero errors.
+Evidence: `typed-pattern-variance-focused.log`, `typed-pattern-variance-slick.log`
+and `typed-pattern-variance-compile.log` under the integration evidence root.
+This supersedes the earlier typed-pattern negative failure, but not the split
+compilation failures recorded in `repeated-pattern-interop/results.json`.
+Full acceptance remains pending. Latest accepted main is being merged into
+this candidate; the merge itself needs fresh validation before acceptance.

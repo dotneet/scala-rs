@@ -11,22 +11,22 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `bafdb625` |
+| commit | `e12cbdb2` |
 |---|---|
 | updated | 2026-09-06 |
 
-Measured independently at `e4d404f1`, then merged as `bafdb625`. This adds
-method-owned Int/Long specialization, including local symbol/constructor cloning,
-source annotation bounds, and typed-graph ownership regressions. No compiler
-source, Cargo input, or test changed after the full run; later documentation-only
+Measured independently at `0306b030`, then merged as `e12cbdb2`. This adds
+for-comprehension value definitions and guards, preserving evaluation order,
+pattern failures, tuple shape and Map.withFilter result types. It includes the
+previously accepted method-owned Int/Long specialization. No compiler source,
+Cargo input, or test changed after the full run; later documentation-only
 commits may follow. Class-owned specialization remains unaccepted.
 Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned; the corpus run
 inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
-Evidence: `/tmp/scala-rs-codex/integration/candidate-e4d404f/results.json`,
-`corpus-status-audit.json`, `corpus-parent-audit.json`,
-`impconvtimes-class-audit.json`, and `clippy-parent-audit.json`.
-Historical passing gates remain passing; MODE=a and the class-specialization
-ledger remain explicitly red below.
+Evidence: `/tmp/scala-rs-codex/integration/candidate-0306b03/results.json`,
+`corpus-status-audit.json`, `corpus-parent-audit.json`, and
+`clippy-parent-audit.json`. Historical passing gates remain passing; MODE=a
+and the class-specialization ledger remain explicitly red below.
 
 ## Compile measures
 
@@ -52,31 +52,32 @@ ledger remain explicitly red below.
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
 | `pos` (1859) | **1053** | 461 | 345 |
-| `neg` (1405) | **659** | 377 | 369 |
-| `run` (2060) | **590** | 917 | 553 |
+| `neg` (1405) | **660** | 376 | 369 |
+| `run` (2060) | **591** | 916 | 553 |
 
-The unchanged complete per-test status reference is
-[`baselines/corpus-318c1568.tsv`](baselines/corpus-318c1568.tsv): 5324 unique
+The complete per-test status reference is
+[`baselines/corpus-e12cbdb2.tsv`](baselines/corpus-e12cbdb2.tsv): 5324 unique
 records, from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compare by `(kind, test)` as well as totals. The current six-field diagnostic
-ledger is `candidate-e4d404f/corpus.tsv` in the evidence directory above.
-All statuses match the preceding baseline. Two six-field records differ from
-`candidate-629570a`: the temporary path in `run/t8199`, and the first exception
-reported for already-failing `run/impconvtimes`. Independent compilation with
-the candidate produced seven class files byte-identical to the saved variance
-baseline. Earlier repeated JVM runs of those same bytes produce both VerifyError
-and IncompatibleClassChangeError. This is an existing invalid emission with
-variable failure order, not a specialization regression or improvement.
-Evidence: `candidate-e4d404f/impconvtimes-class-audit.json` and
-`/tmp/scala-rs-codex/integration/variance-impconvtimes/results.json`.
+ledger is `candidate-0306b03/corpus.tsv` in the evidence directory above.
+No previous pass was lost. `neg/t4163` now rejects a value definition before
+the first generator, at the same offending line as nsc. `run/t6968` now prints
+`1, 3, 5` as nsc does. Independent gain probes are recorded in
+`/tmp/scala-rs-codex/integration/for-corpus-gain-probe/results.json`.
+The eight six-field changes from the variance baseline were reviewed at
+`candidate-c6a7e8f`; this combined candidate differs from that ledger only in
+the temporary output path of `run/t8199`. Existing failures `neg/forward`,
+`neg/t7473`, `run/fors` and `run/forvaleq` reach changed diagnostics; the latter
+two still fail. The existing `run/impconvtimes` exception variation was checked
+with seven byte-identical class files at `candidate-c6a7e8f`; it is not a gain.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-318c1568.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-e12cbdb2.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
 
-Compared with the previous recovery baseline (`4b0568af`), all previous
-passes are retained and only three statuses improve: `run/t3761-overload-byname`,
+The earlier tail-call/by-name merge, compared with recovery (`4b0568af`),
+retained all passes and improved three statuses: `run/t3761-overload-byname`,
 `run/t8893`, and `run/t8893b`. The coordinator separately compiled and executed
 all three with both scala-rs and scalac 2.13.16; their output bytes agree.
 The first fixes by-name overload selection; the latter two no longer overflow
@@ -95,13 +96,12 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **199 result rows, 2245 passed, 0 failed** at `e4d404f1` |
+| `cargo test --workspace --release --no-fail-fast` | **200 result rows, 2252 passed, 0 failed** at `0306b030` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
 `cargo clippy --workspace --release` exits 0 with 58 warning messages versus
-59 in the preceding baseline, with no new warning messages. The removed message
-is a collapsible match in pickle handling. Compare the same command scope;
+58 in the preceding baseline, with an identical warning-message multiset. Compare the same command scope;
 `--all-targets` also includes historical warnings from tests.
 
 ## The six unloadable classes are fixed (2026-09-06)
