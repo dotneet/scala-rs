@@ -41,6 +41,9 @@ fn collect_defs(tree: &mut Tree, st: &mut SymbolTable) {
             for parent in &mut impl_.parents {
                 collect_defs(parent, st);
             }
+            if let Some(self_tpt) = &mut impl_.self_tpt {
+                collect_defs(self_tpt, st);
+            }
         }
         TreeKind::DefDef {
             tparams,
@@ -128,8 +131,7 @@ fn collect_defs(tree: &mut Tree, st: &mut SymbolTable) {
         | TreeKind::SelectFromTypeTree { qual: expr, .. }
         | TreeKind::Bind { body: expr, .. }
         | TreeKind::Star { elem: expr }
-        | TreeKind::SingletonTypeTree { ref_: expr }
-        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => collect_defs(expr, st),
+        | TreeKind::SingletonTypeTree { ref_: expr } => collect_defs(expr, st),
         TreeKind::UnApply { fun, args } => {
             collect_defs(fun, st);
             for arg in args {
@@ -175,12 +177,41 @@ fn collect_defs(tree: &mut Tree, st: &mut SymbolTable) {
             }
             collect_defs(rhs, st);
         }
+        TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            ..
+        } => {
+            for tparam in tparams {
+                collect_defs(tparam, st);
+            }
+            collect_defs(rhs, st);
+            if let Some(lo) = lo {
+                collect_defs(lo, st);
+            }
+            if let Some(hi) = hi {
+                collect_defs(hi, st);
+            }
+            for view in views {
+                collect_defs(view, st);
+            }
+            for bound in ctx_bounds {
+                collect_defs(bound, st);
+            }
+        }
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            collect_defs(tpt, st);
+            collect_defs(annot, st);
+        }
         TreeKind::Empty
         | TreeKind::Super { .. }
         | TreeKind::This { .. }
         | TreeKind::Ident { .. }
         | TreeKind::Literal { .. }
-        | TreeKind::TypeDef { .. }
         | TreeKind::MacroRhs { .. }
         | TreeKind::Wildcard
         | TreeKind::Unimplemented { .. } => {}
@@ -638,6 +669,9 @@ fn collect_variant_symbols(
             for parent in &impl_.parents {
                 collect_variant_symbols(parent, st, owner, original, primitive, map);
             }
+            if let Some(self_tpt) = &impl_.self_tpt {
+                collect_variant_symbols(self_tpt, st, owner, original, primitive, map);
+            }
             for stat in &impl_.body {
                 collect_variant_symbols(stat, st, owner, original, primitive, map);
             }
@@ -676,6 +710,9 @@ fn collect_variant_symbols(
             };
             for parent in &impl_.parents {
                 collect_variant_symbols(parent, st, body_owner, original, primitive, map);
+            }
+            if let Some(self_tpt) = &impl_.self_tpt {
+                collect_variant_symbols(self_tpt, st, body_owner, original, primitive, map);
             }
             for stat in &impl_.body {
                 collect_variant_symbols(stat, st, body_owner, original, primitive, map);
@@ -730,6 +767,46 @@ fn collect_variant_symbols(
             }
             collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
             collect_variant_symbols(rhs, st, current_owner, original, primitive, map);
+        }
+        TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            ..
+        } => {
+            let owner = if tree.sym.is_none() {
+                current_owner
+            } else {
+                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map)
+            };
+            let mut own_tparams = Vec::new();
+            for tparam in tparams {
+                if !tparam.sym.is_none() {
+                    own_tparams.push(clone_one_symbol(
+                        tparam.sym, owner, st, original, primitive, map,
+                    ));
+                }
+                collect_variant_symbols(tparam, st, owner, original, primitive, map);
+            }
+            if !tree.sym.is_none() {
+                st.get_mut(owner).tparams = own_tparams;
+            }
+            collect_variant_symbols(rhs, st, owner, original, primitive, map);
+            if let Some(lo) = lo {
+                collect_variant_symbols(lo, st, owner, original, primitive, map);
+            }
+            if let Some(hi) = hi {
+                collect_variant_symbols(hi, st, owner, original, primitive, map);
+            }
+            for view in views {
+                collect_variant_symbols(view, st, owner, original, primitive, map);
+            }
+            for bound in ctx_bounds {
+                collect_variant_symbols(bound, st, owner, original, primitive, map);
+            }
         }
         TreeKind::Function { vparams, body } => {
             for param in vparams {
@@ -849,9 +926,12 @@ fn collect_variant_symbols(
         | TreeKind::Select { qual: expr, .. }
         | TreeKind::SelectFromTypeTree { qual: expr, .. }
         | TreeKind::Star { elem: expr }
-        | TreeKind::SingletonTypeTree { ref_: expr }
-        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => {
+        | TreeKind::SingletonTypeTree { ref_: expr } => {
             collect_variant_symbols(expr, st, current_owner, original, primitive, map)
+        }
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
+            collect_variant_symbols(annot, st, current_owner, original, primitive, map);
         }
         TreeKind::UnApply { fun, args } => {
             collect_variant_symbols(fun, st, current_owner, original, primitive, map);
@@ -897,7 +977,6 @@ fn collect_variant_symbols(
         | TreeKind::This { .. }
         | TreeKind::Ident { .. }
         | TreeKind::Literal { .. }
-        | TreeKind::TypeDef { .. }
         | TreeKind::MacroRhs { .. }
         | TreeKind::Wildcard
         | TreeKind::Unimplemented { .. } => {}
@@ -934,6 +1013,9 @@ fn clone_local_constructors(
             for parent in &impl_.parents {
                 clone_local_constructors(parent, st, original, variant, primitive, map);
             }
+            if let Some(self_tpt) = &impl_.self_tpt {
+                clone_local_constructors(self_tpt, st, original, variant, primitive, map);
+            }
             for stat in &impl_.body {
                 clone_local_constructors(stat, st, original, variant, primitive, map);
             }
@@ -941,6 +1023,9 @@ fn clone_local_constructors(
         TreeKind::ModuleDef { impl_, .. } => {
             for parent in &impl_.parents {
                 clone_local_constructors(parent, st, original, variant, primitive, map);
+            }
+            if let Some(self_tpt) = &impl_.self_tpt {
+                clone_local_constructors(self_tpt, st, original, variant, primitive, map);
             }
             for stat in &impl_.body {
                 clone_local_constructors(stat, st, original, variant, primitive, map);
@@ -967,6 +1052,32 @@ fn clone_local_constructors(
         TreeKind::ValDef { tpt, rhs, .. } => {
             clone_local_constructors(tpt, st, original, variant, primitive, map);
             clone_local_constructors(rhs, st, original, variant, primitive, map);
+        }
+        TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            ..
+        } => {
+            for tparam in tparams {
+                clone_local_constructors(tparam, st, original, variant, primitive, map);
+            }
+            clone_local_constructors(rhs, st, original, variant, primitive, map);
+            if let Some(lo) = lo {
+                clone_local_constructors(lo, st, original, variant, primitive, map);
+            }
+            if let Some(hi) = hi {
+                clone_local_constructors(hi, st, original, variant, primitive, map);
+            }
+            for view in views {
+                clone_local_constructors(view, st, original, variant, primitive, map);
+            }
+            for bound in ctx_bounds {
+                clone_local_constructors(bound, st, original, variant, primitive, map);
+            }
         }
         TreeKind::Block { stats, expr } => {
             for stat in stats {
@@ -1037,9 +1148,12 @@ fn clone_local_constructors(
         | TreeKind::SelectFromTypeTree { qual: expr, .. }
         | TreeKind::Bind { body: expr, .. }
         | TreeKind::Star { elem: expr }
-        | TreeKind::SingletonTypeTree { ref_: expr }
-        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => {
+        | TreeKind::SingletonTypeTree { ref_: expr } => {
             clone_local_constructors(expr, st, original, variant, primitive, map);
+        }
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            clone_local_constructors(tpt, st, original, variant, primitive, map);
+            clone_local_constructors(annot, st, original, variant, primitive, map);
         }
         TreeKind::UnApply { fun, args } => {
             clone_local_constructors(fun, st, original, variant, primitive, map);
@@ -1091,7 +1205,6 @@ fn clone_local_constructors(
         | TreeKind::This { .. }
         | TreeKind::Ident { .. }
         | TreeKind::Literal { .. }
-        | TreeKind::TypeDef { .. }
         | TreeKind::MacroRhs { .. }
         | TreeKind::Wildcard
         | TreeKind::Unimplemented { .. } => {}
@@ -1267,6 +1380,9 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>, orig
             for parent in &mut impl_.parents {
                 remap_tree_symbols(parent, map, original);
             }
+            if let Some(self_tpt) = &mut impl_.self_tpt {
+                remap_tree_symbols(self_tpt, map, original);
+            }
             for stat in &mut impl_.body {
                 remap_tree_symbols(stat, map, original);
             }
@@ -1274,6 +1390,9 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>, orig
         TreeKind::ModuleDef { impl_, .. } => {
             for parent in &mut impl_.parents {
                 remap_tree_symbols(parent, map, original);
+            }
+            if let Some(self_tpt) = &mut impl_.self_tpt {
+                remap_tree_symbols(self_tpt, map, original);
             }
             for stat in &mut impl_.body {
                 remap_tree_symbols(stat, map, original);
@@ -1300,6 +1419,32 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>, orig
         TreeKind::ValDef { tpt, rhs, .. } => {
             remap_tree_symbols(tpt, map, original);
             remap_tree_symbols(rhs, map, original);
+        }
+        TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            ..
+        } => {
+            for tparam in tparams {
+                remap_tree_symbols(tparam, map, original);
+            }
+            remap_tree_symbols(rhs, map, original);
+            if let Some(lo) = lo {
+                remap_tree_symbols(lo, map, original);
+            }
+            if let Some(hi) = hi {
+                remap_tree_symbols(hi, map, original);
+            }
+            for view in views {
+                remap_tree_symbols(view, map, original);
+            }
+            for bound in ctx_bounds {
+                remap_tree_symbols(bound, map, original);
+            }
         }
         TreeKind::Block { stats, expr } => {
             for stat in stats {
@@ -1365,8 +1510,11 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>, orig
         | TreeKind::SelectFromTypeTree { qual: expr, .. }
         | TreeKind::Bind { body: expr, .. }
         | TreeKind::Star { elem: expr }
-        | TreeKind::SingletonTypeTree { ref_: expr }
-        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => remap_tree_symbols(expr, map, original),
+        | TreeKind::SingletonTypeTree { ref_: expr } => remap_tree_symbols(expr, map, original),
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            remap_tree_symbols(tpt, map, original);
+            remap_tree_symbols(annot, map, original);
+        }
         TreeKind::UnApply { fun, args } => {
             remap_tree_symbols(fun, map, original);
             for arg in args {
@@ -1417,7 +1565,6 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>, orig
         | TreeKind::This { .. }
         | TreeKind::Ident { .. }
         | TreeKind::Literal { .. }
-        | TreeKind::TypeDef { .. }
         | TreeKind::MacroRhs { .. }
         | TreeKind::Wildcard
         | TreeKind::Unimplemented { .. } => {}
@@ -1512,6 +1659,9 @@ fn rewrite_tree(tree: &mut Tree, st: &SymbolTable) {
             for parent in &mut impl_.parents {
                 rewrite_tree(parent, st);
             }
+            if let Some(self_tpt) = &mut impl_.self_tpt {
+                rewrite_tree(self_tpt, st);
+            }
             for stat in &mut impl_.body {
                 rewrite_tree(stat, st);
             }
@@ -1519,6 +1669,32 @@ fn rewrite_tree(tree: &mut Tree, st: &SymbolTable) {
         TreeKind::ValDef { tpt, rhs, .. } => {
             rewrite_tree(tpt, st);
             rewrite_tree(rhs, st);
+        }
+        TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+            ..
+        } => {
+            for tparam in tparams {
+                rewrite_tree(tparam, st);
+            }
+            rewrite_tree(rhs, st);
+            if let Some(lo) = lo {
+                rewrite_tree(lo, st);
+            }
+            if let Some(hi) = hi {
+                rewrite_tree(hi, st);
+            }
+            for view in views {
+                rewrite_tree(view, st);
+            }
+            for bound in ctx_bounds {
+                rewrite_tree(bound, st);
+            }
         }
         TreeKind::DefDef {
             tparams,
@@ -1619,8 +1795,11 @@ fn rewrite_tree(tree: &mut Tree, st: &SymbolTable) {
         | TreeKind::SelectFromTypeTree { qual: expr, .. }
         | TreeKind::Bind { body: expr, .. }
         | TreeKind::Star { elem: expr }
-        | TreeKind::SingletonTypeTree { ref_: expr }
-        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => rewrite_tree(expr, st),
+        | TreeKind::SingletonTypeTree { ref_: expr } => rewrite_tree(expr, st),
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            rewrite_tree(tpt, st);
+            rewrite_tree(annot, st);
+        }
         TreeKind::Alternative { trees } => {
             for child in trees {
                 rewrite_tree(child, st);
@@ -1665,7 +1844,6 @@ fn rewrite_tree(tree: &mut Tree, st: &SymbolTable) {
         | TreeKind::This { .. }
         | TreeKind::Ident { .. }
         | TreeKind::Literal { .. }
-        | TreeKind::TypeDef { .. }
         | TreeKind::MacroRhs { .. }
         | TreeKind::Wildcard
         | TreeKind::Unimplemented { .. } => {}
@@ -1772,6 +1950,9 @@ fn substitute_tree_types(tree: &mut Tree, st: &SymbolTable, method: SymbolId, pr
             for parent in &mut impl_.parents {
                 substitute_tree_types(parent, st, method, primitive);
             }
+            if let Some(self_tpt) = &mut impl_.self_tpt {
+                substitute_tree_types(self_tpt, st, method, primitive);
+            }
             for stat in &mut impl_.body {
                 substitute_tree_types(stat, st, method, primitive);
             }
@@ -1779,6 +1960,9 @@ fn substitute_tree_types(tree: &mut Tree, st: &SymbolTable, method: SymbolId, pr
         TreeKind::ModuleDef { impl_, .. } => {
             for parent in &mut impl_.parents {
                 substitute_tree_types(parent, st, method, primitive);
+            }
+            if let Some(self_tpt) = &mut impl_.self_tpt {
+                substitute_tree_types(self_tpt, st, method, primitive);
             }
             for stat in &mut impl_.body {
                 substitute_tree_types(stat, st, method, primitive);
@@ -1899,9 +2083,12 @@ fn substitute_tree_types(tree: &mut Tree, st: &SymbolTable, method: SymbolId, pr
         | TreeKind::SelectFromTypeTree { qual, .. }
         | TreeKind::Bind { body: qual, .. }
         | TreeKind::Star { elem: qual }
-        | TreeKind::SingletonTypeTree { ref_: qual }
-        | TreeKind::AnnotatedTypeTree { tpt: qual, .. } => {
+        | TreeKind::SingletonTypeTree { ref_: qual } => {
             substitute_tree_types(qual, st, method, primitive);
+        }
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            substitute_tree_types(tpt, st, method, primitive);
+            substitute_tree_types(annot, st, method, primitive);
         }
         TreeKind::UnApply { fun, args } => {
             substitute_tree_types(fun, st, method, primitive);

@@ -1081,16 +1081,15 @@ impl<'a> Pickler<'a> {
         if simple == "Override" || path == "java.lang.Override" {
             return;
         }
-        if simple == scala_rs_parser::specialization::SPECIALIZED
-            || simple == scala_rs_parser::specialization::UNSPECIALIZED
+        if (simple == scala_rs_parser::specialization::SPECIALIZED
+            || simple == scala_rs_parser::specialization::UNSPECIALIZED)
+            && (!preserve_specialization || advertised_specialization.is_none())
         {
-            if !preserve_specialization || advertised_specialization.is_none() {
-                // Class and trait specialization is still outside the first
-                // slice.  Do not advertise those entries to a consumer until
-                // their classfile ABI exists; method type parameters opt in
-                // below once the method-owned variants have been emitted.
-                return;
-            }
+            // Class and trait specialization is still outside the first
+            // slice.  Do not advertise those entries to a consumer until
+            // their classfile ABI exists; method type parameters opt in
+            // below once the method-owned variants have been emitted.
+            return;
         }
         let atp = if simple == scala_rs_parser::specialization::SPECIALIZED {
             // `specialized` is a class directly under scala (unlike
@@ -1623,10 +1622,13 @@ impl<'a> Pickler<'a> {
             Type::String => self.type_ref_named("String"),
             Type::Any => self.type_ref_named("Any"),
             Type::Wildcard | Type::AnyRef => self.type_ref_named("AnyRef"),
-            Type::BoundedWildcard { hi, .. } => match hi {
-                Some(t) => self.pickle_type(t),
-                None => self.type_ref_named("Any"),
-            },
+            Type::BoundedWildcard { hi, .. } => {
+                if let Some(t) = hi.as_deref() {
+                    self.pickle_type(t)
+                } else {
+                    self.type_ref_named("Any")
+                }
+            }
             Type::ThisType(id) => self.pickle_this_tpe(*id),
             Type::SingleType { prefix, sym } => {
                 let pre = if matches!(prefix.as_ref(), Type::NoType | Type::ThisType(_)) {

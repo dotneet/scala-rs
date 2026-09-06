@@ -747,6 +747,145 @@ object NestedLocalTypesMain {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Keep every type-tree edge reachable while cloning a method variant. The
+/// local class combines a self type, a local type alias, and an annotated type
+/// use; its primitive clones must retain the alias's substituted JVM method
+/// descriptor instead of sharing the generic symbols.
+#[test]
+fn method_specialization_type_tree_traversal_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip type-tree traversal fixture: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("method-specialization-type-tree-traversal");
+    let src = root.join("TraversalAbi.scala");
+    fs::write(
+        &src,
+        r#"import scala.specialized
+
+object TraversalAbi {
+  def run[@specialized(Int, Long) A](a: A): String = {
+    class Local {
+      self: Local =>
+      type Alias = A
+      type Higher[X] = (A, X)
+      type Bounded >: Null <: Any
+      def id(x: Alias @unchecked): Alias = x
+    }
+    val x = new Local
+    x.id(a).toString
+  }
+}
+
+object TraversalAbiMain {
+  def main(args: Array[String]): Unit = {
+    println(TraversalAbi.run(7))
+    println(TraversalAbi.run(8L))
+    println(TraversalAbi.run("s"))
+  }
+}
+"#,
+    )
+    .unwrap();
+    let out = root.join("provider");
+    fs::create_dir_all(&out).unwrap();
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs type-tree traversal provider");
+    assert!(status.success(), "type-tree traversal provider failed");
+
+    let generic = javap_class(&out, "TraversalAbi$Local$1", &["-p", "-s"]);
+    assert!(
+        generic.contains("java.lang.Object id(java.lang.Object)")
+            && generic.contains("descriptor: (Ljava/lang/Object;)Ljava/lang/Object;"),
+        "generic local type-tree entry changed: {generic}"
+    );
+    let int_variant = javap_class(&out, "TraversalAbi$Local$2", &["-p", "-s"]);
+    assert!(
+        int_variant.contains("int id(int)") && int_variant.contains("descriptor: (I)I"),
+        "Int local type-tree entry lost primitive owner/type substitution: {int_variant}"
+    );
+    let long_variant = javap_class(&out, "TraversalAbi$Local$3", &["-p", "-s"]);
+    assert!(
+        long_variant.contains("long id(long)") && long_variant.contains("descriptor: (J)J"),
+        "Long local type-tree entry lost primitive owner/type substitution: {long_variant}"
+    );
+
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "TraversalAbiMain",
+        ])
+        .output()
+        .expect("run scala-rs type-tree traversal provider");
+    assert!(
+        run.status.success(),
+        "type-tree traversal runtime failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n8\ns\n");
+
+    let scalac = Path::new("/tmp/scala-2.13.16/bin/scalac");
+    if scalac.is_file() {
+        let nsc = root.join("nsc");
+        fs::create_dir_all(&nsc).unwrap();
+        let status = Command::new(scalac)
+            .args([
+                "-classpath",
+                jar.to_str().unwrap(),
+                "-d",
+                nsc.to_str().unwrap(),
+                src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run scalac type-tree traversal provider");
+        assert!(
+            status.success(),
+            "scalac type-tree traversal provider failed"
+        );
+        for (class, shape) in [
+            (
+                "TraversalAbi$Local$1",
+                "descriptor: (Ljava/lang/Object;)Ljava/lang/Object;",
+            ),
+            ("TraversalAbi$Local$2", "descriptor: (I)I"),
+            ("TraversalAbi$Local$3", "descriptor: (J)J"),
+        ] {
+            let nsc_class = javap_class(&nsc, class, &["-p", "-s"]);
+            assert!(
+                nsc_class.contains(shape),
+                "scalac type-tree ABI changed for {class}: {nsc_class}"
+            );
+        }
+        let nsc_run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{}", nsc.display(), jar.display()),
+                "TraversalAbiMain",
+            ])
+            .output()
+            .expect("run scalac type-tree traversal provider");
+        assert!(
+            nsc_run.status.success(),
+            "scalac type-tree traversal runtime failed: {}",
+            String::from_utf8_lossy(&nsc_run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&nsc_run.stdout), "7\n8\ns\n");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Constructor references inside a variant must be split by ownership. Local
 /// classes and their constructors are cloned, while `String` and a source
 /// class remain external references. The captured local class also checks
