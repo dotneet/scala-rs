@@ -942,13 +942,29 @@ impl Typer {
             return None;
         }
         let gname = format!("{mname}$default${index_1based}");
+        // The pickle spells the constructor getter `<init>$default$n`, while
+        // its JVM classfile method is `$lessinit$greater$default$n`.
+        let jvm_ctor_gname = format!("$lessinit$greater$default${index_1based}");
         let owner = self.st.get(meth).owner;
-        let gid = self
-            .st
-            .lookup_member(owner, &gname)
-            .into_iter()
-            .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)?;
         let span = fun.span;
+        if mname == "<init>" {
+            self.ensure_classfile_members_loaded(owner, span);
+        }
+        let lookup_getter = |name: &str| {
+            self.st
+                .lookup_member(owner, name)
+                .into_iter()
+                .find(|&id| self.st.get(id).kind == crate::symbol::SymKind::Method)
+        };
+        let gid = if mname == "<init>" {
+            // Prefer the JVM spelling when the classfile was available. The
+            // pickle spelling is retained as a fallback for a source class
+            // whose getter is synthesized by this compiler.
+            lookup_getter(&jvm_ctor_gname).or_else(|| lookup_getter(&gname))
+        } else {
+            lookup_getter(&gname)
+        }?;
+        let getter_name = self.st.get(gid).name.clone();
         // An *inserted* `apply` names the receiver itself, not a member of it:
         // `Outer.Inner.Nested(2)` is `Select(Outer.Inner, "Nested")` carrying
         // the companion's `apply` as its symbol, so `method_receiver`'s
@@ -959,7 +975,47 @@ impl Typer {
         let head = Self::application_head(fun);
         let inserted_apply =
             mname == "apply" && Self::head_name(head).is_some_and(|n| n != "apply");
-        let recv = if inserted_apply {
+        // A separately compiled plain class exposes primary-constructor
+        // defaults as static `$lessinit$greater$default$n` methods on the
+        // class itself.  The synthetic `<init>` tree has no ordinary method
+        // receiver, so `method_receiver` manufactured `this`; typing that
+        // receiver in an `extends Parent(...)` clause is invalid and nsc's
+        // static getter call never needs it.  Qualify the getter with the
+        // class name so selection resolves the static member and codegen
+        // emits `invokestatic` without loading a receiver.
+        let ctor_default_getter = (self.st.get(meth).flags.contains(Flags::CONSTRUCTOR)
+            || self.st.get(meth).name == "<init>")
+            && getter_name.starts_with("$lessinit$greater$default$");
+        // The classfile getter is a static forwarder. Preserve that fact for
+        // selection/codegen even when the pickle supplied its symbol without
+        // JVM access flags.
+        if ctor_default_getter {
+            let f = self.st.get(gid).flags.with(Flags::STATIC);
+            self.st.get_mut(gid).flags = f;
+        }
+        let ctor_static_getter = ctor_default_getter;
+        let recv = if ctor_static_getter {
+            let owner_name = self.st.get(owner).name.clone();
+            Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Ident { name: owner_name },
+                ty: Type::Class {
+                    sym: owner,
+                    args: self
+                        .st
+                        .get(owner)
+                        .tparams
+                        .iter()
+                        .map(|&t| Type::TypeParam(t))
+                        .collect(),
+                },
+                sym: owner,
+                postfix: false,
+                scala_ref: false,
+                stable_pat: false,
+            }
+        } else if inserted_apply {
             let mut r = head.clone();
             r.id = NodeId(0);
             r.ty = Type::NoType;
@@ -985,9 +1041,16 @@ impl Typer {
         let mut gfun = Tree {
             id: NodeId(0),
             span,
-            kind: TreeKind::Select {
-                qual: Box::new(recv),
-                name: gname,
+            kind: if ctor_static_getter {
+                // The class qualifier is only a source-level spelling for a
+                // static JVM method. Keep the already resolved symbol rather
+                // than retyping `NscBase` as its companion `NscBase$`.
+                TreeKind::Ident { name: getter_name }
+            } else {
+                TreeKind::Select {
+                    qual: Box::new(recv),
+                    name: getter_name,
+                }
             },
             ty: self.st.get(gid).ty.clone(),
             sym: gid,
@@ -995,7 +1058,9 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
         };
-        self.type_expr(&mut gfun, &Type::NoType);
+        if !ctor_static_getter {
+            self.type_expr(&mut gfun, &Type::NoType);
+        }
         let mut call = Tree {
             id: NodeId(0),
             span,
@@ -1009,7 +1074,9 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
         };
-        self.type_expr(&mut call, &self.st.get(param).ty.clone());
+        if !ctor_static_getter {
+            self.type_expr(&mut call, &self.st.get(param).ty.clone());
+        }
         Some(call)
     }
 

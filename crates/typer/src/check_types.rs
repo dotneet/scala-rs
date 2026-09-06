@@ -2926,6 +2926,34 @@ impl Typer {
         }
     }
 
+    /// Read raw members from a Scala classfile even when its pickle has
+    /// already been adopted.  Most Scala members are supplied from pickles on
+    /// demand; constructor default getters are the one JVM-only exception:
+    /// the pickle spells `<init>$default$n`, while the classfile exposes the
+    /// static `$lessinit$greater$default$n` forwarder.
+    pub(crate) fn ensure_classfile_members_loaded(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        let jvm = self.st.get(class_id).jvm_name.clone();
+        if jvm.is_empty() || jvm.starts_with('[') {
+            return;
+        }
+        let Ok(Some(bytes)) = self.binary.find_class(&jvm) else {
+            return;
+        };
+        let Ok(jc) = crate::javaclass::parse_java_classfile(&bytes) else {
+            return;
+        };
+        let owner = self.st.get(class_id).owner;
+        let id = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
+        if jc.is_scala {
+            self.pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, id);
+        }
+        self.complete_java_parents(class_id, span);
+    }
+
     /// `resolve_type_name`, after completing any alias the name binds to. A
     /// reference from an earlier unit must not see the alias's `<notype>`.
     fn resolve_type_name_completing(&mut self, name: &str, args: &[Type], span: Span) -> Type {

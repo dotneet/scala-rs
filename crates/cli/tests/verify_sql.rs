@@ -39,6 +39,93 @@ fn scala_library_jar() -> Option<PathBuf> {
     jar.is_file().then_some(jar)
 }
 
+fn temurin17_home() -> Option<PathBuf> {
+    let home = PathBuf::from("/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home");
+    home.join("bin/java").is_file().then_some(home)
+}
+
+fn scalac() -> Option<PathBuf> {
+    let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    scalac.is_file().then_some(scalac)
+}
+
+fn jdk17_command(cmd: &mut Command, home: &Path) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut jdk_path = home.join("bin").into_os_string();
+    jdk_path.push(":");
+    jdk_path.push(path);
+    cmd.env("JAVA_HOME", home).env("PATH", jdk_path);
+}
+
+fn compile_scalac(src: &Path, out: &Path, cp: &[&Path], home: &Path, jar: &Path) {
+    let mut cmd = Command::new(scalac().unwrap());
+    let classpath = cp
+        .iter()
+        .map(|p| p.to_str().unwrap())
+        .chain(std::iter::once(jar.to_str().unwrap()))
+        .collect::<Vec<_>>()
+        .join(":");
+    cmd.args([
+        "-classpath",
+        &classpath,
+        "-d",
+        out.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    jdk17_command(&mut cmd, home);
+    let output = cmd.output().expect("run scalac");
+    assert!(
+        output.status.success(),
+        "scalac failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn compile_scala_rs(src: &Path, out: &Path, cp: &[&Path], jar: &Path) {
+    let mut cmd = Command::new(bin());
+    let classpath = cp
+        .iter()
+        .map(|p| p.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
+    cmd.args([
+        "compile",
+        src.to_str().unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+        "-cp",
+        &classpath,
+        "--scala-library",
+        jar.to_str().unwrap(),
+    ]);
+    let output = cmd.output().expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "scala-rs failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_java17(out: &Path, parents: &[&Path], jar: &Path, home: &Path) -> String {
+    let classpath = std::iter::once(out)
+        .chain(parents.iter().copied())
+        .chain(std::iter::once(jar))
+        .map(|p| p.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
+    let mut cmd = Command::new(home.join("bin/java"));
+    cmd.args(["-Xverify:all", "-cp", &classpath, "Main"]);
+    let output = cmd.output().expect("run java");
+    assert!(
+        output.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 #[test]
 fn parent_default_constructor_is_verified() {
     let out = tmp_dir();
@@ -108,4 +195,51 @@ fn qualified_library_class_term_uses_companion() {
         "scala.collection.Factory$:scala.collection.immutable.LazyList$\n"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+#[test]
+fn parent_defaults_interoperate_across_scalac_and_scala_rs() {
+    let (Some(jar), Some(home), Some(_)) = (scala_library_jar(), temurin17_home(), scalac()) else {
+        return;
+    };
+    let root = tmp_dir();
+    let nsc_base = root.join("nsc-base");
+    let rs_child = root.join("rs-child");
+    let rs_base = root.join("rs-base");
+    let nsc_child = root.join("nsc-child");
+    for out in [&nsc_base, &rs_child, &rs_base, &nsc_child] {
+        fs::create_dir_all(out).unwrap();
+    }
+    let fixtures = fixtures_dir();
+    compile_scalac(
+        &fixtures.join("vsql_nsc_base.scala"),
+        &nsc_base,
+        &[],
+        &home,
+        &jar,
+    );
+    compile_scala_rs(
+        &fixtures.join("vsql_rs_child.scala"),
+        &rs_child,
+        &[&nsc_base],
+        &jar,
+    );
+    assert_eq!(
+        run_java17(&rs_child, &[&nsc_base], &jar, &home),
+        "jdbc:nsc:user:password\n"
+    );
+
+    compile_scala_rs(&fixtures.join("vsql_rs_base.scala"), &rs_base, &[], &jar);
+    compile_scalac(
+        &fixtures.join("vsql_nsc_child.scala"),
+        &nsc_child,
+        &[&rs_base],
+        &home,
+        &jar,
+    );
+    assert_eq!(
+        run_java17(&nsc_child, &[&rs_base], &jar, &home),
+        "jdbc:rs:user:password\n"
+    );
+    let _ = fs::remove_dir_all(&root);
 }
