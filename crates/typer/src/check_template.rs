@@ -582,7 +582,11 @@ impl Typer {
     /// "still to be inferred at the call", and nothing downstream can tell the
     /// two apart. Variance is *not* copied: a method's type parameters have
     /// none, and carrying `+T` over would let the variance check read them.
-    fn fresh_method_tparams(&mut self, owner: SymbolId, src: &[SymbolId]) -> Vec<SymbolId> {
+    pub(crate) fn fresh_method_tparams(
+        &mut self,
+        owner: SymbolId,
+        src: &[SymbolId],
+    ) -> Vec<SymbolId> {
         if src.is_empty() {
             return Vec::new();
         }

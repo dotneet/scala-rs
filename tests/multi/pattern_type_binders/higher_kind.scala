@@ -1,0 +1,1 @@
+final class B[F[_]](val value: F[Int]); object Test { def f(a: Any): Any = a match { case b: B[f] => val x: f[Int] = b.value; x; case _ => 0 } }

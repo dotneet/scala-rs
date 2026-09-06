@@ -1,0 +1,1 @@
+trait A[+T]; final class B[T <: CharSequence](val value: T) extends A[T]; object Test { def f(a: A[AnyRef]): Int = a match { case b: B[t] => b.value.length() } }

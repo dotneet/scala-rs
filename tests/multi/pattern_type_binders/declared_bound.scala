@@ -1,0 +1,1 @@
+final class B[T <: CharSequence](val value: T); object Test { def f(a: Any): Int = a match { case b: B[t] => val x: t = b.value; x.length(); case _ => 0 } }

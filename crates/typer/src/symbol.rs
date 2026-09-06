@@ -345,6 +345,8 @@ pub struct Symbol {
     /// `TypeMember`; the pickle writer must retain that declaration kind
     /// instead of inferring it from the resolved type alone.
     pub is_type_alias: bool,
+    /// A rigid existential type introduced by a pattern, never an inference variable.
+    pub is_pattern_skolem: bool,
     /// For classes defined inside a method: enclosing-method locals the class
     /// reads. Each becomes a private field plus a trailing constructor
     /// parameter (see `anon_capture`).
@@ -770,6 +772,7 @@ impl SymbolTable {
                 bound_lo: None,
                 bound_hi: None,
                 is_type_alias: false,
+                is_pattern_skolem: false,
                 captures: vec![],
                 macro_impl: None,
                 declaring_class: String::new(),
@@ -878,6 +881,7 @@ impl SymbolTable {
             bound_lo: None,
             bound_hi: None,
             is_type_alias: false,
+            is_pattern_skolem: false,
             captures: vec![],
             macro_impl: None,
             declaring_class: String::new(),

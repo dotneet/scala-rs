@@ -133,6 +133,11 @@ impl Typer {
     /// parameter of a method this argument has already applied -- one that can
     /// no longer be named here -- is undetermined.
     pub(crate) fn tparam_in_scope(&self, tp: SymbolId) -> bool {
+        // A case-local existential stays rigid after its lexical case scope
+        // is popped; minimising it to Nothing corrupts the join of branches.
+        if self.st.get(tp).is_pattern_skolem {
+            return true;
+        }
         let name = self.st.get(tp).name.clone();
         self.st.lookup_type(&name).contains(&tp)
     }
@@ -324,7 +329,7 @@ impl Typer {
             for tp in open {
                 if type_mentions_tparam(other, tp)
                     || self.st.get(tp).kind != SymKind::TypeParam
-                    || self.st.lookup(&self.st.get(tp).name).contains(&tp)
+                    || self.tparam_in_scope(tp)
                     || self.tparam_variance_in(&out, tp, 1) != Some(1)
                 {
                     continue;

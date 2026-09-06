@@ -1,0 +1,1 @@
+final class B[T]; object Test { def f(a: Any): Int = a match { case b: B[`t`] => 1; case _ => 0 } }
