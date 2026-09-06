@@ -2165,9 +2165,17 @@ impl Typer {
         let Some(r) = self.receiver_collection_root(Some(recv_ty)) else {
             return;
         };
-        if crate::prelude_viewc::declares_view_result(name)
-            && self.st.get(r).jvm_name == "scala/collection/SeqView"
-        {
+        // A *view* is the one collection whose `C` is not itself:
+        // `trait SeqView[+A] extends SeqOps[A, View, View[A]] with View[A]`,
+        // and `javap scala.collection.SeqView` lists the fifteen members it
+        // really does override to return a `SeqView` -- `tail`, `init` and
+        // `distinct` are not among them. Narrowing `ls.view.tail` to a
+        // `SeqView` compiled and then threw `ClassCastException` on the
+        // `scala.collection.View$Drop` the call really returns
+        // (`test/files/run/t4332b.scala`). The application path's
+        // `declares_view_result` list is not enough here: it holds only the
+        // members that take an argument, which is all it ever sees.
+        if self.is_view_class(r) {
             return;
         }
         let rebuilt = if widens {
@@ -2178,6 +2186,27 @@ impl Typer {
         if let Some(t) = rebuilt {
             *inner = t;
         }
+    }
+
+    /// Whether `cls` is `scala.collection.View` or one of its subclasses.
+    ///
+    /// Every view's `C` and `CC` are `View[A]` / `View`, whatever the view's
+    /// own class is, so the `BuildFrom` rebuild must not touch one.
+    fn is_view_class(&self, cls: SymbolId) -> bool {
+        let Some(view) = crate::classpath::find_by_jvm(&self.st, "scala/collection/View") else {
+            return self.st.get(cls).jvm_name.ends_with("View");
+        };
+        cls == view
+            || self
+                .base_type_instance(
+                    &Type::Class {
+                        sym: cls,
+                        args: vec![],
+                    },
+                    view,
+                    0,
+                )
+                .is_some()
     }
 
     /// The receiver's own collection class, for the `BuildFrom` rebuild.

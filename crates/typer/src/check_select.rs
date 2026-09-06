@@ -793,6 +793,24 @@ impl Typer {
     /// nsc sees one `IterableOps.map`. So does this: copies of one pickled
     /// declaration collapse to the first, which is the one `lookup_member`
     /// reached first and so the nearest to the receiver.
+    fn collapse_pickled_copies(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        if !found
+            .iter()
+            .any(|&s| !self.st.get(s).pickled_origin.is_empty())
+        {
+            return found;
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        found
+            .iter()
+            .copied()
+            .filter(|&s| {
+                let origin = self.st.get(s).pickled_origin.as_str();
+                origin.is_empty() || seen.insert(origin)
+            })
+            .collect()
+    }
+
     /// A constructor parameter's *field* and its accessor are one member, not
     /// two alternatives.
     ///
@@ -839,24 +857,6 @@ impl Typer {
         } else {
             kept
         }
-    }
-
-    fn collapse_pickled_copies(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
-        if !found
-            .iter()
-            .any(|&s| !self.st.get(s).pickled_origin.is_empty())
-        {
-            return found;
-        }
-        let mut seen: HashSet<&str> = HashSet::new();
-        found
-            .iter()
-            .copied()
-            .filter(|&s| {
-                let origin = self.st.get(s).pickled_origin.as_str();
-                origin.is_empty() || seen.insert(origin)
-            })
-            .collect()
     }
 
     /// nsc `matchingSymbols`: does `sub` override `base`? Both are members of
