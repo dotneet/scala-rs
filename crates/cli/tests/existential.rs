@@ -120,14 +120,6 @@ fn run_scala_rs(jar: &Path, src: &Path, out: &Path) -> (bool, String) {
     )
 }
 
-fn java_available() -> bool {
-    Command::new("java")
-        .arg("-version")
-        .output()
-        .map(|output| output.status.success() || !output.stderr.is_empty())
-        .unwrap_or(false)
-}
-
 fn run_main(classes: &Path, provider: &Path, jar: &Path) -> String {
     let classpath = cp(&[classes, provider, jar]);
     let output = Command::new("java")
@@ -186,13 +178,11 @@ fn compile_provider_matrix(
             ok,
             "{provider_name} provider rejected positive {label} consumer:\n{msgs}"
         );
-        if java_available() {
-            assert_eq!(
-                run_main(&positive_out, provider, &jar),
-                expected_stdout,
-                "stdout mismatch for {provider_name} provider in {label}"
-            );
-        }
+        assert_eq!(
+            run_main(&positive_out, provider, &jar),
+            expected_stdout,
+            "stdout mismatch for {provider_name} provider in {label}"
+        );
         let _ = fs::remove_dir_all(&positive_out);
 
         let negative_out = tmp_dir(&format!("{label}-{provider_name}-negative"));

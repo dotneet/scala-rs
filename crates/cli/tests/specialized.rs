@@ -875,6 +875,7 @@ object Bound {
         fs::write(
             &consumer_src,
             r#"object BoundConsumer {
+  def u: Int = Bound.upper("hello")
   def i: String = Bound.mixed(7)
   def l: String = Bound.mixed(8L)
   def e: String = Bound.exact(9)
@@ -882,8 +883,8 @@ object Bound {
   def f: String = Bound.fallback("fallback")
 
   def main(args: Array[String]): Unit = {
-    val result = s"$i:$l:$e:$n:$f"
-    if (result != "7:8:9:null-safe:fallback") throw new RuntimeException(result)
+    val result = s"$u:$i:$l:$e:$n:$f"
+    if (result != "5:7:8:9:null-safe:fallback") throw new RuntimeException(result)
     println(result)
   }
 }
@@ -908,6 +909,10 @@ object Bound {
             "scalac bounded specialization consumer failed"
         );
         let consumer = javap_class(&consumer_out, "BoundConsumer$", &["-c", "-p"]);
+        assert!(
+            consumer.contains("Bound$.upper:(Ljava/lang/CharSequence;)I"),
+            "scalac did not retain the generic upper-bound descriptor: {consumer}"
+        );
         assert!(
             consumer.contains("Bound$.mixed$mIc$sp:(I)Ljava/lang/String;"),
             "scalac did not select bounded Int entry: {consumer}"
@@ -950,7 +955,7 @@ object Bound {
         );
         assert_eq!(
             String::from_utf8_lossy(&consumer_run.stdout),
-            "7:8:9:null-safe:fallback\n"
+            "5:7:8:9:null-safe:fallback\n"
         );
     }
     let _ = fs::remove_dir_all(&root);
