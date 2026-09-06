@@ -854,6 +854,7 @@ pub(crate) struct Frame {
     pub(crate) finally_exits: Vec<Label>,
     /// Slot parking a `return` value while those finalizers run.
     pub(crate) return_slot: Option<u16>,
+    pub(crate) tail_loop: Option<crate::gen_tailrec::TailLoop>,
 }
 
 impl Frame {
@@ -863,6 +864,7 @@ impl Frame {
             next_slot: 1,
             finally_exits: Vec::new(),
             return_slot: None,
+            tail_loop: None,
         }
     }
 

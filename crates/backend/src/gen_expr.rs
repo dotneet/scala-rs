@@ -777,6 +777,9 @@ pub(crate) fn discarded_unbox(tree: &Tree) -> Option<&Tree> {
 /// explicit `throw`, `???`, `Breaks.break()`, a `return`) is a harmless
 /// no-op for the same reason.
 pub(crate) fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
+    if crate::gen_tailrec::emit_tail_call(asm, frame, ctx, tree) {
+        return;
+    }
     gen_expr_inner(asm, frame, ctx, tree);
     // Null$ is an ABI marker, not a JVM subtype of every reference class.
     // Preserve evaluation and checked casts, then expose the JVM's null
