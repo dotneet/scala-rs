@@ -1,55 +1,64 @@
-# 直接自己末尾呼び出し
+# Direct self-tail calls
 
-`final` / `private` メソッド、object のメソッド、持ち上げ後のローカル def の
-直接自己末尾呼び出しを JVM の後方分岐へ変換する。`@tailrec` がある場合は
-既存の型検査による実効的 final 判定（sealed class なども含む）を利用する。
-相互再帰は対象外。
+Direct self-tail calls in `final` / `private` methods, object methods, and lifted
+local defs are converted into JVM backward branches. An `@tailrec` annotation
+uses the existing type-checker's effective-finality decision, including sealed
+classes. Mutual recursion is outside the scope.
 
-## 意味論
+## Semantics
 
-`gen_tailrec.rs` は型消去後の本体から `if` の枝、`match` の各本体、block の
-最後の式、型注釈の式にある自己呼び出しを選択する。引数、条件、guard、
-ネストした定義、try/finally の内部は末尾位置として扱わない。
+`gen_tailrec.rs` selects self calls in `if` branches, each `match` body, the last
+expression in a block, and typed expressions after erasure. Calls in arguments,
+conditions, guards, nested definitions, and `try`/`finally` bodies are not in
+tail position.
 
-通常の呼び出しと同じコード生成で receiver と全引数を左から順に評価し、
-その後 JVM の引数スロットへ逆順に格納する。これで引数の交換、Long/Double の
-2 スロット値、Unit、型消去による box/unbox、持ち上げた捕捉引数を扱う。
-別 receiver への呼び出しでは、引数評価後に slot 0 を更新する。
-scalac の変換と同様に、追加の null 検査は入れない。`TrcNull.hop(2, null)` は
-null を一度 receiver にしても本体がフィールドを読まず次の周回で元の instance に戻るため
-正常終了する。通常の `invokevirtual` の null receiver とは異なる、実測した nsc の挙動である。
-ループ先は捕捉フィールドのロードより前なので、receiver の変更後に捕捉値も更新する。
+Code generation evaluates the receiver and all arguments from left to right,
+then stores them in reverse order in the JVM argument slots. This handles
+swapped arguments, two-slot `Long`/`Double` values, `Unit`, boxing and unboxing
+introduced by erasure, and lifted captured arguments. For a call with a different
+receiver, slot 0 is updated after the arguments have been evaluated.
+As with scalac's transformation, no extra null check is inserted.
+`TrcNull.hop(2, null)` terminates because the body does not read a field while
+the receiver is null and returns to the original instance on the next iteration.
+This is the observed nsc behavior and differs from a null receiver in an ordinary
+`invokevirtual`. The loop target precedes captured-field loads, so captured values
+are refreshed after the receiver changes.
 
-by-name パラメータを別の by-name 引数へそのまま渡す場合、typer は既存の thunk を
-引き継ぐ。毎周 `() => x` と包装すると、本体がループになっても最終の値評価で
-thunk の鎖を再帰してしまうためである。
+When a by-name parameter is passed unchanged to another by-name argument, the
+typer forwards the existing thunk. Wrapping it as `() => x` on every iteration
+would make the final value evaluation recurse through the thunk chain even after
+the method body had become a loop.
 
-注釈付きメソッドで、型消去後の未対応形状や処理できなかった末尾呼び出しが残る場合は
-コンパイルエラーにする。特に value class の `$extension` メソッドの尾再帰は未対応。
-明示的な `return` 内の自己再帰、try/catch/finally 内の再帰は現行の型検査が拒否する。
-これらを Scala 2.13 互換として扱ったことにはしない。
+An annotated method is rejected when an unsupported erased shape or an unhandled
+tail call remains. In particular, tail recursion in a value class `$extension`
+method is unsupported. The current type checker also rejects self recursion in an
+explicit `return`, and recursion inside `try`/`catch`/`finally`. These forms are
+not claimed to be Scala 2.13 compatible.
 
-## 回帰テスト
+## Regression test
 
 ```sh
 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 cargo test -p scala-rs-cli --release --test trc_tailrec
 ```
 
-`tests/fixtures/trc_deep.scala` は 100 万～200 万回の再帰を `-Xss256k -Xverify:all`
-で実行し、scalac 2.13.16 との出力一致を検査する。wide 引数交換、match/block、
-local def、可変変数の捕捉、receiver 交換、引数の副作用順、curried、generic、Unit、
-by-name、注釈なしの final、引数なしメソッドを含む。`javap -p -c` で各対象メソッドから
-再帰呼び出しが消え、分岐が生成されていることも検査する。
+`tests/fixtures/trc_deep.scala` runs one to two million recursive calls with
+`-Xss256k -Xverify:all` and checks output against scalac 2.13.16. It covers wide
+argument swaps, `match` and blocks, local defs, mutable captures, receiver swaps,
+argument side-effect order, curried and generic calls, `Unit`, by-name arguments,
+unannotated final methods, and parameterless methods. `javap -p -c` also checks
+that recursive calls disappear from each target method and that a branch is
+generated.
 
-`trc_client.scala` は scalac が scala-rs の classfile を参照して別コンパイルする
-相互運用テスト。`trc_bad.scala` と `trc_inputs_bad.scala` は override 可能なメソッド、
-非末尾再帰、receiver 内の再帰、前の引数節内の再帰を両コンパイラが拒否することを検査する。
-`trc_valueclass_unsupported.scala` は scalac が受理する合法なプログラムであり、
-こちらの未対応を明示するためのテスト。Scala の不正プログラムを表す負例ではない。
+`trc_client.scala` is an interoperability test in which scalac compiles a second
+program against scala-rs classfiles. `trc_bad.scala` and `trc_inputs_bad.scala`
+check that both compilers reject overridable methods, non-tail recursion, calls in
+the receiver, and calls in an earlier argument clause. `trc_valueclass_unsupported.scala`
+is a legal program accepted by scalac; it documents this compiler's unsupported
+case and is not a negative Scala test.
 
-## Zulu 15.0.6 の JIT による比較の落とし穴
+## A JIT comparison trap with Zulu 15.0.6
 
-この開発環境の既定 Java は次の版であった。
+The default Java in this development environment was the following version.
 
 ```
 openjdk version "15.0.6" 2022-01-18
@@ -57,18 +66,20 @@ OpenJDK Runtime Environment Zulu15.38+17-CA (build 15.0.6+5-MTS)
 OpenJDK 64-Bit Server VM Zulu15.38+17-CA (build 15.0.6+5-MTS, mixed mode)
 ```
 
-`TrcDeep.matching(2000000, 0)` は 2000000 を返すべきだが、この VM の既定 JIT では
-実行ごとに異なる小さい値になった。**scalac 2.13.16 が出力した同じプログラムでも再現**
-している。scala-rs の出力だけを見てコンパイラの不正変換と判断してはならない。
+`TrcDeep.matching(2000000, 0)` should return 2000000, but this VM's default JIT
+returned a different small value on each run. **The same happened with the
+program emitted by scalac 2.13.16.** Do not infer an invalid compiler transform
+from scala-rs output alone.
 
 ```sh
-# <out> は scala-rs または scalac が trc_deep.scala をコンパイルしたディレクトリ
+# <out> is the directory where scala-rs or scalac compiled trc_deep.scala
 java -Xverify:all -Xss256k -cp <out>:/tmp/scala-rs-lib/scala-library-2.13.16.jar TrcDeep
-# 同じ classfile がこちらでは期待値を返す
+# The same classfiles return the expected value in these modes.
 java -Xint -Xverify:all -Xss256k -cp <out>:/tmp/scala-rs-lib/scala-library-2.13.16.jar TrcDeep
 java -XX:TieredStopAtLevel=1 -Xss256k -cp <out>:/tmp/scala-rs-lib/scala-library-2.13.16.jar TrcDeep
 ```
 
-Temurin 17.0.3 の既定 JIT でも両コンパイラの出力が正しく動くことを確認した。
-回帰テストは環境にある Temurin 17 を優先し、存在しない環境では Java の `-Xint` を使う。
-JIT の内部原因を特定したという主張ではない。
+The default JIT of Temurin 17.0.3 was also checked with output from both
+compilers, and both ran correctly. Regression tests prefer Temurin 17 when it is
+available and use Java's `-Xint` otherwise. This does not claim to identify the
+JIT's internal cause.
