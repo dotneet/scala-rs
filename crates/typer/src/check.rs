@@ -1224,6 +1224,33 @@ fn rec_fun_is_method(tree: &Tree, meth: SymbolId) -> bool {
     }
 }
 
+// Every argument clause and the receiver is evaluated before the recursive
+// call. Looking only at the outer Apply's args missed recursion in a receiver
+// (`f(0).f(n - 1)`) or in an earlier curried argument clause.
+fn count_tailrec_call_inputs(
+    tree: &Tree,
+    meth: SymbolId,
+    nullary: bool,
+    n_tail: &mut u32,
+    n_nontail: &mut u32,
+) {
+    match &tree.kind {
+        TreeKind::Apply { fun, args } => {
+            count_tailrec_call_inputs(fun, meth, nullary, n_tail, n_nontail);
+            for arg in args {
+                count_tailrec_calls(arg, meth, nullary, false, n_tail, n_nontail);
+            }
+        }
+        TreeKind::TypeApply { fun, .. } => {
+            count_tailrec_call_inputs(fun, meth, nullary, n_tail, n_nontail);
+        }
+        TreeKind::Select { qual, .. } => {
+            count_tailrec_calls(qual, meth, nullary, false, n_tail, n_nontail);
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn count_tailrec_calls(
     tree: &Tree,
     meth: SymbolId,
@@ -1255,21 +1282,7 @@ pub(crate) fn count_tailrec_calls(
         } else {
             *n_nontail += 1;
         }
-        match &tree.kind {
-            TreeKind::Apply { args, .. } => {
-                for a in args {
-                    count_tailrec_calls(a, meth, nullary, false, n_tail, n_nontail);
-                }
-            }
-            TreeKind::TypeApply { fun, .. } => {
-                if let TreeKind::Apply { args, .. } = &fun.kind {
-                    for a in args {
-                        count_tailrec_calls(a, meth, nullary, false, n_tail, n_nontail);
-                    }
-                }
-            }
-            _ => {}
-        }
+        count_tailrec_call_inputs(tree, meth, nullary, n_tail, n_nontail);
         return;
     }
     match &tree.kind {

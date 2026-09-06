@@ -2185,6 +2185,24 @@ impl Typer {
         // type, including `=> T`). Otherwise `tryBreakable { throw e }` would
         // skip Function0 and throw in the caller.
         if let Type::ByName(inner) = pt {
+            // Forward an existing by-name parameter's thunk. Wrapping `x`
+            // as `() => x` here builds a new thunk on every tail iteration;
+            // forcing the final argument then overflows despite the loop.
+            // Erasure recognises ByName + a thunk-expected slot and keeps
+            // the original Function0, preserving laziness and evaluation count.
+            if matches!(tree.kind, TreeKind::Ident { .. })
+                && !tree.sym.is_none()
+                && self.st.get(tree.sym).flags.contains(Flags::BYNAME)
+            {
+                let source = unwrap_fn0_or_byname(&self.st.get(tree.sym).ty);
+                // This is genuine subtyping, not weak numeric conformance:
+                // Int -> Long needs a new thunk that widens each forced value.
+                if self.st.is_sub_type(&source, inner) {
+                    tree.ty = Type::ByName(Box::new(source));
+                    return;
+                }
+                self.adapt(tree, inner);
+            }
             if !matches!(&tree.kind, TreeKind::Function { .. }) {
                 let span = tree.span;
                 let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
