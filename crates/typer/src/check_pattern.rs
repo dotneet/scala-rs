@@ -955,7 +955,7 @@ impl Typer {
             .collect();
         for class in classes {
             self.pickle
-                .complete_class_variance(&mut self.st, &mut self.binary, class);
+                .complete_class_pattern_metadata(&mut self.st, &mut self.binary, class);
         }
         for a in &pb {
             let Type::Class { sym: ac, args: aa } = a else {

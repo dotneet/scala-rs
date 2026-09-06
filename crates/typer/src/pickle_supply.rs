@@ -368,9 +368,9 @@ impl PickleSupply {
         std::mem::take(&mut self.unresolved_refs)
     }
 
-    /// Complete only variance from ScalaSignature. JVM signatures lack it,
-    /// including for parent classes reached without a member lookup.
-    pub fn complete_class_variance(
+    /// Complete variance and finality used by typed pattern compatibility.
+    /// Provisional prelude flags must not make an abstract List look final.
+    pub fn complete_class_pattern_metadata(
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,
@@ -387,6 +387,15 @@ impl PickleSupply {
         let Ok(sig) = self.sigs.class_sig(&mut BinSource(bin), &full, module) else {
             return;
         };
+        let flags = st.get(class_sym).flags;
+        st.get_mut(class_sym).flags = Flags(
+            (flags.0 & !Flags::FINAL.0)
+                | if sig.flags & pflags::FINAL != 0 {
+                    Flags::FINAL.0
+                } else {
+                    0
+                },
+        );
         let ids = st.get(class_sym).tparams.clone();
         if ids.len() != sig.tparams.len() {
             return;

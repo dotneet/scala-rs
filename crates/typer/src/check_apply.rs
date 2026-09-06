@@ -1410,16 +1410,6 @@ impl Typer {
                                 };
                             }
                         }
-                    } else if method_name == "apply"
-                        && !sym.is_none()
-                        && self.st.get(self.st.get(sym).owner).name.starts_with("Some")
-                    {
-                        if let Some(a0) = args.first() {
-                            ret = Type::Class {
-                                sym: self.st.some_sym,
-                                args: vec![a0.ty.widen_constant()],
-                            };
-                        }
                     } else if method_name == "map" {
                         if self.is_array_ops_ty(recv_ty.as_ref()) {
                             if let Some(a0) = args.first() {
@@ -1706,7 +1696,12 @@ impl Typer {
                                 }
                             }
                         }
-                    } else if method_name == "apply" && !sym.is_none() {
+                    } else if method_name == "apply"
+                        && !sym.is_none()
+                        && explicit_type_args(fun).is_none()
+                    {
+                        // Factory result reconstruction is inference only;
+                        // explicit type arguments already determined the result.
                         let owner_n = self.st.get(self.st.get(sym).owner).name.clone();
                         if owner_n == "Map$" {
                             if let Some(a0) = args.first() {

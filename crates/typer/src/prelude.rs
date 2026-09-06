@@ -354,20 +354,20 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     let ordered = crate::prelude_ordering2::add_ordered(st);
     crate::prelude_xmlenum::add_delayed_init_app(st);
 
-    // Some companion with apply
+    // Some.apply[A](value: A): Some[A]. Keep this polymorphic so explicit
+    // arguments and inferred arguments use the same ordinary call pipeline.
     let some_mod = module(st, st.scala_pkg, "Some", "scala/Some$");
     let some_cls = st.module_class_of(some_mod);
-    method(
-        st,
-        some_cls,
-        "apply",
-        vec![Type::Any],
-        Type::Class {
+    let some_apply = method(st, some_cls, "apply", vec![], Type::NoType, Intrinsic::None);
+    let some_a = type_param(st, some_apply, "A");
+    st.get_mut(some_apply).tparams = vec![some_a];
+    st.get_mut(some_apply).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(some_a)]],
+        ret: Box::new(Type::Class {
             sym: st.some_sym,
-            args: vec![],
-        },
-        Intrinsic::None,
-    );
+            args: vec![Type::TypeParam(some_a)],
+        }),
+    };
     let mems = st.get(some_cls).members.clone();
     st.get_mut(some_mod).members.extend(mems);
 
