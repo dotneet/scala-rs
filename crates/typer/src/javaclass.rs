@@ -410,7 +410,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let _ = attrs;
         let name = cp.utf8(name_i).ok_or("unsupported classfile field name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile field desc")?;
-        if name == "$outer" && acc & ACC_STATIC == 0 {
+        if name == "$outer" && acc & (ACC_STATIC | ACC_SYNTHETIC) == ACC_SYNTHETIC {
             outer_desc = Some(desc.clone());
         }
         if acc & ACC_STATIC == 0 && instance_fields.len() < 2 {

@@ -340,3 +340,38 @@ fn external_constructor_defaults_are_typed_and_companion_backed() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A user-defined backtick name `$outer` is an ordinary field. It must not be
+/// mistaken for Scala's synthetic enclosing-instance witness while matching
+/// an externally supplied constructor.
+#[test]
+fn external_constructor_user_dollar_outer_is_not_hidden() {
+    let (Some(jar), Some(home), Some(_)) = (scala_library_jar(), temurin17_home(), scalac()) else {
+        return;
+    };
+    let root = tmp_dir();
+    let nsc_base = root.join("nsc-base");
+    let rs_child = root.join("rs-child");
+    fs::create_dir_all(&nsc_base).unwrap();
+    fs::create_dir_all(&rs_child).unwrap();
+    let fixtures = fixtures_dir();
+    compile_scalac_with_flags(
+        &fixtures.join("vsql_user_dollar_outer_base.scala"),
+        &nsc_base,
+        &[],
+        &home,
+        &jar,
+        &["-Xno-forwarders"],
+    );
+    compile_scala_rs(
+        &fixtures.join("vsql_user_dollar_outer_child.scala"),
+        &rs_child,
+        &[&nsc_base],
+        &jar,
+    );
+    assert_eq!(
+        run_java17(&rs_child, &[&nsc_base], &jar, &home),
+        "7:dollar\n"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
