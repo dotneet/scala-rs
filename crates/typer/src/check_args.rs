@@ -1131,7 +1131,17 @@ impl Typer {
                     continue;
                 }
                 if let Type::Method { paramss, .. } = &fun.ty {
-                    if let Some(ty) = paramss.get(ci).and_then(|c| c.get(pi)) {
+                    // `fun.ty` contains only the clauses left after earlier
+                    // Apply nodes. Match the declaration's clause index to
+                    // that remaining suffix before reading the expected type.
+                    // For `slice(a)(b = 0)(session)`, the default for b is in
+                    // clause zero of fun.ty after slice(a), not clause one.
+                    let consumed = decl.paramss.len().saturating_sub(paramss.len());
+                    if let Some(ty) = ci
+                        .checked_sub(consumed)
+                        .and_then(|remaining| paramss.get(remaining))
+                        .and_then(|clause| clause.get(pi))
+                    {
                         return ty.clone();
                     }
                     // Constructor matching flattens curried clauses, while
