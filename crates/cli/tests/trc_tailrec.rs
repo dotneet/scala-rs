@@ -196,14 +196,35 @@ fn trc_rejects_non_tail_and_overridable() {
     }
 }
 #[test]
-fn trc_unsupported_valueclass_is_not_silently_accepted() {
+fn trc_valueclass_dual_run_and_static_abi() {
     if !prerequisites() {
         return;
     }
+    let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
+    let src = fixture("trc_valueclass.scala");
+    let ours = dir("valueclass-ours");
+    let reference_out = dir("valueclass-reference");
+    let output = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "--scala-library",
+            jar,
+            "-d",
+            ours.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scala-rs value-class tailrec failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let reference = Command::new("/tmp/scala-2.13.16/bin/scalac")
-        .arg(fixture("trc_valueclass_unsupported.scala"))
+        .arg(&src)
         .arg("-d")
-        .arg(dir("valueclass-reference"))
+        .arg(&reference_out)
         .output()
         .unwrap();
     assert!(
@@ -211,26 +232,84 @@ fn trc_unsupported_valueclass_is_not_silently_accepted() {
         "legal Scala: {}",
         String::from_utf8_lossy(&reference.stderr)
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
-        .arg("compile")
-        .arg(fixture("trc_valueclass_unsupported.scala"))
-        .args([
-            "--scala-library",
-            "/tmp/scala-rs-lib/scala-library-2.13.16.jar",
-            "-d",
-        ])
-        .arg(dir("valueclass"))
+    let expected = fs::read(fixture("expected/trc_valueclass.txt")).unwrap();
+    for out in [&ours, &reference_out] {
+        let result = java()
+            .args([
+                "-Xverify:all",
+                "-Xss256k",
+                "-cp",
+                &format!("{}:{jar}", out.display()),
+                "TrcValueclass",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}: {}",
+            out.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, expected, "{}", out.display());
+    }
+
+    // A separately compiled scalac client must resolve the static extension
+    // ABI emitted by scala-rs and run the same loop without boxing the receiver.
+    let client = dir("valueclass-client");
+    let result = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .arg(fixture("trc_valueclass_client.scala"))
+        .arg("-classpath")
+        .arg(format!("{}:{jar}", ours.display()))
+        .arg("-d")
+        .arg(&client)
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    let diag = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
     assert!(
-        diag.contains("unsupported erased tail-call shape"),
-        "{diag}"
+        result.status.success(),
+        "scalac value-class client failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let result = java()
+        .args([
+            "-Xverify:all",
+            "-Xss256k",
+            "-cp",
+            &format!("{}:{}:{jar}", client.display(), ours.display()),
+            "TrcValueclassClient",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "value-class client failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.stdout, expected);
+
+    let javap = Command::new("javap")
+        .args([
+            "-p",
+            "-c",
+            "-s",
+            "-classpath",
+            ours.to_str().unwrap(),
+            "TrcLong",
+        ])
+        .output()
+        .unwrap();
+    assert!(javap.status.success());
+    let dis = String::from_utf8(javap.stdout).unwrap();
+    let body = dis
+        .split("\n\n")
+        .find(|part| part.contains("loop$extension"))
+        .expect("TrcLong.loop$extension javap body");
+    assert!(body.contains("descriptor: (JIJ)J"), "{body}");
+    assert!(body.contains("goto"), "tail loop branch missing:\n{body}");
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.contains("invoke") && line.contains("loop")),
+        "recursive extension call remains:\n{body}"
     );
 }
 #[test]
