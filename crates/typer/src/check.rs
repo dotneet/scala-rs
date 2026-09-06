@@ -172,6 +172,8 @@ pub struct ClasspathPickleMethod {
     pub name: String,
     pub param_names: Vec<String>,
     pub param_types: Vec<ClasspathType>,
+    /// Raw pickle flags for each value parameter, including DEFAULTPARAM.
+    pub param_flags: Vec<u64>,
     pub ret: ClasspathType,
     pub tparams: Vec<ClasspathTypeParam>,
     pub is_val: bool,

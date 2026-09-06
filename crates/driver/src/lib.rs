@@ -834,6 +834,7 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                             name: m.name,
                             param_names: m.param_names,
                             param_types: m.param_types.iter().map(cp_type).collect(),
+                            param_flags: m.param_flags,
                             ret: cp_type(&m.ret),
                             tparams: m.tparams.iter().map(cp_tparam).collect(),
                             is_val: m.is_val,

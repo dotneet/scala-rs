@@ -297,7 +297,7 @@ fn external_constructor_defaults_are_typed_and_companion_backed() {
     );
     assert_eq!(
         run_java17(&rs_child, &[&nsc_base], &jar, &home),
-        "42\n42\ncurried:42\n42\n"
+        "42\n42\ncurried:42\n42\n2\n"
     );
 
     // The getter's result is checked against the substituted constructor

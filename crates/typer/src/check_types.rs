@@ -3035,94 +3035,11 @@ impl Typer {
             let mcls = self.st.module_class_of(module);
             self.ensure_classfile_members_loaded(mcls, "", span);
         }
-        let mut defaults = std::collections::HashSet::new();
-        for owner in [Some(class_id), self.st.companion_module(class_id)]
-            .into_iter()
-            .flatten()
-            .map(|id| self.st.module_class_of(id))
-        {
-            for id in self.st.get(owner).members.iter().copied() {
-                let name = &self.st.get(id).name;
-                let Some(n) = name.strip_prefix("$lessinit$greater$default$") else {
-                    continue;
-                };
-                if let Ok(n) = n.parse::<usize>() {
-                    defaults.insert(n);
-                }
-            }
-        }
-        if defaults.is_empty() {
-            return;
-        }
-        let ctors: Vec<SymbolId> = self
-            .st
-            .lookup_member(class_id, "<init>")
-            .into_iter()
-            .filter(|&ctor| self.st.get(ctor).owner == class_id)
-            .collect();
-        let fields = self.st.get(class_id).ctor_fields.clone();
-        // The JVM name is shared by primary and auxiliary constructors, but
-        // only the primary constructor owns `$lessinit$greater$default$n`.
-        // Constructor fields provide a source-parameter shape for the common
-        // case. A classfile-only constructor may have synthetic parameter
-        // names (`x$0`, ...), so names are preferred but types remain a
-        // fallback. Every selected constructor must also have all defaulted
-        // slots; this rejects a partial pickled view of a curried primary
-        // constructor in favor of its full classfile descriptor. If more than
-        // one constructor remains possible, decline rather than attach a
-        // primary getter to an auxiliary constructor.
-        let highest_default = defaults.iter().copied().max().unwrap_or(0);
-        let matches_fields = |params: &[SymbolId], names: bool| {
-            if params.len() < highest_default {
-                return false;
-            }
-            let mut from = 0;
-            fields.iter().all(|&field| {
-                let field_info = self.st.get(field);
-                let Some(offset) = params[from..].iter().position(|&param| {
-                    let param_info = self.st.get(param);
-                    (!names || param_info.name == field_info.name) && param_info.ty == field_info.ty
-                }) else {
-                    return false;
-                };
-                from += offset + 1;
-                true
-            })
-        };
-        let primary: Vec<SymbolId> = if !fields.is_empty() {
-            let named: Vec<SymbolId> = ctors
-                .iter()
-                .copied()
-                .filter(|&ctor| matches_fields(&self.st.get(ctor).params, true))
-                .collect();
-            if named.len() == 1 {
-                named
-            } else {
-                let typed: Vec<SymbolId> = ctors
-                    .iter()
-                    .copied()
-                    .filter(|&ctor| matches_fields(&self.st.get(ctor).params, false))
-                    .collect();
-                if typed.len() == 1 {
-                    typed
-                } else {
-                    Vec::new()
-                }
-            }
-        } else if ctors.len() == 1 {
-            ctors
-        } else {
-            Vec::new()
-        };
-        for ctor in primary {
-            let params = self.st.get(ctor).params.clone();
-            for n in defaults.iter().copied() {
-                if let Some(&param) = params.get(n.saturating_sub(1)) {
-                    let flags = self.st.get(param).flags.with(Flags::DEFAULTPARAM);
-                    self.st.get_mut(param).flags = flags;
-                }
-            }
-        }
+        // Constructor default ownership is source metadata, not a property of
+        // the JVM getter name. Read and merge each pickled constructor against
+        // its real descriptor; this also covers an auxiliary constructor whose
+        // default getter is forwarded from the class.
+        self.supply_binary_ctors(class_id);
     }
 
     /// `resolve_type_name`, after completing any alias the name binds to. A

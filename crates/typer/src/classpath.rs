@@ -394,6 +394,13 @@ fn install_ctor(
         } else {
             add_term(st, owner, &pname, ty)
         };
+        if m.param_flags
+            .get(i)
+            .is_some_and(|f| f & scala_rs_pickle::read::pflags::DEFAULTPARAM != 0)
+        {
+            let flags = st.get(fid).flags.with(Flags::DEFAULTPARAM);
+            st.get_mut(fid).flags = flags;
+        }
         mark_via_accessor(st, fid, &pname, accessors);
         fields.push(fid);
     }

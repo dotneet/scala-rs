@@ -205,6 +205,11 @@ pub struct PickledMethod {
     pub name: String,
     pub param_names: Vec<String>,
     pub param_types: Vec<PickledType>,
+    /// Raw pickle flags for each value parameter.  The classfile has no
+    /// parameter-level `DEFAULTPARAM` bit, so a classpath reader needs this
+    /// source metadata to attach defaults to the constructor that declared
+    /// them rather than to every JVM overload.
+    pub param_flags: Vec<u64>,
     pub ret: PickledType,
     pub tparams: Vec<PickledTypeParam>,
     pub is_val: bool,
@@ -3305,19 +3310,48 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             continue;
         }
         let (tparams, rest) = peel_info(&entries, *info);
-        if let Some(Entry::MethodTpe { ret, params }) = entries.get(rest as usize) {
+        if let Some(Entry::MethodTpe {
+            ret: first_ret,
+            params: first_params,
+        }) = entries.get(rest as usize)
+        {
+            // Constructors are pickled as a method type per source parameter
+            // clause.  The classpath ABI needs the flattened JVM parameter
+            // order, but the old subset reader kept only the first clause;
+            // that dropped defaults from a curried constructor entirely.
+            let mut params = first_params.clone();
+            let mut ret = *first_ret;
+            if mname == "<init>" {
+                loop {
+                    let Some(Entry::MethodTpe {
+                        ret: next_ret,
+                        params: next_params,
+                    }) = entries.get(ret as usize)
+                    else {
+                        break;
+                    };
+                    params.extend(next_params.iter().copied());
+                    ret = *next_ret;
+                }
+            }
             let mut param_names = Vec::new();
             let mut param_types = Vec::new();
-            for p in params {
+            let mut param_flags = Vec::new();
+            for p in &params {
                 if let Some(Entry::ValSym {
-                    name: pn, info: pt, ..
+                    name: pn,
+                    info: pt,
+                    flags: pf,
+                    ..
                 }) = entries.get(*p as usize)
                 {
                     param_names.push(name_of(&entries, *pn));
                     param_types.push(type_of(&entries, *pt, 0));
+                    param_flags.push(*pf);
                 } else {
                     param_types.push(type_of(&entries, *p, 0));
                     param_names.push(format!("x${}", param_names.len()));
+                    param_flags.push(0);
                 }
             }
             let is_accessor = (*flags & (1u64 << 27)) != 0; // ACCESSOR
@@ -3327,7 +3361,8 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 name: mname.clone(),
                 param_names,
                 param_types,
-                ret: type_of(&entries, *ret, 0),
+                param_flags,
+                ret: type_of(&entries, ret, 0),
                 tparams,
                 is_val: is_accessor,
                 is_ctor: mname == "<init>",
@@ -3344,6 +3379,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 name: mname,
                 param_names: Vec::new(),
                 param_types: Vec::new(),
+                param_flags: Vec::new(),
                 ret: type_of(&entries, rest, 0),
                 tparams,
                 is_val: is_accessor,
