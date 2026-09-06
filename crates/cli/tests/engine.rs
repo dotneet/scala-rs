@@ -116,6 +116,36 @@ fn compile(name: &str, out: &Path, extra: &[&Path]) -> std::process::Output {
         .expect("run scala-rs compile")
 }
 
+fn compile_with_tmpdir(
+    name: &str,
+    out: &Path,
+    extra: &[&Path],
+    tmpdir: &Path,
+) -> std::process::Command {
+    let jar = scala_library_jar().expect("scala-library");
+    let reflect = scala_reflect_jar().expect("scala-reflect");
+    let mut cp = reflect.display().to_string();
+    for e in extra {
+        cp.push(':');
+        cp.push_str(&e.display().to_string());
+    }
+    let mut command = Command::new(bin());
+    command.env("TMPDIR", tmpdir).args([
+        "compile",
+        fixtures_dir()
+            .join(format!("{name}.scala"))
+            .to_str()
+            .unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+        "-cp",
+        &cp,
+        "--scala-library",
+        jar.to_str().unwrap(),
+    ]);
+    command
+}
+
 /// Everything the engine needs. Returns false (and says so) when the machine
 /// cannot run the test at all.
 fn prerequisites(tag: &str) -> bool {
@@ -183,6 +213,68 @@ fn eg_macros_expand_and_run() {
     );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
+}
+
+/// Two compiler processes may populate the same engine cache concurrently.
+/// The cache must expose either the old complete class or the new complete
+/// class, never a source directory whose class file is still being written.
+#[test]
+fn concurrent_engine_cache_publication_is_safe() {
+    if !prerequisites("concurrent engine cache") {
+        return;
+    }
+    let impls = tmp_dir("cache-race-impl");
+    let cache = tmp_dir("cache-race-tmp");
+    let output = compile("eg_impl", &impls, &[]);
+    assert!(
+        output.status.success(),
+        "compile eg_impl failed: {}",
+        diagnostics(&output)
+    );
+
+    let mut children = Vec::new();
+    let mut outputs = Vec::new();
+    let mut dirs = Vec::new();
+    for n in 0..2 {
+        let out = tmp_dir(&format!("cache-race-use-{n}"));
+        let mut command = compile_with_tmpdir("eg_use", &out, &[&impls], &cache);
+        children.push(command.spawn().expect("spawn concurrent scala-rs compile"));
+        dirs.push(out);
+    }
+    for child in children {
+        outputs.push(
+            child
+                .wait_with_output()
+                .expect("wait for concurrent compile"),
+        );
+    }
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "concurrent eg_use compile failed: {}",
+            diagnostics(&output)
+        );
+    }
+
+    let mut classes = Vec::new();
+    for entry in fs::read_dir(&cache).expect("read cache race directory") {
+        let path = entry.expect("cache entry").path();
+        let class = path.join("ScalaRsMacroEngine.class");
+        if class.is_file() {
+            let bytes = fs::read(&class).expect("read published engine class");
+            assert!(bytes.len() >= 8, "published engine class is truncated");
+            assert_eq!(&bytes[0..4], &[0xca, 0xfe, 0xba, 0xbe]);
+            assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 52);
+            classes.push(class);
+        }
+    }
+    assert_eq!(classes.len(), 1, "cache publication left duplicate classes");
+
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&cache);
+    for dir in dirs {
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 /// The same two files through real scalac 2.13.16.
