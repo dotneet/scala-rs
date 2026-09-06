@@ -461,14 +461,11 @@ fn collect_variant_symbols(
             collect_variant_symbols(rhs, st, owner, original, primitive, map);
         }
         TreeKind::ValDef { tpt, rhs, .. } => {
-            let owner = if tree.sym.is_none() {
-                current_owner
-            } else {
+            if !tree.sym.is_none() {
                 clone_one_symbol(tree.sym, current_owner, st, original, primitive, map);
-                map[&tree.sym]
-            };
-            collect_variant_symbols(tpt, st, owner, original, primitive, map);
-            collect_variant_symbols(rhs, st, owner, original, primitive, map);
+            }
+            collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
+            collect_variant_symbols(rhs, st, current_owner, original, primitive, map);
         }
         TreeKind::Function { vparams, body } => {
             for param in vparams {
