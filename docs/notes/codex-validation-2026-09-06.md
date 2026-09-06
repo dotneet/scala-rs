@@ -1,9 +1,8 @@
 # Codex continuation: validation in progress
 
-This is a progress record, not a completed compatibility claim or a new
-baseline. The implementation on `main` remains the implementation measured at
-`902da04`; subsequent main commits currently change documentation and test
-harnesses only. Read `tests/BASELINE.md` rather than remeasuring the old tree.
+This is a progress record, not a completed compatibility claim. Recovery was
+independently measured at `d9eb5dc` and merged into local main as `4b0568af`.
+Read the updated `tests/BASELINE.md` rather than remeasuring the old tree.
 
 ## Current decision state
 
@@ -16,9 +15,11 @@ messages.
   all 1490 Slick class loads (zero failures or incomplete loads), structural
   lint, and Slick MODE=b execution: 12 programs, 36/36 attempts. Measurements
   are Slick 0 errors / 1490 classes, cats 350 errors / 81 files, gitbucket
-  912 / 111, and Scala library 1613 / 171. Full corpus validation is still
-  running in session `28152`; specialization remains 2 match / 26 differ /
-  9 no-compile, with zero specialized classes. It is not yet merge-approved.
+  912 / 111, and Scala library 1613 / 171. Session `28152` completed with
+  exit 0: the full corpus has 5324 unique six-field records, pos 1053/461/345,
+  neg 659/377/369, run 587/920/553. Specialization remains 2 match / 26 differ /
+  9 no-compile, with zero specialized classes. Recovery is merged; the new
+  per-test baseline is `tests/baselines/corpus-4b0568af.tsv`.
 - The original three separate branch corpus runs are complete and each has
   5324 unique, six-field records. Nullcross matches the recorded aggregate
   baseline. Cats and implicitmemo each lose only `run/t5923b` relative to the
@@ -40,9 +41,11 @@ messages.
   An earlier ABI probe accidentally used the agent's stale release binary
   and is explicitly invalidated; only `parent-6f26485-*` evidence is current.
 - Gitbucket import completion plus a conservative implicit candidate filter
-  is frozen at `3f4e170` in `codex/gb-validation`. Session `18153` runs the
-  release workspace suite before a 180-second bounded gitbucket measurement.
-  No completed performance result is claimed yet.
+  is at `3f4e170` in `codex/gb-validation`. Session `18153` completed the
+  release workspace suite with 2231 passing tests and one diagnostic-text
+  failure in `slickimpl`; gitbucket timing was not run. The changed diagnostic
+  still rejects the invariant `BaseTypedType[Any]` assignment, but its type
+  provenance must be reviewed before changing the expectation.
 - External constructor default getters (`c74dd7b`, `1140fb6`) remain held.
   Generic and nested cases now have focused evidence, but assigning default
   flags to every overloaded constructor from getter names requires review.
@@ -52,7 +55,16 @@ Machine-readable process/commit state is in
 `/tmp/scala-rs-codex/integration/candidate-d9eb5dc`. The Slick runner now keeps
 MODE=a and MODE=b client artifacts in separate `progs-a` / `progs-b`
 directories: switching directions previously overwrote successful execution
-evidence. Compiler outputs may still be explicitly reused.
+evidence. Compiler outputs may still be explicitly reused. The coordinator
+reran MODE=b with unchanged recovery output (36/36), then MODE=a for one
+client: all 116 MODE=b artifacts remained byte-identical. Invalid MODE values
+now fail with exit 2. See `slick-preservation.json` in the recovery evidence.
+
+The two newly passing corpus identities have different explanations:
+`t5629` is the generic-owner override-bound correction, while `t12478` is a
+UTF-8 locale effect. The same recovery classfiles print the expected Unicode
+under `C.UTF-8` or explicit `-Dfile.encoding=UTF-8`, and question marks under
+`LC_ALL=C`. Do not attribute that second result to compiler implementation.
 
 ## Preserved implementations
 
