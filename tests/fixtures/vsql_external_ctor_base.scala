@@ -8,6 +8,9 @@ class VSqlAuxDefaultBase(x: Int) {
   def this(s: String = "ok") = this(s.length)
   def value: Int = x
 }
+class VSqlExactOverloadBase(val x: String, val y: Int = 7) {
+  def this(y: Int) = this("exact", y)
+}
 
 object VSqlNested {
   class Base[T](val value: T = 42)

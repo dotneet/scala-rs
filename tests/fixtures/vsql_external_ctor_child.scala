@@ -3,6 +3,7 @@ class VSqlNumericChild extends VSqlNumericBase()
 class VSqlCurriedChild extends VSqlCurriedBase("curried")()
 class VSqlNestedChild extends VSqlNested.Base[Int]()
 class VSqlAuxDefaultChild extends VSqlAuxDefaultBase()
+class VSqlExactOverloadChild extends VSqlExactOverloadBase(5)
 
 object Main {
   def main(args: Array[String]): Unit = {
@@ -11,5 +12,6 @@ object Main {
     println(new VSqlCurriedChild().prefix + ":" + new VSqlCurriedChild().value)
     println(new VSqlNestedChild().value)
     println(new VSqlAuxDefaultChild().value)
+    println(new VSqlExactOverloadChild().x + ":" + new VSqlExactOverloadChild().y)
   }
 }

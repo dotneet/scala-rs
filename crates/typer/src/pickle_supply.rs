@@ -904,7 +904,7 @@ impl PickleSupply {
         if !seen.insert(key) {
             return false;
         }
-        let Some(desc) = self.ctor_desc(bin, internal, &want) else {
+        let Some(desc) = self.ctor_desc(st, bin, class_sym, internal, &want) else {
             trace(format_args!(
                 "{internal}#<init>: no constructor in the class file matches {want:?}"
             ));
@@ -919,6 +919,9 @@ impl PickleSupply {
         let source_params: Vec<SymbolId> = paramss_sym.iter().flatten().copied().collect();
         let source_param_types: Vec<Type> = paramss_ty.iter().flatten().cloned().collect();
         let source_paramss = vec![source_params.clone()];
+        let hidden_outer = self
+            .java_class(bin, internal)
+            .is_some_and(|c| has_hidden_outer(st, class_sym, c));
         let existing = st.get(class_sym).members.iter().copied().find(|&id| {
             if broken.contains(&id) {
                 return false;
@@ -927,13 +930,28 @@ impl PickleSupply {
             if s.name != "<init>" || s.owner != class_sym {
                 return false;
             }
-            s.jvm_name == desc || (s.jvm_name.is_empty() && ctor_params_match(st, id, &want))
+            s.jvm_name == desc
+                || (s.jvm_name.is_empty() && ctor_params_match(st, id, &want, hidden_outer))
         });
         if let Some(existing) = existing {
             // Keep the JVM descriptor already read from the classfile, but
             // replace its erased parameter view with the source-shaped one.
             // An inner class may have one hidden leading outer parameter in
             // the descriptor; it is supplied by codegen, not by Scala source.
+            let old_params = st.get(existing).params.clone();
+            st.get_mut(existing)
+                .members
+                .retain(|id| !old_params.contains(id));
+            st.get_mut(m).members.clear();
+            st.get_mut(m).params.clear();
+            st.get_mut(m).paramss.clear();
+            st.get_mut(m).ty = Type::NoType;
+            for &param in &source_params {
+                st.get_mut(param).owner = existing;
+                if !st.get(existing).members.contains(&param) {
+                    st.get_mut(existing).members.push(param);
+                }
+            }
             st.set_jvm_name(existing, desc);
             st.get_mut(existing).params = source_params.clone();
             st.get_mut(existing).paramss = source_paramss.clone();
@@ -965,12 +983,16 @@ impl PickleSupply {
     /// declines.
     fn ctor_desc(
         &mut self,
+        st: &SymbolTable,
         bin: &mut BinaryIndex,
+        class_sym: SymbolId,
         internal: &str,
         want: &[Option<String>],
     ) -> Option<String> {
         let jc = self.java_class(bin, internal)?;
-        let mut hits: Vec<String> = Vec::new();
+        let hidden_outer = has_hidden_outer(st, class_sym, jc);
+        let mut exact_hits: Vec<String> = Vec::new();
+        let mut hidden_hits: Vec<String> = Vec::new();
         for jm in &jc.methods {
             if jm.name != "<init>" || jm.access & (ACC_BRIDGE | ACC_SYNTHETIC | ACC_STATIC) != 0 {
                 continue;
@@ -978,7 +1000,9 @@ impl PickleSupply {
             let Some(got) = desc_params(&jm.desc) else {
                 continue;
             };
-            if got.len() != want.len() && got.len() != want.len() + 1 {
+            let exact = got.len() == want.len();
+            let hidden = hidden_outer && got.len() == want.len() + 1;
+            if !exact && !hidden {
                 continue;
             }
             let tail = &got[got.len() - want.len()..];
@@ -986,12 +1010,30 @@ impl PickleSupply {
                 Some(w) => g == w,
                 None => g.starts_with('L') || g.starts_with('['),
             });
-            if ok && !hits.contains(&jm.desc) {
-                hits.push(jm.desc.clone());
+            if ok {
+                let hits = if exact {
+                    &mut exact_hits
+                } else {
+                    &mut hidden_hits
+                };
+                if !hits.contains(&jm.desc) {
+                    hits.push(jm.desc.clone());
+                }
             }
         }
+        // A non-inner class can have a legitimate overload whose source
+        // parameters happen to equal the tail of another descriptor. It must
+        // use the exact descriptor; accepting a tail by arity would silently
+        // bind source metadata to the wrong constructor. A non-static nested
+        // class always has the hidden outer slot, so only its tail candidates
+        // are eligible.
+        let hits = if hidden_outer {
+            hidden_hits
+        } else {
+            exact_hits
+        };
         if hits.len() == 1 {
-            hits.pop()
+            hits.into_iter().next()
         } else {
             None
         }
@@ -4608,11 +4650,32 @@ pub(crate) fn desc_arity(desc: &str) -> Option<usize> {
     Some(n)
 }
 
+/// Whether `class_sym`'s JVM constructor has the hidden enclosing-instance
+/// parameter that precedes source parameters. The classpath symbol owner and
+/// the classfile's static-nested flag are both required: a top-level class
+/// whose source name contains `$` is not an inner class, while a class nested
+/// in an object is static and has no `$outer` slot.
+fn has_hidden_outer(st: &SymbolTable, class_sym: SymbolId, classfile: &JavaClass) -> bool {
+    if class_sym.is_none()
+        || classfile.nested_static
+        || st.get(class_sym).flags.contains(Flags::STATIC)
+    {
+        return false;
+    }
+    let owner = st.get(class_sym).owner;
+    !owner.is_none() && st.get(owner).is_class_like() && owner != class_sym
+}
+
 /// Whether an already-installed constructor has the source shape that a
-/// pickle just resolved.  A non-static inner class contributes one hidden
-/// leading outer parameter to its JVM descriptor, so compare the source shape
-/// with the descriptor's tail.
-fn ctor_params_match(st: &SymbolTable, ctor: SymbolId, want: &[Option<String>]) -> bool {
+/// pickle just resolved. A leading extra parameter is accepted only when the
+/// class metadata proves this is a non-static inner class; arity alone must
+/// never bind a non-inner overload to a source constructor.
+fn ctor_params_match(
+    st: &SymbolTable,
+    ctor: SymbolId,
+    want: &[Option<String>],
+    hidden_outer: bool,
+) -> bool {
     let got: Vec<Option<String>> = st
         .get(ctor)
         .params
@@ -4621,7 +4684,7 @@ fn ctor_params_match(st: &SymbolTable, ctor: SymbolId, want: &[Option<String>]) 
         .collect();
     let tail = if got.len() == want.len() {
         Some(got.as_slice())
-    } else if got.len() == want.len() + 1 {
+    } else if hidden_outer && got.len() == want.len() + 1 {
         Some(&got[1..])
     } else {
         None
