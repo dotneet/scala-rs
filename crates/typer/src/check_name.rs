@@ -1492,7 +1492,7 @@ impl Typer {
     /// Returns the modules when there are any, so term position binds them
     /// (SLS 2: the two namespaces are separate, and this is term position);
     /// otherwise the classes it was given, unchanged.
-    fn expose_class_companion(
+    pub(crate) fn expose_class_companion(
         &mut self,
         found: &[SymbolId],
         name: &str,
