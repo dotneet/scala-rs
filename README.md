@@ -32,6 +32,8 @@ makes no claim of conformance to the language specification. What exists today:
 分割コンパイルを両方向で検査しています。正常な継承の JVM 実行と、不正な
 境界変更の拒否を確認するテストは `singleton_metadata` です。
 [修正の範囲と検証方法](docs/notes/singleton-metadata-parent.md) を参照してください。
+外部 trait の `hashCode` / `toString` と組み込み `Any` の上書き関係も、
+[scalac 相互運用テスト](docs/notes/inherited-universal-override.md) で検査します。
 
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and

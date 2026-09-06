@@ -802,9 +802,21 @@ impl Typer {
                         sym: oo,
                         args: vec![],
                     };
-                    let parent = Type::Class {
-                        sym: owner,
-                        args: vec![],
+                    // The universal owners occur as primitive Type variants
+                    // in parent lists, not Class nodes. Comparing with a
+                    // synthetic Class(Any) makes every ordinary override of
+                    // Any.hashCode look like an unrelated overload.
+                    let parent = if owner == self.st.any_sym {
+                        Type::Any
+                    } else if owner == self.st.anyref_sym {
+                        Type::AnyRef
+                    } else if owner == self.st.anyval_sym {
+                        Type::AnyVal
+                    } else {
+                        Type::Class {
+                            sym: owner,
+                            args: vec![],
+                        }
                     };
                     self.st.is_sub_type(&child, &parent)
                         // Inheriting is not overriding: nsc keeps `f(Int)`
