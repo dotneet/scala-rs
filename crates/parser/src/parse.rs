@@ -5472,13 +5472,15 @@ fn desugar_for(
 
     /// `{ x => x match { case pat => <yes>; case _ => false } }`, as nsc's
     /// `withFilter` insertion does. `yes = None` gives the plain refutability
-    /// filter (`true`); passing a guard expression instead is how a guard on a
-    /// destructuring generator gets to see what the pattern binds.
+    /// filter (`true`) with a `false` fallback; passing a guard expression
+    /// instead emits the single-case match nsc uses for a guard on a
+    /// destructuring generator or value-definition tuple.
     fn filter_lambda(p: &mut Parser, pat: &Tree, yes: Option<Tree>) -> Tree {
         let span = pat.span;
         p.placeholder_id += 1;
         let name = format!("x$forf{}", p.placeholder_id);
         let sel = p.alloc(span, TreeKind::Ident { name: name.clone() });
+        let has_guard = yes.is_some();
         let yes = yes.unwrap_or_else(|| {
             p.alloc(
                 span,
@@ -5487,33 +5489,34 @@ fn desugar_for(
                 },
             )
         });
-        let no = p.alloc(
-            span,
-            TreeKind::Literal {
-                lit: Lit::Boolean(false),
-            },
-        );
         let g1 = p.empty(span);
-        let g2 = p.empty(span);
-        let wild = p.alloc(span, TreeKind::Wildcard);
+        let mut cases = vec![CaseDef {
+            pat: pat.clone(),
+            guard: g1,
+            body: yes,
+            span,
+        }];
+        if !has_guard {
+            let no = p.alloc(
+                span,
+                TreeKind::Literal {
+                    lit: Lit::Boolean(false),
+                },
+            );
+            let g2 = p.empty(span);
+            let wild = p.alloc(span, TreeKind::Wildcard);
+            cases.push(CaseDef {
+                pat: wild,
+                guard: g2,
+                body: no,
+                span,
+            });
+        }
         let m = p.alloc(
             span,
             TreeKind::Match {
                 selector: Box::new(sel),
-                cases: vec![
-                    CaseDef {
-                        pat: pat.clone(),
-                        guard: g1,
-                        body: yes,
-                        span,
-                    },
-                    CaseDef {
-                        pat: wild,
-                        guard: g2,
-                        body: no,
-                        span,
-                    },
-                ],
+                cases,
             },
         );
         let tpt = p.empty(span);
