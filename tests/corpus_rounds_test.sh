@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
   for (i = 1; i < argc; ++i) {
     if (i > 1) fputc(' ', log);
     fputs(argv[i], log);
-    if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) out = argv[++i];
+    if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) out = argv[i + 1];
   }
   fputc('\n', log);
   fclose(log);
