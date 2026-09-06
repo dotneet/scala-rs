@@ -22,6 +22,7 @@ pub use crate::gen_lambda::collect_captured_vars;
 pub(crate) use crate::gen_lambda::*;
 pub(crate) use crate::gen_match::*;
 pub(crate) use crate::gen_object::*;
+use scala_rs_span::Span;
 
 /// Options for [`emit_opts`].
 #[derive(Clone, Debug, Default)]
@@ -65,8 +66,18 @@ pub struct EmitOpts {
     pub generic_sigs: Option<Rc<crate::sig::GenericSignatures>>,
 }
 
+/// A backend limitation discovered while lowering a typed tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmitError {
+    pub span: Span,
+    pub message: String,
+}
+
+/// Result of emitting one compilation unit.
+pub type EmitResult = Result<Vec<EmittedClass>, Vec<EmitError>>;
+
 /// Walk a typed compilation unit and emit classes (private-runtime ABI).
-pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> Vec<EmittedClass> {
+pub fn emit(tree: &Tree, st: &SymbolTable, source_name: &str) -> EmitResult {
     emit_opts(tree, st, source_name, EmitOpts::default())
 }
 
@@ -228,12 +239,7 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
 }
 
 /// Walk a typed compilation unit and emit classes.
-pub fn emit_opts(
-    tree: &Tree,
-    st: &SymbolTable,
-    source_name: &str,
-    opts: EmitOpts,
-) -> Vec<EmittedClass> {
+pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpts) -> EmitResult {
     // A shared map already holds this unit's own trait members: the driver
     // harvests every unit of the run before emitting any, and the harvest is a
     // function of the tree alone, so doing it again here would insert the same
@@ -249,7 +255,9 @@ pub fn emit_opts(
     let mut g = Gen {
         st,
         source_name,
+        unit_span: tree.span,
         out: Vec::new(),
+        emit_errors: Rc::new(RefCell::new(Vec::new())),
         extras: RefCell::new(Vec::new()),
         lambda_n: Cell::new(0),
         traits,
@@ -278,13 +286,20 @@ pub fn emit_opts(
         "a hoisted lambda body was queued but never written to a classfile"
     );
     g.out.append(&mut g.extras.borrow_mut());
-    g.out
+    let errors = g.emit_errors.borrow().clone();
+    if errors.is_empty() {
+        Ok(g.out)
+    } else {
+        Err(errors)
+    }
 }
 
 pub(crate) struct Gen<'a> {
     pub(crate) st: &'a SymbolTable,
     pub(crate) source_name: &'a str,
+    pub(crate) unit_span: Span,
     pub(crate) out: Vec<EmittedClass>,
+    pub(crate) emit_errors: Rc<RefCell<Vec<EmitError>>>,
     pub(crate) extras: RefCell<Vec<EmittedClass>>,
     pub(crate) lambda_n: Cell<u32>,
     /// Lambda bodies hoisted out of closures, waiting to be written as
@@ -391,6 +406,7 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) class_sym: SymbolId,
     pub(crate) class_name: &'a str,
     pub(crate) ret_ty: Type,
+    pub(crate) emit_errors: Rc<RefCell<Vec<EmitError>>>,
     pub(crate) extras: &'a RefCell<Vec<EmittedClass>>,
     pub(crate) lambda_n: &'a Cell<u32>,
     /// Lambda bodies waiting to become static methods of `hoist_owner`.
@@ -442,12 +458,14 @@ pub(crate) fn emit_ctx<'a>(
     source: &'a str,
     library_abi: bool,
     boxed_vars: &'a HashSet<SymbolId>,
+    emit_errors: Rc<RefCell<Vec<EmitError>>>,
 ) -> EmitCtx<'a> {
     EmitCtx {
         st,
         class_sym,
         class_name,
         ret_ty,
+        emit_errors,
         extras,
         lambda_n,
         lambda_bodies,
@@ -461,6 +479,21 @@ pub(crate) fn emit_ctx<'a>(
         boxed_vars,
         value_ext: None,
     }
+}
+
+pub(crate) fn report_emit_error(
+    errors: &Rc<RefCell<Vec<EmitError>>>,
+    span: Span,
+    message: impl Into<String>,
+) {
+    errors.borrow_mut().push(EmitError {
+        span,
+        message: message.into(),
+    });
+}
+
+pub(crate) fn report_ctx_error(ctx: &EmitCtx<'_>, span: Span, message: impl Into<String>) {
+    report_emit_error(&ctx.emit_errors, span, message);
 }
 
 /// The `presuper_outer` an `<init>` of `class_id` needs: the enclosing
@@ -735,6 +768,7 @@ pub(crate) fn load_capture_arg(
     frame: &mut Frame,
     ctx: &EmitCtx,
     id: SymbolId,
+    span: Span,
 ) {
     if let Some((slot, sort)) = frame.get(id) {
         if is_boxed_var(ctx, id) {
@@ -756,6 +790,7 @@ pub(crate) fn load_capture_arg(
         );
         return;
     }
+    report_ctx_error(ctx, span, format!("cannot capture {}", ctx.st.get(id).name));
     throw_runtime(asm, &format!("cannot capture {}", ctx.st.get(id).name));
     asm.aconst_null();
 }
@@ -1479,7 +1514,7 @@ mod tests {
         scala_rs_typer::lambda_lift(&mut tree, &mut st);
         scala_rs_typer::erase(&mut tree, &mut st);
         let mut classes = crate::runtime::emit_runtime();
-        classes.extend(emit(&tree, &st, "Test.scala"));
+        classes.extend(emit(&tree, &st, "Test.scala").expect("backend emit"));
         classes
     }
 
@@ -1512,6 +1547,7 @@ mod tests {
                 ..Default::default()
             },
         )
+        .expect("backend emit")
     }
 
     fn run_main(src: &str) -> Option<String> {

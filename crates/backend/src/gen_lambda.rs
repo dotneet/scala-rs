@@ -373,6 +373,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
     local_caps: &[SymbolId],
     ret_ty: &Type,
     boxed_vars: &HashSet<SymbolId>,
+    emit_errors: Rc<RefCell<Vec<EmitError>>>,
 ) {
     let cases: Vec<scala_rs_parser::CaseDef> = pf_match_cases(body).unwrap_or(&[]).to_vec();
     let sel_ty = match &body.kind {
@@ -419,6 +420,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
                         class_sym,
                         class_name: &orig1,
                         ret_ty: Type::Boolean,
+                        emit_errors: std::rc::Rc::clone(&emit_errors),
                         extras,
                         lambda_n,
                         lambda_bodies: ctx_bodies,
@@ -480,6 +482,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
                             class_sym,
                             class_name: &orig_class,
                             ret_ty: ret_ty.clone(),
+                            emit_errors: std::rc::Rc::clone(&emit_errors),
                             extras,
                             lambda_n,
                             lambda_bodies: ctx_bodies,
@@ -694,6 +697,7 @@ pub(crate) fn emit_lambda_body(
     source: &str,
     library_abi: bool,
     boxed: &HashSet<SymbolId>,
+    emit_errors: Rc<RefCell<Vec<EmitError>>>,
     pb: PendingBody,
 ) {
     // nsc's own `$anonfun$` methods are `public static final synthetic`;
@@ -749,6 +753,7 @@ pub(crate) fn emit_lambda_body(
             class_sym: pb.class_sym,
             class_name: &pb.outer_class,
             ret_ty: pb.ret_ty.clone(),
+            emit_errors: std::rc::Rc::clone(&emit_errors),
             extras,
             lambda_n,
             lambda_bodies,
@@ -1118,6 +1123,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 class_sym,
                 class_name: &orig_class,
                 ret_ty: ret_ty.clone(),
+                emit_errors: std::rc::Rc::clone(&ctx.emit_errors),
                 extras,
                 lambda_n,
                 lambda_bodies,
@@ -1177,6 +1183,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
             &local_caps_pf,
             &ret_ty_pf,
             ctx.boxed_vars,
+            std::rc::Rc::clone(&ctx.emit_errors),
         );
     }
     ctx.extras.borrow_mut().push(b.finish());

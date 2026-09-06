@@ -293,6 +293,7 @@ impl<'a> Gen<'a> {
                 self.source_name,
                 self.library_abi,
                 &self.boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
                 pb,
             );
         }
@@ -933,6 +934,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             for stt in &stats {
                 if let TreeKind::ValDef {
@@ -1101,6 +1103,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             // nsc stores `$outer` *before* the super constructor call, so a
             // method the parent's `<init>` dispatches back to this class
@@ -1201,6 +1204,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             if delayed {
                 if library_abi && is_app {
@@ -1342,6 +1346,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             ctx.method_sym = meth;
             tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
@@ -1570,6 +1575,7 @@ impl<'a> Gen<'a> {
                     source,
                     library_abi,
                     boxed_vars,
+                    std::rc::Rc::clone(&self.emit_errors),
                 );
                 ctx.value_ext = Some((
                     class_name.clone(),

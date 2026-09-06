@@ -321,6 +321,7 @@ pub(crate) fn gen_ctor_fields_pattern(
             };
             bind_subpattern(asm, frame, ctx, a, sort, fail);
         } else {
+            report_ctx_error(ctx, pat.span, "pattern arity");
             throw_runtime(asm, "pattern arity");
         }
     }
@@ -503,6 +504,7 @@ pub(crate) fn gen_unapply_pattern(
     if uid.is_none() {
         asm.pop();
         asm.pop();
+        report_ctx_error(ctx, pat.span, "unresolved unapply");
         throw_runtime(asm, "unresolved unapply");
         return;
     }

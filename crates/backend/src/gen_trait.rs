@@ -111,6 +111,7 @@ impl<'a> Gen<'a> {
                     source,
                     library_abi,
                     boxed_vars,
+                    std::rc::Rc::clone(&self.emit_errors),
                 );
                 for vd in &inits {
                     if let TreeKind::ValDef {
@@ -221,6 +222,7 @@ impl<'a> Gen<'a> {
                 source,
                 library_abi,
                 boxed_vars,
+                std::rc::Rc::clone(&self.emit_errors),
             );
             ctx.method_sym = meth;
             tailrec_error = crate::gen_tailrec::begin_tail_loop(asm, &mut frame, &ctx, rhs);
@@ -866,6 +868,13 @@ impl<'a> Gen<'a> {
                 let call_desc = self
                     .super_target_desc(target, &name, pts.len())
                     .unwrap_or_else(|| inst_c.clone());
+                if target.is_none() {
+                    report_emit_error(
+                        &self.emit_errors,
+                        self.unit_span,
+                        format!("no super implementation for {name}"),
+                    );
+                }
                 let call_c = call_desc.clone();
                 b.add_code(ACC_PUBLIC, &acc_c, &inst_c, locals.max(1), |asm| {
                     asm.aload(0);
@@ -1430,6 +1439,7 @@ impl<'a> Gen<'a> {
                         self.st.get(id).name,
                         self.st.get(*parent).name
                     );
+                    report_emit_error(&self.emit_errors, self.unit_span, msg.clone());
                     b.add_code(ACC_PUBLIC, &aname, &adesc, 1, |asm| {
                         throw_runtime(asm, &msg);
                     });
@@ -2272,6 +2282,7 @@ impl<'a> Gen<'a> {
                         source,
                         library_abi,
                         boxed_vars,
+                        std::rc::Rc::clone(&self.emit_errors),
                     );
                     gen_expr(asm, &mut frame, &ctx, &rhs);
                     if is_unit_like(&ret_for_body) {
@@ -2337,6 +2348,7 @@ impl<'a> Gen<'a> {
                         source,
                         library_abi,
                         boxed_vars,
+                        std::rc::Rc::clone(&self.emit_errors),
                     );
                     ctx.value_ext = Some((
                         class_name.clone(),
@@ -2513,6 +2525,7 @@ impl<'a> Gen<'a> {
                     source,
                     library_abi,
                     boxed_vars,
+                    std::rc::Rc::clone(&self.emit_errors),
                 );
                 if via_module {
                     load_module_instance(asm, &ctx, o);
@@ -2629,6 +2642,7 @@ impl<'a> Gen<'a> {
                             source,
                             library_abi,
                             boxed_vars,
+                            std::rc::Rc::clone(&self.emit_errors),
                         );
                         gen_expr(asm, &mut frame, &ctx, rhs);
                     }

@@ -245,6 +245,7 @@ pub(crate) fn emit_local_lazy_body(
     cell: SymbolId,
 ) {
     let Some((slot, _)) = frame.get(cell) else {
+        report_ctx_error(ctx, rhs.span, "lazy val cell is missing");
         throw_runtime(asm, "lazy val cell is missing");
         push_default(asm, ret);
         emit_return(asm, ret);
@@ -982,6 +983,14 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
         }
         TreeKind::Import { .. } | TreeKind::TypeDef { .. } => {}
         _ => {
+            report_ctx_error(
+                ctx,
+                tree.span,
+                format!(
+                    "unimplemented expression: {}",
+                    tree.name().unwrap_or("<tree>")
+                ),
+            );
             throw_runtime(
                 asm,
                 &format!(
@@ -1100,6 +1109,11 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
     }
     let id = tree.sym;
     if id.is_none() {
+        report_ctx_error(
+            ctx,
+            tree.span,
+            format!("unresolved ident {}", tree.name().unwrap_or("?")),
+        );
         throw_runtime(
             asm,
             &format!("unresolved ident {}", tree.name().unwrap_or("?")),
@@ -1266,12 +1280,14 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
                     asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
                 }
                 None => {
+                    report_ctx_error(ctx, tree.span, format!("cannot load {}", sym.name));
                     throw_runtime(asm, &format!("cannot load {}", sym.name));
                     push_default(asm, &tree.ty);
                 }
             }
         }
         _ => {
+            report_ctx_error(ctx, tree.span, format!("cannot load {}", sym.name));
             throw_runtime(asm, &format!("cannot load {}", sym.name));
             push_default(asm, &tree.ty);
         }
@@ -1654,6 +1670,7 @@ pub(crate) fn gen_select(
         emit_getfield(asm, &owner, name, &desc);
         return;
     }
+    report_ctx_error(ctx, tree.span, format!("select {name}"));
     throw_runtime(asm, &format!("select {name}"));
     push_default(asm, &tree.ty);
 }
@@ -1956,7 +1973,7 @@ pub(crate) fn gen_new(
         }
     }
     for id in class_captures(ctx.st, class_id).to_vec() {
-        load_capture_arg(asm, frame, ctx, id);
+        load_capture_arg(asm, frame, ctx, id, tpt.span);
     }
     asm.invokespecial(&internal, "<init>", &desc);
 }
@@ -2581,6 +2598,7 @@ pub(crate) fn gen_apply(
 
     // regular method / apply
     if fun.sym.is_none() {
+        report_ctx_error(ctx, tree.span, "unresolved apply");
         throw_runtime(asm, "unresolved apply");
         push_default(asm, &tree.ty);
         return;
@@ -2613,6 +2631,11 @@ pub(crate) fn gen_apply(
             && !matches!(qual.ty, Type::Array(_))
         {
             if !ctx.library_abi {
+                report_ctx_error(
+                    ctx,
+                    tree.span,
+                    "generic Array element access needs the scala-library ClassTag runtime",
+                );
                 throw_runtime(
                     asm,
                     "generic Array element access needs the scala-library ClassTag runtime",
@@ -2783,6 +2806,11 @@ pub(crate) fn gen_apply(
                     "(Ljava/lang/Object;)Ljava/lang/Object;",
                 );
             } else {
+                report_ctx_error(
+                    ctx,
+                    tree.span,
+                    "Array[T].clone needs the scala-library ScalaRunTime.array_clone",
+                );
                 throw_runtime(
                     asm,
                     "Array[T].clone needs the scala-library ScalaRunTime.array_clone",
