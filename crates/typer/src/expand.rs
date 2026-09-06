@@ -309,7 +309,10 @@ fn compile_engine(dir: &Path) -> Result<(), String> {
         .arg(&staging)
         .arg(&src)
         .output()
-        .map_err(|e| format!("cannot run `javac` to build the macro engine: {e}"))?;
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            format!("cannot run `javac` to build the macro engine: {e}")
+        })?;
     // JDK 8 predates --release.  The source is deliberately Java-8 API
     // compatible, so its default classfile target is correct there.
     if !out.status.success()
@@ -327,7 +330,10 @@ fn compile_engine(dir: &Path) -> Result<(), String> {
             .arg(&staging)
             .arg(&src)
             .output()
-            .map_err(|e| format!("cannot run `javac` to build the macro engine: {e}"))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staging);
+                format!("cannot run `javac` to build the macro engine: {e}")
+            })?;
     }
     if !out.status.success() {
         let detail = bounded_text(&out.stderr);
