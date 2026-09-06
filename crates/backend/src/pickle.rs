@@ -2241,12 +2241,20 @@ impl<'a> Pickler<'a> {
         let name = s.name.clone();
         let owner_id = s.owner.0;
         let own_tparams = s.tparams.clone();
+        let bound_lo = s.bound_lo.clone();
+        let bound_hi = s.bound_hi.clone();
         let name_ref = self.type_name(&name);
         let idx = self.add(TYPESYM, vec![]);
         self.sym_index.insert(id.0, idx);
         let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
-        let lo = self.type_ref_named("Nothing");
-        let hi = self.type_ref_named("Any");
+        let lo = bound_lo
+            .as_ref()
+            .map(|t| self.pickle_type(t))
+            .unwrap_or_else(|| self.type_ref_named("Nothing"));
+        let hi = bound_hi
+            .as_ref()
+            .map(|t| self.pickle_type(t))
+            .unwrap_or_else(|| self.type_ref_named("Any"));
         let mut b = Vec::new();
         write_nat_to(&mut b, lo);
         write_nat_to(&mut b, hi);
@@ -2288,7 +2296,7 @@ impl<'a> Pickler<'a> {
         let tparams: Vec<SymbolId> = s.tparams.clone();
         let bound_lo = s.bound_lo.clone();
         let bound_hi = s.bound_hi.clone();
-        let is_alias = !matches!(rhs, Type::NoType | Type::Error | Type::TypeMember(_));
+        let is_alias = s.is_type_alias;
         let tag = if is_alias { ALIASSYM } else { TYPESYM };
         let name_ref = self.type_name(&name);
         let idx = self.add(tag, vec![]);
@@ -4313,6 +4321,64 @@ object Lib {
             .expect("usesAlias");
         assert_eq!(u.param_types, vec!["Int".to_string()]);
         assert_eq!(u.ret, "Int");
+    }
+
+    #[test]
+    fn pickle_type_member_alias_and_type_parameter_bound() {
+        let src = r#"
+trait Profile {
+  type Schema <: SchemaDef
+  trait SchemaDef {
+    def ++(other: Schema): Schema
+  }
+  object api {
+    type Item[A] = Schema
+  }
+}
+
+trait AbstractTable[A] {
+  type Elem
+}
+class TableQuery[E <: AbstractTable[_]](val value: E)
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        let profile = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "Profile" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("Profile");
+        let profile_tags = pickle_tags(&pickle_class(&st, profile));
+        assert!(
+            profile_tags.contains(&ALIASSYM),
+            "expected ALIASsym for an alias whose RHS is a type member, tags={profile_tags:?}"
+        );
+        assert!(
+            profile_tags.contains(&TYPEBOUNDSTPE),
+            "expected TYPEBOUNDStpe for abstract Schema, tags={profile_tags:?}"
+        );
+
+        let table_query = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "TableQuery" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("TableQuery");
+        let bound_tags = pickle_tags(&pickle_class(&st, table_query));
+        assert!(
+            bound_tags.contains(&TYPEBOUNDSTPE),
+            "expected TYPEBOUNDStpe for E, tags={bound_tags:?}"
+        );
+        assert!(
+            bound_tags.contains(&EXISTENTIALTPE),
+            "expected EXISTENTIALtpe in E <: AbstractTable[_], tags={bound_tags:?}"
+        );
     }
 
     fn pickle_tags_name(bytes: &[u8], idx: u32) -> Option<String> {
