@@ -1,0 +1,9 @@
+AnyRef {
+  def <init>(): Main.A
+  def foo: Int
+}
+AnyRef {
+  def <init>(): Outer.this.B
+  def bar: Int
+}
+List(constructor BB, class B1)
