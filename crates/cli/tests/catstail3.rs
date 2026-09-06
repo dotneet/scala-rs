@@ -286,3 +286,28 @@ fn scalac_agrees_c3_override_bad_is_rejected() {
         &["`override` modifier required to override concrete member"],
     );
 }
+
+/// Inserting an apply must retain declared upper and receiver-dependent lower
+/// bounds; checking argument compatibility only after substitution loses them.
+#[test]
+fn fixtures_c3_bounds_bad_is_rejected() {
+    compile_fails(
+        "c3_bounds_bad",
+        &[
+            "type parameter bounds [A <: Number]",
+            "type parameter bounds [A <: T]",
+            "required: Box[Any]",
+        ],
+    );
+}
+
+#[test]
+fn scalac_agrees_c3_bounds_bad_is_rejected() {
+    scalac_rejects(
+        "c3_bounds_bad",
+        &[
+            "do not conform to method apply's type parameter bounds",
+            "required: Box[Any]",
+        ],
+    );
+}

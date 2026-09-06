@@ -1828,11 +1828,12 @@ impl Typer {
                         let mut ret = ret;
                         if own.as_deref().is_some_and(|t| !t.is_empty()) {
                             self.instantiate_inserted_apply(
-                                sym,
+                                fun,
                                 &mut param_tys,
                                 &mut ret,
                                 &arg_tys,
                                 pt,
+                                tree.span,
                             );
                         }
                         for (i, a) in args.iter_mut().enumerate() {
@@ -1857,11 +1858,12 @@ impl Typer {
                         {
                             let now: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                             self.instantiate_inserted_apply(
-                                sym,
+                                fun,
                                 &mut param_tys,
                                 &mut ret,
                                 &now,
                                 pt,
+                                tree.span,
                             );
                         }
                         tree.ty = ret;
@@ -2434,13 +2436,23 @@ impl Typer {
     /// abstract stops doing so.
     pub(crate) fn instantiate_inserted_apply(
         &mut self,
-        sym: SymbolId,
+        fun: &Tree,
         param_tys: &mut Vec<Type>,
         ret: &mut Type,
         arg_tys: &[Type],
         pt: &Type,
+        span: scala_rs_span::Span,
     ) {
-        let inst = self.infer_method_tparams(sym, param_tys, arg_tys);
+        let sym = fun.sym;
+        let recv = match &fun.kind {
+            TreeKind::Select { qual, .. } => Some(&qual.ty),
+            _ => None,
+        };
+        // Bounds belong to the inserted apply's receiver, not the original
+        // parameterless method's receiver. Infer lower bounds at that type
+        // and validate both bounds before substituting the solution: adapting
+        // to already substituted parameters cannot catch an invalid solution.
+        let inst = self.infer_method_tparams_in(sym, param_tys, arg_tys, recv);
         // A function literal is still a placeholder here; taking it for a
         // solution would hide the expected type from the lambda.
         let inst: Vec<(SymbolId, Type)> = inst
@@ -2448,6 +2460,7 @@ impl Typer {
             .filter(|(_, t)| !mentions_no_type(t) && !t.is_error() && !t.is_no_type())
             .collect();
         let inst = self.add_expected_constraints(sym, ret, pt, inst);
+        self.check_tparam_bounds(sym, &inst, recv, span, true);
         if inst.is_empty() {
             return;
         }

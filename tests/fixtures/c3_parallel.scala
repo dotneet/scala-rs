@@ -108,6 +108,15 @@ object Part {
   }
 }
 
+
+// Bounds must be read at the receiver of the inserted apply.
+class BoundApply[T] { def apply[A <: T](a: A): A = a }
+class LowerApply[T] { def apply[A >: T](a: A): A = a }
+object Bounds {
+  def upper: BoundApply[CharSequence] = new BoundApply[CharSequence]
+  def lower: LowerApply[String] = new LowerApply[String]
+}
+
 object Main {
   def main(args: Array[String]): Unit = {
     println(Par.roundTrip(VecList)(List(List(1, 2), List(3))))
@@ -122,5 +131,7 @@ object Main {
     println(Tup.ap3(((n: Int) => n * 2, 0, 0), 21))
     println(Part.partition(Right(1): Either[String, Int]))
     println(Part.partition(Left("x"): Either[String, Int]))
+    println(Bounds.upper("bounded"))
+    println(Bounds.lower(42))
   }
 }
