@@ -113,7 +113,7 @@ impl Typer {
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
-                self.expose_unqualified_type(name);
+                self.expose_unqualified_type(name, tpt.span);
                 let name = name.clone();
                 let ty = self.resolve_type_name_completing(&name, &[], tpt.span);
                 self.reject_unresolved_type(ty, &name, tpt.span)

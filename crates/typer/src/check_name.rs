@@ -1096,7 +1096,7 @@ impl Typer {
     /// [`SymbolTable::has_real_type_entry`], not `lookup_type().is_empty()`:
     /// the module `lookup_type` offers as a fallback must not look like an
     /// answer already found.
-    pub(crate) fn expose_unqualified_type(&mut self, name: &str) {
+    pub(crate) fn expose_unqualified_type(&mut self, name: &str, span: Span) {
         if name.is_empty() || self.st.has_real_type_entry(name) {
             return;
         }
@@ -1152,6 +1152,26 @@ impl Typer {
             }
             if self.st.has_real_type_entry(name) {
                 break;
+            }
+        }
+        // A term already in scope must not suppress the default imports in
+        // the type namespace. In particular, loading the Stream companion
+        // first must not hide scala.package's polymorphic Stream type alias.
+        for pkg in [self.scala_package(), self.java_lang_package()]
+            .into_iter()
+            .flatten()
+        {
+            if self.st.has_real_type_entry(name) {
+                break;
+            }
+            self.complete_binary_member(pkg, name, span);
+            for id in self.st.lookup_member(pkg, name) {
+                if matches!(
+                    self.st.get(id).kind,
+                    SymKind::TypeMember | SymKind::TypeParam | SymKind::Class
+                ) {
+                    self.st.enter_in_current(name, id);
+                }
             }
         }
     }
