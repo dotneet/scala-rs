@@ -170,7 +170,10 @@ impl Typer {
     /// the implied `.apply`, so the extractor looked empty and every
     /// `Literal(Constant(x))` in the reflection API was rejected.
     pub(crate) fn ensure_apply_supplied(&mut self, fun_ty: &Type) {
-        if !matches!(fun_ty, Type::Class { .. }) {
+        // A parameterless accessor can return a module just as it can
+        // return an ordinary class instance. Both need their apply members
+        // completed before insert_apply_on_nullary decides whether to select.
+        if !matches!(fun_ty, Type::Class { .. } | Type::ModuleRef(_)) {
             return;
         }
         let Some(cls) = self.st.class_sym_of(fun_ty) else {

@@ -30,3 +30,22 @@ A separate cold-completion issue remains. With a return annotation Stream[A],
 Stream(a) fails while Stream.apply(a), fully qualified Stream(a), and explicit
 Stream.apply[A](a) all compile. The warmed Stream(a) fixture now works. Do not
 interpret this repair as complete implementation of companion application.
+
+## Cold module application follow-up
+
+The remaining Stream(a) failure was a nullary accessor whose return type is
+ModuleRef. `insert_apply_on_nullary` calls `ensure_apply_supplied`, but the
+latter only completed Class types. It therefore declined before reaching the
+normal Select path that explicit .apply uses. Completing ModuleRef receivers
+as well repairs the cold case without special-casing Stream.
+
+The permanent test now includes both cold and warmed provider completion in
+separate compiler invocations. default_type_imports, late_factory_inference
+and qualifier_retry pass (4 tests), including matching nsc/scala-rs JVM output
+for both Int and String. Evidence: cold-repaired-results.json and
+cold-focused.log under the same probe directory. Full gates remain pending.
+
+The earlier d2efbcbc full run has finished with 5 corpus losses. It must not be
+merged: pos/t10272, pos/t12077 and pos/t6275 incorrectly reject valid patterns;
+neg/t10073 and neg/t10073b accept unresolved ClassTag inference. The next
+integration work must resolve and independently validate these cases.

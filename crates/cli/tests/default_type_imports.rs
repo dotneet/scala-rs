@@ -23,6 +23,7 @@ fn default_type_imports_after_term_completion_match_scalac() {
         .join("../../tests/fixtures/default_type_imports.scala");
     for (name, source, accepted) in [
         ("positive", fs::read_to_string(positive).unwrap(), true),
+        ("cold", fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cold_module_apply.scala")).unwrap(), true),
         (
             "result",
             "object Bad { def bad[A](a: A): scala.collection.immutable.Stream[Int] = scala.collection.immutable.Stream.apply(a) }".into(),
