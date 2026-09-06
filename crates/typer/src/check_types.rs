@@ -221,27 +221,6 @@ impl Typer {
                     Some("<repeated>") => {
                         Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
-                    // `Option` / `List` / `Some` name the prelude's symbol by
-                    // hand here, whatever prefix they are written with, and
-                    // that survives a source definition of `scala.Option`.
-                    // Making them yield to the source symbol is *not* an
-                    // improvement yet: it takes `src/library` from 2014
-                    // errors to 2251 and from 172 to 205 files, because the
-                    // prelude's `Option` carries members the source one does
-                    // not have working signatures for. See
-                    // `docs/scala-library.md`.
-                    Some("Option") => Type::Class {
-                        sym: self.st.option_sym,
-                        args: as_,
-                    },
-                    Some("List") => Type::Class {
-                        sym: self.st.list_sym,
-                        args: as_,
-                    },
-                    Some("Some") => Type::Class {
-                        sym: self.st.some_sym,
-                        args: as_,
-                    },
                     Some(n)
                         if numbered_arity(n, "Function")
                             .is_some_and(|k| as_.is_empty() || k + 1 == as_.len()) =>

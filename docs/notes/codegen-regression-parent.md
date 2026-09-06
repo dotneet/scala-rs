@@ -62,3 +62,56 @@ Scala libraryにはTNode/CNode/LNode、MutableBufferWrapper、Listの型パタ�
 - `/tmp/scala-rs-codex/integration/error-retry-growth/results.json`
 - 同 `reused-qualifier/results.json`、`focused.log`、`dynamic-focused.log`
 - 同 `measures/results.json` と各 `*-baseline-diff.txt`。
+
+## Applied List/Option/Some の強制解決を除去（親の継続修正）
+
+`check_types::tree_to_type(AppliedTypeTree)` が、名前の最後の要素が
+List/Option/Someなら修飾子やsource定義にかかわらずprelude symbolを返していた。
+コメントにも「source定義へ解決するとlibraryのエラー数が増えるので維持」と
+明記されていた。しかし `custom.List[Int]` までscalaのListになるため、これは
+互換性を保つ処理ではない。3種類も通常のconstructor名解決・型適用へ通した。
+
+修正前のfixtureでは `custom.List` / `custom.Option` のconstructorが見つからず、
+`value` accessorも見つからなかった。修正後は、修飾付きの型注釈・import経由の
+constructor・明示的なscala標準Listを併用し、nscと同じ `7/option/9/3` を出力する。
+custom.List[Int]→custom.List[String]、custom.Option[Int]→custom.Option[String]
+の不正代入は両処理系で型不一致として拒否される。strict JVM実行も成功。
+
+関連テスト24 PASS: applied_collection_names 1、aliaslookup 2、function_pattern 1、
+seqpat 20。import経由のconstructorを追加後もapplied_collection_namesを再実行しPASS。
+型パターン検査を無効化する変更や、Anyへ置き換える変更はない。
+
+追加計測（fresh release build、既定のJDK17/UTF-8）:
+
+- cats 351 errors / 81 files（1.85秒）
+- GitBucket 902 errors / 112 files（5.52秒）
+- Slick 0 errors / 1490 classes（1.76秒）
+- Scala library **1880 errors / 203 files**（1.55秒、直前1620 / 171）
+
+増えた診断全部の妥当性は未監査。数値の悪化だけを理由に誤ったsymbolへの解決に
+戻してはならないが、増分をすべて正しいと断定してもならない。
+全workspaceと全コーパスを検証し、失った実際の互換動作を修正すること。
+全体受け入れ前の候補であり、main基準値は更新しない。
+
+追加証拠: `/tmp/scala-rs-codex/integration/applied-collection-names/` の
+before.log、focused.log、import-focused.log、measures/の各ログとprevious-diff。
+
+### 切り分けられた別の不足
+
+一時的な型関係トレースを採取し、全デバッグコードは除去済み。
+`error-retry-growth/pattern-trace.log` のPATREL行に以下を記録した。
+
+- TNode等のscrutineeが `Named { name: "MainNode", args: [] }` のまま。
+  同じコンテキストで `class_sym_of` は実際のMainNodeのsymbolを発見できる。
+- MutableBufferWrapperのscrutinee `java.util.List` がscala immutable Listの
+  prelude symbol #50になる。この引数はソースで `ju.List[A]` と書かれており、
+  今回除去したAppliedTypeTreeの処理が修飾子を無視する問題に該当する。
+  修正後、このMutableBufferWrapperの誤診断は消えている。
+  別途、classpath.rsのdescriptor readerにも完全JVM名よりsimple nameを
+  優先する処理を見つけた。ただし今回の診断の原因とは断定しない。
+  同名のJavaクラスを使うprovider/consumerで別に再現を取る必要がある。
+- source Listの型パターンもprelude #50（parents=[AnyRef]）を使っていた。
+  今回の名前解決変更の直接の動機はこの経路とcustom fixtureである。
+
+トレース時の計測はJDK環境を明示していないため数値比較には使わず、上の
+環境を固定した追加計測を数値の証拠に使う。
