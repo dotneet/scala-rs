@@ -59,6 +59,28 @@ pub(crate) fn invoke_method(
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
+    // `MapOps$WithFilter` has a pair-specific override whose erased return is
+    // `IterableOps`, alongside the inherited generic `WithFilter.map` whose
+    // erased return is `Object`.  scalac selects the latter when a filtered
+    // map produces a non-pair (for example `Map("a" -> 1).map(_._1)`).  The
+    // symbol table exposes the owner and pair-returning descriptor even for
+    // that inherited overload, so select the erased generic entry point from
+    // the inferred result before falling through to the normal invocation.
+    if ctx.library_abi
+        && owner == "scala/collection/MapOps$WithFilter"
+        && matches!(name, "map" | "flatMap")
+        && result_ty.is_some_and(|t| !builds_pairs(ctx, t))
+    {
+        let d = "(Lscala/Function1;)Ljava/lang/Object;";
+        asm.invokevirtual(&owner, name, d);
+        if let Some(ty) = result_ty {
+            let cls = jvm_desc(ctx.st, ty);
+            if let Some(inner) = cls.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+                asm.checkcast(inner);
+            }
+        }
+        return;
+    }
     if ctx.library_abi && !pickled_with_implicit_clause(ctx.st, id) {
         // `MapOps.map` / `flatMap` / `collect` *build a map*: they require the
         // function to return a pair, and 2.13 picks the `IterableOps` overload

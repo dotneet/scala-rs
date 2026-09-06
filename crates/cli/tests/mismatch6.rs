@@ -180,14 +180,13 @@ fn mism6_bad_is_still_rejected() {
     );
 }
 
-/// A guard after a for-comprehension's value definition needs nsc's tupling
-/// desugaring; this one puts the value in a `val` and has no stream to filter,
-/// so it says so instead of emitting a `withFilter` on the value itself.
+/// A value definition cannot precede the first generator. Reject it instead
+/// of inventing a stream to which the definition could belong.
 #[test]
-fn a_guard_after_a_for_value_definition_is_diagnosed() {
+fn a_value_definition_before_a_for_generator_is_diagnosed() {
     compile_fails(
         "mism6_forval_bad",
-        &["unimplemented: a guard after a value definition in a for-comprehension"],
+        &["value definition must follow a generator in a for-comprehension"],
     );
 }
 

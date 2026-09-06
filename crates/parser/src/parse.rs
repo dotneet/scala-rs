@@ -20,6 +20,10 @@ pub struct ParseResult {
 /// otherwise 2.13 parser. Only the ones this subset implements live here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParseOptions {
+    /// Target the real scala-library ABI. The private runtime intentionally
+    /// ships only Tuple2, so for-comprehension tuple extensions use nested
+    /// pairs when this is false and the flat TupleN shape nsc emits when true.
+    pub library_abi: bool,
     /// `-Xsource:3` / `-Xsource:3-cross`: accept `A & B` as a compound type.
     pub source3: bool,
     /// nsc `-no-specialization`, "Ignore @specialize annotations." Under it
@@ -5335,6 +5339,9 @@ fn desugar_for(
     body: Tree,
     is_yield: bool,
 ) -> Tree {
+    const MAX_TUPLE_ARITY: usize = 22;
+    const MAX_VALUE_DEFS_PER_GROUP: usize = MAX_TUPLE_ARITY - 1;
+
     if enums.is_empty() {
         p.error_span(lo, "empty for-comprehension");
         return body;
@@ -5362,8 +5369,9 @@ fn desugar_for(
             stable_pat: false,
         }
     }
-    /// A generator pattern that always matches: a variable, `_`, or a tuple of
-    /// those. nsc filters the others, and so does `filter_lambda` below.
+    /// A generator pattern that always matches is a variable or `_`. nsc
+    /// inserts `withFilter` for tuple and extractor patterns, even when their
+    /// static element type looks like it could make the pattern irrefutable.
     ///
     /// `deep` marks a position *inside* a larger pattern. nsc's
     /// `makeGenerator` reads a generator whose whole pattern is one identifier
@@ -5384,36 +5392,52 @@ fn desugar_for(
             }
             TreeKind::Wildcard => true,
             TreeKind::Bind { body, .. } => is_irrefutable_at(body, true),
-            TreeKind::Apply { fun, args } => {
-                matches!(&fun.kind, TreeKind::Ident { name } if name.starts_with("Tuple"))
-                    && args.iter().all(|a| is_irrefutable_at(a, true))
-            }
+            TreeKind::Apply { .. } => false,
             _ => false,
         }
     }
     fn is_irrefutable(pat: &Tree) -> bool {
         is_irrefutable_at(pat, false)
     }
-    fn lambda(p: &mut Parser, pat: Tree, body: Tree) -> Tree {
-        let span = pat.span.merge(body.span);
+    fn lambda_with_body<F>(p: &mut Parser, pat: Tree, make_body: F) -> Tree
+    where
+        F: FnOnce(&mut Parser, &str) -> Tree,
+    {
+        let pat_span = pat.span;
         // A `Bind` over a refutable pattern (`o @ NoNull`) has to be matched
         // too: binding only the outer name dropped the test the pattern makes.
         let simple = matches!(&pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard)
-            || (matches!(&pat.kind, TreeKind::Bind { .. }) && is_irrefutable(&pat));
+            || matches!(&pat.kind, TreeKind::Bind { body, .. } if matches!(body.kind, TreeKind::Wildcard));
+        let (name, param_pat) = if simple {
+            match &pat.kind {
+                TreeKind::Ident { name } => (name.clone(), pat),
+                TreeKind::Bind { name, .. } => (name.clone(), pat),
+                TreeKind::Wildcard => {
+                    p.placeholder_id += 1;
+                    let name = format!("x$for{}", p.placeholder_id);
+                    let mut param_pat = pat;
+                    param_pat.kind = TreeKind::Ident { name: name.clone() };
+                    (name, param_pat)
+                }
+                _ => unreachable!("simple for pattern has no capture"),
+            }
+        } else {
+            p.placeholder_id += 1;
+            (format!("x$for{}", p.placeholder_id), pat)
+        };
+        let body = make_body(p, &name);
+        let span = param_pat.span.merge(body.span);
         if !simple {
             // `for ((a, b) <- xs) yield a` — bind the element and match it,
             // which is what nsc's pattern-matching anonymous function does.
-            p.placeholder_id += 1;
-            let name = format!("x$for{}", p.placeholder_id);
-            let sel = p.alloc(pat.span, TreeKind::Ident { name: name.clone() });
-            let guard = p.empty(pat.span);
-            let pat_span = pat.span;
+            let sel = p.alloc(pat_span, TreeKind::Ident { name: name.clone() });
+            let guard = p.empty(pat_span);
             let m = p.alloc(
                 span,
                 TreeKind::Match {
                     selector: Box::new(sel),
                     cases: vec![CaseDef {
-                        pat,
+                        pat: param_pat,
                         guard,
                         body,
                         span,
@@ -5439,7 +5463,7 @@ fn desugar_for(
                 },
             );
         }
-        let v = pat_to_param(pat);
+        let v = pat_to_param(param_pat);
         p.alloc(
             span,
             TreeKind::Function {
@@ -5449,15 +5473,21 @@ fn desugar_for(
         )
     }
 
+    fn lambda(p: &mut Parser, pat: Tree, body: Tree) -> Tree {
+        lambda_with_body(p, pat, |_, _| body)
+    }
+
     /// `{ x => x match { case pat => <yes>; case _ => false } }`, as nsc's
     /// `withFilter` insertion does. `yes = None` gives the plain refutability
-    /// filter (`true`); passing a guard expression instead is how a guard on a
-    /// destructuring generator gets to see what the pattern binds.
+    /// filter (`true`) with a `false` fallback; passing a guard expression
+    /// instead emits the single-case match nsc uses for a guard on a
+    /// destructuring generator or value-definition tuple.
     fn filter_lambda(p: &mut Parser, pat: &Tree, yes: Option<Tree>) -> Tree {
         let span = pat.span;
         p.placeholder_id += 1;
         let name = format!("x$forf{}", p.placeholder_id);
         let sel = p.alloc(span, TreeKind::Ident { name: name.clone() });
+        let has_guard = yes.is_some();
         let yes = yes.unwrap_or_else(|| {
             p.alloc(
                 span,
@@ -5466,33 +5496,34 @@ fn desugar_for(
                 },
             )
         });
-        let no = p.alloc(
-            span,
-            TreeKind::Literal {
-                lit: Lit::Boolean(false),
-            },
-        );
         let g1 = p.empty(span);
-        let g2 = p.empty(span);
-        let wild = p.alloc(span, TreeKind::Wildcard);
+        let mut cases = vec![CaseDef {
+            pat: pat.clone(),
+            guard: g1,
+            body: yes,
+            span,
+        }];
+        if !has_guard {
+            let no = p.alloc(
+                span,
+                TreeKind::Literal {
+                    lit: Lit::Boolean(false),
+                },
+            );
+            let g2 = p.empty(span);
+            let wild = p.alloc(span, TreeKind::Wildcard);
+            cases.push(CaseDef {
+                pat: wild,
+                guard: g2,
+                body: no,
+                span,
+            });
+        }
         let m = p.alloc(
             span,
             TreeKind::Match {
                 selector: Box::new(sel),
-                cases: vec![
-                    CaseDef {
-                        pat: pat.clone(),
-                        guard: g1,
-                        body: yes,
-                        span,
-                    },
-                    CaseDef {
-                        pat: wild,
-                        guard: g2,
-                        body: no,
-                        span,
-                    },
-                ],
+                cases,
             },
         );
         let tpt = p.empty(span);
@@ -5514,119 +5545,437 @@ fn desugar_for(
             },
         )
     }
-    // Work from the last enumerator backwards.
-    let mut acc = body;
-    // Whether a *generator* has already been folded in. A trailing value
-    // definition (`y = e`) is not one: it becomes a `val` in the lambda's
-    // body, so the generator before it is still the innermost one and takes
-    // `map`, not `flatMap`. Counting enumerators instead made
-    // `for { m <- ms; q = f(m) } yield q` a `flatMap` whose function returned
-    // the element rather than a collection.
-    let mut seen_generator = false;
-    for e in enums.into_iter().rev() {
-        let mut rhs = e.rhs;
-        if e.is_val && e.guard.is_some() {
-            // nsc pairs the value up with the generator's element and filters
-            // the resulting stream; the `val` in a block that this desugaring
-            // uses has no stream to filter. Diagnose rather than emit a
-            // `withFilter` on the value itself, which is not what it means.
-            p.error_span(
-                e.pat.span,
-                "unimplemented: a guard after a value definition in a for-comprehension",
-            );
-        }
-        if let Some(g) = e.guard.filter(|_| !e.is_val) {
-            // `for ((i, s) <- xs if i > 0)`: the guard runs on the *element*,
-            // so a destructuring pattern has to be re-matched here or the
-            // names it binds are not in scope (`dummy_ident_from` gave `_`
-            // for every non-ident pattern, and the guard failed to resolve).
-            let pred = if matches!(&e.pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard) {
-                lambda(p, dummy_ident_from(&e.pat), g)
-            } else {
-                filter_lambda(p, &e.pat, Some(g))
-            };
-            let sel = p.alloc(
-                rhs.span,
-                TreeKind::Select {
-                    qual: Box::new(rhs),
-                    name: "withFilter".into(),
+    fn tuple_tree(p: &mut Parser, span: Span, args: Vec<Tree>) -> Tree {
+        if p.opts.library_abi {
+            let arity = args.len();
+            if arity <= 1 {
+                return args.into_iter().next().unwrap_or_else(|| p.empty(span));
+            }
+            let mut fun = p.alloc(
+                span,
+                TreeKind::Ident {
+                    name: format!("Tuple{arity}"),
                 },
             );
-            rhs = p.alloc(
-                sel.span,
+            fun.scala_ref = true;
+            return p.alloc(
+                span,
                 TreeKind::Apply {
-                    fun: Box::new(sel),
-                    args: vec![pred],
+                    fun: Box::new(fun),
+                    args,
                 },
             );
         }
-        if e.is_val {
-            // `y = e` => map { x => val y = e; acc }
-            let tpt = p.empty(e.pat.span);
-            let vd = p.alloc(
-                e.pat.span,
+        let mut args = args.into_iter();
+        let Some(mut result) = args.next() else {
+            return p.empty(span);
+        };
+        for arg in args {
+            let mut fun = p.alloc(
+                span,
+                TreeKind::Ident {
+                    name: "Tuple2".into(),
+                },
+            );
+            fun.scala_ref = true;
+            result = p.alloc(
+                span,
+                TreeKind::Apply {
+                    fun: Box::new(fun),
+                    args: vec![result, arg],
+                },
+            );
+        }
+        result
+    }
+
+    /// Build a tuple with the first field on the left and the remaining
+    /// fields on the right. This keeps every field selectable with Tuple2
+    /// even when the value-definition pattern has more than one binding.
+    fn right_tuple_tree(p: &mut Parser, span: Span, mut args: Vec<Tree>) -> Tree {
+        if p.opts.library_abi {
+            return tuple_tree(p, span, args);
+        }
+        let last = args.pop().expect("right tuple needs at least one field");
+        if args.is_empty() {
+            return last;
+        }
+        let first = args.remove(0);
+        let rest = if args.is_empty() {
+            last
+        } else {
+            args.push(last);
+            right_tuple_tree(p, span, args)
+        };
+        let mut fun = p.alloc(
+            span,
+            TreeKind::Ident {
+                name: "Tuple2".into(),
+            },
+        );
+        fun.scala_ref = true;
+        p.alloc(
+            span,
+            TreeKind::Apply {
+                fun: Box::new(fun),
+                args: vec![first, rest],
+            },
+        )
+    }
+
+    fn right_tuple_select(
+        p: &mut Parser,
+        span: Span,
+        base: &str,
+        index: usize,
+        total: usize,
+    ) -> Tree {
+        let mut result = p.alloc(span, TreeKind::Ident { name: base.into() });
+        if p.opts.library_abi {
+            return p.alloc(
+                span,
+                TreeKind::Select {
+                    qual: Box::new(result),
+                    name: format!("_{}", index + 1),
+                },
+            );
+        }
+        let mut index = index;
+        let mut total = total;
+        while total > 2 && index > 0 {
+            result = p.alloc(
+                span,
+                TreeKind::Select {
+                    qual: Box::new(result),
+                    name: "_2".into(),
+                },
+            );
+            index -= 1;
+            total -= 1;
+        }
+        result = p.alloc(
+            span,
+            TreeKind::Select {
+                qual: Box::new(result),
+                name: format!("_{}", index + 1),
+            },
+        );
+        result
+    }
+
+    /// Return block statements that bind a value-definition pattern and the
+    /// expression carrying the raw value into the next tuple pattern. A
+    /// refutable pattern is matched once, then its bindings are projected from
+    /// the resulting tuple. This is the shape nsc uses and avoids running an
+    /// extractor once per bound name.
+    fn value_parts(p: &mut Parser, pat: Tree, rhs: Tree) -> (Vec<Tree>, Tree) {
+        let pat_span = pat.span;
+        if let TreeKind::Ident { name } = &pat.kind {
+            let tpt = p.empty(pat.span);
+            let def = p.alloc(
+                pat.span,
                 TreeKind::ValDef {
                     mods: Modifiers::default(),
-                    name: e.pat.name().unwrap_or("y$for").to_string(),
+                    name: name.clone(),
                     tpt: Box::new(tpt),
                     rhs: Box::new(rhs),
                 },
             );
-            acc = p.alloc(
-                vd.span.merge(acc.span),
-                TreeKind::Block {
-                    stats: vec![vd],
-                    expr: Box::new(acc),
-                },
-            );
-            continue;
+            let raw = p.alloc(pat.span, TreeKind::Ident { name: name.clone() });
+            return (vec![def], raw);
         }
-        if !e.is_val && !is_irrefutable(&e.pat) {
-            let pred = filter_lambda(p, &e.pat, None);
-            let sel = p.alloc(
-                rhs.span,
-                TreeKind::Select {
-                    qual: Box::new(rhs),
-                    name: "withFilter".into(),
-                },
-            );
-            rhs = p.alloc(
-                sel.span,
-                TreeKind::Apply {
-                    fun: Box::new(sel),
-                    args: vec![pred],
-                },
-            );
-        }
-        let method = if !seen_generator {
-            if is_yield {
-                "map"
-            } else {
-                "foreach"
-            }
-        } else if is_yield {
-            "flatMap"
-        } else {
-            "foreach"
+
+        // A wildcard still evaluates its rhs once. Keep a synthetic local so
+        // the downstream tuple has the same arity and pattern shape as nsc's.
+        p.placeholder_id += 1;
+        let tmp = format!("x$forv{}", p.placeholder_id);
+        let mut names = Vec::new();
+        pattern_bound_names(&pat, &mut names);
+        let outer_raw_name = match &pat.kind {
+            TreeKind::Bind { name, .. } => Some(name.clone()),
+            _ => None,
         };
-        seen_generator = true;
-        let fun = lambda(p, e.pat, acc);
+        if let Some(raw_name) = &outer_raw_name {
+            // `pattern_bound_names` includes the outer name of `p @ pat`.
+            // That name is the raw value already carried in tuple slot 1;
+            // project each binding exactly once from the remaining slots.
+            if names.first().is_some_and(|name| name == raw_name) {
+                names.remove(0);
+            }
+        }
+        if names.is_empty() {
+            let raw_name = outer_raw_name
+                .clone()
+                .unwrap_or_else(|| format!("x$forvraw{}", p.placeholder_id));
+            let guard = p.empty(pat.span);
+            let match_body = p.alloc(
+                pat_span,
+                TreeKind::Ident {
+                    name: raw_name.clone(),
+                },
+            );
+            let match_pat = if outer_raw_name.is_some() {
+                pat
+            } else {
+                p.alloc(
+                    pat_span,
+                    TreeKind::Bind {
+                        name: raw_name.clone(),
+                        body: Box::new(pat),
+                    },
+                )
+            };
+            let m = p.alloc(
+                pat_span,
+                TreeKind::Match {
+                    selector: Box::new(rhs),
+                    cases: vec![CaseDef {
+                        pat: match_pat,
+                        guard,
+                        body: match_body,
+                        span: pat_span,
+                    }],
+                },
+            );
+            let empty_tpt = p.empty(pat_span);
+            let def = p.alloc(
+                pat_span,
+                TreeKind::ValDef {
+                    mods: Modifiers::default(),
+                    name: tmp.clone(),
+                    tpt: Box::new(empty_tpt),
+                    rhs: Box::new(m),
+                },
+            );
+            if outer_raw_name.is_some() {
+                let tpt = p.empty(pat_span);
+                let tmp_ident = p.alloc(pat_span, TreeKind::Ident { name: tmp });
+                let raw_def = p.alloc(
+                    pat_span,
+                    TreeKind::ValDef {
+                        mods: Modifiers::default(),
+                        name: raw_name.clone(),
+                        tpt: Box::new(tpt),
+                        rhs: Box::new(tmp_ident),
+                    },
+                );
+                return (
+                    vec![def, raw_def],
+                    p.alloc(pat_span, TreeKind::Ident { name: raw_name }),
+                );
+            }
+            (vec![def], p.alloc(pat_span, TreeKind::Ident { name: tmp }))
+        } else {
+            let raw_name = outer_raw_name.unwrap_or_else(|| {
+                p.placeholder_id += 1;
+                format!("x$forvraw{}", p.placeholder_id)
+            });
+            let mut bind_args = vec![p.alloc(
+                pat_span,
+                TreeKind::Ident {
+                    name: raw_name.clone(),
+                },
+            )];
+            bind_args.extend(
+                names
+                    .iter()
+                    .map(|name| p.alloc(pat_span, TreeKind::Ident { name: name.clone() })),
+            );
+            let matched = right_tuple_tree(p, pat_span, bind_args);
+            let match_pat = if matches!(&pat.kind, TreeKind::Bind { .. }) {
+                pat
+            } else {
+                p.alloc(
+                    pat_span,
+                    TreeKind::Bind {
+                        name: raw_name.clone(),
+                        body: Box::new(pat),
+                    },
+                )
+            };
+            let guard = p.empty(pat_span);
+            let m = p.alloc(
+                pat_span,
+                TreeKind::Match {
+                    selector: Box::new(rhs),
+                    cases: vec![CaseDef {
+                        pat: match_pat,
+                        guard,
+                        body: matched,
+                        span: pat_span,
+                    }],
+                },
+            );
+            let empty_tpt = p.empty(pat_span);
+            let tmp_def = p.alloc(
+                pat_span,
+                TreeKind::ValDef {
+                    mods: Modifiers::default(),
+                    name: tmp.clone(),
+                    tpt: Box::new(empty_tpt),
+                    rhs: Box::new(m),
+                },
+            );
+            let mut stats = vec![tmp_def];
+            let total = names.len() + 1;
+            for (index, name) in std::iter::once(&raw_name).chain(names.iter()).enumerate() {
+                let sel = right_tuple_select(p, pat_span, &tmp, index, total);
+                let empty_tpt = p.empty(pat_span);
+                stats.push(p.alloc(
+                    pat_span,
+                    TreeKind::ValDef {
+                        mods: Modifiers::default(),
+                        name: name.clone(),
+                        tpt: Box::new(empty_tpt),
+                        rhs: Box::new(sel),
+                    },
+                ));
+            }
+            let raw = p.alloc(pat_span, TreeKind::Ident { name: raw_name });
+            (stats, raw)
+        }
+    }
+
+    fn apply_collection(p: &mut Parser, input: Tree, method: &str, fun: Tree) -> Tree {
+        let span = input.span.merge(fun.span);
         let sel = p.alloc(
-            rhs.span,
+            input.span,
             TreeKind::Select {
-                qual: Box::new(rhs),
+                qual: Box::new(input),
                 name: method.into(),
             },
         );
-        acc = p.alloc(
-            lo.merge(fun.span),
+        p.alloc(
+            span,
             TreeKind::Apply {
                 fun: Box::new(sel),
                 args: vec![fun],
             },
-        );
+        )
     }
-    acc
+
+    fn with_filter(p: &mut Parser, input: Tree, pat: &Tree, guard: Tree) -> Tree {
+        let pred = if matches!(&pat.kind, TreeKind::Ident { .. } | TreeKind::Wildcard) {
+            lambda(p, dummy_ident_from(pat), guard)
+        } else {
+            filter_lambda(p, pat, Some(guard))
+        };
+        apply_collection(p, input, "withFilter", pred)
+    }
+
+    fn filter_generator_rhs(
+        p: &mut Parser,
+        mut rhs: Tree,
+        pat: &Tree,
+        guard: Option<Tree>,
+    ) -> Tree {
+        if !is_irrefutable(pat) {
+            let pred = filter_lambda(p, pat, None);
+            rhs = apply_collection(p, rhs, "withFilter", pred);
+        }
+        if let Some(g) = guard {
+            rhs = with_filter(p, rhs, pat, g);
+        }
+        rhs
+    }
+
+    /// Build the collection pipeline from left to right. `input` is the
+    /// current stream and `pat` binds one of its elements. Value definitions
+    /// extend that element with a tuple; a guard then filters the tuple, so
+    /// names introduced by the value definitions are in scope for it.
+    fn build(
+        p: &mut Parser,
+        enums: &[Enumerator],
+        index: usize,
+        input: Tree,
+        pat: Tree,
+        body: Tree,
+        is_yield: bool,
+    ) -> Tree {
+        if index == enums.len() {
+            let method = if is_yield { "map" } else { "foreach" };
+            let fun = lambda(p, pat, body);
+            return apply_collection(p, input, method, fun);
+        }
+
+        let mut stream = input;
+        let mut current_pat = pat;
+        let mut next = index;
+        if next < enums.len() && enums[next].is_val {
+            let start = next;
+            let mut group_size = 0;
+            while next < enums.len() && enums[next].is_val && group_size < MAX_VALUE_DEFS_PER_GROUP
+            {
+                let has_guard = enums[next].guard.is_some();
+                next += 1;
+                group_size += 1;
+                if has_guard {
+                    break;
+                }
+            }
+            let group: Vec<Enumerator> = enums[start..next].to_vec();
+            let group_pats: Vec<Tree> = group.iter().map(|e| e.pat.clone()).collect();
+            let group_span = current_pat.span;
+            let fun = lambda_with_body(p, current_pat.clone(), |p, capture| {
+                let mut stats = Vec::new();
+                let mut values = Vec::new();
+                for e in &group {
+                    let (mut defs, raw) = value_parts(p, e.pat.clone(), e.rhs.clone());
+                    stats.append(&mut defs);
+                    values.push(raw);
+                }
+                let mut args = vec![p.alloc(
+                    group_span,
+                    TreeKind::Ident {
+                        name: capture.into(),
+                    },
+                )];
+                args.extend(values);
+                let tuple = tuple_tree(p, group_span, args);
+                if stats.is_empty() {
+                    tuple
+                } else {
+                    p.alloc(
+                        group_span.merge(tuple.span),
+                        TreeKind::Block {
+                            stats,
+                            expr: Box::new(tuple),
+                        },
+                    )
+                }
+            });
+            stream = apply_collection(p, stream, "map", fun);
+            if let Some(last_pat) = group_pats.last() {
+                let tuple_span = current_pat.span.merge(last_pat.span);
+                let mut tuple_args = Vec::with_capacity(group_pats.len() + 1);
+                tuple_args.push(current_pat);
+                tuple_args.extend(group_pats);
+                current_pat = tuple_tree(p, tuple_span, tuple_args);
+            }
+            if let Some(g) = group.last().and_then(|e| e.guard.clone()) {
+                stream = with_filter(p, stream, &current_pat, g);
+            }
+            return build(p, enums, next, stream, current_pat, body, is_yield);
+        }
+
+        let e = &enums[index];
+        let rhs = filter_generator_rhs(p, e.rhs.clone(), &e.pat, e.guard.clone());
+        let inner = build(p, enums, index + 1, rhs, e.pat.clone(), body, is_yield);
+        let method = if is_yield { "flatMap" } else { "foreach" };
+        let fun = lambda(p, current_pat, inner);
+        apply_collection(p, stream, method, fun)
+    }
+
+    if enums[0].is_val {
+        p.error_span(
+            enums[0].pat.span,
+            "value definition must follow a generator in a for-comprehension",
+        );
+        return body;
+    }
+    let first = &enums[0];
+    let rhs = filter_generator_rhs(p, first.rhs.clone(), &first.pat, first.guard.clone());
+    build(p, &enums, 1, rhs, first.pat.clone(), body, is_yield)
 }
 
 fn dummy_ident_from(pat: &Tree) -> Tree {
