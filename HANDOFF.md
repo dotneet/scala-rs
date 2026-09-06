@@ -24,6 +24,13 @@ Two parent typed-graph tests cover symbol owners, type parameters, bounds,
 annotations and self types. Clippy has no new warnings (58 versus 59).
 Class-owned specialization is still unaccepted and its ledger remains red.
 
+For-comprehension lowering was independently validated at `0306b030` and
+merged as `e12cbdb2`: 2252 workspace tests pass, all four compile measures and
+strict verification remain unchanged, and Slick MODE=b passes 36/36. Corpus
+5324 has no lost passes and two independently checked gains (`neg/t4163`,
+`run/t6968`). Clippy retains the same 58 warnings. The baseline now points to
+`tests/baselines/corpus-e12cbdb2.tsv`.
+
 Core implementation now runs in the parent session. All Luna implementation
 agents saved their work and stopped. Refer to the validation note and
 `/tmp/scala-rs-codex/integration/current-state.json` for their saved commits/WIP;

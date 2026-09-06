@@ -7,9 +7,8 @@ Read the updated `tests/BASELINE.md` rather than remeasuring the old tree.
 ## Current decision state
 
 The sections below preserve earlier checkpoints; this section supersedes
-their pending-status statements. All new subagents use Luna / xhigh and
-isolated worktrees. They report through collaboration tools, not Codex task
-messages.
+their pending-status statements. Core implementation now runs in the parent
+session; all Luna implementation agents stopped with their work saved.
 
 Latest independent checks (these supersede the pending descriptions below):
 
@@ -629,3 +628,24 @@ independently verified with 37 tests at `49bf1a90`; Slick now reports four sql
 selection errors, down from 66, but emits zero classes. After merging main,
 codegen candidate `a95e7d04` passes the release backend check only. The four sql
 errors and four other earlier corpus losses still prevent acceptance.
+
+
+## Accepted for-comprehension integration and current parent WIP
+
+Candidate `0306b030` was independently measured and merged as `e12cbdb2`.
+Workspace: 2252 pass / 0 fail, 200 result rows. Four compile measures unchanged;
+strict 1490 classes; Slick MODE=b 36/36; MODE=a and specialization remain red.
+Corpus: 5324 identities, no losses, gains neg/t4163 and run/t6968. Relative to
+previously reviewed c6a7e8f the full six-field ledger differs only at the
+run/t8199 temporary path. Clippy: identical 58 warning messages to e4d404f.
+Evidence: `/tmp/scala-rs-codex/integration/candidate-0306b03/`.
+
+Codegen worktree remains separate: parent commits `7f13470b` (retry provisional
+qualifier errors; Slick restored to 0 errors / 1490 classes) and `de79c86b`
+(stable lazy patterns and capture analysis; 52 focused tests pass) are held
+pending complete acceptance. Uncommitted repeated-case-pattern work matches
+nsc on same-unit positive execution but its typed-pattern negative test fails:
+String is wrongly accepted against an Int element. Cross-compilation also
+exposes repeated-parameter and generic case-apply metadata gaps. Do not merge
+this WIP based on its positive test. Reproductions and continuation details are
+in `/tmp/scala-rs-codex/integration/current-state.json`.
