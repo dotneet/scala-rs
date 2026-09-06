@@ -83,7 +83,7 @@ if [[ $1 == --one ]]; then
   extra=$(comm -13 <(print -r -- $theirs) <(print -r -- $ours) | grep -c . || true)
 
   if (( ourrc != 0 )); then
-    why=$(grep -m1 '^error' $work/ours.log | tr '\t' ' ' | cut -c1-100)
+    why=$(grep -m1 '^error' $work/ours.log | LC_ALL=C tr '\t' ' ' | cut -c1-100)
     emit no-compile 0 $nt $nt 0 0 $spt "${why:-compile failed}"
   elif (( missing == 0 && extra == 0 )); then
     emit match $no $nt 0 0 $spo $spt
@@ -150,7 +150,7 @@ xargs_rc=$?
 set -e
 parts=($SPEC_LOG.part/*(N))
 if (( ${#parts} > 0 )); then
-  cat $parts | sort > $SPEC_LOG
+  cat $parts | LC_ALL=C sort > $SPEC_LOG
 else
   : > $SPEC_LOG
 fi
