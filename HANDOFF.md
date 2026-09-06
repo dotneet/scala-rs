@@ -8,6 +8,18 @@ and their required fixes were independently validated at `d9eb5dc` and merged
 locally as `4b0568af`. Tail-call and by-name overload fixes were subsequently
 validated at `dd5047e0` and merged as `318c1568`: 2233 workspace tests pass,
 and all 5324 corpus identities are retained with run passes rising to 590.
+Type-parameter bounds and alias declaration metadata were then independently
+validated at `4b2f941e` and merged as `41375307`. The full release suite passed
+2234 tests; two added interop tests passed separately with identical compiler
+sources, giving 2236 tests on main. All corpus statuses and compile measures
+are unchanged. The baseline explains this composed gate explicitly.
+Variance metadata was independently validated at `629570a8` and merged as
+`9beb69b2`: 2237 release tests pass; all 5324 corpus statuses remain unchanged.
+A stronger test-only follow-up passed at `803be601`. The one changed runtime
+exception was reproduced with byte-identical old/new class files, not a regression.
+Codegen/constructor candidate `73cc75b2` failed 10 workspace tests; parent
+`aa5126ee` fixes six default-clause failures (10 focused tests pass), while
+four Slick constructor failures remain under repair. Do not merge that candidate yet.
 Read the updated `tests/BASELINE.md`, including its
 per-test corpus reference and red MODE=a check. The historical results below
 describe the previous session, not the current baseline. This continuation

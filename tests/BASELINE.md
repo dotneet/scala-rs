@@ -11,17 +11,20 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `318c1568` |
+| commit | `9beb69b2` |
 |---|---|
 | updated | 2026-09-06 |
 
-Measured independently at `dd5047e0`, then merged as `318c1568`; their compiler
-sources and Cargo inputs are identical. Later documentation-only commits may
-follow this commit. Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned;
-the corpus run inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
-Evidence: `/tmp/scala-rs-codex/integration/candidate-dd5047e/results.json` and
-`corpus-parent-audit.json`. All required historical gates completed with exit
-0; the newly measured MODE=a check is explicitly red below.
+Measured independently at `629570a8`, then merged as `9beb69b2`. The only
+change after the full run was a stronger, portable variance interoperability
+test, independently passed at `803be601`; compiler sources and Cargo inputs
+are identical. Later documentation-only commits may follow this commit.
+Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned; the corpus run
+inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
+Evidence: `/tmp/scala-rs-codex/integration/candidate-629570a/results.json`,
+`corpus-parent-audit.json`, `clippy-parent-audit.json`, and
+`supplemental-variance.log`. Historical passing gates remain passing;
+MODE=a and the specialization ledger remain explicitly red below.
 
 ## Compile measures
 
@@ -50,11 +53,19 @@ Evidence: `/tmp/scala-rs-codex/integration/candidate-dd5047e/results.json` and
 | `neg` (1405) | **659** | 377 | 369 |
 | `run` (2060) | **590** | 917 | 553 |
 
-The complete per-test status reference is
+The unchanged complete per-test status reference is
 [`baselines/corpus-318c1568.tsv`](baselines/corpus-318c1568.tsv): 5324 unique
 records, from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
-Compare by `(kind, test)` as well as totals. The full six-field diagnostic
-ledger is `candidate-dd5047e/corpus.tsv` in the evidence directory above.
+Compare by `(kind, test)` as well as totals. The current six-field diagnostic
+ledger is `candidate-629570a/corpus.tsv` in the evidence directory above.
+All statuses match the preceding baseline. Two six-field records differ from
+`candidate-4b2f941`: the temporary path in `run/t8199`, and the first exception
+reported for already-failing `run/impconvtimes`. Independent recompilation
+with both binaries produced seven byte-identical class files; repeated JVM
+runs of those same files produce both VerifyError and IncompatibleClassChangeError.
+This is an existing invalid program emission with variable failure order,
+not a variance regression or improvement. Evidence:
+`/tmp/scala-rs-codex/integration/variance-impconvtimes/results.json`.
 
 Use `python3 tests/compare_corpus.py tests/baselines/corpus-318c1568.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
@@ -81,8 +92,17 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **197 result rows, 2233 passed, 0 failed** |
+| `cargo test --workspace --release --no-fail-fast` | **199 result rows, 2237 passed, 0 failed** at `629570a8` |
+| Test-only validation at `803be601` | **1 passed, 0 failed** (`--test variance`); strengthens an existing test, so the total remains **2237 tests / 199 result rows** |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
+
+No compiler source or Cargo input changed after the full run. The supplemental
+variance test checks class, method, and higher-kinded variance through a real
+scalac consumer, validates each invalid assignment's diagnostic location, and
+compares actual JVM output. `cargo clippy --workspace --release` exits 0 with
+59 warning messages, exactly the preceding baseline's multiset. A separate
+`--all-targets` run exposes seven additional warnings in unchanged tests; it
+must not be compared to the narrower historical warning count.
 
 ## The six unloadable classes are fixed (2026-09-06)
 

@@ -13,6 +13,30 @@ messages.
 
 Latest independent checks (these supersede the pending descriptions below):
 
+- Bounds and alias declaration metadata are merged as `41375307`. Candidate
+  `4b2f941e` passed 2234 workspace tests, every baseline compile measure,
+  strict verification of all 1490 classes, and Slick MODE=b 36/36. MODE=a and
+  the specialization ledger remain red. All 5324 corpus statuses are
+  unchanged; only the existing `t8199` diagnostic's temporary path differs.
+  Two permanent CLI interop tests were added and independently passed at
+  `2b65cdc9`, with no compiler/Cargo changes after the full gate. These verify
+  valid execution and every invalid existential/forward/F/lower type bound.
+  The resulting main test inventory is 2236 tests / 198 result rows, validated
+  by a full run plus that test-only supplement, not a claimed second full run.
+  Clippy retains the preceding 59 warnings; the added tests introduce none.
+  Evidence: `candidate-4b2f941` and `integration/bounds-parent` below the
+  temporary evidence root. `tests/BASELINE.md` now records this merge.
+- Variance metadata (`+A`/`-A`) independently passes its real-scalac/JVM
+  interop test in metadata candidate `9e522013`, but is not yet on main.
+  The newer specialization candidate `14476f75` combines bounds, variance,
+  and local-symbol clone fixes. Its two bounds tests and six specialization
+  tests pass; a seventh test expects scalac to specialize a lower-bounded
+  call that scalac actually keeps generic once real bounds are pickled.
+  Direct execution still produces the correct result, including the newly
+  exercised `upper("hello")` generic CharSequence call. The agent is aligning
+  specialization eligibility and the test with nsc's actual behavior before
+  a new full gate. The successful old `560405fd` full run is not evidence for
+  this newer candidate.
 - Specialization candidate `560405fd` completed its full runner: 2234 release
   workspace tests pass; all four compile measures match the baseline;
   strict verification loads all 1490 classes; Slick MODE=b passes 36/36.
@@ -23,6 +47,13 @@ Latest independent checks (these supersede the pending descriptions below):
   This candidate is still held: additional local-class probes require
   symbol-cloning fixes. Follow-up `e02b8161` is being reviewed for external
   constructor ownership and complete type-symbol remapping before acceptance.
+  An independent bounded-type probe found a second new regression:
+  `size[@specialized(Int) A <: CharSequence](a: A) = a.length` emits an
+  invalid primitive method and fails JVM verification even for a String call.
+  Main and scalac both print `5`; scalac warns that bounds prevent
+  specialization. Variant generation and source annotation advertising must
+  agree on eligible bounds. Evidence: `specialization-validation/bounded`.
+  Clippy exits 0 but adds four warnings (59 to 63); these also remain pending.
 - Combined metadata candidate `fbc4ca7e` passes 15 fresh focused release
   tests (codegen diagnostics, source signatures, constructor defaults).
   It is held because a separate producer probe rejects ordinary `case class
@@ -39,6 +70,9 @@ Latest independent checks (these supersede the pending descriptions below):
   accepted main, and the proposed earlier divergence check `4c261de5` for a
   bounded investigation. Reordering that check alone is not proof of the
   claimed speedup or a fix for fresh inference variables in recursive rules.
+  The independent fresh build passed, but the measurement timed out after
+  60.008 seconds (exit -15) with no diagnostics. Evidence is under
+  `gb-validation/investigation-554b4de`; no error count is inferred.
 - Macro snapshot proposal `f4099fd7` is held: a constructor-field-only
   declaration list is not a complete case-class symbol graph. Generic/active
   symbols must not lose previously working name-only queries. Permanent
@@ -401,3 +435,33 @@ Current process and pending-commit state is also recorded in
 `/tmp/scala-rs-codex/integration/current-state.json`. Original branch corpus
 sessions and script/binary revisions are tracked separately in
 `/tmp/scala-rs-codex/slice-validation/result.json`.
+
+
+## Variance accepted; other candidates still under repair
+
+`9beb69b2` merges compiler candidate `629570a8` plus test-only `803be601`.
+Parent full release validation: 2237 passed, zero failed, 199 result rows;
+Slick 0/1490, cats 350/81, GitBucket 912/111, Scala library 1613/171;
+strict verification loaded all 1490 classes; Slick MODE=b 36/36 attempts.
+MODE=a remains 12 compile failures; specialization remains 2 match / 26 differ /
+9 no_compile. All 5324 corpus identities and statuses match the checked-in
+three-column reference. Full six-field comparison to `candidate-4b2f941` found
+only t8199's output path and impconvtimes's first runtime exception. The latter
+was independently investigated: both compilers emit seven byte-identical classes,
+and repeated runs produce both VerifyError and IncompatibleClassChangeError.
+Evidence is `integration/variance-impconvtimes/results.json` under the existing
+`/tmp/scala-rs-codex` root. The full gate, supplemental test and clippy audits
+are in `integration/candidate-629570a/`. Compiler/Cargo inputs are unchanged
+between the full run, test-only follow-up, and merge. Clippy with the historical
+`--workspace --release` scope retains exactly 59 warning messages.
+
+Unaccepted candidates: codegen/constructor `73cc75b2` full workspace returned
+2238 passed / 10 failed. Parent `aa5126ee` fixes the six selfrec failures by
+indexing default parameter types against the remaining method clauses;
+selfrec plus verify_sql gives 10 fresh passes. Four Slick constructor overload
+failures remain assigned for repair. Implicit candidate `fc2ab4cc` passes 15
+focused tests but rejects a parent-confirmed nsc-positive non-generic implicit
+leaf; real GitBucket still timed out at 60 seconds on its preceding candidate.
+Macro `7f2a9be9` passes a success-required hydration test, but independent probes
+expose incomplete flags, owners, parameter metadata and legal class shapes.
+None of these candidates is accepted based on focused tests alone.
