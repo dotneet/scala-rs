@@ -735,6 +735,19 @@ impl Typer {
                     Type::TypeParam(id) | Type::TypeMember(id) if seen.insert(id) => {
                         typer.st.get(id).bound_hi.clone().unwrap_or(Type::Any)
                     }
+                    Type::Applied { ref ctor, ref args } => {
+                        let Type::TypeMember(id) = ctor.as_ref() else {
+                            return ty;
+                        };
+                        if !seen.insert(*id) {
+                            return ty;
+                        }
+                        let hi = typer.st.get(*id).bound_hi.clone().unwrap_or(Type::Any);
+                        // An applied abstract member's upper bound is written
+                        // in its own type parameters. Test against that bound
+                        // at the actual arguments, e.g. Foo[A] <: A.
+                        typer.st.subst_tparams(*id, args, &hi)
+                    }
                     Type::Annotated { tpe, .. } => *tpe,
                     // Function syntax and FunctionN classes denote the same
                     // type. Use the class form so abstract arguments on both
