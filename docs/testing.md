@@ -721,9 +721,13 @@ still needs a JVM to find it.
 
 ## `tests/verify_all.sh` — the check that was missing (2026-09-06)
 
-Six of the 1490 classes slick compiles to fail JVM verification, and had been
+Six of the 1490 classes slick compiles to failed JVM verification, and had been
 failing for an unknown number of waves while every measure in the battery
-reported green:
+reported green. They are **fixed** as of `agent/verifyfail`
+(`verify_classes=1490 verify_failures=0`); what follows is what they were and
+why nothing saw them, because the second half is the part that will happen
+again. The four roots are written up in
+[`notes/codegen-and-stackmap-frames.md`](notes/codegen-and-stackmap-frames.md).
 
 ```
 BAD slick.collection.heterogeneous.HList$                          VerifyError: Bad type on operand stack
@@ -752,3 +756,22 @@ any class fails.
 **"slick compiles with zero errors" was true and is not the same claim as "the
 JVM will load what we wrote."** That distinction is the reason this file
 already has a section on what each check proves; this is one more line in it.
+
+Two of the six defects would not have been caught even by running the code:
+
+* `PostgresProfile$PostgresQueryBuilder` was one of *five* classes whose
+  `super.expr(n)` had been mis-resolved. The other four resolved to the class's
+  **own** `expr`, which is a perfectly verifiable `invokespecial` and an
+  infinite recursion. Only Postgres named a class that is not an ancestor, and
+  only that one the verifier could see. So `verify_failures` is a lower bound
+  on the mis-compilations underneath it — when it points at something, look for
+  the sibling cases that happen to verify.
+* the two `ResultConverter` bridges cannot be *called* from Scala at all (every
+  argument expression of type `Nothing` diverges before the call), so linking
+  the class is the only thing that can ever check them.
+
+`tests/scala_corpus.sh`'s `run` kind reports 40 `VerifyError`s of its own. They
+were measured before and after this slice, on the same tree, and the set is
+identical: **none of the four roots above is among them.** `run/t8803` is a
+qualified `super[A].m` from inside a lambda (it needs a `C$$super$m`
+accessor); the rest are unexamined.
