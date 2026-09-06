@@ -36,7 +36,11 @@ impl Typer {
             TreeKind::Select { qual, name } => (qual, name.clone()),
             _ => return,
         };
-        if qual.ty.is_no_type() {
+        // A parent-constructor expression can be visited before a later
+        // unit's inferred members are complete. Its qualifier may carry the
+        // provisional Error type from that visit even after the symbol's type
+        // has settled. Error is not a completed qualifier to reuse on retry.
+        if qual.ty.is_no_type() || qual.ty.is_error() {
             // The enclosing application's argument count belongs to *this*
             // selection, not to whatever the qualifier turns out to be.
             let saved_arity = self.callee_arity.take();
