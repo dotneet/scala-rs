@@ -118,9 +118,10 @@ execution modes b and a, specialization, and the complete corpus. Do not
 restart this runner. It ended with exit 1 after the workspace command failed
 with exit 101: two `final3` tests expose inconsistent stack maps in a tail-call
 loop (`Main$.fix`, Object versus Option in local 2). No later phase ran.
-The remaining previously unrun workspace targets are being collected with
-`--no-fail-fast` on the same frozen candidate (session `29423`); this is failure
-collection, not a replacement passing workspace result.
+The remaining previously unrun CLI targets and other workspace tests completed
+with exit 0 on the same frozen candidate (session `29423`, 529.206 and 17.245
+seconds). This is failure collection, not a replacement passing workspace
+result; the original `final3` failure remains in that candidate.
 The existence of `run.json` means the job was dispatched, not that it passed.
 
 Additional independently checked changes staged there:
@@ -183,3 +184,33 @@ The deferred gitbucket import fix `b0e4401` is not accepted. Its bounded
 120-second measure timed out before diagnostics or class output; zero partial
 errors is not a valid error count. A short process profile will distinguish
 compiler work from the startup delay observed in another measurement.
+
+
+## Subsequent independent review
+
+The next candidate `e4c99ce` is frozen for full workspace failure collection
+with `--no-fail-fast`, session `87421`; its log is
+`/tmp/scala-rs-codex/integration-next/workspace-e4c99ce.log`. The new diagnostic
+gate rejects the previously passing `dbio` fixture with `no super
+implementation for superZip`. Investigate the generated accessor and target;
+do not restore a hidden exception stub merely to make the test green.
+
+Tail-loop frame fix `42acefd` reuses declared local types. Value-class extension
+follow-up `bcd9c20` is not yet accepted: independent receiver-changing Long
+recursion compiles but fails JVM verification at `astore_0`. Scalac runs the
+same program with a small stack and prints `2000007`. Evidence is under
+`/tmp/scala-rs-codex/value-tailrec-review`; an additional fix is in progress.
+
+All three original branches have now passed their explicit-JDK-17 workspace
+gates: implicitmemo 2204 tests, nullcross and catstail 2207 each. Applying the
+current strict verifier to the latter two existing output trees exposes
+1490 total / 1488 loaded / 1 verifier failure / 1 incomplete initializer,
+corresponding to the constructor and Factory defects already fixed in the
+integration candidate. Their corpus gates remain open; the validator must
+record harness and binary source revisions separately.
+
+The bounded gitbucket profile captured the compiler at 100% CPU and about
+553 MiB RSS, with Rust implicit-search, unification, type substitution and
+clone frames, and no `_dyld_start` frame. This particular timeout is compiler
+work, not the separately observed startup delay. A semantics-preserving
+optimization remains isolated in `codex/gb-import`.
