@@ -400,11 +400,9 @@ pub struct Symbol {
     /// no `@specialized`, and `Some(empty)` when it carries one that names
     /// nothing specializable.
     ///
-    /// Recording it is stage 1 of specialization: nothing yet *uses* it, since
-    /// nsc's `specialize` phase runs after the typer and the typer applies no
-    /// rule that depends on the annotation. What is still missing is the
-    /// phase itself — no `Foo$mcI$sp` is emitted — and
-    /// `tests/spec_classfiles.sh` measures exactly that gap.
+    /// Recording it is the typer half of specialization. The post-pickler
+    /// method slice consumes one method-owned parameter and emits Int/Long
+    /// entries; class and trait entries remain for a later phase.
     pub specialized: Option<scala_rs_parser::SpecializedTypes>,
     /// `@unspecialized` on a member: nsc's opt-out from the specialization its
     /// owner would otherwise give it. Recorded for the same reason, and with
@@ -437,6 +435,21 @@ pub struct Symbol {
     /// ground truth about which members actually have an accessor: a
     /// `private[this] val` has none and keeps the direct field read.
     pub via_accessor: bool,
+}
+
+/// One method-owned specialization entry created after pickling.
+///
+/// The generic method remains the source-level declaration and the source
+/// pickle.  This record names the additional JVM entry and the primitive that
+/// its cloned body uses; synthetic entries are deliberately created after the
+/// pickle snapshot so they cannot become Scala declarations accidentally.
+#[derive(Clone, Debug)]
+pub struct MethodVariant {
+    pub original: SymbolId,
+    pub symbol: SymbolId,
+    pub type_param: SymbolId,
+    pub ty: Type,
+    pub jvm_name: String,
 }
 
 impl Symbol {
@@ -685,6 +698,8 @@ pub struct SymbolTable {
     /// into a single parameter list. It runs once per compilation unit and
     /// only ever appends, so each pass starts here instead of at 0.
     pub(crate) flattened_upto: usize,
+    /// Method-owned primitive variants produced after the source pickle.
+    pub method_variants: rustc_hash::FxHashMap<SymbolId, Vec<MethodVariant>>,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -794,6 +809,7 @@ impl SymbolTable {
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
             flattened_upto: 0,
+            method_variants: rustc_hash::FxHashMap::default(),
         };
         st.root = st.alloc(
             "<_root_>",
