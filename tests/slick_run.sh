@@ -49,6 +49,11 @@ LIB=/tmp/scala-rs-lib/scala-library-2.13.16.jar
 CCACHE=$HOME/Library/Caches/Coursier/v1/https/repo1.maven.org/maven2
 H2=$CCACHE/com/h2database/h2/2.1.214/h2-2.1.214.jar
 RUNS=${RUNS:-3}
+MODE=${MODE:-b}
+case $MODE in
+  a|b) ;;
+  *) echo "MODE must be a or b, got: $MODE" >&2; exit 2 ;;
+esac
 
 if [[ ! -x $SCALAC || ! -s $LIB || ! -d $SP/slick/.git || ! -s $SP/deps.cp ]]; then
   echo "toolchain or slick checkout missing; run tests/slick_measure.sh once first (it self-restores)" >&2
@@ -130,7 +135,7 @@ fi
 
 CP_A=$WORK/out-rs:$RES:$DEPS:$H2:$LIB
 CP_B=$DIR/out-scalac:$RES:$DEPS:$H2:$LIB
-[[ ${MODE:-b} == a ]] && CP_COMPILE=$CP_A || CP_COMPILE=$CP_B
+[[ $MODE == a ]] && CP_COMPILE=$CP_A || CP_COMPILE=$CP_B
 
 PROGS=($@)
 if [[ ${#PROGS[@]} -eq 0 ]]; then
@@ -139,11 +144,14 @@ fi
 
 load() { uptime | sed 's/.*load averages*: //'; }
 
-mkdir -p $WORK/progs
+# Both directions may reuse the same library outputs, but their client
+# classfiles and execution evidence must survive running the other direction.
+PROG_DIR=$WORK/progs-$MODE
+mkdir -p $PROG_DIR
 PASS=0; DIFF=0; FAIL=0; ATT=0; ATT_OK=0
 for p in $PROGS; do
   src=$ROOT/tests/slick_progs/$p.scala
-  out=$WORK/progs/$p
+  out=$PROG_DIR/$p
   rm -rf $out; mkdir -p $out
   if ! $SCALAC $src -d $out -cp "$CP_COMPILE" > $out/compile.log 2>&1; then
     echo "COMPILE-FAIL $p   (see $out/compile.log)"; FAIL=$((FAIL+1)); continue
@@ -174,5 +182,5 @@ for p in $PROGS; do
     fail) echo "RUN-FAIL     $p   $okc/$RUNS  (see $out/attempt*-a.err $out/attempt*-b.err)"; FAIL=$((FAIL+1));;
   esac
 done
-echo "progs=${#PROGS[@]} ok=$PASS diff=$DIFF fail=$FAIL  runs=$RUNS attempts=$ATT_OK/$ATT  (compile-cp=${MODE:-b}, work=$WORK)"
+echo "progs=${#PROGS[@]} ok=$PASS diff=$DIFF fail=$FAIL  runs=$RUNS attempts=$ATT_OK/$ATT  (compile-cp=$MODE, work=$WORK)"
 [[ $DIFF -eq 0 && $FAIL -eq 0 ]] || exit 1

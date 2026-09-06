@@ -5,6 +5,55 @@ baseline. The implementation on `main` remains the implementation measured at
 `902da04`; subsequent main commits currently change documentation and test
 harnesses only. Read `tests/BASELINE.md` rather than remeasuring the old tree.
 
+## Current decision state
+
+The sections below preserve earlier checkpoints; this section supersedes
+their pending-status statements. All new subagents use Luna / xhigh and
+isolated worktrees. They report through collaboration tools, not Codex task
+messages.
+
+- Recovery `d9eb5dc` has independently passed 2228 release workspace tests,
+  all 1490 Slick class loads (zero failures or incomplete loads), structural
+  lint, and Slick MODE=b execution: 12 programs, 36/36 attempts. Measurements
+  are Slick 0 errors / 1490 classes, cats 350 errors / 81 files, gitbucket
+  912 / 111, and Scala library 1613 / 171. Full corpus validation is still
+  running in session `28152`; specialization remains 2 match / 26 differ /
+  9 no-compile, with zero specialized classes. It is not yet merge-approved.
+- The original three separate branch corpus runs are complete and each has
+  5324 unique, six-field records. Nullcross matches the recorded aggregate
+  baseline. Cats and implicitmemo each lose only `run/t5923b` relative to the
+  nullcross ledger: `new Array[Nothing]` has the wrong runtime class. The
+  existing Null slice fix `83be6e6`, already in recovery, resolves that
+  source-level mismatch in an independent JVM/scalac comparison.
+- Slick MODE=a is newly measured: all 12 clients fail to compile against our
+  classfiles. There is no recorded MODE=a baseline. This exposes the source
+  signature limitation already documented in `docs/language-support.md`:
+  parameter clauses have been flattened before pickling. A source metadata
+  snapshot before lowering is being implemented in `codex/source-signature`.
+  The same logs also expose existential/member metadata gaps; fixing clauses
+  alone must not be reported as full MODE=a compatibility.
+- New features remain separate in `codex/integration-next` at `6f26485`.
+  The tail-call fixes independently pass 28 focused release tests and the
+  super-accessor correction passes 101. A fresh parent-built provider plus a
+  scalac-built subclass still raises `AbstractMethodError` for inherited
+  `Layer$$super$foo`; metadata, overload, and nested-owner fixes are pending.
+  An earlier ABI probe accidentally used the agent's stale release binary
+  and is explicitly invalidated; only `parent-6f26485-*` evidence is current.
+- Gitbucket import completion plus a conservative implicit candidate filter
+  is frozen at `3f4e170` in `codex/gb-validation`. Session `18153` runs the
+  release workspace suite before a 180-second bounded gitbucket measurement.
+  No completed performance result is claimed yet.
+- External constructor default getters (`c74dd7b`, `1140fb6`) remain held.
+  Generic and nested cases now have focused evidence, but assigning default
+  flags to every overloaded constructor from getter names requires review.
+
+Machine-readable process/commit state is in
+`/tmp/scala-rs-codex/integration/current-state.json`. Recovery logs are under
+`/tmp/scala-rs-codex/integration/candidate-d9eb5dc`. The Slick runner now keeps
+MODE=a and MODE=b client artifacts in separate `progs-a` / `progs-b`
+directories: switching directions previously overwrote successful execution
+evidence. Compiler outputs may still be explicitly reused.
+
 ## Preserved implementations
 
 | Work | Branch | Reviewed implementation checkpoint |
