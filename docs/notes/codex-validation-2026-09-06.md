@@ -109,13 +109,18 @@ reference, and only then update the baseline and move main.
 ## Later coordinator checkpoint
 
 Candidate `b1346e9` is frozen in `codex/integration` for independent full
-validation. The tracked command is exec session `81028`, running
+validation. The tracked command was exec session `81028`, running
 `/tmp/scala-rs-codex/integration/validate-candidate.py`; outputs are under
 `/tmp/scala-rs-codex/integration/candidate-b1346e9`. It starts with release
 workspace tests and stops if they fail. Later phases cover the four measures,
 strict verification with the pinned PostgreSQL/Oracle dependencies, Slick
 execution modes b and a, specialization, and the complete corpus. Do not
-restart this runner or change the candidate until its process is finished.
+restart this runner. It ended with exit 1 after the workspace command failed
+with exit 101: two `final3` tests expose inconsistent stack maps in a tail-call
+loop (`Main$.fix`, Object versus Option in local 2). No later phase ran.
+The remaining previously unrun workspace targets are being collected with
+`--no-fail-fast` on the same frozen candidate (session `29423`); this is failure
+collection, not a replacement passing workspace result.
 The existence of `run.json` means the job was dispatched, not that it passed.
 
 Additional independently checked changes staged there:
@@ -136,8 +141,9 @@ Additional independently checked changes staged there:
   javac cannot start.
 
 The qualified `Factory` companion fix (`607765f`) and generic-owner override
-bound substitution (`25a347b`) have been reviewed and staged; their combined
-independent gates are still in progress. The previous independent strict
+bound substitution (`25a347b`) have been reviewed and staged. An independent
+focused run on the next candidate `e4c99ce` passed 31 tests: arraygen 4, codegen
+diagnostics 2, override 23, and verify_sql 2 (session `1216`, exit 0). The previous independent strict
 Slick check loaded 1489 of 1490 classes, with no verifier failures and exactly
 one incomplete initializer (`select Factory`). The Oracle jar used to resolve
 optional coverage is the version pinned in Slick's Dependencies.scala:
@@ -149,7 +155,8 @@ run 572/935/553. This is not an accepted result against the baseline. Its
 Java 15 environment and the observed compiler changes need to be separated.
 The old four workspace runs all stopped at the nine engine startup failures;
 none is a passing full-workspace result. Java 17 reruns of nullcross and
-catstail are tracked by the validation agent in `slice-validation/result.json`.
+catstail each report 2207 passing tests and no failures. Completion and later
+gates are tracked by the validation agent in `slice-validation/result.json`.
 
 Further harness checks now cover non-UTF-8 bytes in both the ledger and its
 report, separate compilation rounds, missing worker records, and early
@@ -161,6 +168,18 @@ New work remains isolated from the frozen candidate: constructor-default
 separate-compilation follow-up, the deferred blocking-slick import fix and its
 bounded performance experiment, and codegen diagnostics. The codegen audit
 found fourteen fallback sites that emit runtime exceptions for compiler
-unsupported/unresolved states. The next slice will make those compilation
-errors with source positions and prevent classfile publication on emission
-failure, while preserving deliberate user throws, MatchError, and `???`.
+unsupported/unresolved states. Commit `12098f0`, staged as `e4c99ce` in `codex/integration-next`, makes those
+compilation errors with source positions and prevents classfile publication
+on emission failure, while preserving deliberate user throws, MatchError,
+and `???`. Independent focused checks passed; full gates remain open.
+
+The external constructor-default follow-up `c74dd7b` is held for review: its
+manual result typing could hide invalid generic default arguments. Scalac
+accepts a separately compiled `GenericDefault[T](value: T = 42)` but rejects
+a client extending `GenericDefault[String]()`; this negative example must
+remain rejected. The agent is checking this and other binary getter cases.
+
+The deferred gitbucket import fix `b0e4401` is not accepted. Its bounded
+120-second measure timed out before diagnostics or class output; zero partial
+errors is not a valid error count. A short process profile will distinguish
+compiler work from the startup delay observed in another measurement.
