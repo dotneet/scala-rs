@@ -1174,6 +1174,7 @@ impl PickleSupply {
             tparams.push(t);
         }
         st.get_mut(id).tparams = tparams;
+        st.get_mut(id).is_type_alias = true;
         // The right-hand side is written in the *declaring* class's
         // vocabulary, the same way an abstract member's bound is.
         let outer = self.self_ty.replace(Type::Class {
@@ -1189,6 +1190,7 @@ impl PickleSupply {
             return None;
         };
         st.get_mut(id).ty = target;
+        st.get_mut(id).is_type_alias = true;
         st.get_mut(owner).members.push(id);
         trace(format_args!("type alias {owner_name}.{name}"));
         Some(Type::TypeMember(id))

@@ -585,6 +585,11 @@ impl Typer {
             tps.push(t);
         }
         self.st.get_mut(id).tparams = tps;
+        // This symbol came from an ALIASsym entry in the provider pickle.
+        // Keep that declaration kind even when the RHS resolves to another
+        // type member; inferring it from the converted RHS turns aliases such
+        // as `type Item[A] = Schema` into abstract TYPEsym entries.
+        self.st.get_mut(id).is_type_alias = true;
         let mut asked: HashSet<String> = HashSet::new();
         for _ in 0..8 {
             if let Some(ty) =
