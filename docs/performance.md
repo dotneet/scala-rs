@@ -288,17 +288,25 @@ shallow. The reason to have it is the family it unblocks. Guarding
 the fix for gitbucket's largest remaining family — multiplies the number of
 candidates in scope, and with that guard applied:
 
-* the memo answers **99.3%** of all `search_implicit_undet` calls (measured
-  over gitbucket's 213 hand-written sources: 3.98M calls, 3.98M hits, 18k
-  entries refused by the divergence signature);
-* `most_specific`, which was 77% of the samples in the deepest search and is
-  quadratic in the number of fitting candidates, disappears from the profile
-  entirely once `strictly_more_specific` is cached.
+* the memo answers **99.3%** of all `search_implicit_undet` calls (counted over
+  gitbucket's 213 hand-written sources: 3.98M calls, 3.98M hits, 18k entries
+  refused by the divergence signature);
+* `most_specific` was **73% of one ten-second profile** taken inside the
+  deepest search, all of it in `is_as_specific_type`, and it does not appear in
+  the profile at all once `strictly_more_specific` is cached. (Two `sample`
+  runs at different points of a long compile are not the same measurement —
+  this says the quadratic comparison is gone from that search, not that the
+  run is 73% shorter.)
 
-**And what it is not enough for.** That guard is still not affordable. What is
-left is not repeated searches — it is the ~0.7% that miss, each of which fits
-*every* candidate in scope to the wanted type before it can answer. The profile
-under the guard is `implicit_fit_open`'s own substitution work
+**And what it is not enough for.** That guard is still not affordable, and the
+bisection is sharp: with the guard, gitbucket's first **190** hand-written
+sources compile in 6 s, and adding the 191st — `util/DatabaseConfig.scala` —
+takes it past 400 s. That is true of both the memoized and the unmemoized
+compiler, so the memo does not reach this.
+
+What is left is not repeated searches — it is the ~0.7% that miss, each of
+which fits *every* candidate in scope to the wanted type before it can answer.
+The profile under the guard is `implicit_fit_open`'s own substitution work
 (`subst_tparams_slice`, `type_mentions_tparam`, `Type::clone` and its drop
 glue) at those misses. nsc has a cheap structural pre-test
 (`isPlausiblyCompatible`) that rejects most candidates before unification is
