@@ -210,6 +210,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                     &sf,
                     file_index,
                     ParseOptions {
+                        library_abi: opts.scala_library.is_some(),
                         source3: opts.xsource3,
                         no_specialization: opts.no_specialization,
                         kind_projector: opts.kind_projector,

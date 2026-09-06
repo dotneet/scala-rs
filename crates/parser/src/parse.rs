@@ -20,6 +20,10 @@ pub struct ParseResult {
 /// otherwise 2.13 parser. Only the ones this subset implements live here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ParseOptions {
+    /// Target the real scala-library ABI. The private runtime intentionally
+    /// ships only Tuple2, so for-comprehension tuple extensions use nested
+    /// pairs when this is false and the flat TupleN shape nsc emits when true.
+    pub library_abi: bool,
     /// `-Xsource:3` / `-Xsource:3-cross`: accept `A & B` as a compound type.
     pub source3: bool,
     /// nsc `-no-specialization`, "Ignore @specialize annotations." Under it
@@ -5335,6 +5339,9 @@ fn desugar_for(
     body: Tree,
     is_yield: bool,
 ) -> Tree {
+    const MAX_TUPLE_ARITY: usize = 22;
+    const MAX_VALUE_DEFS_PER_GROUP: usize = MAX_TUPLE_ARITY - 1;
+
     if enums.is_empty() {
         p.error_span(lo, "empty for-comprehension");
         return body;
@@ -5539,6 +5546,26 @@ fn desugar_for(
         )
     }
     fn tuple_tree(p: &mut Parser, span: Span, args: Vec<Tree>) -> Tree {
+        if p.opts.library_abi {
+            let arity = args.len();
+            if arity <= 1 {
+                return args.into_iter().next().unwrap_or_else(|| p.empty(span));
+            }
+            let mut fun = p.alloc(
+                span,
+                TreeKind::Ident {
+                    name: format!("Tuple{arity}"),
+                },
+            );
+            fun.scala_ref = true;
+            return p.alloc(
+                span,
+                TreeKind::Apply {
+                    fun: Box::new(fun),
+                    args,
+                },
+            );
+        }
         let mut args = args.into_iter();
         let Some(mut result) = args.next() else {
             return p.empty(span);
@@ -5566,6 +5593,9 @@ fn desugar_for(
     /// fields on the right. This keeps every field selectable with Tuple2
     /// even when the value-definition pattern has more than one binding.
     fn right_tuple_tree(p: &mut Parser, span: Span, mut args: Vec<Tree>) -> Tree {
+        if p.opts.library_abi {
+            return tuple_tree(p, span, args);
+        }
         let last = args.pop().expect("right tuple needs at least one field");
         if args.is_empty() {
             return last;
@@ -5601,6 +5631,15 @@ fn desugar_for(
         total: usize,
     ) -> Tree {
         let mut result = p.alloc(span, TreeKind::Ident { name: base.into() });
+        if p.opts.library_abi {
+            return p.alloc(
+                span,
+                TreeKind::Select {
+                    qual: Box::new(result),
+                    name: format!("_{}", index + 1),
+                },
+            );
+        }
         let mut index = index;
         let mut total = total;
         while total > 2 && index > 0 {
@@ -5864,9 +5903,12 @@ fn desugar_for(
         let mut next = index;
         if next < enums.len() && enums[next].is_val {
             let start = next;
-            while next < enums.len() && enums[next].is_val {
+            let mut group_size = 0;
+            while next < enums.len() && enums[next].is_val && group_size < MAX_VALUE_DEFS_PER_GROUP
+            {
                 let has_guard = enums[next].guard.is_some();
                 next += 1;
+                group_size += 1;
                 if has_guard {
                     break;
                 }
@@ -5903,12 +5945,12 @@ fn desugar_for(
                 }
             });
             stream = apply_collection(p, stream, "map", fun);
-            for value_pat in group_pats {
-                current_pat = tuple_tree(
-                    p,
-                    current_pat.span.merge(value_pat.span),
-                    vec![current_pat, value_pat],
-                );
+            if let Some(last_pat) = group_pats.last() {
+                let tuple_span = current_pat.span.merge(last_pat.span);
+                let mut tuple_args = Vec::with_capacity(group_pats.len() + 1);
+                tuple_args.push(current_pat);
+                tuple_args.extend(group_pats);
+                current_pat = tuple_tree(p, tuple_span, tuple_args);
             }
             if let Some(g) = group.last().and_then(|e| e.guard.clone()) {
                 stream = with_filter(p, stream, &current_pat, g);

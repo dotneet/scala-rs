@@ -156,6 +156,64 @@ fn value_definition_guards_match_real_scalac() {
 }
 
 #[test]
+fn value_definition_tuple_shape_matches_scalac() {
+    let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip tuple-shape nsc comparison");
+        return;
+    };
+    let exp = expected("fvg_for_shape");
+    let src = fixtures_dir().join("fvg_for_shape.scala");
+
+    let nsc_out = tmp_dir("fvg_for_shape-scalac");
+    let status = Command::new(scalac)
+        .args([src.to_str().unwrap(), "-d", nsc_out.to_str().unwrap()])
+        .status()
+        .expect("run scalac");
+    assert!(
+        status.success(),
+        "real scalac failed to compile fvg_for_shape"
+    );
+    assert_eq!(run(&nsc_out, Some(&jar)), exp);
+    let _ = fs::remove_dir_all(nsc_out);
+
+    let ours = compile_and_run(
+        "fvg_for_shape",
+        &["--scala-library", jar.to_str().unwrap()],
+        Some(&jar),
+    );
+    assert_eq!(ours, exp, "custom map observed a different tuple shape");
+}
+
+#[test]
+fn value_definition_tuple_group_boundary_matches_scalac() {
+    let (Some(scalac), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip tuple-group boundary nsc comparison");
+        return;
+    };
+    let exp = expected("fvg_for_arity");
+    let src = fixtures_dir().join("fvg_for_arity.scala");
+
+    let nsc_out = tmp_dir("fvg_for_arity-scalac");
+    let status = Command::new(scalac)
+        .args([src.to_str().unwrap(), "-d", nsc_out.to_str().unwrap()])
+        .status()
+        .expect("run scalac");
+    assert!(
+        status.success(),
+        "real scalac failed to compile fvg_for_arity"
+    );
+    assert_eq!(run(&nsc_out, Some(&jar)), exp);
+    let _ = fs::remove_dir_all(nsc_out);
+
+    let ours = compile_and_run(
+        "fvg_for_arity",
+        &["--scala-library", jar.to_str().unwrap()],
+        Some(&jar),
+    );
+    assert_eq!(ours, exp, "value-definition group boundary differs");
+}
+
+#[test]
 fn value_definition_before_generator_is_rejected() {
     let out = tmp_dir("fvg_for_bad");
     let (ok, messages) = compile(
