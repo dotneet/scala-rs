@@ -72,11 +72,14 @@ rm -rf $OUT; mkdir -p $OUT
 # impossible. Appended here rather than in the shared deps.cp so a stale
 # scratchpad state cannot lose it.
 REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
+COMPILER_EXIT=0
 $BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp):$REFLECT" -Xsource:3 \
-  --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > ${SLICK_LOG:-$SP/measure.txt} 2>&1 || true
+  --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > ${SLICK_LOG:-$SP/measure.txt} 2>&1 || COMPILER_EXIT=$?
 ERRORS=$(grep -c '^error' ${SLICK_LOG:-$SP/measure.txt} || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest progress metric.
 BADFILES=$(grep -A 2 '^error' ${SLICK_LOG:-$SP/measure.txt} | grep -oE '(src/main|generated)/[^:]*' | sort -u | wc -l | tr -d ' ')
 rm -rf $RUN
-echo "files=${#FILES[@]} errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES"
+echo "files=${#FILES[@]} errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES compiler_exit=$COMPILER_EXIT"
+source "$ROOT/tests/measure_result.sh"
+validate_measure_result $COMPILER_EXIT $ERRORS $CLASSES ${#FILES[@]} "${SLICK_LOG:-$SP/measure.txt}"

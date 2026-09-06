@@ -1,8 +1,30 @@
 ## Testing
 
 ```bash
-cargo test
+cargo test --workspace --release
 ```
+
+The four compile measurements (`slick`, `cats`, `gitbucket`, `scalalib`)
+report `compiler_exit` alongside their counts. Exit 1 with actual diagnostics
+is a valid measurement of unsupported sources; abnormal exits, a failure
+without diagnostics, no source files, and a supposedly successful build with
+no classes fail the measurement. These are not zero-error results.
+`slick_run.sh` additionally requires the compilation itself to succeed and
+propagates structural lint failures through its output pipeline.
+
+`tests/verify_all.sh` reports `verify_loaded` and `verify_incomplete` as well
+as `verify_classes` and `verify_failures`. Missing dependencies and failed
+static initializers print `INCOMPLETE` rather than disappearing from the
+result. Exit 0 means every discovered class loaded successfully; exit 1 means
+a verification/class-format failure; exit 2 means coverage is incomplete or
+the directory is empty. An incomplete load is not itself proof of a compiler
+defect. Supply the missing runtime classpath and inspect initialization
+failures before making that diagnosis. The JVM runs with `-Xverify:all`.
+
+`bash tests/measurement_harness_test.sh` checks these result classifications
+with 16 shell cases and five small JVM cases, without rebuilding scala-rs or
+rerunning the corpus. See [development-plan.md](development-plan.md) for the
+integration gates and isolated-worktree workflow.
 
 scala/scala's own corpus (`test/files/{pos,neg,run}`, 5324 programs at tag
 `v2.13.16`) is run by `tests/scala_corpus.sh`; see
@@ -749,9 +771,10 @@ Why nothing saw them:
 
 `tests/verify_all.sh <dir> [cp...]` calls `Class.forName(name, **true**,
 loader)` over every class file under a directory and counts `VerifyError` and
-`ClassFormatError`, ignoring anything else a load can throw (a missing
-dependency, a static initialiser wanting a database). It exits non-zero when
-any class fails.
+`ClassFormatError`. Other load failures (a missing dependency, a static
+initializer wanting a database) are reported separately as `INCOMPLETE`.
+It exits non-zero for verification failures, incomplete coverage, or an empty
+directory; the result contract is described at the start of this document.
 
 **"slick compiles with zero errors" was true and is not the same claim as "the
 JVM will load what we wrote."** That distinction is the reason this file
