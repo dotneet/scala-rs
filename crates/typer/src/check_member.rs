@@ -1333,15 +1333,24 @@ impl Typer {
         class_id: SymbolId,
         targs: &[Type],
         args: &mut Vec<Tree>,
+        ctor: SymbolId,
     ) {
         if self.sigs_only {
             return;
         }
-        // Overloaded constructors are resolved from the arguments that are
-        // written; filling one of them here would beg the question.
-        let Some(ctor) = self.sole_own_ctor(class_id) else {
+        // The constructor was already selected from the arguments written in
+        // the parent clause. Do not require it to be the class's sole
+        // constructor: `DriverDataSource(null)` selects the primary
+        // constructor while the class also declares a no-argument auxiliary
+        // constructor. Using `sole_own_ctor` here silently skipped the
+        // primary constructor's defaults and made codegen invoke its full JVM
+        // descriptor with only the explicit `null` on the operand stack.
+        if ctor.is_none()
+            || self.st.get(ctor).kind != crate::symbol::SymKind::Method
+            || self.st.get(ctor).owner != class_id
+        {
             return;
-        };
+        }
         let params = self.st.get(ctor).params.clone();
         if args.len() >= params.len() {
             return;
@@ -1725,7 +1734,7 @@ impl Typer {
                 // them. A synthesized argument that failed to conform would
                 // otherwise turn one honest "could not find implicit" into a
                 // second, misleading "no matching overload".
-                self.fill_parent_ctor_args(node, tree.span, class_id, &targs, args);
+                self.fill_parent_ctor_args(node, tree.span, class_id, &targs, args, sym);
             }
             OverloadPick::Ambiguous => {
                 self.error(tree.span, "ambiguous overload for constructor");
