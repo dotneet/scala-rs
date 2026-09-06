@@ -29,7 +29,10 @@ done
 
 mkdir -p "$WORK/good" "$WORK/missing" "$WORK/bad" "$WORK/empty" "$WORK/init"
 cat > "$WORK/Good.java" <<'JAVA'
-public class Good { public static int value() { return 42; } }
+public class Good {
+  static final Class<?> PLATFORM_TYPE = java.sql.Connection.class;
+  public static int value() { return 42; }
+}
 JAVA
 cat > "$WORK/Child.java" <<'JAVA'
 class Parent {}

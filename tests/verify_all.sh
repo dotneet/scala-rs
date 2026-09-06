@@ -53,7 +53,10 @@ public class VerifyAll {
     cp.add(root.toUri().toURL());
     for (String e : a[1].split(File.pathSeparator))
       if (!e.isEmpty()) cp.add(new File(e).toURI().toURL());
-    URLClassLoader cl = new URLClassLoader(cp.toArray(new URL[0]), null);
+    // Keep application dependencies isolated, but retain the platform loader:
+    // on modular JDKs java.sql is not visible through the bootstrap loader.
+    URLClassLoader cl = new URLClassLoader(cp.toArray(new URL[0]),
+        ClassLoader.getSystemClassLoader().getParent());
 
     int bad = 0, loaded = 0, incomplete = 0;
     for (String n : names) {
@@ -66,10 +69,12 @@ public class VerifyAll {
         bad++;
         String m = String.valueOf(e.getMessage()).split("\n")[0];
         System.out.println("BAD " + n + " :: " + e.getClass().getSimpleName() + ": " + m);
+        if (Boolean.getBoolean("scala.rs.verify.verbose")) e.printStackTrace(System.out);
       } catch (Throwable t) {
         incomplete++;
         String m = String.valueOf(t.getMessage()).split("\n")[0];
         System.out.println("INCOMPLETE " + n + " :: " + t.getClass().getSimpleName() + ": " + m);
+        if (Boolean.getBoolean("scala.rs.verify.verbose")) t.printStackTrace(System.out);
       }
     }
     System.out.println("verify_classes=" + names.size() + " verify_failures=" + bad
@@ -84,4 +89,4 @@ javac -d "$WORK" "$WORK/VerifyAll.java" >/dev/null 2>&1 || {
   echo "verify_all: javac failed" >&2
   exit 2
 }
-java -Xverify:all -cp "$WORK" VerifyAll "$DIR" "$CP"
+java -Xverify:all -Dscala.rs.verify.verbose="${VERIFY_VERBOSE:-false}" -cp "$WORK" VerifyAll "$DIR" "$CP"

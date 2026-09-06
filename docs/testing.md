@@ -20,6 +20,9 @@ a verification/class-format failure; exit 2 means coverage is incomplete or
 the directory is empty. An incomplete load is not itself proof of a compiler
 defect. Supply the missing runtime classpath and inspect initialization
 failures before making that diagnosis. The JVM runs with `-Xverify:all`.
+The isolated loader delegates JDK classes to the platform loader so that
+modules such as `java.sql` remain available. Set `VERIFY_VERBOSE=true` to
+include exception causes and verifier details in the log.
 
 `bash tests/measurement_harness_test.sh` checks these result classifications
 with 16 shell cases and five small JVM cases, without rebuilding scala-rs or
