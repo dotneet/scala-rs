@@ -2081,6 +2081,22 @@ impl Typer {
         for clause in self.conv_implicit_params(conv, from) {
             let mut args = Vec::with_capacity(clause.len());
             for want in &clause {
+                if let Type::Class { sym, args } = want {
+                    if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag" {
+                        if let Some(Type::TypeParam(tp)) = args.first() {
+                            if self.st.get(conv).tparams.contains(tp) {
+                                self.error(
+                                    span,
+                                    format!(
+                                        "type {} is an unresolved spliceable type",
+                                        self.st.get(*tp).name
+                                    ),
+                                );
+                                return tree;
+                            }
+                        }
+                    }
+                }
                 self.warm_implicit_scope(want);
                 let mut search = self.search_implicit(want);
                 // The same completion `fill_implicit_params_in` does for an
@@ -2101,6 +2117,9 @@ impl Typer {
                         let mut a = self.implicit_tree(id, want, span, 0);
                         self.adapt(&mut a, want);
                         args.push(a);
+                    }
+                    ImplicitSearch::None if self.classtag_apply_fallback(want, span).is_some() => {
+                        args.push(self.classtag_apply_fallback(want, span).unwrap());
                     }
                     _ => {
                         let diverged = self.diverged_implicit.borrow().clone();

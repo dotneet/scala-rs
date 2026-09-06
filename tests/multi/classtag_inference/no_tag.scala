@@ -1,0 +1,1 @@
+class Yo[T] { def yo():String="" }; object Test { implicit def view[T](a:Any):Yo[T]=new Yo[T]; "".yo() }

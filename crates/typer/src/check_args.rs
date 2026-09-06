@@ -847,6 +847,61 @@ impl Typer {
             // could match it (slick's `slick/basic/ConcurrencyControl.scala`).
             solved = self.undet_solution(&rest_tys, &undet);
         }
+        if solved.is_none()
+            && rest_tys.iter().any(|ty| {
+                matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+            })
+        {
+            // This continuation is needed only for compiler-generated tags.
+            // Ordinary unsuccessful searches must not be repeated here.
+            // Keep bindings obtained from earlier witnesses even when a later
+            // clause needs compiler-generated ClassTag evidence.
+            let mut partial: Vec<(SymbolId, Type)> = Vec::new();
+            let mut ambiguous = false;
+            for ty in &rest_tys {
+                let ids: Vec<_> = partial.iter().map(|(tp, _)| *tp).collect();
+                let vals: Vec<_> = partial.iter().map(|(_, ty)| ty.clone()).collect();
+                let want = crate::symbol::subst_tparams_slice(&ids, &vals, ty);
+                let open: Vec<_> = undet
+                    .iter()
+                    .copied()
+                    .filter(|tp| !ids.contains(tp))
+                    .collect();
+                let (found, bindings) = self.search_implicit_undet(&want, &open, 0);
+                if matches!(found, ImplicitSearch::Ambiguous(_)) {
+                    ambiguous = true;
+                    break;
+                }
+                if found.is_found() {
+                    partial.extend(bindings);
+                }
+            }
+            if !ambiguous {
+                for tp in &undet {
+                    if partial.iter().any(|(id, _)| id == tp)
+                        || self.tparam_in_scope(*tp)
+                        || !self.st.get(*tp).tparams.is_empty()
+                    {
+                        continue;
+                    }
+                    // Failed ordinary evidence must retain its open variables
+                    // in the diagnostic. Minimize only variables occurring
+                    // exclusively in ClassTag requests, before materialization.
+                    let only_tags = rest_tys.iter().filter(|ty| type_mentions_tparam_deep(ty, *tp)).all(|ty| {
+                        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                    });
+                    if only_tags {
+                        let ids: Vec<_> = partial.iter().map(|(tp, _)| *tp).collect();
+                        let vals: Vec<_> = partial.iter().map(|(_, ty)| ty.clone()).collect();
+                        let lo = self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing);
+                        partial.push((*tp, crate::symbol::subst_tparams_slice(&ids, &vals, &lo)));
+                    }
+                }
+                if !partial.is_empty() {
+                    solved = Some(partial);
+                }
+            }
+        }
         let Some(sol) = solved else {
             return rest_tys;
         };
@@ -1529,6 +1584,36 @@ impl Typer {
     /// it can build none — in which case the search has failed and the caller
     /// reports `No ClassTag available for t`.
     fn classtag_tree(&self, ct_cls: SymbolId, t: &Type, span: Span) -> Option<Tree> {
+        // Standard tags have canonical values; select them only after the
+        // requested type is known, rather than registering them as implicits.
+        let canonical = match t {
+            Type::Int => Some("Int"),
+            Type::Long => Some("Long"),
+            Type::Double => Some("Double"),
+            Type::Float => Some("Float"),
+            Type::Boolean => Some("Boolean"),
+            Type::Byte => Some("Byte"),
+            Type::Short => Some("Short"),
+            Type::Char => Some("Char"),
+            Type::Unit => Some("Unit"),
+            Type::Any => Some("Any"),
+            Type::AnyRef => Some("AnyRef"),
+            Type::Nothing => Some("Nothing"),
+            Type::Null => Some("Null"),
+            _ => None,
+        };
+        if let Some(name) = canonical {
+            let module = self.st.companion_module(ct_cls)?;
+            let owner = self.st.module_class_of(module);
+            if let Some(id) = self.st.lookup_member(owner, name).into_iter().next() {
+                let mut tree = self.ref_implicit(id, span);
+                tree.ty = Type::Class {
+                    sym: ct_cls,
+                    args: vec![t.clone()],
+                };
+                return Some(tree);
+            }
+        }
         // `Array[E]` where `E` has no erasure of its own: nsc emits
         // `arrayType(findSubManifest(E))`, not a `classOf` of the array. The
         // difference is visible — `def f[T: ClassTag] = classTag[Array[T]]`
@@ -1549,7 +1634,7 @@ impl Typer {
 
     /// nsc fills `ClassTag[String]` via `ClassTag.apply(classOf[String])` when
     /// there is no primitive getter (`ClassTag.Int`, …).
-    fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
+    pub(crate) fn classtag_apply_fallback(&self, pt: &Type, span: Span) -> Option<Tree> {
         let Type::Class { sym, args } = pt else {
             return None;
         };

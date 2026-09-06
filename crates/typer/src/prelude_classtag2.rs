@@ -10,14 +10,6 @@ fn plain_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) {
         ret: Box::new(ty),
     };
 }
-fn implicit_getter(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
-    let id = st.alloc(name, owner, SymKind::Method, Flags::IMPLICIT, "");
-    st.get_mut(id).ty = Type::Method {
-        paramss: vec![],
-        ret: Box::new(ty),
-    };
-    id
-}
 pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     let reflect = st.alloc(
         "reflect",
@@ -55,24 +47,22 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
         sym: ct,
         args: vec![elem],
     };
-    implicit_getter(st, mc, "Int", tag(Type::Int));
-    implicit_getter(st, mc, "Long", tag(Type::Long));
-    implicit_getter(st, mc, "Double", tag(Type::Double));
-    implicit_getter(st, mc, "Float", tag(Type::Float));
-    implicit_getter(st, mc, "Boolean", tag(Type::Boolean));
-    implicit_getter(st, mc, "Byte", tag(Type::Byte));
-    implicit_getter(st, mc, "Short", tag(Type::Short));
-    implicit_getter(st, mc, "Char", tag(Type::Char));
-    implicit_getter(st, mc, "Unit", tag(Type::Unit));
-    implicit_getter(st, mc, "Any", tag(Type::Any));
-    implicit_getter(st, mc, "AnyRef", tag(Type::AnyRef));
-    // `scala.AnyRef` is an alias of `java.lang.Object`, so `ClassTag.Object`
-    // has the very type `ClassTag.AnyRef` has. Only one of the two may be a
-    // candidate or `Array("x", "y"): Array[AnyRef]` is ambiguous -- in nsc
-    // neither is implicit at all (the compiler materializes class tags).
+    plain_getter(st, mc, "Int", tag(Type::Int));
+    plain_getter(st, mc, "Long", tag(Type::Long));
+    plain_getter(st, mc, "Double", tag(Type::Double));
+    plain_getter(st, mc, "Float", tag(Type::Float));
+    plain_getter(st, mc, "Boolean", tag(Type::Boolean));
+    plain_getter(st, mc, "Byte", tag(Type::Byte));
+    plain_getter(st, mc, "Short", tag(Type::Short));
+    plain_getter(st, mc, "Char", tag(Type::Char));
+    plain_getter(st, mc, "Unit", tag(Type::Unit));
+    plain_getter(st, mc, "Any", tag(Type::Any));
+    plain_getter(st, mc, "AnyRef", tag(Type::AnyRef));
+    // These are ordinary getters in Scala 2.13. They are not candidates
+    // from which implicit search may infer an unconstrained type argument.
     plain_getter(st, mc, "Object", tag(Type::AnyRef));
-    implicit_getter(st, mc, "Nothing", tag(Type::Nothing));
-    implicit_getter(st, mc, "Null", tag(Type::Null));
+    plain_getter(st, mc, "Nothing", tag(Type::Nothing));
+    plain_getter(st, mc, "Null", tag(Type::Null));
     let apply = method(
         st,
         mc,

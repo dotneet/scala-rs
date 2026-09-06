@@ -1,0 +1,1 @@
+class Yo { def yo():String="" }; object Test { implicit def view[T](a:Any)(implicit ct:reflect.ClassTag[T]):Yo=new Yo; "".yo() }
