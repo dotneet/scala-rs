@@ -364,13 +364,21 @@ impl<'a> Gen<'a> {
                         b.add_abstract(acc, name, &def_method_desc(self.st, stt));
                         b.sign_last(self.sig_of(stt.sym));
                     }
-                    if needs_super_accessor(stt) {
-                        let acc_name = super_accessor_name(self.st, class_id, name);
-                        b.add_abstract(
-                            ACC_PUBLIC | ACC_ABSTRACT,
-                            &acc_name,
-                            &def_method_desc(self.st, stt),
-                        );
+                    let mut super_accesses = Vec::new();
+                    collect_super_accesses(rhs, &mut super_accesses);
+                    for (super_name, super_sym) in super_accesses {
+                        let acc_name = super_accessor_name(self.st, class_id, &super_name);
+                        let desc = if super_name == name.as_str() {
+                            def_method_desc(self.st, stt)
+                        } else if !super_sym.is_none() {
+                            method_desc_from_sym(self.st, super_sym)
+                        } else {
+                            def_method_desc(self.st, stt)
+                        };
+                        if b.methods.iter().any(|m| m.name == acc_name) {
+                            continue;
+                        }
+                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &acc_name, &desc);
                     }
                 }
                 if let TreeKind::ValDef {

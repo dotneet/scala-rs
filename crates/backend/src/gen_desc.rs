@@ -762,60 +762,6 @@ pub(crate) fn trait_member_setter_name(
     }
 }
 
-pub(crate) fn tree_contains_super(tree: &Tree) -> bool {
-    match &tree.kind {
-        TreeKind::Super { .. } => true,
-        TreeKind::Select { qual, .. } => tree_contains_super(qual),
-        TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
-            tree_contains_super(fun) || args.iter().any(tree_contains_super)
-        }
-        TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
-            tree_contains_super(fun)
-        }
-        TreeKind::Block { stats, expr } => {
-            stats.iter().any(tree_contains_super) || tree_contains_super(expr)
-        }
-        TreeKind::If { cond, thenp, elsep } => {
-            tree_contains_super(cond) || tree_contains_super(thenp) || tree_contains_super(elsep)
-        }
-        TreeKind::Assign { lhs, rhs } => tree_contains_super(lhs) || tree_contains_super(rhs),
-        TreeKind::ValDef { rhs, .. } => tree_contains_super(rhs),
-        TreeKind::Function { body, .. } => tree_contains_super(body),
-        TreeKind::Match { selector, cases } => {
-            tree_contains_super(selector)
-                || cases.iter().any(|c| {
-                    tree_contains_super(&c.pat)
-                        || tree_contains_super(&c.guard)
-                        || tree_contains_super(&c.body)
-                })
-        }
-        TreeKind::Try {
-            block,
-            catches,
-            finalizer,
-        } => {
-            tree_contains_super(block)
-                || catches.iter().any(|c| tree_contains_super(&c.body))
-                || tree_contains_super(finalizer)
-        }
-        _ => false,
-    }
-}
-
-pub(crate) fn needs_super_accessor(def: &Tree) -> bool {
-    match &def.kind {
-        TreeKind::DefDef {
-            name, mods, rhs, ..
-        } => {
-            name != "<init>"
-                && name != "<clinit>"
-                && !rhs.is_empty()
-                && (mods.flags.contains(Flags::OVERRIDE) || tree_contains_super(rhs))
-        }
-        _ => false,
-    }
-}
-
 pub(crate) fn is_star_pat(pat: &Tree) -> bool {
     match &pat.kind {
         TreeKind::Star { .. } => true,

@@ -815,21 +815,37 @@ impl<'a> Gen<'a> {
             let mut owed: Vec<(String, String, String, Vec<Type>, Type)> = Vec::new();
             match self.traits.impls.get(parent) {
                 Some(methods) => {
+                    let mut seen = HashSet::new();
                     for m in methods {
-                        if !needs_super_accessor(m) {
-                            continue;
+                        let mut accesses = Vec::new();
+                        collect_super_accesses(m, &mut accesses);
+                        for (name, target) in accesses {
+                            if name.is_empty() || !seen.insert(name.clone()) {
+                                continue;
+                            }
+                            let (desc, pts, ret) = if m.name() == Some(name.as_str()) {
+                                (
+                                    def_method_desc(self.st, m),
+                                    def_param_types(self.st, m),
+                                    method_ret_ty(m),
+                                )
+                            } else if !target.is_none() {
+                                (
+                                    method_desc_from_sym(self.st, target),
+                                    method_params_from_sym(self.st, target),
+                                    method_ret_from_sym(self.st, target),
+                                )
+                            } else {
+                                continue;
+                            };
+                            owed.push((
+                                name.clone(),
+                                super_accessor_name(self.st, *parent, &name),
+                                desc,
+                                pts,
+                                ret,
+                            ));
                         }
-                        let name = m.name().unwrap_or("").to_string();
-                        if name.is_empty() {
-                            continue;
-                        }
-                        owed.push((
-                            name.clone(),
-                            super_accessor_name(self.st, *parent, &name),
-                            def_method_desc(self.st, m),
-                            def_param_types(self.st, m),
-                            method_ret_ty(m),
-                        ));
                     }
                 }
                 None => {

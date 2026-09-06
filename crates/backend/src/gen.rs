@@ -111,10 +111,6 @@ pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImp
 /// trait of ours mixed in by real scalac used to run the *base* implementation
 /// and silently drop the trait's own layer.
 ///
-/// Deliberately narrower than [`needs_super_accessor`], which also declares an
-/// accessor for a plain `override def`: nothing calls those, and asking a
-/// reader to implement `T$$super$m` where the overridden member is itself
-/// deferred has no target to forward to.
 pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_super_accessors(tree, &mut found);
@@ -128,14 +124,36 @@ pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<SymbolId>) {
         if mods.flags.contains(Flags::TRAIT) {
             for stt in &impl_.body {
                 if let TreeKind::DefDef { rhs, .. } = &stt.kind {
-                    if !stt.sym.is_none() && needs_super_accessor(stt) && tree_contains_super(rhs) {
-                        out.push(stt.sym);
+                    if rhs.is_empty() {
+                        continue;
+                    }
+                    let mut accesses = Vec::new();
+                    collect_super_accesses(rhs, &mut accesses);
+                    for (name, _) in accesses {
+                        if let Some(member) = impl_.body.iter().find(|candidate| {
+                            candidate.name() == Some(name.as_str()) && !candidate.sym.is_none()
+                        }) {
+                            out.push(member.sym);
+                        }
                     }
                 }
             }
         }
     }
     for_each_term_child(tree, &mut |c| collect_super_accessors(c, out));
+}
+
+/// Collect the methods selected through `super` in a tree, together with the
+/// symbols selected by typer. The enclosing method is not necessarily the
+/// target: a private helper such as `superZip` may call `super.zip`, and the
+/// accessor belongs to `zip`.
+pub(crate) fn collect_super_accesses(tree: &Tree, out: &mut Vec<(String, SymbolId)>) {
+    if let TreeKind::Select { qual, name } = &tree.kind {
+        if matches!(qual.kind, TreeKind::Super { .. }) && !tree.sym.is_none() {
+            out.push((name.clone(), tree.sym));
+        }
+    }
+    for_each_term_child(tree, &mut |child| collect_super_accesses(child, out));
 }
 
 /// Harvest one unit's concrete trait members. A function of the tree alone:

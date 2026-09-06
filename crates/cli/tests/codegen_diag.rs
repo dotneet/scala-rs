@@ -103,3 +103,35 @@ fn backend_span_keeps_the_failing_unit_with_multiple_sources() {
     );
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn super_accessor_uses_the_selected_target_across_source_units() {
+    let base = fixtures_dir().join("codegen_diag_super_base.scala");
+    let layer = fixtures_dir().join("codegen_diag_super_layer.scala");
+    let main = fixtures_dir().join("codegen_diag_super_main.scala");
+    let out = tmp_dir("super");
+    let output = compile(&[&base, &layer, &main], &out);
+    assert!(
+        output.status.success(),
+        "valid super helper failed to compile: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        has_class_files(&out),
+        "successful compile produced no classfiles"
+    );
+
+    let cp = out.to_str().expect("output path");
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", cp, "Main"])
+        .output()
+        .expect("run generated super helper");
+    assert!(
+        run.status.success(),
+        "generated super helper failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "base\n");
+    let _ = fs::remove_dir_all(out);
+}
