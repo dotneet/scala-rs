@@ -11,15 +11,15 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `4b0568af` |
+| commit | `318c1568` |
 |---|---|
 | updated | 2026-09-06 |
 
-Measured independently at `d9eb5dc`, then merged as `4b0568af`; their compiler
+Measured independently at `dd5047e0`, then merged as `318c1568`; their compiler
 sources and Cargo inputs are identical. Later documentation-only commits may
 follow this commit. Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned;
 the corpus run inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
-Evidence: `/tmp/scala-rs-codex/integration/candidate-d9eb5dc/results.json` and
+Evidence: `/tmp/scala-rs-codex/integration/candidate-dd5047e/results.json` and
 `corpus-parent-audit.json`. All required historical gates completed with exit
 0; the newly measured MODE=a check is explicitly red below.
 
@@ -48,27 +48,40 @@ Evidence: `/tmp/scala-rs-codex/integration/candidate-d9eb5dc/results.json` and
 |---|---:|---:|---:|
 | `pos` (1859) | **1053** | 461 | 345 |
 | `neg` (1405) | **659** | 377 | 369 |
-| `run` (2060) | **587** | 920 | 553 |
+| `run` (2060) | **590** | 917 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-4b0568af.tsv`](baselines/corpus-4b0568af.tsv): 5324 unique
+[`baselines/corpus-318c1568.tsv`](baselines/corpus-318c1568.tsv): 5324 unique
 records, from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compare by `(kind, test)` as well as totals. The full six-field diagnostic
-ledger is `candidate-d9eb5dc/corpus.tsv` in the evidence directory above.
+ledger is `candidate-dd5047e/corpus.tsv` in the evidence directory above.
 
-Compared with the independently checked Null slice ledger (which matches the
-old baseline totals), only `run/t5629` and `run/t12478` changed to pass.
-`t5629` fixes overriding bounds inherited from a generic owner; it does not
-prove specialization. `t12478` is an environment correction, not a compiler
-gain: the same classfiles print `?` under JDK 17 with `LC_ALL=C`, and the
-expected Unicode bytes under the recorded UTF-8 locale. Its three-way locale
-probe is in `candidate-d9eb5dc/unicode-audit/results.json`.
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-318c1568.tsv
+<candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
+duplicate identities, lost passes, and newly skipped tests. A zero exit only
+checks statuses; changed diagnostics and runtime evidence still need review.
+
+Compared with the previous recovery baseline (`4b0568af`), all previous
+passes are retained and only three statuses improve: `run/t3761-overload-byname`,
+`run/t8893`, and `run/t8893b`. The coordinator separately compiled and executed
+all three with both scala-rs and scalac 2.13.16; their output bytes agree.
+The first fixes by-name overload selection; the latter two no longer overflow
+the stack. Apart from these, the six-field ledgers differ only in the output
+path embedded in the existing `run/t8199` filename-too-long diagnostic.
+Evidence is in `candidate-dd5047e/corpus-detail-audit.json` and
+`runtime-parent-audit/results.json`.
+
+The earlier recovery gains remain distinct: `run/t5629` fixes overriding
+bounds inherited from a generic owner; `run/t12478` was a UTF-8 locale effect,
+not a compiler gain. See the preserved recovery ledger and its
+`candidate-d9eb5dc/unicode-audit/results.json`. Do not compare a JDK 17 run
+under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match.
 
 ## Other
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **195 result rows, 2228 passed, 0 failed** |
+| `cargo test --workspace --release --no-fail-fast` | **197 result rows, 2233 passed, 0 failed** |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 ## The six unloadable classes are fixed (2026-09-06)

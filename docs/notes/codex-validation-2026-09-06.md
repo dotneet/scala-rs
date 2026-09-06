@@ -11,6 +11,30 @@ their pending-status statements. All new subagents use Luna / xhigh and
 isolated worktrees. They report through collaboration tools, not Codex task
 messages.
 
+Tail-call work was independently frozen and tested at `dd5047e0` in
+`codex/tail-validation`, then merged locally as `318c1568`.
+Session `41170` completed the full acceptance sequence; it does not include the
+new backend diagnostic gate. Logs are under
+`/tmp/scala-rs-codex/integration/candidate-dd5047e`. The Slick reference build
+is reused from the recovery evidence directory, with separate candidate and
+MODE-specific client directories. Do not start a duplicate full run.
+The workspace phase passed 2233 tests with zero failures (197 result rows).
+All four compile measures equal the accepted baseline, strict verification
+loaded 1490/1490 classes, and MODE=b passed 36/36 attempts. MODE=a still has
+12 compile failures and the specialization ledger is unchanged. All 5324
+corpus identities are present, with no lost pass or new skip. Run passes rose
+from 587 to 590: `t3761-overload-byname`, `t8893`, and `t8893b`. All three
+were separately compiled and executed by the coordinator with both compilers;
+their output bytes agree. The only other six-field ledger difference is a
+temporary path in the unchanged `t8199` filename-too-long diagnostic. See
+`corpus-parent-audit.json`, `corpus-detail-audit.json`, and
+`runtime-parent-audit/results.json`. The current baseline records this merge.
+
+`cargo fmt --all -- --check` passed on merged main. Clippy on the identical
+recovery compiler (`cargo clippy --workspace --release`, session `97405`)
+completed with exit 0 and 59 warnings; this is not a warning-free claim.
+Its log is `candidate-d9eb5dc/clippy.log`.
+
 - Recovery `d9eb5dc` has independently passed 2228 release workspace tests,
   all 1490 Slick class loads (zero failures or incomplete loads), structural
   lint, and Slick MODE=b execution: 12 programs, 36/36 attempts. Measurements
@@ -33,11 +57,14 @@ messages.
   snapshot before lowering is being implemented in `codex/source-signature`.
   The same logs also expose existential/member metadata gaps; fixing clauses
   alone must not be reported as full MODE=a compatibility.
-- New features remain separate in `codex/integration-next` at `6f26485`.
+- New features remain separate in `codex/integration-next` at `1b067aab`.
   The tail-call fixes independently pass 28 focused release tests and the
   super-accessor correction passes 101. A fresh parent-built provider plus a
-  scalac-built subclass still raises `AbstractMethodError` for inherited
-  `Layer$$super$foo`; metadata, overload, and nested-owner fixes are pending.
+  scalac-built subclass raised `AbstractMethodError` for inherited
+  `Layer$$super$foo` at `6f26485`. Metadata tests pass at `1b067aab`, but a
+  fresh concrete-overload linearization probe still raises `VerifyError`.
+  Generic dispatch identity must be preserved before erasure; a permissive
+  abstract-parameter fallback is not accepted.
   An earlier ABI probe accidentally used the agent's stale release binary
   and is explicitly invalidated; only `parent-6f26485-*` evidence is current.
 - Gitbucket import completion plus a conservative implicit candidate filter
@@ -46,6 +73,25 @@ messages.
   failure in `slickimpl`; gitbucket timing was not run. The changed diagnostic
   still rejects the invariant `BaseTypedType[Any]` assignment, but its type
   provenance must be reviewed before changing the expectation.
+  A subsequent investigation-only measurement on the same compiler timed out
+  after 180.006 seconds (exit -15), without diagnostic output. No result count
+  is inferred. `codex/implicit-profile` investigates repeated search work
+  independently of the member-type fix in `codex/gb-import`.
+- The derived implicit member correction `b55cb7d2` is staged separately as
+  `d34fd8de`. Parent release tests passed 30/30 across `gbimport`,
+  `implicitmemo`, `innerclasses`, `outer`, and `slickimpl`. Permanent precise
+  type regressions and three new unreachable-pattern warnings are being
+  addressed before full validation. The timeout above remains unresolved.
+- Method specialization is staged separately as `d80d235c`. Parent review
+  found that cloning a specialized method incorrectly changed a recursive
+  `f[String]` call into the primitive variant, causing `ClassCastException`.
+  The follow-up passes four fresh release tests and the original standalone
+  reproduction now prints `ok`, `ok`, `generic`, matching scalac. This is a
+  focused result, not full workspace/corpus acceptance or class specialization.
+- Current-run macro metadata now has an executable runtime-universe
+  hydration probe and a completed-symbol snapshot design (`3839f888`).
+  Incomplete/active symbols remain explicit refusals. Production snapshot
+  serialization and hydration are being implemented; `mapTo` is not complete.
 - External constructor default getters (`c74dd7b`, `1140fb6`) remain held.
   Generic and nested cases now have focused evidence, but assigning default
   flags to every overloaded constructor from getter names requires review.

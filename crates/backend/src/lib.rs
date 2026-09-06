@@ -12,6 +12,7 @@ mod gen_invoke;
 mod gen_lambda;
 mod gen_match;
 mod gen_object;
+mod gen_tailrec;
 mod gen_trait;
 pub mod ifacebridge;
 pub mod load;
