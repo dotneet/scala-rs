@@ -96,6 +96,7 @@ mod reify;
 mod reify_expand;
 mod seqfn_view;
 mod source_features;
+mod specialize;
 mod symbol;
 mod traitparent;
 mod uncurry;
@@ -136,8 +137,10 @@ pub use lin::{is_interface, linearize, trait_superclass};
 pub use localobj::{check_local_case_class_captures, check_local_objects};
 pub use named_eval_order::restore_named_arg_order;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};
+pub use specialize::{rewrite_specialized_calls, specialize_method_defs};
 pub use symbol::{
-    Intrinsic, MacroBinding, SamSig, SeqPayload, SymKind, Symbol, SymbolTable, AS_SEEN_FROM_MARK,
+    Intrinsic, MacroBinding, MethodVariant, SamSig, SeqPayload, SymKind, Symbol, SymbolTable,
+    AS_SEEN_FROM_MARK,
 };
 pub use uncurry::uncurry;
 pub use value_companion::add_value_class_companions;
