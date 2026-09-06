@@ -79,8 +79,18 @@ pub(crate) fn begin_tail_loop(
     let unsupported = || {
         annotated.then(|| format!("could not optimize @tailrec annotated method {}: unsupported erased tail-call shape", s.name))
     };
+    // A source value-class instance method is still emitted as a boxed helper
+    // beside the real `$extension` static. Its erased self calls are already
+    // routed through the extension path, so only the static body has a slot 0
+    // underlying receiver that this loop transform can update safely.
     if ctx.outer.is_some() {
         return unsupported();
+    }
+    // The boxed helper emitted beside a source value class delegates to its
+    // `$extension` static. Leave that helper's body in its ordinary form; the
+    // static below is the method whose slot 0 can be rewritten safely.
+    if ctx.value_ext.is_none() && ctx.st.is_value_class(ctx.class_sym) {
+        return None;
     }
     let mut calls = HashSet::new();
     collect(rhs, method, s.paramss.is_empty(), &mut calls);
@@ -169,7 +179,17 @@ pub(crate) fn emit_tail_call(
         }
     }
     if receiver.is_some() {
-        asm.astore(0);
+        // A value-class extension keeps its underlying receiver in slot 0.
+        // The receiver expression may itself be a value-class constructor, so
+        // its sort is the underlying primitive (including the two-slot Long /
+        // Double cases), rather than the boxed class reference used by an
+        // ordinary instance method.
+        let receiver_sort = ctx
+            .value_ext
+            .as_ref()
+            .map(|(_, _, sort)| *sort)
+            .unwrap_or(JvmSort::Ref);
+        store(asm, 0, receiver_sort);
     }
     frame
         .tail_loop

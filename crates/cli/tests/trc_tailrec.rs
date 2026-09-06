@@ -299,18 +299,32 @@ fn trc_valueclass_dual_run_and_static_abi() {
         .unwrap();
     assert!(javap.status.success());
     let dis = String::from_utf8(javap.stdout).unwrap();
-    let body = dis
-        .split("\n\n")
-        .find(|part| part.contains("loop$extension"))
-        .expect("TrcLong.loop$extension javap body");
-    assert!(body.contains("descriptor: (JIJ)J"), "{body}");
-    assert!(body.contains("goto"), "tail loop branch missing:\n{body}");
-    assert!(
-        !body
-            .lines()
-            .any(|line| line.contains("invoke") && line.contains("loop")),
-        "recursive extension call remains:\n{body}"
-    );
+    for (name, descriptor) in [
+        ("loop$extension", "(JIJ)J"),
+        ("receiverLoop$extension", "(JI)J"),
+        ("receiverAndArgs$extension", "(JIJ)J"),
+        ("effects$extension", "(JIJ)J"),
+    ] {
+        let body = dis
+            .split("\n\n")
+            .find(|part| {
+                part.lines()
+                    .next()
+                    .is_some_and(|line| line.contains(&format!(" {name}(")))
+            })
+            .unwrap_or_else(|| panic!("TrcLong.{name} javap body missing"));
+        assert!(
+            body.contains(&format!("descriptor: {descriptor}")),
+            "{body}"
+        );
+        assert!(body.contains("goto"), "tail loop branch missing:\n{body}");
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.contains("invoke") && line.contains(name)),
+            "recursive extension call remains:\n{body}"
+        );
+    }
 }
 #[test]
 fn trc_recursion_in_receiver_and_earlier_argument_is_not_tail() {
