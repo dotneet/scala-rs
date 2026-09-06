@@ -92,12 +92,15 @@ LOG=${GITBUCKET_LOG:-$SP/measure.txt}
 # `tests/slick_measure.sh` appends it: measuring without it asks for a macro
 # expansion nobody could perform.
 REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
+COMPILER_EXIT=0
 $BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp):$REFLECT" -Xsource:3-cross \
   -language:postfixOps \
-  --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || true
+  --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || COMPILER_EXIT=$?
 ERRORS=$(grep -c '^error' $LOG || true)
 CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest metric.
 BADFILES=$(grep -A 2 '^error' $LOG | grep -oE '(src/main|twirl/main)/[^:]*' | sort -u | wc -l | tr -d ' ')
 rm -rf $RUN
-echo "files=${#FILES[@]} skipped=$SKIPPED errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES"
+echo "files=${#FILES[@]} skipped=$SKIPPED errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES compiler_exit=$COMPILER_EXIT"
+source "$ROOT/tests/measure_result.sh"
+validate_measure_result $COMPILER_EXIT $ERRORS $CLASSES ${#FILES[@]} "$LOG"
