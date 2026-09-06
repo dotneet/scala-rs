@@ -540,3 +540,44 @@ result reaches MapOps.WithFilter.map and is cast to Tuple2. No later gates ran.
 Its prior 18 focused passes and three exact nsc comparisons do not establish
 full acceptance. The Map WithFilter repair and private Tuple1..Tuple22 support
 are independent pending tasks.
+
+## Core implementation consolidated in the parent session
+
+After repeated integration regressions, core implementation is now owned by
+the parent session. Luna/xhigh agents have saved their existing work and stopped
+implementation. Any later delegation should be bounded reproduction, test
+execution or read-only review. Do not restart the former implementation tasks
+from stale summaries. Preserve all worktrees, including uncommitted experiments.
+
+The method-specialization traversal repair `93af4b01` was applied independently
+as `de970972`, then merged with main at `11103987` in
+`.worktrees/codex-specialization-validation`. All nine focused specialization
+tests pass in the parent environment. A read-only review found no remaining
+traversal omission in the repaired fields. Parent typed-graph invariant tests
+are being added before the next full gate; this candidate is not accepted yet.
+
+Class-specialization candidate `811c24a0` passes 12 focused tests, but independent
+interop probes prove incorrect packaged/nested JVM names, a VerifyError in an
+accessor unrelated to the specialized type parameter, and an override dispatch
+returning the base implementation's answer. Evidence:
+`/tmp/scala-rs-codex/integration/class-package-probe/results.json` and
+`/tmp/scala-rs-codex/class-specialization-audit/`. It remains unaccepted.
+
+Saved, not independently accepted, follow-ups include:
+
+- `12bec5ce`: terminal Object super accessor resolution.
+- `c04acead`: completed case-class macro metadata fidelity.
+- `43af3d29`: implicit Function lookup and dominance symbol handling.
+- `c1dc7aa8`: prefix-preserving TypeProjection representation.
+- `558b009d`: private Tuple1 through Tuple22 runtime.
+- `40f1afaa`, `a65123a7`: collection result handling and external generic copy.
+
+The implicit performance experiment at `codex-implicit-profile` is explicitly
+not acceptable: its anchorless-child pruning accepts a case where nsc reports
+ambiguity. Keep its profile evidence, not its success count, as the next starting
+point. The sql-selection worktree contains unproven changes and debug output.
+The Map WithFilter patch is preserved in the actual git worktree
+`/tmp/scala-rs-codex/for-map-filter-fix-worktree`; its None-result fallback still
+needs parent review. The live checkpoint index is
+`/tmp/scala-rs-codex/integration/current-state.json`; revalidate tool handles
+before treating any recorded process as running.
