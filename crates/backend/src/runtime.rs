@@ -61,6 +61,7 @@ pub fn emit_runtime() -> Vec<EmittedClass> {
         emit_arrow_assoc(),
         emit_boxed_unit(),
         emit_nothing(),
+        emit_null(),
         emit_not_implemented(),
         emit_match_error(),
         emit_non_local_return_control(),
@@ -1859,6 +1860,23 @@ fn emit_nothing() -> EmittedClass {
     b.add_code(ACC_PUBLIC, "<init>", "()V", 1, |asm| {
         asm.aload(0);
         asm.invokespecial("java/lang/Throwable", "<init>", "()V");
+        asm.vreturn();
+    });
+    b.finish()
+}
+
+/// Private-runtime stand-in for `scala.runtime.Null$`, the class `Null` erases
+/// to. Same reason as `Nothing$` above: `def take(x: Null)` is
+/// `(Lscala/runtime/Null$;)I`, and the verifier resolves a parameter's class.
+/// Mirrors scala-library, which declares it `public abstract class Null$` with
+/// a `private` constructor -- no instance of it can exist, `null` is the only
+/// value of the type.
+fn emit_null() -> EmittedClass {
+    let mut b = B::class("scala/runtime/Null$", "java/lang/Object");
+    b.access = ACC_PUBLIC | ACC_SUPER | ACC_ABSTRACT;
+    b.add_code(ACC_PRIVATE, "<init>", "()V", 1, |asm| {
+        asm.aload(0);
+        asm.invokespecial("java/lang/Object", "<init>", "()V");
         asm.vreturn();
     });
     b.finish()

@@ -778,6 +778,18 @@ pub(crate) fn discarded_unbox(tree: &Tree) -> Option<&Tree> {
 /// no-op for the same reason.
 pub(crate) fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     gen_expr_inner(asm, frame, ctx, tree);
+    // Null$ is an ABI marker, not a JVM subtype of every reference class.
+    // Preserve evaluation and checked casts, then expose the JVM's null
+    // verification type so a Scala Null can flow to String, arrays or any
+    // other reference type. This also checks values read through erased
+    // generic results before replacing them with the sole valid Null value.
+    if matches!(tree.ty, Type::Null) && asm.top_object().is_some() {
+        if asm.top_object() != Some("scala/runtime/Null$") {
+            asm.checkcast("scala/runtime/Null$");
+        }
+        asm.pop();
+        asm.aconst_null();
+    }
     if matches!(tree.ty, Type::Nothing) {
         // `athrow` only verifies when what is *on the stack* is a `Throwable`.
         // A `Nothing`-typed tree does not always leave one there: a generic
@@ -1680,6 +1692,17 @@ pub(crate) fn gen_assign(
                     asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
+                // Inherited `var` of a separately compiled superclass: its
+                // field is private there, so go through the setter.
+                if s.via_accessor {
+                    load_owner_instance(asm, ctx, s.owner);
+                    gen_expr(asm, frame, ctx, rhs);
+                    let owner = class_internal(ctx.st, s.owner);
+                    let vd = jvm_desc_val(ctx.st, &s.ty);
+                    fill_boxed_unit_slot(asm, &vd);
+                    asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
+                    return;
+                }
                 // `var` of an *enclosing* class assigned from an anonymous or
                 // local class: the receiver is that instance, reached along
                 // `$outer`, not this one. Pushing `this` put the wrong object
@@ -1711,6 +1734,17 @@ pub(crate) fn gen_assign(
                 let vd = jvm_desc_val(ctx.st, &s.ty);
                 fill_boxed_unit_slot(asm, &vd);
                 asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
+                return;
+            }
+            // A `var` of a separately compiled class: scalac made the field
+            // private, so the write is `v_$eq(x)` exactly as the read is
+            // `v()`. See `Symbol::via_accessor`.
+            if !lhs.sym.is_none() && ctx.st.get(lhs.sym).via_accessor {
+                let s = ctx.st.get(lhs.sym);
+                let owner = class_internal(ctx.st, s.owner);
+                let vd = jvm_desc_val(ctx.st, &s.ty);
+                fill_boxed_unit_slot(asm, &vd);
+                asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
             let owner = if !lhs.sym.is_none() {

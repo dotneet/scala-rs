@@ -97,7 +97,17 @@ fn key(ty: &Type) -> String {
         Type::Char => "C".into(),
         Type::String => "Ljava/lang/String;".into(),
         Type::Nothing => "Lscala/runtime/Nothing$;".into(),
-        Type::Array(t) => format!("[{}", key(t)),
+        // `Null` has a class of its own too, so `def f(x: Null)` and
+        // `def f(x: AnyRef)` are two methods for nsc, not a double definition.
+        Type::Null => "Lscala/runtime/Null$;".into(),
+        Type::Array(t) => {
+            // Both bottom arrays erase to Object[], including nested arrays.
+            let elem = match t.widen_constant() {
+                Type::Null | Type::Nothing => "Ljava/lang/Object;".into(),
+                _ => key(t),
+            };
+            format!("[{elem}")
+        }
         Type::Class { sym, .. } | Type::ModuleRef(sym) | Type::ThisType(sym) => {
             format!("L#{};", sym.0)
         }

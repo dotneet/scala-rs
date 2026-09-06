@@ -248,6 +248,26 @@ impl Typer {
                 found = cand;
             }
         }
+        // A qualified class name in term position denotes its companion
+        // object, just like an unqualified identifier.  Package lookup is
+        // deliberately lazy, so `scala.collection.Factory` used to stop at
+        // the `Factory` class: the generated field then had the trait type
+        // and codegen's unresolved Select path threw `select Factory` while
+        // initializing the package object.  Load the companion before the
+        // final term/class namespace preference below.
+        if !found.is_empty()
+            && recv_ty.is_no_type()
+            && !qual.sym.is_none()
+            && self.st.get(qual.sym).kind == SymKind::Package
+        {
+            let exposed = self.expose_class_companion(&found, &name, tree.span);
+            if exposed
+                .iter()
+                .any(|&s| self.st.get(s).kind == SymKind::Module)
+            {
+                found = exposed;
+            }
+        }
         // A function type is `scala.FunctionN[T1, …, Tn, R]`; `class_sym_of`
         // has no symbol for it, so `f.tupled` / `f.curried` would find nothing.
         if found.is_empty() {
@@ -683,6 +703,9 @@ impl Typer {
                 }
             }
         }
+        // A parameterless collection member returns the receiver's own class,
+        // and only the application path put that back.
+        self.rebuild_parameterless_collection(tree.sym, &name, &recv_ty, &mut tree.ty);
         // A function value's `apply` is the function itself. The prelude's
         // `FunctionN.apply` is declared over erased parameters, so selecting it
         // through a `Type::Function` receiver produced `(Any)Any` and
@@ -733,6 +756,7 @@ impl Typer {
             return found;
         }
         let found = self.collapse_pickled_copies(found);
+        let found = self.drop_field_behind_accessor(found);
         let kept: Vec<SymbolId> = found
             .iter()
             .copied()
@@ -830,6 +854,54 @@ impl Typer {
                 origin.is_empty() || seen.insert(origin)
             })
             .collect()
+    }
+
+    /// A constructor parameter's *field* and its accessor are one member, not
+    /// two alternatives.
+    ///
+    /// `prelude_tuple` gives `Tuple1` and `Tuple3`..`Tuple22` both a
+    /// `ctor_fields` symbol `_1` and a nullary `_1()` method, exactly as the
+    /// class file does (`javap scala.Tuple1`: `public final T1 _1;` *and*
+    /// `public T1 _1();`). In Scala source the name always means the
+    /// accessor -- nsc makes the field `private[this]` -- and `Tuple2`, whose
+    /// prelude declaration has the field alone, was never affected. Where the
+    /// component's own type is a *function*, the resulting
+    /// `<overload (A) => B | (A) => B>` could not be applied at all: cats'
+    /// generated `NTupleMonadInstances.scala` reported `no matching overload`
+    /// for `ff._1(fa._1)` ten times, once per `FlatMapTupleN`.
+    fn drop_field_behind_accessor(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        let is_field = |s: SymbolId| {
+            self.st.get(s).kind == SymKind::Term
+                && self.st.get(self.st.get(s).owner).ctor_fields.contains(&s)
+        };
+        if !found.iter().copied().any(is_field) {
+            return found;
+        }
+        let kept: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .filter(|&s| {
+                if !is_field(s) {
+                    return true;
+                }
+                let owner = self.st.get(s).owner;
+                let field_ty = &self.st.get(s).ty;
+                !found.iter().any(|&o| {
+                    o != s
+                        && self.st.get(o).owner == owner
+                        && self.st.get(o).kind == SymKind::Method
+                        && matches!(&self.st.get(o).ty,
+                            Type::Method { paramss, ret }
+                                if paramss.iter().all(|c| c.is_empty())
+                                    && ret.as_ref() == field_ty)
+                })
+            })
+            .collect();
+        if kept.is_empty() {
+            found
+        } else {
+            kept
+        }
     }
 
     /// nsc `matchingSymbols`: does `sub` override `base`? Both are members of

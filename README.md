@@ -231,6 +231,8 @@ are organised is described in [docs/testing.md](docs/testing.md).
   suite: what is measured, the numbers, and what they found.
 - [docs/cats.md](docs/cats.md) — where this compiler stands on typelevel/cats,
   the second real-world benchmark.
+  引数なしメソッドの戻り値へ挿入する `apply` でも型引数を推論し、
+  レシーバの型で具体化した上限・下限を検証します（`catstail3` の実行・拒否テスト）。
 - [docs/scala-library.md](docs/scala-library.md) — compiling scala/scala's own
   `src/library` from source: the numbers, and the one root behind them.
 - [docs/specialization.md](docs/specialization.md) — `@specialized`: the

@@ -346,7 +346,38 @@ impl Typer {
         if cb != *b && self.st.is_sub_type(&cb, a) {
             return a.clone();
         }
-        self.st.lub(a, b)
+        let plain = self.st.lub(a, b);
+        // Neither branch is the join, and the ordinary walk gave up. nsc
+        // *minimises* each side's own undetermined variables before it joins
+        // them (`solvedTypes`: a variable with no upper constraint is its
+        // lower bound), and joining an open variable against a real type is
+        // exactly what walks out to `AnyRef`. cats' `nonEmptyPartition`
+        //
+        // ```scala
+        // val lastIor = f(reversed.head) match {
+        //   case Right(c) => Ior.right(NonEmptyList.one(c))   // Ior[?A, NEL[C]]
+        //   case Left(b)  => Ior.left(NonEmptyList.one(b))    // Ior[NEL[B], ?B]
+        // }
+        // ```
+        //
+        // was `Ior[AnyRef, AnyRef]`, and every use of `lastIor` after it read
+        // `value :: is not a member of AnyRef` (`NonEmptyList.scala`, and the
+        // same three lines in `NonEmptySeq` and `NonEmptyVector`).
+        //
+        // Only a *tighter* upper bound is taken: the minimised join has to
+        // conform to the one the ordinary walk found, so this can never widen
+        // an answer, only stop it from climbing past the type both branches
+        // were already written at.
+        if ca != *a || cb != *b {
+            let closed_join = self.st.lub(&ca, &cb);
+            if closed_join != plain
+                && !matches!(closed_join, Type::Nothing)
+                && self.st.is_sub_type(&closed_join, &plain)
+            {
+                return closed_join;
+            }
+        }
+        plain
     }
 
     /// The type an `if` or a `match` takes: [`pt_or_lub`], except that an

@@ -34,10 +34,11 @@
 //!
 //! What works today, and what does not, is in `docs/macros.md` §7.11.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{atomic::AtomicBool, atomic::Ordering as AtomicOrdering, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::{decode_method_name, encode_method_name};
@@ -51,6 +52,18 @@ use crate::symbol::{MacroBinding, SymKind, SymbolTable};
 /// build needs no JVM.
 const ENGINE_SOURCE: &str = include_str!("../java/ScalaRsMacroEngine.java");
 
+/// Keep the bridge runnable by the oldest JVM commonly used with Scala 2.13.
+const ENGINE_JAVA_RELEASE: &str = "8";
+
+/// Bump this when the cache layout or compiler policy changes.  In
+/// particular, this keeps class files written by the pre-Java-8-target engine
+/// out of the new cache without deleting a shared cache directory.
+const ENGINE_CACHE_VERSION: &str = "java8-target-v2";
+
+const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const ENGINE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// nsc's `-Ymacro-expand-depth`. A macro whose expansion calls itself has to
 /// stop somewhere, and stopping with a diagnostic beats a stack overflow.
 const MAX_EXPANSION_DEPTH: u32 = 32;
@@ -62,6 +75,9 @@ pub(crate) struct MacroEngine {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stderr_done: Arc<AtomicBool>,
+    stderr_thread: Option<std::thread::JoinHandle<()>>,
     /// Set when an expansion timed out and the child was killed: the pipe is
     /// no longer in sync with the requests, so nothing more may be asked.
     poisoned: bool,
@@ -71,6 +87,10 @@ impl Drop for MacroEngine {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Dropping the handle detaches the bounded collector.  A macro is
+        // allowed to spawn a child process that inherits stderr; joining here
+        // would make compiler shutdown wait forever for that unrelated child.
+        let _ = self.stderr_thread.take();
     }
 }
 
@@ -189,24 +209,8 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
     }
     let dir = engine_dir();
     let class_file = dir.join("ScalaRsMacroEngine.class");
-    if !class_file.is_file() {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create the macro engine directory: {e}"))?;
-        let src = dir.join("ScalaRsMacroEngine.java");
-        std::fs::write(&src, ENGINE_SOURCE)
-            .map_err(|e| format!("cannot write the macro engine source: {e}"))?;
-        let out = Command::new("javac")
-            .arg("-d")
-            .arg(&dir)
-            .arg(&src)
-            .output()
-            .map_err(|e| format!("cannot run `javac` to build the macro engine: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "the macro engine does not compile: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
+    if !valid_engine_class(&class_file) {
+        compile_engine(&dir)?;
     }
     let sep = if cfg!(windows) { ';' } else { ':' };
     let mut cp = dir.display().to_string();
@@ -214,27 +218,35 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         cp.push(sep);
         cp.push_str(&p.display().to_string());
     }
-    let mut child = Command::new("java")
+    let mut child = Command::new(jdk_tool("java"))
         .arg("-cp")
         .arg(&cp)
         .arg("ScalaRsMacroEngine")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start `java` to expand macros: {e}"))?;
     let stdin = child.stdin.take().expect("piped stdin");
-    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-    let mut hello = String::new();
-    match stdout.read_line(&mut hello) {
-        Ok(0) => return Err("the macro engine exited at startup".to_string()),
-        Err(e) => return Err(format!("the macro engine died at startup ({e})")),
-        Ok(_) => {}
-    }
+    let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
+    let (stdout, hello_result) = read_engine_hello(stdout);
+    let hello = match hello_result {
+        Ok(hello) => hello,
+        Err(reason) => {
+            let status = stop_engine(&mut child, Some(stderr_thread));
+            wait_for_stderr(&stderr_done);
+            return Err(startup_failure(&reason, status, &stderr));
+        }
+    };
     let engine = MacroEngine {
         child,
         stdin,
         stdout,
+        stderr,
+        stderr_done,
+        stderr_thread: Some(stderr_thread),
         poisoned: false,
     };
     if hello.trim_end() != "(ready)" {
@@ -243,10 +255,226 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
             Err(_) => hello.trim_end().to_string(),
         };
         // Dropped here so the failed child does not outlive the diagnostic.
-        drop(engine);
-        return Err(why);
+        let mut engine = engine;
+        let status = stop_engine(&mut engine.child, engine.stderr_thread.take());
+        wait_for_stderr(&engine.stderr_done);
+        return Err(startup_failure(&why, status, &engine.stderr));
     }
     Ok(engine)
+}
+
+/// Resolve both JVM tools from the same `JAVA_HOME` when one is supplied.
+/// Build processes can inherit a different PATH from their parent shell, so
+/// invoking bare `java` and `javac` can otherwise mix two JDK installations.
+fn jdk_tool(name: &str) -> PathBuf {
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        let candidate = PathBuf::from(home).join("bin").join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
+}
+
+/// Compile into a private staging directory and publish it with one rename.
+/// No compiler can observe a directory before its class file is complete, and
+/// concurrent compiler processes can safely use the same cache key.
+fn compile_engine(dir: &Path) -> Result<(), String> {
+    static NEXT_STAGING_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT_STAGING_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let staging = dir.with_file_name(format!(
+        "{}-staging-{}-{id}-{nanos}",
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("macro-engine"),
+        std::process::id()
+    ));
+    std::fs::create_dir(&staging)
+        .map_err(|e| format!("cannot create the macro engine staging directory: {e}"))?;
+    let src = staging.join("ScalaRsMacroEngine.java");
+    if let Err(e) = std::fs::write(&src, ENGINE_SOURCE) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("cannot write the macro engine source: {e}"));
+    }
+
+    let javac = jdk_tool("javac");
+    let mut out = Command::new(&javac)
+        .arg("--release")
+        .arg(ENGINE_JAVA_RELEASE)
+        .arg("-d")
+        .arg(&staging)
+        .arg(&src)
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            format!("cannot run `javac` to build the macro engine: {e}")
+        })?;
+    // JDK 8 predates --release.  The source is deliberately Java-8 API
+    // compatible, so its default classfile target is correct there.
+    if !out.status.success()
+        && (out
+            .stderr
+            .windows(b"invalid flag:".len())
+            .any(|w| w == b"invalid flag:")
+            || out
+                .stderr
+                .windows(b"unrecognized option".len())
+                .any(|w| w == b"unrecognized option"))
+    {
+        out = Command::new(&javac)
+            .arg("-d")
+            .arg(&staging)
+            .arg(&src)
+            .output()
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staging);
+                format!("cannot run `javac` to build the macro engine: {e}")
+            })?;
+    }
+    if !out.status.success() {
+        let detail = bounded_text(&out.stderr);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("the macro engine does not compile: {detail}"));
+    }
+    let staged_class = staging.join("ScalaRsMacroEngine.class");
+    if !valid_engine_class(&staged_class) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("the macro engine compiler produced no valid class file".to_string());
+    }
+    match std::fs::rename(&staging, dir) {
+        Ok(()) => Ok(()),
+        Err(_e) if valid_engine_class(&dir.join("ScalaRsMacroEngine.class")) => {
+            // Another process won the publication race.  Its complete cache
+            // is authoritative; this process only cleans its own staging dir.
+            let _ = std::fs::remove_dir_all(&staging);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            Err(format!("cannot publish the macro engine cache: {e}"))
+        }
+    }
+}
+
+fn valid_engine_class(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.len() >= 8
+        && bytes[0..4] == [0xca, 0xfe, 0xba, 0xbe]
+        && u16::from_be_bytes([bytes[6], bytes[7]]) <= 52
+}
+
+fn collect_engine_stderr(
+    stderr: ChildStderr,
+) -> (
+    Arc<Mutex<Vec<u8>>>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let shared = Arc::clone(&captured);
+    let done = Arc::new(AtomicBool::new(false));
+    let thread_done = Arc::clone(&done);
+    let thread = std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut output) = shared.lock() {
+                        append_bounded(&mut output, &buf[..n]);
+                    }
+                }
+            }
+        }
+        thread_done.store(true, AtomicOrdering::Release);
+    });
+    (captured, done, thread)
+}
+
+/// Give the collector a short, bounded chance to observe EOF after the child
+/// has exited.  Joining is unsafe here: a macro may leave a descendant holding
+/// the inherited stderr pipe open indefinitely.
+fn wait_for_stderr(done: &AtomicBool) {
+    let deadline = Instant::now() + ENGINE_STDERR_DRAIN_TIMEOUT;
+    while !done.load(AtomicOrdering::Acquire) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn append_bounded(output: &mut Vec<u8>, bytes: &[u8]) {
+    let remaining = MAX_ENGINE_DIAGNOSTIC_BYTES.saturating_sub(output.len());
+    output.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+}
+
+fn bounded_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ENGINE_DIAGNOSTIC_BYTES)])
+        .trim()
+        .to_string()
+}
+
+fn read_engine_hello(
+    stdout: BufReader<ChildStdout>,
+) -> (BufReader<ChildStdout>, Result<String, String>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut hello = String::new();
+        let result = stdout.read_line(&mut hello).map(|n| (n, hello));
+        let _ = tx.send((stdout, result));
+    });
+    match rx.recv_timeout(ENGINE_STARTUP_TIMEOUT) {
+        Ok((stdout, Ok((0, _)))) => (
+            stdout,
+            Err("the macro engine exited at startup".to_string()),
+        ),
+        Ok((stdout, Ok((_, hello)))) => (stdout, Ok(hello)),
+        Ok((stdout, Err(e))) => (
+            stdout,
+            Err(format!("the macro engine died at startup ({e})")),
+        ),
+        Err(_) => (
+            BufReader::new(dead_pipe()),
+            Err(format!(
+                "the macro engine did not report readiness within {}s",
+                ENGINE_STARTUP_TIMEOUT.as_secs()
+            )),
+        ),
+    }
+}
+
+fn stop_engine(
+    child: &mut Child,
+    _stderr_thread: Option<std::thread::JoinHandle<()>>,
+) -> Option<std::process::ExitStatus> {
+    let _ = child.kill();
+    child.wait().ok()
+}
+
+fn startup_failure(
+    reason: &str,
+    status: Option<std::process::ExitStatus>,
+    stderr: &Arc<Mutex<Vec<u8>>>,
+) -> String {
+    let mut message = reason.to_string();
+    if let Some(status) = status {
+        message.push_str(&format!(" (status: {status})"));
+    }
+    let detail = stderr
+        .lock()
+        .map(|bytes| bounded_text(&bytes))
+        .unwrap_or_default();
+    if !detail.is_empty() {
+        message.push_str("; stderr: ");
+        message.push_str(&detail);
+    }
+    message
 }
 
 fn is_scala_reflect(p: &Path) -> bool {
@@ -259,6 +487,10 @@ fn is_scala_reflect(p: &Path) -> bool {
 /// so an updated engine is never run from a stale class file.
 fn engine_dir() -> PathBuf {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in ENGINE_CACHE_VERSION.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
     for b in ENGINE_SOURCE.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x100_0000_01b3);

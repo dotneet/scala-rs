@@ -1,0 +1,7 @@
+null
+null
+true
+[Ljava.lang.Object;
+true
+2
+cast

@@ -61,6 +61,27 @@ fn javac_available() -> bool {
         .unwrap_or(false)
 }
 
+fn jdk_tool(name: &str) -> PathBuf {
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        let candidate = PathBuf::from(home).join("bin").join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn java_major(version: &str) -> Option<u32> {
+    let version = version.split("version \"").nth(1)?.split('"').next()?;
+    let mut parts = version.split('.');
+    let first = parts.next()?.parse::<u32>().ok()?;
+    if first == 1 {
+        parts.next()?.parse::<u32>().ok()
+    } else {
+        Some(first)
+    }
+}
+
 fn scala_library_jar() -> Option<PathBuf> {
     let cached = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
     cached.is_file().then_some(cached)
@@ -114,6 +135,36 @@ fn compile(name: &str, out: &Path, extra: &[&Path]) -> std::process::Output {
         ])
         .output()
         .expect("run scala-rs compile")
+}
+
+fn compile_with_tmpdir(
+    name: &str,
+    out: &Path,
+    extra: &[&Path],
+    tmpdir: &Path,
+) -> std::process::Command {
+    let jar = scala_library_jar().expect("scala-library");
+    let reflect = scala_reflect_jar().expect("scala-reflect");
+    let mut cp = reflect.display().to_string();
+    for e in extra {
+        cp.push(':');
+        cp.push_str(&e.display().to_string());
+    }
+    let mut command = Command::new(bin());
+    command.env("TMPDIR", tmpdir).args([
+        "compile",
+        fixtures_dir()
+            .join(format!("{name}.scala"))
+            .to_str()
+            .unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+        "-cp",
+        &cp,
+        "--scala-library",
+        jar.to_str().unwrap(),
+    ]);
+    command
 }
 
 /// Everything the engine needs. Returns false (and says so) when the machine
@@ -183,6 +234,235 @@ fn eg_macros_expand_and_run() {
     );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
+}
+
+/// Two compiler processes may populate the same engine cache concurrently.
+/// The cache must expose either the old complete class or the new complete
+/// class, never a source directory whose class file is still being written.
+#[test]
+fn concurrent_engine_cache_publication_is_safe() {
+    if !prerequisites("concurrent engine cache") {
+        return;
+    }
+    let impls = tmp_dir("cache-race-impl");
+    let cache = tmp_dir("cache-race-tmp");
+    let output = compile("eg_impl", &impls, &[]);
+    assert!(
+        output.status.success(),
+        "compile eg_impl failed: {}",
+        diagnostics(&output)
+    );
+
+    let mut children = Vec::new();
+    let mut outputs = Vec::new();
+    let mut dirs = Vec::new();
+    for n in 0..2 {
+        let out = tmp_dir(&format!("cache-race-use-{n}"));
+        let mut command = compile_with_tmpdir("eg_use", &out, &[&impls], &cache);
+        children.push(command.spawn().expect("spawn concurrent scala-rs compile"));
+        dirs.push(out);
+    }
+    for child in children {
+        outputs.push(
+            child
+                .wait_with_output()
+                .expect("wait for concurrent compile"),
+        );
+    }
+    for output in outputs {
+        assert!(
+            output.status.success(),
+            "concurrent eg_use compile failed: {}",
+            diagnostics(&output)
+        );
+    }
+
+    let mut classes = Vec::new();
+    for entry in fs::read_dir(&cache).expect("read cache race directory") {
+        let path = entry.expect("cache entry").path();
+        let class = path.join("ScalaRsMacroEngine.class");
+        if class.is_file() {
+            let bytes = fs::read(&class).expect("read published engine class");
+            assert!(bytes.len() >= 8, "published engine class is truncated");
+            assert_eq!(&bytes[0..4], &[0xca, 0xfe, 0xba, 0xbe]);
+            assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 52);
+            classes.push(class);
+        }
+    }
+    assert_eq!(classes.len(), 1, "cache publication left duplicate classes");
+
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&cache);
+    for dir in dirs {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// Exercise the Java 8/9--15/16+ default-method compatibility branches with
+/// a real proxy, independently of whether the current macro fixtures happen
+/// to call a default member of Context.
+#[test]
+fn default_method_helper_runs_on_selected_jdk() {
+    if !prerequisites("default method helper") {
+        return;
+    }
+    let impls = tmp_dir("default-helper-impl");
+    let cache = tmp_dir("default-helper-cache");
+    let uses = tmp_dir("default-helper-use");
+    let probe = tmp_dir("default-helper-probe");
+    let output = compile_with_tmpdir("eg_impl", &impls, &[], &cache)
+        .output()
+        .expect("compile eg_impl");
+    assert!(
+        output.status.success(),
+        "compile eg_impl failed: {}",
+        diagnostics(&output)
+    );
+    let output = compile_with_tmpdir("eg_use", &uses, &[&impls], &cache)
+        .output()
+        .expect("compile eg_use");
+    assert!(
+        output.status.success(),
+        "warm engine compile failed: {}",
+        diagnostics(&output)
+    );
+
+    let engine_dir = fs::read_dir(&cache)
+        .expect("read engine cache")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| path.join("ScalaRsMacroEngine.class").is_file())
+        .expect("published engine cache");
+    let source = probe.join("DefaultProbe.java");
+    fs::write(
+        &source,
+        r#"import java.lang.reflect.Proxy;
+public class DefaultProbe {
+    public interface Sample { default String value() { return "default-ok"; } }
+    public static void main(String[] args) throws Throwable {
+        Sample value = (Sample) Proxy.newProxyInstance(
+            Sample.class.getClassLoader(), new Class<?>[] { Sample.class },
+            (proxy, method, a) -> ScalaRsMacroEngine.invokeDefault(proxy, method, a));
+        System.out.println(value.value());
+    }
+}
+"#,
+    )
+    .expect("write default method probe");
+    let javac = jdk_tool("javac");
+    let mut compiled = Command::new(&javac)
+        .args([
+            "--release",
+            "8",
+            "-cp",
+            engine_dir.to_str().unwrap(),
+            "-d",
+            probe.to_str().unwrap(),
+            source.to_str().unwrap(),
+        ])
+        .output()
+        .expect("javac default method probe");
+    if !compiled.status.success() && diagnostics(&compiled).contains("invalid flag") {
+        compiled = Command::new(&javac)
+            .args([
+                "-cp",
+                engine_dir.to_str().unwrap(),
+                "-d",
+                probe.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ])
+            .output()
+            .expect("javac default method probe without --release");
+    }
+    assert!(
+        compiled.status.success(),
+        "javac default method probe failed: {}",
+        diagnostics(&compiled)
+    );
+
+    let java = jdk_tool("java");
+    let version = Command::new(&java)
+        .arg("-version")
+        .output()
+        .expect("java version");
+    let version_text = diagnostics(&version);
+    let major = java_major(&version_text).expect("parse java version");
+    let branch = match major {
+        8 => "Java 8 Lookup constructor",
+        9..=15 => "Java 9-15 privateLookupIn",
+        _ => "Java 16+ InvocationHandler.invokeDefault",
+    };
+    eprintln!("default method helper probe: Java {major} via {branch}");
+    assert!(major >= 8, "unsupported Java runtime: {version_text}");
+    let run = Command::new(&java)
+        .args([
+            "-cp",
+            &format!("{}:{}", probe.display(), engine_dir.display()),
+            "DefaultProbe",
+        ])
+        .output()
+        .expect("run default method probe");
+    assert!(
+        run.status.success(),
+        "default method probe failed on Java {major}: {}",
+        diagnostics(&run)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "default-ok\n");
+
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&cache);
+    let _ = fs::remove_dir_all(&uses);
+    let _ = fs::remove_dir_all(&probe);
+}
+
+/// A JVM can fail before writing the ready marker.  Its stderr must be
+/// visible after a short bounded drain even though the collector is detached.
+#[test]
+fn startup_failure_keeps_bounded_stderr_diagnostic() {
+    if !prerequisites("startup stderr") {
+        return;
+    }
+    let impls = tmp_dir("startup-stderr-impl");
+    let cache = tmp_dir("startup-stderr-cache");
+    let warm = tmp_dir("startup-stderr-warm");
+    let failed = tmp_dir("startup-stderr-failed");
+    let output = compile_with_tmpdir("eg_impl", &impls, &[], &cache)
+        .output()
+        .expect("compile eg_impl");
+    assert!(
+        output.status.success(),
+        "compile eg_impl failed: {}",
+        diagnostics(&output)
+    );
+    let output = compile_with_tmpdir("eg_use", &warm, &[&impls], &cache)
+        .output()
+        .expect("warm engine compile");
+    assert!(
+        output.status.success(),
+        "warm engine compile failed: {}",
+        diagnostics(&output)
+    );
+
+    let mut command = compile_with_tmpdir("eg_use", &failed, &[&impls], &cache);
+    command.env("JAVA_TOOL_OPTIONS", "-XscalaRsStartupFailure");
+    let output = command.output().expect("compile with startup failure");
+    let err = diagnostics(&output);
+    assert!(
+        !output.status.success(),
+        "expected startup failure, got: {err}"
+    );
+    assert!(
+        err.contains("status: exit status: 1"),
+        "missing status: {err}"
+    );
+    assert!(
+        err.contains("stderr:") && err.contains("Unrecognized option"),
+        "missing bounded startup stderr: {err}"
+    );
+
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&cache);
+    let _ = fs::remove_dir_all(&warm);
+    let _ = fs::remove_dir_all(&failed);
 }
 
 /// The same two files through real scalac 2.13.16.

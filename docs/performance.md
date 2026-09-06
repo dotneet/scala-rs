@@ -220,10 +220,13 @@ graph rather than the self-time summary):
   15%, spread over everything. The fix is interning — a `TypeId` index, or
   `Rc` for shared subtrees — or simply making `Type` smaller than 56 bytes.
   Either reaches every part of the compiler that touches a type.
-- `implicits_in_scope` runs on every implicit search and rebuilds a set of
-  every name in every enclosing scope (4%). Caching it needs a sound key, and
-  its answer depends on the scope stack *and* on class members that class-file
-  loading adds as the search runs.
+- ~~`implicits_in_scope` runs on every implicit search and rebuilds a set of
+  every name in every enclosing scope (4%).~~ **Done** — see *Memoizing
+  implicit search* below. The key it needed turned out to be no key at all:
+  the whole search runs under `&self`, so nothing it reads can change while it
+  is in flight, and the answer is cached for the length of one implicit
+  operation. (Class-file loading does add members mid-typing, but only from
+  `&mut self`, which is exactly what cannot happen inside a search.)
 - Writing the class files is **7% of wall time**, not the 45% an earlier
   reading of `sample` claimed — see *Writing the class files* below for why
   those two numbers are not the same measurement. 2127 files is 2127 creates.
@@ -236,6 +239,88 @@ graph rather than the self-time summary):
   which are gone: trait bodies are interface default methods now, as in nsc.)
 - The compile is single-threaded. Parsing is trivially parallel; the typer
   shares a mutable symbol table and is not.
+
+### Memoizing implicit search
+
+`ImplicitMemo` in `crates/typer/src/implicits.rs`. It answers
+`search_implicit_undet` from a table keyed by the wanted type, the
+undetermined call-site parameters and the depth, and caches two other things
+along the way: `implicits_in_scope` and `strictly_more_specific` (nsc's
+`improvesCache`).
+
+**What made a key possible.** Every earlier attempt foundered on "the answer
+depends on the context, and the context is the whole scope stack". It does —
+but the whole search runs under `&self`, so none of it can change while a
+search is in flight. The memo is created when the outermost implicit operation
+starts and thrown away when it returns, which turns the context into a constant
+instead of a key. The borrow checker is what enforces this: a caller that needs
+`&mut self` cannot hold the memo alive, and `warm_implicit_candidates` — the
+one thing that really does add symbols mid-typing — is `&mut self`.
+
+Three pieces of state a search reads or writes are not covered by that
+argument, and each is handled separately:
+
+* `open_implicits` (nsc's `openImplicits`, the divergence cut-off) **is**
+  mutable during a search. An entry carries a 64-bit signature of the
+  candidates its subtree asked the divergence check about, and is stored and
+  reused only where that signature is disjoint from the open stack's. A
+  collision costs a miss, never a wrong answer.
+* `MAX_IMPLICIT_DEPTH` makes `depth` matter, but only where the limit actually
+  bit. An entry records whether it did; one that never reached the limit is
+  reused at any *shallower* depth, which is what stops the same wanted type
+  being re-derived once per depth it is reached at.
+* Both of those travel **upwards through cache hits**. A search that took an
+  answer from the memo has that answer's subtree in its own, so a hit ORs the
+  entry's signature and depth-limit flag into the search that read it.
+  Forgetting this is the subtle way to get it wrong: the parent would be
+  recorded as depending on neither and then reused where it does not hold.
+
+`diverged_implicit` keeps only the *first* divergence and is monotone
+inside one top-level search. `implicit_via_module` needs explicit replay:
+two companions can inherit the same member symbol, and discovering the second
+companion overwrites the route recorded for the first. Each memo entry stores
+the final route writes of its subtree and replays them on a hit, including
+writes made while examining candidates for a failed search. Those writes also
+propagate into an enclosing entry, just like divergence and depth dependence.
+
+The resumption review reproduced the missing replay with a focused regression:
+searching companion A, then B, then A again returned A's witness with B's
+receiver route. The cached and uncached searches must agree about both the
+witness and this code-generation metadata. `memo_replays_inherited_companion_route`
+checks found and failed entries; the existing `im_memo` fixture still compares
+executed output with real scalac.
+
+**What it is worth.** On the four compile measures as they stand, nothing
+measurable: today's implicit scope is small enough that the searches are
+shallow. The reason to have it is the family it unblocks. Guarding
+`Typer::import_wildcard` with `PickleSupply::pickle_readable` — one line, and
+the fix for gitbucket's largest remaining family — multiplies the number of
+candidates in scope, and with that guard applied:
+
+* the memo answers **99.3%** of all `search_implicit_undet` calls (counted over
+  gitbucket's 213 hand-written sources: 3.98M calls, 3.98M hits, 18k entries
+  refused by the divergence signature);
+* `most_specific` was **73% of one ten-second profile** taken inside the
+  deepest search, all of it in `is_as_specific_type`, and it does not appear in
+  the profile at all once `strictly_more_specific` is cached. (Two `sample`
+  runs at different points of a long compile are not the same measurement —
+  this says the quadratic comparison is gone from that search, not that the
+  run is 73% shorter.)
+
+**And what it is not enough for.** That guard is still not affordable, and the
+bisection is sharp: with the guard, gitbucket's first **190** hand-written
+sources compile in 6 s, and adding the 191st — `util/DatabaseConfig.scala` —
+takes it past 400 s. That is true of both the memoized and the unmemoized
+compiler, so the memo does not reach this.
+
+What is left is not repeated searches — it is the ~0.7% that miss, each of
+which fits *every* candidate in scope to the wanted type before it can answer.
+The profile under the guard is `implicit_fit_open`'s own substitution work
+(`subst_tparams_slice`, `type_mentions_tparam`, `Type::clone` and its drop
+glue) at those misses. nsc has a cheap structural pre-test
+(`isPlausiblyCompatible`) that rejects most candidates before unification is
+attempted, and that — not more caching — is what the next slice on this needs.
+See `docs/gitbucket.md`.
 
 ### Writing the class files
 
