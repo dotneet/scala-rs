@@ -807,21 +807,18 @@ impl<'a> Gen<'a> {
             if idx == 0 || !is_interface_sym(self.st, *parent) {
                 continue;
             }
-            // `(source name, accessor name, instance descriptor, parameters,
-            // result)`. A trait of this run's own sources contributes one
-            // entry per member whose body writes `super.m`; a trait read from
-            // `-cp` contributes one per accessor its *interface* declares,
-            // which is the same set as far as the class is concerned.
-            let mut owed: Vec<(
-                String,
-                String,
-                String,
-                String,
-                SymbolId,
-                Vec<Type>,
-                Vec<Type>,
-                Type,
-            )> = Vec::new();
+            // Source super calls and binary interface accessors use the same
+            // record, retaining both the accessor ABI and selected target ABI.
+            struct SuperAccessor {
+                name: String,
+                accessor: String,
+                descriptor: String,
+                target_descriptor: String,
+                target: SymbolId,
+                params: Vec<Type>,
+                result: Type,
+            }
+            let mut owed = Vec::new();
             match self.traits.impls.get(parent) {
                 Some(methods) => {
                     let mut seen = HashSet::new();
@@ -857,16 +854,15 @@ impl<'a> Gen<'a> {
                             if !seen.insert((name.clone(), desc.clone())) {
                                 continue;
                             }
-                            owed.push((
-                                name.clone(),
-                                super_accessor_name(self.st, *parent, &name),
-                                desc,
-                                target_desc,
+                            owed.push(SuperAccessor {
+                                accessor: super_accessor_name(self.st, *parent, &name),
+                                name,
+                                descriptor: desc,
+                                target_descriptor: target_desc,
                                 target,
-                                target_params,
-                                pts,
-                                ret,
-                            ));
+                                params: pts,
+                                result: ret,
+                            });
                         }
                     }
                 }
@@ -877,20 +873,28 @@ impl<'a> Gen<'a> {
                         if b.methods.iter().any(|m| m.name == aname && m.desc == desc) {
                             continue;
                         }
-                        owed.push((
+                        owed.push(SuperAccessor {
                             name,
-                            aname,
-                            desc.clone(),
-                            desc,
-                            acc,
-                            method_params_from_sym(self.st, acc),
-                            method_params_from_sym(self.st, acc),
-                            method_ret_from_sym(self.st, acc),
-                        ));
+                            accessor: aname,
+                            descriptor: desc.clone(),
+                            target_descriptor: desc,
+                            target: acc,
+                            params: method_params_from_sym(self.st, acc),
+                            result: method_ret_from_sym(self.st, acc),
+                        });
                     }
                 }
             }
-            for (name, acc, inst_desc, target_desc, target_id, _target_params, pts, ret) in owed {
+            for SuperAccessor {
+                name,
+                accessor: acc,
+                descriptor: inst_desc,
+                target_descriptor: target_desc,
+                target: target_id,
+                params: pts,
+                result: ret,
+            } in owed
+            {
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 for p in &pts {

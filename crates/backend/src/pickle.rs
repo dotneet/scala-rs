@@ -3343,14 +3343,11 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             let mut params = first_params.clone();
             let mut ret = *first_ret;
             if mname == "<init>" {
-                loop {
-                    let Some(Entry::MethodTpe {
-                        ret: next_ret,
-                        params: next_params,
-                    }) = entries.get(ret as usize)
-                    else {
-                        break;
-                    };
+                while let Some(Entry::MethodTpe {
+                    ret: next_ret,
+                    params: next_params,
+                }) = entries.get(ret as usize)
+                {
                     params.extend(next_params.iter().copied());
                     ret = *next_ret;
                 }
