@@ -6,8 +6,8 @@
 //! and the getters of `val` members.
 
 use crate::classfile::{
-    encode_method_name, Field, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC,
-    ACC_STATIC, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
+    decode_method_name, encode_method_name, Field, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE,
+    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::gen::*;
 use crate::ifacebridge::BridgeKind;
@@ -786,13 +786,15 @@ impl<'a> Gen<'a> {
             let enc = enc.to_string();
             // The accessor's name holds the *encoded* method name; the
             // interface's own member list is where the source name is.
-            let Some(name) = members.iter().copied().find_map(|m| {
-                let t = self.st.get(m);
-                (t.kind == SymKind::Method && encode_method_name(&t.name) == enc)
-                    .then(|| t.name.clone())
-            }) else {
-                continue;
-            };
+            let name = members
+                .iter()
+                .copied()
+                .find_map(|m| {
+                    let t = self.st.get(m);
+                    (t.kind == SymKind::Method && encode_method_name(&t.name) == enc)
+                        .then(|| t.name.clone())
+                })
+                .unwrap_or_else(|| decode_method_name(&enc));
             out.push((acc, name));
         }
         out
@@ -873,12 +875,30 @@ impl<'a> Gen<'a> {
                         if b.methods.iter().any(|m| m.name == aname && m.desc == desc) {
                             continue;
                         }
+                        let object_method =
+                            matches!(name.as_str(), "equals" | "hashCode" | "toString");
+                        let target = if object_method {
+                            self.st
+                                .get(self.st.any_sym)
+                                .members
+                                .iter()
+                                .copied()
+                                .find(|&mid| self.st.get(mid).name == name)
+                                .unwrap_or(acc)
+                        } else {
+                            acc
+                        };
                         owed.push(SuperAccessor {
                             name,
                             accessor: aname,
                             descriptor: desc.clone(),
                             target_descriptor: desc,
-                            target: acc,
+                            // A binary trait's accessor is the ABI alias for
+                            // its selected `super` member, not that trait's
+                            // own default. Object methods have no declaring
+                            // interface in the classfile hierarchy, so keep
+                            // their Any target for terminal-super fallback.
+                            target,
                             params: method_params_from_sym(self.st, acc),
                             result: method_ret_from_sym(self.st, acc),
                         });
@@ -1139,6 +1159,24 @@ impl<'a> Gen<'a> {
                     return Some((s, false));
                 }
             }
+        }
+        // `linearize` intentionally omits Any/AnyRef/Object. A trait body
+        // such as `override def toString = super.toString` still selects the
+        // inherited Any member, though, and the class owes an accessor for
+        // it. Resolve that terminal member through the nearest concrete
+        // superclass so `invokespecial` names a legal superclass owner.
+        if self.st.get(target_id).owner == self.st.any_sym
+            && matches!(method, "equals" | "hashCode" | "toString")
+            && desc_params(&method_desc_from_sym(self.st, target_id)) == desc_params(expected_desc)
+        {
+            if let Some(&owner) = lin
+                .iter()
+                .skip(after_idx + 1)
+                .find(|&&s| !is_interface_sym(self.st, s) && !is_top_class(self.st, s))
+            {
+                return Some((owner, false));
+            }
+            return Some((self.st.object_sym, false));
         }
         None
     }
