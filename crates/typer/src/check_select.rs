@@ -509,6 +509,31 @@ impl Typer {
         }
         if found.len() > 1 {
             self.record_overload_group(&found, &name);
+            // `super.m` resolves among the parent linearization's members and
+            // nothing else, so pin this set even though `record_overload_group`
+            // declines to record it (every member is reachable from the head's
+            // own owner, which is its test for "worth remembering").
+            //
+            // `overload_groups` is keyed by the head symbol alone and knows
+            // nothing about the receiver, so declining to record leaves
+            // whatever an *earlier* selection of the same head put there --
+            // and `overload_alternatives` hands that to this selection.
+            // slick declares `def expr(n: Node)` on seven `QueryBuilder`
+            // subclasses next to the inherited `final def expr(n: Node,
+            // skipParens: Boolean)`. An unqualified `expr(…)` inside
+            // `MySQLQueryBuilder` records `[QueryBuilder.expr(Node, Boolean),
+            // MySQLQueryBuilder.expr(Node)]` under the two-parameter head, and
+            // every later `super.expr(n)` -- in *any* profile -- then picked
+            // the subclass alternative that had been recorded last:
+            // `PostgresQueryBuilder` emitted `invokespecial
+            // OracleProfile$OracleQueryBuilder.expr`, which the JVM rejects
+            // outright (`VerifyError: Bad invokespecial instruction: current
+            // class isn't assignable to reference class`), and four other
+            // profiles got their own `expr` back, i.e. infinite recursion that
+            // verifies fine.
+            if super_this.is_some() {
+                self.overload_groups.insert(found[0].0, found.clone());
+            }
         }
         // Only the receivers `subst_as_seen_from` cannot walk. A *class*
         // receiver it walks properly, parent by parent; reading the member a

@@ -187,6 +187,13 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
 - `tests/slick_subset.sh` — find the fixpoint of slick files that compile
   cleanly together, emit their class files, and load every one of them with the
   bytecode verifier on.
+- `tests/verify_all.sh <dir> [cp...]` — load every class file under a directory
+  with `Class.forName(name, true, loader)` and count `VerifyError` /
+  `ClassFormatError`. Initialising is the point: it forces linking, and linking
+  is what runs the verifier over the method bodies. `slick_subset.sh` passes
+  `false` there, so it never verifies a body; this is the check that noticed
+  six of slick's 1490 classes could not be loaded at all while every other
+  measure was green.
 - `tests/slick_run.sh` — build slick twice (scala-rs and real scalac), compile
   the client programs in `tests/slick_progs/` once with real scalac, and run
   that one client binary against each slick build, comparing stdout byte for

@@ -1,0 +1,5 @@
+outer:a
+inner:outer:a:3
+a
+inner2:PR(a):4
+local:a:5

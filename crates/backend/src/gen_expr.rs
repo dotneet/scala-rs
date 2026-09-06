@@ -94,6 +94,38 @@ pub(crate) fn emit_return(asm: &mut Assembler, ty: &Type) {
     ret_of_sort(asm, jvm_sort(ty));
 }
 
+/// A bridge or forwarder has just called a method whose *result descriptor* is
+/// `target_ret`. When that is `scala/runtime/Nothing$` the value cannot be
+/// handed on to anything: `Nothing$` is a subtype of nothing at all, so
+/// `areturn`ing it out of a method declared to return something else is
+/// `VerifyError: Bad return type`, and passing it as an argument is the same
+/// error one frame down. The call cannot complete normally in the first place,
+/// so nsc's `BCodeBodyBuilder.adapt` follows it with `athrow` and lets the
+/// verifier stop looking. Confirmed with `javap -c` on scalac 2.13.16 for both
+/// shapes slick has:
+///
+/// ```text
+/// public java.lang.String compiler();       // override lazy val compiler: Nothing = …
+///   invokevirtual compiler:()Lscala/runtime/Nothing$;
+///   athrow
+/// public void update(java.lang.Object, java.lang.Object);
+///   … checkcast scala/runtime/Nothing$
+///   invokevirtual update:(Ljava/lang/Object;Lscala/runtime/Nothing$;)Lscala/runtime/Nothing$;
+///   athrow
+/// ```
+///
+/// [`gen_expr`] applies this rule to every *expression* of type `Nothing`;
+/// bridges are hand-assembled and never build a `Tree`, so they need it here.
+/// Returns `true` when it emitted the `athrow`, so the caller skips its own
+/// adapt-and-return.
+pub(crate) fn emit_forwarded_nothing(asm: &mut Assembler, target_ret: &str) -> bool {
+    if target_ret == NOTHING_DESC {
+        asm.athrow();
+        return true;
+    }
+    false
+}
+
 pub(crate) fn ret_of_sort(asm: &mut Assembler, sort: JvmSort) {
     match sort {
         JvmSort::Void => asm.vreturn(),

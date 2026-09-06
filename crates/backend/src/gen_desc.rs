@@ -77,12 +77,19 @@ pub(crate) fn class_internal(st: &SymbolTable, id: SymbolId) -> String {
 pub(crate) const BOXED_UNIT: &str = "scala/runtime/BoxedUnit";
 pub(crate) const BOXED_UNIT_DESC: &str = "Lscala/runtime/BoxedUnit;";
 
+/// `Nothing`'s erasure. Unlike `Unit` it is this class in *every* position,
+/// result included, and it is a subtype of nothing at all -- which is what
+/// makes handing such a value on a `VerifyError` rather than a mere
+/// infelicity.
+pub(crate) const NOTHING_CLASS: &str = "scala/runtime/Nothing$";
+pub(crate) const NOTHING_DESC: &str = "Lscala/runtime/Nothing$;";
+
 /// Erasure of a type in a *value* position, as opposed to a method result.
 /// `Nothing` has the same problem as `Unit` and nsc gives it its own class.
 pub(crate) fn jvm_desc_val(st: &SymbolTable, ty: &Type) -> String {
     match ty.widen_constant() {
         Type::Unit | Type::NoType => BOXED_UNIT_DESC.into(),
-        Type::Nothing => "Lscala/runtime/Nothing$;".into(),
+        Type::Nothing => NOTHING_DESC.into(),
         _ => jvm_desc(st, ty),
     }
 }
@@ -116,7 +123,7 @@ pub(crate) fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         // caller invoking such a method needs that descriptor to know a real
         // reference lands on the stack, for `gen_expr`'s `athrow`-append
         // (see its doc comment) to consume.
-        Type::Nothing => "Lscala/runtime/Nothing$;".into(),
+        Type::Nothing => NOTHING_DESC.into(),
         // The other bottom type gets the same treatment, and this one really
         // is an ABI question rather than a verifier one: nsc erases `Null` to
         // `scala/runtime/Null$` in every position (`def n: Null` is
@@ -308,17 +315,17 @@ pub(crate) fn param_adapt(st: &SymbolTable, from: &Type, to: &Type) -> Adapt {
     if erases_to_boxed_unit(from) {
         return Adapt::None;
     }
-    // The two bottom types each erase to a class of their own, so a bridge
-    // from `(Object)` has to say so -- `Object` is not assignable to `Null$`,
-    // and the verifier rejects the whole class. nsc emits exactly this
-    // `checkcast` (`javap -c` on `class NullT extends D[Null]`, and the same
-    // for `D[Nothing]`). The cast can never fail: no instance of either class
-    // exists, so the value is always `null`, and `checkcast` lets `null`
-    // through.
+    // Both bottom types erase to their own classes. A bridge accepting
+    // Object must checkcast before forwarding to a Null$ / Nothing$ slot.
     match to.widen_constant() {
         Type::Null => return Adapt::Cast("scala/runtime/Null$".into()),
-        Type::Nothing => return Adapt::Cast("scala/runtime/Nothing$".into()),
+        Type::Nothing => return Adapt::Cast(NOTHING_CLASS.to_string()),
         _ => {}
+    }
+    // Preserve main's bottom-value handling: a Nothing argument must not
+    // fall through to primitive unboxing while forwarding a reference slot.
+    if matches!(from.widen_constant(), Type::Nothing) {
+        return Adapt::None;
     }
     if is_jvm_primitive(to) && !is_jvm_primitive(from) {
         Adapt::Unbox(to.clone())
@@ -1056,6 +1063,23 @@ pub(crate) fn self_reaches_owner(st: &SymbolTable, current: SymbolId, owner: Sym
     false
 }
 
+/// The `$outer` chain out of `from` reaches an instance that owns `owner`'s
+/// members — i.e. the member is available without reading `from`'s own `this`.
+pub(crate) fn outer_chain_reaches_owner(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> bool {
+    let mut cur = from;
+    let mut seen = HashSet::new();
+    while let Some(o) = enclosing_instance(st, cur) {
+        if !seen.insert(o.0) {
+            return false;
+        }
+        if self_reaches_owner(st, o, owner) {
+            return true;
+        }
+        cur = o;
+    }
+    false
+}
+
 /// Push the instance that owns `owner`'s members: `this`, or the `$outer`
 /// chain of the class being emitted when the member lives further out.
 /// `cur` is the class we are lexically inside (it decides the next hop),
@@ -1064,7 +1088,26 @@ pub(crate) fn self_reaches_owner(st: &SymbolTable, current: SymbolId, owner: Sym
 pub(crate) fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
     let hops = !ctx.class_sym.is_none()
         && !owner.is_none()
-        && !self_reaches_owner(ctx.st, ctx.class_sym, owner);
+        && (!self_reaches_owner(ctx.st, ctx.class_sym, owner)
+            // In the pre-super part of an `<init>` slot 0 is
+            // `uninitializedThis`, which JVMS §4.10.1.9 lets `putfield` take
+            // and nothing else -- no `getfield`, no `invokevirtual`. A
+            // reference there is also *written* outside the template: the
+            // arguments of `new P(rs) { … }` belong to the enclosing class, so
+            // `rs` means the enclosing instance's `rs` and not the field of the
+            // object being built, which has not been assigned yet. So walk out
+            // to the constructor's `$outer` parameter whenever the enclosing
+            // instance can supply the member, *even though* the class being
+            // constructed inherits it as well.
+            //
+            // slick's `PositionedResult.view` is exactly this shape
+            // (`new PositionedResult(rs) { … }` inside `PositionedResult`), and
+            // reading `rs` off `this` had the JVM refuse
+            // `slick.jdbc.PositionedResult$$anon$507` outright: `VerifyError:
+            // Bad type on operand stack … Type uninitializedThis … is not
+            // assignable to 'slick/jdbc/PositionedResult'`.
+            || (ctx.presuper_outer.is_some()
+                && outer_chain_reaches_owner(ctx.st, ctx.class_sym, owner)));
     let (mut cur, mut held) = start_outer_walk(asm, ctx, hops);
     while !cur.is_none() && !owner.is_none() && !self_reaches_owner(ctx.st, held, owner) {
         let Some(o) = enclosing_instance(ctx.st, cur) else {

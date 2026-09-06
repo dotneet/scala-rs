@@ -1,25 +1,37 @@
-//! `reify { … }` over blocks and over members of static `object`s
-//! (`docs/macros.md` §7.17).
+//! `reify { … }` over `val` and `def` definitions bound *inside* the body
+//! itself (the `agent/reifydefs` slice, `docs/macros.md` §7.17 "What
+//! remains", item 3).
 //!
-//! Its own file rather than an addition to `engine.rs`, which is what the
-//! per-slice files beside it (`libctor.rs`, `tqmacro.rs`, `engine.rs`) already
-//! do; `reify.rs` is taken by an unrelated suite about dispatching to the
-//! declaring class.
+//! Its own file per the project convention (`libctor.rs`, `tqmacro.rs`,
+//! `engine.rs`, `rf_reify.rs`), so appending to a shared file's tail never
+//! conflicts with another slice doing the same.
 //!
 //! Two kinds of check, because they catch different things.
 //!
-//! * `rf_shapes.scala` prints `showRaw` of each reified tree and is compared
-//!   with real scalac 2.13.16. A reference built as a bare `Ident` instead of
-//!   `Select(mkIdent(staticModule(…)), …)` still compiles and still evaluates
-//!   to the same value wherever the name happens to be in scope, so **only the
-//!   printed tree tells them apart** -- and only the second one keeps its
-//!   meaning wherever the expansion lands.
-//! * `rf_impl.scala` + `rf_use.scala` really expand through the JVM bridge in
-//!   two runs, and are compared with the same two files built by real scalac.
-//!   That is what says the tree does not merely print right but *runs*.
+//! * `rd_defs.scala` prints `showRaw` of each reified tree and is compared
+//!   with real scalac 2.13.16. A `val`/`def` rebuilt with the wrong
+//!   `Modifiers`, or a declared type rebuilt as `mkTypeTree(...)` instead of
+//!   the structural shape nsc actually uses for a *value* type (as opposed
+//!   to a type *argument* -- see `crate::reify::ReifyRef::StaticClass`'s doc
+//!   comment), still compiles and runs; only the printed tree tells them
+//!   apart.
+//! * `rd_defs_valimpl.scala` + `rd_defs_valuse.scala` really expand through
+//!   the JVM bridge in two runs and are compared with the same two files
+//!   built by real scalac -- the `val` case is the one that round-trips
+//!   *end to end*: the engine's reverse wire-format decoder
+//!   (`crates/typer/src/expand.rs`) already understood `ValDef` before this
+//!   slice (the `agent/staged` slice, `docs/macros.md` §7.13). `DefDef` is
+//!   not among the shapes it accepts yet -- a `def` actually invoked as a
+//!   macro (rather than `reify`d and printed) fails with "the expansion
+//!   contains a `DefDef`, which scala-rs cannot rebuild yet", a pre-existing
+//!   and unrelated gap in that decoder, not in `reify` itself. So a `def`
+//!   with parameters is verified by `rd_defs.scala`'s `showRaw` comparison
+//!   alone, which needs no macro invocation at all (`reify` on
+//!   `scala.reflect.runtime.universe` runs standalone).
 //!
-//! `rf_bad.scala` is the confession: five bodies real scalac compiles and
-//! scala-rs refuses by name.
+//! `rd_defs_bad.scala` is the confession: two shapes real scalac compiles
+//! and scala-rs still refuses by name -- both are about the *declared type*
+//! of a `val`/`def`, not about the definition or the reference to it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,7 +54,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let p = std::env::temp_dir().join(format!(
-        "scala-rs-rfreify-{tag}-{}-{nanos}-{seq}",
+        "scala-rs-reifydefs-{tag}-{}-{nanos}-{seq}",
         std::process::id()
     ));
     fs::create_dir_all(&p).unwrap();
@@ -73,7 +85,7 @@ fn find_scalac() -> Option<PathBuf> {
 }
 
 /// Everything these tests need. Returns false (and says so) when the machine
-/// cannot run them at all -- the same shape as `engine.rs`.
+/// cannot run them at all -- the same shape as `engine.rs` / `rf_reify.rs`.
 fn prerequisites(tag: &str) -> bool {
     if !tool_available("java") || !tool_available("javac") {
         eprintln!("skip {tag}: java / javac not available");
@@ -180,132 +192,126 @@ fn classpath(dirs: &[&Path]) -> String {
     cp
 }
 
-/// `showRaw` of every reified tree in `rf_shapes.scala`, against the runtime
-/// universe.
+/// `showRaw` of six reified trees: an untyped `val`, a typed `val`, a `def`
+/// with a typed parameter, a recursive `def`, two mutually recursive `def`s,
+/// and a `val` read by a `def`. Against the runtime universe.
 #[test]
-fn rf_shapes_reify_and_run() {
-    if !prerequisites("rf_shapes") {
+fn rd_defs_reify_and_run() {
+    if !prerequisites("rd_defs") {
         return;
     }
-    let out_dir = tmp_dir("rf_shapes");
-    let out = compile("rf_shapes", &out_dir, &[]);
+    let out_dir = tmp_dir("rd_defs");
+    let out = compile("rd_defs", &out_dir, &[]);
     assert!(
         out.status.success(),
-        "compile rf_shapes failed: {}",
+        "compile rd_defs failed: {}",
         diagnostics(&out)
     );
     assert_eq!(
-        run_main(&classpath(&[&out_dir]), "rf_shapes"),
-        expected_stdout("rf_shapes"),
-        "stdout mismatch for rf_shapes"
+        run_main(&classpath(&[&out_dir]), "rd_defs"),
+        expected_stdout("rd_defs"),
+        "stdout mismatch for rd_defs"
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// The same file through real scalac 2.13.16. This is what makes the recorded
-/// trees mean something: they are nsc's, not scala-rs's own invention.
+/// The same file through real scalac 2.13.16 -- what makes the recorded
+/// trees mean something: they are nsc's own, not scala-rs's invention.
 #[test]
-fn rf_shapes_match_real_scalac() {
-    if !prerequisites("rf_shapes scalac diff") {
+fn rd_defs_match_real_scalac() {
+    if !prerequisites("rd_defs scalac diff") {
         return;
     }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip rf_shapes scalac diff: scalac not obtainable");
+        eprintln!("skip rd_defs scalac diff: scalac not obtainable");
         return;
     };
-    let out_dir = tmp_dir("rf_shapes-scalac");
-    scalac_compile(&scalac, "rf_shapes", &out_dir, &[]);
+    let out_dir = tmp_dir("rd_defs-scalac");
+    scalac_compile(&scalac, "rd_defs", &out_dir, &[]);
     assert_eq!(
-        run_main(&classpath(&[&out_dir]), "rf_shapes (real scalac build)"),
-        expected_stdout("rf_shapes"),
-        "recorded expectation for rf_shapes does not match real scalac"
+        run_main(&classpath(&[&out_dir]), "rd_defs (real scalac build)"),
+        expected_stdout("rd_defs"),
+        "recorded expectation for rd_defs does not match real scalac"
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// The macro path: `rf_impl.scala` is compiled first, and its `reify` bodies
-/// are really expanded when `rf_use.scala` is compiled against it.
+/// The macro path for the one case that round-trips end to end today: a
+/// `val` bound inside `reify { … }`, expanded by scala-rs and actually run.
 #[test]
-fn rf_macros_expand_and_run() {
-    if !prerequisites("rf_use") {
+fn rd_defs_val_expands_and_runs() {
+    if !prerequisites("rd_defs_valuse") {
         return;
     }
-    let impls = tmp_dir("rf_impl");
-    let uses = tmp_dir("rf_use");
-    let out = compile("rf_impl", &impls, &[]);
+    let impls = tmp_dir("rd_defs_valimpl");
+    let uses = tmp_dir("rd_defs_valuse");
+    let out = compile("rd_defs_valimpl", &impls, &[]);
     assert!(
         out.status.success(),
-        "compile rf_impl failed: {}",
+        "compile rd_defs_valimpl failed: {}",
         diagnostics(&out)
     );
-    let out = compile("rf_use", &uses, &[&impls]);
+    let out = compile("rd_defs_valuse", &uses, &[&impls]);
     assert!(
         out.status.success(),
-        "compile rf_use failed: {}",
+        "compile rd_defs_valuse failed: {}",
         diagnostics(&out)
     );
     assert_eq!(
-        run_main(&classpath(&[&uses, &impls]), "rf_use"),
-        expected_stdout("rf_use"),
-        "stdout mismatch for rf_use"
+        run_main(&classpath(&[&uses, &impls]), "rd_defs_valuse"),
+        expected_stdout("rd_defs_valuse"),
+        "stdout mismatch for rd_defs_valuse"
     );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The same two files through real scalac 2.13.16. A block that dropped a
-/// statement, or a splice built twice, would still compile and still run --
-/// the count `rf_use` prints is what catches it.
+/// The same two files through real scalac 2.13.16.
 #[test]
-fn rf_macros_match_real_scalac() {
-    if !prerequisites("rf_use scalac diff") {
+fn rd_defs_val_matches_real_scalac() {
+    if !prerequisites("rd_defs_valuse scalac diff") {
         return;
     }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip rf_use scalac diff: scalac not obtainable");
+        eprintln!("skip rd_defs_valuse scalac diff: scalac not obtainable");
         return;
     };
-    let impls = tmp_dir("rf_impl-scalac");
-    let uses = tmp_dir("rf_use-scalac");
-    scalac_compile(&scalac, "rf_impl", &impls, &[]);
-    scalac_compile(&scalac, "rf_use", &uses, &[&impls]);
+    let impls = tmp_dir("rd_defs_valimpl-scalac");
+    let uses = tmp_dir("rd_defs_valuse-scalac");
+    scalac_compile(&scalac, "rd_defs_valimpl", &impls, &[]);
+    scalac_compile(&scalac, "rd_defs_valuse", &uses, &[&impls]);
     assert_eq!(
-        run_main(&classpath(&[&uses, &impls]), "rf_use (real scalac build)"),
-        expected_stdout("rf_use"),
-        "recorded expectation for rf_use does not match real scalac"
+        run_main(
+            &classpath(&[&uses, &impls]),
+            "rd_defs_valuse (real scalac build)"
+        ),
+        expected_stdout("rd_defs_valuse"),
+        "recorded expectation for rd_defs_valuse does not match real scalac"
     );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The five bodies still refused, each named. Real scalac compiles all of
-/// them; scala-rs says which construct it cannot build rather than reifying
-/// the bare name, which would compile, run, and mean whatever stood at the
-/// expansion site.
+/// The two shapes still refused, each named. Real scalac compiles both; both
+/// are about the *declared type* of a `val`/`def`, not about the definition
+/// or a reference to it -- see `rd_defs_bad.scala`'s own comments.
 #[test]
-fn rf_gaps_are_named() {
-    if !prerequisites("rf_bad") {
+fn rd_defs_gaps_are_named() {
+    if !prerequisites("rd_defs_bad") {
         return;
     }
-    let out_dir = tmp_dir("rf_bad");
-    let out = compile("rf_bad", &out_dir, &[]);
-    assert!(!out.status.success(), "rf_bad.scala should not compile");
+    let out_dir = tmp_dir("rd_defs_bad");
+    let out = compile("rd_defs_bad", &out_dir, &[]);
+    assert!(
+        !out.status.success(),
+        "rd_defs_bad.scala should not compile"
+    );
     let text = diagnostics(&out);
     for want in [
-        // a member of the enclosing `object` (nsc's `mkThis` form)
-        "`member` is a local, a parameter, or a name that does not stand for a static \
-         `object` or a member of one",
-        // a pattern `val` bound inside a reified block (an ordinary `val` is
-        // reified now; see the `agent/reifydefs` slice)
-        "a pattern definition (`val (a, b) = ...`) is not reified yet",
-        // `scala.math`'s package-object functions
-        "`math` is a local, a parameter, or a name that does not stand for a static \
-         `object` or a member of one",
-        // a class definition inside a reified block
-        "a class definition is not reified yet",
-        // a local of the enclosing method -- nsc's free terms
-        "`here` is a local, a parameter, or a name that does not stand for a static \
-         `object` or a member of one",
+        // `List[Int]`: a type constructor applied to arguments.
+        "a type argument cannot be rebuilt: `List`, a type constructor applied to type arguments",
+        // a locally declared `def`'s own type parameter used in value position
+        "a type argument cannot be rebuilt: `U`",
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
@@ -316,19 +322,19 @@ fn rf_gaps_are_named() {
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// Real scalac accepts `rf_bad.scala`. Without this the fixture could drift
-/// into a file that is simply wrong, and the refusals above would stop being a
-/// confession and start looking like correct rejections.
+/// Real scalac accepts `rd_defs_bad.scala`. Without this the fixture could
+/// drift into a program that is simply wrong, and the refusals above would
+/// stop being a confession and start looking like correct rejections.
 #[test]
-fn rf_gaps_are_accepted_by_real_scalac() {
-    if !prerequisites("rf_bad scalac") {
+fn rd_defs_gaps_are_accepted_by_real_scalac() {
+    if !prerequisites("rd_defs_bad scalac") {
         return;
     }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip rf_bad scalac: scalac not obtainable");
+        eprintln!("skip rd_defs_bad scalac: scalac not obtainable");
         return;
     };
-    let out_dir = tmp_dir("rf_bad-scalac");
-    scalac_compile(&scalac, "rf_bad", &out_dir, &[]);
+    let out_dir = tmp_dir("rd_defs_bad-scalac");
+    scalac_compile(&scalac, "rd_defs_bad", &out_dir, &[]);
     let _ = fs::remove_dir_all(&out_dir);
 }

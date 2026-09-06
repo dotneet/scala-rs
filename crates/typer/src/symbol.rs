@@ -1138,6 +1138,11 @@ impl SymbolTable {
     }
 
     /// Names that live in the term namespace under their own spelling.
+    /// [`Self::is_term_namespace`] for callers outside this module.
+    pub fn is_term_namespace_sym(&self, s: SymbolId) -> bool {
+        self.is_term_namespace(s)
+    }
+
     fn is_term_namespace(&self, s: SymbolId) -> bool {
         matches!(
             self.get(s).kind,
