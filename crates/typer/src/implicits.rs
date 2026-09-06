@@ -94,11 +94,11 @@ pub(crate) struct ImplicitFit {
 /// are replayed identically wherever the entry is reused. A signature
 /// collision can only cost a cache miss.
 ///
-/// The two other cells a search writes are unaffected by a skipped
-/// recomputation: `diverged_implicit` keeps the *first* divergence and is
-/// monotone within one top-level search, and `implicit_via_module` was already
-/// filled by the run that stored the entry (it is keyed by member, never
-/// cleared, and only ever read for the witness that search returned).
+/// The two other cells a search writes need separate treatment:
+/// `diverged_implicit` keeps the *first* divergence and is
+/// monotone within one top-level search. `implicit_via_module` can be
+/// overwritten when two companions inherit the same member, so entries replay
+/// every route their subtree wrote, including writes from failed candidates.
 #[derive(Default)]
 pub(crate) struct ImplicitMemo {
     /// Re-entrancy count of [`Typer::search_implicit_undet`]. The memo is
@@ -120,6 +120,8 @@ pub(crate) struct ImplicitMemo {
     probe: u64,
     /// Whether that subtree was stopped anywhere by [`MAX_IMPLICIT_DEPTH`].
     cut: bool,
+    /// Last companion-route writes made by the subtree currently evaluated.
+    routes: rustc_hash::FxHashMap<u32, SymbolId>,
 }
 
 struct MemoEntry {
@@ -136,6 +138,7 @@ struct MemoEntry {
     cut: bool,
     result: ImplicitSearch,
     bindings: Vec<(SymbolId, Type)>,
+    routes: rustc_hash::FxHashMap<u32, SymbolId>,
 }
 
 /// One bit per `SymbolId`, folded modulo 64.
@@ -228,6 +231,7 @@ impl Drop for MemoLive<'_> {
             m.in_scope = None;
             m.probe = 0;
             m.cut = false;
+            m.routes.clear();
         }
     }
 }
@@ -553,6 +557,10 @@ impl Typer {
                         self.implicit_via_module
                             .borrow_mut()
                             .insert(mem.0, module_sym);
+                        let mut memo = self.implicit_memo.borrow_mut();
+                        if memo.depth > 0 {
+                            memo.routes.insert(mem.0, module_sym);
+                        }
                     }
                     out.push(mem);
                 }
@@ -1577,20 +1585,24 @@ impl Typer {
         // returns; see [`ImplicitMemo`] for why the context it was computed in
         // does not have to be part of the key.
         let live = self.memo_scope();
-        let (outer_probe, outer_cut) = {
+        let (outer_probe, outer_cut, mut outer_routes) = {
             let mut m = self.implicit_memo.borrow_mut();
             (
                 std::mem::replace(&mut m.probe, 0),
                 std::mem::take(&mut m.cut),
+                std::mem::take(&mut m.routes),
             )
         };
         let out = self.search_implicit_uncached(pt, undet, depth);
-        let (probe, cut) = {
+        let (probe, cut, routes) = {
             let mut m = self.implicit_memo.borrow_mut();
             let (p, c) = (m.probe, m.cut);
+            let routes = std::mem::take(&mut m.routes);
+            outer_routes.extend(routes.iter().map(|(&member, &module)| (member, module)));
             m.probe = outer_probe | p;
             m.cut = outer_cut | c;
-            (p, c)
+            m.routes = outer_routes;
+            (p, c, routes)
         };
         if probe & open == 0 {
             let mut m = self.implicit_memo.borrow_mut();
@@ -1602,6 +1614,7 @@ impl Typer {
                 cut,
                 result: out.0.clone(),
                 bindings: out.1.clone(),
+                routes,
             });
         }
         drop(live);
@@ -1657,9 +1670,13 @@ impl Typer {
                 && e.pt == *pt
         })?;
         let out = (e.result.clone(), e.bindings.clone());
-        let (probe, cut) = (e.probe, e.cut);
+        let (probe, cut, routes) = (e.probe, e.cut, e.routes.clone());
+        self.implicit_via_module
+            .borrow_mut()
+            .extend(routes.iter().map(|(&member, &module)| (member, module)));
         m.probe |= probe;
         m.cut |= cut;
+        m.routes.extend(routes);
         Some(out)
     }
 
@@ -3278,5 +3295,96 @@ fn unwrap_byname(t: &Type) -> Type {
     match t {
         Type::ByName(inner) => (**inner).clone(),
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use crate::check::TypecheckOptions;
+
+    #[test]
+    fn memo_replays_inherited_companion_route() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let shared = typer
+            .st
+            .alloc("Shared", root, SymKind::Class, Flags::TRAIT, "Shared");
+        let mut companion = |name: &str| {
+            let class = typer
+                .st
+                .alloc(name, root, SymKind::Class, Flags::EMPTY, name);
+            let module = typer.st.alloc(
+                name,
+                root,
+                SymKind::Module,
+                Flags::EMPTY,
+                format!("{name}$"),
+            );
+            let module_class = typer.st.alloc(
+                format!("{name}$"),
+                root,
+                SymKind::ModuleClass,
+                Flags::EMPTY,
+                format!("{name}$"),
+            );
+            typer.st.get_mut(module).ty = Type::ModuleRef(module_class);
+            typer.st.get_mut(module_class).parents = vec![Type::Class {
+                sym: shared,
+                args: vec![],
+            }];
+            (
+                Type::Class {
+                    sym: class,
+                    args: vec![],
+                },
+                module,
+            )
+        };
+        let (a, module_a) = companion("MemoA");
+        let (b, module_b) = companion("MemoB");
+        let witness = typer.st.alloc(
+            "evidence",
+            shared,
+            SymKind::Term,
+            Flags::IMPLICIT,
+            "evidence",
+        );
+        typer.st.get_mut(witness).ty = a.clone();
+
+        // Conversion search keeps one memo alive while trying different
+        // wanted types. Both companions inherit the same member symbol.
+        let _live = typer.memo_scope();
+        assert!(
+            matches!(typer.search_implicit_at(&a, 1), ImplicitSearch::Found(id) if id == witness)
+        );
+        assert_eq!(
+            typer.implicit_via_module.borrow().get(&witness.0),
+            Some(&module_a)
+        );
+        assert!(matches!(
+            typer.search_implicit_at(&b, 1),
+            ImplicitSearch::None
+        ));
+        assert_eq!(
+            typer.implicit_via_module.borrow().get(&witness.0),
+            Some(&module_b)
+        );
+        assert!(
+            matches!(typer.search_implicit_at(&a, 1), ImplicitSearch::Found(id) if id == witness)
+        );
+        assert_eq!(
+            typer.implicit_via_module.borrow().get(&witness.0),
+            Some(&module_a)
+        );
+        // Failed searches must replay their candidate discovery too.
+        assert!(matches!(
+            typer.search_implicit_at(&b, 1),
+            ImplicitSearch::None
+        ));
+        assert_eq!(
+            typer.implicit_via_module.borrow().get(&witness.0),
+            Some(&module_b)
+        );
     }
 }

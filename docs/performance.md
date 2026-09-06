@@ -275,11 +275,20 @@ argument, and each is handled separately:
   Forgetting this is the subtle way to get it wrong: the parent would be
   recorded as depending on neither and then reused where it does not hold.
 
-`diverged_implicit` and `implicit_via_module` are the two cells a search
-writes, and neither notices a skipped recomputation: the first keeps only the
-*first* divergence and is monotone inside one top-level search, and the second
-is keyed by member, never cleared, and only read for the witness the search
-returned — which the run that filled the entry had already recorded.
+`diverged_implicit` keeps only the *first* divergence and is monotone
+inside one top-level search. `implicit_via_module` needs explicit replay:
+two companions can inherit the same member symbol, and discovering the second
+companion overwrites the route recorded for the first. Each memo entry stores
+the final route writes of its subtree and replays them on a hit, including
+writes made while examining candidates for a failed search. Those writes also
+propagate into an enclosing entry, just like divergence and depth dependence.
+
+The resumption review reproduced the missing replay with a focused regression:
+searching companion A, then B, then A again returned A's witness with B's
+receiver route. The cached and uncached searches must agree about both the
+witness and this code-generation metadata. `memo_replays_inherited_companion_route`
+checks found and failed entries; the existing `im_memo` fixture still compares
+executed output with real scalac.
 
 **What it is worth.** On the four compile measures as they stand, nothing
 measurable: today's implicit scope is small enough that the searches are
