@@ -83,7 +83,7 @@ if [[ $1 == --one ]]; then
   extra=$(comm -13 <(print -r -- $theirs) <(print -r -- $ours) | grep -c . || true)
 
   if (( ourrc != 0 )); then
-    why=$(grep -m1 '^error' $work/ours.log | tr '\t' ' ' | cut -c1-100)
+    why=$(grep -m1 '^error' $work/ours.log | LC_ALL=C tr '\t' ' ' | cut -c1-100)
     emit no-compile 0 $nt $nt 0 0 $spt "${why:-compile failed}"
   elif (( missing == 0 && extra == 0 )); then
     emit match $no $nt 0 0 $spo $spt
@@ -108,7 +108,8 @@ if [[ ! -d $CORPUS/test/files ]]; then
 fi
 have=$(git -C $CORPUS rev-parse HEAD)
 if [[ $have != $SCALA_REV ]]; then
-  echo "warning: corpus at $have, expected $SCALA_REV (v2.13.16)" >&2
+  echo "corpus revision mismatch: got $have, expected $SCALA_REV (v2.13.16)" >&2
+  exit 2
 fi
 
 export SCALAC=${SCALAC:-/tmp/scala-2.13.16/bin/scalac}
@@ -142,8 +143,22 @@ if (( ${#tests} == 0 )); then
   exit 1
 fi
 
-print -l $tests | xargs -P ${SPEC_JOBS:-6} -n 1 -I{} $0 --one {} || true
-cat $SPEC_LOG.part/*(N) | sort > $SPEC_LOG
+expected_total=${#tests}
+set +e
+print -l $tests | xargs -P ${SPEC_JOBS:-6} -n 1 -I{} $0 --one {}
+xargs_rc=$?
+set -e
+parts=($SPEC_LOG.part/*(N))
+if (( ${#parts} > 0 )); then
+  cat $parts | LC_ALL=C sort > $SPEC_LOG
+else
+  : > $SPEC_LOG
+fi
+actual_total=$(wc -l < $SPEC_LOG | tr -d ' ')
+if (( xargs_rc != 0 || actual_total != expected_total )); then
+  echo "specialization ledger incomplete: expected_rows=$expected_total actual_rows=$actual_total worker_exit=$xargs_rc" >&2
+  exit 2
+fi
 rm -rf $SPEC_LOG.part $SPEC_WORK
 
 tot=$(wc -l < $SPEC_LOG | tr -d ' ')

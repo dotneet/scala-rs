@@ -109,7 +109,7 @@ if [[ $1 == --one ]]; then
         $f =~ s{.*/}{};
       }
       END { flush(); print join("\x1e", @o); }
-    ' "$@" 2>/dev/null | tr '\t' ' '
+    ' "$@" 2>/dev/null | LC_ALL=C tr '\t' ' '
   }
 
   # What the `.check` says scalac reports. The error lines are what a `neg`
@@ -130,7 +130,7 @@ if [[ $1 == --one ]]; then
         }
       }
       END { print join("\x1e", @e ? @e : @w); }
-    ' $1 2>/dev/null | tr '\t' ' '
+    ' $1 2>/dev/null | LC_ALL=C tr '\t' ' '
   }
 
   # --- collect the sources -------------------------------------------------
@@ -209,7 +209,7 @@ if [[ $1 == --one ]]; then
       # Keep the first diagnostic verbatim (minus tabs, which are the field
       # separator). Bucketing happens at report time, so the log stays usable
       # for anything we did not think to bucket by.
-      symptom=$(grep -m1 '^error' $log | tr '\t' ' ' | cut -c1-140)
+      symptom=$(grep -m1 '^error' $log | LC_ALL=C tr '\t' ' ' | cut -c1-140)
       break
     fi
   done
@@ -309,7 +309,8 @@ if [[ ! -d $CORPUS/test/files ]]; then
 fi
 have=$(git -C $CORPUS rev-parse HEAD)
 if [[ $have != $SCALA_REV ]]; then
-  echo "warning: corpus at $have, expected $SCALA_REV (v2.13.16)" >&2
+  echo "corpus revision mismatch: got $have, expected $SCALA_REV (v2.13.16)" >&2
+  exit 2
 fi
 
 ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
@@ -329,6 +330,8 @@ KINDS=(${=CORPUS_KINDS:-pos neg run})
 SIZE=${CORPUS_SIZE:-sample}
 SAMPLE=${CORPUS_SAMPLE:-250}
 JOBS=${CORPUS_JOBS:-8}
+typeset -A EXPECTED_COUNTS
+expected_total=0
 
 specs=()
 for kind in $KINDS; do
@@ -350,11 +353,38 @@ for kind in $KINDS; do
     tests=($picked)
   fi
   echo "$kind: ${#tests} tests" >&2
+  EXPECTED_COUNTS[$kind]=${#tests}
+  expected_total=$((expected_total + ${#tests}))
   for t in $tests; do specs+=("$kind:$t"); done
 done
 
-print -l $specs | xargs -P $JOBS -n 1 -I{} $0 --one {} || true
-cat $CORPUS_LOG.part/*(N) | sort > $CORPUS_LOG
+set +e
+print -l $specs | xargs -P $JOBS -n 1 -I{} $0 --one {}
+xargs_rc=$?
+set -e
+parts=($CORPUS_LOG.part/*(N))
+if (( ${#parts} > 0 )); then
+  # Some reference .check files contain non-UTF-8 diagnostic bytes. Sorting
+  # completed records must not discard a whole run because of the host locale.
+  cat $parts | LC_ALL=C sort > $CORPUS_LOG
+else
+  : > $CORPUS_LOG
+fi
+actual_total=$(wc -l < $CORPUS_LOG | tr -d ' ')
+row_error=0
+if (( xargs_rc != 0 || actual_total != expected_total )); then
+  row_error=1
+fi
+for kind in $KINDS; do
+  actual_kind=$(awk -F'\t' -v k=$kind '$1==k' $CORPUS_LOG | wc -l | tr -d ' ')
+  if (( actual_kind != EXPECTED_COUNTS[$kind] )); then
+    row_error=1
+  fi
+done
+if (( row_error != 0 )); then
+  echo "corpus harness incomplete: expected_rows=$expected_total actual_rows=$actual_total worker_exit=$xargs_rc" >&2
+  exit 2
+fi
 rm -rf $CORPUS_LOG.part $CORPUS_WORK
 
 for kind in $KINDS; do

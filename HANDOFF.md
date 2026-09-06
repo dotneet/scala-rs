@@ -1,5 +1,11 @@
 # scala-rs — session handoff
 
+**Codex continuation in progress:** read
+[`docs/notes/codex-validation-2026-09-06.md`](docs/notes/codex-validation-2026-09-06.md)
+for recovered branch checkpoints, newly reproduced defects, Java environment
+requirements, and unfinished validation. The historical results below remain
+the baseline; the continuation has not yet merged the compiler changes.
+
 Written 2026-09-06 at the end of a long parallel-development session. Its
 purpose is to let the next session pick up without re-deriving anything.
 
