@@ -5764,7 +5764,7 @@ fn desugar_for(
                     p.alloc(pat_span, TreeKind::Ident { name: raw_name }),
                 );
             }
-            return (vec![def], p.alloc(pat_span, TreeKind::Ident { name: tmp }));
+            (vec![def], p.alloc(pat_span, TreeKind::Ident { name: tmp }))
         } else {
             let raw_name = outer_raw_name.unwrap_or_else(|| {
                 p.placeholder_id += 1;
@@ -5832,7 +5832,7 @@ fn desugar_for(
                 ));
             }
             let raw = p.alloc(pat_span, TreeKind::Ident { name: raw_name });
-            return (stats, raw);
+            (stats, raw)
         }
     }
 
