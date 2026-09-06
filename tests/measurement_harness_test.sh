@@ -27,7 +27,7 @@ for shell in bash zsh; do
   done
 done
 
-mkdir -p "$WORK/good" "$WORK/missing" "$WORK/bad" "$WORK/empty" "$WORK/init"
+mkdir -p "$WORK/good" "$WORK/missing" "$WORK/bad" "$WORK/empty" "$WORK/init" "$WORK/exit"
 cat > "$WORK/Good.java" <<'JAVA'
 public class Good {
   static final Class<?> PLATFORM_TYPE = java.sql.Connection.class;
@@ -43,6 +43,12 @@ public class Init {
   static { if (System.nanoTime() != 0) throw new RuntimeException("fixture"); }
 }
 JAVA
+cat > "$WORK/Exit.java" <<'JAVA'
+public class Exit {
+  static { System.exit(0); }
+}
+JAVA
+javac -d "$WORK/exit" "$WORK/Exit.java"
 javac -d "$WORK/good" "$WORK/Good.java"
 javac -d "$WORK/missing" "$WORK/Child.java"
 javac -d "$WORK/init" "$WORK/Init.java"
@@ -58,4 +64,6 @@ grep -q 'INCOMPLETE Init :: ExceptionInInitializerError' "$WORK/result.log"
 expect_exit 2 bash "$ROOT/tests/verify_all.sh" "$WORK/empty"
 expect_exit 1 bash "$ROOT/tests/verify_all.sh" "$WORK/bad"
 grep -q 'verify_failures=1' "$WORK/result.log"
-echo 'measurement harness: 21 checks passed'
+expect_exit 2 bash "$ROOT/tests/verify_all.sh" "$WORK/exit"
+grep -q 'verification did not complete' "$WORK/result.log"
+echo 'measurement harness: 22 checks passed'

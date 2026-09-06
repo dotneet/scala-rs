@@ -79,6 +79,9 @@ public class VerifyAll {
     }
     System.out.println("verify_classes=" + names.size() + " verify_failures=" + bad
         + " verify_loaded=" + loaded + " verify_incomplete=" + incomplete);
+    // Initializers may call System.exit(0). A successful process exit is not
+    // evidence that the loop reached every class; publish completion explicitly.
+    Files.write(Paths.get(a[2]), Collections.singletonList("complete"));
     if (bad > 0) System.exit(1);
     if (incomplete > 0 || names.isEmpty()) System.exit(2);
   }
@@ -89,4 +92,10 @@ javac -d "$WORK" "$WORK/VerifyAll.java" >/dev/null 2>&1 || {
   echo "verify_all: javac failed" >&2
   exit 2
 }
-java -Xverify:all -Dscala.rs.verify.verbose="${VERIFY_VERBOSE:-false}" -cp "$WORK" VerifyAll "$DIR" "$CP"
+rc=0
+java -Xverify:all -Dscala.rs.verify.verbose="${VERIFY_VERBOSE:-false}" -cp "$WORK" VerifyAll "$DIR" "$CP" "$WORK/complete" || rc=$?
+if [[ ! -f "$WORK/complete" ]]; then
+  echo "verify_all: verification did not complete (JVM exit=$rc)" >&2
+  exit 2
+fi
+exit "$rc"
