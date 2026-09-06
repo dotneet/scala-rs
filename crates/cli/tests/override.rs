@@ -220,6 +220,18 @@ fn fixtures_ov_ok_scala_library() {
     check_library("ov_ok");
 }
 
+/// An inherited method bound is read through the owner instantiation:
+/// `BoundApply[CharSequence]` makes the base bound `A <: CharSequence`.
+#[test]
+fn ov_owner_bound_private_runtime() {
+    check_private("ov_owner_bound");
+}
+
+#[test]
+fn ov_owner_bound_scala_library() {
+    check_library("ov_owner_bound");
+}
+
 // ----------------------------------- the discarded `Unit` result that follows
 
 /// `agent/anonbridge`'s other leftover, and the reason the two live in one
@@ -407,6 +419,19 @@ fn ov_type_parameter_bounds_may_only_widen() {
         &[
             "incompatible type in overriding",
             "def f[A](x: A): A (defined in class B);",
+        ],
+    );
+}
+
+/// A child bound that is narrower than an instantiated owner bound is still
+/// rejected after the base bound is read through the receiver.
+#[test]
+fn ov_owner_bound_may_not_narrow() {
+    rejected_once(
+        "ov_owner_bound_bad",
+        &[
+            "incompatible type in overriding",
+            "def apply[A <: AnyRef](a: A): A (defined in trait OwnerBound);",
         ],
     );
 }

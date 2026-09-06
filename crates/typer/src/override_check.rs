@@ -291,8 +291,10 @@ fn show_params_of(st: &SymbolTable, m: SymbolId, ty: &Type) -> String {
     out
 }
 
-/// `[A]` / `[A <: AnyRef]`, empty when the member takes no type parameters.
-fn show_tparams(st: &SymbolTable, m: SymbolId) -> String {
+/// Show method bounds as seen from `cls` when it is known. A bound such as
+/// `A <: T` on a member of `BoundApply[T]` is `A <: String` at
+/// `BoundApply[String]`, including in an override diagnostic.
+fn show_tparams_at(st: &SymbolTable, m: SymbolId, cls: SymbolId) -> String {
     let tps = &st.get(m).tparams;
     if tps.is_empty() {
         return String::new();
@@ -302,10 +304,22 @@ fn show_tparams(st: &SymbolTable, m: SymbolId) -> String {
         .map(|&t| {
             let mut o = st.get(t).name.clone();
             if let Some(hi) = &st.get(t).bound_hi {
-                o.push_str(&format!(" <: {}", st.display_type(hi)));
+                let hi = if cls.is_none() {
+                    hi.clone()
+                } else {
+                    let hi = st.subst_as_seen_from(&Type::ThisType(cls), hi);
+                    st.expand_type_members(cls, &hi)
+                };
+                o.push_str(&format!(" <: {}", st.display_type(&hi)));
             }
             if let Some(lo) = &st.get(t).bound_lo {
-                o.push_str(&format!(" >: {}", st.display_type(lo)));
+                let lo = if cls.is_none() {
+                    lo.clone()
+                } else {
+                    let lo = st.subst_as_seen_from(&Type::ThisType(cls), lo);
+                    st.expand_type_members(cls, &lo)
+                };
+                o.push_str(&format!(" >: {}", st.display_type(&lo)));
             }
             o
         })
@@ -341,6 +355,10 @@ fn show_decl(st: &SymbolTable, m: SymbolId) -> String {
 /// `show_decl` for a signature read at an overriding site; see
 /// [`show_params_of`].
 fn show_decl_of(st: &SymbolTable, m: SymbolId, ty: &Type) -> String {
+    show_decl_of_at(st, m, ty, SymbolId::NONE)
+}
+
+fn show_decl_of_at(st: &SymbolTable, m: SymbolId, ty: &Type, cls: SymbolId) -> String {
     let s = st.get(m);
     let mut out = String::new();
     if s.flags.contains(Flags::FINAL) {
@@ -354,7 +372,7 @@ fn show_decl_of(st: &SymbolTable, m: SymbolId, ty: &Type) -> String {
     out.push_str(keyword(st, m));
     out.push(' ');
     out.push_str(&s.name);
-    out.push_str(&show_tparams(st, m));
+    out.push_str(&show_tparams_at(st, m, cls));
     out.push_str(&show_params_of(st, m, ty));
     out.push_str(": ");
     let ret = match ty {
@@ -382,10 +400,12 @@ fn defined_in(st: &SymbolTable, owner: SymbolId) -> String {
     format!("(defined in {})", owner_phrase(st, owner))
 }
 
-/// The `found:` / `required:` line: `(x: Int): String`, or bare `String` for a
-/// nilary `def` and for a `val`.
-fn show_sig(st: &SymbolTable, m: SymbolId, ty: &Type, ret: &Type) -> String {
-    let ps = format!("{}{}", show_tparams(st, m), show_params_of(st, m, ty));
+fn show_sig_at(st: &SymbolTable, m: SymbolId, ty: &Type, ret: &Type, cls: SymbolId) -> String {
+    let ps = format!(
+        "{}{}",
+        show_tparams_at(st, m, cls),
+        show_params_of(st, m, ty)
+    );
     if ps.is_empty() {
         st.display_type(ret)
     } else {
@@ -690,7 +710,7 @@ fn check_pair(
     let base_ty = base_type_at(st, cls, base, child);
     let decl = format!(
         "{} {}",
-        show_decl_of(st, base, &base_ty),
+        show_decl_of_at(st, base, &base_ty, cls),
         defined_in(st, st.get(base).owner)
     );
     let base_deferred = is_deferred(st, base);
@@ -771,14 +791,14 @@ fn check_pair(
     let mismatch = || {
         format!(
             "incompatible type in overriding\n{decl};\n found   : {}\n required: {}",
-            show_sig(st, child, &st.get(child).ty, &crt),
-            show_sig(st, base, &base_ty, &brt)
+            show_sig_at(st, child, &st.get(child).ty, &crt, cls),
+            show_sig_at(st, base, &base_ty, &brt, cls)
         )
     };
     // 8. A type parameter's bound may only widen. This is checked whatever the
     //    result type looks like: `def f[A](x: A): A` returns a type parameter,
     //    which the conformance test below cannot compare.
-    if !tparam_bounds_ok(st, child, base) {
+    if !tparam_bounds_ok(st, cls, child, base) {
         return Some(mismatch());
     }
     // nsc's namer types a member with no written result type *at* the
@@ -801,7 +821,10 @@ fn check_pair(
 /// The override's type parameters must accept at least what the base's do:
 /// scalac takes `override def f[A]` over `def f[A <: AnyRef]` and rejects the
 /// reverse. Only stated upper bounds are compared; an unstated one is `Any`.
-fn tparam_bounds_ok(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
+/// Bounds from a generic owner are read through the overriding class, so the
+/// `T` in `BoundApply[T]` becomes the argument in `BoundApply[String]` before
+/// the method bounds are compared.
+fn tparam_bounds_ok(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> bool {
     let btps = st.get(base).tparams.clone();
     let ctps = st.get(child).tparams.clone();
     if btps.len() != ctps.len() {
@@ -818,6 +841,7 @@ fn tparam_bounds_ok(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
             Some(h) => subst_tparams_slice(&btps, &args, &h),
             None => Type::Any,
         };
+        let bhi = st.subst_as_seen_from(&Type::ThisType(cls), &bhi);
         if uncertain(&bhi) || uncertain(&chi) {
             continue;
         }
