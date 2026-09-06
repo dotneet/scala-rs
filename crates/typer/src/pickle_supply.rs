@@ -921,7 +921,7 @@ impl PickleSupply {
         let source_paramss = vec![source_params.clone()];
         let hidden_outer = self
             .java_class(bin, internal)
-            .is_some_and(|c| has_hidden_outer(st, class_sym, c));
+            .and_then(|c| hidden_outer_desc(st, class_sym, c));
         let existing = st.get(class_sym).members.iter().copied().find(|&id| {
             if broken.contains(&id) {
                 return false;
@@ -931,7 +931,8 @@ impl PickleSupply {
                 return false;
             }
             s.jvm_name == desc
-                || (s.jvm_name.is_empty() && ctor_params_match(st, id, &want, hidden_outer))
+                || (s.jvm_name.is_empty()
+                    && ctor_params_match(st, id, &want, hidden_outer.as_deref()))
         });
         if let Some(existing) = existing {
             // Keep the JVM descriptor already read from the classfile, but
@@ -990,7 +991,7 @@ impl PickleSupply {
         want: &[Option<String>],
     ) -> Option<String> {
         let jc = self.java_class(bin, internal)?;
-        let hidden_outer = has_hidden_outer(st, class_sym, jc);
+        let hidden_outer = hidden_outer_desc(st, class_sym, jc);
         let mut exact_hits: Vec<String> = Vec::new();
         let mut hidden_hits: Vec<String> = Vec::new();
         for jm in &jc.methods {
@@ -1001,7 +1002,9 @@ impl PickleSupply {
                 continue;
             };
             let exact = got.len() == want.len();
-            let hidden = hidden_outer && got.len() == want.len() + 1;
+            let hidden = hidden_outer.as_deref().is_some_and(|outer| {
+                got.len() == want.len() + 1 && got.first().is_some_and(|p| p == outer)
+            });
             if !exact && !hidden {
                 continue;
             }
@@ -1027,7 +1030,7 @@ impl PickleSupply {
         // bind source metadata to the wrong constructor. A non-static nested
         // class always has the hidden outer slot, so only its tail candidates
         // are eligible.
-        let hits = if hidden_outer {
+        let hits = if hidden_outer.is_some() {
             hidden_hits
         } else {
             exact_hits
@@ -4650,20 +4653,29 @@ pub(crate) fn desc_arity(desc: &str) -> Option<usize> {
     Some(n)
 }
 
-/// Whether `class_sym`'s JVM constructor has the hidden enclosing-instance
-/// parameter that precedes source parameters. The classpath symbol owner and
-/// the classfile's static-nested flag are both required: a top-level class
-/// whose source name contains `$` is not an inner class, while a class nested
-/// in an object is static and has no `$outer` slot.
-fn has_hidden_outer(st: &SymbolTable, class_sym: SymbolId, classfile: &JavaClass) -> bool {
+/// The JVM descriptor of `class_sym`'s hidden enclosing-instance parameter.
+/// The classpath symbol owner and the classfile's static-nested flag are both
+/// required: a top-level class whose source name contains `$` is not an inner
+/// class, while a class nested in an object is static and has no `$outer` slot.
+/// Returning the descriptor also prevents an unrelated leading parameter from
+/// being accepted merely because its arity happens to be one larger.
+fn hidden_outer_desc(
+    st: &SymbolTable,
+    class_sym: SymbolId,
+    classfile: &JavaClass,
+) -> Option<String> {
     if class_sym.is_none()
         || classfile.nested_static
         || st.get(class_sym).flags.contains(Flags::STATIC)
     {
-        return false;
+        return None;
     }
     let owner = st.get(class_sym).owner;
-    !owner.is_none() && st.get(owner).is_class_like() && owner != class_sym
+    if owner.is_none() || !st.get(owner).is_class_like() || owner == class_sym {
+        return None;
+    }
+    let outer = st.get(owner).jvm_name.as_str();
+    (!outer.is_empty()).then(|| format!("L{outer};"))
 }
 
 /// Whether an already-installed constructor has the source shape that a
@@ -4674,7 +4686,7 @@ fn ctor_params_match(
     st: &SymbolTable,
     ctor: SymbolId,
     want: &[Option<String>],
-    hidden_outer: bool,
+    hidden_outer: Option<&str>,
 ) -> bool {
     let got: Vec<Option<String>> = st
         .get(ctor)
@@ -4684,7 +4696,9 @@ fn ctor_params_match(
         .collect();
     let tail = if got.len() == want.len() {
         Some(got.as_slice())
-    } else if hidden_outer && got.len() == want.len() + 1 {
+    } else if hidden_outer.is_some_and(|outer| {
+        got.len() == want.len() + 1 && got.first().and_then(Option::as_deref) == Some(outer)
+    }) {
         Some(&got[1..])
     } else {
         None
