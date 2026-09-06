@@ -4672,6 +4672,17 @@ fn hidden_outer_desc(
     {
         return None;
     }
+    // The JVM's `InnerClasses` owner is the lexical owner, but Scala can
+    // lower a class nested in a component trait with a different enclosing
+    // instance type.  For example Slick's
+    // `RelationalTableComponent.Table` is lexically inside the component but
+    // carries `$outer: RelationalProfile`, and both constructor descriptors
+    // begin with that profile type.  The `$outer` field is the classfile's
+    // exact witness for the hidden constructor slot; prefer it over deriving
+    // a descriptor from the symbol owner.
+    if let Some(outer) = classfile.outer_desc.as_deref() {
+        return Some(outer.to_string());
+    }
     let owner = st.get(class_sym).owner;
     if owner.is_none() || !st.get(owner).is_class_like() || owner == class_sym {
         return None;

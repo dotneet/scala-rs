@@ -49,6 +49,10 @@ pub struct JavaClass {
     pub interfaces: Vec<String>,
     pub methods: Vec<JavaMethod>,
     pub fields: Vec<JavaField>,
+    /// Descriptor of Scala's synthetic enclosing-instance field, when present.
+    /// This can differ from the lexical `InnerClasses` owner for classes
+    /// nested in component traits.
+    pub outer_desc: Option<String>,
     pub signature: Option<String>,
     /// Nested type is `static` (`InnerClasses` / `$` in the name).
     pub nested_static: bool,
@@ -396,6 +400,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
     }
     let nfields = c.u2().ok_or("truncated classfile")? as usize;
     let mut fields = Vec::new();
+    let mut outer_desc = None;
     let mut instance_fields: Vec<JavaField> = Vec::new();
     for _ in 0..nfields {
         let acc = c.u2().ok_or("truncated field")?;
@@ -405,6 +410,9 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let _ = attrs;
         let name = cp.utf8(name_i).ok_or("unsupported classfile field name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile field desc")?;
+        if name == "$outer" && acc & ACC_STATIC == 0 {
+            outer_desc = Some(desc.clone());
+        }
         if acc & ACC_STATIC == 0 && instance_fields.len() < 2 {
             instance_fields.push(JavaField {
                 name: name.clone(),
@@ -465,6 +473,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         interfaces,
         methods,
         fields,
+        outer_desc,
         signature,
         nested_static,
         is_scala,
