@@ -257,7 +257,7 @@ fn build_variants(def: &Tree, st: &mut SymbolTable) -> Vec<Tree> {
         clone.ty = variant_ty.clone();
         let symbol_map = clone_variant_symbols(&clone, st, original, variant, &primitive);
         clone.sym = variant;
-        remap_tree_symbols(&mut clone, &symbol_map);
+        remap_tree_symbols(&mut clone, &symbol_map, original);
         substitute_tree_types(&mut clone, st, original, &primitive);
         let params: Vec<SymbolId> = original_params
             .iter()
@@ -315,6 +315,11 @@ fn clone_variant_symbols(
     primitive: &Type,
 ) -> FxHashMap<SymbolId, SymbolId> {
     let mut map = FxHashMap::default();
+    // The method symbol is also the target marker on `return` trees, but it
+    // must remain the original symbol on call trees.  `rewrite_tree` uses that
+    // original call symbol together with the call's actual type arguments to
+    // choose a variant; mapping it here would turn `f[String]` inside an
+    // `f[Int]` clone into another primitive call.
     map.insert(original, variant);
     collect_variant_symbols(tree, st, variant, original, primitive, &mut map);
     map
@@ -631,15 +636,29 @@ fn collect_variant_symbols(
     }
 }
 
-fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>) {
-    if let Some(id) = map.get(&tree.sym) {
-        tree.sym = *id;
+fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>, original: SymbolId) {
+    // Apply/TypeApply/Select/Ident symbols identify the callee being called.
+    // Keep those references on the generic method so rewrite_tree can inspect
+    // their actual type arguments.  Other symbol-bearing trees include local
+    // definitions and Return's non-local-return target and should be remapped.
+    let is_call_reference = matches!(
+        &tree.kind,
+        TreeKind::TypeApply { .. }
+            | TreeKind::Apply { .. }
+            | TreeKind::Select { .. }
+            | TreeKind::SelectFromTypeTree { .. }
+            | TreeKind::Ident { .. }
+    );
+    if !is_call_reference || tree.sym != original {
+        if let Some(id) = map.get(&tree.sym) {
+            tree.sym = *id;
+        }
     }
     match &mut tree.kind {
         TreeKind::PackageDef { pid, stats } => {
-            remap_tree_symbols(pid, map);
+            remap_tree_symbols(pid, map, original);
             for stat in stats {
-                remap_tree_symbols(stat, map);
+                remap_tree_symbols(stat, map, original);
             }
         }
         TreeKind::ClassDef {
@@ -649,26 +668,26 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>) {
             ..
         } => {
             for tp in tparams {
-                remap_tree_symbols(tp, map);
+                remap_tree_symbols(tp, map, original);
             }
             for clause in vparamss {
                 for param in clause {
-                    remap_tree_symbols(param, map);
+                    remap_tree_symbols(param, map, original);
                 }
             }
             for parent in &mut impl_.parents {
-                remap_tree_symbols(parent, map);
+                remap_tree_symbols(parent, map, original);
             }
             for stat in &mut impl_.body {
-                remap_tree_symbols(stat, map);
+                remap_tree_symbols(stat, map, original);
             }
         }
         TreeKind::ModuleDef { impl_, .. } => {
             for parent in &mut impl_.parents {
-                remap_tree_symbols(parent, map);
+                remap_tree_symbols(parent, map, original);
             }
             for stat in &mut impl_.body {
-                remap_tree_symbols(stat, map);
+                remap_tree_symbols(stat, map, original);
             }
         }
         TreeKind::DefDef {
@@ -679,77 +698,77 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>) {
             ..
         } => {
             for tp in tparams {
-                remap_tree_symbols(tp, map);
+                remap_tree_symbols(tp, map, original);
             }
             for clause in vparamss {
                 for param in clause {
-                    remap_tree_symbols(param, map);
+                    remap_tree_symbols(param, map, original);
                 }
             }
-            remap_tree_symbols(tpt, map);
-            remap_tree_symbols(rhs, map);
+            remap_tree_symbols(tpt, map, original);
+            remap_tree_symbols(rhs, map, original);
         }
         TreeKind::ValDef { tpt, rhs, .. } => {
-            remap_tree_symbols(tpt, map);
-            remap_tree_symbols(rhs, map);
+            remap_tree_symbols(tpt, map, original);
+            remap_tree_symbols(rhs, map, original);
         }
         TreeKind::Block { stats, expr } => {
             for stat in stats {
-                remap_tree_symbols(stat, map);
+                remap_tree_symbols(stat, map, original);
             }
-            remap_tree_symbols(expr, map);
+            remap_tree_symbols(expr, map, original);
         }
         TreeKind::If { cond, thenp, elsep } => {
-            remap_tree_symbols(cond, map);
-            remap_tree_symbols(thenp, map);
-            remap_tree_symbols(elsep, map);
+            remap_tree_symbols(cond, map, original);
+            remap_tree_symbols(thenp, map, original);
+            remap_tree_symbols(elsep, map, original);
         }
         TreeKind::Match { selector, cases } => {
-            remap_tree_symbols(selector, map);
+            remap_tree_symbols(selector, map, original);
             for case_def in cases {
-                remap_tree_symbols(&mut case_def.pat, map);
-                remap_tree_symbols(&mut case_def.guard, map);
-                remap_tree_symbols(&mut case_def.body, map);
+                remap_tree_symbols(&mut case_def.pat, map, original);
+                remap_tree_symbols(&mut case_def.guard, map, original);
+                remap_tree_symbols(&mut case_def.body, map, original);
             }
         }
         TreeKind::Function { vparams, body } => {
             for param in vparams {
-                remap_tree_symbols(param, map);
+                remap_tree_symbols(param, map, original);
             }
-            remap_tree_symbols(body, map);
+            remap_tree_symbols(body, map, original);
         }
         TreeKind::Assign { lhs, rhs } => {
-            remap_tree_symbols(lhs, map);
-            remap_tree_symbols(rhs, map);
+            remap_tree_symbols(lhs, map, original);
+            remap_tree_symbols(rhs, map, original);
         }
         TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
-            remap_tree_symbols(cond, map);
-            remap_tree_symbols(body, map);
+            remap_tree_symbols(cond, map, original);
+            remap_tree_symbols(body, map, original);
         }
         TreeKind::Return { expr } | TreeKind::Throw { expr } | TreeKind::New { tpt: expr } => {
-            remap_tree_symbols(expr, map);
+            remap_tree_symbols(expr, map, original);
         }
         TreeKind::Try {
             block,
             catches,
             finalizer,
         } => {
-            remap_tree_symbols(block, map);
+            remap_tree_symbols(block, map, original);
             for case_def in catches {
-                remap_tree_symbols(&mut case_def.pat, map);
-                remap_tree_symbols(&mut case_def.guard, map);
-                remap_tree_symbols(&mut case_def.body, map);
+                remap_tree_symbols(&mut case_def.pat, map, original);
+                remap_tree_symbols(&mut case_def.guard, map, original);
+                remap_tree_symbols(&mut case_def.body, map, original);
             }
-            remap_tree_symbols(finalizer, map);
+            remap_tree_symbols(finalizer, map, original);
         }
         TreeKind::Typed { expr, tpt } => {
-            remap_tree_symbols(expr, map);
-            remap_tree_symbols(tpt, map);
+            remap_tree_symbols(expr, map, original);
+            remap_tree_symbols(tpt, map, original);
         }
         TreeKind::TypeApply { fun, args } | TreeKind::Apply { fun, args } => {
-            remap_tree_symbols(fun, map);
+            remap_tree_symbols(fun, map, original);
             for arg in args {
-                remap_tree_symbols(arg, map);
+                remap_tree_symbols(arg, map, original);
             }
         }
         TreeKind::Import { expr, .. }
@@ -758,22 +777,22 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>) {
         | TreeKind::Bind { body: expr, .. }
         | TreeKind::Star { elem: expr }
         | TreeKind::SingletonTypeTree { ref_: expr }
-        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => remap_tree_symbols(expr, map),
+        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => remap_tree_symbols(expr, map, original),
         TreeKind::UnApply { fun, args } => {
-            remap_tree_symbols(fun, map);
+            remap_tree_symbols(fun, map, original);
             for arg in args {
-                remap_tree_symbols(arg, map);
+                remap_tree_symbols(arg, map, original);
             }
         }
         TreeKind::Alternative { trees } => {
             for child in trees {
-                remap_tree_symbols(child, map);
+                remap_tree_symbols(child, map, original);
             }
         }
         TreeKind::AppliedTypeTree { tpt, args } => {
-            remap_tree_symbols(tpt, map);
+            remap_tree_symbols(tpt, map, original);
             for arg in args {
-                remap_tree_symbols(arg, map);
+                remap_tree_symbols(arg, map, original);
             }
         }
         TreeKind::CompoundTypeTree {
@@ -781,28 +800,28 @@ fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>) {
             refinements,
         } => {
             for parent in parents {
-                remap_tree_symbols(parent, map);
+                remap_tree_symbols(parent, map, original);
             }
             for refinement in refinements {
-                remap_tree_symbols(refinement, map);
+                remap_tree_symbols(refinement, map, original);
             }
         }
         TreeKind::ExistentialTypeTree { tpt, clauses } => {
-            remap_tree_symbols(tpt, map);
+            remap_tree_symbols(tpt, map, original);
             for clause in clauses {
-                remap_tree_symbols(clause, map);
+                remap_tree_symbols(clause, map, original);
             }
         }
         TreeKind::InterpolatedString { args, .. } => {
             for arg in args {
-                remap_tree_symbols(arg, map);
+                remap_tree_symbols(arg, map, original);
             }
         }
         TreeKind::LabelDef { params, rhs, .. } => {
             for param in params {
-                remap_tree_symbols(param, map);
+                remap_tree_symbols(param, map, original);
             }
-            remap_tree_symbols(rhs, map);
+            remap_tree_symbols(rhs, map, original);
         }
         TreeKind::Empty
         | TreeKind::Super { .. }

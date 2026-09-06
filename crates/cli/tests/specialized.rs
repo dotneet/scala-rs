@@ -393,6 +393,9 @@ object MixedOps {
     def loop(n: Int, z: A): A = if (n == 0) z else loop(n - 1, z)
     loop(2, x)
   }
+
+  def poly[@specialized(Int, Long) A](a: A, n: Int): String =
+    if (n == 0) a.toString else poly[String]("ok", 0)
 }
 
 class NonFinalHost {
@@ -404,6 +407,8 @@ object MethodAbiMain {
     if (MixedOps.id(7) != 7) throw new RuntimeException("int")
     if (MixedOps.id(7L) != 7L) throw new RuntimeException("long")
     if (MixedOps.recurse(9) != 9) throw new RuntimeException("recursive")
+    if (MixedOps.poly(1, 1) != "ok") throw new RuntimeException("poly-int")
+    if (MixedOps.poly(2L, 1) != "ok") throw new RuntimeException("poly-long")
     println("method-specialization-ok")
   }
 }
@@ -437,6 +442,10 @@ object MethodAbiMain {
     assert!(
         module.contains("recurse$mIc$sp"),
         "missing recursive variant: {module}"
+    );
+    assert!(
+        module.contains("poly$mIc$sp") && module.contains("poly$mJc$sp"),
+        "missing polymorphic-recursion variants: {module}"
     );
     assert!(
         module.contains("<A> A id(A)"),
@@ -481,6 +490,14 @@ object MethodAbiMain {
   def j: Long = MixedOps.id(7L)
   def d: Double = MixedOps.id(1.0)
   def r: Int = MixedOps.recurse(9)
+  def p: String = MixedOps.poly(1, 1)
+  def q: String = MixedOps.poly(2L, 1)
+
+  def main(args: Array[String]): Unit = {
+    if (i != 7 || j != 7L || d != 1.0 || r != 9 || p != "ok" || q != "ok")
+      throw new RuntimeException(s"$i:$j:$d:$r:$p:$q")
+    println(s"$i:$j:$d:$r:$p:$q")
+  }
 }
 "#,
         )
@@ -515,6 +532,29 @@ object MethodAbiMain {
         assert!(
             !consumer.contains("id$mDc$sp"),
             "scalac selected an unadvertised Double variant: {consumer}"
+        );
+        let consumer_run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!(
+                    "{}:{}:{}",
+                    consumer_out.display(),
+                    out.display(),
+                    jar.display()
+                ),
+                "MethodAbiConsumer",
+            ])
+            .output()
+            .expect("execute scalac method specialization consumer");
+        assert!(
+            consumer_run.status.success(),
+            "scalac consumer runtime failed: {}",
+            String::from_utf8_lossy(&consumer_run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&consumer_run.stdout),
+            "7:7:1.0:9:ok:ok\n"
         );
     } else {
         eprintln!("skip scalac separate consumer: /tmp/scala-2.13.16/bin/scalac unavailable");
