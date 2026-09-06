@@ -85,87 +85,115 @@ for class in \
   require_file "$WORK/provider/$class"
 done
 
-"$JAVAP" -classpath "$WORK/provider" -p -s \
-  OracleBox 'OracleBox$mcI$sp' 'OracleBox$mcJ$sp' \
-  OracleIntBox OracleLongBox OracleStringBox \
-  OracleReadable 'OracleReadable$mcI$sp' 'OracleReadable$mcJ$sp' \
-  OracleReadableInt > "$WORK/provider-signatures.txt"
-"$JAVAP" -classpath "$WORK/provider" -p -c -s \
-  'OracleBox$mcI$sp' 'OracleBox$mcJ$sp' OracleIntBox OracleLongBox \
-  OracleStringBox OracleReadable OracleReadableInt > "$WORK/provider-bytecode.txt"
+provider_javap() {
+  local file=$1
+  local class=$2
+  shift 2
+  "$JAVAP" -classpath "$WORK/provider" -p "$@" "$class" > "$WORK/provider/$file"
+}
+
+provider_javap oracle-box-signatures.txt OracleBox -s
+provider_javap oracle-box-int-signatures.txt 'OracleBox$mcI$sp' -s
+provider_javap oracle-box-long-signatures.txt 'OracleBox$mcJ$sp' -s
+provider_javap oracle-int-box-signatures.txt OracleIntBox -s
+provider_javap oracle-long-box-signatures.txt OracleLongBox -s
+provider_javap oracle-string-box-signatures.txt OracleStringBox -s
+provider_javap oracle-readable-signatures.txt OracleReadable -s
+provider_javap oracle-readable-int-signatures.txt 'OracleReadable$mcI$sp' -s
+provider_javap oracle-readable-long-signatures.txt 'OracleReadable$mcJ$sp' -s
+provider_javap oracle-readable-int-impl-signatures.txt OracleReadableInt -s
+
+provider_javap oracle-box-bytecode.txt OracleBox -c -s
+provider_javap oracle-box-int-bytecode.txt 'OracleBox$mcI$sp' -c -s
+provider_javap oracle-box-long-bytecode.txt 'OracleBox$mcJ$sp' -c -s
+provider_javap oracle-int-box-bytecode.txt OracleIntBox -c -s
+provider_javap oracle-long-box-bytecode.txt OracleLongBox -c -s
+provider_javap oracle-string-box-bytecode.txt OracleStringBox -c -s
+provider_javap oracle-readable-bytecode.txt OracleReadable -c -s
+provider_javap oracle-readable-int-impl-bytecode.txt OracleReadableInt -c -s
 
 # Generic owner: source-shaped storage, fallback method, primitive dispatch,
 # and the marker method that distinguishes a specialized runtime instance.
-require_text 'public class OracleBox<A>' "$WORK/provider-signatures.txt"
-require_text 'public A value;' "$WORK/provider-signatures.txt"
-require_text 'descriptor: Ljava/lang/Object;' "$WORK/provider-signatures.txt"
-require_text 'public <B> B fallback(B);' "$WORK/provider-signatures.txt"
-require_text 'public int value$mcI$sp();' "$WORK/provider-signatures.txt"
-require_text 'descriptor: ()I' "$WORK/provider-signatures.txt"
-require_text 'public long value$mcJ$sp();' "$WORK/provider-signatures.txt"
-require_text 'descriptor: ()J' "$WORK/provider-signatures.txt"
-require_text 'public void value$mcI$sp_$eq(int);' "$WORK/provider-signatures.txt"
-require_text 'descriptor: (I)V' "$WORK/provider-signatures.txt"
-require_text 'public void value$mcJ$sp_$eq(long);' "$WORK/provider-signatures.txt"
-require_text 'descriptor: (J)V' "$WORK/provider-signatures.txt"
-require_text 'public int get$mcI$sp();' "$WORK/provider-signatures.txt"
-require_text 'public long get$mcJ$sp();' "$WORK/provider-signatures.txt"
-require_text 'public void set$mcI$sp(int);' "$WORK/provider-signatures.txt"
-require_text 'public void set$mcJ$sp(long);' "$WORK/provider-signatures.txt"
-require_text 'public boolean specInstance$();' "$WORK/provider-signatures.txt"
-require_text 'public OracleBox(A);' "$WORK/provider-signatures.txt"
-require_text 'descriptor: (Ljava/lang/Object;)V' "$WORK/provider-signatures.txt"
+require_text 'public class OracleBox<A>' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public A value;' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'descriptor: Ljava/lang/Object;' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public <B> B fallback(B);' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public int value$mcI$sp();' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'descriptor: ()I' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public long value$mcJ$sp();' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'descriptor: ()J' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public void value$mcI$sp_$eq(int);' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'descriptor: (I)V' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public void value$mcJ$sp_$eq(long);' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'descriptor: (J)V' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public int get$mcI$sp();' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public long get$mcJ$sp();' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public void set$mcI$sp(int);' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public void set$mcJ$sp(long);' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public boolean specInstance$();' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'public OracleBox(A);' "$WORK/provider/oracle-box-signatures.txt"
+require_text 'descriptor: (Ljava/lang/Object;)V' "$WORK/provider/oracle-box-signatures.txt"
 
 # Specialized siblings: primitive fields and constructors, primitive entries,
 # and erased Object bridges all exist on each selected variant.
-require_text 'public class OracleBox$mcI$sp extends OracleBox<java.lang.Object>' "$WORK/provider-signatures.txt"
-require_text 'public int value$mcI$sp;' "$WORK/provider-signatures.txt"
-require_text 'public OracleBox$mcI$sp(int);' "$WORK/provider-signatures.txt"
-require_text 'public int get();' "$WORK/provider-signatures.txt"
-require_text 'public void set(int);' "$WORK/provider-signatures.txt"
-require_text 'public java.lang.Object get();' "$WORK/provider-signatures.txt"
-require_text 'public void set(java.lang.Object);' "$WORK/provider-signatures.txt"
-require_text 'public class OracleBox$mcJ$sp extends OracleBox<java.lang.Object>' "$WORK/provider-signatures.txt"
-require_text 'public long value$mcJ$sp;' "$WORK/provider-signatures.txt"
-require_text 'public OracleBox$mcJ$sp(long);' "$WORK/provider-signatures.txt"
-require_text 'public long get();' "$WORK/provider-signatures.txt"
-require_text 'public void set(long);' "$WORK/provider-signatures.txt"
-require_text 'public java.lang.Object value();' "$WORK/provider-signatures.txt"
-require_text 'public void value_$eq(java.lang.Object);' "$WORK/provider-signatures.txt"
-require_text 'ireturn' "$WORK/provider-bytecode.txt"
-require_text 'lreturn' "$WORK/provider-bytecode.txt"
-require_text 'boxToInteger' "$WORK/provider-bytecode.txt"
-require_text 'boxToLong' "$WORK/provider-bytecode.txt"
-require_text 'unboxToInt' "$WORK/provider-bytecode.txt"
-require_text 'unboxToLong' "$WORK/provider-bytecode.txt"
+require_text 'public class OracleBox$mcI$sp extends OracleBox<java.lang.Object>' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'public int value$mcI$sp;' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'public OracleBox$mcI$sp(int);' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'public int get();' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'public void set(int);' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'public java.lang.Object get();' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'public void set(java.lang.Object);' "$WORK/provider/oracle-box-int-signatures.txt"
+require_text 'ireturn' "$WORK/provider/oracle-box-int-bytecode.txt"
+require_text 'boxToInteger' "$WORK/provider/oracle-box-int-bytecode.txt"
+require_text 'unboxToInt' "$WORK/provider/oracle-box-int-bytecode.txt"
+require_text 'public class OracleBox$mcJ$sp extends OracleBox<java.lang.Object>' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public long value$mcJ$sp;' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public OracleBox$mcJ$sp(long);' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public long get();' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public void set(long);' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public java.lang.Object get();' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public void set(java.lang.Object);' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public java.lang.Object value();' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'public void value_$eq(java.lang.Object);' "$WORK/provider/oracle-box-long-signatures.txt"
+require_text 'lreturn' "$WORK/provider/oracle-box-long-bytecode.txt"
+require_text 'boxToLong' "$WORK/provider/oracle-box-long-bytecode.txt"
+require_text 'unboxToLong' "$WORK/provider/oracle-box-long-bytecode.txt"
 
 # Direct subclass construction selects the corresponding parent variant;
 # reference construction retains the generic parent constructor.
-require_text 'public class OracleIntBox extends OracleBox$mcI$sp' "$WORK/provider-signatures.txt"
-require_text 'public class OracleLongBox extends OracleBox$mcJ$sp' "$WORK/provider-signatures.txt"
-require_text 'public class OracleStringBox extends OracleBox<java.lang.String>' "$WORK/provider-signatures.txt"
-require_text 'public int get();' "$WORK/provider-signatures.txt"
-require_text 'public long get();' "$WORK/provider-signatures.txt"
-require_text 'public java.lang.Object get();' "$WORK/provider-signatures.txt"
-require_text 'Method OracleBox$mcI$sp."<init>":(I)V' "$WORK/provider-bytecode.txt"
-require_text 'Method OracleBox$mcJ$sp."<init>":(J)V' "$WORK/provider-bytecode.txt"
-require_text 'Method OracleBox."<init>":(Ljava/lang/Object;)V' "$WORK/provider-bytecode.txt"
-require_text 'Method value$mcI$sp:()I' "$WORK/provider-bytecode.txt"
-require_text 'Method value$mcJ$sp:()J' "$WORK/provider-bytecode.txt"
+require_text 'public class OracleIntBox extends OracleBox$mcI$sp' "$WORK/provider/oracle-int-box-signatures.txt"
+require_text 'public OracleIntBox();' "$WORK/provider/oracle-int-box-signatures.txt"
+require_text 'descriptor: ()V' "$WORK/provider/oracle-int-box-signatures.txt"
+require_text 'public int get();' "$WORK/provider/oracle-int-box-signatures.txt"
+require_text 'public java.lang.Object get();' "$WORK/provider/oracle-int-box-signatures.txt"
+require_text 'Method OracleBox$mcI$sp."<init>":(I)V' "$WORK/provider/oracle-int-box-bytecode.txt"
+require_text 'Method value$mcI$sp:()I' "$WORK/provider/oracle-int-box-bytecode.txt"
+require_text 'public class OracleLongBox extends OracleBox$mcJ$sp' "$WORK/provider/oracle-long-box-signatures.txt"
+require_text 'public OracleLongBox();' "$WORK/provider/oracle-long-box-signatures.txt"
+require_text 'descriptor: ()V' "$WORK/provider/oracle-long-box-signatures.txt"
+require_text 'public long get();' "$WORK/provider/oracle-long-box-signatures.txt"
+require_text 'public java.lang.Object get();' "$WORK/provider/oracle-long-box-signatures.txt"
+require_text 'Method OracleBox$mcJ$sp."<init>":(J)V' "$WORK/provider/oracle-long-box-bytecode.txt"
+require_text 'Method value$mcJ$sp:()J' "$WORK/provider/oracle-long-box-bytecode.txt"
+require_text 'public class OracleStringBox extends OracleBox<java.lang.String>' "$WORK/provider/oracle-string-box-signatures.txt"
+require_text 'public OracleStringBox();' "$WORK/provider/oracle-string-box-signatures.txt"
+require_text 'descriptor: ()V' "$WORK/provider/oracle-string-box-signatures.txt"
+require_text 'Method OracleBox."<init>":(Ljava/lang/Object;)V' "$WORK/provider/oracle-string-box-bytecode.txt"
 
 # Specialized trait and implementation bridges are part of this ABI oracle.
-require_text 'public interface OracleReadable<A>' "$WORK/provider-signatures.txt"
-require_text 'public static int read$mcI$sp$(OracleReadable);' "$WORK/provider-signatures.txt"
-require_text 'public default int read$mcI$sp();' "$WORK/provider-signatures.txt"
-require_text 'public static long read$mcJ$sp$(OracleReadable);' "$WORK/provider-signatures.txt"
-require_text 'public default long read$mcJ$sp();' "$WORK/provider-signatures.txt"
-require_text 'public interface OracleReadable$mcI$sp extends OracleReadable<java.lang.Object>' "$WORK/provider-signatures.txt"
-require_text 'public interface OracleReadable$mcJ$sp extends OracleReadable<java.lang.Object>' "$WORK/provider-signatures.txt"
-require_text 'public class OracleReadableInt extends OracleBox$mcI$sp implements OracleReadable$mcI$sp' "$WORK/provider-signatures.txt"
-require_text 'public int read();' "$WORK/provider-signatures.txt"
-require_text 'public int read$mcI$sp();' "$WORK/provider-signatures.txt"
-require_text 'public long read$mcJ$sp();' "$WORK/provider-signatures.txt"
-require_text 'public java.lang.Object read();' "$WORK/provider-signatures.txt"
+require_text 'public interface OracleReadable<A>' "$WORK/provider/oracle-readable-signatures.txt"
+require_text 'public static int read$mcI$sp$(OracleReadable);' "$WORK/provider/oracle-readable-signatures.txt"
+require_text 'public default int read$mcI$sp();' "$WORK/provider/oracle-readable-signatures.txt"
+require_text 'public static long read$mcJ$sp$(OracleReadable);' "$WORK/provider/oracle-readable-signatures.txt"
+require_text 'public default long read$mcJ$sp();' "$WORK/provider/oracle-readable-signatures.txt"
+require_text 'public interface OracleReadable$mcI$sp extends OracleReadable<java.lang.Object>' "$WORK/provider/oracle-readable-int-signatures.txt"
+require_text 'public interface OracleReadable$mcJ$sp extends OracleReadable<java.lang.Object>' "$WORK/provider/oracle-readable-long-signatures.txt"
+require_text 'public class OracleReadableInt extends OracleBox$mcI$sp implements OracleReadable$mcI$sp' "$WORK/provider/oracle-readable-int-impl-signatures.txt"
+require_text 'public int read();' "$WORK/provider/oracle-readable-int-impl-signatures.txt"
+require_text 'public int read$mcI$sp();' "$WORK/provider/oracle-readable-int-impl-signatures.txt"
+require_text 'public long read$mcJ$sp();' "$WORK/provider/oracle-readable-int-impl-signatures.txt"
+require_text 'public java.lang.Object read();' "$WORK/provider/oracle-readable-int-impl-signatures.txt"
+require_text 'Method OracleBox$mcI$sp."<init>":(I)V' "$WORK/provider/oracle-readable-int-impl-bytecode.txt"
 
 # Compile a fresh nsc client against only the provider output and the real
 # library. Its bytecode must select primitive owners for Int/Long, generic
