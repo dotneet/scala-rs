@@ -581,3 +581,18 @@ The Map WithFilter patch is preserved in the actual git worktree
 needs parent review. The live checkpoint index is
 `/tmp/scala-rs-codex/integration/current-state.json`; revalidate tool handles
 before treating any recorded process as running.
+
+Parent follow-up: typed-graph tests were committed as `12222dc4` (two pass),
+and the fixed method candidate is `e4d404f1`. Its full gate is running under
+`candidate-e4d404f`; historical-scope clippy passes with 58 warnings versus 59,
+no new warning messages. Do not edit that frozen worktree during the run.
+
+Parent repaired Map WithFilter as `dc6f2176`: the missing result type is no
+longer treated as proof of a non-pair overload, and non-pair flatMap results
+use the receiver's IterableCC constructor instead of the lambda's List type.
+The new fixture checks pair/non-pair map and flatMap, function values, strict
+runtime equality, and rejection of an invalid List assignment against nsc.
+The fresh focused gate passes 105 tests (conform 86, fvg 7, mismatch6 12).
+After merging main, frozen candidate `c6a7e8f9` is in its full gate under
+`candidate-c6a7e8f`. Neither candidate is accepted yet. All implementation
+subagents have now stopped with their work preserved.

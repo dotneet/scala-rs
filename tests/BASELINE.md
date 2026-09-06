@@ -11,23 +11,22 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `9beb69b2` |
+| commit | `bafdb625` |
 |---|---|
 | updated | 2026-09-06 |
 
-Measured independently at `629570a8`, then merged as `9beb69b2`. The only
-change after the full run was a stronger, portable variance interoperability
-test, independently passed at `803be601`; compiler sources and Cargo inputs
-are identical. Later documentation and non-Cargo test-artifact commits may
-follow this commit. `0f13cc1a` adds a parent-verified nsc-only class-specialization
-ABI oracle; compiler sources, Cargo inputs and the counted test suites are
-unchanged. It does not turn the scala-rs specialization ledger green.
+Measured independently at `e4d404f1`, then merged as `bafdb625`. This adds
+method-owned Int/Long specialization, including local symbol/constructor cloning,
+source annotation bounds, and typed-graph ownership regressions. No compiler
+source, Cargo input, or test changed after the full run; later documentation-only
+commits may follow. Class-owned specialization remains unaccepted.
 Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned; the corpus run
 inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
-Evidence: `/tmp/scala-rs-codex/integration/candidate-629570a/results.json`,
-`corpus-parent-audit.json`, `clippy-parent-audit.json`, and
-`supplemental-variance.log`. Historical passing gates remain passing;
-MODE=a and the specialization ledger remain explicitly red below.
+Evidence: `/tmp/scala-rs-codex/integration/candidate-e4d404f/results.json`,
+`corpus-status-audit.json`, `corpus-parent-audit.json`,
+`impconvtimes-class-audit.json`, and `clippy-parent-audit.json`.
+Historical passing gates remain passing; MODE=a and the class-specialization
+ledger remain explicitly red below.
 
 ## Compile measures
 
@@ -60,14 +59,15 @@ The unchanged complete per-test status reference is
 [`baselines/corpus-318c1568.tsv`](baselines/corpus-318c1568.tsv): 5324 unique
 records, from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compare by `(kind, test)` as well as totals. The current six-field diagnostic
-ledger is `candidate-629570a/corpus.tsv` in the evidence directory above.
+ledger is `candidate-e4d404f/corpus.tsv` in the evidence directory above.
 All statuses match the preceding baseline. Two six-field records differ from
-`candidate-4b2f941`: the temporary path in `run/t8199`, and the first exception
-reported for already-failing `run/impconvtimes`. Independent recompilation
-with both binaries produced seven byte-identical class files; repeated JVM
-runs of those same files produce both VerifyError and IncompatibleClassChangeError.
-This is an existing invalid program emission with variable failure order,
-not a variance regression or improvement. Evidence:
+`candidate-629570a`: the temporary path in `run/t8199`, and the first exception
+reported for already-failing `run/impconvtimes`. Independent compilation with
+the candidate produced seven class files byte-identical to the saved variance
+baseline. Earlier repeated JVM runs of those same bytes produce both VerifyError
+and IncompatibleClassChangeError. This is an existing invalid emission with
+variable failure order, not a specialization regression or improvement.
+Evidence: `candidate-e4d404f/impconvtimes-class-audit.json` and
 `/tmp/scala-rs-codex/integration/variance-impconvtimes/results.json`.
 
 Use `python3 tests/compare_corpus.py tests/baselines/corpus-318c1568.tsv
@@ -95,17 +95,14 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **199 result rows, 2237 passed, 0 failed** at `629570a8` |
-| Test-only validation at `803be601` | **1 passed, 0 failed** (`--test variance`); strengthens an existing test, so the total remains **2237 tests / 199 result rows** |
+| `cargo test --workspace --release --no-fail-fast` | **199 result rows, 2245 passed, 0 failed** at `e4d404f1` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
-No compiler source or Cargo input changed after the full run. The supplemental
-variance test checks class, method, and higher-kinded variance through a real
-scalac consumer, validates each invalid assignment's diagnostic location, and
-compares actual JVM output. `cargo clippy --workspace --release` exits 0 with
-59 warning messages, exactly the preceding baseline's multiset. A separate
-`--all-targets` run exposes seven additional warnings in unchanged tests; it
-must not be compared to the narrower historical warning count.
+No compiler source, Cargo input, or test changed after the full run.
+`cargo clippy --workspace --release` exits 0 with 58 warning messages versus
+59 in the preceding baseline, with no new warning messages. The removed message
+is a collapsible match in pickle handling. Compare the same command scope;
+`--all-targets` also includes historical warnings from tests.
 
 ## The six unloadable classes are fixed (2026-09-06)
 

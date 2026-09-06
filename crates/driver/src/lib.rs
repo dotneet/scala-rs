@@ -45,9 +45,9 @@ pub struct CompileOptions {
     pub source_features: SourceFeatures,
     /// `-Xasync`: enable `scala.async.Async.{async, await}`.
     pub xasync: bool,
-    /// `-no-specialization`: nsc's "Ignore @specialize annotations." Without
-    /// it `@specialized` is diagnosed, because this subset has no
-    /// specialisation phase; with it nsc ignores the annotation too.
+    /// `-no-specialization`: nsc's "Ignore @specialize annotations." With it
+    /// the parser drops the metadata and the method-owned primitive entries;
+    /// without it the implemented method slice is active.
     pub no_specialization: bool,
     /// `-Ykind-projector`: accept kind-projector's `*` placeholder and
     /// `λ` / `Lambda` type lambdas. **Not an nsc flag.** kind-projector is a
@@ -352,6 +352,18 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 scala_rs_backend::gen::mark_super_accessors(&u.tree, &mut st);
             }
             let pickles = std::rc::Rc::new(scala_rs_backend::pickle::pickle_all(&st));
+            // nsc's specialize phase runs after pickler.  Keep the generic
+            // declaration (and its @specialized type-parameter metadata) in
+            // the source pickle, then add only the method-owned JVM entries
+            // and rewrite concrete primitive call sites.  Collection and
+            // rewriting are separate so calls can target a definition in a
+            // later source unit.
+            for u in units.iter_mut() {
+                scala_rs_typer::specialize_method_defs(&mut u.tree, &mut st);
+            }
+            for u in units.iter_mut() {
+                scala_rs_typer::rewrite_specialized_calls(&mut u.tree, &st);
+            }
             // nsc's `mixin`, which runs *after* `pickler`: a trait's
             // unqualified-`private` `val` is renamed to `p$T$$v` in the class
             // files, but the pickle keeps the source name and the `private`

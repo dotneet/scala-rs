@@ -47,7 +47,9 @@
 //! - `type T = Int` / `type A = String` is `ALIASsym` (tag 5) with the aliased
 //!   type as info (nsc 2.13 has no `ALIAStpe`; scalac 2.13.16 typechecks `Lib.T`)
 
-use scala_rs_parser::{Flags, Lit, RefineDecl, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{
+    Flags, Lit, RefineDecl, SpecializedType, SpecializedTypes, SymbolId, Tree, TreeKind, Type,
+};
 use scala_rs_typer::{SymKind, SymbolTable};
 
 pub use scala_rs_pickle::codec::{
@@ -517,6 +519,19 @@ impl<'a> Pickler<'a> {
         self.add(TYPEREFTPE, body)
     }
 
+    fn type_ref_this_in(&mut self, owner: u32, name: &str) -> u32 {
+        let pref = self.add(THISTPE, {
+            let mut body = Vec::new();
+            write_nat_to(&mut body, owner);
+            body
+        });
+        let sym = self.ext_ref_owned(name, owner);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        self.add(TYPEREFTPE, body)
+    }
+
     fn type_ref_in_args(&mut self, owner: u32, name: &str, args: &[Type]) -> u32 {
         let pref = self.noprefix;
         let sym = self.ext_ref_owned(name, owner);
@@ -594,6 +609,62 @@ impl<'a> Pickler<'a> {
         for t in arg_refs {
             write_nat_to(&mut body, *t);
         }
+        self.add(TYPEREFTPE, body)
+    }
+
+    /// A bound written by nsc is rooted at the package/class `ThisType` of
+    /// the referenced declaration.  Ordinary signatures in this subset use
+    /// `NoPrefix` for compact primitive refs, but that shape is not equivalent
+    /// in `TYPEBOUNDStpe`: nsc's specialization phase compares the bound's
+    /// resolved symbol with the candidate primitive.  Keep this spelling
+    /// local to bounds so existing signature refs retain their established
+    /// representation.
+    fn pickle_bound_type(&mut self, ty: &Type) -> u32 {
+        let (owner, name): (u32, &str) = match ty {
+            Type::Unit => (self.scala_module(), "Unit"),
+            Type::Boolean => (self.scala_module(), "Boolean"),
+            Type::Byte => (self.scala_module(), "Byte"),
+            Type::Short => (self.scala_module(), "Short"),
+            Type::Int => (self.scala_module(), "Int"),
+            Type::Long => (self.scala_module(), "Long"),
+            Type::Float => (self.scala_module(), "Float"),
+            Type::Double => (self.scala_module(), "Double"),
+            Type::Char => (self.scala_module(), "Char"),
+            Type::Any => (self.scala_module(), "Any"),
+            Type::AnyRef | Type::Wildcard => (self.scala_module(), "AnyRef"),
+            Type::AnyVal => (self.scala_module(), "AnyVal"),
+            Type::Nothing => (self.scala_module(), "Nothing"),
+            Type::Null => (self.scala_module(), "Null"),
+            Type::String => (self.java_lang_module(), "String"),
+            Type::Class { sym, args } => {
+                if args.is_empty() {
+                    let owner = self.external_owner_ref(*sym);
+                    let name = self.st.get(*sym).name.clone();
+                    let pref = self.add(THISTPE, {
+                        let mut b = Vec::new();
+                        write_nat_to(&mut b, owner);
+                        b
+                    });
+                    let sym_ref = self.ext_ref_owned(&name, owner);
+                    let mut b = Vec::new();
+                    write_nat_to(&mut b, pref);
+                    write_nat_to(&mut b, sym_ref);
+                    return self.add(TYPEREFTPE, b);
+                }
+                return self.pickle_type(ty);
+            }
+            Type::Applied { .. } => return self.pickle_type(ty),
+            _ => return self.pickle_type(ty),
+        };
+        let pref = self.add(THISTPE, {
+            let mut b = Vec::new();
+            write_nat_to(&mut b, owner);
+            b
+        });
+        let sym = self.ext_ref_owned(name, owner);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
         self.add(TYPEREFTPE, body)
     }
 
@@ -994,23 +1065,44 @@ impl<'a> Pickler<'a> {
     }
 
     fn pickle_symannot(&mut self, target: u32, annot: &Tree, owner: SymbolId) {
+        self.pickle_symannot_impl(target, annot, owner, false, None);
+    }
+
+    fn pickle_symannot_impl(
+        &mut self,
+        target: u32,
+        annot: &Tree,
+        owner: SymbolId,
+        preserve_specialization: bool,
+        advertised_specialization: Option<SpecializedTypes>,
+    ) {
         let path = annot.annotation_path();
         let simple = path.rsplit('.').next().unwrap_or(path.as_str());
         if simple == "Override" || path == "java.lang.Override" {
             return;
         }
-        // `@specialized` / `@unspecialized` are accepted and recorded on the
-        // symbol, but the `specialize` phase is not implemented: no `$mc*$sp`
-        // member is emitted. Pickling the annotation would tell scalac that
-        // this class *is* specialized and let it link to members that are not
-        // there, so the pickle stays silent until stage 2 puts them there.
-        // See docs/specialization.md and tests/spec_classfiles.sh.
-        if simple == scala_rs_parser::specialization::SPECIALIZED
-            || simple == scala_rs_parser::specialization::UNSPECIALIZED
+        if (simple == scala_rs_parser::specialization::SPECIALIZED
+            || simple == scala_rs_parser::specialization::UNSPECIALIZED)
+            && (!preserve_specialization || advertised_specialization.is_none())
         {
+            // Class and trait specialization is still outside the first
+            // slice.  Do not advertise those entries to a consumer until
+            // their classfile ABI exists; method type parameters opt in
+            // below once the method-owned variants have been emitted.
             return;
         }
-        let atp = if simple == "tailrec" {
+        let atp = if simple == scala_rs_parser::specialization::SPECIALIZED {
+            // `specialized` is a class directly under scala (unlike
+            // `annotation.unspecialized`).  The source tree often carries
+            // only the imported simple name, so the generic user-annotation
+            // fallback would incorrectly pickle `<empty>.specialized`.
+            let sc = self.scala_module();
+            self.type_ref_this_in(sc, "specialized")
+        } else if simple == scala_rs_parser::specialization::UNSPECIALIZED {
+            let sc = self.scala_module();
+            let ann = self.ext_mod("annotation", Some(sc));
+            self.type_ref_in(ann, "unspecialized")
+        } else if simple == "tailrec" {
             let sc = self.scala_module();
             let ann = self.ext_mod("annotation", Some(sc));
             self.type_ref_in(ann, "tailrec")
@@ -1031,12 +1123,67 @@ impl<'a> Pickler<'a> {
         let mut body = Vec::new();
         write_nat_to(&mut body, target);
         write_nat_to(&mut body, atp);
-        for arg in annot_args(annot) {
-            if let Some(r) = self.pickle_annot_arg(arg, owner) {
-                write_nat_to(&mut body, r);
+        if simple == scala_rs_parser::specialization::SPECIALIZED && preserve_specialization {
+            for selected in advertised_specialization
+                .expect("specialization metadata was checked above")
+                .iter()
+            {
+                if let Some(r) = self.pickle_specialized_type_arg(selected, owner) {
+                    write_nat_to(&mut body, r);
+                }
+            }
+        } else {
+            for arg in annot_args(annot) {
+                let r = if preserve_specialization {
+                    self.pickle_specialized_arg(arg, owner)
+                } else {
+                    self.pickle_annot_arg(arg, owner)
+                };
+                if let Some(r) = r {
+                    write_nat_to(&mut body, r);
+                }
             }
         }
         self.add(SYMANNOT, body);
+    }
+
+    fn pickle_specialized_arg(&mut self, arg: &Tree, owner: SymbolId) -> Option<u32> {
+        let path = arg.annotation_path();
+        let simple = path.rsplit('.').next().unwrap_or("");
+        // nsc's annotation tree spells these as `scala.Int` / `scala.Long`
+        // selections (inside the annotation constructor), while the parser's
+        // normalized source tree keeps the imported names as bare identifiers.
+        // Rebuild that selection so the pickle carries a class symbol rather
+        // than an `<empty>.Int` term reference.
+        let ty = match simple {
+            "Int" => Some(SpecializedType::Int),
+            "Long" => Some(SpecializedType::Long),
+            _ => None,
+        };
+        if let Some(ty) = ty {
+            self.pickle_specialized_type_arg(ty, owner)
+        } else {
+            self.pickle_annot_arg(arg, owner)
+        }
+    }
+
+    fn pickle_specialized_type_arg(
+        &mut self,
+        selected: SpecializedType,
+        owner: SymbolId,
+    ) -> Option<u32> {
+        let (name, class_id) = match selected {
+            SpecializedType::Int => ("Int", self.st.int_sym),
+            SpecializedType::Long => ("Long", self.st.long_sym),
+            _ => return None,
+        };
+        let mut body = Vec::new();
+        write_nat_to(&mut body, SELECTtree as u32);
+        write_nat_to(&mut body, self.type_ref_named(name));
+        write_nat_to(&mut body, self.pickle_class(class_id));
+        write_nat_to(&mut body, self.pickle_ident_tree("scala", owner));
+        write_nat_to(&mut body, self.term_name(name));
+        Some(self.add(TREE, body))
     }
 
     /// Constant (literal / classOf) or TREE Ident/Select/This/Super/Apply.
@@ -1142,6 +1289,17 @@ impl<'a> Pickler<'a> {
                 let ty = self.st.get(id).ty.clone();
                 match ty {
                     Type::Method { ret, .. } => self.pickle_type(&ret),
+                    Type::NoType
+                        if matches!(
+                            self.st.get(id).kind,
+                            SymKind::Class | SymKind::ModuleClass
+                        ) =>
+                    {
+                        self.pickle_type(&Type::Class {
+                            sym: id,
+                            args: vec![],
+                        })
+                    }
                     other => self.pickle_type(&other),
                 }
             }
@@ -1195,6 +1353,9 @@ impl<'a> Pickler<'a> {
         let xfound = xowner.and_then(|o| self.lookup_member_named(o, name));
         let tpe = self.member_tree_tpe(xfound);
         let sym = match xfound {
+            Some(id) if matches!(self.st.get(id).kind, SymKind::Class | SymKind::ModuleClass) => {
+                self.pickle_class(id)
+            }
             Some(id) => self.pickle_member_sym(id),
             None => self.none,
         };
@@ -1215,7 +1376,10 @@ impl<'a> Pickler<'a> {
             Type::ThisType(s) => Some(*s),
             _ => {
                 let k = self.st.get(id).kind;
-                if matches!(k, SymKind::Module | SymKind::ModuleClass | SymKind::Class) {
+                if matches!(
+                    k,
+                    SymKind::Package | SymKind::Module | SymKind::ModuleClass | SymKind::Class
+                ) {
                     let cls = if k == SymKind::Module {
                         self.st.module_class_of(id)
                     } else {
@@ -1386,6 +1550,26 @@ impl<'a> Pickler<'a> {
         }
     }
 
+    fn pickle_type_param_annots(
+        &mut self,
+        id: SymbolId,
+        pickle_idx: u32,
+        advertised_specialization: Option<SpecializedTypes>,
+    ) {
+        let annots = self.st.get(id).annotations.clone();
+        let owner = self.st.get(id).owner;
+        for a in &annots {
+            let path = a.annotation_path();
+            let simple = path.rsplit('.').next().unwrap_or(path.as_str());
+            let advertised = if simple == scala_rs_parser::specialization::SPECIALIZED {
+                advertised_specialization
+            } else {
+                None
+            };
+            self.pickle_symannot_impl(pickle_idx, a, owner, true, advertised);
+        }
+    }
+
     fn pickle_this_tpe(&mut self, cls: SymbolId) -> u32 {
         if let Some(&i) = self.this_tpes.get(&cls.0) {
             return i;
@@ -1438,10 +1622,13 @@ impl<'a> Pickler<'a> {
             Type::String => self.type_ref_named("String"),
             Type::Any => self.type_ref_named("Any"),
             Type::Wildcard | Type::AnyRef => self.type_ref_named("AnyRef"),
-            Type::BoundedWildcard { hi, .. } => match hi {
-                Some(t) => self.pickle_type(t),
-                None => self.type_ref_named("Any"),
-            },
+            Type::BoundedWildcard { hi, .. } => {
+                if let Some(t) = hi.as_deref() {
+                    self.pickle_type(t)
+                } else {
+                    self.type_ref_named("Any")
+                }
+            }
             Type::ThisType(id) => self.pickle_this_tpe(*id),
             Type::SingleType { prefix, sym } => {
                 let pre = if matches!(prefix.as_ref(), Type::NoType | Type::ThisType(_)) {
@@ -2249,12 +2436,17 @@ impl<'a> Pickler<'a> {
         let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
         let lo = bound_lo
             .as_ref()
-            .map(|t| self.pickle_type(t))
+            .map(|t| self.pickle_bound_type(t))
             .unwrap_or_else(|| self.type_ref_named("Nothing"));
         let hi = bound_hi
             .as_ref()
-            .map(|t| self.pickle_type(t))
+            .map(|t| self.pickle_bound_type(t))
             .unwrap_or_else(|| self.type_ref_named("Any"));
+        let advertised_specialization = if self.st.get(s.owner).kind == SymKind::Method {
+            self.st.method_specialization_for_pickle(id)
+        } else {
+            None
+        };
         let mut b = Vec::new();
         write_nat_to(&mut b, lo);
         write_nat_to(&mut b, hi);
@@ -2288,9 +2480,17 @@ impl<'a> Pickler<'a> {
         if s.flags.contains(Flags::CONTRAVARIANT) {
             raw_flags |= 1u64 << 17;
         }
+        // nsc checks SPECIALIZED before interpreting the annotation. Advertise
+        // it only when the corresponding primitive entries will be emitted.
+        if advertised_specialization.is_some() {
+            raw_flags |= 1u64 << 40;
+        }
         let flags = raw_to_pickled(raw_flags);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[idx as usize] = (TYPESYM, body);
+        if self.st.get(SymbolId(owner_id)).kind == SymKind::Method {
+            self.pickle_type_param_annots(id, idx, advertised_specialization);
+        }
         idx
     }
 

@@ -29,9 +29,9 @@ pub struct ParseOptions {
     /// nsc `-no-specialization`, "Ignore @specialize annotations." Under it
     /// `@specialized` / `@unspecialized` are dropped from the tree here, which
     /// is what the flag means; without it they are kept and recorded on the
-    /// symbol (`crate::specialization`). Either way this subset emits no
-    /// `$mc*$sp` members — `tests/spec_classfiles.sh` is the ledger that says
-    /// how far short of nsc that leaves us.
+    /// symbol (`crate::specialization`). The post-pickler method phase consumes
+    /// the record when this flag is false; with the flag set no entries are
+    /// emitted.
     pub no_specialization: bool,
     /// `-Ykind-projector`: accept kind-projector's `*` placeholder and
     /// `λ` / `Lambda` type lambdas, desugaring them to structural type

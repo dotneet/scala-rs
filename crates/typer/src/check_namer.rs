@@ -414,9 +414,14 @@ impl Typer {
             };
             self.st.get_mut(id).flags = self.st.get(id).flags.with(flags);
             self.st.get_mut(id).ty = Type::TypeParam(id);
+            // Keep the source annotation on the type-parameter symbol as
+            // well as the normalized selection.  The post-pickler method
+            // specializer consumes the latter; a separate scalac consumer
+            // consumes the former from the generic method's pickle.
+            self.st.get_mut(id).annotations = annots.clone();
             // `class C[@specialized(Int, Long) T]`: record what the annotation
-            // selects. Nothing reads it yet -- specialization is a phase after
-            // the typer, and this subset does not run it.
+            // selects. The method-owned post-pickler phase consumes the same
+            // record; class and trait ownership remains for a later phase.
             self.st.record_specialization(id, &annots);
             if name != "_" {
                 self.st.enter_in_current(&name, id);
