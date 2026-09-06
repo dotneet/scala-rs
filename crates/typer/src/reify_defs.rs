@@ -114,22 +114,29 @@ const PARAM_MODS: Flags = Flags(
 impl Reifier<'_> {
     /// One statement of a block or a template body: a definition, or an
     /// ordinary term.
+    ///
+    /// A `val` or `def` bound *inside* the `reify { … }` body needs none of
+    /// the free-term machinery: real scalac 2.13.16 reifies both the
+    /// binding and every reference to it structurally, by name, exactly the
+    /// way a quasiquote would (`docs/macros.md` §7.17, "the `reify` widening
+    /// slice" -- confirmed with `-Ymacro-debug-lite`, which never mentions
+    /// `newFreeTerm` for a name the body binds itself). `Reifier::local_bound`
+    /// is what tells such a name apart from one that is genuinely free with
+    /// respect to this body -- bound *outside* it, which is the shape nsc
+    /// carries as a free term and this module cannot build yet.
+    ///
+    /// A `class` / `object` is a different matter: nsc's typer has already
+    /// rewritten an unqualified access to one of its own members into an
+    /// explicit `C.this.member` by the time the reifier sees it, and
+    /// scala-rs walks the *untyped* body, so reproducing that would need
+    /// real member resolution this module does not have. Refused, so a
+    /// definition built without it does not silently capture whatever
+    /// stands at the name from the call site's own scope instead.
     pub(super) fn definition(&self, t: &Tree) -> Result<Tree, String> {
-        // A definition inside a `reify { … }` body binds a symbol the
-        // expansion has to carry with it: nsc reifies it with
-        // `build.newNestedSymbol` and links every reference to that symbol.
-        // Building the definition by name instead would compile and run, and
-        // would bind whatever name the expansion site happens to use -- the
-        // capture reification exists to prevent -- so it is refused. The
-        // quasiquote path, which *is* by name, is unaffected.
         if self.in_reify_mode()
             && matches!(
                 t.kind,
-                TreeKind::ValDef { .. }
-                    | TreeKind::DefDef { .. }
-                    | TreeKind::ClassDef { .. }
-                    | TreeKind::ModuleDef { .. }
-                    | TreeKind::TypeDef { .. }
+                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } | TreeKind::TypeDef { .. }
             )
         {
             return Err(format!("{} is not reified yet", super::describe(&t.kind)));
@@ -283,7 +290,17 @@ impl Reifier<'_> {
         if rhs.is_empty() {
             flags |= nsc::DEFERRED;
         }
-        let r = self.rhs_expr(span, rhs)?;
+        // The parameters are in scope for the body alone -- see
+        // `Reifier::local_bound`.
+        let param_names: Vec<String> = vparamss
+            .iter()
+            .flatten()
+            .filter_map(|p| match &p.kind {
+                TreeKind::ValDef { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let r = self.with_locals(param_names, || self.rhs_expr(span, rhs))?;
         Ok(self.call(
             self.support_member("SyntacticDefDef"),
             vec![
