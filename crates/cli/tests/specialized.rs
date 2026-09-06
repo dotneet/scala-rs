@@ -648,3 +648,310 @@ object LocalClassAbiMain {
     assert_eq!(String::from_utf8_lossy(&run.stdout), "7:8\n");
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Constructor references inside a variant must be split by ownership. Local
+/// classes and their constructors are cloned, while `String` and a source
+/// class remain external references. The captured local class also checks
+/// that its field and method symbols move to the primitive clone together.
+#[test]
+fn method_specialization_constructor_and_capture_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip constructor specialization fixture: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("method-specialization-constructor");
+    let src = root.join("ConstructorReview.scala");
+    fs::write(
+        &src,
+        r#"import scala.specialized
+
+class ExternalBox[A](val value: A)
+
+object ConstructorReview {
+  def local[@specialized(Int, Long) A](a: A): A = {
+    class Captured { def get: A = a }
+    class Base(val x: A)
+    class Child(y: A) extends Base(y)
+    new Child(new Captured().get).x
+  }
+
+  def external[@specialized(Int, Long) A](a: A): A = {
+    val s = new java.lang.String("x")
+    val b = new ExternalBox[A](a)
+    if (s.length != 1) throw new RuntimeException("bad")
+    b.value
+  }
+}
+
+object ConstructorReviewMain {
+  def main(args: Array[String]): Unit = {
+    println(ConstructorReview.local(7))
+    println(ConstructorReview.local(8L))
+    println(ConstructorReview.local("generic"))
+    println(ConstructorReview.external(9))
+    println(ConstructorReview.external(10L))
+    println(ConstructorReview.external("fallback"))
+  }
+}
+"#,
+    )
+    .unwrap();
+    let expected = "7\n8\ngeneric\n9\n10\nfallback\n";
+    let scalac = Path::new("/tmp/scala-2.13.16/bin/scalac");
+    let nsc_out = root.join("nsc");
+    if scalac.is_file() {
+        fs::create_dir_all(&nsc_out).unwrap();
+        let status = Command::new(scalac)
+            .args(["-d", nsc_out.to_str().unwrap(), src.to_str().unwrap()])
+            .status()
+            .expect("run nsc constructor specialization provider");
+        assert!(
+            status.success(),
+            "nsc constructor specialization provider failed"
+        );
+        let run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{}", nsc_out.display(), jar.display()),
+                "ConstructorReviewMain",
+            ])
+            .output()
+            .expect("run nsc constructor specialization provider");
+        assert!(
+            run.status.success(),
+            "nsc constructor specialization runtime failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    }
+
+    let out = root.join("provider");
+    fs::create_dir_all(&out).unwrap();
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs constructor specialization provider");
+    assert!(
+        status.success(),
+        "constructor specialization provider failed"
+    );
+    for suffix in ["$1", "$2", "$3"] {
+        assert!(
+            out.join(format!("ConstructorReview$Base{suffix}.class"))
+                .is_file(),
+            "missing local Base variant {suffix}"
+        );
+        assert!(
+            out.join(format!("ConstructorReview$Child{suffix}.class"))
+                .is_file(),
+            "missing local Child variant {suffix}"
+        );
+    }
+    let external_classes: Vec<_> = fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("ExternalBox$"))
+        .collect();
+    assert!(
+        external_classes.is_empty(),
+        "external constructor was cloned: {external_classes:?}"
+    );
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "ConstructorReviewMain",
+        ])
+        .output()
+        .expect("run scala-rs constructor specialization provider");
+    assert!(
+        run.status.success(),
+        "constructor specialization runtime failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Bounds constrain which primitive entries are real ABI members. An upper
+/// reference bound keeps the method generic, `Nothing .. AnyVal` admits both
+/// primitives, and `Int .. AnyVal` admits Int only. A separately compiled
+/// scalac consumer must follow exactly those advertised entries.
+#[test]
+fn method_specialization_bounds_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip bounded specialization fixture: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("method-specialization-bounds");
+    let src = root.join("Bound.scala");
+    fs::write(
+        &src,
+        r#"import scala.specialized
+
+object Bound {
+  def upper[@specialized(Int, Long) A <: CharSequence](a: A): Int = a.length
+  def lowerNull[@specialized(Int, Long) A >: Null](a: A): String = a.toString
+  def mixed[@specialized(Int, Long) A >: Nothing <: AnyVal](a: A): String = a.toString
+  def exact[@specialized(Int, Long) A >: Int <: AnyVal](a: A): String = a.toString
+  def fallback[@specialized(Int, Long) A](a: A): String = a.toString
+
+  def main(args: Array[String]): Unit = {
+    println(upper("hello"))
+    println(lowerNull("null-safe"))
+    println(mixed(7))
+    println(mixed(8L))
+    println(exact(9))
+    println(fallback("fallback"))
+  }
+}
+"#,
+    )
+    .unwrap();
+    let expected = "5\nnull-safe\n7\n8\n9\nfallback\n";
+    let out = root.join("provider");
+    fs::create_dir_all(&out).unwrap();
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs bounded specialization provider");
+    assert!(status.success(), "bounded specialization provider failed");
+    let module = javap_class(&out, "Bound$", &["-p", "-s"]);
+    assert!(
+        !module.contains("upper$mIc$sp") && !module.contains("upper$mJc$sp"),
+        "upper-bound method was specialized: {module}"
+    );
+    assert!(
+        !module.contains("lowerNull$mIc$sp") && !module.contains("lowerNull$mJc$sp"),
+        "lower-bound method advertised invalid primitive entries: {module}"
+    );
+    assert!(
+        module.contains("mixed$mIc$sp") && module.contains("mixed$mJc$sp"),
+        "valid AnyVal bounds lost primitive entries: {module}"
+    );
+    assert!(
+        module.contains("exact$mIc$sp") && !module.contains("exact$mJc$sp"),
+        "mixed bound advertised the wrong primitive entries: {module}"
+    );
+    assert!(
+        module.contains("<A> java.lang.String fallback(A)"),
+        "generic fallback disappeared: {module}"
+    );
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "Bound",
+        ])
+        .output()
+        .expect("run scala-rs bounded specialization provider");
+    assert!(
+        run.status.success(),
+        "bounded specialization runtime failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    let scalac = Path::new("/tmp/scala-2.13.16/bin/scalac");
+    if scalac.is_file() {
+        let consumer_src = root.join("BoundConsumer.scala");
+        fs::write(
+            &consumer_src,
+            r#"object BoundConsumer {
+  def i: String = Bound.mixed(7)
+  def l: String = Bound.mixed(8L)
+  def e: String = Bound.exact(9)
+  def n: String = Bound.lowerNull("null-safe")
+  def f: String = Bound.fallback("fallback")
+
+  def main(args: Array[String]): Unit = {
+    val result = s"$i:$l:$e:$n:$f"
+    if (result != "7:8:9:null-safe:fallback") throw new RuntimeException(result)
+    println(result)
+  }
+}
+"#,
+        )
+        .unwrap();
+        let consumer_out = root.join("consumer");
+        fs::create_dir_all(&consumer_out).unwrap();
+        let cp = format!("{}:{}", out.display(), jar.display());
+        let status = Command::new(scalac)
+            .args([
+                "-cp",
+                &cp,
+                "-d",
+                consumer_out.to_str().unwrap(),
+                consumer_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run scalac bounded specialization consumer");
+        assert!(
+            status.success(),
+            "scalac bounded specialization consumer failed"
+        );
+        let consumer = javap_class(&consumer_out, "BoundConsumer$", &["-c", "-p"]);
+        assert!(
+            consumer.contains("Bound$.mixed$mIc$sp:(I)Ljava/lang/String;"),
+            "scalac did not select bounded Int entry: {consumer}"
+        );
+        assert!(
+            consumer.contains("Bound$.mixed$mJc$sp:(J)Ljava/lang/String;"),
+            "scalac did not select bounded Long entry: {consumer}"
+        );
+        assert!(
+            consumer.contains("Bound$.exact$mIc$sp:(I)Ljava/lang/String;")
+                && !consumer.contains("exact$mJc$sp"),
+            "scalac selected an unadvertised exact-bound entry: {consumer}"
+        );
+        assert!(
+            !consumer.contains("upper$mIc$sp") && !consumer.contains("upper$mJc$sp"),
+            "scalac selected an unadvertised upper-bound entry: {consumer}"
+        );
+        assert!(
+            !consumer.contains("lowerNull$mIc$sp") && !consumer.contains("lowerNull$mJc$sp"),
+            "scalac selected an unadvertised lower-bound entry: {consumer}"
+        );
+        let consumer_run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!(
+                    "{}:{}:{}",
+                    consumer_out.display(),
+                    out.display(),
+                    jar.display()
+                ),
+                "BoundConsumer",
+            ])
+            .output()
+            .expect("run scalac bounded specialization consumer");
+        assert!(
+            consumer_run.status.success(),
+            "scalac bounded specialization consumer runtime failed: {}",
+            String::from_utf8_lossy(&consumer_run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&consumer_run.stdout),
+            "7:8:9:null-safe:fallback\n"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}

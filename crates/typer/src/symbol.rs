@@ -933,9 +933,23 @@ impl SymbolTable {
         if !eligible_owner {
             return None;
         }
+        let lower = self
+            .get(type_param)
+            .bound_lo
+            .clone()
+            .unwrap_or(Type::Nothing);
+        let upper = self.get(type_param).bound_hi.clone().unwrap_or(Type::Any);
         let supported: Vec<_> = selected
             .iter()
             .filter(|ty| matches!(ty, SpecializedType::Int | SpecializedType::Long))
+            .filter(|ty| {
+                let primitive = match ty {
+                    SpecializedType::Int => Type::Int,
+                    SpecializedType::Long => Type::Long,
+                    _ => unreachable!("the method slice filters Int and Long first"),
+                };
+                self.is_sub_type(&lower, &primitive) && self.is_sub_type(&primitive, &upper)
+            })
             .collect();
         (!supported.is_empty()).then(|| SpecializedTypes::of(&supported))
     }
