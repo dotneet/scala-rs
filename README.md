@@ -42,7 +42,8 @@ scalac 2.13.16 と比較します。集合の結合も含む
 
 出力先をクラスパスに含めて object を再コンパイルする場合も、Java 起動用の
 `main` 転送メソッドを再生成します。`incremental_forwarder` テストは同じ出力先への
-2 回のコンパイルと JVM 実行を scalac と比較します。
+2 回のコンパイルと JVM 実行を scalac と比較し、両方向にコンパイラを入れ替えた
+組み合わせも検査します。
 
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and

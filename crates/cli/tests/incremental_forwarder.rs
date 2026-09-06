@@ -18,10 +18,11 @@ fn recompilation_preserves_main_forwarder() {
     let fixtures =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/multi/incremental_forwarder");
     let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
-    for ours in [false, true] {
-        let out = root.join(format!("{ours}"));
+    for (producer, consumer) in [(false, false), (true, true), (false, true), (true, false)] {
+        let out = root.join(format!("{producer}-{consumer}"));
         fs::create_dir_all(&out).unwrap();
         for round in 1..=2 {
+            let ours = if round == 1 { producer } else { consumer };
             let mut cmd = if ours {
                 let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
                 c.args(["compile", "--scala-library", jar]);
