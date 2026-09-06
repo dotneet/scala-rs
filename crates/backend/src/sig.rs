@@ -314,7 +314,8 @@ impl<'a> Sig<'a> {
                     return d;
                 }
                 let e = match elem.widen_constant() {
-                    Type::Nothing => "Ljava/lang/Object;".to_string(),
+                    // Both bottom types: see `jvm_desc_array_elem`.
+                    Type::Nothing | Type::Null => "Ljava/lang/Object;".to_string(),
                     _ => self.jsig(elem, true, depth + 1),
                 };
                 format!("[{e}")

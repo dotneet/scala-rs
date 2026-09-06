@@ -416,6 +416,27 @@ pub struct Symbol {
     /// looks exactly like a concrete one and `class C extends T` cannot tell
     /// whether `v` still needs implementing.
     pub deferred_val: bool,
+    /// This `val` / `var` lives in a **separately compiled** class whose
+    /// backing field scalac made `private`, so every read goes through the
+    /// public accessor of the same name and every write through `name_$eq`.
+    ///
+    /// `javap -p` on scalac's `class Holder(val n: Int)`:
+    ///
+    /// ```text
+    /// private final int n;
+    /// public int n();
+    /// ```
+    ///
+    /// Reading such a member with `getfield` passes the JVM verifier -- field
+    /// access control is checked at *resolution*, not at verification -- and
+    /// throws `IllegalAccessError` the first time the method runs. This is
+    /// invisible when scala-rs compiles both sides, because scala-rs emits the
+    /// field itself public; it only appears across compilers.
+    ///
+    /// Set by `classpath::install_classpath` from the class file, which is the
+    /// ground truth about which members actually have an accessor: a
+    /// `private[this] val` has none and keeps the direct field read.
+    pub via_accessor: bool,
 }
 
 impl Symbol {
@@ -726,6 +747,7 @@ impl SymbolTable {
                 abstract_override: false,
                 super_accessor: false,
                 deferred_val: false,
+                via_accessor: false,
                 specialized: None,
                 unspecialized: false,
             }],
@@ -829,6 +851,7 @@ impl SymbolTable {
             abstract_override: false,
             super_accessor: false,
             deferred_val: false,
+            via_accessor: false,
             specialized: None,
             unspecialized: false,
         });

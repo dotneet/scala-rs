@@ -1017,3 +1017,32 @@ of most of these notes.
   `println(Some(3))` prints `scala.Some@…` under `--no-scala-library` where
   both the jar mode and real scalac print `Some(3)`. Found while writing a
   fixture that printed an `Option`; the fixture prints `.get` instead.
+
+- **An empty parameter list is pickled as a `NullaryMethodType`.**
+  `def bump(): Int` and `def bump: Int` produce the same `ScalaSignature`
+  entry, because `pickle.rs` writes `POLYtpe(restpe)` whenever the parameter
+  *vector* is empty rather than whenever there is no parameter *clause*. Real
+  scalac then reads our `def bump(): Int` as a nullary member and rejects the
+  call site:
+
+  ```
+  error: Int does not take parameters
+      println(h.bump())
+  ```
+
+  Found writing `crates/cli/tests/nullcross.rs`, whose fixture works around it
+  by declaring `def bump: Int`. It is a separate-compilation-only defect of
+  the same family as the two that slice fixed, it affects every `def m()` we
+  publish, and it needs the symbol's `paramss` (`vec![vec![]]` vs `vec![]`) to
+  survive to the pickler. Both `METHODtpe` with zero parameters and the
+  reader's side of it have to change together.
+
+- **A separately compiled case class's companion cannot be reached by its
+  qualified name.** With `package fv; case class CC(s: String)` on `-cp`,
+  `fv.CC("z")` type-checks and then emits
+  `throw new RuntimeException("select CC")` -- the backend never finds the
+  module. `import fv.CC; CC("z")` works and runs, and so does a qualified
+  *hand-written* `object` (`nxlib.Store.greeting`), so it is specific to the
+  synthesized companion reached through a package prefix, and it is a
+  code-generation gap rather than a typer one. Also found writing
+  `crates/cli/tests/nullcross.rs`.
