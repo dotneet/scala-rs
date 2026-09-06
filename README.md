@@ -215,6 +215,13 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
 How the fixtures, the dual-run harnesses and the pickle-reader regression tests
 are organised is described in [docs/testing.md](docs/testing.md).
 
+別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
+`ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
+scalac を読み手にして、正例の JVM 実行と不正な型引数の拒否を検証します。
+`E#Elem` の接頭部や curried メソッドの引数節には未解決の制限があり、
+Slick の逆方向テスト（MODE=a）はまだ通っていません。
+現在の数値と検証範囲は [tests/BASELINE.md](tests/BASELINE.md) を参照してください。
+
 ## Documentation
 
 - [docs/language-support.md](docs/language-support.md) — the implemented
