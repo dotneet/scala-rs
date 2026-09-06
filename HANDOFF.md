@@ -23,9 +23,10 @@ file rather than measuring the baseline yourself.**
 | corpus `neg` (1405) | 656 | **659** |
 | slick (184 files) | `errors=0`, 1596 classes | `errors=0`, **1490** (nsc emits 1498) |
 | slick execution | 12/12 | **12/12**, `attempts=36/36` |
-| `cargo test --workspace --release` | 153 binaries / 1990 | **190 / 2186**, 0 failed |
+| `cargo test --workspace --release` | 153 binaries / 1990 | **190 / 2193**, 0 failed |
+| `tests/verify_all.sh` (slick, 1490 classes) | 6 failures (undetected) | **0** |
 
-41 slices merged, 326 files changed. Compile time is 1.47 s against nsc's 12 s.
+42 slices merged, 330 files changed. Compile time is 1.47 s against nsc's 12 s.
 
 ## The two things that matter more than the numbers
 
@@ -46,7 +47,7 @@ closed:
   initialising means not linking, and an unlinked class never has its method
   bodies verified. **Six of slick's 1490 classes had been failing JVM
   verification for an unknown number of waves.** `tests/verify_all.sh` now
-  loads every class with `true`.
+  loads every class with `true`, and all six are fixed — the check reports 0.
 * Neither `javap` nor that call reads the `Signature` attribute at all, so 23
   classes throwing `MalformedParameterizedTypeException` were invisible until a
   slice asked `java.lang.reflect` for the generic form of all 26273 members.
