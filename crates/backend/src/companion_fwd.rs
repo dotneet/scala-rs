@@ -67,11 +67,12 @@ pub(crate) fn companion_class_of(st: &SymbolTable, module_class: SymbolId) -> Op
     let s = st.get(module_class);
     let base = s.name.strip_suffix('$').unwrap_or(&s.name).to_string();
     let owner = s.owner;
-    st.get(owner)
-        .members
-        .iter()
-        .copied()
-        .find(|&m| st.get(m).kind == SymKind::Class && st.get(m).name == base)
+    st.get(owner).members.iter().copied().find(|&m| {
+        // A previous compilation's mirror may be on the classpath. Its
+        // static forwarders are outputs to replace, not companion members
+        // that conflict with the new module's forwarders.
+        st.source_classes.contains(&m) && st.get(m).kind == SymKind::Class && st.get(m).name == base
+    })
 }
 
 /// Names a companion class already carries, so a forwarder must not: its own
