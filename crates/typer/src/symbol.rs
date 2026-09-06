@@ -340,6 +340,11 @@ pub struct Symbol {
     pub bound_lo: Option<Type>,
     /// Upper bound of an abstract/HK type member (`type F[_] <: Hi`).
     pub bound_hi: Option<Type>,
+    /// Whether this type-member symbol came from a declaration with a
+    /// right-hand side (`type T = U`).  The RHS may itself be another
+    /// `TypeMember`; the pickle writer must retain that declaration kind
+    /// instead of inferring it from the resolved type alone.
+    pub is_type_alias: bool,
     /// For classes defined inside a method: enclosing-method locals the class
     /// reads. Each becomes a private field plus a trailing constructor
     /// parameter (see `anon_capture`).
@@ -748,6 +753,7 @@ impl SymbolTable {
                 annotations: vec![],
                 bound_lo: None,
                 bound_hi: None,
+                is_type_alias: false,
                 captures: vec![],
                 macro_impl: None,
                 declaring_class: String::new(),
@@ -854,6 +860,7 @@ impl SymbolTable {
             annotations: vec![],
             bound_lo: None,
             bound_hi: None,
+            is_type_alias: false,
             captures: vec![],
             macro_impl: None,
             declaring_class: String::new(),

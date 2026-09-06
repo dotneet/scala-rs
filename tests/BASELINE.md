@@ -11,16 +11,19 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `318c1568` |
+| commit | `41375307` |
 |---|---|
 | updated | 2026-09-06 |
 
-Measured independently at `dd5047e0`, then merged as `318c1568`; their compiler
-sources and Cargo inputs are identical. Later documentation-only commits may
-follow this commit. Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned;
+Measured independently at `4b2f941e`, then merged as `41375307`; their compiler
+sources and Cargo inputs are identical. Two CLI interoperability tests were
+added after the full run and independently passed at `2b65cdc9`; only tests
+and documentation changed between these candidates. Later documentation-only
+commits may follow this commit. Java is Temurin 17 with both `JAVA_HOME` and `PATH` pinned;
 the corpus run inherited `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
-Evidence: `/tmp/scala-rs-codex/integration/candidate-dd5047e/results.json` and
-`corpus-parent-audit.json`. All required historical gates completed with exit
+Evidence: `/tmp/scala-rs-codex/integration/candidate-4b2f941/results.json`,
+`corpus-parent-audit.json`, `supplemental-existential.log`, and
+`supplemental-clippy.log`. All required historical gates completed with exit
 0; the newly measured MODE=a check is explicitly red below.
 
 ## Compile measures
@@ -50,11 +53,13 @@ Evidence: `/tmp/scala-rs-codex/integration/candidate-dd5047e/results.json` and
 | `neg` (1405) | **659** | 377 | 369 |
 | `run` (2060) | **590** | 917 | 553 |
 
-The complete per-test status reference is
+The unchanged complete per-test status reference is
 [`baselines/corpus-318c1568.tsv`](baselines/corpus-318c1568.tsv): 5324 unique
 records, from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
-Compare by `(kind, test)` as well as totals. The full six-field diagnostic
-ledger is `candidate-dd5047e/corpus.tsv` in the evidence directory above.
+Compare by `(kind, test)` as well as totals. The current six-field diagnostic
+ledger is `candidate-4b2f941/corpus.tsv` in the evidence directory above.
+All statuses match the preceding `318c1568` baseline; only the temporary output
+path in the existing `run/t8199` filename-too-long diagnostic differs.
 
 Use `python3 tests/compare_corpus.py tests/baselines/corpus-318c1568.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
@@ -81,8 +86,16 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **197 result rows, 2233 passed, 0 failed** |
+| `cargo test --workspace --release --no-fail-fast` | **197 result rows, 2234 passed, 0 failed** at `4b2f941e` |
+| Additional test-only validation at `2b65cdc9` | **1 result row, 2 passed, 0 failed** (`--test existential`); main now contains **2236 tests / 198 result rows** in total |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
+
+The two test rows above describe a composed gate, not a second full-workspace
+run. No compiler source or Cargo input changed after the full run. Clippy's
+full warning-message multiset remains 59, identical to the preceding baseline;
+the supplemental CLI test adds no warning. The new interop tests verify actual
+JVM output and reject every invalid type argument through a real scalac
+consumer, including existential, forward-reference, F-bound, and lower bounds.
 
 ## The six unloadable classes are fixed (2026-09-06)
 

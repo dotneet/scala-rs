@@ -1148,12 +1148,15 @@ impl Typer {
                 tree.sym = id;
             }
             TreeKind::TypeDef { .. } => {
-                let (name, flags, annots, within) = match &tree.kind {
-                    TreeKind::TypeDef { name, mods, .. } => (
+                let (name, flags, annots, within, is_type_alias) = match &tree.kind {
+                    TreeKind::TypeDef {
+                        name, mods, rhs, ..
+                    } => (
                         name.clone(),
                         mods.flags,
                         mods.annotations.clone(),
                         mods.private_within.clone(),
+                        !rhs.is_empty(),
                     ),
                     _ => return,
                 };
@@ -1162,6 +1165,7 @@ impl Typer {
                     .alloc(&name, self.st.owner, SymKind::TypeMember, flags, "");
                 self.st.get_mut(id).private_within = within;
                 self.st.get_mut(id).annotations = annots;
+                self.st.get_mut(id).is_type_alias = is_type_alias;
                 self.st.enter_in_current(&name, id);
                 tree.sym = id;
                 if let TreeKind::TypeDef { tparams, .. } = &mut tree.kind {

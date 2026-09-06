@@ -11,6 +11,73 @@ their pending-status statements. All new subagents use Luna / xhigh and
 isolated worktrees. They report through collaboration tools, not Codex task
 messages.
 
+Latest independent checks (these supersede the pending descriptions below):
+
+- Bounds and alias declaration metadata are merged as `41375307`. Candidate
+  `4b2f941e` passed 2234 workspace tests, every baseline compile measure,
+  strict verification of all 1490 classes, and Slick MODE=b 36/36. MODE=a and
+  the specialization ledger remain red. All 5324 corpus statuses are
+  unchanged; only the existing `t8199` diagnostic's temporary path differs.
+  Two permanent CLI interop tests were added and independently passed at
+  `2b65cdc9`, with no compiler/Cargo changes after the full gate. These verify
+  valid execution and every invalid existential/forward/F/lower type bound.
+  The resulting main test inventory is 2236 tests / 198 result rows, validated
+  by a full run plus that test-only supplement, not a claimed second full run.
+  Clippy retains the preceding 59 warnings; the added tests introduce none.
+  Evidence: `candidate-4b2f941` and `integration/bounds-parent` below the
+  temporary evidence root. `tests/BASELINE.md` now records this merge.
+- Variance metadata (`+A`/`-A`) independently passes its real-scalac/JVM
+  interop test in metadata candidate `9e522013`, but is not yet on main.
+  The newer specialization candidate `14476f75` combines bounds, variance,
+  and local-symbol clone fixes. Its two bounds tests and six specialization
+  tests pass; a seventh test expects scalac to specialize a lower-bounded
+  call that scalac actually keeps generic once real bounds are pickled.
+  Direct execution still produces the correct result, including the newly
+  exercised `upper("hello")` generic CharSequence call. The agent is aligning
+  specialization eligibility and the test with nsc's actual behavior before
+  a new full gate. The successful old `560405fd` full run is not evidence for
+  this newer candidate.
+- Specialization candidate `560405fd` completed its full runner: 2234 release
+  workspace tests pass; all four compile measures match the baseline;
+  strict verification loads all 1490 classes; Slick MODE=b passes 36/36.
+  MODE=a and the class-specialization ledger remain red and unchanged.
+  All 5324 corpus statuses match `318c1568`; the only six-field difference
+  is the temporary output path in the existing `run/t8199` diagnostic.
+  Evidence: `candidate-560405f/results.json` and `corpus-parent-audit.json`.
+  This candidate is still held: additional local-class probes require
+  symbol-cloning fixes. Follow-up `e02b8161` is being reviewed for external
+  constructor ownership and complete type-symbol remapping before acceptance.
+  An independent bounded-type probe found a second new regression:
+  `size[@specialized(Int) A <: CharSequence](a: A) = a.length` emits an
+  invalid primitive method and fails JVM verification even for a String call.
+  Main and scalac both print `5`; scalac warns that bounds prevent
+  specialization. Variant generation and source annotation advertising must
+  agree on eligible bounds. Evidence: `specialization-validation/bounded`.
+  Clippy exits 0 but adds four warnings (59 to 63); these also remain pending.
+- Combined metadata candidate `fbc4ca7e` passes 15 fresh focused release
+  tests (codegen diagnostics, source signatures, constructor defaults).
+  It is held because a separate producer probe rejects ordinary `case class
+  Row(i: Int, s: String)` for missing `Equals.canEqual`, while accepted main
+  compiles it. Do not classify that regression as a pre-existing defect.
+  A different overload probe reveals an existing defect: a case class with
+  `def canEqual(i: Int)` compiles on main but throws `ClassCastException` when
+  called through `Equals`; scalac prints `true`. Both are assigned to the
+  source-signature follow-up. Evidence is under
+  `integration/source-signature-probes/{rows,case-overload}-results.json`.
+- Gitbucket precision candidate `29e38dd1` passes four independently run
+  release tests, including exact negative diagnostics and JVM runtime output.
+  Its performance is not accepted. Candidate `554b4de1` combines this work,
+  accepted main, and the proposed earlier divergence check `4c261de5` for a
+  bounded investigation. Reordering that check alone is not proof of the
+  claimed speedup or a fix for fresh inference variables in recursive rules.
+  The independent fresh build passed, but the measurement timed out after
+  60.008 seconds (exit -15) with no diagnostics. Evidence is under
+  `gb-validation/investigation-554b4de`; no error count is inferred.
+- Macro snapshot proposal `f4099fd7` is held: a constructor-field-only
+  declaration list is not a complete case-class symbol graph. Generic/active
+  symbols must not lose previously working name-only queries. Permanent
+  reflection comparisons and a safe incomplete-snapshot path are pending.
+
 Tail-call work was independently frozen and tested at `dd5047e0` in
 `codex/tail-validation`, then merged locally as `318c1568`.
 Session `41170` completed the full acceptance sequence; it does not include the
