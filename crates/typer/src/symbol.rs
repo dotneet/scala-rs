@@ -585,6 +585,10 @@ pub struct SymbolTable {
     /// Enclosing owner while naming/typing.
     pub owner: SymbolId,
     pub this_class: SymbolId,
+    /// Source-trait `super` targets that have no declaration in that trait.
+    /// The backend pickles these as `SUPERACCESSOR` aliases so scalac's mixin
+    /// phase can synthesize the forwarding method in an external subclass.
+    pub super_accessor_targets: rustc_hash::FxHashMap<SymbolId, Vec<SymbolId>>,
     /// Terms whose pre-erasure type was a user value class, and which one.
     /// Erasure replaces the type with the underlying representation, but the
     /// backend still has to know that `case class Box(m: Meters)` prints its
@@ -778,6 +782,7 @@ impl SymbolTable {
             object_sym: SymbolId(0),
             owner: SymbolId(0),
             this_class: SymbolId(0),
+            super_accessor_targets: rustc_hash::FxHashMap::default(),
             value_class_terms: rustc_hash::FxHashMap::default(),
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),

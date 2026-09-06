@@ -375,7 +375,10 @@ impl<'a> Gen<'a> {
                         } else {
                             def_method_desc(self.st, stt)
                         };
-                        if b.methods.iter().any(|m| m.name == acc_name) {
+                        if b.methods
+                            .iter()
+                            .any(|m| m.name == acc_name && m.desc == desc)
+                        {
                             continue;
                         }
                         b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &acc_name, &desc);

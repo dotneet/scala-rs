@@ -1840,6 +1840,20 @@ impl<'a> Pickler<'a> {
                 let acc = format!("super${}", crate::classfile::encode_method_name(&s.name));
                 self.pickle_super_accessor(m, idx, &acc);
             }
+            // An unqualified `super.m` may select a concrete method inherited
+            // from a parent without the source trait redeclaring `m`. Such a
+            // symbol cannot carry the trait-local SUPERACCESSOR flag, so the
+            // pre-pickler records the target on the trait and we emit the
+            // alias here with the parent's symbol as its referent.
+            if let Some(targets) = self.st.super_accessor_targets.get(&class_id).cloned() {
+                for target in targets {
+                    let acc = format!(
+                        "super${}",
+                        crate::classfile::encode_method_name(&self.st.get(target).name)
+                    );
+                    self.pickle_super_accessor(target, idx, &acc);
+                }
+            }
             self.pickle_mixin_ctor(idx);
         }
 
@@ -2013,9 +2027,11 @@ impl<'a> Pickler<'a> {
         // No alias, no accessor: nsc's unpickler asserts that every
         // SUPERACCESSOR carries one, and a member whose signature we could not
         // pickle has no entry to point at.
-        let Some(alias) = self.sym_index.get(&method_id.0).copied() else {
-            return;
-        };
+        let alias = self
+            .sym_index
+            .get(&method_id.0)
+            .copied()
+            .unwrap_or_else(|| self.pickle_term_ref(method_id));
         let (paramss, ret) = match &self.st.get(method_id).ty {
             Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
             other => (Vec::new(), other.clone()),

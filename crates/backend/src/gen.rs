@@ -114,12 +114,35 @@ pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImp
 pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_super_accessors(tree, &mut found);
-    for id in found {
-        st.get_mut(id).super_accessor = true;
+    for (trait_id, name, target) in found {
+        let candidates: Vec<SymbolId> = st
+            .get(trait_id)
+            .members
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let s = st.get(id);
+                s.kind == SymKind::Method && s.name == name
+            })
+            .collect();
+        let target_desc = method_desc_from_sym(st, target);
+        let own = candidates
+            .iter()
+            .copied()
+            .find(|&id| method_desc_from_sym(st, id) == target_desc)
+            .or_else(|| (candidates.len() == 1).then(|| candidates[0]));
+        if let Some(id) = own {
+            st.get_mut(id).super_accessor = true;
+        } else {
+            let targets = st.super_accessor_targets.entry(trait_id).or_default();
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
     }
 }
 
-pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<SymbolId>) {
+pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<(SymbolId, String, SymbolId)>) {
     if let TreeKind::ClassDef { mods, impl_, .. } = &tree.kind {
         if mods.flags.contains(Flags::TRAIT) {
             for stt in &impl_.body {
@@ -129,11 +152,9 @@ pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<SymbolId>) {
                     }
                     let mut accesses = Vec::new();
                     collect_super_accesses(rhs, &mut accesses);
-                    for (name, _) in accesses {
-                        if let Some(member) = impl_.body.iter().find(|candidate| {
-                            candidate.name() == Some(name.as_str()) && !candidate.sym.is_none()
-                        }) {
-                            out.push(member.sym);
+                    for (name, target) in accesses {
+                        if !target.is_none() && !tree.sym.is_none() {
+                            out.push((tree.sym, name, target));
                         }
                     }
                 }
@@ -149,9 +170,24 @@ pub(crate) fn collect_super_accessors(tree: &Tree, out: &mut Vec<SymbolId>) {
 /// accessor belongs to `zip`.
 pub(crate) fn collect_super_accesses(tree: &Tree, out: &mut Vec<(String, SymbolId)>) {
     if let TreeKind::Select { qual, name } = &tree.kind {
-        if matches!(qual.kind, TreeKind::Super { .. }) && !tree.sym.is_none() {
+        if matches!(
+            qual.kind,
+            TreeKind::Super {
+                qual: None,
+                mix: None
+            }
+        ) && !tree.sym.is_none()
+        {
             out.push((name.clone(), tree.sym));
         }
+    }
+    // A `super` inside a nested class/object belongs to that nested owner;
+    // it must not make the enclosing trait publish an accessor.
+    if matches!(
+        tree.kind,
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+    ) {
+        return;
     }
     for_each_term_child(tree, &mut |child| collect_super_accesses(child, out));
 }

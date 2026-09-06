@@ -1562,7 +1562,7 @@ pub(crate) fn gen_select(
                     }
                 }
                 if matches!(qual.kind, TreeKind::Super { .. }) {
-                    invoke_super(asm, ctx, tree.sym);
+                    invoke_super(asm, ctx, tree.sym, super_is_qualified(qual));
                 } else if matches!(ic, Intrinsic::AnyHash) {
                     emit_any_hash(asm, &qual.ty);
                 } else if matches!(ic, Intrinsic::GetClass) {
@@ -2821,7 +2821,7 @@ pub(crate) fn gen_apply(
         }
     }
     if fun_is_super(fun) {
-        invoke_super(asm, ctx, fun.sym);
+        invoke_super(asm, ctx, fun.sym, super_is_qualified(fun));
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {
@@ -2836,9 +2836,31 @@ pub(crate) fn fun_is_super(fun: &Tree) -> bool {
     }
 }
 
-pub(crate) fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId) {
+pub(crate) fn super_is_qualified(fun: &Tree) -> bool {
+    let super_kind = match &peel_fun(fun).kind {
+        TreeKind::Select { qual, .. } => &qual.kind,
+        other => other,
+    };
+    matches!(
+        super_kind,
+        TreeKind::Super { qual: Some(_), .. } | TreeKind::Super { mix: Some(_), .. }
+    )
+}
+
+pub(crate) fn invoke_super(asm: &mut Assembler, ctx: &EmitCtx, id: SymbolId, qualified: bool) {
     let s = ctx.st.get(id);
     let desc = method_desc_from_sym(ctx.st, id);
+    if qualified {
+        let owner_id = s.owner;
+        let owner = class_internal(ctx.st, owner_id);
+        if is_interface_sym(ctx.st, owner_id) {
+            let static_desc = trait_static_desc(&owner, &desc);
+            asm.invokestatic_interface(&owner, &trait_static_name(&s.name), &static_desc);
+        } else {
+            asm.invokespecial(&owner, &s.name, &desc);
+        }
+        return;
+    }
     if is_interface_sym(ctx.st, ctx.class_sym) {
         let acc = super_accessor_name(ctx.st, ctx.class_sym, &s.name);
         let iface = class_internal(ctx.st, ctx.class_sym);
