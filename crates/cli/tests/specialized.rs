@@ -1,7 +1,5 @@
-//! E2E tests for `@specialized` (stage 1): the annotation is accepted and
-//! recorded on the symbol without the `specialize` phase, so the program
-//! must still run and compute the unspecialized answer. Split out of
-//! `e2e.rs`.
+//! E2E tests for the method-owned `@specialized` slice. Class and trait
+//! specialization remain outside this fixture file's first-slice coverage.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -350,4 +348,176 @@ fn sp_alias_fixture() {
 #[test]
 fn sp_annot_bad_is_rejected() {
     compile_fails("sp_annot_bad", "type mismatch");
+}
+
+fn javap_class(out: &Path, class: &str, flags: &[&str]) -> String {
+    let mut cmd = Command::new("javap");
+    cmd.args(["-classpath", out.to_str().unwrap()]);
+    cmd.args(flags);
+    cmd.arg(class);
+    let output = cmd.output().expect("javap");
+    assert!(
+        output.status.success(),
+        "javap {class} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The first slice must keep the generic method, emit only the supported
+/// Int/Long entries, and leave both unsupported Double selections and
+/// override-capable class methods on the generic path. The body deliberately
+/// exercises a local, nested def, captured closure, early return, and
+/// recursion so the primitive clone cannot share stale generic symbols.
+#[test]
+fn method_specialization_abi_and_body_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip method specialization ABI fixture: scala-library unavailable");
+        return;
+    };
+    let root = tmp_dir("method-specialization-abi");
+    let src = root.join("MethodAbi.scala");
+    fs::write(
+        &src,
+        r#"import scala.specialized
+
+object MixedOps {
+  def id[@specialized(Int, Long, Double) A](x: A): A = {
+    val y: A = x
+    def nested(z: A): A = z
+    val f: A => A = (v: A) => nested(v)
+    return f(y)
+  }
+
+  def recurse[@specialized(Int) A](x: A): A = {
+    def loop(n: Int, z: A): A = if (n == 0) z else loop(n - 1, z)
+    loop(2, x)
+  }
+}
+
+class NonFinalHost {
+  def id[@specialized(Int, Long) A](x: A): A = x
+}
+
+object MethodAbiMain {
+  def main(args: Array[String]): Unit = {
+    if (MixedOps.id(7) != 7) throw new RuntimeException("int")
+    if (MixedOps.id(7L) != 7L) throw new RuntimeException("long")
+    if (MixedOps.recurse(9) != 9) throw new RuntimeException("recursive")
+    println("method-specialization-ok")
+  }
+}
+"#,
+    )
+    .unwrap();
+    let out = root.join("provider");
+    fs::create_dir_all(&out).unwrap();
+    let status = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .status()
+        .expect("run scala-rs method specialization compile");
+    assert!(status.success(), "method specialization provider failed");
+
+    let module = javap_class(&out, "MixedOps$", &["-p", "-s"]);
+    assert!(
+        module.contains("id$mIc$sp"),
+        "missing Int variant: {module}"
+    );
+    assert!(
+        module.contains("id$mJc$sp"),
+        "missing Long variant: {module}"
+    );
+    assert!(
+        module.contains("recurse$mIc$sp"),
+        "missing recursive variant: {module}"
+    );
+    assert!(
+        module.contains("<A> A id(A)"),
+        "missing generic fallback: {module}"
+    );
+    assert!(
+        !module.contains("id$mDc$sp"),
+        "unsupported Double variant was emitted: {module}"
+    );
+    let non_final = javap_class(&out, "NonFinalHost", &["-p", "-s"]);
+    assert!(
+        !non_final.contains("id$mIc$sp") && !non_final.contains("id$mJc$sp"),
+        "override-capable method was specialized: {non_final}"
+    );
+
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{}:{}", out.display(), jar.display()),
+            "MethodAbiMain",
+        ])
+        .output()
+        .expect("java method specialization fixture");
+    assert!(
+        run.status.success(),
+        "method specialization runtime failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "method-specialization-ok\n"
+    );
+
+    let scalac = Path::new("/tmp/scala-2.13.16/bin/scalac");
+    if scalac.is_file() {
+        let consumer_src = root.join("MethodAbiConsumer.scala");
+        fs::write(
+            &consumer_src,
+            r#"object MethodAbiConsumer {
+  def i: Int = MixedOps.id(7)
+  def j: Long = MixedOps.id(7L)
+  def d: Double = MixedOps.id(1.0)
+  def r: Int = MixedOps.recurse(9)
+}
+"#,
+        )
+        .unwrap();
+        let consumer_out = root.join("consumer");
+        fs::create_dir_all(&consumer_out).unwrap();
+        let cp = format!("{}:{}", out.display(), jar.display());
+        let status = Command::new(scalac)
+            .args([
+                "-cp",
+                &cp,
+                "-d",
+                consumer_out.to_str().unwrap(),
+                consumer_src.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run scalac method specialization consumer");
+        assert!(status.success(), "scalac consumer failed");
+        let consumer = javap_class(&consumer_out, "MethodAbiConsumer$", &["-c", "-p"]);
+        assert!(
+            consumer.contains("MixedOps$.id$mIc$sp:(I)I"),
+            "scalac did not select Int variant: {consumer}"
+        );
+        assert!(
+            consumer.contains("MixedOps$.id$mJc$sp:(J)J"),
+            "scalac did not select Long variant: {consumer}"
+        );
+        assert!(
+            consumer.contains("MixedOps$.id:(Ljava/lang/Object;)Ljava/lang/Object;"),
+            "scalac did not retain generic Double fallback: {consumer}"
+        );
+        assert!(
+            !consumer.contains("id$mDc$sp"),
+            "scalac selected an unadvertised Double variant: {consumer}"
+        );
+    } else {
+        eprintln!("skip scalac separate consumer: /tmp/scala-2.13.16/bin/scalac unavailable");
+    }
+    let _ = fs::remove_dir_all(&root);
 }

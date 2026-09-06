@@ -124,7 +124,7 @@ trait gaps remain expected red checks until their own ABI work lands.
 | Method symbols | `typer/src/symbol.rs` | Track original-to-variant ownership, exact `$mIc$sp`/`$mJc$sp` names, selected type, and JVM method type. |
 | Method emission | `backend/src/gen_class.rs::emit_def`; `backend/src/gen_desc.rs::jvm_desc` | Emit the primitive sibling in the same owner while retaining the generic `(Object)Object` entry. |
 | Call rewriting | typed `Apply` and `TypeApply` trees before `erase` | Select a variant only for a statically supported primitive argument. Preserve generic calls, boxing, and generic fallback for String or unknown types. |
-| Source pickle | `backend/src/pickle.rs::pickle_typesym` and symbol annotations | Preserve method type-parameter `@specialized` metadata and the nsc `SPECIALIZED` flag. Synthetic variants are post-pickle implementation entries, not source declarations. |
+| Source pickle | `backend/src/pickle.rs::pickle_typesym` and symbol annotations | Preserve only method type-parameter selections for which this slice emits an eligible variant, together with the nsc `SPECIALIZED` flag. Synthetic variants are post-pickle implementation entries, not source declarations. |
 | Generic signatures | `backend/src/sig.rs` | Keep the generic method signature on the base entry. Primitive siblings have primitive descriptors and no fabricated generic type-parameter signature. |
 | Dispatch boundary | method flags and owner kind | Start with module, `final`, and `private` methods. Do not rewrite an override-capable method until both entries and override dispatch are specified. |
 | Class and trait ABI | `backend/src/gen_class.rs`, `backend/src/gen_trait.rs` | Follow-up work for `$mcI$sp` classes, marker interfaces, default/static helpers, and bridges. It is outside this slice. |
@@ -143,7 +143,10 @@ generic method declaration must remain in the source `ScalaSignature`, while a
 scalac consumer needs the method type parameter to carry both its
 `@specialized(Int, Long)` symbol annotation and the nsc `SPECIALIZED` symbol
 flag. The annotation records the allowed selections; the flag tells the
-consumer that a specialized entry is available. Synthetic `$mIc$sp` and
+consumer that a specialized entry is available. The source pickle advertises
+only selections that the eligible method slice actually emits, so an
+unsupported `Double` selection or an override-capable method keeps the generic
+fallback without advertising a missing entry. Synthetic `$mIc$sp` and
 `$mJc$sp` symbols are emitted after the source pickle and are not serialized
 as additional source declarations.
 
@@ -191,7 +194,8 @@ For each supported selection:
    and unsupported selections continue through the generic entry and its
    boxing behavior.
 4. Preserve method type-parameter `@specialized` metadata and the nsc
-   `SPECIALIZED` flag in the generic source pickle. Do not add synthetic
+   `SPECIALIZED` flag in the generic source pickle only for emitted Int/Long
+   entries. Do not advertise unsupported selections, and do not add synthetic
    variants to the source pickle.
 5. Keep a method that can be overridden on the generic path until its
    specialized override and bridge rules are implemented. A shape being out

@@ -1,6 +1,6 @@
 //! Symbols, scopes, and the compilation context.
 
-use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
+use scala_rs_parser::{Flags, RefineDecl, SpecializedType, SpecializedTypes, SymbolId, Type};
 
 /// Decl name that marks a refinement as the as-seen-from view of a type
 /// projection rather than something the program wrote. Not a legal Scala
@@ -448,6 +448,7 @@ pub struct MethodVariant {
     pub original: SymbolId,
     pub symbol: SymbolId,
     pub type_param: SymbolId,
+    pub selected: SpecializedType,
     pub ty: Type,
     pub jvm_name: String,
 }
@@ -901,6 +902,42 @@ impl SymbolTable {
                 self.get_mut(id).unspecialized = true;
             }
         }
+    }
+
+    /// The method-owned selections that the first post-pickle specializer can
+    /// actually emit.  Pickling runs before `specialize_method_defs`, so the
+    /// writer cannot consult `method_variants`; it must use the same stable
+    /// eligibility boundary here instead.  Returning `None` suppresses both
+    /// the annotation and nsc's SPECIALIZED bit, leaving a generic fallback
+    /// declaration with no promise of a missing JVM entry.
+    pub fn method_specialization_for_pickle(
+        &self,
+        type_param: SymbolId,
+    ) -> Option<scala_rs_parser::SpecializedTypes> {
+        let selected = self.get(type_param).specialized?;
+        let method_id = self.get(type_param).owner;
+        let method = self.get(method_id);
+        if method.kind != SymKind::Method
+            || method.unspecialized
+            || method.flags.contains(Flags::ABSTRACT)
+            || method.flags.contains(Flags::NATIVE)
+            || method.tparams.len() != 1
+        {
+            return None;
+        }
+        let owner = self.get(method.owner);
+        let eligible_owner = matches!(owner.kind, SymKind::ModuleClass)
+            || owner.flags.contains(Flags::FINAL)
+            || method.flags.contains(Flags::PRIVATE)
+            || method.flags.contains(Flags::FINAL);
+        if !eligible_owner {
+            return None;
+        }
+        let supported: Vec<_> = selected
+            .iter()
+            .filter(|ty| matches!(ty, SpecializedType::Int | SpecializedType::Long))
+            .collect();
+        (!supported.is_empty()).then(|| SpecializedTypes::of(&supported))
     }
 
     pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {

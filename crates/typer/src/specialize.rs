@@ -8,6 +8,7 @@
 //! overridable class method needs dispatch and bridge work that belongs to a
 //! later phase.
 
+use rustc_hash::FxHashMap;
 use scala_rs_parser::{Flags, SpecializedType, SymbolId, Tree, TreeKind, Type};
 
 use crate::symbol::{MethodVariant, SymKind, SymbolTable};
@@ -250,14 +251,32 @@ fn build_variants(def: &Tree, st: &mut SymbolTable) -> Vec<Tree> {
         {
             let symbol = st.get_mut(variant);
             symbol.ty = variant_ty.clone();
-            symbol.params = original_params.clone();
-            symbol.paramss = original_paramss.clone();
             symbol.tparams.clear();
         }
         let mut clone = def.clone();
-        clone.sym = variant;
         clone.ty = variant_ty.clone();
+        let symbol_map = clone_variant_symbols(&clone, st, original, variant, &primitive);
+        clone.sym = variant;
+        remap_tree_symbols(&mut clone, &symbol_map);
         substitute_tree_types(&mut clone, st, original, &primitive);
+        let params: Vec<SymbolId> = original_params
+            .iter()
+            .map(|id| symbol_map.get(id).copied().unwrap_or(*id))
+            .collect();
+        let paramss: Vec<Vec<SymbolId>> = original_paramss
+            .iter()
+            .map(|clause| {
+                clause
+                    .iter()
+                    .map(|id| symbol_map.get(id).copied().unwrap_or(*id))
+                    .collect()
+            })
+            .collect();
+        {
+            let symbol = st.get_mut(variant);
+            symbol.params = params;
+            symbol.paramss = paramss;
+        }
         if let TreeKind::DefDef {
             mods,
             name: clone_name,
@@ -273,6 +292,7 @@ fn build_variants(def: &Tree, st: &mut SymbolTable) -> Vec<Tree> {
             original,
             symbol: variant,
             type_param,
+            selected: selected_ty,
             ty: variant_ty,
             jvm_name: variant_name,
         });
@@ -280,6 +300,523 @@ fn build_variants(def: &Tree, st: &mut SymbolTable) -> Vec<Tree> {
     }
     st.method_variants.insert(original, records);
     out
+}
+
+/// Clone symbols defined inside a method body before substituting its type
+/// parameter.  A typed tree clone alone is not enough: codegen uses parameter
+/// and local symbol types when it allocates JVM slots, especially for lambda
+/// bodies and nested definitions.  Sharing the generic symbols here would
+/// leave an `Object` slot behind while the cloned tree asks for an `Int`.
+fn clone_variant_symbols(
+    tree: &Tree,
+    st: &mut SymbolTable,
+    original: SymbolId,
+    variant: SymbolId,
+    primitive: &Type,
+) -> FxHashMap<SymbolId, SymbolId> {
+    let mut map = FxHashMap::default();
+    map.insert(original, variant);
+    collect_variant_symbols(tree, st, variant, original, primitive, &mut map);
+    map
+}
+
+fn clone_one_symbol(
+    old: SymbolId,
+    owner: SymbolId,
+    st: &mut SymbolTable,
+    original: SymbolId,
+    primitive: &Type,
+    map: &mut FxHashMap<SymbolId, SymbolId>,
+) -> SymbolId {
+    if old.is_none() {
+        return old;
+    }
+    if let Some(id) = map.get(&old) {
+        return *id;
+    }
+    let source = st.get(old).clone();
+    let id = st.alloc(
+        source.name.clone(),
+        owner,
+        source.kind,
+        source.flags,
+        source.jvm_name.clone(),
+    );
+    let mut copy = source;
+    copy.id = id;
+    copy.owner = owner;
+    copy.members.clear();
+    copy.params.clear();
+    copy.paramss.clear();
+    copy.tparams.clear();
+    copy.ty = st.subst_tparams(original, std::slice::from_ref(primitive), &copy.ty);
+    copy.bound_lo = copy
+        .bound_lo
+        .map(|ty| st.subst_tparams(original, std::slice::from_ref(primitive), &ty));
+    copy.bound_hi = copy
+        .bound_hi
+        .map(|ty| st.subst_tparams(original, std::slice::from_ref(primitive), &ty));
+    *st.get_mut(id) = copy;
+    map.insert(old, id);
+    id
+}
+
+fn collect_variant_symbols(
+    tree: &Tree,
+    st: &mut SymbolTable,
+    current_owner: SymbolId,
+    original: SymbolId,
+    primitive: &Type,
+    map: &mut FxHashMap<SymbolId, SymbolId>,
+) {
+    match &tree.kind {
+        TreeKind::PackageDef { pid, stats } => {
+            collect_variant_symbols(pid, st, current_owner, original, primitive, map);
+            for stat in stats {
+                collect_variant_symbols(stat, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::ClassDef {
+            tparams,
+            vparamss,
+            impl_,
+            ..
+        } => {
+            let owner = if tree.sym.is_none() {
+                current_owner
+            } else {
+                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map)
+            };
+            for tp in tparams {
+                collect_variant_symbols(tp, st, owner, original, primitive, map);
+            }
+            for clause in vparamss {
+                for param in clause {
+                    collect_variant_symbols(param, st, owner, original, primitive, map);
+                }
+            }
+            for parent in &impl_.parents {
+                collect_variant_symbols(parent, st, owner, original, primitive, map);
+            }
+            for stat in &impl_.body {
+                collect_variant_symbols(stat, st, owner, original, primitive, map);
+            }
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            let owner = if tree.sym.is_none() {
+                current_owner
+            } else {
+                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map)
+            };
+            for parent in &impl_.parents {
+                collect_variant_symbols(parent, st, owner, original, primitive, map);
+            }
+            for stat in &impl_.body {
+                collect_variant_symbols(stat, st, owner, original, primitive, map);
+            }
+        }
+        TreeKind::DefDef {
+            tparams,
+            vparamss,
+            tpt,
+            rhs,
+            ..
+        } => {
+            let owner = if tree.sym == original {
+                current_owner
+            } else if tree.sym.is_none() {
+                current_owner
+            } else {
+                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map)
+            };
+            let mut own_tparams = Vec::new();
+            for tp in tparams {
+                if !tp.sym.is_none() {
+                    own_tparams.push(clone_one_symbol(
+                        tp.sym, owner, st, original, primitive, map,
+                    ));
+                }
+                collect_variant_symbols(tp, st, owner, original, primitive, map);
+            }
+            let mut own_paramss = Vec::new();
+            for clause in vparamss {
+                let mut params = Vec::new();
+                for param in clause {
+                    if !param.sym.is_none() {
+                        params.push(clone_one_symbol(
+                            param.sym, owner, st, original, primitive, map,
+                        ));
+                    }
+                    collect_variant_symbols(param, st, owner, original, primitive, map);
+                }
+                own_paramss.push(params);
+            }
+            if tree.sym != original && !tree.sym.is_none() {
+                let symbol = st.get_mut(owner);
+                symbol.tparams = own_tparams;
+                symbol.paramss = own_paramss.clone();
+                symbol.params = own_paramss.into_iter().flatten().collect();
+            }
+            collect_variant_symbols(tpt, st, owner, original, primitive, map);
+            collect_variant_symbols(rhs, st, owner, original, primitive, map);
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => {
+            let owner = if tree.sym.is_none() {
+                current_owner
+            } else {
+                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map);
+                map[&tree.sym]
+            };
+            collect_variant_symbols(tpt, st, owner, original, primitive, map);
+            collect_variant_symbols(rhs, st, owner, original, primitive, map);
+        }
+        TreeKind::Function { vparams, body } => {
+            for param in vparams {
+                if !param.sym.is_none() {
+                    clone_one_symbol(param.sym, current_owner, st, original, primitive, map);
+                }
+                collect_variant_symbols(param, st, current_owner, original, primitive, map);
+            }
+            collect_variant_symbols(body, st, current_owner, original, primitive, map);
+        }
+        TreeKind::LabelDef { params, rhs, .. } => {
+            for param in params {
+                if !param.sym.is_none() {
+                    clone_one_symbol(param.sym, current_owner, st, original, primitive, map);
+                }
+                collect_variant_symbols(param, st, current_owner, original, primitive, map);
+            }
+            collect_variant_symbols(rhs, st, current_owner, original, primitive, map);
+        }
+        TreeKind::Bind { body, .. } => {
+            if !tree.sym.is_none() {
+                clone_one_symbol(tree.sym, current_owner, st, original, primitive, map);
+            }
+            collect_variant_symbols(body, st, current_owner, original, primitive, map);
+        }
+        TreeKind::Block { stats, expr } => {
+            for stat in stats {
+                collect_variant_symbols(stat, st, current_owner, original, primitive, map);
+            }
+            collect_variant_symbols(expr, st, current_owner, original, primitive, map);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            collect_variant_symbols(cond, st, current_owner, original, primitive, map);
+            collect_variant_symbols(thenp, st, current_owner, original, primitive, map);
+            collect_variant_symbols(elsep, st, current_owner, original, primitive, map);
+        }
+        TreeKind::Match { selector, cases } => {
+            collect_variant_symbols(selector, st, current_owner, original, primitive, map);
+            for case_def in cases {
+                collect_variant_symbols(&case_def.pat, st, current_owner, original, primitive, map);
+                collect_variant_symbols(
+                    &case_def.guard,
+                    st,
+                    current_owner,
+                    original,
+                    primitive,
+                    map,
+                );
+                collect_variant_symbols(
+                    &case_def.body,
+                    st,
+                    current_owner,
+                    original,
+                    primitive,
+                    map,
+                );
+            }
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            collect_variant_symbols(lhs, st, current_owner, original, primitive, map);
+            collect_variant_symbols(rhs, st, current_owner, original, primitive, map);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            collect_variant_symbols(cond, st, current_owner, original, primitive, map);
+            collect_variant_symbols(body, st, current_owner, original, primitive, map);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } | TreeKind::New { tpt: expr } => {
+            collect_variant_symbols(expr, st, current_owner, original, primitive, map);
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            collect_variant_symbols(block, st, current_owner, original, primitive, map);
+            for case_def in catches {
+                collect_variant_symbols(&case_def.pat, st, current_owner, original, primitive, map);
+                collect_variant_symbols(
+                    &case_def.guard,
+                    st,
+                    current_owner,
+                    original,
+                    primitive,
+                    map,
+                );
+                collect_variant_symbols(
+                    &case_def.body,
+                    st,
+                    current_owner,
+                    original,
+                    primitive,
+                    map,
+                );
+            }
+            collect_variant_symbols(finalizer, st, current_owner, original, primitive, map);
+        }
+        TreeKind::Typed { expr, tpt } => {
+            collect_variant_symbols(expr, st, current_owner, original, primitive, map);
+            collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
+        }
+        TreeKind::TypeApply { fun, args } | TreeKind::Apply { fun, args } => {
+            collect_variant_symbols(fun, st, current_owner, original, primitive, map);
+            for arg in args {
+                collect_variant_symbols(arg, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::Import { expr, .. }
+        | TreeKind::Select { qual: expr, .. }
+        | TreeKind::SelectFromTypeTree { qual: expr, .. }
+        | TreeKind::Star { elem: expr }
+        | TreeKind::SingletonTypeTree { ref_: expr }
+        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => {
+            collect_variant_symbols(expr, st, current_owner, original, primitive, map)
+        }
+        TreeKind::UnApply { fun, args } => {
+            collect_variant_symbols(fun, st, current_owner, original, primitive, map);
+            for arg in args {
+                collect_variant_symbols(arg, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::Alternative { trees } => {
+            for child in trees {
+                collect_variant_symbols(child, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
+            for arg in args {
+                collect_variant_symbols(arg, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::CompoundTypeTree {
+            parents,
+            refinements,
+        } => {
+            for parent in parents {
+                collect_variant_symbols(parent, st, current_owner, original, primitive, map);
+            }
+            for refinement in refinements {
+                collect_variant_symbols(refinement, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::ExistentialTypeTree { tpt, clauses } => {
+            collect_variant_symbols(tpt, st, current_owner, original, primitive, map);
+            for clause in clauses {
+                collect_variant_symbols(clause, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::InterpolatedString { args, .. } => {
+            for arg in args {
+                collect_variant_symbols(arg, st, current_owner, original, primitive, map);
+            }
+        }
+        TreeKind::Empty
+        | TreeKind::Super { .. }
+        | TreeKind::This { .. }
+        | TreeKind::Ident { .. }
+        | TreeKind::Literal { .. }
+        | TreeKind::TypeDef { .. }
+        | TreeKind::MacroRhs { .. }
+        | TreeKind::Wildcard
+        | TreeKind::Unimplemented { .. } => {}
+    }
+}
+
+fn remap_tree_symbols(tree: &mut Tree, map: &FxHashMap<SymbolId, SymbolId>) {
+    if let Some(id) = map.get(&tree.sym) {
+        tree.sym = *id;
+    }
+    match &mut tree.kind {
+        TreeKind::PackageDef { pid, stats } => {
+            remap_tree_symbols(pid, map);
+            for stat in stats {
+                remap_tree_symbols(stat, map);
+            }
+        }
+        TreeKind::ClassDef {
+            tparams,
+            vparamss,
+            impl_,
+            ..
+        } => {
+            for tp in tparams {
+                remap_tree_symbols(tp, map);
+            }
+            for clause in vparamss {
+                for param in clause {
+                    remap_tree_symbols(param, map);
+                }
+            }
+            for parent in &mut impl_.parents {
+                remap_tree_symbols(parent, map);
+            }
+            for stat in &mut impl_.body {
+                remap_tree_symbols(stat, map);
+            }
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            for parent in &mut impl_.parents {
+                remap_tree_symbols(parent, map);
+            }
+            for stat in &mut impl_.body {
+                remap_tree_symbols(stat, map);
+            }
+        }
+        TreeKind::DefDef {
+            tparams,
+            vparamss,
+            tpt,
+            rhs,
+            ..
+        } => {
+            for tp in tparams {
+                remap_tree_symbols(tp, map);
+            }
+            for clause in vparamss {
+                for param in clause {
+                    remap_tree_symbols(param, map);
+                }
+            }
+            remap_tree_symbols(tpt, map);
+            remap_tree_symbols(rhs, map);
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => {
+            remap_tree_symbols(tpt, map);
+            remap_tree_symbols(rhs, map);
+        }
+        TreeKind::Block { stats, expr } => {
+            for stat in stats {
+                remap_tree_symbols(stat, map);
+            }
+            remap_tree_symbols(expr, map);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            remap_tree_symbols(cond, map);
+            remap_tree_symbols(thenp, map);
+            remap_tree_symbols(elsep, map);
+        }
+        TreeKind::Match { selector, cases } => {
+            remap_tree_symbols(selector, map);
+            for case_def in cases {
+                remap_tree_symbols(&mut case_def.pat, map);
+                remap_tree_symbols(&mut case_def.guard, map);
+                remap_tree_symbols(&mut case_def.body, map);
+            }
+        }
+        TreeKind::Function { vparams, body } => {
+            for param in vparams {
+                remap_tree_symbols(param, map);
+            }
+            remap_tree_symbols(body, map);
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            remap_tree_symbols(lhs, map);
+            remap_tree_symbols(rhs, map);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            remap_tree_symbols(cond, map);
+            remap_tree_symbols(body, map);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } | TreeKind::New { tpt: expr } => {
+            remap_tree_symbols(expr, map);
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            remap_tree_symbols(block, map);
+            for case_def in catches {
+                remap_tree_symbols(&mut case_def.pat, map);
+                remap_tree_symbols(&mut case_def.guard, map);
+                remap_tree_symbols(&mut case_def.body, map);
+            }
+            remap_tree_symbols(finalizer, map);
+        }
+        TreeKind::Typed { expr, tpt } => {
+            remap_tree_symbols(expr, map);
+            remap_tree_symbols(tpt, map);
+        }
+        TreeKind::TypeApply { fun, args } | TreeKind::Apply { fun, args } => {
+            remap_tree_symbols(fun, map);
+            for arg in args {
+                remap_tree_symbols(arg, map);
+            }
+        }
+        TreeKind::Import { expr, .. }
+        | TreeKind::Select { qual: expr, .. }
+        | TreeKind::SelectFromTypeTree { qual: expr, .. }
+        | TreeKind::Bind { body: expr, .. }
+        | TreeKind::Star { elem: expr }
+        | TreeKind::SingletonTypeTree { ref_: expr }
+        | TreeKind::AnnotatedTypeTree { tpt: expr, .. } => remap_tree_symbols(expr, map),
+        TreeKind::UnApply { fun, args } => {
+            remap_tree_symbols(fun, map);
+            for arg in args {
+                remap_tree_symbols(arg, map);
+            }
+        }
+        TreeKind::Alternative { trees } => {
+            for child in trees {
+                remap_tree_symbols(child, map);
+            }
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            remap_tree_symbols(tpt, map);
+            for arg in args {
+                remap_tree_symbols(arg, map);
+            }
+        }
+        TreeKind::CompoundTypeTree {
+            parents,
+            refinements,
+        } => {
+            for parent in parents {
+                remap_tree_symbols(parent, map);
+            }
+            for refinement in refinements {
+                remap_tree_symbols(refinement, map);
+            }
+        }
+        TreeKind::ExistentialTypeTree { tpt, clauses } => {
+            remap_tree_symbols(tpt, map);
+            for clause in clauses {
+                remap_tree_symbols(clause, map);
+            }
+        }
+        TreeKind::InterpolatedString { args, .. } => {
+            for arg in args {
+                remap_tree_symbols(arg, map);
+            }
+        }
+        TreeKind::LabelDef { params, rhs, .. } => {
+            for param in params {
+                remap_tree_symbols(param, map);
+            }
+            remap_tree_symbols(rhs, map);
+        }
+        TreeKind::Empty
+        | TreeKind::Super { .. }
+        | TreeKind::This { .. }
+        | TreeKind::Ident { .. }
+        | TreeKind::Literal { .. }
+        | TreeKind::TypeDef { .. }
+        | TreeKind::MacroRhs { .. }
+        | TreeKind::Wildcard
+        | TreeKind::Unimplemented { .. } => {}
+    }
 }
 
 fn eligible_owner(st: &SymbolTable, method: SymbolId) -> bool {
@@ -303,12 +840,7 @@ fn variant_for(st: &SymbolTable, original: SymbolId, ty: &Type) -> Option<Method
     st.method_variants.get(&original).and_then(|variants| {
         variants
             .iter()
-            .find(|variant| {
-                let Type::Method { paramss, ret } = &variant.ty else {
-                    return false;
-                };
-                paramss.iter().flatten().any(|param| param == ty) && **ret == *ty
-            })
+            .find(|variant| primitive_type(variant.selected) == *ty)
             .cloned()
     })
 }
