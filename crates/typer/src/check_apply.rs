@@ -1815,6 +1815,27 @@ impl Typer {
                         fun.sym = sym;
                         tree.sym = sym;
                         let own = (!sym.is_none()).then(|| self.st.get(sym).tparams.clone());
+                        // The inserted `apply` is a method like any other, and
+                        // its *own* type parameters are this call's to solve.
+                        // This branch used to hand the declaration's result
+                        // back raw, so `P.sequential(fta)` -- a parameterless
+                        // `def sequential: F ~> M` auto-applied, whose
+                        // `FunctionK.apply[A](fa: F[A]): G[A]` is reached only
+                        // here -- was `M[A]` with `A` still the declaration's
+                        // own parameter (cats `Parallel.scala`, 24 of its 39
+                        // errors read `found: M[A] required: M[T[A]]`).
+                        let mut param_tys = param_tys;
+                        let mut ret = ret;
+                        if own.as_deref().is_some_and(|t| !t.is_empty()) {
+                            self.instantiate_inserted_apply(
+                                fun,
+                                &mut param_tys,
+                                &mut ret,
+                                &arg_tys,
+                                pt,
+                                tree.span,
+                            );
+                        }
                         for (i, a) in args.iter_mut().enumerate() {
                             let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                             let open = self.open_tparams_of(&p, own.as_deref());
@@ -1828,6 +1849,22 @@ impl Typer {
                                     .unwrap_or_else(|| self.open_to_bounds(&p, &open));
                                 self.adapt(a, &p_check);
                             }
+                        }
+                        // A lambda argument had no type when the first pass
+                        // ran; now it has one, so a parameter the first pass
+                        // could not reach gets a second chance.
+                        if own.as_deref().is_some_and(|t| !t.is_empty())
+                            && mentions_tparam(&ret, own.as_deref().unwrap_or(&[]))
+                        {
+                            let now: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                            self.instantiate_inserted_apply(
+                                fun,
+                                &mut param_tys,
+                                &mut ret,
+                                &now,
+                                pt,
+                                tree.span,
+                            );
                         }
                         tree.ty = ret;
                         return;
@@ -2076,6 +2113,104 @@ impl Typer {
         self.rebuild_from_receiver(recv_root, declared)
     }
 
+    /// [`Self::rebuild_from_receiver`] for a member selected *without* an
+    /// argument list.
+    ///
+    /// `tail`, `init`, `reverse`, `distinct` are declared `C` and
+    /// `zipWithIndex` / `flatten` are declared `CC[B]`, exactly like the
+    /// members the application path already rebuilds -- but a parameterless
+    /// selection never reaches that path, and what the declaration says
+    /// depends on which class the pickle was asked about. `PickleSupply`
+    /// answers a completion by walking the *linearization* and substituting,
+    /// then installs the result on the class that was asked: once some
+    /// `aSeq.tail` has put `IterableOps.tail: C` on `immutable.Seq` as
+    /// `Seq[A]`, `aVector.tail` finds that by inheritance and is a `Seq[A]`.
+    /// Whether `xs.tail` on a `Vector` typed as a `Vector` therefore depended
+    /// on whether a `Seq` receiver appeared earlier in the run -- cats'
+    /// `NonEmptySeq`, `NonEmptyLazyList`, `stream.scala` and `arraySeq.scala`
+    /// all read `found: Iterable[A] required: LazyList[A]` and friends for
+    /// this reason, and a one-line file with the two selections in the other
+    /// order compiled.
+    ///
+    /// Same gates as the application path: only a `scala/collection/` class,
+    /// only a real subclass of what the declaration named, and `SeqView` keeps
+    /// the `View` results it really declares.
+    pub(crate) fn rebuild_parameterless_collection(
+        &self,
+        sym: SymbolId,
+        name: &str,
+        recv_ty: &Type,
+        ty: &mut Type,
+    ) {
+        // `zipWithIndex` and `flatten` widen the element type (`CC[B]`), which
+        // a sorted collection cannot rebuild without an `Ordering`.
+        let widens = matches!(name, "zipWithIndex" | "flatten");
+        if !widens && !crate::check::returns_receiver_collection(name) {
+            return;
+        }
+        // `flatten` is `(implicit asIterable: A => IterableOnce[B]): CC[B]`, so
+        // what the selection carries is a method type whose only clause is
+        // implicit. Rebuilding its *result* is the same answer the value gets
+        // once the witness is filled in, and no other clause shape is touched:
+        // a member that really takes arguments is the application path's.
+        let inner = match ty {
+            Type::Class { .. } => ty,
+            Type::Method { ret, .. }
+                if !sym.is_none()
+                    && self.only_implicit_clauses(sym)
+                    && matches!(**ret, Type::Class { .. }) =>
+            {
+                ret.as_mut()
+            }
+            _ => return,
+        };
+        let Some(r) = self.receiver_collection_root(Some(recv_ty)) else {
+            return;
+        };
+        // A *view* is the one collection whose `C` is not itself:
+        // `trait SeqView[+A] extends SeqOps[A, View, View[A]] with View[A]`,
+        // and `javap scala.collection.SeqView` lists the fifteen members it
+        // really does override to return a `SeqView` -- `tail`, `init` and
+        // `distinct` are not among them. Narrowing `ls.view.tail` to a
+        // `SeqView` compiled and then threw `ClassCastException` on the
+        // `scala.collection.View$Drop` the call really returns
+        // (`test/files/run/t4332b.scala`). The application path's
+        // `declares_view_result` list is not enough here: it holds only the
+        // members that take an argument, which is all it ever sees.
+        if self.is_view_class(r) {
+            return;
+        }
+        let rebuilt = if widens {
+            self.rebuild_widened(r, inner)
+        } else {
+            self.rebuild_from_receiver(r, inner)
+        };
+        if let Some(t) = rebuilt {
+            *inner = t;
+        }
+    }
+
+    /// Whether `cls` is `scala.collection.View` or one of its subclasses.
+    ///
+    /// Every view's `C` and `CC` are `View[A]` / `View`, whatever the view's
+    /// own class is, so the `BuildFrom` rebuild must not touch one.
+    fn is_view_class(&self, cls: SymbolId) -> bool {
+        let Some(view) = crate::classpath::find_by_jvm(&self.st, "scala/collection/View") else {
+            return self.st.get(cls).jvm_name.ends_with("View");
+        };
+        cls == view
+            || self
+                .base_type_instance(
+                    &Type::Class {
+                        sym: cls,
+                        args: vec![],
+                    },
+                    view,
+                    0,
+                )
+                .is_some()
+    }
+
     /// The receiver's own collection class, for the `BuildFrom` rebuild.
     fn receiver_collection_root(&self, recv_ty: Option<&Type>) -> Option<SymbolId> {
         recv_ty
@@ -2282,6 +2417,60 @@ impl Typer {
             .into_iter()
             .find(|id| self.st.get(*id).kind == crate::symbol::SymKind::Class)
             .unwrap_or(SymbolId::NONE)
+    }
+
+    /// Solve the type parameters of an `apply` that was inserted on a
+    /// parameterless result (`insert_apply_on_nullary`), and rewrite the
+    /// parameter types and the result to the solution.
+    ///
+    /// The main application path does this at the point it picks an
+    /// alternative; the inserted-`apply` retry never did, so a generic `apply`
+    /// reached only that way handed its declaration's own type parameters back
+    /// as the call's type. That is the whole of `cats.Parallel`'s
+    /// `P.sequential(fta)` / `P.parallel(f(a))`: `F ~> M` is a *value*, so the
+    /// `FunctionK.apply[A](fa: F[A]): G[A]` behind it is auto-applied here.
+    ///
+    /// Only what the arguments (and then the expected type) actually pin is
+    /// substituted -- a parameter nothing decides is left standing, exactly as
+    /// the main path leaves it, so nothing that used to typecheck by staying
+    /// abstract stops doing so.
+    pub(crate) fn instantiate_inserted_apply(
+        &mut self,
+        fun: &Tree,
+        param_tys: &mut Vec<Type>,
+        ret: &mut Type,
+        arg_tys: &[Type],
+        pt: &Type,
+        span: scala_rs_span::Span,
+    ) {
+        let sym = fun.sym;
+        let recv = match &fun.kind {
+            TreeKind::Select { qual, .. } => Some(&qual.ty),
+            _ => None,
+        };
+        // Bounds belong to the inserted apply's receiver, not the original
+        // parameterless method's receiver. Infer lower bounds at that type
+        // and validate both bounds before substituting the solution: adapting
+        // to already substituted parameters cannot catch an invalid solution.
+        let inst = self.infer_method_tparams_in(sym, param_tys, arg_tys, recv);
+        // A function literal is still a placeholder here; taking it for a
+        // solution would hide the expected type from the lambda.
+        let inst: Vec<(SymbolId, Type)> = inst
+            .into_iter()
+            .filter(|(_, t)| !mentions_no_type(t) && !t.is_error() && !t.is_no_type())
+            .collect();
+        let inst = self.add_expected_constraints(sym, ret, pt, inst);
+        self.check_tparam_bounds(sym, &inst, recv, span, true);
+        if inst.is_empty() {
+            return;
+        }
+        let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
+        let args_t: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        *param_tys = param_tys
+            .iter()
+            .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
+            .collect();
+        *ret = crate::symbol::subst_tparams_slice(&tps, &args_t, ret);
     }
 
     /// Least upper bound, with the numeric widenings nsc applies before lubbing

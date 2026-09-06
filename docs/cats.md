@@ -1157,3 +1157,177 @@ argument never reaches the placeholder. Separately, `ArraySeq(1, 2, 3)` and
 `Stream(1, 2, 3)` do not resolve (`no matching overload for (Seq, Any)AnyRef`
 / `for Stream$`); the fixture builds those with `ArraySeq.unsafeWrapArray` and
 `Stream.range` instead.
+
+## Five roots in the flat tail (`agent/catstail3`)
+
+**124 errors, from 474 to 350.** `tests/cats_measure.sh` goes from **474
+errors / 88 files** to **350 / 81**. `Parallel.scala` 39 → 6,
+`NTupleMonadInstances.scala` 21 → 11, `NonEmptySeq.scala` 15 → 7,
+`NonEmptyVector.scala` 14 → 7, `NonEmptyLazyList.scala` 18 → 11,
+`InjectK.scala` 3 → 0, `stream.scala` 12 → 7, `Chain.scala` 13 → 7, and
+sixteen smaller files improve. No file gets worse. `scalalib_measure.sh`
+drops 1647 → 1625 alongside; slick and gitbucket are unchanged.
+
+The tail was flat -- the largest symptom was 15 -- so the work was to
+re-bundle it by cause. Five roots covered fourteen of the listed symptoms, and
+none of the bundles the wave's brief proposed survived contact: the
+`NonEmptyParallel.F[A]` mismatches and the `M[A]` ones are the same root as
+each other but have nothing to do with the `FlatMapTupleN` self-type, and the
+four `Iterable[…]` / `SortedMap` / `Iterator` mismatches split two ways.
+
+### An inserted `apply` never had its own type parameters solved
+
+`cats.Parallel` reaches `FunctionK.apply[A](fa: F[A]): G[A]` through a
+*value*:
+
+```scala
+trait NonEmptyParallel[M[_]] {
+  type F[_]
+  def sequential: F ~> M
+  def parallel: M ~> F
+}
+…
+val fta: P.F[T[A]] = Traverse[T].traverse(ta)(f.andThen(P.parallel.apply))(P.applicative)
+P.sequential(fta)
+```
+
+`P.sequential` is a parameterless `def`, so the application path cannot
+resolve a one-argument call against it, `insert_apply_on_nullary` rewrites the
+callee to `sequential.apply`, and resolution is retried. That retry adapted the
+arguments and then set the call's type to the alternative's *declared* result
+-- no inference at all. `P.sequential(fta)` was therefore `M[A]` with `A` still
+`apply`'s own type parameter, which is every `found: M[A] required: M[T[A]]`
+and every `found: NonEmptyParallel.F[A] required: NonEmptyParallel.F[T[A]]` in
+the file. `Typer::instantiate_inserted_apply` runs the same inference the main
+path runs, twice: once before the arguments are typed, and once after, because
+a function literal has no type on the first pass.
+
+Thirteen lines reproduce it, and the abstract type member is essential -- with
+`F` and `G` plain type parameters of the enclosing method the same call always
+worked, because then the *receiver* is not a parameterless def.
+
+### A parameterless collection member kept whichever `C` was asked for first
+
+`tail` and `init` are declared `C`; `zipWithIndex` and `flatten` are `CC[B]`.
+`check_apply` already rebuilds those around the receiver's own class
+(`returns_receiver_collection` → `rebuild_from_receiver`), because neither the
+prelude nor a pickle can spell `C`. A selection with **no argument list** never
+reached that path.
+
+That would have been harmless if member completion answered per receiver, but
+it does not: `PickleSupply::complete` walks the queried class's linearization,
+substitutes each step, and installs the result **on the class it was asked
+about**. So the first `aSeq.tail` in a run puts `IterableOps.tail: C` on
+`scala.collection.immutable.Seq` as `Seq[A]`, and every later `aVector.tail`
+finds *that* by inheritance. The two-line file
+
+```scala
+def a[A](xs: Seq[A]): Seq[A] = xs.tail
+def b[A](xs: Vector[A]): Vector[A] = xs.tail   // found: Seq[A]
+```
+
+fails, and compiles with the two lines swapped. This is the same hazard
+`supply_receiver_override` documents for `Map#collect`, and its guard cannot
+catch this case: it compares *erased parameters* only, deliberately, so two
+nullary methods always look alike.
+
+`Typer::rebuild_parameterless_collection` applies the existing rebuild on the
+selection path under the same gates -- a `scala/collection/` class, a real
+subclass of what the declaration named, `SeqView` exempt, and the widening
+members refused for a sorted collection that would need an `Ordering`. For
+`flatten`, whose only clause is implicit, it rebuilds the method type's result.
+
+The `SortedMap`/`SortedSet` mismatches in `instances/sortedMap.scala` (9) are
+*not* this: they are `needs_ordering_to_rebuild` declining on purpose, and
+closing them means selecting `SortedMapOps`' own overload.
+
+### cats' `compose` tower is overloading, not overriding
+
+```scala
+trait Functor[F[_]] extends Invariant[F] { def compose[G[_]: Functor]: Functor[λ[α => F[G[α]]]] = … }
+trait Apply[F[_]] extends Functor[F]     { def compose[G[_]: Apply]:   Apply[λ[α => F[G[α]]]]   = … }
+```
+
+No `override` on either, and scalac is right to accept it: the implicit
+parameter's type is different, and parameter types are invariant under
+overriding, so these are two alternatives. `override_check`'s `same_type`
+answers "same" for anything `robust` refuses to compare, and `robust` refuses
+every type mentioning a type parameter -- so all nine of these (`Applicative`,
+`Apply`, `Bitraverse`, `Contravariant`, `Distributive`, `Functor`,
+`NonEmptyTraverse`, `Reducible`, `Traverse`) were "`override` modifier
+required".
+
+`definitely_different` settles the cases that need no argument at all: `C[X]`
+and `D[X]` are the same type only if `C` and `D` are the same class, and one
+being a **strict** subclass of the other says they are not. Strictness is what
+rules out the duplicate symbols one class file read twice leaves behind -- two
+readings of one class are mutual subtypes, and this says nothing about them.
+
+### A constructor field and its accessor were two alternatives
+
+`javap scala.Tuple1` shows both `public final T1 _1;` and `public T1 _1();`,
+and `prelude_tuple` faithfully declares both for `Tuple1` and
+`Tuple3`..`Tuple22`. Both were selection candidates, so `ff._1` came back as
+`<overload (A) => B | (A) => B>`. Where the component is not a function that
+survives -- `(1, 2, 3)._1` is fine -- but an application of the overload finds
+no alternative at all, because `resolve_overload_with`'s `Type::Overload` arm
+only collects `Type::Method` alternatives. cats' generated
+`NTupleMonadInstances.scala` writes `ff._1(fa._1)` once per `FlatMapTupleN`:
+ten reports. `Tuple2`, whose prelude declaration (in `prelude.rs`, not
+`prelude_tuple.rs`) has the field alone, was never affected.
+
+In Scala source the name is always the accessor -- nsc makes the field
+`private[this]` -- so `drop_field_behind_accessor`, inside `drop_overridden`,
+drops a `ctor_fields` symbol when the same owner also declares a nullary
+method of that name and result type.
+
+### Branches that each leave the *other* type parameter open
+
+```scala
+val lastIor = f(reversed.head) match {
+  case Right(c) => Ior.right(NonEmptyList.one(c))   // Ior[?A, NEL[C]]
+  case Left(b)  => Ior.left(NonEmptyList.one(b))    // Ior[NEL[B], ?B]
+}
+```
+
+`lub_branches` closes each side's undetermined variables only to ask whether
+the *other* side is then the join; here neither is, so both closings were
+discarded and the ordinary walk joined an open variable against a real type in
+both positions -- `Ior[AnyRef, AnyRef]`. Every later use of `lastIor` read
+`value :: is not a member of AnyRef`, which is what
+[`agent/catstail`](#the-collection-cons-operators-and-extractors-agentcatstail)
+guessed was lambda *parameter* inference. It is not; it is the value's own
+type. `NonEmptyList`, `NonEmptySeq` and `NonEmptyVector` have the same three
+lines.
+
+nsc minimises a variable with no upper constraint to its lower bound before
+joining (`solvedTypes`), which is what `minimize_undet` already does on the
+argument path. The minimised join is now taken when it **conforms to** the one
+the ordinary walk found -- only ever a tighter upper bound, never a wider one.
+
+`tests/fixtures/c3_parallel.scala` runs all five, byte-identical to real
+scalac 2.13.16's output; `c3_parallel_bad.scala` and `c3_override_bad.scala`
+pin the four rejections that must survive. Tests in
+`crates/cli/tests/catstail3.rs`.
+
+**Still the largest groups after this** (`EitherT` 25, `IorT` 23,
+`NTupleMonadInstances` 11, `OptionT` 16, `Kleisli` 14): the monad-transformer
+remainder the `agent/monadtrans` slice named as separate roots, plus the
+kind-projector type lambda that is never beta-reduced (`[A0, β](A0, β)[A0,
+Any]` has no `.copy`).
+
+
+### 検証で見つかった inserted `apply` の型境界漏れ
+
+既存スライスの検証時、推論した型引数を代入する前の境界検証が抜けていることを
+実行で確認した。`def upper: UpperApply` に続く `upper("wrong")` は、
+`UpperApply.apply[A <: Number]` に違反していても受理されていた。
+`OwnerApply[T].apply[A <: T]` と、不変な `Box[A]` を受け取る
+`LowerApply[T].apply[A >: T]` でも同じく誤受理した。3 呼出しを含むソースを
+scala-rs は 6 classfiles にコンパイルし、scalac 2.13.16 は拒否した。
+
+挿入した `apply` のレシーバ型を通常の推論と同じ
+`infer_method_tparams_in` に渡し、`check_tparam_bounds` で上限・下限を確認して
+から型を代入する。元の引数なしメソッドのレシーバでは境界の `T` が異なるため、
+新しい `Select` のレシーバを使う。`c3_bounds_bad.scala` はこの 3 呼出しの拒否、
+`c3_parallel.scala` は境界に収まる呼出しの出力を実 scalac と比較する。
