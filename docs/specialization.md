@@ -1,8 +1,12 @@
 # `@specialized`
 
-**Status: stage 1 is done, stage 2 is not.** The annotation is accepted and
-what it selects is recorded on the type parameter's symbol; no `Foo$mcI$sp`
-class is emitted. `tests/spec_classfiles.sh` is the ledger for the difference.
+**Status: method-owned Int/Long specialization is implemented; class-owned
+specialization remains incomplete.** One method-owned type parameter is
+specialized for object methods and final/private class methods, with primitive
+entry points and call selection. Local classes, constructors and type symbols
+are cloned for each entry. See [the implementation plan](specialization-plan.md)
+for the current boundary and tests. No `Foo$mcI$sp` class is emitted on main;
+`tests/spec_classfiles.sh` still records the class-specialization gap.
 
 This used to be the single largest cluster of corpus failures attributable to
 one missing feature: **107 tests** (70 `pos`, 37 `run` — measured later as 111:

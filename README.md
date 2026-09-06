@@ -246,9 +246,10 @@ Slick の逆方向テスト（MODE=a）はまだ通っていません。
   レシーバの型で具体化した上限・下限を検証します（`catstail3` の実行・拒否テスト）。
 - [docs/scala-library.md](docs/scala-library.md) — compiling scala/scala's own
   `src/library` from source: the numbers, and the one root behind them.
-- [docs/specialization.md](docs/specialization.md) — `@specialized`: the
-  annotation is accepted and recorded, the phase that emits `Foo$mcI$sp` is
-  not. `tests/spec_classfiles.sh` measures the gap against real scalac.
+- [docs/specialization.md](docs/specialization.md) — `@specialized` はメソッドが
+  所有する1型引数の Int/Long 特殊化を実装しています（object・final・private
+  メソッド）。クラス特殊化は未完了です。`tests/spec_classfiles.sh` で
+  scalac との差を引き続き計測します。
 - [docs/notes/](docs/notes/README.md) — development notes: the investigations
   and the reasoning behind individual changes.
 

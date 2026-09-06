@@ -110,9 +110,9 @@ OPTIONS:
                         every feature. `-Xsource-features:help` lists them;
                         `case-apply-copy-access` is the one implemented here.
     -no-specialization  Ignore `@specialized` / `@unspecialized` (nsc's flag of
-                        the same name). Without it they are diagnosed: there is
-                        no specialisation phase here, so the emitted class would
-                        silently lack the `$mc*$sp` members callers link against.
+                        the same name). Without it the implemented method-owned
+                        Int/Long entries are emitted; class/trait entries remain
+                        outside this phase.
     -Ykind-projector    Accept the kind-projector plugin's type-lambda syntax:
                         the `*` placeholder (`Either[E, *]`, `(A, *)`, `A => *`)
                         and `λ[α => F[α]]` / `Lambda[(A, B) => F[B, A]]`. NOT an

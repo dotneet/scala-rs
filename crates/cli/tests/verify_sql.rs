@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn bin() -> PathBuf {
@@ -14,11 +15,16 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn tmp_dir() -> PathBuf {
+    static NEXT_TMP_DIR: AtomicU64 = AtomicU64::new(0);
+    let slot = NEXT_TMP_DIR.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("scala-rs-vsql-{nanos}-{}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "scala-rs-vsql-{nanos}-{}-{slot}",
+        std::process::id()
+    ))
 }
 
 fn run_java(out: &Path) -> String {

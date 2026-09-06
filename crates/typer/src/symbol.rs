@@ -1,6 +1,6 @@
 //! Symbols, scopes, and the compilation context.
 
-use scala_rs_parser::{Flags, RefineDecl, SymbolId, Type};
+use scala_rs_parser::{Flags, RefineDecl, SpecializedType, SpecializedTypes, SymbolId, Type};
 
 /// Decl name that marks a refinement as the as-seen-from view of a type
 /// projection rather than something the program wrote. Not a legal Scala
@@ -405,11 +405,9 @@ pub struct Symbol {
     /// no `@specialized`, and `Some(empty)` when it carries one that names
     /// nothing specializable.
     ///
-    /// Recording it is stage 1 of specialization: nothing yet *uses* it, since
-    /// nsc's `specialize` phase runs after the typer and the typer applies no
-    /// rule that depends on the annotation. What is still missing is the
-    /// phase itself — no `Foo$mcI$sp` is emitted — and
-    /// `tests/spec_classfiles.sh` measures exactly that gap.
+    /// Recording it is the typer half of specialization. The post-pickler
+    /// method slice consumes one method-owned parameter and emits Int/Long
+    /// entries; class and trait entries remain for a later phase.
     pub specialized: Option<scala_rs_parser::SpecializedTypes>,
     /// `@unspecialized` on a member: nsc's opt-out from the specialization its
     /// owner would otherwise give it. Recorded for the same reason, and with
@@ -442,6 +440,22 @@ pub struct Symbol {
     /// ground truth about which members actually have an accessor: a
     /// `private[this] val` has none and keeps the direct field read.
     pub via_accessor: bool,
+}
+
+/// One method-owned specialization entry created after pickling.
+///
+/// The generic method remains the source-level declaration and the source
+/// pickle.  This record names the additional JVM entry and the primitive that
+/// its cloned body uses; synthetic entries are deliberately created after the
+/// pickle snapshot so they cannot become Scala declarations accidentally.
+#[derive(Clone, Debug)]
+pub struct MethodVariant {
+    pub original: SymbolId,
+    pub symbol: SymbolId,
+    pub type_param: SymbolId,
+    pub selected: SpecializedType,
+    pub ty: Type,
+    pub jvm_name: String,
 }
 
 impl Symbol {
@@ -699,6 +713,8 @@ pub struct SymbolTable {
     /// into a single parameter list. It runs once per compilation unit and
     /// only ever appends, so each pass starts here instead of at 0.
     pub(crate) flattened_upto: usize,
+    /// Method-owned primitive variants produced after the source pickle.
+    pub method_variants: rustc_hash::FxHashMap<SymbolId, Vec<MethodVariant>>,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -811,6 +827,7 @@ impl SymbolTable {
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
             flattened_upto: 0,
+            method_variants: rustc_hash::FxHashMap::default(),
         };
         st.root = st.alloc(
             "<_root_>",
@@ -903,6 +920,56 @@ impl SymbolTable {
                 self.get_mut(id).unspecialized = true;
             }
         }
+    }
+
+    /// The method-owned selections that the first post-pickle specializer can
+    /// actually emit.  Pickling runs before `specialize_method_defs`, so the
+    /// writer cannot consult `method_variants`; it must use the same stable
+    /// eligibility boundary here instead.  Returning `None` suppresses both
+    /// the annotation and nsc's SPECIALIZED bit, leaving a generic fallback
+    /// declaration with no promise of a missing JVM entry.
+    pub fn method_specialization_for_pickle(
+        &self,
+        type_param: SymbolId,
+    ) -> Option<scala_rs_parser::SpecializedTypes> {
+        let selected = self.get(type_param).specialized?;
+        let method_id = self.get(type_param).owner;
+        let method = self.get(method_id);
+        if method.kind != SymKind::Method
+            || method.unspecialized
+            || method.flags.contains(Flags::ABSTRACT)
+            || method.flags.contains(Flags::NATIVE)
+            || method.tparams.len() != 1
+        {
+            return None;
+        }
+        let owner = self.get(method.owner);
+        let eligible_owner = matches!(owner.kind, SymKind::ModuleClass)
+            || owner.flags.contains(Flags::FINAL)
+            || method.flags.contains(Flags::PRIVATE)
+            || method.flags.contains(Flags::FINAL);
+        if !eligible_owner {
+            return None;
+        }
+        let lower = self
+            .get(type_param)
+            .bound_lo
+            .clone()
+            .unwrap_or(Type::Nothing);
+        let upper = self.get(type_param).bound_hi.clone().unwrap_or(Type::Any);
+        let supported: Vec<_> = selected
+            .iter()
+            .filter(|ty| matches!(ty, SpecializedType::Int | SpecializedType::Long))
+            .filter(|ty| {
+                let primitive = match ty {
+                    SpecializedType::Int => Type::Int,
+                    SpecializedType::Long => Type::Long,
+                    _ => unreachable!("the method slice filters Int and Long first"),
+                };
+                self.is_sub_type(&lower, &primitive) && self.is_sub_type(&primitive, &upper)
+            })
+            .collect();
+        (!supported.is_empty()).then(|| SpecializedTypes::of(&supported))
     }
 
     pub fn enter_in_current(&mut self, name: &str, id: SymbolId) {
