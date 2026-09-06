@@ -1,0 +1,1 @@
+class X { def f(n: Any) = "mono"; def f[A](n: A) = "poly" }; object Main extends App { println(new X().f(1)) }

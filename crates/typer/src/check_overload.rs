@@ -161,6 +161,36 @@ impl Typer {
         !fun.ty.is_error() && !fun.ty.is_no_type()
     }
 
+    /// An overloaded module member competes through its apply methods. Once
+    /// one wins, preserve the original receiver in `receiver.module.apply`.
+    pub(crate) fn select_overloaded_module_apply(&mut self, fun: &mut Tree, chosen: SymbolId) {
+        if chosen.is_none() || !matches!(fun.ty, Type::Overload(_)) {
+            return;
+        }
+        let Some(alts) = self.overload_member_types.get(&fun.sym.0) else {
+            return;
+        };
+        let module = alts.iter().find_map(|(sym, ty)| {
+            if let Type::ModuleRef(owner) = ty {
+                if self.st.lookup_member(*owner, "apply").contains(&chosen) {
+                    return Some((*sym, ty.clone()));
+                }
+            }
+            None
+        });
+        if let Some((sym, ty)) = module {
+            let mut inner = fun.clone();
+            inner.sym = sym;
+            inner.ty = ty;
+            fun.kind = TreeKind::Select {
+                qual: Box::new(inner),
+                name: "apply".into(),
+            };
+            fun.sym = chosen;
+            fun.ty = self.st.get(chosen).ty.clone();
+        }
+    }
+
     /// Make sure a value used as a function has whatever `apply` its pickle
     /// declares before overloads are weighed.
     ///
@@ -173,6 +203,12 @@ impl Typer {
         // A parameterless accessor can return a module just as it can
         // return an ordinary class instance. Both need their apply members
         // completed before insert_apply_on_nullary decides whether to select.
+        if let Type::Overload(alts) = fun_ty {
+            for alt in alts {
+                self.ensure_apply_supplied(alt);
+            }
+            return;
+        }
         if !matches!(fun_ty, Type::Class { .. } | Type::ModuleRef(_)) {
             return;
         }
@@ -210,6 +246,7 @@ impl Typer {
         supplied: Option<&Vec<(SymbolId, Type)>>,
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
+        let mut module_apply_candidates = Vec::new();
         // Which parameter clause these candidates come from: `f(a)(b = 1)`
         // applied as `f(1)()` leaves a residual method type whose only clause
         // is the *second* one, and that is where the defaults live.
@@ -280,6 +317,22 @@ impl Typer {
                                 paramss.first().cloned().unwrap_or_default(),
                                 (**ret).clone(),
                             ));
+                        }
+                        if let Type::ModuleRef(module) = ty {
+                            for apply in
+                                self.drop_overridden(self.st.lookup_member(*module, "apply"))
+                            {
+                                let apply_ty =
+                                    self.st.subst_as_seen_from(ty, &self.st.get(apply).ty);
+                                if let Type::Method { paramss, ret } = apply_ty {
+                                    module_apply_candidates.push(apply);
+                                    cands.push((
+                                        apply,
+                                        paramss.first().cloned().unwrap_or_default(),
+                                        *ret,
+                                    ));
+                                }
+                            }
                         }
                     }
                     if cands.is_empty() {
@@ -414,7 +467,12 @@ impl Typer {
                 // its package object both carry `math.max`. Identical
                 // signatures are one alternative, not an ambiguity.
                 let mut winners = winners;
-                winners.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
+                winners.dedup_by(|a, b| {
+                    module_apply_candidates.contains(&a.0) == module_apply_candidates.contains(&b.0)
+                        && self.st.get(a.0).name == self.st.get(b.0).name
+                        && a.1 == b.1
+                        && a.2 == b.2
+                });
                 // The same test again, but blind to *which* symbols a
                 // candidate's own type parameters are. `mutable.HashMap`
                 // reaches `getOrElse[V1 >: V](K, => V1): V1` twice -- once as
@@ -430,12 +488,16 @@ impl Typer {
                         .iter()
                         .map(|(s, ps, r)| self.canonical_sig(*s, ps, r))
                         .collect();
-                    let mut seen: Vec<Vec<Type>> = Vec::new();
+                    let mut seen = Vec::new();
                     let mut i = 0;
-                    winners.retain(|_| {
-                        let k = &keyed[i];
+                    winners.retain(|(sym, _, _)| {
+                        let k = (
+                            module_apply_candidates.contains(sym),
+                            self.st.get(*sym).name.clone(),
+                            keyed[i].clone(),
+                        );
                         i += 1;
-                        if seen.contains(k) {
+                        if seen.contains(&k) {
                             false
                         } else {
                             seen.push(k.clone());
@@ -497,26 +559,34 @@ impl Typer {
                         winners = from_jar;
                     }
                 }
-                // A tie between a monomorphic alternative and a polymorphic
-                // one goes to the monomorphic one.
-                //
-                // `Set() ++ o` is the case: the receiver's element type is
-                // still undetermined, so `SetOps.++(IterableOnce[?A])` and
-                // `IterableOps.++[B](IterableOnce[B])` each accept the other's
-                // parameter -- `?A` can be `B`, and `B` can be `?A`. nsc picks
-                // the monomorphic one (`-Xprint:typer` shows `.++(o)`, with no
-                // type argument), and it is the more specific reading: it
-                // takes the receiver's own element type rather than inventing
-                // a variable. Only at the tie; a call the rules above settle
-                // is not touched.
+                // Applicability can solve receiver variables while comparing
+                // signatures. Break that tie only when the monomorphic domain
+                // is strictly narrower than each rigid polymorphic domain.
+                // Equal domains (for example `1` and `A <: 1`) stay ambiguous.
                 if winners.len() > 1 {
-                    let arity = winners[0].1.len();
-                    let mono: Vec<(SymbolId, Vec<Type>, Type)> = winners
+                    let mono: Vec<_> = winners
                         .iter()
                         .filter(|a| !a.0.is_none() && self.st.get(a.0).tparams.is_empty())
                         .cloned()
                         .collect();
-                    if mono.len() == 1 && winners.iter().all(|w| w.1.len() == arity) {
+                    if mono.len() == 1
+                        && winners.iter().all(|b| {
+                            if b.0 == mono[0].0 {
+                                return true;
+                            }
+                            let rigid = self.rigidify_own_tparams(b.0, &b.1);
+                            mono[0].1.len() == rigid.len()
+                                && mono[0]
+                                    .1
+                                    .iter()
+                                    .zip(&rigid)
+                                    .all(|(a, b)| self.st.is_sub_type(a, b))
+                                && !rigid
+                                    .iter()
+                                    .zip(&mono[0].1)
+                                    .all(|(b, a)| self.st.is_sub_type(b, a))
+                        })
+                    {
                         winners = mono;
                     }
                 }
@@ -554,6 +624,25 @@ impl Typer {
             .collect()
     }
 
+    /// Complete declaring owners preserved by synthetic inherited overloads.
+    /// Their installation owner is a lookup location, not their specificity owner.
+    pub(crate) fn complete_overload_owners(&mut self, fun: &Tree) {
+        if fun.sym.is_none() || !matches!(fun.ty, Type::Overload(_)) {
+            return;
+        }
+        let name = self.st.get(fun.sym).name.clone();
+        let owners: Vec<_> = self
+            .overload_alternatives(fun.sym, &name)
+            .into_iter()
+            .map(|m| self.st.get(m).declaring_class.clone())
+            .filter(|owner| !owner.is_empty())
+            .collect();
+        for owner in owners {
+            let cls = crate::classpath::find_or_stub_java_class(&mut self.st, &owner);
+            self.ensure_java_loaded(cls, fun.span);
+        }
+    }
+
     /// nsc's `isInProperSubClassOf`: `a`'s owner is a class, `b`'s owner is a
     /// different class, and the first is a subclass of the second. Only real
     /// classes count -- two alternatives owned by the same class, or by
@@ -562,8 +651,12 @@ impl Typer {
         if a.is_none() || b.is_none() {
             return false;
         }
-        let ao = self.st.get(a).owner;
-        let bo = self.st.get(b).owner;
+        let declaration_owner = |m: SymbolId| {
+            let symbol = self.st.get(m);
+            crate::classpath::find_by_jvm(&self.st, &symbol.declaring_class).unwrap_or(symbol.owner)
+        };
+        let ao = declaration_owner(a);
+        let bo = declaration_owner(b);
         if ao.is_none() || bo.is_none() || ao == bo {
             return false;
         }

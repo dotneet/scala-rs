@@ -634,6 +634,7 @@ impl Typer {
         }
         let fun_ty = fun.ty.clone();
         self.ensure_apply_supplied(&fun_ty);
+        self.complete_overload_owners(fun);
         // Before the alternatives are weighed, not only after they all fail:
         // a call that *resolves* still has to solve its type parameters from
         // the arguments' base types, and an argument whose class was never
@@ -682,6 +683,7 @@ impl Typer {
                     // overwrites. Keep it: it is the key to the alternatives as
                     // seen from this receiver.
                     let group_key = fun.sym;
+                    self.select_overloaded_module_apply(fun, sym);
                     if !sym.is_none() {
                         fun.sym = sym;
                         tree.sym = sym;
@@ -1547,7 +1549,32 @@ impl Typer {
                                 crate::prelude_viewc::declares_view_result(&method_name)
                                     && self.st.get(r).jvm_name == "scala/collection/SeqView";
                             if !keeps_view {
-                                if let Some(t) = self.rebuild_from_receiver(r, &ret) {
+                                let widened_concat =
+                                    matches!(method_name.as_str(), "++" | "$plus$plus")
+                                        && !sym.is_none()
+                                        && !self.st.get(sym).tparams.is_empty();
+                                // A map can widen its values while preserving
+                                // the key type and its existing Ordering[K].
+                                let preserves_keys = match (
+                                    recv_ty
+                                        .as_ref()
+                                        .and_then(|recv| self.base_type_instance(recv, r, 0)),
+                                    &ret,
+                                ) {
+                                    (
+                                        Some(Type::Class { args: keys, .. }),
+                                        Type::Class { args: result, .. },
+                                    ) if keys.len() == 2 && result.len() == 2 => {
+                                        keys[0] == result[0]
+                                    }
+                                    _ => false,
+                                };
+                                let rebuilt = if widened_concat && !preserves_keys {
+                                    self.rebuild_widened(r, &ret)
+                                } else {
+                                    self.rebuild_from_receiver(r, &ret)
+                                };
+                                if let Some(t) = rebuilt {
                                     ret = t;
                                 }
                             }

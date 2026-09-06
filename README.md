@@ -35,6 +35,11 @@ makes no claim of conformance to the language specification. What exists today:
 外部 trait の `hashCode` / `toString` と組み込み `Any` の上書き関係も、
 [scalac 相互運用テスト](docs/notes/inherited-universal-override.md) で検査します。
 
+同名メソッドと object の `apply` は両方をオーバーロード候補として比較します。
+単一候補の呼び出し結果と曖昧な呼び出しの拒否は、`overload_module` テストで
+scalac 2.13.16 と比較します。集合の結合も含む
+[修正範囲と検証方法](docs/notes/overload-module-and-set.md) を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
