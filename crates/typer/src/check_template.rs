@@ -373,6 +373,7 @@ impl Typer {
                 }
             }
         }
+        self.check_inheritance_cycle(id, parents, tree_span);
         self.check_mixin_superclasses(id, parents, tree_span);
         self.link_case_product(id);
         self.register_sealed_child(id);
@@ -656,6 +657,7 @@ impl Typer {
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;
         }
+        self.check_inheritance_cycle(cls, parents, mod_span);
         self.check_mixin_superclasses(cls, parents, mod_span);
         // A `case object`'s module class is a `Product` too; a case class's
         // companion is not, and `wants_product` tells them apart by the `CASE`
@@ -1242,6 +1244,79 @@ impl Typer {
             }
             work.extend(self.st.get(pid).parents.iter().rev().cloned());
         }
+    }
+
+    /// `trait A extends B` beside `trait B extends A`: an `extends` graph that
+    /// leads back to a class whose own parents are still being worked out.
+    ///
+    /// scalac 2.13.16, read off the real compiler:
+    ///
+    /// ```text
+    /// CycT.scala:3: error: illegal cyclic reference involving trait A
+    /// trait B extends A
+    ///         ^
+    /// ```
+    ///
+    /// It reports **once** per cycle, at the template that closes it, naming
+    /// the class whose completion was re-entered; [`crate::lin::inheritance_cycle`]
+    /// picks both the same way, so every class on the cycle agrees on who
+    /// reports and only that one does.
+    ///
+    /// One cycle, not every cycle: `first_cycle_from` stops at the first one it
+    /// meets, so in a tangle of overlapping cycles the ones behind it go
+    /// unmentioned. scalac reports more there (it has a second diagnostic,
+    /// `illegal cyclic inheritance`, that this compiler does not reproduce),
+    /// but the first line agrees and the program is rejected either way. See
+    /// `docs/not-implemented.md`.
+    ///
+    /// Without this the cycle had no diagnostic at all: `trait S extends S`
+    /// and `trait A extends B` / `trait B extends A` were compiled to class
+    /// files, and a cycle with more than one parent per node made the
+    /// linearization walk run for hours.
+    ///
+    /// Reporting is not the whole job. nsc replaces the offending parent with
+    /// an error type and carries on, so nothing downstream ever meets the
+    /// cycle; this compiler has more than one walk that a cycle defeats
+    /// (`SymbolTable::is_sub_type` fans out over parents under a depth bound
+    /// of its own, which a cycle turns into `branching^200`), so the closing
+    /// edge is cut here for the same reason. `Type::Error` is a subtype of
+    /// everything, so every such walk stops at it in one step. Only a template
+    /// that has just been rejected is ever touched.
+    fn check_inheritance_cycle(&mut self, class_id: SymbolId, parents: &[Tree], span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        let Some(cycle) = crate::lin::inheritance_cycle(&self.st, class_id) else {
+            return;
+        };
+        if cycle.closing != class_id {
+            return;
+        }
+        let at = parents.first().map(|p| p.span).unwrap_or(span);
+        let kind = if crate::lin::is_interface(&self.st, cycle.involving) {
+            "trait"
+        } else {
+            "class"
+        };
+        let name = self.st.get(cycle.involving).name.clone();
+        self.error(
+            at,
+            format!("illegal cyclic reference involving {kind} {name}"),
+        );
+        // Cut the edge that closes the cycle, in place so the remaining
+        // parents keep their indices and the carets that are computed from
+        // them still land where they did.
+        let cut: Vec<Type> = self
+            .st
+            .get(class_id)
+            .parents
+            .iter()
+            .map(|p| match self.st.class_sym_of(p) {
+                Some(pid) if pid == cycle.involving => Type::Error,
+                _ => p.clone(),
+            })
+            .collect();
+        self.st.get_mut(class_id).parents = cut;
     }
 
     /// SLS 5.3.3: `T` may only be mixed into a subclass of `T`'s own
