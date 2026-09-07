@@ -1,0 +1,11 @@
+Some(Left(boom))
+Some(Right(7))
+List(Left(a), Left(b))
+4
+Some(Left(x))
+Box(List(Left(1), Left(2)))
+Box(Box(Some(Right(deep))))
+Some(Left(c))
+Some(Right(11))
+Box(IorT(List(Right(u), Right(v))))
+Left(plain)

@@ -358,7 +358,33 @@ impl Typer {
         let _ = name;
     }
 
+    /// A value's type is settled here, so whatever its right-hand side left
+    /// undetermined stops being a variable: a *later* statement must not be
+    /// able to instantiate it.
+    ///
+    /// nsc keeps `undetparams` in the typer context, which is per definition.
+    /// scala-rs keeps one list on the typer, saved and restored around each
+    /// application (`type_apply`) but around nothing else, so a variable that
+    /// reached a definition's result with nothing to pin it stayed open for
+    /// the rest of the block. With `def boom[A](m: String): Box[A]`,
+    ///
+    /// ```scala
+    /// val x = good.fold(boom, _ => new Box(()))
+    /// val bad: Box[Unit] = x
+    /// ```
+    ///
+    /// the second line solved the *first* line's `A`, and a program nsc
+    /// rejects compiled. (nsc infers `Box[_1] forSome { type _1 <: Unit }`
+    /// for `x` and reports the mismatch.) Dropping the variables here leaves
+    /// `x`'s type naming `A` as the fixed type it now is, which is what the
+    /// mismatch describes.
     pub(crate) fn type_val_body(&mut self, tree: &mut Tree) {
+        let saved = std::mem::take(&mut self.undet_tvars);
+        self.type_val_body_in(tree);
+        self.undet_tvars = saved;
+    }
+
+    fn type_val_body_in(&mut self, tree: &mut Tree) {
         let presuper = matches!(
             &tree.kind,
             TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
