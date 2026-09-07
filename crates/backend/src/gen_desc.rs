@@ -531,6 +531,22 @@ pub(crate) fn ctor_param_tys(
     }
 }
 
+/// A trait's own `<init>` symbol (source or binary) exists only so the typer
+/// can resolve `new T()` / `extends T()`; it is never emitted to bytecode
+/// (SLS 5.1.2: a trait's parents are constraints, not run by the trait
+/// itself), so it must never be the owner this function hands back. Doing so
+/// was a live bug for *source* traits too, not only classfile ones: `new T()
+/// { … }` type-checked and then `invokespecial T.<init>:()V` against an
+/// interface that has no such method, which the JVM accepts at class-load
+/// time and rejects at verification (`VerifyError: Bad <init> method call`) --
+/// caught only by actually running the emitted class, not by its error count.
+/// `split_parents` already treats an interface parent as never contributing
+/// the real superclass; this must agree with it, or the two disagree about
+/// which class the `<init>` body's `invokespecial` targets versus what the
+/// class file's own `super_class` entry says. The real superclass -- `Object`
+/// unless the linearization supplies a deeper one -- is what the final
+/// fallback below returns, and every trait in the linearization still gets
+/// its `$init$` called by `mixin_init_calls`.
 pub(crate) fn parent_super_ctor(
     st: &SymbolTable,
     parents: &[Tree],
@@ -538,7 +554,7 @@ pub(crate) fn parent_super_ctor(
 ) -> (String, String, Vec<Tree>, SymbolId, Vec<Type>) {
     for p in parents {
         if let TreeKind::Apply { args, .. } = &p.kind {
-            if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
+            if !p.sym.is_none() && st.get(p.sym).name == "<init>" && !is_interface_sym(st, st.get(p.sym).owner) {
                 let cls = st.get(p.sym).owner;
                 let owner = class_internal(st, cls);
                 let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
@@ -547,14 +563,14 @@ pub(crate) fn parent_super_ctor(
             }
             if let Some(cls) = st.class_sym_of(&p.ty) {
                 let owner = class_internal(st, cls);
-                if owner == super_name || super_name == "java/lang/Object" {
+                if !is_interface_sym(st, cls) && (owner == super_name || super_name == "java/lang/Object") {
                     let desc = ctor_desc(st, cls, args);
                     let field_tys = ctor_param_tys(st, SymbolId::NONE, cls, args);
                     return (owner, desc, args.clone(), cls, field_tys);
                 }
             }
         }
-        if !p.sym.is_none() && st.get(p.sym).name == "<init>" {
+        if !p.sym.is_none() && st.get(p.sym).name == "<init>" && !is_interface_sym(st, st.get(p.sym).owner) {
             let cls = st.get(p.sym).owner;
             let owner = class_internal(st, cls);
             let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));

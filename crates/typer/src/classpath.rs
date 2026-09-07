@@ -188,6 +188,14 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         }
         mark_defaults_from_getters(st, owner);
         copy_package_object_members(st, owner, c);
+        // This eager `-cp` scan only ever sets `Flags::INTERFACE` (never
+        // `Flags::TRAIT`; both are checked together everywhere that matters),
+        // and a trait's pickle subset never carries an `m.is_ctor` entry --
+        // see `ensure_interface_ctor`'s doc comment for why. Without this, a
+        // trait reached through a loose classfile directory rather than a jar
+        // (this scan does not read jars at all; `-cp somedir` does) got no
+        // `<init>` from any path.
+        ensure_interface_ctor(st, owner);
     }
 
     attach_classpath_parents(st, classes, &installed);
@@ -417,6 +425,59 @@ fn install_ctor(
         ClasspathType::simple("Unit"),
         Vec::new(),
     );
+}
+
+/// Give a binary interface -- a Scala trait or a plain Java interface, read
+/// from a classfile or a jar -- the empty-argument-list `<init>` that
+/// `new I()` (and `extends I()`) resolve against, when nothing has already
+/// given it a real one.
+///
+/// Neither a trait's class file nor its `ScalaSignature` pickle ever mentions
+/// `<init>`: SLS 5.1.2 makes a trait's parents mere constraints that the
+/// *mixing-in* class runs, never the trait itself, so nsc's own bytecode for
+/// `Constraint` -- confirmed with `javap -p`, `interface … { … validate$(…);
+/// … $init$(…); }` -- has no constructor at all, and neither does the pickle
+/// (it lists `$init$` and both `validate` overloads, nothing named `<init>`).
+/// Without this, `pick_ctor_at` finds no alternative at all for the class's
+/// *own* `<init>` and reports "no matching overload for constructor
+/// Constraint with arguments ()" for the one call every trait actually
+/// accepts.
+///
+/// Deliberately mirrors `check_namer::namer_class`, which allocates a
+/// zero-field `<init>` unconditionally for every template compiled from
+/// source, trait included -- so a jar-backed trait resolves `new I()` /
+/// `new I(x)` exactly the way a source one already does: the former finds its
+/// one alternative and matches, the latter finds it and correctly reports "no
+/// matching overload" for the non-empty argument list.
+///
+/// The symbol is never given a JVM descriptor and is never picked as a real
+/// superclass constructor: `parent_super_ctor` (`crates/backend/src/gen_desc.rs`)
+/// refuses any candidate whose owner `is_interface_sym`, so codegen never
+/// tries to `invokespecial` it. An anonymous subclass's own `<init>` calls the
+/// real superclass (`Object`, or whatever the linearization supplies) and lets
+/// `mixin_init_calls` invoke the interface's `$init$`, exactly as it does for
+/// a trait compiled in this run.
+///
+/// Only ever adds: a class or trait that already has its own `<init>` --
+/// from source, from a real classfile constructor, or from an earlier call
+/// here -- is left untouched.
+fn ensure_interface_ctor(st: &mut SymbolTable, id: SymbolId) {
+    if id.is_none() || !st.get(id).flags.contains(Flags::INTERFACE) {
+        return;
+    }
+    let has_own_ctor = st
+        .get(id)
+        .members
+        .iter()
+        .any(|&m| st.get(m).owner == id && st.get(m).name == "<init>");
+    if has_own_ctor {
+        return;
+    }
+    let ctor = st.alloc("<init>", id, SymKind::Method, Flags::CONSTRUCTOR, "");
+    st.get_mut(ctor).ty = Type::Method {
+        paramss: vec![],
+        ret: Box::new(Type::Unit),
+    };
 }
 
 fn resolve_type_in(
@@ -937,12 +998,14 @@ pub fn install_java_class_in(
     {
         apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
+        ensure_interface_ctor(st, id);
         return id;
     }
     if let Some(id) = find_by_jvm(st, &c.internal_name) {
         apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
         enter_in_companion_scope(st, id, owner, &c.internal_name);
+        ensure_interface_ctor(st, id);
         return id;
     }
     let flags = java_class_flags(c);
@@ -956,6 +1019,7 @@ pub fn install_java_class_in(
     }
     apply_java_class_meta(st, id, c);
     fill_java_members(st, id, c);
+    ensure_interface_ctor(st, id);
     id
 }
 
