@@ -1331,3 +1331,136 @@ scala-rs は 6 classfiles にコンパイルし、scalac 2.13.16 は拒否した
 から型を代入する。元の引数なしメソッドのレシーバでは境界の `T` が異なるため、
 新しい `Select` のレシーバを使う。`c3_bounds_bad.scala` はこの 3 呼出しの拒否、
 `c3_parallel.scala` は境界に収まる呼出しの出力を実 scalac と比較する。
+
+## Two leftover type parameters, and the diagnostic that hid them (`agent/catseta`)
+
+346 -> **326** errors, 81 -> 80 files. `IorT` 23 -> 17, `EitherT` 25 -> 19,
+`OptionT` 16 -> 16 (its remainder is a different root).
+
+The sharpest symptom was a mismatch whose two sides printed the same string:
+
+```
+error: type mismatch; found: IorT[F, A, B]  required: IorT[F, A, B]
+ 191 |     def apply[F[_], A](fa: F[A])(implicit F: Functor[F]): IorT[F, A, B] = IorT(F.map(fa)(Ior.left))
+```
+
+Two distinct symbols named `B`. Both roots are the same mistake -- a type
+parameter nothing had instantiated yet was carried on as if it were a fixed
+type, instead of being a variable for the enclosing call to solve.
+
+1. **Eta-expansion in an argument position.** `map`'s own `B` is undetermined
+   while its function argument is typed, so `Ior.left` is adapted at the
+   expected type `A => _` (`check_apply`'s `relaxed`). That pins `Ior.left`'s
+   `A` and says nothing about its `B`. `solve_eta_tparams` substituted what it
+   could and left the rest standing; the leftover then travelled through
+   `map`'s result into `IorT[F, A, B]`. Writing the same argument as an
+   explicit lambda always compiled, which is what said the eta path was the
+   difference.
+2. **An inserted `apply` whose receiver is polymorphic.** `IorT.liftF(fb)` is
+   `right(fb)`, and `def right[A]: RightPartiallyApplied[A]` takes no
+   arguments at all, so its `A` is fixed by nothing until the `apply`'s result
+   meets the declared type. `instantiate_inserted_apply` solved the *apply's*
+   parameters; the receiver's were left standing. `liftF`, `liftK` and the
+   `pure` of every `IorT`/`EitherT`/`OptionT` instance reported the same name
+   against itself.
+
+nsc eta-expands into an untyped `x$1 => Ior.left(x$1)` and types that, so the
+unsolved parameters join the context's `undetparams` and the outer expected
+type fixes them. `record_open_tparams` puts both cases on that footing:
+`type_apply` already leaks a variable the result still mentions outward, and
+`solve_undet_result` already solves it against `pt`.
+
+Four things had to follow.
+
+* **A variable is still bounded.** `solve_eta_tparams`, `instantiate_undet_arg`
+  and `solve_undet_result` all turned a variable into a type with no bounds
+  check, so `Box(Inv.make(a))` with `def make[A, B <: Number]` and a declared
+  `Box[Inv[A, String]]` was accepted -- while the same call *without* the
+  wrapper was rejected, because that path goes through `check_tparam_bounds`.
+  `undet_solution_in_bounds` refuses the solution; the mismatch is then
+  reported against what was written.
+* **A missing implicit argument was being emitted as a missing argument.** The
+  inserted-`apply` branch of `type_apply_in` returned without calling
+  `fill_defaults_and_implicits`, so `IorT.liftF` compiled to an `invokestatic`
+  with one operand too few -- a `VerifyError`, with the typer silent. Filling
+  the clause turns six of those into `no implicit: could not find implicit
+  value of type Applicative[F]`, which is why the count is 326 and not 320:
+  the sites are real, and finding a `Monad[F]` for an `Applicative[F]`
+  parameter inside `IorTMonad` is a separate gap.
+* **An invariant parameter does not contain a wildcard on the left.**
+  `is_sub_type` read `C[_ <: T]` and `C[T]` as containment in both directions.
+  `Box[_ <: Unit]` is `Box[t] forSome { type t <: Unit }`, and an invariant
+  `Box` admits it only if `t` *is* `Unit`; nsc rejects it with a note about
+  the variance. Now so do we.
+* **A by-name argument was never checked against its parameter.** `adapt`'s
+  `ByName` arm wrapped whatever it was given in a thunk and returned, so
+  `def >>[B](fb: => F[B])` accepted a `Box[_ <: Unit]` for `Box[Unit]`. The
+  check that closes it is deliberately narrow -- only an argument whose type
+  carries a wildcard, i.e. an existential a lub built. A by-name argument is
+  adapted *before* the callee's own variables are finally solved, so the
+  expected type there is often one nobody has committed to yet: checking it in
+  general makes `run/transpose` fail, because `def wrap[T >: Null](body: => T)`
+  asks for `List[List[Nothing]]` at every call site. Widening this needs the
+  by-name argument to be adapted after the callee's inference, not before.
+
+`tests/fixtures/ce_etainfer.scala` runs every shape and prints the values, so
+an instantiation that merely compiles (`Nothing`, `Any`) cannot pass; its
+output is byte-identical to scalac 2.13.16's. `ce_etainfer_bad.scala` and
+`ce_etabound_bad.scala` pin the four rejections, both compilers.
+
+The full scala/scala corpus is unchanged against
+`tests/baselines/corpus-0d200adb.tsv`: 5324 rows, zero changed statuses.
+`transpose` is the reason the by-name check is narrow -- the general form lost
+it, and the narrow form does not.
+
+### Naming the owner when two type parameters print alike
+
+nsc writes `A(in method make)`. scala-rs now writes
+`A (defined in method make)`, and only when the two sides of a mismatch would
+otherwise be the same string, and only for the names that are actually
+ambiguous there (`type_mismatch_message`). It is worth the twenty lines: it
+turned three more `IorT` errors into self-describing ones the moment it
+existed --
+
+```
+found: IorT[F, A (defined in method right), B]  required: IorT[F, A (defined in method liftK), B]
+found: Vector[A (defined in method empty)]      required: Vector[A (defined in class Chain)]
+```
+
+-- and the second of those is in `Chain.scala`, which nobody had connected to
+this cluster.
+
+### The cost, measured
+
+gitbucket went 895 -> **899**. All four are the invariant-wildcard rule
+meeting an existential we should not have built:
+
+```
+acc.getOrElse(e._1, Set())            // acc: Map[A, Set[A]]
+found: Tuple2[A, Set[_ <: A]]  required: Tuple2[A, Set[A]]
+```
+
+`getOrElse[V1 >: V](default: => V1)` should solve `V1 := Set[A]` and type
+`Set()` at it, the way nsc does; we type the argument first, minimise its own
+variable to `Nothing`, and lub `Set[A]` with `Set[Nothing]` under an invariant
+`Set` -- which is exactly the existential the new rule refuses. The
+conformance rule is nsc's (nsc rejects `Box[_ <: Unit]` for `Box[Unit]` in the
+reduced case); the imprecision is upstream of it, in solving a
+lower-bounded parameter from an argument that carries a variable of its own.
+That is the next thing to fix here, and it is worth four gitbucket errors plus
+whatever else the laxity was hiding.
+
+### The remaining head
+
+`type mismatch` is still the largest cluster (156 of 326), and no pair prints
+identically any more except one that is not a type-parameter collision at all
+(`Seq[A]` against `Seq[A]` in `NonEmptySeq.sortBy`, two different `Seq`
+classes). The next families by size:
+
+* the `$anon` refinement family the brief asked about is **not** this root and
+  was left alone: `found: IorT[NonEmptyParallel.F, E, A] required:
+  IorT[$anon$1780.F, E, A]`, 40 error lines mention an `$anon$` type. An
+  abstract type member of an anonymous `Parallel` instance is not recognised
+  as the same type as the trait's `F`. It needs its own reduction.
+* `Ordering[AA]` against `Ordering[A]` (6), `NonEmptyList[AnyRef]` against
+  `NonEmptyList[C]` (4), `Map[K, B]` against `SortedMap[K, B]` (4).

@@ -215,7 +215,7 @@ fn uncertain(ty: &Type) -> bool {
     bad
 }
 
-fn walk_type(ty: &Type, f: &mut impl FnMut(&Type)) {
+pub(crate) fn walk_type(ty: &Type, f: &mut impl FnMut(&Type)) {
     f(ty);
     match ty {
         Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => walk_type(t, f),

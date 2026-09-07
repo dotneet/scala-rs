@@ -1666,6 +1666,20 @@ pub(crate) fn pt_or_lub(pt: &Type, branches: Type) -> Type {
 /// reported `no matching overload for (F[Either[A, B]])EitherT[F, A, B] with
 /// arguments (F[_])` throughout `EitherT`, `OptionT` and `IorT`, while the
 /// same body written as a plain lambda (no `match`) type-checked.
+/// Whether a type carries a wildcard anywhere inside it -- an existential the
+/// compiler built rather than a type the program wrote, typically the lub of
+/// two arguments of an invariant parameter (`lub_at` gives
+/// `Set[_ <: A]` for `Set[A]` and `Set[Nothing]`).
+pub(crate) fn type_has_wildcard(ty: &Type) -> bool {
+    let mut hit = false;
+    crate::override_check::walk_type(ty, &mut |t| {
+        if matches!(t, Type::Wildcard | Type::BoundedWildcard { .. }) {
+            hit = true;
+        }
+    });
+    hit
+}
+
 pub(crate) fn pt_is_undecided(pt: &Type) -> bool {
     fn walk(t: &Type) -> bool {
         match t {

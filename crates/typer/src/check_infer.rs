@@ -195,6 +195,45 @@ impl Typer {
         self.st.is_sub_type(&solved, param)
     }
 
+    /// A variable's solution still has to respect the parameter's own bounds.
+    ///
+    /// `undet_compatible` already refuses an *applicability* answer that
+    /// violates them, but the two places that turn a variable into a type had
+    /// no such check. `def make[A, B <: Number](a: A): Inv[A, B]` written as
+    /// `Box(Inv.make(a))` with a declared `Box[Inv[A, String]]` was accepted:
+    /// `B` reached the result unsolved, the expected type said `String`, and
+    /// nothing asked whether a `String` is a `Number`. nsc reports `inferred
+    /// type arguments [A,String] do not conform to method make's type
+    /// parameter bounds [A,B <: Number]`; the same call *without* the wrapper
+    /// (`Inv.make(a)` directly) was already rejected, because that path goes
+    /// through `check_tparam_bounds`.
+    ///
+    /// A bound that still mentions a type parameter says nothing yet, exactly
+    /// as in `check_tparam_bounds`.
+    pub(crate) fn undet_solution_in_bounds(&self, tp: SymbolId, t: &Type) -> bool {
+        if t.is_no_type() || t.is_error() {
+            return true;
+        }
+        for (bound, upper) in [
+            (self.st.get(tp).bound_hi.clone(), true),
+            (self.st.get(tp).bound_lo.clone(), false),
+        ] {
+            let Some(bound) = bound else { continue };
+            if bound.is_error() || bound.is_no_type() || mentions_any_tparam(&bound) {
+                continue;
+            }
+            let ok = if upper {
+                self.st.is_sub_type(t, &bound) || self.st.hk_ctor_meets_proper_bound(t, &bound)
+            } else {
+                self.st.is_sub_type(&bound, t)
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Solve the variables an argument still carries from the parameter it
     /// fills, and rewrite the argument's type to the solution. This is where
     /// nsc's undetermined variables stop being variables: the alternative is
@@ -224,6 +263,9 @@ impl Typer {
                 // bound, the same instantiation nsc's `solve` picks.
                 _ => self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing),
             };
+            if !self.undet_solution_in_bounds(*tp, &t) {
+                continue;
+            }
             solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
         }
         if self.st.is_sub_type(&solved, p) {
@@ -261,7 +303,7 @@ impl Typer {
             let Some(t) = unify_one(*tp, &tree.ty, pt) else {
                 continue;
             };
-            if t.is_no_type() || t.is_error() {
+            if t.is_no_type() || t.is_error() || !self.undet_solution_in_bounds(*tp, &t) {
                 continue;
             }
             solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
@@ -2263,6 +2305,48 @@ impl Typer {
                 self.adapt(tree, inner);
             }
             if !matches!(&tree.kind, TreeKind::Function { .. }) {
+                // A by-name parameter still has a type, and this arm used to
+                // wrap whatever it was given in a thunk and return without
+                // asking whether the thunk produces an `inner`: it is the one
+                // argument position with no conformance check at all, so
+                // `def >>[B](fb: => F[B])` took a `Box[_ <: Unit]` where
+                // `Box[Unit]` was required and the mismatch surfaced nowhere.
+                //
+                // The check is deliberately narrow -- only an argument whose
+                // type carries a *wildcard*. A by-name argument is adapted
+                // before the callee's own variables are finally solved, so
+                // `inner` here is often a type nobody has committed to yet:
+                // `run/transpose` writes `def wrap[T >: Null](body: => T)` and
+                // asks for `List[List[Nothing]]` at every call, and checking
+                // that rejects a program nsc accepts. What a wildcard reaches
+                // this position is a different thing -- an existential built
+                // by a lub, which an invariant parameter must not swallow --
+                // and it is the case the general laxity was hiding. Widening
+                // the check needs the argument to be adapted after the
+                // callee's inference, not before.
+                //
+                // Two further exclusions: an expected type that still mentions
+                // a type parameter has not been decided (a member read without
+                // its receiver's arguments substituted in asks for
+                // `LazyList[A]`), and a tree that is *already* a thunk is one
+                // being forwarded, so what has to conform is what it yields.
+                let found = unwrap_fn0_or_byname(&tree.ty);
+                if type_has_wildcard(&found)
+                    && !found.is_no_type()
+                    && !found.is_error()
+                    && !inner.is_no_type()
+                    && !inner.is_error()
+                    && !mentions_any_tparam(inner)
+                    && !mentions_any_tparam(&found)
+                    && !pt_is_undecided(inner)
+                    && !pt_is_undecided(&found)
+                    && !self.st.is_sub_type(&found, inner)
+                {
+                    self.adapt(tree, inner);
+                    if tree.ty.is_error() {
+                        return;
+                    }
+                }
                 let span = tree.span;
                 let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                 let ret = if inner_tree.ty.is_no_type() || inner_tree.ty.is_error() {
@@ -2364,8 +2448,10 @@ impl Typer {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
                 let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
                 let ret = (**ret).clone();
+                let msym = tree.sym;
                 let (params, ret) = self.solve_eta_tparams(tree.sym, params, ret, pt);
                 eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
+                self.record_open_tparams(msym, &tree.ty);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
                 }
@@ -2437,15 +2523,57 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
-        self.error(
-            tree.span,
-            format!(
-                "type mismatch; found: {}  required: {}",
-                self.st.display_type(&tree.ty),
-                self.st.display_type(pt)
-            ),
-        );
+        let msg = self.type_mismatch_message(&tree.ty, pt);
+        self.error(tree.span, msg);
         tree.ty = Type::Error;
+    }
+
+    /// `type mismatch; found: X  required: Y`, with the type parameters whose
+    /// names would otherwise collide attributed to their owners.
+    ///
+    /// A mismatch that prints the same string twice tells the reader nothing,
+    /// and it is not a rare shape: two type parameters with the same name in
+    /// scope at once is exactly what a wrong instantiation leaves behind, so
+    /// the message that should have made the bug obvious was the one that hid
+    /// it. nsc writes `A(in method make)`; this writes
+    /// `A (defined in method make)`, in the same spirit.
+    ///
+    /// Only the ambiguous names are qualified -- a name that stands for the
+    /// same symbol on both sides is not in question, and annotating it would
+    /// bury the one that is.
+    pub(crate) fn type_mismatch_message(&self, found: &Type, required: &Type) -> String {
+        let f = self.st.display_type(found);
+        let r = self.st.display_type(required);
+        if f != r {
+            return format!("type mismatch; found: {f}  required: {r}");
+        }
+        let mut seen: Vec<SymbolId> = Vec::new();
+        for t in [found, required] {
+            crate::override_check::walk_type(t, &mut |t| {
+                if let Type::TypeParam(id) = t {
+                    if !seen.contains(id) {
+                        seen.push(*id);
+                    }
+                }
+            });
+        }
+        // Same name, different symbol: those are the ones worth naming.
+        let ambiguous: Vec<SymbolId> = seen
+            .iter()
+            .copied()
+            .filter(|a| {
+                seen.iter()
+                    .any(|b| b != a && self.st.get(*b).name == self.st.get(*a).name)
+            })
+            .collect();
+        if ambiguous.is_empty() {
+            return format!("type mismatch; found: {f}  required: {r}");
+        }
+        *self.st.qualify_tparams.borrow_mut() = ambiguous;
+        let f = self.st.display_type(found);
+        let r = self.st.display_type(required);
+        self.st.qualify_tparams.borrow_mut().clear();
+        format!("type mismatch; found: {f}  required: {r}")
     }
 
     /// Solve a polymorphic method's own type parameters against the function
@@ -2460,6 +2588,65 @@ impl Typer {
     /// own result is still being inferred expects `Node => Any` and the lub of
     /// the two swallowed `Node`. A parameter the arguments cannot pin -- one
     /// that occurs only in the result -- is still the expected result's to fix.
+    /// A type parameter of `msym` that `ty` still mentions is a *variable*,
+    /// not a type: record it so the call that encloses this one solves it.
+    ///
+    /// Two paths reach here, and both used to leave the symbol standing as if
+    /// it were a fixed type.
+    ///
+    /// **Eta-expansion.**
+    ///
+    /// `solve_eta_tparams` reads what the expected function type says, and an
+    /// argument position says very little: the result of a function-typed
+    /// parameter whose own variable is still open is opened to `_`
+    /// (`check_apply`'s `relaxed`), so `F.map(fa)(Ior.left)` hands `Ior.left`
+    /// the expected type `A => _`. That pins `Ior.left`'s `A` and leaves its
+    /// `B` untouched, and the eta-expanded value used to carry that `B`
+    /// symbol onwards as if it were a fixed type. It then travelled through
+    /// `map`'s result into `IorT[F, A, B]` -- a *different* `B` from the one
+    /// the enclosing class binds, printing under the same name, which is why
+    /// cats reported `type mismatch; found: IorT[F, A, B] required:
+    /// IorT[F, A, B]` in `IorT`, `EitherT` and `OptionT`.
+    ///
+    /// nsc eta-expands into an untyped `x$1 => Ior.left(x$1)` and types that,
+    /// so the application's unsolved parameters become the enclosing context's
+    /// `undetparams` and the outer expected type is what fixes them. Recording
+    /// them here puts them on the same footing: `type_apply` leaks a variable
+    /// the result still mentions outward, and `solve_undet_result` solves it
+    /// against `pt` -- here the declared `IorT[F, A, B]`.
+    ///
+    /// **An inserted `apply` whose receiver is polymorphic.**
+    ///
+    /// `IorT.liftF(fb)` is `right(fb)`, where `def right[A]:
+    /// RightPartiallyApplied[A]` takes no arguments at all: `right`'s own `A`
+    /// is fixed by nothing until the inserted `apply`'s result meets the
+    /// declared `IorT[F, A, B]`. `instantiate_inserted_apply` solves the
+    /// *`apply`'s* parameters; the receiver's were left standing, and
+    /// `liftF`, `liftK` and the `pure` of every `IorT`/`EitherT`/`OptionT`
+    /// type-class instance reported the same name against itself.
+    ///
+    /// Only a parameter that is *not* in scope is a variable; an enclosing
+    /// `def f[T]`'s own `T` is a type here, as it is everywhere else
+    /// (`tparam_in_scope`).
+    pub(crate) fn record_open_tparams(&mut self, msym: SymbolId, ty: &Type) {
+        if msym.is_none() {
+            return;
+        }
+        let open: Vec<SymbolId> = self
+            .st
+            .get(msym)
+            .tparams
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(ty, *tp) && !self.tparam_in_scope(*tp))
+            .collect();
+        for tp in open {
+            if !self.undet_tvars.contains(&tp) {
+                self.undet_tvars.push(tp);
+            }
+        }
+    }
+
     pub(crate) fn solve_eta_tparams(
         &mut self,
         sym: SymbolId,
@@ -2489,6 +2676,12 @@ impl Typer {
                 }
             }
         }
+        // An instantiation the parameter's own bounds refuse is not an
+        // instantiation. Leaving the variable open is what the caller expects:
+        // `record_open_tparams` hands it outward and the mismatch is reported
+        // against what was written, rather than a `Number` parameter quietly
+        // becoming a `String`.
+        inst.retain(|(id, t)| self.undet_solution_in_bounds(*id, t));
         if inst.is_empty() {
             return (params, ret);
         }
