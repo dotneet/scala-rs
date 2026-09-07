@@ -165,7 +165,7 @@ impl Typer {
         }
         let mut solved = arg.clone();
         for tp in &open {
-            let Some(t) = unify_one(*tp, arg, param) else {
+            let Some(t) = unify_one(&self.st, *tp, arg, param) else {
                 // The parameter pins nothing here (`def f(x: Any)` taking
                 // `List.empty`). Leave the variable to its bound: an
                 // undetermined variable is `Nothing` at worst, and `Nothing`
@@ -257,7 +257,7 @@ impl Typer {
         }
         let mut solved = a.ty.clone();
         for tp in &open {
-            let t = match unify_one(*tp, &a.ty, p) {
+            let t = match unify_one(&self.st, *tp, &a.ty, p) {
                 Some(t) if !t.is_no_type() && !t.is_error() => t,
                 // Nothing pins it. An unconstrained variable is its lower
                 // bound, the same instantiation nsc's `solve` picks.
@@ -300,7 +300,7 @@ impl Typer {
         }
         let mut solved = tree.ty.clone();
         for tp in &open {
-            let Some(t) = unify_one(*tp, &tree.ty, pt) else {
+            let Some(t) = unify_one(&self.st, *tp, &tree.ty, pt) else {
                 continue;
             };
             if t.is_no_type() || t.is_error() || !self.undet_solution_in_bounds(*tp, &t) {
@@ -500,7 +500,7 @@ impl Typer {
         // Every branch has to be an application of the same constructor, or
         // there is nothing to read the argument off.
         let pt_args = match pt {
-            Type::Class { args, .. } | Type::Applied { args, .. } => args,
+            Type::Class { args, .. } | Type::Applied { args, .. } | Type::Tuple(args) => args,
             _ => return None,
         };
         let same_head = |b: &Type| -> Option<Vec<Type>> {
@@ -511,6 +511,8 @@ impl Typer {
                 (Type::Applied { ctor: c1, .. }, Type::Applied { ctor: c2, args }) if c1 == c2 => {
                     Some(args.clone())
                 }
+                // A tuple, spelled structurally or as its `TupleN` class.
+                (Type::Tuple(_), _) => self.as_tuple_args(b),
                 _ => None,
             }
         };
@@ -543,6 +545,7 @@ impl Typer {
                 ctor: ctor.clone(),
                 args: out_args,
             },
+            Type::Tuple(_) => Type::Tuple(out_args),
             _ => return None,
         })
     }
@@ -630,7 +633,7 @@ impl Typer {
         }
         let mut out = p.clone();
         for tp in open {
-            let t = unify_one(*tp, p, arg)?;
+            let t = unify_one(&self.st, *tp, p, arg)?;
             if t.is_no_type() || t.is_error() {
                 return None;
             }
@@ -1418,9 +1421,9 @@ impl Typer {
                 )
             });
             let mut hit = if keep_singleton {
-                unify_one_precise(tp, p, a)
+                unify_one_precise(&self.st, tp, p, a)
             } else {
-                unify_one(tp, p, a)
+                unify_one(&self.st, tp, p, a)
             };
             // The same step for a *function* parameter: a `Map[K, V]` is a
             // `K => V`, and that is the shape `def map[B](f: A => B)` reads
@@ -1429,7 +1432,7 @@ impl Typer {
             // calls resolved to.
             if hit.is_none() && is_function_pt(p) && !matches!(a, Type::Function { .. }) {
                 if let Some(view) = self.function_view(a) {
-                    hit = unify_one(tp, p, &view);
+                    hit = unify_one(&self.st, tp, p, &view);
                 }
             }
             // A rigid type parameter argument is what its *upper bound* is,
@@ -1445,7 +1448,7 @@ impl Typer {
                     if let Some(hi) = hi {
                         if !matches!(hi, Type::TypeParam(_)) {
                             let hi = self.align_to_param_class(p, &hi);
-                            hit = unify_one(tp, p, &hi);
+                            hit = unify_one(&self.st, tp, p, &hi);
                         }
                     }
                 }
@@ -1763,6 +1766,47 @@ impl Typer {
                 if ras.len() == pas.len() =>
             {
                 for (x, y) in ras.iter().zip(pas) {
+                    self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
+                }
+            }
+            // The expected type has *more* arguments than the result applies:
+            // nsc's partial unification, the same rule `unify_one_precise`
+            // reads an argument by. `def mk[G[_], A]: G[A]` against a declared
+            // `Either[String, Int]` captures `Either[String, *]` for `G` and
+            // matches `A` against `Int`. The kinds have to line up first.
+            (Type::Applied { ctor, args: ras }, Type::Class { sym, args: pas })
+                if ras.len() < pas.len() && self.st.class_tparam_count(*sym) == pas.len() =>
+            {
+                let captured = pas.len() - ras.len();
+                let head = Type::Class {
+                    sym: *sym,
+                    args: pas[..captured].to_vec(),
+                };
+                if !crate::check::ctor_kinds_unify(&self.st, ctor, &head, ras.len()) {
+                    return;
+                }
+                self.collect_expected(tps, ctor, &head, variance, depth + 1, allow_covariant, out);
+                for (x, y) in ras.iter().zip(&pas[captured..]) {
+                    self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
+                }
+            }
+            (
+                Type::Applied {
+                    ctor: rc,
+                    args: ras,
+                },
+                Type::Applied {
+                    ctor: pc,
+                    args: pas,
+                },
+            ) if ras.len() < pas.len() => {
+                let captured = pas.len() - ras.len();
+                let head = crate::symbol::apply_type_ctor((**pc).clone(), pas[..captured].to_vec());
+                if !crate::check::ctor_kinds_unify(&self.st, rc, &head, ras.len()) {
+                    return;
+                }
+                self.collect_expected(tps, rc, &head, variance, depth + 1, allow_covariant, out);
+                for (x, y) in ras.iter().zip(&pas[captured..]) {
                     self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
                 }
             }

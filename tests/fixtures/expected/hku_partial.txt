@@ -1,0 +1,12 @@
+pick Either: Int
+two Tri: String,Boolean
+two Quad: String,Boolean
+pick alias: Long
+pick Function1: String
+pick Tuple2: Boolean
+two Tuple3: String,Int
+pick IxSt: String
+mapAccumulate: 13 List(a10, b11, c12)
+withIndex: 2 List(x, yy)
+mkInv: Int
+mkCtr: Boolean

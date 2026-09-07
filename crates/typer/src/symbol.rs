@@ -3807,6 +3807,26 @@ impl SymbolTable {
                         .zip(a2.iter())
                         .all(|(x, y)| self.is_sub_type(x, y))
             }
+            // `_[_]`: an undetermined type constructor applied to arguments,
+            // the shape `check_apply` relaxes `G[B]` to while the argument
+            // that decides `G` is being typed. nsc's `appliedType(WildcardType,
+            // args)` is `WildcardType` itself; here the application is kept so
+            // that the arity is still visible, and anything with at least that
+            // many type arguments is under it -- partial unification captures
+            // the surplus (`St[S, B]` is `_[_]` with `G := St[S, *]`). `Any` and
+            // `Nothing` are kind-polymorphic, as in `unifySimple`.
+            (other, Type::Applied { ctor, args }) if matches!(**ctor, Type::Wildcard) => {
+                match other {
+                    Type::Any | Type::Nothing | Type::Wildcard | Type::Null => true,
+                    Type::Class { args: oa, .. } | Type::Applied { args: oa, .. } => {
+                        oa.len() >= args.len()
+                    }
+                    Type::Tuple(ts) => ts.len() >= args.len(),
+                    Type::Function { params, .. } => params.len() + 1 >= args.len(),
+                    Type::Array(_) => args.len() == 1,
+                    _ => false,
+                }
+            }
             (Type::Applied { ctor, args }, other) => {
                 let folded = apply_type_ctor((**ctor).clone(), args.clone());
                 if let Type::Applied { ctor, .. } = &folded {

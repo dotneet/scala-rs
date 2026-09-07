@@ -160,7 +160,7 @@ impl Typer {
             }
             let args: Vec<Type> = tps
                 .iter()
-                .map(|tp| unify_one(*tp, &c, sel_ty).unwrap_or(Type::Any))
+                .map(|tp| unify_one(&self.st, *tp, &c, sel_ty).unwrap_or(Type::Any))
                 .collect();
             if args.iter().any(|a| !matches!(a, Type::Any)) {
                 return args;
@@ -1427,7 +1427,7 @@ impl Typer {
         };
         let mut out = Vec::with_capacity(tps.len());
         for tp in &tps {
-            match unify_tparam(*tp, base_args, &sel_args) {
+            match unify_tparam(&self.st, *tp, base_args, &sel_args) {
                 Some(t) if !t.is_no_type() => out.push(t),
                 _ => return Vec::new(),
             }
@@ -1522,7 +1522,7 @@ impl Typer {
         };
         tps.iter()
             .map(|tp| {
-                unify_tparam(*tp, &base_args, &pt_args)
+                unify_tparam(&self.st, *tp, &base_args, &pt_args)
                     .filter(|t| !t.is_no_type() && !t.is_error() && !mentions_no_type(t))
             })
             .collect()
@@ -1854,7 +1854,7 @@ impl Typer {
         let mut ids = Vec::new();
         let mut tys = Vec::new();
         for tp in &tps {
-            if let Some(t) = unify_tparam(*tp, &params, &args) {
+            if let Some(t) = unify_tparam(&self.st, *tp, &params, &args) {
                 if !t.is_no_type() && !t.is_error() {
                     ids.push(*tp);
                     tys.push(t);
@@ -1885,7 +1885,7 @@ impl Typer {
                     if ids.contains(tp) {
                         continue;
                     }
-                    if let Some(t) = unify_tparam(*tp, &hi, &inst) {
+                    if let Some(t) = unify_tparam(&self.st, *tp, &hi, &inst) {
                         if !t.is_no_type() && !t.is_error() {
                             ids.push(*tp);
                             tys.push(t);
@@ -1970,7 +1970,7 @@ impl Typer {
         let mut ids = Vec::new();
         let mut tys = Vec::new();
         for tp in tps {
-            if let Some(t) = unify_tparam(tp, &params, &args) {
+            if let Some(t) = unify_tparam(&self.st, tp, &params, &args) {
                 if !t.is_no_type() && !t.is_error() {
                     ids.push(tp);
                     tys.push(t);

@@ -995,7 +995,7 @@ impl Typer {
         let tps = self.st.get(id).tparams.clone();
         let mut args = Vec::with_capacity(tps.len());
         for tp in &tps {
-            args.push(crate::check::unify_one(*tp, ret, pt)?);
+            args.push(crate::check::unify_one(&self.st, *tp, ret, pt)?);
         }
         Some(args)
     }
@@ -1040,7 +1040,7 @@ impl Typer {
                 Some(t) => targs.push(self.simplify_solved(&t)),
                 // Not pinned down by the result type; the one-sided guess is
                 // the last chance before the candidate is dropped.
-                None => targs.push(crate::check::unify_one(*tp, ret, pt)?),
+                None => targs.push(crate::check::unify_one(&self.st, *tp, ret, pt)?),
             }
         }
         // A solution read off a higher-kinded position is an `Applied` whose

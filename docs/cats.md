@@ -2283,3 +2283,191 @@ Outside that family the next largest single mechanisms are `Ordering[AA]`
 against `Ordering[A]` (6, `agent/catseta`'s leftover), `Map[K, B]` against
 `SortedMap[K, B]` (4) with `Set[A]` against `SortedSet[A]` (2), and
 `NonEmptyList[AnyRef]` against `NonEmptyList[C]` (4).
+
+## Inventing the type lambda that was already there (`agent/hkunify`)
+
+**231 -> 215 errors, 75 -> 73 files**, measured on `8554717c` and again after
+merging `main` at `7aa47c29` (`agent/linorder2`), the same 16 error locations
+gone each time and none appeared. `agent/catsinfer` left this family at the
+head with a warning: "nothing here constructs a lambda during inference -- this
+is nsc's `solvedTypes` with an `HKTypeVar`, real machinery, not a guard".
+The machinery turned out to be smaller than the warning, because the
+representation already had the shape nsc's rule produces.
+
+### What nsc actually restricts it to
+
+The general problem -- which of `IndexedStateT[Eval, S, S, B]`'s four
+positions becomes the parameter of the lambda that solves `G[B]` -- is
+undecidable, and nsc does not attempt it. `TypeVar.unifyFull` in
+`scala/reflect/internal/Types.scala` (the rule from scala/bug#2712, on by
+default since 2.13) reads the constructor as *curried*: with the variable
+applied to `k` arguments and the type to `n >= k`, the leftmost `n - k`
+arguments are captured as constants and only the rightmost `k` are matched
+against the variable's; fewer than `k` is no solution at all, and the kinds of
+the abstracted parameters must be those of the variable's (`unifiableKinds`).
+That is the whole rule. `Either[String, Int]` against `F[A]` is
+`F := Either[String, *]`, `A := Int` -- and never `[x]Either[x, Int]`, however
+well that would fit whatever else the call says. Real scalac 2.13.16 confirms
+the shape on every fixture line (`-Xprint:typer` shows
+`go[[A]St[S,A], A, B]`, `two[[Y, Z]Tri[Int,Y,Z], String, Boolean]`,
+`pick[[+R]Int => R, String]`); the cloned parameters keep the class's own
+variance.
+
+For a *lower* bound (an argument against a parameter, the direction these
+cats lines need) nsc also tries the argument's parents and base types when the
+type itself does not unify; for an upper bound (the expected type) only the
+type and its alias chain. And **in a covariant position of the expected type
+nsc does not partially unify at all**: `def mk[G[_], A](a: A): G[A]` checked
+against `Either[String, Int]` is `mk[Nothing, Int]` -- `Nothing` is
+kind-polymorphic and minimisation wins. Only an invariant or contravariant
+position (`Inv[G[A]]`, `G[A] => Int`) captures. The fixture pins both, and
+this compiler still leaves such a covariant `G` unsolved rather than
+minimising it to `Nothing`; that is a separate gap and not touched here.
+
+### The representation already curries
+
+A type lambda in this compiler is an anonymous alias symbol (`agent/hkpath`),
+and inventing one per unification would have needed the memoisation that
+slice paid for. It is not needed: a `Type::Class { sym, args }` with fewer
+arguments than the class has parameters **is** the curried constructor --
+`kind_arity` subtracts what is applied, `apply_type_ctor` appends the rest, and
+`is_sub_type`, `eta_expand_pair` and the implicit search's `Unify` all
+already read it as a constructor of the remaining arity. So
+`G := Class { IndexedStateT, [Eval, S, S] }` is nsc's
+`PolyType([x], IndexedStateT[Eval, S, S, x])`, two spellings of it are
+structurally equal, and the implicit `Applicative[G]` is answered by cats'
+`Monad[IndexedStateT[F, S, S, *]]` through the eta-expansion that was already
+there. The same holds for an alias applied to a prefix
+(`Applied { State, [S] }`) and for a lambda that captured enclosing parameters
+(`refinement_type_member` hands those out partially applied for exactly this
+reason).
+
+What changed:
+
+* **`unify_one_precise`** (`check.rs`): the `Applied` pattern against a
+  `Class`, an `Applied`, a `Function` (read as `FunctionN`) or a `Tuple` (read
+  as `TupleN`) actual captures the surplus (`partial_unify_applied`). It now
+  takes the symbol table, threaded through every caller, because the two
+  guards need it: a class with parameters still to come is not a type an
+  application can be matched against, and the kinds of the abstracted
+  parameters have to be the variable's (`ctor_kinds_unify`). Before, the arm
+  solved `G := IndexedStateT` -- the bare four-parameter class -- and zipped
+  `B` against `Eval`, which is what every `no matching overload for (F[A])…`
+  in this family was. When the class itself does not unify, its parents are
+  tried and then theirs (`unify_applied_via_parents`), each seen from the type
+  it is reached through -- nsc's `registerBound` for a lower bound. The first
+  full corpus run said why that half is not optional: `pos/hkrange`
+  (`Range` for `CC[Int]`), `pos/t2693` (`new T[Int] {}` for `T[A]`) and
+  `pos/t2712-2` (`CB extends A[Boolean, Long] with B[Boolean, Double]` for
+  `M[A]`) had all been *passing* on the old arm's ill-kinded `CC := Range`,
+  and the arity guard alone turned them into losses. With the walk they pass
+  for nsc's reason, and with nsc's answer: `f(1 to 5)` is an
+  `IndexedSeq[Int]` under both compilers (checked by assigning it to a
+  `String` and reading the mismatch).
+* **`is_sub_type`** (`symbol.rs`): `_[_]`, the shape `check_apply` relaxes
+  `G[B]` to while the deciding argument is typed, admitted only an applied
+  *abstract* constructor. nsc's `appliedType(WildcardType, args)` is
+  `WildcardType`; here the application is kept so its arity stays visible, and
+  anything with at least that many type arguments is under it. This is what
+  printed `required: _[_]`.
+* **`collect_expected`** (`check_infer.rs`): the same capture for an expected
+  type with more arguments than the result applies, in the positions nsc
+  captures in.
+* **`section_param_types` / `undo_eta_param_types`** (`check_overload.rs`,
+  `check_apply.rs`): `traverse(fa)(a => State(s => f(s, a)))` has a second
+  root. `State.apply[S, A](f: S => (S, A))`'s `S` is undetermined while its
+  literal is typed, and the literal's `s` was typed at the bound, `Any`
+  (`found: Any  required: S`, the `.run(init).value` cascade with it). nsc's
+  `typedFunctionUndoingEtaExpansion` (2.13's, which no longer requires every
+  argument to be a parameter) types the body's callee first and reads the
+  parameter type off it -- `f: (S, A) => (S, B)` says `s: S`. The existing
+  placeholder-section rule already did this for a monomorphic *method*
+  callee; a function *value* is a callee too, and a parameter of the enclosing
+  method is a fixed type there (one in `undet_tvars` is not). It is consulted
+  only for a parameter position that mentions a variable this call has not
+  decided, so a written `Any => Int` still types its parameter as `Any`.
+* **`fill_undecided`** (`check_infer.rs`): `Traverse.scala:209`, which the
+  previous slice counted as a cascade of this family, was not one. cats'
+  `mapAccumulate(0L, fa)((i, a) => if (i == idx) (i + 1, b) else (i + 1, a))`
+  types its literal at `(Long, _)`, and an `if` under a *tuple* expected type
+  had no arm to decide the `_` from its branches the way a `match` under
+  `F[_]` does. One arm; `Some[F[_]]` became `Some[F[B]]`.
+
+### The honest split of the nine
+
+The previous slice's "9 lines, one root" were, by location: `Traverse.scala`
+143 (four errors), 161 (two), 177 (two), 209 (one), and `TraverseFilter.scala`
+145/146 (three). Of those thirteen error lines, **nine were partial
+unification** (161, 177, 145/146 and two of 143's four), **three were the
+missing-parameter-type root** at 143 (`Any` for `s`, the `(Any, F[B])` result,
+and the `ambiguous implicit` that an unsolved `G` produced), and **one (209)
+was the tuple `if`**. Partial unification also took **four lines nobody had
+connected to it**: `EitherT.scala` 1038/1069/1131, `Nested(fa: F[G[A]])`
+given a `P.F[Validated[E, A]]`, whose `G` is `Validated[E, *]`; and
+`instances/sortedMap.scala:69`, `mapAccumulateFromStrictFunctor(init, fa, f)`
+on a `SortedMap[K, A]`, whose `F` is `SortedMap[K, *]`. Sixteen locations.
+
+### Correctness
+
+`tests/fixtures/hku_partial.scala` runs every shape and prints, for each, the
+name of the type an implicit was found for -- so the *solution* is what is
+compared, and an instantiation that merely compiles cannot pass:
+`pick(e: Either[String, Int])` prints `Int`, `two(new Tri[Int, String,
+Boolean])` prints `String,Boolean`, and cats' line 143 is there in its own
+spelling with a four-parameter `IxSt[F[_], SA, SB, A]` behind a `St[S, A]`
+alias and an `Ap[St[S, *]]` instance to find. `expected/hku_partial.txt` is
+what real scalac 2.13.16 prints for the same source, and the e2e test asserts
+scalac's own run against it as well. On the pre-fix binary (`8554717c`) the
+fixture does not compile: 17 errors, every shape among them.
+
+`tests/fixtures/hku_partial_bad.scala` is the half that says the rule is a
+restriction: `both(e, new Inv[String])` for `def both[F[_], A](fa: F[A], a:
+Inv[A])` would type-check under `[x]Either[x, Int]` and nsc refuses it
+(`A := Any`, and an invariant `Inv[String]` is not that); a declared
+`Either[Int, String]` asks for the other abstraction; a two-parameter variable
+meets `Option[Int]`; and `Foo[Int, List]` for `G[A]` puts a constructor in the
+abstracted position. Real scalac rejects all four at lines 16, 19, 22 and 26,
+and so do we, at the same lines. The pre-fix binary rejected them too -- for
+the wrong reason at 19 (`no matching overload`, because it could not unify at
+all) -- so the negative half is what stops the new arms from over-reaching,
+not what shows they exist.
+
+### The cost, measured
+
+On the merged tree (`7aa47c29`): gitbucket 398/83 unchanged, slick `errors=0
+classes=1490` with **all 1490 class files byte-identical** to the pre-fix
+build (`SLICK_OUT` on both binaries, `diff -r` empty), the scala library
+1552 -> **1551** (`sys/process/BasicIO.scala:57`, a `LazyList[_]` the tuple
+arm now decides), `MODE=b tests/slick_run.sh` `progs=12 ok=12 diff=0 fail=0
+attempts=36/36`. `slick_subset.sh` and `verify_all.sh` were not run: nothing
+here reaches codegen, and the byte-identical class files say so more directly.
+No new clippy warnings; the 37 in the typer crate are all in untouched code.
+
+On the scala/scala corpus (`CORPUS_SIZE=full`, 5324 units) against
+`tests/baselines/corpus-d056a7f7.tsv`: **`losses=0`**, 17 gains. Nine of
+them are this slice's, checked by rerunning them on the `8554717c` binary
+where they fail: `pos/t2712-1`, `-3`, `-4`, `-7` and `neg/t2712-2` (the
+SI-2712 partial-unification tests themselves), `pos/hk-infer`, `pos/t5683`,
+`pos/tcpoly_infer_implicit_tuple_wrapper`, and `pos/fun_undo_eta` -- the
+corpus's own test for the undo-eta parameter typing. The other eight
+(`pos/t10714`, `t10714b`, `t6895`, `t7753`, `t8801`, `run/t102`, `run/t3798`,
+`neg/t7507`) already pass on `8554717c`; they are earlier slices' gains the
+ledger predates. The candidate is `pos 1086 / neg 670 / run 618`.
+
+### The head after this slice
+
+215 errors in 73 files: **106 `type mismatch`** (79 distinct pairs), **61 `no
+matching overload`**, 22 `no implicit`, 7 `ambiguous implicit`. The
+wildcard/`Nothing` family that stood at 18 lines is **11**, none of them
+partial unification: `OptionT.scala` 496/510/524/538 (4) are the
+"parameter fixed from the first of two arguments without lubbing the second"
+root the previous slice named (`cata(Left(left), Right.apply)`);
+`Validated.scala:1128` and `syntax/either.scala:405` (`Either[Any, Nothing]`
+against `Either[Throwable, A]`, a `catchNonFatal` shape) are one more root;
+and `EitherK.scala:60`, `Kleisli.scala:79`, `WriterT.scala:182` (two) and
+`syntax/option.scala:395` are singletons. The largest single mechanisms
+outside it are unchanged: `Ordering[AA]` against `Ordering[A]` (6), `Map[K,
+B]` against `SortedMap[K, B]` (4) with `Set[A]` against `SortedSet[A]` (2),
+`NonEmptyList[AnyRef]` against `NonEmptyList[C]` (4), `(A, A) => A` against
+`Function2[Any, A, Any]` (4). By file: `OptionT.scala` 11, `Kleisli.scala`
+10, `instances/try.scala` 7, `Chain.scala` 7.
