@@ -13,6 +13,45 @@ use crate::implicits::ImplicitSearch;
 use crate::symbol::SymKind;
 use scala_rs_parser::ast::*;
 
+/// nsc `Infer.shapeType`, as `Typers.preSelectOverloaded` uses it: what an
+/// argument *tree* stands for before any alternative has been chosen, and so
+/// before a function literal can have been typed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ArgShape {
+    /// Anything that is not a function literal. Its own type is its shape.
+    Value,
+    /// `x => e` (annotated or not): `FunctionN[Any, …, Nothing]`.
+    Function,
+    /// `{ case … }`: `PartialFunction[Any, Nothing]`.
+    CaseBlock,
+}
+
+/// A formal's type with the by-name / repeated / annotation wrappers off, so
+/// that `=> PartialFunction[A, B]` and `PartialFunction[A, B]*` are recognised
+/// as the `PartialFunction` formals they are.
+fn strip_param_wrappers(ty: &Type) -> &Type {
+    match strip_annotations(ty) {
+        Type::ByName(inner) | Type::Repeated(inner) => strip_param_wrappers(inner),
+        other => other,
+    }
+}
+
+/// [`ArgShape`] for each argument of one application.
+pub(crate) fn arg_shapes(args: &[Tree]) -> Vec<ArgShape> {
+    args.iter()
+        .map(|a| match &a.kind {
+            TreeKind::Function { vparams, body } => {
+                if is_case_block_literal(vparams, body) {
+                    ArgShape::CaseBlock
+                } else {
+                    ArgShape::Function
+                }
+            }
+            _ => ArgShape::Value,
+        })
+        .collect()
+}
+
 impl Typer {
     /// The single overloaded alternative of `sym` that takes `n` type
     /// parameters, if there is exactly one.
@@ -234,7 +273,25 @@ impl Typer {
         arg_tys: &[Type],
         pt: &Type,
     ) -> OverloadPick {
-        self.resolve_overload_with(fun_ty, fun_sym, arg_tys, pt, None)
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, &[])
+    }
+
+    /// [`Self::resolve_overload`], with the arguments' [`ArgShape`]s.
+    ///
+    /// A caller that still has the argument *trees* can say what nsc's
+    /// `shapeType` would: whether a literal is `{ case … }` or not is the
+    /// difference between a `PartialFunction[Any, Nothing]` shape and a
+    /// `FunctionN[Any, …, Nothing]` one, and `preSelectOverloaded` throws out
+    /// alternatives on it.
+    pub(crate) fn resolve_overload_shaped(
+        &self,
+        fun_ty: &Type,
+        fun_sym: SymbolId,
+        arg_tys: &[Type],
+        pt: &Type,
+        shapes: &[ArgShape],
+    ) -> OverloadPick {
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, shapes)
     }
 
     /// [`Self::resolve_overload`], with the alternatives' types supplied by the
@@ -248,8 +305,20 @@ impl Typer {
         fun_ty: &Type,
         fun_sym: SymbolId,
         arg_tys: &[Type],
+        pt: &Type,
+        supplied: Option<&Vec<(SymbolId, Type)>>,
+    ) -> OverloadPick {
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, supplied, &[])
+    }
+
+    fn resolve_overload_inner(
+        &self,
+        fun_ty: &Type,
+        fun_sym: SymbolId,
+        arg_tys: &[Type],
         _pt: &Type,
         supplied: Option<&Vec<(SymbolId, Type)>>,
+        shapes: &[ArgShape],
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         let mut module_apply_candidates = Vec::new();
@@ -369,7 +438,7 @@ impl Typer {
                     .map(|t| Type::TypeParam(*t))
                     .collect();
                 let cls = Type::Class { sym: *sym, args };
-                return self.resolve_overload(&cls, fun_sym, arg_tys, _pt);
+                return self.resolve_overload_inner(&cls, fun_sym, arg_tys, _pt, supplied, shapes);
             }
             Type::Class { sym, .. } => {
                 // `drop_overridden`, as everywhere else a member is looked up
@@ -452,7 +521,7 @@ impl Typer {
                     .collect()
             }
         };
-        let applicable = self.narrow_by_lambda_shape(applicable, arg_tys);
+        let applicable = self.narrow_by_lambda_shape(applicable, arg_tys, shapes);
         match applicable.len() {
             0 => OverloadPick::None,
             1 => {
@@ -669,15 +738,48 @@ impl Typer {
         if !self.st.get(ao).is_class_like() || !self.st.get(bo).is_class_like() {
             return false;
         }
-        self.base_type_instance(
-            &Type::Class {
-                sym: ao,
-                args: vec![],
-            },
-            bo,
-            0,
-        )
-        .is_some()
+        self.class_has_base(ao, bo)
+    }
+
+    /// Whether `sup` is among `sub`'s base classes.
+    ///
+    /// The question is about *symbols*, so unlike
+    /// [`Self::base_type_instance`] no type arguments have to be carried
+    /// through the walk -- and that is what lets it read a parent written as a
+    /// function type. `class AndThen[-T, +R] extends (T => R)` (cats
+    /// `data/AndThen.scala`) records `Type::Function` as its parent, which
+    /// both `class_reaches` and `base_type_instance` stop dead at, so
+    /// `AndThen.andThen`/`compose` and the `Function1` members they override
+    /// were two equally specific alternatives with no owner relation to
+    /// separate them -- `ambiguous overload` where nsc's `isInProperSubClassOf`
+    /// takes the subclass's.
+    fn class_has_base(&self, sub: SymbolId, sup: SymbolId) -> bool {
+        let mut seen: Vec<u32> = vec![sub.0];
+        let mut work: Vec<SymbolId> = vec![sub];
+        while let Some(c) = work.pop() {
+            for p in &self.st.get(c).parents {
+                let owned;
+                let p = match p {
+                    Type::Function { .. } => match self.st.function_class_form(p) {
+                        Some(c) => {
+                            owned = c;
+                            &owned
+                        }
+                        None => continue,
+                    },
+                    other => other,
+                };
+                let Type::Class { sym, .. } = p else { continue };
+                if *sym == sup {
+                    return true;
+                }
+                if !seen.contains(&sym.0) {
+                    seen.push(sym.0);
+                    work.push(*sym);
+                }
+            }
+        }
+        false
     }
 
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
@@ -1301,6 +1403,61 @@ impl Typer {
         }
     }
 
+    /// The other half of nsc's `preSelectOverloaded`: the shape of a function
+    /// literal says *what* it is, not only how many parameters it takes.
+    ///
+    /// `x => e` has shape `FunctionN[Any, …, Nothing]`, and that is not a
+    /// `PartialFunction` -- nor SAM-convertible to one, since
+    /// `PartialFunction` declares two abstract members -- so an alternative
+    /// whose formal at that position is a `PartialFunction` is thrown away
+    /// before specificity is weighed. `{ case … }` has shape
+    /// `PartialFunction[Any, Nothing]`, which fits both kinds of formal, and
+    /// is left to specificity (where the `PartialFunction` one is the more
+    /// specific and wins).
+    ///
+    /// This is a *pre-selection*, so it only ever narrows a choice that
+    /// already exists: with the `PartialFunction` alternative the only one,
+    /// nothing is dropped and the literal is adapted as usual
+    /// (`def f(p: PartialFunction[Int, Int]); f((x: Int) => x)` compiles for
+    /// scalac 2.13.16, and the same call against an overload set does not
+    /// choose that alternative).
+    ///
+    /// `PartialFunction.andThen` is the pair that needs it:
+    /// `andThen[C](k: B => C)` and `andThen[C](k: PartialFunction[B, C])` are
+    /// both applicable to an un-inferred literal, and the second is strictly
+    /// the more specific, so without the shape every `pf.andThen(s => …)`
+    /// would silently compose *domains* -- a wrong `isDefinedAt` at run time,
+    /// not a compile error.
+    fn narrow_by_partial_function_shape(
+        &self,
+        applicable: Vec<(SymbolId, Vec<Type>, Type)>,
+        shapes: &[ArgShape],
+    ) -> Vec<(SymbolId, Vec<Type>, Type)> {
+        if !shapes.contains(&ArgShape::Function) {
+            return applicable;
+        }
+        let kept: Vec<(SymbolId, Vec<Type>, Type)> = applicable
+            .iter()
+            .filter(|(_, ps, _)| {
+                shapes.iter().enumerate().all(|(i, shape)| {
+                    *shape != ArgShape::Function
+                        || match param_at(ps, i) {
+                            Some(p) => {
+                                partial_function_type(&self.st, strip_param_wrappers(p)).is_none()
+                            }
+                            None => true,
+                        }
+                })
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            applicable
+        } else {
+            kept
+        }
+    }
+
     /// nsc's shape-type pass (`Infer.shapeType`, used by
     /// `inferMethodAlternative` before the arguments are typed): a function
     /// literal whose parameter *types* are still unknown already has a fixed
@@ -1324,7 +1481,12 @@ impl Typer {
         &self,
         applicable: Vec<(SymbolId, Vec<Type>, Type)>,
         args: &[Type],
+        shapes: &[ArgShape],
     ) -> Vec<(SymbolId, Vec<Type>, Type)> {
+        if applicable.len() < 2 {
+            return applicable;
+        }
+        let applicable = self.narrow_by_partial_function_shape(applicable, shapes);
         if applicable.len() < 2 {
             return applicable;
         }
@@ -1857,8 +2019,23 @@ impl Typer {
         // (`Try.recover`, `Option.collect`, `List.collect`). A literal that is
         // not typed yet scores better, so `collect` can infer `B` from the
         // case bodies rather than from an open type parameter.
+        //
+        // This is the *literal* being adapted, which is `typedFunction`'s job
+        // in nsc, and it has no business in a specificity comparison. There
+        // both sides are declared signatures -- never trees -- and nsc weighs
+        // them with `isCompatible`, which has no function-to-`PartialFunction`
+        // coercion at all (`PartialFunction` declares two abstract members, so
+        // it is not a SAM type either; a `val g: Int => Int` passed to a
+        // `PartialFunction[Int, Int]` parameter is a `type mismatch` for
+        // scalac 2.13.16). Scoring a match here made
+        // `PartialFunction.andThen[C](k: B => C)` as specific as
+        // `andThen[C](k: PartialFunction[B, C])` -- each was as specific as
+        // the other and every `pf.andThen(…)` was `ambiguous overload`.
         if let Type::Function { params, ret } = arg {
-            if params.len() == 1 && partial_function_type(&self.st, param).is_some() {
+            if params.len() == 1
+                && !self.spec_probe.get()
+                && partial_function_type(&self.st, param).is_some()
+            {
                 return if params[0].is_no_type() && ret.is_no_type() {
                     Some(6)
                 } else {
