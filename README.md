@@ -87,6 +87,39 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 連鎖を実行して実 scalac の出力と比較する検査と、閉路の拒否行の検査は
 `linearization` テスト（`tests/fixtures/linterm_*.scala`）にあります。
 
+同じ「深さの上限は再帰木の大きさを抑えない」という誤りが
+`SymbolTable::is_sub_type` の親走査にもありました。そして**こちらは閉路を必要と
+しません**。
+
+```text
+trait A(n) extends A(n-1) with B(n-1)
+trait B(n) extends A(n-1) with B(n-1)
+```
+
+は閉路のない正当な階層で、実 scalac は約 2 秒でコンパイルします。しかし上まで
+到達する経路が `2^n` 本あり、`any()` は `true` でしか短絡しないため、
+`false`（オーバーロード解決と implicit 探索が最も多く尋ねる答え）を返すのに
+すべての経路をたどっていました。22 段で 4 秒、24 段で 19 秒、26 段で 74 秒と
+1 段ごとに倍増します。深さは 26 しかないので上限 200 は一度も発火せず、閉路が
+ないので閉路検査も助けになりません。
+
+必要だったのは経路の記録ではなく**メモ**でした。別経路で再到達した同じ問いを
+一度だけ答えるようにし、あわせて評価中の同じ問い `(a, b)` への再入は `false`
+と答えます（最小不動点。閉路を通らずに得られる `true` はすべて残ります）。キーは
+問い全体で、シンボル単体ではありません（`List[Int]` と `List[String]` は別の問い
+です）。`subst_tparams_cow` は型引数を**増やす**ことがあり問いの集合が有限とは
+限らないので、既存の深さ上限は後詰めとして残してあります。詳細は
+`SymbolTable::walk_parents` のコメントを参照してください。
+
+メモは 1 つの最外の問いにつき 256 歩を超えてから初めて有効になります。ほとんどの
+問いは数歩で終わり（`String <: CharSequence` は 3 歩）、そこでメモを取ると型検査で
+最も熱いアームが遅くなるだけだからです。実測でも遅くなっていません（538 ファイルの
+scala-library を交互に min-of-5 で計測して修正前 3877ms / 修正後 3542ms）。答えが
+変わっていないことは slick の 1490 個の class file が修正前と 1 バイトも違わない
+ことで確かめています。正常系（9 段のダイヤモンドを実行し実 scalac の出力と比較。
+オーバーロード解決が走査の `true` に依存する例を含む）と、停止することの検査は
+`subtypeterm` テストと `tests/fixtures/subtypeterm_diamond*.scala` にあります。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -280,6 +313,13 @@ are organised is described in [docs/testing.md](docs/testing.md).
 停止のためのガードが線形化を黙って切り詰めれば出力から trait が 1 つ消えます）。
 異常系は閉路のある `extends` グラフが scalac と同じ行・同じ文言で拒否されること、
 そして**そもそも停止すること**（60 秒の上限つき）を検査します。
+
+`subtypeterm` テストは `SymbolTable::is_sub_type` の親走査について同じ二重の検査を
+します。停止側は 34 段のダイヤモンド継承（経路は `2^34` 本。修正前は 5 時間の外挿）
+が 10 秒以内に終わることと、22 段と 30 段の所要時間の比が指数的でないこと。正常系は
+`tests/fixtures/subtypeterm_diamond.scala` を実行して実 scalac の出力と比較します
+（停止のためのガードが `true` を 1 つ落とせば、診断は出ないままオーバーロード解決が
+静かに変わるので、実行して出力を比べる以外に気づく方法がありません）。
 
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の

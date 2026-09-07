@@ -3184,3 +3184,25 @@ fn fixtures_linterm_cycle_bad() {
 fn fixtures_linterm_missing_prefix_bad() {
     compile_fails("linterm_missing_prefix_bad", "illegal cyclic reference");
 }
+
+/// Nine levels of diamonds, asked a spread of subtype questions whose answer
+/// is `true`. The guard that makes `SymbolTable::is_sub_type` terminate buys
+/// that by answering `false` for a re-entrant question, so the risk it carries
+/// is a lost `true` -- which changes overload and implicit selection silently,
+/// with no diagnostic. This runs the program and compares what it printed
+/// against real scalac's own output, including one overload whose resolution
+/// depends on the walk (`which(b)` must pick `A8`, not `A0`).
+#[test]
+fn fixtures_subtypeterm_diamond() {
+    check("subtypeterm_diamond");
+}
+
+/// 22 levels of diamonds -- `2^22` paths through a legal, *acyclic* hierarchy
+/// that scalac compiles in about two seconds. `is_sub_type` walked every path
+/// and took 4 s here, doubling per level added (26 levels took 74 s), because
+/// it was bounded by depth alone and depth was only 22. No cycle check could
+/// have helped: there is no cycle. See `SymbolTable::walk_parents`.
+#[test]
+fn fixtures_subtypeterm_diamond_bad() {
+    compile_fails("subtypeterm_diamond_bad", "type mismatch");
+}
