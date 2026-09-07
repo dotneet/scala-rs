@@ -3207,7 +3207,7 @@ impl PickleSupply {
     /// refusal, and the memo then stands in for the pickled signature once the
     /// class really is adopted. See the blocking-slick entry in
     /// `docs/gitbucket.md`.
-    fn pickle_readable(&self, st: &SymbolTable, class_sym: SymbolId) -> bool {
+    pub(crate) fn pickle_readable(&self, st: &SymbolTable, class_sym: SymbolId) -> bool {
         st.get(class_sym).jvm_name.starts_with("scala/")
             || self.adopted.contains(&class_sym.0)
             || self.implicits_supplied.contains(&class_sym.0)

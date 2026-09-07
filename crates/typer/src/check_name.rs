@@ -959,14 +959,27 @@ impl Typer {
                 //
                 // Asking about a class whose pickle this compiler is not
                 // reading yet is worse than useless -- `PickleSupply::complete`
-                // declines it *and memoizes the refusal*, so the later
-                // `adopt_binary_class` gets that memo instead of the pickled
-                // signature. See `docs/gitbucket.md`'s "not fixed" entry on
-                // blocking-slick: guarding this loop with
-                // `PickleSupply::pickle_readable` is correct and makes
-                // gitbucket 50x slower, because implicit search is exponential
-                // in the size of the implicit scope.
-                if self.library_abi {
+                // declines it *and memoizes the refusal*, so the
+                // `adopt_binary_class` that reads the class a moment later
+                // gets that memo instead of the pickled signature, and every
+                // `implicit def` the class declares stays in the implicit
+                // scope as the class file reader's plain method: nothing in
+                // bytecode records `implicit`, so it can never be selected.
+                // Hence the `pickle_readable` guard. A class the walk skips
+                // here is not lost -- once something adopts it, a later walk
+                // of the same import sees `pickle_readable` and supplies the
+                // pickled signatures. `tests/multi/implicit_wildcard_binary`
+                // is that ordering in fifteen lines; blocking-slick's eleven
+                // `Query` conversions are the real case
+                // (`docs/gitbucket.md`).
+                //
+                // The guard used to make `tests/gitbucket_measure.sh` 50x
+                // slower, because implicit search is exponential in the size
+                // of the implicit scope. `agent/implicitfilter`
+                // (`Typer::plausibly_inhabits` and the `pinned` rule in
+                // `crates/typer/src/implicits.rs`) removed that cost; the
+                // measure now runs in under 8 s with the guard on.
+                if self.library_abi && self.pickle.pickle_readable(&self.st, cur) {
                     for n in self
                         .pickle
                         .implicit_member_names(&self.st, &mut self.binary, cur)
