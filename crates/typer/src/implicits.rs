@@ -340,11 +340,21 @@ impl Typer {
                 if id.is_none() || !walked.insert(id.0) {
                     continue;
                 }
+                // A `private` member of a *strict* ancestor is not inherited
+                // (SLS 5.2), so it is not a candidate here at all -- the same
+                // rule `SymbolTable::lookup_member` applies to a named
+                // reference. gitbucket's `object helpers extends
+                // AvatarImageProvider with LinkConverter with RequestCache`
+                // reached `RequestCache`'s `private implicit def
+                // context2Session` this way, and it then competed with the
+                // `request2Session` nsc actually chooses.
+                let inherited = id != self.st.this_class;
                 for &m in &self.st.get(id).members {
                     // A local declaration shadows a same-named instance
                     // member too -- an unqualified reference to that name
                     // resolves to the local one, not `this.name`.
                     if self.st.get(m).flags.contains(Flags::IMPLICIT)
+                        && !(inherited && self.st.private_to_owner(m))
                         && !shadowed_names.contains(self.st.get(m).name.as_str())
                         && seen.insert(m.0)
                     {

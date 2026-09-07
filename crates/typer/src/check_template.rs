@@ -1121,7 +1121,13 @@ impl Typer {
             if !seen.insert(cls.0) {
                 continue;
             }
-            self.enter_members_of(cls);
+            // `self: T =>` makes `T`'s members visible unqualified, but it
+            // does not widen access: a `private` member of `T` is still
+            // private to `T`, and a template that merely *names* `T` as its
+            // self type is not `T`. Only `self: ThisClass =>` (and the
+            // untyped `self =>`, which is `ThisType(class_id)`) reaches the
+            // template's own private members.
+            self.enter_members_of(cls, cls != class_id);
             // members of Foo's parents too (lookup_member walks them; Ident needs scope)
             let mut work = self.st.get(cls).parents.clone();
             while let Some(p) = work.pop() {
@@ -1131,7 +1137,7 @@ impl Typer {
                 if !seen.insert(pid.0) {
                     continue;
                 }
-                self.enter_members_of(pid);
+                self.enter_members_of(pid, pid != class_id);
                 work.extend(self.st.get(pid).parents.clone());
             }
         }
@@ -1153,10 +1159,21 @@ impl Typer {
     /// Bring `cls`'s members into the current scope, minus the ones another
     /// template never inherits: its constructor, its compiler-made `$` names
     /// and its self alias (see `Symbol::self_alias`).
-    fn enter_members_of(&mut self, cls: SymbolId) {
+    ///
+    /// `foreign` says the members are being borrowed by a *different*
+    /// template, which is the case for every self type but the identity one.
+    /// Then a plain `private` member is dropped, for the reason
+    /// `enter_inherited_members` drops it: SLS 5.2 makes it accessible only
+    /// from inside its own class, and a self type is a conformance
+    /// obligation, not membership. A qualified `private[C]` stays, since the
+    /// qualifier can name a package that encloses the borrower.
+    fn enter_members_of(&mut self, cls: SymbolId, foreign: bool) {
         let alias = self.st.get(cls).self_alias;
         for m in self.st.get(cls).members.clone() {
             if Some(m) == alias {
+                continue;
+            }
+            if foreign && self.st.private_to_owner(m) {
                 continue;
             }
             let n = self.st.get(m).name.clone();
