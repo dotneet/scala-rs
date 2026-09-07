@@ -1705,6 +1705,13 @@ errors **111 → 110**. Every `$default$` message is gone (28 → 0). slick is
 unchanged (`errors=0 classes=1490`), and so are cats (346) and the scala
 library (1554).
 
+The full scala/scala corpus moves three `pos` tests and nothing else:
+`pos/t2809` (a protected inherited default reached from a nested class),
+`pos/t4036` and `pos/t9014` (a `def` with a default inside a method body).
+All three are default-argument tests. It also caught an intermediate version
+of root 2 turning `neg/t4196` from rejected to accepted; see
+`docs/default-arguments.md`.
+
 ## Not fixed: blocking-slick's conversions under `import profile.blockingApi._`
 
 The largest single family left in gitbucket is ~170 diagnostics of the shape
