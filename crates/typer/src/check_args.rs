@@ -790,6 +790,20 @@ impl Typer {
                 .into_iter()
                 .map(|tys| self.instantiate_from_call(sym, clause_idx, &first, args, tys))
                 .collect();
+            // nsc's dependent method types: a *later* clause may name a
+            // parameter of the clause just applied. `def foo(x: Int)(y: C)(z:
+            // y.T)` (`pos/t1569`) and `def lazyDep(t: T)(u: => t.U)`
+            // (`run/t6443-by-name`) are both this, and the argument settles
+            // what `y.T` is -- either to a concrete type its class fixes, or
+            // to the same member behind the *argument's* path.
+            let rest_tys: Vec<Vec<Type>> = rest_tys
+                .into_iter()
+                .map(|tys| {
+                    tys.into_iter()
+                        .map(|t| self.subst_dependent_paths(&first, args, t))
+                        .collect()
+                })
+                .collect();
             let ret = match fun_ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
                 _ => match &self.st.get(sym).ty {
@@ -802,6 +816,7 @@ impl Typer {
                 .into_iter()
                 .next()
                 .unwrap_or(Type::NoType);
+            let ret = self.subst_dependent_paths(&first, args, ret);
             return Some(Type::Method {
                 paramss: rest_tys,
                 ret: Box::new(ret),

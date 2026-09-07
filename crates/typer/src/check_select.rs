@@ -586,7 +586,16 @@ impl Typer {
             }
             _ => Vec::new(),
         };
+        // nsc's as-seen-from carries the prefix. An extension conversion is
+        // left out: the members are the conversion result's, and the path the
+        // source wrote leads to the receiver, not to it.
+        let path_members = if ext_conv.is_none() {
+            self.receiver_path_members(qual, &recv_ty, &found)
+        } else {
+            Vec::new()
+        };
         let subst = |ty: Type| -> Type {
+            let ty = apply_path_members(ty, &path_members);
             // `import seq.integral._; increment < zero` is
             // `integral.mkOrderingOps(increment) < zero`, and `OrderingOps#<`
             // takes an `Ordering`'s `T`, not one of its own: the receiver here
@@ -2725,4 +2734,13 @@ impl Typer {
             _ => false,
         }
     }
+}
+
+/// Apply the (declaration, path member) rewrite `receiver_path_members` built.
+fn apply_path_members(ty: Type, map: &[(SymbolId, SymbolId)]) -> Type {
+    let mut ty = ty;
+    for (decl, sk) in map {
+        ty = crate::symbol::subst_type_member(&ty, *decl, &Type::TypeMember(*sk));
+    }
+    ty
 }
