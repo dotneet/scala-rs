@@ -1935,3 +1935,145 @@ same failure collapses to (`Applicative[[γ]Nested[P.F, _, γ]]` against
 against `Kleisli[P.F, A, γ]`, `_[_]` as a required type in `IndexedStateT`'s
 six). That is inference, not prefixes, and it is the largest remaining family
 with one mechanism behind it.
+
+## The self alias the prefix names (`agent/hkselfalias`)
+
+**A repair slice.** `agent/hkpath` turned `--test tmember` red on `main`, and
+neither it nor `agent/projection` ran that suite. `tmember1.scala` models
+slick's profile cake:
+
+```scala
+trait TypesComponent { self: Profile => type ColumnType[T] <: TypedType[T] }
+trait Profile extends TypesComponent { self: Profile =>
+  trait API { type ColumnType[T] = self.ColumnType[T] }
+}
+trait JdbcProfile extends Profile { type ColumnType[T] = JdbcType[T] }
+object Main extends JdbcProfile { object api extends API; … }
+```
+
+and `api.ColumnType[Int]` at `Main` reported
+
+```
+error: type mismatch; found: JdbcType[Int]  required: self.ColumnType[Int]
+```
+
+Nothing new was needed to reduce it before: `API`'s alias recorded the bare
+declaration, and `expand_type_members`' ordinary name walk -- `from` and then
+its lexically enclosing classes -- found `Main`'s own `type ColumnType[T] =
+JdbcType[T]`. Lifting the arity restriction from `can_be_path_member` made
+`self.ColumnType` a *path member*, and `expand_type_members` refuses a path
+member the name walk on purpose (`agent/projection`: re-resolving `q.T` by
+name in the class being expanded is what dropping the prefix looked like). So
+the alias kept the outer declaration and never met `Main`'s.
+
+### The rule that decides it
+
+A self alias is a term bound in its own class's template scope, so `self.T`
+written in `Profile` is `Profile.this.T`. Reading it needs the instance, and
+**the instance is what the written prefix names** -- never the class doing the
+reading. `SymbolTable::self_alias_member_at` walks `from` and its enclosing
+classes for the first one that inherits the self alias's owner, and takes that
+class's member of the same name. Two guards keep it from being a widening:
+
+* **a class that leaves `T` deferred answers "no"**, and the path member
+  stands. `p.T` and `q.T` on two abstract prefixes must still be two types.
+* **a class whose own `T` is an alias naming this very path member answers
+  "no"** as well. That is cats' `Representable#compose` -- an anonymous
+  `Representable` subclass whose `type Rp = (self.Rp, other.Rp)` names the
+  *outer* `Representable` -- and resolving it by name in the subclass is the
+  right-hand side folding back onto itself, which is the reason a path member
+  is refused the name walk in the first place.
+
+**`from` is the prefix's class, and the distinction is load-bearing.** The
+first version of this fix ran the reduction from `this_class`, at the
+`expand_type_members(this_class, …)` that `apply_types` already performs on a
+written applied type. It fixed `tmember1` and **accepted** this, which real
+scalac rejects:
+
+```scala
+object Jdbc extends JdbcProfile {           // type ColumnType[T] = JdbcType[T]
+  val stolen: Mem.api.ColumnType[Int] = new JdbcType[Int]("INTEGER")
+}
+```
+
+-- `Mem.api.ColumnType[Int]` is `MemType[Int]` wherever it is written. So the
+reduction moved to `Typer::with_prefix_if_type_member`, which already had the
+qualifier in hand for its own side table, and `apply_types` now calls
+`expand_written_type`: the same walk with the self-alias step suppressed,
+because what the source wrote may carry a prefix of its own and the class
+being typed is not it. Driving it from the prefix also makes it work from
+*outside* any profile (`Jdbc.api.ColumnType[Int]` in an unrelated object),
+which the `this_class` version could not do at all.
+
+### The two slick pickles
+
+`agent/hkpath` reported two of slick's 1490 class files not byte-identical --
+`RelationalProfile` and `RelationalProfile$RelationalAPI`, `javap -p -c`
+identical, the pickle 199 bytes larger -- and named this alias as the cause.
+It is, and the growth was a *second* defect, not a consequence of the first.
+Reading the pickles back (`scala_signature_bytes` + `read_pickle`) says what
+each compiler wrote for `type ColumnType[T] = self.ColumnType[T]`:
+
+| | entry for the right-hand side |
+| --- | --- |
+| `ab18fc50` (pre-`hkpath`) | `TypeRef(ThisType(RelationalAPI), <the alias itself>)` |
+| `9a00edce` (`main`) | a fresh **root-owned** `TypeSym` `ColumnType <: TypedType[T]` |
+| here | `TypeRef(ThisType(RelationalProfile), EXTref ColumnType @ RelationalTypesComponent)` |
+
+**Byte-identity with `ab18fc50` is not the right target**: that pickle is a
+*cyclic* alias, `RelationalAPI.this.ColumnType = RelationalAPI.this.ColumnType`,
+which is the right-hand side folding onto itself in the shape the typer used
+to have. `main`'s is wrong the other way: `pickle_type` does replace a path
+member by its declaration, but `pickle_type_member` then *mints* a symbol, and
+its owner falls back to the root when the declaring class is not in this
+pickle -- `ColumnType` is declared in `RelationalTypesComponent`, a different
+top-level trait. nsc reads that as `<root>.ColumnType` and reports it missing
+from the classpath. `Pickler::pickle_projected_member` writes an external
+reference to the real declaration instead, under the `ThisType` the self alias
+stands for, which is nsc's own `RelationalProfile.this.ColumnType`.
+
+The class files are 10127 / 9125 bytes against `ab18fc50`'s 10117 / 9113 and
+`main`'s 10314 / 9312, `javap -p -c` is identical to `ab18fc50`'s for both,
+and the other **1488 files are byte-identical to `main`'s and to
+`ab18fc50`'s**. The same root-owned fallback is reachable for an abstract
+projection and for a path through a parameter; both predate `agent/hkpath`,
+both are written that way on `main` and on `ab18fc50` alike, and widening the
+fix to them moves ten more of slick's class files (`BasicProfile`,
+`CompilerState`, `JdbcProfile`, `Parameters`, `ShapedValue`, `TableQuery`,
+`MemoryProfile`). That belongs with `agent/absproj`, not with a repair slice;
+`pickle_projected_member` is deliberately gated on the self-alias case.
+
+### Still not reduced
+
+**An un-applied first-order `p.T`.** `type ColumnType = self.ColumnType` with
+no type parameters, read as `api.ColumnType`, is still the abstract member: a
+written type with no arguments never reaches `apply_types`, so it never
+reaches `with_prefix_if_type_member` either. This is **older than
+`agent/hkpath`** -- the fixture has no parameterized member anywhere, so the
+arity clause never applied to it -- and it fails on `ab18fc50` the same way.
+The first-order path this repairs is the *applied* one.
+
+### Fixtures
+
+`tests/fixtures/hkself_member.scala` runs and prints what real scalac 2.13.16
+prints (`expected/hkself_member.txt`), and the e2e test asserts scalac's own
+run against that file as well. It carries two profiles that settle
+`ColumnType` differently, a profile that leaves it deferred (where the member
+must *stay* abstract and still match the declaration `describe` is written
+against), a read from outside either profile, and the `Representable#compose`
+shape. On `9a00edce` it does not compile at all: seven errors, every one of
+them `self.ColumnType` against the concrete type.
+
+`tests/fixtures/hkself_member_bad.scala` is the negative half, and it is the
+one that says the prefix still means something. Real scalac 2.13.16 rejects
+exactly two of its four reads, at lines 29 and 41. On `9a00edce` **all four**
+fail -- the two legal ones included -- so the count, not just the lines, is
+what the e2e test pins.
+
+### What it cost elsewhere
+
+cats **251 / 75** (unchanged: the fix must not give back `agent/hkpath`'s 29),
+gitbucket 496 / 96, the scala library 1550 / 168, slick `errors=0
+files_with_errors=0 classes=1490`, `MODE=b tests/slick_run.sh` `progs=12 ok=12
+diff=0 fail=0 attempts=36/36`, `tests/slick_subset.sh` `verified=1490 failed=0
+lint_problems=0`.
