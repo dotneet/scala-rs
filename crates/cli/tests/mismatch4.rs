@@ -150,7 +150,12 @@ fn mism4_bad_is_still_rejected() {
             "type mismatch; found: $anon$1  required: Fixed5[String, Eff5]",
             "incompatible type in overriding type N5",
             "type mismatch; found: Map[String, Int]  required: (Int) => Int",
-            "type mismatch; found: Nd5  required: Nd5.Self",
+            // `a.Self`, not `Nd5.Self`: real scalac 2.13.16 reports
+            // `required: a.Self` here, and `agent/projection` made the path
+            // survive into the message. Checked against scalac on this very
+            // fixture -- the comment beside line 47 of `mism4_bad.scala` says
+            // the same.
+            "type mismatch; found: Nd5  required: a.Self",
             "type mismatch; found: Seq[String]  required: IndexedSeq[String]",
         ],
     );
