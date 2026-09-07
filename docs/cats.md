@@ -1666,7 +1666,6 @@ Backend#Session }` written in source, the gitbucket half. That is a projection
 out of an *abstract type*, and what it needs is a reduction that fires when an
 outer prefix fixes `Backend` -- see `docs/gitbucket.md`, "Still owed after
 `agent/projection`".
-=======
 ## The inherited self type read at the wrong arguments (`agent/selftype`)
 
 **303 -> 291 errors, 78 -> 77 files.** Twelve `illegal inheritance` errors, all
