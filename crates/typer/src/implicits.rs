@@ -862,6 +862,18 @@ impl Typer {
         if !self.plausibly_inhabits(cand_res, pt) {
             return None;
         }
+        // The mirror of the erroneous *wanted* type in
+        // [`Self::search_implicit_undet`]: nsc's `ImplicitComputation.survives`
+        // requires `!isCyclicOrErroneous` of the candidate too, and for the
+        // same reason -- `plausibly_inhabits` lets `Type::Error` stand for
+        // anything, so a candidate whose own type failed to resolve is
+        // applicable everywhere. Inside gitbucket's `extractFromJsonBody`, its
+        // own `mf: Manifest[A]` parameter was such a candidate, and three
+        // conversions in that method body came out `ambiguous implicit: mf,
+        // request` / `mf, jsonFormats`.
+        if crate::check::type_is_erroneous(cand_res) {
+            return None;
+        }
         match &*cand_ty {
             Type::Method { paramss, ret } => {
                 if paramss.iter().all(|c| c.is_empty()) {
@@ -1664,6 +1676,15 @@ impl Typer {
         undet: &[SymbolId],
         depth: usize,
     ) -> (ImplicitSearch, Vec<(SymbolId, Type)>) {
+        // nsc's `inferImplicit`: a wanted type that is already erroneous ends
+        // the search before a single candidate is looked at. Otherwise
+        // [`Self::plausibly_inhabits`] lets `Type::Error` stand for anything and
+        // every implicit in scope becomes a candidate -- which is how a missing
+        // `Predef.Manifest` turned into `ambiguous implicit:` naming thirty-two
+        // slick column types (`crate::check::type_is_erroneous`).
+        if crate::check::type_is_erroneous(pt) {
+            return (ImplicitSearch::None, Vec::new());
+        }
         let key = memo_key(pt, undet);
         let open = self.open_implicit_mask();
         if let Some(hit) = self.memo_lookup(key, pt, undet, depth, open) {

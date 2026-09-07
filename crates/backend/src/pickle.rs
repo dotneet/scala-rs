@@ -1732,7 +1732,7 @@ impl<'a> Pickler<'a> {
                 // the distinction; the pickle and erasure agree with each
                 // other by both dropping it.
                 if let Some(d) = self.st.projected_decl(*id) {
-                    return self.pickle_type(&Type::TypeMember(d));
+                    return self.pickle_projected_member(*id, d);
                 }
                 let owner = self.st.get(*id).owner.0;
                 let pref = self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix);
@@ -2560,6 +2560,68 @@ impl<'a> Pickler<'a> {
 
     /// Abstract `type A` is TYPEsym + TYPEBOUNDStpe + DEFERRED.
     /// Alias `type T = Int` is nsc ALIASsym with the aliased type as info.
+    /// The declaration a path member (`self.T`) or an abstract projection
+    /// (`E#T`) stands for, written as a *reference* when this pickle does not
+    /// contain it.
+    ///
+    /// `pickle_type_member` mints a symbol entry, and its owner falls back to
+    /// the root when the declaring class is not in this pickle. That is what
+    /// slick's `RelationalProfile$RelationalAPI` picked up as soon as
+    /// `agent/hkpath` let `type ColumnType[T] = self.ColumnType[T]` record a
+    /// prefix: `ColumnType` is declared in `RelationalTypesComponent`, a
+    /// different top-level trait, so the alias's right-hand side became a
+    /// fresh root-owned `type ColumnType[T] <: TypedType[T]` -- nsc reads
+    /// that as `<root>.ColumnType` and reports it missing from the classpath.
+    ///
+    /// An external reference names the real declaration instead, under the
+    /// enclosing instance the self alias stands for, which is nsc's own
+    /// `RelationalProfile.this.ColumnType`.
+    ///
+    /// Only a *self alias* is treated this way. The same root-owned fallback
+    /// is reachable for an abstract projection (`E#T` on a foreign `E`) and
+    /// for a path through a parameter, but both predate `agent/hkpath` and
+    /// both are written that way on `main` and on `ab18fc50` alike; widening
+    /// this to them moves ten more of slick's class files and belongs with
+    /// whoever owns `agent/absproj`, not to a repair slice.
+    fn pickle_projected_member(&mut self, id: SymbolId, decl: SymbolId) -> u32 {
+        let owner = self.st.get(decl).owner;
+        let Some(this_cls) = self.self_alias_class(id) else {
+            return self.pickle_type(&Type::TypeMember(decl));
+        };
+        if self.sym_index.contains_key(&decl.0)
+            || owner.is_none()
+            || self.sym_index.contains_key(&owner.0)
+            || !self.st.get(owner).is_class_like()
+            || !self.st.get(owner).jvm_name.contains('/')
+        {
+            return self.pickle_type(&Type::TypeMember(decl));
+        }
+        // A self alias is another spelling of `this`, so the prefix is the
+        // `ThisType` of the class that declares it -- normally the class this
+        // pickle is being written for.
+        let pref = self
+            .this_tpes
+            .get(&this_cls.0)
+            .copied()
+            .unwrap_or(self.noprefix);
+        let owner_ref = self.external_class_ref(owner);
+        let name = self.st.get(decl).name.clone();
+        let sym = self.ext_ref_owned(&name, owner_ref);
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        self.add(TYPEREFTPE, body)
+    }
+
+    /// The class whose self alias a path member's path starts at, if it does.
+    fn self_alias_class(&self, id: SymbolId) -> Option<SymbolId> {
+        let &[head] = self.st.path_member_path(id)? else {
+            return None;
+        };
+        let owner = self.st.get(head).owner;
+        (self.st.get(owner).self_alias == Some(head)).then_some(owner)
+    }
+
     fn pickle_type_member(&mut self, id: SymbolId) -> u32 {
         if let Some(i) = self.sym_index.get(&id.0) {
             return *i;
