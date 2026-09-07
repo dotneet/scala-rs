@@ -3179,8 +3179,11 @@ fn fixtures_linterm_cycle_bad() {
 
 /// A parent whose qualifier names nothing must be rejected rather than
 /// silently resolved to whatever shares the simple name -- which in cats was
-/// the enclosing trait, making it its own parent.
+/// the enclosing trait, making it its own parent. It is now reported as the
+/// missing qualifier it is, the way scalac 2.13.16 reports it, rather than as
+/// the cycle the bare-name fallback used to manufacture; see
+/// `Typer::qualifier_names_nothing` and `crates/cli/tests/qualfallback.rs`.
 #[test]
 fn fixtures_linterm_missing_prefix_bad() {
-    compile_fails("linterm_missing_prefix_bad", "illegal cyclic reference");
+    compile_fails("linterm_missing_prefix_bad", "not found: value Missing");
 }
