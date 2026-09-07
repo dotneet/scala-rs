@@ -1565,8 +1565,9 @@ foo({ case x => x })
 
 Ten error lines in three files: `Eval.scala` 102/103/106, `Representable.scala`
 86, and the six in `Tuple2K.scala` 142-156. Measured 326 -> 316 at the branch
-point (`20c39e49`) and 303 -> 293 after merging `main` (`d056a7f7`) -- the same
-ten, with nothing new either time. On the scala/scala corpus
+point (`20c39e49`) and 303 -> 293 against `main` at both `d056a7f7` and
+`b4f0eb0f` -- the same ten each time, with nothing new. On the scala/scala
+corpus
 (`CORPUS_SIZE=full`): `losses=0`, with `pos/t8801` -- the Peano encoding whose
 `type Prev <: Nat { type Succ = Nat.this.type }` is exactly this shape --
 newly passing.
