@@ -54,6 +54,21 @@ scalac 2.13.16 と比較します。集合の結合も含む
 どちらも診断結果を変えず、コストだけを下げます。検証は `implfilter` テストと
 [docs/gitbucket.md](docs/gitbucket.md) を参照してください。
 
+失敗した暗黙検索は、そこで報告して止まります。nsc と同じ規則が 2 つあります。
+(1) 要求型がすでにエラー型なら検索そのものを行いません（`Type::Error` は
+`plausibly_inhabits` の前判定をすべて通過するため、スコープ中の暗黙値が全部
+候補になり「ambiguous implicit」を名乗っていました。gitbucket では 1 か所で
+32 個の候補を並べていました）。同じ理由で、エラー型の要求に対する
+「暗黙値が見つからない」診断も出しません — 原因はそれが失敗した場所で
+すでに報告済みです。(2) 暗黙引数を埋められなかった適用は nsc の
+`applyImplicitArgs` と同じくエラー木にします。見つからなかった証拠だけが
+決められた型引数（slick の `map[F, G, T](f)(implicit shape: Shape[…]):
+Query[G, T, C]` の `T`）が式に漏れ出し、その上のすべての選択が二重に
+報告されるのを止めます。正常系（証拠が見つかる場合に型引数が正しく決まり
+JVM 実行結果が scalac と一致すること）と異常系（scalac と同じ 2 行だけを
+拒否すること）は `implcascade` テスト（`tests/fixtures/implcascade.scala`、
+`tests/fixtures/implcascade_bad.scala`）で比較します。
+
 ワイルドカード import は、まだ pickle を読んでいないクラスに問い合わせません。
 問い合わせると `PickleSupply` が拒否を恒久的に記憶してしまい、直後に同じクラスを
 読み込む `adopt_binary_class` がその記憶を受け取るため、jar 側の `implicit def` が
