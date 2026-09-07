@@ -1289,6 +1289,25 @@ impl SymbolTable {
         s.flags.contains(Flags::PRIVATE) && s.private_within.is_none()
     }
 
+    /// Every class a `self:` annotation makes visible from inside the class.
+    ///
+    /// A cake's self type is routinely a *compound*: gitbucket's
+    /// `WikiControllerBase` writes
+    /// `self: WikiService & RepositoryService & AccountService & …`, six
+    /// components. `class_sym_of` answers a `Type::Refined` with its **first**
+    /// parent alone, so only `WikiService`'s members were reachable
+    /// unqualified and `getAccountByUserName$default$2` was "not a member of
+    /// WikiControllerBase".
+    pub fn self_type_classes(&self, ty: &Type) -> Vec<SymbolId> {
+        match ty {
+            Type::Refined { parents, .. } => parents
+                .iter()
+                .filter_map(|p| self.class_sym_of(p))
+                .collect(),
+            other => self.class_sym_of(other).into_iter().collect(),
+        }
+    }
+
     pub fn lookup_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
@@ -1315,9 +1334,7 @@ impl SymbolTable {
                 }
             }
             if let Some(st) = &sym.self_type {
-                if let Some(ps) = self.class_sym_of(st) {
-                    work.push(ps);
-                }
+                work.extend(self.self_type_classes(st));
             }
         }
         out
@@ -1352,9 +1369,7 @@ impl SymbolTable {
                 }
             }
             if let Some(st) = &sym.self_type {
-                if let Some(ps) = self.class_sym_of(st) {
-                    work.push(ps);
-                }
+                work.extend(self.self_type_classes(st));
             }
         }
         out
@@ -2043,9 +2058,7 @@ impl SymbolTable {
                 }
             }
             if let Some(st) = &self.get(c).self_type {
-                if let Some(ps) = self.class_sym_of(st) {
-                    work.push(ps);
-                }
+                work.extend(self.self_type_classes(st));
             }
         }
         false

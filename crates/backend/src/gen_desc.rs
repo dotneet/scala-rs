@@ -1085,7 +1085,16 @@ pub(crate) fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: Sym
             || (ctx.presuper_outer.is_some()
                 && outer_chain_reaches_owner(ctx.st, ctx.class_sym, owner)));
     let (mut cur, mut held) = start_outer_walk(asm, ctx, hops);
-    while !cur.is_none() && !owner.is_none() && !self_reaches_owner(ctx.st, held, owner) {
+    while !cur.is_none()
+        && !owner.is_none()
+        && !self_reaches_owner(ctx.st, held, owner)
+        // A class whose `self:` annotation supplies the member is where the
+        // walk ends: at run time that instance really is mixed with the self
+        // type, so the member is on it, and every further hop leaves the
+        // object the source meant. This is the stopping condition for the
+        // walk `outer_self_type_reaches` starts.
+        && !self_type_supplies(ctx.st, held, owner)
+    {
         let Some(o) = enclosing_instance(ctx.st, cur) else {
             break;
         };
@@ -1182,6 +1191,50 @@ pub(crate) fn outer_chain_reaches(st: &SymbolTable, from: SymbolId, owner: Symbo
         held = outer_field_class(st, cur).unwrap_or(o);
         cur = o;
     }
+}
+
+/// The `$outer` chain out of `from` reaches a class whose **self type**
+/// supplies `owner`'s members.
+///
+/// A cake trait's `self: AccountService =>` makes that trait's members
+/// nameable unqualified inside it, but the trait does not *extend* it, so
+/// `outer_chain_reaches` — which follows real parents — reports that the
+/// chain does not reach `owner` and the call falls back to `this` plus a
+/// cast. Inside the trait's own body that cast is right (`this` really is
+/// mixed with the self type at every instantiation). Inside a class *nested*
+/// in the trait it is on the wrong object: gitbucket's
+/// `new Runner { … getAccountByUserName(u) … }` in an `AccountService`-cake
+/// controller compiled to `aload_0; checkcast AccountService` and threw
+/// `ClassCastException: Ctl$$anon$1 cannot be cast to AccountService` from a
+/// program that type-checked.
+pub(crate) fn outer_self_type_reaches(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> bool {
+    if owner.is_none() {
+        return false;
+    }
+    let mut cur = from;
+    let mut seen = HashSet::new();
+    while let Some(o) = enclosing_instance(st, cur) {
+        if !seen.insert(o.0) {
+            return false;
+        }
+        if self_type_supplies(st, o, owner) {
+            return true;
+        }
+        cur = o;
+    }
+    false
+}
+
+/// `cls`'s own `self:` annotation supplies `owner`'s members.
+///
+/// A compound self type (`self: A with B =>`) supplies all of its components.
+pub(crate) fn self_type_supplies(st: &SymbolTable, cls: SymbolId, owner: SymbolId) -> bool {
+    let Some(t) = st.get(cls).self_type.clone() else {
+        return false;
+    };
+    st.self_type_classes(&t)
+        .into_iter()
+        .any(|s| self_reaches_owner(st, s, owner))
 }
 
 /// The nearest enclosing object whose instance can serve as `owner`'s
