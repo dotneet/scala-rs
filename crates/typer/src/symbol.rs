@@ -1762,12 +1762,12 @@ impl SymbolTable {
         args: &[Type],
         ty: &'t Type,
     ) -> std::borrow::Cow<'t, Type> {
-        let out = subst_tparams_cow(&self.get(owner).tparams, args, ty);
+        let tps = &self.get(owner).tparams;
+        let out = subst_tparams_cow(tps, args, ty);
         if self.abs_projection_of.is_empty() {
             return out;
         }
-        let tps = self.get(owner).tparams.clone();
-        match self.subst_projections(&tps, args, &out) {
+        match self.subst_projections(tps, args, &out) {
             t if t == *out => out,
             t => std::borrow::Cow::Owned(t),
         }
@@ -1979,21 +1979,6 @@ impl SymbolTable {
         }
         let rhs = self.type_member_as_seen(m);
         Some(self.subst_as_seen_from(pre, &rhs))
-    }
-
-    /// `pre#T`: reduced where `pre` settles it, and an [abstract
-    /// projection](SymbolTable::abstract_projection) where `pre` is still
-    /// abstract.
-    pub fn project_member(&mut self, pre: &Type, decl: SymbolId) -> Type {
-        if let Some(t) = self.reduce_projection(pre, decl) {
-            return t;
-        }
-        match pre {
-            Type::TypeParam(p) | Type::TypeMember(p) => {
-                Type::TypeMember(self.abstract_projection(*p, decl))
-            }
-            _ => Type::TypeMember(decl),
-        }
     }
 
     /// Does `ty` mention an abstract projection anywhere?
