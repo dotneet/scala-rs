@@ -2132,6 +2132,46 @@ imported `Implicits.request2Session` both apply, and we report
 `ambiguous implicit` 14 times. nsc tries the nearest context's implicits first
 and never sees the second. That is `crates/typer/src/implicits.rs`.
 
+> **This reading was wrong, and the row is now closed** (`agent/implctx`,
+> 2026-09-07). nsc does *not* try one nesting level at a time. 2.13's
+> `ImplicitComputation` builds its candidate list as
+> `iss flatMap { is => … ; shadower addInfos is ; … }` — the list of lists is
+> flattened, and the level structure is used only so a nearer level's *names*
+> shadow the same name further out, which `implicits_in_scope` already did.
+> Real scalac confirms it: an enclosing class's `implicit def` and a
+> same-typed one arriving through an import are reported ambiguous, exactly
+> as we did.
+>
+> The actual root is access, not nesting: **a `private` member is not
+> inherited** (SLS 5.2), so `context2Session` is not a candidate outside
+> `RequestCache` at all. `SymbolTable::lookup_member` and
+> `enter_inherited_members` applied that rule; three other routes into the
+> implicit scope did not, and gitbucket exercises all three at once —
+>
+> * the ancestor walk in `Typer::implicits_in_scope`, for
+>   `object gitbucket.core.view.helpers extends … with RequestCache`;
+> * `bind_self_type`, for `LinkConverter` / `AvatarImageProvider` /
+>   `ActivityService`, which all carry `self: RequestCache =>`. A self type is
+>   a conformance obligation, not membership, and does not widen access;
+> * `import_wildcard`, which walks the imported object's ancestors, for the
+>   `import gitbucket.core.view.helpers._` every controller writes.
+>
+> gitbucket **717 → 679**, `files_with_errors` 103 → 102, measured on the
+> tree with `agent/implguard` merged. The `context2Session, request2Session`
+> family (14) and the `jsonFormats, formats` pair (9) go to zero; no error
+> kind is new, and two `value update is not a member of Query[G, T, Seq]`
+> become the instantiated `Query[(Rep[String], …), …]`. cats, slick and the
+> scala library are unchanged. The remaining
+> `ambiguous implicit: jsonFormats, context, …` rows in the table below are a
+> *different* root — a search whose expected type is general enough that
+> every implicit in scope fits — and are not this one.
+>
+> The negative half is the load-bearing half: `tests/fixtures/`
+> `implctx_privinherit_bad.scala` pins the three arrangements scalac really
+> does reject, including a class's *own* private implicit competing with an
+> import in that same body, so the fix cannot drift into "prefer the nearer
+> candidate".
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
