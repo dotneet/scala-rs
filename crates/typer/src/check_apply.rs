@@ -1515,7 +1515,22 @@ impl Typer {
                                             Some(r)
                                         }
                                         (_, Some(d)) => Some(d),
-                                        (r, None) => r,
+                                        // The declaration named no
+                                        // single-argument class, so there is
+                                        // nothing to read the element type
+                                        // out of and the receiver's own class
+                                        // is the only candidate left. Only a
+                                        // `scala.collection` class may take
+                                        // it: slick's `Query[+E, U, C[_]]`
+                                        // declares `map` as `Query[G, T, C]`,
+                                        // and rebuilding *that* against a
+                                        // one-parameter receiver turned
+                                        // `TableQuery[Accounts].map(_.name)`
+                                        // into `TableQuery[Rep[String]]` --
+                                        // a type slick's own bound
+                                        // (`E <: AbstractTable[_]`) forbids.
+                                        (Some(r), None) if self.maps_to_own_class(r) => Some(r),
+                                        (_, None) => None,
                                     };
                                     if let Some(t) = pair_rebuild {
                                         ret = t;

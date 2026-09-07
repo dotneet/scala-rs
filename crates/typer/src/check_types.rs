@@ -757,6 +757,35 @@ impl Typer {
         None
     }
 
+    /// `P#T` where `P` is a type parameter or a type member the program has
+    /// left deferred, so `P`'s *bound* is the only place `T` can be looked up.
+    ///
+    /// nsc resolves the member there and then reduces only what the bound
+    /// really fixes: an alias (`type Backend <: JdbcBackend` where
+    /// `JdbcBackend` writes `type Session = SessionDef`) dealiases, and a
+    /// declaration the bound also leaves deferred does **not** -- `E#Elem` is
+    /// not `AbstractRow`'s `Elem`, and reading it as one is what made
+    /// `slick.lifted.TableQuery[E]`'s element type `Any` for every `E`. The
+    /// unreduced case becomes an [abstract
+    /// projection](SymbolTable::abstract_projection), which
+    /// `SymbolTable::subst_projections` reduces at the argument.
+    fn project_through_bound(
+        &mut self,
+        span: Span,
+        prefix: SymbolId,
+        bound: &Type,
+        name: &str,
+    ) -> Type {
+        let through = self.project_from_prefix(span, bound, name);
+        let Type::TypeMember(m) = through else {
+            return through;
+        };
+        if !self.st.is_deferred_type_member(m) || self.st.abs_projection(m).is_some() {
+            return through;
+        }
+        Type::TypeMember(self.st.abstract_projection(prefix, m))
+    }
+
     fn project_from_prefix(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
         // A projection out of a prefix that already failed reports nothing new.
         if prefix.is_error() {
@@ -831,7 +860,7 @@ impl Typer {
                     return self.project_from_prefix(span, &seen, name);
                 }
                 if let Some(hi) = self.st.get(*id).bound_hi.clone() {
-                    return self.project_from_prefix(span, &hi, name);
+                    return self.project_through_bound(span, *id, &hi, name);
                 }
                 self.error(
                     span,
@@ -841,6 +870,28 @@ impl Typer {
                     ),
                 );
                 return Type::Error;
+            }
+            // `E#T` for a type parameter `E`: the same question as for a
+            // deferred type member, and the shape slick's `TableQuery[E <:
+            // AbstractTable[_]] extends Query[E, E#TableElementType, Seq]`
+            // is written in.
+            Type::TypeParam(id) if !self.st.get(*id).tparams.is_empty() => {
+                let n = self.st.get(*id).name.clone();
+                self.error(span, format!("type {n} takes type parameters"));
+                return Type::Error;
+            }
+            Type::TypeParam(id) => {
+                let Some(hi) = self.st.get(*id).bound_hi.clone() else {
+                    self.error(
+                        span,
+                        format!(
+                            "type {name} is not a member of {}",
+                            self.st.display_type(prefix)
+                        ),
+                    );
+                    return Type::Error;
+                };
+                return self.project_through_bound(span, *id, &hi, name);
             }
             other => match self.st.class_sym_of(other) {
                 Some(sym) => sym,
@@ -1018,6 +1069,16 @@ impl Typer {
     pub(crate) fn at_term_path(&mut self, path_tree: &Tree, pty: &Type, t: Type) -> Type {
         let Type::TypeMember(m) = t else {
             return t;
+        };
+        // `p.T` on a `p: P` whose type is abstract: `project_from_prefix`
+        // answered with the abstract projection `P#T`, because the *type* `P`
+        // settles nothing. The *term* `p` does -- it is one instance, and
+        // `path_member` is the representation for that (`agent/projection`).
+        // Slick's `def get[P <: Phase](p: P): Option[p.State]` is exactly
+        // this, and leaving the projection in place lost fourteen calls.
+        let m = match self.st.abs_projection(m) {
+            Some((_, decl)) => decl,
+            None => m,
         };
         if !self.can_be_path_member(m, pty) {
             return t;
