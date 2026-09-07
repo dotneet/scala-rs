@@ -616,6 +616,16 @@ pub struct Typer {
     /// has no value argument mentioning `T`, so only the witness fixes it, and
     /// the caller has to put that solution into the result type as well.
     pub(crate) implicit_undet_solved: Vec<(SymbolId, Type)>,
+    /// Whether the last [`Typer::fill_implicit_params`] left a parameter empty.
+    ///
+    /// nsc's `applyImplicitArgs` ends with `if (args contains EmptyTree)
+    /// setError(tree)`: an application whose implicit argument could not be
+    /// found is an *error tree*, and nothing is typed against its result. Ours
+    /// used to hand back the declared result type with the type parameters the
+    /// missing witness was the only thing that could have solved still in it,
+    /// and every selection on that leaked parameter reported again --
+    /// `value _1 is not a member of T`, `value map is not a member of O2`.
+    pub(crate) implicit_arg_missing: bool,
 }
 
 /// Highest `TupleN` scala-library defines.
@@ -918,6 +928,7 @@ impl Typer {
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             type_member_prefixes: std::cell::RefCell::new(HashMap::new()),
             implicit_undet_solved: Vec::new(),
+            implicit_arg_missing: false,
         }
     }
 
@@ -2633,6 +2644,40 @@ pub(crate) fn type_mentions_wildcard(ty: &Type) -> bool {
             params.iter().any(type_mentions_wildcard) || type_mentions_wildcard(ret)
         }
         Type::Refined { parents, .. } => parents.iter().any(type_mentions_wildcard),
+        _ => false,
+    }
+}
+
+/// nsc's `Type.isErroneous`: the type carries an error somewhere inside it, so
+/// whatever went wrong has already been reported at the place that produced it.
+///
+/// A type like this must not start an implicit search and must not be named in
+/// a diagnostic of its own. `def f[A](implicit m: Manifest[A])` in a compiler
+/// whose `Predef` has no `Manifest` gives the parameter `Type::Error`, and an
+/// implicit search against it accepted *every* implicit in scope -- gitbucket
+/// reported `ambiguous implicit:` followed by seven, and in one file
+/// thirty-two, unrelated names at each of the 23 call sites of
+/// `extractFromJsonBody`. nsc reports the missing type once and says nothing at
+/// the call sites.
+pub(crate) fn type_is_erroneous(ty: &Type) -> bool {
+    match ty {
+        Type::Error => true,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(type_is_erroneous)
+        }
+        Type::Applied { ctor, args } => {
+            type_is_erroneous(ctor) || args.iter().any(type_is_erroneous)
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            type_is_erroneous(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(type_is_erroneous) || type_is_erroneous(ret)
+        }
+        Type::Method { paramss, ret } => {
+            paramss.iter().flatten().any(type_is_erroneous) || type_is_erroneous(ret)
+        }
+        Type::Refined { parents, .. } => parents.iter().any(type_is_erroneous),
         _ => false,
     }
 }
