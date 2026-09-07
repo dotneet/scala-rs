@@ -2091,13 +2091,25 @@ the two lambda parameters above. Real scalac rejects all five at lines 33, 50,
 
 ### The cost, measured
 
-gitbucket 496/96, the scala library 1550/168 and slick `errors=0
-classes=1490` are unchanged; **all 1490 slick class files are byte-identical**
-to the pre-fix build, so the one change that reaches codegen changes nothing
-there. `MODE=b tests/slick_run.sh` is 12/12 36/36, `tests/slick_subset.sh` is
-184 files / 1490 classes / `verified=1490 failed=0` / `lint_problems=0`, and
+Measured twice: on the branch point `9a00edce`, and again after merging `main`
+at `66732045` (`agent/linterm` and `agent/gbhead`). Against the merged `main`
+alone, gitbucket is 398/83, the scala library 1552/168 and slick `errors=0
+classes=1490` -- **all unchanged by this slice**, with cats 251 -> 231 and the
+same twenty locations gone. (gitbucket's 496 -> 398 and the library's
+1550 -> 1552 are `agent/gbhead`'s, measured on `main` with this branch's three
+files checked out to `main`'s versions and back.)
+
+**All 1490 slick class files are byte-identical** to the pre-fix build, so the
+one change that reaches codegen changes nothing there. `MODE=b
+tests/slick_run.sh` is 12/12 36/36, `tests/slick_subset.sh` is 184 files / 1490
+classes / `verified=1490 failed=0` / `lint_problems=0`, and
 `tests/verify_all.sh` reports `verify_failures=0` (the two `INCOMPLETE`
 `slick.jdbc` singletons want a JDBC driver and are identical before and after).
+
+On the scala/scala corpus (`CORPUS_SIZE=full`), `losses=0` against
+`tests/baselines/corpus-d056a7f7.tsv`, with **`pos/t6895` newly passing** --
+`barFoo(null) : Foo[({type L[X] = Bar[StringOr, X]})#L]`, the type-lambda
+expected type of the second rule, found by the corpus rather than by cats.
 
 ### The head after this slice
 
