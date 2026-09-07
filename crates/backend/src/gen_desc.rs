@@ -554,7 +554,10 @@ pub(crate) fn parent_super_ctor(
 ) -> (String, String, Vec<Tree>, SymbolId, Vec<Type>) {
     for p in parents {
         if let TreeKind::Apply { args, .. } = &p.kind {
-            if !p.sym.is_none() && st.get(p.sym).name == "<init>" && !is_interface_sym(st, st.get(p.sym).owner) {
+            if !p.sym.is_none()
+                && st.get(p.sym).name == "<init>"
+                && !is_interface_sym(st, st.get(p.sym).owner)
+            {
                 let cls = st.get(p.sym).owner;
                 let owner = class_internal(st, cls);
                 let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
@@ -563,14 +566,19 @@ pub(crate) fn parent_super_ctor(
             }
             if let Some(cls) = st.class_sym_of(&p.ty) {
                 let owner = class_internal(st, cls);
-                if !is_interface_sym(st, cls) && (owner == super_name || super_name == "java/lang/Object") {
+                if !is_interface_sym(st, cls)
+                    && (owner == super_name || super_name == "java/lang/Object")
+                {
                     let desc = ctor_desc(st, cls, args);
                     let field_tys = ctor_param_tys(st, SymbolId::NONE, cls, args);
                     return (owner, desc, args.clone(), cls, field_tys);
                 }
             }
         }
-        if !p.sym.is_none() && st.get(p.sym).name == "<init>" && !is_interface_sym(st, st.get(p.sym).owner) {
+        if !p.sym.is_none()
+            && st.get(p.sym).name == "<init>"
+            && !is_interface_sym(st, st.get(p.sym).owner)
+        {
             let cls = st.get(p.sym).owner;
             let owner = class_internal(st, cls);
             let desc = with_enclosing_outer_param(st, cls, &method_desc_from_sym(st, p.sym));
