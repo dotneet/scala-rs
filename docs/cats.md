@@ -1935,3 +1935,171 @@ same failure collapses to (`Applicative[[γ]Nested[P.F, _, γ]]` against
 against `Kleisli[P.F, A, γ]`, `_[_]` as a required type in `IndexedStateT`'s
 six). That is inference, not prefixes, and it is the largest remaining family
 with one mechanism behind it.
+
+## The undecided position read as a decision (`agent/catsinfer`)
+
+**251 -> 231 errors, 75 files unchanged.** 20 error *locations* disappeared and
+none appeared. `agent/hkpath` named the head as "a type parameter that occurs
+only under an applied abstract type constructor, left unsolved" and counted 24
+error lines that print a `_` or the `Nothing` it collapses to. **Seven of those
+were one root and two more were its mirror image; a third fixed line is a
+cascade of the second; and ten of the twenty locations this slice moved were
+not in that family at all -- they are a third root nobody had named.** The 24
+itself is now 18, and those 18 are three further roots. The honest split is
+below.
+
+### The root, which is not in `unify_one`
+
+`unify_one_precise` already descends into the arguments of an applied type
+whose constructor is a variable (`Type::Applied` against `Type::Applied` and
+against `Type::Class`), and `G[T[B]]` against `P.F[T[Int]]` really does solve
+both. The wildcard was never a failure to unify. It was **read out of the
+expected type**.
+
+An undetermined variable in an argument's expected type is opened to
+`Type::Wildcard` -- `check_apply`'s `relaxed` for a function-typed parameter
+whose result mentions one, `open_to_bounds` for a higher-kinded one. That
+wildcard means "the argument decides this". `expected_solution` refuses a
+*bare* `Wildcard`, and read a solution out of every **nested** one:
+
+```scala
+val gtb: P.F[T[B]] = Traverse[T].flatTraverse(ta)(a => P.parallel(f(a)))(P.applicative, FlatMap[T])
+```
+
+The literal is typed at `A => _[T[_]]`. Inside it, `P.parallel`'s own
+`apply[X](fa: M[X]): P.F[X]` met that expected type, and because an argument of
+an application is invariant, `X := T[_]` **outranked** the `T[B]` its own
+argument gave. The call came out `P.F[T[_]]`.
+
+Three narrow rules, each measured on its own:
+
+* **A wildcard-bearing expected solution never overrides the arguments'**
+  (`add_expected_constraints_in`'s `Some(slot)` arm). Worth the four
+  `Parallel.scala` lines.
+* **Nor is it pushed for a parameter an argument still to be typed states**
+  (the filter after `add_expected_constraints` in `check_apply`). The pass runs
+  before the arguments are typed; nsc runs it after.
+* **Nor is it written into a parameter type for a bare lambda's benefit** (the
+  `weak` block). `F.map(f(a0).value) { case … }` in `EitherT`/`IorT`/`OptionT`'s
+  `tailRecM` took `B := Either[L, _]` off the enclosing `F[Either[L, _]]`,
+  which also hid `B` from `open_tparams_of`, so the match that decides it was
+  never consulted. Worth those three `(F[_])` lines -- the family the
+  `pt_is_undecided` comment in `check.rs` named and `agent/monadtrans` left
+  three of.
+
+**Refusing every nested wildcard outright costs slick six errors**, and that is
+the measurement that shaped the rules. `options: Set[TableOption[?]] = Set()`
+is a *source existential*: `Set()` pins nothing, and `A := TableOption[_]` is
+the best answer there is. `Type::Wildcard` is both nsc's `WildcardType` and its
+`ExistentialType` here, so the two cannot be told apart by shape -- only by
+whether anything else in the call has an opinion. All three rules are phrased
+that way, and slick stays at `errors=0 classes=1490`.
+
+### The mirror image: an expected type that does say something
+
+`Applicative[[γ]Kleisli[P.F, Nothing, γ]]` against
+`Applicative[[γ]Kleisli[P.F, A, γ]]` is the opposite mistake.
+
+```scala
+def applicative: Applicative[Kleisli[P.F, A, *]] = catsDataApplicativeForKleisli(P.applicative)
+```
+
+`catsDataApplicativeForKleisli[F[_], A]` states `A` nowhere but inside the type
+lambda in its result, and a lambda is an anonymous alias symbol whose body
+lives beside it in the symbol table (`refinement_type_member`, and
+kind-projector's `*` desugars to exactly that). Every arm of `collect_expected`
+saw an opaque `TypeMember`, `dealias` will not unfold a higher-kinded alias,
+and `A` was minimised to `Nothing`. `eta_expand_pair` -- the step `is_sub_type`
+already takes to compare two constructors -- applies both sides to one set of
+parameters so the bodies can be walked. Worth `EitherT.scala:1053` (the
+`Nested[P.F, _, γ]` line, plus the `ambiguous implicit` its unsolved `A` was
+producing at the same line) and `Kleisli.scala:464`.
+
+### Ten more that were a different root entirely
+
+Re-clustering after the two rules above put a family of twelve at the head that
+nobody had connected to anything:
+
+```
+found: (A) => B          required: (E) => Any
+found: (A, A) => A       required: Function2[Any, A, Any]
+```
+
+It reduces to five lines with no cats in it:
+
+```scala
+class P1[+E, +A] { def map[B](f: A => B): P1[E, B] = new P1[E, B] }
+def go[E, A, B](fa: P1[E, A], f: A => B): P1[E, B] = fa.map(f)
+```
+
+The lambda parameter of `map`/`flatMap`/`foreach`/`withFilter`/`pipe`/`tap` is
+guessed from the receiver's **first** type argument (`elem_type`) when the
+signature "has not settled it", and `settled` counted any type parameter at all
+as unsettled. Read through `fa: P1[E, A]`, the declaration states its parameter
+as the *caller's* own `A` -- in scope, rigid, and already the answer -- and the
+guess replaced it with the `E`. A rigid parameter is settled too; the guess is
+for one still written in the *declaring* class's parameter, which is not in
+scope at the call site. That is `Validated` (4), `Ior` (3), `IorT` (2) and
+`NonEmptyMapImpl` (1).
+
+The laxity was also unsound in the other direction: `fa.map((e: E) => …)` on a
+`Vd[E, A]` **compiled** before this change, and scalac rejects it.
+`tests/fixtures/wci_elem_bad.scala:27` pins it, at scalac's own line.
+
+### Correctness
+
+`tests/fixtures/wci_open.scala` runs all three shapes of the first two rules and
+`wci_elem.scala` runs the third; both print, and every line calls a method only
+the *right* instantiation has (`mkString` needs `B = String`, `v + 1` needs
+`B = Int`, `s.toUpperCase` needs the element and not the error type). The
+expected files are what real scalac 2.13.16 prints for the same sources, and
+the e2e tests assert scalac's own run against them as well. On the pre-fix
+binary `wci_open.scala` fails with exactly one error per shape and
+`wci_elem.scala` with two.
+
+`wci_open_bad.scala` and `wci_elem_bad.scala` are the halves that say the
+solutions bind: a declared type the call does not produce, a type lambda whose
+`A` has no `Show`, an explicit `A` that disagrees with the declared one, and
+the two lambda parameters above. Real scalac rejects all five at lines 33, 50,
+52, 25 and 27, and so do we, with the same types.
+
+### The cost, measured
+
+gitbucket 496/96, the scala library 1550/168 and slick `errors=0
+classes=1490` are unchanged; **all 1490 slick class files are byte-identical**
+to the pre-fix build, so the one change that reaches codegen changes nothing
+there. `MODE=b tests/slick_run.sh` is 12/12 36/36, `tests/slick_subset.sh` is
+184 files / 1490 classes / `verified=1490 failed=0` / `lint_problems=0`, and
+`tests/verify_all.sh` reports `verify_failures=0` (the two `INCOMPLETE`
+`slick.jdbc` singletons want a JDBC driver and are identical before and after).
+
+### The head after this slice
+
+231 errors in 75 files: **112 `type mismatch`** (85 distinct found/required
+pairs), **59 `no matching overload`**, 22 `no implicit`. The wildcard/`Nothing`
+family the previous slice counted at 24 is down to **18 lines**, and they are
+now three separate roots, none of them the one this slice fixed:
+
+* **Higher-order unification: inventing a type lambda** (9 lines, the largest).
+  `traverse(fa)(a => State(s => f(s, a)))` has to solve `G[B]` against
+  `IndexedStateT[Eval, S, S, B]`, i.e. `G := [x]IndexedStateT[Eval, S, S, x]`.
+  Nothing here constructs a lambda during inference -- `refinement_type_member`
+  only allocates one for a *written* refinement -- so `G` stays open and prints
+  as the required `_[_]`, taking `Traverse.scala` 143/161/177 and
+  `TraverseFilter.scala` 146 with a `value run is not a member of _[F[_]]`
+  cascade each. This is nsc's `solvedTypes` with an `HKTypeVar`, and it is a
+  real piece of machinery, not a guard.
+* **A parameter fixed from the first of two arguments without lubbing the
+  second** (4 lines). `EitherT(cata(Left(left), Right.apply))` in `OptionT`
+  fixes `cata[B]`'s `B` to `Left[L, Nothing]` and then checks the eta-expanded
+  `Right.apply` against it; nsc lubs the two to `Either[L, A]`.
+  `unify_tparam_all` does lub two contributions -- a *by-name* first argument
+  and an eta-expanded second do not both reach it.
+* Singletons: `EitherK`'s `Nothing`, `Kleisli.scala:79`'s `(_) => F[C]`,
+  `Traverse.scala:209`'s `Some[F[_]]` (a cascade of the first bullet, same
+  file), `ApplicativeError[F, _ >: E]`.
+
+Outside that family the next largest single mechanisms are `Ordering[AA]`
+against `Ordering[A]` (6, `agent/catseta`'s leftover), `Map[K, B]` against
+`SortedMap[K, B]` (4) with `Set[A]` against `SortedSet[A]` (2), and
+`NonEmptyList[AnyRef]` against `NonEmptyList[C]` (4).
