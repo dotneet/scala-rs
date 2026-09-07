@@ -713,28 +713,77 @@ fn add_method_types(
     id
 }
 
+/// Mark the parameters a separately compiled method declares defaults for.
+///
+/// A class file records no per-parameter "has a default" bit. What it does
+/// carry is the getter nsc emitted beside the method -- `apply$default$2`,
+/// `halt$default$1` -- so the getters are the only evidence available for a
+/// class whose pickle the typer does not read (or reads and then declines,
+/// which is what happens to a case class's *synthetic* companion `apply`).
+///
+/// The getter's name does not say which *overload* it belongs to.
+/// `org.scalatra.Control` declares `halt(ActionResult)` next to
+/// `halt[T](Integer = null, T = (), Map = Map.empty)`, and taking the first
+/// alternative would have given the one-parameter overload a default it does
+/// not have. Arity settles most slots; where it does not, the getter's result
+/// descriptor is the parameter's own declared type and settles the rest.
 fn mark_defaults_from_getters(st: &mut SymbolTable, owner: SymbolId) {
     let members = st.get(owner).members.clone();
-    let getters: Vec<(String, usize)> = members
+    let getters: Vec<(SymbolId, String, usize)> = members
         .iter()
-        .filter_map(|&id| parse_default_getter(&st.get(id).name))
+        .filter(|&&id| st.get(id).kind == SymKind::Method)
+        .filter_map(|&id| {
+            let (meth, idx) = parse_default_getter(&st.get(id).name)?;
+            Some((id, meth, idx))
+        })
         .collect();
-    for (meth, idx) in getters {
-        let Some(mid) = st
+    for (gid, meth, idx) in getters {
+        let cands: Vec<SymbolId> = st
             .lookup_member(owner, &meth)
             .into_iter()
-            .find(|&id| st.get(id).kind == SymKind::Method)
-        else {
-            continue;
+            .filter(|&id| st.get(id).kind == SymKind::Method)
+            .filter(|&id| st.get(id).params.len() >= idx)
+            .collect();
+        let mid = match cands.len() {
+            0 => continue,
+            1 => cands[0],
+            _ => {
+                let mut typed = cands
+                    .iter()
+                    .copied()
+                    .filter(|&id| getter_fills_param(st, gid, id, idx));
+                let Some(only) = typed.next() else {
+                    continue;
+                };
+                // Two alternatives whose parameter has the same erased type:
+                // nothing here can tell them apart, and guessing would give a
+                // default to a method that has none.
+                if typed.next().is_some() {
+                    continue;
+                }
+                only
+            }
         };
-        let params = st.get(mid).params.clone();
-        if idx == 0 || idx > params.len() {
-            continue;
-        }
-        let pid = params[idx - 1];
+        let pid = st.get(mid).params[idx - 1];
         let f = st.get(pid).flags.with(Flags::DEFAULTPARAM);
         st.get_mut(pid).flags = f;
     }
+}
+
+/// Whether `gid`, a `name$default$idx` getter, returns what `mid`'s `idx`-th
+/// parameter is declared as. Both descriptors come from the same class file,
+/// so this is an exact comparison; when either is missing the answer is "no",
+/// which leaves the ambiguity unresolved rather than resolving it wrongly.
+fn getter_fills_param(st: &SymbolTable, gid: SymbolId, mid: SymbolId, idx: usize) -> bool {
+    let gdesc = st.get(gid).jvm_name.clone();
+    let mdesc = st.get(mid).jvm_name.clone();
+    let (Some(gret), Some(mparams)) = (
+        gdesc.split_once(')').map(|(_, r)| r.to_string()),
+        crate::pickle_supply::desc_params(&mdesc),
+    ) else {
+        return false;
+    };
+    mparams.get(idx - 1).is_some_and(|p| *p == gret)
 }
 
 pub fn parse_default_getter(name: &str) -> Option<(String, usize)> {
@@ -1602,6 +1651,14 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         st.get_mut(id).flags = flags;
         st.set_jvm_name(id, f.desc.clone());
     }
+    // A class file's `name$default$n` methods are the only record that its
+    // `name` has defaults at all: the parameter-level `DEFAULTPARAM` bit is a
+    // pickle's, and a member the pickle path declines (a case class's
+    // synthetic companion `apply`, which `Member::is_public_api` filters out)
+    // is described by this reader alone. Without the mark, `FieldSerializer()`
+    // reached overload selection with no arguments against a four-parameter
+    // signature.
+    mark_defaults_from_getters(st, owner);
 }
 
 fn jtype_to_type(

@@ -1666,6 +1666,52 @@ reason below.
 
 slick is unchanged (`errors=0 classes=1490`).
 
+### 32. Default arguments: five roots, one family — 69 errors (typer + backend)
+
+`docs/default-arguments.md` is the full write-up; the short version is that a
+default argument is a *call*, and every one of these five was about which
+symbol answers for it.
+
+1. **A method declared in a class file had no defaults at all.** A class file
+   records no per-parameter bit, so the getters beside the method are the only
+   evidence — and the class file reader ignored them. json4s's
+   `FieldSerializer[…]()` is 22 of these.
+2. **A case class's companion `apply` is `SYNTHETIC`,** so the *pickled* one
+   was never installed and the class file's cruder description — which records
+   neither the defaults nor which clause is `implicit` — stood in its place.
+   Root 1 alone cannot fix json4s: the trailing `ClassTag` is an implicit
+   parameter and only the pickle says so.
+3. **A default getter whose signature carries a type parameter it never
+   mentions was declined,** and a getter that cannot be supplied makes the
+   *method* ineligible. nsc infers a getter's result type, so scalatra's
+   `halt[T: Manifest](status = null, body: T = (), headers = …)` pickles
+   `halt$default$1` as `[T]()Integer`. `halt(400)` was left with only the
+   unrelated `halt(ActionResult)` overload.
+4. **The getter was selected off the enclosing class of the call site** rather
+   than off the prefix the method resolved through — 28 errors across a
+   wildcard-imported object (`avatar$default$3`), a cake self type seen from
+   inside an anonymous class (`getAccountByUserName$default$2`), and a local
+   `def` inside a Twirl template's `apply` (`menuitem$default$5`, 8 of them).
+   The anonymous-class shape was also a **miscompilation** of the main call:
+   `aload_0; checkcast AccountService` on an object that does not implement it,
+   with explicit arguments and no defaults involved.
+5. **A compound self type contributed only its first component.**
+   `self: WikiService & RepositoryService & AccountService & … =>` is how every
+   controller here is written, and `class_sym_of` answers a `Type::Refined`
+   with its first parent alone.
+
+Measured on `tests/gitbucket_measure.sh`: **895 → 826 errors**, files with
+errors **111 → 110**. Every `$default$` message is gone (28 → 0). slick is
+unchanged (`errors=0 classes=1490`), and so are cats (346) and the scala
+library (1554).
+
+The full scala/scala corpus moves three `pos` tests and nothing else:
+`pos/t2809` (a protected inherited default reached from a nested class),
+`pos/t4036` and `pos/t9014` (a `def` with a default inside a method body).
+All three are default-argument tests. It also caught an intermediate version
+of root 2 turning `neg/t4196` from rejected to accepted; see
+`docs/default-arguments.md`.
+
 ## Not fixed: blocking-slick's conversions under `import profile.blockingApi._`
 
 The largest single family left in gitbucket is ~170 diagnostics of the shape
