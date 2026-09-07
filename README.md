@@ -45,6 +45,15 @@ scalac 2.13.16 と比較します。集合の結合も含む
 2 回のコンパイルと JVM 実行を scalac と比較し、両方向にコンパイラを入れ替えた
 組み合わせも検査します。
 
+暗黙検索は、候補を単一化する前に nsc の `isPlausiblyCompatible` にあたる構造的な
+前判定（`Typer::plausibly_inhabits`）で絞り込みます。候補の結果型と要求型が
+どちらもクラスで、どちらの親も他方に到達しない場合だけ棄却するので、最後の
+適合判定が必ず失敗する候補しか落としません。あわせて、単一化がワイルドカードに
+しか解けなかった型引数は「確定した」とは数えません（slick の `tupleNShape` のような
+導出規則が、要求型が何も言っていない場面で自分の暗黙引数を探し続けるのを止めます）。
+どちらも診断結果を変えず、コストだけを下げます。検証は `implfilter` テストと
+[docs/gitbucket.md](docs/gitbucket.md) を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

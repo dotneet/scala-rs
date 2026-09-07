@@ -46,8 +46,12 @@
 //! **Not fixed** (`docs/gitbucket.md`, "not fixed: blocking-slick's
 //! conversions under `import profile.blockingApi._`"): the ~170 `value list /
 //! update / firstOption is not a member of Query[…]` diagnostics. The cause is
-//! known and reproduced in fifteen lines; the fix is one guard and it makes
-//! `tests/gitbucket_measure.sh` more than fifty times slower.
+//! known and reproduced in fifteen lines; the fix is one guard. That guard
+//! used to make `tests/gitbucket_measure.sh` more than fifty times slower --
+//! `agent/implicitfilter` closed that, see `crates/cli/tests/implfilter.rs` --
+//! and is still unmerged because turning it on exposes the independent
+//! `Session` / `JdbcBackend#SessionDef` root, which costs more than the
+//! family is worth.
 
 use std::fs;
 use std::path::{Path, PathBuf};
