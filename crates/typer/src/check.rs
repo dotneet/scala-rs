@@ -2898,18 +2898,17 @@ pub(crate) fn unify_one_precise(
                 ctor: ac,
                 args: aas,
             } => partial_unify_applied(st, tp, ctor, pas, ac.as_ref().clone(), aas),
-            Type::Class { sym, args: aas } => {
-                // A constructor with arguments still to come is not a type
-                // an application can be matched against.
-                if st.class_tparam_count(*sym) > aas.len() {
-                    return None;
-                }
-                let unapplied = Type::Class {
-                    sym: *sym,
-                    args: vec![],
-                };
-                partial_unify_applied(st, tp, ctor, pas, unapplied, aas)
-            }
+            Type::Class { .. } => unify_applied_class(st, tp, ctor, pas, actual).or_else(|| {
+                // nsc tries the type itself, then its parents, then its base
+                // types (`registerBound`, for a lower bound): `Range` has no
+                // arguments for `CC[Int]` to match, `IndexedSeq[Int]` does.
+                unify_applied_via_parents(st, tp, ctor, pas, actual)
+            }),
+            // A compound is each of its parents, the same way the `Class`
+            // pattern reads one: `new T[Int] {}` is `Object with T[Int]`.
+            Type::Refined { parents, .. } => parents
+                .iter()
+                .find_map(|p| unify_one_precise(st, tp, pattern, p)),
             // `Int => String` is `Function1[Int, String]` and `(A, B)` is
             // `Tuple2[A, B]`: nsc unifies `F[A]` with either through the
             // class (`F := Function1[Int, *]`, `F := Tuple2[A, *]`).
@@ -2991,6 +2990,64 @@ pub(crate) fn unify_one_precise(
         },
         _ => None,
     }
+}
+
+/// Pattern `ctor[pas]` against a class type, the type itself only.
+fn unify_applied_class(
+    st: &SymbolTable,
+    tp: SymbolId,
+    ctor: &Type,
+    pas: &[Type],
+    actual: &Type,
+) -> Option<Type> {
+    let Type::Class { sym, args: aas } = actual else {
+        return None;
+    };
+    // A constructor with arguments still to come is not a type an
+    // application can be matched against.
+    if st.class_tparam_count(*sym) > aas.len() {
+        return None;
+    }
+    let unapplied = Type::Class {
+        sym: *sym,
+        args: vec![],
+    };
+    partial_unify_applied(st, tp, ctor, pas, unapplied, aas)
+}
+
+/// Pattern `ctor[pas]` against the base types of a class type that did not
+/// unify itself: the direct parents first, then theirs, each seen from the
+/// type they are reached through, and the first that unifies decides.
+fn unify_applied_via_parents(
+    st: &SymbolTable,
+    tp: SymbolId,
+    ctor: &Type,
+    pas: &[Type],
+    actual: &Type,
+) -> Option<Type> {
+    let mut seen: Vec<SymbolId> = Vec::new();
+    let mut level: Vec<Type> = vec![actual.clone()];
+    while !level.is_empty() {
+        let mut next: Vec<Type> = Vec::new();
+        for t in &level {
+            let Type::Class { sym, .. } = t else {
+                continue;
+            };
+            if seen.contains(sym) {
+                continue;
+            }
+            seen.push(*sym);
+            for q in st.get(*sym).parents.clone() {
+                let p = st.subst_as_seen_from(t, &q);
+                if let Some(r) = unify_applied_class(st, tp, ctor, pas, &p) {
+                    return Some(r);
+                }
+                next.push(p);
+            }
+        }
+        level = next;
+    }
+    None
 }
 
 /// The partial-unification step of [`unify_one_precise`]: pattern `ctor[pas]`

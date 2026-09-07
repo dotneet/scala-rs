@@ -113,6 +113,20 @@ scalac がコンパイルした jar に対する検証は `implguard` テスト
 （`Typer::relaxed_pt_depth`）。`Cache[(Seq[String], Class[_]), String]` のように
 利用者が書いた `_` は、これまでどおり解として読みます。
 
+A higher-kinded type variable is solved by nsc's partial unification
+(scala/bug#2712): against a type applied to more arguments than the variable
+takes, the leftmost surplus is captured and only the rightmost arguments are
+abstracted, so `G[B]` against `IndexedStateT[Eval, S, S, B]` is
+`G := IndexedStateT[Eval, S, S, *]`. A partially applied class is already a
+type constructor here, so no lambda symbol is invented and two spellings of the
+same abstraction compare equal. The same capture reads an invariant or
+contravariant position of the expected type, and a literal parameter whose
+expected type is still a variable is read off the literal's body
+(`s => f(s, a)`), as nsc's `typedFunctionUndoingEtaExpansion` does. The JVM run
+and the rejections are compared with scalac 2.13.16 by the `hkunify` tests
+(`tests/fixtures/hku_partial*.scala`); see "Inventing the type lambda that was
+already there" in [docs/cats.md](docs/cats.md).
+
 継承グラフに閉路がある場合も線形化（SLS 5.1.2）は必ず停止します。以前は再帰の
 深さだけを 64 で打ち切っていましたが、深さの上限は再帰木の**大きさ**を抑えません。
 親が 2 つある節点が閉路上にあると木は `分岐^64` になり、`trait X extends Y with Z;
