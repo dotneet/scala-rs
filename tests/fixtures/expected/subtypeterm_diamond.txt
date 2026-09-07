@@ -1,0 +1,11 @@
+A0
+B0
+A0
+B0
+A0
+picked A8
+picked A0
+A0
+B0
+true
+true

@@ -1515,17 +1515,32 @@ impl Typer {
         // a different thing on each path. Keying the walk on the bare symbol
         // checked whichever path was popped first and let the other through.
         let mut work = vec![this_ty.clone()];
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Compared as types, not as `format!("{bt:?}")` strings. The strings
+        // agreed with `==` but cost an allocation and a full rendering of every
+        // base type visited, and the rendering grows with the type: exactly the
+        // walk below that needs bounding is the one that made them longest.
+        let mut seen: Vec<Type> = Vec::new();
+        // `subst_tparams` can *grow* a type argument, so the set of base types
+        // is not guaranteed finite: `trait A[X] extends A[F[X]]` reaches a base
+        // type one application larger every turn, each one new to `seen`, and
+        // this loop had no bound of any kind to stop it. A real hierarchy is
+        // tens of base types; anything that reaches this many is malformed, and
+        // gets its diagnostic from the cycle check rather than from here.
+        const MAX_BASE_TYPES: usize = 10_000;
         while let Some(bt) = work.pop() {
+            if seen.len() >= MAX_BASE_TYPES {
+                break;
+            }
             let Some(id) = self.st.class_sym_of(&bt) else {
                 continue;
             };
             // Deduplicating on the instantiation rather than the symbol keeps
             // the ordinary diamond (every path reaches `FlatMapArity[Box]`)
             // collapsed to one visit, so this stays linear on real hierarchies.
-            if !seen.insert(format!("{bt:?}")) {
+            if seen.contains(&bt) {
                 continue;
             }
+            seen.push(bt.clone());
             let args: Vec<Type> = match &bt {
                 Type::Class { args, .. } => args.clone(),
                 _ => Vec::new(),

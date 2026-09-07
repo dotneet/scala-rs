@@ -69,6 +69,7 @@ fn enter_alias(id: SymbolId) -> Option<AliasGuard> {
     EXPANDING_ALIASES.with(|b| {
         let mut v = b.borrow_mut();
         if v.contains(&id) {
+            note_walk_truncation();
             return None;
         }
         v.push(id);
@@ -126,6 +127,7 @@ pub(crate) fn enter_chase(kind: Chase, id: SymbolId) -> Option<ChaseGuard> {
     CHASING.with(|c| {
         let mut v = c.borrow_mut();
         if v.contains(&key) {
+            note_walk_truncation();
             return None;
         }
         v.push(key);
@@ -139,6 +141,7 @@ fn enter_depth() -> Option<BoundGuard> {
     EXPANDING_BOUNDS.with(|b| {
         let mut v = b.borrow_mut();
         if v.len() > 200 {
+            note_walk_truncation();
             return None;
         }
         v.push(u32::MAX);
@@ -146,11 +149,110 @@ fn enter_depth() -> Option<BoundGuard> {
     })
 }
 
+thread_local! {
+    /// Bookkeeping for the parent fan-outs in [`SymbolTable::is_sub_type`].
+    /// See [`SymbolTable::walk_parents`] for what it is for.
+    static SUBTYPE_WALK: std::cell::RefCell<SubtypeWalk> =
+        const { std::cell::RefCell::new(SubtypeWalk::new()) };
+}
+
+/// Parent-walk steps one outermost question may take before the memo below is
+/// engaged.
+///
+/// The memo costs two `Type` clones per distinct question, and the overwhelming
+/// majority of questions are answered in a handful of steps by a hierarchy that
+/// is a few nodes deep -- `String <: CharSequence` is three. Paying for a memo
+/// there would slow down the hottest arm of the type checker to insure against
+/// a shape it never meets. Above this many steps the walk has already proved it
+/// is not that kind of question, and the memo is cheap next to what it saves.
+///
+/// Only a performance knob: engaging the memo later never changes an answer,
+/// because nothing is ever *read* from the memo that was not first recorded by
+/// this same walk.
+const SUBTYPE_MEMO_AFTER: u32 = 256;
+
+/// See [`SymbolTable::walk_parents`].
+struct SubtypeWalk {
+    /// How many parent walks are on the stack. The memo and the path describe
+    /// one outermost question and are cleared when this returns to zero:
+    /// `is_sub_type` takes `&self`, so no parent list can move under a walk,
+    /// but they certainly move between one walk and the next.
+    depth: u32,
+    /// Parent-walk steps taken since the outermost walk began.
+    steps: u32,
+    /// The questions currently being answered, innermost last.
+    path: Vec<(Type, Type)>,
+    /// Questions already answered during this outermost question.
+    memo: Vec<(Type, Type, bool)>,
+    /// Bumped whenever a question is answered `false` only because it was
+    /// already on `path`. A result is memoisable only while this stands still
+    /// across it.
+    truncations: u32,
+}
+
+impl SubtypeWalk {
+    const fn new() -> Self {
+        SubtypeWalk {
+            depth: 0,
+            steps: 0,
+            path: Vec::new(),
+            memo: Vec::new(),
+            truncations: 0,
+        }
+    }
+}
+
+/// Record that an ambient guard refused an expansion.
+///
+/// `enter_bound`, `enter_alias`, `enter_chase` and `enter_depth` all answer
+/// "stop" based on what is *already* being expanded, so a subtype question
+/// asked underneath one of them can get a different answer than the same
+/// question asked on its own -- an F-bound (`A <: Rep[A]`) is not re-expanded
+/// while it is already being expanded, and the answer may be `false` only for
+/// that reason. Memoising such a result would leak one caller's ambient state
+/// into another's answer, which is the same hazard as memoising a result that
+/// truncated at `path`, so it is counted the same way and suppresses the same
+/// memo entries.
+fn note_walk_truncation() {
+    SUBTYPE_WALK.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.depth > 0 {
+            w.truncations += 1;
+        }
+    });
+}
+
+/// Pops one parent walk off [`SUBTYPE_WALK`], and empties it once the
+/// outermost one returns.
+struct WalkGuard {
+    /// Whether this walk pushed its question onto `path`.
+    tracked: bool,
+}
+
+impl Drop for WalkGuard {
+    fn drop(&mut self) {
+        SUBTYPE_WALK.with(|w| {
+            let mut w = w.borrow_mut();
+            if self.tracked {
+                w.path.pop();
+            }
+            w.depth -= 1;
+            if w.depth == 0 {
+                w.steps = 0;
+                w.truncations = 0;
+                w.path.clear();
+                w.memo.clear();
+            }
+        });
+    }
+}
+
 /// Returns `None` when this parameter's bound is already being expanded.
 fn enter_bound(id: SymbolId) -> Option<BoundGuard> {
     EXPANDING_BOUNDS.with(|b| {
         let mut v = b.borrow_mut();
         if v.contains(&id.0) {
+            note_walk_truncation();
             return None;
         }
         v.push(id.0);
@@ -3342,6 +3444,100 @@ impl SymbolTable {
         Some(false)
     }
 
+    /// Run `f`, a fan-out over `a`'s parents asking whether any of them is
+    /// under `b`, with the bookkeeping that makes that walk terminate and stay
+    /// polynomial.
+    ///
+    /// The walk used to be bounded by [`enter_depth`] alone. **A depth bound
+    /// bounds the depth of the recursion tree, not its size.** With two parents
+    /// per node the tree is `2^depth`, and `any()` short-circuits only on
+    /// `true` -- the blow-up case is a `false`, which is the answer overload
+    /// resolution and implicit search ask for most of the time. Two shapes hit
+    /// it, and only the first needs a cycle:
+    ///
+    /// * A cyclic `extends` graph. `linearize` grew its own guard for this; the
+    ///   cycle is diagnosed and the closing edge replaced by `Type::Error`, so
+    ///   a *reported* cycle no longer reaches here. This guard is what covers
+    ///   the ones that do not (a `ModuleRef` parent, a cycle closed after that
+    ///   check, or any parent list this compiler builds wrongly).
+    ///
+    /// * **A perfectly legal, acyclic hierarchy.** Ten levels of diamonds is
+    ///   `2^10` distinct paths to the top and this walk took every one of them.
+    ///   26 levels of
+    ///
+    ///   ```text
+    ///   trait A(n) extends A(n-1) with B(n-1)
+    ///   trait B(n) extends A(n-1) with B(n-1)
+    ///   ```
+    ///
+    ///   took 74 s to answer one `A26 <: Double`, doubling with every level
+    ///   added, where scalac 2.13.16 compiles the same file in 1.9 s. Depth
+    ///   there is 26 -- the bound of 200 never fired, and no cycle check could
+    ///   have helped, because there is no cycle.
+    ///
+    /// So a `seen` set keyed on the recursion path is not enough: the second
+    /// shape re-reaches the *same* question down a different path, not the same
+    /// one. What that needs is the memo. The two together are the standard
+    /// least-fixed-point treatment, and are what [`crate::lin`] carries:
+    ///
+    /// * A question already on `path` is re-entrant, and is answered `false`.
+    ///   There is no finite derivation of `a <: b` that needs `a <: b`, so
+    ///   `false` is the least fixed point rather than a guess, and every `true`
+    ///   reachable without the cycle survives.
+    /// * A question already in `memo` is answered from it, which is what turns
+    ///   `2^n` into one visit per distinct question.
+    /// * A result computed while anything under it truncated at `path` is
+    ///   **not** memoised: that answer depends on where the walk came from, and
+    ///   caching it would leak one caller's truncation into another's answer.
+    ///
+    /// Keyed on the whole question, never on the bare symbol: a legitimate walk
+    /// revisits a class at different type arguments, and `List[Int]` and
+    /// `List[String]` are different questions with different answers.
+    ///
+    /// [`enter_depth`] stays as the backstop it always was. `subst_tparams_cow`
+    /// can *grow* a type argument (`F[F[A]]`), so the set of distinct questions
+    /// is not guaranteed finite, and neither the path nor the memo would bound
+    /// a walk that keeps inventing new ones.
+    fn walk_parents(&self, a: &Type, b: &Type, f: impl FnOnce() -> bool) -> bool {
+        let Some(_depth) = enter_depth() else {
+            return false;
+        };
+        let (tracked, answer) = SUBTYPE_WALK.with(|w| {
+            let mut w = w.borrow_mut();
+            w.depth += 1;
+            w.steps = w.steps.saturating_add(1);
+            if w.steps <= SUBTYPE_MEMO_AFTER {
+                return (false, None);
+            }
+            if w.path.iter().any(|(x, y)| x == a && y == b) {
+                w.truncations += 1;
+                return (false, Some(false));
+            }
+            if let Some(&(_, _, r)) = w.memo.iter().find(|(x, y, _)| x == a && y == b) {
+                return (false, Some(r));
+            }
+            w.path.push((a.clone(), b.clone()));
+            (true, None)
+        });
+        // Held across `f`, which recurses: it pops this walk and, when the
+        // outermost one returns, empties the memo.
+        let _walk = WalkGuard { tracked };
+        if let Some(r) = answer {
+            return r;
+        }
+        let before = SUBTYPE_WALK.with(|w| w.borrow().truncations);
+        let r = f();
+        if tracked {
+            SUBTYPE_WALK.with(|w| {
+                let mut w = w.borrow_mut();
+                if w.truncations == before {
+                    w.memo.push((a.clone(), b.clone(), r));
+                }
+            });
+        }
+        r
+    }
+
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
         if a == b {
             return true;
@@ -3735,13 +3931,10 @@ impl SymbolTable {
             // implements `CharSequence`, `Comparable<String>` and
             // `Serializable` (`prelude_strhier`). Without this walk every JDK
             // overload taking a `CharSequence` was inapplicable to a `String`.
-            (Type::String, b) => {
-                let Some(_g) = enter_depth() else {
-                    return false;
-                };
+            (Type::String, b) => self.walk_parents(a, b, || {
                 let parents = &self.get(self.string_sym).parents;
                 parents.iter().any(|p| self.is_sub_type(p, b))
-            }
+            }),
             (Type::Class { sym: s1, args: a1 }, b) => {
                 // `scala.FunctionN[T1, …, R]` and the structural function type
                 // are one and the same type; the prelude writes a parent that
@@ -3751,24 +3944,26 @@ impl SymbolTable {
                     return self.is_sub_type(&f, b);
                 }
                 // A malformed hierarchy (`object B extends B`) would otherwise
-                // walk its own parents forever. Depth, not identity: a legitimate
-                // walk revisits a class at a different type argument.
-                let Some(_g) = enter_depth() else {
-                    return false;
-                };
-                // Borrowed: this is the arm the subtype walk spends most of
-                // its time in, and cloning the parent list and the type
-                // parameters at every node of the DAG dominated its cost.
-                let child = self.get(*s1);
-                child.parents.iter().any(|p| {
-                    // `self.`, not the free function: a parent carrying an
-                    // abstract projection over `s1`'s own parameters is only
-                    // the base type the question is about once the projection
-                    // is reduced at `a1` (`SymbolTable::subst_projections`).
-                    // The method costs one `is_empty` when no program in this
-                    // run has a projection at all.
-                    let p = self.subst_tparams_cow(*s1, a1, p);
-                    self.is_sub_type(&p, b)
+                // walk its own parents forever, and a legal one that is merely
+                // deep and diamond-shaped would take `2^depth` paths to the
+                // top. `walk_parents` is where both are stopped, and its
+                // comment says why neither a depth bound nor a set keyed on the
+                // bare symbol is enough.
+                self.walk_parents(a, b, || {
+                    // Borrowed: this is the arm the subtype walk spends most of
+                    // its time in, and cloning the parent list and the type
+                    // parameters at every node of the DAG dominated its cost.
+                    let child = self.get(*s1);
+                    child.parents.iter().any(|p| {
+                        // `self.`, not the free function: a parent carrying an
+                        // abstract projection over `s1`'s own parameters is only
+                        // the base type the question is about once the projection
+                        // is reduced at `a1` (`SymbolTable::subst_projections`).
+                        // The method costs one `is_empty` when no program in this
+                        // run has a projection at all.
+                        let p = self.subst_tparams_cow(*s1, a1, p);
+                        self.is_sub_type(&p, b)
+                    })
                 })
             }
             // `(A, B)` *is* `Tuple2[A, B]`, so everything it inherits --
@@ -3803,12 +3998,9 @@ impl SymbolTable {
                 }
             }
             (Type::ModuleRef(s), Type::Class { sym, .. }) if s == sym => true,
-            (Type::ModuleRef(s), b) => {
-                let Some(_g) = enter_depth() else {
-                    return false;
-                };
+            (Type::ModuleRef(s), b) => self.walk_parents(a, b, || {
                 self.get(*s).parents.iter().any(|p| self.is_sub_type(p, b))
-            }
+            }),
             (Type::TypeParam(a), Type::TypeParam(b)) if a == b => true,
             (Type::TypeMember(a), Type::TypeMember(b)) if a == b => true,
             (Type::TypeMember(id), b) => {

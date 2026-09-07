@@ -201,3 +201,14 @@ Compiler flags (`agent/xflags`):
   `validateParentClasses`, which this compiler has no equivalent of — and we
   print the first of them. The program is rejected either way; the count and
   the follow-on diagnostics are not reproduced.
+- **A downstream type mismatch suppressed by a repaired cycle.** Once
+  `illegal cyclic reference` is reported, the closing parent edge becomes
+  `Type::Error`, and `is_sub_type`'s `(Type::Error, _) => true` arm then accepts
+  everything that class is passed to. For `trait X extends Y with Z; trait Y
+  extends Z with W; trait Z extends X with W; trait W extends X with Y` plus
+  `val q: Q = (x: X)`, scalac 2.13.16 prints three errors -- two cyclic and one
+  `type mismatch; found: X, required: Q` -- and this compiler prints the two
+  cyclic ones. Absorbing follow-on errors is the point of an error type, so this
+  is a fidelity gap rather than a wrong acceptance: the program is rejected
+  either way. Noted while guarding `SymbolTable::is_sub_type`, whose own
+  termination no longer depends on that repair.
