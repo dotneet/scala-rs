@@ -2191,12 +2191,12 @@ impl Typer {
         name: &str,
         span: Span,
     ) -> Option<(SymbolId, SymbolId, Type)> {
-        // A higher-kinded conversion is applicable only if its own implicit
-        // clause has a witness (`conv_param_matches`), and that search cannot
-        // load anything -- it takes `&self`. The witness for `FlatMap[Box]`
-        // lives on `Box`'s companion, which is a class file nothing else asks
-        // for, so warm the receiver's implicit scope here, where the mutable
-        // borrow still exists.
+        // A conversion is applicable only if its own implicit clauses have
+        // witnesses ([`Self::drop_witnessless_conversions`], below). The
+        // witness for `FlatMap[Box]` lives on `Box`'s companion, which is a
+        // class file nothing else asks for, so warm the receiver's implicit
+        // scope here as well: a conversion the receiver's own companion
+        // supplies would otherwise be dropped for want of a class file.
         self.warm_implicit_scope(from);
         let mut hits: Vec<(SymbolId, SymbolId, Type)> = Vec::new();
         let mut ids = self.implicits_in_scope();
@@ -2248,6 +2248,7 @@ impl Typer {
         hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
         self.drop_inherited_duplicates(&mut hits);
         self.drop_overridden_conversions(&mut hits);
+        self.drop_witnessless_conversions(&mut hits, from, span);
         self.drop_inapplicable_conversions(&mut hits, name);
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
@@ -2293,6 +2294,79 @@ impl Typer {
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
             }
         }
+    }
+
+    /// A view whose own implicit arguments cannot be found is not a
+    /// candidate, and the search carries on without it.
+    ///
+    /// nsc's `inferView` types the whole application, implicit clauses
+    /// included; a failure there makes the candidate not applicable rather
+    /// than raising its error, and `adaptToMemberWithArgs` falls back on the
+    /// selection's own `value x is not a member of T`. cats'
+    /// `toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` fits *every*
+    /// one-argument application by shape, so without this every
+    /// `xs.flatMap(...)` on a type with no `FlatMap` instance was reported as
+    /// a missing `FlatMap`, at two spans -- `type_select` inserting the view
+    /// and `rewrite_apply_extension` inserting it again -- instead of as the
+    /// member error scalac reports.
+    ///
+    /// Runs before the tie-breakers, so a witnessless conversion does not take
+    /// part in an ambiguity either: the *other* view, the one that does apply,
+    /// wins outright.
+    fn drop_witnessless_conversions(
+        &mut self,
+        hits: &mut Vec<(SymbolId, SymbolId, Type)>,
+        from: &Type,
+        span: Span,
+    ) {
+        let mut i = 0;
+        while i < hits.len() {
+            if self.conv_implicits_available(hits[i].0, from, span) {
+                i += 1;
+            } else {
+                hits.remove(i);
+            }
+        }
+    }
+
+    /// Whether every implicit clause of a conversion can actually be filled,
+    /// warming exactly what [`Self::fill_conv_implicits`] warms.
+    ///
+    /// The two must agree: a clause this rejects costs a conversion nsc
+    /// applies, and one it accepts that the fill then cannot satisfy is the
+    /// duplicate diagnostic this pass exists to remove.
+    fn conv_implicits_available(&mut self, id: SymbolId, from: &Type, span: Span) -> bool {
+        let clauses = self.conv_implicit_params(id, from);
+        for want in clauses.iter().flatten() {
+            // `ClassTag[A]` with `A` still the conversion's own parameter is
+            // `fill_conv_implicits`'s "unresolved spliceable type"; that
+            // diagnostic says more than a member error, so leave it standing.
+            if self.classtag_of_conv_tparam(id, want) {
+                continue;
+            }
+            self.warm_implicit_scope(want);
+            let mut search = self.search_implicit(want);
+            if matches!(search, ImplicitSearch::None)
+                && self.warm_implicit_candidates(std::slice::from_ref(want))
+            {
+                search = self.search_implicit(want);
+            }
+            if search.is_found() || self.classtag_apply_fallback(want, span).is_some() {
+                continue;
+            }
+            return false;
+        }
+        true
+    }
+
+    /// `ClassTag[A]` where `A` is one of the conversion's own type parameters.
+    fn classtag_of_conv_tparam(&self, id: SymbolId, want: &Type) -> bool {
+        let Type::Class { sym, args } = want else {
+            return false;
+        };
+        self.st.get(*sym).jvm_name == "scala/reflect/ClassTag"
+            && matches!(args.first(), Some(Type::TypeParam(tp))
+                if self.st.get(id).tparams.contains(tp))
     }
 
     /// A conversion whose member cannot take the arguments the call site
@@ -2723,19 +2797,16 @@ impl Typer {
             }
             _ => false,
         };
-        if !fits_ctor {
-            return false;
-        }
         // That widening alone would let a higher-kinded conversion claim every
-        // applied type, turning "not a member" into "no implicit". A conversion
-        // whose own implicit clause has no witness is not applicable (nsc
-        // checks the same), and that is what keeps the widening honest. Only
-        // the widened path pays for the search; a conversion that matched by
-        // conformance is decided exactly as before.
-        self.conv_implicit_params(id, from)
-            .iter()
-            .flatten()
-            .all(|want| self.search_implicit_at(want, 1).is_found())
+        // applied type. What keeps it honest is that a conversion whose own
+        // implicit clause has no witness is not applicable at all -- but that
+        // is a property of the whole application, not of this parameter, and
+        // deciding it here could only be done with the implicit scopes as they
+        // happened to be loaded. Every caller of [`Self::conversion_result`]
+        // now settles it for itself: [`Self::view_undet_bindings`] with
+        // [`Self::conv_implicits_resolve`], [`Self::search_extension`] with
+        // [`Self::drop_witnessless_conversions`], which may load first.
+        fits_ctor
     }
 
     /// The single value parameter of a conversion, as declared.

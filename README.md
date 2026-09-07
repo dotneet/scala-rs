@@ -127,6 +127,23 @@ and the rejections are compared with scalac 2.13.16 by the `hkunify` tests
 (`tests/fixtures/hku_partial*.scala`); see "Inventing the type lambda that was
 already there" in [docs/cats.md](docs/cats.md).
 
+暗黙の変換は、**その適用全体**（自身の暗黙パラメータ節を含む）が成立して初めて
+候補になります。cats の
+`implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])` は形だけ
+見れば 1 引数の適用型すべてに当てはまるので、上の部分単一化で `F := Bag` が解ける
+ようになった時点で、`FlatMap` インスタンスを持たない型に対する `bag.flatMap(f)` が
+「`FlatMap[Bag]` が見つからない」という診断になっていました（しかも変換を挿す経路が
+2 つあるため 2 回）。nsc はこれを報告しません。`inferView` は暗黙引数まで含めて適用を
+型付けし、失敗した変換は**候補から外して**探索を続けます。どれも残らなければ、残る
+診断は選択自身のもの——`value flatMap is not a member of Bag[Int]`——で、位置も選択
+自身の位置です。これは**探索の**規則であって診断の抑制ではないので、
+`toFlatMapOps(new Bag(1))` と手で書いた場合の暗黙値不足はこれまでどおりエラーです。
+証人がある正常系の JVM 実行、証人のない変換が落ちて**別の**変換が勝つ例（両者は
+引数型では優劣が付かず、暗黙節だけが差になります）、および 2 種類の拒否は
+`convimpl` テスト（`tests/fixtures/cimpl_*.scala`）で scalac 2.13.16 と比較します。
+詳細は [docs/cats.md](docs/cats.md) の「The view that was found and could not be
+applied」を参照してください。
+
 継承グラフに閉路がある場合も線形化（SLS 5.1.2）は必ず停止します。以前は再帰の
 深さだけを 64 で打ち切っていましたが、深さの上限は再帰木の**大きさ**を抑えません。
 親が 2 つある節点が閉路上にあると木は `分岐^64` になり、`trait X extends Y with Z;

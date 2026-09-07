@@ -2471,3 +2471,106 @@ B]` against `SortedMap[K, B]` (4) with `Set[A]` against `SortedSet[A]` (2),
 `NonEmptyList[AnyRef]` against `NonEmptyList[C]` (4), `(A, A) => A` against
 `Function2[Any, A, Any]` (4). By file: `OptionT.scala` 11, `Kleisli.scala`
 10, `instances/try.scala` 7, `Chain.scala` 7.
+
+## The view that was found and could not be applied (`agent/convimpl`)
+
+**gitbucket 398 -> 393 errors, 83 files unchanged**; cats, slick and the scala
+library unchanged. This slice is a repair: the previous one
+(`agent/hkunify`, above) left `main` red on two tests, and the root is older
+than the change that exposed it.
+
+### The symptom
+
+```scala
+final class Bag[A](val a: A)
+
+implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F]): FlatMapOps[F, A]
+
+new Bag(1).flatMap(n => new Bag(n))
+```
+
+scalac 2.13.16 reports `value flatMap is not a member of Bag[Int]`. We reported
+`could not find implicit value of type FlatMap[Bag]`, twice, at two different
+spans on the same line.
+
+Partial unification is what made the second error possible, and it is not
+wrong: `F := Bag`, `A := Int` is exactly how nsc solves that parameter too.
+Before it, `F` could not be solved at all, the conversion was never applicable,
+and `not a member` came out *by accident*. What the accident had been standing
+in for is a rule we did not have.
+
+### The rule
+
+nsc's `inferView` types the whole application, implicit clauses included
+(`Implicits.scala`, `typedImplicit1` -> `typed1` of the candidate tree). A
+failure anywhere in it makes the candidate **not applicable**: the error is
+raised inside the search's own context and discarded with the candidate, the
+search goes on with the remaining views, and if none survives,
+`adaptToMemberWithArgs` falls back on the selection's own diagnostic, at the
+selection's own position.
+
+So the rule is a rule of the *search*, not a licence to swallow the
+diagnostic. Three shapes separate the two readings, and all three were checked
+against real scalac 2.13.16 before anything was written:
+
+| program | scalac 2.13.16 |
+| --- | --- |
+| the view has no witness, and no other view applies | `value flatMap is not a member of Bag[Int]` |
+| the view has no witness, another view does apply | compiles, uses the other view |
+| `toFlatMapOps(new Bag(1))`, written out by hand | `could not find implicit value for parameter F: FlatMap[Bag]` |
+
+The third is the one a "never report a conversion's missing witness" rule
+would have broken, and it is the case where the message is what the user
+actually needs.
+
+### What changed
+
+`Typer::search_extension` collects the conversions whose result has the wanted
+member and then narrows the set: duplicates reached twice, conversions a
+subclass overrides, members that cannot take the call's arguments. A fourth
+pass, `drop_witnessless_conversions`, now runs among them and drops any
+candidate whose own implicit clauses cannot be filled. It runs **before** the
+tie-breakers, so a witnessless view does not take part in an ambiguity either
+-- which is what turned two conversions that used to tie into an answer.
+
+The check, `conv_implicits_available`, warms exactly what `fill_conv_implicits`
+warms (the wanted type's implicit scope, then the candidates' parents) and asks
+at the same depth. The two must agree in both directions: a clause the search
+rejects costs a conversion nsc applies, and one it accepts that the fill cannot
+satisfy is the duplicate diagnostic -- `type_select` inserting the view and
+`rewrite_apply_extension` inserting it again, each reporting the same failure.
+With the search deciding it, neither path reaches the fill with a view that
+cannot be completed, and the duplicate is gone by construction rather than by
+de-duplicating messages.
+
+One narrow exception: a `ClassTag[A]` whose `A` is still the conversion's own
+type parameter is left to `fill_conv_implicits`, which reports `type A is an
+unresolved spliceable type`. That says more than a member error.
+
+`conv_param_matches` used to carry half of this rule -- it ran the same search
+for the widened "any type constructor applied to one argument" path only, and
+under `&self`, so it could not load the class file a witness lives in. Partial
+unification made `is_sub_type` accept that shape outright, so the guard stopped
+being reached; it is now removed rather than repaired, because the property is
+one of the whole application and both callers of `conversion_result` settle it
+for themselves.
+
+### Verification
+
+`cimpl_view` (the witness is there: the view applies and the program runs),
+`cimpl_other_conv` (two views equally specific by argument type, separated only
+by their implicit clauses -- the witnessless one is dropped and the other wins
+outright), `cimpl_view_bad` and `cimpl_explicit_bad` (the two rejections). Each
+is pinned against scalac 2.13.16, the positive two byte for byte on stdout, on
+both the real library and the private runtime. On the pre-fix binary
+`cimpl_view_bad` reports the wrong error twice and `cimpl_other_conv` does not
+compile at all (`value describe is not a member of Bag[Int]`).
+
+gitbucket's five: two `TypedType[Option[Date]]` and one `BaseTypedType[B1]`
+`no implicit` become the member errors nsc would report (`value asc/desc is not
+a member of Rep[Option[Date]]`), and two `OptionLift[P, Rep[Option[T]]]` with
+their two dependent `no matching overload` lines go away entirely. On the
+scala/scala corpus (`CORPUS_SIZE=full`, 5324 units) the candidate is
+`pos 1086 / neg 670 / run 618` -- identical to `aa707a3f` -- with `losses=0`
+against `tests/baselines/corpus-7aa47c29.tsv` and the nine gains that ledger
+predates, all of them `agent/hkunify`'s.
