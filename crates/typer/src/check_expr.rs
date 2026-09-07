@@ -693,9 +693,11 @@ impl Typer {
                 // term rather than by the trait that declares it -- that is
                 // what makes `p.T` and `q.T` different types. The `Liftable`
                 // instance is chosen by where the member is *declared*, so ask
-                // for the declaration first; `path_member_decl` answers `None`
-                // for an ordinary member and the lookup is unchanged.
-                let id = &self.st.path_member_decl(*id).unwrap_or(*id);
+                // for the declaration first; `projected_decl` answers `None`
+                // for an ordinary member and the lookup is unchanged. It
+                // covers an abstract projection (`E#T`, owned by the type
+                // parameter `E`) as well, which has the same hazard.
+                let id = &self.st.projected_decl(*id).unwrap_or(*id);
                 let owner = self.st.get(self.st.get(*id).owner).jvm_name.clone();
                 match owner.as_str() {
                     "scala/reflect/api/Trees" => Lift::Tree,
