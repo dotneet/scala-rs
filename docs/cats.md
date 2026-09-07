@@ -1666,3 +1666,113 @@ Backend#Session }` written in source, the gitbucket half. That is a projection
 out of an *abstract type*, and what it needs is a reduction that fires when an
 outer prefix fixes `Backend` -- see `docs/gitbucket.md`, "Still owed after
 `agent/projection`".
+=======
+## The inherited self type read at the wrong arguments (`agent/selftype`)
+
+**303 -> 291 errors, 78 -> 77 files.** Twelve `illegal inheritance` errors, all
+of one root, all in generated code:
+
+```
+error: illegal inheritance: self-type FlatMapTuple1 does not conform to FlatMap[F]
+ --> cats/instances/NTupleMonadInstances.scala:219:20
+```
+
+`class FlatMapTuple1 extends FlatMap[Tuple1]` inherits `self: FlatMap[F] =>`
+from `FlatMapArityFunctions[F]`, by way of `trait FlatMap[F[_]] extends
+Apply[F] with FlatMapArityFunctions[F]`. Read with `F := Tuple1` the
+requirement is `FlatMap[Tuple1]`, which the class obviously satisfies. We were
+comparing against the *unsubstituted* `FlatMap[F]`.
+
+### Why it would not reduce
+
+The substitution was being attempted, so the shape alone does not reproduce it.
+A hand-written hierarchy of exactly this form compiles cleanly, in one file or
+several, which cost an earlier attempt an afternoon. The trigger is a **three-way
+declaration order**:
+
+1. the trait that *declares* the self type (`FlatMapArityFunctions`) is typed
+   **before** the class, so its `self_type` is already bound and the check has
+   something to test;
+2. the class itself;
+3. the trait that *supplies the argument* (`FlatMap`) is typed **after** the
+   class.
+
+Only then does `check_self_conformance` run against a `FlatMap` whose own
+parents are still the unapplied `Type::Class { args: [] }` that the header pass
+installs -- `[Apply, FlatMapArityFunctions]` rather than `[Apply[F],
+FlatMapArityFunctions[F]]`. With no arguments to substitute, `F` stays `F`.
+
+In cats that order falls out of the file names alone. `tests/cats_measure.sh`
+sorts the source set, the generated `FlatMapArityFunctions.scala` sorts before
+`instances/NTupleMonadInstances.scala`, and the hand-written
+`src/main/scala/cats/FlatMap.scala` sorts after both.
+
+`tests/fixtures/selftype_inherited_hk.scala` reproduces it in a single file by
+writing the three declarations in that order; move `FlatMap` above the class and
+the fixture stops proving anything.
+
+### What changed
+
+Two things in `Checker::check_self_conformance`, `crates/typer/src/check_template.rs`:
+
+* **The check is held back to the body pass.** During `sigs_only` the base-type
+  chain is still half-built, so any conformance verdict it reaches is about a
+  type that does not exist yet -- the same reason `inherited_superclass` is
+  already held back. Nothing is lost by waiting: the body pass types every unit
+  the signature pass typed and reaches the check for each of them.
+* **The walk now carries each base type applied, not just its symbol.** The old
+  worklist held bare `SymbolId`s and asked `subst_as_seen_from` to rediscover
+  the instantiation from scratch. That found only one path into a trait
+  inherited twice at different arguments, and deduplicated the other away:
+  `class WrongArg extends FlatMap[Cup] with FlatMapArity[Box]` reached
+  `FlatMapArity` as `[Cup]`, concluded `WrongArg <: FlatMap[Cup]`, and accepted
+  a class real scalac rejects. Substituting along the walk instead fixes both
+  the verdict and the message, which now names scalac's `FlatMap[Box]` rather
+  than a raw `FlatMap[F]`.
+
+Substituting along the walk makes the old `subst_as_seen_from` call redundant,
+and running it as well substituted a second time over an already-instantiated
+type: cats' `Nested` self types came out as the doubly-applied
+`Apply[[α][F, G, α]F[G[α]][F, G, G[α]]]` and picked up eight new errors. It is
+gone; `expand_type_members` still runs, and still carries the slick cake cases
+the original comment describes.
+
+`tests/fixtures/selftype_inherited_hk_bad.scala` is the negative half. Both of
+its classes genuinely fail an inherited self type and real scalac 2.13.16
+rejects both, at lines 20 and 25, against the substituted `FlatMap[Box]`; the
+e2e test pins the lines and the types, not just the words `illegal inheritance`.
+
+### The head after this slice
+
+The twelve were a whole family, and removing them does not change the shape of
+what is left: 291 errors in 77 files, still **149 `type mismatch`** and **84 `no
+matching overload`**. Those two are *not* one root each -- 149 type mismatches
+carry 116 distinct found/required pairs -- but they are not fifty either.
+
+The largest single-root family left is **`Parallel` / `NonEmptyParallel`'s
+abstract type member `type F[_]` read through an instance prefix**. Cats writes
+
+```scala
+trait NonEmptyParallel[M[_]] extends Serializable { type F[_]; def apply: Apply[F]; ... }
+```
+
+and every instance refines `F`. Reading `P.F` where `P` is a particular instance
+has to give that instance's refinement; we produce the declaration's own
+unrefined member instead, so the two sides print almost identically and compare
+unequal:
+
+```
+found:    Applicative[[γ$24$]Nested[NonEmptyParallel.F, [β$5$]Validated[E, β$5$], γ$24$]]
+required: Applicative[[γ$29$]Nested[$anon$1667.F, [β$28$]Validated[E, β$28$], γ$29$]]
+```
+
+**74 of the 291 error lines (25%)** name such a prefix-read type member, 33 of
+them `NonEmptyParallel.F` specifically. They concentrate in exactly the files at
+the head of the per-file count -- `EitherT` (19 errors in the file), `IorT` (17),
+`OptionT` (16), `Kleisli` (14), `WriterT` (7) and `Parallel.scala` itself -- and
+they are spread across all three of the surviving message kinds, which is why
+clustering by message kind hides them.
+
+This is path-dependent type member territory, so it belongs to whatever slice
+owns that area rather than to a second self-type pass. It is the one place in
+the remaining tail where a single fix should be worth tens of errors.

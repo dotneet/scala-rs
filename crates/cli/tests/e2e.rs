@@ -424,6 +424,12 @@ fn fatal_warnings_makes_non_exhaustive_fail() {
 }
 
 fn compile_fails(name: &str, needle: &str) {
+    let _ = compile_fails_out(name, needle);
+}
+
+/// `compile_fails`, but hands back the diagnostics so a test can also pin the
+/// line and the exact types a message names.
+fn compile_fails_out(name: &str, needle: &str) -> String {
     let src = fixtures_dir().join(format!("{name}.scala"));
     let out = tmp_dir(name);
     let output = Command::new(bin())
@@ -450,6 +456,7 @@ fn compile_fails(name: &str, needle: &str) {
         "expected {needle:?} in diagnostics for {name}, got {err:?}"
     );
     let _ = fs::remove_dir_all(&out);
+    err
 }
 
 fn compile_fails_lib(name: &str, needle: &str) {
@@ -579,6 +586,14 @@ fn fixtures_type_member() {
 #[test]
 fn fixtures_self_type() {
     check("self_type");
+}
+
+/// cats' `NTupleMonadInstances` shape: an inherited self type read with the
+/// linking parent's arguments substituted in. The declaration order in the
+/// fixture is load-bearing -- see the comment at the top of it.
+#[test]
+fn fixtures_selftype_inherited_hk() {
+    check("selftype_inherited_hk");
 }
 
 #[test]
@@ -1102,6 +1117,23 @@ fn fixtures_capture_var_bad_is_error() {
 #[test]
 fn fixtures_self_type_bad_is_error() {
     compile_fails("self_type_bad", "illegal inheritance");
+}
+
+/// Holding the self-type check back to the body pass must not stop it
+/// rejecting anything. Both classes in this fixture genuinely fail an
+/// *inherited* self type, and real scalac 2.13.16 rejects both -- at lines 20
+/// and 25, against the substituted `FlatMap[Box]`, which is what these assert.
+#[test]
+fn fixtures_selftype_inherited_hk_bad_is_error() {
+    let err = compile_fails_out("selftype_inherited_hk_bad", "illegal inheritance");
+    for needle in [
+        "self-type NotAFlatMap does not conform to FlatMap[Box]",
+        "selftype_inherited_hk_bad.scala:20:",
+        "self-type WrongArg does not conform to FlatMap[Box]",
+        "selftype_inherited_hk_bad.scala:25:",
+    ] {
+        assert!(err.contains(needle), "expected {needle:?} in: {err}");
+    }
 }
 
 #[test]

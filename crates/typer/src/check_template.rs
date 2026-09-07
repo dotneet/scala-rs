@@ -1405,26 +1405,75 @@ impl Typer {
         if is_trait {
             return;
         }
+        // Not during the header (`sigs_only`) pass. Reading an inherited self
+        // type means walking the base-type chain and substituting each parent's
+        // type arguments into it, and in that pass a parent declared by a unit
+        // that has not been reached yet is still the unapplied
+        // `Type::Class { args: [] }` that `parents_pass_tmpl` installs -- the
+        // same reason `inherited_superclass` is held back above.
+        //
+        // With no arguments to substitute, the inherited requirement stays in
+        // the *declaring* trait's vocabulary. cats' `class FlatMapTuple1
+        // extends FlatMap[Tuple1]` inherits `self: FlatMap[F] =>` from
+        // `FlatMapArityFunctions[F]` through `trait FlatMap[F[_]] extends
+        // Apply[F] with FlatMapArityFunctions[F]`; while `FlatMap`'s own
+        // parents read `[Apply, FlatMapArityFunctions]`, `F` never becomes
+        // `Tuple1` and the class is rejected against a requirement it plainly
+        // meets. The body pass sees `[Apply[F], FlatMapArityFunctions[F]]`,
+        // substitutes, and accepts it.
+        //
+        // Nothing is lost by waiting: the body pass types every unit the
+        // signature pass typed, and reaches this check for each of them, so a
+        // class that genuinely fails an inherited self type is still rejected
+        // -- at the same line -- one pass later.
+        if self.sigs_only {
+            return;
+        }
         // `class C[F[_]] extends P[F]` conforms to `P`'s self type as `C[F]`,
         // not as a bare `C`: dropping the arguments made every parameterized
         // cake class "not conform".
         let this_ty = self.st.self_type_of_class(class_id);
-        let mut work = vec![class_id];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(id) = work.pop() {
-            if !seen.insert(id.0) {
+        // The worklist carries each base type *applied*, not just its symbol.
+        // The same trait can be inherited twice at different arguments --
+        // `class WrongArg extends FlatMap[Cup] with FlatMapArity[Box]` reaches
+        // `FlatMapArity` as both `[Cup]` and `[Box]` -- and its self type means
+        // a different thing on each path. Keying the walk on the bare symbol
+        // checked whichever path was popped first and let the other through.
+        let mut work = vec![this_ty.clone()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Some(bt) = work.pop() {
+            let Some(id) = self.st.class_sym_of(&bt) else {
+                continue;
+            };
+            // Deduplicating on the instantiation rather than the symbol keeps
+            // the ordinary diamond (every path reaches `FlatMapArity[Box]`)
+            // collapsed to one visit, so this stays linear on real hierarchies.
+            if !seen.insert(format!("{bt:?}")) {
                 continue;
             }
+            let args: Vec<Type> = match &bt {
+                Type::Class { args, .. } => args.clone(),
+                _ => Vec::new(),
+            };
             if let Some(st) = self.st.get(id).self_type.clone() {
                 // The self type was written in the *declaring* trait's
-                // vocabulary. Two things separate it from what it means here:
-                // the parent's type parameters (`this: Database[F] =>` on
+                // vocabulary. Three things separate it from what it means here:
+                // this occurrence's own arguments (`FlatMapArity[Box]` makes
+                // `self: FlatMap[F] =>` mean `FlatMap[Box]`), the enclosing
+                // parent's type parameters (`this: Database[F] =>` on
                 // `BasicDatabaseDef[F]`), and the abstract type members its
                 // enclosing cake left open (`type Database[F[_]]` on
                 // `BasicBackend`, aliased to `JdbcDatabaseDef[F]` by
                 // `JdbcBackend`). Reading it raw compares `JdbcDatabaseDef`
                 // against `BasicBackend.Database[F]`, which nothing satisfies.
-                let st = self.st.subst_as_seen_from(&this_ty, &st);
+                //
+                // The walk above already carries each parent's arguments down
+                // the chain, which is the job `subst_as_seen_from` used to be
+                // asked to redo from scratch here. Running it as well
+                // substitutes a second time over an already-instantiated type:
+                // cats' `Nested` self types came out as the doubly-applied
+                // `Apply[[α][F, G, α]F[G[α]][F, G, G[α]]]` and were rejected.
+                let st = self.st.subst_tparams(id, &args, &st);
                 let st = self.st.expand_type_members(class_id, &st);
                 if !self.st.is_sub_type(&this_ty, &st) {
                     self.error(
@@ -1438,9 +1487,10 @@ impl Typer {
                 }
             }
             for p in self.st.get(id).parents.clone() {
-                if let Some(ps) = self.st.class_sym_of(&p) {
-                    work.push(ps);
-                }
+                // The parent is declared in this base type's vocabulary, so it
+                // has to be instantiated before it can instantiate anything of
+                // its own -- the same step `subst_as_seen_from`'s walk takes.
+                work.push(self.st.subst_tparams(id, &args, &p));
             }
         }
     }
