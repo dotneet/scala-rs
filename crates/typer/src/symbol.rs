@@ -2033,12 +2033,18 @@ impl SymbolTable {
     /// reduction fires here -- once, at `E := Accounts`, where `Accounts`
     /// really does fix `TableElementType` to `(String, Int)`.
     ///
-    /// A projection whose new prefix settles nothing is left alone rather
-    /// than rebuilt against it: allocating would need `&mut self` on one of
-    /// the hottest paths in the typer, and an abstract projection already
-    /// conforms both ways with the bare declaration it stands for
-    /// (`is_sub_type`), which is exactly the precision this compiler had
-    /// before projections existed.
+    /// A projection whose new prefix settles nothing -- `E'#T` at `E' := E`,
+    /// another abstract type -- becomes the bare **declaration**, not a
+    /// projection through the new prefix. Rebuilding one would need `&mut
+    /// self` on one of the hottest paths in the typer; keeping the old one
+    /// would leave a projection through a prefix that is no longer in scope,
+    /// and two such stale symbols do not compare equal to each other
+    /// (`def widenOf[E <: AbstractRow](rs: RowSet[E]): E#ElementType =
+    /// rs.widen` reported `found: E#ElementType required: E#ElementType`).
+    /// The bare declaration is exactly the answer this compiler produced
+    /// everywhere before projections existed, and `is_sub_type` relates it to
+    /// a projection in both directions, so no question gets a worse answer
+    /// than it had.
     pub fn subst_projections(&self, tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
         if !self.mentions_abs_projection(ty) {
             return ty.clone();
@@ -2057,7 +2063,7 @@ impl SymbolTable {
                 return t.clone();
             };
             self.reduce_projection(arg, decl)
-                .unwrap_or_else(|| t.clone())
+                .unwrap_or(Type::TypeMember(decl))
         })
     }
 
