@@ -87,6 +87,21 @@ scalac がコンパイルした jar に対する検証は `implguard` テスト
 [docs/cats.md](docs/cats.md) の「The same member, higher-kinded」を参照して
 ください。
 
+継承グラフに閉路がある場合も線形化（SLS 5.1.2）は必ず停止します。以前は再帰の
+深さだけを 64 で打ち切っていましたが、深さの上限は再帰木の**大きさ**を抑えません。
+親が 2 つある節点が閉路上にあると木は `分岐^64` になり、`trait X extends Y with Z;
+trait Y extends Z; trait Z extends X` という 3 行（実際の scalac は 2 秒未満で
+拒否します）だけで CPU を 100% 使い切ったまま何時間も返りませんでした。現在は
+`crates/typer/src/lin.rs` が再帰の**経路**を持ち、線形化中のクラスに再入した時点で
+打ち切るので、どんなシンボルグラフでも停止します。あわせて閉路そのものを
+`illegal cyclic reference involving trait X` と診断し（scalac 2.13.16 と同じ行・
+同じ文言）、閉路を閉じている親を error 型に置き換えて先へ進みます。置き換えは
+nsc と同じ理由で、`SymbolTable::is_sub_type` など親をたどる他の走査も閉路に
+出会わなくなります。正しい階層に対する線形化は変えていません（slick の 1490 個の
+class file が main と 1 バイトも違いません）。深く広いダイヤモンド継承の `super`
+連鎖を実行して実 scalac の出力と比較する検査と、閉路の拒否行の検査は
+`linearization` テスト（`tests/fixtures/linterm_*.scala`）にあります。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -273,6 +288,13 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
 
 How the fixtures, the dual-run harnesses and the pickle-reader regression tests
 are organised is described in [docs/testing.md](docs/testing.md).
+
+線形化（SLS 5.1.2）は `linearization` テストで二重に検査します。正常系は深く広い
+ダイヤモンド継承の `super` 連鎖を実行し、同じソースを実 scalac 2.13.16 で
+コンパイル・実行した出力と直接比較します（`super` の連鎖がそのまま線形化なので、
+停止のためのガードが線形化を黙って切り詰めれば出力から trait が 1 つ消えます）。
+異常系は閉路のある `extends` グラフが scalac と同じ行・同じ文言で拒否されること、
+そして**そもそも停止すること**（60 秒の上限つき）を検査します。
 
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
