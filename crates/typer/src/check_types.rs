@@ -869,6 +869,26 @@ impl Typer {
             found = self.st.lookup_member(cls, name);
         }
         found.sort_by_key(|s| if self.st.get(*s).owner == cls { 0 } else { 1 });
+        // Every candidate is a *deferred* type member inherited from an
+        // ancestor, and `cls` may well fix it: `slick.jdbc.JdbcBackend`
+        // declares `type Session = SessionDef` over the `type Session` its
+        // `slick.basic.BasicBackend` parent leaves abstract. Whether the
+        // abstract declaration is already in the table depends only on which
+        // file was compiled first, so ask the pickle -- which reads the
+        // linearisation most-derived-first -- before answering with it.
+        if self.library_abi
+            && !found.is_empty()
+            && found
+                .iter()
+                .all(|&m| self.st.get(m).owner != cls && self.st.is_deferred_type_member(m))
+        {
+            if let Some(ty) =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, cls, name)
+            {
+                return self.st.expand_in_type(prefix, &ty);
+            }
+        }
         for m in found {
             let ty = match self.st.get(m).kind {
                 SymKind::TypeMember => self.st.type_member_as_seen(m),

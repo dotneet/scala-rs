@@ -669,6 +669,9 @@ impl Typer {
         // Owners of members that came in *inherited* from a superclass of the
         // object named in the import; see `remember_named_import_prefix`.
         let mut inherited_through: Vec<SymbolId> = Vec::new();
+        // Deferred type members held back from the term-namespace loop; see
+        // the comment there.
+        let mut deferred_inherited: Vec<SymbolId> = Vec::new();
         for &owner in owners {
             if owner.is_none() {
                 continue;
@@ -786,6 +789,20 @@ impl Typer {
                 }
             }
             for m in found {
+                // A *deferred* type member the import's owner only inherits is
+                // not necessarily what this name means there: `import
+                // slick.jdbc.JdbcBackend.Session` has to see the `type Session
+                // = SessionDef` that `JdbcBackend` fixes, not the `type
+                // Session` its `slick.basic.BasicBackend` parent leaves
+                // abstract. Which of the two the table already holds depends
+                // only on what an earlier file happened to complete, so the
+                // pickle -- read most-derived-first by the `type` half below
+                // -- decides. Kept aside, not dropped: if that half finds
+                // nothing, the inherited declaration is still the answer.
+                if self.st.is_deferred_type_member(m) && self.st.get(m).owner != owner {
+                    deferred_inherited.push(m);
+                    continue;
+                }
                 self.st.enter_in_current(to, m);
                 entered = true;
                 let mowner = self.st.get(m).owner;
@@ -840,6 +857,14 @@ impl Typer {
                     }
                     _ => {}
                 }
+            }
+        }
+        // Nothing better came from a pickle, so an inherited declaration held
+        // back above is what the name means after all.
+        if !self.st.has_real_type_entry(to) {
+            for m in deferred_inherited {
+                self.st.enter_in_current(to, m);
+                entered = true;
             }
         }
         if entered {

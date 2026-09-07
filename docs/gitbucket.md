@@ -1905,6 +1905,85 @@ both reproduce in the same file
   `implicit session: Session` parameter fails to answer a blocking-slick
   member's `implicit session: JdbcBackend#SessionDef`.
 
+## Fixed: a concrete backend's type members (`agent/backendtypes`)
+
+The `Session` entry above was two independent roots, not one, and the brief
+that grouped it with `Database` / `DatabaseFactory` was wrong about the third.
+895 → 882.
+
+**Root 1: a deferred declaration outranked the definition that fixes it.**
+`slick.basic.BasicBackend` declares `type Session`; `slick.jdbc.JdbcBackend`
+fixes it to `SessionDef`. `lookup_member` walks the parents depth-first and a
+class read from a jar has its members completed one name at a time, so which
+of the two answered `JdbcBackend#Session` depended only on what an earlier
+file had happened to complete. `gitbucket.core.model.package` writes exactly
+that (`type Session = slick.jdbc.JdbcBackend#Session`), and it resolved to the
+abstract declaration whenever a `blockingApi._` import had run first —
+reproducible in eight lines, with the two import lines in either order giving
+different answers. Fixed in four places that all pick one member out of a
+linearisation: `SymbolTable::type_members_named` (concrete before deferred),
+`PickleSupply::complete_type_member` and `install_type_alias` (an inherited
+deferred member is not the answer for a derived class; ask the pickle, which
+is ordered most-derived-first), and `Checker::project_from_prefix`.
+
+**Root 2: `p#T` lost its prefix on the way out of the pickle.**
+`BasicProfile.API` declares `type Session = Backend#Session`, and
+`crates/pickle/src/sym.rs` dropped the prefix of every `TypeRefTpe`, so the
+answer was `T`'s own declaration — the abstract one, since the prefix is what
+settles it. The reader now keeps `prefix#T` when the prefix is a type
+parameter or an abstract type member of the same unit, and `conv_ref` resolves
+the prefix against the class the member is being completed *for* (`JdbcProfile`
+fixes `type Backend = JdbcBackend`), falling back to the old answer when
+nothing settles it. Only an alias settles a prefix: a prefix that is itself
+still deferred is refused, or the walk stops one class short of the alias
+(`RelationalProfile.Backend` instead of `JdbcProfile`'s).
+
+**Not this cluster: `Database` / `DatabaseFactory` (20 errors).** These are an
+*import precedence* defect, not a type-member one. `Database() withTransaction`
+resolves `Database` to the wildcard-imported `blockingApi.Database` instead of
+`gitbucket.core.servlet.Database`, because a wildcard import and an explicit
+one (or a package-level definition of the same compilation unit) land in the
+same scope here and the last one entered wins. SLS 2 ranks a wildcard import
+below both. Eleven lines reproduce it with no slick types involved:
+
+```scala
+package q                    // K1.scala
+object Database { def apply(): Int = 42 }
+```
+```scala
+package r                    // K2.scala
+import slick.jdbc.H2Profile.api._
+import q.Database
+object Main { def g(): Unit = { val x: Int = Database(); println(x) } }
+```
+
+nsc accepts it; we report `found: BasicBackend.DatabaseFactory required: Int`.
+Giving `Scope` a wildcard rank fixes all of that and is **not** in this merge:
+it was measured at 900 (from 895) because the 20 errors move to
+`withTransaction is not a member of DatabaseDef` — blocking-slick's
+`BlockingDatabase` implicit class is a separate wall behind it — while
+scalatra's `RichRequest` / `RichSession` conversions pick up ~30 new ones.
+Worth its own slice, with those two as the acceptance criterion.
+
+**Also still owed**, in the same shape as root 2 but on the source side:
+
+```scala
+trait BaseProfile { type Backend <: BaseBackend; trait API { type Session = Backend#Session } }
+trait ConcreteProfile extends BaseProfile { type Backend = ConcreteBackend; ... }
+```
+
+`Checker::project_from_prefix` widens `Backend` to its bound at the point the
+*alias* is typed, so `TheProfile.api.Session` is `BaseBackend.Session` and
+`s.label` is "not a member". nsc keeps the projection until the use site.
+Doing the same needs a `Type::Projection` the typer does not have; the pickle
+path above works around it only because the prefix is still a name there.
+
+**Left over: implicit search does not rank by context nesting.** With `Session`
+correct, `RequestCache`'s own `private implicit def context2Session` and the
+imported `Implicits.request2Session` both apply, and we report
+`ambiguous implicit` 14 times. nsc tries the nearest context's implicits first
+and never sees the second. That is `crates/typer/src/implicits.rs`.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
