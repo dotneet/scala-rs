@@ -1092,15 +1092,10 @@ impl Typer {
     ) -> Type {
         // The arguments have to line up one for one with the parameters, or
         // the index a path names is not the index this call filled.
-        if params.len() != args.len() || !self.st.mentions_path_member(&ret) {
+        if params.len() != args.len() || !self.st.mentions_path_member_deep(&ret) {
             return ret;
         }
-        let skolems: Vec<SymbolId> = self
-            .st
-            .type_members_in(&ret)
-            .into_iter()
-            .filter(|m| self.st.path_member_decl(*m).is_some())
-            .collect();
+        let skolems: Vec<SymbolId> = self.st.path_members_in(&ret);
         let mut out = ret;
         for sk in skolems {
             let Some(path) = self.st.path_member_path(sk).map(|p| p.to_vec()) else {
@@ -1119,7 +1114,7 @@ impl Typer {
                 if self.st.class_sym_of(&prefix).is_some() {
                     let seen = self.st.expand_in_type(&prefix, &Type::TypeMember(decl));
                     if !matches!(&seen, Type::TypeMember(x) if *x == decl) {
-                        out = crate::symbol::subst_type_member(&out, sk, &seen);
+                        out = self.st.subst_path_member_deep(&out, sk, &seen);
                     }
                 }
                 continue;
@@ -1132,7 +1127,9 @@ impl Typer {
                 continue;
             }
             let re = self.st.path_member(&actual, decl, &prefix);
-            out = crate::symbol::subst_type_member(&out, sk, &Type::TypeMember(re));
+            out = self
+                .st
+                .subst_path_member_deep(&out, sk, &Type::TypeMember(re));
         }
         out
     }
@@ -1145,10 +1142,7 @@ impl Typer {
     /// inference and reduction, and carrying a prefix through that is a step
     /// this slice does not take.
     fn can_be_path_member(&self, m: SymbolId, prefix: &Type) -> bool {
-        if !self.st.is_deferred_type_member(m)
-            || self.st.path_member_decl(m).is_some()
-            || !self.st.get(m).tparams.is_empty()
-        {
+        if !self.st.is_deferred_type_member(m) || self.st.path_member_decl(m).is_some() {
             return false;
         }
         // ...and only when the *prefix's own class* still leaves it deferred.

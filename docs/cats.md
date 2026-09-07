@@ -1776,3 +1776,156 @@ clustering by message kind hides them.
 This is path-dependent type member territory, so it belongs to whatever slice
 owns that area rather than to a second self-type pass. It is the one place in
 the remaining tail where a single fix should be worth tens of errors.
+
+## The same member, higher-kinded (`agent/hkpath`)
+
+**281 -> 252 errors, 75 files unchanged.** 28 error *locations* disappeared and
+none appeared. `agent/projection`'s limit #2 -- "only a first-order member" --
+is gone, and the dependent-method-type substitution that limit was protecting
+had to grow two things before it could hold.
+
+### Lifting the restriction, on its own
+
+`can_be_path_member` refused any declaration with type parameters. Dropping
+that one clause takes cats from 281 to **255**, and adds three errors of a
+single new shape in two files (`files_with_errors` 75 -> 76):
+
+```
+found:    Parallel[[γ$20$]EitherT[M, E, γ$20$]] { type F[x] = […]Nested[P.F, […]Validated[E, …], …][E, x] }
+required: Parallel[[γ$4$] EitherT[M, E, γ$4$]]  { type F[x] = […]Nested[P.F, […]Validated[E, …], …][E, x] }
+```
+
+-- the two sides printing *identically*, because they are two different `P`s:
+
+```scala
+def catsDataParallelForEitherTWithParallelEffect[M[_], E: Semigroup](implicit
+  P: Parallel[M]
+): Parallel.Aux[EitherT[M, E, *], Nested[P.F, Validated[E, *], *]] =
+  accumulatingParallel[M, E]
+```
+
+`accumulatingParallel`'s result names `accumulatingParallel`'s own `P`. This is
+exactly nsc's dependent method types and exactly what `subst_dependent_paths`
+is for -- it just could not reach this call.
+
+### Two reasons it could not
+
+**1. The clause is one nobody wrote.** `accumulatingParallel[M, E]` is a
+`TypeApply` with no argument list at all; the implicit clause is filled in by
+`adapt_implicit_apply` (`check_infer.rs`), which builds the argument trees and
+then hands out the declared result untouched. `subst_dependent_paths` now runs
+there, on the parameters and the arguments that pass just went and found. The
+scala/scala corpus has this shape twice: `pos/t10714` and `pos/t10714b`
+
+```scala
+class Bar { type Baz = Foo; def foo(implicit foo: Baz): foo.Out = ??? }
+(new Bar).foo.foo
+```
+
+both fail on `ab18fc50` and both pass now.
+
+**2. Every occurrence to substitute was inside a type lambda.** A type lambda
+is not a shape in `Type`: `Nested[P.F, Validated[E, *], *]` is an *anonymous
+alias symbol* whose body is stored beside it in the symbol table
+(`refinement_type_member`, and kind-projector's `*` desugars to exactly that
+refinement). So `mentions_path_member` said "no" about a type that displays
+`P.F` twice, and `map_type` had nothing to rewrite.
+
+`mentions_path_member_deep`, `path_members_in` and `subst_path_member_deep`
+walk into such a body. A rewrite there cannot edit the alias in place -- the
+same symbol stands for every use of that written type -- so it allocates a
+copy, memoised on (alias, member, replacement) in `path_member_lambdas`, which
+is what keeps two spellings of one substituted type comparing equal. Only
+*anonymous* aliases are followed: a class's own `type X = …` is resolved by
+name elsewhere, and cloning it would make two members where the source
+declares one.
+
+With both halves, cats is **252**, `files_with_errors` back to 75, and
+`pos/t7753` (`indirect(converted)(23)` on `def indirect(si: SI)(v:
+si.instance.Out)`) passes as well.
+
+**`mentions_path_member` itself stayed shallow, deliberately.** `is_sub_type`
+pairs it with `drop_path_members`, which takes `&self` and therefore cannot
+rewrite a lambda body either. Answering "yes" for an occurrence its partner
+cannot then remove makes `is_sub_type` recurse on an unchanged type: the first
+build of the deep version overflowed the stack on cats' first `Parallel`
+instance.
+
+### Correctness
+
+`tests/fixtures/hkp_member.scala` is `NonEmptyParallel` cut down to what the
+defect needs, and it *runs*: `expected/hkp_member.txt` is what real scalac
+2.13.16 prints for the same source, and the e2e test asserts scalac's own run
+against that file as well. On `ab18fc50` the fixture does not compile at all --
+seven errors, with the cats signature (`found: Cell[Par.F[A]] required:
+Cell[Cell[Cell[Cell[Cell[$anon$2.F[A]]]]]]`, the declaration on one side and
+the anonymous class's own member on the other, plus the alias folding back on
+itself).
+
+`tests/fixtures/hkp_member_bad.scala` is the negative half, and it is the half
+that says the representation still means something:
+
+```scala
+def mix[M[_], N[_]](p: Par[M], q: Par[N])(fa: p.F[Int]): q.F[Int] = fa
+def mixBack[M[_], N[_]](p: Par[M], q: Par[N])(fa: q.F[Int]): p.F[Int] = fa
+def absent[M[_]](p: Par[M])(fa: p.G[Int]): Int = 0
+```
+
+`ab18fc50` **accepts the first two** -- `p.F` and `q.F` were both the
+declaration `Par.F` -- and rejects only the third. Real scalac 2.13.16 rejects
+all three, at lines 19, 22 and 25, and so do we now, with the same types; the
+e2e test pins the lines and the types on both compilers.
+
+### What it cost elsewhere
+
+gitbucket 679/102, the scala library 1550/168 and slick `errors=0
+classes=1490` are all unchanged, `MODE=b tests/slick_run.sh` is 12/12 36/36,
+`tests/slick_subset.sh` is 184 files / 1490 classes / `verified=1490 failed=0`
+/ `lint_problems=0`, and `tests/verify_all.sh` over those 1490 classes reports
+`verify_failures=0`. On the corpus (`CORPUS_SIZE=full`), `losses=0`.
+
+**Two of slick's 1490 class files are not byte-identical**, and both differ
+*only* in their `ScalaSignature`: `javap -p -c` is identical for
+`RelationalProfile` and `RelationalProfile$RelationalAPI`, and the pickle grows
+by 199 bytes. The cause is in the source:
+
+```scala
+trait RelationalProfile … { self =>
+  trait API … { type ColumnType[T] = self.ColumnType[T]; … }
+  type ColumnType[T] <: TypedType[T]
+```
+
+`self.ColumnType` is a higher-kinded member behind the self alias, so it is now
+a path member and the alias records the outer declaration instead of resolving
+its own right-hand side back to itself. `MODE=a tests/slick_run.sh` -- the
+direction that makes real scalac read our pickles -- is 0/12 both before and
+after this change, for reasons this slice does not touch (the pickle loses the
+`implicit` flag on evidence parameters, and carries a stub `inline` symbol that
+`scala.reflect` refuses outright); so it cannot discriminate, and nothing else
+in the battery moved.
+
+### The head after this slice
+
+252 errors in 75 files: **128 `type mismatch`** (95 distinct found/required
+pairs), **62 `no matching overload`**, 22 `no implicit`. The prefix-read type
+member family is down from 35 error lines to **9**, and those 9 are no longer a
+prefix defect -- both sides now say `P.F`.
+
+**The next root in this neighbourhood is a type parameter that occurs only
+under an *applied abstract type constructor*, left unsolved.** `Parallel.scala`
+line 247 is the clearest instance:
+
+```scala
+def parFlatTraverse[T[_]: Traverse: FlatMap, M[_], A, B](ta: T[A])(f: A => M[T[B]])(implicit
+  P: Parallel[M]): M[T[B]] = {
+  val gtb: P.F[T[B]] = Traverse[T].flatTraverse(ta)(a => P.parallel(f(a)))(P.applicative, FlatMap[T])
+```
+
+`flatTraverse[G[_], A, B]` has `B` only inside `G[T[B]]`. We solve `G := P.F`
+and leave `B` open, so the call comes out `P.F[T[_]]` against a declared
+`P.F[T[B]]`. **24 of the 252 error lines** name such a `_` or the `Nothing` the
+same failure collapses to (`Applicative[[γ]Nested[P.F, _, γ]]` against
+`Applicative[[γ]Nested[P.F, [β]Either[E, β], γ]]`, `Kleisli[P.F, Nothing, γ]`
+against `Kleisli[P.F, A, γ]`, `_[_]` as a required type in `IndexedStateT`'s
+six). That is inference, not prefixes, and it is the largest remaining family
+with one mechanism behind it.
