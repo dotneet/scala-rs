@@ -2443,6 +2443,17 @@ attempts=36/36`. `slick_subset.sh` and `verify_all.sh` were not run: nothing
 here reaches codegen, and the byte-identical class files say so more directly.
 No new clippy warnings; the 37 in the typer crate are all in untouched code.
 
+On the scala/scala corpus (`CORPUS_SIZE=full`, 5324 units) against
+`tests/baselines/corpus-d056a7f7.tsv`: **`losses=0`**, 17 gains. Nine of
+them are this slice's, checked by rerunning them on the `8554717c` binary
+where they fail: `pos/t2712-1`, `-3`, `-4`, `-7` and `neg/t2712-2` (the
+SI-2712 partial-unification tests themselves), `pos/hk-infer`, `pos/t5683`,
+`pos/tcpoly_infer_implicit_tuple_wrapper`, and `pos/fun_undo_eta` -- the
+corpus's own test for the undo-eta parameter typing. The other eight
+(`pos/t10714`, `t10714b`, `t6895`, `t7753`, `t8801`, `run/t102`, `run/t3798`,
+`neg/t7507`) already pass on `8554717c`; they are earlier slices' gains the
+ledger predates. The candidate is `pos 1086 / neg 670 / run 618`.
+
 ### The head after this slice
 
 215 errors in 73 files: **106 `type mismatch`** (79 distinct pairs), **61 `no
