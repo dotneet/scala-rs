@@ -1661,11 +1661,17 @@ parameters (`subst_dependent_paths`, nsc's dependent method types).
   `-varargs`) are the corpus's three tests for that half, and they were the
   only losses the first full corpus run reported.
 
-**Not fixed, and not the same mechanism**: `trait API { type Session =
-Backend#Session }` written in source, the gitbucket half. That is a projection
-out of an *abstract type*, and what it needs is a reduction that fires when an
-outer prefix fixes `Backend` -- see `docs/gitbucket.md`, "Still owed after
-`agent/projection`".
+**Not fixed here, and not the same mechanism**: a projection out of an
+*abstract type* (`E#TableElementType`, `Backend#Session`). Taken by
+`agent/absproj`, which represents it the same way this slice represents a path
+member -- a deferred `TypeMember` symbol per (prefix, declaration) pair, not a
+`Type` variant -- but settles it differently: a path member never reduces,
+while an abstract projection reduces the moment its prefix is *instantiated*
+(`SymbolTable::subst_projections`). The two meet in `Typer::at_term_path`,
+where a projection reached through a term path (`def get[P <: Phase](p: P):
+Option[p.State]`) is unwrapped back to its declaration and re-attached as a
+path member: the term settles what the type does not. See
+`docs/gitbucket.md`, "A projection out of an abstract type".
 
 ## The inherited self type read at the wrong arguments (`agent/selftype`)
 

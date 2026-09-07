@@ -762,6 +762,23 @@ pub struct SymbolTable {
     /// property the path members themselves exist to provide.
     pub(crate) path_member_lambdas:
         rustc_hash::FxHashMap<(SymbolId, SymbolId), Vec<(Type, SymbolId)>>,
+    /// `P#T` where the prefix `P` is still abstract -- a type parameter or a
+    /// deferred type member -- so the projection cannot be reduced yet.
+    ///
+    /// Represented the same way a path-dependent member is, and for the same
+    /// reason (see [`SymbolTable::path_members`]): a deferred `TypeMember`
+    /// symbol allocated once per (prefix, declaration) pair rather than a new
+    /// `Type` variant. The difference is what settles it. A path member is
+    /// settled by the path it was written through and never reduces; an
+    /// abstract projection reduces the moment its prefix is *instantiated* --
+    /// `TableQuery[E <: AbstractTable[_]] extends Query[E, E#TableElementType,
+    /// Seq]` at `E := Accounts` is `Query[Accounts, (String, Int), Seq]` --
+    /// which is what [`SymbolTable::subst_projections`] does.
+    ///
+    /// Keyed by the prefix's symbol and the declaration being projected.
+    pub(crate) abs_projections: rustc_hash::FxHashMap<(SymbolId, SymbolId), SymbolId>,
+    /// `(prefix symbol, declaration)` for each symbol in `abs_projections`.
+    pub(crate) abs_projection_of: rustc_hash::FxHashMap<SymbolId, (SymbolId, SymbolId)>,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -883,6 +900,8 @@ impl SymbolTable {
             path_member_decl: rustc_hash::FxHashMap::default(),
             path_member_path: rustc_hash::FxHashMap::default(),
             path_member_lambdas: rustc_hash::FxHashMap::default(),
+            abs_projections: rustc_hash::FxHashMap::default(),
+            abs_projection_of: rustc_hash::FxHashMap::default(),
         };
         st.root = st.alloc(
             "<_root_>",
@@ -1686,6 +1705,9 @@ impl SymbolTable {
             return ty.clone();
         }
         let out = subst_map(ty, tps, args);
+        // `P#T` reduces exactly here: `P` is one of `tps` and `args` is what
+        // it has just become. See `subst_projections`.
+        let out = self.subst_projections(tps, args, &out);
         // Substituting a type *lambda* for a type constructor leaves the
         // applications it lands in folded: `def twice[F[_]](fa: F[Int])` with
         // `F = ({ type L[X] = Reader[Int, X] })#L` gives `L[Int]`, and
@@ -1748,7 +1770,15 @@ impl SymbolTable {
         args: &[Type],
         ty: &'t Type,
     ) -> std::borrow::Cow<'t, Type> {
-        subst_tparams_cow(&self.get(owner).tparams, args, ty)
+        let tps = &self.get(owner).tparams;
+        let out = subst_tparams_cow(tps, args, ty);
+        if self.abs_projection_of.is_empty() {
+            return out;
+        }
+        match self.subst_projections(tps, args, &out) {
+            t if t == *out => out,
+            t => std::borrow::Cow::Owned(t),
+        }
     }
 
     /// nsc: a *alias* type member is equivalent to (not merely bounded by) its
@@ -1857,6 +1887,177 @@ impl SymbolTable {
         self.path_member_decl.insert(id, decl);
         self.path_member_path.insert(id, path.to_vec());
         id
+    }
+
+    /// `P#T` as a type, where the prefix `P` is a type parameter or a type
+    /// member the program has left deferred, so nothing here can reduce it.
+    ///
+    /// Allocated once per (prefix, declaration) pair and reused, so two
+    /// spellings of the same projection are the same type. The bounds are
+    /// the declaration's own, minus any that mention the declaring class's
+    /// type parameters: those are written in a vocabulary the projection has
+    /// no arguments for, and a bound that means nothing here would make
+    /// unrelated types conform.
+    pub fn abstract_projection(&mut self, prefix: SymbolId, decl: SymbolId) -> SymbolId {
+        if let Some(id) = self.abs_projections.get(&(prefix, decl)) {
+            return *id;
+        }
+        let info = self.get(decl);
+        let name = info.name.clone();
+        let flags = info.flags;
+        let tparams = info.tparams.clone();
+        let owner_tps = self.get(info.owner).tparams.clone();
+        let keep = |st: &Self, t: Option<Type>| -> Option<Type> {
+            let t = t?;
+            (!st.mentions_tparams(&t, &owner_tps)).then_some(t)
+        };
+        let lo = keep(self, info.bound_lo.clone());
+        let hi = keep(self, info.bound_hi.clone());
+        let id = self.alloc(name, prefix, SymKind::TypeMember, flags, "");
+        // Deferred, and it stands for itself: an abstract projection is
+        // exactly as opaque as the declaration it projects until the prefix
+        // is instantiated.
+        self.symbols[id.0 as usize].ty = Type::TypeMember(id);
+        self.symbols[id.0 as usize].tparams = tparams;
+        self.symbols[id.0 as usize].bound_lo = lo;
+        self.symbols[id.0 as usize].bound_hi = hi;
+        self.abs_projections.insert((prefix, decl), id);
+        self.abs_projection_of.insert(id, (prefix, decl));
+        id
+    }
+
+    fn mentions_tparams(&self, ty: &Type, tps: &[SymbolId]) -> bool {
+        if tps.is_empty() {
+            return false;
+        }
+        any_type(
+            ty,
+            &mut |t| matches!(t, Type::TypeParam(id) | Type::TypeMember(id) if tps.contains(id)),
+        )
+    }
+
+    /// `(prefix, declaration)` when `id` is an abstract projection, `None`
+    /// otherwise.
+    pub fn abs_projection(&self, id: SymbolId) -> Option<(SymbolId, SymbolId)> {
+        self.abs_projection_of.get(&id).copied()
+    }
+
+    /// The declaration `id` stands for when it is a path-dependent member or
+    /// an abstract projection: what erasure, the pickle and the backend see,
+    /// so that nothing downstream of the typer has to know either exists.
+    pub fn projected_decl(&self, id: SymbolId) -> Option<SymbolId> {
+        self.path_member_decl
+            .get(&id)
+            .copied()
+            .or_else(|| self.abs_projection_of.get(&id).map(|(_, d)| *d))
+    }
+
+    /// `pre#T` reduced, or `None` when `pre` does not settle `T`.
+    ///
+    /// `None` covers the two cases that must *not* reduce: a prefix that is
+    /// still abstract (real scalac rejects `class TQ[E <: Table[_]] extends
+    /// Query[E, E#Element]` precisely because `E#Element` is not the bound's
+    /// `Element`), and a class that inherits the declaration without fixing
+    /// it.
+    pub fn reduce_projection(&self, pre: &Type, decl: SymbolId) -> Option<Type> {
+        // A prefix that is still abstract settles nothing, and reading it
+        // through its *bound* is the too-eager reduction: `class TQ[E <:
+        // Table[_]] extends Query[E, E#Element]` is rejected by real scalac
+        // exactly because `E#Element` is not the bound's `Element`.
+        // `class_sym_of` would follow the bound, so it is ruled out first.
+        if matches!(pre, Type::TypeParam(_))
+            || matches!(pre, Type::TypeMember(id) if self.is_deferred_type_member(*id))
+        {
+            return None;
+        }
+        let name = self.get(decl).name.clone();
+        let cls = self.class_sym_of(pre)?;
+        let owner = self.get(decl).owner;
+        // Only a class that really has this declaration above it can answer
+        // for it; anything else would be a different member of the same name.
+        if owner != cls && !self.is_ancestor_of(owner, cls) {
+            return None;
+        }
+        let m = self
+            .type_members_named(cls, &name)
+            .into_iter()
+            .find(|m| self.get(*m).kind == SymKind::TypeMember)?;
+        if self.is_deferred_type_member(m) || !self.get(m).tparams.is_empty() {
+            return None;
+        }
+        let rhs = self.type_member_as_seen(m);
+        Some(self.subst_as_seen_from(pre, &rhs))
+    }
+
+    /// Does `ty` mention an abstract projection anywhere?
+    pub fn mentions_abs_projection(&self, ty: &Type) -> bool {
+        if self.abs_projection_of.is_empty() {
+            return false;
+        }
+        any_type(
+            ty,
+            &mut |t| matches!(t, Type::TypeMember(id) if self.abs_projection_of.contains_key(id)),
+        )
+    }
+
+    /// Replace every abstract projection in `ty` by the declaration it
+    /// projects. Erasure, the pickle and the backend read types through this,
+    /// so nothing downstream of the typer has to know projections exist.
+    pub fn drop_abs_projections(&self, ty: &Type) -> Type {
+        if self.abs_projection_of.is_empty() {
+            return ty.clone();
+        }
+        map_type(ty, &mut |t| match t {
+            Type::TypeMember(id) => self
+                .abs_projection_of
+                .get(id)
+                .map(|(_, d)| Type::TypeMember(*d))
+                .unwrap_or_else(|| t.clone()),
+            other => other.clone(),
+        })
+    }
+
+    /// Reduce every `P#T` in `ty` whose prefix `P` is one of `tps`, now that
+    /// `args` says what `P` is.
+    ///
+    /// This is the whole point of the representation: `TableQuery[E <:
+    /// AbstractTable[_]] extends Query[E, E#TableElementType, Seq]` is read
+    /// out of slick's pickle with `E#TableElementType` unreduced, and the
+    /// reduction fires here -- once, at `E := Accounts`, where `Accounts`
+    /// really does fix `TableElementType` to `(String, Int)`.
+    ///
+    /// A projection whose new prefix settles nothing -- `E'#T` at `E' := E`,
+    /// another abstract type -- becomes the bare **declaration**, not a
+    /// projection through the new prefix. Rebuilding one would need `&mut
+    /// self` on one of the hottest paths in the typer; keeping the old one
+    /// would leave a projection through a prefix that is no longer in scope,
+    /// and two such stale symbols do not compare equal to each other
+    /// (`def widenOf[E <: AbstractRow](rs: RowSet[E]): E#ElementType =
+    /// rs.widen` reported `found: E#ElementType required: E#ElementType`).
+    /// The bare declaration is exactly the answer this compiler produced
+    /// everywhere before projections existed, and `is_sub_type` relates it to
+    /// a projection in both directions, so no question gets a worse answer
+    /// than it had.
+    pub fn subst_projections(&self, tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
+        if !self.mentions_abs_projection(ty) {
+            return ty.clone();
+        }
+        map_type(ty, &mut |t| {
+            let Type::TypeMember(id) = t else {
+                return t.clone();
+            };
+            let Some((pre, decl)) = self.abs_projection(*id) else {
+                return t.clone();
+            };
+            let Some(i) = tps.iter().position(|p| *p == pre) else {
+                return t.clone();
+            };
+            let Some(arg) = args.get(i) else {
+                return t.clone();
+            };
+            self.reduce_projection(arg, decl)
+                .unwrap_or(Type::TypeMember(decl))
+        })
     }
 
     /// Every type member `ty` mentions anywhere, refinements included.
@@ -2828,7 +3029,11 @@ impl SymbolTable {
             };
             let s = self.get(sym);
             for p in &s.parents {
-                let p = subst_tparams_cow(&s.tparams, args, p);
+                // `self.subst_tparams_cow`, not the free function: a parent
+                // written as `Query[E, E#TableElementType, Seq]` only becomes
+                // the base type the source asked for once the projection is
+                // reduced at `E`'s argument.
+                let p = self.subst_tparams_cow(sym, args, p);
                 if seen.contains(&*p) {
                     continue;
                 }
@@ -3182,6 +3387,27 @@ impl SymbolTable {
                 };
             }
         }
+        // An abstract projection (`E#T`, `E` still a type parameter) and the
+        // bare declaration it projects conform in both directions, for the
+        // same reason a path member does: the bare declaration is what every
+        // route that does not carry a prefix still produces -- including the
+        // erased generic signature of the very class the projection was read
+        // out of -- and refusing it would invent errors, not find them. Two
+        // projections through *different* prefixes are left to the arms
+        // below and stay distinct, which is what makes the reduction sound.
+        if !self.abs_projection_of.is_empty() {
+            let (pa, pb) = (
+                self.mentions_abs_projection(a),
+                self.mentions_abs_projection(b),
+            );
+            if pa != pb {
+                return if pa {
+                    self.is_sub_type(&self.drop_abs_projections(a), b)
+                } else {
+                    self.is_sub_type(a, &self.drop_abs_projections(b))
+                };
+            }
+        }
         // An abstract type on the *right* is at least its lower bound:
         // `def f[E, O >: E](x: E): O = x` is legal, and so is every
         // `ShapedValue[_ <: E, U]` where a `ShapedValue[_ <: O, U]` is wanted.
@@ -3518,7 +3744,13 @@ impl SymbolTable {
                 // parameters at every node of the DAG dominated its cost.
                 let child = self.get(*s1);
                 child.parents.iter().any(|p| {
-                    let p = subst_tparams_cow(&child.tparams, a1, p);
+                    // `self.`, not the free function: a parent carrying an
+                    // abstract projection over `s1`'s own parameters is only
+                    // the base type the question is about once the projection
+                    // is reduced at `a1` (`SymbolTable::subst_projections`).
+                    // The method costs one `is_empty` when no program in this
+                    // run has a projection at all.
+                    let p = self.subst_tparams_cow(*s1, a1, p);
                     self.is_sub_type(&p, b)
                 })
             }
@@ -3861,6 +4093,10 @@ impl SymbolTable {
             }
             Type::TypeMember(id) => {
                 let s = self.get(*id);
+                // An abstract projection prints the way the program wrote it.
+                if self.abs_projection_of.contains_key(id) {
+                    return format!("{}#{}", self.get(s.owner).name, s.name);
+                }
                 format!("{}.{}", self.get(s.owner).name, s.name)
             }
             Type::ThisType(id) => format!("{}.this.type", self.get(*id).name),
@@ -4079,8 +4315,12 @@ impl SymbolTable {
                 // A path-dependent member already says which prefix it came
                 // through. Re-resolving its *name* in `from` is what dropping
                 // the prefix looked like: `q.T` would come back as `A`'s own
-                // `T`, and `p.T` with it.
-                if self.path_member_decl.contains_key(id) {
+                // `T`, and `p.T` with it. An abstract projection is the same
+                // case one step further out: `API`'s `type Session =
+                // Backend#Session` must not come back as `API`'s own
+                // `Session`, which is the alias being expanded.
+                if self.path_member_decl.contains_key(id) || self.abs_projection_of.contains_key(id)
+                {
                     return ty.clone();
                 }
                 let name = self.get(*id).name.clone();
