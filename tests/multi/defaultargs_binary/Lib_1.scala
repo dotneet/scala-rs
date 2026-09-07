@@ -1,6 +1,7 @@
 // The library half of the "defaults declared in a class file" test. Compiled
-// separately -- by real scalac and by scala-rs -- so the consumer sees only
-// the class files and the pickle, never this source.
+// separately, by **real scalac**, so the consumer sees only the class files
+// and nsc's own pickle and never this source. That is the setting the defect
+// appears in: gitbucket calls json4s and scalatra out of published jars.
 package dalib
 
 import scala.reflect.ClassTag
