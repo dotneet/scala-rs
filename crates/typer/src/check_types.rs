@@ -941,7 +941,233 @@ impl Typer {
             );
             return Type::Error;
         };
-        self.project_from_prefix(span, &pty, name)
+        let t = self.project_from_prefix(span, &pty, name);
+        self.at_term_path(prefix, &pty, t)
+    }
+
+    /// The chain of term symbols a stable path names (`a.b.c` -> `[a, b, c]`),
+    /// or `None` when the path is not spelled out of terms -- `this`, `super`,
+    /// a package, or an `object`, none of which can denote two instances and
+    /// so none of which need their members told apart by prefix.
+    ///
+    /// The chain must *start* at a local: a parameter, a local `val`, or a
+    /// pattern binding. A path that starts at a member of some class carries
+    /// an implied outer prefix (`backend.Session` inside `BasicProfile` is
+    /// `this.backend.Session`), and reading it through another receiver has to
+    /// compose the two -- slick writes `profile.runSynchronousQuery(...)(s: profile.backend.Session)`
+    /// and gets `backend.Session` for the parameter. Composing prefixes is a
+    /// step beyond this slice; a local path never needs it, because there is
+    /// no outer instance for it to be relative to.
+    pub(crate) fn stable_term_path(&self, t: &Tree) -> Option<Vec<SymbolId>> {
+        let path = self.stable_term_path_in(t)?;
+        let head = *path.first()?;
+        let owner = self.st.get(head).owner;
+        if owner.is_none() {
+            return None;
+        }
+        // A class's self alias (`trait Rep { self => … }`) is allowed: it is
+        // another spelling of `this`, so it has no outer prefix either, and
+        // it is the one that keeps `type Representation = (self.Representation,
+        // G.Representation)` in an anonymous subclass from resolving its own
+        // right-hand side back to itself by name (cats' `Representable#compose`).
+        let is_self_alias = self.st.get(owner).self_alias == Some(head);
+        (is_self_alias || !self.st.get(owner).is_class_like()).then_some(path)
+    }
+
+    fn stable_term_path_in(&self, t: &Tree) -> Option<Vec<SymbolId>> {
+        match &t.kind {
+            TreeKind::Ident { name } => {
+                // A tree that has already been typed says which symbol it
+                // resolved to; only a type tree, which is read before any of
+                // that, has to go back to the scope.
+                if !t.sym.is_none()
+                    && matches!(self.st.get(t.sym).kind, SymKind::Term | SymKind::Method)
+                {
+                    return Some(vec![t.sym]);
+                }
+                let s = self.st.lookup_term(name).into_iter().find(|s| {
+                    matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method)
+                        && !self.st.get(*s).ty.is_no_type()
+                })?;
+                Some(vec![s])
+            }
+            TreeKind::Select { qual, name }
+            | TreeKind::SelectFromTypeTree {
+                qual,
+                name,
+                hash: false,
+            } => {
+                let mut chain = self.stable_term_path_in(qual)?;
+                let qty = self.term_path_type(qual)?;
+                let cls = self.st.class_sym_of(&qty)?;
+                let s =
+                    self.st.lookup_member(cls, name).into_iter().find(|s| {
+                        matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method)
+                    })?;
+                chain.push(s);
+                Some(chain)
+            }
+            _ => None,
+        }
+    }
+
+    /// `T` seen through the term path `path_tree`, whose type is `pty`.
+    ///
+    /// Only a *deferred* member needs this: an alias carries its right-hand
+    /// side, which `project_from_prefix` has already read through the prefix.
+    pub(crate) fn at_term_path(&mut self, path_tree: &Tree, pty: &Type, t: Type) -> Type {
+        let Type::TypeMember(m) = t else {
+            return t;
+        };
+        if !self.can_be_path_member(m, pty) {
+            return t;
+        }
+        let Some(path) = self.stable_term_path(path_tree) else {
+            return t;
+        };
+        Type::TypeMember(self.st.path_member(&path, m, pty))
+    }
+
+    /// The rewrite that puts a selected member's type behind the path its
+    /// receiver was written as: `c.start` on `val start: () => Eval[Start]` is
+    /// `() => Eval[c.Start]`, not `() => Eval[Start]`.
+    ///
+    /// Returned as a (declaration, path member) list rather than applied,
+    /// because it has to run on the *declaration* -- before the receiver's
+    /// type arguments are substituted in. Afterwards an occurrence that came
+    /// from a type argument (`case cc: FlatMap[c.Start]` makes `cc.run`'s
+    /// result `Eval[c.Start]`) is indistinguishable from one the declaration
+    /// wrote, and re-pathing both to `cc` is wrong.
+    ///
+    /// Only members the receiver's class declares are rewritten -- a type
+    /// member of some other class that the signature mentions is not the
+    /// receiver's to reinterpret.
+    pub(crate) fn receiver_path_members(
+        &mut self,
+        qual: &Tree,
+        recv_ty: &Type,
+        found: &[SymbolId],
+    ) -> Vec<(SymbolId, SymbolId)> {
+        let Some(cls) = self.st.class_sym_of(recv_ty) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<SymbolId> = Vec::new();
+        for s in found {
+            let ty = self.st.get(*s).ty.clone();
+            for m in self.st.type_members_in(&ty) {
+                if candidates.contains(&m) || !self.can_be_path_member(m, recv_ty) {
+                    continue;
+                }
+                let name = self.st.get(m).name.clone();
+                if self.st.lookup_member(cls, &name).contains(&m) {
+                    candidates.push(m);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let Some(path) = self.stable_term_path(qual) else {
+            return Vec::new();
+        };
+        candidates
+            .into_iter()
+            .map(|m| (m, self.st.path_member(&path, m, recv_ty)))
+            .collect()
+    }
+
+    /// nsc's dependent method types, for the paths this compiler tracks.
+    ///
+    /// `def nanos[C](c: C)(implicit ev: Classifier[C]): ev.R` names one of its
+    /// own parameters in its result, and at a call site that means the
+    /// *argument's* path. Without the substitution the callee's `ev.R` and the
+    /// caller's `ev.R` are two different paths, and every one of
+    /// `DurationConversions`' fourteen forwarders fails against its own
+    /// signature with `found: ev.R  required: ev.R`.
+    pub(crate) fn subst_dependent_paths(
+        &mut self,
+        sym: SymbolId,
+        args: &[Tree],
+        ret: Type,
+    ) -> Type {
+        if sym.is_none() || !self.st.mentions_path_member(&ret) {
+            return ret;
+        }
+        let params: Vec<SymbolId> = self.st.get(sym).paramss.iter().flatten().copied().collect();
+        // The arguments have to line up one for one with the parameters, or
+        // the index a path names is not the index this call filled.
+        if params.len() != args.len() {
+            return ret;
+        }
+        let skolems: Vec<SymbolId> = self
+            .st
+            .type_members_in(&ret)
+            .into_iter()
+            .filter(|m| self.st.path_member_decl(*m).is_some())
+            .collect();
+        let mut out = ret;
+        for sk in skolems {
+            let Some(path) = self.st.path_member_path(sk).map(|p| p.to_vec()) else {
+                continue;
+            };
+            let Some(i) = params.iter().position(|p| *p == path[0]) else {
+                continue;
+            };
+            let decl = self.st.path_member_decl(sk).unwrap_or(sk);
+            let prefix = args[i].ty.clone();
+            // The argument's own class may *fix* the member -- slick's
+            // `state.get(Phase.assignUniqueSymbols)` is `Option[p.State]` on a
+            // `p` whose actual class defines `State`. Then the answer is that
+            // type, not a path at all.
+            if !self.can_be_path_member(decl, &prefix) {
+                if self.st.class_sym_of(&prefix).is_some() {
+                    let seen = self.st.expand_in_type(&prefix, &Type::TypeMember(decl));
+                    if !matches!(&seen, Type::TypeMember(x) if *x == decl) {
+                        out = crate::symbol::subst_type_member(&out, sk, &seen);
+                    }
+                }
+                continue;
+            }
+            let Some(mut actual) = self.stable_term_path(&args[i]) else {
+                continue;
+            };
+            actual.extend_from_slice(&path[1..]);
+            if actual == path {
+                continue;
+            }
+            let re = self.st.path_member(&actual, decl, &prefix);
+            out = crate::symbol::subst_type_member(&out, sk, &Type::TypeMember(re));
+        }
+        out
+    }
+
+    /// Is `m` a declaration a path can be attached to?
+    ///
+    /// A *deferred* member only: an alias carries its right-hand side, which
+    /// has already been read through the prefix. And a first-order one only: a
+    /// higher-kinded member is a type constructor whose application drives
+    /// inference and reduction, and carrying a prefix through that is a step
+    /// this slice does not take.
+    fn can_be_path_member(&self, m: SymbolId, prefix: &Type) -> bool {
+        if !self.st.is_deferred_type_member(m)
+            || self.st.path_member_decl(m).is_some()
+            || !self.st.get(m).tparams.is_empty()
+        {
+            return false;
+        }
+        // ...and only when the *prefix's own class* still leaves it deferred.
+        // `trait Node { type Self >: this.type <: Node }` is abstract at its
+        // declaration, but `this2: ParameterSwitch` fixes it, so `this2.Self`
+        // is `ParameterSwitch` -- not an abstract member behind a prefix.
+        // Freezing it as one made six of slick's `:@` calls fail against
+        // their own declared result.
+        if self.st.class_sym_of(prefix).is_none() {
+            return false;
+        }
+        matches!(
+            self.st.expand_in_type(prefix, &Type::TypeMember(m)),
+            Type::TypeMember(x) if x == m
+        )
     }
 
     pub(crate) fn is_stable_path(&self, t: &Tree) -> bool {

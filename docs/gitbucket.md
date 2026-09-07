@@ -1978,6 +1978,37 @@ trait ConcreteProfile extends BaseProfile { type Backend = ConcreteBackend; ... 
 Doing the same needs a `Type::Projection` the typer does not have; the pickle
 path above works around it only because the prefix is still a name there.
 
+**Still owed after `agent/projection`, and not the same mechanism.** That
+slice gave a type member seen through a *term* path (`p.T`) its own symbol, so
+`p.T` and `q.T` are two types (docs/cats.md, "Path-dependent type members").
+This one is a projection out of an *abstract type*, and what it needs is not a
+prefix to carry but a **reduction that fires later**: `Backend#Session` has to
+stay unreduced until an outer prefix (`TheProfile`, through
+`ConcreteProfile`'s `type Backend = ConcreteBackend`) fixes `Backend`, and the
+class that fixes it is not in `API`'s owner chain -- `expand_type_members`
+walks `enclosing_classes(API)`, which reaches `BaseProfile` and stops. Eight
+lines reproduce it, and nsc accepts all of them:
+
+```scala
+trait BaseBackend { type Session }
+class SessionDef { def label: String = "s" }
+trait ConcreteBackend extends BaseBackend { type Session = SessionDef }
+trait BaseProfile { type Backend <: BaseBackend; trait API { type Session = Backend#Session }; val api: API }
+trait ConcreteProfile extends BaseProfile { type Backend = ConcreteBackend; val api: API = new API {} }
+object TheProfile extends ConcreteProfile
+object Main { def f(s: TheProfile.api.Session): String = s.label }
+```
+
+We report `value label is not a member of API.Session`. Whoever takes it
+should start from `projected_class_type` / `symbol::AS_SEEN_FROM_MARK`, which
+is how `agent/proj` already carries what a prefix settles across a `A#B`, and
+not from the path-member symbols -- those answer a different question.
+
+The same eight lines also turn up a second, independent defect on the way:
+`object api extends API` does not count as an implementation of the inherited
+`val api: API` ("object creation impossible"), which is why the repro above
+writes `val api: API = new API {}`.
+
 **Left over: implicit search does not rank by context nesting.** With `Session`
 correct, `RequestCache`'s own `private implicit def context2Session` and the
 imported `Implicits.request2Session` both apply, and we report

@@ -1462,5 +1462,105 @@ classes). The next families by size:
   IorT[$anon$1780.F, E, A]`, 40 error lines mention an `$anon$` type. An
   abstract type member of an anonymous `Parallel` instance is not recognised
   as the same type as the trait's `F`. It needs its own reduction.
+  (`agent/projection` later took ten of those lines -- the first-order ones,
+  `Eval#flatMap` and `Representable` -- and confirmed the rest, all of them
+  `NonEmptyParallel.F`, are the eta-expansion root above and not this one.
+  See "Path-dependent type members" at the end of this file.)
 * `Ordering[AA]` against `Ordering[A]` (6), `NonEmptyList[AnyRef]` against
   `NonEmptyList[C]` (4), `Map[K, B]` against `SortedMap[K, B]` (4).
+
+## Path-dependent type members (`agent/projection`)
+
+326 -> 316. Ten error lines in three files: `Eval.scala` 102/103/106,
+`Representable.scala` 86, and the six in `Tuple2K.scala` 142-156.
+
+**The defect.** `Type::TypeMember` carries no prefix, so `p.T` and `q.T` were
+the same type. `q.put(p.get)` type-checked -- nsc rejects it with
+`found: p.T  required: q.T` -- and cats' `Eval#flatMap`, which writes
+
+```scala
+case c: Eval.FlatMap[A] =>
+  new Eval.FlatMap[B] {
+    type Start = c.Start
+    val start: () => Eval[Start] = c.start
+```
+
+reported `found: () => Eval[FlatMap.Start]  required: () => Eval[$anon$1367.Start]`.
+Both halves were wrong the same way: `c.start` came out at the *declaration*
+in `FlatMap` rather than at `c`, and the anonymous class's `type Start =
+c.Start` never expanded, because `type_member_as_seen` folded any alias whose
+right-hand side was another type member back to itself -- a rule that is right
+for a deferred member (`type A` is spelled as a self reference) and wrong for
+an alias, and one `is_deferred_type_member` already draws correctly.
+
+**The representation, and why not `Type::Projection`.** A path-dependent
+member is a **symbol**: a deferred `TypeMember` allocated once per (path,
+declaration) pair, owned by the path's last term so it prints as `p.T`, and
+carrying the declaration's bounds read through the prefix
+(`SymbolTable::path_member`). Every walk that already handles an abstract type
+member handles this one with no new arm, and a walk that knows nothing about
+paths is exactly as imprecise as it was before -- which is what a new `Type`
+variant could not promise across conformance, substitution, as-seen-from,
+erasure and the pickle at once.
+
+Three places had to learn about it:
+
+* **`is_sub_type`** relaxes in one direction only. A path member and the bare
+  declaration it stands for conform both ways, because the bare declaration is
+  still what this compiler produces everywhere the prefix is not tracked;
+  when *both* sides carry a path they are compared as the distinct symbols
+  they are. That asymmetry is the whole negative property.
+* **`expand_type_members`** must not re-resolve a path member *by name* in the
+  class it is expanding into -- that is what dropping the prefix looked like,
+  and it is also what made an anonymous subclass's `type Rp = (self.Rp,
+  other.Rp)` resolve its own right-hand side back to itself
+  (`Representable#compose`; the `enter_alias` guard in `symbol.rs` exists for
+  that shape).
+* **Erasure and the pickle** both replace a path member by its declaration
+  (`erase_ty`, `pickle_type`). They therefore agree with each other and with
+  everything the backend saw before this change; the typer keeps the
+  distinction and nothing downstream has to know it exists. Reading the
+  *bound through the prefix* in erasure would have been a real divergence:
+  `class C[X] { type T <: X }` bounds `c.T` by `String` for a `c: C[String]`
+  where `T` itself is bounded only by `X`.
+
+**Where a path is attached.** At a written type `p.T` (`path_dependent_type`),
+at a member selected through a path (`receiver_path_members`, applied to the
+*declaration* before the receiver's type arguments go in -- afterwards an
+occurrence that came from a type argument is indistinguishable from one the
+declaration wrote), and at a call whose result names one of the callee's own
+parameters (`subst_dependent_paths`, nsc's dependent method types).
+
+**Four restrictions, each with the measurement that asked for it.**
+
+* **Only a member the prefix's own class still leaves deferred.** slick's
+  `trait Node { type Self >: this.type <: Node }` is abstract at its
+  declaration and fixed by every subclass, so `this2.Self` on a
+  `this2: ParameterSwitch` is `ParameterSwitch`. Freezing it as a path member
+  made six `:@` calls fail against their own declared result (slick 0 -> 22).
+* **Only a first-order member.** A higher-kinded member (`type F[_]`) is a
+  type constructor whose application drives inference and reduction; giving it
+  a prefix as well is a separate step. cats' `Parallel` instances are written
+  entirely in terms of `P.F` and the ones that fail there fail for the
+  eta-expansion reason `agent/catseta` recorded, not this one.
+* **Only a path that starts at a local** -- a parameter, a local `val`, a
+  pattern binding -- **or at a class's self alias.** A path starting at an
+  arbitrary member of a class carries an implied outer prefix
+  (`backend.Session` inside `BasicProfile` is `this.backend.Session`), and
+  reading it through another receiver has to *compose* the two: slick writes
+  `profile.runSynchronousQuery(...)(s: profile.backend.Session)` and got
+  `backend.Session` for the parameter. Composition is a step beyond this
+  slice. A self alias is exempt because it is another spelling of `this` and
+  so has no outer prefix either -- and it is what keeps
+  `Representable#compose` correct.
+* **Dependent substitution needs the arguments to line up one for one with
+  the parameters.** Without it, `DurationConversions`' fourteen forwarders
+  (`def nanos[C](c: C)(implicit ev: Classifier[C]): ev.R = nanoseconds(c)`)
+  each failed against their own signature with `found: ev.R  required: ev.R`
+  -- two different `ev`s (scala library 1554 -> 1567).
+
+**Not fixed, and not the same mechanism**: `trait API { type Session =
+Backend#Session }` written in source, the gitbucket half. That is a projection
+out of an *abstract type*, and what it needs is a reduction that fires when an
+outer prefix fixes `Backend` -- see `docs/gitbucket.md`, "Still owed after
+`agent/projection`".

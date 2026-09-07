@@ -733,6 +733,28 @@ pub struct SymbolTable {
     /// whose name really is ambiguous there, so that nothing else in the
     /// compiler sees a different type string.
     pub(crate) qualify_tparams: std::cell::RefCell<Vec<SymbolId>>,
+    /// `p.T`: an abstract type member seen through a stable term path.
+    ///
+    /// `Type::TypeMember` carries no prefix, so `p.T` and `q.T` were the same
+    /// type and `q.put(p.get)` type-checked. Rather than give every type a
+    /// prefix -- one variant reaching conformance, substitution, as-seen-from,
+    /// erasure and the pickle at once -- a path-dependent member is a
+    /// *symbol*: a deferred `TypeMember` allocated once per (path,
+    /// declaration) pair, carrying the declaration's bounds as seen from the
+    /// path and printing as `p.T`. Every walk that already handles an abstract
+    /// member handles this one unchanged, and a walk that knows nothing about
+    /// paths is no less precise than it was.
+    ///
+    /// Keyed by the chain of term symbols that spells the path (`a.b.c` is
+    /// `[a, b, c]`) together with the declaration being projected.
+    pub(crate) path_members: rustc_hash::FxHashMap<(Vec<SymbolId>, SymbolId), SymbolId>,
+    /// The declaration a path-dependent member stands for. Erasure and the
+    /// pickle read this so that they see exactly the type they saw before the
+    /// typer could tell two paths apart.
+    pub(crate) path_member_decl: rustc_hash::FxHashMap<SymbolId, SymbolId>,
+    /// The path each path-dependent member was projected out of, for the
+    /// dependent-method-type substitution in `subst_dependent_paths`.
+    pub(crate) path_member_path: rustc_hash::FxHashMap<SymbolId, Vec<SymbolId>>,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -850,6 +872,9 @@ impl SymbolTable {
             flattened_upto: 0,
             method_variants: rustc_hash::FxHashMap::default(),
             qualify_tparams: std::cell::RefCell::new(Vec::new()),
+            path_members: rustc_hash::FxHashMap::default(),
+            path_member_decl: rustc_hash::FxHashMap::default(),
+            path_member_path: rustc_hash::FxHashMap::default(),
         };
         st.root = st.alloc(
             "<_root_>",
@@ -1768,10 +1793,104 @@ impl SymbolTable {
             Type::TypeMember(id)
         } else {
             match self.get(id).ty.clone() {
-                Type::NoType | Type::Error | Type::TypeMember(_) => Type::TypeMember(id),
+                Type::NoType | Type::Error => Type::TypeMember(id),
+                // A *deferred* member stands for itself; an alias whose
+                // right-hand side is some *other* member is an alias like any
+                // other. `new FlatMap[B] { type Start = c.Start }` is the
+                // second kind, and folding it to itself left the anonymous
+                // class's `Start` opaque, so `c.start`'s `c.Start` never met
+                // it (cats' `Eval#flatMap`). This is exactly the distinction
+                // `is_deferred_type_member` draws.
+                Type::TypeMember(inner) if inner == id => Type::TypeMember(id),
                 other => other,
             }
         }
+    }
+
+    /// The declaration `id` stands for when `id` is a path-dependent member
+    /// (`p.T` -> `T`), and `None` for every other symbol.
+    pub fn path_member_decl(&self, id: SymbolId) -> Option<SymbolId> {
+        self.path_member_decl.get(&id).copied()
+    }
+
+    /// The path `id` was projected out of, for a path-dependent member.
+    pub fn path_member_path(&self, id: SymbolId) -> Option<&[SymbolId]> {
+        self.path_member_path.get(&id).map(|v| v.as_slice())
+    }
+
+    /// `p.T` as a type, given the term path `p` and the declaration `T`.
+    ///
+    /// The symbol is allocated once per pair and reused, so two spellings of
+    /// the same path give the same type and compare equal; two different paths
+    /// give two symbols and do not. `prefix` is the path's own type, used to
+    /// read the declaration's bounds through it (`type T <: List[A]` of an
+    /// `A[Int]` is bounded by `List[Int]` here).
+    pub fn path_member(&mut self, path: &[SymbolId], decl: SymbolId, prefix: &Type) -> SymbolId {
+        let key = (path.to_vec(), decl);
+        if let Some(id) = self.path_members.get(&key) {
+            return *id;
+        }
+        let info = self.get(decl);
+        let name = info.name.clone();
+        let flags = info.flags;
+        let tparams = info.tparams.clone();
+        let lo = info.bound_lo.clone();
+        let hi = info.bound_hi.clone();
+        let owner = *path.last().unwrap_or(&SymbolId::NONE);
+        let id = self.alloc(name, owner, SymKind::TypeMember, flags, "");
+        // A deferred member stands for itself: `p.T` is abstract exactly when
+        // `T` is, and a concrete `T` never reaches here (the alias expands and
+        // carries the prefix along in its right-hand side).
+        self.symbols[id.0 as usize].ty = Type::TypeMember(id);
+        self.symbols[id.0 as usize].tparams = tparams;
+        self.symbols[id.0 as usize].bound_lo = lo.map(|t| self.expand_in_type(prefix, &t));
+        self.symbols[id.0 as usize].bound_hi = hi.map(|t| self.expand_in_type(prefix, &t));
+        self.path_members.insert(key, id);
+        self.path_member_decl.insert(id, decl);
+        self.path_member_path.insert(id, path.to_vec());
+        id
+    }
+
+    /// Every type member `ty` mentions anywhere, refinements included.
+    pub fn type_members_in(&self, ty: &Type) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
+        any_type(ty, &mut |t| {
+            if let Type::TypeMember(id) = t {
+                if !out.contains(id) {
+                    out.push(*id);
+                }
+            }
+            false
+        });
+        out
+    }
+
+    /// Does `ty` mention a path-dependent member anywhere?
+    pub fn mentions_path_member(&self, ty: &Type) -> bool {
+        if self.path_member_decl.is_empty() {
+            return false;
+        }
+        any_type(
+            ty,
+            &mut |t| matches!(t, Type::TypeMember(id) if self.path_member_decl.contains_key(id)),
+        )
+    }
+
+    /// Replace every path-dependent member in `ty` by the declaration it
+    /// stands for. Erasure, the pickle and the backend read types through
+    /// this, so nothing downstream of the typer has to know that paths exist.
+    pub fn drop_path_members(&self, ty: &Type) -> Type {
+        if self.path_member_decl.is_empty() {
+            return ty.clone();
+        }
+        map_type(ty, &mut |t| match t {
+            Type::TypeMember(id) => self
+                .path_member_decl
+                .get(id)
+                .map(|d| Type::TypeMember(*d))
+                .unwrap_or_else(|| t.clone()),
+            other => other.clone(),
+        })
     }
 
     /// The class that supplies the members of a parameterized abstract type
@@ -2850,6 +2969,22 @@ impl SymbolTable {
         if let Some(r) = self.hk_alias_sub_type(a, b) {
             return r;
         }
+        // A path-dependent member (`p.T`) and the bare declaration it stands
+        // for (`T`) conform in both directions: the bare declaration is what
+        // this compiler still produces everywhere the prefix was not tracked,
+        // and refusing it would invent errors nsc does not have. Two members
+        // that *both* carry a path are deliberately left to the arms below --
+        // `p.T` and `q.T` are different types, which is the whole point.
+        if !self.path_member_decl.is_empty() {
+            let (pa, pb) = (self.mentions_path_member(a), self.mentions_path_member(b));
+            if pa != pb {
+                return if pa {
+                    self.is_sub_type(&self.drop_path_members(a), b)
+                } else {
+                    self.is_sub_type(a, &self.drop_path_members(b))
+                };
+            }
+        }
         // An abstract type on the *right* is at least its lower bound:
         // `def f[E, O >: E](x: E): O = x` is legal, and so is every
         // `ShapedValue[_ <: E, U]` where a `ShapedValue[_ <: O, U]` is wanted.
@@ -3744,6 +3879,13 @@ impl SymbolTable {
                 if self.get(*id).owner.is_none() {
                     return ty.clone();
                 }
+                // A path-dependent member already says which prefix it came
+                // through. Re-resolving its *name* in `from` is what dropping
+                // the prefix looked like: `q.T` would come back as `A`'s own
+                // `T`, and `p.T` with it.
+                if self.path_member_decl.contains_key(id) {
+                    return ty.clone();
+                }
                 let name = self.get(*id).name.clone();
                 // `from` first, then its lexically enclosing classes: an inner
                 // class (`Main.factory: Main.Factory`) sees `Main`'s implementation
@@ -4461,6 +4603,133 @@ pub(crate) fn subst_tparams_cow<'a>(
         std::borrow::Cow::Borrowed(ty)
     } else {
         std::borrow::Cow::Owned(subst_map(ty, tps, args))
+    }
+}
+
+/// Does any node of `ty` satisfy `f`? Walks the same shapes as `map_type`
+/// without rebuilding anything.
+pub(crate) fn any_type(ty: &Type, f: &mut impl FnMut(&Type) -> bool) -> bool {
+    if f(ty) {
+        return true;
+    }
+    let some = |ts: &[Type], f: &mut _| ts.iter().any(|t| any_type(t, f));
+    match ty {
+        Type::Class { args, .. }
+        | Type::Tuple(args)
+        | Type::Named { args, .. }
+        | Type::Overload(args) => some(args, f),
+        Type::Applied { ctor, args } => any_type(ctor, f) || some(args, f),
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            any_type(t, f)
+        }
+        Type::SingleType { prefix, .. } => any_type(prefix, f),
+        Type::Function { params, ret } => some(params, f) || any_type(ret, f),
+        Type::Method { paramss, ret } => paramss.iter().any(|ps| some(ps, f)) || any_type(ret, f),
+        Type::BoundedWildcard { lo, hi } => {
+            lo.as_ref().is_some_and(|t| any_type(t, f))
+                || hi.as_ref().is_some_and(|t| any_type(t, f))
+        }
+        Type::Refined { parents, decls } => {
+            some(parents, f)
+                || decls.iter().any(|d| match d {
+                    RefineDecl::Type { rhs, lo, hi, .. } => {
+                        rhs.as_ref().is_some_and(|t| any_type(t, f))
+                            || lo.as_ref().is_some_and(|t| any_type(t, f))
+                            || hi.as_ref().is_some_and(|t| any_type(t, f))
+                    }
+                    RefineDecl::Def { paramss, ret, .. } => {
+                        paramss.iter().any(|ps| some(ps, f)) || any_type(ret, f)
+                    }
+                    RefineDecl::Val { ty, .. } => any_type(ty, f),
+                })
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite every node of `ty` bottom-up with `f`.
+///
+/// `f` sees each leaf, and each composite node once its children have already
+/// been rewritten, so a rewrite that only replaces leaves needs no arm of its
+/// own for the shape it is walking through.
+pub(crate) fn map_type(ty: &Type, f: &mut impl FnMut(&Type) -> Type) -> Type {
+    let rebuilt = match ty {
+        Type::Class { sym, args } => Type::Class {
+            sym: *sym,
+            args: args.iter().map(|a| map_type(a, f)).collect(),
+        },
+        Type::Applied { ctor, args } => apply_type_ctor(
+            map_type(ctor, f),
+            args.iter().map(|a| map_type(a, f)).collect(),
+        ),
+        Type::Array(t) => Type::Array(Box::new(map_type(t, f))),
+        Type::ByName(t) => Type::ByName(Box::new(map_type(t, f))),
+        Type::Repeated(t) => Type::Repeated(Box::new(map_type(t, f))),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| map_type(t, f)).collect()),
+        Type::Overload(ts) => Type::Overload(ts.iter().map(|t| map_type(t, f)).collect()),
+        Type::Named { name, args } => Type::Named {
+            name: name.clone(),
+            args: args.iter().map(|a| map_type(a, f)).collect(),
+        },
+        Type::Function { params, ret } => Type::Function {
+            params: params.iter().map(|p| map_type(p, f)).collect(),
+            ret: Box::new(map_type(ret, f)),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(|p| map_type(p, f)).collect())
+                .collect(),
+            ret: Box::new(map_type(ret, f)),
+        },
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(map_type(tpe, f)),
+            annot: annot.clone(),
+        },
+        Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
+            lo: lo.as_ref().map(|t| Box::new(map_type(t, f))),
+            hi: hi.as_ref().map(|t| Box::new(map_type(t, f))),
+        },
+        Type::SingleType { prefix, sym } => Type::SingleType {
+            prefix: Box::new(map_type(prefix, f)),
+            sym: *sym,
+        },
+        Type::Refined { parents, decls } => Type::Refined {
+            parents: parents.iter().map(|p| map_type(p, f)).collect(),
+            decls: decls.iter().map(|d| map_refine_decl(d, f)).collect(),
+        },
+        other => other.clone(),
+    };
+    f(&rebuilt)
+}
+
+fn map_refine_decl(d: &RefineDecl, f: &mut impl FnMut(&Type) -> Type) -> RefineDecl {
+    match d {
+        RefineDecl::Type {
+            name,
+            rhs,
+            tparams,
+            lo,
+            hi,
+        } => RefineDecl::Type {
+            name: name.clone(),
+            rhs: rhs.as_ref().map(|t| map_type(t, f)),
+            tparams: *tparams,
+            lo: lo.as_ref().map(|t| map_type(t, f)),
+            hi: hi.as_ref().map(|t| map_type(t, f)),
+        },
+        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+            name: name.clone(),
+            paramss: paramss
+                .iter()
+                .map(|ps| ps.iter().map(|p| map_type(p, f)).collect())
+                .collect(),
+            ret: map_type(ret, f),
+        },
+        RefineDecl::Val { name, ty } => RefineDecl::Val {
+            name: name.clone(),
+            ty: map_type(ty, f),
+        },
     }
 }
 
