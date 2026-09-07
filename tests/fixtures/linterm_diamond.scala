@@ -10,11 +10,14 @@
 // recompiles this same source with real scalac 2.13.16 and compares the two
 // programs' output directly. The expected output below came from scalac.
 //
-// The shapes here deliberately keep every `with` list an antichain (no mixin
-// is an ancestor of an earlier one). A redundant later mixin -- `class C
-// extends L3 with L1` where `L3` already extends `L1` -- is linearized
-// correctly by `lin.rs` but mis-wired by the backend's super chain; that is a
-// separate, pre-existing defect and is not what this fixture is measuring.
+// `Wider` below is the shape SLS 5.1.2's `+:` gets right and a C3 merge does
+// not: a shared ancestor reached at two different depths. It used to compile
+// cleanly and print the wrong chain.
+//
+// A mixin an earlier parent already extends -- `class C extends L3 with L1`
+// where `L3` already extends `L1` -- is linearized correctly by `lin.rs` but
+// still mis-resolved when the class body says `super`; that is a separate,
+// pre-existing defect (`docs/not-implemented.md`) and is not measured here.
 trait L0 {
   def t: String = "L0"
 }
@@ -71,10 +74,19 @@ class Three extends Root with L3 with L4 {
   override def t: String = "Three " + super.t
 }
 
+// `L5` and `L6` share `L4`, but `L5` reaches it through `L3` and `L6` reaches
+// it directly, so the shared ancestor sits at two different depths. SLS 5.1.2
+// folds `L(L5) +: L(L6) +: L(Root)`, which keeps `L3` immediately behind `L5`;
+// a C3 merge with no free head has to guess, and guessed `L4` first.
+class Wider extends Root with L6 with L5 {
+  override def t: String = "Wider " + super.t
+}
+
 object Main {
   def main(args: Array[String]): Unit = {
     println(new Deep().show)
     println(new Wide().t)
     println(new Three().t)
+    println(new Wider().t)
   }
 }

@@ -1,9 +1,22 @@
 //! Class linearization (SLS 5.1.2), shared by the typer and the backend.
 //!
-//! The C3 merge used to live only in `crates/backend/src/gen.rs`, where it
-//! drives super accessors and mixin forwarders. The typer needs the *same*
-//! order to decide whether an `abstract override` member ever reaches a
-//! concrete implementation, so it lives here and `gen.rs` calls in.
+//! The merge used to live only in `crates/backend/src/gen.rs`, where it drives
+//! super accessors and mixin forwarders. The typer needs the *same* order to
+//! decide whether an `abstract override` member ever reaches a concrete
+//! implementation, so it lives here and `gen.rs` calls in.
+//!
+//! ## Why this is `+:` and not a C3 merge
+//!
+//! SLS 5.1.2 does not specify a C3 merge. It specifies a right-associative fold
+//! of `+:` over the parents' linearizations, and `+:` is total — it has an
+//! answer for every pair of lists, including two that order a shared ancestor
+//! differently. A C3 merge does not: when no list head is free it has to guess.
+//! This one guessed `lists[0][0]`, which put a shared ancestor reached at two
+//! different depths in the wrong place. `class Wider extends Root with L6 with
+//! L5` over `tests/fixtures/linterm_diamond.scala` came out `Wider L5 L6 L4 L3
+//! L1 L2 L0` where scalac 2.13.16 says `Wider L5 L3 L6 L4 L1 L2 L0` — a clean
+//! compile that ran the `super` chain in the wrong order, with no diagnostic.
+//! [`Lin::lin`] now performs that fold literally; see [`prepend_replacing`].
 //!
 //! ## Why the walk carries a path and a memo
 //!
@@ -60,33 +73,37 @@ fn parents_of(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
         .collect()
 }
 
-fn c3_merge(mut lists: Vec<Vec<SymbolId>>) -> Vec<SymbolId> {
-    let mut out = Vec::new();
-    loop {
-        lists.retain(|l| !l.is_empty());
-        if lists.is_empty() {
-            break;
-        }
-        let mut chosen = None;
-        for l in &lists {
-            let h = l[0];
-            let in_tail = lists.iter().any(|o| o.iter().skip(1).any(|&x| x == h));
-            if !in_tail {
-                chosen = Some(h);
-                break;
-            }
-        }
-        let h = match chosen {
-            Some(h) => h,
-            None => lists[0][0],
-        };
-        out.push(h);
-        for l in &mut lists {
-            if l.first() == Some(&h) {
-                l.remove(0);
-            }
-        }
-    }
+/// SLS 5.1.2's `+:`: concatenation in which the elements of the right operand
+/// **replace** the identical elements of the left one. So `a +: b` is every
+/// element of `a` that `b` does not already list, followed by all of `b`.
+///
+/// Two properties the linearization leans on:
+///
+///  * A class reachable through two parents ends up where the *right* operand
+///    puts it — i.e. the earlier-written parent wins the position, because the
+///    fold in [`Lin::lin`] is right-associative with the first parent innermost.
+///  * The result has no duplicates as long as `a` and `b` each have none, so
+///    the whole fold stays duplicate-free by induction and no repair pass is
+///    needed afterwards.
+///
+/// That second property is load-bearing for Java interop, not just tidiness.
+/// A Java class routinely re-`implements` an interface its own superclass
+/// already implements — `class LinkedHashMap<K,V> extends HashMap<K,V>
+/// implements Map<K,V>`. The C3 merge this replaced had no rule for that shape:
+/// with no head free it fell back to `lists[0][0]`, emitting `java.util.Map` at
+/// index 2 *and* again later, so `java.util.Map` preceded `java.util.HashMap`.
+/// Since only a more derived base can implement a deferred member,
+/// `HashMap.put` stopped counting as an implementation of `Map.put` and
+/// `class Cache extends java.util.LinkedHashMap[String, Int]` was told it
+/// "needs to be abstract" over eight members `HashMap` and `AbstractMap`
+/// define. Under `+:` the shape needs no special case at all: `L(Map) +:
+/// L(HashMap)` deletes `Map` from the left operand outright, because
+/// `L(HashMap)` already lists it, and `HashMap` keeps its place. That path is
+/// pinned by `crates/cli/tests/javanest.rs`.
+fn prepend_replacing(a: &[SymbolId], b: Vec<SymbolId>) -> Vec<SymbolId> {
+    let mut out: Vec<SymbolId> = Vec::with_capacity(a.len() + b.len());
+    out.extend(a.iter().copied().filter(|x| !b.contains(x)));
+    out.extend(b);
     out
 }
 
@@ -119,51 +136,26 @@ impl Lin<'_> {
         let before = self.truncations;
         let parents = parents_of(self.st, cls);
         self.path.push(cls);
-        let mut lists: Vec<Vec<SymbolId>> = parents.iter().rev().map(|&p| self.lin(p)).collect();
+        let lins: Vec<Vec<SymbolId>> = parents.iter().map(|&p| self.lin(p)).collect();
         self.path.pop();
-        lists.push(parents.iter().rev().copied().collect());
+        // SLS 5.1.2 verbatim: `L(C) = C, L(Cn) +: … +: L(C1)`, where `+:` is
+        // right-associative. So `L(C1)` — the *first* parent — is the innermost
+        // operand, and each later parent's linearization is prepended to what
+        // the earlier ones already built. Folding left over the parents in
+        // source order with `acc = L(Ci) +: acc` is exactly that fold.
+        let mut acc: Vec<SymbolId> = Vec::new();
+        for l in &lins {
+            acc = prepend_replacing(l, acc);
+        }
         let mut out = vec![cls];
         // `cls` heads its own linearization; a cyclic `extends` graph that
         // reaches it again must not list it twice.
-        out.extend(
-            dedup_keep_last(c3_merge(lists))
-                .into_iter()
-                .filter(|&b| b != cls),
-        );
+        out.extend(acc.into_iter().filter(|&b| b != cls));
         if self.truncations == before {
             self.memo.insert(cls.0, out.clone());
         }
         out
     }
-}
-
-/// Drop every repeat of a class, keeping its **last** position.
-///
-/// SLS 5.1.2 builds `L(C) = C, L(Cn) +: … +: L(C1)`, and `a +: b` deletes from
-/// `a` whatever `b` already lists — so when a class is reachable through two
-/// parents, the *later* list decides where it sits. `c3_merge` above cannot
-/// always honour that: when the two parents impose contradictory orders it
-/// falls back to `lists[0][0]` and emits the class again later from the list
-/// that really owns it.
-///
-/// Java's collections hit this constantly, because a Java class re-`implements`
-/// an interface its own superclass already implements:
-/// `class LinkedHashMap<K,V> extends HashMap<K,V> implements Map<K,V>`. The
-/// fallback put `java.util.Map` at index 2 and `java.util.HashMap` at index 3,
-/// and since only a *more derived* base can implement a deferred member,
-/// `HashMap.put` no longer counted as implementing `Map.put` —
-/// `class Cache extends java.util.LinkedHashMap[String, Int]` was told it
-/// "needs to be abstract" over eight members `HashMap` and `AbstractMap`
-/// define. Keeping the last occurrence is precisely `+:`, and it also removes
-/// the duplicates, which nothing downstream wants.
-fn dedup_keep_last(v: Vec<SymbolId>) -> Vec<SymbolId> {
-    let mut out: Vec<SymbolId> = Vec::with_capacity(v.len());
-    for (i, &x) in v.iter().enumerate() {
-        if !v[i + 1..].contains(&x) {
-            out.push(x);
-        }
-    }
-    out
 }
 
 /// `cls` itself first, then its ancestors most-derived first (SLS 5.1.2).

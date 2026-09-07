@@ -128,6 +128,24 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 連鎖を実行して実 scalac の出力と比較する検査と、閉路の拒否行の検査は
 `linearization` テスト（`tests/fixtures/linterm_*.scala`）にあります。
 
+線形化そのものは SLS 5.1.2 の `+:` の畳み込みで、C3 merge ではありません。SLS が
+定めているのは親の線形化に対する右結合の `+:` の畳み込みで、`+:` は**どんな 2 つの
+列に対しても**答えを持ちます（共有する祖先の順序が食い違っていても）。C3 merge は
+そうではなく、どの先頭も自由でないときに推測するしかありません。以前の実装は
+`lists[0][0]` を選んでいたため、**深さの違う 2 経路から届く祖先**の位置を間違え、
+`class Wider extends Root with L6 with L5` が scalac の `Wider L5 L3 L6 L4 L1 L2 L0`
+に対して `Wider L5 L6 L4 L3 L1 L2 L0` になっていました。畳み込みをそのまま書くと
+重複も生じないので、`dedup_keep_last` による後始末（Java の
+`class LinkedHashMap extends HashMap implements Map` のために必要でした）も
+不要になります。
+
+この形（`class Wider extends Root with L6 with L5`）は
+`tests/fixtures/linterm_diamond.scala` に入っていて、`linearization` テストが
+実 scalac 2.13.16 の出力と比較します。なお、**先行する親がすでに継承している
+mixin** を書いたときにクラス本体の `super` が解決先を誤る欠陥は別にあり、
+`docs/not-implemented.md` に根本原因（`base_type_seq` が反復する基底クラスを
+最派生でない具体化に解決すること）まで記録してあります。
+
 同じ「深さの上限は再帰木の大きさを抑えない」という誤りが
 `SymbolTable::is_sub_type` の親走査にもありました。そして**こちらは閉路を必要と
 しません**。
