@@ -1086,17 +1086,13 @@ impl Typer {
     /// signature with `found: ev.R  required: ev.R`.
     pub(crate) fn subst_dependent_paths(
         &mut self,
-        sym: SymbolId,
+        params: &[SymbolId],
         args: &[Tree],
         ret: Type,
     ) -> Type {
-        if sym.is_none() || !self.st.mentions_path_member(&ret) {
-            return ret;
-        }
-        let params: Vec<SymbolId> = self.st.get(sym).paramss.iter().flatten().copied().collect();
         // The arguments have to line up one for one with the parameters, or
         // the index a path names is not the index this call filled.
-        if params.len() != args.len() {
+        if params.len() != args.len() || !self.st.mentions_path_member(&ret) {
             return ret;
         }
         let skolems: Vec<SymbolId> = self

@@ -1563,8 +1563,13 @@ foo({ case x => x })
 
 ## Path-dependent type members (`agent/projection`)
 
-326 -> 316. Ten error lines in three files: `Eval.scala` 102/103/106,
-`Representable.scala` 86, and the six in `Tuple2K.scala` 142-156.
+Ten error lines in three files: `Eval.scala` 102/103/106, `Representable.scala`
+86, and the six in `Tuple2K.scala` 142-156. Measured 326 -> 316 at the branch
+point (`20c39e49`) and 303 -> 293 after merging `main` (`d056a7f7`) -- the same
+ten, with nothing new either time. On the scala/scala corpus
+(`CORPUS_SIZE=full`): `losses=0`, with `pos/t8801` -- the Peano encoding whose
+`type Prev <: Nat { type Succ = Nat.this.type }` is exactly this shape --
+newly passing.
 
 **The defect.** `Type::TypeMember` carries no prefix, so `p.T` and `q.T` were
 the same type. `q.put(p.get)` type-checked -- nsc rejects it with
@@ -1649,7 +1654,11 @@ parameters (`subst_dependent_paths`, nsc's dependent method types).
   the parameters.** Without it, `DurationConversions`' fourteen forwarders
   (`def nanos[C](c: C)(implicit ev: Classifier[C]): ev.R = nanoseconds(c)`)
   each failed against their own signature with `found: ev.R  required: ev.R`
-  -- two different `ev`s (scala library 1554 -> 1567).
+  -- two different `ev`s (scala library 1554 -> 1567). It runs on a *later
+  parameter clause* as well as on the result: `def foo(x: Int)(y: C)(z: y.T)`
+  (`pos/t1569`) and `def lazyDep(t: T)(u: => t.U)` (`run/t6443-by-name` and
+  `-varargs`) are the corpus's three tests for that half, and they were the
+  only losses the first full corpus run reported.
 
 **Not fixed, and not the same mechanism**: `trait API { type Session =
 Backend#Session }` written in source, the gitbucket half. That is a projection

@@ -1,4 +1,6 @@
 int:7
 [s3]
 n5
+vz
+lz9
 a&b

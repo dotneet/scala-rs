@@ -1867,7 +1867,9 @@ impl Typer {
                     let ret = leftover.unwrap_or(ret);
                     let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
                     let ret = self.subst_dependent_members(&param_tys, &arg_tys, &ret);
-                    let ret = self.subst_dependent_paths(sym, args, ret);
+                    let params: Vec<SymbolId> =
+                        self.st.get(sym).paramss.iter().flatten().copied().collect();
+                    let ret = self.subst_dependent_paths(&params, args, ret);
                     tree.ty = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
                 }
                 OverloadPick::Ambiguous => {

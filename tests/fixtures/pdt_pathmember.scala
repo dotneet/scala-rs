@@ -14,7 +14,10 @@
 //  3. `Rep#pair` -- cats' `Representable#compose`: an anonymous subclass whose
 //     `type Rp` is built out of the enclosing instance's own member, named
 //     through the self alias.
-//  4. `Main.use` -- a member selected through a path and handed back to the
+//  4. `Dep.take` / `Dep.lazily` -- `pos/t1569` and `run/t6443-by-name`: a
+//     later parameter clause names a parameter of the clause just applied,
+//     and the argument settles what `c.V` is.
+//  5. `Main.use` -- a member selected through a path and handed back to the
 //     same path's method.
 
 trait Box {
@@ -71,6 +74,15 @@ trait Rep { self =>
   }
 }
 
+// A later parameter clause naming a parameter of the clause just applied:
+// `pos/t1569` and `run/t6443-by-name` in the scala/scala corpus.
+class Cell { type V }
+
+object Dep {
+  def take(x: Int)(c: Cell)(v: c.V): String = "v" + v
+  def lazily(c: Cell)(v: => c.V): String = "lz" + v
+}
+
 object Main {
   def use(b: Box): String = b.show(b.get)
 
@@ -87,6 +99,9 @@ object Main {
 
     val two: String = Fwd.two(5)
     println(two)
+
+    println(Dep.take(1)(new Cell { type V = String })("z"))
+    println(Dep.lazily(new Cell { type V = Int })(9))
 
     val r1 = new Rep { type Rp = Int; def tag: String = "a" }
     val r2 = new Rep { type Rp = String; def tag: String = "b" }
