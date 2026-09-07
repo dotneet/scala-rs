@@ -1743,6 +1743,26 @@ impl SymbolTable {
 
     /// Use-site view of a type member: keep higher-kinded aliases as constructors
     /// (`type F[X] = Id[X]` stays `TypeMember` until applied as `F[Int]`).
+    /// Is `id` a type member the program left *deferred* (`type A`, `type A <:
+    /// B`), as opposed to one it fixed with a right-hand side (`type A = B`)?
+    ///
+    /// A `TypeMember` symbol carries its right-hand side in `ty`; a deferred
+    /// one has none, which is spelled either as `NoType` or as a self
+    /// reference. nsc's rule is that a concrete definition overrides a
+    /// deferred one, so every place that picks one member out of a class's
+    /// linearisation has to be able to tell them apart.
+    pub fn is_deferred_type_member(&self, id: SymbolId) -> bool {
+        let info = self.get(id);
+        if info.kind != SymKind::TypeMember {
+            return false;
+        }
+        match &info.ty {
+            Type::NoType | Type::Error => true,
+            Type::TypeMember(inner) => *inner == id,
+            _ => false,
+        }
+    }
+
     pub fn type_member_as_seen(&self, id: SymbolId) -> Type {
         if !self.get(id).tparams.is_empty() {
             Type::TypeMember(id)
@@ -3679,6 +3699,21 @@ impl SymbolTable {
         out
     }
 
+    /// The type members `owner` has under `name`, with the ones that fix a
+    /// right-hand side ahead of the ones left deferred.
+    ///
+    /// `lookup_member` walks the parents depth-first, so an abstract `type
+    /// Session` declared in `slick.basic.BasicBackend` can come out ahead of
+    /// the `type Session = SessionDef` that `slick.jdbc.JdbcBackend` fixes it
+    /// to. nsc resolves the same name in linearisation order, where a
+    /// concrete definition overrides a deferred one; reading the deferred one
+    /// leaves an opaque type with no members at all.
+    pub(crate) fn type_members_named(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
+        let mut found = self.lookup_member(owner, name);
+        found.sort_by_key(|&m| u8::from(self.is_deferred_type_member(m)));
+        found
+    }
+
     /// `from` and the class-like symbols lexically enclosing it, innermost first.
     pub(crate) fn enclosing_classes(&self, from: SymbolId) -> Vec<SymbolId> {
         let mut out = Vec::new();
@@ -3715,7 +3750,7 @@ impl SymbolTable {
                 // of an abstract member declared beside `Factory`, which is what
                 // nsc reaches through the outer-instance prefix.
                 for owner in self.enclosing_classes(from) {
-                    for m in self.lookup_member(owner, &name) {
+                    for m in self.type_members_named(owner, &name) {
                         if self.get(m).kind == SymKind::TypeMember {
                             if !self.get(m).tparams.is_empty() {
                                 return Type::TypeMember(m);

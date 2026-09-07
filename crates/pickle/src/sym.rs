@@ -572,9 +572,27 @@ impl Builder<'_> {
                     SigType::None
                 }
             },
-            Some(Entry::TypeRefTpe { sym, args, .. }) => {
-                let (sym, args) = (*sym, args.clone());
+            Some(Entry::TypeRefTpe { prefix, sym, args }) => {
+                let (prefix, sym, args) = (*prefix, *sym, args.clone());
                 let name = self.sym_ref_name(sym);
+                // `p#T` where the prefix is itself a type parameter or an
+                // abstract type member of the same unit -- `Backend#Session`
+                // in slick's `BasicProfile.API`, `E#TableElementType` in its
+                // `TableQuery`. Dropping the prefix here answers with `T`'s
+                // *declaration*, which is the abstract one whenever the
+                // prefix is what settles it, so it is kept: `prefix#T`, the
+                // way the source writes it. Nothing else about a `TypeRef`
+                // changes -- a prefix that is a package, a `this`, or a
+                // qualified class is not a name a later stage could resolve
+                // any better than the member's own full name.
+                let name = match self.ty(prefix, d) {
+                    SigType::Ref { sym: p, args: pa }
+                        if pa.is_empty() && !p.contains('.') && !p.contains('#') && p != name =>
+                    {
+                        format!("{p}#{name}")
+                    }
+                    _ => name,
+                };
                 SigType::Ref {
                     sym: name,
                     args: args.into_iter().map(|a| self.ty(a, d)).collect(),
