@@ -813,6 +813,29 @@ impl Typer {
                             // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
                             // gets `T` from nowhere else.
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
+                            // nsc reads the expected type *after* the arguments
+                            // are typed. Here the pass runs first, so a solution
+                            // the expected type only knows as `_` -- the stand-in
+                            // an enclosing call put there for a variable it has
+                            // not decided -- would fix a parameter an argument
+                            // still to be typed is about to state exactly. Only
+                            // inside such an argument (`relaxed_pt_depth`): a
+                            // wildcard the program wrote says as much as any
+                            // other type, and `build { case (sq, cs) => … }` at
+                            // a declared `Cache[(Seq[String], Class[_]), String]`
+                            // has nothing else to give the pattern its types
+                            // (`pos/t12899`). A parameter no remaining argument
+                            // mentions keeps the wildcard either way.
+                            let inst: Vec<(SymbolId, Type)> = inst
+                                .into_iter()
+                                .filter(|(tp, t)| {
+                                    self.relaxed_pt_depth == 0
+                                        || !type_has_wildcard(t)
+                                        || !param_tys.iter().zip(&arg_tys).any(|(p, a)| {
+                                            mentions_no_type(a) && type_mentions_tparam(p, *tp)
+                                        })
+                                })
+                                .collect();
                             self.check_tparam_bounds(sym, &inst, recv_ty.as_ref(), tree.span, true);
                             if !inst.is_empty() {
                                 let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
@@ -861,8 +884,25 @@ impl Typer {
                                     Vec::new(),
                                     true,
                                 );
-                                let (ids, vals): (Vec<SymbolId>, Vec<Type>) =
-                                    weak.into_iter().filter(|(id, _)| open.contains(id)).unzip();
+                                // Not a solution the expected type only knows as
+                                // `_`: that wildcard is the stand-in an enclosing
+                                // call left for a variable *it* has not decided,
+                                // and writing it into the parameter both tells
+                                // the literal nothing and hides the variable from
+                                // `open_tparams_of` below, so the literal's own
+                                // answer never reaches the result. cats'
+                                // `F.map(f(a0).value) { case … }` inside
+                                // `EitherT`/`IorT`/`OptionT`'s `tailRecM` came
+                                // out `F[_]` this way. Again only inside a
+                                // relaxed expected type -- a wildcard the
+                                // program wrote is a type like any other.
+                                let drop_wild = self.relaxed_pt_depth > 0;
+                                let (ids, vals): (Vec<SymbolId>, Vec<Type>) = weak
+                                    .into_iter()
+                                    .filter(|(id, v)| {
+                                        open.contains(id) && !(drop_wild && type_has_wildcard(v))
+                                    })
+                                    .unzip();
                                 if !ids.is_empty() {
                                     param_tys = param_tys
                                         .iter()
@@ -930,6 +970,23 @@ impl Typer {
                                                 | Type::TypeMember(_)
                                         )
                                 };
+                                // A *rigid* type parameter is settled too. Read
+                                // through the receiver, `class Vd[+E, +A] { def
+                                // map[B](f: A => B) }` states its parameter as
+                                // the caller's own `A`, which is in scope here
+                                // and cannot be a variable; the guess then
+                                // overruled it with `args[0]` -- the `E` -- and
+                                // every `fa.map(f)` on a two-parameter covariant
+                                // class reported `found: (A) => B  required:
+                                // (E) => Any`. The guess is for a parameter
+                                // still written in the *declaring* class's own
+                                // parameter, which is not in scope at the call
+                                // site.
+                                let settled = settled
+                                    || matches!(&fp[..], [Type::TypeParam(tp)]
+                                        if self.tparam_in_scope(*tp)
+                                            && !self.undet_tvars.contains(tp)
+                                            && !self.st.get(sym).tparams.contains(tp));
                                 let fparams = if fp.len() == 1
                                     && !settled
                                     && self.st.kind_arity(&elem) == 0
@@ -1028,7 +1085,19 @@ impl Typer {
                                 _ => p.clone(),
                             };
                             let pt_arg = self.open_to_bounds(&relaxed, &open);
+                            // A wildcard this substitution just put in is our
+                            // own "not decided yet", not an existential the
+                            // program wrote. Say so for as long as the argument
+                            // is being typed, so the calls inside it do not read
+                            // their own type parameters out of it.
+                            let relaxed_here = type_has_wildcard(&pt_arg) && !type_has_wildcard(&p);
+                            if relaxed_here {
+                                self.relaxed_pt_depth += 1;
+                            }
                             self.type_expr(a, &pt_arg);
+                            if relaxed_here {
+                                self.relaxed_pt_depth -= 1;
+                            }
                         }
                         // nsc adapts an argument before it constrains the call. An
                         // argument that still carries an all-implicit clause is not

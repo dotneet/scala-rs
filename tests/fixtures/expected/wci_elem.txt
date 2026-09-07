@@ -1,0 +1,6 @@
+Val(3)
+Inv(7)
+Val(ABC)
+Inv(7)
+Val(6)
+Val(cba)
