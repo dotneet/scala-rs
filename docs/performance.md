@@ -322,6 +322,35 @@ glue) at those misses. nsc has a cheap structural pre-test
 attempted, and that — not more caching — is what the next slice on this needs.
 See `docs/gitbucket.md`.
 
+**That slice ran, and the pre-test was not the answer either.**
+`Typer::plausibly_inhabits` is now in the tree: two `Type::Class` heads that
+cannot reach each other reject the candidate before `Unify` touches it, and the
+"no" is sound because substitution replaces `TypeParam` *leaves* and so leaves
+both head symbols exactly where the final `is_sub_type` will find them. It
+rejects **58% of all fits** under the guard (11.5M of 20M on the 191-file
+reproduction) and, on its own, that run still did not finish in 600 s — because
+the deep tree is made entirely of *same-head* nodes (`Shape` against `Shape`),
+which no test on head symbols can cut.
+
+What cut it was an applicability rule, not a filter: a candidate parameter that
+unification "solved" only to a **wildcard** was being counted as pinned down,
+so slick's 22 `tupleNShape` rules all looked applicable to a wanted
+`Shape[_ <: L, ?M, ?U, ?P]` and each searched all of its own `Shape` clauses at
+every level down to `MAX_IMPLICIT_DEPTH`. Discounting a wildcard solution took
+the reproduction from **over 600 s to 14.4 s** and the whole 353-file measure
+to 6.3 s — with the guard on. Both changes are diagnostic-neutral on all three
+measures. The guard is still unmerged, now for a diagnostic reason
+(`Session` / `JdbcBackend#SessionDef`) rather than a timing one;
+`docs/gitbucket.md` has the thirteen-line reproduction.
+
+The general lesson is worth keeping: **the profile named the work, and cutting
+the work named in the profile was not the same as cutting the tree that
+generated it.** `sample` showed `subst_tparams_slice` and `Type::clone`, and
+removing 58% of those calls changed the wall clock by nothing at all, because
+the surviving 42% were the recursive ones. A histogram of *which candidate at
+which depth* — 102k entries apiece for every one of ~30 `Shape` witnesses at
+depth 7 — is what pointed at the rule that admitted them.
+
 ### Writing the class files
 
 Two changes, both in `crates/driver/src/lib.rs`. slick, 184 files, 2127 class

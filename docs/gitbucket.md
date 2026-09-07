@@ -1716,9 +1716,14 @@ of root 2 turning `neg/t4196` from rejected to accepted; see
 
 The largest single family left in gitbucket is ~170 diagnostics of the shape
 `value list / update / firstOption / insert / delete is not a member of
-Query[…]`. **The cause is known and reproduces in fifteen lines; the fix is one
-guard, and the guard makes `tests/gitbucket_measure.sh` more than fifty times
-slower.** It is written down here rather than landed.
+Query[…]`. **The cause is known and reproduces in fifteen lines, and the fix is
+one guard.** It is written down here rather than landed.
+
+The guard used to be unaffordable — it made `tests/gitbucket_measure.sh` more
+than fifty times slower. **That is no longer true**: it now costs nothing
+measurable, and it closes all ~170. What holds it back today is that turning it
+on exposes a *different*, independent root that costs more than it saves. Read
+this section in order; *The guard is affordable now* below is where that stands.
 
 **What is wrong.** gitbucket reaches slick through
 `com.github.takezoe.blocking-slick`, whose `BlockingJdbcProfile.BlockingAPI`
@@ -1796,6 +1801,95 @@ anything. **That test, not more caching, is what this family needs next**, and
 it is the same idea the *What is left* list in `docs/performance.md` records for
 `search_extension` (and the same hazard: the cheap test must not need the
 result class's pickle, or it costs what it was meant to save).
+
+### The guard is affordable now, and blocked on something else (`agent/implicitfilter`)
+
+**The 50x is gone.** With the guard on, the 191-file reproduction above went
+from **over 600 s to 14.4 s**, and the whole 353-file measure runs in **6.3 s**
+against 5–7 s without the guard. Two changes in
+`crates/typer/src/implicits.rs` did it, and **both are diagnostic-neutral**:
+with the guard reverted, all three measures are bit-for-bit the baseline
+(gitbucket `errors=895 files_with_errors=111`, cats `errors=346
+files_with_errors=81`, slick `errors=0 classes=1490`).
+
+*`Typer::plausibly_inhabits`* is the `isPlausiblyCompatible` this section asked
+for. When a candidate's declared result type and the wanted type are both
+`Type::Class` and neither head symbol reaches the other, **it rejects; anything
+else it lets through**. The "no" is sound for a reason that needs no new
+argument: every path out of `implicit_fit_at` that returns `Some` ends in
+`implicit_result_conforms(inst, want)`, where `inst` is the result with the
+candidate's parameters substituted and `want` the wanted type with the call
+site's substituted — and substitution replaces `Type::TypeParam` *leaves*, so
+those two still have the head symbols the test looked at. For a `Class`/`Class`
+pair with different heads that check is `SymbolTable::is_sub_type`, whose
+answer is *already* decided by exactly this `class_reaches` walk. It also needs
+no pickle: `class_reaches` walks parent symbols without substituting, and a
+hierarchy it cannot read as plain classes answers `None`, which means "cannot
+say" and lets the candidate through.
+
+**It is not what made the guard affordable, and the measurement says why.** On
+the 191-file reproduction the filter rejects **58%** of all fits (11.5M of 20M)
+and the run still did not finish in 600 s. Of the 42% that survive, the largest
+share by far is **same head symbol** — `Shape` against `Shape` — and the deep
+tree is made of nothing else, so no structural test on head symbols can reach
+it. (The rest: 10% `Applied`/`Class`, 6% `other`/`Class`, 4% `Refined`/`Class`.)
+
+*The `pinned` rule* is what reached it. `implicit_fit_open` describes itself as
+running "only when the wanted type pinned down at least one of the candidate's
+parameters", and enforced that by counting *solved* parameters — but
+`Unify::unify_at` answers a `_` with `true` without recording a constraint. So
+slick's 22 `tupleNShape` rules,
+
+```text
+tupleNShape[Level, M1…Mn, U1…Un, P1…Pn](implicit u1: Shape[_ <: Level, M1, U1, P1], …)
+  : Shape[Level, (M1, …, Mn), (U1, …, Un), (P1, …, Pn)]
+```
+
+counted `Level := _ <: FlatShapeLevel` as pinned against a wanted `Shape[_ <:
+L, ?M, ?U, ?P]` — which is what every level of the search below the first is
+asking for — and each of them then searched all *n* of its own `Shape` clauses,
+at every level down to `MAX_IMPLICIT_DEPTH`, each clause another
+`Shape[_ <: L', ?M', ?U', ?P']` that can never be answered. `sample` showed it
+directly: an unbroken `implicit_fit_open → search_implicit_undet →
+implicit_fit_at` recursion eight deep, and a wanted type whose first argument
+had accreted one wildcard per level (`Shape[_ <: _ <: _ <: … <:
+FlatShapeLevel, M6, U6, P6]`). A parameter solved only to a wildcard no longer
+counts as pinned. Fixtures: `tests/fixtures/implfilter.scala`,
+`crates/cli/tests/implfilter.rs`.
+
+**What blocks the guard now is a diagnostic, not a clock.** Turned on, it fixes
+the family exactly as predicted — `value list` 41 → 0, `delete` 47 → 0,
+`insert` 34 → 0, `firstOption` 29 → 0, `update` 14 → 0, **−170 in all** — and
+then loses more than it gains to *one* of the two independent roots listed
+below: `no implicit: could not find implicit value of type SessionDef`, **0 →
+194**, for a net `errors=895 → 1031`. So it is still not merged, and the reason
+has changed. Thirteen lines, no gitbucket checkout:
+
+```scala
+import com.github.takezoe.slick.blocking.BlockingH2Driver
+import com.github.takezoe.slick.blocking.BlockingH2Driver.blockingApi._
+
+class Accounts(tag: Tag) extends Table[(String, Int)](tag, "ACCOUNTS") {
+  def name = column[String]("NAME")
+  def age = column[Int]("AGE")
+  def * = (name, age)
+}
+
+object T {
+  val q = TableQuery[Accounts]
+  def all(implicit s: Session): List[(String, Int)] = q.list   // no implicit: SessionDef
+}
+```
+
+The `q.list` now resolves; its `implicit session: JdbcBackend#SessionDef`
+clause does not. The candidate in scope is `s : TypeMember(BasicBackend#Session)`
+whose `bound_hi` is `BasicBackend#SessionDef`, and the wanted type is the
+*class* `slick/jdbc/JdbcBackend$SessionDef`. `is_sub_type` follows a
+`TypeMember`'s upper bound and correctly says no: the bound has to be read as
+seen from the concrete `BlockingH2Driver`, whose `backend` is `JdbcBackend`,
+and that is a type-member as-seen-from question in `SymbolTable`, not an
+implicit-search one. **That, and the `E#TableElementType` projection beside it,
+is what the next slice on this family owes.**
 
 Two further roots were isolated on the way and are independent of the above;
 both reproduce in the same file

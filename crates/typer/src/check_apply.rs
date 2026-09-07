@@ -1950,7 +1950,17 @@ impl Typer {
                                     tree.span,
                                 );
                             }
-                            tree.ty = ret;
+                            // The inserted `apply` has default and implicit
+                            // clauses like any other method, and this branch
+                            // filled neither: the call was emitted with the
+                            // implicit argument simply absent, which the JVM
+                            // reports as a `VerifyError` rather than the typer
+                            // reporting anything at all. cats' `IorT.liftF` is
+                            // `right(fb)`, and `RightPartiallyApplied.apply`
+                            // is `(fb: F[B])(implicit F: Functor[F])`.
+                            let leftover = self
+                                .fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
+                            tree.ty = leftover.unwrap_or(ret);
                             return;
                         }
                     }

@@ -143,6 +143,12 @@ impl Typer {
         // parameterless call before the `apply`.
         let mut inner = fun.clone();
         inner.ty = (*ret).clone();
+        // The receiver's own type parameters are this call's to solve, not
+        // fixed types. `IorT.liftF(fb) = right(fb)` reaches
+        // `RightPartiallyApplied[A].apply` through `def right[A]`, whose `A`
+        // nothing has pinned yet; the enclosing expected type is what says
+        // what it is. See `record_open_tparams`.
+        self.record_open_tparams(fun.sym, &ret);
         let span = fun.span;
         *fun = Tree {
             id: NodeId(0),

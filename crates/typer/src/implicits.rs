@@ -839,6 +839,19 @@ impl Typer {
             return None;
         }
         let cand_ty = self.implicit_candidate_ty(id);
+        // The cheap structural rejection, before anything is unified.
+        // `cand_res` is exactly the type the arms below hand to
+        // [`Self::implicit_solve`] / [`Self::implicit_fit_open`], so what
+        // [`Self::plausibly_inhabits`] is asked about is what would have been
+        // fitted.
+        let cand_res: &Type = match &*cand_ty {
+            Type::Method { ret, .. } => ret,
+            Type::Function { params, ret } if params.is_empty() => ret,
+            t => t,
+        };
+        if !self.plausibly_inhabits(cand_res, pt) {
+            return None;
+        }
         match &*cand_ty {
             Type::Method { paramss, ret } => {
                 if paramss.iter().all(|c| c.is_empty()) {
@@ -1097,9 +1110,21 @@ impl Typer {
         }
         let mut targs: Vec<Type> = Vec::with_capacity(tps.len());
         let mut open: Vec<SymbolId> = Vec::new();
+        // A parameter whose only "solution" is a wildcard has not been pinned
+        // down by anything: `Unify::unify_at` answers `_` with `true` without
+        // recording a constraint, so `Level := _ <: FlatShapeLevel` says no
+        // more about `tuple22Shape` than leaving `Level` open does. It is
+        // still *used* as the solution below -- only the "did the wanted type
+        // say anything at all about this candidate" test discounts it.
+        let mut pinned = 0usize;
         for tp in &tps {
             match u.solved(*tp) {
-                Some(t) => targs.push(self.simplify_solved(&t)),
+                Some(t) => {
+                    if !matches!(t, Type::Wildcard | Type::BoundedWildcard { .. }) {
+                        pinned += 1;
+                    }
+                    targs.push(self.simplify_solved(&t))
+                }
                 None => {
                     open.push(*tp);
                     targs.push(Type::TypeParam(*tp));
@@ -1107,9 +1132,22 @@ impl Typer {
             }
         }
         // Nothing left open: the ordinary solve already had its say, and
-        // failed on conformance or bounds. Everything left open: the wanted
-        // type says nothing about this candidate at all.
-        if open.is_empty() || open.len() == tps.len() {
+        // failed on conformance or bounds. Nothing *pinned*: the wanted type
+        // says nothing about this candidate at all -- either every parameter
+        // is open, or the only ones it settled it settled against a `_`.
+        //
+        // That second half is what keeps this fallback to the job its
+        // documentation claims. slick's `tupleNShape` rules are
+        // `Shape[Level, (M1, …, Mn), (U1, …, Un), (P1, …, Pn)]`, and a wanted
+        // `Shape[_ <: L, ?M, ?U, ?P]` -- which is what every level of this
+        // search below the first is asking for -- binds `Level` to the
+        // wildcard and nothing else. Counted as pinned, all 22 of them then
+        // search all of their own `Shape` clauses, at every level down to
+        // `MAX_IMPLICIT_DEPTH`, and each clause is another wanted
+        // `Shape[_ <: L', ?M', ?U', ?P']` that can never be answered. That
+        // tree, not the fitting of any one candidate, is what made the
+        // `import_wildcard` `pickle_readable` guard unaffordable.
+        if open.is_empty() || pinned == 0 {
             return None;
         }
         if self.implicit_diverges(id, pt) {
@@ -1291,6 +1329,46 @@ impl Typer {
             }
             other => other.clone(),
         }
+    }
+
+    /// nsc's `isPlausiblyCompatible`: a purely structural test on a
+    /// candidate's *declared* result type that rejects most of the implicit
+    /// scope before [`Unify`] is asked anything.
+    ///
+    /// **What it can say "no" to, and why the "no" is sound.** Every path out
+    /// of [`Self::implicit_fit_at`] that returns `Some` ends in
+    /// [`Self::implicit_result_conforms(inst, want)`], where `inst` is `have`
+    /// with the candidate's type parameters substituted (by
+    /// `subst_tparams_slice`, then `simplify_solved`) and `want` is `pt` with
+    /// the call site's undetermined ones substituted. Substitution replaces
+    /// `Type::TypeParam` *leaves*; `fold_applied` and `collapse_refinements`
+    /// rebuild a `Type::Class` under its own symbol. So when `have` and `pt`
+    /// are both `Type::Class`, **the two head symbols are the ones `inst` and
+    /// `want` will still have**, whatever the search goes on to solve.
+    ///
+    /// `implicit_result_conforms` compares two classes with different symbols
+    /// by `SymbolTable::is_sub_type`, whose own answer for that pair is
+    /// already decided by exactly the test below (the `class_reaches` fast
+    /// rejection). This therefore rejects a candidate only where the
+    /// conformance check at the end of the fit is *already* going to answer
+    /// `false` -- it can lose no witness, and it changes no diagnostic.
+    ///
+    /// **And it needs no pickle.** `class_reaches` walks parent symbols with a
+    /// visited set and never substitutes, so it asks the symbol table only
+    /// what `is_sub_type` was going to ask it anyway; a hierarchy it cannot
+    /// read as plain classes answers `None`, which is "cannot say" and lets
+    /// the candidate through. The expensive step this replaces is
+    /// `Unify::unify_at`'s pair of `base_type_instance` walks, which build a
+    /// substituted base type on *both* sides before they can fail -- and,
+    /// worse, a candidate that survives them recurses into
+    /// [`Self::implicit_fit_open`] and searches for its own clauses.
+    fn plausibly_inhabits(&self, have: &Type, pt: &Type) -> bool {
+        let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (have, pt) else {
+            return true;
+        };
+        s1 == s2
+            || self.st.is_function_class_shape(*s1, a1)
+            || self.st.class_reaches(*s1, *s2) != Some(false)
     }
 
     /// ClassTag is invariant. Covariant `is_sub_type` would let

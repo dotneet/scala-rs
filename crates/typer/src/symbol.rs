@@ -721,6 +721,18 @@ pub struct SymbolTable {
     pub(crate) flattened_upto: usize,
     /// Method-owned primitive variants produced after the source pickle.
     pub method_variants: rustc_hash::FxHashMap<SymbolId, Vec<MethodVariant>>,
+    /// Type parameters `display_type` has to name their owner for.
+    ///
+    /// Two distinct type parameters can share a name, and a diagnostic that
+    /// prints only the name then says nothing: cats' `IorT` reported
+    /// `type mismatch; found: IorT[F, A, B]  required: IorT[F, A, B]`, where
+    /// the two `B`s were `IorT`'s own and one belonging to a method the typer
+    /// had eta-expanded. nsc disambiguates the same way (`A(in method make)`).
+    ///
+    /// Set only around rendering one message, and only for the parameters
+    /// whose name really is ambiguous there, so that nothing else in the
+    /// compiler sees a different type string.
+    pub(crate) qualify_tparams: std::cell::RefCell<Vec<SymbolId>>,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -837,6 +849,7 @@ impl SymbolTable {
             erasure_settled: false,
             flattened_upto: 0,
             method_variants: rustc_hash::FxHashMap::default(),
+            qualify_tparams: std::cell::RefCell::new(Vec::new()),
         };
         st.root = st.alloc(
             "<_root_>",
@@ -2953,11 +2966,24 @@ impl SymbolTable {
                             }
                         } else if flags.contains(Flags::COVARIANT) {
                             self.is_sub_type(x, y)
-                        } else if is_wildcard_arg(x) || is_wildcard_arg(y) {
+                        } else if is_wildcard_arg(y) {
                             // An invariant parameter still *contains* a
                             // wildcard: `List[Byte]` is a
                             // `Collection[_ <: Number]`.
+                            //
+                            // Only on the *right*. A wildcard on the left is
+                            // an existential -- `Box[_ <: Unit]` is
+                            // `Box[t] forSome { type t <: Unit }` -- and an
+                            // invariant parameter admits it in place of
+                            // `Box[Unit]` only if `t` *is* `Unit`, which the
+                            // wildcard is precisely not saying. Reading it as
+                            // containment in both directions accepted
+                            // `val bad: Box[Unit] = x` for an `x` inferred as
+                            // `Box[_ <: Unit]`, which nsc rejects with a note
+                            // about `Box` being invariant.
                             self.is_sub_type(x, y)
+                        } else if is_wildcard_arg(x) {
+                            false
                         } else {
                             // Invariant: `A[Int]` is not an `A[Any]`.
                             self.is_sub_type(x, y) && self.is_sub_type(y, x)
@@ -3410,6 +3436,27 @@ impl SymbolTable {
         Some((names, body))
     }
 
+    /// `method left`, `class IorT`, `trait Functor` -- what a type parameter
+    /// belongs to, for a diagnostic that would otherwise print two different
+    /// parameters under the same name. `None` when the owner says nothing
+    /// (no symbol, or a package).
+    pub(crate) fn tparam_owner_desc(&self, tp: SymbolId) -> Option<String> {
+        let owner = self.get(tp).owner;
+        if owner.is_none() {
+            return None;
+        }
+        let s = self.get(owner);
+        let what = match s.kind {
+            SymKind::Method => "method",
+            SymKind::Class if s.flags.contains(Flags::TRAIT) => "trait",
+            SymKind::Class => "class",
+            SymKind::Module | SymKind::ModuleClass => "object",
+            SymKind::TypeMember => "type",
+            _ => return None,
+        };
+        Some(format!("{what} {}", s.name))
+    }
+
     pub fn display_type(&self, ty: &Type) -> String {
         // The as-seen-from view of `A#B` prints as `B`: its decls are the
         // compiler's bookkeeping, not something the program wrote.
@@ -3436,7 +3483,17 @@ impl SymbolTable {
                 s
             }
             Type::ModuleRef(id) => self.get(*id).name.clone(),
-            Type::TypeParam(id) => self.get(*id).name.clone(),
+            Type::TypeParam(id) => {
+                let name = self.get(*id).name.clone();
+                if self.qualify_tparams.borrow().contains(id) {
+                    match self.tparam_owner_desc(*id) {
+                        Some(owner) => format!("{name} (defined in {owner})"),
+                        None => name,
+                    }
+                } else {
+                    name
+                }
+            }
             Type::Applied { ctor, args } => {
                 let mut s = self.display_type(ctor);
                 s.push('[');
