@@ -813,6 +813,25 @@ impl Typer {
                             // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
                             // gets `T` from nowhere else.
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
+                            // nsc reads the expected type *after* the arguments
+                            // are typed. Here the pass runs first, so a solution
+                            // the expected type only knows as `_` -- the stand-in
+                            // an enclosing call put there for a variable it has
+                            // not decided (`check_apply`'s `relaxed`) -- would
+                            // fix a parameter an argument still to be typed is
+                            // about to state exactly. A parameter no remaining
+                            // argument mentions keeps the wildcard: `Set()` for
+                            // a declared `Set[TableOption[?]]` has nothing else
+                            // to go on.
+                            let inst: Vec<(SymbolId, Type)> = inst
+                                .into_iter()
+                                .filter(|(tp, t)| {
+                                    !type_has_wildcard(t)
+                                        || !param_tys.iter().zip(&arg_tys).any(|(p, a)| {
+                                            mentions_no_type(a) && type_mentions_tparam(p, *tp)
+                                        })
+                                })
+                                .collect();
                             self.check_tparam_bounds(sym, &inst, recv_ty.as_ref(), tree.span, true);
                             if !inst.is_empty() {
                                 let tps: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
@@ -861,8 +880,20 @@ impl Typer {
                                     Vec::new(),
                                     true,
                                 );
-                                let (ids, vals): (Vec<SymbolId>, Vec<Type>) =
-                                    weak.into_iter().filter(|(id, _)| open.contains(id)).unzip();
+                                // Not a solution the expected type only knows as
+                                // `_`: that wildcard is the stand-in an enclosing
+                                // call left for a variable *it* has not decided,
+                                // and writing it into the parameter both tells
+                                // the literal nothing and hides the variable from
+                                // `open_tparams_of` below, so the literal's own
+                                // answer never reaches the result. cats'
+                                // `F.map(f(a0).value) { case … }` inside
+                                // `EitherT`/`IorT`/`OptionT`'s `tailRecM` came
+                                // out `F[_]` this way.
+                                let (ids, vals): (Vec<SymbolId>, Vec<Type>) = weak
+                                    .into_iter()
+                                    .filter(|(id, v)| open.contains(id) && !type_has_wildcard(v))
+                                    .unzip();
                                 if !ids.is_empty() {
                                     param_tys = param_tys
                                         .iter()
@@ -930,6 +961,23 @@ impl Typer {
                                                 | Type::TypeMember(_)
                                         )
                                 };
+                                // A *rigid* type parameter is settled too. Read
+                                // through the receiver, `class Vd[+E, +A] { def
+                                // map[B](f: A => B) }` states its parameter as
+                                // the caller's own `A`, which is in scope here
+                                // and cannot be a variable; the guess then
+                                // overruled it with `args[0]` -- the `E` -- and
+                                // every `fa.map(f)` on a two-parameter covariant
+                                // class reported `found: (A) => B  required:
+                                // (E) => Any`. The guess is for a parameter
+                                // still written in the *declaring* class's own
+                                // parameter, which is not in scope at the call
+                                // site.
+                                let settled = settled
+                                    || matches!(&fp[..], [Type::TypeParam(tp)]
+                                        if self.tparam_in_scope(*tp)
+                                            && !self.undet_tvars.contains(tp)
+                                            && !self.st.get(sym).tparams.contains(tp));
                                 let fparams = if fp.len() == 1
                                     && !settled
                                     && self.st.kind_arity(&elem) == 0

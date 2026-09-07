@@ -72,6 +72,19 @@ scalac がコンパイルした jar に対する検証は `implguard` テスト
 [docs/cats.md](docs/cats.md) の「The same member, higher-kinded」を参照して
 ください。
 
+引数の期待型に置かれる「まだ決まっていない」印（`_`）は、制約として読みません。
+`f: A => G[F[B]]` のような引数はリテラルを `A => _[T[_]]` という期待型で型付け
+しますが、その `_` は外側の呼び出しが未決だと言っているだけなので、内側の呼び出し
+が自分の型パラメータをそこから取ると `P.F[T[_]]` のような結果になります。引数が
+すでに答えを出している位置、およびこれから型付けする引数が決める位置では、
+`_` を含む解を採用しません。逆に、型ラムダ（`({ type L[x] = Kle[F, A, x] })#L`）
+の中にしか現れない型パラメータは、期待型のラムダ本体まで降りて解きます。
+`Applicative[Kleisli[F, A, *]]` の `A` はこれまで `Nothing` に潰れていました。
+正常系の JVM 実行と不正例の拒否は `wcinfer` テスト
+（`tests/fixtures/wci_open*.scala`）で scalac 2.13.16 と比較します。詳細は
+[docs/cats.md](docs/cats.md) の「The undecided position read as a decision」を
+参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
