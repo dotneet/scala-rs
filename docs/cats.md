@@ -1536,7 +1536,23 @@ different instantiations. No specificity rule can separate them, because for
 nsc there is nothing to separate: it sees a single member. This belongs to the
 member-supply seam, not to `isAsSpecific`.
 
-**Measured**: `tests/cats_measure.sh` 326 -> **303** errors, 80 -> 78 files.
-All 16 `andThen`/`compose` ambiguities are gone; the 4 `lazyZip` remain.
-gitbucket 867 (unchanged), the scala library 1554 -> 1553, slick unchanged at
-`errors=0 classes=1490`.
+**Measured**, on `9739388f` alone (the fix's own effect, before merging main):
+`tests/cats_measure.sh` 326 -> **303** errors, 80 -> 78 files. All 16
+`andThen`/`compose` ambiguities are gone; the 4 `lazyZip` remain. gitbucket 867
+(unchanged), the scala library 1554 -> 1553, slick unchanged at
+`errors=0 classes=1490` with `MODE=b tests/slick_run.sh` at 12/12, 36/36.
+
+All 1490 slick class files are **byte-identical** to the ones the same tree
+without this change emits (`SLICK_OUT=… tests/slick_measure.sh` on both, then
+`diff -r`). That is the check this change needs: slick had no errors either
+way, so the only thing a wrong pick could have moved is the emitted call.
+
+On the scala/scala corpus (`CORPUS_SIZE=full`): `losses=0`, and
+`pos/existential-function-pt` newly passes -- it is this defect exactly:
+
+```scala
+def foo(a: Function[String, _ <: String]): a.type = a
+foo(x => x)
+def foo(a: PartialFunction[String, _ <: String]): a.type = a
+foo({ case x => x })
+```
