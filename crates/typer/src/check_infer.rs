@@ -1553,7 +1553,26 @@ impl Typer {
                 // conforms -- otherwise the call is ill-typed and the argument
                 // type is what the user needs to see in the message.
                 Some(slot) => {
-                    if strong && slot.1 != ty && self.st.is_sub_type(&slot.1, &ty) {
+                    // ... and only when the expected type actually says
+                    // something. A wildcard in it is `check_apply`'s `relaxed`
+                    // stand-in for a variable *this* call has not decided yet,
+                    // one level down from the bare `_` `expected_solution`
+                    // already refuses, so a solution carrying one is strictly
+                    // less precise than the argument's and must not replace it.
+                    // `flatTraverse(ta)(a => P.parallel(f(a)))(…)` types its
+                    // literal at `A => _[T[_]]`; `P.parallel`'s own
+                    // `apply[X](fa: M[X]): P.F[X]` then took `X := T[_]` from
+                    // that expected type instead of the `T[B]` its argument
+                    // gave, and the call came out `P.F[T[_]]`.
+                    // Where the arguments pinned *nothing* the wildcard is
+                    // still the best answer there is -- `Set()` for a declared
+                    // `Set[TableOption[?]]` is a source existential and solves
+                    // `A := TableOption[_]` through the `None` arm below.
+                    if strong
+                        && slot.1 != ty
+                        && !type_has_wildcard(&ty)
+                        && self.st.is_sub_type(&slot.1, &ty)
+                    {
                         slot.1 = ty;
                     }
                 }
@@ -1593,6 +1612,24 @@ impl Typer {
                     if let Some(t) = self.expected_solution(tps, pt) {
                         out.push((*id, t, variance == 0));
                     }
+                }
+            }
+            // Two type *constructors*, at least one of them a type lambda.
+            // `def catsDataApplicativeForKleisli[F[_], A](implicit F:
+            // Applicative[F]): Applicative[Kleisli[F, A, *]]` states `A`
+            // nowhere but inside that lambda, and a lambda is an anonymous
+            // alias symbol whose body lives beside it in the symbol table
+            // (`refinement_type_member`), so every arm below saw an opaque
+            // member and read nothing out of the expected
+            // `Applicative[Kleisli[P.F, A, *]]`. `A` was then minimised to
+            // `Nothing`. `eta_expand_pair` applies both sides to one set of
+            // parameters -- the same step `is_sub_type` already takes to
+            // compare two constructors -- so the bodies can be walked.
+            _ if self.st.kind_arity(ret) > 0
+                && self.st.kind_arity(pt) == self.st.kind_arity(ret) =>
+            {
+                if let Some((er, ep)) = self.st.eta_expand_pair(ret, pt) {
+                    self.collect_expected(tps, &er, &ep, variance, depth + 1, allow_covariant, out);
                 }
             }
             // `type Scope = Map[TermSymbol, Type]` names a `Map`; the walk has

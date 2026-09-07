@@ -499,6 +499,19 @@ pub struct Typer {
     /// Saved and restored around each application, since typing an argument
     /// runs another application inside this one.
     pub(crate) undet_tvars: Vec<SymbolId>,
+    /// Non-zero while an argument is being typed against an expected type this
+    /// compiler *relaxed*: an undetermined variable in it was replaced by
+    /// `Type::Wildcard` to say "the argument decides this" (`check_apply`'s
+    /// `relaxed`, `open_to_bounds`).
+    ///
+    /// `Type::Wildcard` is also what a source `_` parses to, so the two cannot
+    /// be told apart by shape -- `Set[TableOption[?]]` and `Cache[(Seq[String],
+    /// Class[_]), String]` are existentials the program wrote, and reading a
+    /// solution out of them is right. This says which of the two a wildcard in
+    /// the expected type is, and nothing else does.
+    ///
+    /// Saved and restored around the argument, like `undet_tvars`.
+    pub(crate) relaxed_pt_depth: u32,
     /// Set while two alternatives are being compared for specificity.
     ///
     /// Specificity asks a hypothetical question -- "would `b` accept `a`'s
@@ -918,6 +931,7 @@ impl Typer {
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),
+            relaxed_pt_depth: 0,
             spec_probe: std::cell::Cell::new(false),
             tupling: false,
             parent_ctx: None,
