@@ -96,6 +96,16 @@ pub struct PickleSupply {
     /// `Builder[Int, List[Int]]` receiver that is a `Builder`, not the
     /// `Growable` the erased signature names.
     self_ty: Option<Type>,
+    /// The class a type member is being completed **for**, when that is not
+    /// the class that declares it.
+    ///
+    /// `slick.basic.BasicProfile.API` declares `type Session = Backend#Session`
+    /// and leaves `Backend` abstract; `slick.jdbc.JdbcProfile`, which is
+    /// where a concrete profile's `api` object really lives, fixes `type
+    /// Backend = JdbcBackend`. The right-hand side has to be read in the
+    /// vocabulary of the class the name was asked of, or the projection's
+    /// prefix never resolves to anything but the abstract declaration.
+    completing_for: Option<SymbolId>,
     /// What a `p.type` naming one of the member's *own* parameters means,
     /// while that member is being installed: the parameter's declared type.
     ///
@@ -1119,18 +1129,35 @@ impl PickleSupply {
         if class_sym.is_none() || name.is_empty() {
             return None;
         }
-        if let Some(id) = st
-            .lookup_member(class_sym, name)
+        // An answer already in the table is only usable when it is the one
+        // `class_sym` itself means. A *deferred* member reached through a
+        // parent is not: `slick.basic.BasicBackend` declares `type Session`
+        // and `slick.jdbc.JdbcBackend` fixes it to `SessionDef`, and whichever
+        // of the two a previous file happened to install first decided what
+        // `JdbcBackend#Session` meant for the rest of the run. The pickle
+        // lookup below walks the linearisation most-derived-first, which is
+        // nsc's own rule, so ask it before settling for an inherited
+        // declaration.
+        let installed = st
+            .type_members_named(class_sym, name)
             .into_iter()
-            .find(|&s| st.get(s).kind == SymKind::TypeMember)
-        {
-            return Some(st.type_member_as_seen(id));
+            .find(|&s| st.get(s).kind == SymKind::TypeMember);
+        if let Some(id) = installed {
+            if st.get(id).owner == class_sym || !st.is_deferred_type_member(id) {
+                return Some(st.type_member_as_seen(id));
+            }
         }
         let key = (class_sym.0, name.to_string());
         if let Some(memo) = self.tried_types.get(&key) {
             return memo.clone();
         }
-        let answer = self.complete_type_member_uncached(st, bin, class_sym, name);
+        let outer_for = self.completing_for.replace(class_sym);
+        let mut answer = self.complete_type_member_uncached(st, bin, class_sym, name);
+        self.completing_for = outer_for;
+        // No pickle said anything better, so the inherited declaration stands.
+        if answer.is_none() {
+            answer = installed.map(|id| st.type_member_as_seen(id));
+        }
         self.tried_types.insert(key, answer.clone());
         answer
     }
@@ -1247,10 +1274,14 @@ impl PickleSupply {
         ty: &SigType,
     ) -> Option<Type> {
         let owner = self.ensure_class(st, bin, owner_name, false)?;
+        // Only a member of `owner` itself is this alias: the pickle hit named
+        // the class that *declares* the alias, so a same-named declaration
+        // reached through one of its parents is the deferred member this
+        // alias overrides, not the alias.
         if let Some(id) = st
-            .lookup_member(owner, name)
+            .type_members_named(owner, name)
             .into_iter()
-            .find(|&s| st.get(s).kind == SymKind::TypeMember)
+            .find(|&s| st.get(s).kind == SymKind::TypeMember && st.get(s).owner == owner)
         {
             return Some(st.type_member_as_seen(id));
         }
@@ -3939,6 +3970,18 @@ impl PickleSupply {
         d: u32,
         want_arity: usize,
     ) -> Option<Type> {
+        // `p#T`, kept whole by the pickle reader when `p` is a type parameter
+        // or an abstract type member. The prefix is what settles which `T`
+        // this is; when it cannot be settled here, the member's own qualified
+        // name is exactly the answer the reader used to give.
+        if let Some((pre, member)) = sym.split_once('#') {
+            if let Some(t) = self.conv_projection(st, bin, scope, pre, member, args, d) {
+                trace(format_args!("projection {sym} -> {}", st.display_type(&t)));
+                return Some(t);
+            }
+            trace(format_args!("projection {sym}: prefix does not settle it"));
+            return self.conv_ref(st, bin, scope, member, args, d, want_arity);
+        }
         if let Some(bound) = scope.get(sym) {
             if args.is_empty() {
                 return Some(bound.clone());
@@ -4127,6 +4170,113 @@ impl PickleSupply {
     /// `None` outside a completion, and for any name no ancestor declares --
     /// a bare `Ref` is far more often a type parameter or a class, and this
     /// runs only after both of those have been ruled out.
+    /// `p#T` read as the type it stands for.
+    ///
+    /// `p` is a type parameter or an abstract type member; resolving it to the
+    /// class the surrounding cake fixes it to is what makes `T` more than its
+    /// own declaration. `None` when nothing here can settle the prefix, in
+    /// which case the caller falls back to `T`'s declaration -- the answer the
+    /// prefix was dropped for before this existed.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_projection(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        prefix: &str,
+        member: &str,
+        args: &[SigType],
+        d: u32,
+    ) -> Option<Type> {
+        if d > 24 {
+            return None;
+        }
+        let short = member.rsplit_once('.').map(|(_, m)| m).unwrap_or(member);
+        let pre = match scope.get(prefix) {
+            Some(t) => t.clone(),
+            None => {
+                // The prefix is written in the vocabulary of the class the
+                // member was asked of, not of the class that declares it.
+                let root = self.completing_for.map(|c| Type::Class {
+                    sym: c,
+                    args: Vec::new(),
+                });
+                let outer = match root {
+                    Some(r) => self.self_ty.replace(r),
+                    None => self.self_ty.clone(),
+                };
+                let found = self
+                    .self_type_member_at(st, bin, scope, prefix, &[], d + 1, true, true)
+                    .or_else(|| self.stable_prefix_type(st, bin, prefix));
+                trace(format_args!(
+                    "projection prefix {prefix} at {:?}: {}",
+                    self.self_ty.as_ref().map(|t| st.display_type(t)),
+                    found
+                        .as_ref()
+                        .map(|t| st.display_type(t))
+                        .unwrap_or_else(|| "-".into())
+                ));
+                self.self_ty = outer;
+                found?
+            }
+        };
+        // A prefix that is itself still abstract settles nothing.
+        if matches!(&pre, Type::TypeMember(id) if st.is_deferred_type_member(*id)) {
+            return None;
+        }
+        let cls = st.class_sym_of(&pre)?;
+        let t = self.complete_type_member(st, bin, cls, short)?;
+        // The prefix settled nothing: `T` came back as the same declaration
+        // the fall-back path would have installed anyway.
+        if matches!(&t, Type::TypeMember(id) if st.is_deferred_type_member(*id)) {
+            return None;
+        }
+        if args.is_empty() {
+            return Some(t);
+        }
+        if st.kind_arity(&t) != args.len() {
+            return None;
+        }
+        let a = self.conv_all(st, bin, scope, args, d)?;
+        Some(Type::Applied {
+            ctor: Box::new(t),
+            args: a,
+        })
+    }
+
+    /// The type of a stable *value* standing as a projection prefix
+    /// (`backend.DatabaseFactory`), read off the class the member is being
+    /// completed for. `self.self_ty` already names that class.
+    fn stable_prefix_type(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        name: &str,
+    ) -> Option<Type> {
+        let Some(Type::Class { sym, .. }) = self.self_ty.clone() else {
+            return None;
+        };
+        for owner in st.enclosing_classes(sym) {
+            if !st.get(owner).is_class_like() {
+                continue;
+            }
+            let mut found = st.lookup_member(owner, name);
+            if found.is_empty() {
+                found = self.complete(st, bin, owner, name);
+            }
+            for m in found {
+                if !matches!(st.get(m).kind, SymKind::Term | SymKind::Method) {
+                    continue;
+                }
+                let t = st.get(m).ty.result().clone();
+                if st.class_sym_of(&t).is_some() {
+                    return Some(t);
+                }
+            }
+        }
+        None
+    }
+
     fn self_type_member(
         &mut self,
         st: &mut SymbolTable,
@@ -4135,6 +4285,27 @@ impl PickleSupply {
         name: &str,
         args: &[SigType],
         d: u32,
+    ) -> Option<Type> {
+        self.self_type_member_at(st, bin, scope, name, args, d, false, false)
+    }
+
+    /// `allow_nullary` lifts the "an applied member only" rule below, and
+    /// `aliases_only` takes only a member some class *fixes*. Both are set for
+    /// the *prefix* of a projection: a prefix is not a member, so no erased
+    /// descriptor competes with the answer, and a prefix that is still
+    /// abstract settles nothing -- taking it would stop the walk one class
+    /// short of the alias that does.
+    #[allow(clippy::too_many_arguments)]
+    fn self_type_member_at(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        name: &str,
+        args: &[SigType],
+        d: u32,
+        allow_nullary: bool,
+        aliases_only: bool,
     ) -> Option<Type> {
         let cls = match &self.self_ty {
             Some(Type::Class { sym, .. }) => *sym,
@@ -4157,7 +4328,7 @@ impl PickleSupply {
         // preferring the abstract member over it broke
         // `crates/cli/tests/aliaslookup.rs`. An applied member has no such
         // competition, since there is no erased descriptor to lose.
-        if args.is_empty() && !internal.starts_with("scala/") {
+        if args.is_empty() && !allow_nullary && !internal.starts_with("scala/") {
             return None;
         }
         if internal.is_empty()
@@ -4213,6 +4384,9 @@ impl PickleSupply {
                         ));
                         return Some(t);
                     }
+                }
+                if aliases_only {
+                    continue;
                 }
                 if let Some(t) = self.abstract_type_member(st, bin, &qualified, d) {
                     if args.is_empty() {
