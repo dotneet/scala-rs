@@ -11,11 +11,15 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `15bee7f9` |
+| commit | `d056a7f7` |
 |---|---|
 | updated | 2026-09-07 |
 
-Six slices have merged in two composed gates. The first three, at `9739388f`:
+Seven slices have merged in three composed gates. `agent/implguard` was
+measured alone on top of the six below, at `d056a7f7`: the corpus is
+**byte-identical** to `15bee7f9` (`changes: []`, `losses=0`), the workspace
+suite is 226 rows / 2314 passed / 0 failed, and gitbucket falls 785 -> 717
+with cats, slick and the library measure unmoved. The first three, at `9739388f`:
 `agent/gbtrait` (`new T()` for a trait read from a class file), `agent/catseta`
 (the type parameters eta-expansion and inserted applies left open), and
 `agent/implicitfilter` (a plausibility pre-filter and a `pinned` correction in
@@ -76,7 +80,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `run` (2060) | **616** | 891 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-15bee7f9.tsv`](baselines/corpus-15bee7f9.tsv): 5324 unique
+[`baselines/corpus-d056a7f7.tsv`](baselines/corpus-d056a7f7.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `0d200adb`, `losses=0` and one status improved (`pos/t6666d`).
 Compared with `9739388f`, `losses=0` and six improved: `pos/existential-function-pt`
@@ -104,7 +108,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-15bee7f9.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-d056a7f7.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -131,7 +135,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **225 result rows, 2312 passed, 0 failed** at `15bee7f9` |
+| `cargo test --workspace --release --no-fail-fast` | **226 result rows, 2314 passed, 0 failed** at `d056a7f7` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
