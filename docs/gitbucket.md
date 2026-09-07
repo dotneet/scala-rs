@@ -2301,6 +2301,18 @@ in its own file because scalac's override phase never runs when the typer has
 already reported. `absproj_reduce.scala` executes and prints, and
 `crates/cli/tests/absproj.rs` diffs it against real scalac 2.13.16.
 
+**A projection in a *parameter* position is still not compared, and never
+was.** `trait BaseProfile { type Backend <: BaseBackend; def use(s:
+Backend#Session): String }` with `trait ConcreteProfile extends BaseProfile {
+type Backend = ConcreteBackend; def use(s: String): String = s }` is `object
+creation impossible` under real scalac and compiles here. That is
+`override_check.rs`'s `robust`, which refuses to compare any type containing a
+`Type::TypeMember` and answers "compatible" — deliberately, because comparing
+them once produced 150 diagnostics scalac does not make. It behaved
+identically before this slice (the parameter was a `TypeMember` either way),
+so nothing regressed; it is written down because the shape looks like
+something this fixture set should pin and is not.
+
 **The `withTransaction` / `withSession` rows are not this cluster.** The brief
 that opened this slice expected 12 of them here. They now read `value
 withTransaction is not a member of BasicBackend.DatabaseFactory` (19 of them),
