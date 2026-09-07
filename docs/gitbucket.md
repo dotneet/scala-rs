@@ -2322,8 +2322,10 @@ with projections.
 
 ## Fixed: a failed implicit search kept typing (`agent/gbhead`)
 
-**496 → 416 errors, 96 → 83 files.** cats 251 → 249 / 75, the scala library
-1550 → 1541 / 168, slick unmoved at `errors=0 classes=1490`.
+**496 → 398 errors, 96 → 83 files.** cats unmoved at 251 / 75, slick unmoved at
+`errors=0 classes=1490`, the scala library 1550 → **1552** / 168 — the two are
+explained below and are not a cascade being hidden. Measured against
+`d2fdc4ef` (main with `agent/linterm` merged), both binaries on the same tree.
 
 The brief that opened this slice named three symptom families at the head of
 gitbucket and asked whether they are one root. **They are two, and the two
@@ -2332,11 +2334,11 @@ what happens after a search has already failed.
 
 | family | before | after |
 |---|---:|---:|
-| A — `value _N is not a member of T` / `of G` | 22 | 0 |
-| B — `ambiguous implicit: <everything in scope>` | 31 | 3 |
+| A — `value _N is not a member of T` / `of G` / `of A` | 23 | 9 |
+| B — `ambiguous implicit: <everything in scope>` | 31 | 0 |
 | C — `value map is not a member of O2` | 13 | 0 |
-| every `is not a member of` | 145 | 124 |
-| every `no implicit` | 137 | 112 |
+| every `is not a member of` | 145 | 106 |
+| every `no implicit` | 137 | 113 |
 
 ### The two roots
 
@@ -2366,6 +2368,26 @@ would name has already been reported where it failed. Six lines:
 `crate::check::type_is_erroneous`, an early `None` in `search_implicit_undet`,
 and that guard at the two report sites. **496 → 467**, files 96 → 83.
 
+The mirror of it is the *candidate* whose own type is erroneous, and it costs
+the two errors the scala library gained. nsc's `ImplicitComputation.survives`
+requires `!isCyclicOrErroneous` of the candidate as well, for exactly the same
+reason: `Type::Error` inhabits anything, so such a candidate is applicable
+everywhere. Three conversions inside `extractFromJsonBody`'s own body came out
+`ambiguous implicit: mf, request` / `mf, jsonFormats` because its own
+`mf: Manifest[A]` was one. `Range.scala:608` is where declining them costs
+something —
+
+```scala
+implicit val bigDecAsIntegral: Numeric.BigDecimalAsIfIntegral = Numeric.BigDecimalAsIfIntegral
+```
+
+whose type we already report as `type BigDecimalAsIfIntegral is not a member of
+<notype>`, so the two `NumericRange(start, end, step)` calls beneath it now say
+`could not find implicit value of type Integral[BigDecimal]` where before they
+silently took the erroneous `val`. That is not a regression to argue away: an
+implicit whose type failed to resolve answering a search is how a wrong program
+gets accepted, and both errors are downstream of one we already print.
+
 **2. An application whose implicit argument was missing kept its declared
 result type.** nsc's `applyImplicitArgs` ends `if (args contains EmptyTree)
 setError(tree)`. Ours handed back the result type with the type parameters the
@@ -2383,9 +2405,31 @@ are exactly that shape, and `IssuesService.scala` is where both show. One
 `value _1 is not a member of T` six times on line 231 — after the missing
 `Shape` had already been reported on line 202. `joinLeft`'s `O2` leaked the
 same way and is the whole of family C. Marking the application `Type::Error`
-(`Typer::implicit_arg_missing`, taken in `type_apply_in` right after
-`fill_defaults_and_implicits`) is **467 → 416**; the "not a member" report
-already stood down for an erroneous receiver.
+(`Typer::implicit_arg_missing`, read at the end of the `OverloadPick::Found`
+arm of `type_apply_in`) is **467 → 398**; the "not a member" report already
+stood down for an erroneous receiver.
+
+**Our version of nsc's rule is narrower, and it has to be.** Two attempts at
+the faithful one broke `pos/annotated-original` in the scala corpus, a program
+that had compiled:
+
+```scala
+def impl(c: Context)(a: c.Expr[Any]) = c.Expr[Any](c.untypecheck(a.tree))
+def m(a: Any): Any = macro impl
+```
+
+`c.Expr[Any](…)` fails this very search on the pass that infers `impl`'s result
+type — the `WeakTypeTag[Any]` it wants is brought into scope later, by the
+`macro impl` beside it — and succeeds on a later attempt. Setting the error the
+moment `fill_defaults_and_implicits` returns *and returning* skipped the rest of
+the arm, and the rest of the arm is what loads the symbols the next attempt
+needs; the retry then failed too and the error stuck. Setting it at the end of
+the arm was not enough either, because the poisoned type is itself what makes
+the enclosing prototype retry keep the failing attempt. What holds is the
+narrower rule: poison **only when the result type still mentions one of the
+callee's type parameters**, which is precisely the leak — `Query[G, T, C]`
+does, `Expr[Any]` does not. A one-pass compiler would not need the qualifier;
+we are not one.
 
 So families A and C are one root, family B is another, and what makes them look
 like one is that both leave a *failed* search's tree typed as if it had
@@ -2414,6 +2458,35 @@ eight residual `value _N is not a member of A` on `IssuesService.scala:231` are
 that path: `RichSeq[A]` is applied to a receiver that is now `Error`, and `A`
 has nothing to be solved from. They are the remainder of family A, and they
 want a narrower rule than "no views on error".
+
+The general lesson, for the next slice that reaches for `Type::Error` as a
+stopper: **in this compiler an `Error` in a tree is not only a statement about
+the program, it is an input to the passes that come after it**, and three of
+the four places one can be written here made a program that compiled stop
+compiling. Measure each one separately; the aggregate number hides the trade.
+
+### The head afterwards
+
+All three families are out of it. What is left is slick's own machinery, and
+almost nothing else:
+
+| n | message |
+|---:|---|
+| 46 | `no implicit … CanBeQueryCondition[Any]` |
+| 31 | `macro expansion is not implemented: cannot expand mapTo` |
+| 19 | `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])` |
+| 13 | `ambiguous overload for constructor` |
+| 12 | `value withTransaction is not a member of BasicBackend.DatabaseFactory` |
+| 12 | `no implicit … OptionMapper2[Boolean, Boolean, Boolean, Boolean, P2, R]` |
+| 8 | `value url is not a member of Any` |
+| 8 | `value _N is not a member of A` (the residue of family A, above) |
+| 8 | `no implicit … TypedType[Option[String]]` |
+| 8 | `no implicit … ExecutionContext` |
+
+`no implicit` is 113 of the 398 and `is not a member of` 106; between them they
+are more than half, and the `Any` in nine of the rows above is what a
+`CanBeQueryCondition` that could not be found leaves behind. The next lever is
+still slick's `Shape` / `CanBeQueryCondition` derivation, not the diagnostics.
 
 ### Not fixed here, and worth a slice: `Predef.Manifest`
 
