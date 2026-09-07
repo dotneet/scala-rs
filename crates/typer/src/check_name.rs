@@ -976,7 +976,19 @@ impl Typer {
                         }
                     }
                 }
+                // `import o._` imports what `o` has, and a `private` member of
+                // a *strict* ancestor of `o` is not one: SLS 5.2 keeps it
+                // inside its own class, so `o` does not inherit it and no
+                // import can name it. gitbucket's `object helpers extends …
+                // with RequestCache` is where this mattered -- every
+                // `import gitbucket.core.view.helpers._` was pulling in
+                // `RequestCache`'s `private implicit def context2Session`,
+                // which then competed with the `request2Session` nsc picks.
+                let inherited = cur != o;
                 for m in self.st.get(cur).members.clone() {
+                    if inherited && self.st.private_to_owner(m) {
+                        continue;
+                    }
                     let n = self.st.get(m).name.clone();
                     if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
                         continue;

@@ -1284,7 +1284,7 @@ impl SymbolTable {
     /// the one that is not a member at all could win (`run/t7475b`).
     /// A qualified `private[C]` stays visible: the qualifier can name an
     /// enclosing package that does contain the subclass.
-    fn private_to_owner(&self, m: SymbolId) -> bool {
+    pub(crate) fn private_to_owner(&self, m: SymbolId) -> bool {
         let s = self.get(m);
         s.flags.contains(Flags::PRIVATE) && s.private_within.is_none()
     }
