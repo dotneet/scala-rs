@@ -20,4 +20,12 @@ object BadMain extends Svc2 {
 
   // Nor does it invent a parameter name.
   val c: String = get("x", removed = true)
+
+  // Supplying a case class's *synthetic* companion `apply` from a pickle must
+  // not make an instance of the class applicable. `scala/scala`'s
+  // `neg/t4196` is exactly this: a `Some[String]` applied to an argument, for
+  // which scalac says "Some[String] does not take parameters". Supplying the
+  // pickled `Some$.apply` here compiled it as `Some$.apply("spurious")` with
+  // the receiver dropped.
+  val d: Any = Some("first")("spurious")
 }

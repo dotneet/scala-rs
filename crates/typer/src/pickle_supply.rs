@@ -1467,6 +1467,15 @@ impl PickleSupply {
         } else {
             Vec::new()
         };
+        // A *prelude* class's `apply` is hand-written and authoritative --
+        // `adopt_binary_class` refuses such a class outright for the same
+        // reason. Offering the pickled `Some$.apply` from here made
+        // `Some("x")("spurious")` compile (`neg/t4196`): the caller reads a
+        // non-empty answer as "this receiver can be applied", and the
+        // application went out as `Some$.apply("spurious")` with the receiver
+        // dropped. The case-class relaxation is for the libraries on `-cp`,
+        // which is where the class file's description is all there is.
+        let case_synthetic_ok = !(internal.starts_with("scala/") && class_sym.0 < st.prelude_end);
         let mut installed: Vec<SymbolId> = Vec::new();
         let mut seen_shapes: HashSet<String> = HashSet::new();
         // The arities of the overloads taking a function parameter already in.
@@ -1525,7 +1534,7 @@ impl PickleSupply {
                 continue;
             }
             if !m.is_public_api()
-                && !m.is_case_synthetic()
+                && !(case_synthetic_ok && m.is_case_synthetic())
                 && !(synthetic_ok && is_default_getter(&m.name))
             {
                 continue;

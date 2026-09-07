@@ -2,34 +2,29 @@
 //! `name$default$n` getter is reached through a prefix the call site does not
 //! write, and default arguments declared in a separately compiled class file.
 //!
-//! Two roots, both about *which symbol answers for the getter*:
+//! `docs/default-arguments.md` is the full account. In short, a default
+//! argument is a *call*, and five separate things stopped the right getter
+//! from being called:
 //!
-//! 1. A method declared in a class file had no defaults at all. A class file
-//!    carries no per-parameter "has a default" bit, and the two places that
-//!    could supply one both declined: the class file reader
-//!    (`classpath::fill_java_members`) never looked at the `name$default$n`
-//!    methods sitting beside the method, and the pickle reader skipped a case
-//!    class's companion `apply` because nsc marks it `SYNTHETIC`. json4s's
-//!    `FieldSerializer[String]()` therefore reached overload selection with
-//!    no arguments against `(PartialFunction, PartialFunction, Boolean,
-//!    ClassTag[String])`.
-//!
-//! 2. The getter was selected off the *enclosing class* of the call site
-//!    rather than off the prefix the method itself resolved through --
-//!    "value avatar$default$3 is not a member of IndexControllerBase" for a
-//!    name that came in through `import helpers._`, and "value
-//!    getAccountByUserNameIgnoreCase$default$2 is not a member of $anon$61"
-//!    for one a cake's self type contributes, seen from inside an anonymous
-//!    class. The main call was emitted correctly in the first shape and
-//!    *miscompiled* in the second (`aload_0; checkcast AccountService` on an
-//!    anonymous class that does not implement it -- a `ClassCastException`
-//!    from a program that type-checked), so the backend's receiver walk had
-//!    to learn about self types too.
+//! 1. a class file records no per-parameter "has a default" bit, and the
+//!    class file reader ignored the `name$default$n` methods beside the
+//!    method, which are the only evidence;
+//! 2. a case class's companion `apply` is `SYNTHETIC`, so the *pickled* one --
+//!    the only description that says which clause is `implicit` -- was never
+//!    installed. json4s's `FieldSerializer[String]()` needs both;
+//! 3. a default getter carrying a type parameter its signature mentions
+//!    nowhere was declined, and that declines the whole method
+//!    (scalatra's `halt(400)`);
+//! 4. the getter was selected off the enclosing class of the call site rather
+//!    than off the prefix the method resolved through -- a wildcard-imported
+//!    object, a cake self type seen from inside an anonymous class (which was
+//!    a `ClassCastException` in the *main* call too), a local `def`;
+//! 5. a compound self type contributed only its first component.
 //!
 //! Every default here is called and printed, so a getter that answers the
 //! wrong value cannot pass as a green test. `tests/multi/defaultargs_binary`
-//! is compiled by **real scalac** first, which is the setting the first root
-//! only appears in.
+//! is compiled by **real scalac** first, which is the setting root 1 and 2
+//! only appear in.
 //!
 //! Kept out of `crates/cli/tests/e2e.rs` on purpose; see `.agent-brief.md`.
 
@@ -198,6 +193,30 @@ fn fixtures_da_defaults_bad() {
     assert!(
         err.contains("unknown parameter name: removed"),
         "an undeclared parameter name must fail: {err}"
+    );
+    assert!(
+        err.contains("value apply is not a member of"),
+        "an instance of a case class is not applicable (scala/scala's neg/t4196): {err}"
+    );
+}
+
+/// The same file against the real `scala-library` ABI, where the pickled
+/// `Some$.apply` is the one the case-class relaxation could have offered.
+#[test]
+fn fixtures_da_defaults_bad_lib() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip da_defaults_bad library run: scala-library jar not obtainable");
+        return;
+    };
+    let err = compile_errors(
+        "da_defaults_bad",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    // The receiver prints as a supertype here, which is imprecise but is
+    // still a rejection; nsc says "Some[String] does not take parameters".
+    assert!(
+        err.contains("value apply is not a member of"),
+        "an instance of a case class is not applicable: {err}"
     );
 }
 
