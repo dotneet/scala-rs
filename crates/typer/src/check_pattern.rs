@@ -1264,12 +1264,35 @@ impl Typer {
     /// also walks the parent's own self-type -- which found
     /// `RelationalActionComponent { self: RelationalProfile => }`'s self-type
     /// member for `super.computeCapabilities` inside `RelationalProfile`
-    /// itself, i.e. the very override being completed. This walks every real
-    /// parent, last-declared first (later mixins are more specific in Scala's
-    /// linearization, so `super` prefers them), and returns the first parent
-    /// whose *real* inheritance chain actually defines `name` -- `Relational
-    /// ActionComponent` has no `computeCapabilities` of its own, so the
-    /// search continues past it to `BasicProfile`, which does.
+    /// itself, i.e. the very override being completed. This walks the real
+    /// chain instead, and returns the first entry whose *real* inheritance
+    /// chain actually defines `name` -- `RelationalActionComponent` has no
+    /// `computeCapabilities` of its own, so the search continues past it to
+    /// `BasicProfile`, which does.
+    ///
+    /// ## Why the walk is the linearization and not the reversed parent list
+    ///
+    /// It used to be `parents.reverse()` -- the syntactically last mixin
+    /// first, on the reasoning that a later mixin is the more specific one.
+    /// That is true only while the `with` list is an *antichain*. Write a
+    /// mixin an earlier parent already extends and the two orders part
+    /// company:
+    ///
+    /// ```text
+    /// trait L1 extends L0; trait L2 extends L0; trait L3 extends L1 with L2
+    /// class C1 extends L3 with L1
+    /// ```
+    ///
+    /// `C1`'s linearization is `C1 L3 L2 L1 L0` -- SLS 5.1.2's `+:` deletes the
+    /// redundant `L1` from the later operand, so `L3` stays in front -- and
+    /// scalac 2.13.16 prints `C1 L3 L2 L1 L0`. The reversed parent list starts
+    /// at `L1` instead, so `super.t` resolved to `L1.t` and the program printed
+    /// `C1 L1 L0`: two traits silently dropped out of the `super` chain, with
+    /// no diagnostic anywhere. Walking [`crate::lin::linearize`] is both the
+    /// rule SLS 6.5 states and, for an antichain, the same list the reversed
+    /// parents gave -- the head of the linearization after `this_id` is the
+    /// last-written mixin exactly when that mixin is not already an ancestor of
+    /// an earlier one.
     pub(crate) fn super_select_member(
         &self,
         this_id: SymbolId,
@@ -1279,29 +1302,39 @@ impl Typer {
         if this_id.is_none() {
             return None;
         }
-        let mut parents: Vec<SymbolId> = self
-            .st
-            .get(this_id)
-            .parents
-            .iter()
-            .filter_map(|p| self.st.class_sym_of(p))
-            .filter(|p| {
-                let n = self.st.get(*p).name.as_str();
-                n != "AnyRef" && n != "Any" && n != "AnyVal" && n != "Object"
-            })
-            .filter(|p| {
-                let jvm = self.st.get(*p).jvm_name.as_str();
-                jvm != "scala/Product" && jvm != "java/io/Serializable"
-            })
-            .collect();
-        if let Some(mix_name) = mix {
-            parents.retain(|p| {
-                let n = self.st.get(*p).name.as_str();
-                n == mix_name || n.trim_end_matches('$') == mix_name
-            });
+        // `super[T].m` names one parent outright (SLS 6.5); it is resolved
+        // against the written parent list, not the linearization, because only
+        // a direct parent may be named.
+        let mut parents: Vec<SymbolId> = if let Some(mix_name) = mix {
+            self.st
+                .get(this_id)
+                .parents
+                .iter()
+                .filter_map(|p| self.st.class_sym_of(p))
+                .filter(|p| {
+                    let n = self.st.get(*p).name.as_str();
+                    n == mix_name || n.trim_end_matches('$') == mix_name
+                })
+                .collect()
         } else {
-            parents.reverse();
-        }
+            // `linearize` already drops `Any` / `AnyRef` / `AnyVal` / `Object`
+            // and heads the list with `this_id` itself; `super` starts at the
+            // element after it.
+            crate::lin::linearize(&self.st, this_id)
+                .into_iter()
+                .filter(|&p| p != this_id)
+                .collect()
+        };
+        // `Product` and `Serializable` are never what `super` means. nsc writes
+        // every case class as `C extends Base with Product with Serializable`,
+        // so they sit at the front of the linearization, and neither defines
+        // anything a subclass overrides. Taking them literally made `override
+        // def getDumpInfo = super.getDumpInfo…` in slick's case classes report
+        // `value getDumpInfo is not a member of Serializable` -- 30 times.
+        parents.retain(|p| {
+            let jvm = self.st.get(*p).jvm_name.as_str();
+            jvm != "scala/Product" && jvm != "java/io/Serializable"
+        });
         // nsc resolves `super.m` to the first *concrete* `m` along the
         // linearization: a mixin that only re-declares `m` (slick's
         // `BasicStreamingQueryActionExtensionMethodsImpl` narrows `result`

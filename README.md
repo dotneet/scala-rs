@@ -87,6 +87,27 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 連鎖を実行して実 scalac の出力と比較する検査と、閉路の拒否行の検査は
 `linearization` テスト（`tests/fixtures/linterm_*.scala`）にあります。
 
+線形化そのものは SLS 5.1.2 の `+:` の畳み込みで、C3 merge ではありません。SLS が
+定めているのは親の線形化に対する右結合の `+:` の畳み込みで、`+:` は**どんな 2 つの
+列に対しても**答えを持ちます（共有する祖先の順序が食い違っていても）。C3 merge は
+そうではなく、どの先頭も自由でないときに推測するしかありません。以前の実装は
+`lists[0][0]` を選んでいたため、**深さの違う 2 経路から届く祖先**の位置を間違え、
+`class Wider extends Root with L6 with L5` が scalac の `Wider L5 L3 L6 L4 L1 L2 L0`
+に対して `Wider L5 L6 L4 L3 L1 L2 L0` になっていました。畳み込みをそのまま書くと
+重複も生じないので、`dedup_keep_last` による後始末（Java の
+`class LinkedHashMap extends HashMap implements Map` のために必要でした）も
+不要になります。
+
+`super` の解決先も、構文上最後の親ではなく線形化から選びます。`with` の並びが
+反鎖（どの mixin も先行する mixin の祖先でない）である限り両者は一致しますが、
+**先行する親がすでに継承している mixin**を書くと食い違います。
+`trait L3 extends L1 with L2` に対する `class C1 extends L3 with L1` の線形化は
+`C1 L3 L2 L1 L0`（`+:` が冗長な `L1` を削るので `L3` が前に残ります）で、
+scalac もそう印字しますが、最後の親から探すと `super.t` が `L1.t` に解決され、
+`C1 L1 L0` — trait が 2 つ黙って消えた出力になっていました。どちらも診断は出ず、
+クリーンにコンパイルされていました。両方の形は `tests/fixtures/linterm_diamond.scala`
+に入っていて、`linearization` テストが実 scalac 2.13.16 の出力と比較します。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

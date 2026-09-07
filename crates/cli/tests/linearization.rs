@@ -169,6 +169,28 @@ fn super_chain_matches_scalac() {
         ours.contains("Deep L9 L8 L7 L6 L5 L4 L3 L2 L1 L0"),
         "super chain lost a trait: {ours}"
     );
+    // The two shapes SLS 5.1.2's `+:` gets right and a C3 merge does not. Both
+    // used to compile cleanly and print a *different* chain, so they are named
+    // here as well as covered by the whole-output comparison below: a
+    // regression should say which shape broke, not just that some line moved.
+    //
+    //  * `class Wider extends Root with L6 with L5` reaches `L4` at two
+    //    different depths (through `L3` from `L5`, directly from `L6`). The
+    //    fold `L(L5) +: L(L6) +: L(Root)` keeps `L3` immediately behind `L5`;
+    //    the C3 merge, with no free head, fell back to its first list and
+    //    printed `Wider L5 L6 L4 L3 L1 L2 L0`.
+    assert!(
+        ours.contains("Wider L5 L3 L6 L4 L1 L2 L0"),
+        "a shared ancestor reached at two depths is misplaced: {ours}"
+    );
+    //  * `class Redundant extends L3 with L1`, where `L3` already extends `L1`.
+    //    `+:` deletes the redundant `L1`, so `super` in the class body means
+    //    `L3`. Resolving `super` against the syntactically last parent instead
+    //    printed `Redundant L1 L0`, dropping `L3` and `L2` with no diagnostic.
+    assert!(
+        ours.contains("Redundant L3 L2 L1 L0"),
+        "a redundant later mixin captured the class's own super: {ours}"
+    );
 
     let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
         eprintln!("skip scalac oracle for linterm_diamond: scalac or jar not obtainable");

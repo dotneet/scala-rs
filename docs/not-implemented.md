@@ -187,21 +187,6 @@ Compiler flags (`agent/xflags`):
   `X.AllOps` into a self-inheriting trait; the program is still rejected, but
   as `illegal cyclic reference involving trait AllOps` rather than for the
   missing qualifier. Fixture: `tests/fixtures/linterm_missing_prefix_bad.scala`.
-- **SLS 5.1.2's `+:` in the linearization merge, for two mixins that share an
-  ancestor at different depths.** `class Wider extends Root with L6 with L5`,
-  over the hierarchy in `tests/fixtures/linterm_diamond.scala`, linearizes to
-  `Wider L5 L3 L6 L4 L1 L2 L0` in scalac and to `Wider L5 L6 L4 L3 L1 L2 L0`
-  here: `L3` is placed after `L4` instead of directly after `L5`. The C3 merge
-  in `crates/typer/src/lin.rs` reaches for `lists[0][0]` when no head is free,
-  and `dedup_keep_last` then repairs only the duplicate, not the position. The
-  observable consequence is the order `super` calls run in. The shapes the
-  fixture does cover — a ten-level chain over four diamonds, and two mixins
-  whose linearizations interleave — agree with scalac exactly.
-- **A mixin an earlier parent already extends.** `class C extends L3 with L1`
-  where `trait L3 extends L1` linearizes correctly (`C L3 L2 L1 L0`, which is
-  scalac's answer) but the backend wires `C`'s `super` chain to `L1` and skips
-  `L3` entirely, so the program prints `C L1 L0`. The defect is in the emitted
-  super accessors, not in the order the typer computed.
 - **Every cycle in a tangle of overlapping `extends` cycles, and nsc's second
   cyclic diagnostic.** A cyclic inheritance graph is now rejected with
   `illegal cyclic reference involving trait X`, at scalac's line and with
