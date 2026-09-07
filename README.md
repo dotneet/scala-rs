@@ -54,6 +54,30 @@ scalac 2.13.16 と比較します。集合の結合も含む
 どちらも診断結果を変えず、コストだけを下げます。検証は `implfilter` テストと
 [docs/gitbucket.md](docs/gitbucket.md) を参照してください。
 
+失敗した暗黙検索は、そこで報告して止まります。`Type::Error` は
+`plausibly_inhabits` の前判定をすべて通過してしまうため、要求型または候補の型が
+エラー型だと「何にでも適合する」ことになり、スコープ中の暗黙値が全部候補になって
+「ambiguous implicit」を名乗っていました（gitbucket では 1 か所で 32 個の候補を
+並べていました）。nsc に合わせて 3 つの規則を入れています。(1) 要求型がすでに
+エラー型なら検索を行いません。(2) 自分の型がエラー型の候補は
+`ImplicitComputation.survives` と同じく候補から外します（型が解決できなかった
+`implicit val` が検索に答えるのは、誤ったプログラムを受理する経路です）。
+(3) エラー型の要求に対する「暗黙値が見つからない」診断は出しません —
+原因はそれが失敗した場所ですでに報告済みです。
+
+暗黙引数を埋められなかった適用は、nsc の `applyImplicitArgs` と同じく
+エラー木にします。見つからなかった証拠だけが決められる型引数（slick の
+`map[F, G, T](f)(implicit shape: Shape[…]): Query[G, T, C]` の `T`）が式に
+漏れ出し、その上のすべての選択が二重に報告されるのを止めます。ただし
+**結果型がまだ呼び出し先の型引数を含んでいる場合に限ります**。scala-rs は
+単一パスではなく、同じ式を複数回型付けするため、漏れていない結果まで
+エラーにすると「以前は通っていたプログラムが通らなくなる」ことが実際に
+起きました（`pos/annotated-original`）。正常系（証拠が見つかる場合に型引数が
+正しく決まり JVM 実行結果が scalac と一致すること）と異常系（scalac と同じ
+2 行だけを拒否すること）は `implcascade` テスト
+（`tests/fixtures/implcascade.scala`、`tests/fixtures/implcascade_bad.scala`）
+で比較します。
+
 ワイルドカード import は、まだ pickle を読んでいないクラスに問い合わせません。
 問い合わせると `PickleSupply` が拒否を恒久的に記憶してしまい、直後に同じクラスを
 読み込む `adopt_binary_class` がその記憶を受け取るため、jar 側の `implicit def` が

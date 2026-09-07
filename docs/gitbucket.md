@@ -2320,6 +2320,200 @@ which is the *import precedence* defect written up under `agent/backendtypes`
 above — a wildcard import outranking an explicit one — and has nothing to do
 with projections.
 
+## Fixed: a failed implicit search kept typing (`agent/gbhead`)
+
+**496 → 398 errors, 96 → 83 files.** cats unmoved at 251 / 75, slick unmoved at
+`errors=0 classes=1490`, the scala library 1550 → **1552** / 168 — the two are
+explained below and are not a cascade being hidden. Measured against
+`d2fdc4ef` (main with `agent/linterm` merged), both binaries on the same tree.
+
+The brief that opened this slice named three symptom families at the head of
+gitbucket and asked whether they are one root. **They are two, and the two
+share a consequence.** Neither is about implicit *priority*: both are about
+what happens after a search has already failed.
+
+| family | before | after |
+|---|---:|---:|
+| A — `value _N is not a member of T` / `of G` / `of A` | 23 | 9 |
+| B — `ambiguous implicit: <everything in scope>` | 31 | 0 |
+| C — `value map is not a member of O2` | 13 | 0 |
+| every `is not a member of` | 145 | 106 |
+| every `no implicit` | 137 | 113 |
+
+### The two roots
+
+**1. A search against an erroneous wanted type accepted every candidate.**
+`Typer::implicit_fit_at` opens with the structural pre-filter
+`plausibly_inhabits(candidate, pt)`, and `Type::Error` plausibly inhabits
+anything — so with an erroneous `pt` nothing is rejected, every implicit in
+scope becomes a candidate, and `most_specific` answers `Ambiguous`. That is the
+whole of family B. gitbucket's
+
+```scala
+def extractFromJsonBody[A](implicit request: HttpServletRequest, mf: Manifest[A]): Option[A]
+```
+
+has an erroneous parameter type here, because our `Predef` has no `Manifest`
+alias (`scala.reflect.Manifest` resolves; `Manifest` and `Predef.Manifest` do
+not). Each of its 23 call sites reported `ambiguous implicit: jsonFormats,
+context, RichRequest, RichString, context2ApiJsonFormatContext, RichSession,
+request2Session`, and in `AccountController` the same search named **thirty-two**
+candidates, every slick column type among them. The brief's reading was right,
+and the candidate list was the evidence: names that unrelated cannot all be
+applicable to a determined type.
+
+nsc never starts a search against an erroneous type, and `applyImplicitArgs`
+reports a missing implicit only `if (!param.tpe.isErroneous)` — the type it
+would name has already been reported where it failed. Six lines:
+`crate::check::type_is_erroneous`, an early `None` in `search_implicit_undet`,
+and that guard at the two report sites. **496 → 467**, files 96 → 83.
+
+The mirror of it is the *candidate* whose own type is erroneous, and it costs
+the two errors the scala library gained. nsc's `ImplicitComputation.survives`
+requires `!isCyclicOrErroneous` of the candidate as well, for exactly the same
+reason: `Type::Error` inhabits anything, so such a candidate is applicable
+everywhere. Three conversions inside `extractFromJsonBody`'s own body came out
+`ambiguous implicit: mf, request` / `mf, jsonFormats` because its own
+`mf: Manifest[A]` was one. `Range.scala:608` is where declining them costs
+something —
+
+```scala
+implicit val bigDecAsIntegral: Numeric.BigDecimalAsIfIntegral = Numeric.BigDecimalAsIfIntegral
+```
+
+whose type we already report as `type BigDecimalAsIfIntegral is not a member of
+<notype>`, so the two `NumericRange(start, end, step)` calls beneath it now say
+`could not find implicit value of type Integral[BigDecimal]` where before they
+silently took the erroneous `val`. That is not a regression to argue away: an
+implicit whose type failed to resolve answering a search is how a wrong program
+gets accepted, and both errors are downstream of one we already print.
+
+**2. An application whose implicit argument was missing kept its declared
+result type.** nsc's `applyImplicitArgs` ends `if (args contains EmptyTree)
+setError(tree)`. Ours handed back the result type with the type parameters the
+missing witness was the only thing that could have solved *still in it*, and
+every selection on that leaked parameter reported again. slick's
+
+```scala
+def map[F, G, T](f: E => F)(implicit shape: Shape[_ <: FlatShapeLevel, F, T, G]): Query[G, T, C]
+def joinLeft[E2, U2, D[_], O2](q2: Query[E2, U2, D])(implicit ol: OptionLift[E2, O2], …)
+```
+
+are exactly that shape, and `IssuesService.scala` is where both show. One
+`.map { … }` whose `Shape` was not found made `T` leak through `.list` into
+`RichSeq[A].splitWith`, so `c1._1.userName == c2._1.userName && …` reported
+`value _1 is not a member of T` six times on line 231 — after the missing
+`Shape` had already been reported on line 202. `joinLeft`'s `O2` leaked the
+same way and is the whole of family C. Marking the application `Type::Error`
+(`Typer::implicit_arg_missing`, read at the end of the `OverloadPick::Found`
+arm of `type_apply_in`) is **467 → 398**; the "not a member" report already
+stood down for an erroneous receiver.
+
+**Our version of nsc's rule is narrower, and it has to be.** Two attempts at
+the faithful one broke `pos/annotated-original` in the scala corpus, a program
+that had compiled:
+
+```scala
+def impl(c: Context)(a: c.Expr[Any]) = c.Expr[Any](c.untypecheck(a.tree))
+def m(a: Any): Any = macro impl
+```
+
+`c.Expr[Any](…)` fails this very search on the pass that infers `impl`'s result
+type — the `WeakTypeTag[Any]` it wants is brought into scope later, by the
+`macro impl` beside it — and succeeds on a later attempt. Setting the error the
+moment `fill_defaults_and_implicits` returns *and returning* skipped the rest of
+the arm, and the rest of the arm is what loads the symbols the next attempt
+needs; the retry then failed too and the error stuck. Setting it at the end of
+the arm was not enough either, because the poisoned type is itself what makes
+the enclosing prototype retry keep the failing attempt. What holds is the
+narrower rule: poison **only when the result type still mentions one of the
+callee's type parameters**, which is precisely the leak — `Query[G, T, C]`
+does, `Expr[Any]` does not. A one-pass compiler would not need the qualifier;
+we are not one.
+
+So families A and C are one root, family B is another, and what makes them look
+like one is that both leave a *failed* search's tree typed as if it had
+succeeded.
+
+### The bar this had to clear
+
+Suppressing errors is the easiest way to make a benchmark number go down and
+the easiest way to compile a wrong program. Two things hold it:
+`tests/fixtures/implcascade_bad.scala` is rejected at real scalac 2.13.16's own
+two lines (22 and 38) and at no others — the pre-fix binary reported five
+errors there, the extra three being one `value _1 is not a member of T` and two
+`ambiguous implicit:` lists — and `tests/fixtures/implcascade.scala` *executes*
+and prints, so a witness that settles a type parameter appearing in no value
+argument is shown to still settle it, against real scalac's own output.
+`crates/cli/tests/implcascade.rs`.
+
+### What did not work
+
+Declining an implicit *conversion* for an erroneous receiver
+(`if found.is_empty() && !recv_ty.is_error()` in `type_select`) looks like the
+same rule and is not: **416 → 504**. `type_select`'s own preamble says why — an
+`Error` qualifier there is often provisional, from a visit before a later
+unit's members were complete, and the conversion is retried and needed. The
+eight residual `value _N is not a member of A` on `IssuesService.scala:231` are
+that path: `RichSeq[A]` is applied to a receiver that is now `Error`, and `A`
+has nothing to be solved from. They are the remainder of family A, and they
+want a narrower rule than "no views on error".
+
+The general lesson, for the next slice that reaches for `Type::Error` as a
+stopper: **in this compiler an `Error` in a tree is not only a statement about
+the program, it is an input to the passes that come after it**, and three of
+the four places one can be written here made a program that compiled stop
+compiling. Measure each one separately; the aggregate number hides the trade.
+
+### The head afterwards
+
+All three families are out of it. What is left is slick's own machinery, and
+almost nothing else:
+
+| n | message |
+|---:|---|
+| 46 | `no implicit … CanBeQueryCondition[Any]` |
+| 31 | `macro expansion is not implemented: cannot expand mapTo` |
+| 19 | `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])` |
+| 13 | `ambiguous overload for constructor` |
+| 12 | `value withTransaction is not a member of BasicBackend.DatabaseFactory` |
+| 12 | `no implicit … OptionMapper2[Boolean, Boolean, Boolean, Boolean, P2, R]` |
+| 8 | `value url is not a member of Any` |
+| 8 | `value _N is not a member of A` (the residue of family A, above) |
+| 8 | `no implicit … TypedType[Option[String]]` |
+| 8 | `no implicit … ExecutionContext` |
+
+`no implicit` is 113 of the 398 and `is not a member of` 106; between them they
+are more than half, and the `Any` in nine of the rows above is what a
+`CanBeQueryCondition` that could not be found leaves behind. The next lever is
+still slick's `Shape` / `CanBeQueryCondition` derivation, not the diagnostics.
+
+### Not fixed here, and worth a slice: `Predef.Manifest`
+
+`Manifest` is `type Manifest[T] = scala.reflect.Manifest[T]` in `Predef`, and
+we do not have the alias. With the cascade suppressed this costs one error
+(`not found: type Manifest`) instead of 24, so adding the alias *alone* would
+make the number worse: the 23 call sites would start reporting `no implicit …
+Manifest[X]`. nsc does not find those either — it **materialises** them, the
+way it materialises `ClassTag`, through `Implicits.manifestOfType`. The five
+`no implicit … could not find implicit value of type Manifest[…]` already in
+the log (json4s's `extract[A]` and `read[A]`, whose `Manifest` comes from the
+jar's pickle and so does resolve) are the same request. Alias plus
+materialisation is worth about 28 here; either half on its own is not worth
+doing.
+
+### One thing that was not ours
+
+Three `--test e2e` cases that dual-run against real scalac were failing on this
+machine with `object scala in compiler mirror not found`. The launcher the
+measurement scripts write at `/tmp/scala-2.13.16/bin/scalac` is
+`java -cp <the three jars> scala.tools.nsc.Main`, with no
+`-Dscala.usejavacp=true`, so nsc cannot see the standard library at all; and
+because the scripts only write it `if [[ ! -x … ]]`, a wrong launcher survives
+until /tmp is wiped. All three scripts now set the property and rewrite the
+launcher on every run, through a temp file and `mv` so a scalac another
+measurement is running cannot see a half-written one.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
