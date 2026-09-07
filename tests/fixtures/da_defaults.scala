@@ -51,6 +51,18 @@ trait Wiki { self: AccountService with ActivityService =>
   def edit(): String = recordActivity("wiki") + " " + getAccountByUserName("w")
 }
 
+// The self-type-through-`$outer` shape one level deeper, so the receiver walk
+// has to *stop* at the class whose self type supplies the member instead of
+// running on to the outermost enclosing instance.
+class Outer(val tag: String) {
+  trait Inner { self: AccountService =>
+    def make(): Runner = new Runner {
+      def run(): String = tag + "/" + getAccountByUserName("deep")
+    }
+  }
+  object use extends Inner with AccountService
+}
+
 // A `def` inside a method body, with a default. Its getter is local to that
 // body, so the default is spliced rather than selected off a receiver -- twirl
 // writes gitbucket's templates this way.
@@ -79,5 +91,6 @@ object Main extends Ctl with AccountService with Plain with Wiki with ActivitySe
     println(getAccountByUserName("named", includeRemoved = true))
     println(edit())
     println(Local.render("branches"))
+    println(new Outer("o").use.make().run())
   }
 }
