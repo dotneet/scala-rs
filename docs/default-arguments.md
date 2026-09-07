@@ -51,6 +51,17 @@ one that records neither the defaults nor which clause is `implicit`.
 exactly the members it derives from a `case` declaration) admits those three,
 and `adopt_binary_class` drops the class file copies it replaces.
 
+**Not for a prelude class.** The relaxation is scoped to classes whose only
+description is a class file; `scala.*` classes the prelude built are
+hand-written and authoritative, and `adopt_binary_class` refuses them outright
+for the same reason. Offering the pickled `Some$.apply` from `complete_named`
+made `Some("first")("spurious")` compile -- as `Some$.apply("spurious")`, with
+the receiver dropped and the lambda never called. That is `scala/scala`'s
+`neg/t4196`, and the full corpus is what caught it; the shape is now in
+`tests/fixtures/da_defaults_bad.scala`. The underlying looseness -- a
+non-empty `complete_named` answer read as "this receiver can be applied" -- is
+not fixed here.
+
 ## Which prefix the getter is selected off
 
 The getter is a fresh `Select` built by `Typer::default_getter_apply`, so it
