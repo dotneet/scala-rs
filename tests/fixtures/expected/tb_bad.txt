@@ -1,0 +1,3 @@
+class String
+object TbBadCompanion
+package scala

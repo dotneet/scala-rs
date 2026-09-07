@@ -274,26 +274,25 @@ fn tb_prefix_import_matches_real_scalac() {
     );
 }
 
-/// What is still unimplemented is *named*, not silently accepted. Real scalac
-/// compiles and runs `tb_bad.scala`; scala-rs reports one error per line and
-/// emits nothing.
+/// `scala.reflect.api.Mirror`'s `staticClass` / `staticModule` /
+/// `staticPackage`, which a `JavaUniverse`'s mirror reaches through the
+/// parent `Mirror[JavaUniverse.this.type]`.
+///
+/// This was a confession until `agent/backendtypes`: the fixture's header
+/// records why none of the three was reachable, and the test asserted the
+/// diagnostic rather than the answer. It now compiles and runs, and the
+/// expected file is real scalac's own output for the same source.
 #[test]
-fn tb_bad_is_named_not_stubbed() {
+fn tb_bad_static_mirror_members_run() {
     if !prerequisites("tb_bad") {
         return;
     }
     let out_dir = tmp_dir("tb_bad");
     let out = compile("tb_bad", &out_dir, &[]);
     assert!(
-        !out.status.success(),
-        "tb_bad compiled, but scala-rs cannot reach `api.Mirror`'s members: {}",
+        out.status.success(),
+        "tb_bad failed to compile: {}",
         diagnostics(&out)
     );
-    let text = diagnostics(&out);
-    for name in ["staticClass", "staticModule", "staticPackage"] {
-        assert!(
-            text.contains(&format!("value {name} is not a member of")),
-            "tb_bad should name {name} as unreachable, got: {text}"
-        );
-    }
+    assert_eq!(run_main(&[&out_dir], "tb_bad"), expected_stdout("tb_bad"));
 }
