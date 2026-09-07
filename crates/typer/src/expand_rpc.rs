@@ -78,13 +78,16 @@ impl Typer {
     /// error behind on the way.
     fn answer_typecheck(&mut self, items: &[Sexp]) -> String {
         let (Ok(tree_sexp), Ok(mode)) = (at(items, 2), at(items, 3).map(|s| s.text())) else {
+            // Unreachable through the engine, which always writes all three;
+            // said rather than unwrapped, because a malformed line must not
+            // leave the engine blocked on a read.
             return refusal("the macro engine asked a malformed `c.typecheck`");
         };
         // `c.typecheck` is re-entrant in nsc. Here each nested question would
         // need its own conversation on a pipe that carries one, and the
         // `converse` loop is what serialises them -- but a *tree* that itself
         // triggers another query cannot be, so the depth is bounded and named.
-        if self.macro_rpc_forcing.len() >= MAX_QUERY_DEPTH {
+        if self.macro_query_depth >= MAX_QUERY_DEPTH {
             return refusal(&format!(
                 "`c.typecheck` was asked more than {MAX_QUERY_DEPTH} deep; \
                  scala-rs stops rather than recurse further"
@@ -95,7 +98,14 @@ impl Typer {
             Ok(t) => t,
             Err(why) => return refusal(&why),
         };
-        self.macro_rpc_forcing.push(mode.clone());
+        // A macro application inside the tree is refused (`macro_engine_busy`),
+        // and the refusal is recorded against the span every node of a rebuilt
+        // tree carries -- which is the *outer* call site's. Left there it would
+        // be a reason attached to a call that succeeded, so it is put back the
+        // way it was, exactly like the diagnostics.
+        let key = self.macro_failure_key(span);
+        let outer_failure = self.macro_failures.get(&key).cloned();
+        self.macro_query_depth += 1;
         let answer = match mode.as_str() {
             "TERM" => self.typecheck_term(&mut tree),
             "TYPE" => self.typecheck_type(&tree),
@@ -104,7 +114,15 @@ impl Typer {
                  not implement (only TERMmode and TYPEmode)"
             )),
         };
-        self.macro_rpc_forcing.pop();
+        self.macro_query_depth -= 1;
+        match outer_failure {
+            Some(why) => {
+                self.macro_failures.insert(key, why);
+            }
+            None => {
+                self.macro_failures.remove(&key);
+            }
+        }
         answer
     }
 

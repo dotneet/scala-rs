@@ -405,10 +405,16 @@ pub struct Typer {
     /// query -- a macro application inside a `c.typecheck` argument -- has to
     /// be refused with a reason rather than started on a second engine.
     pub(crate) macro_engine_busy: bool,
-    /// The full names of the classes whose signatures a reverse-RPC query is
-    /// currently forcing. A query that would force one already on this stack
-    /// is a cycle, and is refused by name instead of looping.
+    /// The full names of the classes the engine's mirror is currently having
+    /// described (`crates/typer/src/expand_rpc.rs`). A description that would
+    /// have to describe a class already on this stack is a cycle, and stops
+    /// there instead of looping.
     pub(crate) macro_rpc_forcing: Vec<String>,
+    /// How deep the current chain of engine queries is. One `c.typecheck` can
+    /// contain a tree whose typing asks another question; the pipe carries one
+    /// conversation, so the chain is bounded and named rather than left to
+    /// recurse.
+    pub(crate) macro_query_depth: usize,
     /// The call site an engine query is answered at: the span of the macro
     /// application currently being expanded, so a tree the engine hands over
     /// gets positions inside the file that asked for the expansion.
@@ -880,6 +886,7 @@ impl Typer {
             macro_depth: 0,
             macro_engine_busy: false,
             macro_rpc_forcing: Vec::new(),
+            macro_query_depth: 0,
             macro_rpc_span: Span::DUMMY,
             macro_undescribed: Vec::new(),
             macro_local_tags: HashMap::new(),

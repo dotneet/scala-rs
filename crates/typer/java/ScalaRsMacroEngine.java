@@ -272,7 +272,7 @@ public final class ScalaRsMacroEngine {
     /**
      * Ask scala-rs a question in the middle of an expansion.
      *
-     * This is the reverse direction of the bridge (`docs/macros.md` 7.18).
+     * This is the reverse direction of the bridge (`docs/macros.md` §7.18).
      * The engine writes `(q ...)` on the same stdout the reply goes to, and
      * scala-rs -- which is sitting in its read loop waiting for that reply --
      * recognises the `q`, answers on stdin, and goes back to waiting. So the
@@ -546,7 +546,7 @@ public final class ScalaRsMacroEngine {
      *
      * {@link #synthType} builds the same symbol with no info at all, which is
      * all scala-rs could offer before the bridge could ask questions
-     * backwards (`docs/macros.md` 5.1): identity and nothing else, so that an
+     * backwards (`docs/macros.md` §5.1): identity and nothing else, so that an
      * implementation asking a real question got an exception instead of a
      * quiet wrong answer. It got one for `tpe.toString` too, because the
      * reflect internals need an info to print a type at all.
