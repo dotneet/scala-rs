@@ -11,21 +11,34 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `0d200adb` |
+| commit | `9739388f` |
 |---|---|
-| updated | 2026-09-06 |
+| updated | 2026-09-07 |
 
-Measured independently at `c1b8c79271983805387dddc3db73e0c6bd7acc7e`,
-then merged as `0d200adb`. This adds incremental module forwarder regeneration to
-`2098c6fe`: recompiling against previous output no longer removes static main.
-All four scalac/scala-rs producer/consumer combinations are compiled twice and
-executed with strict verification and exact changed-output assertions.
-No compiler source, Cargo input, or test changed after the full run; later
-documentation-only commits may follow. Java is Temurin 17 with `JAVA_HOME` and
-`PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
-Evidence: `/tmp/scala-rs-codex/integration/candidate-c1b8c79/results.json`,
-`corpus-main-audit.json`, `impconvtimes-audit/results.json`, and
-`positive-gain-audit-10f3ef0/forwarder-clippy-audit.json`.
+Three slices were merged as one composed gate at `9739388f`: `agent/gbtrait`
+(`new T()` for a trait read from a class file), `agent/catseta` (the type
+parameters eta-expansion and inserted applies left open), and
+`agent/implicitfilter` (a plausibility pre-filter and a `pinned` correction in
+implicit search). The coordinator measured the merged tree, not the branches.
+Every number below was measured after the last source commit; only this file
+and the saved corpus ledger changed afterwards. Java is Temurin 17 with
+`JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
+
+`agent/implicitfilter` is measurement-neutral on all four compile measures by
+design: it exists to make the `import_wildcard` `pickle_readable` guard
+affordable, and that guard is **still off**. With the pre-filter the 191-file
+gitbucket reproduction went from over 600 s to 14.4 s and the full 353-file
+measure to 6.3 s, so timing is no longer what blocks the guard. Turning it on
+now closes the `Query` family (−170) and loses +194 to the
+`BasicBackend#Session` as-seen-from root, which is a separate slice's work.
+See `docs/gitbucket.md`.
+
+`agent/catseta` costs gitbucket **+4**, reported rather than hidden: with
+`acc: Map[A, Set[A]]`, `acc.getOrElse(e._1, Set())` now infers `Set[_ <: A]`
+where nsc infers `Set[A]`, and the newly correct invariant-wildcard rule then
+rejects it. The rule matches nsc; the imprecision is upstream of it, in the
+order arguments are typed against an undetermined parameter. `docs/cats.md`
+carries the analysis.
 All previously passing status gates remain passing. MODE=a and class-owned
 specialization remain explicitly red; this is not a completion claim.
 
@@ -34,8 +47,8 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **346** | **81** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **895** | **111** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **326** | **80** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **867** | **109** | — |
 | `tests/scalalib_measure.sh` (538) | **1554** | **168** | — |
 
 ## Execution
@@ -52,13 +65,15 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1068** | 446 | 345 |
+| `pos` (1859) | **1069** | 445 | 345 |
 | `neg` (1405) | **668** | 368 | 369 |
 | `run` (2060) | **614** | 893 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-0d200adb.tsv`](baselines/corpus-0d200adb.tsv): 5324 unique
+[`baselines/corpus-9739388f.tsv`](baselines/corpus-9739388f.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+Compared with `0d200adb`, `losses=0` and exactly one status improved
+(`pos/t6666d`); the other 5323 are unchanged.
 Compared with `2098c6fe`, all 5324 statuses are unchanged. The two changed
 six-field records are an output path in `run/t8199` and the first reported JVM
 exception in `run/impconvtimes`; all seven generated classes of the latter are
@@ -80,7 +95,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-0d200adb.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-9739388f.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -107,12 +122,14 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **219 result rows, 2290 passed, 0 failed** at `c1b8c792` |
+| `cargo test --workspace --release --no-fail-fast` | **222 result rows, 2301 passed, 0 failed** at `9739388f` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
 `cargo clippy --workspace --release` exits 0 with 57 warning messages versus
-57 in the preceding baseline, with no added warning messages. Compare the same command scope;
+57 in the preceding baseline, with no added warning messages. Count the
+messages, not `^warning:` lines: the six per-crate "generated N warnings"
+summaries make the raw count 63, and a slice reported that as drift. Compare the same command scope;
 `--all-targets` also includes historical warnings from tests.
 
 ## The six unloadable classes are fixed (2026-09-06)
