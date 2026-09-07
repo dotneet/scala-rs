@@ -543,7 +543,97 @@ impl PickleSupply {
             }
             drop_stale_members(st, class_sym, &stale, &installed);
         }
+        self.settle_overriding_type_aliases(st, bin, class_sym, &sig, &full, is_module);
         true
+    }
+
+    /// Install the type **aliases** this class declares that fix a type
+    /// member an ancestor left deferred.
+    ///
+    /// An alias leaves no trace in the bytecode, so the class-file reader
+    /// cannot know that `RelationalTableComponent.Table[T]` fixes
+    /// `AbstractTable`'s `type TableElementType` to `T`. Until something asks
+    /// for the name by hand, `SymbolTable::type_members_named` walks the
+    /// parents and answers with the *abstract* declaration -- and every
+    /// reduction of `E#TableElementType` at `E := Accounts` then has nothing
+    /// to reduce to. This is `agent/backendtypes`' "a deferred declaration
+    /// outranked the definition that fixes it", moved from lookup time to
+    /// adoption time, because a reduction deep inside `subst_tparams` has no
+    /// pickle to ask.
+    ///
+    /// Deliberately narrow: only an alias that *overrides* is installed.
+    /// `slick.lifted.Aliases` declares thirty re-exports (`type Rep[T] =
+    /// lifted.Rep[T]`) that override nothing, and installing those eagerly
+    /// would change name resolution for every program that adopts the class
+    /// without answering any question the symbol table got wrong.
+    fn settle_overriding_type_aliases(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        sig: &scala_rs_pickle::sym::ClassSig,
+        full: &str,
+        is_module: bool,
+    ) {
+        // Only a *nullary* alias. A parameterised one is a type constructor
+        // whose expansion `expand_applied_hk_alias` drives at the use site,
+        // and the on-demand path already installs it with its parameters.
+        let aliases: Vec<(String, SigType)> = sig
+            .members
+            .iter()
+            .filter(|m| {
+                m.kind == MemberKind::TypeAlias
+                    && m.is_public_api()
+                    && !matches!(m.ty, SigType::Poly { .. })
+            })
+            .map(|m| (m.name.clone(), m.ty.clone()))
+            .collect();
+        if aliases.is_empty() {
+            return;
+        }
+        let mut scope: HashMap<String, Type> = HashMap::new();
+        for tp in &st.get(class_sym).tparams {
+            scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
+        }
+        for (name, rhs) in &aliases {
+            // Already declared here: the class-file reader or an earlier
+            // completion got there first, and this must not add a second.
+            if st
+                .type_members_named(class_sym, name)
+                .into_iter()
+                .any(|s| st.get(s).owner == class_sym)
+            {
+                continue;
+            }
+            let overrides = {
+                let mut src = BinSource(bin);
+                let (hits, _) = self.sigs.lookup(&mut src, full, is_module, name);
+                hits.iter()
+                    .any(|h| h.member.kind == MemberKind::AbstractType && h.owner != full)
+            };
+            if !overrides {
+                continue;
+            }
+            let outer = self.self_ty.replace(Type::Class {
+                sym: class_sym,
+                args: Vec::new(),
+            });
+            let conv = self.conv_at(st, bin, &scope, rhs, 0);
+            self.self_ty = outer;
+            let Some(target) = conv else {
+                trace(format_args!(
+                    "{full}#{name}: overriding alias {rhs:?} does not convert"
+                ));
+                continue;
+            };
+            let id = st.alloc(name, class_sym, SymKind::TypeMember, Flags::EMPTY, "");
+            st.get_mut(id).ty = target;
+            st.get_mut(id).is_type_alias = true;
+            st.get_mut(class_sym).members.push(id);
+            trace(format_args!(
+                "{full}#{name}: overriding type alias installed"
+            ));
+        }
     }
 
     /// Install the members `class_sym`'s pickle marks `implicit`, and only
@@ -4021,8 +4111,28 @@ impl PickleSupply {
                 trace(format_args!("projection {sym} -> {}", st.display_type(&t)));
                 return Some(t);
             }
+            let fallback = self.conv_ref(st, bin, scope, member, args, d, want_arity)?;
+            // The prefix is a type parameter, or a type member the class
+            // leaves deferred: nothing here can settle it, but the class's
+            // *users* can. `slick.lifted.TableQuery[E <: AbstractTable[_]]
+            // extends Query[E, E#TableElementType, Seq]` is only a
+            // `Query[Accounts, (String, Int), Seq]` because `Accounts` fixes
+            // `TableElementType`, and answering with the bare declaration --
+            // which is what dropping the prefix does -- is where the `Any`
+            // in every downstream slick error came from. Keep the projection
+            // and let `SymbolTable::subst_projections` reduce it at the
+            // argument.
+            if args.is_empty() {
+                if let Type::TypeMember(decl) = fallback {
+                    if let Some(p) = Self::abstract_prefix_sym(st, scope, pre) {
+                        let id = st.abstract_projection(p, decl);
+                        trace(format_args!("projection {sym}: kept unreduced"));
+                        return Some(Type::TypeMember(id));
+                    }
+                }
+            }
             trace(format_args!("projection {sym}: prefix does not settle it"));
-            return self.conv_ref(st, bin, scope, member, args, d, want_arity);
+            return Some(fallback);
         }
         if let Some(bound) = scope.get(sym) {
             if args.is_empty() {
@@ -4219,6 +4329,21 @@ impl PickleSupply {
     /// own declaration. `None` when nothing here can settle the prefix, in
     /// which case the caller falls back to `T`'s declaration -- the answer the
     /// prefix was dropped for before this existed.
+    /// The symbol a projection prefix names when it is still abstract -- a
+    /// type parameter of the class or member being read, or a type member
+    /// left deferred -- and `None` when it is anything a reduction could use.
+    fn abstract_prefix_sym(
+        st: &SymbolTable,
+        scope: &HashMap<String, Type>,
+        prefix: &str,
+    ) -> Option<SymbolId> {
+        match scope.get(prefix)? {
+            Type::TypeParam(id) => Some(*id),
+            Type::TypeMember(id) if st.is_deferred_type_member(*id) => Some(*id),
+            _ => None,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn conv_projection(
         &mut self,
@@ -4623,6 +4748,32 @@ impl PickleSupply {
             other => (Vec::new(), other.clone()),
         };
         if tps.len() != args.len() {
+            // A parameterised alias named with *no* arguments is a type
+            // constructor: `Query[+E, U, C[_]]`'s third argument is pickled
+            // as a bare `scala.package.Seq`, and `type Seq[+A] =
+            // scala.collection.immutable.Seq[A]` is an alias. Declining it
+            // failed the whole parent, which is why slick's `TableQuery`
+            // never got a pickled `Query` parent at all. Only an alias that
+            // is a plain eta-expansion (its right-hand side applies one class
+            // to its own parameters, in order) has a constructor to answer
+            // with; anything else is a type lambda this reader cannot spell.
+            if args.is_empty() && !tps.is_empty() {
+                let SigType::Ref {
+                    sym: target,
+                    args: targs,
+                } = &target
+                else {
+                    return None;
+                };
+                if targs.len() != tps.len()
+                    || !targs.iter().zip(tps.iter()).all(|(a, tp)| {
+                        matches!(a, SigType::Ref { sym, args } if args.is_empty() && *sym == tp.name)
+                    })
+                {
+                    return None;
+                }
+                return self.conv_ref(st, bin, scope, target, &[], d, tps.len());
+            }
             return None;
         }
         let mut map: HashMap<String, SigType> = HashMap::new();

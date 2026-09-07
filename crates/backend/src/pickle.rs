@@ -1724,12 +1724,14 @@ impl<'a> Pickler<'a> {
             }
             Type::TypeMember(id) => {
                 // A path-dependent member (`p.T`) is a typer-only symbol whose
-                // owner is the *term* `p`, which the pickle has no name for.
-                // Write the declaration it stands for, exactly as this
-                // compiler did before it could tell two prefixes apart. The
-                // typer keeps the distinction; the pickle and erasure agree
-                // with each other by both dropping it.
-                if let Some(d) = self.st.path_member_decl(*id) {
+                // owner is the *term* `p`, which the pickle has no name for;
+                // an abstract projection (`E#T`) is one whose owner is a type
+                // parameter, which it has no name for either. Write the
+                // declaration each stands for, exactly as this compiler did
+                // before it could tell two prefixes apart. The typer keeps
+                // the distinction; the pickle and erasure agree with each
+                // other by both dropping it.
+                if let Some(d) = self.st.projected_decl(*id) {
                     return self.pickle_type(&Type::TypeMember(d));
                 }
                 let owner = self.st.get(*id).owner.0;

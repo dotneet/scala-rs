@@ -670,14 +670,15 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         // `Names$TermNameApi`, so a `TermName` passed where `NameApi` is
         // expected is cast at the call site rather than erased more widely.
         Type::TypeMember(id) => {
-            // A path-dependent member erases exactly as the declaration it
-            // stands for. The typer can tell `p.T` from `q.T`; the JVM cannot,
-            // and a descriptor that disagreed with what the pickle records
-            // would be a miscompilation no error count would show. Reading the
-            // bound *through the prefix* would be such a disagreement:
+            // A path-dependent member -- and an abstract projection `E#T` --
+            // erases exactly as the declaration it stands for. The typer can
+            // tell `p.T` from `q.T`; the JVM cannot, and a descriptor that
+            // disagreed with what the pickle records would be a
+            // miscompilation no error count would show. Reading the bound
+            // *through the prefix* would be such a disagreement:
             // `class C[X] { type T <: X }` bounds `c.T` by `String` for a
             // `c: C[String]` where `T` itself is bounded only by `X`.
-            if let Some(d) = st.path_member_decl(*id) {
+            if let Some(d) = st.projected_decl(*id) {
                 return erase_ty(&Type::TypeMember(d), st);
             }
             // Same guard as for a type parameter: `type X <: Y` with `type Y
