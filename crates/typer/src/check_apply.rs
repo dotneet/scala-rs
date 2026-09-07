@@ -640,7 +640,12 @@ impl Typer {
         // the arguments' base types, and an argument whose class was never
         // completed has none.
         self.complete_arg_classes(&arg_tys);
-        let mut chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+        // nsc `Typers.preSelectOverloaded`: what an argument *tree* is -- a
+        // `{ case … }` literal, some other function literal, or a value --
+        // throws out alternatives before their types are weighed. `arg_tys`
+        // has one entry per argument, in order, so the two line up.
+        let shapes = crate::check_overload::arg_shapes(args);
+        let mut chosen = self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes);
         if matches!(chosen, OverloadPick::None) {
             // A *view* can make an argument applicable, but the test for one
             // (`arg_conforms` -> `search_conversion`) runs on `&self` and so
@@ -658,7 +663,7 @@ impl Typer {
                 fresh |= self.warm_own_scope_once(t);
             }
             if fresh {
-                chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+                chosen = self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes);
             }
         }
         'resolve: loop {
@@ -1894,7 +1899,7 @@ impl Typer {
                     if self.insert_apply_on_nullary(fun) {
                         let fun_ty = fun.ty.clone();
                         if let OverloadPick::Found(sym, param_tys, ret) =
-                            self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt)
+                            self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes)
                         {
                             fun.sym = sym;
                             tree.sym = sym;
@@ -1967,7 +1972,8 @@ impl Typer {
                     }
                     if self.widen_with_companion(fun) {
                         let fun_ty = fun.ty.clone();
-                        chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+                        chosen =
+                            self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes);
                         if matches!(chosen, OverloadPick::Found(..)) {
                             // A newly loaded alternative needs the same inference,
                             // bounds, defaults and implicit clauses as an ordinary
@@ -1982,7 +1988,8 @@ impl Typer {
                     // by hand are still in the pickle.
                     if self.widen_module_from_pickle(fun) {
                         let fun_ty = fun.ty.clone();
-                        chosen = self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt);
+                        chosen =
+                            self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes);
                         if matches!(chosen, OverloadPick::Found(..)) {
                             // A newly loaded alternative needs the same inference,
                             // bounds, defaults and implicit clauses as an ordinary
@@ -1993,7 +2000,8 @@ impl Typer {
                     }
                     if self.rewrite_apply_extension(fun) {
                         let fun_ty = fun.ty.clone();
-                        match self.resolve_overload(&fun_ty, fun.sym, &arg_tys, pt) {
+                        match self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes)
+                        {
                             OverloadPick::Found(sym, param_tys, ret) => {
                                 fun.sym = sym;
                                 tree.sym = sym;

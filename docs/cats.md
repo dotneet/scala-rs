@@ -1469,6 +1469,98 @@ classes). The next families by size:
 * `Ordering[AA]` against `Ordering[A]` (6), `NonEmptyList[AnyRef]` against
   `NonEmptyList[C]` (4), `Map[K, B]` against `SortedMap[K, B]` (4).
 
+### `andThen` / `compose`: three roots under one diagnostic
+
+`ambiguous overload for andThen with arguments ((<notype>) => <notype>)` was
+13 errors, `compose` 3 and `lazyZip` 4. The first two share nothing with the
+third, and the first two are themselves two different roots. The two-line
+reproduction needs no cats at all:
+
+```scala
+val pf: PartialFunction[Int, String] = { case 1 => "one" }
+val g: PartialFunction[Int, Int] = pf.andThen(s => s.length)
+```
+
+**1. Specificity has to be strict.** `arg_score` deliberately lets a
+one-parameter function type inhabit a `PartialFunction[A, B]` formal, so that
+a `{ case … }` literal -- which reaches overload resolution as a plain
+one-parameter function -- can be passed to `collect` or `recover`. That is the
+*literal* being adapted, which is `typedFunction`'s job in nsc. Specificity
+compares two declared signatures with `isCompatible`, which has no
+function-to-`PartialFunction` coercion at all: `PartialFunction` declares two
+abstract members, so it is not a SAM type either, and scalac 2.13.16 rejects
+
+```scala
+def f(p: PartialFunction[Int, Int]) = 0
+val g: Int => Int = x => x
+f(g)   // type mismatch; found: Int => Int  required: PartialFunction[Int,Int]
+```
+
+Scoring a match made `PartialFunction.andThen[C](k: B => C)` as specific as
+`andThen[C](k: PartialFunction[B, C])` and the reverse, so nothing separated
+them. The rule is now gated on `spec_probe`.
+
+**2. The shape type was only being used for arity.** nsc's
+`preSelectOverloaded` throws out alternatives with `Infer.shapeType`, and the
+shape of `x => e` is `FunctionN[Any, …, Nothing]` while the shape of
+`{ case … }` is `PartialFunction[Any, Nothing]`. Only the first rules out a
+`PartialFunction` formal. That single difference decides which `andThen` runs,
+and the two behave differently:
+
+```scala
+pf.andThen(s => s.length)     // B => C:            keeps pf's domain
+pf.andThen { case "one" => 1 }// PartialFunction:   composes both domains
+```
+
+so getting it wrong is a wrong `isDefinedAt` at run time, not a compile error.
+`narrow_by_lambda_shape` compared arities only; the argument trees are now
+summarised as `ArgShape`s and handed to it. It is a *pre-selection*, so it
+never narrows a set of one -- a plain literal against a lone `PartialFunction`
+formal still adapts, as it does for scalac.
+
+**3. `isInProperSubClassOf` was blind to a function-typed parent.**
+`sealed abstract class AndThen[-T, +R] extends (T => R)` (`data/AndThen.scala`)
+records `Type::Function` as its parent, and both `class_reaches` and
+`base_type_instance` stop dead there. So the `override def andThen` /
+`compose` it declares and the `Function1` members they override were two
+equally specific alternatives with no owner relation to separate them.
+`class_has_base` reads such a parent back as `FunctionN`; it asks about
+symbols only, which is why it can carry no type arguments and still answer.
+
+**`lazyZip` is a different root and was left alone.** Its two alternatives
+have *identical* parameter types and unrelated owners:
+
+```
+lazyZip owner=Seq             :: (Iterable[B]) => LazyZip2[A, B, ArraySeq[A]]
+lazyZip owner=AbstractIterable :: (Iterable[B]) => LazyZip2[A, B, Iterable]
+```
+
+That is one library member -- `IterableOps.lazyZip` -- adopted twice at
+different instantiations. No specificity rule can separate them, because for
+nsc there is nothing to separate: it sees a single member. This belongs to the
+member-supply seam, not to `isAsSpecific`.
+
+**Measured**, on `9739388f` alone (the fix's own effect, before merging main):
+`tests/cats_measure.sh` 326 -> **303** errors, 80 -> 78 files. All 16
+`andThen`/`compose` ambiguities are gone; the 4 `lazyZip` remain. gitbucket 867
+(unchanged), the scala library 1554 -> 1553, slick unchanged at
+`errors=0 classes=1490` with `MODE=b tests/slick_run.sh` at 12/12, 36/36.
+
+All 1490 slick class files are **byte-identical** to the ones the same tree
+without this change emits (`SLICK_OUT=… tests/slick_measure.sh` on both, then
+`diff -r`). That is the check this change needs: slick had no errors either
+way, so the only thing a wrong pick could have moved is the emitted call.
+
+On the scala/scala corpus (`CORPUS_SIZE=full`): `losses=0`, and
+`pos/existential-function-pt` newly passes -- it is this defect exactly:
+
+```scala
+def foo(a: Function[String, _ <: String]): a.type = a
+foo(x => x)
+def foo(a: PartialFunction[String, _ <: String]): a.type = a
+foo({ case x => x })
+```
+
 ## Path-dependent type members (`agent/projection`)
 
 326 -> 316. Ten error lines in three files: `Eval.scala` 102/103/106,
