@@ -2126,6 +2126,15 @@ The same eight lines also turn up a second, independent defect on the way:
 `val api: API` ("object creation impossible"), which is why the repro above
 writes `val api: API = new API {}`.
 
+> **The projection half is done** (`agent/absproj`, below); the eight lines
+> above are **not**, and it turned out they never were about the projection.
+> Delete `Backend#Session` from them entirely -- `trait API { type Session =
+> SessionDef }`, five lines, not a projection in sight -- and
+> `TheProfile.api.Session` still reports `object api is not a member of object
+> TheProfile`. The wall is a *term path through an object's `val`* not being
+> read as a term prefix at all, one stage before any projection question. See
+> "A projection out of an abstract type" below.
+
 **Left over: implicit search does not rank by context nesting.** With `Session`
 correct, `RequestCache`'s own `private implicit def context2Session` and the
 imported `Implicits.request2Session` both apply, and we report
@@ -2171,6 +2180,133 @@ and never sees the second. That is `crates/typer/src/implicits.rs`.
 > does reject, including a class's *own* private implicit competing with an
 > import in that same body, so the fix cannot drift into "prefer the nearer
 > candidate".
+
+## Fixed: a projection out of an abstract type (`agent/absproj`)
+
+**679 → 496 errors, 102 → 96 files.** slick 0/0/1490, cats 281 → 280, the
+scala library 1550/168 — all unmoved or better. `E#TableElementType` was the
+largest single cluster left in gitbucket, and it is what put `Any` in 263 of
+its error lines (108 remain).
+
+`slick.lifted.TableQuery` is declared
+
+```scala
+abstract class TableQuery[E <: AbstractTable[_]] extends Query[E, E#TableElementType, Seq]
+```
+
+and the class *file* can only say `extends Query<E, java.lang.Object, Seq>` —
+`javap -p slick.lifted.TableQuery` shows exactly that, because erasure is
+where a projection out of an abstract type goes. So the element type of every
+`TableQuery[T]` was `Any`, and everything downstream of it failed with `Any`
+in it. Twelve lines reproduce it against the published jars, and real scalac
+2.13.16 accepts all of them:
+
+```scala
+import slick.jdbc.H2Profile.api._
+class Accounts(tag: Tag) extends Table[(String, Int)](tag, "ACCOUNT") {
+  def name = column[String]("NAME"); def age = column[Int]("AGE"); def * = (name, age)
+}
+object Main {
+  val accounts = TableQuery[Accounts]
+  val q: Query[Accounts, (String, Int), Seq] = accounts
+  val names: Query[Rep[String], String, Seq] = accounts.map(_.name)
+}
+```
+
+**Four things had to be true at once**, and the first three are each enough on
+their own to hide the other two.
+
+**1. The pickle's `Query` parent never converted at all.** `attach_parents`
+already *refines* a parent it can read from the pickle over the class file's
+erased one, so the machinery to replace `Query[E, Object, Seq]` was in place —
+but the conversion was declining, and not because of the projection.
+`Query[+E, U, C[_]]`'s third argument is pickled as a bare `scala.package.Seq`,
+and `scala.package` declares `type Seq[+A] = scala.collection.immutable.Seq[A]`:
+a *parameterised alias named with no arguments*, which `expand_alias` refused
+because `tps.len() != args.len()`. An alias that is a plain eta-expansion (its
+right-hand side applies one class to its own parameters, in order) has a
+constructor to answer with, and now does.
+
+**2. The projection is a symbol, not a `Type` variant.** The same argument
+`agent/projection` made (docs/cats.md, "Path-dependent type members"): a new
+`Type::Projection` reaches conformance, substitution, as-seen-from, erasure
+and the pickle at once. `SymbolTable::abstract_projection(prefix, decl)`
+allocates a deferred `TypeMember` once per pair, owned by the prefix symbol so
+it prints as `E#TableElementType`, and every walk that already handles an
+abstract member handles it unchanged. Erasure and the pickle replace it with
+the declaration (`SymbolTable::projected_decl`), so they agree with each other
+and with everything the backend saw before. It carries the declaration's
+bounds *minus* any that mention the declaring class's type parameters: those
+are written in a vocabulary the projection has no arguments for, and a bound
+that means nothing here would make unrelated types conform.
+
+The reduction fires in `SymbolTable::subst_projections`, called from
+`subst_tparams` and `subst_tparams_cow` — the two places a class's type
+parameters meet their arguments — which is what "reduce later, when the prefix
+is known" means operationally. `is_sub_type`'s parent walk had to move from
+the free `subst_tparams_cow` to the method for the same reason.
+
+**3. `Table`'s alias that fixes `TableElementType` was not in the symbol
+table.** `AbstractTable` leaves `type TableElementType` deferred and
+`RelationalTableComponent.Table[T]` fixes it to `T` — and an alias leaves *no
+trace in the bytecode at all*, so until something asked for the name by hand
+`type_members_named(Accounts, "TableElementType")` walked the parents and
+answered with the abstract declaration. There was then nothing for the
+reduction to reduce to. This is `agent/backendtypes`' root 1 ("a deferred
+declaration outranked the definition that fixes it") moved from lookup time to
+adoption time, because a reduction inside `subst_tparams` has no pickle to
+ask: `PickleSupply::settle_overriding_type_aliases` installs, when a class is
+adopted, the nullary type aliases its own pickle declares **that override an
+abstract type declared above it**. Deliberately narrow — `slick.lifted.Aliases`
+declares thirty re-exports (`type Rep[T] = lifted.Rep[T]`) that override
+nothing, and installing those eagerly would change name resolution without
+answering any question the table got wrong.
+
+**4. `accounts.map(_.name)` was rebuilt as `TableQuery[Rep[String]]`.** With
+the base type finally right, `Query.map`'s declared `Query[G, T, C]` was then
+mangled by the collection `BuildFrom` heuristic in `check_apply.rs`: its last
+arm read "the declaration names no single-argument class, so use the
+receiver's own class", unconditionally, for any receiver with exactly one type
+parameter. `TableQuery[E <: AbstractTable[_]]` has one, and `Rep[String]` is
+not an `AbstractTable`. That arm is now gated on `maps_to_own_class` like
+every other arm beside it.
+
+**What it does not do, deliberately.**
+
+* **A projection over a *method* type parameter is never reduced.** `def
+  f[E <: AbstractRow](rs: RowSet[E]): E#ElementType` keeps the projection in
+  its signature and prints it accurately, but instantiating `E` at a call site
+  goes through the free `subst_tparams_slice`, which has no `SymbolTable`.
+  Reaching it means making `subst_map` a method, at some fifty call sites.
+  Nothing measured depends on it: slick writes the shape on classes.
+* **A projection whose prefix is substituted by *another* abstract type
+  becomes the bare declaration**, not a projection through the new prefix —
+  rebuilding one needs `&mut SymbolTable` on one of the hottest paths in the
+  typer. This is exactly the answer the compiler gave everywhere before, and
+  `is_sub_type` relates a projection and its bare declaration in both
+  directions (the same asymmetry `agent/projection` documents), so no question
+  gets a worse answer than it had. The one shape where it is less precise than
+  nsc is written out at the bottom of
+  `tests/fixtures/absproj_reduce_bad.scala`.
+* **Higher-kinded members are out**, as in `agent/projection`.
+
+**The negative half.** `tests/fixtures/absproj_reduce_bad.scala` pins the two
+rejections real scalac makes at the same lines: the reduction having really
+happened (`Rows[Account, String]` is refused because the element type is
+`(String, Int)`), and the too-eager reduction — with `E` abstract,
+`RowSet[E]` is **not** a `Rows[E, Any]`, which is precisely what reading
+`E#ElementType` through `E`'s bound would have made it.
+`absproj_override_bad.scala` pins the override check against the reduced type,
+in its own file because scalac's override phase never runs when the typer has
+already reported. `absproj_reduce.scala` executes and prints, and
+`crates/cli/tests/absproj.rs` diffs it against real scalac 2.13.16.
+
+**The `withTransaction` / `withSession` rows are not this cluster.** The brief
+that opened this slice expected 12 of them here. They now read `value
+withTransaction is not a member of BasicBackend.DatabaseFactory` (19 of them),
+which is the *import precedence* defect written up under `agent/backendtypes`
+above — a wildcard import outranking an explicit one — and has nothing to do
+with projections.
 
 ## Not fixed: a guard after a value definition in a for-comprehension
 
