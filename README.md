@@ -111,6 +111,18 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 連鎖を実行して実 scalac の出力と比較する検査と、閉路の拒否行の検査は
 `linearization` テスト（`tests/fixtures/linterm_*.scala`）にあります。
 
+クラスの**自己別名**越しに読んだ型メンバー（slick の profile cake が書く
+`trait Profile { self: Profile => trait API { type ColumnType[T] = self.ColumnType[T] } }`）
+は、その接頭部が指すインスタンスまで簡約します。決めるのは**書かれた接頭部**
+であって読み手のクラスではありません。`object Jdbc` の中に書いた
+`Mem.api.ColumnType[Int]` は `MemType[Int]` のままです。`ColumnType` を抽象の
+まま残すプロファイルでは簡約せず、右辺がその出現自身を指す別名（cats の
+`Representable#compose`）も簡約しません。型引数を伴わない一階の `p.T` は
+まだ簡約しません（本スライス以前からの制限）。正常系の JVM 実行と不正例の拒否は
+`hkselfalias` テスト（`tests/fixtures/hkself_member*.scala`）で scalac 2.13.16 と
+比較します。詳細は [docs/cats.md](docs/cats.md) の「The self alias the prefix
+names」を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

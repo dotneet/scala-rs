@@ -42,6 +42,23 @@ impl Drop for AliasGuard {
     }
 }
 
+thread_local! {
+    /// Is the expansion in progress re-reading a *written* type from the
+    /// class being typed, rather than reading a member through the prefix it
+    /// was selected from? Then `self.T` must be left alone: the class doing
+    /// the reading is not what a written prefix names. See
+    /// `SymbolTable::expand_written_type`.
+    static WRITTEN_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct WrittenGuard(bool);
+
+impl Drop for WrittenGuard {
+    fn drop(&mut self) {
+        WRITTEN_TYPE.with(|c| c.set(self.0));
+    }
+}
+
 /// Returns `None` when this alias's right-hand side is already being expanded.
 /// `Type::TypeMember` carries no prefix, so an anonymous class that defines
 /// `type R = (self.R, G.R)` while its parent declares an abstract `R` resolves
@@ -4302,6 +4319,93 @@ impl SymbolTable {
         out
     }
 
+    /// `self.T` -- a path member whose path is a class's *self alias* -- read
+    /// from a class that supplies the instance `self` names.
+    ///
+    /// A self alias is another spelling of `this`, so a `self.T` written
+    /// inside `O` denotes `O.this.T`; seen from a class that inherits `O`, the
+    /// member `O` left deferred may well be fixed. slick's profile cake is
+    /// that shape, and `tmember1.scala` is it cut down:
+    ///
+    /// ```scala
+    /// trait Profile extends TypesComponent { self: Profile =>
+    ///   trait API { type ColumnType[T] = self.ColumnType[T] }
+    /// }
+    /// object Main extends JdbcProfile { object api extends API }   // type ColumnType[T] = JdbcType[T]
+    /// ```
+    ///
+    /// `api.ColumnType[Int]` inside `Main` is `JdbcType[Int]`, because `Main`
+    /// is the `Profile` that `API`'s `self` names. Before `agent/hkpath` the
+    /// alias recorded the bare declaration and this fell out of the ordinary
+    /// name walk below; with a prefix on it, it has to be asked for here.
+    ///
+    /// Two guards keep it from becoming an unconditional widening:
+    ///
+    /// * a class that leaves `T` deferred answers `None`. `p.T` and `q.T` on
+    ///   two such prefixes must stay distinct, and handing back the bare
+    ///   declaration is exactly the widening `agent/projection` removed.
+    /// * a class whose own `T` is an alias that *names this very path member*
+    ///   answers `None` as well. cats' `Representable#compose` writes `type Rp
+    ///   = (self.Rp, other.Rp)` in an anonymous `Representable` subclass, where
+    ///   `self` is the *outer* `Representable`; resolving it by name in the
+    ///   subclass is the right-hand side folding back onto itself, and it is
+    ///   the reason a path member is refused the name walk in the first place.
+    fn self_alias_member_at(&self, from: SymbolId, id: SymbolId) -> Option<Type> {
+        if WRITTEN_TYPE.with(|c| c.get()) {
+            return None;
+        }
+        let decl = *self.path_member_decl.get(&id)?;
+        let &[head] = self.path_member_path.get(&id)?.as_slice() else {
+            return None;
+        };
+        let owner = self.get(head).owner;
+        if owner.is_none() || self.get(owner).self_alias != Some(head) {
+            return None;
+        }
+        let name = self.get(decl).name.clone();
+        for cls in self.enclosing_classes(from) {
+            // Only a class that really is one of these supplies the instance:
+            // an enclosing class that never inherited `owner` is some other
+            // object, and its member of the same name is a different member.
+            if cls != owner && !self.is_ancestor_of(owner, cls) {
+                continue;
+            }
+            let m = self
+                .type_members_named(cls, &name)
+                .into_iter()
+                .find(|m| self.get(*m).kind == SymKind::TypeMember)?;
+            if self.is_deferred_type_member(m) {
+                return None;
+            }
+            if self.path_members_in(&self.get(m).ty).contains(&id) {
+                return None;
+            }
+            if !self.get(m).tparams.is_empty() {
+                return Some(Type::TypeMember(m));
+            }
+            let t = self.get(m).ty.clone();
+            let _guard = enter_alias(m)?;
+            return Some(self.expand_type_members(cls, &t));
+        }
+        None
+    }
+
+    /// [`Self::expand_type_members`] for re-reading a type the *source wrote*
+    /// from the class being typed, where `from` is `this_class` rather than
+    /// anything the type itself names.
+    ///
+    /// The difference is `self.T`. A written type may carry its own prefix,
+    /// and then the reading class is not what settles it:
+    /// `Mem.api.ColumnType[Int]` inside `object Jdbc` is `Mem`'s member and
+    /// stays `MemType[Int]`. The prefix-driven reduction happens where the
+    /// prefix is still in hand (`Typer::with_prefix_if_type_member`); here it
+    /// is suppressed.
+    pub fn expand_written_type(&self, from: SymbolId, ty: &Type) -> Type {
+        let saved = WRITTEN_TYPE.with(|c| c.replace(true));
+        let _guard = WrittenGuard(saved);
+        self.expand_type_members(from, ty)
+    }
+
     /// Replace abstract type members with aliases defined on `from` (and parents).
     pub fn expand_type_members(&self, from: SymbolId, ty: &Type) -> Type {
         match ty {
@@ -4321,7 +4425,9 @@ impl SymbolTable {
                 // `Session`, which is the alias being expanded.
                 if self.path_member_decl.contains_key(id) || self.abs_projection_of.contains_key(id)
                 {
-                    return ty.clone();
+                    return self
+                        .self_alias_member_at(from, *id)
+                        .unwrap_or_else(|| ty.clone());
                 }
                 let name = self.get(*id).name.clone();
                 // `from` first, then its lexically enclosing classes: an inner
