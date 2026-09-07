@@ -122,15 +122,12 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 `class LinkedHashMap extends HashMap implements Map` のために必要でした）も
 不要になります。
 
-`super` の解決先も、構文上最後の親ではなく線形化から選びます。`with` の並びが
-反鎖（どの mixin も先行する mixin の祖先でない）である限り両者は一致しますが、
-**先行する親がすでに継承している mixin**を書くと食い違います。
-`trait L3 extends L1 with L2` に対する `class C1 extends L3 with L1` の線形化は
-`C1 L3 L2 L1 L0`（`+:` が冗長な `L1` を削るので `L3` が前に残ります）で、
-scalac もそう印字しますが、最後の親から探すと `super.t` が `L1.t` に解決され、
-`C1 L1 L0` — trait が 2 つ黙って消えた出力になっていました。どちらも診断は出ず、
-クリーンにコンパイルされていました。両方の形は `tests/fixtures/linterm_diamond.scala`
-に入っていて、`linearization` テストが実 scalac 2.13.16 の出力と比較します。
+この形（`class Wider extends Root with L6 with L5`）は
+`tests/fixtures/linterm_diamond.scala` に入っていて、`linearization` テストが
+実 scalac 2.13.16 の出力と比較します。なお、**先行する親がすでに継承している
+mixin** を書いたときにクラス本体の `super` が解決先を誤る欠陥は別にあり、
+`docs/not-implemented.md` に根本原因（`base_type_seq` が反復する基底クラスを
+最派生でない具体化に解決すること）まで記録してあります。
 
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and

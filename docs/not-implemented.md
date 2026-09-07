@@ -187,6 +187,43 @@ Compiler flags (`agent/xflags`):
   `X.AllOps` into a self-inheriting trait; the program is still rejected, but
   as `illegal cyclic reference involving trait AllOps` rather than for the
   missing qualifier. Fixture: `tests/fixtures/linterm_missing_prefix_bad.scala`.
+- **`super` in a class whose `with` list is not an antichain.** `class C1
+  extends L3 with L1`, where `trait L3 extends L1 with L2`, linearizes to
+  `C1 L3 L2 L1 L0` — the typer has this right, and it is scalac's answer — but
+  the program prints `C1 L1 L0`. `Typer::super_select_member`
+  (`crates/typer/src/check_pattern.rs`) walks the *written* parent list
+  reversed, on the reasoning that a later mixin is the more specific one; that
+  holds only while the list is an antichain, and `L1` is already an ancestor of
+  `L3`. So `super.t` resolves to `L1.t`, two traits drop out of the chain, and
+  nothing is reported. The emitted `$$super$` accessors are byte-identical to
+  scalac's; the single wrong instruction is `C1.t()`'s `invokestatic L1.t$`.
+
+  Walking `lin::linearize` instead is the rule SLS 6.5 states and does fix this
+  shape, but it cannot land on its own: it costs five new errors on the scala
+  library (`1552 -> 1557`), all one family, and they pin a second defect
+  underneath. `super_select_member` returns a single class that serves both as
+  the search entry *and* as the type prefix, and the reversed-parent walk was
+  compensating for the prefix being wrong. `final class LazyList[+A] extends
+  AbstractSeq[A] with LinearSeq[A] with LinearSeqOps[A, LazyList, LazyList[A]]`
+  has exactly the redundant-mixin shape (`LinearSeq` already extends
+  `LinearSeqOps`), so the reversed walk stopped on the `…Ops[A, CC, C]` mixin
+  that carries the bindings and read `super.diff` as `LazyList[A]`; the
+  linearization stops on `LinearSeq` first and reads it as `Seq[A]`. nsc has no
+  such dependence, because it types `super.m` as `m.tpe.asSeenFrom(this.type,
+  m.owner)`.
+
+  Making the prefix `this`'s own type is closer to nsc and fixes most of them
+  (`1552 -> 1556`, `files_with_errors 168 -> 167`), but four survive, and they
+  are a *third* defect: `SymbolTable::base_type_seq` resolves a base class
+  reachable at two different instantiations to the first one in written-parent
+  order rather than the most derived. `final class HashMap[K, +V] extends
+  AbstractMap[K, V] with StrictOptimizedMapOps[K, V, HashMap, HashMap[K, V]]`
+  reaches `MapOps` as both `MapOps[K, V, Map, Map[K, V]]` (through
+  `AbstractMap`) and `MapOps[K, V, HashMap, HashMap[K, V]]`, and takes the
+  former, so `super.updatedWith` is `Map[K, V1]` where `HashMap[K, V1]` is
+  wanted. That is the one to fix first; the `super` walk can then follow.
+  Measured on `agent/linorder2` at `66732045`; `crates/typer/src/lin.rs`'s own
+  `+:` fix is independent of all three and is byte-identical everywhere.
 - **Every cycle in a tangle of overlapping `extends` cycles, and nsc's second
   cyclic diagnostic.** A cyclic inheritance graph is now rejected with
   `illegal cyclic reference involving trait X`, at scalac's line and with
