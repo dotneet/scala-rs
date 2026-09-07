@@ -1740,6 +1740,11 @@ pub(crate) fn pt_is_undecided(pt: &Type) -> bool {
             Type::Wildcard => true,
             Type::Applied { args, .. } => args.iter().any(walk),
             Type::Class { args, .. } => args.iter().any(walk),
+            // `(S, B)` with `B` still open: cats' `mapAccumulate` types its
+            // `(S, A) => (S, B)` literal at `(Long, _)`, and an `if` in that
+            // literal's body has to decide the `_` the same way a `match`
+            // decides `F[_]`.
+            Type::Tuple(args) => args.iter().any(walk),
             _ => false,
         }
     }
@@ -2465,9 +2470,14 @@ pub(crate) fn unarrayify(t: &Type, array_sym: SymbolId) -> Type {
 }
 
 /// The first of `params` that pins `tp` against the matching `args` entry.
-pub(crate) fn unify_tparam(tp: SymbolId, params: &[Type], args: &[Type]) -> Option<Type> {
+pub(crate) fn unify_tparam(
+    st: &SymbolTable,
+    tp: SymbolId,
+    params: &[Type],
+    args: &[Type],
+) -> Option<Type> {
     for (p, a) in params.iter().zip(args) {
-        if let Some(t) = unify_one(tp, p, a) {
+        if let Some(t) = unify_one(st, tp, p, a) {
             return Some(t);
         }
     }
@@ -2798,16 +2808,26 @@ pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
     }
 }
 
-pub(crate) fn unify_one(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
-    unify_one_precise(tp, pattern, actual).map(|t| t.widen_constant())
+pub(crate) fn unify_one(
+    st: &SymbolTable,
+    tp: SymbolId,
+    pattern: &Type,
+    actual: &Type,
+) -> Option<Type> {
+    unify_one_precise(st, tp, pattern, actual).map(|t| t.widen_constant())
 }
 
-pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> Option<Type> {
+pub(crate) fn unify_one_precise(
+    st: &SymbolTable,
+    tp: SymbolId,
+    pattern: &Type,
+    actual: &Type,
+) -> Option<Type> {
     if let Type::Annotated { tpe, .. } = actual {
-        return unify_one_precise(tp, pattern, tpe);
+        return unify_one_precise(st, tp, pattern, tpe);
     }
     match pattern {
-        Type::Annotated { tpe, .. } => unify_one_precise(tp, tpe, actual),
+        Type::Annotated { tpe, .. } => unify_one_precise(st, tp, tpe, actual),
         Type::TypeParam(id) if *id == tp => {
             if actual.is_no_type() || actual.is_error() {
                 None
@@ -2816,7 +2836,7 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
             }
         }
         Type::BoundedWildcard { hi: Some(h), .. } | Type::BoundedWildcard { lo: Some(h), .. } => {
-            unify_one_precise(tp, h, actual)
+            unify_one_precise(st, tp, h, actual)
         }
         Type::Wildcard => None,
         Type::Class { args: pas, .. } => {
@@ -2832,7 +2852,7 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
                 // `U'` is.
                 Type::Refined { parents, .. } => {
                     for a in parents {
-                        if let Some(t) = unify_one_precise(tp, pattern, a) {
+                        if let Some(t) = unify_one_precise(st, tp, pattern, a) {
                             return Some(t);
                         }
                     }
@@ -2841,7 +2861,7 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
                 _ => return None,
             };
             for (p, a) in pas.iter().zip(aas) {
-                if let Some(t) = unify_one_precise(tp, p, a) {
+                if let Some(t) = unify_one_precise(st, tp, p, a) {
                     return Some(t);
                 }
             }
@@ -2855,41 +2875,58 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
                 _ => return None,
             };
             for (p, a) in pts.iter().zip(aas) {
-                if let Some(t) = unify_one_precise(tp, p, a) {
+                if let Some(t) = unify_one_precise(st, tp, p, a) {
                     return Some(t);
                 }
             }
             None
         }
+        // `G[X1, …, Xk]` against an application: nsc's partial unification
+        // (`TypeVar.unifyFull`, the rule from scala/bug#2712). An actual with
+        // exactly `k` arguments matches constructor to constructor and
+        // argument to argument. One with `n > k` arguments is read as a
+        // curried constructor: the leftmost `n - k` arguments are *captured*
+        // into the solution for the constructor and only the rightmost `k`
+        // are matched against the pattern's -- `Either[String, Int]` against
+        // `F[A]` is `F := Either[String, *]`, `A := Int`. Fewer than `k`
+        // arguments is no solution. A partially applied class is already a
+        // type constructor in this representation (`kind_arity` subtracts the
+        // arguments applied), so no lambda has to be invented; and two
+        // spellings of the same abstraction are structurally equal.
         Type::Applied { ctor, args: pas } => match actual {
             Type::Applied {
                 ctor: ac,
                 args: aas,
-            } => {
-                if let Some(t) = unify_one_precise(tp, ctor, ac) {
-                    return Some(t);
-                }
-                for (p, a) in pas.iter().zip(aas) {
-                    if let Some(t) = unify_one_precise(tp, p, a) {
-                        return Some(t);
-                    }
-                }
-                None
-            }
+            } => partial_unify_applied(st, tp, ctor, pas, ac.as_ref().clone(), aas),
             Type::Class { sym, args: aas } => {
+                // A constructor with arguments still to come is not a type
+                // an application can be matched against.
+                if st.class_tparam_count(*sym) > aas.len() {
+                    return None;
+                }
                 let unapplied = Type::Class {
                     sym: *sym,
                     args: vec![],
                 };
-                if let Some(t) = unify_one_precise(tp, ctor, &unapplied) {
-                    return Some(t);
-                }
-                for (p, a) in pas.iter().zip(aas) {
-                    if let Some(t) = unify_one_precise(tp, p, a) {
-                        return Some(t);
+                partial_unify_applied(st, tp, ctor, pas, unapplied, aas)
+            }
+            // `Int => String` is `Function1[Int, String]` and `(A, B)` is
+            // `Tuple2[A, B]`: nsc unifies `F[A]` with either through the
+            // class (`F := Function1[Int, *]`, `F := Tuple2[A, *]`).
+            Type::Function { .. } | Type::Tuple(_) => {
+                let as_class = match actual {
+                    Type::Function { .. } => st.function_class_form(actual),
+                    Type::Tuple(ts) => {
+                        crate::classpath::find_by_jvm(st, &format!("scala/Tuple{}", ts.len())).map(
+                            |sym| Type::Class {
+                                sym,
+                                args: ts.clone(),
+                            },
+                        )
                     }
-                }
-                None
+                    _ => None,
+                }?;
+                unify_one_precise(st, tp, pattern, &as_class)
             }
             _ => None,
         },
@@ -2900,11 +2937,11 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
             } = actual
             {
                 for (p, a) in params.iter().zip(aps) {
-                    if let Some(t) = unify_one_precise(tp, p, a) {
+                    if let Some(t) = unify_one_precise(st, tp, p, a) {
                         return Some(t);
                     }
                 }
-                unify_one_precise(tp, ret, ar)
+                unify_one_precise(st, tp, ret, ar)
             } else {
                 None
             }
@@ -2921,14 +2958,14 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
             match actual {
                 Type::Refined { parents: aps, .. } if aps.len() == parents.len() => {
                     for (p, a) in parents.iter().zip(aps) {
-                        if let Some(t) = unify_one_precise(tp, p, a) {
+                        if let Some(t) = unify_one_precise(st, tp, p, a) {
                             return Some(t);
                         }
                     }
                 }
                 _ => {
                     for p in parents {
-                        if let Some(t) = unify_one_precise(tp, p, actual) {
+                        if let Some(t) = unify_one_precise(st, tp, p, actual) {
                             return Some(t);
                         }
                     }
@@ -2937,25 +2974,74 @@ pub(crate) fn unify_one_precise(tp: SymbolId, pattern: &Type, actual: &Type) -> 
             None
         }
         Type::Array(p) => match actual {
-            Type::Array(a) => unify_one_precise(tp, p, a),
+            Type::Array(a) => unify_one_precise(st, tp, p, a),
             _ => None,
         },
         Type::ByName(p) => match actual {
-            Type::ByName(a) => unify_one_precise(tp, p, a),
-            _ => unify_one_precise(tp, p, actual),
+            Type::ByName(a) => unify_one_precise(st, tp, p, a),
+            _ => unify_one_precise(st, tp, p, actual),
         },
         // `Seq(xs: _*)` hands the parameter a `Repeated` of its *element*
         // type, not of the sequence: unwrapping only the pattern solved
         // `Seq.apply[A](A*)` to `A = Int*` and made `Seq(xs: _*)` a
         // `Seq[Int*]`.
         Type::Repeated(p) => match actual {
-            Type::Repeated(a) => unify_one_precise(tp, p, a),
-            _ => unify_one_precise(tp, p, actual),
+            Type::Repeated(a) => unify_one_precise(st, tp, p, a),
+            _ => unify_one_precise(st, tp, p, actual),
         },
         _ => None,
     }
 }
 
+/// The partial-unification step of [`unify_one_precise`]: pattern `ctor[pas]`
+/// against `actual_ctor[aas]`, capturing the leftmost surplus arguments of the
+/// actual into its constructor.
+///
+/// The kinds have to line up first, as nsc's `unifiableKinds` demands: the
+/// parameters the pattern's constructor still expects must have the arities
+/// of the parameters the captured constructor still expects. `G[_]` against
+/// `Foo[A, M[_]]` would otherwise be solved as `G := Foo[A, *]` with `M`'s
+/// argument, a bare constructor, standing in for a proper type. Only checked
+/// when both sides can say what those parameters are.
+fn partial_unify_applied(
+    st: &SymbolTable,
+    tp: SymbolId,
+    ctor: &Type,
+    pas: &[Type],
+    actual_ctor: Type,
+    aas: &[Type],
+) -> Option<Type> {
+    if aas.len() < pas.len() {
+        return None;
+    }
+    let captured = aas.len() - pas.len();
+    let ctor_actual = crate::symbol::apply_type_ctor(actual_ctor, aas[..captured].to_vec());
+    if !ctor_kinds_unify(st, ctor, &ctor_actual, pas.len()) {
+        return None;
+    }
+    if let Some(t) = unify_one_precise(st, tp, ctor, &ctor_actual) {
+        return Some(t);
+    }
+    for (p, a) in pas.iter().zip(&aas[captured..]) {
+        if let Some(t) = unify_one_precise(st, tp, p, a) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Whether a pattern constructor applied to `n` arguments may stand for
+/// `actual`: the next `n` parameters of each have the same arities. Answers
+/// yes when either side cannot say (a parameter count that does not match
+/// `n`), leaving that to the conformance check that follows inference.
+pub(crate) fn ctor_kinds_unify(st: &SymbolTable, ctor: &Type, actual: &Type, n: usize) -> bool {
+    let want = st.tparam_arities(ctor);
+    let have = st.tparam_arities(actual);
+    if want.len() != n || have.len() != n {
+        return true;
+    }
+    want == have
+}
 impl Typer {
     pub fn dump_typed(&self, tree: &Tree) -> String {
         scala_rs_parser::dump_tree(tree)

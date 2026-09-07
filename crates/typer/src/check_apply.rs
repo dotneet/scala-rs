@@ -1084,6 +1084,23 @@ impl Typer {
                                 }
                                 _ => p.clone(),
                             };
+                            // A literal's *parameter* whose expected type is
+                            // such a variable would be typed at the bound. nsc
+                            // reads it off the literal's own body first when
+                            // that body applies something to the parameter
+                            // (`typedFunctionUndoingEtaExpansion`).
+                            let relaxed = match &relaxed {
+                                Type::Function { params, ret } => {
+                                    match self.undo_eta_param_types(a, params, &open) {
+                                        Some(params) => Type::Function {
+                                            params,
+                                            ret: ret.clone(),
+                                        },
+                                        None => relaxed,
+                                    }
+                                }
+                                _ => relaxed,
+                            };
                             let pt_arg = self.open_to_bounds(&relaxed, &open);
                             // A wildcard this substitution just put in is our
                             // own "not decided yet", not an existential the
@@ -1149,7 +1166,7 @@ impl Typer {
                             for tp in open_recv {
                                 let hit = froms
                                     .iter()
-                                    .find_map(|from| unify_one(tp, &p, from))
+                                    .find_map(|from| unify_one(&self.st, tp, &p, from))
                                     .filter(|t| {
                                         !t.is_no_type()
                                             && !t.is_error()
@@ -1169,7 +1186,7 @@ impl Typer {
                                     // callee's *own* parameters already get this
                                     // treatment in `add_expected_constraints`; a
                                     // receiver's did not.
-                                    let t = match unify_one(tp, &ret, pt) {
+                                    let t = match unify_one(&self.st, tp, &ret, pt) {
                                         Some(e)
                                             if e != t
                                                 && !e.is_no_type()

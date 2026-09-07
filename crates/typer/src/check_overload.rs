@@ -2178,10 +2178,31 @@ impl Typer {
         };
         self.type_expr(&mut probe, &dummy_method);
         self.diags.truncate(mark);
-        if probe.sym.is_none() || matches!(probe.ty, Type::Overload(_)) {
+        if matches!(probe.ty, Type::Overload(_)) {
             return none;
         }
-        if !self.st.get(probe.sym).tparams.is_empty() {
+        // A function *value* is a callee too: nsc types `meth` against a
+        // method expectation, and `f: (S, A) => (S, B)` answers with its
+        // `apply`. `s => f(s, a)` inside `State(…)` is cats' `mapAccumulate`,
+        // where the expected parameter type is a variable nothing has fixed
+        // yet, and `f`'s own parameter is the only thing that says `s: S`. A
+        // rigid type parameter of the enclosing method is a fixed type there;
+        // one this call is still solving (`undet_tvars`) is not.
+        if let Type::Function { params, .. } = &probe.ty {
+            if params.len() != args.len() {
+                return none;
+            }
+            let mut out = none;
+            for (pi, ai) in at.iter().enumerate() {
+                let t = params[*ai].clone();
+                let undet = matches!(&t, Type::TypeParam(id) if self.undet_tvars.contains(id));
+                if !t.is_no_type() && !t.is_error() && !undet && !type_has_wildcard(&t) {
+                    out[pi] = t;
+                }
+            }
+            return out;
+        }
+        if probe.sym.is_none() || !self.st.get(probe.sym).tparams.is_empty() {
             return none;
         }
         let Type::Method { paramss, .. } = &probe.ty else {
@@ -2207,6 +2228,41 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// nsc's `typedFunctionUndoingEtaExpansion` for a literal whose expected
+    /// parameter types this call has not decided: the parameter type
+    /// `params[i]` mentions one of `open`, so the argument is about to be typed
+    /// against that variable's bound, and the literal's body -- an application
+    /// that passes the parameter straight on -- may say more. Returns the
+    /// expected parameter types with those positions replaced by what the
+    /// callee states, or `None` when there is nothing to replace.
+    pub(crate) fn undo_eta_param_types(
+        &mut self,
+        a: &Tree,
+        params: &[Type],
+        open: &[SymbolId],
+    ) -> Option<Vec<Type>> {
+        if !is_bare_lambda(a) {
+            return None;
+        }
+        let TreeKind::Function { vparams, body } = &a.kind else {
+            return None;
+        };
+        if vparams.len() != params.len() || !params.iter().any(|p| mentions_tparam(p, open)) {
+            return None;
+        }
+        let (vparams, body) = (vparams.clone(), (**body).clone());
+        let from_section = self.section_param_types(&vparams, &body);
+        let mut out = params.to_vec();
+        let mut changed = false;
+        for (i, p) in params.iter().enumerate() {
+            if mentions_tparam(p, open) && !from_section[i].is_no_type() {
+                out[i] = from_section[i].clone();
+                changed = true;
+            }
+        }
+        changed.then_some(out)
     }
 
     /// Rewrite `x$pf => x$pf match { … }` into `(x$1, …, x$n) => (x$1, …, x$n)
