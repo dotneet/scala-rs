@@ -755,6 +755,13 @@ pub struct SymbolTable {
     /// The path each path-dependent member was projected out of, for the
     /// dependent-method-type substitution in `subst_dependent_paths`.
     pub(crate) path_member_path: rustc_hash::FxHashMap<SymbolId, Vec<SymbolId>>,
+    /// The rewritten copy of an anonymous type-lambda alias, per (alias, the
+    /// path member being replaced, its replacement). Substituting the same
+    /// pair into the same lambda twice has to give the same symbol, or two
+    /// spellings of one type would stop comparing equal -- which is the
+    /// property the path members themselves exist to provide.
+    pub(crate) path_member_lambdas:
+        rustc_hash::FxHashMap<(SymbolId, SymbolId), Vec<(Type, SymbolId)>>,
     /// `P#T` where the prefix `P` is still abstract -- a type parameter or a
     /// deferred type member -- so the projection cannot be reduced yet.
     ///
@@ -892,6 +899,7 @@ impl SymbolTable {
             path_members: rustc_hash::FxHashMap::default(),
             path_member_decl: rustc_hash::FxHashMap::default(),
             path_member_path: rustc_hash::FxHashMap::default(),
+            path_member_lambdas: rustc_hash::FxHashMap::default(),
             abs_projections: rustc_hash::FxHashMap::default(),
             abs_projection_of: rustc_hash::FxHashMap::default(),
         };
@@ -2066,7 +2074,13 @@ impl SymbolTable {
         out
     }
 
-    /// Does `ty` mention a path-dependent member anywhere?
+    /// Does `ty` itself spell a path-dependent member anywhere?
+    ///
+    /// Shallow on purpose. `is_sub_type` pairs this with `drop_path_members`,
+    /// which cannot look inside a type lambda either -- it takes `&self` and a
+    /// rewritten lambda is a new symbol. Answering "yes" for a member this
+    /// walk's partner cannot then remove is an `is_sub_type` that recurses on
+    /// an unchanged type until the stack runs out.
     pub fn mentions_path_member(&self, ty: &Type) -> bool {
         if self.path_member_decl.is_empty() {
             return false;
@@ -2075,6 +2089,189 @@ impl SymbolTable {
             ty,
             &mut |t| matches!(t, Type::TypeMember(id) if self.path_member_decl.contains_key(id)),
         )
+    }
+
+    /// Does `ty` mention a path-dependent member anywhere, the bodies of the
+    /// type lambdas it reaches included?
+    ///
+    /// A type lambda is a symbol whose *body* is stored beside it, so a walk
+    /// that means to find every occurrence has to look inside one:
+    /// `Parallel.Aux[EitherT[M, E, *], Nested[P.F, Validated[E, *], *]]` keeps
+    /// `P.F` in the body of the anonymous alias kind-projector's `*` produced,
+    /// and nowhere in the type itself.
+    pub fn mentions_path_member_deep(&self, ty: &Type) -> bool {
+        if self.path_member_decl.is_empty() {
+            return false;
+        }
+        let mut seen: Vec<SymbolId> = Vec::new();
+        self.mentions_path_member_in(ty, &mut seen)
+    }
+
+    fn mentions_path_member_in(&self, ty: &Type, seen: &mut Vec<SymbolId>) -> bool {
+        let mut inner: Vec<SymbolId> = Vec::new();
+        let hit = any_type(ty, &mut |t| match t {
+            Type::TypeMember(id) if self.path_member_decl.contains_key(id) => true,
+            Type::TypeMember(id) => {
+                if self.is_structural_alias(*id) && !seen.contains(id) && !inner.contains(id) {
+                    inner.push(*id);
+                }
+                false
+            }
+            _ => false,
+        });
+        if hit {
+            return true;
+        }
+        for id in inner {
+            seen.push(id);
+            let body = self.get(id).ty.clone();
+            if self.mentions_path_member_in(&body, seen) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Every path-dependent member `ty` mentions, the bodies of the anonymous
+    /// type-lambda aliases it reaches included. `type_members_in` sees only
+    /// what the type itself spells, which for a lambda is the alias symbol.
+    pub fn path_members_in(&self, ty: &Type) -> Vec<SymbolId> {
+        let mut out: Vec<SymbolId> = Vec::new();
+        let mut seen: Vec<SymbolId> = Vec::new();
+        self.path_members_in_into(ty, &mut out, &mut seen);
+        out
+    }
+
+    fn path_members_in_into(&self, ty: &Type, out: &mut Vec<SymbolId>, seen: &mut Vec<SymbolId>) {
+        let mut inner: Vec<SymbolId> = Vec::new();
+        any_type(ty, &mut |t| {
+            if let Type::TypeMember(id) = t {
+                if self.path_member_decl.contains_key(id) {
+                    if !out.contains(id) {
+                        out.push(*id);
+                    }
+                } else if self.is_structural_alias(*id) && !seen.contains(id) {
+                    seen.push(*id);
+                    inner.push(*id);
+                }
+            }
+            false
+        });
+        for id in inner {
+            let body = self.get(id).ty.clone();
+            self.path_members_in_into(&body, out, seen);
+        }
+    }
+
+    /// An anonymous alias standing for a structural type member -- what a type
+    /// lambda (`[a]Either[String, a]`, kind-projector's `Either[String, *]`)
+    /// and a refinement's `type L = …` are both represented as. Its body lives
+    /// in the symbol table rather than in the type, so a substitution that
+    /// means to reach every occurrence has to go through it, and a rewrite has
+    /// to allocate a fresh alias rather than edit this one in place: the same
+    /// symbol stands for every use of that written type.
+    ///
+    /// Only an *anonymous* one. A class's own `type X = …` is a member other
+    /// code resolves by name, and cloning it would make two members where the
+    /// program declares one.
+    fn is_structural_alias(&self, id: SymbolId) -> bool {
+        let s = self.get(id);
+        s.owner.is_none()
+            && s.is_type_alias
+            && s.kind == SymKind::TypeMember
+            && !matches!(&s.ty, Type::TypeMember(x) if *x == id)
+    }
+
+    /// Replace the path-dependent member `from` by `to` throughout `ty`,
+    /// reaching into the body of every anonymous type-lambda alias on the way
+    /// by allocating a rewritten copy of it.
+    ///
+    /// cats' `def catsDataParallelForEitherTWithParallelEffect[M[_], E:
+    /// Semigroup](implicit P: Parallel[M]): Parallel.Aux[EitherT[M, E, *],
+    /// Nested[P.F, Validated[E, *], *]] = accumulatingParallel[M, E]` is the
+    /// case: the callee's result names the callee's own `P`, the caller has a
+    /// `P` of its own, and every occurrence to substitute sits inside a lambda.
+    pub fn subst_path_member_deep(&mut self, ty: &Type, from: SymbolId, to: &Type) -> Type {
+        if !self.mentions_path_member_deep(ty) {
+            return ty.clone();
+        }
+        let mut stack: Vec<SymbolId> = Vec::new();
+        self.subst_path_member_in(ty, from, to, &mut stack)
+    }
+
+    fn subst_path_member_in(
+        &mut self,
+        ty: &Type,
+        from: SymbolId,
+        to: &Type,
+        stack: &mut Vec<SymbolId>,
+    ) -> Type {
+        // Which anonymous aliases in `ty` have to be rewritten, and to what.
+        let mut aliases: Vec<SymbolId> = Vec::new();
+        any_type(ty, &mut |t| {
+            if let Type::TypeMember(id) = t {
+                if self.is_structural_alias(*id) && !aliases.contains(id) {
+                    aliases.push(*id);
+                }
+            }
+            false
+        });
+        let mut rewritten: Vec<(SymbolId, SymbolId)> = Vec::new();
+        for a in aliases {
+            // A recursive alias would otherwise clone itself forever.
+            if stack.contains(&a) {
+                continue;
+            }
+            let body = self.get(a).ty.clone();
+            let mut probe = stack.clone();
+            probe.push(a);
+            if !self.mentions_path_member_in(&body, &mut probe) {
+                continue;
+            }
+            if let Some(id) = self
+                .path_member_lambdas
+                .get(&(a, from))
+                .and_then(|v| v.iter().find(|(t, _)| t == to))
+                .map(|(_, id)| *id)
+            {
+                rewritten.push((a, id));
+                continue;
+            }
+            let info = self.get(a);
+            let (name, flags, tparams, lo, hi) = (
+                info.name.clone(),
+                info.flags,
+                info.tparams.clone(),
+                info.bound_lo.clone(),
+                info.bound_hi.clone(),
+            );
+            let clone = self.alloc(&name, SymbolId::NONE, SymKind::TypeMember, flags, "");
+            self.symbols[clone.0 as usize].tparams = tparams;
+            self.symbols[clone.0 as usize].is_type_alias = true;
+            // Insert before recursing: a body that reaches this alias again
+            // then finds the copy instead of starting a second one.
+            self.path_member_lambdas
+                .entry((a, from))
+                .or_default()
+                .push((to.clone(), clone));
+            stack.push(a);
+            let new_body = self.subst_path_member_in(&body, from, to, stack);
+            let lo = lo.map(|t| self.subst_path_member_in(&t, from, to, stack));
+            let hi = hi.map(|t| self.subst_path_member_in(&t, from, to, stack));
+            stack.pop();
+            self.symbols[clone.0 as usize].ty = new_body;
+            self.symbols[clone.0 as usize].bound_lo = lo;
+            self.symbols[clone.0 as usize].bound_hi = hi;
+            rewritten.push((a, clone));
+        }
+        map_type(ty, &mut |t| match t {
+            Type::TypeMember(id) if *id == from => to.clone(),
+            Type::TypeMember(id) => match rewritten.iter().find(|(a, _)| a == id) {
+                Some((_, c)) => Type::TypeMember(*c),
+                None => t.clone(),
+            },
+            other => other.clone(),
+        })
     }
 
     /// Replace every path-dependent member in `ty` by the declaration it

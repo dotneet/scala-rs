@@ -1243,6 +1243,16 @@ impl Typer {
         }
         let mut args = Vec::new();
         self.fill_implicit_params(span, &mut args, &tys, &first);
+        // The result may name one of the *implicit* parameters this pass just
+        // filled in. cats writes `def accumulatingParallel[M[_], E](implicit
+        // P: Parallel[M], E: Semigroup[E]): Parallel.Aux[…, IorT[P.F, E, *]]`
+        // and calls it as `accumulatingParallel[M, E]` from a method with an
+        // implicit `P` of its own: without the substitution the callee's `P.F`
+        // and the caller's `P.F` are two different paths, and the call fails
+        // against its own declared result. This is `subst_dependent_paths`'
+        // ordinary job, at the one clause whose arguments the compiler -- not
+        // the programmer -- wrote.
+        let ret = self.subst_dependent_paths(&first, &args, ret);
         let mut inner = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
         if !solved.is_empty() {
             let ids: Vec<SymbolId> = solved.iter().map(|(i, _)| *i).collect();

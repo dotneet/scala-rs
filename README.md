@@ -63,6 +63,15 @@ scalac 2.13.16 と比較します。集合の結合も含む
 scalac がコンパイルした jar に対する検証は `implguard` テスト
 （`tests/multi/implicit_wildcard_binary`）を参照してください。
 
+パス依存型メンバーは高階のもの（`trait P[M[_]] { type F[_] }` の `P.F`）も
+接頭部ごとに区別します。別々の `p` / `q` の `F` は別の型構成子であり、宣言が
+持たない名前は従来どおり診断します。呼び出し側が書かなかった暗黙引数節でも
+依存メソッド型の置換を行い、型ラムダ（kind-projector の `*` を含む）の本体に
+現れる出現まで書き換えます。正常系の JVM 実行と不正例の拒否は `hkpath` テスト
+（`tests/fixtures/hkp_member*.scala`）で scalac 2.13.16 と比較します。詳細は
+[docs/cats.md](docs/cats.md) の「The same member, higher-kinded」を参照して
+ください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
