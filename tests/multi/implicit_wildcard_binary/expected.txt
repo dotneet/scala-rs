@@ -1,0 +1,4 @@
+x
+rich:3
+int=3
+plain:3
