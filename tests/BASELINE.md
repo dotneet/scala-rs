@@ -11,15 +11,23 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `9739388f` |
+| commit | `15bee7f9` |
 |---|---|
 | updated | 2026-09-07 |
 
-Three slices were merged as one composed gate at `9739388f`: `agent/gbtrait`
-(`new T()` for a trait read from a class file), `agent/catseta` (the type
-parameters eta-expansion and inserted applies left open), and
+Six slices have merged in two composed gates. The first three, at `9739388f`:
+`agent/gbtrait` (`new T()` for a trait read from a class file), `agent/catseta`
+(the type parameters eta-expansion and inserted applies left open), and
 `agent/implicitfilter` (a plausibility pre-filter and a `pinned` correction in
-implicit search). The coordinator measured the merged tree, not the branches.
+implicit search). The next three, measured together at `15bee7f9`:
+`agent/defaultargs` (five roots under default arguments, including a
+class-file's defaults being invisible and an anonymous class's `$outer` walk
+that emitted a `ClassCastException` regardless of defaults), `agent/backendtypes`
+(a deferred type-member declaration outranking the definition that fixes it, and
+a `p#T` prefix dropped by the pickle reader), and `agent/overspec` (overload
+specificity, plus nsc's shape-type pre-selection, plus a function-typed parent
+that `class_reaches` could not see through). The coordinator measured the merged
+tree, not the branches.
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -47,9 +55,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **326** | **80** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **867** | **109** | — |
-| `tests/scalalib_measure.sh` (538) | **1554** | **168** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **303** | **78** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **785** | **103** | — |
+| `tests/scalalib_measure.sh` (538) | **1553** | **168** | — |
 
 ## Execution
 
@@ -65,15 +73,18 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1069** | 445 | 345 |
+| `pos` (1859) | **1073** | 441 | 345 |
 | `neg` (1405) | **668** | 368 | 369 |
-| `run` (2060) | **614** | 893 | 553 |
+| `run` (2060) | **616** | 891 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-9739388f.tsv`](baselines/corpus-9739388f.tsv): 5324 unique
+[`baselines/corpus-15bee7f9.tsv`](baselines/corpus-15bee7f9.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
-Compared with `0d200adb`, `losses=0` and exactly one status improved
-(`pos/t6666d`); the other 5323 are unchanged.
+Compared with `0d200adb`, `losses=0` and one status improved (`pos/t6666d`).
+Compared with `9739388f`, `losses=0` and six improved: `pos/existential-function-pt`
+(the Function/PartialFunction choice `agent/overspec` fixed), `pos/t2809`,
+`pos/t4036`, `pos/t9014` (default arguments), `run/reflection-enclosed-basic`
+and `run/t9182` (type members). Nothing else moved in either comparison.
 Compared with `2098c6fe`, all 5324 statuses are unchanged. The two changed
 six-field records are an output path in `run/t8199` and the first reported JVM
 exception in `run/impconvtimes`; all seven generated classes of the latter are
@@ -95,7 +106,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-9739388f.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-15bee7f9.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -122,7 +133,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **222 result rows, 2301 passed, 0 failed** at `9739388f` |
+| `cargo test --workspace --release --no-fail-fast` | **225 result rows, 2312 passed, 0 failed** at `15bee7f9` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -143,6 +154,21 @@ turned up **four more classes broken the same way that verify cleanly** --
 `super.expr(n)` resolved to the class's own `expr`, which is legal bytecode and
 merely infinite recursion. **A verifier's failure count is a lower bound on
 miscompilation**, not a measure of it.
+
+## The `import_wildcard` guard is ready and is not in yet (2026-09-07)
+
+`docs/gitbucket.md` has blocked the `pickle_readable` guard on
+`Typer::import_wildcard` for several waves, for two reasons that are now both
+gone: `agent/implicitfilter` removed the 50x cost, and `agent/backendtypes`
+fixed the `BasicBackend#Session` root that the guard used to trip over. The
+coordinator applied it to this tree as a two-line experiment and measured
+**gitbucket 785 -> 717 in 11.6 s** with cats, slick and the library measure all
+unchanged; the whole `value list / delete / insert / firstOption / update /
+returning is not a member of Query[...]` family (151 errors) disappears and 52
+new `type mismatch` errors appear behind it, from code that now types far
+enough to fail later. The experiment was reverted; `agent/implguard` is landing
+it with a test that actually distinguishes the two binaries and an audit of the
+52.
 
 ## What is deliberately red
 
