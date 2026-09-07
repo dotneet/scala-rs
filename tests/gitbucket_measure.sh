@@ -20,9 +20,17 @@ if [[ ! -x /tmp/scala-2.13.16/bin/scalac ]]; then
   cp $CCACHE/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16.jar /tmp/scala-2.13.16/lib/scala-library.jar
   cp $CCACHE/org/scala-lang/scala-reflect/2.13.16/scala-reflect-2.13.16.jar /tmp/scala-2.13.16/lib/scala-reflect.jar
   cp $CCACHE/org/scala-lang/scala-compiler/2.13.16/scala-compiler-2.13.16.jar /tmp/scala-2.13.16/lib/scala-compiler.jar
-  printf '#!/bin/sh\nL=/tmp/scala-2.13.16/lib\nexec java -cp "$L/scala-compiler.jar:$L/scala-library.jar:$L/scala-reflect.jar" scala.tools.nsc.Main "$@"\n' > /tmp/scala-2.13.16/bin/scalac
-  chmod +x /tmp/scala-2.13.16/bin/scalac
 fi
+# Always refresh the launcher, and refresh it atomically. A launcher written
+# before `-Dscala.usejavacp=true` was added cannot find the standard library
+# ("object scala in compiler mirror not found", which took out three `--test
+# e2e` cases that compare against real scalac), and the guard above would keep
+# that stale two-line file for as long as /tmp survives. `mv` so a scalac that
+# another measurement is running right now never sees a half-written one.
+mkdir -p /tmp/scala-2.13.16/bin
+printf '#!/bin/sh\nL=/tmp/scala-2.13.16/lib\nexec java -Dscala.usejavacp=true -cp "$L/scala-compiler.jar:$L/scala-library.jar:$L/scala-reflect.jar" scala.tools.nsc.Main "$@"\n' > /tmp/scala-2.13.16/bin/scalac.$$
+chmod +x /tmp/scala-2.13.16/bin/scalac.$$
+mv -f /tmp/scala-2.13.16/bin/scalac.$$ /tmp/scala-2.13.16/bin/scalac
 SRCROOT=$SP/gitbucket
 if [[ ! -d $SRCROOT/.git ]]; then
   mkdir -p $SP; rm -rf $SRCROOT

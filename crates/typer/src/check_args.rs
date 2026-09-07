@@ -661,6 +661,13 @@ impl Typer {
         fun: &Tree,
         pt: &Type,
     ) -> Option<Type> {
+        // Before the early returns below, not after: this call's caller reads
+        // the flag when this returns, and the arguments were typed *before*
+        // this was called. Leaving the reset next to `implicit_undet_solved`'s
+        // let an inner application's failure -- `c.Expr[Any](c.untypecheck(…))`
+        // in `pos/annotated-original`, whose outer callee is not a symbol --
+        // travel out and poison an application that had filled everything.
+        self.implicit_arg_missing = false;
         let sym = fun.sym;
         if sym.is_none() {
             return None;
@@ -1539,8 +1546,10 @@ impl Typer {
                         }
                     }
                     _ => {
-                        let diverged = self.diverged_implicit.borrow().clone();
-                        self.error(span, self.missing_implicit_message(&want, diverged));
+                        if !crate::check::type_is_erroneous(&want) {
+                            let diverged = self.diverged_implicit.borrow().clone();
+                            self.error(span, self.missing_implicit_message(&want, diverged));
+                        }
                         return tree;
                     }
                 }
@@ -1627,10 +1636,19 @@ impl Typer {
                     } else if let Some(d) = self.implicit_param_default(*pid, &pty) {
                         args.push(d);
                     } else {
-                        self.error(span, self.missing_implicit_message(&pty, diverged));
+                        // nsc's `applyImplicitArgs` leaves an `EmptyTree` here
+                        // and turns the whole application into an error tree,
+                        // and it reports the missing implicit only
+                        // `if (!param.tpe.isErroneous)` -- the type it would
+                        // name has already been reported where it failed.
+                        self.implicit_arg_missing = true;
+                        if !crate::check::type_is_erroneous(&pty) {
+                            self.error(span, self.missing_implicit_message(&pty, diverged));
+                        }
                     }
                 }
                 ImplicitSearch::Ambiguous(ids) => {
+                    self.implicit_arg_missing = true;
                     self.error(
                         span,
                         format!("ambiguous implicit: {}", self.describe_implicits(&ids)),

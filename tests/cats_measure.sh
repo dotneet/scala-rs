@@ -19,9 +19,13 @@ if [[ ! -x /tmp/scala-2.13.16/bin/scalac ]]; then
   cp $CCACHE/org/scala-lang/scala-library/2.13.16/scala-library-2.13.16.jar /tmp/scala-2.13.16/lib/scala-library.jar
   cp $CCACHE/org/scala-lang/scala-reflect/2.13.16/scala-reflect-2.13.16.jar /tmp/scala-2.13.16/lib/scala-reflect.jar
   cp $CCACHE/org/scala-lang/scala-compiler/2.13.16/scala-compiler-2.13.16.jar /tmp/scala-2.13.16/lib/scala-compiler.jar
-  printf '#!/bin/sh\nL=/tmp/scala-2.13.16/lib\nexec java -cp "$L/scala-compiler.jar:$L/scala-library.jar:$L/scala-reflect.jar" scala.tools.nsc.Main "$@"\n' > /tmp/scala-2.13.16/bin/scalac
-  chmod +x /tmp/scala-2.13.16/bin/scalac
 fi
+# Always refresh the launcher, and refresh it atomically -- see
+# tests/gitbucket_measure.sh for why the guard above is not enough.
+mkdir -p /tmp/scala-2.13.16/bin
+printf '#!/bin/sh\nL=/tmp/scala-2.13.16/lib\nexec java -Dscala.usejavacp=true -cp "$L/scala-compiler.jar:$L/scala-library.jar:$L/scala-reflect.jar" scala.tools.nsc.Main "$@"\n' > /tmp/scala-2.13.16/bin/scalac.$$
+chmod +x /tmp/scala-2.13.16/bin/scalac.$$
+mv -f /tmp/scala-2.13.16/bin/scalac.$$ /tmp/scala-2.13.16/bin/scalac
 if [[ ! -d $SP/cats/.git ]]; then
   mkdir -p $SP; rm -rf $SP/cats
   git clone https://github.com/typelevel/cats.git $SP/cats >/dev/null 2>&1
