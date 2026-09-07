@@ -640,10 +640,15 @@ impl Typer {
         // An alias body may still name an abstract member (`type C[T] = self.C[T]`).
         // The class being typed knows how it implements those, so re-read the
         // result from there, as `bind_found` does for term types.
+        //
+        // `expand_written_type`, not the plain walk: what the source wrote may
+        // carry its own prefix, and a `self.C` behind one belongs to the class
+        // that prefix names, not to the class being typed. The prefix is still
+        // in hand in `with_prefix_if_type_member`, which runs right after this.
         if self.st.this_class.is_none() {
             expanded
         } else {
-            self.st.expand_type_members(self.st.this_class, &expanded)
+            self.st.expand_written_type(self.st.this_class, &expanded)
         }
     }
 

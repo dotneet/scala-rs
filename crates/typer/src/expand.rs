@@ -68,6 +68,12 @@ const ENGINE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 /// stop somewhere, and stopping with a diagnostic beats a stack overflow.
 const MAX_EXPANSION_DEPTH: u32 = 32;
 
+/// How many questions one expansion may ask scala-rs before it is presumed to
+/// be looping (`crates/typer/src/expand_rpc.rs`). Answering costs the
+/// implementation no time budget, so without this a loop that asks and
+/// discards would run until the compiler was killed.
+const MAX_ENGINE_QUERIES: u32 = 1024;
+
 // ---------------------------------------------------------------- the process
 
 /// The engine process, started on the first expansion of a run.
@@ -117,26 +123,46 @@ fn expansion_timeout() -> Option<Duration> {
 }
 
 impl MacroEngine {
-    /// One request, one reply. `Err` is a reason, already phrased for a user.
-    ///
-    /// The reply is read on a helper thread so a wedged implementation costs a
-    /// diagnostic and a killed child, not a process that never returns. Once
-    /// timed out the engine is poisoned: the pipe still holds whatever that
-    /// expansion eventually writes, so every later request would read the
-    /// wrong reply.
-    fn ask(&mut self, request: &str) -> Result<Sexp, String> {
+    /// Write one line to the engine. `Err` is a reason, already phrased for a
+    /// user.
+    pub(crate) fn send(&mut self, line: &str) -> Result<(), String> {
         if self.poisoned {
             return Err("the macro engine was shut down after an expansion \
                         timed out; later expansions in this run cannot be \
                         trusted and are not attempted"
                 .to_string());
         }
-        writeln!(self.stdin, "{request}").map_err(|e| format!("the macro engine died ({e})"))?;
+        writeln!(self.stdin, "{line}").map_err(|e| format!("the macro engine died ({e})"))?;
         self.stdin
             .flush()
-            .map_err(|e| format!("the macro engine died ({e})"))?;
+            .map_err(|e| format!("the macro engine died ({e})"))
+    }
 
-        let Some(limit) = expansion_timeout() else {
+    /// Read one line the engine wrote, waiting at most what is left of
+    /// `budget`, and take off it what the wait cost.
+    ///
+    /// The read runs on a helper thread so a wedged implementation costs a
+    /// diagnostic and a killed child, not a process that never returns. Once
+    /// timed out the engine is poisoned: the pipe still holds whatever that
+    /// expansion eventually writes, so every later request would read the
+    /// wrong reply.
+    ///
+    /// **The budget is the implementation's own time, not the wall clock of
+    /// the conversation.** Since `agent/macromirror` the engine may stop
+    /// mid-expansion to ask scala-rs a question ([`Typer::converse`]), and the
+    /// time scala-rs spends answering is scala-rs's, not the macro's -- an
+    /// implementation that asks a hundred questions must not be killed for
+    /// how long *we* took. Only the intervals the engine holds the ball are
+    /// subtracted, so the total an implementation gets is the same 20 seconds
+    /// whether it asks nothing or asks a hundred times.
+    pub(crate) fn read_reply(&mut self, budget: &mut Option<Duration>) -> Result<Sexp, String> {
+        if self.poisoned {
+            return Err("the macro engine was shut down after an expansion \
+                        timed out; later expansions in this run cannot be \
+                        trusted and are not attempted"
+                .to_string());
+        }
+        let Some(limit) = *budget else {
             let mut line = String::new();
             return match self.stdout.read_line(&mut line) {
                 Ok(0) => Err("the macro engine exited without a reply".to_string()),
@@ -155,7 +181,10 @@ impl MacroEngine {
             let r = stdout.read_line(&mut line).map(|n| (n, line));
             let _ = tx.send((stdout, r));
         });
-        match rx.recv_timeout(limit) {
+        let started = Instant::now();
+        let outcome = rx.recv_timeout(limit);
+        *budget = Some(limit.saturating_sub(started.elapsed()));
+        match outcome {
             Ok((stdout, r)) => {
                 self.stdout = stdout;
                 match r {
@@ -624,6 +653,19 @@ impl Typer {
         if let Some(built) = self.fasttrack_expansion(binding, tree.span) {
             return built;
         }
+        // The pipe carries one conversation at a time. Reaching here while a
+        // query is being answered means a macro application inside the tree
+        // an implementation handed to `c.typecheck`; nsc expands it (its typer
+        // and its macro runner are the same process), and this bridge cannot
+        // without a second engine and a second conversation.
+        if self.macro_engine_busy {
+            return Err("this macro application is inside a tree a macro \
+                        implementation asked `c.typecheck` about, and the \
+                        engine is already running that implementation; \
+                        scala-rs does not expand a macro from inside another \
+                        expansion's query yet"
+                .to_string());
+        }
         let (argss, targs, prefix) = peel_application(tree);
         let (request, placeholders) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
@@ -642,11 +684,9 @@ impl Typer {
                 }
             }
         }
-        let reply = self
-            .macro_engine
-            .as_mut()
-            .expect("engine started")
-            .ask(&request)?;
+        self.macro_rpc_span = tree.span;
+        self.macro_undescribed.clear();
+        let reply = self.converse(&request)?;
         let items = reply.list()?;
         match items.first().and_then(|s| s.atom()) {
             Some("ok") => self.tree_from_reply(at(items, 1)?, tree.span),
@@ -661,6 +701,11 @@ impl Typer {
                 if let Some(why) = placeholder_verdict(&placeholders, &msg) {
                     return Err(why);
                 }
+                if let Some(why) =
+                    crate::expand_rpc::undescribed_verdict(&self.macro_undescribed, &msg)
+                {
+                    return Err(why);
+                }
                 self.error(tree.span, msg);
                 Err("the macro implementation aborted the expansion".to_string())
             }
@@ -673,10 +718,76 @@ impl Typer {
                     if let Some(why) = placeholder_verdict(&placeholders, &msg) {
                         return Err(why);
                     }
+                    if let Some(why) =
+                        crate::expand_rpc::undescribed_verdict(&self.macro_undescribed, &msg)
+                    {
+                        return Err(why);
+                    }
                 }
                 Err(msg)
             }
             _ => Err(format!("the macro engine replied {reply:?}")),
+        }
+    }
+
+    /// Send one request and read the reply, answering whatever the engine
+    /// asks along the way.
+    ///
+    /// The protocol used to be one line out, one line back. It is now a
+    /// *conversation*: an expansion may stop and write `(q …)`, a question
+    /// only scala-rs can answer -- what does this tree typecheck to, in the
+    /// scope the macro was called from -- and wait for `(a …)` on its own
+    /// stdin before going on. That is the reverse RPC `docs/macros.md` §7.18
+    /// asks for, and it is what makes `c.typecheck` possible at all: the
+    /// answer has to come from the run's own symbols, which live here and
+    /// cannot be snapshotted into the engine.
+    ///
+    /// The engine is taken out of `self` for the duration, because answering
+    /// needs `&mut self` -- the answer is computed by really typechecking, in
+    /// the real typer, at the real call site. `macro_engine_busy` says so, and
+    /// is what stops an expansion nested inside an answer from starting a
+    /// second engine.
+    fn converse(&mut self, request: &str) -> Result<Sexp, String> {
+        let Some(mut engine) = self.macro_engine.take() else {
+            return Err("the macro engine is not running".to_string());
+        };
+        let outer_busy = self.macro_engine_busy;
+        self.macro_engine_busy = true;
+        let mut budget = expansion_timeout();
+        let result = self.converse_with(&mut engine, request, &mut budget);
+        self.macro_engine_busy = outer_busy;
+        self.macro_engine = Some(engine);
+        result
+    }
+
+    fn converse_with(
+        &mut self,
+        engine: &mut MacroEngine,
+        request: &str,
+        budget: &mut Option<Duration>,
+    ) -> Result<Sexp, String> {
+        engine.send(request)?;
+        // A wedged implementation is caught by the budget; a *chattering* one
+        // -- an implementation whose questions never end although each is
+        // answered quickly -- is not, because answering costs it no budget.
+        // This is the same guard `MAX_EXPANSION_DEPTH` is for one level up.
+        let mut asked = 0u32;
+        loop {
+            let reply = engine.read_reply(budget)?;
+            let items = reply.list()?;
+            if items.first().and_then(|s| s.atom()) != Some("q") {
+                return Ok(reply);
+            }
+            asked += 1;
+            if asked > MAX_ENGINE_QUERIES {
+                return Err(format!(
+                    "the macro implementation asked scala-rs more than \
+                     {MAX_ENGINE_QUERIES} questions in one expansion; it is \
+                     looping"
+                ));
+            }
+            let answer = self.answer_query(items);
+            engine.send(&answer)?;
         }
     }
 
@@ -877,7 +988,7 @@ impl Typer {
 
     /// Rebuild the reflect tree the engine wrote as an *untyped* scala-rs
     /// tree, ready to be typechecked at the call site.
-    fn tree_from_reply(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
+    pub(crate) fn tree_from_reply(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
         let items = s.list()?;
         if items.first().and_then(|s| s.atom()) != Some("t") {
             return Err(format!("the macro engine returned {s:?}"));
@@ -1215,7 +1326,7 @@ fn literal_from(s: &Sexp) -> Result<Lit, String> {
 
 /// The `i`th item of a reply node. The engine is a separate process, so a
 /// short node is a protocol error to report, never a panic in the compiler.
-fn at(items: &[Sexp], i: usize) -> Result<&Sexp, String> {
+pub(crate) fn at(items: &[Sexp], i: usize) -> Result<&Sexp, String> {
     items
         .get(i)
         .ok_or_else(|| "the macro engine sent a truncated node".to_string())
@@ -1447,7 +1558,7 @@ fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
     }
 }
 
-fn lit_to_wire(lit: &Lit, out: &mut String) -> Result<(), String> {
+pub(crate) fn lit_to_wire(lit: &Lit, out: &mut String) -> Result<(), String> {
     let (kind, text) = match lit {
         Lit::Unit => ("Unit", "()".to_string()),
         Lit::Null => ("Null", "null".to_string()),
@@ -1518,7 +1629,7 @@ fn plain_class_of(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId
 /// `a/b/Outer$Inner` is `a.b.Outer.Inner`: the JVM separates an owner from a
 /// nested class with `$` and a package from its contents with `/`, and Scala
 /// spells both with a dot.
-fn scala_full_name(st: &crate::symbol::SymbolTable, sym: SymbolId) -> String {
+pub(crate) fn scala_full_name(st: &crate::symbol::SymbolTable, sym: SymbolId) -> String {
     st.jvm_internal(sym).replace(['/', '$'], ".")
 }
 
@@ -1612,14 +1723,14 @@ impl Sexp {
         }
     }
 
-    fn list(&self) -> Result<&Vec<Sexp>, String> {
+    pub(crate) fn list(&self) -> Result<&Vec<Sexp>, String> {
         match self {
             Sexp::List(v) => Ok(v),
             other => Err(format!("the macro engine sent {other:?}")),
         }
     }
 
-    fn atom(&self) -> Option<&str> {
+    pub(crate) fn atom(&self) -> Option<&str> {
         match self {
             Sexp::Atom(a) => Some(a),
             _ => None,
@@ -1627,7 +1738,7 @@ impl Sexp {
     }
 
     /// The payload of an atom or string, whichever this is.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         match self {
             Sexp::Atom(a) | Sexp::Str(a) => a.clone(),
             other => format!("{other:?}"),
@@ -1643,7 +1754,7 @@ impl Sexp {
     }
 }
 
-fn quote_into(out: &mut String, s: &str) {
+pub(crate) fn quote_into(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {

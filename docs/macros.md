@@ -64,6 +64,8 @@ unrealistic, it is stated as such.
   - 7.16 `ShapedValue.mapToImpl` — three roots (the `agent/shaped` slice)
   - 7.17 Blocks, and members of static `object`s (the `reify` widening slice)
   - 7.18 A class the current run is compiling, as a type tag (the `agent/macrotag` slice)
+  - 7.19 `val` and `def` definitions bound inside a `reify` body (the `agent/reifydefs` slice)
+  - 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -566,6 +568,16 @@ way every unexpanded macro does. `tests/fixtures/mg_inspect_bad.scala` pins
 both halves: the placeholder's verdict is refused, and the same
 implementation's verdict on `java.lang.String` -- a class the mirror really can
 find -- is reported as itself.
+
+**Since `agent/macromirror` (§7.20) the placeholder is no longer the only
+option.** A class this run is compiling that scala-rs can describe *completely*
+-- every parent, every declared member, every one of their types -- now travels
+described, and the engine builds a real `ClassInfoType` for it. What is written
+above is still exactly what happens whenever it cannot: a class with type
+parameters, with a field, or with a member whose type has no faithful spelling
+on the wire stays a name and nothing else. The `tag_descriptor` path in
+particular is unchanged, so a *type argument* still goes over as the empty
+placeholder; §7.20 says why that is the right place to stop for now.
 
 The residual, stated plainly: an implementation could inspect a placeholder and
 return a *tree* rather than aborting. Being blackbox, that tree is still
@@ -2774,3 +2786,258 @@ coordinator hand-off rather than here.
    `agent/staged` slice added `ValDef` there; nothing has added `DefDef` since), needed before a `def`
    with parameters can round-trip through an actual macro invocation the way `val` now does.
 4. Free terms for a local or a parameter bound *outside* the reify body — unchanged from §7.17.
+
+### 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
+
+§7.18 named two pieces of work, in order, and said the first one is "a real mirror over the current
+run's symbols … *reverse RPC* from the engine to the typer … and it is also what `c.typecheck` and
+`c.inferImplicitValue` need, so it is one piece of work and not three". This slice built the channel
+and the first two things that travel on it. `c.inferImplicitValue` is still unimplemented, and
+`mapTo` is still refused — see "The premise this slice had to correct" below, which is the part of
+§7.18 that turned out not to hold.
+
+#### The channel
+
+Expansion used to be one line out and one line back: scala-rs wrote `(expand …)` and read the reply.
+It is now a **conversation**. An implementation running inside the engine may stop mid-flight, write
+`(q …)` on the same stdout the reply would go to, and block reading its own stdin; scala-rs — which
+is sitting in `MacroEngine::read_reply` waiting for that reply — sees the `q`, answers `(a …)` or
+`(no "reason")`, and goes back to waiting. The two processes take turns, so the pipe stays in step:
+exactly one line written for one line read, at every level.
+
+```text
+scala-rs (Rust)                        engine (JVM)
+───────────────                        ────────────
+(expand …)               ──────→       invoke the implementation
+                                          c.typecheck(Ident(TermName("x")))
+                         ←──────       (q typecheck …)
+type it, here, now, in the
+scope the macro was called from
+                         ──────→       (a ok <type> <tree>)
+                                       … the implementation goes on
+                         ←──────       (ok <expansion>)
+```
+
+The pieces are `Typer::converse` / `converse_with` (`crates/typer/src/expand.rs`), which drives the
+loop, and `Typer::answer_query` (`crates/typer/src/expand_rpc.rs`, new), which answers. The engine
+side is `ScalaRsMacroEngine.query`.
+
+**Why it has to be a channel and not a message.** The thing an implementation wants to know — what
+does this tree mean *here* — depends on the scope the macro was called from, and that scope has only
+ever existed inside scala-rs. Sending a description of it up front is what §5.1 shows to be
+impossible: while `lazy val Issues = TableQuery[Issues]` is being typed, the members of
+`class Issues` are still un-inferred, so there is no instant at which a correct snapshot could be
+taken. Asking instead forces exactly the lazy signature the typer would have forced, at the moment
+the question is asked.
+
+**Three answers, never a fourth.** `(a ok …)`, the real answer; `(a fail "msg")`, "the typer rejected
+that", which the engine raises the way nsc does; and `(no "reason")`, *scala-rs cannot answer this
+question*, which becomes the call site's diagnostic. A question scala-rs would have to guess at is
+the third kind. There is no "approximately".
+
+#### Re-entrancy, timeouts and cycles
+
+Three failure modes had to be closed, and each of them is a thing that has actually gone wrong in
+this project before.
+
+* **Re-entrancy.** Answering needs `&mut Typer`, so the engine handle is taken out of
+  `Typer::macro_engine` for the duration and `macro_engine_busy` is set. A macro application inside
+  a tree handed to `c.typecheck` therefore cannot start a second engine: `Typer::macro_expansion`
+  sees the flag and refuses with a reason. nsc expands it, because its typer and its macro runner
+  are the same process; this bridge would need a second conversation on a pipe that carries one.
+
+* **The timeout now measures the implementation's own time.** `SCALA_RS_MACRO_TIMEOUT_SECS` is
+  unchanged at 20 seconds, but only the intervals during which *the engine holds the ball* are
+  subtracted from it (`MacroEngine::read_reply` takes a `&mut Option<Duration>` and decrements it by
+  what the read cost). An implementation that asks a hundred questions must not be killed for how
+  long scala-rs took to answer them. That leaves a macro that asks without end, which no time budget
+  catches because answering costs it nothing: `MAX_ENGINE_QUERIES` (1024 per expansion) does, and
+  `MAX_QUERY_DEPTH` (16) bounds a chain of nested questions.
+
+* **Cycles.** `Typer::macro_rpc_forcing` is the stack of class names whose descriptions are being
+  built. A description that would have to describe a class already on it stops there and hands the
+  engine the *name*, whose symbol the engine has already created — so the description closes over
+  the same symbol rather than recursing. `class Node { def next: Node }` is exactly this, and it is
+  in the fixture: `t.tpe.member(TermName("next")).info` prints `Node` under scala-rs and under real
+  scalac alike. Nothing loops, and nothing is left half-described.
+
+#### `c.typecheck`
+
+`c.typecheck(tree, mode, pt, silent, withImplicitViewsDisabled, withMacrosDisabled)` in **TERMmode**
+and **TYPEmode**. The tree is serialised with the engine's existing generic tree serialiser, rebuilt
+by `Typer::tree_from_reply`, typed by the real `Typer::type_expr` (or read by `tree_to_type` in
+TYPEmode) at the call site, and written back with its type.
+
+Diagnostics the attempt raises are **rolled back**, not reported: a `c.typecheck` that fails is not a
+compile error in nsc either — it raises `TypecheckException` and lets the implementation decide — and
+an implementation that probes with `silent = true` must not leave errors behind on the way.
+
+The four things this bridge cannot honour are refused **by name** rather than ignored, because
+ignoring any of them answers a question the implementation did not ask:
+
+| asked for | why it is refused |
+| --- | --- |
+| a `pt` other than `WildcardType` | scala-rs types the tree with no expectation; a `pt` changes what the answer may be |
+| `withImplicitViewsDisabled` | scala-rs's typer has no switch for it |
+| `withMacrosDisabled` | likewise |
+| `PATTERNmode` | reading it as TERMmode would type a pattern as an expression |
+
+**`TypecheckException` cannot reach an implementation at all.** This is a limit of the execution
+model rather than of this slice, and it is worth writing down because it is not obvious: the
+`Context` is a `java.lang.reflect.Proxy`, a proxy wraps any *checked* exception the interface method
+does not declare in an `UndeclaredThrowableException`, `TypecheckException extends Exception`, and
+`Typers.typecheck` declares nothing. So `catch { case c.TypecheckException(_, msg) => … }` — the way
+the failure is meant to be handled, and what `t6814` and `macro-typecheck-implicitsdisabled` both
+write — does not match. An implementation that catches it therefore decided what to do next on
+something it was not told, so the expansion is **refused with that reason** rather than accepted.
+Closing this needs a generated `Context` class instead of a proxy, which is a much larger change than
+it sounds: it means writing all 72 members out by hand in Java, against a Scala interface.
+
+#### The mirror over the current run's symbols
+
+Before this slice, a class the current run is compiling reached the engine as a name and **no info at
+all** (§5.1's `(syn "a.b.C")`). That is safe but nearly useless: the reflect internals need an info to
+do *anything* with a symbol, `Symbol.info` opens with `assert(infos ne null, this.name)`, and so even
+`tpe.toString` came back as `java.lang.AssertionError: assertion failed: Marker`.
+
+Such a class now travels **described**: `(run "a.b.C" (f …) (parents …) (decls …))`, which
+`ScalaRsMacroEngine.runClassType` turns into a real `ClassInfoType` over a real `Scope` of real member
+symbols. The description is built by `Typer::describe_run_class`, and the symbol is cached under the
+same key `synthType` uses, so a class that arrived first as an empty placeholder is **completed in
+place** rather than duplicated — two symbols for one class would break every identity comparison an
+implementation makes.
+
+**It is all or nothing, and that is the whole design.** Either scala-rs can describe the class
+completely and truthfully at that instant, or it stays the empty placeholder it always was. A `decls`
+missing a member is not less information; it is the *wrong answer* to `decls`, and an implementation
+that acts on it builds a tree from a class it half understands — which is precisely what §7.18 warns
+a half-built mirror does. So the description is refused, and the class falls back to the placeholder,
+when:
+
+* the class has **type parameters** — the engine is handed a `typeRef` with no arguments, so they
+  would have nothing to bind;
+* a member is a **field**: scala-rs models `val x: Int` as one symbol, and nsc's `decls` has *two*, a
+  private field and a `STABLE` accessor. Describing it as either one describes a different class;
+* a member is **polymorphic**, has more than one parameter clause, or is a nested class or type
+  member;
+* any parent or member type is one the wire cannot spell (a singleton type, a refinement, an abstract
+  type — the same refusals `Typer::type_to_wire` makes everywhere);
+* the class is **already being described** (the cycle case above).
+
+The primary constructor is spelled out rather than described: scala-rs models it as returning `Unit`
+with no parameter clause and nsc as returning the class with one, so the wire carries a marker and
+the engine fills in the class's own type. Flags travel **by name** (`CASE`, `TRAIT`, `ABSTRACT`,
+`FINAL`, `SEALED` on the class; `DEFERRED` and the access flags on a member), looked up on
+`universe.Flag` at the far end, for the same reason the `Modifiers` serialiser already argues in the
+other direction: nsc's bit layout is an internal detail and several bits carry two names.
+
+**When it cannot describe, the diagnostic says so.** `Typer::macro_undescribed` remembers the class
+and the reason; if the implementation then trips over the placeholder, `undescribed_verdict` replaces
+`assertion failed: Bag` — which is not a sentence about the program being compiled — with
+"the implementation asked about `Bag` (`size` is a field, and scala-rs models a `val` as one symbol
+where nsc has a private field and a stable accessor), and scala-rs could not describe it to the macro
+engine…".
+
+#### The premise this slice had to correct
+
+§7.18 says `mapTo` stays refused because `mapToImpl` interrogates its type argument and the
+placeholder answers nothing, and warns that "attempting only the first half would be worse than
+nothing: `mapToImpl` would then run far enough to abort or to build a tree from a half-known class".
+
+**Measured, that is not where gitbucket's 31 `mapTo` sites stop.** Every one of them reads
+
+```text
+cannot expand mapTo (implementation slick.lifted.ShapedValue$.mapToImpl): scala-rs cannot build a
+type tag for `ClassTag`, a type constructor applied to type arguments
+```
+
+which is `Typer::tag_descriptor` failing to build the *request*. `mapToImpl` is never invoked at all.
+The wall is one layer earlier than §7.18 assumed, and it is a different wall: the tag descriptor on
+the wire is `(ty "name")`, which carries no type arguments, so a tag for an applied type constructor
+cannot be sent. Nothing in this slice touches `tag_descriptor`, and the 31 diagnostics are unchanged,
+word for word (checked, not assumed: `grep -c` on the gitbucket log for the exact sentence returns 31
+before and after).
+
+That also means the §7.18 warning does not bind this slice the way it reads: there is no path by
+which `mapToImpl` could start running here, because the request that would carry its type argument
+cannot be built. The next slice that wants `mapTo` should start by making a tag descriptor able to
+carry type arguments — the *answer* side already does (`serType` writes `(ty "name" <arg>…)` and
+`typeFor` now reads it) — not by extending the mirror.
+
+#### What this is worth, measured
+
+**Nothing, on the corpus, and the measurement is the point of saying so.**
+
+Scoped to the subset this slice can reach: every scala/scala `pos` and `run` test whose sources call
+`c.typecheck` from a macro `Context` (as opposed to `ToolBox.typecheck`, which needs scala-compiler at
+run time and which nothing here touches) — 26 test directories, 33 rows.
+
+```
+CORPUS_KINDS='pos run' CORPUS_SIZE=full CORPUS_FILTER='(annotated-original|annotated-treecopy|
+attachments-typed-another-ident|attachments-typed-ident|byname-implicits-32|t7377|t7461|t8064|t8719|
+macro-reify-chained1|macro-reify-chained2|macro-reify-nested-a1|macro-reify-nested-a2|
+macro-reify-nested-b1|macro-reify-nested-b2|macro-reify-splice-outside-reify|macro-reify-unreify|
+macro-typecheck-implicitsdisabled|macro-typecheck-macrosdisabled|macro-typecheck-macrosdisabled2|
+t12577|t12680|t6187|t6814|t7240|typecheck)'
+```
+
+| | before | after |
+| --- | --- | --- |
+| `pos` | 5 pass / 3 fail / 3 skip | 5 pass / 3 fail / 3 skip |
+| `run` | 1 pass / 19 fail / 2 skip | 1 pass / 19 fail / 2 skip |
+
+`tests/compare_corpus.py` reports `changes: []`, `losses: 0`. Not one row differs, and **not even a
+symptom moved** — which is a weaker result than §7.19's, where 108 tests stayed at `pass=0` but their
+diagnostics got more precise.
+
+The reason is worth recording, because it is what the next slice inherits: **not one of these tests
+gets as far as invoking `c.typecheck`.** They stop while scala-rs is *compiling the macro
+implementation's own source*, one or two layers earlier:
+
+| symptom | tests |
+| --- | --- |
+| `not found: extractor Apply` — pattern matching over the reflect API in the implementation | 6 (`macro-reify-chained{1,2}`, `macro-reify-nested-{a1,a2,b1,b2}`) |
+| `pattern arity` — likewise, `case c.TypecheckException(_, msg)` and friends | 3 (`macro-typecheck-macrosdisabled{,2}`, `t6814`) |
+| `whitebox macros are not implemented` | 1 (`typecheck`) |
+| a `NoSuchMethodError` at run time — §7.17's "a macro def compiled in an earlier round has no `macro_impl` in scala-rs's own pickle" | 3 (`macro-reify-unreify`, `macro-typecheck-implicitsdisabled`, `t12577`) |
+| errors compiling the implementation for unrelated reasons | 3 (`t7240`, `t6187b`, `annotated-treecopy`) |
+| `ToolBox` at run time, out of reach of anything on this branch | 3 (`toolbox_typecheck_*`) |
+
+So `c.typecheck` is real and is exercised end to end by fixtures that execute and are compared
+against real scalac — but the corpus cannot show it, because **pattern matching over the reflect API
+in a macro implementation is the wall in front of it**, and that is a type-checker feature, not a
+macro-engine one. Anyone hoping to move this cluster should go there first.
+
+The four compile measures, both execution harnesses and the full corpus are all unchanged (see the
+commit message and the hand-off): this slice supplies no symbol and accepts no program it did not
+accept before.
+
+#### Validation
+
+* `tests/fixtures/mtc_impl.scala` + `mtc_use.scala` — eight `c.typecheck` questions, expanded for
+  real through the bridge and **executed**, byte-identical to real scalac 2.13.16 compiling the same
+  two files against each other (`crates/cli/tests/macromirror.rs`,
+  `mtc_typecheck_expands_and_runs`). Two of the eight are the mirror: `Marker` and `Node` are classes
+  *this compilation is defining*, so `mirror.staticClass` could never find them. One is the constant
+  type `Int(1)`, which had to travel as a constant type rather than be widened. One splices the tree
+  `c.typecheck` returned straight into the expansion, so what runs is what the answer said.
+* `tests/fixtures/mtc_bad_impl.scala` + `mtc_bad.scala` — seven questions the mirror cannot answer,
+  each refused with a reason that names the missing capability. **Five of the seven are programs real
+  scalac compiles and runs** (printing `Int(1) / Int(1) / Int(1) / caught / Bag`); scala-rs answers
+  none of them. `mtc_unanswerable_questions_are_named` pins each refusal's wording.
+
+#### What remains
+
+1. **`c.inferImplicitValue` / `c.inferImplicitView`**, the other half of what §7.18 said this channel
+   is for. The channel is built; implicit search already exists in `crates/typer/src/implicits.rs`;
+   what is missing is the query and the same all-or-nothing rule about what may be written back.
+2. **A tag descriptor that carries type arguments** (`Typer::tag_descriptor`). This is what gitbucket's
+   31 `mapTo` sites actually stop at, and it is the first thing anyone chasing `mapTo` should do. The
+   answer direction already reads `(ty "name" <arg>…)`.
+3. **Fields in a described class.** The single biggest limit on the mirror: a class with a `val` is
+   not described at all today. Doing it right means modelling nsc's private-field-plus-stable-accessor
+   pair, which is a decision about what `decls` *means*, not a serialisation detail.
+4. **A `Context` that is not a `java.lang.reflect.Proxy`**, so a `TypecheckException` can reach an
+   implementation. Everything else the proxy does is fine; this one checked exception is the whole
+   cost, and it is what stands between `t6814` and a corpus number.
+5. **Rebuilding the trees `mapToImpl` returns** — §7.18's step 2, untouched and unchanged.

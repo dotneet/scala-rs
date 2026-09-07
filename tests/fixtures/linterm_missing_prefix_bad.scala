@@ -10,9 +10,9 @@
 //
 //   error: not found: value Missing
 //
-// This compiler reports the cycle instead of the missing qualifier. That gap
-// is recorded in docs/not-implemented.md; what this fixture pins is that the
-// input is *rejected* and that the compiler terminates.
+// This compiler said `illegal cyclic reference` until the fallback was
+// narrowed to qualifiers that denote something (`qualifier_names_nothing`);
+// it now says the same words on the same line. Keep this header 15 lines.
 object Bar {
   trait Ops[A]
   trait AllOps[A] extends Ops[A] with Missing.AllOps[A]

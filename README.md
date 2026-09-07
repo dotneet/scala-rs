@@ -129,6 +129,18 @@ mixin** を書いたときにクラス本体の `super` が解決先を誤る欠
 `docs/not-implemented.md` に根本原因（`base_type_seq` が反復する基底クラスを
 最派生でない具体化に解決すること）まで記録してあります。
 
+クラスの**自己別名**越しに読んだ型メンバー（slick の profile cake が書く
+`trait Profile { self: Profile => trait API { type ColumnType[T] = self.ColumnType[T] } }`）
+は、その接頭部が指すインスタンスまで簡約します。決めるのは**書かれた接頭部**
+であって読み手のクラスではありません。`object Jdbc` の中に書いた
+`Mem.api.ColumnType[Int]` は `MemType[Int]` のままです。`ColumnType` を抽象の
+まま残すプロファイルでは簡約せず、右辺がその出現自身を指す別名（cats の
+`Representable#compose`）も簡約しません。型引数を伴わない一階の `p.T` は
+まだ簡約しません（本スライス以前からの制限）。正常系の JVM 実行と不正例の拒否は
+`hkselfalias` テスト（`tests/fixtures/hkself_member*.scala`）で scalac 2.13.16 と
+比較します。詳細は [docs/cats.md](docs/cats.md) の「The self alias the prefix
+names」を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -322,6 +334,18 @@ are organised is described in [docs/testing.md](docs/testing.md).
 停止のためのガードが線形化を黙って切り詰めれば出力から trait が 1 つ消えます）。
 異常系は閉路のある `extends` グラフが scalac と同じ行・同じ文言で拒否されること、
 そして**そもそも停止すること**（60 秒の上限つき）を検査します。
+
+型の**修飾子**が何も指さない場合（`trait AllOps[A] extends Ops[A] with
+Missing.AllOps[A]`）は、`crates/cli/tests/qualfallback.rs` が両方向を固定します。
+`tree_to_type` の `TreeKind::Select` は、接頭部の下に名前が見つからないとき単純名へ
+フォールバックします（jar の `type` エイリアスはバイトコードに痕跡を残さないため、
+Twirl が生成する全テンプレートの親句にある `HtmlFormat.Appendable` はこの経路でしか
+解決できません）。このフォールバックが誤記にも効いてしまい、同じ単純名を持つ無関係な
+型——cats では定義中の trait 自身——に静かに束縛されていました。`qualifier_names_nothing`
+は、修飾子が**何かを指している**ときだけフォールバックを許します。指していなければ
+scalac と同じ `not found: value <q>` を同じ行に出します。正常系の fixture は
+コンパイルするだけでなく**実行**して出力を実 scalac と比較します（別のエイリアスに
+束縛し直されても型検査は通ってしまうため）。
 
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
