@@ -37,6 +37,53 @@ impl Typer {
         }
     }
 
+    /// `q` in a type `q.T` denotes nothing at all: no term, no type, no
+    /// package, nowhere this pass can reach.
+    ///
+    /// This is what keeps the bare-name fallback in `tree_to_type`'s
+    /// `TreeKind::Select` arm from answering a missing import with whatever
+    /// happens to share the simple name. The fallback is there for paths this
+    /// pass cannot model -- a `type` alias a jar class declares leaves no
+    /// trace in the bytecode, so `HtmlFormat.Appendable`, which Twirl writes
+    /// in the parents clause of every generated template, has no symbol for
+    /// `lookup_qualified_type` to find -- and in every one of those the
+    /// *qualifier* still resolves: `HtmlFormat` is a module in a jar. When it
+    /// resolves to nothing there is no path left to model, and nsc's answer
+    /// is `not found: value q`. Falling back on `T` alone made
+    /// `trait AllOps[A] extends Ops[A] with Missing.AllOps[A]` inherit from
+    /// the very trait being defined.
+    ///
+    /// Only a plain `Ident` qualifier is judged. A longer prefix has more
+    /// ways to be a path this pass cannot enumerate, and one whose own head
+    /// is missing already reaches `missing_qualified_type`'s `Select` arm by
+    /// the ordinary route.
+    ///
+    /// Restricted to [`Self::strict_type_names`] -- parents clauses, and
+    /// signatures outside a file whose scope this compiler cannot enumerate
+    /// -- for the same reason the sibling `missing_qualified_type` call in
+    /// that arm is: those are the positions where every name a file writes
+    /// has already been given every chance to resolve.
+    fn qualifier_names_nothing(&mut self, qual: &Tree) -> bool {
+        if !self.strict_type_names {
+            return false;
+        }
+        let TreeKind::Ident { name } = &qual.kind else {
+            return false;
+        };
+        let name = name.clone();
+        if self.exist_quantified.iter().any(|q| *q == name) {
+            return false;
+        }
+        // Both exposures run every open package, wildcard import and pickle
+        // before answering; `qualified_type_owners` calls `expose_unqualified`
+        // itself.
+        if !self.qualified_type_owners(qual).is_empty() {
+            return false;
+        }
+        self.expose_unqualified_type(&name, qual.span);
+        self.st.lookup(&name).is_empty() && !self.st.has_real_type_entry(&name)
+    }
+
     /// `qual.name` denotes no type. Report it the way nsc does: blame the
     /// leftmost segment that does not resolve, so `p2.sub.Foo` with no `sub`
     /// is `object sub is not a member of package p2` and not a complaint about
@@ -140,6 +187,13 @@ impl Typer {
                             args: vec![],
                         },
                     }
+                } else if self.qualifier_names_nothing(qual) {
+                    // The qualifier itself denotes nothing -- see
+                    // [`Self::qualifier_names_nothing`]. There is no path here
+                    // for this pass to fail to model, so the bare-name
+                    // fallback below would answer with an unrelated class that
+                    // merely shares the simple name.
+                    self.missing_qualified_type(qual, name, tpt.span)
                 } else {
                     // The prefix knows nothing of that name. Falling back on
                     // the *bare* name is deliberate -- a path this pass cannot

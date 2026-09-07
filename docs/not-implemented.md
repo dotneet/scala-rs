@@ -175,18 +175,6 @@ Compiler flags (`agent/xflags`):
   try/catch/finally tail positions remain conservatively rejected by the
   typer. Mutual recursion is not transformed. See [tailrec.md](tailrec.md)
   for the precise scope and differential execution tests.
-- **An unresolved *qualifier* in a parent type.** `trait AllOps[A] extends
-  Ops[A] with Missing.AllOps[A]`, where nothing named `Missing` exists, is
-  `not found: value Missing` in scalac 2.13.16. This compiler falls back on the
-  bare name (`tree_to_type`'s `TreeKind::Select` arm in
-  `crates/typer/src/check_types.rs` — a deliberate fallback, because a path
-  this pass cannot model still has to resolve that way) and only reports when
-  the bare name resolves to nothing either. When it *does* resolve, the parent
-  silently becomes the wrong class. In cats' typeclass hierarchy the bare name
-  is the enclosing trait itself, so removing `Apply.scala` turned every
-  `X.AllOps` into a self-inheriting trait; the program is still rejected, but
-  as `illegal cyclic reference involving trait AllOps` rather than for the
-  missing qualifier. Fixture: `tests/fixtures/linterm_missing_prefix_bad.scala`.
 - **SLS 5.1.2's `+:` in the linearization merge, for two mixins that share an
   ancestor at different depths.** `class Wider extends Root with L6 with L5`,
   over the hierarchy in `tests/fixtures/linterm_diamond.scala`, linearizes to

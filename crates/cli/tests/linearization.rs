@@ -287,11 +287,12 @@ fn cyclic_extends_matches_scalacs_lines() {
 /// itself, which is what turned a missing file into a self-inheriting trait
 /// and, before the fix, into a compiler that never returned.
 ///
-/// scalac says `not found: value Missing` here and this compiler still says
-/// `illegal cyclic reference` (the fallback in `check_types.rs`'s `Select` arm
-/// is a separate defect, recorded in `docs/not-implemented.md`). What this
-/// test pins is the part that must never regress: the compilation *ends*, and
-/// it ends with an error rather than with class files.
+/// scalac says `not found: value Missing` here, and so does this compiler now
+/// that `Typer::qualifier_names_nothing` narrows that fallback to qualifiers
+/// which denote something (the wording is pinned in
+/// `crates/cli/tests/qualfallback.rs`). What this test pins is the part that
+/// must never regress: the compilation *ends*, and it ends with an error
+/// rather than with class files.
 #[test]
 fn unresolved_qualified_parent_terminates_with_a_diagnostic() {
     let src = fixture("linterm_missing_prefix_bad");

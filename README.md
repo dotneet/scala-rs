@@ -281,6 +281,18 @@ are organised is described in [docs/testing.md](docs/testing.md).
 異常系は閉路のある `extends` グラフが scalac と同じ行・同じ文言で拒否されること、
 そして**そもそも停止すること**（60 秒の上限つき）を検査します。
 
+型の**修飾子**が何も指さない場合（`trait AllOps[A] extends Ops[A] with
+Missing.AllOps[A]`）は、`crates/cli/tests/qualfallback.rs` が両方向を固定します。
+`tree_to_type` の `TreeKind::Select` は、接頭部の下に名前が見つからないとき単純名へ
+フォールバックします（jar の `type` エイリアスはバイトコードに痕跡を残さないため、
+Twirl が生成する全テンプレートの親句にある `HtmlFormat.Appendable` はこの経路でしか
+解決できません）。このフォールバックが誤記にも効いてしまい、同じ単純名を持つ無関係な
+型——cats では定義中の trait 自身——に静かに束縛されていました。`qualifier_names_nothing`
+は、修飾子が**何かを指している**ときだけフォールバックを許します。指していなければ
+scalac と同じ `not found: value <q>` を同じ行に出します。正常系の fixture は
+コンパイルするだけでなく**実行**して出力を実 scalac と比較します（別のエイリアスに
+束縛し直されても型検査は通ってしまうため）。
+
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
 scalac を読み手にして、正例の JVM 実行と不正な型引数の拒否を検証します。
