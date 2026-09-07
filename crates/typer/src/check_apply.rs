@@ -1399,6 +1399,17 @@ impl Typer {
                     }
                     let leftover =
                         self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
+                    // nsc's `applyImplicitArgs`: `if (args contains EmptyTree)
+                    // setError(tree)`. The witness that was not found is often
+                    // the only thing that could have said what one of the
+                    // callee's type parameters is -- slick's
+                    // `map[F, T, G](f)(implicit shape: Shape[_, F, T, G]):
+                    // Query[G, T, C]` is exactly that -- so handing back the
+                    // declared result type leaks `T` into the program and every
+                    // selection on it reports again. 19 `value _N is not a
+                    // member of T` and 13 `value map is not a member of O2` in
+                    // gitbucket were that cascade.
+                    let impl_missing = std::mem::take(&mut self.implicit_arg_missing);
                     if !self.implicit_undet_solved.is_empty() {
                         let sol = std::mem::take(&mut self.implicit_undet_solved);
                         let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
@@ -1885,7 +1896,41 @@ impl Typer {
                     let params: Vec<SymbolId> =
                         self.st.get(sym).paramss.iter().flatten().copied().collect();
                     let ret = self.subst_dependent_paths(&params, args, ret);
-                    tree.ty = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
+                    let ret = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
+                    // nsc's `applyImplicitArgs` ends `if (args contains
+                    // EmptyTree) setError(tree)`. The witness that was not
+                    // found is often the only thing that could have said what
+                    // one of the callee's type parameters is -- slick's
+                    // `map[F, G, T](f)(implicit shape: Shape[_, F, T, G]):
+                    // Query[G, T, C]` is exactly that -- so handing the
+                    // declared result type back leaks `T` into the program and
+                    // every selection on it reports again. 19 `value _N is not
+                    // a member of T` and 13 `value map is not a member of O2`
+                    // in gitbucket were that cascade.
+                    //
+                    // Narrower than nsc's rule, deliberately, and only because
+                    // ours is not a one-pass compiler: the result is poisoned
+                    // only when it still *mentions* one of the callee's type
+                    // parameters, which is exactly the leak. `c.Expr[Any](…)`
+                    // in `pos/annotated-original` also fails this search on the
+                    // pass that infers `impl`'s result type -- the
+                    // `WeakTypeTag[Any]` it wants is brought into scope later by
+                    // the `= macro impl` beside it -- and its result `Expr[Any]`
+                    // is fully determined, so nothing leaks and nothing is
+                    // poisoned. Marking that one an error made a program that
+                    // had compiled stop compiling.
+                    let leaks = !sym.is_none()
+                        && self
+                            .st
+                            .get(sym)
+                            .tparams
+                            .iter()
+                            .any(|&tp| crate::check::type_mentions_tparam(&ret, tp));
+                    tree.ty = if impl_missing && leaks {
+                        Type::Error
+                    } else {
+                        ret
+                    };
                 }
                 OverloadPick::Ambiguous => {
                     // An argument that already failed cannot pick an alternative;

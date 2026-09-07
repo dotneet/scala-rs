@@ -725,19 +725,30 @@ impl Typer {
             // has no prefix" note for that harder, still-open case.
             return applied;
         }
-        if let Some(owner) = self.qualified_type_owners(qual).into_iter().next() {
-            if matches!(
-                self.st.get(owner).kind,
-                SymKind::Module | SymKind::ModuleClass
-            ) {
-                let mut map = self.type_member_prefixes.borrow_mut();
-                let owners = map.entry(id.0).or_default();
-                if !owners.contains(&owner) {
-                    owners.push(owner);
-                }
+        let Some(owner) = self.qualified_type_owners(qual).into_iter().next() else {
+            return applied;
+        };
+        if !matches!(
+            self.st.get(owner).kind,
+            SymKind::Module | SymKind::ModuleClass
+        ) {
+            return applied;
+        }
+        {
+            let mut map = self.type_member_prefixes.borrow_mut();
+            let owners = map.entry(id.0).or_default();
+            if !owners.contains(&owner) {
+                owners.push(owner);
             }
         }
-        applied
+        // `Jdbc.api.ColumnType[Int]` reduces to whatever the *profile that
+        // owns `api`* makes of `ColumnType`, because `API`'s alias names its
+        // enclosing profile through a self alias. The prefix is the only
+        // thing that says which profile that is, so the reduction happens
+        // here and not in the ordinary `this_class` walk: written inside
+        // `object Jdbc`, `Mem.api.ColumnType[Int]` is still `MemType[Int]`.
+        let from = self.as_type_owner(owner);
+        self.st.expand_type_members(from, &applied)
     }
 
     /// The aliases `pcls` supplies for the abstract type members declared
