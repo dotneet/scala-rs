@@ -38,6 +38,41 @@ public final class ScalaRsMacroEngine {
     static Object universe;
     static Object mirror;
     static ClassLoader macroCl;
+    /**
+     * The pipe, as fields, because expansion is a *conversation* rather than
+     * one line in and one line out: an implementation may stop mid-flight and
+     * ask scala-rs a question ({@link #query}), which is written and read on
+     * the same two streams the request came in on.
+     */
+    static BufferedReader in;
+    static PrintStream out;
+    /**
+     * Set when scala-rs answered a question with "scala-rs cannot answer
+     * this". It is raised as an {@link Gap}, which is an `Error` so that an
+     * implementation's own `catch (ex: Exception)` does not swallow it -- and
+     * remembered here as well, because several implementations catch
+     * `Throwable`. A gap that the implementation swallowed still ends the
+     * expansion with the reason, rather than letting it build a tree from an
+     * answer it did not get.
+     */
+    static String pendingGap;
+    /**
+     * The message of a `TypecheckException` this engine raised for a failed
+     * `c.typecheck`, cleared when the implementation returns.
+     *
+     * It is here because the exception **cannot reach the implementation**.
+     * The `Context` is a `java.lang.reflect.Proxy`, and a proxy wraps any
+     * checked exception the interface method does not declare in an
+     * `UndeclaredThrowableException`; `TypecheckException extends Exception`
+     * and `Typers.typecheck` declares nothing. So an implementation that
+     * writes `catch { case c.TypecheckException(_, msg) => ... }` -- which is
+     * how the failure is meant to be handled -- does not match, and one that
+     * catches `Throwable` sees the wrapper instead. Either way its answer is
+     * built on something it was not told, so the expansion ends with this
+     * reason rather than with that answer. Closing the gap needs a generated
+     * `Context` class instead of a proxy.
+     */
+    static String pendingTypecheckFailure;
     /** `c.freshName` counter, like nsc's per-run one. */
     static int fresh = 0;
     /**
@@ -49,9 +84,8 @@ public final class ScalaRsMacroEngine {
     static List<String> compilerSettings = new ArrayList<>();
 
     public static void main(String[] args) throws Exception {
-        PrintStream out = new PrintStream(System.out, true, "UTF-8");
-        BufferedReader in =
-            new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        out = new PrintStream(System.out, true, "UTF-8");
+        in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         macroCl = ScalaRsMacroEngine.class.getClassLoader();
         try {
             Class<?> pkg = Class.forName("scala.reflect.runtime.package$", true, macroCl);
@@ -168,15 +202,37 @@ public final class ScalaRsMacroEngine {
                 + impl.getParameterCount() + " arguments, the call site supplies " + argv.size());
         }
 
+        pendingGap = null;
+        pendingTypecheckFailure = null;
         Object result;
         try {
             result = impl.invoke(receiver, argv.toArray());
         } catch (InvocationTargetException e) {
             Throwable cause = e.getCause();
+            if (pendingGap != null) {
+                return err(pendingGap);
+            }
+            if (pendingTypecheckFailure != null) {
+                return err("c.typecheck rejected the tree the implementation gave it: "
+                    + pendingTypecheckFailure);
+            }
             if (cause instanceof Abort) {
                 return "(abort " + Sexp.quote(cause.getMessage()) + ")";
             }
             return err("the macro implementation threw " + describe(cause));
+        }
+        // A gap the implementation caught and carried on from. Its answer is
+        // built on something scala-rs never told it, so the reason is
+        // reported instead of the tree.
+        if (pendingGap != null) {
+            return err(pendingGap);
+        }
+        if (pendingTypecheckFailure != null) {
+            return err("c.typecheck rejected the tree the implementation gave it ("
+                + pendingTypecheckFailure + "), and the implementation caught the failure. "
+                + "scala-rs cannot hand a TypecheckException to an implementation -- the "
+                + "Context is a java.lang.reflect.Proxy, which wraps it -- so what it did "
+                + "next was decided on something it was not told");
         }
         Object tree = result;
         Class<?> exprCls = Class.forName("scala.reflect.api.Exprs$Expr", true, macroCl);
@@ -187,6 +243,124 @@ public final class ScalaRsMacroEngine {
         ser(tree, sb);
         sb.append(')');
         return sb.toString();
+    }
+
+    // ------------------------------------------------------- reverse RPC
+
+    /**
+     * A question scala-rs could not answer.
+     *
+     * An `Error` rather than an `Exception` on purpose: an implementation that
+     * writes `try c.typecheck(t) catch { case ex: Exception => ... }` -- and
+     * several in the wild do -- must not be able to turn "scala-rs has no
+     * answer" into a tree of its own devising. {@link #pendingGap} catches the
+     * remaining `catch (ex: Throwable)` case.
+     */
+    static final class Gap extends Error {
+        private static final long serialVersionUID = 1L;
+
+        Gap(String msg) {
+            super(msg);
+        }
+    }
+
+    static Gap gap(String why) {
+        pendingGap = why;
+        return new Gap(why);
+    }
+
+    /**
+     * Ask scala-rs a question in the middle of an expansion.
+     *
+     * This is the reverse direction of the bridge (`docs/macros.md` 7.18).
+     * The engine writes `(q ...)` on the same stdout the reply goes to, and
+     * scala-rs -- which is sitting in its read loop waiting for that reply --
+     * recognises the `q`, answers on stdin, and goes back to waiting. So the
+     * two processes take turns and the pipe stays in step: exactly one line is
+     * written and exactly one is read.
+     *
+     * The answer is `(a ...)`, or `(no "reason")` for a question scala-rs
+     * cannot answer, which is raised as a {@link Gap} and becomes the call
+     * site's diagnostic.
+     */
+    static Sexp query(String q) throws Exception {
+        out.println(q);
+        String line = in.readLine();
+        if (line == null) {
+            throw new Gap("scala-rs closed the pipe while the macro was asking it a question");
+        }
+        Sexp ans = Sexp.parse(line);
+        if (ans.isList() && !ans.items.isEmpty() && "no".equals(ans.items.get(0).atom)) {
+            throw gap(ans.items.get(1).text());
+        }
+        return ans;
+    }
+
+    /**
+     * `c.typecheck(tree, mode, pt, silent, ...)`.
+     *
+     * nsc typechecks the tree in the macro call site's own context. scala-rs
+     * is where that context lives, so the tree goes back over the wire, is
+     * typed there for real, and comes back as the tree the typer made of it
+     * with its type set on it.
+     *
+     * The arguments this bridge cannot honour are refused by name rather than
+     * ignored. A `pt` other than `WildcardType` asks a different question from
+     * the one that is sent; `withImplicitViewsDisabled` and
+     * `withMacrosDisabled` ask for a typer mode scala-rs has no switch for.
+     * Ignoring any of the three would answer a question nobody asked.
+     */
+    static Object typecheck(Object tree, Object mode, Object pt, boolean silent,
+                            boolean noViews, boolean noMacros) throws Exception {
+        if (pt != null && pt != call(universe, "WildcardType", 0)) {
+            throw gap("c.typecheck was given the expected type `" + pt
+                + "`; scala-rs types the tree with no expectation and cannot honour one yet");
+        }
+        if (noViews) {
+            throw gap("c.typecheck was asked to disable implicit views, which scala-rs's "
+                + "typer has no switch for");
+        }
+        if (noMacros) {
+            throw gap("c.typecheck was asked to disable macro expansion, which scala-rs's "
+                + "typer has no switch for");
+        }
+        String modeName = String.valueOf(mode);
+        if (!"TERM".equals(modeName) && !"TYPE".equals(modeName)
+                && !"PATTERN".equals(modeName)) {
+            throw gap("c.typecheck was given the mode `" + modeName
+                + "`, which did not come from c.TERMmode, c.TYPEmode or c.PATTERNmode");
+        }
+        StringBuilder sb = new StringBuilder("(q typecheck ");
+        ser(tree, sb);
+        sb.append(' ').append(Sexp.quote(modeName)).append(' ')
+          .append(silent ? "1" : "0").append(')');
+        Sexp ans = query(sb.toString());
+        String verdict = ans.items.get(1).atom;
+        if ("fail".equals(verdict)) {
+            String msg = ans.items.get(2).text();
+            if (silent) {
+                // nsc: a silent typecheck that fails is `EmptyTree`.
+                return call(universe, "EmptyTree", 0);
+            }
+            pendingTypecheckFailure = msg;
+            sneakyThrow(newTypecheckException(msg));
+        }
+        Object tpe = typeFor(ans.items.get(2));
+        Object built = buildTree(ans.items.get(3));
+        Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
+        return call(support, "setType", 2, built, tpe);
+    }
+
+    /** `scala.reflect.macros.TypecheckException(NoPosition, msg)`. */
+    static Throwable newTypecheckException(String msg) throws Exception {
+        Class<?> cls = Class.forName("scala.reflect.macros.TypecheckException", true, macroCl);
+        Object pos = call(universe, "NoPosition", 0);
+        return (Throwable) ctor(cls, 2).newInstance(pos, msg);
+    }
+
+    @SuppressWarnings("unchecked")
+    static <T extends Throwable> void sneakyThrow(Throwable t) throws T {
+        throw (T) t;
     }
 
     // ------------------------------------------------------- building trees
@@ -218,6 +392,21 @@ public final class ScalaRsMacroEngine {
                 }
                 return call(companion("Apply"), "apply", 2, fun, list(as));
             }
+            // The three below arrive only in an *answer* to `c.typecheck`:
+            // they are shapes scala-rs's typer produces, not shapes a call
+            // site hands to an implementation.
+            case "Block": {
+                List<Object> stats = new ArrayList<>();
+                for (Sexp k : kids.get(0).items.subList(1, kids.get(0).items.size())) {
+                    stats.add(buildTree(k));
+                }
+                return call(companion("Block"), "apply", 2, list(stats), buildTree(kids.get(1)));
+            }
+            case "If":
+                return call(companion("If"), "apply", 3, buildTree(kids.get(0)),
+                    buildTree(kids.get(1)), buildTree(kids.get(2)));
+            case "TypeTree":
+                return call(companion("TypeTree"), "apply", 0);
             default:
                 throw new IllegalArgumentException(
                     "scala-rs cannot hand a " + kind + " to a macro implementation");
@@ -264,15 +453,37 @@ public final class ScalaRsMacroEngine {
         return tagOf(typeFor(s));
     }
 
-    /** The `universe.Type` a `(ty …)` / `(syn …)` descriptor names. */
+    /**
+     * The `universe.Type` a type descriptor names.
+     *
+     * `(ty "a.b.C" <arg>…)` is a class the mirror finds on the macro
+     * classpath, applied to its type arguments; `(syn "a.b.C")` is one this
+     * run is compiling ({@link #synthType}); `(cst (c "Int" "1"))` is the
+     * constant type nsc gives a literal, which `c.typecheck(q"1").tpe` has to
+     * be if it is to be the type nsc reports.
+     */
     static Object typeFor(Sexp s) throws Exception {
         String head = s.items.get(0).atom;
+        if ("cst".equals(head)) {
+            return call(call(universe, "internal", 0), "constantType", 1,
+                constant(s.items.get(1)));
+        }
         String name = s.items.get(1).text();
         if ("syn".equals(head)) {
             return synthType(name);
         }
+        if ("run".equals(head)) {
+            return runClassType(s);
+        }
         Object cls = call(mirror, "staticClass", 1, name);
-        return call(call(cls, "asType", 0), "toType", 0);
+        if (s.items.size() <= 2) {
+            return call(call(cls, "asType", 0), "toType", 0);
+        }
+        List<Object> args = new ArrayList<>();
+        for (Sexp a : s.items.subList(2, s.items.size())) {
+            args.add(typeFor(a));
+        }
+        return call(universe, "appliedType", 2, cls, list(args));
     }
 
     /** `WeakTypeTag` for a type already built in the runtime universe. */
@@ -328,6 +539,160 @@ public final class ScalaRsMacroEngine {
             call(internal, "thisType", 1, owner), sym, list(new ArrayList<>()));
         synthetic.put(fullName, tpe);
         return tpe;
+    }
+
+    /**
+     * A class the calling run is compiling, **described**.
+     *
+     * {@link #synthType} builds the same symbol with no info at all, which is
+     * all scala-rs could offer before the bridge could ask questions
+     * backwards (`docs/macros.md` 5.1): identity and nothing else, so that an
+     * implementation asking a real question got an exception instead of a
+     * quiet wrong answer. It got one for `tpe.toString` too, because the
+     * reflect internals need an info to print a type at all.
+     *
+     * scala-rs now sends the description with the name, and it does so only
+     * when it can describe the class *completely* -- every parent, every
+     * declared member, every one of their types. A `(syn ...)` still arrives
+     * whenever it cannot, and that stays the empty placeholder. So there is no
+     * middle state here: the symbol is either fully described or not described
+     * at all, and this method is only reached in the first case.
+     *
+     * The symbol is cached under the same key as {@link #synthType}'s, so a
+     * class named twice in one expansion is one symbol. A name that arrived
+     * first as an empty placeholder is completed in place rather than
+     * duplicated -- completing a symbol that had no info is monotone, and two
+     * symbols for one class would break every identity comparison an
+     * implementation makes.
+     */
+    static Object runClassType(Sexp s) throws Exception {
+        String fullName = s.items.get(1).text();
+        Object known = synthetic.get(fullName);
+        Object internal = call(universe, "internal", 0);
+        Object sym;
+        Object tpe;
+        if (known != null) {
+            tpe = known;
+            sym = call(tpe, "typeSymbol", 0);
+            if (Boolean.TRUE.equals(call(sym, "isInitialized", 0))) {
+                return tpe;
+            }
+        } else {
+            Object owner = call(mirror, "EmptyPackageClass", 0);
+            sym = call(internal, "newClassSymbol", 4, owner, typeName(fullName),
+                call(universe, "NoPosition", 0), flagsOf(s.items.get(2)));
+            tpe = call(internal, "typeRef", 3, call(internal, "thisType", 1, owner), sym,
+                list(new ArrayList<>()));
+            synthetic.put(fullName, tpe);
+        }
+        Object support = call(internal, "reificationSupport", 0);
+        List<Object> parents = new ArrayList<>();
+        Sexp ps = s.field("parents");
+        for (Sexp x : ps.items.subList(1, ps.items.size())) {
+            parents.add(typeFor(x));
+        }
+        List<Object> decls = new ArrayList<>();
+        Sexp ds = s.field("decls");
+        for (Sexp d : ds.items.subList(1, ds.items.size())) {
+            decls.add(declSymbol(sym, tpe, d));
+        }
+        Object scope = call(internal, "newScopeWith", 1, seq(decls));
+        Object info = call(internal, "classInfoType", 3, list(parents), scope, sym);
+        call(support, "setInfo", 2, sym, info);
+        return tpe;
+    }
+
+    /**
+     * One declared member of such a class.
+     *
+     * The constructor is spelled out rather than described: scala-rs models it
+     * as returning `Unit` with no parameter clause and nsc as returning the
+     * class with one, so the wire carries the marker and the *class's own
+     * type* is filled in here, where it is to hand.
+     */
+    static Object declSymbol(Object owner, Object ownerType, Sexp d) throws Exception {
+        String name = d.items.get(1).text();
+        Sexp flagNames = d.items.get(2);
+        long flags = flagsOf(flagNames);
+        boolean isMethod = hasFlagName(flagNames, "METHOD");
+        boolean isCtor = hasFlagName(flagNames, "CONSTRUCTOR");
+        Object internal = call(universe, "internal", 0);
+        Object support = call(internal, "reificationSupport", 0);
+        Sexp shape = d.items.get(3);
+        boolean nullary = "nullary".equals(shape.items.get(0).atom);
+        Object result = isCtor ? ownerType : typeFor(d.items.get(4));
+        Object sym = isMethod
+            ? call(internal, "newMethodSymbol", 4, owner, termName(name),
+                call(universe, "NoPosition", 0), Long.valueOf(flags))
+            : call(internal, "newTermSymbol", 4, owner, termName(name),
+                call(universe, "NoPosition", 0), Long.valueOf(flags));
+        Object info;
+        if (!isMethod) {
+            info = result;
+        } else if (nullary) {
+            info = call(internal, "nullaryMethodType", 1, result);
+        } else {
+            List<Object> params = new ArrayList<>();
+            int i = 0;
+            for (Sexp pt : shape.items.subList(1, shape.items.size())) {
+                Object p = call(internal, "newTermSymbol", 4, sym, termName("x$" + (++i)),
+                    call(universe, "NoPosition", 0), Long.valueOf(flagValue("PARAM")));
+                call(support, "setInfo", 2, p, typeFor(pt));
+                params.add(p);
+            }
+            info = call(internal, "methodType", 2, list(params), result);
+        }
+        return call(support, "setInfo", 2, sym, info);
+    }
+
+    /**
+     * A `(f "NAME" ...)` list as nsc's flag bits.
+     *
+     * The names are looked up on `universe.Flag` rather than hard-coded, for
+     * the reason {@link #serMods} gives in the other direction: the bit layout
+     * is an internal detail. A name that is not there is an error, never a
+     * silently dropped flag -- a member described without `DEFERRED` is a
+     * different member.
+     */
+    static long flagsOf(Sexp f) throws Exception {
+        long flags = 0;
+        for (Sexp n : f.items.subList(1, f.items.size())) {
+            String name = n.text();
+            // Not flags: markers that say which *kind* of symbol to build.
+            // `METHOD` and `CONSTRUCTOR` are internal bits `newMethodSymbol`
+            // sets on its own, and `universe.Flag` does not publish either.
+            if ("METHOD".equals(name) || "CONSTRUCTOR".equals(name)) {
+                continue;
+            }
+            flags |= flagValue(name);
+        }
+        return flags;
+    }
+
+    static boolean hasFlagName(Sexp f, String want) {
+        for (Sexp n : f.items.subList(1, f.items.size())) {
+            if (want.equals(n.text())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static long flagValue(String name) throws Exception {
+        Object flagValues = call(universe, "Flag", 0);
+        for (Method m : flagValues.getClass().getMethods()) {
+            if (m.getParameterCount() == 0 && m.getReturnType() == long.class
+                    && m.getName().equals(name)) {
+                m.setAccessible(true);
+                return ((Number) m.invoke(flagValues)).longValue();
+            }
+        }
+        throw new IllegalStateException("no reflect flag named " + name);
+    }
+
+    /** `Seq(xs)`: `newScopeWith` takes a varargs sequence, not a list. */
+    static Object seq(List<Object> xs) throws Exception {
+        return list(xs);
     }
 
     /** `universe.Expr(mirror, FixedMirrorTreeCreator(mirror, tree))(tag)`. */
@@ -633,6 +998,26 @@ public final class ScalaRsMacroEngine {
             }
             if (n.equals("abort")) {
                 throw new Abort(String.valueOf(a[a.length - 1]));
+            }
+            // `c.typecheck` and the three modes it takes.
+            //
+            // nsc's modes are `analyzer.Mode` values, an internal bitset this
+            // engine has no access to and no use for: the only thing it does
+            // with a mode is send its name to scala-rs. So the marker *is* the
+            // name, and a mode that did not come from one of these three is
+            // refused by name rather than read as TERMmode
+            // ({@link #typecheck}).
+            if (arity == 0 && (n.equals("TERMmode") || n.equals("TYPEmode")
+                    || n.equals("PATTERNmode"))) {
+                return n.substring(0, n.length() - "mode".length());
+            }
+            if (n.equals("typecheck") && arity == 6) {
+                return typecheck(a[0], a[1], a[2], (Boolean) a[3], (Boolean) a[4],
+                    (Boolean) a[5]);
+            }
+            if (n.equals("TypecheckException") && arity == 0) {
+                return Class.forName("scala.reflect.macros.TypecheckException$", true, macroCl)
+                    .getField("MODULE$").get(null);
             }
             // `c.enclosingPosition` is where an implementation says its
             // diagnostics belong, and `c.abort(c.enclosingPosition, msg)` is

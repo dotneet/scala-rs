@@ -399,6 +399,24 @@ pub struct Typer {
     pub(crate) macro_failures: HashMap<(usize, u32, u32), String>,
     /// How deep the current chain of expansions is.
     pub(crate) macro_depth: u32,
+    /// Set while the engine is mid-expansion and this typer is answering one
+    /// of its queries (`crates/typer/src/expand_rpc.rs`). The pipe carries one
+    /// conversation at a time, so an expansion asked for *while* answering a
+    /// query -- a macro application inside a `c.typecheck` argument -- has to
+    /// be refused with a reason rather than started on a second engine.
+    pub(crate) macro_engine_busy: bool,
+    /// The full names of the classes whose signatures a reverse-RPC query is
+    /// currently forcing. A query that would force one already on this stack
+    /// is a cycle, and is refused by name instead of looping.
+    pub(crate) macro_rpc_forcing: Vec<String>,
+    /// The call site an engine query is answered at: the span of the macro
+    /// application currently being expanded, so a tree the engine hands over
+    /// gets positions inside the file that asked for the expansion.
+    pub(crate) macro_rpc_span: Span,
+    /// Classes this run is compiling that an answer to the engine had to name
+    /// but that scala-rs could not describe, with the reason. Cleared at the
+    /// start of every expansion (`crates/typer/src/expand_rpc.rs`).
+    pub(crate) macro_undescribed: Vec<(String, String)>,
     /// Types handed to the engine as *placeholder* symbols, by the full name
     /// the placeholder carries. A class this run is compiling has no class
     /// file for the engine's mirror to find, so it travels as its name alone
@@ -860,6 +878,10 @@ impl Typer {
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),
             macro_depth: 0,
+            macro_engine_busy: false,
+            macro_rpc_forcing: Vec::new(),
+            macro_rpc_span: Span::DUMMY,
+            macro_undescribed: Vec::new(),
             macro_local_tags: HashMap::new(),
             has_macro_defs: false,
             parent_ctor_scope: false,
