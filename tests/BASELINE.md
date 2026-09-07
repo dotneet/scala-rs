@@ -11,27 +11,47 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `d056a7f7` |
+| commit | `7aa47c29` |
 |---|---|
-| updated | 2026-09-07 |
+| updated | 2026-09-08 |
 
-Seven slices have merged in three composed gates. `agent/implguard` was
-measured alone on top of the six below, at `d056a7f7`: the corpus is
-**byte-identical** to `15bee7f9` (`changes: []`, `losses=0`), the workspace
-suite is 226 rows / 2314 passed / 0 failed, and gitbucket falls 785 -> 717
-with cats, slick and the library measure unmoved. The first three, at `9739388f`:
-`agent/gbtrait` (`new T()` for a trait read from a class file), `agent/catseta`
-(the type parameters eta-expansion and inserted applies left open), and
-`agent/implicitfilter` (a plausibility pre-filter and a `pinned` correction in
-implicit search). The next three, measured together at `15bee7f9`:
-`agent/defaultargs` (five roots under default arguments, including a
-class-file's defaults being invisible and an anonymous class's `$outer` walk
-that emitted a `ClassCastException` regardless of defaults), `agent/backendtypes`
-(a deferred type-member declaration outranking the definition that fixes it, and
-a `p#T` prefix dropped by the pickle reader), and `agent/overspec` (overload
-specificity, plus nsc's shape-type pre-selection, plus a function-typed parent
-that `class_reaches` could not see through). The coordinator measured the merged
-tree, not the branches.
+**Fifteen slices have merged this session**, in five composed gates. The
+coordinator measured the merged tree each time, not the branches.
+
+| gate | slices | gitbucket | cats |
+|---|---|---:|---:|
+| `9739388f` | `gbtrait`, `catseta`, `implicitfilter` | 895 -> 867 | 346 -> 326 |
+| `15bee7f9` | `defaultargs`, `backendtypes`, `overspec` | -> 785 | -> 303 |
+| `d056a7f7` | `implguard` | -> 717 | 303 |
+| `9a00edce` | `projection`, `selftype`, `hkpath` | 717 | -> 251 |
+| `7aa47c29` | `linterm`, `gbhead`, `hkselfalias`, `macromirror`, `qualfallback`, `subtypeterm`, `catsinfer`, `linorder2` | -> 398 | -> 231 |
+
+Four of those fifteen move no number and are the most important. **`linterm`
+and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
+by depth (64 and 200) and *a depth bound bounds the depth of the recursion
+tree, not its size*, so a cyclic — or merely wide and legal — hierarchy did
+`branching^depth` work. A 41-file cats input ran for **five and a half hours**
+and now takes 1.08 s; a legal 26-level diamond took 74 s against scalac's 1.9 s.
+Before `linterm`, `trait A extends B; trait B extends A` **compiled to class
+files with no diagnostic at all**. **`qualfallback`** closed a silent
+wrong-answer: a parent type whose qualifier named nothing fell back on the bare
+simple name, so `Missing.AllOps` bound the enclosing trait and a program
+compiled with the wrong parent. **`linorder2`** replaced the C3 merge with
+SLS 5.1.2's `+:` fold — SLS specifies no C3 merge, and `+:` is total where the
+merge had to guess.
+
+`agent/macromirror` built the reverse-RPC channel and `c.typecheck` and
+measured a **yield of zero**, with the reason itemised: not one corpus test
+reaches a `c.typecheck` call, and `mapTo`'s 31 gitbucket refusals stop one
+layer earlier, in `tag_descriptor`, which cannot carry type arguments. That is
+where the next slice on macros starts.
+
+`agent/linorder2` also **implemented, measured and retracted** its second half:
+walking the linearization in `super_select_member` gives scalac's chain and
+costs 5 new library errors, because the reversed-parent walk was compensating
+for two deeper defects. Both are named in `docs/not-implemented.md`, in the
+order they must be fixed.
+
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -57,9 +77,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **303** | **78** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **717** | **103** | — |
-| `tests/scalalib_measure.sh` (538) | **1553** | **168** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **231** | **75** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **398** | **83** | — |
+| `tests/scalalib_measure.sh` (538) | **1552** | **168** | — |
 
 ## Execution
 
@@ -75,18 +95,20 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1073** | 441 | 345 |
-| `neg` (1405) | **668** | 368 | 369 |
-| `run` (2060) | **616** | 891 | 553 |
+| `pos` (1859) | **1078** | 436 | 345 |
+| `neg` (1405) | **669** | 367 | 369 |
+| `run` (2060) | **618** | 889 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-d056a7f7.tsv`](baselines/corpus-d056a7f7.tsv): 5324 unique
+[`baselines/corpus-7aa47c29.tsv`](baselines/corpus-7aa47c29.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
-Compared with `0d200adb`, `losses=0` and one status improved (`pos/t6666d`).
-Compared with `9739388f`, `losses=0` and six improved: `pos/existential-function-pt`
-(the Function/PartialFunction choice `agent/overspec` fixed), `pos/t2809`,
-`pos/t4036`, `pos/t9014` (default arguments), `run/reflection-enclosed-basic`
-and `run/t9182` (type members). Nothing else moved in either comparison.
+Compared with `d056a7f7`, `losses=0` and **eight statuses improved, nothing
+else moved**: `neg/t7507` (a `self: Cake =>` seeing `Cake`'s `private[this]`,
+which we used to accept), `pos/t10714`, `pos/t10714b`, `pos/t7753` (dependent
+result types through an inserted `apply`), `pos/t6895` (partial expected-type
+solutions), `pos/t8801`, `run/t102` and `run/t3798`. Every earlier gate was
+`losses=0` as well; across the whole session no corpus status has ever gone
+from pass to fail.
 Compared with `2098c6fe`, all 5324 statuses are unchanged. The two changed
 six-field records are an output path in `run/t8199` and the first reported JVM
 exception in `run/impconvtimes`; all seven generated classes of the latter are
@@ -108,7 +130,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-d056a7f7.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-7aa47c29.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -135,7 +157,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **226 result rows, 2314 passed, 0 failed** at `d056a7f7` |
+| `cargo test --workspace --release --no-fail-fast` | **237 result rows, 2367 passed, 0 failed** at `7aa47c29` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
