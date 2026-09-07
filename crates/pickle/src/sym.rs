@@ -169,6 +169,30 @@ impl Member {
             && !self.name.contains("$default$")
             && !self.name.ends_with(' ')
     }
+
+    /// A `case class`'s compiler-generated API: the companion's `apply` and
+    /// `unapply`, and the class's own `copy`.
+    ///
+    /// nsc marks all three `SYNTHETIC`, which [`Member::is_public_api`]
+    /// filters out along with bridges and `$anonfun`s -- but these are the
+    /// API a case class exists for, and the class file alone does not
+    /// describe them well enough to call: it records neither which clause is
+    /// `implicit` nor which parameters have defaults. `FieldSerializer[A]()`
+    /// (json4s) reached overload selection against
+    /// `(PartialFunction, PartialFunction, Boolean, ClassTag[A])` with no
+    /// arguments for exactly that reason.
+    ///
+    /// `CASE` alongside `SYNTHETIC` is what distinguishes them; nsc sets it on
+    /// the members it derives from a `case` declaration and on nothing else.
+    pub fn is_case_synthetic(&self) -> bool {
+        self.has(pflags::CASE)
+            && self.has(pflags::SYNTHETIC)
+            && !self.has(pflags::PRIVATE)
+            && !self.has(pflags::BRIDGE)
+            && !self.has(pflags::LOCAL)
+            && !self.name.contains("$default$")
+            && !self.name.ends_with(' ')
+    }
 }
 
 /// One class or module class recovered from a pickle.

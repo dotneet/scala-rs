@@ -1160,6 +1160,45 @@ pub(crate) fn outer_chain_reaches(st: &SymbolTable, from: SymbolId, owner: Symbo
     }
 }
 
+/// The `$outer` chain out of `from` reaches a class whose **self type**
+/// supplies `owner`'s members.
+///
+/// A cake trait's `self: AccountService =>` makes that trait's members
+/// nameable unqualified inside it, but the trait does not *extend* it, so
+/// `outer_chain_reaches` — which follows real parents — reports that the
+/// chain does not reach `owner` and the call falls back to `this` plus a
+/// cast. Inside the trait's own body that cast is right (`this` really is
+/// mixed with the self type at every instantiation). Inside a class *nested*
+/// in the trait it is on the wrong object: gitbucket's
+/// `new Runner { … getAccountByUserName(u) … }` in an `AccountService`-cake
+/// controller compiled to `aload_0; checkcast AccountService` and threw
+/// `ClassCastException: Ctl$$anon$1 cannot be cast to AccountService` from a
+/// program that type-checked.
+pub(crate) fn outer_self_type_reaches(st: &SymbolTable, from: SymbolId, owner: SymbolId) -> bool {
+    if owner.is_none() {
+        return false;
+    }
+    let mut cur = from;
+    let mut seen = HashSet::new();
+    while let Some(o) = enclosing_instance(st, cur) {
+        if !seen.insert(o.0) {
+            return false;
+        }
+        if let Some(s) = st
+            .get(o)
+            .self_type
+            .clone()
+            .and_then(|t| st.class_sym_of(&t))
+        {
+            if self_reaches_owner(st, s, owner) {
+                return true;
+            }
+        }
+        cur = o;
+    }
+    false
+}
+
 /// The nearest enclosing object whose instance can serve as `owner`'s
 /// `$outer`: `object DB2Profile extends … { class T extends Table }` hands
 /// `DB2Profile$.MODULE$` to `Table`'s constructor, exactly as nsc does.

@@ -4122,7 +4122,11 @@ pub(crate) fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
             } else if owner == ctx.class_sym || owner.is_none() {
                 load_this(asm, ctx);
             } else if !is_owner_compatible(ctx.st, ctx.class_sym, owner)
-                && outer_chain_reaches(ctx.st, ctx.class_sym, owner)
+                && (outer_chain_reaches(ctx.st, ctx.class_sym, owner)
+                    // The member arrives through an enclosing class's *self
+                    // type*, which is not one of its parents. See
+                    // `outer_self_type_reaches`.
+                    || outer_self_type_reaches(ctx.st, ctx.class_sym, owner))
             {
                 // The method lives further out than `this`: a class nested in
                 // another class reaches the enclosing instance's methods

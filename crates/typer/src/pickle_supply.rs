@@ -496,7 +496,14 @@ impl PickleSupply {
         // read as a val's stability, not a def's absence of it.
         let mut names: Vec<String> = Vec::new();
         for m in &sig.members {
-            if (m.kind != MemberKind::Def && m.kind != MemberKind::Val) || !m.is_public_api() {
+            if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
+                continue;
+            }
+            // A case class's `apply` / `unapply` / `copy` are taken over too,
+            // so the class file reader's description of them -- which cannot
+            // say "implicit clause" or "this parameter has a default" -- is
+            // dropped here rather than left to shadow the pickled one.
+            if !m.is_public_api() && !m.is_case_synthetic() {
                 continue;
             }
             let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
@@ -1517,7 +1524,10 @@ impl PickleSupply {
             if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
                 continue;
             }
-            if !m.is_public_api() && !(synthetic_ok && is_default_getter(&m.name)) {
+            if !m.is_public_api()
+                && !m.is_case_synthetic()
+                && !(synthetic_ok && is_default_getter(&m.name))
+            {
                 continue;
             }
             let Some(mut shape) = read_shape(&m.ty) else {
@@ -3395,6 +3405,29 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
                     .clauses
                     .iter()
                     .any(|c| c.params.iter().any(|p| mentioned(&p.ty).contains(&tp.name))) =>
+            {
+                kept.push(ShapeTParam {
+                    name: tp.name.clone(),
+                    lo: tp.lo.clone(),
+                    hi: tp.hi.clone(),
+                    arity: tp.arity,
+                });
+            }
+            // A type parameter the signature never mentions again: no
+            // parameter and no result names it, so nothing the call site does
+            // depends on how it is solved and there is no implicit to fail.
+            // nsc's *default getters* are where this shape comes from -- they
+            // inherit the method's type parameters whether or not the default
+            // expression uses them, so `def halt[T: Manifest](status: Integer
+            // = null, body: T = (), headers: Map[…] = …)` gives
+            // `halt$default$1[T]: Integer`. Declining that getter declined
+            // `halt` itself (`install` refuses a member whose default it
+            // cannot fill), which is how `halt(400)` was left with only the
+            // unrelated `halt(ActionResult)` overload.
+            _ if !shape
+                .clauses
+                .iter()
+                .any(|c| c.params.iter().any(|p| mentioned(&p.ty).contains(&tp.name))) =>
             {
                 kept.push(ShapeTParam {
                     name: tp.name.clone(),

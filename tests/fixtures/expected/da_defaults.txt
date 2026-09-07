@@ -1,0 +1,10 @@
+octocat/16/false
+qualified/32/false
+root:false
+direct:false
+@me|@me
+xfalse
+explicit/8/true
+named:true
+wiki!push w:false
+files0|branches3

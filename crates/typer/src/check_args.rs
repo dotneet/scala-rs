@@ -1008,6 +1008,17 @@ impl Typer {
         // its JVM classfile method is `$lessinit$greater$default$n`.
         let jvm_ctor_gname = format!("$lessinit$greater$default${index_1based}");
         let owner = self.st.get(meth).owner;
+        // A `def` written inside a method body. Its getter is declared in that
+        // same body, so there is no receiver to select it off and no class to
+        // emit it on; the caller splices the default's own expression
+        // instead, in the scope that wrote it. Selecting it anyway reported
+        // "value menuitem$default$2 is not a member of Main$" -- twirl writes
+        // gitbucket's templates as a local
+        // `def menuitem(…, count: Int = 0)` inside `apply`, called eight
+        // times.
+        if !owner.is_none() && !self.st.get(owner).is_class_like() {
+            return None;
+        }
         let span = fun.span;
         if mname == "<init>" {
             self.ensure_classfile_members_loaded(owner, &jvm_ctor_gname, span);
@@ -1120,7 +1131,7 @@ impl Typer {
             self.type_expr(&mut r, &Type::NoType);
             r
         } else {
-            self.method_receiver(fun)
+            self.default_getter_receiver(fun, getter_owner, span)
         };
         let mut preceding = Self::applied_clause_args(fun);
         preceding.extend_from_slice(prior);
@@ -1157,20 +1168,58 @@ impl Typer {
             stable_pat: false,
         };
         self.type_expr(&mut gfun, &Type::NoType);
-        let mut call = Tree {
-            id: NodeId(0),
-            span,
-            kind: TreeKind::Apply {
-                fun: Box::new(gfun),
-                args: preceding.to_vec(),
-            },
-            ty: param_ty.clone(),
-            sym: gid,
-            postfix: false,
-            scala_ref: false,
-            stable_pat: false,
+        // A parameter whose type is still a type parameter of the method
+        // being applied is not an expectation the getter has to meet -- it is
+        // what the getter's result *determines*. nsc infers the method's type
+        // arguments from the filled-in defaults along with the written ones:
+        // `def halt[T](status: Integer = null, body: T = (), …)` called as
+        // `halt(400)` solves `T = Unit` from `halt$default$2()`. Demanding
+        // conformance to the unsolved `T` instead reported
+        // "type mismatch; found: Unit  required: T".
+        // `pretype_spliced_default` withholds the expectation for the same
+        // reason when the default's expression is spliced.
+        let mut tps = Vec::new();
+        crate::check::collect_tparams(&param_ty, &mut tps);
+        let expected = if tps.is_empty() {
+            param_ty.clone()
+        } else {
+            Type::NoType
         };
-        self.type_expr(&mut call, &param_ty);
+        // One `Apply` per clause the getter declares. A getter for a *later*
+        // clause keeps the method's currying -- `def join(a: String)(b: String
+        // = "-")(c: String = a + b)` pickles `join$default$3` as
+        // `(a: String)(b: String): String`, though its class file method takes
+        // both parameters at once -- and handing all of them to a single
+        // `Apply` matched them against the first clause alone: "no matching
+        // overload for (String)(String)String with arguments ("a", "+")".
+        // A getter this compiler declares itself is uncurried, which the
+        // one-clause fallback covers.
+        let clauses: Vec<usize> = match self.st.get(gid).paramss.as_slice() {
+            [] => vec![0],
+            cs => cs.iter().map(|c| c.len()).collect(),
+        };
+        let mut rest = preceding.to_vec();
+        let mut call = gfun;
+        let last = clauses.len() - 1;
+        for (i, n) in clauses.into_iter().enumerate() {
+            let args: Vec<Tree> = rest.drain(..n.min(rest.len())).collect();
+            let mut next = Tree {
+                id: NodeId(0),
+                span,
+                kind: TreeKind::Apply {
+                    fun: Box::new(call),
+                    args,
+                },
+                ty: param_ty.clone(),
+                sym: gid,
+                postfix: false,
+                scala_ref: false,
+                stable_pat: false,
+            };
+            let pt = if i == last { &expected } else { &Type::NoType };
+            self.type_expr(&mut next, pt);
+            call = next;
+        }
         Some(call)
     }
 
@@ -1254,6 +1303,120 @@ impl Typer {
             TreeKind::Select { name, .. } | TreeKind::Ident { name } => Some(name.as_str()),
             _ => None,
         }
+    }
+
+    /// The qualifier a `name$default$n` call has to be selected off.
+    ///
+    /// [`Self::method_receiver`] answers `this` for a callee that is not a
+    /// `Select`, which is right only when the enclosing class really has the
+    /// member. A name reached without writing a qualifier need not be one:
+    ///
+    /// * `import helpers._; avatar(name, 16)` -- `avatar` belongs to the
+    ///   *object*, and `this.avatar$default$3` reported "value
+    ///   avatar$default$3 is not a member of IndexControllerBase";
+    /// * a cake's `self: AccountService =>` seen from inside an anonymous
+    ///   class -- `getAccountByUserName` belongs to the trait the self type
+    ///   names, reachable through the *enclosing* class's `this` and not the
+    ///   anonymous class's: "not a member of $anon$61".
+    ///
+    /// The main call is emitted correctly in both shapes already (codegen
+    /// loads `MODULE$` for a module's member, and walks `$outer` for an
+    /// enclosing one); it is only the getter, which is built as a fresh
+    /// `Select` here, that needed the same prefix the method itself resolved
+    /// through.
+    fn default_getter_receiver(&mut self, fun: &Tree, getter_owner: SymbolId, span: Span) -> Tree {
+        let recv = self.method_receiver(fun);
+        if getter_owner.is_none() || !matches!(recv.kind, TreeKind::This { qual: None }) {
+            return recv;
+        }
+        // An object's member is selected off the object however the name
+        // reached this scope.
+        if self.st.get(getter_owner).kind == SymKind::ModuleClass {
+            if let Some(module) = self.module_value_of(getter_owner) {
+                return Tree {
+                    id: NodeId(0),
+                    span,
+                    kind: TreeKind::Ident {
+                        name: self.st.get(module).name.clone(),
+                    },
+                    ty: Type::ModuleRef(getter_owner),
+                    sym: module,
+                    postfix: false,
+                    scala_ref: false,
+                    stable_pat: false,
+                };
+            }
+        }
+        // `this` already has it: the ordinary inherited case.
+        let this_class = self.st.this_class;
+        if this_class.is_none() || self.this_reaches(this_class, getter_owner) {
+            return recv;
+        }
+        // Otherwise the member comes from further out. Name that class
+        // explicitly (`Ctl.this`), which `Typer::this_owner` resolves and the
+        // backend's `load_qualified_this` walks `$outer` for.
+        let mut cur = self.st.get(this_class).owner;
+        while !cur.is_none() {
+            if self.st.get(cur).is_class_like() && self.this_reaches(cur, getter_owner) {
+                let mut t = Tree {
+                    id: NodeId(0),
+                    span,
+                    kind: TreeKind::This {
+                        qual: Some(self.st.get(cur).name.trim_end_matches('$').to_string()),
+                    },
+                    ty: Type::NoType,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                    scala_ref: false,
+                    stable_pat: false,
+                };
+                self.type_expr(&mut t, &Type::NoType);
+                return t;
+            }
+            cur = self.st.get(cur).owner;
+        }
+        recv
+    }
+
+    /// The `object` symbol whose value denotes `mcls`.
+    fn module_value_of(&self, mcls: SymbolId) -> Option<SymbolId> {
+        let owner = self.st.get(mcls).owner;
+        self.st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| self.st.get(m).kind == SymKind::Module && self.st.module_class_of(m) == mcls)
+    }
+
+    /// Whether `this` of class `cls` can select a member declared by `owner` --
+    /// through the real parents, or through a `self:` annotation, which is how
+    /// a cake makes its collaborators' members visible unqualified.
+    fn this_reaches(&self, cls: SymbolId, owner: SymbolId) -> bool {
+        if cls == owner {
+            return true;
+        }
+        let mut seen: Vec<u32> = Vec::new();
+        let mut work = vec![cls];
+        while let Some(c) = work.pop() {
+            if c == owner {
+                return true;
+            }
+            if seen.contains(&c.0) || seen.len() > 256 {
+                continue;
+            }
+            seen.push(c.0);
+            let s = self.st.get(c);
+            for p in &s.parents {
+                if let Some(ps) = self.st.class_sym_of(p) {
+                    work.push(ps);
+                }
+            }
+            if let Some(t) = s.self_type.clone() {
+                work.extend(self.st.self_type_classes(&t));
+            }
+        }
+        false
     }
 
     fn method_receiver(&self, fun: &Tree) -> Tree {
