@@ -11,11 +11,14 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `7aa47c29` |
+| commit | `8d4cdde0` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Fifteen slices have merged this session**, in five composed gates. The
+**Seventeen slices have merged this session**, in six composed gates. From
+this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
+directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
+named in the summary. This one reports `VERDICT=PASS`. The
 coordinator measured the merged tree each time, not the branches.
 
 | gate | slices | gitbucket | cats |
@@ -25,6 +28,7 @@ coordinator measured the merged tree each time, not the branches.
 | `d056a7f7` | `implguard` | -> 717 | 303 |
 | `9a00edce` | `projection`, `selftype`, `hkpath` | 717 | -> 251 |
 | `7aa47c29` | `linterm`, `gbhead`, `hkselfalias`, `macromirror`, `qualfallback`, `subtypeterm`, `catsinfer`, `linorder2` | -> 398 | -> 231 |
+| `8d4cdde0` | `hkunify`, `convimpl` | -> 393 | -> 215 |
 
 Four of those fifteen move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -52,6 +56,25 @@ costs 5 new library errors, because the reversed-parent walk was compensating
 for two deeper defects. Both are named in `docs/not-implemented.md`, in the
 order they must be fixed.
 
+`agent/hkunify` (Fable 5.1) implemented nsc's partial unification —
+`TypeVar.unifyFull`, scala/bug#2712: with the variable applied to `k`
+arguments and the type to `n >= k`, the leftmost `n - k` are captured as
+constants and only the rightmost `k` are abstracted, so `Either[String, Int]`
+against `F[A]` is `F := Either[String, *]` and never `[x]Either[x, Int]`. No
+type lambda had to be invented: a `Type::Class` with fewer arguments than the
+class has parameters already *is* the curried constructor here. Its first full
+corpus showed `losses=3`, ill-kinded solutions the old code let through; the
+parent-walk half of nsc's rule closed them.
+
+`agent/convimpl` then repaired what that exposed. A view whose implicit
+argument has no witness must be **discarded during search**, not reported: nsc
+answers `value flatMap is not a member of Bag[Int]`. The guard for this already
+existed but sat on the widened path only and ran under `&self`, so it could not
+load the class file a witness lives in. Making search and fill agree removed a
+duplicated diagnostic structurally rather than by de-duplicating messages, and
+a case where two views tie on argument type and differ only in their implicit
+clauses now compiles as scalac compiles it.
+
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -77,9 +100,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **231** | **75** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **398** | **83** | — |
-| `tests/scalalib_measure.sh` (538) | **1552** | **168** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **215** | **73** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **393** | **83** | — |
+| `tests/scalalib_measure.sh` (538) | **1551** | **168** | — |
 
 ## Execution
 
@@ -95,15 +118,20 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1078** | 436 | 345 |
-| `neg` (1405) | **669** | 367 | 369 |
+| `pos` (1859) | **1086** | 428 | 345 |
+| `neg` (1405) | **670** | 366 | 369 |
 | `run` (2060) | **618** | 889 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-7aa47c29.tsv`](baselines/corpus-7aa47c29.tsv): 5324 unique
+[`baselines/corpus-8d4cdde0.tsv`](baselines/corpus-8d4cdde0.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
-Compared with `d056a7f7`, `losses=0` and **eight statuses improved, nothing
-else moved**: `neg/t7507` (a `self: Cake =>` seeing `Cake`'s `private[this]`,
+Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
+else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
+`pos/t5683`, `pos/tcpoly_infer_implicit_tuple_wrapper` and `pos/fun_undo_eta`,
+which are scala/bug#2712's own partial-unification tests and are the direct
+evidence that `agent/hkunify` implemented nsc's rule rather than a rule that
+happens to fit cats. Compared with `d056a7f7`, `losses=0` and **eight
+statuses improved**: `neg/t7507` (a `self: Cake =>` seeing `Cake`'s `private[this]`,
 which we used to accept), `pos/t10714`, `pos/t10714b`, `pos/t7753` (dependent
 result types through an inserted `apply`), `pos/t6895` (partial expected-type
 solutions), `pos/t8801`, `run/t102` and `run/t3798`. Every earlier gate was
@@ -130,7 +158,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-7aa47c29.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-8d4cdde0.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -157,7 +185,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **237 result rows, 2367 passed, 0 failed** at `7aa47c29` |
+| `cargo test --workspace --release --no-fail-fast` | **239 result rows, 2379 passed, 0 failed** at `8d4cdde0` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
