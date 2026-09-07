@@ -78,6 +78,10 @@ AccountService` on an object that does not implement it -- a
 and no defaults involved. `gen_desc::outer_self_type_reaches` teaches the
 backend's receiver walk that an enclosing class's **self type** supplies
 members too, so the `$outer` is loaded and cast instead.
+`gen_desc::self_type_supplies` is the matching stopping condition inside
+`load_owner_instance`: the class that carries the annotation really is mixed
+with its self type at run time, so the walk ends there rather than running on
+to the outermost enclosing instance.
 
 ## A compound self type contributed only its first component
 
