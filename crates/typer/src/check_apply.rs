@@ -817,16 +817,20 @@ impl Typer {
                             // are typed. Here the pass runs first, so a solution
                             // the expected type only knows as `_` -- the stand-in
                             // an enclosing call put there for a variable it has
-                            // not decided (`check_apply`'s `relaxed`) -- would
-                            // fix a parameter an argument still to be typed is
-                            // about to state exactly. A parameter no remaining
-                            // argument mentions keeps the wildcard: `Set()` for
-                            // a declared `Set[TableOption[?]]` has nothing else
-                            // to go on.
+                            // not decided -- would fix a parameter an argument
+                            // still to be typed is about to state exactly. Only
+                            // inside such an argument (`relaxed_pt_depth`): a
+                            // wildcard the program wrote says as much as any
+                            // other type, and `build { case (sq, cs) => … }` at
+                            // a declared `Cache[(Seq[String], Class[_]), String]`
+                            // has nothing else to give the pattern its types
+                            // (`pos/t12899`). A parameter no remaining argument
+                            // mentions keeps the wildcard either way.
                             let inst: Vec<(SymbolId, Type)> = inst
                                 .into_iter()
                                 .filter(|(tp, t)| {
-                                    !type_has_wildcard(t)
+                                    self.relaxed_pt_depth == 0
+                                        || !type_has_wildcard(t)
                                         || !param_tys.iter().zip(&arg_tys).any(|(p, a)| {
                                             mentions_no_type(a) && type_mentions_tparam(p, *tp)
                                         })
@@ -889,10 +893,15 @@ impl Typer {
                                 // answer never reaches the result. cats'
                                 // `F.map(f(a0).value) { case … }` inside
                                 // `EitherT`/`IorT`/`OptionT`'s `tailRecM` came
-                                // out `F[_]` this way.
+                                // out `F[_]` this way. Again only inside a
+                                // relaxed expected type -- a wildcard the
+                                // program wrote is a type like any other.
+                                let drop_wild = self.relaxed_pt_depth > 0;
                                 let (ids, vals): (Vec<SymbolId>, Vec<Type>) = weak
                                     .into_iter()
-                                    .filter(|(id, v)| open.contains(id) && !type_has_wildcard(v))
+                                    .filter(|(id, v)| {
+                                        open.contains(id) && !(drop_wild && type_has_wildcard(v))
+                                    })
                                     .unzip();
                                 if !ids.is_empty() {
                                     param_tys = param_tys
@@ -1076,7 +1085,19 @@ impl Typer {
                                 _ => p.clone(),
                             };
                             let pt_arg = self.open_to_bounds(&relaxed, &open);
+                            // A wildcard this substitution just put in is our
+                            // own "not decided yet", not an existential the
+                            // program wrote. Say so for as long as the argument
+                            // is being typed, so the calls inside it do not read
+                            // their own type parameters out of it.
+                            let relaxed_here = type_has_wildcard(&pt_arg) && !type_has_wildcard(&p);
+                            if relaxed_here {
+                                self.relaxed_pt_depth += 1;
+                            }
                             self.type_expr(a, &pt_arg);
+                            if relaxed_here {
+                                self.relaxed_pt_depth -= 1;
+                            }
                         }
                         // nsc adapts an argument before it constrains the call. An
                         // argument that still carries an all-implicit clause is not

@@ -1978,22 +1978,48 @@ Three narrow rules, each measured on its own:
   `Parallel.scala` lines.
 * **Nor is it pushed for a parameter an argument still to be typed states**
   (the filter after `add_expected_constraints` in `check_apply`). The pass runs
-  before the arguments are typed; nsc runs it after.
+  before the arguments are typed; nsc runs it after. Only inside a relaxed
+  expected type -- see below.
 * **Nor is it written into a parameter type for a bare lambda's benefit** (the
   `weak` block). `F.map(f(a0).value) { case … }` in `EitherT`/`IorT`/`OptionT`'s
   `tailRecM` took `B := Either[L, _]` off the enclosing `F[Either[L, _]]`,
   which also hid `B` from `open_tparams_of`, so the match that decides it was
   never consulted. Worth those three `(F[_])` lines -- the family the
   `pt_is_undecided` comment in `check.rs` named and `agent/monadtrans` left
-  three of.
+  three of. Only inside a relaxed expected type, same as the last.
 
-**Refusing every nested wildcard outright costs slick six errors**, and that is
-the measurement that shaped the rules. `options: Set[TableOption[?]] = Set()`
-is a *source existential*: `Set()` pins nothing, and `A := TableOption[_]` is
-the best answer there is. `Type::Wildcard` is both nsc's `WildcardType` and its
-`ExistentialType` here, so the two cannot be told apart by shape -- only by
-whether anything else in the call has an opinion. All three rules are phrased
-that way, and slick stays at `errors=0 classes=1490`.
+### A source `_` is not the same wildcard, and only provenance says so
+
+**Refusing every nested wildcard outright costs slick six errors**, and the
+recovery from that cost two more measurements before the rules were right.
+
+`options: Set[TableOption[?]] = Set()` is a *source existential*: `Set()` pins
+nothing, and `A := TableOption[_]` is the best answer there is. The first
+attempt kept it by phrasing the rules as "only where something else in the call
+has an opinion" -- which held slick at `errors=0` and cats at 231, and then
+**lost `pos/t12899` on the corpus**:
+
+```scala
+val c1: Cache[(Seq[String], Class[_]), String] = build { case (sq, cs) => mk(sq, cs) }
+```
+
+`K := (Seq[String], Class[_])` carries a wildcard, nothing else in the call has
+an opinion about `K`, and the `{ case … }` that would have to be given its
+pattern types is exactly the "argument still to be typed" the rule was written
+around. It is structurally identical to the cats cases and semantically their
+opposite.
+
+`Type::Wildcard` is both nsc's `WildcardType` and (with no bounds) its
+`ExistentialType`, so **the two cannot be told apart by shape at all** -- nsc
+never has this problem because they are different types there. What separates
+them is where the wildcard came from, so `Typer::relaxed_pt_depth` records it:
+non-zero exactly while an argument is being typed against an expected type this
+compiler relaxed. The two "do not push" rules apply only inside that; the "do
+not override a precise answer" rule needs no flag, because a wildcard-bearing
+type is less precise than the argument's answer whoever wrote it.
+
+With the flag, slick is `errors=0 classes=1490`, `pos/t12899` passes again, and
+cats is the same 231 with the same twenty locations gone.
 
 ### The mirror image: an expected type that does say something
 

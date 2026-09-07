@@ -16,6 +16,11 @@
 //
 // Everything prints a value, so an instantiation that merely compiles --
 // `Nothing`, `Any`, `_` -- cannot pass.
+//
+// The last object is the converse, and the reason none of the three rules can
+// be phrased on the *shape* of a wildcard: `Cache[(Seq[String], Class[_]),
+// String]` is an existential the program wrote, and it is the only thing that
+// can give `{ case (sq, cs) => … }` its pattern types.
 
 trait FunK[F[_], G[_]] { def apply[A](fa: F[A]): G[A] }
 
@@ -132,6 +137,26 @@ object Instances {
   implicit object showInt extends Show[Int] { def name: String = "Int" }
 }
 
+// -------------------------------------------------------------- the converse
+
+// A wildcard the *program* wrote is a type like any other, and where nothing
+// else has an opinion it is the only thing that can give a `{ case … }` its
+// pattern types. `scala/scala`'s `pos/t12899` reduced: the rules above must
+// not touch this one.
+
+trait Cache[K, V] { def load(k: K): V }
+
+object Kafi {
+  def build[K, V](): Cache[K, V] = null
+  def build[K, V](c: Cache[K, V]): Cache[K, V] = c
+
+  def mk(sq: Seq[String], cs: Class[_]): String = sq.mkString(",") + ":" + cs.getSimpleName
+
+  val c1: Cache[(Seq[String], Class[_]), String] = build {
+    case (sq, cs) => mk(sq, cs)
+  }
+}
+
 // -------------------------------------------------------------------- driver
 
 object Main {
@@ -168,5 +193,7 @@ object Main {
     import Instances._
     val a: Apl2[({ type L[x] = Kle[List, Int, x] })#L] = Kle.appForKle
     println(a.label)
+
+    println(Kafi.c1.load((Seq("x", "y"), classOf[String])))
   }
 }
