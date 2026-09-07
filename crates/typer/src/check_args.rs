@@ -1319,11 +1319,11 @@ impl Typer {
     ///   names, reachable through the *enclosing* class's `this` and not the
     ///   anonymous class's: "not a member of $anon$61".
     ///
-    /// The main call is emitted correctly in both shapes already (codegen
-    /// loads `MODULE$` for a module's member, and walks `$outer` for an
-    /// enclosing one); it is only the getter, which is built as a fresh
-    /// `Select` here, that needed the same prefix the method itself resolved
-    /// through.
+    /// The *main* call never needed a written qualifier -- codegen derives its
+    /// receiver from the method's owner -- so only the getter, built as a
+    /// fresh `Select` here, has to be given the prefix the method itself
+    /// resolved through. (The self-type shape was wrong in codegen as well,
+    /// which `gen_desc::outer_self_type_reaches` fixes.)
     fn default_getter_receiver(&mut self, fun: &Tree, getter_owner: SymbolId, span: Span) -> Tree {
         let recv = self.method_receiver(fun);
         if getter_owner.is_none() || !matches!(recv.kind, TreeKind::This { qual: None }) {
