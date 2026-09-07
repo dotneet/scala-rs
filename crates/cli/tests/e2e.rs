@@ -3155,3 +3155,32 @@ fn dynamic_explicit_type_arguments_reject_invalid_arguments_and_bounds() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+/// A deep, wide, diamond-shaped hierarchy whose printed `super` chain *is* its
+/// linearization. `crates/cli/tests/linearization.rs` additionally compares
+/// that output against real scalac 2.13.16; this keeps it in the main e2e
+/// sweep, where a truncated linearization shows up as a lost trait rather than
+/// as a compile failure.
+#[test]
+fn fixtures_linterm_diamond() {
+    check("linterm_diamond");
+}
+
+/// A cyclic `extends` graph is rejected, not compiled -- and, before that,
+/// terminates. The branching cycle in this fixture used to spin at 100% CPU
+/// for hours (see `crates/typer/src/lin.rs`).
+#[test]
+fn fixtures_linterm_cycle_bad() {
+    compile_fails(
+        "linterm_cycle_bad",
+        "illegal cyclic reference involving trait X",
+    );
+}
+
+/// A parent whose qualifier names nothing must be rejected rather than
+/// silently resolved to whatever shares the simple name -- which in cats was
+/// the enclosing trait, making it its own parent.
+#[test]
+fn fixtures_linterm_missing_prefix_bad() {
+    compile_fails("linterm_missing_prefix_bad", "illegal cyclic reference");
+}
