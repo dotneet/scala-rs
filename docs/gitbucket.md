@@ -1712,18 +1712,20 @@ All three are default-argument tests. It also caught an intermediate version
 of root 2 turning `neg/t4196` from rejected to accepted; see
 `docs/default-arguments.md`.
 
-## Not fixed: blocking-slick's conversions under `import profile.blockingApi._`
+## Fixed: blocking-slick's conversions under `import profile.blockingApi._` (`agent/implguard`)
 
-The largest single family left in gitbucket is ~170 diagnostics of the shape
+The largest single family in gitbucket was 205 diagnostics of the shape
 `value list / update / firstOption / insert / delete is not a member of
-Query[…]`. **The cause is known and reproduces in fifteen lines, and the fix is
-one guard.** It is written down here rather than landed.
+Query[…]`. **The cause reproduces in fifteen lines and the fix is one guard.**
+It is landed now; `tests/gitbucket_measure.sh` reports **785 → 717 errors**,
+`files_with_errors` unchanged at 103, in 7.7 s. cats (326/80), slick (0/0,
+1490 classes) and the scala library (1554/168) are bit-for-bit unchanged.
 
-The guard used to be unaffordable — it made `tests/gitbucket_measure.sh` more
-than fifty times slower. **That is no longer true**: it now costs nothing
-measurable, and it closes all ~170. What holds it back today is that turning it
-on exposes a *different*, independent root that costs more than it saves. Read
-this section in order; *The guard is affordable now* below is where that stands.
+The account below is kept in the order it was worked out, because two separate
+things had to be true before the guard could land and both of them are
+measurements someone will want again. *What is wrong* and *Why* are the defect;
+*The guard is affordable now* is the cost; *What landed, and what it uncovered*
+at the end is the merge and the audit of what appeared in its place.
 
 **What is wrong.** gitbucket reaches slick through
 `com.github.takezoe.blocking-slick`, whose `BlockingJdbcProfile.BlockingAPI`
@@ -1759,7 +1761,7 @@ rather than allocate a second one, and dropping it as stale left the class with
 no member of that name at all — and it no longer leaves the same symbol listed
 twice, which would make every selection on it ambiguous against itself.
 
-**Why the rest is not.** Guarding the `import_wildcard` loop with
+**Why the rest was not, at the time.** Guarding the `import_wildcard` loop with
 `pickle_readable` fixes the whole family: the eleven conversions are supplied
 with their pickled signatures, `q.list` / `q.map(_.name).update(3)` /
 `q.firstOption` all resolve, and a fifteen-line jar-backed reproduction goes
@@ -1857,13 +1859,13 @@ FlatShapeLevel, M6, U6, P6]`). A parameter solved only to a wildcard no longer
 counts as pinned. Fixtures: `tests/fixtures/implfilter.scala`,
 `crates/cli/tests/implfilter.rs`.
 
-**What blocks the guard now is a diagnostic, not a clock.** Turned on, it fixes
-the family exactly as predicted — `value list` 41 → 0, `delete` 47 → 0,
-`insert` 34 → 0, `firstOption` 29 → 0, `update` 14 → 0, **−170 in all** — and
-then loses more than it gains to *one* of the two independent roots listed
-below: `no implicit: could not find implicit value of type SessionDef`, **0 →
-194**, for a net `errors=895 → 1031`. So it is still not merged, and the reason
-has changed. Thirteen lines, no gitbucket checkout:
+**What blocked the guard after that was a diagnostic, not a clock.** Turned on
+at `main` `9739388f`, it fixed the family exactly as predicted — `value list`
+41 → 0, `delete` 47 → 0, `insert` 34 → 0, `firstOption` 29 → 0, `update`
+14 → 0, **−170 in all** — and then lost more than it gained to *one* of the two
+independent roots listed below: `no implicit: could not find implicit value of
+type SessionDef`, **0 → 194**, for a net `errors=895 → 1031`. `agent/backendtypes`
+fixed that root; the thirteen-line reproduction below no longer reports it.
 
 ```scala
 import com.github.takezoe.slick.blocking.BlockingH2Driver
@@ -1877,19 +1879,22 @@ class Accounts(tag: Tag) extends Table[(String, Int)](tag, "ACCOUNTS") {
 
 object T {
   val q = TableQuery[Accounts]
-  def all(implicit s: Session): List[(String, Int)] = q.list   // no implicit: SessionDef
+  def all(implicit s: Session): List[(String, Int)] = q.list
 }
 ```
 
-The `q.list` now resolves; its `implicit session: JdbcBackend#SessionDef`
-clause does not. The candidate in scope is `s : TypeMember(BasicBackend#Session)`
+At the time, `q.list` resolved but its `implicit session: JdbcBackend#SessionDef`
+clause did not. The candidate in scope is `s : TypeMember(BasicBackend#Session)`
 whose `bound_hi` is `BasicBackend#SessionDef`, and the wanted type is the
 *class* `slick/jdbc/JdbcBackend$SessionDef`. `is_sub_type` follows a
-`TypeMember`'s upper bound and correctly says no: the bound has to be read as
+`TypeMember`'s upper bound and correctly said no: the bound has to be read as
 seen from the concrete `BlockingH2Driver`, whose `backend` is `JdbcBackend`,
 and that is a type-member as-seen-from question in `SymbolTable`, not an
-implicit-search one. **That, and the `E#TableElementType` projection beside it,
-is what the next slice on this family owes.**
+implicit-search one. `agent/backendtypes` answered it. **On the tree this
+guard landed on, the same thirteen lines report
+`type mismatch; found: List[Any] required: List[(String, Int)]` instead** —
+the `E#TableElementType` projection below, which is now the only thing between
+this file and `nsc`'s answer.
 
 Two further roots were isolated on the way and are independent of the above;
 both reproduce in the same file
@@ -1903,7 +1908,119 @@ both reproduce in the same file
 * `Session` (slick's `Backend#Session`, an abstract type member bounded by
   `JdbcBackend.SessionDef`) does not conform to `SessionDef`, so every
   `implicit session: Session` parameter fails to answer a blocking-slick
-  member's `implicit session: JdbcBackend#SessionDef`.
+  member's `implicit session: JdbcBackend#SessionDef`. **Fixed** by
+  `agent/backendtypes`.
+
+### What landed, and what it uncovered (`agent/implguard`)
+
+The diff is two lines:
+
+```rust
+// crates/typer/src/check_name.rs, in `Typer::import_wildcard`
+if self.library_abi && self.pickle.pickle_readable(&self.st, cur) {
+// crates/typer/src/pickle_supply.rs
+pub(crate) fn pickle_readable(…)          // was private
+```
+
+**Why skipping the class is not a loss.** `import_wildcard` walks the same
+import several times over a compilation. On the first walk a `-cp` class that
+nothing has adopted is a stub, and asking it anything only memoizes a refusal;
+by the later walks the class has usually been adopted for an ordinary reason —
+in gitbucket, `class Accounts(tag: Tag) extends Table[…]` resolves a parent,
+which loads and adopts the API — and `pickle_readable` is then true, so the
+walk supplies the pickled signatures after all. Traced on blocking-slick: the
+refusal is at the first walk, the adoption at the second, and the eleven
+conversions arrive on the third.
+
+**The test.** `tests/multi/implicit_wildcard_binary` + `crates/cli/tests/implguard.rs`.
+The library half is compiled by real scalac, so the consumer sees only class
+files and nsc's pickle — the only setting the memo exists in. Getting the
+*ordering* right is the whole trick, and two shapes that look equivalent are
+not:
+
+* an `object api { implicit def … }` reached by `import glib.api._` compiles
+  **with and without the guard**, and so proves nothing: a top-level class's
+  members are already in the symbol table when the walk runs, so
+  `lookup_member` is non-empty and `supply_from_pickle_class` is never called;
+* the conversions have to be on a trait **nested** in another trait and reached
+  through a **value** (`Profile#API`, `val api: API`), which is the stub case,
+  *and* the consumer has to name something from the same import in a position
+  resolved before the bodies are typed (`class Sub extends Leafy(label)`), so
+  that the adoption really happens afterwards.
+
+Verified both ways round on this tree: with the guard reverted the fixture
+reports `value described is not a member of 3` and `value naming is not a
+member of 3`; with it, it compiles and `java Main` prints what nsc's own build
+of the same two files prints. `toNamed` carries an implicit clause on purpose —
+bytecode cannot say "implicit clause", so a conversion that fires proves the
+*pickled* signature is what got installed. `Bad_1.scala` pins the other side:
+`toPlain` is a plain `def` and `3.plainly` stays an error.
+
+**What the 785 → 717 is made of.** The whole `Query[…]` family goes to zero:
+
+| family | before | after |
+|---|---:|---:|
+| `value list is not a member of Query[…]` | 56 | **0** |
+| `value delete …` | 47 | **0** |
+| `value update …` | 37 | **0** |
+| `value insert …` | 34 | **0** |
+| `value firstOption …` | 31 | **0** |
+| `type mismatch` | 33 | 85 |
+| `value … is not a member of …` (all other) | 177 | 221 |
+| `no matching overload` | 92 | 129 |
+| `no implicit: CanBeQueryCondition` | 46 | 48 |
+| `no implicit: OptionLift` | 17 | 21 |
+
+**The 52 new `type mismatch`es are one root, and it is the one named above.**
+55 appear, 3 disappear. 48 of the 55 are on a line that already carried an
+error; the other 7 are one or two lines below one. Every one of them is a
+query result whose *element* type is `Any`:
+`found: List[Any] required: List[AccessToken]`,
+`found: Option[Any] required: Option[Account]`,
+`found: List[(Any, Any)] required: List[(CommitStatus, Account)]`, and so on
+through 21 of gitbucket's `service/` files. That is
+`class TableQuery[E <: AbstractTable[_]] extends Query[E, E#TableElementType, Seq]`
+with `E#TableElementType` uncomputed — the first of the two roots listed just
+above, which was already visible in the *old* messages
+(`value list is not a member of Query[Issues, Any, Seq]`: the `Any` is the same
+`Any`). Before the guard those calls stopped at "not a member"; now they get
+one step further and the wrong element type is what fails.
+
+Three of the 55 do not mention `Any` themselves —
+`RepositoryService.scala:193/195/202`, `found: RepositoryInfo required: String`
+and friends. They are the argument list of one `new RepositoryInfo(…)` whose
+second argument is the `Any` on line 194: the overload was selected against a
+wrong argument type and the remaining positions then mismatch. Same root, one
+expression.
+
+**One file that was clean is not any more**, and it is worth being precise
+about, because it is the only candidate for a regression:
+`service/IssueCreationService.scala:41`, `type mismatch; found: Any required:
+Issue`. It reads `val issue: Issue = getIssue(owner, name, issueId.toString).get`,
+and `IssuesService.getIssue` has **no declared result type**:
+
+```scala
+def getIssue(owner: String, repository: String, issueId: String)(implicit s: Session) =
+  if (isInteger(issueId))
+    Issues filter (_.byPrimaryKey(owner, repository, issueId.toInt)) firstOption
+  else None
+```
+
+Before the guard, `Issues filter (…)` collapsed to `Nothing` — that is where
+the 15 `value issueId is not a member of Nothing` in the old log came from —
+`.firstOption` on `Nothing` is accepted, the inferred result was `None.type`,
+and `.get` on it is `Nothing`, which conforms to `Issue`. So the line was never
+*right*; it was accepted because a sub-expression had already given up. With
+the guard the same method infers `Option[Any]` and the caller is told. `nsc`
+infers `Option[Issue]` and will once `E#TableElementType` is computed.
+`GpgUtil.scala` becomes clean in the same measurement, so `files_with_errors`
+stays at 103.
+
+**Nothing here is a case we used to get right.** No message changed from a
+correct acceptance to a rejection, and the `… is not a member of Nothing`
+group (15 `issueId`, 10 `title`, 8 `openedUserName`, …) is replaced one for one
+by the same messages saying `Any`, which is the type slick's signature really
+gives without the projection.
 
 ## Fixed: a concrete backend's type members (`agent/backendtypes`)
 

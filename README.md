@@ -54,6 +54,15 @@ scalac 2.13.16 と比較します。集合の結合も含む
 どちらも診断結果を変えず、コストだけを下げます。検証は `implfilter` テストと
 [docs/gitbucket.md](docs/gitbucket.md) を参照してください。
 
+ワイルドカード import は、まだ pickle を読んでいないクラスに問い合わせません。
+問い合わせると `PickleSupply` が拒否を恒久的に記憶してしまい、直後に同じクラスを
+読み込む `adopt_binary_class` がその記憶を受け取るため、jar 側の `implicit def` が
+「implicit と書かれていない普通のメソッド」として暗黙スコープに残り、決して選ばれ
+なくなります（バイトコードに implicit は記録されません）。スキップしたクラスは、
+別の理由で読み込まれたあとの同じ import の再走査で改めて供給されます。
+scalac がコンパイルした jar に対する検証は `implguard` テスト
+（`tests/multi/implicit_wildcard_binary`）を参照してください。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

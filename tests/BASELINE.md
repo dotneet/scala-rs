@@ -32,14 +32,12 @@ Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
 
-`agent/implicitfilter` is measurement-neutral on all four compile measures by
-design: it exists to make the `import_wildcard` `pickle_readable` guard
-affordable, and that guard is **still off**. With the pre-filter the 191-file
-gitbucket reproduction went from over 600 s to 14.4 s and the full 353-file
-measure to 6.3 s, so timing is no longer what blocks the guard. Turning it on
-now closes the `Query` family (−170) and loses +194 to the
-`BasicBackend#Session` as-seen-from root, which is a separate slice's work.
-See `docs/gitbucket.md`.
+`agent/implicitfilter` was measurement-neutral on all four compile measures by
+design: it existed to make the `import_wildcard` `pickle_readable` guard
+affordable. **That guard is on now** (`agent/implguard`, the section below),
+and it is what takes gitbucket from 785 to 717. With the pre-filter the
+191-file gitbucket reproduction went from over 600 s to 14.4 s; the full
+353-file measure runs in **5.3 s with the guard on**.
 
 `agent/catseta` costs gitbucket **+4**, reported rather than hidden: with
 `acc: Map[A, Set[A]]`, `acc.getOrElse(e._1, Set())` now infers `Set[_ <: A]`
@@ -56,7 +54,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **303** | **78** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **785** | **103** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **717** | **103** | — |
 | `tests/scalalib_measure.sh` (538) | **1553** | **168** | — |
 
 ## Execution
@@ -155,20 +153,35 @@ turned up **four more classes broken the same way that verify cleanly** --
 merely infinite recursion. **A verifier's failure count is a lower bound on
 miscompilation**, not a measure of it.
 
-## The `import_wildcard` guard is ready and is not in yet (2026-09-07)
+## The `import_wildcard` guard landed (`agent/implguard`, 2026-09-07)
 
-`docs/gitbucket.md` has blocked the `pickle_readable` guard on
-`Typer::import_wildcard` for several waves, for two reasons that are now both
-gone: `agent/implicitfilter` removed the 50x cost, and `agent/backendtypes`
-fixed the `BasicBackend#Session` root that the guard used to trip over. The
-coordinator applied it to this tree as a two-line experiment and measured
-**gitbucket 785 -> 717 in 11.6 s** with cats, slick and the library measure all
-unchanged; the whole `value list / delete / insert / firstOption / update /
-returning is not a member of Query[...]` family (151 errors) disappears and 52
-new `type mismatch` errors appear behind it, from code that now types far
-enough to fail later. The experiment was reverted; `agent/implguard` is landing
-it with a test that actually distinguishes the two binaries and an audit of the
-52.
+`docs/gitbucket.md` had blocked the `pickle_readable` guard on
+`Typer::import_wildcard` for several waves, for two reasons that are both gone:
+`agent/implicitfilter` removed the 50x cost, and `agent/backendtypes` fixed the
+`BasicBackend#Session` root that the guard used to trip over.
+
+Measured on `agent/implguard` after merging `main` at `15bee7f9`:
+**gitbucket 785 -> 717 errors, `files_with_errors` unchanged at 103, in 5.3 s**,
+with cats (303/78), slick (0/0, 1490 classes) and the scala library (1553/168)
+bit-for-bit unchanged. The whole `value list / delete / insert / firstOption /
+update is not a member of Query[...]` family — 205 errors on this tree — goes
+to zero; 52 net new `type mismatch` errors appear behind it, from code that now
+types far enough to fail later.
+
+The 52 were audited, not assumed: every one is a query result whose element
+type is `Any`, because `TableQuery[E] extends Query[E, E#TableElementType, Seq]`
+and that projection is still not computed — the same `Any` the *old* messages
+already printed (`value list is not a member of Query[Issues, Any, Seq]`). One
+file that was clean gains one error (`IssueCreationService.scala:41`), and it
+is a cascade through an inferred result type that used to be `None.type`
+because the query body had collapsed to `Nothing`. Nothing that used to be
+right became wrong. `docs/gitbucket.md`, *What landed, and what it uncovered*.
+
+The test is `tests/multi/implicit_wildcard_binary` + `crates/cli/tests/implguard.rs`:
+real scalac compiles the library, scala-rs the consumer, and the fixture was
+verified to **fail on the unguarded binary and pass on the guarded one**. The
+ordering is load-bearing — an `object api { implicit def … }` reached by a
+wildcard import compiles either way and proves nothing.
 
 ## What is deliberately red
 
