@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `b15df464` |
+| commit | `4d613d25` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Twenty-seven slices have merged this session**, in nine composed gates. From
+**Twenty-nine slices have merged this session**, in ten composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -32,6 +32,7 @@ coordinator measured the merged tree each time, not the branches.
 | `54df4d43` | `gbmapto`, `basetypeseq`, `catstail`, `gbshape` | -> 337 | -> 196 |
 | `f4b829ec` | `mapto2`, `impprio`, `sortedmap`, `gbopt` | -> 270 | -> 188 |
 | `b15df464` | `anyconstr`, `libmaxmin` | 270 | -> 185 |
+| `4d613d25` | `libcaseeq`, `libanyval` | 270 | 185 |
 
 Four of those fifteen move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -185,6 +186,34 @@ ledger from eleven gates ago and still printed `VERDICT=PASS`. The ledger is
 now read from the name recorded in this file, and one that cannot be resolved
 is a `FAIL`. The `gate:` line prints which ledger was used.
 
+The tenth gate finished the library wave: **1554 -> 1111 errors, 168 -> 155
+files** across four slices, and both of this gate's two corrected the brief
+they were given.
+
+* **`agent/libcaseeq`** — the backend always emitted `canEqual`; the *typer
+  symbol* was missing. It is invisible in jar mode because `scala.Equals`
+  arrives from a pickle and `override_check::modifiers_are_known` suppresses
+  its modifiers, so the deferred member reads as implemented; only a run that
+  compiles `Equals` from source exposes it. The audit it was asked for was
+  worth more than the 28: against scalac's `-Xprint:typer`, three further gaps
+  are now recorded in `docs/comparison-with-scalac.md` — the companion's
+  `writeReplace`, the class-side static forwarders, and **a case class's
+  `hashCode`, which is a 31-fold where nsc uses MurmurHash3** and so returns a
+  different number at run time. 333 slick class files change, in the
+  `ScalaSignature` only; every one was decoded and shown to have gained
+  `canEqual` and lost nothing, and `javap -p -c` is identical for all 1490.
+* **`agent/libanyval`** — **only 1 of the 34 errors was about the top of the
+  hierarchy.** The other 33 were `override_check::same_type` answering "same
+  type" for any pair mentioning a type parameter, so `MapOps.concat[V2]` read
+  as *overriding* `IterableOps.concat[B]` instead of overloading it. Nothing
+  was held out: `Any.scala` and its neighbours live in `src/library-aux`,
+  which the measure never compiled. Its corpus gains include `neg/t3854`, a
+  program we used to accept. Three of its own attempts regressed cats (188 ->
+  197) or gitbucket (270 -> 285) where the library count alone showed an
+  improvement — the other two measures are what caught them. It also stopped
+  the backend bridging an overload, which had been emitting a `checkcast` and
+  throwing `ClassCastException` where scalac emits a mixin forwarder.
+
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -212,7 +241,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **185** | **71** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **270** | **79** | — |
-| `tests/scalalib_measure.sh` (538) | **1173** | **157** | — |
+| `tests/scalalib_measure.sh` (538) | **1111** | **155** | — |
 
 ## Execution
 
@@ -228,12 +257,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1088** | 426 | 345 |
-| `neg` (1405) | **673** | 363 | 369 |
+| `pos` (1859) | **1089** | 425 | 345 |
+| `neg` (1405) | **674** | 362 | 369 |
 | `run` (2060) | **618** | 889 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-b15df464.tsv`](baselines/corpus-b15df464.tsv): 5324 unique
+[`baselines/corpus-4d613d25.tsv`](baselines/corpus-4d613d25.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -268,7 +297,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-b15df464.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-4d613d25.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -295,7 +324,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **249 result rows, 2418 passed, 0 failed** at `b15df464` |
+| `cargo test --workspace --release --no-fail-fast` | **250 result rows, 2428 passed, 0 failed** at `4d613d25` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
