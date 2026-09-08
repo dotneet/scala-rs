@@ -922,6 +922,193 @@ measured at zero; neither is in the change.
 See the slice's report for the full table; every measure other than the
 library is unchanged to the error.
 
+## The `agent/libnotype` slice: `<notype>` was three roots, and only one owed a diagnostic
+
+**1111 errors in 155 files → 1024 in 150**, measured on this branch against the
+`8f1df474` branch point. The `<notype>` cluster went **56 → 6**. gitbucket
+`270 / 79`, cats `185 / 71` and slick `errors=0 classes=1490` are unmoved.
+
+The brief handed this slice 48 errors under two headings — 18 `value + is not a
+member of <notype>` and 11 `value min` — and asked "why does the receiver have
+no type at all, and why was nothing reported where it was lost?". Instrumenting
+the one report site (`check_select.rs`, printing the qualifier's *symbol* when
+its type is `NoType`) answered it in one run of the measure, and the answer was
+that the 56 errors had three unrelated causes with three different answers to
+the second half of the question.
+
+| receiver, as the symbol table had it | errors |
+|---|---:|
+| `Math` / `Runtime`, `kind=Package`, `jvm="scala/Math"` | 26 |
+| `newCachedHashCode` / `dataToNodeMigrationTargets`, a local `var` | 26 |
+| `accum`, a local `val` | 35 |
+
+The third row is larger than its share of the `<notype>` count because most of
+what it removed says something else (`no matching overload for constructor ::`).
+
+### 1. A directory classpath entry was matched case-insensitively
+
+`jvm="scala/Math"` is the whole diagnosis. `Typer::complete_binary_member`
+treats a directory under a package as proof that a *package* of that name
+exists:
+
+```rust
+if self.binary.has_package_prefix(&prefix) {
+    let _ = crate::classpath::ensure_package(&mut self.st, &internal);
+    return;
+}
+```
+
+and `BinaryIndex::has_package_prefix` answered that with `path.join(rel).is_dir()`.
+macOS's default APFS volume is case-insensitive, and
+`tests/scalalib_measure.sh`'s Java classpath really does contain
+`scala/math/ScalaNumber.class` and `scala/runtime/BoxesRunTime.class` — so
+`<cp>/scala/Math` and `<cp>/scala/Runtime` were directories, `package
+scala.Math` and `package scala.Runtime` were invented, and because the search
+order is `scala` first and *then* the implicit `import java.lang._`, they
+shadowed `java.lang.Math` and `java.lang.Runtime` for the whole run. Every
+`Math.min` / `Math.max` / `Math.nextAfter` / `Math.multiplyExact` /
+`Runtime.getRuntime` in `src/library` then selected on a package.
+
+Nothing was reported where the name was lost, because as far as the typer was
+concerned nothing had failed. The only diagnostic in the run came from the
+*backend* — `cannot load Math`, for the one occurrence in a value position.
+
+`java.lang.Math.max(1, 2)` worked throughout, and so did bare `Integer`,
+`String`, `System`, `Thread`, `Character`, `StrictMath` and `Class`: this only
+ever hit a `java.lang` class whose name collides case-insensitively with a
+`scala.*` package on the classpath. It also only ever hit the `--no-scala-library`
+arrangement, because the jar entries a zip is asked about are matched exactly.
+
+Both directory lookups in `BinaryIndex` — the package prefix and the class file
+— now verify the on-disk spelling of every component (`path_case_matches`).
+It runs only after the cheap `is_dir()`/`is_file()` has said yes, and
+`find_class` memoises, so the cost is bounded by the number of distinct names
+actually found on a directory entry.
+
+### 2. A blank line before a bare block was read as an argument list
+
+nsc's scanner distinguishes `NEWLINE` from `NEWLINES` (`Scanners.pastBlankLine`),
+and `newLineOptWhenFollowedBy(LBRACE)` skips only the former. So in real scalac
+2.13.16
+
+```scala
+g
+{ 41 }          // an application: g { 41 }
+
+g(1)
+
+{ 41 }          // two statements
+```
+
+Our lexer collapsed every run of line breaks into one `Newline` token, so both
+were applications — and `HashMap.concat` and `HashSet.concat` are written as
+
+```scala
+var newCachedHashCode = 0
+
+{
+  …
+  newCachedHashCode += newNode.cachedJavaKeySetHashCode
+```
+
+which parsed as `0 { … }`. The `var` took the failed application's type, and
+all 18 `+=` and both `|=` beneath it reported on `<notype>`.
+
+Here an error *was* printed — `value apply is not a member of 0`, at the `var` —
+so this family was not silent. It was worse than silent in a different way: the
+message describes a program the author did not write, at a line where nothing
+is wrong.
+
+`Token` now carries `blank_line`, set in `Lexer::emit` by the same rule nsc
+uses (scan back over whitespace from the `\n`; a comment counts as content,
+because nsc scans raw characters and `/` is not whitespace), and OR-ed across a
+run when `drop_non_separating_newlines` collapses it. `simple_expr_rest` stops
+its application loop at a blank line.
+
+Deliberately **not** changed: `newline_opt_when_followed_by`, which the
+template and `extends` parsers use. nsc rejects `class A` + blank line + `{ … }`
+too (checked against real scalac), so being faithful there would turn programs
+this compiler currently accepts into errors, with nothing to gain in any
+measure. Worth doing on its own if the `neg` corpus ever asks for it.
+
+### 3. `new X` was resolved in the term namespace
+
+The unqualified-`Ident` arm of `TreeKind::New` used `SymbolTable::lookup`,
+which returns the innermost scope that binds the name *at all*. `HashMap.concat`
+writes
+
+```scala
+class accum extends AbstractFunction2[K, V1, Unit] with Function1[(K, V1), Unit] { … }
+…
+val accum = new accum
+```
+
+and in the nested block the nearest `accum` is the `val` being defined. No
+`Class` among the candidates, so the arm fell through to
+`self.type_expr(tpt, &Type::NoType)` — typing `accum` as an *expression*, which
+found the half-built value and handed back its `NoType`. **This is the one of
+the three where a diagnostic really was owed and never came**: the search
+failed and the tree was left typed as if it had succeeded, which is exactly the
+shape `agent/gbhead` recorded above.
+
+`lookup_type` skips a scope that binds the name only as a term, by
+construction, so the fix is to consult it when the plain lookup found nothing
+in the type namespace. That also fixes the same collision in `List.scala`,
+where `List` declares `def ::` and the class `::` is top-level: `new ::(x, xs)`
+had been finding the method. 35 errors, of which only 2 mentioned `<notype>` —
+the rest were `no matching overload for constructor ::`, `type mismatch; found:
+::[Nothing]`, and `value next is not a member of ::[Nothing]`.
+
+The narrow shape matters. `found` is replaced only when it holds no
+`Class`/`TypeParam`/`TypeMember` at all, so the `only_module` path
+(`object O` alone under the name, which nsc reports as `not found: type O`) and
+the `class type required but T found` path are untouched, and both are pinned
+in `tests/fixtures/libnotype_bad.scala`.
+
+### Verification
+
+`tests/fixtures/libnotype.scala` **executes and prints**, against the private
+runtime and against the real library ABI, and its expected output is real
+scalac 2.13.16's from compiling the same source. `libnotype_bad.scala` is
+rejected at three of scalac's own four lines — 12 (the blank-line one: if the
+blank line did not end the expression, `one { (x: Int) => x }` is well typed
+and the file compiles clean), 16 and 19. Line 10, scalac's `missing argument
+list for method one`, is a separate pre-existing laxity about eta-expansion in
+this compiler and is not asserted. All four tests in
+`crates/cli/tests/libnotype.rs` fail on a build of the branch point.
+
+No error kind in the library log went **up**, and no new kind appeared — which
+is unusual for a cascade fix and is worth saying, because it means none of the
+87 was hiding a further error.
+
+### What is left of `<notype>`
+
+Six: 2 `ambiguous overload for processFully with arguments ((<notype>) =>
+<notype>)` (the deliberate placeholder for a literal whose parameter types are
+not yet known — `check_overload.rs` documents it), 2 `type Partial is not a
+member of <notype>` (`BigDecimal.scala`'s `Range.Partial[…]`), 1 `type
+BigDecimalAsIfIntegral is not a member of <notype>` (`Range.scala:608`,
+`Numeric.BigDecimalAsIfIntegral`) and 1 `type mismatch; found: <overload Int |
+<notype>>`. The middle two are the *type* namespace's version of the same
+question and were not investigated here.
+
+### The head of the library afterwards
+
+| n | message |
+|---:|---|
+| 15 | `type mismatch; found: <overload Stream[A] \| Iterable[A] \| Stream[A]>  required: Stream[A]` |
+| 13 | `type mismatch; found: T  required: A` |
+| 13 | `no matching overload for (MainNode[K, V], …)Boolean` |
+| 9 | `value & is not a member of Boolean` |
+| 9 | `incompatible type in overriding` |
+| 8 | `type mismatch; found: null  required: A` |
+| 8 | `reassignment to val initBlank` |
+| 8 | `no matching overload for <overload (Array[Long], Long)Unit \| …>` |
+| 7 | `value -> is not a member of TimeUnit` |
+| 7 | `type mismatch; found: Array[Nothing]  required: Array[Array[AnyRef]]` |
+| 7 | `type mismatch; found: ((K, V)) => U  required: (K) => Any` |
+| 7 | `could not optimize @tailrec annotated method` |
+
 ## What to do next, in order
 
 0. **`->` when two conversions offer it — 28 errors, 3 files.** The twelve-line
