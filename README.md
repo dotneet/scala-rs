@@ -62,6 +62,17 @@ makes no claim of conformance to the language specification. What exists today:
 値引数が型パラメータに触れない `scala/collection/concurrent/TrieMap.scala` の
 `CNode.renewed` などでは `C[Nothing, Nothing]` になっていました。
 
+Type arguments written on an **overloaded** callee now instantiate every
+alternative before applicability is weighed, which is SLS 6.26.3 and nsc's
+`Infer.inferPolyAlternatives`; they used to arrive only after an alternative
+had been picked, so each alternative re-inferred its own instantiation from
+the value arguments. A written `new C[…]` is also checked against the class's
+declared bounds (nsc's refchecks `checkBounds`) and for having the right
+*number* of arguments — only the over-applied direction was reported before.
+The tests are `overscore` (`tests/fixtures/ovsc_*.scala`), and
+`ovsc_legal.scala` is the guard that the two new rejections do not reach legal
+code.
+
 `case class` に合成する `hashCode` は、`--scala-library` では nsc と**同じ値**に
 なりました。以前は両モードとも 31 倍で畳んでいたため、`Point(1, "a").hashCode` が
 scalac の `-1322997830` に対して `128` になり、自前の `equals` とは整合するものの、

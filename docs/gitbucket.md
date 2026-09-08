@@ -3037,6 +3037,72 @@ worth a slice of their own.
   plain `final class` and not a value class. The typer defect is identical
   either way.
 
+## Fixed: explicit type arguments did not reach the overload pick (`agent/overscore`)
+
+**271 / 80 -> 270 / 79**, and the diff of the two error logs is exactly one
+line, at the site the brief named. This closes the session's one *stated, not
+netted* regression.
+
+`EditorConfigUtil.scala:129` writes
+
+```scala
+props.getValue[Integer](PropertyType.tab_width, TabSizeDefault, false)
+```
+
+against ec4j's two **public** overloads `(PropertyType[T], T, boolean)T` and
+`(String, T, boolean)T`. `agent/triemapjava` made `tab_width` a genuine
+`PropertyType[Integer]` by reading the Java field's `Signature` attribute, and
+the call then reported `no matching overload … with arguments
+(PropertyType[Integer], Int, false)`.
+
+The diagnosis in `docs/scala-library.md` was that overload *scoring* ignores
+the boxing conversion. **It does not** — the measurement says so. Two
+candidates with an `Int` argument for a `java.lang.Integer` parameter resolve
+perfectly well:
+
+```scala
+object Ov4 {
+  def f(p: String, d: Integer): Integer = d
+  def f(p: Boolean, d: Integer): Integer = d
+}
+Ov4.f("x", 4)     // compiles, before this slice and after
+```
+
+`arg_conforms` already has a two-phase applicability test — without views,
+then with — and the second phase finds `Predef.int2Integer` like any other
+view. What was actually missing is one step earlier. `is_applicable` called
+`infer_method_tparams` on every alternative and **ignored the type arguments
+the caller wrote**, so with `[Integer]` written and a `4` for the second
+parameter, `T` was inferred as the least upper bound of `Integer` and
+`scala.Int` — `Any`. `PropertyType` is invariant, so the first alternative was
+rejected on its *first* argument; the second wants a `String` there. Both
+gone, and the boxing never got a chance to matter. A debug print of
+`is_applicable`'s instantiated parameters settled this in one run:
+
+```
+DBG is_applicable getValue params=["P[Any]", "Any", "Boolean"] args=["P[Integer]", "4", "false"]
+DBG is_applicable getValue params=["String", "Int", "Boolean"]  args=["P[Integer]", "4", "false"]
+```
+
+nsc has no such gap: `Infer.inferPolyAlternatives` applies the written
+arguments to every alternative before applicability is weighed, which is SLS
+6.26.3's "explicit type arguments *are* the instantiation". `is_applicable`
+now takes them and substitutes instead of inferring, for exactly the
+alternatives that take as many type parameters as were written.
+
+Why it looked like a boxing problem: with the default already an `Integer`,
+inference agrees with the written argument and the call resolves; with only
+one candidate there is no applicability gate to fail, because a lone
+alternative is adapted rather than scored. Only a *pair* plus an argument that
+disagrees with the written instantiation fails, and boxing is merely the most
+common reason for two argument types to disagree. `tests/fixtures/ovsc_targs.scala`
+is the reduced form, and it prints *which* alternative ran — picking the wrong
+one is a run-time defect, not a compile-time one.
+
+All 1490 slick class files are byte-identical to the ones the same tree
+without this change emits, and the full scala/scala corpus reports `losses=0`
+with **no row changed at all**.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes

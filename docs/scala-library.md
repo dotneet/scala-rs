@@ -2757,6 +2757,106 @@ Expected non-static field`.
 `tests/fixtures/java/tmjava/JBase.java` with javac and reads it back as a
 class file, the way `tests/multi/` fixtures do it and the way the measurement
 itself gets the library's Java sources.
+
+## The `agent/overscore` slice: three of the four `triemapjava` left on the list
+
+Three of the four "found here, not fixed here" items above are one
+neighbourhood -- what overload resolution and `new` are willing to accept --
+and all three made the compiler answer where it should not. All three are
+closed. `crates/cli/tests/overscore.rs`, six tests, fixtures `ovsc_targs`,
+`ovsc_bounds_bad`, `ovsc_targcount_bad`, `ovsc_legal`.
+
+The library measure is **740 / 138 both before and after, with a
+byte-identical error log** -- this slice's yield is elsewhere (gitbucket 271
+-> 270) and its risk is here, which is why the log was diffed rather than the
+count compared.
+
+### The overload item was not about boxing
+
+The list above says "overload scoring ignores the boxing conversion". That is
+wrong, and one six-line program says so: two candidates with an `Int` argument
+for a `java.lang.Integer` parameter already resolve, because `arg_conforms`
+falls back to `search_conversion` and finds `Predef.int2Integer`. The real gap
+is one step earlier -- `is_applicable` ignored the type arguments the caller
+*wrote* and re-inferred each alternative's instantiation from the value
+arguments, so `getValue[Integer](p: PropertyType[Integer], 4, false)` solved
+`T` to `lub(Integer, Int)` and the invariant `PropertyType` sank the
+alternative on its *first* argument. nsc applies written arguments first
+(`Infer.inferPolyAlternatives`, SLS 6.26.3). The full working is in
+`docs/gitbucket.md` under "Fixed: explicit type arguments did not reach the
+overload pick"; it is recorded there because that is where it was measured.
+
+**The lesson is the one this file already carries twice**: a diagnosis in a
+brief is a hypothesis. This one had a plausible mechanism, a reproduction, and
+a correct prediction of the yield, and was still about the wrong function. A
+debug print of `is_applicable`'s instantiated parameter types cost one build
+and settled it.
+
+### Constructor type-argument bounds, and the one error the first attempt cost
+
+`new Bounded2[Int, String]` for `class Bounded2[K <: AnyRef, V]` compiled.
+`check_infer::check_class_tparam_bounds` is the class-side twin of the
+existing `check_tparam_bounds`, called from the `New` path in `check_expr`,
+and it draws the same message scalac's refchecks does.
+
+Two things had to be got right, and the measurement found both:
+
+* **A higher-kinded parameter's bound is not a proper type.**
+  `SortedMapOps.WithFilter[K, V, IterableCC, MapCC[X, Y] <: Map[X, Y], …]` --
+  the bound is written in `MapCC`'s *own* arguments, so asking `is_sub_type`
+  about it is not the right question. The first version of the check did ask,
+  and `scala/collection/Iterable.scala:1044` became a 741st library error.
+  nsc asks a different question there (`checkKindBounds`), and `apply_types`
+  already answers the kind half. Higher-kinded parameters are now skipped.
+* **`mentions_any_tparam` does not reach inside a `with` type.** The same
+  declaration's `CC <: Map[X, Y] with SortedMapOps[X, Y, CC, _]` is a
+  `Type::Refined`, which that helper has no arm for, so a bound that plainly
+  mentions two type parameters read as ground. The local
+  `bound_mentions_tparam` covers `Refined`, `BoundedWildcard` and
+  `SingleType`; widening the shared helper would have changed the *method*
+  bounds path, which this slice did not measure.
+
+Only *written* arguments are checked. An un-applied `new C` carries the
+class's own parameters as placeholders, and those satisfy their own bounds by
+construction, so it passes silently; inferred arguments are still unchecked,
+which nsc does check and a later slice could take.
+
+### The under-applied type-argument list
+
+`apply_types` reported `ctor_arity < args.len()` and nothing for the other
+direction, so `new Cell[K]` for a two-parameter `Cell` kept the one argument
+it had and filled the rest with the class's own parameters. Scala 2 has no
+partial application of a type constructor; nsc says `wrong number of type
+arguments for X, should be N`, and so does this compiler now. Worth nothing on
+any measure -- rejecting a program nobody in the four corpora writes is the
+whole yield, which is why `ovsc_targcount_bad.scala` pins the message and the
+line and `ovsc_legal.scala` exists at all.
+
+### The over-reach guard
+
+`ovsc_legal.scala` is seven legal `new`s, each sitting next to something the
+two new checks refuse: a bound that is met, a bound stated in another
+parameter (`class Pair[A, B <: A]`), a higher-kinded bound, a bound behind a
+`with` type, an existential argument, and the `agent/triemapjava` shape
+`new Self[K, V]` written from inside `Self`. The **pre-fix binary compiles it
+to byte-identical class files and prints the same seven lines**, which is the
+claim a rejection rule needs and a count cannot make.
+
+### Found here, not fixed here
+
+* **An `F[A]` field is read without a cast to the applied constructor.**
+  `class Holder[F[X] <: Boxy[X], A](val f: F[A])`, then
+  `new Holder[OneBox, Int](new OneBox(3)).f.get`, emits a `getfield get` on
+  `OneBox` with a `Boxy` on the stack and the JVM verifier rejects the method:
+  `VerifyError: Bad type on operand stack`. `F[A]` erases to `F`'s bound and
+  the read is never cast to `OneBox`. Entirely pre-existing -- the pre-fix
+  binary emits the identical bad method -- in both `--scala-library` and
+  private-runtime modes, and no compile-time measure can see it. It is why
+  `ovsc_legal.scala` builds its `Holder` and then declines to read the field
+  back.
+* **Java statics are still inherited into a Scala subclass's scope.** Untouched
+  by this slice; see the `triemapjava` list above.
+
 ## The `agent/hkbound` slice: an applied abstract constructor is at least its bound
 
 **852 errors in 145 files -> 807 in 142.** The brief handed this slice one

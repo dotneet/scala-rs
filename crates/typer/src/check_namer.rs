@@ -654,6 +654,30 @@ impl Typer {
             }
             return Type::Error;
         }
+        // The other direction. Scala 2 has no partial application of a type
+        // constructor, so `new Cell[K]` for `class Cell[K, V]` is an error
+        // (`wrong number of type arguments`), and only the *over*-applied case
+        // was reported here: an under-applied list silently kept whatever
+        // arguments it had and filled the rest with the class's own
+        // parameters, so `new Cell[K](…)` built a `Cell[K, V]` naming a `V`
+        // the caller never chose.
+        //
+        // Not inside a type *pattern*: `case _: Map[_, _]` reaches here fully
+        // applied, but a pattern's expected type can leave a constructor with
+        // no arguments at all, and `args.is_empty()` has already returned
+        // above. Nor for a bare wildcard argument, which is the existential
+        // spelling and not a partial application.
+        if ctor_arity > args.len() {
+            self.error(
+                span,
+                format!(
+                    "wrong number of type arguments for {}, should be {}",
+                    self.st.display_type(&ctor),
+                    ctor_arity
+                ),
+            );
+            return Type::Error;
+        }
         let expected = self.st.tparam_arities(&ctor);
         for (i, a) in args.iter().enumerate() {
             let exp = expected.get(i).copied().unwrap_or(0);
