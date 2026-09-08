@@ -1197,11 +1197,7 @@ impl Typer {
                 // `members_including_inherited` once the header pass has
                 // resolved every unit's parents for real.
                 let mems = self.st.get(cls).members.clone();
-                for mem in mems {
-                    if !self.st.get(pkg).members.contains(&mem) {
-                        self.st.get_mut(pkg).members.push(mem);
-                    }
-                }
+                self.st.fold_package_object_members(pkg, &mems);
                 self.pending_pkg_folds.push((pkg, cls));
             }
         }

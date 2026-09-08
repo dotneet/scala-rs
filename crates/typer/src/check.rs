@@ -840,11 +840,7 @@ pub fn typecheck_units_src(
     // ran.
     for (pkg, cls) in std::mem::take(&mut t.pending_pkg_folds) {
         let mems = t.st.members_including_inherited(cls);
-        for mem in mems {
-            if !t.st.get(pkg).members.contains(&mem) {
-                t.st.get_mut(pkg).members.push(mem);
-            }
-        }
+        t.st.fold_package_object_members(pkg, &mems);
     }
     // After the header pass: loading `scala.collection.IterableFactory` pulls
     // in the `scala` package object, and doing that before any source has
