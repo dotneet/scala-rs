@@ -255,6 +255,17 @@ impl Typer {
                 // to load into the pattern, and `load_symbol` fell through to
                 // `throw new RuntimeException("cannot load X")` -- a stub in
                 // the middle of a method that compiled without a word.
+                // A stable-id pattern is a *reference*, so SLS 2's ambiguity
+                // between a definition and an import nested more deeply than
+                // it applies here too: `case PrimaryKey =>` under
+                // `import ColumnOption._` inside a class that declares
+                // `PrimaryKey` is the first of the two errors scalac reports
+                // in `neg/name-lookup-stable`. A lowercase name is a fresh
+                // binding and refers to nothing.
+                if !is_varid {
+                    let name = name.clone();
+                    self.report_defn_import_ambiguity(&name, pat.span);
+                }
                 if let Some(sym) = stable.filter(|_| !is_varid) {
                     if !self.st.is_term_namespace_sym(sym) {
                         self.error(

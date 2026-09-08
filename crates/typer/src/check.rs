@@ -308,6 +308,13 @@ pub struct Typer {
     /// source position rather than by a counter so that the several passes
     /// over a unit agree about which clause a binding came from.
     pub(crate) import_origin: u64,
+    /// The source text of each `import` clause, keyed by its
+    /// [`Self::import_origin`]. nsc's "reference to X is ambiguous" prints
+    /// the clause itself on its third line ("import ColumnOption._"), and a
+    /// `Binding` records only *which* clause it was; the text is kept here
+    /// rather than on the binding so that nothing but the diagnostic pays for
+    /// it.
+    pub(crate) import_text: HashMap<u64, String>,
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     pub(crate) sigs_only: bool,
@@ -915,6 +922,7 @@ impl Typer {
             open_pkgs: HashMap::new(),
             unit_pkg_defs: HashMap::new(),
             import_origin: 0,
+            import_text: HashMap::new(),
             sigs_only: false,
             header_pass: false,
             strict_type_names: false,
