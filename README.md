@@ -298,6 +298,38 @@ scalac 2.13.16 は `Str[A]` と型付けます。nsc は
 `btmeet_basetypemeet_bad.scala` は scalac と同じ 3 行（23・44・52 行目）で
 拒否されることを固定します（`btmeet` テスト）。
 
+**1 つの継承メンバを兄弟の 2 つが override している場合、順序を決めるのは
+レシーバの線形化だけです。** `TreeSet[A]` は `Set` 経由で
+`IterableFactoryDefaults`（`CC = Set`）を、直接 `SortedSetFactoryDefaults`
+（`CC = TreeSet`）を mixin し、どちらも 1 つの `IterableOps.empty` に対して
+`override def empty: CC[A @uncheckedVariance]` を書きます。両者は互いの
+サブクラスではないので `Check::drop_overridden` の所有者テストは順序を付けられず、
+どちらも定義なので宣言／定義テストも効きません。結果、`TreeSet` 内の裸の `empty`
+は `<overload Set[A] | TreeSet[A]>` のままでした。nsc の `findMember` は
+レシーバの base type sequence を辿って**最初に一致したもの**を採り、それは
+`TreeSet` の線形化でより派生側にある `SortedSetFactoryDefaults` の方です。
+`Check::drop_sibling_overrides` がこの規則で、`crate::lin::linearize` の順序を
+そのまま使います。答えが「対」ではなく「レシーバ」に属することは主張ではなく
+計測です——同じ 2 つの trait を mixin 順だけ変えた 2 クラスに対し、実 scalac
+2.13.16 はそれぞれ**別の** override を実行します。
+規則は狭く保っています。(1) 両方が定義であること（一方が `DEFERRED` なら
+nsc は置き換えをやめるため。`agent/liboverload` が「階層が決める」版を計測し、
+scalac と乖離することを確認済み）、(2) 所有者が互いに無関係であること
+（関係があれば既存の所有者テストの担当）、(3) **両方が override している
+メンバが候補集合の中にあること**——`Check::same_signature` は型パラメータを
+含む引数を何にでも一致させるので、形だけでは「同じメンバ」とは言えません
+（`agent/libanyval`）。さらに `Check::same_member_at` がレシーバの prefix で
+両者を substitute してから引数リストを厳密に比較します。これがないと
+`trait GA[T] extends GBase[T]` と `trait GB extends GBase[String]` が持つ
+**本物のオーバーロード**を消してしまい、`agent/catstail` が slick を 0 →
+7 errors にした形と同じになります（実際に計測して確認しました）。
+`tests/fixtures/sibover_siblingoverride.scala` は mixin 順を入れ替えた 2 つの
+クラス・ライブラリと同じ形・本物のオーバーロード・宣言と定義の同居を**実行**して
+実 scalac 2.13.16 の出力と 1 行ずつ比較し、`sibover_siblingoverride_bad.scala` は
+scalac と同じ 2 行（35・36 行目）で拒否されることを固定します（`sibover` テスト）。
+scala library は 912 → **894 errors**（145 files のまま）、cats・gitbucket・slick
+は不変で、slick の 1490 class ファイルは byte 一致です。
+
 A library member is read from the pickle on demand, and where two classes in
 the receiver's linearization declare the same name with the same *explicit*
 parameters, only one copy is kept — nsc's `isAsSpecific` looks through an
