@@ -513,7 +513,12 @@ impl Typer {
                 found = non_local;
             }
         }
-        found = self.drop_overridden(found);
+        // The receiver's linearization is what orders two sibling overrides of
+        // one member, so it is passed rather than looked up again.
+        found = self.drop_overridden_at(
+            self.st.class_sym_of(&recv_ty).unwrap_or(SymbolId::NONE),
+            found,
+        );
         // `x.toString` finds both `Any.toString` and `Int.toString`; they have
         // the same type, so this is one member, not an ambiguous overload.
         if found.len() > 1 {
@@ -910,8 +915,20 @@ impl Typer {
         &seen == want
     }
 
-    /// Prefer a definition on a subclass over the inherited member it overrides.
+    /// Prefer a definition on a subclass over the inherited member it
+    /// overrides, with no receiver to break a tie between two siblings.
+    ///
+    /// Call sites that know which class the lookup was about should use
+    /// [`Check::drop_overridden_at`]: two *sibling* overrides of one inherited
+    /// member can only be ordered by the receiver's linearization, and this
+    /// entry point hands such a pair back unreduced.
     pub(crate) fn drop_overridden(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        self.drop_overridden_at(SymbolId::NONE, found)
+    }
+
+    /// Prefer a definition on a subclass over the inherited member it
+    /// overrides; `recv` is the class the lookup was about, when one is known.
+    pub(crate) fn drop_overridden_at(&self, recv: SymbolId, found: Vec<SymbolId>) -> Vec<SymbolId> {
         if found.len() <= 1 {
             return found;
         }
@@ -984,6 +1001,7 @@ impl Typer {
                 })
             })
             .collect();
+        let kept = self.drop_sibling_overrides(recv, &found, kept);
         // Dropping *every* candidate is never what this rule means -- it
         // removes shadowed duplicates, and a set that eliminates itself
         // mutually (seen first with agent/tail2's supplied jar implicits next
@@ -993,6 +1011,223 @@ impl Typer {
             return found;
         }
         kept
+    }
+
+    /// Two sibling *overrides* of one inherited member: the receiver's
+    /// linearization decides, and nothing else can.
+    ///
+    /// `TreeSet[A]` mixes in `IterableFactoryDefaults` (through `Set`, at
+    /// `CC = Set`) and `SortedSetFactoryDefaults` (at `CC = TreeSet`), and both
+    /// of them write `override def empty: CC[A @uncheckedVariance]` over the
+    /// one `IterableOps.empty`. Neither trait derives from the other, so the
+    /// owner rule above cannot order them, and both are definitions, so
+    /// `definition_outranks_declaration` does not apply either. A bare `empty`
+    /// in `TreeSet` was therefore `<overload Set[A] | TreeSet[A]>`.
+    ///
+    /// nsc's `findMember` walks the receiver's **base type sequence** and keeps
+    /// the first match; here that is `SortedSetFactoryDefaults`'s, because it is
+    /// the more derived of the two *in `TreeSet`'s* linearization. The answer is
+    /// a property of the receiver and not of the pair: real scalac 2.13.16 runs
+    /// `Fac2.emp` for `class Later extends Fac1 with Fac2` and `Fac1.emp` for
+    /// `class Earlier extends Fac2 with Fac1`, over the same two traits
+    /// (`tests/fixtures/sibover_siblingoverride.scala`). So this takes a
+    /// receiver, and the entry point without one does not reduce such a pair.
+    ///
+    /// ## Why the guards are what they are
+    ///
+    /// Three slices have loosened this reduction too far, each in its own way,
+    /// so each condition below is answering one of them.
+    ///
+    ///  * **Both must be definitions.** `agent/liboverload` measured "the
+    ///    hierarchy decides, take the most derived declaration": it removes 53
+    ///    library errors and diverges from scalac, because nsc stops replacing
+    ///    once either side is `DEFERRED` -- `trait A { def f: A = null }` with
+    ///    `class C extends A { override def f: C }` gives `f` the type `A`. A
+    ///    declaration next to a definition is `definition_outranks_declaration`'s
+    ///    business; this rule stays out of it.
+    ///
+    ///  * **The owners must be unrelated.** A pair in one hierarchy is already
+    ///    ordered by the owner test above, and re-deciding it here could only
+    ///    disagree with it.
+    ///
+    ///  * **They must both override a member that is in the candidate set.**
+    ///    `agent/libanyval`'s lesson is that "these two are the same member" is
+    ///    a claim that needs evidence rather than a shape test: `same_signature`
+    ///    passes any pair whose parameters mention a type parameter, so on its
+    ///    own it would collapse `trait A[T] { def f(x: T) = 1 }` with
+    ///    `trait B { def f(x: String) = 2 }` and *delete a genuine overload* --
+    ///    which is how `agent/catstail` took slick from 0 to 7 errors. The
+    ///    evidence demanded here is the third candidate the owner rule has just
+    ///    dropped in favour of both: a member of the same name and signature
+    ///    whose owner is strictly above both owners. `IterableOps.empty` is in
+    ///    `found` for all twelve library sites, and two unrelated overloads have
+    ///    no such common declaration to point at. That is still not enough on
+    ///    its own -- see [`Check::same_member_at`], which is the guard that
+    ///    substitutes at the receiver before comparing, and without which this
+    ///    rule was measured deleting a genuine overload.
+    ///
+    /// Both owners must also appear in the receiver's linearization, or there is
+    /// no order to consult and the pair is left alone.
+    fn drop_sibling_overrides(
+        &self,
+        recv: SymbolId,
+        found: &[SymbolId],
+        kept: Vec<SymbolId>,
+    ) -> Vec<SymbolId> {
+        if recv.is_none() || kept.len() < 2 {
+            return kept;
+        }
+        // Cheapest question first, and allocation-free: is there a pair here
+        // this rule could possibly be about at all? `drop_overridden` runs on
+        // every member selection, and on the standard library some twenty
+        // thousand of them arrive with more than one candidate still standing
+        // while twelve are this defect -- so neither the prefix below nor the
+        // linearization may be built on the way past.
+        if !Self::any_pair(&kept, |a, b| self.could_be_sibling_pair(a, b)) {
+            return kept;
+        }
+        // The receiver read at its own type parameters, which is the prefix
+        // every candidate's signature has to be seen from before two of them
+        // can be compared. See `same_member_at`.
+        let prefix = Type::Class {
+            sym: recv,
+            args: self
+                .st
+                .get(recv)
+                .tparams
+                .iter()
+                .map(|&t| Type::TypeParam(t))
+                .collect(),
+        };
+        if !Self::any_pair(&kept, |a, b| {
+            self.maybe_sibling_override(&prefix, found, a, b)
+        }) {
+            return kept;
+        }
+        let lin = crate::lin::linearize(&self.st, recv);
+        let pos = |s: SymbolId| lin.iter().position(|&c| c == self.st.get(s).owner);
+        let out: Vec<SymbolId> = kept
+            .iter()
+            .copied()
+            .filter(|&s| {
+                let Some(here) = pos(s) else {
+                    return true;
+                };
+                !kept.iter().any(|&other| {
+                    other != s
+                        && pos(other).is_some_and(|there| there < here)
+                        && self.maybe_sibling_override(&prefix, found, s, other)
+                })
+            })
+            .collect();
+        if out.is_empty() {
+            kept
+        } else {
+            out
+        }
+    }
+
+    /// Is `child` below `parent` in the class hierarchy, asked the way the
+    /// owner rule in [`Check::drop_overridden_at`] asks it?
+    ///
+    /// It has to be that predicate and no other. `drop_sibling_overrides` fires
+    /// exactly where the owner rule did not, so a different ancestry test could
+    /// let both rules act on one pair -- or neither. `class_reaches` is the
+    /// cheaper walk and was tried here first; it answers `None` for
+    /// `SortedSetFactoryDefaults` and the rest of the `*FactoryDefaults`
+    /// family, whose parent lists it cannot follow, so the rule never fired on
+    /// the twelve library sites it was written for.
+    fn owner_is_below(&self, child: SymbolId, parent: SymbolId) -> bool {
+        self.st.is_sub_type(
+            &Type::Class {
+                sym: child,
+                args: vec![],
+            },
+            &self.owner_as_type(parent),
+        )
+    }
+
+    /// Is there a pair in `xs` that `f` accepts?
+    fn any_pair(xs: &[SymbolId], f: impl Fn(SymbolId, SymbolId) -> bool) -> bool {
+        xs.iter()
+            .enumerate()
+            .any(|(i, &a)| xs[i + 1..].iter().any(|&b| f(a, b)))
+    }
+
+    /// The part of "two sibling overrides of one member" that costs nothing to
+    /// ask: no substitution, no hierarchy walk, no allocation. Every selection
+    /// with more than one candidate left is asked this, and almost none of them
+    /// get past it.
+    fn could_be_sibling_pair(&self, a: SymbolId, b: SymbolId) -> bool {
+        let ao = self.st.get(a).owner;
+        let bo = self.st.get(b).owner;
+        ao != bo
+            && !ao.is_none()
+            && !bo.is_none()
+            && !self.is_deferred_member(a)
+            && !self.is_deferred_member(b)
+            && self.same_signature(a, b)
+    }
+
+    /// Everything [`Check::drop_sibling_overrides`] can ask without walking the
+    /// receiver's linearization: are `a` and `b` two sibling overrides of one
+    /// member? See that method for why each clause is here.
+    fn maybe_sibling_override(
+        &self,
+        prefix: &Type,
+        found: &[SymbolId],
+        a: SymbolId,
+        b: SymbolId,
+    ) -> bool {
+        let ao = self.st.get(a).owner;
+        let bo = self.st.get(b).owner;
+        self.could_be_sibling_pair(a, b)
+            && self.same_member_at(prefix, a, b)
+            && !self.owner_is_below(ao, bo)
+            && !self.owner_is_below(bo, ao)
+            && found.iter().any(|&base| {
+                let base_owner = self.st.get(base).owner;
+                base != a
+                    && base != b
+                    && !base_owner.is_none()
+                    && base_owner != ao
+                    && base_owner != bo
+                    && self.same_signature(a, base)
+                    && self.same_member_at(prefix, a, base)
+                    && self.same_member_at(prefix, b, base)
+                    && self.owner_is_below(ao, base_owner)
+                    && self.owner_is_below(bo, base_owner)
+            })
+    }
+
+    /// Do `a` and `b` have the same parameter list *as the receiver sees them*?
+    ///
+    /// [`Check::same_signature`] deliberately does not reconstruct the prefix:
+    /// it lets a parameter that mentions a type parameter match anything,
+    /// because on its own it has no prefix to substitute at. That leniency is
+    /// safe for a pair the hierarchy already orders, and fatal here.
+    /// `trait GBase[T] { def g(x: T) = "GBase" }` with
+    /// `trait GA[T] extends GBase[T] { override def g(x: T) = "GA" }` and
+    /// `trait GB extends GBase[String] { def g(x: Int) = "GB" }` gives
+    /// `class GBoth extends GA[String] with GB` two *genuine* alternatives that
+    /// `same_signature` calls one member -- `T` matches `Int` -- and every
+    /// other guard here admits, `GBase.g` standing above both. Reducing that
+    /// pair deletes `g(Int)`: `b.g("s")` became `no matching overload for
+    /// (Int)String with arguments ("s")`, which is the shape that took
+    /// `agent/catstail`'s slick from 0 errors to 7.
+    ///
+    /// This rule has a receiver, so it can ask the question `same_signature`
+    /// could not: substitute both members at the receiver's own prefix -- `T`
+    /// becomes `String` in `GA` and the parameter lists come out `String`
+    /// against `Int` -- and compare them exactly. A substitution that does not
+    /// fire leaves the two spellings unequal, so the rule declines rather than
+    /// guesses.
+    fn same_member_at(&self, prefix: &Type, a: SymbolId, b: SymbolId) -> bool {
+        let seen =
+            |s: SymbolId| flat_param_types(&self.st.subst_as_seen_from(prefix, &self.st.get(s).ty));
+        let ap = seen(a);
+        let bp = seen(b);
+        ap.len() == bp.len() && ap.iter().zip(&bp).all(|(x, y)| x == y)
     }
 
     /// One pickled declaration reached through two classes is one member.

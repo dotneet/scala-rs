@@ -2054,6 +2054,143 @@ more derived of the two *in `TreeSet`'s linearization*. That is a fourth
 member-collapse rule, not a base-type question, and the base types here are
 already right.
 
+## The `agent/siblingover` slice: the receiver's linearization, and only it
+
+**912 errors in 145 files -> 894 in 145**, measured against `main` at
+`fd65f6f7`. cats **182 -> 182**, gitbucket **270 -> 270**, slick `errors=0
+files_with_errors=0 classes=1490` with all 1490 class files byte-identical
+(`SLICK_OUT` on both binaries, `diff -r` empty). Eighteen lines removed and
+**none added anywhere**.
+
+The brief was the section above. It was right about the root and about which
+sites it explains; it was wrong about one family, and the split is below.
+
+### The rule
+
+`Check::drop_sibling_overrides`, run at the end of `drop_overridden` and given
+the class the lookup was about: among the candidates the older rules could not
+order, drop the one whose owner comes **later** in the receiver's
+linearization. `crate::lin::linearize` already computes that order.
+
+That the answer belongs to the receiver rather than to the pair is measured,
+not argued. One pair of traits, two classes differing only in mixin order:
+
+```scala
+trait Ops { def emp: Ops }
+trait Fac1 extends Ops { override def emp: Ops = { println("Fac1.emp"); this } }
+trait Fac2 extends Ops { override def emp: Ops = { println("Fac2.emp"); this } }
+class Later   extends Fac1 with Fac2   // scalac 2.13.16 runs Fac2.emp
+class Earlier extends Fac2 with Fac1   // scalac 2.13.16 runs Fac1.emp
+```
+
+so no property of `Fac1` and `Fac2` alone can produce scalac's answer. Both
+lines are in `tests/fixtures/sibover_siblingoverride.scala`, which is run and
+compared against real scalac by `crates/cli/tests/sibover.rs`.
+
+Writing the two parents so that the *wider* override heads the linearization
+is rejected by scalac ("incompatible type in overriding"), so in any program
+that compiles, "first in the linearization" and "narrowest type" coincide. The
+linearization is the formulation kept because it is nsc's and because it is
+still an answer when the two types are equal, as in `Later` above. (This
+compiler accepts that rejected class, before and after this slice: a gap in
+the override check, not in member lookup.)
+
+### The three guards, one per slice that got this wrong
+
+  * **Both candidates must be definitions.** `agent/liboverload` measured "the
+    hierarchy decides, take the most derived declaration" and found it diverges
+    from scalac, which stops replacing once either side is `DEFERRED`. A
+    declaration beside a definition stays `definition_outranks_declaration`'s.
+
+  * **The owners must be unrelated**, asked with the *same* `is_sub_type`
+    predicate the owner rule uses, so the two rules cannot both fire on one
+    pair or both decline it. `class_reaches` is the cheaper walk and was tried
+    first: it answers `None` for the whole `*FactoryDefaults` family, whose
+    parent lists it cannot follow, and the rule never fired on the twelve sites
+    it was written for.
+
+  * **They must both override a member that is in the candidate set**, *and*
+    have the same parameter list once substituted at the receiver
+    (`Check::same_member_at`). `same_signature` deliberately lets a parameter
+    mentioning a type parameter match anything, having no prefix to substitute
+    at; this rule has a receiver, so it can ask the real question.
+    `agent/libanyval`'s lesson -- "these two are the same member" needs
+    evidence, not a shape test -- has teeth here, and the version without
+    `same_member_at` was **measured deleting a genuine overload**:
+
+    ```scala
+    trait GBase[T] { def g(x: T): String = "GBase" }
+    trait GA[T] extends GBase[T] { override def g(x: T): String = "GA" }
+    trait GB extends GBase[String] { def g(x: Int): String = "GB" }
+    class GBoth extends GA[String] with GB
+    ```
+
+    `T` matches `Int`, `GBase.g` stands above both, every other guard admits,
+    and `b.g("s")` became `no matching overload for (Int)String with arguments
+    ("s")` -- the shape that took `agent/catstail`'s slick from 0 errors to 7.
+    The library measure does not contain this program and did not catch it; a
+    fixture did.
+
+### The honest split of the families the brief listed
+
+Twenty `<overload ...>` error lines were in scope. **Twelve are this root and
+eight are not**, and the eight are not the mechanism `agent/liboverload`
+suggested either.
+
+| n | family | root |
+|---:|---|---|
+| 3 | `<overload Set[A] \| TreeSet[A]>` | sibling overrides |
+| 3 | `<overload Iterable[(K, V)] \| Map[K, V] \| TreeMap[K, V]>` | sibling overrides |
+| 2 | `<overload SortedMap[K, V] \| Map[K, V] \| Iterable[(K, V)]>` | sibling overrides |
+| 2 | `<overload Map[K, V] \| Iterable[(K, V)]>` | sibling overrides |
+| 2 | `<overload Iterable[(K, V)] \| VectorMap[K, V]>` | sibling overrides |
+| 7 | `<overload Nil$ \| Nil$>` | **package member vs package object** |
+| 1 | `<overload List$ \| List$>` | **package member vs package object** |
+
+The twelve are every bare or selected `empty` in `TreeMap`, `TreeSet`,
+`VectorMap` and the four `WithDefault` classes, and their candidate sets are
+always `IterableOps.empty` plus two or three of
+`IterableFactoryDefaults` / `MapFactoryDefaults` / `SortedMapFactoryDefaults` /
+`SortedSetFactoryDefaults` -- the base correctly dropped by the owner rule,
+the siblings left standing.
+
+The `Nil` family is something else entirely. Its two candidates are `Nil` the
+`Module` owned by the package `scala`, and `Nil` the `Term` owned by
+`package$` -- the package object's `val Nil = scala.collection.immutable.Nil`.
+One entity supplied twice, by two different routes; the owners are a package
+and a package-object class, which stand in no `extends` relation, so no
+ordering rule can apply and none should. The repeated type in the display is
+what a duplicate *supply* looks like. It is also **not** the mechanism
+`agent/liboverload` described (two rules cancelling and the `kept.is_empty()`
+fallback returning everything): instrumenting `drop_overridden` over the whole
+library run recorded **zero** empty-`kept` events. The set is not
+mis-*reduced*; it is never reducible, because it should never have had two
+members. That is a supply-seam question and it is untouched here.
+
+### What else moved
+
+Six of the eighteen are not `empty`: three `<overload String | ()String>`
+(`toString` on a `StringBuilder` and two others, a parameterless `val` beside a
+nullary `def` -- `same_signature` matches those on purpose) and three
+`ambiguous overload for fromSpecific`. All six are the same root, and all six
+are sites real scalac compiles.
+
+### What it costs
+
+Nothing measurable. Compiling `src/library`, min of eight, alternating both
+which binary runs and the order inside each round: **1.85s before, 1.85s
+after**, spread 1.85-1.89 on either side. The same battery on a machine with
+four other slices measuring on it read 2.87s against 2.90s (+1%), with a
+1.85-3.09 spread across the session -- which is why the order is alternated
+and why both numbers are here rather than only the flattering one.
+
+`drop_overridden` runs on every member selection, and on `src/library` some
+twenty thousand of them arrive with more than one candidate still standing
+while twelve are this defect. So the receiver's prefix is not built and the
+linearization is not walked until an allocation-free scan
+(`Check::could_be_sibling_pair`: owners differ, both concrete, same arity)
+finds a pair that could possibly be this rule's business.
+
 ## Running it
 
 ```

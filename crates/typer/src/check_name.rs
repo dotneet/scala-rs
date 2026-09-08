@@ -1938,7 +1938,10 @@ impl Typer {
         // The template scope holds a class's own members next to the inherited
         // ones, so `val symbolName` and the `def symbolName` it implements both
         // answer to the name. An override is one member, not an overload.
-        found = self.drop_overridden(found);
+        // A bare name is read at the enclosing class, so that is the receiver
+        // whose linearization orders two sibling overrides of one member:
+        // `empty` written inside `TreeSet` is `TreeSet`'s `empty`.
+        found = self.drop_overridden_at(self.st.this_class, found);
         let ref_span = tree.span;
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, ref_span);

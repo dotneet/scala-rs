@@ -1,0 +1,8 @@
+Fac2.emp
+Fac1.emp
+CFac2.emp
+CFac2.emp
+took Narrow
+GA
+GB
+DDefn.d
