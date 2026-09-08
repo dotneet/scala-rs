@@ -25,13 +25,31 @@ ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 cd "$ROOT"
 GATE_DIR=${GATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/scala-rs-gate-XXXXXX")}
 mkdir -p "$GATE_DIR"
-LEDGER=${GATE_LEDGER:-$(ls -t tests/baselines/corpus-*.tsv 2>/dev/null | head -1)}
+# The ledger to compare the corpus against. `tests/BASELINE.md` names the
+# current one and the coordinator keeps it up to date, so read it from there.
+#
+# It used to be `ls -t … | head -1`. In a git worktree every baseline file
+# carries the checkout time, so the "newest" one is arbitrary: a slice's gate
+# picked a 106 KB ledger from eleven gates ago instead of the 732 KB current
+# one. The gate still said PASS -- it was comparing against nothing. A check
+# that reports green over nothing is the exact failure this script exists to
+# prevent, so an unresolvable ledger is now a FAIL, not a shrug.
+if [[ -n ${GATE_LEDGER:-} ]]; then
+  LEDGER=$GATE_LEDGER
+else
+  LEDGER=$(grep -oE 'tests/baselines/corpus-[0-9a-f]{8}\.tsv|baselines/corpus-[0-9a-f]{8}\.tsv' tests/BASELINE.md 2>/dev/null \
+             | sed 's|^baselines/|tests/baselines/|' | head -1)
+fi
 SKIP=${GATE_SKIP:-}
 skipped() { [[ " $SKIP " == *" $1 "* ]] }
 
 HEAD=$(git rev-parse --short=8 HEAD)
 DIRTY=$(git status --porcelain | wc -l | tr -d ' ')
 print "gate: HEAD=$HEAD dirty_files=$DIRTY dir=$GATE_DIR ledger=${LEDGER:-none}"
+if [[ -n ${LEDGER:-} && ! -s $LEDGER ]]; then
+  print "gate: ledger $LEDGER does not exist or is empty"
+  LEDGER=""
+fi
 
 FAIL=()
 NOTE=()
@@ -91,7 +109,7 @@ if skipped corpus; then NOTE+=("corpus SKIPPED"); else
     print "  vs $LEDGER: losses=$LOSSES changes=$CHANGES"
     [[ $LOSSES == 0 ]] || FAIL+=("corpus losses=$LOSSES vs $LEDGER")
   else
-    FAIL+=("corpus produced no ledger to compare")
+    FAIL+=("corpus has no ledger to compare against (ledger='${LEDGER:-}', tsv=$GATE_DIR/corpus.tsv)")
   fi
 fi
 

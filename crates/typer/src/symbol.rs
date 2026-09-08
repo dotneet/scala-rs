@@ -2841,11 +2841,72 @@ impl SymbolTable {
         Some((ea, eb))
     }
 
+    /// Eta-expand a pair where one side is a type lambda and the other is an
+    /// *abstract* constructor -- a higher-kinded type parameter (`CC[_]`) or an
+    /// abstract type member (`type F[_]`), the two shapes
+    /// [`SymbolTable::eta_expand_pair`] deliberately declines.
+    ///
+    /// nsc has no such split. `isHKSubType` normalizes both sides, which
+    /// eta-expands each to a `PolyType`, and `isPolySubType` then asks
+    /// `sameLength` on the parameters and compares the bodies -- for an
+    /// abstract constructor exactly as for a class or an alias. Normalizing an
+    /// `AliasTypeRef` also beta-reduces its body, so a lambda whose body does
+    /// not mention its parameter reduces to that body: `type AnyConstr[X] =
+    /// Any` is `[X]Any`, and `[x]CC[x] <:< [X]Any` holds for *every* `CC`
+    /// because `CC[x] <:< Any` does. That is `scala.collection`'s own
+    /// `AnyConstr`, and it is why `IterableOps[A, CC, C]` is an
+    /// `IterableOps[A, AnyConstr, _]`.
+    ///
+    /// Requiring one side to be a lambda is the point: this reduces an *alias*,
+    /// it does not relate two abstract constructors to each other. The kinds of
+    /// the parameters have to agree as well as their number -- `sameLength` is
+    /// nsc's arity check, and `cmp` over `corresponds` is its kind check.
+    fn eta_expand_abstract_pair(&self, a: &Type, b: &Type) -> Option<(Type, Type)> {
+        let n = self.kind_arity(a);
+        if n == 0 || self.kind_arity(b) != n {
+            return None;
+        }
+        let abstract_ctor = |t: &Type| {
+            let head = match t {
+                Type::Applied { ctor, .. } => ctor.as_ref(),
+                other => other,
+            };
+            matches!(head, Type::TypeParam(_) | Type::TypeMember(_))
+        };
+        // Exactly one side is the lambda being reduced; the other is abstract.
+        let (params, _) = match (self.hk_alias(a), self.hk_alias(b)) {
+            (Some(la), None) if abstract_ctor(b) => la,
+            (None, Some(lb)) if abstract_ctor(a) => lb,
+            _ => return None,
+        };
+        if params.len() != n || self.tparam_arities(a) != self.tparam_arities(b) {
+            return None;
+        }
+        let args: Vec<Type> = params.iter().map(|p| Type::TypeParam(*p)).collect();
+        let ea = self.expand_applied_hk_alias(apply_type_ctor(a.clone(), args.clone()));
+        let eb = self.expand_applied_hk_alias(apply_type_ctor(b.clone(), args));
+        Some((ea, eb))
+    }
+
     /// Conformance between two type constructors, decided on their bodies.
     /// See [`SymbolTable::eta_expand_pair`].
     fn hk_alias_sub_type(&self, a: &Type, b: &Type) -> Option<bool> {
-        let (ea, eb) = self.eta_expand_pair(a, b)?;
-        Some(self.is_sub_type(&ea, &eb))
+        if let Some((ea, eb)) = self.eta_expand_pair(a, b) {
+            return Some(self.is_sub_type(&ea, &eb));
+        }
+        // The abstract half is deliberately *not* conclusive. Where both sides
+        // eta-expand, their bodies are the whole story and a `false` is an
+        // answer. An abstract constructor's body is `CC[x]` and says nothing on
+        // its own, so the arms below -- bounds, path members, projections --
+        // still have to run. This arm can only add acceptances, which is what
+        // keeps `type G[X] = List[X]` from making `Option` conform to `G`:
+        // `Option[x] <: List[x]` is false here and false there.
+        let (ea, eb) = self.eta_expand_abstract_pair(a, b)?;
+        if self.is_sub_type(&ea, &eb) {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     /// Does the type *constructor* `ctor` satisfy the proper-type bound

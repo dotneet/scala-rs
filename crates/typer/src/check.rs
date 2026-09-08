@@ -862,6 +862,13 @@ pub fn typecheck_units_src(
         }
         t.sigs_only = false;
     }
+    // `Predef._` is open around every unit, and the prelude's copy of its
+    // members was taken before any source was read. If the run's own sources
+    // define `scala.Predef`, its members belong in that scope too -- and they
+    // only exist once the signature pass above has run. See
+    // `crate::predef_reimport`; a no-op for every program that does not
+    // define `scala.Predef` itself.
+    crate::predef_reimport::reimport_source_predef(&mut t.st);
     // Default arguments are bodies, not signatures: typing them during the
     // pass above would let one name only the members of the units that come
     // before its own on the command line.

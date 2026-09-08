@@ -499,6 +499,87 @@ is expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
 (the two that execute code), the corpus, and the full workspace suite. The
 classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 
+## A constructor alias that ignores its parameter (`agent/anyconstr`)
+
+**1420 -> 1367 errors**, 53 gone and none new. Measured on `fce0a0d8` and
+again after merging `main` at `f4b829ec` (`agent/gbopt`) — the same 53 error
+locations gone each time and none appeared. Both A/Bs compare two saved
+binaries (`SCALA_RS=<binary>`), never a revert in the working tree.
+
+`scala.collection` declares `type AnyConstr[X] = Any`. It is a type
+*constructor* whose body does not mention its parameter, so **every**
+one-parameter constructor conforms to it, and `IndexedSeq#stepper`'s
+
+```scala
+case _ => shape.parUnbox(new AnyIndexedSeqStepper[A](this, 0, length))
+```
+
+really does pass an `IndexedSeqOps[A, CC, C]` where an `IndexedSeqOps[A,
+AnyConstr, _]` is wanted. All 53 were that one shape, in five files:
+`Iterable.scala` (25), `IndexedSeq.scala` (11), `Seq.scala` (9), `Set.scala`
+(3) and the rest of `collection`.
+
+### The rule, not the instance
+
+`type F[X] = Any` is the degenerate case; the general question is how nsc
+compares two type constructors of the same arity when one of them is an alias,
+and the answer is `normalize` plus `sameLength` in `Types.scala`. `isHKSubType`
+normalizes both sides — which eta-expands each `TypeRef` to a `PolyType` and
+beta-reduces an alias body — and `isPolySubType` then requires `sameLength` on
+the parameters and compares the bodies. `[x]CC[x] <:< [X]Any` holds for every
+`CC` because `CC[x] <:< Any` does; `[x]Option[x] <:< [X]List[X]` does not,
+because `Option[x] <:< List[x]` does not. One rule decides both.
+
+This compiler already compared two type constructors that way —
+`SymbolTable::eta_expand_pair`, built by `agent/hkunify`, where a `Type::Class`
+with fewer arguments than the class has parameters *is* the curried
+constructor. What it declined was the pair where one side is an **abstract**
+constructor: a higher-kinded type parameter (`CC[_]`) or an abstract type
+member. That is exactly the library's case, and it is the only thing this slice
+adds (`eta_expand_abstract_pair`). The kinds have to agree as well as their
+number, which is nsc's `corresponds`/`cmp` beside its `sameLength`.
+
+The new arm is deliberately **widening-only**. Where both sides eta-expand,
+their bodies are the whole answer and a `false` is an answer; an abstract
+constructor's body is `CC[x]` and settles nothing on its own, so a `false`
+there still falls through to the bound, path-member and projection arms below
+it. Reducing more eagerly than that is what would make unrelated constructors
+conform.
+
+### The overload it was silently getting wrong
+
+`tests/fixtures/ac_anyconstr.scala` runs and prints the name of the method body
+that ran, so an acceptance that answered the conformance question the wrong way
+cannot pass. Three of its calls did not compile before the fix. The fourth did
+— and printed the wrong answer:
+
+```scala
+def sel(x: Ops[Int, AnyConstr, _]): String = "sel:anyconstr"
+def sel(x: Any): String                    = "sel:any"
+```
+
+With an abstract `CC`, `sel(this)` fell through to the `Any` overload and
+compiled. `expected/ac_anyconstr.txt` is real scalac 2.13.16's own run of the
+same source, and the e2e test asserts scalac's run against it as well as ours.
+
+`ac_anyconstr_bad.scala` is the restriction: `type G[X] = List[X]` must not
+make `Option` conform to `G`, an abstract `CC` is not `List` either, and the
+reduction is not symmetric (`Ops[Int, AnyConstr, String]` is not an
+`Ops[Int, CC, String]`). Real scalac rejects all three at lines 26, 30 and 35
+and so do we, at the same lines. They were rejected before the fix too — the
+negative fixture is what stops the new arm from over-reaching, not evidence
+that it exists.
+
+### One divergence found and left alone
+
+nsc treats `Any` and `Nothing` as **kind-overloaded**: `checkKindBoundsHK`
+skips the arity check when the argument's `typeSymbol` is `AnyClass` or
+`NothingClass`, so real scalac accepts `Ops[Int, Two, _]` for
+`type Two[X, Y] = Any` against a `CC[_]` parameter, where we report `kinds of
+the type arguments (Two) do not conform`. It is a separate defect in kind
+checking, it costs the library nothing (`AnyConstr` is arity 1 and used at
+arity 1), and it is not touched here.
+
 ## The `agent/libanyval` slice: an overload is not an override
 
 **1420 errors in 166 files → 1386 in 164**, measured on `agent/libanyval` cut
@@ -689,6 +770,149 @@ the inherited alternative.
 
 ## What to do next, in order
 
+Re-clustered on the 1367 that remain (`agent/anyconstr`, merged at `515a43c4`): 474
+`type mismatch`, 453 `X is not a member of Y`, 157 `no matching overload`, 42
+`no matching overload for constructor`, 33 `not found: value`, 32 `needs to be
+abstract`, 22 `` `override` modifier required``, 20 `ambiguous overload`.
+
+1. **The prelude collision is still the whole first half.** The receivers in
+   `is not a member of` are `Int` (69), `Array` (68), `<notype>` (51) and
+   `String` (36); the `<overload Stream[A] | Iterable[A] | Stream[A]>` spelling
+   accounts for 38 more between the two classes. This is the root named above
+   under "The one root" and nothing in it has changed.
+2. **`new Array(WIDTH)` does not take its element type from the expected
+   type** — `a2 = new Array(WIDTH)` where `a2: Array[Array[AnyRef]]` reports
+   `found: Array[Nothing]`. About 28 errors at five nesting depths, nearly all
+   in `Vector.scala`, which is the largest single mechanism outside the
+   collision.
+3. **`Iterator.empty.next()` leaves the element parameter uninstantiated** —
+   13 × `type mismatch; found: T  required: A`, in `IndexedSeqView.scala` and
+   `Iterator.scala`. `Iterator.empty` is an `Iterator[Nothing]`, so `next(): T`
+   is `Nothing` and conforms to every `A`.
+4. Do **not** assume the overriding family (now 54) is a second root. The ones
+   sampled were the same collision seen from the other side, and it has shrunk
+   in step with everything else, which is consistent with that reading.
+5. `src/reflect` and `src/compiler` are not worth measuring yet.
+
+## The `agent/libmaxmin` slice: `Predef._` is an import, not a snapshot
+
+**1420 errors in 166 files → 1226 in 157**, measured on this branch merged with
+`main` at `f4b829ec` (`agent/gbopt`). The brief handed this slice 55 errors —
+34 `value max is not a member of Int` and 21 `value min` — together with a
+hypothesis about the pickle seam. The hypothesis was wrong in both halves, and
+saying how is most of the value of the entry.
+
+### What the brief said, and what is actually true
+
+> `Predef`, `RichInt` and `intWrapper` are being *defined* by the files under
+> compilation while also being supplied by the `--scala-library` jar the
+> measure links against, and something about that seam loses the conversion.
+
+Three measurements say otherwise.
+
+* **The measure does not link the jar.** `tests/scalalib_measure.sh` runs
+  `--no-scala-library` by default — the section "The measurement is not run
+  against the jar" above says so — and in that mode `prelude.rs` gates *both*
+  `RichInt` and `intWrapper` on `library_abi`, so neither is built at all.
+  There was no jar copy to win the seam, because there was no second copy.
+* **The source declaration is not shadowed and is not un-implicit.** Writing
+  `import scala.Predef._` by hand in the same file makes both `a xmax b` and an
+  explicit `scala.Predef.xintWrapper(a).xmax(b)` resolve. The conversion was
+  simply not in scope.
+* **It has nothing to do with `src/library`.** It reproduces in fifteen lines
+  with no library source anywhere (`crates/cli/tests/libmaxmin.rs`,
+  `source_predef_conversion_is_in_scope_everywhere`).
+
+### The cause
+
+nsc opens `java.lang._`, `scala._` and `Predef._` around every unit, and
+`Predef` there means whatever `scala.Predef` resolves to. This compiler
+modelled the third by *copying* the prelude's `Predef` members into the base
+scope at install time (`prelude::import_members`), before any source is read.
+A run whose own sources define `scala.Predef` therefore got a scope describing
+a `Predef` the program does not have.
+
+This is the same defect the `agent/preludeshadow` section records for the
+`scala._` half — "`scala._` was a snapshot, not an import" — and that slice's
+`Typer::auto_import_scala_member` fixed only that half: it enters a source
+*class or object* landing directly in package `scala`, and says nothing about
+the *members* of a source `Predef`, which is a different scope.
+`crates/typer/src/predef_reimport.rs` is the missing half. It runs from
+`check::typecheck_units` between the signature pass and the body pass — the
+members of a source `object Predef` do not exist before the signature pass, so
+this cannot be done in the namer the way `auto_import_scala_member` is.
+
+### Three things it has to get right
+
+Each was measured by getting it wrong first.
+
+| what | getting it wrong cost |
+|---|---|
+| **Replace, do not join.** A source member supersedes the prelude's snapshot of that name. | Entering them alongside made every `int2Integer` two candidates: **16** new `ambiguous implicit: X, X`, in a run that had had 2 ambiguities in total. |
+| **Do not dedupe by name.** `Predef` overloads `require` and `assert`. | Keeping only the first binding cost **17** errors reading `no matching overload for (Boolean)Unit with arguments (Boolean, String)`, across nine files — every two-argument `require`/`assert` in the library. |
+| **Record the import, not only its members.** | An inherited conversion's owner is a plain class, so codegen emitted the call on `this`: `3 bigger 7` type-checked and then died with `class Main$ cannot be cast to class scala.LowPriorityProbe`. `Typer::wildcard_module_for` recovers the receiver from a recorded wildcard — against the module **class**, because the module *value* carries no `parents` and `inherits_from` walks those. |
+
+The third is why `tests/fixtures/libmaxmin_predef.scala` is **run**, not merely
+compiled. Nothing else in this repository would have caught it: the JVM
+verifier does not object, and every compile-only measure was green.
+
+### What moved
+
+52 files improved and 3 regressed:
+
+| file | before | after |
+|---|---|---|
+| `scala/collection/immutable/ArraySeq.scala` | 32 | **5** |
+| `scala/collection/Iterator.scala` | 34 | 15 |
+| `scala/collection/View.scala` | 20 | 4 |
+| `scala/collection/concurrent/TrieMap.scala` | 66 | 51 |
+| `scala/collection/LazyZipOps.scala` | 12 | **0** |
+| `scala/math/BigDecimal.scala` | 19 | 9 |
+| `scala/collection/StringOps.scala` | 20 | 10 |
+| `scala/math/BigInt.scala` | 4 | **0** |
+| `scala/annotation/elidable.scala` | 2 | **13** |
+| `scala/concurrent/Future.scala` | 14 | **23** |
+| `scala/concurrent/duration/Duration.scala` | 18 | **22** |
+
+The three regressions are one root and **28 errors of `value -> is not a
+member`**, at sites that previously died one line earlier on `not found: value
+Map`. It is a **pre-existing defect, not this slice's**: two conversions in
+scope offering `->` from the same source type select neither, and it
+reproduces with no `Predef` and no re-import anywhere —
+
+```scala
+package scala
+object PredefY {
+  implicit final class ArrowAssocQ[A](private val self: A) extends AnyVal {
+    def -> [B](y: B): (A, B) = (self, y)
+  }
+}
+// another file
+import scala.PredefY._
+object U { val a = 1 -> 2 }   // value -> is not a member of 1
+```
+
+Removing the prelude's competing conversion by name does not reach it: the
+prelude spells it **`any2ArrowAssoc`** while the library's implicit class
+synthesizes **`ArrowAssoc`**, so the names never meet. A rule keyed on
+`prelude_shadowed` instead does not reach it either — the source `ArrowAssoc`
+is owned by `object Predef`, not by package `scala`, so
+`shadow_supplied_by_source` never records a victim for it. Both were tried and
+measured at zero; neither is in the change.
+
+### The other targets, before and after
+
+See the slice's report for the full table; every measure other than the
+library is unchanged to the error.
+
+## What to do next, in order
+
+0. **`->` when two conversions offer it — 28 errors, 3 files.** The twelve-line
+   reproduction is above. Worth taking before anything else in this list,
+   because it is the only regression standing between the current number and a
+   clean sweep of the `Predef` work, and because "two candidates, so neither"
+   is a wrong answer anywhere it happens, not only here. Note the two fixes
+   that look right and are not, recorded above, before starting.
 1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
    `new VectorN(…)` on a generic constructor infers `Any` for the element
    where the context expects `Vector[B]`. Nothing to do with the prelude; it
