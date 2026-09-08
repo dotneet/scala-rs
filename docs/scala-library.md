@@ -1897,10 +1897,12 @@ would make the numbers above unreadable; `crates/cli/tests/intrinsicqual.rs`
 names it in the guard test that would otherwise carry it.
 
 `new Sec("abcd")`, where `class Sec(val a: Int)` also declares `def this(s:
-String)`, emits an `invokespecial` at the *primary* constructor's descriptor
-and is a `VerifyError: Bad type on operand stack`. Also pre-existing, also
-unrelated to access: it reproduces with no modifier on the secondary
-constructor at all.
+String)`, is a `VerifyError: Bad type on operand stack`. Also pre-existing,
+also unrelated to access: it reproduces with no modifier on the secondary
+constructor at all. Closed by `agent/secondaryctor` below -- where the
+diagnosis offered here ("emits an `invokespecial` at the *primary*
+constructor's descriptor") turned out to be wrong: the descriptor was right
+all along and the *argument* was adapted against the primary.
 
 ## The `agent/basetypemeet` slice: a base class reached twice is the meet
 
@@ -2190,6 +2192,276 @@ while twelve are this defect. So the receiver's prefix is not built and the
 linearization is not walked until an allocation-free scan
 (`Check::could_be_sibling_pair`: owners differ, both concrete, same arity)
 finds a pair that could possibly be this rule's business.
+## The `agent/unitpop` slice: a `Unit` intrinsic and its discard disagreeing
+
+The first of the two left above, closed. `gen_call::gen_predef_poly` ended
+
+```rust
+if is_unit_like(result_ty) { asm.pop(); }
+else { maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty)); }
+```
+
+`Unit` is the one result where the erased `(Object)Object` descriptor still
+returns a reference — `Predef.identity(())` hands back `BoxedUnit.UNIT` — so
+the `pop` always fired at `identity(())`. Dropping it is right for a
+**statement** and wrong for an **argument**: `gen_predef_println` had already
+been told by `unit_leaves_boxed_ref` that its argument left a reference, so it
+emitted no `BoxedUnit` of its own, and `println(identity(()))` handed
+`scala/Predef$.println` an empty stack (`VerifyError: Operand stack
+underflow`). nsc leaves the value — `javap` on real scalac 2.13.16 reads
+`invokevirtual identity; invokevirtual println`, with no cast between them —
+and lets the generic statement-position discard take it. So does this now:
+`gen_predef_poly` always leaves what its descriptor promises, and
+`gen_expr::discarded_predef_poly` pops it in `gen_stat`, beside
+`unit_stat_leaves_ref` and `unit_call_leaves_ref`. It resolves the call head
+the way `gen_apply` resolves it (`flatten_apply_owned` over `peel_fun`, then
+`predef_poly_name` on the callee's `Intrinsic`), so the emitter that pushes
+and the discard that pops cannot disagree about which calls are covered.
+
+**The private runtime was failing the mirror image of the same disagreement**,
+and the same predicate closes it. `--no-scala-library` inlines the intrinsic
+(`gen_apply`'s `Intrinsic::Identity` arm is a bare `gen_expr` of the
+argument), erasure boxes a `Unit` argument, and `unit_stat_leaves_ref` refuses
+every symbol that carries an `Intrinsic` — so a discarded `identity(())` was
+`getstatic BoxedUnit.UNIT` with nothing after it. Straight-line code merely
+leaked an operand slot, which is why it survived; the first control-flow join
+after it did not:
+
+```scala
+def f(b: Boolean): Unit = if (b) identity(()) else side("f")
+// VerifyError: Inconsistent stackmap frames at branch target 18
+```
+
+A user-defined `def myid[A](a: A): A = a` in the same position was already
+right (`getstatic UNIT; invokevirtual myid; pop`) — only the intrinsic was
+exempt. `discarded_predef_poly` therefore mirrors the emitters arm for arm:
+under `library_abi` the `(Object)Object` invoke always leaves a value, while
+the private runtime leaves whatever the argument left
+(`unit_leaves_boxed_ref`), except a `locally { … }` thunk, whose `Unit` result
+that arm already pops where it emits it.
+
+**Only running the program catches any of this.** Both shapes compile clean in
+both modes; the classfile is well-formed and `-Xverify:all` or execution is
+the first thing that objects. `tests/fixtures/unitpop_intrinsic.scala` holds
+both positions in one program — `identity(())` as an argument, and
+`identity(())` / `locally { … }` discarded as a statement, each followed by a
+branch — plus the same three intrinsics at a non-`Unit` type so the two paths
+cannot drift, and a discarded intrinsic in an `if` branch, a `match` arm, a
+`try` body, a `while` body and a whole method body. It runs under
+`-Xverify:all` in both modes and matches real scalac 2.13.16's output line for
+line. An unmodified build of the branch point compiles it in both modes and
+fails to run it in both: `Operand stack underflow` at `Main$.a3` with the jar,
+`Inconsistent stackmap frames` at `Main$.s7` without it. The case commented
+out in `crates/cli/tests/intrinsicqual.rs` is enabled.
+
+**slick's 1490 class files are byte-identical** between a pre-fix and a
+post-fix binary (`SLICK_OUT=… tests/slick_measure.sh` on both, `diff -r`, exit
+0): nothing in slick's 184 files calls `identity` / `locally` / `implicitly`
+at `Unit`. `errors=0 files_with_errors=0 classes=1490` on both.
+
+### Found here, not fixed here
+
+`new Sec("abcd")` — the second defect left above — is **not** the same
+mechanism and is left reduced. On this build the `invokespecial` descriptor is
+in fact correct; what is wrong is the *argument*, which arrives already
+adapted to the **primary** constructor's parameter type:
+
+```text
+ldc "abcd"; checkcast java/lang/Integer; invokevirtual Integer.intValue;
+invokestatic Integer.valueOf; invokespecial Sec."<init>":(Ljava/lang/String;)V
+```
+
+That `$unbox`/`$box` pair is in the tree before the backend sees it —
+`gen_new` takes its parameter types from `ctor_param_tys`, which reads the
+selected `<init>`'s own `Type::Method` and is right here — so the defect is in
+the typer's overload resolution for `new`, which types the arguments against
+the primary constructor while selecting the secondary one for the call.
+Reproduces in both modes, byte-identical before and after this slice.
+
+**Closed by `agent/secondaryctor` below**, which reached this same reading
+independently and found the exact line: `erasure::method_param_types` takes
+the class's *first* `<init>` member for a `new`, which is always the primary.
+The two diagnoses agree in full — the descriptor was right, the argument was
+adapted against the wrong constructor.
+
+## The `agent/secondaryctor` slice: `new C(...)` on a secondary constructor
+
+This closes the second "Found here, not fixed here" item above. The
+reproduction is `agent/intrinsicqual`'s, unchanged:
+
+```scala
+object Main {
+  def main(a: Array[String]): Unit = println(new Sec(1).viaSecondary.a)
+}
+class Sec(val a: Int) {
+  def this(s: String) = this(s.length)
+  def viaSecondary: Sec = new Sec("abcd")
+}
+```
+
+Real scalac 2.13.16 prints `4`. An unmodified build of the branch point, in
+**both** linking modes, is
+
+```text
+java.lang.VerifyError: Bad type on operand stack
+  Location: Sec.viaSecondary()LSec; @15: invokespecial
+  Reason: Type 'java/lang/Integer' is not assignable to 'java/lang/String'
+```
+
+### The descriptor was never wrong
+
+The natural reading of that message -- and the one recorded above -- is that
+codegen built the `<init>` descriptor from the class's `ctor_fields` instead
+of from the constructor the typer picked. It does not. `javap` on the branch
+point's own output says so:
+
+```text
+0: new Sec
+3: dup
+4: ldc           "abcd"
+6: checkcast     java/lang/Integer      <-- 
+9: invokevirtual java/lang/Integer.intValue:()I   <-- 
+12: invokestatic java/lang/Integer.valueOf:(I)Ljava/lang/Integer;  <-- 
+15: invokespecial Sec."<init>":(Ljava/lang/String;)V
+```
+
+The `invokespecial` names the **secondary's** descriptor, which is exactly
+what scalac emits. `gen_new` already receives the picked constructor as
+`tree.sym` and `method_desc_from_sym` already renders it. What is wrong is the
+three instructions in front of it: the `String` literal is unboxed to `int`
+and boxed back, so an `Integer` arrives in a slot the descriptor declares
+`String`.
+
+### Where it came from: `erasure::method_param_types`
+
+Erasure asks "what parameter types does this application adapt its arguments
+to?" and, for a `new`, answered by taking the class's **first** `<init>`
+member:
+
+```rust
+if matches!(&fun.kind, TreeKind::New { .. }) {
+    …
+    for m in &st.get(c).members {
+        if st.get(*m).name == "<init>" {
+            if let Type::Method { paramss, .. } = &st.get(*m).ty {
+                return paramss.iter().flatten().cloned().collect();
+            }
+        }
+    }
+```
+
+That is always the primary. So `box_adaptation(String, expected = Int)`
+returned `Unbox(Int)` and `wrap_unbox` put an `$unbox` node around the
+argument -- while the backend, reading the resolved symbol, emitted the
+secondary's descriptor. The two halves disagreed because they were reading
+different constructors.
+
+The fix hands `method_param_types` the `Apply`'s own symbol -- the alternative
+`pick_ctor_at` chose, and the same symbol `gen_new` builds the descriptor
+from -- so they cannot disagree again. Where there is no resolved symbol the
+fallback now prefers an `<init>` whose arity matches the call before falling
+back to the first, which is what it did unconditionally before.
+
+### The other direction, and the corpus test it turns green
+
+The reduction has the primary taking a primitive and the secondary a
+reference. The inverse is the same defect and it is the one the corpus was
+already failing on: `test/files/run/kmpSliceSearch.scala` opens with
+
+```scala
+val rng = new scala.util.Random(java.lang.Integer.parseInt("kmp", 36))
+```
+
+`scala.util.Random`'s primary is `(self: java.util.Random)` -- a reference --
+and the constructor this picks is `def this(seed: Int)`. Adapting against the
+primary made `box_adaptation(got = Int, expected = java.util.Random)` return
+`Box`, so the `int` was boxed and handed to a descriptor that says `int`:
+
+```text
+VerifyError: Bad type on operand stack
+  Type 'java/lang/Integer' is not assignable to integer
+```
+
+`run/kmpSliceSearch` goes `fail` -> `pass` and now matches its `.check` file
+exactly. The entire class-file difference is **one instruction**, on a
+normalised `javap -c` diff of `Test$`:
+
+```text
+88d87
+<   invokestatic  // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+```
+
+Two things follow. First, the defect is **not confined to classes declared in
+source** -- `Random` is read from the jar, and the constructor alternatives
+come out of its pickle. Second, a jar test is not automatically a test for
+this: `scala.collection.mutable.StringBuilder`, the obvious candidate, has
+nothing but reference parameters on every alternative, so it passed on the
+branch point too. `crates/cli/tests/secondaryctor.rs` carries both.
+
+### Yield: one corpus `run` test, zero class files of slick
+
+**slick's 1490 class files are byte-identical** between the branch point and
+this change (`SLICK_OUT=… tests/slick_measure.sh` on both binaries, `diff -r`,
+exit 0). `errors=0 files_with_errors=0 classes=1490` before and after. The
+compile counts do not move either: scala library `917 / 146`, gitbucket
+`270 / 79`, cats `185 / 71`, `MODE=b tests/slick_run.sh` `progs=12 ok=12
+diff=0 fail=0 attempts=36/36`, `tests/slick_subset.sh` `verified=1490 failed=0
+lint_problems=0`. This is a run-time correctness fix, so that is the expected
+shape: the corpus `run` population is the only place it could show, and it
+did, once.
+
+That is not a vacuous negative -- slick has exactly four secondary
+constructors, and each was checked:
+
+| site | primary | secondary | why it cannot move |
+|---|---|---|---|
+| `RelationalProfile.Table` | `(Tag, Option[String], String)` | `(Tag, String)` | arg 1 adapts to `Option[String]` instead of `String`; both erase to references, so `box_adaptation` returns `None` either way |
+| `util.ConstArray` | `(Array[Any], Int)` | `(Array[Any])` | the only argument is parameter 0 of both; identical |
+| `jdbc.DriverDataSource` | 8 params | `()` | no arguments, so the adaptation loop is empty |
+| `compiler.CompilerState` | `(QueryCompiler, SymbolNamer, Node, HashMap, Boolean)` | `(QueryCompiler, Node)` | arg 1 adapts to `SymbolNamer` instead of `Node`; both references. The primary's primitive `Boolean` is parameter 4 and a two-argument call never reaches it |
+
+`box_adaptation` only produces a `Box` / `Unbox` / `VcBox` / `VcUnbox` when the
+two types straddle the primitive/reference line or a value class. Every slick
+secondary differs from its primary only in reference positions, so the wrong
+answer and the right answer erased to the same tree. The defect needs a
+primitive (or a value class) on one side and a reference on the other -- which
+is precisely the reduction, and precisely the fixture.
+
+### What it is worth, measured by running it
+
+`tests/fixtures/secondaryctor_new.scala` holds, in one program: a secondary
+constructor called from inside the class, from the companion and from an
+unrelated object; two secondaries whose erased descriptors differ in exactly
+one parameter; a secondary that delegates to another secondary rather than to
+the primary; a value class in a secondary's parameter list; a default
+argument; and a plain `new C(primary args)` for every one of those classes, so
+the primary path is pinned in the same program. The expected output is what
+`/tmp/scala-2.13.16/bin/scalac` prints compiling that same file, and this
+branch matches it in both `--scala-library` and `--no-scala-library` mode. On
+the branch point it is a `VerifyError` in both modes.
+
+The multiset of `<init>` descriptors `Main$` emits is identical to scalac's,
+including `Dist."<init>":(I)V` for the secondary that takes a value class.
+
+### Found here, not fixed here
+
+A default argument on a **secondary** constructor is rejected outright:
+
+```scala
+class Deft(val p: Int, val q: String) {
+  def this(p: String, q: String = "dq") = this(p.length, q)
+}
+```
+
+`error: value <init>$default$2 is not a member of Main$`.
+`Typer::synthesize_ctor_default_getters` only ever runs over the *primary*
+constructor's parameters, so the getter the call site needs is never declared
+and the lookup falls out to the enclosing object. This reproduces unchanged on
+the branch point, it is a hard error rather than a silent miscompile, and it is
+a different mechanism from this slice's defect, so it is recorded rather than
+fixed. `crates/cli/tests/secondaryctor.rs` asserts the *rejection*, so the test
+fails and says so when a later slice implements it; the fixture puts its
+default on the primary instead.
 
 ## Running it
 
