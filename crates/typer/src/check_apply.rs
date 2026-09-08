@@ -816,7 +816,17 @@ impl Typer {
         // throws out alternatives before their types are weighed. `arg_tys`
         // has one entry per argument, in order, so the two line up.
         let shapes = crate::check_overload::arg_shapes(args);
-        let mut chosen = self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes);
+        // nsc `Infer.inferPolyAlternatives`: what the caller *wrote* as type
+        // arguments instantiates every alternative before applicability is
+        // weighed. Reaching the pick only afterwards (`pending_targs` below)
+        // left each alternative to infer its own instantiation from the value
+        // arguments, so `getValue[Integer](p: PropertyType[Integer], 4, false)`
+        // solved `T` to the `lub(Integer, Int)` -- `Any` -- and `PropertyType`
+        // is invariant, so *both* alternatives were rejected and the call was
+        // `no matching overload` where scalac boxes the `4` and picks one.
+        let written_targs = explicit_type_args(fun).unwrap_or_default();
+        let mut chosen =
+            self.resolve_overload_targs(&fun_ty, fun.sym, &arg_tys, pt, &shapes, &written_targs);
         if matches!(chosen, OverloadPick::None) {
             // A *view* can make an argument applicable, but the test for one
             // (`arg_conforms` -> `search_conversion`) runs on `&self` and so
@@ -834,7 +844,14 @@ impl Typer {
                 fresh |= self.warm_own_scope_once(t);
             }
             if fresh {
-                chosen = self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes);
+                chosen = self.resolve_overload_targs(
+                    &fun_ty,
+                    fun.sym,
+                    &arg_tys,
+                    pt,
+                    &shapes,
+                    &written_targs,
+                );
             }
         }
         'resolve: loop {

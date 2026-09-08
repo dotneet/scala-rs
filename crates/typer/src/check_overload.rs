@@ -273,7 +273,7 @@ impl Typer {
         arg_tys: &[Type],
         pt: &Type,
     ) -> OverloadPick {
-        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, &[])
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, &[], &[])
     }
 
     /// [`Self::resolve_overload`], with the arguments' [`ArgShape`]s.
@@ -291,7 +291,28 @@ impl Typer {
         pt: &Type,
         shapes: &[ArgShape],
     ) -> OverloadPick {
-        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, shapes)
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, shapes, &[])
+    }
+
+    /// [`Self::resolve_overload_shaped`], with the type arguments the caller
+    /// *wrote* on the callee.
+    ///
+    /// nsc applies those to every alternative before applicability is weighed
+    /// (`Infer.inferPolyAlternatives`, SLS 6.26.3: explicit type arguments
+    /// *are* the instantiation). Here they used to reach the call only after
+    /// an alternative had been picked, so each alternative was instantiated by
+    /// inferring from the value arguments alone -- and an argument that
+    /// disagrees with the written argument sank the whole set.
+    pub(crate) fn resolve_overload_targs(
+        &self,
+        fun_ty: &Type,
+        fun_sym: SymbolId,
+        arg_tys: &[Type],
+        pt: &Type,
+        shapes: &[ArgShape],
+        targs: &[Type],
+    ) -> OverloadPick {
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, None, shapes, targs)
     }
 
     /// [`Self::resolve_overload`], with the alternatives' types supplied by the
@@ -308,7 +329,7 @@ impl Typer {
         pt: &Type,
         supplied: Option<&Vec<(SymbolId, Type)>>,
     ) -> OverloadPick {
-        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, supplied, &[])
+        self.resolve_overload_inner(fun_ty, fun_sym, arg_tys, pt, supplied, &[], &[])
     }
 
     fn resolve_overload_inner(
@@ -319,6 +340,7 @@ impl Typer {
         _pt: &Type,
         supplied: Option<&Vec<(SymbolId, Type)>>,
         shapes: &[ArgShape],
+        targs: &[Type],
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         let mut module_apply_candidates = Vec::new();
@@ -438,7 +460,8 @@ impl Typer {
                     .map(|t| Type::TypeParam(*t))
                     .collect();
                 let cls = Type::Class { sym: *sym, args };
-                return self.resolve_overload_inner(&cls, fun_sym, arg_tys, _pt, supplied, shapes);
+                return self
+                    .resolve_overload_inner(&cls, fun_sym, arg_tys, _pt, supplied, shapes, targs);
             }
             Type::Class { sym, .. } => {
                 // `drop_overridden`, as everywhere else a member is looked up
@@ -509,7 +532,7 @@ impl Typer {
         let applicable: Vec<(SymbolId, Vec<Type>, Type)> = {
             let no_view: Vec<_> = cands
                 .iter()
-                .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, false))
+                .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, false, targs))
                 .cloned()
                 .collect();
             if !no_view.is_empty() {
@@ -517,7 +540,9 @@ impl Typer {
             } else {
                 cands
                     .into_iter()
-                    .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, true))
+                    .filter(|(sym, ps, _)| {
+                        self.is_applicable(*sym, clause, ps, arg_tys, true, targs)
+                    })
                     .collect()
             }
         };
@@ -819,7 +844,7 @@ impl Typer {
                 .collect()
         };
         let saved = self.spec_probe.replace(true);
-        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true)
+        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true, &[])
             && self.function_params_conform(&a_ps, &b_ps);
         self.spec_probe.set(saved);
         out
@@ -1591,10 +1616,22 @@ impl Typer {
         params: &[Type],
         args: &[Type],
         allow_widen: bool,
+        targs: &[Type],
     ) -> bool {
         let instantiated;
         let params = if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
-            let inst = self.infer_method_tparams(sym, params, args);
+            // Explicit type arguments *are* the instantiation (SLS 6.26.3);
+            // nsc applies them to every alternative in `inferPolyAlternatives`
+            // before applicability is weighed. Only when the alternative takes
+            // exactly as many as were written -- an alternative of some other
+            // arity is not the one they were written for, and nsc drops it
+            // from the set entirely.
+            let tps = self.st.get(sym).tparams.clone();
+            let inst: Vec<(SymbolId, Type)> = if targs.len() == tps.len() {
+                tps.iter().copied().zip(targs.iter().cloned()).collect()
+            } else {
+                self.infer_method_tparams(sym, params, args)
+            };
             if inst.is_empty() {
                 params
             } else {
