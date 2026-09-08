@@ -1094,6 +1094,54 @@ impl Typer {
     /// second names `B` in its result, and `List("a").sum` must still be
     /// `B := String` so the search reports the missing `Numeric[String]`
     /// instead of leaving an unapplied method type standing as the value.
+    /// `lo`, with the declaring class's type parameters replaced by what they
+    /// are at this reference.
+    ///
+    /// The declaration's type and the tree's differ exactly by that
+    /// substitution -- the tree is the member as seen from its prefix -- so
+    /// matching one against the other recovers it, whether the prefix was a
+    /// receiver tree, an enclosing `this`, or a self type.
+    fn bound_as_seen_here(&self, tree: &Tree, tp: SymbolId, lo: Type) -> Type {
+        if !mentions_any_tparam(&lo) {
+            return lo;
+        }
+        let method = self.st.get(tp).owner;
+        let owner = self.st.get(method).owner;
+        let class_tps = self.st.get(owner).tparams.clone();
+        if class_tps.is_empty() {
+            return lo;
+        }
+        let flatten = |t: &Type| -> Vec<Type> {
+            match t {
+                Type::Method { paramss, ret } => {
+                    let mut v: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                    v.push((**ret).clone());
+                    v
+                }
+                other => vec![other.clone()],
+            }
+        };
+        let decl = flatten(&self.st.get(method).ty);
+        let here = flatten(&tree.ty);
+        if decl.len() != here.len() {
+            return lo;
+        }
+        let mut ids = Vec::new();
+        let mut vals = Vec::new();
+        for cp in class_tps {
+            if !type_mentions_tparam(&lo, cp) {
+                continue;
+            }
+            if let Some(t) = self.unify_tparam_all(cp, &decl, &here) {
+                if !t.is_no_type() && !t.is_error() && !type_mentions_tparam(&t, cp) {
+                    ids.push(cp);
+                    vals.push(t);
+                }
+            }
+        }
+        crate::symbol::subst_tparams_slice(&ids, &vals, &lo)
+    }
+
     fn pin_lower_bounded_implicit_tparams(&mut self, tree: &mut Tree, undet: &[SymbolId]) {
         // The bound is written in the declaration (`B >: A`); what this call
         // sees is that bound at the receiver.
@@ -1110,8 +1158,22 @@ impl Typer {
             let Some(lo) = self.st.get(tp).bound_lo.clone() else {
                 continue;
             };
+            // The bound is written in the declaring class's own type
+            // parameters (`B >: A`), and what this call sees is that bound
+            // *here*. Two things say what `A` is, and neither covers the
+            // other: the receiver, and the tree's own type, which is already
+            // the member as seen from wherever it was reached.
+            //
+            // Only the second reaches `trait Q1 { self: PriorityQueue[Int] =>
+            // def biggest: Int = max }`, where the member is named
+            // unqualified through a self type and there is no receiver tree
+            // at all. Matching the declaration `(Ordering[B])A` against this
+            // tree's `(Ordering[B])Int` gives `A = Int`, and the search is
+            // for the `Ordering[Int]` nsc asks for.
+            let lo = self.bound_as_seen_here(tree, tp, lo);
             let lo = match &recv {
                 Some(r) if !r.is_no_type() && !r.is_error() => self.st.subst_as_seen_from(r, &lo),
+                None if mentions_any_tparam(&lo) => continue,
                 _ => lo,
             };
             // `Nothing` is nsc's "no constraint" answer, and a bound that is
@@ -1198,17 +1260,16 @@ impl Typer {
             .into_iter()
             .filter(|(_, t)| !t.is_no_type() && !t.is_error() && !matches!(t, Type::TypeParam(_)))
             .collect();
-        // What the expected type did *not* pin down, and only a lower bound
-        // constrains, is instantiated at that bound now.
+        // A parameter only a lower bound constrains is instantiated at that
+        // bound now -- ahead of `from_pt`, because nsc's `solvedTypes`
+        // *minimizes* a variable in covariant position and the expected type
+        // is only an upper constraint on it. `println(g.sum)` has `pt = Any`
+        // over `sum[B >: Int](implicit num: Numeric[B]): B`, and taking the
+        // expectation's answer asks for a `Numeric[Any]` nsc never asks for.
         let (undet, ret, from_pt) = if undet.is_empty() || is_callee {
             (undet, ret, from_pt)
         } else {
-            let open: Vec<SymbolId> = undet
-                .iter()
-                .copied()
-                .filter(|tp| !from_pt.iter().any(|(id, _)| id == tp))
-                .collect();
-            self.pin_lower_bounded_implicit_tparams(tree, &open);
+            self.pin_lower_bounded_implicit_tparams(tree, &undet);
             let ret = match &tree.ty {
                 Type::Method { ret, .. } => (**ret).clone(),
                 _ => return,
