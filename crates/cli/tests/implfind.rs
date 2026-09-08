@@ -200,13 +200,24 @@ fn fixtures_implfind_scala_library() {
 }
 
 /// The two relaxed access rules are not relaxed too far. nsc rejects these two too.
+///
+/// Real scalac 2.13.16 on this fixture:
+///
+/// ```text
+/// value hidden in object Prot cannot be accessed as a member of object implfindbad.Prot from class Stranger in package other
+/// object Inner in object Outer cannot be accessed as a member of object implfindbad.Outer from class Outsider in package other
+/// ```
+///
+/// Ours differs only in that the prefix type is unqualified (`object Prot`,
+/// not `object implfindbad.Prot`) -- `display_type` prints every type that
+/// way, in every diagnostic, not just this one.
 #[test]
 fn fixtures_implfind_bad_is_error() {
     compile_fails_with(
         "implfind_bad",
         &[
-            "value hidden cannot be accessed as a member of Prot$ from Stranger",
-            "value Inner cannot be accessed as a member of Outer$ from Outsider",
+            "value hidden in object Prot cannot be accessed as a member of object Prot from class Stranger in package other",
+            "object Inner in object Outer cannot be accessed as a member of object Outer from class Outsider in package other",
         ],
         &["--no-scala-library"],
     );

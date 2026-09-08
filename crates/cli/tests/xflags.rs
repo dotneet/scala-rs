@@ -297,13 +297,24 @@ fn the_feature_closes_the_private_constructor() {
     let err = diagnostics(&output);
     assert!(!output.status.success(), "expected rejections: {err}");
     let errors: Vec<&str> = err.lines().filter(|l| l.starts_with("error:")).collect();
+    // Real scalac 2.13.16 for this same file, verified below:
+    //
+    //   method apply in object C cannot be accessed as a member of object xflags.C from object Use in package xflags
+    //   method apply in object C cannot be accessed as a member of object xflags.C from object Use in package xflags
+    //   method copy in class C cannot be accessed as a member of xflags.C from object Use in package xflags
+    //   method copy in class D cannot be accessed as a member of xflags.D from object Use in package xflags
+    //
+    // Word for word ours, except that nsc qualifies the *prefix type* with its
+    // package (`xflags.C`). That is `display_type`'s doing and shows in every
+    // diagnostic this compiler prints, not something the access message
+    // decides; see `docs/comparison-with-scalac.md`.
     assert_eq!(
         errors,
         vec![
-            "error: value apply cannot be accessed as a member of C$ from Use$",
-            "error: value apply cannot be accessed as a member of C$ from Use$",
-            "error: value copy cannot be accessed as a member of C from Use$",
-            "error: value copy cannot be accessed as a member of D from Use$",
+            "error: method apply in object C cannot be accessed as a member of object C from object Use in package xflags",
+            "error: method apply in object C cannot be accessed as a member of object C from object Use in package xflags",
+            "error: method copy in class C cannot be accessed as a member of C from object Use in package xflags",
+            "error: method copy in class D cannot be accessed as a member of D from object Use in package xflags",
         ],
         "unexpected diagnostics:\n{err}"
     );
@@ -322,9 +333,9 @@ fn the_feature_closes_the_private_constructor() {
         let text = diagnostics(&o);
         assert!(!o.status.success(), "scalac accepted it with the feature");
         for needle in [
-            "method apply in object C cannot be accessed",
-            "method copy in class C cannot be accessed",
-            "method copy in class D cannot be accessed",
+            "method apply in object C cannot be accessed as a member of object xflags.C from object Use in package xflags",
+            "method copy in class C cannot be accessed as a member of xflags.C from object Use in package xflags",
+            "method copy in class D cannot be accessed as a member of xflags.D from object Use in package xflags",
         ] {
             assert!(text.contains(needle), "scalac is missing {needle}: {text}");
         }

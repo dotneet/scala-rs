@@ -377,13 +377,17 @@ fn fixtures_ctacc_builder_without_library_is_error() {
 /// Only a `case class`'s first parameter list becomes accessors on its own: a
 /// plain class's parameter without `val` stays private state, and reading it
 /// from outside is still an error. (nsc words this "value hidden is not a
-/// member of Plain"; we report the access rather than the absence, since the
-/// constructor field is a symbol here.)
+/// member of Plain" -- verified against scalac 2.13.16 on this fixture -- and
+/// we report the access rather than the absence, since the constructor field
+/// is a symbol here. The *shape* of what we print is nsc's `AccessError`
+/// wording, which for this member nsc itself would spell "value hidden in
+/// class Plain": cf. `t1422`'s `.check`, "value foo in class A cannot be
+/// accessed as a member of A from object A".)
 #[test]
 fn fixtures_ctacc_plain_param_bad_is_error() {
     compile_fails(
         "ctacc_plain_bad",
         &["--no-scala-library"],
-        "value hidden cannot be accessed as a member of Plain",
+        "value hidden in class Plain cannot be accessed as a member of Plain from object Main",
     );
 }

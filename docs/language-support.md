@@ -1970,7 +1970,7 @@ Measurement (`tests/slick_measure.sh`, 184 slick files, `-Xsource:3`) goes **127
 - **Visibility of constructor fields**. nsc uses `private final`; we use `public final` (accessors and bridges match). The codegen for pattern matching `getfield`s the same-named field directly, so making it private would require moving that path to an accessor call.
 - **`Vector.newBuilder` / `List.newBuilder`** are not on the companions, so a `Builder` instance has to be written by hand (`ctacc_builder.scala` does that).
 - **The `ClassTag` for `xs.toArray` is sometimes not filled in**. slick's `ProductResultConverter` (6 cases that call `cha(i)` with `(ClassTag[B])Any` still in place) remains.
-- **The diagnostic for reading a constructor argument (without `val`) from outside** differs from nsc. nsc says `value hidden is not a member of Plain`; we say `value hidden cannot be accessed as a member of Plain from Main$` (both are errors; `ctacc_plain_bad`).
+- **The diagnostic for reading a constructor argument (without `val`) from outside** differs from nsc. nsc says `value hidden is not a member of Plain`; we say `value hidden in class Plain cannot be accessed as a member of Plain from object Main` (both are errors; `ctacc_plain_bad`). The sentence is nsc's `AccessError` wording since `agent/accessmsg` — nsc words *this* member the same way when it takes that branch (cf. `neg/t1422`'s `.check`) — but nsc reports the absence here rather than the access.
 
 ### Making case classes `Product`s (`agent/product`)
 

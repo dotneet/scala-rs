@@ -1317,16 +1317,63 @@ over the block's `ClassDef` / `ModuleDef` statements — and `companion_scope`
 requires a match. Both being `None` (a template member, or top level) leaves
 every ordinary companion pair exactly as it was.
 
-**The wording is ours, not scalac's, and deliberately.** scalac says `method x
-in class C cannot be accessed as a member of C from object C`; we say `value x
-cannot be accessed as a member of C from C$`, at the same line, for the same
-reason. That difference is nsc's `fullLocationString` ("method x in class C")
-and `directObjectString` ("object C" for a module class), and it applies to
-*every* access diagnostic this compiler emits, not to this rule — four other
-test files pin the current spelling. Changing it is one cross-cutting slice of
-its own, and doing it here would have been four other slices' fixtures edited
-while five slices ran in parallel. So this test scores **T0**, not T3, and the
-report says why.
+**The wording was ours, not scalac's, and deliberately so; the follow-up slice
+`agent/accessmsg` fixed it.** The rule slice scored this test **T0** because
+we said `value x cannot be accessed as a member of C from C$` where scalac
+says `method x in class C cannot be accessed as a member of C from object C` —
+the same line, the same reason, a different sentence. That difference is nsc's
+`fullLocationString` ("method x in class C") and `directObjectString` ("object
+C" for a module class), and it applied to *every* access diagnostic this
+compiler emitted, not to this rule, so it was one cross-cutting change of its
+own rather than four other slices' fixtures edited under five parallel slices.
+
+See "[Access diagnostics now read like nsc's](#access-diagnostics-now-read-like-nscs)"
+below: the test now scores **T3**, byte-identical to the `.check`.
+
+### Access diagnostics now read like nsc's
+
+`ContextErrors.AccessError` builds its message from three nsc primitives, and
+we now build ours from the same three:
+
+```scala
+val location = if (sym.isClassConstructor) s"in $owner0"
+               else s"as a member of ${pre.widen.directObjectString}"
+val from     = s" from ${owner0.fullLocationString}"
+underlyingSymbol(sym).fullLocationString + " cannot be accessed " + location + from
+```
+
+* `fullLocationString` is `<kind> <name> in <owner kind> <owner>` — "method x
+  in class C", "variable foo in class Sub2", "object Inner in object Outer".
+  The kind comes from `Symbol#kindString` in its sanitized spelling, and nsc
+  reaches the member through `underlyingSymbol` first, so a `val`'s getter
+  answers as the field: "value", "variable" for a `var`, "lazy value" for a
+  `lazy val`, never "getter"/"setter". The location is one level and is
+  dropped for the root and the empty package, which is why a top-level access
+  in the empty package reads plain "class Q3" and one inside `package xflags`
+  reads "object Use in package xflags".
+* `directObjectString` spells a module `object C` where it is the direct
+  object of the sentence, instead of the `C.type` (`C$` for us) it prints
+  everywhere else.
+* A constructor takes `in <owner>` in place of `as a member of <prefix>`. We
+  build that branch too, though nothing reaches it yet: private and protected
+  constructors are still accepted (`neg/sensitive`, `neg/t4987`,
+  `neg/t6601`, `neg/protected-constructors`), which is a missing *check*, not
+  a missing message.
+
+Over the 26 `neg` tests whose `.check` contains `cannot be accessed`, the
+wording score moved **T1/T2/T3 = 0 → 3** (13.6% of the 22 scored) with T0
+unchanged at 13: `neg/t8002-nested-scope`, `neg/t3714-neg` and `neg/t3871`
+are now byte-identical to their `.check` files. The error *count* does not
+move at all, and is not supposed to — this slice changes what the diagnostic
+says, not which programs are rejected.
+
+One difference is left, and it is not this message's: nsc qualifies the prefix
+type with its package (`as a member of object xflags.C`, `as a member of
+mism8bad.Holder`) where `SymbolTable::display_type` prints `object C` and
+`Holder`. That is how *every* type is printed in *every* diagnostic we emit,
+so it belongs to `display_type` and not to `AccessError`. nsc also appends an
+indented "Access to protected method secret not permitted because …"
+explanation for the `protected` cases; we print the sentence only.
 
 ### The fourth is reduced, not implemented
 
