@@ -2139,6 +2139,13 @@ Worth its own slice, with those two as the acceptance criterion.
 > ancestors is one import and stays an overload set. Zero of these fire across
 > gitbucket, cats, slick and the scala library: 1414 files, no false positive.
 >
+> **The corpus has a test named after this rule, and it now passes.**
+> `neg/import-precedence` is 70 lines of `import uniq1.X` against
+> `import uniq1.uniq2._` in every nesting arrangement, and scalac's `.check`
+> file rejects exactly two of them. It failed before this slice and passes
+> after, together with `neg/t4831`, `neg/t9125`, `pos/t2458` and `pos/t9552`;
+> `losses=0` against `baselines/corpus-54df4d43.tsv`.
+>
 > **Two rules the scala/scala corpus wrote, and neither was guessed.** The
 > first full corpus run showed `losses=3` and each one was a real overreach.
 > `pos/t2133` writes `import bip._; import bar._` where `bar.fn` is
