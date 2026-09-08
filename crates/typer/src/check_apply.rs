@@ -297,6 +297,33 @@ impl Typer {
             } else {
                 (None, Vec::new())
             };
+            // nsc's `AccessError` on the constructor it just resolved. It has
+            // to happen here: `new C(…)` is not a member selection, so
+            // `type_select`'s access check never sees the `<init>` and a
+            // `private` / `protected` constructor was accepted from anywhere
+            // (`neg/sensitive`, `neg/t4987`, `neg/t6601`,
+            // `neg/protected-constructors`). Only on a constructor that was
+            // actually picked -- a failed overload has already been reported,
+            // and a second message about the alternative it did not pick is
+            // noise.
+            //
+            // Only on a `new` the *program wrote*. Several rewrites build one
+            // with `Tree::dummy`, and the access question there belongs to the
+            // member they rewrote, not to the constructor they lowered it to:
+            // `v.copy(x = 2)` on a `case class C private (x: Int)` becomes
+            // `new C(2)`, and nsc asks whether `copy` is accessible (which
+            // `case_copy_access_error` does, under
+            // `-Xsource-features:case-apply-copy-access`) and never whether
+            // the constructor is. Reporting there refused
+            // `tests/fixtures/xflags_case_access_bad.scala`, which scalac
+            // 2.13.16 compiles cleanly with no flag. A parsed `new` always
+            // carries a real span.
+            let synthetic = tree.span.is_dummy() || fun.span.is_dummy();
+            if let (Some(sym), Some(c)) = (ctor_sym, class_id) {
+                if !synthetic {
+                    self.ctor_access_error(sym, c, tree.span);
+                }
+            }
             // Generic inference must use ctor *fields* (`Tuple2._1: A`) even when
             // the picked `<init>` is erased to `(Any, Any)` in the prelude.
             let nargs = args.len();

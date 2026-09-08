@@ -2096,6 +2096,43 @@ fn unresolved_print(fun: &Tree, name: &str) -> bool {
     fun.sym.is_none() && fun.name() == Some(name)
 }
 
+/// The same question for `Predef`'s three polymorphic members, and the same
+/// answer: `gen_predef_poly` emits
+/// `scala/Predef$.<name>:(Ljava/lang/Object;)Ljava/lang/Object;` with the
+/// qualifier discarded *and every argument but the first dropped*, so
+/// applying it on the strength of the name alone replaced a user's
+/// `identity` / `locally` / `implicitly` with the identity function.
+///
+/// The guard used to be `fun.name() == Some("identity") || … || …` with a
+/// second, subsumed disjunct that also tested the intrinsic, which is why the
+/// symbol was never consulted:
+///
+/// * `Helper.identity("a")` -- a plain method that happens to carry the name
+///   -- was emitted as `Predef.identity("a")` and gave back `"a"`. It
+///   compiles, it verifies, and nothing short of running it says otherwise.
+/// * `mk("m").identity(side("i"), side("j"))` lost the receiver *and* the
+///   second argument: neither expression was evaluated at all.
+///
+/// `Intrinsic::Identity` / `Locally` / `Implicitly` are set on the prelude's
+/// own `Predef` members (`prelude_predef2::add_predef_members`), so the
+/// intrinsic names the exact set that may be rewritten. The name test stays
+/// alongside it because `Intrinsic::Identity` is shared with unrelated
+/// members (`AnyVal.toString`, `unary_+`, `Using.resource`) whose calls
+/// `gen_predef_poly` must never claim, and the name-only fallback now applies
+/// solely to a call with no symbol at all, where there is nothing else to
+/// emit.
+fn predef_poly_name(fun: &Tree, ic: Intrinsic) -> Option<&str> {
+    let name = fun.name()?;
+    if !matches!(name, "identity" | "locally" | "implicitly") {
+        return None;
+    }
+    let is_predefs = matches!(
+        ic,
+        Intrinsic::Identity | Intrinsic::Locally | Intrinsic::Implicitly
+    );
+    (is_predefs || fun.sym.is_none()).then_some(name)
+}
+
 pub(crate) fn gen_apply(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -2273,26 +2310,11 @@ pub(crate) fn gen_apply(
         push_default(asm, &tree.ty);
         return;
     }
-    if ctx.library_abi
-        && (fun.name() == Some("identity")
-            || fun.name() == Some("locally")
-            || fun.name() == Some("implicitly")
-            || matches!(
-                ic,
-                Intrinsic::Identity | Intrinsic::Locally | Intrinsic::Implicitly
-            ) && fun
-                .name()
-                .is_some_and(|n| n == "identity" || n == "locally" || n == "implicitly"))
-    {
-        gen_predef_poly(
-            asm,
-            frame,
-            ctx,
-            args,
-            &tree.ty,
-            fun.name().unwrap_or("identity"),
-        );
-        return;
+    if ctx.library_abi {
+        if let Some(name) = predef_poly_name(fun, ic) {
+            gen_predef_poly(asm, frame, ctx, args, &tree.ty, name);
+            return;
+        }
     }
 
     if matches!(ic, Intrinsic::Identity) {
