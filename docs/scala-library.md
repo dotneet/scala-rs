@@ -1367,14 +1367,25 @@ question and were not investigated here.
    member`` — by fixing the matcher rather than by lookup work. What is left
    of it is 9 `incompatible type in overriding` plus 10 `overrides nothing`,
    and those *are* the member-lookup bug seen from the other side.
-4. `src/reflect` and `src/compiler` are not worth measuring yet.
+4. **`SymbolTable::base_type_args` takes the first path, not the meet.** The
+   second defect `agent/liboverload` found and did not fix; its section below
+   has the trace and a nine-line reproduction. It is what makes
+   `IterableOps.tail` read as `Iterable[A]` from `Stream`, and it is what is
+   left behind every `<overload …>` receiver in the log: `<overload Nil$ |
+   Nil$>` (7), `<overload Set[A] | TreeSet[A]>` (3), `<overload Iterable[(K,
+   V)] | Map[K, V] | TreeMap[K, V]>` (3). Those are two instantiations of one
+   base, so no member-collapse rule can reach them.
+5. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 
 ## The `agent/liboverload` slice: re-abstracting is overriding
 
-**1104 errors in 154 files → 1051 in 153**, measured on this branch merged
-with `main` at `fb297e74` (`agent/libtailrec`). Every other target is
-unchanged to the error, and slick's 1490 class files are byte-identical.
+**971 errors in 147 files → 918 in 146**, measured on this branch merged with
+`main` at `acec3f09` (`agent/libprelude`, `agent/libnotype`) against that same
+`main` measured on its own. The delta is the same **-53** it was at the branch
+point (`fb297e74`, 1104 → 1051), so the two waves do not overlap. Every other
+target is unchanged to the error, and slick's 1490 class files are
+byte-identical.
 
 The brief handed this slice two clusters — 21 `type mismatch; found:
 <overload Stream[A] | Iterable[A] | Stream[A]>` and 23 `value <member> is not
@@ -1440,8 +1451,8 @@ member does not become the member: `f` there is an `A`. The same is true when
 the definition is generic and the declaration narrows past the instantiation
 (`trait Holder[+C] { def get: C = ??? }`, `class NarrowBox extends
 Holder[Any] { override def get: NarrowBox }` — nsc reports `Any`). Taking the
-most derived declaration removed **53** library errors and **5** cats errors
-and diverged from scalac on both shapes; it is not in the change.
+most derived declaration removed the same **53** library errors and **5** cats
+errors, and diverged from scalac on both shapes; it is not in the change.
 
 What is in the change is narrower: **a declaration that only *restates* the
 definition is one member.** `Stream.tail: Stream[A]` is exactly what
@@ -1510,17 +1521,34 @@ directly.
 
 The 50 `<overload …Stream…>` and `<overload …LinearSeq…>` receivers are gone,
 together with the five `could not optimize @tailrec` that `agent/libtailrec`
-traced to them. `Stream.scala` goes from 43 errors to 0. The clusters left at
-the head are re-listed under "What to do next" below.
+traced to them. **`Stream.scala` goes from 51 error lines to 1**, and it is
+the only file that changes.
+
+Re-clustered on the 918 that remain: 435 `type mismatch`, 179 `no matching
+overload`, 145 `X is not a member of Y`, 33 `not found`, 18 `ambiguous
+overload`. The largest `type mismatch` families are 43 `found:
+Array[Nothing]` (`new Array(WIDTH)` not reading its element type from the
+expected type, mostly `Vector.scala`) and 41 `found: T`
+(`Iterator.empty.next()` leaving the element parameter uninstantiated). The
+worst files are `TrieMap.scala` (47), `Vector.scala` (45), `Seq.scala` (31)
+and `Factory.scala` (31).
+
+The `<overload …>` spellings left are all the *other* defect this slice
+found — two instantiations of one base, not two symbols: `<overload Nil$ |
+Nil$>` (7), `<overload Set[A] | TreeSet[A]>` (3), `<overload Iterable[(K, V)]
+| Map[K, V] | TreeMap[K, V]>` (3). No member-collapse rule can reach those;
+`base_type_args` is where they live.
 
 ### The other targets, before and after
 
+Measured on the merged tree at `acec3f09`, each against that same `main`:
+
 | | before | after |
 |---|---|---|
-| scala library (538) | 1104 / 154 | **1051 / 153** |
+| scala library (538) | 971 / 147 | **918 / 146** |
 | gitbucket (353) | 270 / 79 | 270 / 79 |
 | cats (339) | 185 / 71 | 185 / 71 |
-| slick (184) | `errors=0 classes=1490` | `errors=0 classes=1490`, all 1490 byte-identical |
+| slick (184) | `errors=0 classes=1490` | `errors=0 classes=1490`, all 1490 byte-identical (`SLICK_OUT` on both binaries, `diff -r` empty) |
 
 ## Running it
 
