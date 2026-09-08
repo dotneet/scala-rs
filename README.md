@@ -170,6 +170,22 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 `class LinkedHashMap extends HashMap implements Map` のために必要でした）も
 不要になります。
 
+A library member is read from the pickle on demand, and where two classes in
+the receiver's linearization declare the same name with the same *explicit*
+parameters, only one copy is kept — nsc's `isAsSpecific` looks through an
+implicit clause, so two such declarations are equally specific and supplying
+both makes every call ambiguous. The one kept used to be whichever the walk
+offered first, and for `SortedMap` that is `MapOps.map[K2, V2](f)` rather than
+the `SortedMapOps.map[K2, V2](f)(implicit ordering: Ordering[K2])` that
+overloads it: `aSortedMap.map(f)` compiled and returned an **unordered** `Map`,
+with no diagnostic anywhere. A declaration that adds an implicit clause to one
+it inherits now supersedes it — that clause is the `Ordering` witness, and it
+is the only way the result can be the receiver's own sorted collection.
+Declarations with the same number of parameters are unaffected. The sorted
+collections are run rather than merely compiled in
+`tests/fixtures/sm_ordering.scala` (`sortedmap` test), under a reversed
+`Ordering[Int]` so that iteration order is the evidence; see `docs/cats.md`.
+
 この形（`class Wider extends Root with L6 with L5`）は
 `tests/fixtures/linterm_diamond.scala` に入っていて、`linearization` テストが
 実 scalac 2.13.16 の出力と比較します。なお、**先行する親がすでに継承している
