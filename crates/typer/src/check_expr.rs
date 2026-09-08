@@ -1577,6 +1577,32 @@ impl Typer {
                 // `TypedRep.<init>()` and the program dies with
                 // `NoSuchMethodError` at run time.
                 if !applied {
+                    // `new Array[Int]` with no argument list at all. `Array`'s
+                    // one constructor takes the length, so nsc rejects it in
+                    // the same words it uses for `new Array[Int]()`. This
+                    // compiler accepted it as an `Array[Int]` *value* and
+                    // codegen then emitted `new "[java/lang/Object"` with an
+                    // `invokespecial` of a constructor no array class has --
+                    // bytecode the verifier refuses, reached with no
+                    // diagnostic. The arity check on the applied form lives in
+                    // `type_apply`; this is the same check one node up, where
+                    // there is no application to carry it.
+                    if let Some(elem) = self.array_elem_expected(&tree.ty) {
+                        let shown = if elem_unwritten {
+                            "T".to_string()
+                        } else {
+                            self.st.display_type(&elem)
+                        };
+                        self.error(
+                            tree.span,
+                            format!(
+                                "not enough arguments for constructor Array: \
+                                 (_length: Int): Array[{shown}].\n\
+                                 Unspecified value parameter _length."
+                            ),
+                        );
+                        return;
+                    }
                     let fillable = self
                         .st
                         .class_sym_of(&tree.ty)

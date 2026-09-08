@@ -3251,3 +3251,27 @@ fn scala_library_dual_run_arrayelem_tag() {
 fn fixtures_arrayelem_bad() {
     compile_fails_lib("arrayelem_bad", "cannot find class tag for element type K");
 }
+
+/// `Array`'s one constructor takes the length, and reading the element off the
+/// expected type does not change that. This is scala/scala's own
+/// `test/files/neg/multi-array.scala` plus the three arities around it, and
+/// scala-rs reports all four with nsc's exact wording -- including nsc's
+/// distinction between `Array[T]` (element inferred, so the arity check runs
+/// before instantiation) and `Array[Int]` (element written). Two of the four
+/// were accepted outright before: `new Array[Int](10, 10)` and the
+/// argument-list-less `new Array[Int]`, both of which reached codegen and
+/// emitted an `invokespecial` of a constructor no array class has.
+#[test]
+fn fixtures_arrayelem_arity_bad() {
+    let err = compile_fails_out(
+        "arrayelem_arity_bad",
+        "too many arguments (found 2, expected 1) for constructor Array: (_length: Int): Array[T]",
+    );
+    for needle in [
+        "too many arguments (found 2, expected 1) for constructor Array: (_length: Int): Array[Int]",
+        "not enough arguments for constructor Array: (_length: Int): Array[Int].",
+        "Unspecified value parameter _length.",
+    ] {
+        assert!(err.contains(needle), "missing {needle:?} in {err}");
+    }
+}
