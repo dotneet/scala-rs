@@ -3305,6 +3305,37 @@ fn scala_library_dual_run_ctorgaps_secdefault() {
     dual_run_fixture("ctorgaps_secdefault");
 }
 
+/// A constructor default in a **later parameter clause**, which
+/// `agent/ctorgaps` left open as a silent miscompile: `new Curr(7)()` emitted
+/// an `invokespecial` with one argument for a three-parameter descriptor and
+/// died with `VerifyError: Bad type on operand stack`.
+///
+/// A `new`'s arguments reach `fill_defaults_and_implicits` already flattened
+/// -- that is the shape the JVM descriptor has -- while the function measured
+/// them against the callee's *unflattened* `paramss`, found the first clause
+/// complete, and returned a method type for a clause nobody was going to
+/// apply.
+///
+/// This is the only shape in which a constructor default may legally name an
+/// earlier parameter (nsc rejects a same-clause reference), so the fixture is
+/// mostly about *which value* each default produced: the primary and a
+/// secondary side by side, a nullary getter for a default that reads nothing,
+/// a clause filled part-way, a companion the source wrote, an inferred getter
+/// result on a generic class, a three-clause constructor whose last default
+/// names the *first* clause's parameter, and a computed default. The expected
+/// output is real scalac 2.13.16's, matched in both linking modes; an
+/// unmodified build of the branch point compiles the file with no diagnostic
+/// at all and throws `VerifyError` on its first line.
+#[test]
+fn fixtures_ctorgaps_clause() {
+    check("ctorgaps_clause");
+}
+
+#[test]
+fn scala_library_dual_run_ctorgaps_clause() {
+    dual_run_fixture("ctorgaps_clause");
+}
+
 /// nsc's own rule, and the one that makes the getter's name unambiguous: a
 /// getter is named after the parameter *position*, so two constructors that
 /// both define defaults want the same `$lessinit$greater$default$2` with

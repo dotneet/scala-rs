@@ -621,15 +621,19 @@ object Main {
     }
 }
 
-/// Found here, not fixed here, and left as an assertion on the rejection so
-/// the test fails and says so when a later slice closes it.
+/// nsc fills a default only when no alternative applies *without* one
+/// (`Infer.inferMethodAlternative`), so `new Prefer(1)` below is the
+/// **primary** and prints `1`. This compiler weighed both alternatives at once
+/// and reported `ambiguous overload for constructor`; `agent/ctorgaps` left
+/// that pinned as a rejection and `agent/ctorgaps2` closed it, so the
+/// assertion is now on the value.
 ///
-/// nsc fills a default only when no alternative applies *without* one, so
-/// `new Prefer(1)` below is the **primary**. This compiler weighs both
-/// alternatives at once and reports `ambiguous overload for constructor`.
-/// Pre-existing: an unmodified build of `agent/ctorgaps`' branch point
-/// reports the same words at the same line, and it is a rejection rather than
-/// a wrong pick, so nothing is silently miscompiled by it.
+/// `1` rather than `105` is the whole point: the secondary is applicable to
+/// one `Int` too, and picking it would be a wrong answer rather than a
+/// refusal. `new Prefer(1, 2)` still reaches the secondary, so the rule
+/// removes the alternative from the *weighing* and not from the class.
+///
+/// Both lines are real scalac 2.13.16's output for the same source.
 #[test]
 fn nsc_prefers_the_alternative_that_needs_no_default() {
     let src = r#"
@@ -637,54 +641,96 @@ class Prefer(val n: Int) {
   def this(k: Int, bump: Int = 5) = this(k * 100 + bump)
 }
 object Main {
-  def main(args: Array[String]): Unit = println(new Prefer(1).n)
+  def main(args: Array[String]): Unit = {
+    println(new Prefer(1).n)
+    println(new Prefer(1, 2).n)
+  }
 }
 "#;
-    let dir = tmp_dir("ctorprefer");
-    let file = dir.join("ctorprefer.scala");
-    fs::write(&file, src).unwrap();
-    let out = dir.join("out");
-    fs::create_dir_all(&out).unwrap();
-    let output = Command::new(bin())
-        .args([
-            "compile",
-            file.to_str().unwrap(),
-            "-d",
-            out.to_str().unwrap(),
-            "--no-scala-library",
-        ])
+    if !java_available() {
+        return;
+    }
+    let out = compile("ctorprefer", src, &["--no-scala-library"]);
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
         .output()
-        .expect("run scala-rs compile");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .expect("java");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        !output.status.success() && text.contains("ambiguous overload for constructor"),
-        "expected the known overload-vs-default gap; got:\n{text}"
+        output.status.success() && text.split_whitespace().collect::<Vec<_>>() == ["1", "102"],
+        "expected scalac's `1` then `102`; got status {:?}\n{text}\n{err}",
+        output.status
     );
-    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(out.parent().unwrap());
 }
 
-/// Found here, not fixed here: a constructor default in a **later parameter
-/// clause** is never filled at all.
+/// The other half of that rule: nsc selects the constructor on the **first
+/// clause**, so a curried `new` may not be answered by an alternative that
+/// clause never fitted.
 ///
-/// `new Curr(7)()` on `class Curr(a: Int)(b: String = "b" + a)` emits an
-/// `invokespecial` with one argument for a two-parameter descriptor:
-/// `VerifyError: Bad type on operand stack`. The cause is not the secondary
-/// constructor and not the getter -- `fill_defaults_and_implicits` re-reads
-/// the callee's *unflattened* `paramss` while a `new`'s arguments reach it
-/// already flattened, so the second clause is never seen as short. It
-/// reproduces on the **primary** constructor of a plain class, with or
-/// without a companion, and on an unmodified build of the branch point; the
-/// identical `def m(a: Int)(b: String = "b" + a)` is filled correctly.
-///
-/// This is the only shape in which a constructor default may legally name an
-/// earlier parameter (nsc rejects a same-clause reference outright), so it is
-/// what `tests/fixtures/ctorgaps_secdefault.scala` cannot cover.
+/// `new Three(2)("m")()` folds to `(2, "m")`, which the primary `(Int,
+/// String)` accepts exactly -- and with the defaults now filled and the
+/// no-default alternative now preferred, that would be a silent wrong answer
+/// (`"m"` for `"m/m2"`) where it used to be `ambiguous overload`. Holding the
+/// pick to the alternatives whose first clause is one parameter long -- the
+/// same set `flatten_curried_new` measured its arity against -- leaves only
+/// the secondary. Both lines are real scalac 2.13.16's.
 #[test]
-fn a_default_in_a_later_ctor_clause_is_not_filled() {
+fn a_curried_new_is_picked_on_its_first_clause() {
+    let src = r#"
+class Three(val a: Int, val bc: String) {
+  def this(a: Int)(m: String)(tail: String = m + a) = this(a, m + "/" + tail)
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new Three(2)("m")().bc)
+    println(new Three(2, "z").bc)
+  }
+}
+"#;
+    if !java_available() {
+        return;
+    }
+    let out = compile("ctorthree", src, &["--no-scala-library"]);
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success() && text.split_whitespace().collect::<Vec<_>>() == ["m/m2", "z"],
+        "expected scalac's `m/m2` then `z`; got status {:?}\n{text}\n{err}",
+        output.status
+    );
+    let _ = fs::remove_dir_all(out.parent().unwrap());
+}
+
+/// A constructor default in a **later parameter clause**, which
+/// `agent/ctorgaps` left open and `agent/ctorgaps2` closed. This test used to
+/// assert the defect; it now asserts the value.
+///
+/// `new Curr(7)()` on the class below emitted an `invokespecial` with one
+/// argument for a three-parameter descriptor: `VerifyError: Bad type on
+/// operand stack`. The cause was neither the secondary constructor nor the
+/// getter -- `fill_defaults_and_implicits` re-read the callee's *unflattened*
+/// `paramss` while a `new`'s arguments reach it already flattened, so the
+/// second clause was never seen as short. It reproduced on the **primary**
+/// constructor of a plain class, with or without a companion, while the
+/// identical `def m(a: Int)(b: String = "b" + a)` was filled correctly.
+///
+/// `"b714"` is `b = "b" + 7` and `c = 7 * 2`, concatenated by the delegation
+/// -- so this says the defaults were evaluated with *this* call's `a` and not
+/// merely that three arguments reached the descriptor. It is real scalac
+/// 2.13.16's answer for the same source.
+///
+/// `Curr` writes no companion on purpose: a later-clause default may name an
+/// earlier parameter, so its `$lessinit$greater$default$n` takes that
+/// parameter and cannot be spliced at the call site. nsc synthesizes a `Curr$`
+/// to hold it, and `needs_ctor_default_companion` is what does that here.
+#[test]
+fn a_default_in_a_later_ctor_clause_is_filled() {
     let src = r#"
 class Curr(val a: Int, val b: String) {
   def this(a: Int)(b: String = "b" + a, c: Int = a * 2) = this(a, b + c)
@@ -697,14 +743,22 @@ object Main {
         return;
     }
     let out = compile("ctorcurried", src, &["--no-scala-library"]);
+    assert!(
+        out.join("Curr$.class").exists(),
+        "the getter's companion must be emitted; got {:?}",
+        fs::read_dir(&out).map(|d| d
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect::<Vec<_>>())
+    );
     let output = Command::new("java")
         .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
         .output()
         .expect("java");
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        !output.status.success() && err.contains("VerifyError"),
-        "expected the known later-clause gap; got status {:?}\n{err}",
+        output.status.success() && text.trim() == "b714",
+        "expected scalac's `b714`; got status {:?}\n{text}\n{err}",
         output.status
     );
     let _ = fs::remove_dir_all(out.parent().unwrap());

@@ -145,7 +145,13 @@ impl Typer {
 
     fn namer_enter_tmpl(&mut self, tree: &mut Tree) {
         match &tree.kind {
-            TreeKind::ClassDef { name, mods, .. } => {
+            TreeKind::ClassDef {
+                name,
+                mods,
+                vparamss,
+                impl_,
+                ..
+            } => {
                 let is_trait = mods.flags.contains(Flags::TRAIT);
                 let flags = mods.flags.with(if is_trait {
                     Flags::ABSTRACT
@@ -173,7 +179,25 @@ impl Typer {
                 tree.sym = id;
                 if mods.flags.contains(Flags::CASE) {
                     let class_jvm = jvm.clone();
-                    self.ensure_companion(name, &class_jvm, id);
+                    self.ensure_companion(name, &class_jvm, id, true);
+                } else if Self::needs_ctor_default_companion(vparamss, impl_) {
+                    // A constructor default in a *later* clause may name a
+                    // parameter of an earlier one, and
+                    // `$lessinit$greater$default$n` takes those parameters for
+                    // exactly that reason. The getter lives on the companion,
+                    // so a class that has no companion of its own needs the
+                    // one nsc synthesizes here -- `javap` on scalac 2.13.16's
+                    // `class Curr(a: Int)(b: String = "b" + a)` shows a
+                    // `Curr$` holding `$lessinit$greater$default$2(int)`.
+                    //
+                    // Only for that shape. A default in the *first* clause has
+                    // nothing it may legally read (nsc rejects a same-clause
+                    // reference), so its expression can be spliced at the call
+                    // site and no companion is needed; synthesizing one anyway
+                    // would emit a class file for every class in the world
+                    // that takes a defaulted argument.
+                    let class_jvm = jvm.clone();
+                    self.ensure_companion(name, &class_jvm, id, false);
                 }
             }
             TreeKind::ModuleDef { name, mods, .. } => {
@@ -302,7 +326,38 @@ impl Typer {
     /// `class_jvm` is the companion's *class*'s binary name: a local case
     /// class carries an index (`Main$P$1`) that the companion has to reuse
     /// rather than draw a fresh one for.
-    fn ensure_companion(&mut self, name: &str, class_jvm: &str, class_id: SymbolId) -> SymbolId {
+    /// Whether any constructor of this class declares a default in a clause
+    /// **after its first** -- on the primary (`vparamss`) or on a `def
+    /// this(...)` in the body.
+    ///
+    /// That is the only place a constructor default may read another
+    /// parameter, and therefore the only place the getter cannot be replaced
+    /// by splicing the default's expression at the call site.
+    fn needs_ctor_default_companion(vparamss: &[Vec<Tree>], impl_: &Template) -> bool {
+        fn later_clause_default(vparamss: &[Vec<Tree>]) -> bool {
+            vparamss.iter().skip(1).flatten().any(|p| match &p.kind {
+                TreeKind::ValDef { mods, rhs, .. } => {
+                    mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty()
+                }
+                _ => false,
+            })
+        }
+        later_clause_default(vparamss)
+            || impl_.body.iter().any(|m| match &m.kind {
+                TreeKind::DefDef { name, vparamss, .. } => {
+                    name == "<init>" && later_clause_default(vparamss)
+                }
+                _ => false,
+            })
+    }
+
+    fn ensure_companion(
+        &mut self,
+        name: &str,
+        class_jvm: &str,
+        class_id: SymbolId,
+        case: bool,
+    ) -> SymbolId {
         let existing = self
             .st
             .lookup(name)
@@ -312,6 +367,11 @@ impl Typer {
             return e;
         }
         let jvm = format!("{class_jvm}$");
+        // Only a *case* class's companion is `CASE`: `prelude_product` reads
+        // that flag to decide which `AbstractFunctionN` the module extends and
+        // whether it owes an `apply` / `unapply`. A companion synthesized
+        // merely to hold `$lessinit$greater$default$n` owes none of that.
+        let case_flag = if case { Flags::CASE } else { Flags::EMPTY };
         let cls = self.st.alloc(
             &format!("{name}$"),
             self.st.owner,
@@ -319,14 +379,14 @@ impl Typer {
             Flags::MODULE
                 .with(Flags::FINAL)
                 .with(Flags::SYNTHETIC)
-                .with(Flags::CASE),
+                .with(case_flag),
             &jvm,
         );
         let m = self.st.alloc(
             name,
             self.st.owner,
             SymKind::Module,
-            Flags::MODULE.with(Flags::SYNTHETIC).with(Flags::CASE),
+            Flags::MODULE.with(Flags::SYNTHETIC).with(case_flag),
             &jvm,
         );
         self.st.get_mut(m).ty = Type::ModuleRef(cls);
