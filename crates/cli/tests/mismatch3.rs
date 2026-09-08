@@ -170,12 +170,17 @@ fn mismatch3_fixture_dual_run() {
 }
 
 /// The relaxations must not swallow the errors nsc still reports.
+///
+/// The access message is real scalac 2.13.16's, word for word: the fixture is
+/// in the empty package, so there is no package qualification for us to be
+/// missing. (scalac adds an indented "Access to protected method secret not
+/// permitted because ..." explanation underneath; we print the sentence only.)
 #[test]
 fn mism3_bad_is_still_rejected() {
     compile_fails(
         "mism3_bad",
         &[
-            "value secret cannot be accessed as a member of P3 from Q3",
+            "method secret in class P3 cannot be accessed as a member of P3 from class Q3",
             "type mismatch; found: Cell3[Int]  required: Cell3[String]",
         ],
     );

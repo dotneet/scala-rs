@@ -174,12 +174,23 @@ fn mism8_fixture_runs_in_both_modes() {
 }
 
 /// What the relaxations must not swallow. Every one of these is an error real
-/// scalac 2.13.16 gives for the same source.
+/// scalac 2.13.16 gives for the same source:
+///
+/// ```text
+/// value slot in class Holder cannot be accessed as a member of mism8bad.Holder from object Use
+/// value y is not a member of mism8bad.Local
+/// ```
+///
+/// Ours words the first the same but leaves the prefix type unqualified
+/// (`Holder`), and reports the second as an access rather than an absence.
 #[test]
 fn mism8_access_bad_is_still_rejected() {
     compile_fails(
         "mism8_access_bad",
-        &["value slot cannot be accessed", "value y"],
+        &[
+            "value slot in class Holder cannot be accessed as a member of Holder from object Use",
+            "value y",
+        ],
     );
 }
 

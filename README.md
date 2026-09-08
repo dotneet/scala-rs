@@ -358,6 +358,20 @@ codegen 側も出すようにしました（実 scalac が `Empty().copy()` を�
 が呼び出し側をコンパイルして**実行**し scalac 同士の出力と一致すること、異常系は
 `f()` が同じ行・同じ件数で拒否されることを固定します。
 
+アクセス不能な member の診断は nsc の `ContextErrors.AccessError` と同じ文を組み
+立てるようになりました。主語は `underlyingSymbol(sym).fullLocationString`——
+`method x in class C`、`variable foo in class Sub2`、`object Inner in object
+Outer`——で、module class は `directObjectString` に従って `C$` ではなく `object
+C` と綴ります。`from` 側も同じ規則です（`object Use in package xflags`、空パッ
+ケージなら `class Q3`）。コンストラクタは nsc と同じく `as a member of <prefix>`
+ではなく `in <owner>` になります。`.check` に `cannot be accessed` を含む `neg`
+コーパス 26 件で、文言の一致は **T1/T2/T3 = 0 → 3**（`t8002-nested-scope`、
+`t3714-neg`、`t3871` が `.check` と 1 バイト違わず一致）。**エラー件数は動きま
+せん**——変わるのは診断が何と言うかであって、どのプログラムを拒否するかではあり
+ません。残る差は prefix の型がパッケージ修飾されないこと（`object C` に対し nsc は
+`object xflags.C`）で、これは `display_type` が**すべての**診断で型を印字する
+やり方であって、この診断の問題ではありません。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -552,7 +566,11 @@ scalac 2.13.16 の出力そのもの——9 件の診断を行と文言で——
 ユニバーサルトレイト、型エイリアスと匿名クラスと `PartialFunction` リテラルを
 持つ値クラス、`private` を読むコンパニオン——を**実行**して実 scalac の出力と
 比較します。拒否規則は広すぎると動いていたプログラムを壊すので、正常系が
-**修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。
+**修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。ローカル
+コンパニオンの異常系は、行だけでなく実 scalac 2.13.16 の**文そのもの**
+（`method x in class C cannot be accessed as a member of C from object C` と
+`value y in class D cannot be accessed as a member of D from object D`）を固定
+します。
 
 線形化（SLS 5.1.2）は `linearization` テストで二重に検査します。正常系は深く広い
 ダイヤモンド継承の `super` 連鎖を実行し、同じソースを実 scalac 2.13.16 で

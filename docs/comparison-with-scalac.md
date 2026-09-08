@@ -432,4 +432,18 @@ The honest diff.
   Sequence patterns on `Seq` / `Array` require jar linking (they are diagnosed
   under `--no-scala-library`).
 
+- **Access diagnostics** are built the way nsc's `ContextErrors.AccessError`
+  builds them: the subject is `underlyingSymbol(sym).fullLocationString`
+  (`method x in class C`, `variable foo in class Sub2`, `object Inner in object
+  Outer`), a module class is spelled `object C` rather than `C$`
+  (`directObjectString`), the `from` clause names the enclosing class the same
+  way (`object Use in package xflags`; nothing is appended for the empty
+  package), and a constructor takes `in <owner>` in place of `as a member of
+  <prefix>`. Two differences remain. The prefix type is not package-qualified
+  — we print `object C` and `Holder` where nsc prints `object xflags.C` and
+  `mism8bad.Holder` — which is `SymbolTable::display_type`'s doing and shows in
+  every diagnostic, not only this one; and nsc appends an indented "Access to
+  protected method `m` not permitted because …" explanation for the
+  `protected` cases, which we do not print.
+
 It is not a replacement for scalac. It is a reimplementation of a subset.

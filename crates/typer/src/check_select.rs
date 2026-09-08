@@ -525,14 +525,28 @@ impl Typer {
                 found.truncate(1);
             }
         }
+        // Keep the alternative `retain` is about to drop: nsc names the member
+        // it resolved, with its kind and its owner (`method x in class C`), so
+        // the message needs a symbol and not just the written name. A
+        // `SymbolId` copy, not a clone of the vector -- this runs on every
+        // member selection.
+        let rejected = found.first().copied().unwrap_or(SymbolId::NONE);
         found.retain(|s| self.accessible(*s, Some(qual.as_ref())));
         self.note_companion_access(&found);
         if found.is_empty() {
+            let subject = rejected;
+            // nsc's `AccessError`: a constructor is `in <owner>`, everything
+            // else `as a member of <prefix>`.
+            let location = if self.st.get(subject).flags.contains(Flags::CONSTRUCTOR) {
+                format!("in {}", self.access_sym_string(self.st.this_class))
+            } else {
+                format!("as a member of {}", self.access_prefix_string(&qual.ty))
+            };
             self.error(
                 tree.span,
                 format!(
-                    "value {name} cannot be accessed as a member of {} from {}",
-                    self.st.display_type(&qual.ty),
+                    "{} cannot be accessed {location} from {}",
+                    self.access_full_location_string(subject),
                     self.access_from_name()
                 ),
             );
@@ -1312,11 +1326,120 @@ impl Typer {
         })
     }
 
+    /// nsc `Symbol#kindString`, in the "sanitized" spelling error messages
+    /// use. `ContextErrors` prints a symbol through `toString`, which is
+    /// `kindString + " " + name`, and that is the subject of every access
+    /// diagnostic.
+    ///
+    /// nsc reaches the member through `underlyingSymbol`, which replaces a
+    /// getter or setter by the field it accesses: `val x` reads "value x" and
+    /// `var x` reads "variable x", never "getter"/"setter". We have no
+    /// separate field symbol for a source `val`, and a `val` read back from a
+    /// pickle is an `ACCESSOR` method, so both stand in for the field here.
+    fn access_kind_word(&self, sym: SymbolId) -> &'static str {
+        let s = self.st.get(sym);
+        let f = s.flags;
+        let value_word = || {
+            if f.contains(Flags::MUTABLE) {
+                "variable"
+            } else if f.contains(Flags::LAZY) {
+                "lazy value"
+            } else {
+                "value"
+            }
+        };
+        match s.kind {
+            SymKind::Package => "package",
+            SymKind::Module | SymKind::ModuleClass => "object",
+            SymKind::Class => {
+                if f.contains(Flags::TRAIT) || f.contains(Flags::INTERFACE) {
+                    "trait"
+                } else {
+                    "class"
+                }
+            }
+            SymKind::TypeMember | SymKind::TypeParam => "type",
+            SymKind::Method if f.contains(Flags::CONSTRUCTOR) => "constructor",
+            SymKind::Method if f.contains(Flags::ACCESSOR) => value_word(),
+            SymKind::Method => "method",
+            SymKind::Term => value_word(),
+            SymKind::NoSymbol => "value",
+        }
+    }
+
+    /// The name nsc shows for a symbol: the module *class* `C$` is spelled
+    /// `C`, and a constructor -- whose own name is `<init>` -- borrows its
+    /// owner's (nsc `hasMeaninglessName`).
+    fn access_sym_name(&self, sym: SymbolId) -> String {
+        let s = self.st.get(sym);
+        if s.kind == SymKind::Method && s.flags.contains(Flags::CONSTRUCTOR) {
+            return self.access_sym_name(s.owner);
+        }
+        if s.kind == SymKind::ModuleClass {
+            if let Some(stripped) = s.name.strip_suffix('$') {
+                return stripped.to_string();
+            }
+        }
+        s.name.clone()
+    }
+
+    /// nsc `Symbol#toString`: `<kind> <name>`, e.g. `method x`, `object C`.
+    fn access_sym_string(&self, sym: SymbolId) -> String {
+        format!(
+            "{} {}",
+            self.access_kind_word(sym),
+            self.access_sym_name(sym)
+        )
+    }
+
+    /// nsc `Symbol#locationString`: ` in <owner>`, empty when the owner is not
+    /// a class or is an "empty prefix" -- the root, or the empty package. One
+    /// level only: `object Use in package xflags`, never the whole chain.
+    fn access_location_string(&self, sym: SymbolId) -> String {
+        let owner = self.st.get(sym).owner;
+        if owner.is_none() || owner == self.st.root {
+            return String::new();
+        }
+        match self.st.get(owner).kind {
+            // A package *class* is a class to nsc, hence `in package p`.
+            SymKind::Class | SymKind::ModuleClass | SymKind::Module | SymKind::Package => {
+                format!(" in {}", self.access_sym_string(owner))
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// nsc `Symbol#fullLocationString`: `toString + locationString`.
+    fn access_full_location_string(&self, sym: SymbolId) -> String {
+        format!(
+            "{}{}",
+            self.access_sym_string(sym),
+            self.access_location_string(sym)
+        )
+    }
+
+    /// nsc `Type#directObjectString`: a module reads as `object C` where it is
+    /// the direct object of the sentence, rather than the `C.type` (`C$` for
+    /// us) it prints everywhere else.
+    fn access_prefix_string(&self, ty: &Type) -> String {
+        if let Some(sym) = self.st.class_sym_of(ty) {
+            if matches!(
+                self.st.get(sym).kind,
+                SymKind::Module | SymKind::ModuleClass
+            ) {
+                return self.access_sym_string(sym);
+            }
+        }
+        self.st.display_type(ty)
+    }
+
+    /// nsc's ` from ${owner0.fullLocationString}` -- the class the access
+    /// takes place in, named the way the subject is.
     fn access_from_name(&self) -> String {
         if self.st.this_class.is_none() {
             "<none>".into()
         } else {
-            self.st.get(self.st.this_class).name.clone()
+            self.access_full_location_string(self.st.this_class)
         }
     }
 
@@ -1355,11 +1478,12 @@ impl Typer {
             }
             return false;
         }
+        let subject = self.access_full_location_string(copy);
         let owner = self.st.get(class_id).name.clone();
         let from = self.access_from_name();
         self.error(
             span,
-            format!("value copy cannot be accessed as a member of {owner} from {from}"),
+            format!("{subject} cannot be accessed as a member of {owner} from {from}"),
         );
         true
     }

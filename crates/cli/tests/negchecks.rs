@@ -253,15 +253,21 @@ fn legal_universal_trait_and_value_class_still_run() {
 /// `private def x`. scalac 2.13.16 rejects both accesses in this fixture, at
 /// lines 8 and 16.
 ///
-/// **The wording is ours, not scalac's, and deliberately so.** scalac says
-/// `method x in class C cannot be accessed as a member of C from object C`;
-/// this compiler says `value x cannot be accessed as a member of C from C$`
-/// for *every* access error it reports, has done since long before this
-/// slice, and four other test files pin that spelling. `fullLocationString`
-/// ("method x in class C") and `directObjectString` ("object C" for a module
-/// class) are one cross-cutting change to every access diagnostic in the
-/// compiler, not part of this rule. The line and the cause are what this test
-/// pins; see `docs/comparison-with-scalac.md`.
+/// **The wording is now scalac's**, word for word. nsc builds the message
+/// from `underlyingSymbol(sym).fullLocationString` ("method x in class C") and
+/// `pre.widen.directObjectString` ("object C" for a module class); the earlier
+/// slice that added this *rule* left the message spelling alone because it
+/// belongs to every access diagnostic in the compiler. Real scalac 2.13.16 on
+/// this fixture:
+///
+/// ```text
+/// negchecks_companion_scope_bad.scala:8: error: method x in class C cannot be accessed as a member of C from object C
+/// negchecks_companion_scope_bad.scala:16: error: value y in class D cannot be accessed as a member of D from object D
+/// ```
+///
+/// Both are in the empty package, so nothing is left for us to qualify: the
+/// two sentences below are byte-identical to nsc's. See
+/// `docs/comparison-with-scalac.md`.
 #[test]
 fn a_local_object_in_a_nested_block_is_not_a_companion() {
     let err = compile_bad("companion-scope", "negchecks_companion_scope_bad.scala");
@@ -272,6 +278,15 @@ fn a_local_object_in_a_nested_block_is_not_a_companion() {
         assert!(
             err.contains(line),
             "expected an inaccessible-member error at {line}:\n{err}"
+        );
+    }
+    for message in [
+        "method x in class C cannot be accessed as a member of C from object C",
+        "value y in class D cannot be accessed as a member of D from object D",
+    ] {
+        assert!(
+            err.contains(message),
+            "expected scalac's own wording {message:?}:\n{err}"
         );
     }
     assert_eq!(
