@@ -70,6 +70,30 @@ SLICK=$(SLICK_LOG=$GATE_DIR/slick.txt tests/slick_measure.sh 2>&1 | tail -1); pr
 CATS=$(CATS_LOG=$GATE_DIR/cats.txt tests/cats_measure.sh 2>&1 | tail -1);      print "  cats      $CATS"
 GB=$(GITBUCKET_LOG=$GATE_DIR/gitbucket.txt tests/gitbucket_measure.sh 2>&1 | tail -1); print "  gitbucket $GB"
 LIB=$(SCALALIB_LOG=$GATE_DIR/scalalib.txt tests/scalalib_measure.sh 2>&1 | tail -1);   print "  library   $LIB"
+
+# A measure that compiled the wrong number of files is not a measure. Only
+# slick used to be checked here, so on 2026-09-09 a gate printed
+# `VERDICT=PASS` with cats reporting `measurement invalid: no source files`
+# (its checkout had been gutted) and gitbucket reporting `files=25` of 353.
+# Both sat inside a passing run. That is the same failure as a ledger chosen
+# by mtime: a check reporting green over nothing. The file counts are pinned
+# here, and `measurement invalid` from any of the four is a FAIL.
+check_measure() {  # name, summary line, expected `files=` count
+  local what=$1 line=$2 want=$3
+  if [[ $line == *"measurement invalid"* ]]; then
+    FAIL+=("$what measure invalid: $line"); return
+  fi
+  local got=$(print -r -- "$line" | grep -oE '(^| )files=[0-9]+' | head -1 | grep -oE '[0-9]+')
+  if [[ -z $got ]]; then
+    FAIL+=("$what measure printed no files= count: $line")
+  elif [[ $got != $want ]]; then
+    FAIL+=("$what compiled $got files, expected $want: $line")
+  fi
+}
+check_measure slick     "$SLICK" 184
+check_measure cats      "$CATS"  339
+check_measure gitbucket "$GB"    353
+check_measure library   "$LIB"   538
 [[ $SLICK == *"errors=0 files_with_errors=0 classes=1490"* ]] || FAIL+=("slick measure: $SLICK")
 
 # --- execution --------------------------------------------------------------
