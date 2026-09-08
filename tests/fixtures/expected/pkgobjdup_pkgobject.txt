@@ -1,0 +1,10 @@
+inner.Payload
+true
+Box(7)
+pick(Int)
+pick(Double)
+Box(9)
+outer's own object Thing
+true
+true
+0
