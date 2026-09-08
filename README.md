@@ -256,6 +256,31 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 `class LinkedHashMap extends HashMap implements Map` のために必要でした）も
 不要になります。
 
+2 つの親から**別々の具体化で**届く基底クラスは、先に届いた方ではなく
+**meet（両者の下限）** で読みます。以前は線形化を歩いて最初の具体化を採って
+いました（最派生の「到達元」が勝つ、という規則）が、それは nsc の規則ではなく、
+足りてもいません。`trait Str[+A] extends LinOps[A, Str[A]] with Iter[A]` は
+`IterOps` に `IterOps[A, Str[A]]` と `IterOps[A, Iter[A]]` の 2 通りで到達し、
+`Iter` と `LinOps` はどちらも他方の上にはいません。SLS 5.1.2 は最後に書かれた
+`Iter` を先に並べるので、`IterOps.tail` は `Iter[A]` と読まれていました——実
+scalac 2.13.16 は `Str[A]` と型付けます。nsc は
+`BaseTypeSeqs.compoundBaseTypeSeq` で到達したすべての具体化を保持し、
+`mergePrefixAndArgs(variants, Variance.Contravariant, _)` で解決します。すなわち
+**共変パラメータでは glb（最派生）、反変パラメータでは lub（最汎化）**であり、
+「常に最派生を採る」規則は反変側を逆に間違えます。`SymbolTable::base_type_args`
+がこの規則になりました。線形化の順序自体は変えていません（`agent/basetypeseq`
+がその案を 1551 → 1579 と計測して捨てています）。`@uncheckedVariance` だけが
+違う 2 つの到達は同じ型なので 1 つに畳み、注釈のない綴りを残します
+（nsc の `=:=` は注釈を見ません）。`Check::base_type_instance` も、対象に到達
+しうる親が 2 つ以上あるときはこの merge 済みの答えを読みます。おかげで
+「宣言が定義を言い直しているだけか」を、宣言の所有者から定義の所有者への
+**すべての経路**を 512 ノードの予算で試して調べる必要がなくなり、親 DAG の深さに
+対して指数的なその走査（オーバーロード解決の内側で走っていました）を削除しました。
+`tests/fixtures/btmeet_basetypemeet.scala` は共変・反変の両側と
+`@uncheckedVariance` の綴りを**実行**して実 scalac 2.13.16 の出力と比較し、
+`btmeet_basetypemeet_bad.scala` は scalac と同じ 3 行（23・44・52 行目）で
+拒否されることを固定します（`btmeet` テスト）。
+
 A library member is read from the pickle on demand, and where two classes in
 the receiver's linearization declare the same name with the same *explicit*
 parameters, only one copy is kept — nsc's `isAsSpecific` looks through an
@@ -406,6 +431,21 @@ constructor を持つクラスの pickle されたフラグのみ。バイトコ
 以前は通していた `new SepPriv("x")` を拒否するようになったことで裏付けています。
 分割コンパイル越し（`neg/t6601`）はまだ通ります——コンストラクタの privacy が
 クラスファイルの往復で失われるためで、`pickle_supply.rs` 側の別スライスです。
+
+**`Unit` を返す `Predef` の多相組み込みが、要る値を捨てなくなりました。**
+`gen_predef_poly` は結果型が `Unit` のとき自分の結果を必ず `pop` していました。
+`identity` / `locally` / `implicitly` は `(Object)Object` に消去されるので、
+`Unit` でも参照（`BoxedUnit.UNIT`）を返します。捨ててよいのは**文の位置**だけで、
+値が**引数**のときは呼び手のスタックが空になり、`println(identity(()))` は
+`VerifyError: Operand stack underflow` でした。nsc と同じく値を残し、`gen_stat`
+の文位置の破棄（`discarded_predef_poly`）が落とすようにしました。私有ランタイム
+側は同じ食い違いの**裏返し**（消去が引数を box するのに誰も pop せず、
+`if (b) identity(()) else side()` が `Inconsistent stackmap frames`）で、同じ述語
+で閉じています。fixture `tests/fixtures/unitpop_intrinsic.scala` は両方の位置を
+1 つのプログラムに持ち、`-Xverify:all` の下で**実行**して両モードとも実 scalac
+2.13.16 の出力と一致します。**コンパイルは通り、実行しなければ分からない**種類の
+誤りなので、テストは必ず走らせて出力を比較します。slick の 1490 クラスファイルは
+修正前後で**バイト単位で不変**です。
 
 **secondary constructor への `new C(…)` が正しい引数を渡すようになりました。**
 `class Sec(val a: Int) { def this(s: String) = … }` に対する `new Sec("abcd")` は
@@ -645,9 +685,20 @@ scalac の行と文で、正常系（`tests/fixtures/intrinsicqual_ctor.scala`�
 オーバーロードを持つクラス）は**実行**して固定します。拒否規則なので、正常系が
 **修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。
 
+`unitpop` テストは、`Unit` を返す `Predef` の多相組み込みが**値の位置では値を
+残し、文の位置では落とす**ことを固定します。片方だけ直すと必ずもう片方が壊れる
+（残しすぎればスタックに残骸が出て `Inconsistent stackmap frames`、捨てすぎれば
+`Operand stack underflow`）ので、`tests/fixtures/unitpop_intrinsic.scala` は
+両方の位置と、非 `Unit` の同じ 3 つを 1 本のプログラムに入れています。文の位置は
+どれも直後に分岐を置いてあります——残骸は次の stackmap frame まで生き延びて
+初めて見つかるからです。**コンパイルも通り `javap` も通る**種類の誤りなので、
+検査は `java -Xverify:all` での**実行**と実 scalac 2.13.16 との出力比較だけです。
+両モードで回し、修正前のバイナリでは jar モードが `Operand stack underflow`、
+私有ランタイムが `Inconsistent stackmap frames` で落ちることを確認しています。
+
 `secondaryctor` テストは secondary constructor への `new` を固定します。この種の
 欠陥はエラー数にもクラスファイル数にも現れず、呼び出し箇所の `javap` すら正しく
-見えるので、**10 本すべてが `java -Xverify:all` でプログラムを実行**します。
+見えるので、**11 本すべてが `java -Xverify:all` でプログラムを実行**します。
 fixture `tests/fixtures/secondaryctor_new.scala` は、クラス内部・コンパニオン・
 無関係なオブジェクトからの呼び出し、消去後の記述子が 1 引数だけ違う 2 つの
 secondary、別の secondary へ委譲する secondary、値クラスを取る secondary、

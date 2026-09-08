@@ -1621,14 +1621,15 @@ were never affected).
    member`` — by fixing the matcher rather than by lookup work. What is left
    of it is 9 `incompatible type in overriding` plus 10 `overrides nothing`,
    and those *are* the member-lookup bug seen from the other side.
-4. **`SymbolTable::base_type_args` takes the first path, not the meet.** The
-   second defect `agent/liboverload` found and did not fix; its section below
-   has the trace and a nine-line reproduction. It is what makes
-   `IterableOps.tail` read as `Iterable[A]` from `Stream`, and it is what is
-   left behind every `<overload …>` receiver in the log: `<overload Nil$ |
-   Nil$>` (7), `<overload Set[A] | TreeSet[A]>` (3), `<overload Iterable[(K,
-   V)] | Map[K, V] | TreeMap[K, V]>` (3). Those are two instantiations of one
-   base, so no member-collapse rule can reach them.
+4. ~~**`SymbolTable::base_type_args` takes the first path, not the meet.**~~
+   Done by `agent/basetypemeet`, in the section below: 917 -> 912, and the
+   base type of a class reached twice is now nsc's contravariant merge. The
+   half of this item that named the `<overload …>` receivers was **wrong**,
+   and that slice measured it: `<overload Nil$ | Nil$>` (7), `<overload Set[A]
+   | TreeSet[A]>` (3) and `<overload Iterable[(K, V)] | Map[K, V] |
+   TreeMap[K, V]>` (3) are two *symbols*, not two instantiations — two sibling
+   overrides of one inherited member, which `drop_overridden` has no rule for.
+   That is a member-collapse question after all, and it is the next one.
 5. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 
@@ -1903,6 +1904,250 @@ diagnosis offered here ("emits an `invokespecial` at the *primary*
 constructor's descriptor") turned out to be wrong: the descriptor was right
 all along and the *argument* was adapted against the primary.
 
+## The `agent/basetypemeet` slice: a base class reached twice is the meet
+
+**917 errors in 146 files -> 912 in 145**, measured on this branch merged with
+`main` at `5dc7f703` (`agent/nameamb`, `agent/intrinsicqual`) against that same
+`main` measured on its own, and the same **-5** it was at the branch point
+(`e76b0ebf`), so the waves do not overlap. cats **185 -> 182**, gitbucket
+**270 -> 270**, slick `errors=0 files_with_errors=0 classes=1490` with all
+1490 class files byte-identical (`SLICK_OUT` on both binaries, `diff -r`
+empty). The scala/scala corpus is unchanged: `pos 1095 / neg 673 / run 626`,
+`CORPUS_SIZE=full`, `losses=0 changes=0` against
+`tests/baselines/corpus-3fd80269.tsv`.
+
+The brief was item 4 of the list above, and `agent/liboverload`'s claim that
+**every** `<overload ...>` receiver left in the log is this defect. That claim
+is wrong, and the measured yield says so: 5 lines, not the 13 the `<overload
+Nil$ | Nil$>` / `<overload Set[A] | TreeSet[A]>` / `<overload Iterable[(K, V)]
+| Map[K, V] | TreeMap[K, V]>` families come to. Those families are a **third**
+root; the last section here says what it is.
+
+### The rule, and why "most derived reacher" is not it
+
+`agent/basetypeseq` made `SymbolTable::base_type_args` walk the linearization
+and keep the **first** instantiation offered for each base class, on the
+grounds that `linearize` lists a class before all of its ancestors, so the
+first arrival is the one the most derived *reacher* supplies. That fixes
+`HashMap`, where `AbstractMap` and `StrictOptimizedMapOps` do stand in a
+hierarchy. It cannot fix a base two **siblings** reach:
+
+```scala
+trait IterOps[+A, +C] { def me: C; def tail: C = me }
+trait Iter[+A] extends IterOps[A, Iter[A]]
+trait LinOps[+A, +C] extends IterOps[A, C]
+final class Str[+A](val a: A) extends LinOps[A, Str[A]] with Iter[A] {
+  def me: Str[A] = this
+  def onlyOnStr: String = "Str"
+  def check: String = tail.onlyOnStr   // value onlyOnStr is not a member of Iter[A]
+}
+```
+
+`L(Str)` is `Str, Iter, LinOps, IterOps` -- `Iter` is first because it is
+written **last** -- and neither `Iter` nor `LinOps` is above the other, so the
+order says nothing about which instantiation of `IterOps` is right. scalac
+2.13.16 accepts that file. In the library it is `Stream`, which reaches
+`IterableOps` at `Stream[A]` through `LinearSeqOps` and at `Iterable[A]`
+through `Iterable`.
+
+nsc's answer is not an order at all. `BaseTypeSeqs.compoundBaseTypeSeq` keeps
+**every** variant a base class is reached at (`minTypes`) and stores the entry
+as a lazy `RefinedType`; `BaseTypeSeq.apply` then resolves it with
+
+```scala
+mergePrefixAndArgs(variants, Variance.Contravariant, lubDepth(variants))
+```
+
+which, position by position and by the *parameter's* variance against that
+contravariant direction, takes `glb` at a covariant parameter (the most
+derived arrival), `lub` at a contravariant one (the least derived), and for an
+invariant parameter builds an existential over `TypeBounds(glb, lub)`.
+`SymbolTable::meet_base_args` is that rule. The invariant case keeps the first
+arrival instead: two different arguments there is an illegal inheritance, so a
+program without that error is unaffected and one with it is the inheritance
+check's business.
+
+**Both halves are load-bearing.** A rule that simply took the most derived
+arrival gets the covariant half right and the contravariant half backwards:
+`trait Both extends Wide[Animal] with Narrow` (where `Wide[-T] extends Sink[T]`
+and `Narrow extends Sink[Dog]`) reaches `Sink` at `Dog` and at `Animal`, and
+`take` accepts an `Animal` -- the **lub**. `tests/fixtures/btmeet_basetypemeet.scala`
+runs both.
+
+Nothing here reorders the linearization. `agent/basetypeseq` measured that
+(1551 -> **1579**, "the order that is right at one node is not right at the
+node below") and threw it away; the merge does not care what order the
+variants arrive in.
+
+### `@uncheckedVariance` is a spelling, not a variant
+
+`IterableFactoryDefaults[+A, +CC[x]] extends IterableOps[A, CC, CC[A
+@uncheckedVariance]]` reaches `IterableOps` before `SeqOps` does in `Stream`'s
+linearization, so the first arrival is `Stream[A @uncheckedVariance]` and the
+second is `Stream[A]`. nsc's `=:=` does not look at the annotation, and scalac
+prints the base type without it -- ask scalac for `override` on a method that
+narrows `IterOps.tail` and it says `def tail: Restated[A] (defined in trait
+IterOps)`. So the merge folds arrivals that differ only by annotations into one
+and keeps the plain spelling.
+
+That is not cosmetic. `Check::declaration_restates_definition` compares the
+definition read at the declaration's prefix with the declaration's own type
+**structurally**, and `Restated[A @uncheckedVariance]` is not `Restated[A]`.
+With the annotated spelling winning the merge, `agent/liboverload`'s whole -53
+comes back (917 -> **964**, measured).
+
+### The 512-node walk is gone
+
+`Check::base_type_instance` had the same first-path defect, and it is why
+`Check::restated_on_some_path` existed: with no way to ask for *the* base type,
+`declaration_restates_definition` asked whether **some** path from the
+declaration's owner to the definition's spells the declaration's type, over a
+walk whose path count is exponential in the depth of the parent DAG, budgeted
+at 512 nodes, run inside overload resolution. `base_type_instance` now reads
+the merged entry -- but only when more than one parent clause can reach the
+target and the target has type parameters at all; a plain chain keeps the cheap
+walk, because `base_type_args` linearizes and this runs in pattern typing.
+`restated_on_some_path` is deleted, and the library measure is identical with
+it and without it.
+
+### What moved, and what it cost
+
+Five library lines: `Cannot prove that (K, Any) <:< (K, String)`, two `value
+unwrap is not a member of Iterable[Char]`, `found: CC[A] required: CC[B]` and
+`found: CC[B (defined in class Map)] required: CC[B (defined in method map)]`.
+No line appeared anywhere. cats loses three and **rewrites six more**, every
+one of them from a base to something below it -- `found: Iterable[B]` becomes
+`found: Seq[B]`, `Iterable[Tuple2[A, B]]` becomes `Set[Tuple2[A, B]]`,
+`Iterator[Iterable[A]]` becomes `Iterator[Seq[A]]` -- which is the direction
+scalac agrees with and the `sliding`/`grouped` family `docs/cats.md` separated
+out.
+
+It costs **about 10% of compile time** on `src/library`: 1.66s -> 1.82s of user
+CPU on a quiet machine, min of five alternating runs, and 7-16% on a machine
+with four other slices measuring on it (the numbers here were taken both ways,
+because the spread between the two is larger than the effect).
+`base_type_args` runs on every `subst_as_seen_from`, so the merge is on the
+hot path. That it is on the hot path at all was established rather than
+assumed: an env-gated build with the old first-arrival body restored ran at
+`main`'s speed with everything else in place, and `sample` put
+`meet_type -> is_ancestor_of` on the profile. Four things were measured and kept: one map with one hash lookup per
+parent clause instead of two (a second map cost 20% on its own), the arguments
+lifted out of the slot rather than cloned, an allocation-free fast path for the
+argument positions every arrival agrees on (nearly all of them), and
+`class_reaches` in place of `is_ancestor_of` for the ancestry test plus a memo
+of its answers for the walk -- `is_ancestor_of` allocates a hash set per call
+and the same pair decides several positions of several base classes. Before
+those the same change cost 25%.
+
+### The third root: two sibling *overrides* of one member
+
+The `<overload ...>` receivers `agent/liboverload` left are **not** this
+defect. `TreeSet.scala` 85/90/96 report `type mismatch; found: <overload
+Set[A @uncheckedVariance] | TreeSet[A @uncheckedVariance]> required:
+TreeSet[A]` for a bare `empty`, and the two alternatives are two different
+symbols: `IterableFactoryDefaults.empty: CC[A @uncheckedVariance]` reached at
+`CC = Set`, and `SortedSetFactoryDefaults.empty: CC[A @uncheckedVariance]`
+reached at `CC = TreeSet`. Neither trait derives from the other -- they are
+siblings, each overriding `IterableOps.empty` -- so `drop_overridden`'s owner
+test cannot order them and its declaration/definition test does not apply
+(both are definitions). nsc's `findMember` walks the base type sequence and
+keeps the first match, which is `SortedSetFactoryDefaults`'s because it is the
+more derived of the two *in `TreeSet`'s linearization*. That is a fourth
+member-collapse rule, not a base-type question, and the base types here are
+already right.
+
+## The `agent/unitpop` slice: a `Unit` intrinsic and its discard disagreeing
+
+The first of the two left above, closed. `gen_call::gen_predef_poly` ended
+
+```rust
+if is_unit_like(result_ty) { asm.pop(); }
+else { maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty)); }
+```
+
+`Unit` is the one result where the erased `(Object)Object` descriptor still
+returns a reference — `Predef.identity(())` hands back `BoxedUnit.UNIT` — so
+the `pop` always fired at `identity(())`. Dropping it is right for a
+**statement** and wrong for an **argument**: `gen_predef_println` had already
+been told by `unit_leaves_boxed_ref` that its argument left a reference, so it
+emitted no `BoxedUnit` of its own, and `println(identity(()))` handed
+`scala/Predef$.println` an empty stack (`VerifyError: Operand stack
+underflow`). nsc leaves the value — `javap` on real scalac 2.13.16 reads
+`invokevirtual identity; invokevirtual println`, with no cast between them —
+and lets the generic statement-position discard take it. So does this now:
+`gen_predef_poly` always leaves what its descriptor promises, and
+`gen_expr::discarded_predef_poly` pops it in `gen_stat`, beside
+`unit_stat_leaves_ref` and `unit_call_leaves_ref`. It resolves the call head
+the way `gen_apply` resolves it (`flatten_apply_owned` over `peel_fun`, then
+`predef_poly_name` on the callee's `Intrinsic`), so the emitter that pushes
+and the discard that pops cannot disagree about which calls are covered.
+
+**The private runtime was failing the mirror image of the same disagreement**,
+and the same predicate closes it. `--no-scala-library` inlines the intrinsic
+(`gen_apply`'s `Intrinsic::Identity` arm is a bare `gen_expr` of the
+argument), erasure boxes a `Unit` argument, and `unit_stat_leaves_ref` refuses
+every symbol that carries an `Intrinsic` — so a discarded `identity(())` was
+`getstatic BoxedUnit.UNIT` with nothing after it. Straight-line code merely
+leaked an operand slot, which is why it survived; the first control-flow join
+after it did not:
+
+```scala
+def f(b: Boolean): Unit = if (b) identity(()) else side("f")
+// VerifyError: Inconsistent stackmap frames at branch target 18
+```
+
+A user-defined `def myid[A](a: A): A = a` in the same position was already
+right (`getstatic UNIT; invokevirtual myid; pop`) — only the intrinsic was
+exempt. `discarded_predef_poly` therefore mirrors the emitters arm for arm:
+under `library_abi` the `(Object)Object` invoke always leaves a value, while
+the private runtime leaves whatever the argument left
+(`unit_leaves_boxed_ref`), except a `locally { … }` thunk, whose `Unit` result
+that arm already pops where it emits it.
+
+**Only running the program catches any of this.** Both shapes compile clean in
+both modes; the classfile is well-formed and `-Xverify:all` or execution is
+the first thing that objects. `tests/fixtures/unitpop_intrinsic.scala` holds
+both positions in one program — `identity(())` as an argument, and
+`identity(())` / `locally { … }` discarded as a statement, each followed by a
+branch — plus the same three intrinsics at a non-`Unit` type so the two paths
+cannot drift, and a discarded intrinsic in an `if` branch, a `match` arm, a
+`try` body, a `while` body and a whole method body. It runs under
+`-Xverify:all` in both modes and matches real scalac 2.13.16's output line for
+line. An unmodified build of the branch point compiles it in both modes and
+fails to run it in both: `Operand stack underflow` at `Main$.a3` with the jar,
+`Inconsistent stackmap frames` at `Main$.s7` without it. The case commented
+out in `crates/cli/tests/intrinsicqual.rs` is enabled.
+
+**slick's 1490 class files are byte-identical** between a pre-fix and a
+post-fix binary (`SLICK_OUT=… tests/slick_measure.sh` on both, `diff -r`, exit
+0): nothing in slick's 184 files calls `identity` / `locally` / `implicitly`
+at `Unit`. `errors=0 files_with_errors=0 classes=1490` on both.
+
+### Found here, not fixed here
+
+`new Sec("abcd")` — the second defect left above — is **not** the same
+mechanism and is left reduced. On this build the `invokespecial` descriptor is
+in fact correct; what is wrong is the *argument*, which arrives already
+adapted to the **primary** constructor's parameter type:
+
+```text
+ldc "abcd"; checkcast java/lang/Integer; invokevirtual Integer.intValue;
+invokestatic Integer.valueOf; invokespecial Sec."<init>":(Ljava/lang/String;)V
+```
+
+That `$unbox`/`$box` pair is in the tree before the backend sees it —
+`gen_new` takes its parameter types from `ctor_param_tys`, which reads the
+selected `<init>`'s own `Type::Method` and is right here — so the defect is in
+the typer's overload resolution for `new`, which types the arguments against
+the primary constructor while selecting the secondary one for the call.
+Reproduces in both modes, byte-identical before and after this slice.
+
+**Closed by `agent/secondaryctor` below**, which reached this same reading
+independently and found the exact line: `erasure::method_param_types` takes
+the class's *first* `<init>` member for a `new`, which is always the primary.
+The two diagnoses agree in full — the descriptor was right, the argument was
+adapted against the wrong constructor.
+
 ## The `agent/secondaryctor` slice: `new C(...)` on a secondary constructor
 
 This closes the second "Found here, not fixed here" item above. The
@@ -2081,6 +2326,8 @@ a different mechanism from this slice's defect, so it is recorded rather than
 fixed. `crates/cli/tests/secondaryctor.rs` asserts the *rejection*, so the test
 fails and says so when a later slice implements it; the fixture puts its
 default on the primary instead.
+
+## Running it
 
 ```
 SCALALIB_LOG=$MYDIR/measure.txt SCALALIB_RUN=$MYDIR/run \
