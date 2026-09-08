@@ -1,0 +1,9 @@
+java-fixed(1)
+java-varargs(2)
+java-only(2,7)
+java-refs(2)
+java-wide(1,5)
+java-inst-fixed
+[I
+[[I
+s-varargs(3)

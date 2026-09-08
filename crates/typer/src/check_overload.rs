@@ -847,6 +847,7 @@ impl Typer {
         // Without this every polymorphic alternative was as specific as every
         // monomorphic one and the pair came out `ambiguous overload`.
         let a_ps = self.rigidify_own_tparams(a_sym, a_ps);
+        let a_ps = self.spec_argtpes(&a_ps, b_ps);
         // `B`'s type parameters are undetermined, exactly as for a real call.
         let inst = if b_sym.is_none() || self.st.get(b_sym).tparams.is_empty() {
             Vec::new()
@@ -867,6 +868,61 @@ impl Typer {
             && self.function_params_conform(&a_ps, &b_ps);
         self.spec_probe.set(saved);
         out
+    }
+
+    /// `A`'s parameter types read as the *argument* types of the hypothetical
+    /// call that decides specificity -- nsc `Infer.isAsSpecific`'s
+    /// `if (isVarArgsList(params) && isVarArgsList(ftpe2.params))` clause.
+    ///
+    /// A repeated parameter is unwrapped to its element type only when *both*
+    /// signatures are varargs lists (`f(Int, Int*)` against `f(Int*)` compares
+    /// `Int, Int` with `Int*`). When only `A` is a varargs list, its trailing
+    /// `T*` stays a repeated type on the argument side, and `arg_score` under
+    /// [`Typer::spec_probe`] scores it against nothing at all. That single
+    /// asymmetry is what gives a fixed-arity alternative the win over its own
+    /// varargs sibling:
+    ///
+    /// ```text
+    /// def g(x: Int)   as specific as g(Int*)?  Int  vs Int* -> yes
+    /// def g(x: Int*)  as specific as g(Int)?   Int* vs Int  -> no
+    /// ```
+    ///
+    /// "Against nothing at all" is stronger than the `<repeated>[T] <: Seq[T]`
+    /// that nsc's own definition of the wrapper suggests, and it is what
+    /// scalac 2.13.16 does. Six measurements, three of them Java read back
+    /// from a class file, agree on it and on no weaker rule -- the `Any` and
+    /// `Object` rows are the ones a `Seq[T]` model gets wrong:
+    ///
+    /// | alternatives | call | scalac 2.13.16 |
+    /// |---|---|---|
+    /// | `a(Int)`, `a(Int*)` (Java `int...`) | `a(1)` | fixed |
+    /// | `c(Object)`, `c(Object*)` (Java) | `c("z")` | fixed |
+    /// | `e(java.util.List[Object])`, `e(Object*)` (Java) | `e(list)` | fixed |
+    /// | `b(Object)`, `b(Int*)` (Java) | `b(1)` | **ambiguous** |
+    /// | `s(Any)`, `s(Int*)` (Scala) | `s(1)` | **ambiguous** |
+    /// | `u(Int, Int*)`, `u(Int*)` (Scala) | `u(1)` | **ambiguous** |
+    ///
+    /// The last two are why the both-varargs unwrap has to stay, and why the
+    /// rule cannot simply be "a fixed-arity alternative wins": `u` is a tie
+    /// between two varargs lists, and `s`/`b` are ties in which the
+    /// fixed-arity alternative is *not* as specific as the varargs one.
+    ///
+    /// Nothing here is Java-specific. `def g(x: Int)` beside
+    /// `def g(x: Int*)` in plain Scala had the same `ambiguous overload`, and
+    /// scalac resolves both to the fixed-arity alternative; the defect showed
+    /// up on `java.lang.reflect.Array.newInstance`, which declares exactly
+    /// this pair, because that is what the standard library calls.
+    fn spec_argtpes(&self, a_ps: &[Type], b_ps: &[Type]) -> Vec<Type> {
+        let (_, a_rep) = split_repeated(a_ps);
+        let (_, b_rep) = split_repeated(b_ps);
+        match (a_rep, b_rep) {
+            (Some(a_elem), Some(_)) => {
+                let mut out = a_ps[..a_ps.len() - 1].to_vec();
+                out.push(a_elem.clone());
+                out
+            }
+            _ => a_ps.to_vec(),
+        }
     }
 
     /// `arg_score` deliberately scores any two function types with the same
@@ -1629,6 +1685,21 @@ impl Typer {
                     .iter()
                     .all(|a| self.arg_conforms(a, elem, allow_widen, open));
         }
+        // Only a repeated parameter list takes a repeated *argument*. nsc's
+        // `<repeated>[T]` is a type of its own, and it conforms to no ordinary
+        // formal -- not to `T`, not to `Any`, not through a view. Two
+        // different things reach here as one:
+        //
+        //  * an `f(xs: _*)` splice, which must not be accepted by a
+        //    fixed-arity alternative and silently passed as a single element;
+        //  * a declared `T*` weighed as an *argument* type by
+        //    `is_as_specific_method`, which is what makes a varargs
+        //    alternative lose to its fixed-arity sibling. See `spec_argtpes`
+        //    for the six scalac 2.13.16 measurements that pin this, including
+        //    the two ties it must *not* break.
+        if args.iter().any(|a| matches!(a, Type::Repeated(_))) {
+            return false;
+        }
         if args.len() > params.len() {
             return false;
         }
@@ -1802,22 +1873,79 @@ impl Typer {
         Some(s)
     }
 
-    /// `Seq[T]` for a repeated parameter's element type, when the prelude has
-    /// `Seq` (it does in both modes).
+    /// `Seq[T]` for a repeated parameter's element type — the type nsc gives
+    /// `xs: T*` *inside* the body.
+    ///
+    /// `None` when this run has no `scala.collection.immutable.Seq` at all,
+    /// which `--no-scala-library` mode has not: the private runtime
+    /// (`backend::runtime`) ships no `Seq`, so a repeated parameter cannot be
+    /// used as a value there, and the caller leaves the `T*` in place and lets
+    /// the member lookup report it.
     pub(crate) fn seq_of(&self, elem: &Type) -> Option<Type> {
-        // `lookup_type`, not `lookup`: the latter stops at the first scope
-        // binding the name at all, so a `def Seq` in scope left every repeated
-        // parameter as the bare `T*` (`value length is not a member of Int*`).
-        // This is the same shape as the `TupleN` capture above.
-        let sym = self
-            .st
-            .lookup_type("Seq")
-            .into_iter()
-            .find(|s| self.st.get(*s).kind == SymKind::Class)?;
-        Some(Type::Class {
+        self.the_seq_class().map(|sym| Type::Class {
             sym,
             args: vec![elem.clone()],
         })
+    }
+
+    /// nsc's `definitions.SeqClass`: the class whose binary name is
+    /// `scala/collection/immutable/Seq`, wherever this run gets it from — the
+    /// prelude (which owns its `Seq` by package `scala`, the jar's `scala.Seq`
+    /// alias already collapsed), or a source `package scala.collection.
+    /// immutable`, which is what `tests/scalalib_measure.sh` compiles.
+    ///
+    /// It is deliberately **not** a scope lookup. nsc's is a fixed symbol, and
+    /// asking the scope was wrong in both directions:
+    ///
+    /// * it found the wrong `Seq`. A program may bind the name to something of
+    ///   its own, and `object Main { class Seq[A] { def tag = "MINE" };
+    ///   def f(xs: Int*) = xs.tag }` then *compiled* — `gen_desc` writes
+    ///   `Lscala/collection/immutable/Seq;` for a repeated parameter whatever
+    ///   the typer decided, so the emitted `invokevirtual Main$Seq.tag` met an
+    ///   `ArraySeq$ofInt` and threw `ClassCastException` with no diagnostic
+    ///   anywhere. scalac 2.13.16 reports `value tag is not a member of
+    ///   Seq[Int]`, and so does this now
+    ///   (`tests/fixtures/varargsrecv_shadow_bad.scala`).
+    /// * it found no `Seq` where there was one. A run that compiles the
+    ///   standard library from source binds the name only as
+    ///   `scala/package.scala`'s `type Seq[+A] = scala.collection.immutable.
+    ///   Seq[A]`, an alias — and in a file that writes a single qualified
+    ///   package clause (`package scala.jdk`) not even that, because a source
+    ///   `type` alias in `scala/package.scala` is not entered into the
+    ///   `scala._` auto-import scope the way a source class or object is
+    ///   (`Typer::auto_import_scala_member`). Every repeated parameter in the
+    ///   library was left as the bare `T*`: `value length is not a member of
+    ///   Short*`, `Unit*`, `T*`, `Array[T]*`, and 48 more.
+    fn the_seq_class(&self) -> Option<SymbolId> {
+        const BINARY: &str = "scala/collection/immutable/Seq";
+        let is_it = |s: &SymbolId| {
+            let info = self.st.get(*s);
+            info.kind == SymKind::Class && info.jvm_name == BINARY
+        };
+        if self.st.scala_pkg.is_none() {
+            return None;
+        }
+        if let Some(s) = self
+            .st
+            .lookup_member(self.st.scala_pkg, "Seq")
+            .iter()
+            .find(|s| is_it(s))
+        {
+            return Some(*s);
+        }
+        let mut pkg = self.st.scala_pkg;
+        for seg in ["collection", "immutable"] {
+            pkg = self
+                .st
+                .lookup_member(pkg, seg)
+                .into_iter()
+                .find(|s| self.st.get(*s).kind == SymKind::Package)?;
+        }
+        self.st
+            .lookup_member(pkg, "Seq")
+            .iter()
+            .find(|s| is_it(s))
+            .copied()
     }
 
     /// `arg` seen as the structural function type it inherits, if it does.
@@ -2025,6 +2153,8 @@ impl Typer {
             return self.arg_score(inner, param);
         }
         // A `xs: _*` argument is already the sequence the parameter wants.
+        // Whether the *parameter list* takes one at all is `is_applicable`'s
+        // question, not this one.
         if let Type::Repeated(inner) = arg {
             return self.arg_score(inner, param);
         }

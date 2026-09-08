@@ -891,6 +891,35 @@ scalac と同じ行で固定します。この欠陥は `src/library` の計測�
 （ライブラリは狭化対象への負のリテラルを一度も書かない）——正しさの修正であって、
 歩留まりの修正ではありません。
 
+`varargsrecv` テストは、可変長引数を**値として使う**ときの受け手の型を固定します。
+`xs: T*` は本体では `scala.collection.immutable.Seq[T]` であり、`T*` は宣言の
+書き方にすぎません。`Check::seq_of` はこれを名前 `Seq` の**スコープ検索**で
+求めていましたが、nsc の `definitions.SeqClass` は固定シンボルで、`scala.Seq` は
+そのエイリアスです。スコープ検索は両方向に誤ります。**違う `Seq` を拾う**方は
+無害ではありません——`gen_desc` は可変長引数に必ず
+`Lscala/collection/immutable/Seq;` を書くので、`object Main { class Seq[A] { def
+tag = "MINE" }; def f(xs: Int*) = xs.tag }` は修正前は**コンパイルが通り**、
+実行時に `ClassCastException: ArraySeq$ofInt cannot be cast to Main$Seq` で
+落ちていました（診断はどこにも出ません）。**あるのに見つけられない**方は
+`src/library` の計測そのもので、`scala/package.scala` の
+`type Seq[+A] = …` というエイリアス（`package scala` を書くファイル）と、
+`package scala.jdk` のような修飾付き 1 節を書くファイルでは束縛すら無いことの
+2 つでした。現在は JVM 名が `scala/collection/immutable/Seq` のクラスを
+`scala` パッケージとパス（ソースの `scala.collection.immutable`）から引きます。
+正常系 `tests/fixtures/varargsrecv.scala` はプリミティブ・`Unit`・型パラメータ・
+`Array` 要素・空呼び出し・`xs: _*` の転送を 1 本に入れ、同じ object の中で名前
+`Seq` を自前のクラスとエイリアスに束縛したうえで**実行**し、実 scalac 2.13.16 の
+出力と比較します（`expected/varargsrecv.txt` が scalac のものであることもテストが
+毎回作り直して確かめます）。記述子と呼び出し側の包み方（`wrapIntArray` /
+`wrapUnitArray` / `wrapRefArray`、空なら `Nil`）も `javap -c` で scalac と突き合わせ
+ます。異常系は 3 つ——自前の `Seq` のメンバーは受け手に無いこと（scalac と同じ文）、
+`*` 引数が節の最後でないこと（`*-parameter must come last`。メソッド・`case class`・
+クラスの 3 箇所、scalac と同じ文言と件数。修正前は**黙って通って**おり、
+scala/scala 自身の `neg/parstar` はこれで `fail` → `pass` になります）、
+`val v: Int*` が拒否されること——です。私有ランタイムには
+`scala.collection.immutable.Seq` が無いため、そのモードでは可変長引数を値として
+使えず、テストはその**拒否**を固定します（黙って通しません）。
+
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
 scalac を読み手にして、正例の JVM 実行と不正な型引数の拒否を検証します。

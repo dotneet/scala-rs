@@ -566,8 +566,18 @@ impl Typer {
         for clause in vparamss.iter_mut() {
             let mut ct = Vec::new();
             let mut ids = Vec::new();
-            for p in clause.iter_mut() {
+            let last_in_clause = clause.len().saturating_sub(1);
+            for (pi, p) in clause.iter_mut().enumerate() {
                 self.type_val_sig(p);
+                // nsc, at this parameter's own position. A repeated parameter
+                // covers every argument from its position on, so one that is
+                // not last has no meaning; `def f(xs: Int*, y: Int)` used to
+                // be accepted, and the call `f(1, 2)` then had to guess which
+                // argument was `y`. The rule is per *clause*: scalac 2.13.16
+                // accepts `def g(xs: Int*)(y: Int)`.
+                if matches!(p.ty, Type::Repeated(_)) && pi != last_in_clause {
+                    self.error(p.span, "*-parameter must come last");
+                }
                 if p.ty.is_no_type() {
                     self.error(
                         p.span,
