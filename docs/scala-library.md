@@ -1346,6 +1346,78 @@ question and were not investigated here.
 | 7 | `type mismatch; found: ((K, V)) => U  required: (K) => Any` |
 | 7 | `could not optimize @tailrec annotated method` |
 
+## The `agent/neglit` slice: a negated constant literal is not folded before the narrowing check
+
+Closes the second of `agent/libprelude`'s "Three defects found and not fixed
+here", above: `val b: Byte = -3` and `val b: Byte = -300` were both `type
+mismatch; found: Int  required: Byte` (as were the `Short` and `Char`
+equivalents), while `val b: Byte = 3` was fine. Real scalac 2.13.16 accepts
+`-3`, `-4` and `65` against `Byte`/`Short`/`Char` and rejects `-300` exactly
+where it rejects `300`.
+
+**Zero errors in `src/library` before and after — the library never writes a
+negated literal against a narrowing target. This is a correctness item, not a
+yield one, and no measure in this document moved.** scala library `1065 /
+154`, gitbucket `270 / 79`, cats `185 / 71`, slick (compile) `errors=0
+classes=1490`, all unchanged from the `agent/libprelude` row above.
+
+### The mechanism
+
+`-3` has no negative-literal token in this parser: it desugars at parse time
+to `Apply(Select(Literal(3), "unary_-"), Nil)`, the same as any other unary
+operator call. `unary_-` is a real prelude method (`Intrinsic::IntUn("-")`,
+`crates/typer/src/prelude_anyval2.rs`) whose *declared* return type is the
+widened `Int`, so once the `Apply` is typechecked the tree's type is
+`Type::Int` — a concrete type, not `Type::Constant(Lit::Int(-3))`.
+
+`Typer::adapt` (`crates/typer/src/check_infer.rs`) is where SLS 6.26.1's
+narrowing already lived: a bare literal like `3` carries `Type::Constant`
+all the way to the point `adapt` applies the expected type, and a single
+`if let Type::Constant(Lit::Int(v)) = &tree.ty` check there decides whether
+it fits `Byte`/`Short`/`Char`. `-3` never reaches that check with a matching
+`tree.ty`, because the method call in between replaced the constant with its
+declared (necessarily widened) return type.
+
+SLS 6.24 defines a constant expression to include a unary `-` applied to a
+literal, so the fix recovers that fact from the tree's *shape* rather than
+its type: `negated_int_literal` matches exactly `Apply(Select(Literal(Lit::
+Int(v)), "unary_-"), [])` and returns `-v`. `adapt`'s existing check now asks
+for that value when `tree.ty` is not already a `Constant`, and applies the
+same `fits` range test either way — one narrowing rule, not two. On success
+the tree becomes a plain `Literal` (the same shape a bare `3` already is),
+which is why no codegen change was needed: `gen_literal` pushes the `int`
+constant from the `Lit` alone, and `Byte`/`Short`/`Char` are `int` on the
+JVM operand stack regardless of which literal shape produced the value.
+
+Deliberately narrow: the match requires a literal *operand*, not merely a
+constant-typed one, so `val n = 3; val b: Byte = -n` is untouched and still
+reports the plain `Int`/`Byte` mismatch scalac itself gives. Widening a
+negated literal to `Long`/`Float`/`Double` (`val l: Long = -3`) was already
+correct before this slice — that is `numeric_widen`, not the narrowing check,
+and does not care whether the `Int` it is widening is a literal or not.
+
+### Fixtures
+
+`tests/fixtures/negl_run.scala` is **run**, not merely compiled, in both
+`--no-scala-library` and `--scala-library` mode, against `expected/
+negl_run.txt` (real scalac 2.13.16's own output for the same source): a fold
+landing on the right type but the wrong value — a truncation, a dropped sign
+— would type-check and only show up here. It covers `Byte`, `Short`, `Char`,
+the pre-existing plain-literal path alongside the new negated one, both
+`Byte` boundary values (`127`, `-128`), and `Long`/`Float`/`Double` widening.
+
+Three negative fixtures, each pinned against real scalac at the same line:
+`negl_bad_range.scala` (`val b: Byte = -300`), `negl_bad_nonconst.scala`
+(`val n = 3; val b: Byte = -n`), and `negl_bad_boundary.scala` (`128` and
+`-129`, one step past each side of the range `negl_run.scala` accepts). All
+four fixtures were confirmed to behave differently on the pre-fix binary:
+`negl_run.scala` failed to compile at all before the fix (the bug), while all
+three negative fixtures already failed the same way before and after (they
+were never affected).
+
+`crates/cli/tests/neglit.rs` holds all of this, kept out of `e2e.rs` per
+`.agent-brief.md`. Fixtures use the `negl_` prefix.
+
 ## What to do next, in order
 
 0. ~~**`->` when two conversions offer it — 28 errors, 3 files.**~~ Done by
