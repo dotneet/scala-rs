@@ -2654,6 +2654,46 @@ pub(crate) fn invoke_method(
     maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
 }
 
+/// Whether a reference loaded with JVM descriptor `from_desc` still has to be
+/// narrowed before it can be used at `want`.
+///
+/// `Ljava/lang/Object;` is the obvious case, and for a long time it was the
+/// only one either caller tested for. It is not the only one. A member declared
+/// at a **bounded** type parameter erases to its bound: `val f: F[A]` in
+/// `class Holder[F[X] <: Boxy[X], A]` has the descriptor `LBoxy;`, and so does
+/// the first-order `class BHolder[T <: Boxy[Int]](val f: T)`. Read back at
+/// `Holder[OneBox, Int]` the value is an `OneBox[Int]` and a `checkcast` is
+/// still owed, so `h.f.get` put a `Boxy` under `getfield OneBox.get` and the
+/// JVM verifier threw the whole method out: `VerifyError: Bad type on operand
+/// stack`. Nothing at compile time can see this -- the class files are emitted
+/// and no diagnostic is drawn.
+///
+/// The decidable form of the question is the one `maybe_unbox_erased_result`
+/// already asks on the *method result* path: is the declared erasure **known**
+/// to conform to what we want? When that cannot be shown, narrow. (Which is
+/// why a `def m: F[A]` was already correct while the field beside it was not.)
+///
+/// `Object` keeps its unconditional answer rather than going through the
+/// conformance test, because the callers do more than `checkcast` on it --
+/// `emit_from_erased_object` unboxes a primitive `want`, and `checkcast_internal`
+/// has no name for one, so routing `Object` through the test below would stop
+/// `case Some(x)` on an `Option[Int]` from unboxing.
+pub(crate) fn erased_load_needs_narrowing(st: &SymbolTable, from_desc: &str, want: &Type) -> bool {
+    if from_desc == "Ljava/lang/Object;" {
+        return true;
+    }
+    let Some(declared) = from_desc
+        .strip_prefix('L')
+        .and_then(|s| s.strip_suffix(';'))
+    else {
+        return false;
+    };
+    let Some(cn) = checkcast_internal(st, want) else {
+        return false;
+    };
+    declared != cn && has_class_sym(st, want) && !internal_conforms(st, declared, &cn)
+}
+
 /// After loading a generic field (`Object` / type param), cast or unbox to the
 /// tree's instantiated type so `name + arg._1` can `append(String)`.
 pub(crate) fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &Type, want: &Type) {
@@ -2667,7 +2707,7 @@ pub(crate) fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &
     }
     if let Some(cn) = checkcast_internal(ctx.st, want) {
         let from_desc = jvm_desc(ctx.st, from);
-        if from_desc == "Ljava/lang/Object;" {
+        if erased_load_needs_narrowing(ctx.st, &from_desc, want) {
             asm.checkcast(&cn);
         }
     }
