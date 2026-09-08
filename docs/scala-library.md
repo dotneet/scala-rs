@@ -499,23 +499,110 @@ is expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
 (the two that execute code), the corpus, and the full workspace suite. The
 classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 
+## A constructor alias that ignores its parameter (`agent/anyconstr`)
+
+**1420 -> 1367 errors**, 53 gone and none new, measured on `fce0a0d8` with the
+same binary before and after (`SCALA_RS=<saved binary>`).
+
+`scala.collection` declares `type AnyConstr[X] = Any`. It is a type
+*constructor* whose body does not mention its parameter, so **every**
+one-parameter constructor conforms to it, and `IndexedSeq#stepper`'s
+
+```scala
+case _ => shape.parUnbox(new AnyIndexedSeqStepper[A](this, 0, length))
+```
+
+really does pass an `IndexedSeqOps[A, CC, C]` where an `IndexedSeqOps[A,
+AnyConstr, _]` is wanted. All 53 were that one shape, in five files:
+`Iterable.scala` (25), `IndexedSeq.scala` (11), `Seq.scala` (9), `Set.scala`
+(3) and the rest of `collection`.
+
+### The rule, not the instance
+
+`type F[X] = Any` is the degenerate case; the general question is how nsc
+compares two type constructors of the same arity when one of them is an alias,
+and the answer is `normalize` plus `sameLength` in `Types.scala`. `isHKSubType`
+normalizes both sides — which eta-expands each `TypeRef` to a `PolyType` and
+beta-reduces an alias body — and `isPolySubType` then requires `sameLength` on
+the parameters and compares the bodies. `[x]CC[x] <:< [X]Any` holds for every
+`CC` because `CC[x] <:< Any` does; `[x]Option[x] <:< [X]List[X]` does not,
+because `Option[x] <:< List[x]` does not. One rule decides both.
+
+This compiler already compared two type constructors that way —
+`SymbolTable::eta_expand_pair`, built by `agent/hkunify`, where a `Type::Class`
+with fewer arguments than the class has parameters *is* the curried
+constructor. What it declined was the pair where one side is an **abstract**
+constructor: a higher-kinded type parameter (`CC[_]`) or an abstract type
+member. That is exactly the library's case, and it is the only thing this slice
+adds (`eta_expand_abstract_pair`). The kinds have to agree as well as their
+number, which is nsc's `corresponds`/`cmp` beside its `sameLength`.
+
+The new arm is deliberately **widening-only**. Where both sides eta-expand,
+their bodies are the whole answer and a `false` is an answer; an abstract
+constructor's body is `CC[x]` and settles nothing on its own, so a `false`
+there still falls through to the bound, path-member and projection arms below
+it. Reducing more eagerly than that is what would make unrelated constructors
+conform.
+
+### The overload it was silently getting wrong
+
+`tests/fixtures/ac_anyconstr.scala` runs and prints the name of the method body
+that ran, so an acceptance that answered the conformance question the wrong way
+cannot pass. Three of its calls did not compile before the fix. The fourth did
+— and printed the wrong answer:
+
+```scala
+def sel(x: Ops[Int, AnyConstr, _]): String = "sel:anyconstr"
+def sel(x: Any): String                    = "sel:any"
+```
+
+With an abstract `CC`, `sel(this)` fell through to the `Any` overload and
+compiled. `expected/ac_anyconstr.txt` is real scalac 2.13.16's own run of the
+same source, and the e2e test asserts scalac's run against it as well as ours.
+
+`ac_anyconstr_bad.scala` is the restriction: `type G[X] = List[X]` must not
+make `Option` conform to `G`, an abstract `CC` is not `List` either, and the
+reduction is not symmetric (`Ops[Int, AnyConstr, String]` is not an
+`Ops[Int, CC, String]`). Real scalac rejects all three at lines 26, 30 and 35
+and so do we, at the same lines. They were rejected before the fix too — the
+negative fixture is what stops the new arm from over-reaching, not evidence
+that it exists.
+
+### One divergence found and left alone
+
+nsc treats `Any` and `Nothing` as **kind-overloaded**: `checkKindBoundsHK`
+skips the arity check when the argument's `typeSymbol` is `AnyClass` or
+`NothingClass`, so real scalac accepts `Ops[Int, Two, _]` for
+`type Two[X, Y] = Any` against a `CC[_]` parameter, where we report `kinds of
+the type arguments (Two) do not conform`. It is a separate defect in kind
+checking, it costs the library nothing (`AnyConstr` is arity 1 and used at
+arity 1), and it is not touched here.
+
 ## What to do next, in order
 
-1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
-   `new VectorN(…)` on a generic constructor infers `Any` for the element
-   where the context expects `Vector[B]`. Nothing to do with the prelude; it
-   is constructor type inference. `Tree[A, …]` (73, `RedBlackTree.scala`) and
-   `Array[Any]` (43) look like the same shape and should be checked together.
-2. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
-   classes report `class TupleN needs to be abstract` against
-   `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
-3. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
-   required`` plus 21 `incompatible type in overriding`) is a second root. It
-   looks like one — `overrides nothing` does not need member lookup to
-   succeed — but the ones sampled were the same bug seen from the other side.
-   It has shrunk from 263 along with everything else, which is consistent with
-   that reading.
-4. `src/reflect` and `src/compiler` are not worth measuring yet.
+Re-clustered on the 1367 that remain (`agent/anyconstr`, `fce0a0d8`): 474
+`type mismatch`, 453 `X is not a member of Y`, 157 `no matching overload`, 42
+`no matching overload for constructor`, 33 `not found: value`, 32 `needs to be
+abstract`, 22 `` `override` modifier required``, 20 `ambiguous overload`.
+
+1. **The prelude collision is still the whole first half.** The receivers in
+   `is not a member of` are `Int` (69), `Array` (68), `<notype>` (51) and
+   `String` (36); the `<overload Stream[A] | Iterable[A] | Stream[A]>` spelling
+   accounts for 38 more between the two classes. This is the root named above
+   under "The one root" and nothing in it has changed.
+2. **`new Array(WIDTH)` does not take its element type from the expected
+   type** — `a2 = new Array(WIDTH)` where `a2: Array[Array[AnyRef]]` reports
+   `found: Array[Nothing]`. About 28 errors at five nesting depths, nearly all
+   in `Vector.scala`, which is the largest single mechanism outside the
+   collision.
+3. **`Iterator.empty.next()` leaves the element parameter uninstantiated** —
+   13 × `type mismatch; found: T  required: A`, in `IndexedSeqView.scala` and
+   `Iterator.scala`. `Iterator.empty` is an `Iterator[Nothing]`, so `next(): T`
+   is `Nothing` and conforms to every `A`.
+4. Do **not** assume the overriding family (now 54) is a second root. The ones
+   sampled were the same collision seen from the other side, and it has shrunk
+   in step with everything else, which is consistent with that reading.
+5. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 
 ## Running it
