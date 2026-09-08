@@ -539,22 +539,39 @@ fn is_constructor_app(ty: &Type) -> bool {
     ) || matches!(ty, Type::Class { args, .. } if !args.is_empty())
 }
 
-/// The `FunctionN` / `TupleN` class a structural arrow or tuple type denotes,
-/// so `PartialFunction[B, C]` and `B => C` can be told apart by their heads.
-fn structural_head(st: &SymbolTable, ty: &Type) -> Option<String> {
+/// The class a structural type denotes — the `FunctionN` of an arrow, the
+/// `TupleN` of a tuple, `scala.Array` of an array — so `PartialFunction[B, C]`
+/// and `B => C` can be told apart by their heads.
+///
+/// The answer comes from the symbol table and nowhere else. An earlier version
+/// spelled the JVM names out (`"scala/Array"` for `Type::Array`) and compared
+/// them against a real symbol's `jvm_name`; the two disagree, and
+/// `TC[C[_]] { def sizeOf(c: C[Int]) }` implemented at `C = Array` by
+/// `sizeOf(c: Array[Int])` stopped counting as an implementation
+/// (`tests/fixtures/at.scala`). Only the structural variants and `Class` are
+/// answered for: `class_sym_of` resolves a type parameter through its bound
+/// and `Null` to `AnyRef`, and nothing may be concluded from either.
+fn head_sym(st: &SymbolTable, ty: &Type) -> Option<SymbolId> {
     match ty {
-        Type::Function { params, .. } => Some(format!("scala/Function{}", params.len())),
-        Type::Tuple(ts) => Some(format!("scala/Tuple{}", ts.len())),
-        Type::Array(_) => Some("scala/Array".to_string()),
-        Type::Class { sym, .. } => {
-            let j = &st.get(*sym).jvm_name;
-            if j.is_empty() {
-                None
-            } else {
-                Some(j.clone())
-            }
-        }
+        Type::Class { sym, .. } => Some(*sym),
+        Type::Array(_) | Type::Tuple(_) => st.class_sym_of(ty),
+        Type::Function { params, .. } => st
+            .lookup_type(&format!("Function{}", params.len()))
+            .into_iter()
+            .find(|s| st.get(*s).is_class_like()),
         _ => None,
+    }
+}
+
+/// [`definitely_different`] over two heads that are not both spelled `Class`.
+fn heads_differ(st: &SymbolTable, a: &Type, b: &Type) -> bool {
+    let bare = |s: SymbolId| Type::Class {
+        sym: s,
+        args: Vec::new(),
+    };
+    match (head_sym(st, a), head_sym(st, b)) {
+        (Some(x), Some(y)) => definitely_different(st, &bare(x), &bare(y)),
+        _ => false,
     }
 }
 
@@ -586,9 +603,17 @@ fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type)
         (Type::Repeated(_), _) | (_, Type::Repeated(_)) => true,
         (Type::ByName(_), _) | (_, Type::ByName(_)) => true,
         (Type::Array(x), Type::Array(y)) => certainly_different(st, rigid, x, y),
+        // Arity is *not* decided on, here or for a function below. `Tuple2`
+        // really is not `Tuple3` and `Function0` is not `Function1`, but the
+        // arity scala-rs stores is not always the arity the source wrote:
+        // `Unit => X` arrives as `Function { params: [], ret: X }`, so the ten
+        // `f: Unit => F[A]` parameters in cats (`OptionT`, `EitherT`,
+        // `IorT`, …) read as a different arity from the `E => F[A]` they
+        // override and produced nine "overrides nothing" errors scalac does
+        // not report. Only element-wise differences at an agreed arity count.
         (Type::Tuple(xs), Type::Tuple(ys)) => {
-            xs.len() != ys.len()
-                || xs
+            xs.len() == ys.len()
+                && xs
                     .iter()
                     .zip(ys)
                     .any(|(x, y)| certainly_different(st, rigid, x, y))
@@ -603,12 +628,12 @@ fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type)
                 ret: ry,
             },
         ) => {
-            ps.len() != qs.len()
-                || ps
+            ps.len() == qs.len()
+                && (ps
                     .iter()
                     .zip(qs)
                     .any(|(x, y)| certainly_different(st, rigid, x, y))
-                || certainly_different(st, rigid, rx, ry)
+                    || certainly_different(st, rigid, rx, ry))
         }
         (Type::Class { sym: x, args: xs }, Type::Class { sym: y, args: ys }) => {
             if x == y {
@@ -624,10 +649,9 @@ fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type)
         (Type::TypeParam(p), other) | (other, Type::TypeParam(p)) => {
             rigid.contains(p) && is_constructor_app(other)
         }
-        _ => match (structural_head(st, a), structural_head(st, b)) {
-            (Some(x), Some(y)) => x != y,
-            _ => false,
-        },
+        // A structural type against a class: `PartialFunction[B, C]` against
+        // `B => C`, `Array[_ <: T]` against `IterableOnce[T]`.
+        _ => heads_differ(st, a, b),
     }
 }
 
@@ -635,7 +659,10 @@ fn same_type(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
     }
-    if definitely_different(st, a, b) || certainly_different(st, rigid, a, b) {
+    if definitely_different(st, a, b) {
+        return false;
+    }
+    if certainly_different(st, rigid, a, b) {
         return false;
     }
     if !robust(a) || !robust(b) {
@@ -655,6 +682,21 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
     if st.get(child).tparams.len() != st.get(base).tparams.len() {
         return false;
     }
+    let bty = base_type_at(st, cls, base, child);
+    let bps = match &bty {
+        Type::Method { paramss, .. } => norm_paramss(paramss),
+        _ => Vec::new(),
+    };
+    let rigid = rigid_tparams(st, cls, child);
+    let agrees = |cps: &[Vec<Type>]| {
+        cps.len() == bps.len()
+            && cps.iter().zip(bps.iter()).all(|(c, b)| {
+                c.len() == b.len()
+                    && c.iter()
+                        .zip(b.iter())
+                        .all(|(ct, bt)| same_type(st, &rigid, ct, bt))
+            })
+    };
     // nsc `matchingSymbols` compares `self.memberType(sym1)` with
     // `self.memberType(sym2)`: *both* signatures read at the same prefix. The
     // child is not always owned by `cls` — `check_missing_implementations`
@@ -662,31 +704,25 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
     // inherited from another — and reading only the base at `cls` left the
     // pair in two different frames, `Iterator.filter(p: A => Boolean)` against
     // `IterableOnceOps.filter(pred: Seq[B] => Boolean)`.
-    let cty = member_type_at(st, cls, child);
-    let cps = match &cty {
+    //
+    // *Either* reading counts, because `subst_as_seen_from` is an
+    // approximation and reading the child through it is not always an
+    // improvement: gitbucket's fifteen controllers implement scalatra's
+    // `Initializable.initialize(config: ConfigT)` from a class file, and read
+    // at the controller the implementation stopped matching the declaration —
+    // fifteen `needs to be abstract` errors scalac does not report. Taking the
+    // union keeps this module on the side it has always been on: silence when
+    // a comparison is not to be trusted.
+    agrees(&paramss_of(st, child)) || agrees(&member_paramss_at(st, cls, child))
+}
+
+/// `child`'s parameter lists read at `cls`, for the second reading `matches`
+/// tries.
+fn member_paramss_at(st: &SymbolTable, cls: SymbolId, child: SymbolId) -> Vec<Vec<Type>> {
+    match &member_type_at(st, cls, child) {
         Type::Method { paramss, .. } => norm_paramss(paramss),
         _ => Vec::new(),
-    };
-    let bty = base_type_at(st, cls, base, child);
-    let bps = match &bty {
-        Type::Method { paramss, .. } => norm_paramss(paramss),
-        _ => Vec::new(),
-    };
-    if cps.len() != bps.len() {
-        return false;
     }
-    let rigid = rigid_tparams(st, cls, child);
-    for (c, b) in cps.iter().zip(bps.iter()) {
-        if c.len() != b.len() {
-            return false;
-        }
-        for (ct, bt) in c.iter().zip(b.iter()) {
-            if !same_type(st, &rigid, ct, bt) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Whether `child` and `base` are provably *two* methods — an overload no
@@ -709,24 +745,23 @@ fn provably_overloaded(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: S
     if st.get(child).tparams.len() != st.get(base).tparams.len() {
         return false;
     }
-    let cps = match &member_type_at(st, cls, child) {
-        Type::Method { paramss, .. } => norm_paramss(paramss),
-        _ => return false,
-    };
     let bps = match &base_type_at(st, cls, base, child) {
         Type::Method { paramss, .. } => norm_paramss(paramss),
         _ => return false,
     };
-    if cps.len() != bps.len() {
-        return false;
-    }
     let rigid = rigid_tparams(st, cls, child);
-    cps.iter().zip(bps.iter()).any(|(c, b)| {
-        c.len() == b.len()
-            && c.iter()
-                .zip(b.iter())
-                .any(|(ct, bt)| certainly_different(st, &rigid, ct, bt))
-    })
+    // Proven only when *both* readings of the child say so, mirroring the
+    // union `matches` takes.
+    let differs = |cps: &[Vec<Type>]| {
+        cps.len() == bps.len()
+            && cps.iter().zip(bps.iter()).any(|(c, b)| {
+                c.len() == b.len()
+                    && c.iter()
+                        .zip(b.iter())
+                        .any(|(ct, bt)| certainly_different(st, &rigid, ct, bt))
+            })
+    };
+    differs(&paramss_of(st, child)) && differs(&member_paramss_at(st, cls, child))
 }
 
 /// The backend's dispatch relation is deliberately stricter than the

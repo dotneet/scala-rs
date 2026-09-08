@@ -566,6 +566,31 @@ overriding method's own parameters and those of the class the check runs in
 count, because a leftover parameter is a `subst_as_seen_from` that failed and
 nothing may be concluded from it.
 
+**Three things it deliberately does *not* decide**, each of them a regression
+the cats and gitbucket measurements caught before this landed:
+
+* **Arity, of a function or a tuple.** `Function0` really is not `Function1`,
+  but the arity scala-rs *stores* is not always the arity the source wrote:
+  `Unit => X` arrives as `Function { params: [], ret: X }`. Ten
+  `f: Unit => F[A]` parameters in cats (`OptionT`, `EitherT`, `IorT`) read as a
+  different arity from the `E => F[A]` they override — **cats 188 -> 197**,
+  nine `overrides nothing` errors scalac does not report.
+* **A head spelled out rather than looked up.** An early version compared
+  `"scala/Array"` against a symbol's `jvm_name`; they disagree, and
+  `TC[C[_]] { def sizeOf(c: C[Int]) }` implemented at `C = Array` stopped
+  counting as an implementation (`tests/fixtures/at.scala`). `head_sym` asks
+  the symbol table and nothing else.
+* **One reading of the child's signature.** nsc's `matchingSymbols` reads both
+  sides at the same prefix, and doing that fixed four spurious
+  `needs to be abstract` errors in the library — but `subst_as_seen_from` is an
+  approximation, and reading the child through it is not always an improvement:
+  gitbucket's fifteen controllers implement scalatra's
+  `Initializable.initialize(config: ConfigT)` from a class file, and read at the
+  controller the implementation stopped matching — **gitbucket 270 -> 285**.
+  `matches` now takes the *union* of the two readings, and
+  `provably_overloaded` the intersection. Both land on the side this module has
+  always been on: silence when a comparison is not to be trusted.
+
 Two supporting corrections came out of the same measurement:
 
 * **`matches` now reads both signatures at the same prefix**, as nsc's
@@ -634,14 +659,16 @@ redefine `Object`'s finals). All four are in `crates/cli/tests/override.rs`.
 
 ### The other targets, before and after this slice
 
+Measured on this branch merged with `main`; "before" is the merge base
+`c76886f7`, measured in the same tree to be sure of it.
+
 | target | before | after |
 |---|---|---|
 | scala library | `1420 / 166` | **`1386 / 164`** |
-| gitbucket | `333 / 81` | `333 / 81` |
+| gitbucket | `270 / 79` | `270 / 79` |
 | cats | `188 / 72` | `188 / 72` |
 | slick (compile) | `errors=0 classes=1490` | `errors=0 classes=1490` |
 | slick (`MODE=b`) | `progs=12 ok=12 diff=0 fail=0` | `progs=12 ok=12 diff=0 fail=0` |
-| corpus | `pos 1086 / neg 670 / run 618` | `pos 1089 / neg 674 / run 618`, `losses=0` |
 
 ### A defect found and not fixed here
 
