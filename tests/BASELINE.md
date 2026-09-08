@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `5108669a` |
+| commit | `d39d5a65` |
 |---|---|
-| updated | 2026-09-08 |
+| updated | 2026-09-09 |
 
-**Fifty-seven slices have merged this session**, in fourteen composed gates. From
+**Sixty slices have merged this session**, in sixteen composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -34,8 +34,12 @@ coordinator measured the merged tree each time, not the branches.
 | `b15df464` | `anyconstr`, `libmaxmin` | 270 | -> 185 |
 | `4d613d25` | `libcaseeq`, `libanyval` | 270 | 185 |
 | `3fd80269` | `libtailrec`, `libprelude`, `libnotype`, `neglit`, `caseabi`, `pickleparams`, `liboverload`, `negchecks`, `sysout`, `accessmsg` | 270 | 185 |
+| `70f349ea` | `arrayelem`, `basetypemeet`, `pkgobjdup`, `siblingover`, `unitpop`, `secondaryctor` | -> 270 | -> 182 |
+| `5108669a` | `triemapjava`, `nameamb`, `ctorgaps`, `implctx` | 270 -> 271 | 182 |
+| `462aeebb` | `overscore`, `varargsrecv` | 271 -> 270 | 182 |
+| `d39d5a65` | `javavarargs` | -> **265** | 182 |
 
-Four of those fifteen move no number and are the most important. **`linterm`
+Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
 by depth (64 and 200) and *a depth bound bounds the depth of the recursion
 tree, not its size*, so a cyclic — or merely wide and legal — hierarchy did
@@ -241,8 +245,8 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **182** | **71** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **271** | **80** | — |
-| `tests/scalalib_measure.sh` (538) | **740** | **138** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **265** | **77** | — |
+| `tests/scalalib_measure.sh` (538) | **672** | **132** | — |
 
 ## Execution
 
@@ -258,12 +262,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1101** | 413 | 345 |
-| `neg` (1405) | **683** | 353 | 369 |
+| `pos` (1859) | **1103** | 411 | 345 |
+| `neg` (1405) | **687** | 349 | 369 |
 | `run` (2060) | **628** | 879 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-5108669a.tsv`](baselines/corpus-5108669a.tsv): 5324 unique
+[`baselines/corpus-d39d5a65.tsv`](baselines/corpus-d39d5a65.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -534,6 +538,56 @@ makes `PropertyType.tab_width` a `PropertyType[Integer]`, which pins
 not consider the boxing that adaptation would apply. Either candidate alone
 compiles, so the gap is pre-existing and separate; the pre-fix binary accepted
 the call only because it did not know what `tab_width` was.
+
+## Gates fifteen and sixteen: two wrong answers behind one message
+
+Both slices were briefed as message families and both turned out to be
+**accepted programs that could not run**. Neither was visible in any error
+count, because the count only sees what we reject.
+
+1. **A repeated parameter's `Seq` was a name looked up in scope.** nsc's is
+   `definitions.SeqClass`, a fixed symbol; ours was whatever the scope bound.
+   That was wrong in both directions. It found a *user's* `Seq` --
+   `object Main { class Seq[A] { def tag = "MINE" }; def f(xs: Int*) = xs.tag }`
+   compiled, and since `gen_desc` writes `Lscala/collection/immutable/Seq;`
+   for a repeated parameter whatever the typer concluded, the emitted
+   `invokevirtual Main$Seq.tag` met an `ArraySeq$ofInt` and threw
+   `ClassCastException` at run time with no diagnostic anywhere. And it found
+   *no* `Seq` when the standard library is compiled from source, where the
+   only binding is `scala/package.scala`'s alias, so every repeated parameter
+   in the library was left as the bare `T*`. `agent/varargsrecv` also
+   implemented nsc's `*-parameter must come last`, per parameter clause, which
+   we had silently accepted; `neg/parstar` is scala/scala's own test for it.
+2. **A Java varargs call with a primitive element type could not run.**
+   `gen_java_varargs_array` boxed into `anewarray java/lang/Object`, so
+   `f(int...)` was `VerifyError: '[Ljava/lang/Object;' is not assignable to
+   '[I'`. Only reference element types worked, and nothing noticed because the
+   library never calls the varargs side. Found by `agent/javavarargs` while
+   fixing the resolution defect above it -- and its sibling, a `f(xs: _*)`
+   splice accepted by a *fixed-arity* alternative, only became reachable once
+   that alternative could win.
+
+The resolution rule itself is worth recording, because "prefer the fixed-arity
+alternative" is wrong. `agent/javavarargs` measured six pairs against scalac
+2.13.16, three of them read back from javac's class files: `f(Object)` /
+`f(Int*)` on `f(1)` and `f(Int, Int*)` / `f(Int*)` on `f(1)` are **ambiguous**,
+and we had been *accepting* the first. The rule is nsc's `Infer.isAsSpecific`
+asymmetry -- a repeated parameter is unwrapped to its element type only when
+both signatures are varargs lists -- and it is not Java-specific at all;
+`mutable.Buffer`'s own `prepend(A)` / `prepend(A*)` had the same defect.
+
+**The composition is worth more than either slice.** Separately the library
+measured 685 and 727; together it is **672**, because `javavarargs`' first
+attempt closed only 2 of its 12 sites -- `seq_of`'s scope dependence, the very
+thing `varargsrecv` fixed, was what stopped the rest. Two slices with different
+briefs found the same seam from opposite sides.
+
+Both slices also corrected their briefs. I handed `varargsrecv` `Array.scala`
+and `collection/Seq.scala` as one family; `Seq.scala` contains **no** repeated
+parameter at all -- its 21 errors are `val (elms, idxs) = init()`, a tuple
+pattern definition whose component types are never instantiated, now the
+largest single mechanism in the remaining 672. I handed `javavarargs` twelve
+Java sites; the thirteenth was Scala and in the standard library.
 
 ## What is deliberately red
 
