@@ -1116,6 +1116,31 @@ impl Typer {
                 // (`Typer::plausibly_inhabits` and the `pinned` rule in
                 // `crates/typer/src/implicits.rs`) removed that cost; the
                 // measure now runs in under 8 s with the guard on.
+                //
+                // "Once something adopts it" is the part that does not always
+                // happen. A *nested* class on `-cp` carries no
+                // `ScalaSignature` of its own -- the pickle sits on the
+                // enclosing top-level class file -- and nothing adopts a class
+                // the program never writes by name. `import <a val>._` where
+                // the val's type is such a class is exactly that: the walk
+                // below still enters the members the class file reader
+                // installed, so the names are in scope and an *explicit* call
+                // compiles, but nothing in bytecode records `implicit`, so not
+                // one of them can ever be selected as a view. blocking-slick's
+                // `BlockingAPI` is the case (`BlockingDatabase`,
+                // `RepQueryExecutor`, `queryToInsertInvoker` ...), and
+                // `tests/multi/nestedapiimplicit` is three declarations of the
+                // same shape with no library involved.
+                //
+                // So adopt it here rather than hope. `adopt_binary_class` is
+                // the operation `pickle_readable` is waiting for, it declines
+                // anything with no pickle to read (and `java.*`, `$anon` and
+                // the prelude's own `scala.*`), and it is idempotent, so this
+                // is a no-op for every class the old ordering already reached.
+                if self.library_abi && !self.pickle.pickle_readable(&self.st, cur) {
+                    self.pickle
+                        .adopt_binary_class(&mut self.st, &mut self.binary, cur);
+                }
                 if self.library_abi && self.pickle.pickle_readable(&self.st, cur) {
                     for n in self
                         .pickle

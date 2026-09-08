@@ -513,7 +513,7 @@ impl PickleSupply {
             // so the class file reader's description of them -- which cannot
             // say "implicit clause" or "this parameter has a default" -- is
             // dropped here rather than left to shadow the pickled one.
-            if !m.is_public_api() && !m.is_case_synthetic() {
+            if !m.is_public_api() && !m.is_case_synthetic() && !m.is_implicit_class_conversion() {
                 continue;
             }
             let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
@@ -819,7 +819,12 @@ impl PickleSupply {
         };
         let mut names: Vec<String> = Vec::new();
         for m in &sig.members {
-            if m.kind != MemberKind::Def || !m.is_public_api() || !m.has(pflags::IMPLICIT) {
+            // `is_implicit_class_conversion`: an `implicit class`'s conversion
+            // method is `SYNTHETIC`, which `is_public_api` hides.
+            if m.kind != MemberKind::Def
+                || !m.has(pflags::IMPLICIT)
+                || (!m.is_public_api() && !m.is_implicit_class_conversion())
+            {
                 continue;
             }
             let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
@@ -952,9 +957,12 @@ impl PickleSupply {
                 };
                 if let Ok(sig) = sig {
                     for m in &sig.members {
+                        // `is_implicit_class_conversion`: an `implicit class`'s
+                        // conversion method is `SYNTHETIC`, which
+                        // `is_public_api` hides.
                         if m.kind != MemberKind::Def
-                            || !m.is_public_api()
                             || !m.has(pflags::IMPLICIT)
+                            || (!m.is_public_api() && !m.is_implicit_class_conversion())
                         {
                             continue;
                         }
@@ -1856,6 +1864,7 @@ impl PickleSupply {
             }
             if !m.is_public_api()
                 && !(case_synthetic_ok && m.is_case_synthetic())
+                && !m.is_implicit_class_conversion()
                 && !(synthetic_ok && is_default_getter(&m.name))
             {
                 continue;
