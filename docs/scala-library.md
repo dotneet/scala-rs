@@ -3588,6 +3588,45 @@ F[A]) { def m: F[A] = g }` was already correct while the field beside it was
 not. The fix is that question, asked on the load path; the two had simply
 drifted apart.
 
+### There are two sites, and the second is only found by looking
+
+With the load path fixed, the fixture ran and every shape in it was green. The
+neighbour the brief named last — `F[A]` bound by a *pattern* — was still broken,
+and the fixture did not say so, because the pattern it held was a type test
+followed by a field read and that goes back through the load path. The
+extractor form does not:
+
+```scala
+case class CBox[F[X] <: Boxy[X], A](f: F[A], n: Int)
+cb match { case CBox(b, n) => b.tag }     // VerifyError, after the first fix
+```
+
+`gen_ctor_fields_pattern` reads the constructor field itself — a `case class`'s
+synthesized `unapply` has no body, so the match lowering never calls it — and it
+carried its own copy of the same test:
+
+```rust
+if fdesc == "Ljava/lang/Object;" {
+    emit_from_erased_object(asm, ctx.st, &a.ty);
+}
+```
+
+so the binder held a `Boxy` while the typer had given it `OneBox[Int]`. Both
+sites now ask one shared question, `erased_load_needs_narrowing`.
+
+`Object` keeps its unconditional answer inside that helper rather than going
+through the conformance test, and that is load-bearing at *this* site: the
+callers do more than `checkcast` on it. `emit_from_erased_object` unboxes when
+`want` is primitive, and `checkcast_internal` has no name for a primitive, so
+routing `Object` through the general test would have stopped `case Some(x)` on
+an `Option[Int]` from unboxing.
+
+The general lesson is the one `docs/` already carries about `verify_failures`
+being a lower bound: **a verifier failure marks the extent of what the verifier
+can see, not the extent of the damage.** Here the first fix made the failure go
+away in every shape that had one, and the second site was reachable only by
+writing down the neighbouring shapes and running them.
+
 ### What it is worth, and what it is not
 
 Nothing on any compile measure, by construction — the class files were always
@@ -3595,10 +3634,11 @@ emitted and the compiler never reported anything. slick is
 `errors=0 files_with_errors=0 classes=1490` with all **1490 class files
 byte-identical** to the pre-fix binary's (`SLICK_OUT` on both saved binaries,
 `diff -r` empty), so slick never reads a member off a value declared at a
-bounded parameter. The yield is the fixture and the six shapes it pins:
+bounded parameter. The yield is the fixture and the seven shapes it pins:
 the higher-kinded field, the first-order bounded field, the `Object` field
 (so a later change cannot silently drop *its* cast), the method result, a read
-through a pattern, and a bound that is itself higher-kinded.
+through a type-test pattern, a binder from a case-class extractor, and a bound
+that is itself higher-kinded.
 
 ### The divergence from scalac that this does *not* close
 

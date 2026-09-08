@@ -27,6 +27,17 @@
 //! write erases to `Object`, and `Object` was the one case the load path cast
 //! for.
 //!
+//! **There are two sites, not one.** Fixing the field-read path leaves
+//! `case CBox(b, n)` for `case class CBox[F[X] <: Boxy[X], A](f: F[A], n: Int)`
+//! still failing the verifier: the match lowering does not go through `Select`
+//! at all, it reads the constructor field itself (`gen_ctor_fields_pattern`)
+//! and carried its own copy of the same `Object`-only test, so the binder held
+//! a `Boxy` while the typer had given it `OneBox[Int]`. Both now ask one shared
+//! question, `erased_load_needs_narrowing`. The second site was found by
+//! probing the neighbours after the first was green -- which is the standing
+//! lesson that a verifier failure marks the extent of what the *verifier* can
+//! see, not the extent of the damage.
+//!
 //! **The fix** is one arm in `maybe_cast_erased_load`, and it is a copy of the
 //! question the *method result* path already asks in
 //! `maybe_unbox_erased_result`: is the declared erasure *known* to conform to
@@ -226,8 +237,11 @@ fn hkfield_casts_the_wide_loads_and_only_those() {
         ("Field hkf/OHolder.f:Ljava/lang/Object;", "class hkf/OneBox"),
         // (4) the method result, which already worked: still cast.
         ("Method hkf/MHolder.m:()Lhkf/Boxy;", "class hkf/OneBox"),
-        // (5) through a pattern, and (6) at a higher-kinded bound.
+        // (5) through a pattern, (5b) bound by a case-class extractor -- the
+        // second site of the root, in the match lowering rather than the
+        // `Select` path -- and (6) at a higher-kinded bound.
         ("Field hkf/PBox.f:Lhkf/Boxy;", "class hkf/OneBox"),
+        ("Field hkf/CBox.f:Lhkf/Boxy;", "class hkf/OneBox"),
         ("Field hkf/WHolder.w:Lhkf/Wrap;", "class hkf/WOne"),
     ] {
         let at = code

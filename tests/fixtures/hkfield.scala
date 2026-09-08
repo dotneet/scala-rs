@@ -32,8 +32,15 @@ class OHolder[T](val f: T)
 // (4) A *method* returning `F[A]`.
 class MHolder[F[X] <: Boxy[X], A](g: F[A]) { def m: F[A] = g }
 
-// (5) `F[A]` reached through a pattern.
+// (5) `F[A]` reached through a pattern: a type test, then the field read.
 class PBox[F[X] <: Boxy[X], A](val f: F[A])
+
+// (5b) The stronger pattern form -- a case-class extractor that *binds* the
+// `F[A]`. This is a second site of the same root and is not reached by fixing
+// the field-read path: the match lowering reads the constructor field itself
+// (`gen_ctor_fields_pattern`) and had its own `Object`-only narrowing test, so
+// the binder held a `Boxy` while the typer had given it `OneBox[Int]`.
+case class CBox[F[X] <: Boxy[X], A](f: F[A], n: Int)
 
 // (6) `F`'s own bound is higher-kinded.
 trait Wrap[G[_]] { def peel: G[Int] }
@@ -75,6 +82,13 @@ object Main {
     pb match {
       case p: PBox[OneBox, Int] => println(p.f.tag)
     }
+
+    val cb = CBox[OneBox, Int](new OneBox(9), 3)
+    cb match {
+      case CBox(b, n) => println(b.tag + n)
+    }
+    val CBox(b2, n2) = cb
+    println(b2.tag + n2)
 
     val wh = new WHolder[WOne, OneBox](new WOne[OneBox](new OneBox(7)))
     println(wh.w.wtag)
