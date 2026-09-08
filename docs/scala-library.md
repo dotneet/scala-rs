@@ -3242,6 +3242,148 @@ expected shape and not a vacuous negative:
 All three are pinned by assertions on the current behaviour, so a later slice
 that closes one is told by a failing test.
 
+## The `agent/javavarargs` slice: a varargs alternative against its own sibling
+
+**740 / 138 -> 727 / 135.** Thirteen errors, one root, and it is not the root
+the brief named.
+
+```
+error: ambiguous overload for newInstance with arguments (Class[A], 0)
+ --> src/library/scala/Array.scala:158:32
+```
+
+`java.lang.reflect.Array` declares `newInstance(Class<?>, int)` beside
+`newInstance(Class<?>, int...)`, and twelve calls in seven files stopped there
+(`Array`, `Vector` x2, `Platform`, `ClassManifestDeprecatedApis` x5, `ClassTag`
+x2, `ScalaRunTime`). Three of those files had no other error, which is the
+whole of the file count's move.
+
+### It is not about Java
+
+The brief asked whether this is specific to Java varargs read from a class
+file. It is not, and one probe settles it -- real scalac 2.13.16 on
+
+```scala
+def g(x: Int): String = "scala-fixed"
+def g(x: Int*): String = "scala-varargs"
+g(1)          // scala-fixed
+JV.f(1)       // java-fixed, for the same pair declared in Java
+```
+
+prints `scala-fixed` and `java-fixed`, and scala-rs called both `ambiguous
+overload`. The standard library declares the Scala form itself:
+`mutable.Buffer` has `def prepend(elem: A)` beside
+`@inline final def prepend(elems: A*)`, and `Buffer.scala:56` was a
+**thirteenth** instance of this root that the count of twelve had not been
+connected to, because its message says `prepend`, not `newInstance`. So the
+honest split of the twelve is *twelve of twelve, one root* -- with a thirteenth
+outside the cluster the brief drew.
+
+### The rule, and the four measurements that say it is not "fixed wins"
+
+nsc's `Infer.isAsSpecific` asks whether `B` is applicable to `A`'s parameter
+types. `arg_score` unwrapped a `Repeated` *argument* to its element type --
+right for an `f(xs: _*)` splice, wrong for a declared repeated formal being
+weighed as an argument type -- so `g(Int*)` was as specific as `g(Int)` and
+`g(Int)` as specific as `g(Int*)`, and nothing separated them.
+
+nsc unwraps a repeated parameter only when **both** signatures are varargs
+lists. Otherwise a `T*` on the argument side conforms to no ordinary formal.
+Six scalac 2.13.16 runs pin that, and no weaker rule fits all six -- in
+particular not `<repeated>[T] <: Seq[T]`, which nsc's own definition of the
+wrapper suggests and which gets the `Any` and `Object` rows wrong:
+
+| alternatives | call | scalac 2.13.16 |
+|---|---|---|
+| `a(Int)`, `a(Int*)` (Java `int...`) | `a(1)` | fixed |
+| `c(Object)`, `c(Object*)` (Java) | `c("z")` | fixed |
+| `e(java.util.List[Object])`, `e(Object*)` (Java) | `e(list)` | fixed |
+| `b(Object)`, `b(Int*)` (Java) | `b(1)` | **ambiguous** |
+| `s(Any)`, `s(Int*)` (Scala) | `s(1)` | **ambiguous** |
+| `u(Int, Int*)`, `u(Int*)` (Scala) | `u(1)` | **ambiguous** |
+
+`b` and `s` are ties in which the *fixed-arity* alternative is not as specific
+as the varargs one either -- `Object` does not conform to `Int` -- so "a
+fixed-arity alternative wins" would accept two programs scalac refuses. Before
+this slice scala-rs accepted both of them; it now reports both, at scalac's
+lines. `u` is a tie between two varargs lists, and it is why the both-varargs
+unwrap has to stay.
+
+The rule was derived from those six runs and only afterwards found written
+down: scala/scala's own `pos/overload_poly_repeated.scala` is a test for this
+exact pair and carries nsc's `-Ytyper-debug` trace in a comment.
+
+```text
+isCompatibleArgs false (List(Int*), List(Int))
+isAsSpecific false: (xs: Int*)Int >> (x: Int)Int?
+ --> the repeated case is not more specific than the single-arg case because
+     you can't apply something of `Int*` to `Int`
+```
+
+`isCompatibleArgs(List(Int*), List(Int))` is `false` -- not "`Seq[Int]` against
+`Int`", which would also be false, but for a reason that would have made the
+`Any` and `Object` rows come out wrong. It is applicability that refuses it,
+which is where this implementation puts it too.
+
+### One rule, in applicability
+
+The whole thing is one line in `is_applicable`: a repeated *argument* is
+refused by any parameter list that has no repeated parameter. That is
+simultaneously
+
+* nsc's specificity asymmetry (the varargs signature is not as specific as its
+  fixed-arity sibling, while the sibling is as specific as it), and
+* the `f(xs: _*)` rule, which nothing enforced before. It could not be seen
+  while the pair was ambiguous; the moment a fixed-arity alternative could
+  win, `g(Seq(4, 5, 6): _*)` selected `g(x: Int)`, passed the sequence as one
+  element and died in the verifier.
+
+`spec_argtpes` does the both-varargs unwrap, and that is the only other piece.
+
+### Two more defects on the same seam, both pre-existing
+
+* **A Java varargs call with a primitive element type could not run.**
+  `gen_java_varargs_array` had `anewarray java/lang/Object` as its fallback and
+  boxed every argument into it, so `JW.only(1, 2)` against `only(int...)` was
+  `VerifyError: Type '[Ljava/lang/Object;' is not assignable to '[I'`. Only a
+  reference element type had ever worked, which is why nothing had noticed:
+  the library never calls the varargs alternative. Reproduced on the pre-fix
+  binary before touching it. It now uses `emit_newarray` / `emit_array_store`
+  with the element type the parameter declares and converts each argument to
+  it (`f(5)` against `f(long...)` is `i2l`), and every call site in
+  `jvarargs_java.scala` compiles to the instructions real scalac emits,
+  descriptor for descriptor.
+* **Not fixed, and not this root**: `e(java.util.List[Object])` beside
+  `e(Object*)` resolves to the varargs alternative here and to the fixed one in
+  scalac. The specificity comparison is never reached -- the `List` alternative
+  is not applicable to a `java.util.ArrayList[Object]` argument in the first
+  place, though the same argument reaches the same formal on a *Scala* method
+  without complaint. That is a Java-generic-hierarchy applicability question,
+  it is untouched by this slice (verified: the specificity probe is never run
+  for that call), and it wants its own reduction.
+
+### Elsewhere
+
+gitbucket `271 / 80 -> 266 / 78`, all five removals and none added: JGit's
+`Repository.getRefsByPrefix(String...)` (3) and Spring's
+`MimeMessageHelper.addTo` / `addBcc` (1 each), every one of them the same Java
+pair. cats unchanged at `182 / 71`; slick unchanged at `errors=0 classes=1490`.
+
+`ambiguous overload` is now down to **two** lines in the whole library, both
+`processFully` in `sys/process/BasicIO.scala` -- a function literal weighed
+against two alternatives, a different root, left alone.
+
+On the scala/scala corpus (`CORPUS_SIZE=full`): `losses=0`, five gains, and
+every one of them is this slice's own subject matter --
+
+* `pos/overload_poly_repeated`, the test quoted above;
+* `neg/t4728` (`f(x: X)` beside `f(ys: Y*)`) and `neg/t8344`
+  (`f(x: Object)` beside `f(x: String*)`) -- the two ties that must *not* be
+  broken, and the `b` row of the table is `t8344`'s shape exactly;
+* `neg/t875`, which is seven misuses of `xs: _*` and needs the applicability
+  rule above to reject a repeated argument at a fixed-arity formal;
+* `pos/t0305`.
+
 ## Running it
 
 ```
