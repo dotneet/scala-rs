@@ -1389,6 +1389,14 @@ number against the coordinator's `acec3f09` baseline:
 | `cargo test --workspace --release` | — | 255 rows, **2457 passed, 0 failed** | 256 rows, **2469 passed, 0 failed** |
 | corpus full | — | `pos 1095`, `neg 673`, `run 623` | identical |
 
+`main` moved again while that second gate ran (`agent/pickleparams`), so the
+branch tip carries a third merge. It is a clean auto-merge — `README.md` and
+`crates/typer/src/symbol.rs` are the two files both sides touched and neither
+conflicted — and `cargo test --workspace --release` on it is 257 rows, **2475
+passed, 0 failed**. The four measures and the corpus were not re-run a third
+time: with five slices landing in parallel that is a treadmill, and the
+coordinator's gate at merge time is the authoritative one.
+
 **Three rejection rules and not one number moved.** That is the result worth
 recording: the direction these rules push is the one that turns working
 programs into errors, and 1414 files of real Scala across four projects say
