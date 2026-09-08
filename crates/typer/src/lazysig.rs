@@ -180,6 +180,69 @@ impl Typer {
         );
     }
 
+    /// Give a member the signature pass has already built the scope stack this
+    /// *round* is standing in.
+    ///
+    /// The same argument [`Self::refresh_alias_sigs`] makes for type aliases,
+    /// for the value members beside them: a pending signature's scope snapshot
+    /// is what its body will later be typed in, and every round's snapshot is
+    /// this template's own, so a later one is only ever better.
+    ///
+    /// It matters because the second signature round is *selective*.
+    /// `sig_rerun_safe` rebuilds a `def` only when the first round reported
+    /// something or left an unresolved name in its type, and rebuilding is the
+    /// only thing that re-registers it. gitbucket's
+    ///
+    /// ```scala
+    /// protected[model] trait TemplateComponent { self: Profile =>
+    ///   import profile.api._
+    ///   trait BasicTemplate { self: Table[?] =>
+    ///     def byRepository(owner: String, repository: String) =
+    ///       (userName === owner.bind) && (repositoryName === repository.bind)
+    ///     def byRepository(userName: Rep[String], repositoryName: Rep[String]) = …
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// is both halves of that in one overload set. `import profile.api._`
+    /// cannot resolve on the first round -- `profile` is an abstract `val` of
+    /// another unit, whose own signature pass has not run -- so the *first*
+    /// alternative, whose parameters are plain `String`s, has nothing wrong
+    /// with its signature, is never rebuilt, and kept a snapshot with no
+    /// wildcard import in it. The second alternative writes `Rep[String]`,
+    /// which is unresolved on that round, so it *is* rebuilt and its snapshot
+    /// has the import.
+    ///
+    /// A call from another unit then completes the first alternative's body in
+    /// the stale scope: slick's `columnExtensionMethods` /
+    /// `valueToConstColumn` are not implicits in scope there, `===` and `.bind`
+    /// are both "not a member", the erroneous `&&` receiver takes
+    /// `Predef.Boolean2boolean`, and the method's *inferred result type* is
+    /// cached as `Boolean` instead of `Rep[Boolean]` -- which is what
+    /// `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])`
+    /// is, at every call site of it. Only the snapshot is refreshed here: the
+    /// signature itself is not rebuilt, so none of what `sig_rerun_safe`
+    /// declines to redo (a second evidence clause, re-typed view bounds)
+    /// happens.
+    pub(crate) fn refresh_pending_scope(&mut self, tree: &Tree) {
+        if !self.sigs_only || tree.sym.is_none() {
+            return;
+        }
+        if !self.pending_sigs.contains_key(&tree.sym) {
+            return;
+        }
+        let scopes = Rc::new(self.st.scopes[self.lazy_base_scopes..].to_vec());
+        let owner = self.st.owner;
+        let this_class = self.st.this_class;
+        let file_index = self.file_index;
+        if let Some(p) = self.pending_sigs.get_mut(&tree.sym) {
+            p.scopes = Some(scopes);
+            p.owner = owner;
+            p.this_class = this_class;
+            p.file_index = file_index;
+        }
+    }
+
     /// Give this template's still-pending type aliases the scope stack the
     /// header pass is standing in.
     ///

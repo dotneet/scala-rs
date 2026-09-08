@@ -180,6 +180,7 @@ impl Typer {
             && !self.sig_done.insert((self.file_index, tree.id))
         {
             self.retry_overridden_ret(tree);
+            self.refresh_pending_scope(tree);
             return;
         }
         match &tree.kind {
