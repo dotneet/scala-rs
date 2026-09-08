@@ -737,7 +737,7 @@ impl Typer {
         parts
     }
 
-    fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
+    pub(crate) fn companion_implicits(&self, ty: &Type) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
         let mut parts = Vec::new();
