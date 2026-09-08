@@ -74,7 +74,10 @@ fn java_available() -> bool {
 }
 
 fn run_scalac(scalac: &Path, args: &[&str]) {
-    let output = Command::new(scalac).args(args).output().expect("run scalac");
+    let output = Command::new(scalac)
+        .args(args)
+        .output()
+        .expect("run scalac");
     assert!(
         output.status.success(),
         "scalac {args:?} failed:\n{}{}",

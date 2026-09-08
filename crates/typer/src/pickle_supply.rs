@@ -513,7 +513,10 @@ impl PickleSupply {
             // so the class file reader's description of them -- which cannot
             // say "implicit clause" or "this parameter has a default" -- is
             // dropped here rather than left to shadow the pickled one.
-            if !m.is_public_api() && !m.is_case_synthetic() && !m.is_implicit_class_conversion() {
+            if !m.is_public_api()
+                && !m.is_case_synthetic()
+                && !implicit_class_conversion_from(&internal, m)
+            {
                 continue;
             }
             let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
@@ -823,7 +826,7 @@ impl PickleSupply {
             // method is `SYNTHETIC`, which `is_public_api` hides.
             if m.kind != MemberKind::Def
                 || !m.has(pflags::IMPLICIT)
-                || (!m.is_public_api() && !m.is_implicit_class_conversion())
+                || (!m.is_public_api() && !implicit_class_conversion_from(&internal, m))
             {
                 continue;
             }
@@ -962,7 +965,7 @@ impl PickleSupply {
                         // `is_public_api` hides.
                         if m.kind != MemberKind::Def
                             || !m.has(pflags::IMPLICIT)
-                            || (!m.is_public_api() && !m.is_implicit_class_conversion())
+                            || (!m.is_public_api() && !implicit_class_conversion_from(&internal, m))
                         {
                             continue;
                         }
@@ -1864,7 +1867,7 @@ impl PickleSupply {
             }
             if !m.is_public_api()
                 && !(case_synthetic_ok && m.is_case_synthetic())
-                && !m.is_implicit_class_conversion()
+                && !implicit_class_conversion_from(&hit.owner, m)
                 && !(synthetic_ok && is_default_getter(&m.name))
             {
                 continue;
@@ -5293,6 +5296,34 @@ fn is_default_getter(name: &str) -> bool {
         return false;
     };
     !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Whether a pickled member may be taken as an `implicit class`'s conversion
+/// method, given the class that declares it.
+///
+/// nsc marks that method `SYNTHETIC` (`Member::is_implicit_class_conversion`),
+/// and reading it is what makes any `-cp` library's `implicit class` usable as
+/// a view at all. **`scala.*` is excluded**, for the same reason
+/// [`PickleSupply::adopt_binary_class`] refuses a prelude class outright: the
+/// standard library's implicit classes are hand-written in `prelude_*.rs`, and
+/// the pickled declaration is not a better version of them — it is a worse
+/// one, because it does not carry what those files know.
+///
+/// That is measured, not assumed. Admitting `scala.*` here took
+/// `scala.concurrent.duration.DurationInt` (a *value* class, whose receiver
+/// erases to `int`) away from `prelude_durrange.rs`, and `3.seconds` emitted
+/// an `invokevirtual` on an integer — a `VerifyError`, not a type error. It
+/// took `scala.reflect.api.Quasiquotes.Quasiquote` away from the quasiquote
+/// path, and `q"h"` became a reference to the inner object `q$` instead of a
+/// macro expansion. `run/duration-coarsest`, `run/t10513` and `pos/t5639`
+/// went with them. None of the 26 gitbucket errors this rule closes is in
+/// `scala.*`.
+///
+/// `owner` is accepted in either spelling: JVM internal (`scala/concurrent/…`)
+/// or dotted (`scala.concurrent.…`). Both carry the separator, so a package
+/// named `scalaz` is not caught by it.
+fn implicit_class_conversion_from(owner: &str, m: &scala_rs_pickle::Member) -> bool {
+    !owner.starts_with("scala/") && !owner.starts_with("scala.") && m.is_implicit_class_conversion()
 }
 
 /// The unspecialized class a `@specialized` variant was generated from.
