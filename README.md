@@ -26,9 +26,11 @@ makes no claim of conformance to the language specification. What exists today:
 - An unqualified name is resolved by SLS 2's four precedence levels —
   definitions of the same compilation unit, explicit imports, wildcard imports,
   then package members of other units — and two bindings of one level in one
-  scope are reported as an ambiguous reference. See
+  scope are reported as an ambiguous reference. So is a definition together
+  with an `import` clause nested more deeply than it, which precedence alone
+  would let the definition win. See
   [docs/gitbucket.md](docs/gitbucket.md) ("Not this cluster: `Database` /
-  `DatabaseFactory`") and the `impprio` test.
+  `DatabaseFactory`") and the `impprio` and `nameamb` tests.
 
 直接自己末尾呼び出しは `final` / `private` / object / ローカル def でループ化します。
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは

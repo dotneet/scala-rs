@@ -82,6 +82,7 @@ impl Typer {
         let span = tree.span;
         let saved_origin = self.import_origin;
         self.import_origin = ((self.file_index as u64 + 1) << 32) | (span.lo.0 as u64 + 1);
+        self.record_import_text(span);
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
                 let owners = self.import_prefix(qual, span);
@@ -123,6 +124,94 @@ impl Typer {
         }
         self.import_origin = saved_origin;
         tree.ty = Type::NoType;
+    }
+
+    /// Keep the source text of the clause `import_origin` identifies, for
+    /// nsc's "…imported subsequently by / import ColumnOption._".
+    ///
+    /// The clause's own text, not a printed tree: the two agree on everything
+    /// this compiler parses (`import p._`, `import p.X`, `import p.{X, Y}`),
+    /// and the source is what the reader is looking at. `import a.b, c.d` is
+    /// several clauses and only the first carries the keyword, so a clause
+    /// that does not begin with one is given it back. Runs of whitespace
+    /// collapse so that a clause spread over several lines still prints as
+    /// the one line nsc puts there.
+    fn record_import_text(&mut self, span: Span) {
+        if self.import_origin == 0 || self.import_text.contains_key(&self.import_origin) {
+            return;
+        }
+        let Some(src) = self.sources.get(self.file_index) else {
+            return;
+        };
+        let (lo, hi) = (span.lo.0 as usize, span.hi.0 as usize);
+        if lo >= hi {
+            return;
+        }
+        let Some(text) = src.get(lo..hi) else {
+            return;
+        };
+        let mut text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return;
+        }
+        if text.split(|c: char| c.is_whitespace() || c == '.').next() != Some("import") {
+            text = format!("import {text}");
+        }
+        self.import_text.insert(self.import_origin, text);
+    }
+
+    /// SLS 2's ambiguity between a definition and an `import` clause *nested
+    /// more deeply* than it, in the three lines nsc writes.
+    ///
+    /// See [`SymbolTable::ambiguous_defn_and_deeper_import`] for the rule.
+    /// Returns whether it fired, so that a caller which would otherwise go on
+    /// to pick one of the two candidates can stop.
+    pub(crate) fn report_defn_import_ambiguity(&mut self, name: &str, span: Span) -> bool {
+        let Some((def_sym, origin)) = self.st.ambiguous_defn_and_deeper_import(name) else {
+            return false;
+        };
+        let owner = self.defining_owner_desc(self.st.get(def_sym).owner);
+        // Nothing recorded the clause only if it was entered by a pass that
+        // never saw the source; say so rather than losing the rejection.
+        let clause = self
+            .import_text
+            .get(&origin)
+            .cloned()
+            .unwrap_or_else(|| "an import in an inner scope".to_string());
+        self.error(
+            span,
+            format!(
+                "reference to {name} is ambiguous;\n\
+                 it is both defined in {owner} and imported subsequently by\n\
+                 {clause}"
+            ),
+        );
+        true
+    }
+
+    /// `class A` / `trait B` / `object C` / `package p` / `method f`, the way
+    /// nsc's `Symbol.toString` spells the owner of a definition in that
+    /// message. The *simple* name: nsc prints "package p7", not the full
+    /// path, which is why this is not [`Typer::owner_desc`].
+    fn defining_owner_desc(&self, owner: SymbolId) -> String {
+        if owner.is_none() {
+            return "an enclosing scope".to_string();
+        }
+        let s = self.st.get(owner);
+        let name = s.name.trim_end_matches('$');
+        match s.kind {
+            SymKind::Package if name.is_empty() => "package <empty>".to_string(),
+            SymKind::Package => format!("package {name}"),
+            SymKind::Module | SymKind::ModuleClass => format!("object {name}"),
+            SymKind::Method => format!("method {name}"),
+            SymKind::Class
+                if s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE) =>
+            {
+                format!("trait {name}")
+            }
+            SymKind::Class => format!("class {name}"),
+            _ => name.to_string(),
+        }
     }
 
     /// The symbol whose members an import's selectors name.
@@ -891,6 +980,44 @@ impl Typer {
         );
     }
 
+    /// Whether an unqualified `private` member is reachable from the class
+    /// being typed: SLS 5.2 lets it out of its own owner only into something
+    /// nested in that owner, and into the owner's **companion** -- a class
+    /// and its object see each other's `private`s, and `class C { import C._ }`
+    /// over an `object C` with a `private def` is a program scalac accepts.
+    /// A `private[p]` member carries a `private_within` and is not this
+    /// question.
+    fn private_member_visible_here(&self, m: SymbolId) -> bool {
+        let owner = self.st.get(m).owner;
+        let mut cur = self.st.this_class;
+        for _ in 0..64 {
+            if cur.is_none() {
+                return false;
+            }
+            if cur == owner || self.companions(cur, owner) {
+                return true;
+            }
+            let up = self.st.get(cur).owner;
+            if up == cur {
+                return false;
+            }
+            cur = up;
+        }
+        false
+    }
+
+    /// Whether `a` and `b` are a class and its companion object, in either
+    /// order and whichever of the module and its module class stands for the
+    /// object.
+    fn companions(&self, a: SymbolId, b: SymbolId) -> bool {
+        let module_class = |c: SymbolId| {
+            self.st
+                .companion_module(c)
+                .map(|m| self.st.module_class_of(m))
+        };
+        module_class(a) == Some(b) || module_class(b) == Some(a)
+    }
+
     /// `package p` / `object O` / `class C`, for a diagnostic.
     pub(crate) fn owner_desc(&self, owner: SymbolId) -> String {
         let s = self.st.get(owner);
@@ -1009,7 +1136,18 @@ impl Typer {
                 // which then competed with the `request2Session` nsc picks.
                 let inherited = cur != o;
                 for m in self.st.get(cur).members.clone() {
-                    if inherited && self.st.private_to_owner(m) {
+                    // A `private` member of a *strict* ancestor of `o` is not
+                    // one of `o`'s (above), and a `private` member of `o`
+                    // itself is not one the reference site may see. SLS 5.2,
+                    // and nsc's `qualifies` filter in `Context.lookupSymbol`:
+                    // `object Priv { private[this] def hidden = … }` offers
+                    // nothing under that name to `import Priv._` written
+                    // anywhere else, so a class that declares its own
+                    // `hidden` binds *its* one. We bound the private member,
+                    // and printed its answer.
+                    if self.st.private_to_owner(m)
+                        && (inherited || !self.private_member_visible_here(m))
+                    {
                         continue;
                     }
                     let n = self.st.get(m).name.clone();
@@ -1590,6 +1728,13 @@ impl Typer {
         // program, and which one we picked used to depend on symbol ids.
         if self.st.ambiguous_term_import(&name) {
             self.error(tree.span, format!("reference to {name} is ambiguous"));
+        } else {
+            // The other half of the same rule: a definition and an import
+            // *nested more deeply* than it. Precedence would settle it and
+            // nsc refuses to, so picking either one is a wrong program --
+            // this one printed the imported answer where scalac rejects the
+            // file (`neg/name-lookup-stable`).
+            self.report_defn_import_ambiguity(&name, tree.span);
         }
         let mut found = self.st.lookup(&name);
         // See `SymbolTable::lookup_extractor`: in a constructor pattern a
