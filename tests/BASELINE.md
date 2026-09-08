@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `d39d5a65` |
+| commit | `d0c89fc1` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty slices have merged this session**, in sixteen composed gates. From
+**Sixty-two slices have merged this session**, in eighteen composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -38,6 +38,8 @@ coordinator measured the merged tree each time, not the branches.
 | `5108669a` | `triemapjava`, `nameamb`, `ctorgaps`, `implctx` | 270 -> 271 | 182 |
 | `462aeebb` | `overscore`, `varargsrecv` | 271 -> 270 | 182 |
 | `d39d5a65` | `javavarargs` | -> **265** | 182 |
+| `aa38b9e9` | `tuplepat` | 265 | 182 -> **177** |
+| `d0c89fc1` | `ctorgaps2` | 265 | 177 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -244,9 +246,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **182** | **71** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **177** | **69** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **265** | **77** | — |
-| `tests/scalalib_measure.sh` (538) | **672** | **132** | — |
+| `tests/scalalib_measure.sh` (538) | **622** | **131** | — |
 
 ## Execution
 
@@ -262,12 +264,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1103** | 411 | 345 |
+| `pos` (1859) | **1104** | 410 | 345 |
 | `neg` (1405) | **687** | 349 | 369 |
 | `run` (2060) | **628** | 879 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-d39d5a65.tsv`](baselines/corpus-d39d5a65.tsv): 5324 unique
+[`baselines/corpus-d0c89fc1.tsv`](baselines/corpus-d0c89fc1.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -588,6 +590,61 @@ parameter at all -- its 21 errors are `val (elms, idxs) = init()`, a tuple
 pattern definition whose component types are never instantiated, now the
 largest single mechanism in the remaining 672. I handed `javavarargs` twelve
 Java sites; the thirteenth was Scala and in the standard library.
+
+## Gates seventeen and eighteen: two briefs the slices had to throw away
+
+`agent/tuplepat` was briefed on tuple pattern definitions, which the previous
+slice's measurement had identified as the largest remaining mechanism in the
+library (21 of `collection/Seq.scala`'s 31 errors). **Pattern definitions were
+never broken.** They compile, they evaluate the right-hand side once, they
+throw `MatchError` on a refutable pattern, and the slice's fixture executes six
+shapes of them against scalac's own output to say so. The `T1`/`T2` in the
+errors were the *residue of a failed right-hand side*: when one component of a
+tuple expression fails to type, `Tuple2`'s parameters stay uninstantiated and
+the pattern definition faithfully hands that to every name it binds. **The
+messenger looked like the culprit because it is the thing that repeats.**
+
+Three unrelated roots were behind it, all confirmed against scalac 2.13.16:
+
+1. **`private[this]` through a trait's self-alias.** nsc's `isAccessible` asks
+   the prefix *type* (`pre =:= sym.owner.thisType`); we asked whether the tree
+   was a `This` node. `trait SeqOps { self => … }` writes `self.toGenericSeq`
+   as an `Ident`, so the syntactic test could never pass, and no
+   `private[this]` member of the library was reachable through its own alias.
+2. **An inherited factory `apply` called as `Obj[K, V](…)`**, taken at its
+   declaration instead of as seen from the module, so
+   `mutable.HashMap[A, Int]()` returned `CC[A, Int]`. 30 errors.
+3. **`xs.to(Factory)` with an abstract element type**: the guard meant to
+   check that no *unknowns* remain rejected any type parameter at all,
+   including an enclosing class's own fixed one. `List[Int]` worked and
+   `List[A]` did not, which is why the shape survived this long.
+
+Fixing (2) made a call *reachable* — and it was mis-compiled. The redirect left
+the receiver a bare `Ident`, which in a class body means `this`, so
+`Fac.apply` was emitted against `this`: `ClassCastException` at run time, with
+the verifier, the class loader and the lint all silent because the types agree.
+**Gate seventeen's corpus is `changes=0`.** It closed 50 library errors, 5 cats
+errors and one silent mis-compile, and moved no test status at all.
+
+`agent/ctorgaps2` **corrected a note this file's predecessor documents.** The
+recorded warning was that `private[p]` constructors must not be closed by
+tightening the flag test, because that would reject every `private[slick]`
+constructor slick itself calls. There is no flag to tighten: scalac 2.13.16
+pickles `class Qual private[libp] (…)` with `flags=0x200`, `PRIVATE` and
+`PROTECTED` both clear, and the boundary in `privateWithin`. Reading it
+properly then exposed two holes — a constructor installed but not repaired
+carried no `CONSTRUCTOR` flag and **skipped the access check entirely**, and
+the descriptorless partial symbol was counted as another callable constructor.
+The writing half stays open (emitting `privateWithin` moves every `SymInfo`
+entry after it) and is pinned by a test.
+
+Its second gap is the session's recurring lesson in miniature: implementing
+nsc's "prefer the alternative that needs no default" **turns a refusal into a
+silent wrong answer** on its own. `new Three(2)("m")()` folds to `(2, "m")`,
+which a primary `(Int, String)` accepts exactly, and prints `m` where scalac
+prints `m/m2`. nsc selects on the first written clause; holding the pick to the
+same alternative set the fold measured its arity against is what makes the rule
+safe.
 
 ## What is deliberately red
 
