@@ -297,6 +297,28 @@ The honest diff.
 - **Phases**: there are no separate passes like nsc's mixin. There are
   **uncurry**, **lambda-lift** (nested defs), erasure, and the closure conversion
   of lambdas.
+- **Method types in the pickle** (`ScalaSignature`). nsc's pickler runs *before*
+  uncurry, so a class file records the parameter clauses the source wrote and
+  keeps `def f: T` (a `NullaryMethodType`, pickled as a `POLYtpe` with no type
+  parameters) apart from `def f(): T` (a `MethodType` over an empty list). Both
+  halves of that matter to a reader: scalac accepts `f()` and `f` against the
+  second and answers `T does not take parameters` to `f()` against the first.
+  scala-rs pickles both distinctions the same way. Because our own uncurry has
+  already joined a method's clauses by the time the backend sees the symbol,
+  the shape is recorded on the symbol first (`Symbol::pickle_clauses`) and the
+  pickler writes one `METHODtpe` per clause — so `def makeDatabase[F[_]: Async]()`
+  reaches scalac as `[F[_]]()(implicit ev: Async[F])` rather than as
+  `[F[_]](implicit ev: Async[F])`. A `name$default$n` getter with no clause
+  before it stays *nullary*, as nsc's is; pickled with an empty list instead, a
+  scalac caller that omits the argument compiles with "Auto-application to `()`
+  is deprecated".
+
+  The reading side is not symmetric yet. A jar (and any class a lazy completion
+  reaches) goes through `crates/pickle`, which keeps every clause; the eager
+  scan of a `-cp` **class directory** goes through the subset decoder in
+  `crates/backend/src/pickle.rs`, which models a member as one flat parameter
+  list. So `T.cur(1)(2)` against a class directory *we* produced is still
+  rejected by scala-rs even though real scalac accepts the same class file.
 - **sealed**: a non-exhaustive match is a warning, as in scalac. It becomes an
   error under `-Xfatal-warnings`.
 - **The synthesized members of a `case class`** (SLS 5.3.2). `-Xprint:typer` on
