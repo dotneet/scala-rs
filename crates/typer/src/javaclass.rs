@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
 const ACC_PUBLIC: u16 = 0x0001;
+const ACC_PRIVATE: u16 = 0x0002;
 const ACC_PROTECTED: u16 = 0x0004;
 const ACC_STATIC: u16 = 0x0008;
 const ACC_VARARGS: u16 = 0x0080;
@@ -33,6 +34,9 @@ pub struct JavaField {
     pub name: String,
     pub desc: String,
     pub access: u16,
+    /// The field's `Signature` attribute, when it has one: the generic type
+    /// the descriptor erased (`MainNode<K, V>` for `INodeBase.mainnode`).
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -444,7 +448,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         let name_i = c.u2().ok_or("truncated field")?;
         let desc_i = c.u2().ok_or("truncated field")?;
         let attrs = read_attrs(&mut c, &cp).ok_or("truncated field attributes")?;
-        let _ = attrs;
+        let signature = attr_utf8(&attrs, "Signature", &cp);
         let name = cp.utf8(name_i).ok_or("unsupported classfile field name")?;
         let desc = cp.utf8(desc_i).ok_or("unsupported classfile field desc")?;
         if name == "$outer" && acc & (ACC_STATIC | ACC_SYNTHETIC) == ACC_SYNTHETIC {
@@ -455,6 +459,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
                 name: name.clone(),
                 desc: desc.clone(),
                 access: acc,
+                signature: signature.clone(),
             });
         }
         if acc & ACC_SYNTHETIC == 0 && java_member_visible(acc) {
@@ -462,6 +467,7 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
                 name,
                 desc,
                 access: acc,
+                signature,
             });
         }
     }
@@ -550,8 +556,27 @@ pub fn is_java_enum(access: u16) -> bool {
     access & ACC_ENUM != 0
 }
 
+/// Default access: none of `public` / `protected` / `private`, i.e. Java's
+/// package-private. Scala models it as `private[<package>]`, which is what
+/// `classpath::fill_java_members` records.
+pub fn is_java_package_private(access: u16) -> bool {
+    access & (ACC_PUBLIC | ACC_PROTECTED | ACC_PRIVATE) == 0
+}
+
+/// Which members of a class file are worth a symbol at all.
+///
+/// Only `private` is dropped: it is unreachable from any other class file, so
+/// nothing a Scala source writes can name it. Package-private members *are*
+/// reachable — from the same package — and dropping them cost
+/// `scala/collection/concurrent/TrieMap.scala` 11 errors: `INodeBase.java`
+/// declares `static final Object RESTART` and `NO_SUCH_ELEMENT_SENTINEL` with
+/// default access, and `INode` both selects them as `INodeBase.RESTART` and
+/// pulls them in with `import INodeBase._`. Real scalac accepts every one of
+/// those (checked against 2.13.16); it is the *access check* in
+/// `Typer::accessible`, not the class-file reader, that keeps them out of
+/// other packages.
 fn java_member_visible(access: u16) -> bool {
-    access & ACC_PUBLIC != 0 || access & ACC_PROTECTED != 0
+    access & ACC_PRIVATE == 0
 }
 
 struct Cp {

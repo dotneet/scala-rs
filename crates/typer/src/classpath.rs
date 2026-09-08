@@ -1602,6 +1602,36 @@ fn is_erased_scala_forwarder(
     c.is_scala && m.signature.is_none() && m.name != "<init>" && !st.get(owner).tparams.is_empty()
 }
 
+/// Record a class file's default-access member as Scala's `private[<pkg>]`.
+///
+/// The two notions are the same one: reachable from the member's own package
+/// and nowhere else. `Typer::accessible` already enforces `PRIVATE` with a
+/// `private_within` qualifier by walking out from the *member's* owner, so the
+/// package's simple name is enough to name the boundary unambiguously — two
+/// packages called `concurrent` cannot be confused, because the walk starts at
+/// the member and stops at the first enclosing package.
+///
+/// `Flags` is a full `u32`, so this reuses the existing qualifier rather than
+/// claiming a 33rd bit.
+fn mark_java_package_private(st: &mut SymbolTable, id: SymbolId, owner: SymbolId, access: u16) {
+    if !crate::javaclass::is_java_package_private(access) {
+        return;
+    }
+    let mut pkg = owner;
+    while !pkg.is_none() && st.get(pkg).kind != SymKind::Package {
+        pkg = st.get(pkg).owner;
+    }
+    if pkg.is_none() {
+        return;
+    }
+    let name = st.get(pkg).name.clone();
+    if name.is_empty() {
+        return;
+    }
+    st.get_mut(id).flags = st.get(id).flags.with(Flags::PRIVATE);
+    st.get_mut(id).private_within = Some(name);
+}
+
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
     for m in &c.methods {
         if is_erased_scala_forwarder(st, owner, c, m) {
@@ -1678,6 +1708,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         let flags = java_method_flags(m);
         let id = add_method_types(st, owner, &m.name, names, params, ret);
         st.get_mut(id).flags = flags;
+        mark_java_package_private(st, id, owner, m.access);
         st.set_jvm_name(id, m.desc.clone());
         if !mtparams.is_empty() {
             for tid in &mtparams {
@@ -1697,7 +1728,20 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         {
             continue;
         }
-        let ty = parse_field_ty_java(st, &f.desc).0;
+        // The generic type first, the erased descriptor only as a fallback.
+        // A field's `Signature` attribute was read and thrown away, so
+        // `scala/collection/concurrent/INodeBase.java`'s `public volatile
+        // MainNode<K, V> mainnode` reached the Scala subclass as a raw
+        // `MainNode`, and `key`/`value`-shaped inherited fields as `Object`.
+        // Methods have taken their signature since they were first loaded;
+        // this is the same treatment for fields.
+        let env = tparam_env(st, owner);
+        let ty = f
+            .signature
+            .as_deref()
+            .and_then(crate::javasign::parse_field_sig)
+            .map(|jt| jtype_to_type(st, &jt, &env))
+            .unwrap_or_else(|| parse_field_ty_java(st, &f.desc).0);
         let mut flags = Flags::JAVA;
         if crate::javaclass::is_java_static(f.access) {
             flags = flags.with(Flags::STATIC);
@@ -1710,6 +1754,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         }
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;
+        mark_java_package_private(st, id, owner, f.access);
         st.set_jvm_name(id, f.desc.clone());
     }
     // A class file's `name$default$n` methods are the only record that its

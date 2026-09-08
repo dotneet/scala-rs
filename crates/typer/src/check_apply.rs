@@ -73,6 +73,33 @@ impl Typer {
             && self.is_open_array_new(a)
     }
 
+    /// Whether the `new C[…]` this tree heads *wrote* a type-argument list.
+    ///
+    /// The type a `New` head carries cannot answer that. `Type::Class { sym,
+    /// args }` looks the same whether the arguments came from the source or
+    /// were filled in with the class's own parameters as placeholders, and
+    /// [`type_args_are_instantiated`] — which is how the constructor path
+    /// decides whether to trust them — refuses any argument that *is* one of
+    /// the instantiated class's own type parameters.
+    ///
+    /// That refusal is right for a placeholder and wrong for a `new C[K, V]`
+    /// written from inside `C`, where `K` and `V` name the enclosing
+    /// instance's parameters and are the only sensible answer. So ask the
+    /// tree, which knows what the programmer typed.
+    fn new_wrote_type_args(fun: &Tree) -> bool {
+        let TreeKind::New { tpt } = &fun.kind else {
+            return false;
+        };
+        let mut cur = &**tpt;
+        // `new C[K, V] @unchecked` keeps the applied type under the annotation.
+        while let TreeKind::AnnotatedTypeTree { tpt, .. } = &cur.kind {
+            cur = tpt;
+        }
+        matches!(&cur.kind,
+            TreeKind::AppliedTypeTree { args, .. } | TreeKind::TypeApply { args, .. }
+                if !args.is_empty())
+    }
+
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
@@ -238,8 +265,28 @@ impl Typer {
                 .unwrap_or_default();
             // Keep explicit `new C[T](…)` args; otherwise infer. Do not adapt
             // constructor arguments to raw type parameters (`A`) first.
+            //
+            // A *written* type-argument list is explicit even when its
+            // arguments are the instantiated class's own type parameters,
+            // which is exactly what `new C[K, V]` inside `class C[K, V]`
+            // writes: `CNode`'s `updatedAt` / `insertedAt` / `removedAt` /
+            // `renewed` (`concurrent/TrieMap.scala`) all end in
+            // `new CNode[K, V](…)`. Judged on the type alone those look like
+            // uninstantiated placeholders, so the whole list was dropped and
+            // the parameters re-inferred from the value arguments — which
+            // mention neither, so both solved to `Nothing` and each method's
+            // inferred result type became `CNode[Nothing, Nothing]`. Every
+            // caller then failed; 13 of that file's 46 errors were the single
+            // overload `GCAS(cn, cn.renewed(startgen, ct), ct)`.
             let explicit: Vec<Type> = match &fun.ty {
-                Type::Class { args, .. } if type_args_are_instantiated(args, &tps) => args.clone(),
+                Type::Class { args, .. }
+                    if type_args_are_instantiated(args, &tps)
+                        || (Self::new_wrote_type_args(fun)
+                            && !args.is_empty()
+                            && (tps.is_empty() || args.len() == tps.len())) =>
+                {
+                    args.clone()
+                }
                 _ => Vec::new(),
             };
             let infer = !tps.is_empty() && explicit.is_empty();

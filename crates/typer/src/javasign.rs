@@ -258,6 +258,22 @@ pub fn parse_class_sig(s: &str) -> Option<ClassSig> {
     Some(ClassSig { tparams, supers })
 }
 
+/// A field's `Signature` attribute: one type, no type-parameter section.
+///
+/// `scala/collection/concurrent/INodeBase.java`'s `public volatile
+/// MainNode<K, V> mainnode` has descriptor `Lscala/collection/concurrent/
+/// MainNode;` and signature `Lscala/collection/concurrent/MainNode<TK;TV;>;`.
+/// Reading only the descriptor erases the arguments, and the subclass then
+/// sees the field at its raw type.
+pub fn parse_field_sig(s: &str) -> Option<JType> {
+    let mut p = P::new(s);
+    let t = p.parse_java_type()?;
+    // A field signature is exactly one type; anything left over means this is
+    // not one, and guessing from a partial parse would be worse than the
+    // descriptor.
+    p.peek().is_none().then_some(t)
+}
+
 pub fn parse_method_sig(s: &str) -> Option<MethodSig> {
     let mut p = P::new(s);
     let tparams = p.parse_tparams()?;
