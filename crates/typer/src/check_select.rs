@@ -1833,10 +1833,20 @@ impl Typer {
         true
     }
 
+    /// nsc asks this of the prefix **type** (`pre =:= sym.owner.thisType`,
+    /// `pre.isInstanceOf[ThisType]`), not of the tree. The difference is the
+    /// self-alias: `trait SeqOps[…] { self => … }` binds `self` to
+    /// `SeqOps.this`, and `self.toGenericSeq` is written as an `Ident`, so a
+    /// syntactic test for `This` misses it. That is what made every
+    /// `private[this]` member of the standard library unreachable through its
+    /// own self-alias -- see `crates/cli/tests/tuplepat.rs`.
     fn prefix_is_this(&self, prefix: Option<&Tree>) -> bool {
         match prefix {
             None => true,
-            Some(t) => matches!(t.kind, TreeKind::This { .. } | TreeKind::Super { .. }),
+            Some(t) => {
+                matches!(t.kind, TreeKind::This { .. } | TreeKind::Super { .. })
+                    || matches!(t.ty, Type::ThisType(_))
+            }
         }
     }
 

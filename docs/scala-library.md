@@ -3672,6 +3672,101 @@ every one of them is this slice's own subject matter --
   rule above to reject a repeated argument at a fixed-arity formal;
 * `pos/t0305`.
 
+## The `agent/tuplepat` slice: `T1`/`T2` was a cascade, not a pattern definition
+
+`scala/collection/Seq.scala` carried 31 of the library's 685 errors at
+`462aeebb`, and 21 of them read `value <x> is not a member of T1` or `T2` --
+`T1`/`T2` being `Tuple2`'s own parameter names. The standing diagnosis was that
+`private[this] val (elms, idxs) = init()` -- a **tuple pattern definition** in
+`SeqOps`' `PermutationsItr` / `CombinationsItr` -- gave its accessors those
+names instead of the components of the right-hand side's type.
+
+**That is not what happens.** A pattern definition whose right-hand side types
+correctly has always worked; six of them are executed in
+`tests/fixtures/tuplepat.scala`, including the `private[this]` and
+three-component shapes, in a class nested in a generic trait. `T1`/`T2` is what
+a *failed* right-hand side leaves behind: a tuple literal one of whose
+components did not type keeps `Tuple2`'s parameter uninstantiated, the pattern
+definition hands that faithfully to every bound name, and every later use of a
+bound name reports it. Twenty-one reports, one root each level up.
+
+Three roots were underneath, and all three reproduce in fifteen lines against
+the real jar -- none of them needs `src/library` and none of them involves a
+pattern definition:
+
+1. **A `private[this]` member reached through the trait's self-alias.**
+   `trait SeqOps[…] { self => … }`, and `self.toGenericSeq` from inside
+   `PermutationsItr`. `Checker::prefix_is_this` asked the *tree* whether the
+   prefix was a `This` node. nsc (`Contexts.isAccessible`) asks the prefix
+   **type**: `pre =:= sym.owner.thisType` for an object-private member. A
+   self-alias is an `Ident` whose type is `SeqOps.this.type`, so the syntactic
+   test missed every one. **5 errors.**
+2. **An inherited factory `apply` reached as `Obj[K, V](…)`.** `object HashMap
+   extends MapFactory[HashMap]` inherits
+   `def apply[K, V](elems: (K, V)*): CC[K, V]`. The redirect in `check_expr`
+   that turns `mutable.HashMap[A, Int]()` into that `apply` took
+   `SymbolTable::get(sym).ty` raw, so the call came back `CC[A, Int]` -- the
+   *declaring trait's* parameter, unsubstituted. Writing `.apply` out went
+   through `type_select`, which does the substitution, which is why only the
+   implicit redirect was wrong. **30 errors.**
+3. **`xs.to(SomeFactory)` with an abstract element type.**
+   `Implicits::open_conversion_fit` ended with
+   `if mentions_any_tparam(&solved_to) { return None }`. The intent was to
+   reject a solution that still contains an *unknown*; what it rejected was any
+   solution mentioning any type parameter, and a type parameter of an enclosing
+   class or method is a fixed type. `List[Int].to(ArrayBuffer)` worked;
+   `class C[A] { def es: List[A] }` and `es.to(ArrayBuffer)` did not. The guard
+   now names the unknowns (`rest` and `open`). **15 errors.**
+
+Together: **685 -> 635** library errors, `Seq.scala` 31 -> 7, and every one of
+the 21 `T1`/`T2` reports gone. cats 182 -> 177; gitbucket and slick unchanged.
+52 errors went, 2 arrived, both of them the same two sites reporting the
+residual below with a better type in the message.
+
+### The miscompilation root 2 was hiding
+
+Making the type right made the call *reachable*, and executing it found the
+receiver wrong. `peel_fun` reads the receiver off the tree shape, and a bare
+`Ident` in a class body means `this`, so
+
+```scala
+trait Fac { def apply[K](x: K): String = "F" + x }
+object TM extends Fac
+class Uses { def two: String = TM[Int](1) }
+```
+
+emitted `Fac.apply` **on `this`** and threw
+`ClassCastException: class Uses cannot be cast to class Fac`. It is present at
+`462aeebb` and at every commit that has the redirect; nothing but execution
+sees it, because the types stay consistent (`.agent-brief.md`, *`verify_failures`
+is a lower bound*). `TM.apply[Int](1)`, `TM(1)` and an `apply` the object
+declares itself were all correct. The redirect now builds the `Select` those
+take.
+
+### Found, not fixed
+
+* **`unzip` in `--no-scala-library` mode infers a nested tuple.** The last two
+  `Seq.scala` errors are `val (es, is) = (… map … sortBy …).unzip` coming back
+  with an element type `Tuple2[Tuple2[Tuple2[Tuple2[Tuple2[Tuple2[A, Int],
+  Int], Int], Int], Int], Int]` -- six levels, one per `Tuple2` in the chain.
+  The same expression against the *jar's* `unzip` is correct, so it is the
+  source-library supply of `IterableOps.unzip` / `sortBy`, not the inference
+  rule as such. 2 errors.
+* **`Obj.apply[K, V]()` with an empty parameter list.** scalac calls it; this
+  compiler reads `Obj.apply[K, V]` as the completed application and the `()` as
+  a second one ("value apply is not a member of QC[Int, Int]"). Independent of
+  the roots above -- it happens whether the `apply` is inherited or declared,
+  and only with the empty clause.
+* **The synthetic holder a pattern definition creates is public.** nsc emits
+  `private static final scala.Tuple2 x$2` and no accessor; this compiler emits
+  a public field *and* a public `x$pat2()` accessor. The programs behave
+  identically -- `tests/fixtures/tuplepat.scala` is that claim, executed,
+  including that the right-hand side is evaluated once -- but the ABI carries
+  members it should not.
+
+All three are pinned by tests in `crates/cli/tests/tuplepat.rs` on their
+current behaviour, so a later slice that closes one is told by a failing test.
+
 ## Running it
 
 ```
