@@ -769,6 +769,7 @@ impl Typer {
             return found;
         }
         let found = self.collapse_pickled_copies(found);
+        let found = self.drop_classfile_forwarders(found);
         let found = self.drop_field_behind_accessor(found);
         let kept: Vec<SymbolId> = found
             .iter()
@@ -879,6 +880,191 @@ impl Typer {
                 origin.is_empty() || seen.insert(origin)
             })
             .collect()
+    }
+
+    /// A mixin forwarder read from a class file is not a declaration.
+    ///
+    /// scalac gives every concrete class a forwarder for each default method
+    /// it inherits from a trait, and writes a `Signature` for it. The JVM's
+    /// generic signature language cannot say everything a Scala one can, so
+    /// the forwarder is a *lossy copy* of the declaration:
+    ///
+    /// ```text
+    /// scala.collection.IterableOnceOps:  def reduceLeft[B >: A](op: (B, A) => B): B
+    /// scala.collection.AbstractIterable: public <B> B reduceLeft(Function2<B, A, B>)
+    /// ```
+    ///
+    /// -- the lower bound `B >: A` is gone, and a member with several
+    /// parameter clauses is flattened into one (`foldLeft(z)(op)` becomes
+    /// `foldLeft(Object, Function2)`). `is_erased_scala_forwarder` drops the
+    /// forwarders that carry *no* signature at all; these carry one, so both
+    /// copies were installed and both reached the receiver. Overload
+    /// resolution then had two alternatives where nsc has one, and picking
+    /// the forwarder left `B` with nothing but `Any` to be: cats'
+    /// `toLazyList.reduceLeft(f)` was `found: (A, A) => A  required:
+    /// Function2[Any, A, Any]`, and `toLazyList.foldLeft(b)(f)` ate `(b)` as
+    /// the whole argument list and reported `value apply is not a member of
+    /// B` for the second one. Fifteen error lines across
+    /// `NonEmptyLazyList.scala`, `instances/lazyList.scala`,
+    /// `instances/stream.scala` and `instances/arraySeq.scala`.
+    ///
+    /// The rule is narrow: the copy is dropped only when the pickled
+    /// declaration it forwards to is *in the same candidate set*, so the
+    /// member is still reachable and the call goes to the trait's own
+    /// interface method, which is what the forwarder would have called
+    /// anyway. A class-file member with no pickled counterpart -- a real Java
+    /// method, or an override that adds a signature nothing else has -- is
+    /// untouched, because the erased parameter lists have to match too.
+    fn drop_classfile_forwarders(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+        if found.len() < 2
+            || !found
+                .iter()
+                .any(|&s| self.st.get(s).pickled_origin.is_empty())
+        {
+            return found;
+        }
+        let params: Vec<Vec<Option<String>>> = found
+            .iter()
+            .map(|&s| crate::pickle_supply::flat_erased_params(&self.st, &self.st.get(s).ty))
+            .collect();
+        let kept: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(i, s)| {
+                let sym = self.st.get(s);
+                // Only a member the *class file reader* installed. An empty
+                // `pickled_origin` is also what a member read from source
+                // carries, and a source class that implements a library trait
+                // -- slick's `class ProductWrapper extends Product`, with its
+                // own `productArity` -- is not a forwarder for the
+                // declaration it implements. `jvm_name` is a JVM descriptor
+                // exactly for the symbols `fill_java_members` made, which is
+                // how the rest of the compiler tells the two apart.
+                if !sym.pickled_origin.is_empty()
+                    || sym.kind != SymKind::Method
+                    || !sym.jvm_name.starts_with('(')
+                {
+                    return true;
+                }
+                let owner = sym.owner;
+                if owner.is_none() {
+                    return true;
+                }
+                !found.iter().enumerate().any(|(j, &other)| {
+                    if j == i {
+                        return false;
+                    }
+                    let o = self.st.get(other);
+                    let oo = o.owner;
+                    !o.pickled_origin.is_empty()
+                        && !oo.is_none()
+                        && oo != owner
+                        && params[i] == params[j]
+                        && self.faithful_bytecode_copy(other, s)
+                        && self.st.is_ancestor_of(oo, owner)
+                })
+            })
+            .map(|(_, s)| s)
+            .collect();
+        if kept.is_empty() {
+            return found;
+        }
+        kept
+    }
+
+    /// Whether `copy` says exactly what `decl` says, minus what a JVM generic
+    /// signature cannot write down.
+    ///
+    /// This is what makes a mixin forwarder recognisable. scalac writes the
+    /// forwarder's signature from the declaration it forwards to, so the two
+    /// agree everywhere the signature language allows, and differ in exactly
+    /// two places:
+    ///
+    ///  * **Several parameter clauses become one.** The JVM has a single
+    ///    argument list, so `foldLeft[B](z: B)(op: (B, A) => B): B` is
+    ///    `foldLeft(Object, Function2)` and `xs.foldLeft(b)(f)` reads `(b)` as
+    ///    the whole call, then applies its `B` result to `(f)`.
+    ///  * **A type parameter loses its lower bound.** `<B:Ljava/lang/Object;>`
+    ///    is all there is for `[B >: A]`, so `reduceLeft`'s `B` had nothing
+    ///    but `Any` to be solved to.
+    ///
+    /// Anything else the class file states is a difference it is *entitled*
+    /// to state, and usually a better answer than the declaration's:
+    /// `immutable.List` renders the `++[B >: A](that): CC[B]` it inherits as
+    /// `++(IterableOnce): List[B]`, `immutable.Map` renders `getOrElse(key:
+    /// K, ...)` with the erased `Any` for its key, and `SetOps.++(that:
+    /// IterableOnce[A]): C` is a genuinely different overload from
+    /// `IterableOps.++[B >: A]`. Comparing the whole flattened signature --
+    /// rather than counting clauses and bounds, which the first version of
+    /// this rule did -- keeps all three: it cost slick seven errors, from
+    /// `xs ++ ys` on a `List` down to `Iterable` and two `getOrElse`
+    /// candidates left with nothing to separate them.
+    fn faithful_bytecode_copy(&self, decl: SymbolId, copy: SymbolId) -> bool {
+        let (dt, ct) = (
+            self.st.get(decl).tparams.clone(),
+            self.st.get(copy).tparams.clone(),
+        );
+        if dt.len() != ct.len() {
+            return false;
+        }
+        let flat = |s: SymbolId| match &self.st.get(s).ty {
+            Type::Method { paramss, ret } => Some((
+                paramss.iter().flatten().cloned().collect::<Vec<Type>>(),
+                (**ret).clone(),
+            )),
+            _ => None,
+        };
+        let (Some((dps, dret)), Some((cps, cret))) = (flat(decl), flat(copy)) else {
+            return false;
+        };
+        if dps.len() != cps.len() {
+            return false;
+        }
+        // The two are declared in different classes and each has its own
+        // symbols for the parameters, so `[B]` on one is not `[B]` on the
+        // other. scalac writes the forwarder from the declaration, keeping
+        // every name, so lining them up by *name* is exact here -- and a
+        // parameter whose name the copy does not have (the erased `Any`
+        // `immutable.Map#getOrElse` has for its key) then fails to match,
+        // which is the answer wanted.
+        let mut mine: Vec<SymbolId> = Vec::new();
+        crate::check::collect_tparams(&self.st.get(decl).ty, &mut mine);
+        let mut theirs: Vec<SymbolId> = ct.clone();
+        crate::check::collect_tparams(&self.st.get(copy).ty, &mut theirs);
+        let mut from: Vec<SymbolId> = Vec::new();
+        let mut to: Vec<Type> = Vec::new();
+        for m in mine.into_iter().chain(dt.iter().copied()) {
+            if from.contains(&m) {
+                continue;
+            }
+            let name = &self.st.get(m).name;
+            let Some(&t) = theirs.iter().find(|&&t| &self.st.get(t).name == name) else {
+                continue;
+            };
+            from.push(m);
+            to.push(Type::TypeParam(t));
+        }
+        let at_copy = |t: &Type| crate::symbol::subst_tparams_slice(&from, &to, t);
+        dps.iter()
+            .zip(&cps)
+            .all(|(d, c)| self.same_erased_shape(&at_copy(d), c))
+            && self.same_erased_shape(&at_copy(&dret), &cret)
+    }
+
+    /// Type equality as a class file can express it: a function type and the
+    /// `FunctionN` it erases to are the same thing, and a by-name parameter
+    /// is written as its own type (the class file has `Function0`, but the
+    /// reader keeps the declaration's `=> T` where it has one).
+    fn same_erased_shape(&self, a: &Type, b: &Type) -> bool {
+        let norm = |t: &Type| -> Type {
+            let t = match t {
+                Type::ByName(inner) => (**inner).clone(),
+                other => other.clone(),
+            };
+            self.st.function_class_form(&t).unwrap_or(t)
+        };
+        norm(a) == norm(b)
     }
 
     /// A constructor parameter's *field* and its accessor are one member, not
