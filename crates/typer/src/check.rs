@@ -24,7 +24,7 @@
 use crate::javaclass::BinaryIndex;
 use crate::lazysig::PendingSig;
 use crate::prelude::install_prelude;
-use crate::symbol::{SymKind, SymbolTable};
+use crate::symbol::{bool_shortcircuit_rhs, SymKind, SymbolTable};
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
@@ -1318,6 +1318,7 @@ fn rec_fun_is_method(tree: &Tree, meth: SymbolId) -> bool {
 // call. Looking only at the outer Apply's args missed recursion in a receiver
 // (`f(0).f(n - 1)`) or in an earlier curried argument clause.
 fn count_tailrec_call_inputs(
+    st: &SymbolTable,
     tree: &Tree,
     meth: SymbolId,
     nullary: bool,
@@ -1326,22 +1327,23 @@ fn count_tailrec_call_inputs(
 ) {
     match &tree.kind {
         TreeKind::Apply { fun, args } => {
-            count_tailrec_call_inputs(fun, meth, nullary, n_tail, n_nontail);
+            count_tailrec_call_inputs(st, fun, meth, nullary, n_tail, n_nontail);
             for arg in args {
-                count_tailrec_calls(arg, meth, nullary, false, n_tail, n_nontail);
+                count_tailrec_calls(st, arg, meth, nullary, false, n_tail, n_nontail);
             }
         }
         TreeKind::TypeApply { fun, .. } => {
-            count_tailrec_call_inputs(fun, meth, nullary, n_tail, n_nontail);
+            count_tailrec_call_inputs(st, fun, meth, nullary, n_tail, n_nontail);
         }
         TreeKind::Select { qual, .. } => {
-            count_tailrec_calls(qual, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, qual, meth, nullary, false, n_tail, n_nontail);
         }
         _ => {}
     }
 }
 
 pub(crate) fn count_tailrec_calls(
+    st: &SymbolTable,
     tree: &Tree,
     meth: SymbolId,
     nullary: bool,
@@ -1362,7 +1364,7 @@ pub(crate) fn count_tailrec_calls(
             *n_nontail += 1;
         }
         if let TreeKind::Select { qual, .. } = &tree.kind {
-            count_tailrec_calls(qual, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, qual, meth, nullary, false, n_tail, n_nontail);
         }
         return;
     }
@@ -1372,72 +1374,99 @@ pub(crate) fn count_tailrec_calls(
         } else {
             *n_nontail += 1;
         }
-        count_tailrec_call_inputs(tree, meth, nullary, n_tail, n_nontail);
+        count_tailrec_call_inputs(st, tree, meth, nullary, n_tail, n_nontail);
+        return;
+    }
+    // The right operand of `scala.Boolean.&&` / `scala.Boolean.||` is a tail
+    // position, exactly as in nsc's `TailCalls` (`fun.symbol == Boolean_and ||
+    // fun.symbol == Boolean_or` keeps the argument in the tail context). Both
+    // are compiled to a conditional branch over the operand, so nothing runs
+    // after it. Seven `@tailrec` methods in the 2.13.16 library are written
+    // this way -- `LinearSeq.sameElements`, `List.equals`,
+    // `ListSet.containsInternal`, `StringParsers.forAllBetween`,
+    // `Promise.tryComplete0`, `ClassManifestDeprecatedApis.subtype` and
+    // `sys.process.Parser.skipToDelim` -- and all seven were rejected.
+    if let Some(rhs) = bool_shortcircuit_rhs(st, tree) {
+        if let TreeKind::Apply { fun, .. } = &tree.kind {
+            count_tailrec_calls(st, fun, meth, nullary, false, n_tail, n_nontail);
+        }
+        count_tailrec_calls(st, rhs, meth, nullary, tail, n_tail, n_nontail);
         return;
     }
     match &tree.kind {
         TreeKind::If { cond, thenp, elsep } => {
-            count_tailrec_calls(cond, meth, nullary, false, n_tail, n_nontail);
-            count_tailrec_calls(thenp, meth, nullary, tail, n_tail, n_nontail);
-            count_tailrec_calls(elsep, meth, nullary, tail, n_tail, n_nontail);
+            count_tailrec_calls(st, cond, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, thenp, meth, nullary, tail, n_tail, n_nontail);
+            count_tailrec_calls(st, elsep, meth, nullary, tail, n_tail, n_nontail);
         }
         TreeKind::Block { stats, expr } => {
             for s in stats {
-                count_tailrec_calls(s, meth, nullary, false, n_tail, n_nontail);
+                count_tailrec_calls(st, s, meth, nullary, false, n_tail, n_nontail);
             }
-            count_tailrec_calls(expr, meth, nullary, tail, n_tail, n_nontail);
+            count_tailrec_calls(st, expr, meth, nullary, tail, n_tail, n_nontail);
         }
         TreeKind::Match { selector, cases } => {
-            count_tailrec_calls(selector, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, selector, meth, nullary, false, n_tail, n_nontail);
             for c in cases {
                 if !c.guard.is_empty() {
-                    count_tailrec_calls(&c.guard, meth, nullary, false, n_tail, n_nontail);
+                    count_tailrec_calls(st, &c.guard, meth, nullary, false, n_tail, n_nontail);
                 }
-                count_tailrec_calls(&c.body, meth, nullary, tail, n_tail, n_nontail);
+                count_tailrec_calls(st, &c.body, meth, nullary, tail, n_tail, n_nontail);
             }
         }
         TreeKind::Apply { fun, args } => {
-            count_tailrec_calls(fun, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, fun, meth, nullary, false, n_tail, n_nontail);
             for a in args {
-                count_tailrec_calls(a, meth, nullary, false, n_tail, n_nontail);
+                count_tailrec_calls(st, a, meth, nullary, false, n_tail, n_nontail);
             }
         }
         TreeKind::TypeApply { fun, args } => {
-            count_tailrec_calls(fun, meth, nullary, tail, n_tail, n_nontail);
+            count_tailrec_calls(st, fun, meth, nullary, tail, n_tail, n_nontail);
             let _ = args;
         }
         TreeKind::Select { qual, .. } => {
-            count_tailrec_calls(qual, meth, nullary, false, n_tail, n_nontail)
+            count_tailrec_calls(st, qual, meth, nullary, false, n_tail, n_nontail)
         }
         TreeKind::Typed { expr, .. } => {
-            count_tailrec_calls(expr, meth, nullary, tail, n_tail, n_nontail)
+            count_tailrec_calls(st, expr, meth, nullary, tail, n_tail, n_nontail)
         }
         TreeKind::Assign { lhs, rhs } => {
-            count_tailrec_calls(lhs, meth, nullary, false, n_tail, n_nontail);
-            count_tailrec_calls(rhs, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, lhs, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, rhs, meth, nullary, false, n_tail, n_nontail);
         }
         TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
-            count_tailrec_calls(cond, meth, nullary, false, n_tail, n_nontail);
-            count_tailrec_calls(body, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, cond, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, body, meth, nullary, false, n_tail, n_nontail);
         }
         TreeKind::Try {
             block,
             catches,
             finalizer,
         } => {
-            count_tailrec_calls(block, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, block, meth, nullary, false, n_tail, n_nontail);
             for c in catches {
-                count_tailrec_calls(&c.body, meth, nullary, false, n_tail, n_nontail);
+                count_tailrec_calls(st, &c.body, meth, nullary, false, n_tail, n_nontail);
             }
             if !finalizer.is_empty() {
-                count_tailrec_calls(finalizer, meth, nullary, false, n_tail, n_nontail);
+                count_tailrec_calls(st, finalizer, meth, nullary, false, n_tail, n_nontail);
             }
         }
         TreeKind::Function { body, .. } => {
-            count_tailrec_calls(body, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, body, meth, nullary, false, n_tail, n_nontail);
         }
         TreeKind::Return { expr } | TreeKind::Throw { expr } => {
-            count_tailrec_calls(expr, meth, nullary, false, n_tail, n_nontail);
+            count_tailrec_calls(st, expr, meth, nullary, false, n_tail, n_nontail);
+        }
+        // A `val`'s right-hand side is part of the method body and is never a
+        // tail position. Skipping it made `{ val x = f(n - 1); f(x) }` look
+        // like a body with one tail call and nothing else, so nsc's
+        // "recursive call not in tail position" was reported as "contains no
+        // recursive calls" when it was the only call -- and not reported at
+        // all when another call was in tail position. A nested `def` is
+        // deliberately not descended into: nsc scopes the transform to the
+        // enclosing method's own body.
+        TreeKind::ValDef { rhs, .. } => {
+            count_tailrec_calls(st, rhs, meth, nullary, false, n_tail, n_nontail);
         }
         _ => {}
     }
