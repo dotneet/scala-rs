@@ -2503,16 +2503,33 @@ impl Typer {
             return;
         }
         // SLS 6.26.1: an `Int` *literal* in range narrows to `Byte`, `Short`
-        // or `Char` (`val b: Byte = 1`). Only a constant; `val b: Byte = n`
-        // stays an error.
-        if let Type::Constant(Lit::Int(v)) = &tree.ty {
+        // or `Char` (`val b: Byte = 1`). SLS 6.24 defines a constant
+        // expression to also include a unary `-` applied to one (`val b:
+        // Byte = -3`) -- `unary_-` is a real method whose declared return
+        // type is the widened `Int`, so by the time it is typed here `-3`'s
+        // constant-ness has to be recovered from the tree shape, not from
+        // `tree.ty`. `negated_int_literal` is deliberately narrow: only a
+        // literal operand counts, so `val n = 3; val b: Byte = -n` stays the
+        // error scalac itself reports.
+        let const_int = match &tree.ty {
+            Type::Constant(Lit::Int(v)) => Some(*v),
+            _ => negated_int_literal(tree),
+        };
+        if let Some(v) = const_int {
             let fits = match pt {
-                Type::Byte => (-128..=127).contains(v),
-                Type::Short => (-32768..=32767).contains(v),
-                Type::Char => (0..=65535).contains(v),
+                Type::Byte => (-128..=127).contains(&v),
+                Type::Short => (-32768..=32767).contains(&v),
+                Type::Char => (0..=65535).contains(&v),
                 _ => false,
             };
             if fits {
+                if !matches!(tree.ty, Type::Constant(_)) {
+                    // Fold `unary_-(<literal>)` into the literal it denotes,
+                    // the same shape the plain-literal case already is --
+                    // codegen (`gen_literal`) pushes the int constant either
+                    // way, byte/short/char all being `int` on the stack.
+                    tree.kind = TreeKind::Literal { lit: Lit::Int(v) };
+                }
                 tree.ty = pt.clone();
                 return;
             }
@@ -3304,4 +3321,38 @@ impl Typer {
             },
         );
     }
+}
+
+/// Recognizes `unary_-` applied directly to a source `Int` literal (`-3`,
+/// parsed as `Apply(Select(Literal(3), "unary_-"), Nil)`) and returns the
+/// value it denotes.
+///
+/// SLS 6.24 defines a constant expression to include a unary `-` applied to
+/// a literal, but this compiler types `unary_-` as an ordinary method call --
+/// its declared return type is `Int`, not a `Type::Constant` -- so nothing
+/// upstream of [`Typer::adapt`] marks `-3` as a constant the way a bare `3`
+/// already is. Deliberately narrow to that one shape: the operand must be a
+/// literal, not merely constant-typed, so `val n = 3; val b: Byte = -n`
+/// (`n` is a stable reference, not a literal) is left alone and still
+/// reports the type mismatch scalac itself gives.
+fn negated_int_literal(tree: &Tree) -> Option<i32> {
+    let TreeKind::Apply { fun, args } = &tree.kind else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let TreeKind::Select { qual, name } = &fun.kind else {
+        return None;
+    };
+    if name != "unary_-" {
+        return None;
+    }
+    let TreeKind::Literal {
+        lit: Lit::Int(v), ..
+    } = &qual.kind
+    else {
+        return None;
+    };
+    Some(v.wrapping_neg())
 }
