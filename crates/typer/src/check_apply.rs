@@ -2437,8 +2437,37 @@ impl Typer {
     /// A `scala.collection` class whose real `map` returns its own type
     /// constructor. `Range` (no type parameter of its own) and a user class
     /// that extends one of these are not among them.
+    ///
+    /// Living in `scala.collection` is not enough, and the difference is the
+    /// element. Every real collection passes its *own* type parameters down as
+    /// the element `IterableOnce` receives -- `Vector[A]` is an
+    /// `IterableOnce[A]`, `TreeMap[K, V]` an `IterableOnce[(K, V)]` -- so
+    /// putting the receiver's class back around the element the declaration
+    /// computed is the same type nsc's `BuildFrom` arrives at.
+    /// `Iterator.GroupedIterator[B]` is an `IterableOnce[Seq[B]]`: its `CC` is
+    /// `Iterator`, and rebuilding gave `it.sliding(n).map(f)` the type
+    /// `GroupedIterator[B]`, which claims an element of `Seq[B]` for a value
+    /// whose elements are `B`. A class whose element is not its own parameter
+    /// keeps the `CC` its declaration names.
     fn maps_to_own_class(&self, cls: SymbolId) -> bool {
-        self.st.get(cls).jvm_name.starts_with("scala/collection/")
+        if !self.st.get(cls).jvm_name.starts_with("scala/collection/") {
+            return false;
+        }
+        let Some(io) = crate::classpath::find_by_jvm(&self.st, "scala/collection/IterableOnce")
+        else {
+            return true;
+        };
+        if cls == io || self.st.class_reaches(cls, io) != Some(true) {
+            return true;
+        }
+        let tps = self.st.get(cls).tparams.clone();
+        let args: Vec<Type> = tps.iter().map(|t| Type::TypeParam(*t)).collect();
+        let bta = self.st.base_type_args(cls, &args);
+        let Some([elem]) = bta.get(&io.0).map(|a| &a[..]) else {
+            return true;
+        };
+        let own = |t: &Type| matches!(t, Type::TypeParam(p) if tps.contains(p));
+        own(elem) || self.pair_args(elem).is_some_and(|p| p.iter().all(own))
     }
 
     /// The two components of a pair type, however it is spelled.
@@ -2874,7 +2903,10 @@ impl Typer {
             }
             Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
             Type::Class { sym, .. } if self.st.get(*sym).name == "BitSet" => Some(Type::Int),
-            Type::Class { args, .. } if !args.is_empty() => Some(args[0].clone()),
+            Type::Class { sym, args } if !args.is_empty() => Some(
+                self.iterable_once_elem(*sym, args)
+                    .unwrap_or_else(|| args[0].clone()),
+            ),
             // cats' syntax layer hands back `Ops[F, A] { type TypeClassType =
             // FlatMap[F] }`; the arguments live on the parent.
             Type::Refined { parents, .. } => parents.iter().find_map(|p| self.elem_type(p)),
@@ -2886,6 +2918,37 @@ impl Typer {
                     None
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// The argument a collection receiver passes to `IterableOnce`, which is
+    /// its element type whatever its own first type argument happens to be.
+    ///
+    /// The first type argument is the element for every collection this guess
+    /// was written for, and it is not the element in general.
+    /// `Iterator[A].sliding(n)` hands back
+    /// `Iterator.GroupedIterator[B] extends AbstractIterator[Seq[B]]`, whose
+    /// element is `Seq[B]`; guessing `B` typed the lambda of
+    /// `it.sliding(n).map(f)` against `A` and reported `found: (Seq[A]) => B
+    /// required: (A) => Any` for a function that is exactly right. nsc reads
+    /// the parameter off `IterableOnceOps.map`'s declaration seen from the
+    /// receiver, and this is that answer for the one position the guess needs.
+    ///
+    /// `None` when the receiver is not an `IterableOnce` at all -- `Option`,
+    /// `Future`, `Try` and cats' `Ops[F, A]` all reach this and keep the
+    /// caller's existing fallback.
+    fn iterable_once_elem(&self, sym: SymbolId, args: &[Type]) -> Option<Type> {
+        let io = crate::classpath::find_by_jvm(&self.st, "scala/collection/IterableOnce")?;
+        // Cheap enough to run before the linearizing walk, and it is `false`
+        // for `Option` / `Future` / cats' `Ops`, which is nearly every caller.
+        if sym == io || self.st.class_reaches(sym, io) != Some(true) {
+            return None;
+        }
+        let bta = self.st.base_type_args(sym, args);
+        let at = bta.get(&io.0)?;
+        match &at[..] {
+            [e] => Some(e.clone()),
             _ => None,
         }
     }

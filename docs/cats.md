@@ -2983,3 +2983,108 @@ directly and never asks. The program compiles, the call goes out as
 wrong answer into a false rejection, so the fix is the same as `keySet`'s:
 supply `SortedSetOps.map` from the pickle. `tests/fixtures/sm_ordering.scala`
 says in a comment why it does not exercise it.
+
+## The `agent/basetypeargs` slice: a nested class read from a pickle
+
+The brief for this slice named `SymbolTable::base_type_args`' first-path
+behaviour as the root of a `sliding` / `grouped` cluster. **That premise is
+stale**: `agent/basetypemeet` closed the first-path defect two gates earlier,
+and this slice measured it — `base_type_args` is correct here, and neither of
+the two roots it found is in the symbol table's base-type walk.
+
+Measured, `SCALA_RS=<baseline binary>` on `5800b6ea` against the same tree
+with the change:
+
+| | before | after |
+|---|---:|---:|
+| cats (339, 1 skipped) | 182 / 71 files | **181 / 70** |
+| scala library (538) | 672 / 132 | **664 / 132** |
+| gitbucket (353, 1 skipped) | 265 / 77 | 265 / 77 |
+
+Nine errors go and **no error appears anywhere**, compared line by line rather
+than by total.
+
+### The one shape that breaks every guess at once
+
+`Iterator[A].sliding(n)` and `.grouped(n)` return `Iterator.GroupedIterator[B]`,
+an inner class of `trait Iterator` declared
+`extends AbstractIterator[immutable.Seq[B]]`. Its element is `Seq[B]` and its
+`CC` is `Iterator` — so it is neither "the receiver's first type argument" nor
+"the receiver's own class", and this compiler was assuming both. Three separate
+defects met on it:
+
+1. **`PickleSupply::ensure_class` entered a nested class as a package-level
+   one.** It split `scala/collection/Iterator$GroupedIterator` at the last `/`
+   and nothing else, so the symbol was called `Iterator$GroupedIterator` and
+   owned by the package `scala.collection` — a **second symbol** for the class
+   `install_java_class_in` enters correctly as `GroupedIterator` inside
+   `Iterator`. Which one a program got depended on which path reached the class
+   first, and the printed receiver said so: `Iterator$GroupedIterator[A]` where
+   scalac prints `it.GroupedIterator[A]`.
+
+   The order dependence is directly observable on the branch point.
+   `def x[A](it: Iterator[A]): Iterator[Seq[A]] = it.sliding(2)` is rejected;
+   put `def warm[A](it: Iterator[A]): Seq[A] = it.sliding(2).next()` above it
+   and the same expression compiles, because the member lookup drags the class
+   file in first. `crates/cli/tests/btargs.rs` pins both orders.
+2. **The stub had no parents, and one hop is not a hierarchy.**
+   `stub_superclass_from_classfile` declines a nested class that has type
+   parameters, on the correct ground that a class file cannot say what
+   arguments its superclass is applied at — but its *pickle* can, and
+   `ensure_class` is the one place that has already opened it. Attaching only
+   `AbstractIterator[Seq[B]]` was still not enough: `AbstractIterator`'s own
+   stub was standing at `AnyRef`, so `Iterator` was not a base class either.
+   The attachment now walks the chain it has just created. It is deliberately
+   confined to *nested* classes: a top-level stub standing for a library class
+   the prelude also declares is the case `ensure_class`' doc comment is about,
+   and giving that one a parent chain changes subtyping under hand-written
+   prelude members.
+3. **`elem_type` and `rebuild_from_receiver` guessed.** With the hierarchy in
+   place, `Check::elem_type` still answered `args[0]` for the element and
+   `rebuild_from_receiver` still put `GroupedIterator` back as the `CC`, so
+   `it.sliding(n).map(f)` reported `found: (Seq[A]) => B  required: (A) => Any`
+   for a function that is exactly right, and `it.grouped(n).map(_.size)` came
+   back as a `GroupedIterator[Int]` — a type claiming elements of `Seq[Int]`
+   for a value whose elements are `Int`. Both now read the receiver's base type
+   at `IterableOnce`: the element is the argument it passes there, and a class
+   "maps to its own class" only when the element it passes is its *own* type
+   parameter (or, for a `Map`, the pair of them). `Vector`, `TreeMap` and every
+   other real collection are unchanged by construction, and both are pinned as
+   controls in the fixture.
+
+(3) is what the library's other seven lines are: `IntMap[T]` and `LongMap[T]`
+are `IterableOnce[(Int, T)]` and `IterableOnce[(Long, T)]`, so
+`m.foreach(kv => …)` was `found: ((Int, T)) => U  required: (T) => Any`
+(`IntMap.scala:218`, `LongMap.scala:213`), and `Iterable.scala` 481/524 are
+`grouped`/`sliding` seen from inside `IterableOps` itself.
+
+### Cost
+
+`elem_type` and `maps_to_own_class` now consult `base_type_args`, which
+`docs/scala-library.md` records as a hot path. They run per *call site* of
+`map`/`flatMap`/`foreach`/`withFilter`, not per `subst_as_seen_from`, and
+`class_reaches` gates the walk to receivers that really are an `IterableOnce`
+— `Option`, `Future`, `Try` and cats' `Ops[F, A]` never reach it. Measured on
+`src/library`, min of three alternating runs of `tests/scalalib_measure.sh`:
+2.19 s user before, 2.35 s after, with means of 2.44 s and 2.43 s. The effect
+is inside the run-to-run spread.
+
+### Found and not fixed: `grouped` on a real collection
+
+Four cats lines that *look* like the family above are a different root and are
+untouched: `NonEmptyLazyList.scala:462`
+(`found: (LazyList[A]) => …  required: (Iterable[A]) => Any`),
+`NonEmptyVector.scala:357` (`required: (Seq[A]) => Any`),
+`NonEmptySeq.scala:364` and `instances/stream.scala:64`. These are
+`IterableOps.grouped(size): Iterator[C]` on an ordinary collection, with `C`
+answered as a *base* of the receiver rather than the receiver — the shape the
+brief described, on a receiver that has nothing to do with `GroupedIterator`.
+
+**They do not reproduce outside the full cats run**, which is the useful part of
+the measurement. `final class NEV[+A] private (val toVector: Vector[A]) extends
+AnyVal { def grp(size: Int): Iterator[NEV[A]] = toVector.grouped(size).map(NEV.unsafe) }`
+compiles, and so does `NonEmptyVector.scala` compiled *on its own* with the
+measure's own flags and classpath (130 other errors, none of them this one).
+So the receiver's shape depends on what else is in the run, and the next slice
+on this should start by recording where `Vector`'s parent list comes from in
+the full run rather than by minimising the expression.

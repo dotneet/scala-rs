@@ -3265,14 +3265,27 @@ impl PickleSupply {
             self.sigs.class_sig(&mut src, full_name, module).ok()?
         };
         let base = key.strip_suffix('$').unwrap_or(&key).to_string();
-        let (pkg_jvm, simple) = match base.rsplit_once('/') {
-            Some((p, n)) => (p.to_string(), n.to_string()),
-            None => (String::new(), base.clone()),
-        };
+        // A nested class belongs to the class that encloses it, not to the
+        // package. Splitting `scala/collection/Iterator$GroupedIterator` at
+        // the last `/` alone entered a *package-level* class whose simple name
+        // was `Iterator$GroupedIterator`, which is not a name any Scala source
+        // can write and, worse, is a **second symbol** for a class the
+        // class-file loader enters correctly as `GroupedIterator` inside
+        // `Iterator`. Which of the two a program got depended on which path
+        // reached the class first: name `Iterator.GroupedIterator` in a
+        // signature and `install_java_class_in` builds the member; let
+        // `it.sliding(n)`'s pickled result type arrive first and this built the
+        // package-level twin, whose parent list is `AnyRef` — so
+        // `it.sliding(n).map(f)` reported `found: (Seq[A]) => B  required:
+        // (A) => Any` and `Iterator[A].sliding(n)` conformed to no `Iterator`
+        // at all. [`crate::classpath::java_class_owner`] is the rule the rest
+        // of the compiler already uses to decide who owns a nested JVM class,
+        // and both paths now agree on one symbol.
+        let simple = crate::classpath::java_simple_name(&base);
         if simple.is_empty() {
             return None;
         }
-        let owner = crate::classpath::ensure_package(st, &pkg_jvm);
+        let owner = crate::classpath::java_class_owner(st, &base);
         let id = if module {
             let cls = st.alloc(
                 format!("{simple}$"),
@@ -3313,8 +3326,49 @@ impl PickleSupply {
             id
         };
         trace(format_args!("stubbed class {full_name} (module={module})"));
+        // Before anything that can convert another signature: `attach_parents`
+        // below reaches `conv_ref` for each parent, and a hierarchy that names
+        // this class again must find the symbol rather than build a second one.
+        self.stubs.insert(key.clone(), id);
         self.stub_superclass_from_classfile(st, bin, id, &key);
-        self.stubs.insert(key, id);
+        // `stub_superclass_from_classfile` declines a nested class that has
+        // type parameters, because a class file cannot say what arguments its
+        // superclass is applied at. Its pickle can, and this is the one place
+        // that has already opened it. Without this the stub stays at `AnyRef`:
+        // `Iterator[A].sliding(n)` returns `Iterator.GroupedIterator[B]`, which
+        // extends `AbstractIterator[Seq[B]]`, and with no parents it conformed
+        // to no `Iterator` at all -- so `.map(f)` read the element off the
+        // receiver's own first argument and asked for `(A) => Any` where the
+        // element is `Seq[A]`.
+        //
+        // Narrow to a *nested* class on purpose. A top-level stub standing for
+        // a library class the prelude also declares is the case the doc
+        // comment above is about, and giving that one a parent chain changes
+        // subtyping for hand-written prelude members; a nested class is one
+        // nothing hand-writes, and `AnyRef` is never the answer for it.
+        if is_nested_jvm_name(&key) {
+            self.attach_parents(st, bin, id, full_name, module);
+            // And transitively, because one hop is not a hierarchy.
+            // `GroupedIterator` gains `AbstractIterator[Seq[B]]`, whose own
+            // stub is still standing at `AnyRef`, so `Iterator` was still not
+            // a base class and `it.sliding(n)` conformed to no `Iterator`.
+            // `ensure_parents` memoises in `self.parented`, and the classes it
+            // reaches are the ones this hierarchy names, so the walk is the
+            // parent chain and not the library.
+            let mut queue: Vec<SymbolId> = parent_classes(st, id);
+            let mut depth = 0;
+            while let Some(p) = queue.pop() {
+                if self.parented.contains(&p.0) {
+                    continue;
+                }
+                self.ensure_parents(st, bin, p);
+                queue.extend(parent_classes(st, p));
+                depth += 1;
+                if depth > 256 {
+                    break;
+                }
+            }
+        }
         Some(id)
     }
 
@@ -3351,11 +3405,7 @@ impl PickleSupply {
         cls: SymbolId,
         internal: &str,
     ) {
-        let nested = internal
-            .rsplit('/')
-            .next()
-            .is_some_and(|simple| simple.trim_end_matches('$').contains('$'));
-        if !nested {
+        if !is_nested_jvm_name(internal) {
             return;
         }
         // With type parameters of its own the class file cannot say what
@@ -5202,6 +5252,29 @@ pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -
 ///
 /// `a/b/Outer$Inner` names `a.b.Outer.Inner`; `a/b/Outer` does not. Trailing
 /// `$` (a module class) does not change the simple name.
+/// The class symbols a class's parent list names.
+fn parent_classes(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
+    st.get(cls)
+        .parents
+        .iter()
+        .filter_map(|p| match p {
+            Type::Class { sym, .. } => Some(*sym),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a JVM internal name names a class nested inside another class.
+///
+/// `scala/collection/Iterator$GroupedIterator` yes; `scala/collection/Iterator`
+/// and the module class `scala/Predef$` no.
+fn is_nested_jvm_name(internal: &str) -> bool {
+    internal
+        .rsplit('/')
+        .next()
+        .is_some_and(|simple| simple.trim_end_matches('$').contains('$'))
+}
+
 fn names_class(candidate: &str, full_name: &str) -> bool {
     let Some(simple) = full_name.rsplit('.').next() else {
         return false;
