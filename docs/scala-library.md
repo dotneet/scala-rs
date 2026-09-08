@@ -501,8 +501,10 @@ classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 
 ## A constructor alias that ignores its parameter (`agent/anyconstr`)
 
-**1420 -> 1367 errors**, 53 gone and none new, measured on `fce0a0d8` with the
-same binary before and after (`SCALA_RS=<saved binary>`).
+**1420 -> 1367 errors**, 53 gone and none new. Measured on `fce0a0d8` and
+again after merging `main` at `f4b829ec` (`agent/gbopt`) — the same 53 error
+locations gone each time and none appeared. Both A/Bs compare two saved
+binaries (`SCALA_RS=<binary>`), never a revert in the working tree.
 
 `scala.collection` declares `type AnyConstr[X] = Any`. It is a type
 *constructor* whose body does not mention its parameter, so **every**
@@ -580,7 +582,7 @@ arity 1), and it is not touched here.
 
 ## What to do next, in order
 
-Re-clustered on the 1367 that remain (`agent/anyconstr`, `fce0a0d8`): 474
+Re-clustered on the 1367 that remain (`agent/anyconstr`, merged at `515a43c4`): 474
 `type mismatch`, 453 `X is not a member of Y`, 157 `no matching overload`, 42
 `no matching overload for constructor`, 33 `not found: value`, 32 `needs to be
 abstract`, 22 `` `override` modifier required``, 20 `ambiguous overload`.
