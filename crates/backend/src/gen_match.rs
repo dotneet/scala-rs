@@ -323,11 +323,21 @@ pub(crate) fn gen_ctor_fields_pattern(
             // `case Some((s, _: TableNode))` on a plain `Node`, and
             // `case P(v) :: t` on every non-`P` head, into a
             // `ClassCastException` instead of a failed match.
+            //
+            // `Object` is not the only descriptor that binds too wide, which
+            // is the second site of the defect `erased_load_needs_narrowing`
+            // documents: a field at a *bounded* parameter erases to its bound,
+            // so `case CBox(b, n)` for
+            // `case class CBox[F[X] <: Boxy[X], A](f: F[A], n: Int)` bound a
+            // `Boxy` into a binder the typer had given the type `OneBox[Int]`,
+            // and the first member read off `b` failed the verifier. The
+            // `Select` path is not involved -- this reads the constructor
+            // field itself -- so fixing that one left this one standing.
             let sort = if reads_erased_value(ctx, a) {
                 // The test reads the field as it stands.
                 jvm_sort(&fty)
             } else {
-                if fdesc == "Ljava/lang/Object;" {
+                if erased_load_needs_narrowing(ctx.st, &fdesc, &a.ty) {
                     emit_from_erased_object(asm, ctx.st, &a.ty);
                 }
                 jvm_sort(&a.ty)
