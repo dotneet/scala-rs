@@ -1,0 +1,6 @@
+MyMap(two,2)
+MapOps
+pick:ops
+Box(Box(7))
+Box(Box(Box(7)))
+Box(Box(7))
