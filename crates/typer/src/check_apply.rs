@@ -164,7 +164,10 @@ impl Typer {
         // `Apply`s, and left alone the outer one was an application of the
         // *instance* -- slick's `new SimpleLiteral(name)(tpe)` looked up
         // `apply` on the companion and reported `ambiguous overload`.
-        self.flatten_curried_new(tree);
+        // The length of the first written clause, when clauses were folded: the
+        // pick below is held to the alternatives that clause could name, which
+        // is the set the fold already measured its arity against.
+        let curried_first_len = self.flatten_curried_new(tree);
         // Kept before the borrow below: `record_named_arg_order` keys the
         // application by it.
         let tree_id = tree.id;
@@ -398,7 +401,8 @@ impl Typer {
                 // its `targs` all along (`pick_ctor_at`); the `new` path did
                 // not.
                 self.supply_binary_ctors(c);
-                let mut picked = self.pick_ctor_at(c, &explicit, &arg_tys, None);
+                let mut picked =
+                    self.pick_ctor_at_clause(c, &explicit, &arg_tys, None, curried_first_len);
                 // An argument whose class is still a `-cp` stub is a subtype of
                 // nothing: `find_or_stub_java_class` gives one `parents =
                 // [AnyRef]` until the classfile is really read.
@@ -409,7 +413,8 @@ impl Typer {
                 // ask once more -- only a pick that has already failed pays,
                 // and `ensure_java_loaded` reads each classfile once.
                 if !matches!(picked, OverloadPick::Found(..)) && self.warm_java_args(&arg_tys) {
-                    picked = self.pick_ctor_at(c, &explicit, &arg_tys, None);
+                    picked =
+                        self.pick_ctor_at_clause(c, &explicit, &arg_tys, None, curried_first_len);
                 }
                 match picked {
                     OverloadPick::Found(sym, ps, _) => {

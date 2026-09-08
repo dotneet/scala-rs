@@ -512,6 +512,79 @@ impl<'a> Gen<'a> {
     ///
     /// The module's methods forward to the statics rather than repeating the
     /// bodies, so there is one copy of each and both ABIs work.
+    /// The companion a plain class needs only because a constructor default
+    /// lives in a **later parameter clause**.
+    ///
+    /// Such a default may name a parameter of an earlier clause, so its
+    /// `$lessinit$greater$default$n` takes those parameters and cannot be
+    /// replaced by splicing the default's expression at the call site.
+    /// `Typer::needs_ctor_default_companion` declares the module for exactly
+    /// that shape, as nsc does -- `javap` on scalac 2.13.16's
+    /// `class Curr(a: Int)(b: String = "b" + a)` shows a `Curr$` holding
+    /// `$lessinit$greater$default$2(int)` -- and this writes its classfile.
+    /// Without it the call links against a `Curr$` that was never emitted and
+    /// dies with `NoClassDefFoundError`.
+    /// Whether this class's companion exists *only* to hold constructor
+    /// default getters, and so has no `ModuleDef` of its own to be emitted
+    /// from.
+    ///
+    /// Asked of the symbol table rather than of the tree, so the classfile can
+    /// never disagree with the pickle: the module is emitted exactly when the
+    /// typer declared a `$lessinit$greater$default$n` on it.
+    pub(crate) fn needs_ctor_default_companion(&self, class_id: SymbolId) -> bool {
+        if class_id.is_none() {
+            return false;
+        }
+        let Some(m) = self.st.companion_module(class_id) else {
+            return false;
+        };
+        if !self.st.get(m).flags.contains(Flags::SYNTHETIC) {
+            return false;
+        }
+        let mcls = module_class_id(self.st, m);
+        if mcls.is_none() {
+            return false;
+        }
+        self.st.get(mcls).members.iter().any(|&x| {
+            self.st
+                .get(x)
+                .name
+                .starts_with("$lessinit$greater$default$")
+        })
+    }
+
+    pub(crate) fn emit_ctor_default_companion(&mut self, class_tree: &Tree) {
+        let class_id = class_tree.sym;
+        if class_id.is_none() {
+            return;
+        }
+        let Some(comp) = self
+            .st
+            .companion_module(class_id)
+            .map(|m| module_class_id(self.st, m))
+        else {
+            return;
+        };
+        let this_name = format!("{}$", class_internal(self.st, class_id));
+        let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
+        b.access = ACC_PUBLIC | ACC_FINAL | ACC_SUPER;
+        b.fields.push(Field {
+            access: ACC_PUBLIC | ACC_STATIC | ACC_FINAL,
+            name: "MODULE$".into(),
+            desc: format!("L{this_name};"),
+        });
+        self.emit_module_init(&mut b, comp, &[], &[], None, Some(comp));
+        self.emit_module_clinit(&mut b);
+        self.emit_default_getters(&mut b, comp);
+        // A Scala classfile with no signature at all is read back as a *Java*
+        // class, and the Java symbol then collides with the `object` the
+        // class's own pickle declares -- the same reason
+        // `emit_value_companion` attaches one.
+        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
+        self.out
+            .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
+    }
+
     pub(crate) fn emit_value_companion(&mut self, class_tree: &Tree) {
         let class_id = class_tree.sym;
         if class_id.is_none() || !self.st.is_value_class(class_id) {

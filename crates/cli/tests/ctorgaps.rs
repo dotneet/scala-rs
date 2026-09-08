@@ -404,53 +404,141 @@ fn an_inaccessible_alternative_does_not_become_the_pick() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// Found here, not fixed here: `private[p]` / `protected[p]` on a constructor
-/// does not survive the round trip, and is left **accessible** on purpose.
+/// `private[p]` on a constructor, **read** back across a separate
+/// compilation. `agent/ctorgaps` left this pinned on the acceptance; the
+/// reading half is closed and the assertion is now on the refusal.
 ///
-/// nsc pickles a qualified access as the bare `PRIVATE` flag plus a
-/// `privateWithin` reference; this reader records that the reference is there
-/// (`Member::private_within`) but does not resolve `p`. Marking such a
-/// constructor `private` on the strength of the flag alone would refuse every
-/// `private[slick]` constructor slick's own code calls -- an over-rejection,
-/// which is the one failure mode this change must not have. So it keeps the
-/// accessibility it had before the slice, and scalac refuses one program we
-/// accept.
+/// The note on record said nsc pickles a qualified access as "the bare
+/// `PRIVATE` flag plus a `privateWithin` reference". The flag is not there:
+/// scalac 2.13.16's own pickle for
 ///
-/// The assertion is on the acceptance, so this test fails and says so when a
-/// later slice resolves the boundary.
+/// ```scala
+/// class Qual private[libp] (val s: String)
+/// ```
+///
+/// gives its `<init>` `flags=0x200`, with `PRIVATE` and `PROTECTED` both
+/// clear and `privateWithin` pointing at `libp`. So there was never a flag to
+/// tighten -- `private[p]` is the *reference*, and the fix is to resolve it.
+/// `Member::private_within` now carries the boundary's simple name, which is
+/// what an access qualifier is: `Typer::access_within_of` walks out from the
+/// member's own owner until it finds a class or package so named, so two
+/// packages called `concurrent` cannot be confused.
+///
+/// Both halves of the ladder run here, because over-rejection is the failure
+/// mode this must not have: the caller **inside** `libp` still compiles and
+/// prints, and only the one outside is refused. Our sentence is scalac's,
+/// word for word, checked against scalac refusing the same program.
 #[test]
-fn a_qualified_private_constructor_is_still_accepted_from_outside() {
+fn a_qualified_private_constructor_is_refused_outside_its_package() {
     let (Some(jar), Some(sc)) = (scala_library_jar(), scalac()) else {
         eprintln!("skip qualified private: jar or scalac not present");
         return;
     };
+    const QUAL_CHECK: &str = "constructor Qual in class Qual cannot be accessed \
+         in class BadQual from class BadQual in package other";
     let dir = tmp_dir("ladderqual");
+    let app = dir.join("app");
+    let ok_app = dir.join("okapp");
+    let ref_out = dir.join("ref");
+    let sc_lib = dir.join("sclib");
+    for d in [&app, &ok_app, &ref_out, &sc_lib] {
+        fs::create_dir_all(d).unwrap();
+    }
+    // The library half is scalac's, so what is read back is nsc's own pickle
+    // and not merely our writer agreeing with our reader.
+    let lib_src = write_src(&dir, "LadderLib", LADDER_LIB);
+    ok(
+        compile_scalac(&sc, &lib_src, &sc_lib, &jar, None),
+        "the ladder library under scalac",
+    );
+    let bad = write_src(
+        &dir,
+        "BadQual",
+        "package other\nclass BadQual { new libp.Qual(\"x\") }\n",
+    );
+    rejected(
+        compile_rs(&bad, &app, &jar, Some(&sc_lib)),
+        "`private[libp]` from another package",
+        QUAL_CHECK,
+    );
+    // scalac refusing the same program with the same sentence is what says the
+    // diagnostic is nsc's and not ours.
+    rejected(
+        compile_scalac(&sc, &bad, &ref_out, &jar, Some(&sc_lib)),
+        "scalac on `private[libp]` from another package",
+        QUAL_CHECK,
+    );
+    // The accepted half, and it runs: a boundary that refused this too would
+    // break every `private[slick]` constructor slick's own code calls.
+    let good = write_src(
+        &dir,
+        "OkQual",
+        "package libp\nobject OkMain {\n  def main(a: Array[String]): Unit = {\n    \
+         println(new Qual(\"b\").show)\n    println(Qual.make(\"c\").show)\n  }\n}\n",
+    );
+    ok(
+        compile_rs(&good, &ok_app, &jar, Some(&sc_lib)),
+        "`private[libp]` from inside libp",
+    );
+    let run = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!(
+                "{}:{}:{}",
+                ok_app.display(),
+                sc_lib.display(),
+                jar.display()
+            ),
+            "libp.OkMain",
+        ])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success() && String::from_utf8_lossy(&run.stdout).as_ref() == "qual:b\nqual:c\n",
+        "the accepted half must run:\n{}\n{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The other half, still open and pinned on the acceptance so a later slice is
+/// told: this compiler does not **write** the boundary.
+///
+/// `backend::pickle::pickled_access_flags` drops the `PRIVATE` flag for a
+/// qualified-private member on purpose and emits no `privateWithin` entry at
+/// all, so a `private[libp]` constructor in a class file *we* wrote is
+/// indistinguishable from a public one -- to our own reader and to real
+/// scalac alike. Both are asserted, because the writing side is only proved by
+/// the compiler that did not write it.
+///
+/// Closing it is a pickle-format change: `SymInfo` gains a symbol reference,
+/// which moves every entry after it. It is not a matter of setting a flag.
+#[test]
+fn our_own_class_file_does_not_yet_carry_the_qualified_boundary() {
+    let (Some(jar), Some(sc)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip qualified private writer: jar or scalac not present");
+        return;
+    };
+    let dir = tmp_dir("ladderqualw");
     let lib = ladder_lib(&dir, &jar);
     let app = dir.join("app");
     let ref_out = dir.join("ref");
     fs::create_dir_all(&app).unwrap();
     fs::create_dir_all(&ref_out).unwrap();
-    let src = write_src(
+    let bad = write_src(
         &dir,
         "BadQual",
         "package other\nclass BadQual { new libp.Qual(\"x\") }\n",
     );
     ok(
-        compile_rs(&src, &app, &jar, Some(&lib)),
-        "the known `private[p]` gap",
+        compile_rs(&bad, &app, &jar, Some(&lib)),
+        "the known `private[p]` *writer* gap, read by us",
     );
-    let sc_lib = dir.join("sclib");
-    fs::create_dir_all(&sc_lib).unwrap();
-    let lib_src = dir.join("LadderLib.scala");
     ok(
-        compile_scalac(&sc, &lib_src, &sc_lib, &jar, None),
-        "the ladder library under scalac",
-    );
-    let run = compile_scalac(&sc, &src, &ref_out, &jar, Some(&sc_lib));
-    assert!(
-        !run.ok && run.text.contains("cannot be accessed"),
-        "scalac is expected to refuse `private[libp]` from outside; got:\n{}",
-        run.text
+        compile_scalac(&sc, &bad, &ref_out, &jar, Some(&lib)),
+        "the known `private[p]` *writer* gap, read by scalac",
     );
     let _ = fs::remove_dir_all(&dir);
 }

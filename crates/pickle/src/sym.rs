@@ -170,16 +170,29 @@ pub struct Member {
     pub ty: SigType,
     /// Set for a `MACRO` def whose `@macroImpl` annotation could be read.
     pub macro_impl: Option<MacroImpl>,
-    /// The symbol carried a `privateWithin` reference, i.e. it is
-    /// `private[p]` / `protected[p]` and not a plain `private` / `protected`.
+    /// The **simple name** of the symbol's `privateWithin` reference, i.e. the
+    /// `p` of `private[p]` / `protected[p]`.
     ///
     /// nsc pickles `private[p]` as `PRIVATE` **plus** that reference, so the
     /// flag alone cannot tell the two apart -- and a reader that treats
-    /// `private[p]` as `private` refuses calls scalac accepts. Only the fact
-    /// is kept, not the scope: a consumer that cannot resolve `p` should
-    /// leave the member accessible rather than guess, which is what
-    /// `PickleSupply::install_ctor` does.
-    pub private_within: bool,
+    /// `private[p]` as a plain `private` refuses calls scalac accepts.
+    ///
+    /// The simple name is what the boundary is, not a shorthand for it: an
+    /// access qualifier is resolved by walking *out from the member's own
+    /// owner* until a class or package of that name is found, so two packages
+    /// called `concurrent` can never be confused. `Typer::access_within_of`
+    /// does that walk, and `classpath::mark_java_package_private` already
+    /// records a Java package-private member the same way.
+    pub private_within: Option<String>,
+    /// The symbol carried a `privateWithin` reference **at all**, whether or
+    /// not [`Member::private_within`] could name it.
+    ///
+    /// The two are not the same question, and a consumer that conflates them
+    /// over-rejects. `PRIVATE` with no reference is a plain `private`;
+    /// `PRIVATE` with a reference this reader could not resolve is a
+    /// `private[p]` whose `p` is unknown, and treating *that* as a plain
+    /// `private` refuses every call scalac accepts.
+    pub has_private_within: bool,
 }
 
 impl Member {
@@ -359,6 +372,15 @@ impl Builder<'_> {
             return None;
         }
         let name = self.p.name(info.name)?.to_string();
+        // The boundary's own simple name. A `privateWithin` that points at
+        // nothing this pickle names leaves `None`, and the consumer then keeps
+        // the accessibility it would have had -- guessing a boundary is the
+        // one way this can refuse a call scalac accepts.
+        let private_within = info
+            .private_within
+            .and_then(|w| self.p.sym_name(w))
+            .filter(|n| !n.is_empty() && *n != "<root>" && *n != "<empty>")
+            .map(|n| n.to_string());
         let ty = self.ty(info.info, 0);
         let macro_impl = if info.has(pflags::MACRO) {
             self.macro_impl_of(id)
@@ -371,7 +393,8 @@ impl Builder<'_> {
             flags: info.flags,
             ty,
             macro_impl,
-            private_within: info.private_within.is_some(),
+            private_within,
+            has_private_within: info.private_within.is_some(),
         })
     }
 

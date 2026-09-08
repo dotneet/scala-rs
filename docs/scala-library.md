@@ -3767,6 +3767,202 @@ take.
 
 All three are pinned by tests in `crates/cli/tests/tuplepat.rs` on their
 current behaviour, so a later slice that closes one is told by a failing test.
+## The `agent/ctorgaps2` slice: two of the three constructor gaps, closed
+
+`agent/ctorgaps` left three, each pinned by a test asserting the *current*
+behaviour so it goes red when closed. Two are closed here and the third is
+closed on its reading side; every pinning test now asserts the new behaviour
+rather than the old.
+
+### 1. A constructor default in a later parameter clause (the `VerifyError`)
+
+The most severe of the three, because it is a **silent miscompile**:
+`new Curr(7)()` on
+
+```scala
+class Curr(val a: Int, val b: String) {
+  def this(a: Int)(b: String = "b" + a, c: Int = a * 2) = this(a, b + c)
+}
+```
+
+compiled with no diagnostic and emitted an `invokespecial` with **one**
+argument for a three-parameter descriptor. `java -Xverify:all` says
+`VerifyError: Bad type on operand stack`.
+
+The diagnosis on record was right, and is worth restating precisely, because
+the fix has two halves and only the first follows from it. A `new`'s arguments
+reach `fill_defaults_and_implicits` already flattened -- `flatten_curried_new`,
+`flatten_curried_ctor_delegation` and `type_parent_ctor_app` all flatten a
+constructor's clauses, because that is the shape the JVM descriptor has --
+while the function measured them against the callee's *unflattened* `paramss`
+read back off the symbol. The first clause was complete, so the call was not
+short, and the function returned a method type describing a second clause that
+nobody was going to apply.
+
+`ctor_args_arrive_flat` recognises that shape -- an `<init>`, more than one
+declared clause, a `param_tys` as long as the flattened parameter list, and a
+**default** among what is missing -- and `fill_flat_ctor_params` fills the
+flattened tail instead: defaults through their getters, then any implicit
+clause behind them. The equal-length test is what separates the constructor
+callers from an ordinary `f(a)(b)`, whose `param_tys` is the one clause being
+applied. An all-implicit tail is deliberately left to the clause-by-clause
+path below it, which substitutes the call's type arguments into the searched
+types (`instantiate_from_call`, `solve_implicit_only_tparams`); slick's
+`new TypedCase[B, P](...)` needs that, and a flat search would not do it.
+
+#### The second half: the getter has nowhere to live
+
+This is the only shape in which a constructor default may legally name an
+earlier parameter -- nsc rejects a same-clause reference outright -- and that
+is exactly why the getter cannot be replaced by splicing the default's
+expression at the call site: `"b" + a` has no `a` in the caller's scope. nsc
+emits a getter that **takes** the preceding clauses' parameters, and `javap`
+on scalac 2.13.16's output for the class above shows it on a companion the
+source never wrote:
+
+```text
+public final class Curr$ {
+  public static final Curr$ MODULE$;
+  public java.lang.String $lessinit$greater$default$2(int);
+  public int $lessinit$greater$default$3(int);
+}
+```
+
+We synthesized no such companion, so with the fill in place the call became
+`error: not found: value a` -- a refusal instead of a `VerifyError`, which is
+better and still wrong. `Typer::needs_ctor_default_companion` now declares one
+for exactly that shape (a default in a clause after the first, on the primary
+or on a `def this(...)` in the body), and
+`Codegen::emit_ctor_default_companion` writes its classfile beside
+`emit_value_companion`, which had the same problem for a different reason.
+`javap` on our `Curr$` and on scalac's agree member for member, descriptors
+included.
+
+**Only that shape.** A first-clause default may legally name nothing, so its
+expression is still spliced at the call site and still adds no classfile --
+which is why slick's class-file count does not move. Synthesizing a companion
+for every class that takes a defaulted argument is the larger gap
+`docs/not-implemented.md` still records.
+
+### 2. Preferring the alternative that needs no default
+
+nsc's `Infer.inferMethodAlternative` weighs the alternatives applicable to the
+arguments *as written* first, and reaches for the ones a default would
+complete only when that set is empty. Weighing both at once made
+`new Prefer(1)` on
+`class Prefer(n: Int) { def this(k: Int, bump: Int = 5) = this(k * 100 + bump) }`
+`ambiguous overload for constructor`. `needs_a_default` asks for
+`DEFAULTPARAM` and not for `trailing_omissible`'s weaker "default *or*
+implicit", because an implicit parameter is filled by a search that runs after
+the alternative has been chosen, and nsc's applicability ignores the implicit
+clause outright.
+
+#### That rule alone turns a refusal into a wrong answer
+
+Which is worse than what it fixes, so it is not the whole change.
+`new Three(2)("m")()` on
+
+```scala
+class Three(val a: Int, val bc: String) {
+  def this(a: Int)(m: String)(tail: String = m + a) = this(a, m + "/" + tail)
+}
+```
+
+folds to `(2, "m")`, which the **primary** accepts exactly. With defaults now
+filled and the no-default alternative now preferred, the primary wins and the
+program prints `m` where scalac prints `m/m2` -- a silent wrong pick where the
+branch point had an `ambiguous overload`.
+
+nsc selects the constructor on the **first clause**, and `(2)` alone is not an
+`(Int, String)`. `flatten_curried_new` already computed the arity it folds by
+from the alternatives whose first clause is `first_len` long
+(`new_head_ctor_arity`); it now *reports* that length, and
+`pick_ctor_at_clause` holds the pick to the same set -- dropped when it would
+leave nothing, so a class this cannot describe is picked exactly as before.
+The two halves of the same decision now read the same alternatives.
+
+### 3. `private[p]`: the reading half, and what the note on record got wrong
+
+`agent/ctorgaps` recorded that nsc pickles a qualified access as "the bare
+`PRIVATE` flag **plus** a `privateWithin` reference", and left the constructor
+accessible so as not to refuse every `private[slick]` constructor slick itself
+calls.
+
+**There is no flag.** scalac 2.13.16's own pickle for
+`class Qual private[libp] (val s: String)` gives its `<init>` `flags=0x200`,
+with `PRIVATE` and `PROTECTED` both clear and `privateWithin` pointing at
+`libp`. So there was never a flag to tighten, and never an over-rejection to
+fear from tightening one: `private[p]` **is** the reference, and closing the
+gap means resolving it -- which is what the brief said.
+
+`Member::private_within` is now the boundary's simple name rather than a bool,
+which is what an access qualifier is: `Typer::access_within_of` walks out from
+the member's own owner until it finds a class or package so named, so two
+packages called `concurrent` cannot be confused -- the same reading
+`classpath::mark_java_package_private` already took for a Java package-private
+member. `Member::has_private_within` is kept beside it because the two
+questions are not the same one: a reference this reader could not name must
+leave the constructor as accessible as it was, since `access_within_of`
+*denies* when it cannot find the boundary.
+
+Two further things were in the way, and both were holes rather than
+trade-offs:
+
+* The constructor `PickleSupply` **installs** -- rather than repairs, when the
+  class file's member table has not yet produced its own -- was allocated as a
+  plain `SymKind::Method` named `<init>` with no `CONSTRUCTOR` flag, and
+  `ctor_access_error` asked for that flag. So every such constructor skipped
+  the access check outright. It now carries the flag, which is also what makes
+  the diagnostic say `constructor Qual in class Qual` rather than
+  `method <init>`.
+* `other_accessible_ctor` counted the descriptorless partial symbol as
+  "another constructor this site may call", and so declined to report.
+  `pick_ctor_at` already knows that shape and filters it; this now applies the
+  same rule.
+
+Our sentence is nsc's, word for word, checked against scalac refusing the same
+program:
+
+```text
+constructor Qual in class Qual cannot be accessed in class BadQual from class BadQual in package other
+```
+
+**The accepted half runs.** A caller inside `libp` still compiles and prints
+`qual:b` / `qual:c`, and slick -- which calls `private[slick]` constructors --
+is unchanged at `errors=0 files_with_errors=0 classes=1490`, with its 1490
+class files byte-identical. Over-rejection is the failure mode this could have
+had and does not.
+
+#### Left open: the writing half
+
+`backend::pickle::pickled_access_flags` drops the flag for a qualified-private
+member on purpose and emits no `privateWithin` entry at all, so the boundary is
+absent from a class file *we* wrote -- our own reader and real scalac both
+accept `new libp.Qual("x")` against it, and both are asserted so the pin says
+what it means. Closing it is a pickle-format change: `SymInfo` gains a symbol
+reference, which moves every entry after it. That is a slice of its own, and
+its measurements are the pickle's rather than the typer's.
+
+### What was measured
+
+* **slick `errors=0 files_with_errors=0 classes=1490`**, and its 1490 class
+  files are **byte-identical** to the branch point's -- `SLICK_OUT` on the
+  pre-fix and post-fix binaries, `diff -r`, exit 0, empty output. Measured
+  twice: once after the first two fixes and once after `private[p]`, because
+  the second is the one that could over-reject.
+* `tests/fixtures/ctorgaps_clause.scala` **runs** under `java -Xverify:all` in
+  **both** linking modes and matches real scalac 2.13.16 line for line. It
+  holds a default in the second clause, one naming an earlier clause's
+  parameter, both of those on a primary and on a secondary, a nullary getter
+  for a default that reads nothing, a clause filled part-way, a companion the
+  source wrote, an inferred getter result on a generic class, a three-clause
+  constructor whose last default names the *first* clause's parameter, and the
+  overload preference. An unmodified build of the branch point compiles it
+  with no diagnostic and throws `VerifyError` on its first line.
+* Every pinning test was rewritten to assert the new behaviour, and each was
+  checked against the pre-fix binary: the branch point accepts
+  `new libp.Qual("x")` from `package other`, refuses `new Prefer(1)` with
+  `ambiguous overload for constructor`, and verifier-errors on `Curr`.
 
 ## Running it
 

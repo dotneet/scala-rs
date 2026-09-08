@@ -1705,7 +1705,16 @@ impl Typer {
         if ctor.is_none() || class_id.is_none() {
             return false;
         }
-        if !self.st.get(ctor).flags.contains(Flags::CONSTRUCTOR) {
+        // `Flags::CONSTRUCTOR` **or** the name, which is the same test
+        // `default_getter_apply` makes. A constructor `PickleSupply` installs
+        // rather than repairs -- the pickle described one the class file's
+        // member table had not yet produced -- is allocated as a plain
+        // `SymKind::Method` named `<init>` and carries no `CONSTRUCTOR` flag,
+        // so asking for the flag alone let every such constructor skip the
+        // access check outright.
+        if !self.st.get(ctor).flags.contains(Flags::CONSTRUCTOR)
+            && self.st.get(ctor).name != "<init>"
+        {
             return false;
         }
         if self.ctor_accessible(ctor, class_id) {
@@ -1759,11 +1768,25 @@ impl Typer {
     /// Does `class_id` declare a constructor other than `ctor` that this site
     /// may call?
     fn other_accessible_ctor(&self, ctor: SymbolId, class_id: SymbolId) -> bool {
-        self.st
+        let own: Vec<SymbolId> = self
+            .st
             .lookup_member(class_id, "<init>")
             .into_iter()
-            .filter(|&s| s != ctor && self.st.get(s).owner == class_id)
+            .filter(|&s| self.st.get(s).owner == class_id)
             .filter(|&s| self.st.get(s).kind == SymKind::Method)
+            .collect();
+        // `pick_ctor_at`'s own rule, for the same reason it has it: a
+        // separately compiled class can be supplied twice, its pickle exposing
+        // a source-shaped constructor with **no** JVM descriptor beside the
+        // descriptor-bearing one the class-file repair installs. The
+        // descriptorless partial is not a second constructor, and counting it
+        // as "another constructor this site may call" kept every restricted
+        // constructor on such a class accessible -- which is exactly how a
+        // `private[p]` one stayed callable from outside `p`.
+        let has_linked = own.iter().any(|&s| !self.st.get(s).jvm_name.is_empty());
+        own.into_iter()
+            .filter(|&s| s != ctor)
+            .filter(|&s| !has_linked || !self.st.get(s).jvm_name.is_empty())
             .any(|s| self.ctor_accessible(s, class_id))
     }
 
