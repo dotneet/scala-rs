@@ -1617,8 +1617,200 @@ were never affected).
    member`` — by fixing the matcher rather than by lookup work. What is left
    of it is 9 `incompatible type in overriding` plus 10 `overrides nothing`,
    and those *are* the member-lookup bug seen from the other side.
-4. `src/reflect` and `src/compiler` are not worth measuring yet.
+4. **`SymbolTable::base_type_args` takes the first path, not the meet.** The
+   second defect `agent/liboverload` found and did not fix; its section below
+   has the trace and a nine-line reproduction. It is what makes
+   `IterableOps.tail` read as `Iterable[A]` from `Stream`, and it is what is
+   left behind every `<overload …>` receiver in the log: `<overload Nil$ |
+   Nil$>` (7), `<overload Set[A] | TreeSet[A]>` (3), `<overload Iterable[(K,
+   V)] | Map[K, V] | TreeMap[K, V]>` (3). Those are two instantiations of one
+   base, so no member-collapse rule can reach them.
+5. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
+
+## The `agent/liboverload` slice: re-abstracting is overriding
+
+**970 errors in 147 files → 917 in 146**, measured on this branch merged with
+`main` at `659580a9` (`agent/libprelude`, `agent/libnotype`, `agent/neglit`)
+against that same `main` measured on its own. The delta is the same **-53** it
+was at the branch point (`fb297e74`, 1104 → 1051) and at `acec3f09`
+(971 → 918), so the waves do not overlap. Every other
+target is unchanged to the error, and slick's 1490 class files are
+byte-identical.
+
+The brief handed this slice two clusters — 21 `type mismatch; found:
+<overload Stream[A] | Iterable[A] | Stream[A]>` and 23 `value <member> is not
+a member of <overload Iterable[A] | Stream[A] | Stream[A]>` — and asked which
+of the known prelude collisions it is: a forwarder (`agent/catstail`), a
+supply seam, a prelude/source duplicate (`agent/preludeshadow`,
+`agent/libmaxmin`), or something else.
+
+### It is none of them
+
+One trace of the candidate set settles it. Selecting `tail` inside `Stream`
+offers three symbols:
+
+```
+sym=5798  owner=IterableOps    ty=C          deferred=false
+sym=6347  owner=LinearSeqOps   ty=C          deferred=true
+sym=11876 owner=Stream         ty=Stream[A]  deferred=true
+```
+
+`prelude_end` is **1195**. All three owners are source classes of the library
+under compilation, none has a `pickled_origin`, none has a JVM descriptor, and
+there is no jar in this mode. They are the library's own override chain:
+`IterableOps` defines `def tail: C = ...` (`Iterable.scala` 527),
+`LinearSeqOps` re-declares it abstract (`LinearSeq.scala` 54), and `Stream`
+re-declares it again (`Stream.scala` 34). **Re-abstracting is overriding, and
+nothing had told `drop_overridden` so.**
+
+### The two rules cancelled out
+
+`Check::drop_overridden` filters each candidate against every other. Two of
+its rules answered this pair in opposite directions:
+
+* the declaration/definition rule dropped `LinearSeqOps.tail` and
+  `Stream.tail` because they are declarations standing next to a definition —
+  the rule `agent/gbshape` added for gitbucket's self-typed
+  `Profile.profile` / `ProfileProvider.profile`;
+* the owner rule dropped `IterableOps.tail` because `LinearSeqOps` is below
+  it, and `LinearSeqOps.tail` because `Stream` is below *it*.
+
+Every candidate was dropped, `kept` came out empty, and the `kept.is_empty()`
+fallback — which exists so that a mutually-eliminating set does not leave the
+caller indexing into nothing — handed back the **whole unreduced set**. That
+is why the printed receiver has three alternatives and repeats a type: it is
+not an overload at all, it is the candidate list nobody reduced.
+
+Both rules now go through `definition_outranks_declaration`, so exactly one of
+them fires.
+
+### Which one wins is nsc's answer, not the hierarchy's
+
+The obvious fix — "the hierarchy decides; take the most derived declaration" —
+is wrong, and scalac 2.13.16 says so in four lines:
+
+```scala
+trait A { def f: A = null }
+abstract class C extends A { override def f: C; def tag: Int = 1; def g = f.tag }
+// error: value tag is not a member of A
+```
+
+nsc's `findMember` stops replacing a member it has already found once either
+side is `DEFERRED`, so a declaration that *narrows* a concrete inherited
+member does not become the member: `f` there is an `A`. The same is true when
+the definition is generic and the declaration narrows past the instantiation
+(`trait Holder[+C] { def get: C = ??? }`, `class NarrowBox extends
+Holder[Any] { override def get: NarrowBox }` — nsc reports `Any`). Taking the
+most derived declaration removed the same **53** library errors and **5** cats
+errors, and diverged from scalac on both shapes; it is not in the change.
+
+What is in the change is narrower: **a declaration that only *restates* the
+definition is one member.** `Stream.tail: Stream[A]` is exactly what
+`IterableOps.tail: C` says at that prefix, so which symbol survives cannot be
+observed — except that reaching the answer through the definition needs the
+prefix, and that is the part this compiler gets wrong (below). So the
+declaration is preferred exactly where it cannot change the answer, because it
+already carries it written out. cats is then unchanged at 185, which is
+correct: its five were the shape nsc rejects.
+
+### A second defect, found and not fixed: as-seen-from takes the first path
+
+`SymbolTable::base_type_args` walks the linearization and keeps the **first**
+instantiation of each base class it meets (`or_insert_with`). `Stream` reaches
+`IterableOps` as both `IterableOps[A, Stream, Stream[A]]` and `IterableOps[A,
+Iterable, Iterable[A]]`, and takes the second — which is why
+`IterableOps.tail` prints as `Iterable[A]` in the unreduced overload above,
+and why `Check::base_type_instance`, which stops at the first parent that
+reaches the target, cannot be used to decide "restates" either. nsc's
+`baseType` takes the *meet*, which for a covariant parameter is the most
+derived. `Check::restated_on_some_path` asks whether **some** path spells the
+declaration's own type, which gets the same answer here without changing what
+`baseType` means everywhere else; fixing `base_type_args` is the real repair
+and is a slice of its own. Building the rule on the first path instead leaves
+16 of the 53 (`value tailDefined is not a member of Iterable[A]`,
+`found: Iterable[A] required: Stream[A]`) — measured.
+
+The ordering matters and is what makes the defect reproducible in nine lines:
+
+```scala
+trait IterOps[+A, +C] { def tail: C = ??? }
+trait Iter[+A] extends IterOps[A, Iter[A]]
+trait LinOps[+A, +C] extends IterOps[A, C] { def tail: C }
+trait Str[+A] extends LinOps[A, Str[A]] with Iter[A] {
+  def tail: Str[A]
+  def flag: Boolean
+  def go: Boolean = tail.flag   // value flag is not a member of
+}                               // <overload Iter[A] | Str[A] | Str[A]>
+```
+
+Put `Iter[A]` first instead and the linearization reaches `IterOps` through
+`LinOps`, the three as-seen-from types collapse to `Str[A]`, and the unreduced
+set is harmless. That is why the same shape written the other way round
+compiles on the pre-fix binary.
+
+### Fixtures
+
+`tests/fixtures/libov_reabstract.scala` is the shape above, made to run: each
+of `second`, `third` and `lastOne` walks `tail`, so an alternative that merely
+type-checks cannot pass, and it carries the gitbucket self-type pair as well,
+which the rule must still collapse the other way. It runs in **both** modes
+and against real scalac 2.13.16, byte for byte on stdout. On the pre-fix
+binary it does not compile: four errors, three of them
+`<overload Iter[A] | Str[A] | Str[A]>`.
+
+`tests/fixtures/libov_reabstract_bad.scala` is the restriction. `bad1` and
+`bad2` are the two nsc shapes above — this compiler now reports scalac's own
+`Ops` and `Any`, where the pre-fix binary named the unreduced candidate set.
+`bad3` keeps an inherited alternative the subclass does not override, and
+`bad4` keeps a genuine ambiguity ambiguous; both are unchanged by the rule and
+are there to say so. All four are rejected at scalac's own lines 25, 35, 45
+and 54, which `crates/cli/tests/liboverload.rs` asserts against scalac
+directly.
+
+### What moved
+
+The 50 `<overload …Stream…>` and `<overload …LinearSeq…>` receivers are gone,
+together with the five `could not optimize @tailrec` that `agent/libtailrec`
+traced to them. **`Stream.scala` goes from 51 error lines to 1**, and it is
+the only file that changes.
+
+Re-clustered on the 918 that remain: 435 `type mismatch`, 179 `no matching
+overload`, 145 `X is not a member of Y`, 33 `not found`, 18 `ambiguous
+overload`. The largest `type mismatch` families are 43 `found:
+Array[Nothing]` (`new Array(WIDTH)` not reading its element type from the
+expected type, mostly `Vector.scala`) and 41 `found: T`
+(`Iterator.empty.next()` leaving the element parameter uninstantiated). The
+worst files are `TrieMap.scala` (47), `Vector.scala` (45), `Seq.scala` (31)
+and `Factory.scala` (31).
+
+The `<overload …>` spellings left are all the *other* defect this slice
+found — two instantiations of one base, not two symbols: `<overload Nil$ |
+Nil$>` (7), `<overload Set[A] | TreeSet[A]>` (3), `<overload Iterable[(K, V)]
+| Map[K, V] | TreeMap[K, V]>` (3). No member-collapse rule can reach those;
+`base_type_args` is where they live.
+
+### The other targets, before and after
+
+Measured on the merged tree at `659580a9`, each against that same `main`:
+
+| | before | after |
+|---|---|---|
+| scala library (538) | 970 / 147 | **917 / 146** |
+| gitbucket (353) | 270 / 79 | 270 / 79 |
+| cats (339) | 185 / 71 | 185 / 71 |
+| slick (184) | `errors=0 classes=1490` | `errors=0 classes=1490`, all 1490 byte-identical (`SLICK_OUT` on both binaries, `diff -r` empty) |
+
+On the scala/scala corpus (`CORPUS_SIZE=full`, 5324 rows) **every row is
+identical** to `main` -- `pos 1095 / neg 670 / run 623`, compared row by row
+for all three kinds at `acec3f09`, not only by count, and unchanged again at
+`659580a9`. `tests/verify_merge.sh` still reports `VERDICT=FAIL` there,
+because its ledger is `tests/baselines/corpus-4d613d25.tsv` and `main` has
+moved three times since: the
+4 `neg` losses (`anytrait`, `name-lookup-stable`, `t8002-nested-scope`,
+`valueclasses-impl-restrictions`, all `accepted-but-should-not-compile`) and
+the 11 `pos`/`run` gains it names all reproduce on unmodified `main`. The
+ledger needs re-taking; none of the 15 is this slice's.
 
 ## Running it
 

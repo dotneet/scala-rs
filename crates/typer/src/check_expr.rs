@@ -822,6 +822,9 @@ impl Typer {
         {
             return;
         }
+        // Read before the match takes `tree.kind` mutably. Only the `Block`
+        // arm uses it, to name the scope its local definitions share.
+        let tree_id = tree.id;
         match &mut tree.kind {
             TreeKind::Literal { lit } => {
                 tree.ty = Type::Constant(lit.clone());
@@ -1070,13 +1073,34 @@ impl Typer {
                 }
                 // Local classes are visible to the whole block, including
                 // statements that precede their definition.
+                //
+                // The block is also the *scope* a companion pair has to share
+                // (nsc `Contexts.lookupSibling`), and two blocks of one method
+                // share an owner -- so which block each local class or object
+                // was declared in is recorded here, where it is known, and
+                // read back by `Checker::companion_scope`. Recorded on every
+                // pass, not only the one that allocates the symbol: the
+                // signature and body passes both walk this block.
+                let block_scope = (self.file_index as u64) << 32 | u64::from(tree_id.0);
                 for s in stats.iter_mut() {
-                    if matches!(
+                    if !matches!(
                         s.kind,
                         TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
-                    ) && s.sym.is_none()
-                    {
+                    ) {
+                        continue;
+                    }
+                    if s.sym.is_none() {
                         self.namer(s);
+                    }
+                    if !s.sym.is_none() {
+                        self.st.get_mut(s.sym).local_scope = Some(block_scope);
+                        // A `ModuleDef`'s symbol is the module; the access
+                        // check walks module *classes*, so the scope has to
+                        // reach the one that stands for it.
+                        let mc = self.st.module_class_of(s.sym);
+                        if !mc.is_none() && mc != s.sym {
+                            self.st.get_mut(mc).local_scope = Some(block_scope);
+                        }
                     }
                 }
                 // `implicit class C(x: P) { ... }` desugars to a synthetic
