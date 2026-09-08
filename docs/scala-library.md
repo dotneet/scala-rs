@@ -922,14 +922,222 @@ measured at zero; neither is in the change.
 See the slice's report for the full table; every measure other than the
 library is unchanged to the error.
 
+## The `agent/libprelude` slice: members the prelude does not declare
+
+**1111 errors in 155 files → 1065 in 154**, on this branch merged with `main`.
+The brief handed this slice one symptom — `value & is not a member of Boolean`
+— and asked for an audit rather than a patch. Three things came out of it, and
+the audit is worth more than any of them.
+
+### The audit
+
+`javap -p` over `scala-library-2.13.16.jar` lists every instance member of
+`scala.{Boolean,Byte,Short,Char,Int,Long,Float,Double,Unit}` — **727** of them,
+counting each overload. A generated probe puts one call to each through both
+compilers, twice, because a *missing* member and a *wrongly typed* one fail
+differently:
+
+| probe | each call ascribed to | catches |
+|---|---|---|
+| positive | the result type javap reports | absent members, and results that are too narrow |
+| negative | the next *narrower* type | results that are too wide (real scalac rejects all 727) |
+
+**The positive probe drew exactly 10 errors and the negative probe none.** In
+both `--scala-library` and `--no-scala-library`, identically. Every other
+declared member, and every result type, already agreed with scalac — which is
+the useful half of the answer, and is not something anyone had checked.
+
+The ten: `Boolean.&`, `Boolean.|`, `Boolean.^`, and `unary_+` on all seven
+numeric classes. `unary_+` costs the library measure nothing; the other three
+cost 15 (`&` 9, `^` 6 — the library writes no `Boolean.|`).
+
+Two things the audit says are *deliberate*, not gaps, and should not be
+"fixed" by the next slice:
+
+* **The value-class companions** (`Int.MaxValue`, `Double.NaN`, `Byte.box`,
+  `int2long`, …) are absent in `--no-scala-library` and present in
+  `--scala-library`. `crates/typer/src/prelude_numeric.rs` gates them on
+  `library_abi` on purpose: the private runtime has no `scala/Int$` classfile,
+  so declaring them there would emit calls to classes that do not exist. The
+  one real gap the probe found is `Boolean.box` / `Boolean.unbox`, which fail
+  in **jar** mode too; nothing in any measured corpus writes them.
+* `Predef.any2ArrowAssoc` is the reverse: a member scalac does **not** declare
+  (2.13's is `ArrowAssoc`), and it is the whole of the `->` defect below.
+
+### `Boolean`'s `&`, `|`, `^` are not `&&` and `||`
+
+`p & q` evaluates `q` unconditionally. Emitting the short-circuiting form
+would type-check, verify, and pass every classfile check in this repository
+while silently dropping `q`'s side effects, so
+`tests/fixtures/libprelude_boolbit.scala` **runs**, with each operand
+appending to a trace: `trace=LR` for `&` against `trace=L` for `&&`. Expected
+output is real scalac 2.13.16's own, and both modes match it.
+
+### `x.unary_-` written out in full never reached its intrinsic
+
+Found while adding `unary_+`, pre-existing, and invisible to every
+compile-only check. The prefix spelling `-x` is an `Apply` and has always
+worked; the *selected* spelling is a bare `Select`, and `gen_select`'s
+intrinsic chain had no case for the five unary value-class families. It fell
+through to `invoke_method` and emitted
+`invokevirtual java.lang.Byte.unary_$minus()` — a method the box does not
+have. **It compiled, it verified, and it threw `NoSuchMethodError` at run
+time**, on all nine members (`unary_-`/`unary_~` on Byte/Short/Char/Int/Long,
+`unary_-` on Float/Double, `unary_!` on Boolean). `emit_prim_unary` is now
+shared by both spellings.
+
+### `->`: the doc's own reproduction was not a bug
+
+The entry above prescribes item 0 with a twelve-line reproduction and two
+fixes measured at zero. One command settles it:
+
+```
+$ scalac -classpath scala-library-2.13.16.jar A.scala B.scala
+B.scala:2: error: type mismatch;
+ found   : Int(1)
+ required: ?{def ->(x$1: ? >: Int(2)): ?}
+Note that implicit conversions are not applicable because they are ambiguous:
+ both method ArrowAssoc in object Predef of type [A](self: A): ArrowAssoc[A]
+ and method ArrowAssocQ in object PredefY of type [A](self: A): PredefY.ArrowAssocQ[A]
+ are possible conversion functions from Int(1) to ?{def ->(x$1: ? >: Int(2)): ?}
+```
+
+**Real scalac rejects that program too.** Two conversions genuinely in scope
+for the same source type *are* an ambiguity; "two candidates, so neither" is
+the right answer there, and the two fixes that measured zero were aimed at a
+case that is not wrong. It is pinned now, as a negative test
+(`two_real_conversions_are_still_an_ambiguity`), so it cannot be "fixed" by a
+later slice.
+
+`src/library` is a different situation, and the difference is the whole
+defect. There the program has exactly **one** `->` conversion, `Predef`'s own.
+This compiler had a second — its own prelude stand-in for it. Instrumenting
+`search_extension`'s tie says so directly:
+
+```
+TIE -> from="ALL" :: [("any2ArrowAssoc", 400, "Predef$", "ArrowAssoc"),
+                      ("ArrowAssoc",    2869, "Predef$", "ArrowAssoc[String]")]
+```
+
+id 400 is the prelude's; id 2869 is the source `implicit final class
+ArrowAssoc`. `predef_reimport` supersedes the prelude's `Predef` snapshot **by
+name**, and these two names never meet, because `any2ArrowAssoc` is 2.10's
+spelling — `javap -p scala.Predef$` on 2.13.16 has `public final <A> A
+ArrowAssoc(A)` and no `any2ArrowAssoc` at all.
+
+`Check::drop_superseded_prelude_conversions` drops a prelude candidate owned
+by the prelude `Predef` when the run's own sources have supplied that object
+(`SymbolTable::predef_superseded`) and some other candidate remains. It never
+fires for an ordinary program, and it never empties a candidate set.
+
+**Two more principled-looking shapes were measured and are not in the change**
+— record them the way the entry above records its two:
+
+| shape | measured |
+|---|---|
+| rename the prelude's copy to `ArrowAssoc`, so replace-by-name reaches it | **1099 / 158** |
+| retire the whole prelude `Predef` snapshot once the source one arrives (nsc's actual model) | **1083 / 156** |
+| drop the prelude candidate only when another remains | **1065 / 154** |
+
+The first two are the same experiment: both remove the stand-in outright, and
+both cost more than they save, because the source `ArrowAssoc` does not reach
+every site the stand-in did — `t.head -> t.tail` on a bare type parameter in
+`collection/package.scala` is one, and there are six of that shape. Keeping
+the stand-in as a *last resort* rather than as a competitor is what gets the
+whole 28 with nothing new in the log.
+
+### `eq` / `ne` under a universal trait
+
+The retirement experiment turned this up, and it is pre-existing:
+
+```scala
+trait Eqls extends Any { def canEqual(that: Any): Boolean }
+trait Prod extends Any with Eqls
+final class T2[A, B](val _1: A, val _2: B) extends Prod
+def f(t: T2[Int, Int]) = t eq null      // value eq is not a member of T2[A, B]
+def g(t: T2[Int, Int]): AnyRef = t      // accepted
+```
+
+`lookup_member` reaches `AnyRef`'s members only by walking a *declared*
+parent, and `rough_parents` supplies `AnyRef` only when the parent list is
+**empty**, so a class whose ancestry bottoms out in a universal trait has a
+chain that ends at `Any`. That is `src/library`'s whole
+`Tuple`/`Product`/`Iterator` family: `scala.Equals` is
+`trait Equals extends scala.Any`. The compiler already agrees the receiver is
+a reference — the second line is accepted — so `check_select` now asks
+`AnyRef` when the receiver conforms to it, last, after the declared members
+and after any view.
+
+In the library this was masked by the stand-in above: `any2ArrowAssoc`'s
+result is the prelude's `ArrowAssoc extends AnyRef`, which *does* have `eq`,
+so `t eq null` was resolving through an `->` conversion. Remove one without
+the other and 19 `eq`/`ne` errors appear.
+
+`tests/fixtures/libprelude_anyref.scala` runs, because `eq` is reference
+identity: `p eq q` is false where `p == q` is true, so a fallback that
+resolved it to `==` would type-check, verify and print the wrong answer.
+
+### Three defects found and not fixed here
+
+1. **A source `scala.Predef` breaks `java.lang.System.out.println` in
+   `--scala-library` mode.** Eleven lines, no `->` anywhere:
+
+   ```scala
+   package scala { object Predef { type String = java.lang.String } }
+   object Main { def main(a: Array[String]): Unit = java.lang.System.out.println("hello") }
+   ```
+
+   compiles, and dies with
+   `NoSuchMethodError: 'void scala.Predef$.println(java.lang.Object)'`. The
+   qualified select is being given the prelude `Predef`'s receiver. Correct in
+   `--no-scala-library`, and correct in jar mode without the source `Predef`,
+   so it is the `predef_reimport` wildcard that codegen reads back. It costs
+   the measure nothing (the measure is `--no-scala-library`) and it is why
+   `libprelude_arrow.scala` is run in one mode only.
+2. **`val b: Byte = -3` is rejected** — `type mismatch; found: Int required:
+   Byte`, in both modes, while `val b: Byte = 3` is fine. A negated constant
+   literal is not folded before the narrowing check. Real scalac accepts it.
+   Zero errors in `src/library`, so it is a correctness item, not a yield one.
+3. **`def f(a: Int, b: Int) = a eq b` is accepted**, boxing through
+   `int2Integer`; scalac rejects it with "the result type of an implicit
+   conversion must be more specific than AnyRef". Pre-existing — an unmodified
+   build of `main` at `8f1df474` accepts it — and it is in implicit search,
+   not in the `AnyRef` fallback above, which asks `is_sub_type(recv, AnyRef)`
+   and is never reached.
+
+### The other targets, before and after
+
+| target | before | after |
+|---|---|---|
+| scala library | `1111 / 155` | **`1065 / 154`** |
+| gitbucket | `270 / 79` | `270 / 79` |
+| cats | `185 / 71` | `185 / 71` |
+| slick (compile) | `errors=0 classes=1490` | `errors=0 classes=1490` |
+
+### The head of what remains, re-clustered on the 1065
+
+18 `value + is not a member of <notype>`, 15 `found: <overload Stream[A] |
+Iterable[A] | Stream[A]> required: Stream[A]`, 13 `found: T required: A`, 13
+`no matching overload for (MainNode[K, V], …)Boolean`, 11 `value min is not a
+member of <notype>`, 9 `incompatible type in overriding`, 8 `value max is not
+a member of <notype>`, 8 `found: null required: A`, 8 `reassignment to val
+initBlank`, 7 `could not optimize @tailrec`, 6 `value tail is not a member of
+<overload Iterable[A] | Stream[A] | Stream[A]>`. The `->` family is gone; the
+`&` / `^` family is gone.
+
+The `<notype>` receiver (18 + 11 + 8 = 37 between `+`, `min` and `max`) is now
+the largest single spelling in the log and has no entry anywhere in this
+document. It is worth a slice of its own: a receiver printed as `<notype>` is
+a symbol whose type was never assigned, so the site of the error is not the
+root and the counts above are what one root is worth.
+
 ## What to do next, in order
 
-0. **`->` when two conversions offer it — 28 errors, 3 files.** The twelve-line
-   reproduction is above. Worth taking before anything else in this list,
-   because it is the only regression standing between the current number and a
-   clean sweep of the `Predef` work, and because "two candidates, so neither"
-   is a wrong answer anywhere it happens, not only here. Note the two fixes
-   that look right and are not, recorded above, before starting.
+0. ~~**`->` when two conversions offer it — 28 errors, 3 files.**~~ Done by
+   `agent/libprelude`, in the section just above, which also shows that the
+   twelve-line reproduction is **not** a case this compiler gets wrong: real
+   scalac 2.13.16 rejects it too. Read that section before trusting anything
+   in this list that is written as a reproduction rather than a measurement.
 1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
    `new VectorN(…)` on a generic constructor infers `Any` for the element
    where the context expects `Vector[B]`. Nothing to do with the prelude; it
