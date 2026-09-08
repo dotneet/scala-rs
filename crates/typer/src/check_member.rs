@@ -913,12 +913,27 @@ impl Typer {
                 Flags::SYNTHETIC,
                 "",
             );
+            // With nothing preceding it the getter is *nullary* -- nsc's
+            // `def copy$default$1: Int`, a `NullaryMethodType` -- and not a
+            // method over an empty list. The two are different types to a
+            // reader: pickled as `copy$default$1()`, scalac warns
+            // "Auto-application to `()` is deprecated" at every call that
+            // omits a `copy` argument, and Scala 3 would eta-expand it.
+            let getter_paramss = if preceding.is_empty() {
+                Vec::new()
+            } else {
+                vec![preceding.clone()]
+            };
             self.st.get_mut(gid).ty = Type::Method {
-                paramss: vec![preceding_tys],
+                paramss: if preceding_tys.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![preceding_tys]
+                },
                 ret: Box::new(ret.clone()),
             };
             self.st.get_mut(gid).params = preceding.clone();
-            self.st.get_mut(gid).paramss = vec![preceding.clone()];
+            self.st.get_mut(gid).paramss = getter_paramss;
             self.st.get_mut(gid).tparams = tp_ids.to_vec();
             if self.st.get(*pid).default_rhs.is_some() {
                 if self.defer_default_rhs {

@@ -337,6 +337,27 @@ jar の `@macroImpl` 注釈側とソース側の両方の読み手を直して�
 `mt2_bad.scala`（実 scalac は通る 3 例）が名指しで拒否されることを固定します
 （`mapto2` テスト）。詳細は [docs/macros.md](docs/macros.md) §7.22 を参照してください。
 
+**空の引数リストが pickle を通るようになりました。** nsc は `def f: T`
+（`NullaryMethodType`）と `def f(): T`（引数 0 個の `MethodType`）を別の型として
+区別し、呼び出し側にもそれを課します（前者に `f()` と書けば
+`T does not take parameters`）。scala-rs は両方を `NullaryMethodType` として書いて
+いたため、**自分のソースが書いた括弧のまま呼べないクラスファイル**を出していました
+（実 scalac が `println(Keys.empty())` に `Empty does not take parameters`）。
+case class 固有の話ではなく、`def f(): T` すべてが対象です。あわせて
+`uncurry` が潰す前の**引数節の形**を `Symbol::pickle_clauses` に記録し、pickler は
+節ごとに `METHODtpe` を書くようにしました（nsc の pickler は uncurry より前に
+走るため）。これで `def makeDatabase[F[_]: Async](): F[…]` が
+`[F[_]]()(implicit ev)` として、`def cur(a)(b)` が `(a)(b)` として読まれます。
+逆に**過剰修正も禁物**で、引数の無い `name$default$n` ゲッターは nsc と同じく
+nullary のままにします（`()` を付けて書くと実 scalac が
+`Auto-application to () is deprecated` を出します）。0 フィールド case class の
+`copy()` は pickle にあって classfile に無い「幽霊メンバー」だったので、
+codegen 側も出すようにしました（実 scalac が `Empty().copy()` を通した先で
+`NoSuchMethodError` になっていました）。分割コンパイルの検証は `pickleparams`
+テスト（`tests/fixtures/pp_*.scala`）で、正常系は scala-rs がライブラリを、実 scalac
+が呼び出し側をコンパイルして**実行**し scalac 同士の出力と一致すること、異常系は
+`f()` が同じ行・同じ件数で拒否されることを固定します。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -580,7 +601,12 @@ scalac と同じ行で固定します。この欠陥は `src/library` の計測�
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
 scalac を読み手にして、正例の JVM 実行と不正な型引数の拒否を検証します。
-`E#Elem` の接頭部や curried メソッドの引数節には未解決の制限があり、
+メソッドの引数節（空リストを含む）は書き手側では nsc と同じ入れ子の
+`METHODtpe` として保存されるようになりました。ただし `-cp` のクラスディレクトリを
+読む簡易デコーダ（`crates/backend/src/pickle.rs` の `unpickle`）はメンバーを
+1 本の平坦な引数リストとして持つため、**自分が出したクラスファイルに対しては**
+`T.cur(1)(2)` をまだ受け付けません（実 scalac は受け付けます）。
+`E#Elem` の接頭部にも未解決の制限があり、
 Slick の逆方向テスト（MODE=a）はまだ通っていません。
 現在の数値と検証範囲は [tests/BASELINE.md](tests/BASELINE.md) を参照してください。
 
