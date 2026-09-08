@@ -1550,6 +1550,16 @@ Measured on the merged tree at `acec3f09`, each against that same `main`:
 | cats (339) | 185 / 71 | 185 / 71 |
 | slick (184) | `errors=0 classes=1490` | `errors=0 classes=1490`, all 1490 byte-identical (`SLICK_OUT` on both binaries, `diff -r` empty) |
 
+On the scala/scala corpus (`CORPUS_SIZE=full`, 5324 rows) **every row is
+identical** to `main` at `acec3f09` -- `pos 1095 / neg 670 / run 623`, compared
+row by row for all three kinds, not only by count. `tests/verify_merge.sh`
+still reports `VERDICT=FAIL` there, because its ledger is
+`tests/baselines/corpus-4d613d25.tsv` and `main` has moved twice since: the
+4 `neg` losses (`anytrait`, `name-lookup-stable`, `t8002-nested-scope`,
+`valueclasses-impl-restrictions`, all `accepted-but-should-not-compile`) and
+the 11 `pos`/`run` gains it names all reproduce on unmodified `main`. The
+ledger needs re-taking; none of the 15 is this slice's.
+
 ## Running it
 
 ```
