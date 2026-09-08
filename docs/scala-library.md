@@ -582,11 +582,14 @@ arity 1), and it is not touched here.
 
 ## The `agent/libanyval` slice: an overload is not an override
 
-**1420 errors in 166 files → 1386 in 164**, measured on `agent/libanyval` cut
-from `main` at `fce0a0d8`. Every other target is unchanged; see the table at
-the end of this section. The 34 that went are exactly the two override
-clusters — 22 `` `override` modifier required to override concrete member`` and
-12 `cannot override final member`` — and **no new error appeared anywhere**.
+**1173 errors in 157 files → 1139 in 155**, measured on `agent/libanyval`
+merged with `main` at `b15df464` (`agent/anyconstr`, `agent/libmaxmin`). The
+same 34 go on the branch's own base, `fce0a0d8`, where they read
+**1420 / 166 → 1386 / 164**: they are exactly the two override clusters —
+22 `` `override` modifier required to override concrete member`` and
+12 `cannot override final member`` — and **no new error appeared in any
+cluster**, before or after the merge. Every other target is unchanged; see the
+table at the end of this section.
 
 ### The question this slice was set, and the answer
 
@@ -740,16 +743,28 @@ redefine `Object`'s finals). All four are in `crates/cli/tests/override.rs`.
 
 ### The other targets, before and after this slice
 
-Measured on this branch merged with `main`; "before" is the merge base
-`c76886f7`, measured in the same tree to be sure of it.
+Measured on this branch merged with `main` at `b15df464`; "before" is that
+merge base, built and measured in the same tree rather than read off a table.
+(The cats and gitbucket regressions in the section above were found exactly
+this way, and both are back at the base figure.)
 
-| target | before | after |
+| target | before (`b15df464`) | after |
 |---|---|---|
-| scala library | `1420 / 166` | **`1386 / 164`** |
+| scala library | `1173 / 157` | **`1139 / 155`** |
 | gitbucket | `270 / 79` | `270 / 79` |
-| cats | `188 / 72` | `188 / 72` |
+| cats | `185 / 71` | `185 / 71` |
 | slick (compile) | `errors=0 classes=1490` | `errors=0 classes=1490` |
 | slick (`MODE=b`) | `progs=12 ok=12 diff=0 fail=0` | `progs=12 ok=12 diff=0 fail=0` |
+
+The head of what remains, re-clustered on the 1139: 22 `class TupleN needs to
+be abstract`, 18 `value + is not a member of <notype>`, 15
+`found: <overload Stream[A] | Iterable[A] | Stream[A]> required: Stream[A]`,
+13 `found: T required: A`, 13 `no matching overload for
+(MainNode[K, V], …)Boolean`, 11 `value min is not a member of <notype>`, 9
+`incompatible type in overriding`, 9 `value & is not a member of Boolean`. The
+overriding family is now 9 `incompatible type in overriding` plus 10
+`overrides nothing`, and both of those are the member-lookup root seen from
+the other side.
 
 ### A defect found and not fixed here
 
@@ -774,6 +789,8 @@ Re-clustered on the 1367 that remain (`agent/anyconstr`, merged at `515a43c4`): 
 `type mismatch`, 453 `X is not a member of Y`, 157 `no matching overload`, 42
 `no matching overload for constructor`, 33 `not found: value`, 32 `needs to be
 abstract`, 22 `` `override` modifier required``, 20 `ambiguous overload`.
+(`agent/libanyval`, below, has since removed all 22 of the
+`` `override` modifier required`` and the 12 `cannot override final member`.)
 
 1. **The prelude collision is still the whole first half.** The receivers in
    `is not a member of` are `Int` (69), `Array` (68), `<notype>` (51) and
