@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `4d613d25` |
+| commit | `3fd80269` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Twenty-nine slices have merged this session**, in ten composed gates. From
+**Thirty-nine slices have merged this session**, in eleven composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -33,6 +33,7 @@ coordinator measured the merged tree each time, not the branches.
 | `f4b829ec` | `mapto2`, `impprio`, `sortedmap`, `gbopt` | -> 270 | -> 188 |
 | `b15df464` | `anyconstr`, `libmaxmin` | 270 | -> 185 |
 | `4d613d25` | `libcaseeq`, `libanyval` | 270 | 185 |
+| `3fd80269` | `libtailrec`, `libprelude`, `libnotype`, `neglit`, `caseabi`, `pickleparams`, `liboverload`, `negchecks`, `sysout`, `accessmsg` | 270 | 185 |
 
 Four of those fifteen move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -241,7 +242,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **185** | **71** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **270** | **79** | — |
-| `tests/scalalib_measure.sh` (538) | **1111** | **155** | — |
+| `tests/scalalib_measure.sh` (538) | **917** | **146** | — |
 
 ## Execution
 
@@ -257,12 +258,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1089** | 425 | 345 |
-| `neg` (1405) | **674** | 362 | 369 |
-| `run` (2060) | **618** | 889 | 553 |
+| `pos` (1859) | **1095** | 419 | 345 |
+| `neg` (1405) | **673** | 363 | 369 |
+| `run` (2060) | **626** | 881 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-4d613d25.tsv`](baselines/corpus-4d613d25.tsv): 5324 unique
+[`baselines/corpus-3fd80269.tsv`](baselines/corpus-3fd80269.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -297,7 +298,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-4d613d25.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-3fd80269.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -324,7 +325,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **250 result rows, 2428 passed, 0 failed** at `4d613d25` |
+| `cargo test --workspace --release --no-fail-fast` | **259 result rows, 2487 passed, 0 failed** at `3fd80269` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -378,6 +379,63 @@ real scalac compiles the library, scala-rs the consumer, and the fixture was
 verified to **fail on the unguarded binary and pass on the guarded one**. The
 ordering is load-bearing — an `object api { implicit def … }` reached by a
 wildcard import compiles either way and proves nothing.
+
+## The one corpus loss, and why it is recorded rather than reverted
+
+Every gate before this one was `losses=0`. This one is **`losses=1`**, and it
+is honest: **`neg/name-lookup-stable`**.
+
+`agent/libnotype` removed a set of bogus errors — a case-insensitive directory
+classpath fabricating `package scala.Math`, a blank line not ending an
+expression, and `new X` resolved in the term namespace. Four `neg` tests had
+been "passing" *because* of those errors, on messages that appear nowhere in
+their `.check` files. The coordinator verified each against its `.check` and
+against scalac. `agent/negchecks` then implemented three of the four missing
+rules, and those three are byte-identical to their `.check` again. The fourth
+is this one: scalac reports `reference to PrimaryKey is ambiguous; it is both
+defined in class A and imported subsequently by import ColumnOption._`, and we
+**emit nothing at all** — verified directly.
+
+So the pass was never real, and the loss is the compiler telling the truth
+about a check it does not implement. `agent/negchecks` reduced it to sixteen
+lines and wrote down what closing it needs (`SymbolTable::scopes` already
+carries depth; the comparison is innermost-`Explicit`/`Wildcard` scope against
+innermost-`Definition` scope, with `BindRank::PackageElsewhere` as nsc's
+level-4 exception, and the message needs the definition's owner and the import
+clause's source text). It is in `docs/not-implemented.md`.
+
+## What this gate cost that no error count shows
+
+Three of its slices found the compiler getting a *right-looking* answer wrong,
+and one of them was hiding under every green check this project has:
+
+* **`agent/sysout`** — `gen_apply` dispatched the `println`/`print` intrinsic
+  **by name**, discarding the qualifier. So `java.lang.System.err.println(x)`
+  went to **stdout**, in both modes, in ordinary programs. Worse, slick's
+  `TreePrinter`'s two-argument `print(n, out)` was hijacked and its
+  `PrintWriter` was **never constructed** — a real miscompilation, while
+  `slick_measure` said `errors=0 classes=1490`, `verify_all` said
+  `verify_failures=0`, `classfile_lint` said `lint_problems=0`, and
+  `slick_run` said `progs=12 ok=12 diff=0`. A twelve-program execution check
+  proves nothing about the code those twelve programs do not reach.
+* **`agent/pickleparams`** — we pickled `def f(): T` as `def f: T`, so real
+  scalac reading our class files rejected every call written with parentheses:
+  14 errors on the interoperability fixture, now 0. Fixing it exposed a
+  *phantom member* — a zero-field case class's `copy()` was pickled and never
+  emitted, unreachable until the pickle became right — and an over-correction
+  that only `-deprecation -Xfatal-warnings` could see, which the test now runs
+  under permanently.
+* **`agent/negchecks`** — `localobj.rs` already implemented "nested object is
+  not allowed in value class", behind the driver's `if !has_errors(&diags)`.
+  A second check firing made the first one's message disappear. **A rejection
+  rule cannot live behind a `!has_errors` guard.**
+
+`agent/accessmsg` then rebuilt the access diagnostic the way nsc's
+`AccessError` builds it — `underlyingSymbol(sym).fullLocationString` and
+`directObjectString`, so `method x in class C … from object C` rather than
+`value x … from C$`. It moves no count; it moves three `neg` tests to
+byte-identical with their `.check` and the wording-score of the 26 access
+tests from 0 to 3.
 
 ## What is deliberately red
 
