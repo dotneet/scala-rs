@@ -1074,7 +1074,17 @@ impl PickleSupply {
         let ctors: Vec<scala_rs_pickle::sym::Member> = sig
             .members
             .iter()
-            .filter(|m| m.kind == MemberKind::Def && m.name == "<init>" && m.is_public_api())
+            // Deliberately **not** `is_public_api`, which hides a `private`
+            // member outright. A `private` constructor has to be supplied and
+            // *marked*, not dropped: dropped, `neg/t6601`'s
+            // `new PrivateConstructor("")` in a separate compilation found no
+            // constructor at all where nsc reports an access error -- and
+            // before that, found the class file's `<init>` (emitted
+            // `ACC_PUBLIC`, as nsc emits it) and accepted the call.
+            .filter(|m| m.kind == MemberKind::Def && m.name == "<init>")
+            .filter(|m| {
+                !m.has(pflags::BRIDGE) && !m.has(pflags::SYNTHETIC) && !m.has(pflags::LOCAL)
+            })
             .cloned()
             .collect();
         if ctors.is_empty() {
@@ -1135,9 +1145,21 @@ impl PickleSupply {
         let Some(shape) = read_shape(&member.ty) else {
             return false;
         };
+        // The access the *pickle* records. The class file cannot carry it: nsc
+        // emits even a `private` constructor `ACC_PUBLIC` (`javap -p` on
+        // `class PrivateConstructor private(s: String) extends AnyVal` says
+        // so), so this is the only place a separately compiled caller can
+        // learn it.
+        //
+        // `private[p]` is pickled as `PRIVATE` **plus** a `privateWithin`
+        // reference, and this reader does not resolve `p`. Treating it as a
+        // plain `private` would refuse calls scalac accepts -- slick's
+        // `private[slick]` constructors are exactly that shape -- so a member
+        // with an access boundary is left as accessible as it is today.
+        let access = ctor_access_flags(member);
         // A constructor takes no type parameters of its own; nsc writes the
         // class's as a `POLYtpe` wrapper, and those are already in scope.
-        let m = st.alloc("<init>", SymbolId::NONE, SymKind::Method, Flags::EMPTY, "");
+        let m = st.alloc("<init>", SymbolId::NONE, SymKind::Method, access, "");
         let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
         let mut paramss_sym: Vec<Vec<SymbolId>> = Vec::new();
         for clause in &shape.clauses {
@@ -1232,6 +1254,14 @@ impl PickleSupply {
                 }
             }
             st.set_jvm_name(existing, desc);
+            // The symbol being repaired came from the class file's descriptor,
+            // where the constructor is `ACC_PUBLIC` whatever the source said.
+            // Only ever *adds* the pickle's access: nothing here can widen a
+            // constructor the typer already knows to be restricted.
+            if access != Flags::EMPTY {
+                let f = st.get(existing).flags.with(access);
+                st.get_mut(existing).flags = f;
+            }
             st.get_mut(existing).params = source_params.clone();
             st.get_mut(existing).paramss = source_paramss.clone();
             st.get_mut(existing).ty = Type::Method {
@@ -5410,6 +5440,31 @@ fn ctor_params_match(
         None
     };
     tail.is_some_and(|tail| tail == want)
+}
+
+/// The access modifier a pickled `<init>` carries, as this compiler's flags.
+///
+/// A class file cannot answer this: nsc emits a `private` constructor
+/// `ACC_PUBLIC`, so the `ScalaSignature` is the only record of it, and reading
+/// it is what makes `neg/t6601` -- a *separate* compilation -- reject.
+///
+/// `private[p]` and `protected[p]` are pickled as the bare flag **plus** a
+/// `privateWithin` reference. This reader does not resolve `p`, and guessing
+/// "private" for one would refuse calls scalac accepts, so a member with an
+/// access boundary keeps the accessibility it had before this existed --
+/// public, as the descriptor said. That is the conservative half: this
+/// function can only ever *add* a restriction the pickle states outright.
+fn ctor_access_flags(member: &scala_rs_pickle::sym::Member) -> Flags {
+    if member.private_within {
+        return Flags::EMPTY;
+    }
+    if member.has(pflags::PRIVATE) {
+        Flags::PRIVATE
+    } else if member.has(pflags::PROTECTED) {
+        Flags::PROTECTED
+    } else {
+        Flags::EMPTY
+    }
 }
 
 /// Does this constructor symbol carry a parameter whose type never resolved?

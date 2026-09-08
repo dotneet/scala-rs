@@ -3275,3 +3275,57 @@ fn fixtures_arrayelem_arity_bad() {
         assert!(err.contains(needle), "missing {needle:?} in {err}");
     }
 }
+
+/// A default argument on a **secondary** constructor.
+///
+/// `synthesize_ctor_default_getters` ran over the *primary*'s parameters
+/// only, so `new Deft("abc")` on
+/// `class Deft(p: Int, q: String) { def this(p: String, q: String = "dq") = … }`
+/// reported `value <init>$default$2 is not a member of Main$`: the getter the
+/// call site wanted was never declared and the lookup fell out to the
+/// enclosing object.
+///
+/// The fixture prints every default it fills, so a getter that answers with
+/// the wrong expression cannot pass -- a secondary with a default omitted and
+/// written, a secondary that delegates to another secondary and lets *its*
+/// default fill in, a default that is computed (and reads a top-level object
+/// rather than a literal), a case class whose secondary must **not** grow an
+/// `apply$default$n`, a class with defaults on the primary and a secondary
+/// side by side, and a generic class whose getter repeats the class's type
+/// parameters. The expected output is real scalac 2.13.16's, and this branch
+/// matches it in both linking modes; an unmodified build of the branch point
+/// reports the `<init>$default$2` error five times.
+#[test]
+fn fixtures_ctorgaps_secdefault() {
+    check("ctorgaps_secdefault");
+}
+
+#[test]
+fn scala_library_dual_run_ctorgaps_secdefault() {
+    dual_run_fixture("ctorgaps_secdefault");
+}
+
+/// nsc's own rule, and the one that makes the getter's name unambiguous: a
+/// getter is named after the parameter *position*, so two constructors that
+/// both define defaults want the same `$lessinit$greater$default$2` with
+/// different bodies. Accepted before this slice, which would have handed the
+/// second constructor's caller the first's default with nothing to show for
+/// it. scalac 2.13.16 reports these exact words at the class.
+#[test]
+fn fixtures_ctorgaps_secdefault_bad() {
+    compile_fails_lib(
+        "ctorgaps_secdefault_bad",
+        "in class Two, multiple overloaded alternatives of constructor Two define default arguments.",
+    );
+}
+
+/// A secondary constructor's default cannot name what the class declares:
+/// `new T(1)` has no instance yet. Accepted before this slice *and*
+/// miscompiled -- `f` resolved to the field and the spliced tree read it off
+/// the caller's own `this`, so the fixture's `Main` threw
+/// `ClassCastException: class Main$ cannot be cast to class T` with no
+/// diagnostic. scalac 2.13.16's message, line and column.
+#[test]
+fn fixtures_ctorgaps_secthis_bad() {
+    compile_fails_lib("ctorgaps_secthis_bad", "not found: value f");
+}

@@ -1354,11 +1354,18 @@ underlyingSymbol(sym).fullLocationString + " cannot be accessed " + location + f
 * `directObjectString` spells a module `object C` where it is the direct
   object of the sentence, instead of the `C.type` (`C$` for us) it prints
   everywhere else.
-* A constructor takes `in <owner>` in place of `as a member of <prefix>`. We
-  build that branch too, though nothing reaches it yet: private and protected
-  constructors are still accepted (`neg/sensitive`, `neg/t4987`,
-  `neg/t6601`, `neg/protected-constructors`), which is a missing *check*, not
-  a missing message.
+* A constructor takes `in <owner>` in place of `as a member of <prefix>`. That
+  branch was written here before anything reached it -- private and protected
+  constructors were accepted outright. `agent/intrinsicqual` added the check
+  and closed `neg/sensitive`, `neg/t4987` and `neg/protected-constructors`;
+  `agent/ctorgaps` closed the fourth, `neg/t6601`, which is a separate
+  compilation and needed the *pickle reader* to mark the constructor rather
+  than drop it. All four now reproduce their `.check` sentence.
+
+`agent/ctorgaps` also closed `neg/t7870`, which is not an access test at all
+but the same area: `class C(a: Int = 0, b: Any) { def this(a: Int = 0) = … }`
+is nsc's "multiple overloaded alternatives of constructor C define default
+arguments", and we now report it in nsc's words at nsc's line.
 
 Over the 26 `neg` tests whose `.check` contains `cannot be accessed`, the
 wording score moved **T1/T2/T3 = 0 → 3** (13.6% of the 22 scored) with T0

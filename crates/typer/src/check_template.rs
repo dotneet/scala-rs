@@ -430,6 +430,21 @@ impl Typer {
                 self.type_member_body(stt);
             }
         }
+        // Now that every `def this(...)` in the body has a signature, the
+        // *secondary* constructors owe their own
+        // `$lessinit$greater$default$n` on the companion, for the same reason
+        // the primary does: nothing in this run calls them (the omitted
+        // argument is spliced at the call site) but a separately compiled
+        // caller emits the getter call. The rejection runs first, so the
+        // getter names cannot collide.
+        if !id.is_none() {
+            self.check_ctor_default_overloads(id, tree.span);
+            for stt in body.iter() {
+                if matches!(&stt.kind, TreeKind::DefDef { name, .. } if name == "<init>") {
+                    self.synthesize_secondary_ctor_default_getters(id, stt.sym);
+                }
+            }
+        }
         self.finish_case_apply(id, &paramss_ty, &paramss_ids);
         self.check_type_member_kind_override(id, tree.span);
         self.check_self_conformance(id, tree.span);
