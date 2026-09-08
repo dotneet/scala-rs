@@ -2577,8 +2577,9 @@ predates, all of them `agent/hkunify`'s.
 
 ## The forwarder standing next to the declaration (`agent/catstail`)
 
-**215 -> 200 errors, 73 files unchanged.** Fifteen error locations gone and
-none appeared; gitbucket 393 -> 391 as well. The brief for this slice named
+**215 -> 200 errors on `eb4c9c61`, and 211 -> 196 after merging
+`agent/basetypeseq`; 73 files unchanged either way.** Fifteen error
+locations gone and none appeared; gitbucket 393 -> 391 as well. The brief for this slice named
 six families and asked which of them are genuinely separate. The answer is
 that the largest thing in cats was **none of them**: fifteen lines nobody had
 connected to each other, spread over four files, wearing three different
@@ -2683,16 +2684,21 @@ are rejected at scalac's own 25 and 29.
 
 ### The cost, measured
 
-On the merged tree (`main` at `eb4c9c61`, `agent/gbshape` and
-`agent/gbmapto`): against that same `main` measured on its own, cats
-215 -> **200** / 73 files, gitbucket 393 -> **391** / 83 files, the scala
-library **1551** / 168 unchanged, slick `errors=0 files_with_errors=0
-classes=1490` with **all 1490 class files byte-identical** to `main`'s build
-(`SLICK_OUT` on both binaries, `diff -r` empty). `MODE=b tests/slick_run.sh`
-is `progs=12 ok=12 diff=0 fail=0 attempts=36/36`. `slick_subset.sh` was not
-run: nothing here reaches codegen, and the byte-identical class files say so
-more directly. No new clippy warnings (pickle 0, typer 37, all in untouched
-code).
+Measured twice: on `main` at `eb4c9c61` (`agent/gbshape`, `agent/gbmapto`),
+and again after merging `main` at `3b9a61ed` (`agent/basetypeseq`), each
+time against that same `main` measured on its own. The delta is identical
+in both: cats **-15** (215 -> 200 on the first, 211 -> 196 on the second --
+`agent/basetypeseq` takes four of the same lines), gitbucket **-2**
+(393 -> 391 both times), the scala library **unchanged** (1551 -> 1551, then
+1420 -> 1420), and slick `errors=0 files_with_errors=0 classes=1490` with
+**all 1490 class files byte-identical** to `main`'s build both times
+(`SLICK_OUT` on both binaries, `diff -r` empty). `MODE=b
+tests/slick_run.sh` is `progs=12 ok=12 diff=0 fail=0 attempts=36/36`.
+`slick_subset.sh` was not run: nothing here reaches codegen, and the
+byte-identical class files say so more directly. On the scala/scala corpus
+(`CORPUS_SIZE=full`) `pos 1086 / neg 670 / run 618`, with `losses=0` **and
+no changes at all** against `tests/baselines/corpus-8d4cdde0.tsv`. No new
+clippy warnings (pickle 0, typer 37, all in untouched code).
 
 ### The pickle's linearization is not ordered by derivedness (not fixed)
 
@@ -2787,10 +2793,16 @@ target), and `BitSet`'s `C` is the base-type merge of (1) above --
 
 ### The head after this slice
 
-200 errors in 73 files: **96 `type mismatch`** (73 distinct found/required
-pairs), **61 `no matching overload`**, 22 `no implicit`, 7 `ambiguous
-implicit`. By file: `OptionT.scala` 11, `Kleisli.scala` 10, `Chain.scala` 7,
-`instances/try.scala` 7. The largest single mechanisms, re-clustered:
+200 errors in 73 files on `eb4c9c61` (96 `type mismatch` over 73 distinct
+found/required pairs, 61 `no matching overload`, 22 `no implicit`, 7
+`ambiguous implicit`), and **196 in 73 files** after merging
+`agent/basetypeseq`: **95 `type mismatch`** over **72** distinct pairs, **58
+`no matching overload`**, 22 `no implicit`, 7 `ambiguous implicit`. That
+slice takes `Chain.scala` 1084/1085, `NonEmptyLazyList.scala:378` and
+`NonEmptySeq.scala:294` -- the `found: Seq[A]  required: Seq[A]` shape --
+and nothing else here moves. By file: `OptionT.scala` 11, `Kleisli.scala`
+10, `instances/try.scala` 7, `syntax/either.scala` 6. The largest single
+mechanisms, re-clustered:
 
 * **`SortedMap`/`SortedSet` losing their ordering** (15, and *two* roots, not
   one). The `(implicit Ordering[K2])` overload, diagnosed above with a
