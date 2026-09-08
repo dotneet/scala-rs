@@ -103,6 +103,19 @@ impl CtorAccess {
     pub(crate) fn copy_flags(&self) -> Flags {
         Flags(self.flags.0 & ACCESS_FLAGS.0)
     }
+
+    /// The access the *primary constructor symbol* itself carries.
+    ///
+    /// Unlike `apply_flags` / `copy_flags` this is not a `-Xsource-features`
+    /// question: `class C private ()` means the constructor is private in
+    /// plain 2.13, and the `<init>` symbol has to say so or no access check
+    /// can be made on `new C()`. A secondary `protected def this(…)` already
+    /// arrives with its modifiers on the symbol (`type_def_sig`); the primary
+    /// one is allocated by the namer from the class's `ctor_mods`, which were
+    /// not being read at all.
+    pub(crate) fn ctor_flags(&self) -> Flags {
+        Flags(self.flags.0 & ACCESS_FLAGS.0)
+    }
 }
 
 /// How a case class's `copy` was written: `p.copy(…)` or, inside the class

@@ -446,4 +446,67 @@ The honest diff.
   protected method `m` not permitted because …" explanation for the
   `protected` cases, which we do not print.
 
+- **A `private` or `protected` constructor is access-checked** since
+  `agent/intrinsicqual`. `agent/accessmsg` built nsc's `isClassConstructor`
+  branch of that message and found it unreachable, and the reason was two
+  gaps, not one: the primary constructor's symbol did not carry the modifier
+  the class wrote (`class C private ()` puts it on `ctor_mods`, which the
+  namer was not reading), and `new C(…)` is not a member selection, so
+  `type_select`'s access check never saw an `<init>`. Both are closed.
+  `new C(…)` now reports at nsc's line, with nsc's first line, on nsc's own
+  `neg/sensitive`, `neg/t4987` and `neg/protected-constructors`.
+
+  Four details, each measured rather than assumed:
+
+  * The **prefix for a `new` is the class being constructed**, which is what
+    nsc weighs a `protected` access against. So `class Sub extends Prot("x")`
+    is legal — a parent-constructor call is not a `new` and never reaches the
+    check — while `new Prot("x")` written inside `Sub` is not, and scalac
+    2.13.16 agrees ("prefix type Prot does not conform to class Sub where the
+    access takes place").
+  * nsc drops inaccessible alternatives **before** overload resolution; our
+    pick is made first. Where the class has another constructor this site may
+    call, the check declines to speak rather than refuse a program scalac
+    accepts (`class Mixed(val v: String) { private def this(len: Int) = … }`).
+    The cost is that `neg/protected-constructors`' line 17 gets no diagnostic
+    from us at all, where nsc reports an arity error against the accessible
+    nullary constructor.
+  * The check runs only on a `new` **the program wrote**. Several rewrites
+    build one with `Tree::dummy`, and the access question there belongs to the
+    member they rewrote: `v.copy(x = 2)` on a `case class C private (x: Int)`
+    lowers to `new C(2)`, and nsc asks whether `copy` is accessible — which
+    `case_copy_access_error` already does under
+    `-Xsource-features:case-apply-copy-access` — never whether the constructor
+    is. Reporting there refused `tests/fixtures/xflags_case_access_bad.scala`,
+    which scalac compiles cleanly with no flag.
+  * We still do not print nsc's indented "Access to protected constructor …
+    not permitted because …" explanation, as for every other `protected` case.
+
+  Putting the modifier on the constructor symbol also puts it in the
+  `ScalaSignature`, which is where the change is visible: **four of slick's
+  1490 class files differ, by exactly one byte each**
+  (`slick/compiler/CompilerState`, `slick/basic/ConcurrencyControl` and its
+  companion and `ConnectionArbiter` — the two slick classes with a `private`
+  primary constructor), in the pickled flags of `<init>` and nowhere else. No
+  bytecode, no method access flag and no constant-pool entry moves; the
+  primary constructor is still emitted `ACC_PUBLIC`, as before. That the new
+  byte is the right one has a direct measurement: **real scalac 2.13.16,
+  reading our class file**, accepted `new SepPriv("x")` against the old pickle
+  and refuses it against the new one with its own message — our signature had
+  been telling it the constructor was public
+  (`crates/cli/tests/intrinsicqual.rs`,
+  `real_scalac_reads_the_constructor_as_private_from_our_classfile`).
+
+- **`neg/t6601` is still accepted**, and it is the one of the four the check
+  above does not reach. It is a separate compilation: `PrivateConstructor_1`
+  is compiled to a class file, and `AccessPrivateConstructor_2` reads it back.
+  Constructor privacy does not survive that round trip — the class file emits
+  `<init>` as `ACC_PUBLIC`, and neither the classfile reader nor the pickle
+  reader puts `PRIVATE` on the `<init>` it supplies. Closing it is a change to
+  `crates/typer/src/pickle_supply.rs` (whose `is_visible` currently *hides*
+  private members outright, so the constructor would have to be supplied and
+  marked rather than dropped, or the access error would become "no such
+  constructor"). That is the supply seam `.agent-brief.md` singles out, and it
+  wants its own slice.
+
 It is not a replacement for scalac. It is a reimplementation of a subset.
