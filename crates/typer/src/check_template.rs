@@ -2143,7 +2143,15 @@ impl Typer {
         // NominalType => n.sourceNominalType; case _ => this }`, which nsc
         // accepts and this counted as no recursive call at all.
         let nullary = self.st.get(tree.sym).paramss.is_empty();
-        count_tailrec_calls(rhs, tree.sym, nullary, true, &mut tail, &mut nontail);
+        count_tailrec_calls(
+            &self.st,
+            rhs,
+            tree.sym,
+            nullary,
+            true,
+            &mut tail,
+            &mut nontail,
+        );
         if nontail > 0 {
             self.error(
                 tree.span,
