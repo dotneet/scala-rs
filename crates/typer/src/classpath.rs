@@ -1252,7 +1252,7 @@ pub fn java_simple_name(internal: &str) -> String {
     simple.to_string()
 }
 
-fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
+pub(crate) fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
     let trimmed = internal.trim_end_matches('$');
     if let Some((outer, _)) = trimmed.rsplit_once('$') {
         return find_or_stub_java_class(st, outer);
