@@ -347,3 +347,97 @@ object Main {
     );
     let _ = fs::remove_dir_all(out.parent().unwrap());
 }
+
+/// The shape that is actually in a measured corpus.
+///
+/// `slick/util/TreePrinter.scala` declares its own `print(n, out)` and writes
+/// through the `PrintWriter` it is handed. Before the fix, `get` called
+/// `Predef.print(n)` -- `gen_predef_println` reads `args[0]` and drops the
+/// rest, so the writer was never even constructed -- and `get` returned the
+/// empty string while the dump went to the console. It compiled, it verified,
+/// and `tests/slick_measure.sh` reported `errors=0 classes=1490` throughout.
+///
+/// Expected output is real scalac 2.13.16's on the same source.
+#[test]
+fn a_writer_passed_as_an_argument_is_written_to() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile(
+        "treeprinter",
+        r#"
+import java.io.{PrintWriter, StringWriter}
+
+case class TreePrinter(name: String = "") {
+  def get(n: String): String = {
+    val buf = new StringWriter
+    print(n, new PrintWriter(buf))
+    buf.getBuffer.toString
+  }
+
+  def print(n: String, out: PrintWriter): Unit = {
+    out.print(name)
+    out.println(n)
+    out.flush()
+  }
+}
+
+object Main {
+  def main(args: Array[String]): Unit = {
+    val s = TreePrinter("tree: ").get("body")
+    java.lang.System.out.println("[" + s.replace("\n", "\\n") + "]")
+  }
+}
+"#,
+        &["--scala-library", jar_s],
+    );
+    let (stdout, _) = run_java(&out, Some(jar_s));
+    assert_eq!(
+        stdout, "[tree: body\\n]\n",
+        "the PrintWriter argument must receive the output"
+    );
+    let _ = fs::remove_dir_all(out.parent().unwrap());
+}
+
+/// `Console` is not `Predef` either, and `Console.err` is the idiomatic Scala
+/// spelling of the stream the defect was losing.
+///
+/// `Predef.println` delegates to `Console.println`, so the hijack of
+/// `Console.println` itself printed the right text and is invisible; the
+/// `Console.err` line is not. Expected output is real scalac 2.13.16's.
+#[test]
+fn console_err_println_goes_to_stderr() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile(
+        "console",
+        r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    Console.println("c1")
+    Console.print("c2")
+    Console.println()
+    Console.err.println("c3")
+    Console.out.println("c4")
+    scala.Console.println("c5")
+  }
+}
+"#,
+        &["--scala-library", jar_s],
+    );
+    let (stdout, stderr) = run_java(&out, Some(jar_s));
+    assert_eq!(stdout, "c1\nc2\nc4\nc5\n", "stdout");
+    assert_eq!(stderr, "c3\n", "Console.err must reach stderr");
+    let _ = fs::remove_dir_all(out.parent().unwrap());
+}
