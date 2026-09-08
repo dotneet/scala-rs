@@ -1816,6 +1816,117 @@ moved three times since: the
 the 11 `pos`/`run` gains it names all reproduce on unmodified `main`. The
 ledger needs re-taking; none of the 15 is this slice's.
 
+## The `agent/arrayelem` slice: `new Array(n)` reads its element from `pt`
+
+**917 errors in 146 files → 875 in 146**, measured on this branch against the
+`e76b0ebf` baseline. 42 removed, **none added** -- the two error sets differ
+only by deletions, checked line by line and not by count. Every other target
+is unchanged to the error (gitbucket 270 / 79, cats 185 / 71, slick
+`errors=0 classes=1490`), and slick's 1490 class files are **byte-identical**
+(`SLICK_OUT` on the pre-fix and post-fix binaries, `diff -r` empty).
+
+Not one `new Array(` is left in the library log.
+
+### The element is the allocation, not a type argument
+
+`new Array(0)` was `no matching overload for constructor Array` in jar mode
+and `found: Array[Nothing]` against the library's own sources, and it is
+tempting to file that with the other inference gaps. It is not one of them:
+`Array` erases to a `newarray`/`anewarray` of a *specific* JVM type, so the
+element decides which array class is allocated. Getting it wrong is an
+`ArrayStoreException` at run time and **not a compile error** -- an
+`Array[Nothing]` is an `Object[]` and will happily accept a `checkcast` to
+`String[]` that fails only at the first store.
+
+So the fixtures run rather than compile. `arrayelem` builds one array per
+shape the library writes -- a `val` with an ascription, an argument position,
+an assignment, a nested element, a constructor argument -- stores into each,
+reads back, and prints `getClass.getName`; the expected output is real scalac
+2.13.16's, and the emitted `newarray int` / `anewarray java/lang/String` /
+`anewarray "[Ljava/lang/Object;"` match its bytecode instruction for
+instruction.
+
+### What nsc actually does, measured rather than recalled
+
+Four facts, each from a scalac 2.13.16 run:
+
+* `val a: Array[Int] = new Array(3)` → `newarray int`, and
+  `take(new Array(2))` at `(Array[String])Int` → `anewarray
+  java/lang/String`. The element comes from the expected type and the
+  allocation is direct.
+* `def mk[K](): Cell[K] = new Cell[K](new Array(0))` → **`cannot find class
+  tag for element type K`**. The element is read off the expected type
+  *first*, and only then does the `ClassTag` requirement apply to it. This is
+  the negative case, and it is what tells you the inference happened.
+* `val a = new Array(3)`, with nothing at all to read from, **compiles**. nsc
+  solves the element to `Nothing` and builds it as
+  `ClassTag.Nothing.newArray(3)`, whose runtime class is `[Ljava.lang.Object;`
+  -- so "nothing to infer from" is not the negative case. scala-rs reaches the
+  same array class the other way, by the `anewarray java/lang/Object` that
+  `jvm_desc_array_elem` already gives `Nothing`, which is also what scalac
+  itself emits for a written `new Array[Nothing](3)`.
+* `new Array[Int](10, 10)` and `new Array[Int]` are both rejected on arity,
+  and nsc names `Array[T]` when the element was inferred and `Array[Int]` when
+  it was written -- the arity check runs *before* instantiation.
+
+### Three things had to be true at once
+
+1. **`SymbolTable::is_array_class`, not `array_sym`.** When the library's own
+   `src/library/scala/Array.scala` is under compilation,
+   `shadow_supplied_by_source` puts the source class into every scope and
+   deliberately leaves `array_sym` pointing at the prelude's symbol, because
+   that id is written into prelude signatures still in use. A rule that asked
+   about `array_sym` alone was correct against the jar and answered "no" for
+   all 64 of the library's own. This is why the first fix measured **917 →
+   917**.
+2. **The prefix carries the type, not just the node.** `gen_new` reads
+   `tpt.ty` to choose between `newarray` and `new`. Writing the element only
+   onto the `New` node compiled and then emitted `new "[java/lang/Object"`
+   followed by an `invokespecial` of a constructor no array class has.
+3. **An argument position has to ask twice.** nsc leaves the constructor's `T`
+   undetermined until the argument is checked against the parameter; this
+   compiler solves it at the `New`, so `new CNode[K, V](0, new Array(0), gen)`
+   (`concurrent/TrieMap.scala`) needed a re-type once the parameter type was
+   known (`Typer::array_new_wants`). Two library sites, and the shape the
+   brief singled out.
+
+   The re-type must be **monotone**: it keeps an element an earlier pass
+   already found. A block is typed once for its value and once for its
+   statements, and reading `pt` unconditionally on the second pass overwrote
+   the `AnyRef` that `a1 = new Array(WIDTH)` (`immutable/Vector.scala`) had
+   just been given. That version measured **895** -- worse than the 877 the
+   step before it -- and the 18 it put back were all in `Vector.scala`.
+
+### The arity hole the corpus found
+
+`neg/multi-array` went from pass to fail, and it was the slice's own doing —
+but the defect was older. The `new Array…` path typed every argument as an
+`Int` and never counted them, so `new Array[Int](10, 10)` was accepted
+outright on the *pre-fix* binary too. It looked fine only because the
+un-annotated `new Array(10, 10)` was rejected further down for matching no
+constructor, which is a different diagnosis and stopped being reached once the
+element could be inferred. `new Array[Int]`, with no argument list at all,
+never became an `Apply` and had the same hole one node up. Both are now
+nsc's own wording, `Array[T]` / `Array[Int]` distinction included.
+
+Worth noting for whoever audits the next `neg` regression: the loss the gate
+reported was **not** the audited `neg/name-lookup-stable`, which does not
+appear against `corpus-3fd80269.tsv` at all. Check the list, not the count.
+
+### The head after this wave (875)
+
+`type mismatch` 393, `no matching overload` 147, `X is not a member of Y` 143,
+`no matching overload for constructor` 31, `not found: value` 27, `ambiguous
+overload` 18, `illegal inheritance` 11, `incompatible type in overriding` 9.
+The `is not a member of` receivers are now `CC` (18), `T2` (17), `Array` (17),
+`String` (10), `T1` (9) -- the prelude collision named at the top of this
+file, unmoved. The largest `type mismatch` shapes are `found: T required: A`
+(13, the `Iterator.empty.next()` item already on the list), `found: null
+required: A` (8), and `found: Array[AnyRef] required: Array[Any]` /
+`found: Array[A] required: Array[Any]` (6 each) -- those last two are
+**variance**, not construction: `Array` is invariant and the receiver these
+appear on is `ArrayOps`, so they are a separate question from this slice's.
+
 ## Running it
 
 ```
