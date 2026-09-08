@@ -2056,12 +2056,19 @@ already right.
 
 ## The `agent/arrayelem` slice: `new Array(n)` reads its element from `pt`
 
-**917 errors in 146 files → 875 in 146**, measured on this branch against the
-`e76b0ebf` baseline. 42 removed, **none added** -- the two error sets differ
-only by deletions, checked line by line and not by count. Every other target
-is unchanged to the error (gitbucket 270 / 79, cats 185 / 71, slick
-`errors=0 classes=1490`), and slick's 1490 class files are **byte-identical**
-(`SLICK_OUT` on the pre-fix and post-fix binaries, `diff -r` empty).
+**917 errors in 146 files → 875 in 146** at the branch point (`e76b0ebf`).
+42 removed, **none added** -- the two error sets differ only by deletions,
+checked line by line and not by count. Every other target is unchanged to the
+error (gitbucket 270 / 79, cats 185 / 71, slick `errors=0 classes=1490`), and
+slick's 1490 class files are **byte-identical** (`SLICK_OUT` on the pre-fix
+and post-fix binaries, `diff -r` empty).
+
+Merged with `main` at `fd65f6f7` (`agent/nameamb`, `agent/intrinsicqual`,
+`agent/basetypemeet`), the same **-42**: `main`'s 912 / 145 becomes **870 /
+145**, so this wave and `agent/basetypemeet`'s -5 do not overlap. cats and
+gitbucket are `main`'s own numbers there (182 / 71 and 270 / 79), and slick's
+1490 class files are byte-identical against that `main` too -- re-checked on
+the merged tree, not carried over from the branch point.
 
 Not one `new Array(` is left in the library log.
 
