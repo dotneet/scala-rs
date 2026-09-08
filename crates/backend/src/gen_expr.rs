@@ -717,6 +717,7 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
                 // emits (`invokevirtual id; pop`).
                 if unit_stat_leaves_ref(tree, ctx.st)
                     || (ctx.library_abi && unit_call_leaves_ref(tree, ctx.st))
+                    || discarded_predef_poly(tree, ctx)
                 {
                     asm.pop();
                 }
@@ -2131,6 +2132,70 @@ fn predef_poly_name(fun: &Tree, ic: Intrinsic) -> Option<&str> {
         Intrinsic::Identity | Intrinsic::Locally | Intrinsic::Implicitly
     );
     (is_predefs || fun.sym.is_none()).then_some(name)
+}
+
+/// The other half of `predef_poly_name`: did the code `gen_apply` emitted for
+/// this **discarded** `Unit`-typed `identity` / `locally` / `implicitly` call
+/// leave a value on the stack?
+///
+/// `gen_predef_poly` used to drop its own `Unit` result, which underflowed the
+/// stack wherever the value was actually wanted:
+/// `println(identity(()))` compiled and threw
+/// `VerifyError: Operand stack underflow`, because `gen_predef_println` had
+/// been told by `unit_leaves_boxed_ref` that the argument left a reference.
+/// nsc keeps the value and drops it in statement position instead, so this is
+/// where it now goes.
+///
+/// The call head is resolved exactly the way `gen_apply` resolves it —
+/// `flatten_apply_owned` over `peel_fun`, then the callee's `Intrinsic` — so
+/// the emitter that pushes and the discard that pops cannot come to different
+/// conclusions about *which* calls this covers. What each mode pushes is a
+/// separate question, and the arms below mirror the emitters one for one:
+/// under `library_abi` `gen_predef_poly` invokes `(Object)Object` and always
+/// leaves a value, while the private runtime inlines the intrinsic and leaves
+/// whatever the argument left.
+///
+/// The private half was leaking before this too, in the mirror-image way: a
+/// discarded `identity(())` there is `getstatic BoxedUnit.UNIT` with nothing
+/// after it, because erasure boxes the argument and `unit_stat_leaves_ref`
+/// refuses every symbol that carries an `Intrinsic`. Straight-line code got
+/// away with it; `if (b) identity(()) else side()` did not
+/// (`VerifyError: Inconsistent stackmap frames`).
+fn discarded_predef_poly(tree: &Tree, ctx: &EmitCtx) -> bool {
+    match &tree.kind {
+        TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => {
+            discarded_predef_poly(expr, ctx)
+        }
+        TreeKind::Apply { fun, args } => {
+            let (fun, args) = flatten_apply_owned(peel_fun(fun), args);
+            let ic = if fun.sym.is_none() {
+                Intrinsic::None
+            } else {
+                ctx.st.get(fun.sym).intrinsic
+            };
+            let Some(name) = predef_poly_name(fun, ic) else {
+                return false;
+            };
+            if ctx.library_abi {
+                return true;
+            }
+            match (name, args.first()) {
+                // `gen_apply`'s `Locally` arm invokes the thunk's
+                // `apply()Ljava/lang/Object;` and pops the result itself when
+                // the result is `Unit`, so nothing is left to drop here.
+                ("locally", Some(a)) if matches!(a.ty, Type::Function { .. }) => false,
+                // `Identity` / `Implicitly` / a non-thunk `locally` are a bare
+                // `gen_expr` of the argument: they leave exactly what it left.
+                (_, Some(a)) => unit_leaves_boxed_ref(a, ctx.st),
+                // Nilary `identity` falls back to `gen_receiver`, which pushes
+                // the qualifier; the other two push `push_default`, and
+                // `Unit`'s default is nothing at all.
+                ("identity", None) => true,
+                (_, None) => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn gen_apply(

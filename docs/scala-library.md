@@ -1901,6 +1901,92 @@ and is a `VerifyError: Bad type on operand stack`. Also pre-existing, also
 unrelated to access: it reproduces with no modifier on the secondary
 constructor at all.
 
+## The `agent/unitpop` slice: a `Unit` intrinsic and its discard disagreeing
+
+The first of the two left above, closed. `gen_call::gen_predef_poly` ended
+
+```rust
+if is_unit_like(result_ty) { asm.pop(); }
+else { maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty)); }
+```
+
+`Unit` is the one result where the erased `(Object)Object` descriptor still
+returns a reference — `Predef.identity(())` hands back `BoxedUnit.UNIT` — so
+the `pop` always fired at `identity(())`. Dropping it is right for a
+**statement** and wrong for an **argument**: `gen_predef_println` had already
+been told by `unit_leaves_boxed_ref` that its argument left a reference, so it
+emitted no `BoxedUnit` of its own, and `println(identity(()))` handed
+`scala/Predef$.println` an empty stack (`VerifyError: Operand stack
+underflow`). nsc leaves the value — `javap` on real scalac 2.13.16 reads
+`invokevirtual identity; invokevirtual println`, with no cast between them —
+and lets the generic statement-position discard take it. So does this now:
+`gen_predef_poly` always leaves what its descriptor promises, and
+`gen_expr::discarded_predef_poly` pops it in `gen_stat`, beside
+`unit_stat_leaves_ref` and `unit_call_leaves_ref`. It resolves the call head
+the way `gen_apply` resolves it (`flatten_apply_owned` over `peel_fun`, then
+`predef_poly_name` on the callee's `Intrinsic`), so the emitter that pushes
+and the discard that pops cannot disagree about which calls are covered.
+
+**The private runtime was failing the mirror image of the same disagreement**,
+and the same predicate closes it. `--no-scala-library` inlines the intrinsic
+(`gen_apply`'s `Intrinsic::Identity` arm is a bare `gen_expr` of the
+argument), erasure boxes a `Unit` argument, and `unit_stat_leaves_ref` refuses
+every symbol that carries an `Intrinsic` — so a discarded `identity(())` was
+`getstatic BoxedUnit.UNIT` with nothing after it. Straight-line code merely
+leaked an operand slot, which is why it survived; the first control-flow join
+after it did not:
+
+```scala
+def f(b: Boolean): Unit = if (b) identity(()) else side("f")
+// VerifyError: Inconsistent stackmap frames at branch target 18
+```
+
+A user-defined `def myid[A](a: A): A = a` in the same position was already
+right (`getstatic UNIT; invokevirtual myid; pop`) — only the intrinsic was
+exempt. `discarded_predef_poly` therefore mirrors the emitters arm for arm:
+under `library_abi` the `(Object)Object` invoke always leaves a value, while
+the private runtime leaves whatever the argument left
+(`unit_leaves_boxed_ref`), except a `locally { … }` thunk, whose `Unit` result
+that arm already pops where it emits it.
+
+**Only running the program catches any of this.** Both shapes compile clean in
+both modes; the classfile is well-formed and `-Xverify:all` or execution is
+the first thing that objects. `tests/fixtures/unitpop_intrinsic.scala` holds
+both positions in one program — `identity(())` as an argument, and
+`identity(())` / `locally { … }` discarded as a statement, each followed by a
+branch — plus the same three intrinsics at a non-`Unit` type so the two paths
+cannot drift, and a discarded intrinsic in an `if` branch, a `match` arm, a
+`try` body, a `while` body and a whole method body. It runs under
+`-Xverify:all` in both modes and matches real scalac 2.13.16's output line for
+line. An unmodified build of the branch point compiles it in both modes and
+fails to run it in both: `Operand stack underflow` at `Main$.a3` with the jar,
+`Inconsistent stackmap frames` at `Main$.s7` without it. The case commented
+out in `crates/cli/tests/intrinsicqual.rs` is enabled.
+
+**slick's 1490 class files are byte-identical** between a pre-fix and a
+post-fix binary (`SLICK_OUT=… tests/slick_measure.sh` on both, `diff -r`, exit
+0): nothing in slick's 184 files calls `identity` / `locally` / `implicitly`
+at `Unit`. `errors=0 files_with_errors=0 classes=1490` on both.
+
+### Found here, not fixed here
+
+`new Sec("abcd")` — the second defect left above — is **not** the same
+mechanism and is left reduced. On this build the `invokespecial` descriptor is
+in fact correct; what is wrong is the *argument*, which arrives already
+adapted to the **primary** constructor's parameter type:
+
+```text
+ldc "abcd"; checkcast java/lang/Integer; invokevirtual Integer.intValue;
+invokestatic Integer.valueOf; invokespecial Sec."<init>":(Ljava/lang/String;)V
+```
+
+That `$unbox`/`$box` pair is in the tree before the backend sees it —
+`gen_new` takes its parameter types from `ctor_param_tys`, which reads the
+selected `<init>`'s own `Type::Method` and is right here — so the defect is in
+the typer's overload resolution for `new`, which types the arguments against
+the primary constructor while selecting the secondary one for the call.
+Reproduces in both modes, byte-identical before and after this slice.
+
 ## Running it
 
 ```

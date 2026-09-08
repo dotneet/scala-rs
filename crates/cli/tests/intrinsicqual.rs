@@ -348,15 +348,18 @@ object Main {
     println(implicitly[String])
     println(identity(7))
     println(locally(8))
-    // `println(identity(()))` belongs here and is left out: it is a
-    // pre-existing `VerifyError: Operand stack underflow` on an unmodified
-    // build of the branch point too. `gen_predef_poly` pops its own result
-    // when the result type is `Unit`, which is right in statement position
-    // and wrong when the value is an argument. Reported, not fixed here.
+    // Enabled by `agent/unitpop`, which fixed the defect this note named:
+    // `gen_predef_poly` popped its own result whenever the result type was
+    // `Unit`, which is right in statement position and wrong when the value
+    // is an argument, so this line was `VerifyError: Operand stack underflow`
+    // on an unmodified build of the branch point. It now leaves the value,
+    // as nsc does, and `gen_expr::discarded_predef_poly` drops it where it is
+    // discarded. See `crates/cli/tests/unitpop.rs`.
+    println(identity(()))
   }
 }
 "#;
-    let expect = "k\nl\nm\nn\no\nev\n7\n8\n";
+    let expect = "k\nl\nm\nn\no\nev\n7\n8\n()\n";
     for (tag, extra, cp) in both_modes() {
         let flags: Vec<&str> = extra.iter().map(String::as_str).collect();
         let out = compile(&format!("predefpoly-{tag}"), src, &flags);
