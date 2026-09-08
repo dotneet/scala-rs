@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `d0c89fc1` |
+| commit | `80c660c0` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-two slices have merged this session**, in eighteen composed gates. From
+**Sixty-three slices have merged this session**, in nineteen composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -40,6 +40,7 @@ coordinator measured the merged tree each time, not the branches.
 | `d39d5a65` | `javavarargs` | -> **265** | 182 |
 | `aa38b9e9` | `tuplepat` | 265 | 182 -> **177** |
 | `d0c89fc1` | `ctorgaps2` | 265 | 177 |
+| `80c660c0` | `hkfield` | 265 | 177 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -645,6 +646,32 @@ which a primary `(Int, String)` accepts exactly, and prints `m` where scalac
 prints `m/m2`. nsc selects on the first written clause; holding the pick to the
 same alternative set the fold measured its arity against is what makes the rule
 safe.
+
+## Gate nineteen: the ledger is unchanged and that is the point
+
+`agent/hkfield` moved no compile measure and no corpus status. It could not:
+the change is in the backend, and every measure that counts errors stops before
+code is emitted. What it closed is a `VerifyError` -- a member declared at a
+**bounded** type parameter erases to its bound, not to `Object`, and both
+erased-load sites tested for the literal `Ljava/lang/Object;`. The class files
+were emitted with no diagnostic and the JVM threw the method out at run time.
+
+Briefed as higher-kinded, it is not: the slice found the first-order
+`class BHolder[T <: Boxy[Int]](val f: T)` broken identically, and higher-kinded
+shapes only looked special because an unbounded parameter erases to `Object`.
+The decidable question was already written one function away, on the method
+*result* path (`is the declared erasure known to conform to what we want?`),
+which is why `def m: F[A]` was correct while the field beside it was not.
+
+The second site was found by attacking neighbouring shapes after the first went
+green: a case class's synthetic `unapply` has no body, so the match reads the
+constructor field directly, through its own copy of the same `Object`-only
+test. The fixture's pattern case had been passing through the `Select` path,
+so fixing one site left the other standing and silent.
+
+Its test reads `javap -c` and asserts not only that a `checkcast` appears where
+scalac puts one, but that **none appears** where scalac emits none -- an
+unnecessary cast is a divergence too, and running green does not show it.
 
 ## What is deliberately red
 
