@@ -2285,19 +2285,16 @@ impl<'a> Pickler<'a> {
             param_refs.push(self.add(VALSYM, pbody));
         }
         let ret_ref = self.pickle_type(&ret);
-        let info = if param_refs.is_empty() {
-            // nsc NullaryMethodType = POLYtpe(restpe) with no tparams.
-            let mut pt = Vec::new();
-            write_nat_to(&mut pt, ret_ref);
-            self.add(POLYTPE, pt)
-        } else {
-            let mut mt = Vec::new();
-            write_nat_to(&mut mt, ret_ref);
-            for p in param_refs {
-                write_nat_to(&mut mt, p);
-            }
-            self.add(METHODTPE, mt)
+        // The accessor's type is the accessed method's, clauses included: a
+        // `super.m()` accessor for `def m(): T` has to take the empty list too,
+        // or nsc reads the trait as declaring a different member than the class
+        // implementing it.
+        let acc_paramss: Vec<Vec<Type>> = match &self.st.get(method_id).ty {
+            Type::Method { paramss, .. } => paramss.clone(),
+            _ => Vec::new(),
         };
+        let sizes = self.clause_sizes(method_id, &acc_paramss, param_refs.len(), acc_name);
+        let info = self.nest_method_type(ret_ref, &param_refs, &sizes);
         // METHOD | PRIVATE | SUPERACCESSOR. `private` is not
         // decoration: `RefChecks` walks the *non-private* deferred members of
         // a class and would demand `class S needs to be abstract. Missing
@@ -2352,6 +2349,73 @@ impl<'a> Pickler<'a> {
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
         self.current_owner = saved;
+    }
+
+    /// The parameter *clauses* a method pickles as, as parameter counts.
+    ///
+    /// An empty result is nsc's `NullaryMethodType` -- `def f: T`. That is a
+    /// different type from `def f(): T`, which is a `MethodType` over an empty
+    /// list, and a reader holds the call site to the difference: scalac
+    /// answers `Empty does not take parameters` when a caller writes `f()`
+    /// against the first. Collapsing the two made every `def f(): T` we
+    /// emitted uncallable with the parentheses its own source wrote.
+    fn clause_sizes(
+        &self,
+        method_id: SymbolId,
+        paramss: &[Vec<Type>],
+        nparams: usize,
+        meth_name: &str,
+    ) -> Vec<usize> {
+        // `uncurry` recorded the source's clauses on the symbol before joining
+        // them into one; the symbol's own type still carries them only when
+        // uncurry left it alone. Either is usable only if it accounts for
+        // every parameter -- `lambda_lift` splices captured values into the
+        // first clause afterwards, and a synthesized default getter's
+        // parameters are a *prefix* of the method the symbol was copied from.
+        let recorded = &self.st.get(method_id).pickle_clauses;
+        let mut sizes: Vec<usize> =
+            if !recorded.is_empty() && recorded.iter().sum::<usize>() == nparams {
+                recorded.clone()
+            } else {
+                paramss.iter().map(|c| c.len()).collect()
+            };
+        if sizes.iter().sum::<usize>() != nparams {
+            sizes = if nparams == 0 {
+                Vec::new()
+            } else {
+                vec![nparams]
+            };
+        }
+        // A constructor always takes a list, even an empty one: there is no
+        // parameterless constructor for nsc to read back.
+        if sizes.is_empty() && meth_name == "<init>" {
+            sizes.push(0);
+        }
+        sizes
+    }
+
+    /// `restpe` wrapped in one `METHODtpe` per clause, or a `POLYtpe` with no
+    /// type parameters when there is no clause at all.
+    fn nest_method_type(&mut self, ret_ref: u32, param_refs: &[u32], sizes: &[usize]) -> u32 {
+        if sizes.is_empty() {
+            // nsc NullaryMethodType = POLYtpe(restpe) with no tparams.
+            let mut pt = Vec::new();
+            write_nat_to(&mut pt, ret_ref);
+            return self.add(POLYTPE, pt);
+        }
+        let mut info = ret_ref;
+        let mut end = param_refs.len();
+        for &n in sizes.iter().rev() {
+            let start = end - n;
+            let mut mt = Vec::new();
+            write_nat_to(&mut mt, info);
+            for p in &param_refs[start..end] {
+                write_nat_to(&mut mt, *p);
+            }
+            info = self.add(METHODTPE, mt);
+            end = start;
+        }
+        info
     }
 
     fn pickle_method(&mut self, method_id: SymbolId, owner_ref: u32, _this_tpe: u32) -> u32 {
@@ -2416,24 +2480,8 @@ impl<'a> Pickler<'a> {
         } else {
             self.pickle_type(&ret)
         };
-        let mut info = if params.is_empty() && meth_name != "<init>" {
-            // nsc NullaryMethodType = POLYtpe(restpe) with no tparams.
-            let mut pt = Vec::new();
-            write_nat_to(&mut pt, ret_ref);
-            self.add(POLYTPE, pt)
-        } else {
-            // One `METHODtpe`, because `uncurry` has already flattened the
-            // parameter *lists* off the symbol by the time anything is
-            // pickled: `def bind(fa)(f)` reaches here as `bind(fa, f)` and the
-            // original shape is gone. So it pickles as one list, and a reader
-            // -- scalac included -- sees `bind(fa, f)`. See README Remaining.
-            let mut mt = Vec::new();
-            write_nat_to(&mut mt, ret_ref);
-            for p in param_refs {
-                write_nat_to(&mut mt, p);
-            }
-            self.add(METHODTPE, mt)
-        };
+        let clause_sizes = self.clause_sizes(method_id, &paramss, params.len(), &meth_name);
+        let mut info = self.nest_method_type(ret_ref, &param_refs, &clause_sizes);
         if !meth_tparams.is_empty() {
             let mut tpref = Vec::new();
             // nsc POLYtpe = restpe, {tparams}
@@ -3614,21 +3662,25 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             params: first_params,
         }) = entries.get(rest as usize)
         {
-            // Constructors are pickled as a method type per source parameter
-            // clause.  The classpath ABI needs the flattened JVM parameter
-            // order, but the old subset reader kept only the first clause;
-            // that dropped defaults from a curried constructor entirely.
+            // A method is pickled as one method type per source parameter
+            // clause. This subset reader models a member as one flat list --
+            // the classpath ABI's JVM parameter order -- so every clause has
+            // to be joined onto it. Keeping only the first left the *result*
+            // pointing at the next clause's `METHODtpe`, which `type_of` has
+            // no reading for and answers `Any` to: `def cur(a: Int)(b: Int)`
+            // came back as `cur(a: Int): Any` and `cur(1)(2)` reported "value
+            // apply is not a member of Any". It only ever showed on a
+            // constructor before, because that was the one case with the
+            // loop.
             let mut params = first_params.clone();
             let mut ret = *first_ret;
-            if mname == "<init>" {
-                while let Some(Entry::MethodTpe {
-                    ret: next_ret,
-                    params: next_params,
-                }) = entries.get(ret as usize)
-                {
-                    params.extend(next_params.iter().copied());
-                    ret = *next_ret;
-                }
+            while let Some(Entry::MethodTpe {
+                ret: next_ret,
+                params: next_params,
+            }) = entries.get(ret as usize)
+            {
+                params.extend(next_params.iter().copied());
+                ret = *next_ret;
             }
             let mut param_names = Vec::new();
             let mut param_types = Vec::new();

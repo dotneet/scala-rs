@@ -241,3 +241,102 @@ class Outer {
     // binds `Outer.Cfg` from is there too.
     assert!(outer.1.iter().any(|n| n == "Cfg"), "{found:?}");
 }
+
+/// `def f(): T` and `def f: T` are two different types, and the pickle has to
+/// keep them apart.
+///
+/// nsc writes the first as a `METHODtpe` over an empty parameter list and the
+/// second as a `POLYtpe` with no type parameters (`NullaryMethodType`), and
+/// holds the call site to the difference: `f()` against the second is
+/// `Int does not take parameters`. We used to write both as the `POLYtpe`, so
+/// every zero-argument method we emitted -- a zero-field case class's
+/// `apply()` included -- was uncallable with the parentheses its own source
+/// wrote.
+#[test]
+fn an_empty_parameter_list_is_not_a_nullary_method() {
+    let sigs = sigs_of(
+        r#"
+trait Ord[A]
+case class Empty()
+class Zero {
+  def run(): Int = 1
+  def value: Int = 2
+  def withImplicit()(implicit ord: Ord[Int]): Int = 0
+  def curried(a: Int)(b: Int): Int = a + b
+  def generic[A](a: A)(): Int = 0
+}
+"#,
+    );
+    let zero = sigs
+        .iter()
+        .find(|c| c.full_name == "Zero" && !c.is_module)
+        .expect("Zero");
+    assert_eq!(render(&zero.member("run").expect("run").ty), "()scala.Int");
+    assert_eq!(
+        render(&zero.member("value").expect("value").ty),
+        "=> scala.Int"
+    );
+    // The clauses `uncurry` joins off the symbol are pickled the way nsc
+    // pickles them, which is before uncurry runs: nested `METHODtpe`s.
+    assert_eq!(
+        render(&zero.member("withImplicit").expect("withImplicit").ty),
+        "()(implicit ord: Ord[scala.Int])scala.Int"
+    );
+    assert_eq!(
+        render(&zero.member("curried").expect("curried").ty),
+        "(a: scala.Int)(b: scala.Int)scala.Int"
+    );
+    assert_eq!(
+        render(&zero.member("generic").expect("generic").ty),
+        "[A](a: A)()scala.Int"
+    );
+    // The zero-field case class, whose `apply()` is what real scalac rejected.
+    let empty_obj = sigs
+        .iter()
+        .find(|c| c.full_name == "Empty" && c.is_module)
+        .expect("Empty module class");
+    assert_eq!(
+        render(&empty_obj.member("apply").expect("apply").ty),
+        "()Empty"
+    );
+    let empty = sigs
+        .iter()
+        .find(|c| c.full_name == "Empty" && !c.is_module)
+        .expect("Empty class");
+    assert_eq!(render(&empty.member("copy").expect("copy").ty), "()Empty");
+}
+
+/// A default getter with no preceding clause is nullary, like nsc's.
+///
+/// Pickled as `copy$default$1()` instead, real scalac accepts the class file
+/// but warns "Auto-application to `()` is deprecated" at every call that
+/// omits a `copy` argument -- and Scala 3 would eta-expand it instead.
+#[test]
+fn a_default_getter_with_no_preceding_clause_is_nullary() {
+    let sigs = sigs_of(
+        r#"
+case class Pair(a: Int, b: Int)
+class Curried { def f(a: Int)(b: Int = a): Int = a + b }
+"#,
+    );
+    let pair = sigs
+        .iter()
+        .find(|c| c.full_name == "Pair" && !c.is_module)
+        .expect("Pair");
+    for n in ["copy$default$1", "copy$default$2"] {
+        assert_eq!(
+            render(&pair.member(n).unwrap_or_else(|| panic!("{n}")).ty),
+            "=> scala.Int",
+            "{n}"
+        );
+    }
+    // A later clause's getter does take the clauses before it.
+    let curried = sigs
+        .iter()
+        .find(|c| c.full_name == "Curried" && !c.is_module)
+        .expect("Curried");
+    assert_eq!(
+        render(&curried.member("f$default$2").expect("f$default$2").ty),
+        "(a: scala.Int)scala.Int"
+    );
+}
