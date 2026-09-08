@@ -1081,6 +1081,34 @@ No error kind in the library log went **up**, and no new kind appeared — which
 is unusual for a cascade fix and is worth saying, because it means none of the
 87 was hiding a further error.
 
+### The four `neg` corpus losses, audited
+
+`tests/verify_merge.sh` reports `VERDICT=FAIL` on this branch for
+`corpus losses=4`. The corpus moved `pos 1089 → 1094`, `run 618 → 621`,
+`neg 674 → 670`. All four `neg` losses are the same thing: the test had been
+"passing" on an error that is not in its `.check` at all, produced by one of
+the three bugs above. Compiled with a build of the branch point and with this
+one, side by side:
+
+| test | what scalac reports | what we reported before | now |
+|---|---|---|---|
+| `anytrait` | 3 × `field/statement not allowed in universal trait` (3, 5, 9) | `recursive value x needs type`; `value apply is not a member of 1` | clean |
+| `name-lookup-stable` | 2 × `reference to PrimaryKey is ambiguous` (15, 17) | `no matching overload for Nothing with arguments (PrimaryKey$)` | clean |
+| `t8002-nested-scope` | `method x in class C cannot be accessed … from object C` (8) | `value x is not a member of C$` | clean |
+| `valueclasses-impl-restrictions` | 3 × `implementation restriction: nested … in value class` (3, 9, 23) | `no matching overload for String with arguments ((<notype>) => <notype>)` | clean |
+
+Three of the four are the blank-line parse (`1 { x += 1 }`, `??? { import …; … }`,
+`i2.z { case x => x }`) and the fourth is `new C()` resolving to `object C`,
+which is the third root exactly. The last row's old message is itself one of
+the `<notype>` symptoms this slice was sent after.
+
+What actually remains unimplemented behind them: universal-trait restrictions,
+value-class nesting restrictions, name-ambiguity between a member and a
+subsequent wildcard import, and `private` access checking on a *nested* class.
+None was ever implemented; the corpus was crediting us for them because a
+different bug happened to reject the same files. This is the `neg` upper bound
+`.agent-brief.md` warns about, seen from the other side.
+
 ### What is left of `<notype>`
 
 Six: 2 `ambiguous overload for processFully with arguments ((<notype>) =>
