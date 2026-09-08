@@ -927,15 +927,57 @@ impl Typer {
         crate::classpath::find_by_jvm(&self.st, internal)
     }
 
+    /// `canEqual(that: Any): Boolean`, the one member of `scala.Equals` that
+    /// `AnyRef` does not already supply (`Equals` declares `equals` too, and
+    /// `AnyRef.equals` implements it). SLS 5.3.2 lists it among the members
+    /// synthesized for every `case class` and `case object`, and nsc emits
+    /// `<synthetic> def canEqual(x$1: Any): Boolean = x$1.isInstanceOf[C]`.
+    ///
+    /// The backend has always emitted the method
+    /// (`emit_case_object_methods`); without the symbol the *typer* did not
+    /// know the class had it, so a case class whose `Product` chain was
+    /// visible as source — every `TupleN`, `Some`, `Left`, `Right`,
+    /// `Try`'s `Success`/`Failure` when `src/library` is compiled — was
+    /// reported "needs to be abstract. Missing implementation for member of
+    /// trait Equals". Against the *jar* the declaration comes from a pickle,
+    /// whose modifiers `override_check::modifiers_are_known` withholds, so the
+    /// gap was invisible there.
+    ///
+    /// A hand-written `canEqual` wins, exactly as it does in the backend.
+    fn synthesize_can_equal(&mut self, class_id: SymbolId) {
+        if self
+            .st
+            .get(class_id)
+            .members
+            .iter()
+            .any(|&m| self.st.get(m).name == "canEqual")
+        {
+            return;
+        }
+        let id = self
+            .st
+            .alloc("canEqual", class_id, SymKind::Method, Flags::SYNTHETIC, "");
+        let p = self.st.alloc("that", id, SymKind::Term, Flags::PARAM, "");
+        self.st.get_mut(p).ty = Type::Any;
+        self.st.get_mut(id).params = vec![p];
+        self.st.get_mut(id).paramss = vec![vec![p]];
+        self.st.get_mut(id).ty = Type::Method {
+            paramss: vec![vec![Type::Any]],
+            ret: Box::new(Type::Boolean),
+        };
+    }
+
     /// `productPrefix: String`, `productArity: Int`, `productElement(n: Int): Any`
     /// and `productElementName(n: Int): String`, the four `scala.Product`
     /// members nsc *overrides* in every `case class` and `case object`
-    /// (`productIterator` and `productElementNames` it inherits instead). The
-    /// backend emits all four; the first two fold to constants.
+    /// (`productIterator` and `productElementNames` it inherits instead), plus
+    /// `canEqual` from `scala.Equals`. The backend emits all five; the first
+    /// two fold to constants.
     ///
-    /// Synthesized in both library modes: none of the four mentions a library
+    /// Synthesized in both library modes: none of the five mentions a library
     /// type, so the private runtime backs them just as well.
     fn synthesize_product_members(&mut self, class_id: SymbolId) {
+        self.synthesize_can_equal(class_id);
         for (name, ret) in [("productPrefix", Type::String), ("productArity", Type::Int)] {
             if self
                 .st

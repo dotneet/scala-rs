@@ -299,6 +299,22 @@ The honest diff.
   of lambdas.
 - **sealed**: a non-exhaustive match is a warning, as in scalac. It becomes an
   error under `-Xfatal-warnings`.
+- **The synthesized members of a `case class`** (SLS 5.3.2). `-Xprint:typer` on
+  `case class Point(x: Int, y: String)` gives nsc's full set: `copy` /
+  `copy$default$N` / `productPrefix` / `productArity` / `productElement` /
+  `productIterator` / `canEqual` / `productElementName` / `hashCode` /
+  `toString` / `equals`, and on the companion `toString` / `apply` / `unapply` /
+  `writeReplace`. A `case object` gets the same minus `equals`, `copy` and
+  `productElementName`. scala-rs emits all of those except the companion's
+  `writeReplace` and the static forwarders nsc puts on the class for the
+  companion's `apply` / `unapply` / `tupled` / `curried`; its case-accessor
+  fields are `public final` where nsc's are `private final`.
+  **One synthesized body differs on purpose**: a case class's `hashCode` folds
+  the fields with 31 rather than nsc's `MurmurHash3` mix / `Statics.finalizeHash`,
+  so `Point(1, "a").hashCode` is `128` where scalac gives `-1322997830`. It
+  agrees with `equals` and is stable within a run, but it is not scalac's value,
+  and it does not depend on `scala.runtime`, which is what the private-runtime
+  mode needs. A `case object`'s `hashCode` *is* nsc's (`"Foo".hashCode`).
 - **AnyVal**: scalac emits both the value class's class file and the extension
   methods. scala-rs does the same: `new C(x)` erases to the underlying value and
   calls go to the `$extension` static methods. In positions that need a reference
