@@ -1,0 +1,5 @@
+fixed(1)
+varargs
+varargs
+h-fixed(a,1)
+h-varargs(a)
