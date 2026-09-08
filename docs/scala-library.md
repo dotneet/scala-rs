@@ -1481,6 +1481,30 @@ That a fix worth zero corpus tests is still worth making is the point of the
 section: the corpus measures text on stdout, and this defect preserved the text
 while replacing the method, the receiver and — in slick's case — an argument.
 
+### The numbers
+
+`tests/verify_merge.sh` on the merged tree (`agent/neglit` had landed on `main`
+in the meantime):
+
+| check | branch point `acec3f09` | merged tree |
+|---|---|---|
+| scala library | `971 / 147` | `970 / 147` |
+| gitbucket | `270 / 79` | `270 / 79` |
+| cats | `185 / 71` | `185 / 71` |
+| slick (compile) | `errors=0 files_with_errors=0 classes=1490` | same |
+| `slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | same |
+| subset + lint | — | `verified=1490 failed=0 lint_problems=0` |
+| `cargo test --workspace --release` | — | `256 rows, 2472 passed, 0 failed` |
+| corpus (full) | — | `pos 1095 / neg 670 / run 623`, identical test-for-test to `acec3f09` |
+
+The library's one-error move is `agent/neglit`'s, not this change: a gate run
+on this branch *before* merging it reported `971 / 147` with the print fix
+already in, and the corpus is identical row for row on both binaries.
+
+`VERDICT=FAIL` on both gate runs, for `corpus losses=4` against
+`tests/baselines/corpus-4d613d25.tsv` — the four `agent/libnotype` losses named
+above, which the ledger predates. Nothing else fails.
+
 ### Not fixed here, same root
 
 `gen_apply` has one more name-only dispatch of the same shape, immediately
