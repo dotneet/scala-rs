@@ -8,7 +8,7 @@
 //! of the identifier once a candidate is chosen.
 
 use crate::check::*;
-use crate::symbol::SymKind;
+use crate::symbol::{BindRank, SymKind};
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 use std::collections::{HashMap, HashSet};
@@ -80,6 +80,8 @@ impl Typer {
             self.language_implicit_conversions = true;
         }
         let span = tree.span;
+        let saved_origin = self.import_origin;
+        self.import_origin = ((self.file_index as u64 + 1) << 32) | (span.lo.0 as u64 + 1);
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
                 let owners = self.import_prefix(qual, span);
@@ -113,11 +115,13 @@ impl Typer {
             TreeKind::Ident { name } => {
                 let n = name.clone();
                 for f in self.st.lookup(&n) {
-                    self.st.enter_in_current(&n, f);
+                    self.st
+                        .enter_import_in_current(&n, f, BindRank::Explicit, self.import_origin);
                 }
             }
             _ => {}
         }
+        self.import_origin = saved_origin;
         tree.ty = Type::NoType;
     }
 
@@ -665,6 +669,7 @@ impl Typer {
 
     /// `import p.n` / `import p.{n => alias}`.
     fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span, qual: &Tree) {
+        let origin = self.import_origin;
         let mut entered = false;
         // Owners of members that came in *inherited* from a superclass of the
         // object named in the import; see `remember_named_import_prefix`.
@@ -803,7 +808,8 @@ impl Typer {
                     deferred_inherited.push(m);
                     continue;
                 }
-                self.st.enter_in_current(to, m);
+                self.st
+                    .enter_import_in_current(to, m, BindRank::Explicit, origin);
                 entered = true;
                 let mowner = self.st.get(m).owner;
                 if mowner != owner
@@ -843,7 +849,8 @@ impl Typer {
                         .complete_type_member(&mut self.st, &mut self.binary, owner, from);
                 match member {
                     Some(Type::TypeMember(id)) => {
-                        self.st.enter_in_current(to, id);
+                        self.st
+                            .enter_import_in_current(to, id, BindRank::Explicit, origin);
                         entered = true;
                         break;
                     }
@@ -851,7 +858,8 @@ impl Typer {
                     // of its own; when that is a plain class, the class is
                     // what the imported name means.
                     Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
-                        self.st.enter_in_current(to, sym);
+                        self.st
+                            .enter_import_in_current(to, sym, BindRank::Explicit, origin);
                         entered = true;
                         break;
                     }
@@ -863,7 +871,8 @@ impl Typer {
         // back above is what the name means after all.
         if !self.st.has_real_type_entry(to) {
             for m in deferred_inherited {
-                self.st.enter_in_current(to, m);
+                self.st
+                    .enter_import_in_current(to, m, BindRank::Explicit, origin);
                 entered = true;
             }
         }
@@ -903,6 +912,7 @@ impl Typer {
     /// the owner is also recorded so that a name only reachable by reading a
     /// classfile is still found later (see `expose_unqualified`).
     fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span) {
+        let origin = self.import_origin;
         // A wildcard whose prefix is a package or an object is enumerable: the
         // walk below enters every member it has. Anything else -- a prefix
         // that did not resolve, or a *value* whose type is a jar class read one
@@ -1006,7 +1016,10 @@ impl Typer {
                     if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
                         continue;
                     }
-                    self.st.enter_in_current(&n, m);
+                    // SLS 2 precedence 3: below a definition and below an
+                    // explicit import, whichever order the two are written in.
+                    self.st
+                        .enter_import_in_current(&n, m, BindRank::Wildcard, origin);
                 }
                 for p in self.st.get(cur).parents.clone() {
                     if let Some(ps) = self.st.class_sym_of(&p) {
@@ -1147,7 +1160,20 @@ impl Typer {
     /// the module `lookup_type` offers as a fallback must not look like an
     /// answer already found.
     pub(crate) fn expose_unqualified_type(&mut self, name: &str, span: Span) {
-        if name.is_empty() || self.st.has_real_type_entry(name) {
+        if name.is_empty() {
+            return;
+        }
+        if self.st.has_real_type_entry(name) {
+            // The type namespace has an answer, but an *import's* answer is
+            // still outranked by a definition this unit's own package clause
+            // makes available. Same rule, and same one stage, as
+            // `expose_unqualified`.
+            if matches!(
+                self.st.type_bind_rank(name),
+                Some(BindRank::Explicit) | Some(BindRank::Wildcard)
+            ) {
+                self.expose_same_unit_package_def(name);
+            }
             return;
         }
         if self.library_abi {
@@ -1157,7 +1183,8 @@ impl Typer {
                     .complete_type_member(&mut self.st, &mut self.binary, owner, name)
                 {
                     Some(Type::TypeMember(id)) => {
-                        self.st.enter_in_current(name, id);
+                        self.st
+                            .enter_in_current_ranked(name, id, BindRank::Wildcard);
                         return;
                     }
                     // A *nullary* alias has no symbol of its own -- it is its
@@ -1173,7 +1200,8 @@ impl Typer {
                     // matched no constructor and no signature
                     // ("type mismatch; found: Tag required: Tag").
                     Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
-                        self.st.enter_in_current(name, sym);
+                        self.st
+                            .enter_in_current_ranked(name, sym, BindRank::Wildcard);
                         return;
                     }
                     _ => {}
@@ -1220,7 +1248,8 @@ impl Typer {
                     self.st.get(id).kind,
                     SymKind::TypeMember | SymKind::TypeParam | SymKind::Class
                 ) {
-                    self.st.enter_in_current(name, id);
+                    self.st
+                        .enter_in_current_ranked(name, id, BindRank::Wildcard);
                 }
             }
         }
@@ -1268,8 +1297,35 @@ impl Typer {
     }
 
     pub(crate) fn expose_unqualified(&mut self, name: &str, span: Span) {
-        if name.is_empty() || !self.st.lookup(name).is_empty() {
+        if name.is_empty() {
             return;
+        }
+        match self.st.bind_rank(name) {
+            // Nothing answers to the name yet: the whole search below runs.
+            None => {}
+            // Already bound at the strongest precedence there is.
+            Some(BindRank::Definition) => return,
+            // Bound by an import. One thing still outranks that: a definition
+            // this same compilation unit's package clause makes available
+            // (SLS 2 precedence 1 against 2 or 3). Nothing else the search
+            // below can find does, so this is the only stage that runs --
+            // which also keeps the cost at one hash lookup for every
+            // identifier that is already in scope.
+            Some(BindRank::Explicit) | Some(BindRank::Wildcard) => {
+                self.expose_same_unit_package_def(name);
+                return;
+            }
+            // Bound by a package clause of *another* unit, in a scope nested
+            // inside the one this unit's own clause would bind it in.
+            // Precedence says level 1 beats level 4, nesting says the inner
+            // binding wins, and nsc answers neither: it reports the reference
+            // ambiguous ("it is both defined in package p and available as
+            // class X in package q", `neg/t10662`). Preferring the outer
+            // definition here would turn that rejection into an acceptance,
+            // so the nearer binding is left standing -- telling the two apart
+            // needs a nesting depth on each binding, which `Scope` does not
+            // carry. See docs/gitbucket.md.
+            Some(BindRank::PackageElsewhere) => return,
         }
         let from = if !self.st.this_class.is_none() {
             self.st.this_class
@@ -1328,7 +1384,8 @@ impl Typer {
             if let Some(sp) = self.scala_package() {
                 self.complete_binary_member(sp, name, span);
                 for id in self.st.lookup_member(sp, name) {
-                    self.st.enter_in_current(name, id);
+                    self.st
+                        .enter_in_current_ranked(name, id, BindRank::Wildcard);
                 }
             }
         }
@@ -1337,7 +1394,8 @@ impl Typer {
             if let Some(jl) = self.java_lang_package() {
                 self.complete_binary_member(jl, name, span);
                 for id in self.st.lookup_member(jl, name) {
-                    self.st.enter_in_current(name, id);
+                    self.st
+                        .enter_in_current_ranked(name, id, BindRank::Wildcard);
                 }
             }
         }
@@ -1347,6 +1405,69 @@ impl Typer {
                 self.st.enter_in_current(name, id);
             }
         }
+    }
+
+    /// Whether the compilation unit being typed is the one whose `package pkg`
+    /// clause defines `name`. See [`Typer::unit_pkg_defs`].
+    ///
+    /// By name, not by symbol: a `case class` brings a companion the file
+    /// never wrote, and the synthetic module is as much a definition of this
+    /// unit as the class is. Two units defining the same name in one package
+    /// is a double definition either way, so nothing else can be caught by
+    /// the looser test.
+    pub(crate) fn unit_defines(&self, pkg: SymbolId, name: &str) -> bool {
+        self.unit_pkg_defs
+            .get(&self.file_index)
+            .and_then(|m| m.get(name))
+            .is_some_and(|v| v.iter().any(|&(p, _)| p == pkg))
+    }
+
+    /// Enter a definition **this** compilation unit's own package clause makes
+    /// available, so that it can outrank an import of the same name.
+    ///
+    /// SLS 2 puts such a definition at precedence 1 and a wildcard import at
+    /// 3, and gitbucket relies on the difference in both directions at once:
+    /// `servlet/TransactionFilter.scala` writes `object Database` at the
+    /// bottom of the file whose `import … blockingApi._` at the top offers
+    /// slick's `Database`, while `servlet/GitRepositoryServlet.scala` -- same
+    /// package, another unit, so precedence 4 -- has to name it in an explicit
+    /// import, and says so in a comment.
+    ///
+    /// Returns whether anything was entered.
+    fn expose_same_unit_package_def(&mut self, name: &str) -> bool {
+        let Some(defs) = self
+            .unit_pkg_defs
+            .get(&self.file_index)
+            .and_then(|m| m.get(name))
+            .cloned()
+        else {
+            return false;
+        };
+        let from = if !self.st.this_class.is_none() {
+            self.st.this_class
+        } else {
+            self.st.owner
+        };
+        // Only the clause the reference is *directly* in, not every clause it
+        // is inside. Precedence and nesting agree in that one case and nsc
+        // reports an ambiguity whenever they disagree: `neg/t10662b` has
+        // `class X` in `package p`, `import r.X` in the `package q` nested
+        // inside it, and rejects the reference rather than letting either
+        // rule win. Reaching out to an enclosing clause here would turn that
+        // rejection into an acceptance. gitbucket's `TransactionFilter.scala`
+        // -- the case this exists for -- has the definition and the wildcard
+        // import in the same clause.
+        let here = self.enclosing_package(from);
+        let mut entered = false;
+        for (pkg, id) in defs {
+            if pkg != here {
+                continue;
+            }
+            self.st
+                .enter_in_current_ranked(name, id, BindRank::Definition);
+            entered = true;
+        }
+        entered
     }
 
     /// The lazily-read half of a wildcard import.
@@ -1421,7 +1542,8 @@ impl Typer {
                 continue;
             }
             for id in found {
-                self.st.enter_in_current(name, id);
+                self.st
+                    .enter_in_current_ranked(name, id, BindRank::Wildcard);
             }
             break;
         }
@@ -1459,6 +1581,15 @@ impl Typer {
                 self.bind_found(tree, found, pt);
                 return;
             }
+        }
+        // SLS 2: two bindings of the same precedence in the same scope make
+        // the reference ambiguous. Only two *import* clauses can produce that
+        // -- two definitions of one name in one scope are an overload set or
+        // a double definition, and both are somebody else's diagnostic.
+        // Reported, not silently resolved: picking either one is a wrong
+        // program, and which one we picked used to depend on symbol ids.
+        if self.st.ambiguous_term_import(&name) {
+            self.error(tree.span, format!("reference to {name} is ambiguous"));
         }
         let mut found = self.st.lookup(&name);
         // See `SymbolTable::lookup_extractor`: in a constructor pattern a

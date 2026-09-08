@@ -324,9 +324,14 @@ impl Typer {
                 if !shadowed_names.insert(name.as_str()) {
                     continue;
                 }
-                for id in ids {
-                    if self.st.get(*id).flags.contains(Flags::IMPLICIT) && seen.insert(id.0) {
-                        out.push(*id);
+                // Every binding of the name, whatever its SLS 2 precedence:
+                // an implicit is found by searching the scope, not by being
+                // written down, so a shadowed *name* still offers its
+                // implicit. nsc's `ImplicitComputation` shadows by name only
+                // across levels, which the `shadowed_names` set above is.
+                for b in ids {
+                    if self.st.get(b.sym).flags.contains(Flags::IMPLICIT) && seen.insert(b.sym.0) {
+                        out.push(b.sym);
                     }
                 }
             }

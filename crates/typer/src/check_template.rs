@@ -9,7 +9,7 @@
 //! the messages for an implicit that was not found.
 
 use crate::check::*;
-use crate::symbol::SymKind;
+use crate::symbol::{BindRank, SymKind};
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 use std::collections::HashSet;
@@ -26,7 +26,21 @@ impl Typer {
                         if n.ends_with('$') {
                             continue;
                         }
-                        self.st.enter_in_current(&n, m);
+                        // A package clause's definitions share this scope with
+                        // the file's imports, so SLS 2 has to tell the two
+                        // halves of "made available by a package clause"
+                        // apart: defined in *this* unit it is precedence 1 and
+                        // outranks a wildcard import (gitbucket's
+                        // `TransactionFilter.scala`, which writes `object
+                        // Database` under an `import … blockingApi._`),
+                        // defined in another unit it is precedence 4 and the
+                        // wildcard import outranks it.
+                        let rank = if self.unit_defines(tree.sym, &n) {
+                            BindRank::Definition
+                        } else {
+                            BindRank::PackageElsewhere
+                        };
+                        self.st.enter_in_current_ranked(&n, m, rank);
                     }
                 }
                 for s in stats.iter_mut() {

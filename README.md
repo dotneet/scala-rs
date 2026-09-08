@@ -23,6 +23,12 @@ makes no claim of conformance to the language specification. What exists today:
 - Lambdas are emitted as `invokedynamic` through `LambdaMetafactory`, like nsc
   2.13. `PartialFunction` literals and arities above 22 are still compiled to
   anonymous classes.
+- An unqualified name is resolved by SLS 2's four precedence levels —
+  definitions of the same compilation unit, explicit imports, wildcard imports,
+  then package members of other units — and two bindings of one level in one
+  scope are reported as an ambiguous reference. See
+  [docs/gitbucket.md](docs/gitbucket.md) ("Not this cluster: `Database` /
+  `DatabaseFactory`") and the `impprio` test.
 
 直接自己末尾呼び出しは `final` / `private` / object / ローカル def でループ化します。
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは

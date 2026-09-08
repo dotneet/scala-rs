@@ -2082,6 +2082,114 @@ it was measured at 900 (from 895) because the 20 errors move to
 scalatra's `RichRequest` / `RichSession` conversions pick up ~30 new ones.
 Worth its own slice, with those two as the acceptance criterion.
 
+> **Done, and the second half of that measurement no longer reproduces**
+> (`agent/impprio`, 2026-09-08). Eight merges later, on gitbucket **337 → 333**:
+> the 19 `DatabaseFactory` errors move to `withTransaction is not a member of
+> DatabaseDef` exactly as predicted, and the ~30 scalatra `RichRequest` /
+> `RichSession` errors **do not appear at all** — `agent/implctx`,
+> `agent/implguard`, `agent/convimpl` and `agent/absproj` closed whatever was
+> producing them. cats 196, slick 0/0/1490 and the scala library 1420/166 are
+> unmoved. Three more errors go with the 19 (`closeDataSource`, and two
+> `constructor TreeWalk`), and nothing else moves in either direction.
+>
+> **What the defect actually was is worse than an error count.** Every
+> arrangement above *compiles either way*; the eleven lines merely happened to
+> pick a type the next call rejected. Four lines of the same shape compile
+> silently and print the wrong answer:
+>
+> ```scala
+> package p            // A.scala
+> object Wild { object Database { def apply(): String = "wild" } }
+> package q { object Database { def apply(): String = "explicit" } }
+> ```
+> ```scala
+> package r            // B.scala
+> import p.Wild._
+> import p.q.Database
+> object Main { def main(a: Array[String]): Unit = println(Database()) }
+> ```
+>
+> scalac prints `explicit`; scala-rs printed `wild`. So the fixture is a
+> *running* one (`tests/multi/impprio`, `crates/cli/tests/impprio.rs`): each
+> arrangement prints which definition was selected, and the expected file is
+> real scalac 2.13.16's output for the same three files.
+>
+> **All four SLS 2 levels, not a tie-break.** `Scope` now stores a
+> `BindRank` beside every symbol and `lookup` returns only the entries at the
+> best rank present — namespace filter first, since terms and types are ranked
+> separately. Level 4 is what makes it a ranking rather than a preference:
+> a package member from *another* compilation unit ranks **below** a wildcard
+> import, and collapsing it into level 1 makes `import lib.Wild._` lose to a
+> sibling file's `object Sibling`, which real scalac does not do. Telling 1
+> from 4 needs to know which unit a definition came from, so the namer records
+> each unit's own top-level definitions (`Typer::unit_pkg_defs`) and the
+> package-clause scope in `Typer::typer` enters them at `Definition` while
+> everything else in the same package list goes in at `PackageElsewhere`.
+> Recorded by *name*, deliberately: a `case class` brings a companion the file
+> never wrote, and ranking that companion below the class hid every synthetic
+> `apply` in gitbucket — 337 → 543 for one measurement, all of it
+> `no matching overload for (<notype>, <notype>)ApiError`.
+>
+> **The negative half.** Two bindings of one precedence in one scope are an
+> ambiguous reference, and scalac rejects all three arrangements in
+> `tests/multi/impprio/Bad_1.scala`. `Binding::origin` records *which import
+> clause* made a binding (as `(file, byte offset)`, so the several passes over
+> a unit agree), and the reference is reported only when two distinct clauses
+> tie — an overload set that one `import p._` brings in from two of `p`'s
+> ancestors is one import and stays an overload set. Zero of these fire across
+> gitbucket, cats, slick and the scala library: 1414 files, no false positive.
+>
+> **Two rules the scala/scala corpus wrote, and neither was guessed.** The
+> first full corpus run showed `losses=3` and each one was a real overreach.
+> `pos/t2133` writes `import bip._; import bar._` where `bar.fn` is
+> `private[this]`: the ambiguity has to be reported only between bindings that
+> are *visible* at the reference, which is nsc's `qualifies` filter in
+> `Context.lookupSymbol` — there is one candidate there, not two.
+> `neg/t10662b` puts `class X` in `package p` and `import r.X` in the
+> `package q` nested inside it; nsc rejects the reference ("it is both defined
+> in package p and imported subsequently by import r.X") rather than letting
+> either precedence or nesting decide, so preferring the same-unit definition
+> across a clause boundary turns that rejection into an acceptance. The
+> preference is therefore restricted to the clause the reference is *directly*
+> in, which is gitbucket's shape and the only one where precedence and nesting
+> agree. `neg/t10662` is the same lesson without the import.
+>
+> **Still owed, and measured as not reachable from here.** nsc also reports an
+> ambiguity when a definition and an import are at *different* nesting levels
+> and the import is the deeper one (`Contexts.lookupSymbol`: an import is only
+> consulted when `imp1.depth > symbolDepth`, and then defSym and impSym
+> together are an error unless the definition is package-owned in another
+> unit). Three arrangements verified against 2.13.16 —
+> an inherited member vs a wildcard import inside a method, the same with an
+> explicit import, and an outer explicit import vs an inner wildcard — are
+> rejected by scalac and silently resolved by us. They need a depth on each
+> binding, not just a rank, and `Scope` does not carry one.
+
+**The next wall behind it: blocking-slick's `BlockingDatabase`.** With the
+precedence fixed, the same 19 lines report `value withTransaction is not a
+member of DatabaseDef`. Seven lines reproduce it against gitbucket's own
+dependency classpath:
+
+```scala
+import com.github.takezoe.slick.blocking.BlockingH2Driver
+import BlockingH2Driver.blockingApi._
+
+object Main {
+  val db: slick.jdbc.JdbcBackend#DatabaseDef = null
+  def f(): Unit = db.withTransaction { _ => () }
+}
+```
+
+`javap -p` says the conversion is there and is not a declaration problem:
+`BlockingJdbcProfile$BlockingAPI` has
+`public default …BlockingAPI$BlockingDatabase BlockingDatabase(JdbcBackend$DatabaseDef)`,
+and `BlockingDatabase` declares `withSession` and `withTransaction`. What is
+different about it from the conversions `agent/implguard` already made work is
+that the *result* is an inner class of the imported value's own type
+(`api.BlockingDatabase`, with an `$outer`), reached through
+`import <a val>._`. That is where the next slice starts, and it is not an
+import-precedence question.
+
 **Also still owed**, in the same shape as root 2 but on the source side:
 
 ```scala
