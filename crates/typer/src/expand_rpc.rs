@@ -476,7 +476,7 @@ impl Typer {
     /// Whether `sym` is a class this compilation run is itself defining --
     /// that is, one with no class file for the engine's mirror to find. The
     /// same test [`Typer::tag_descriptor`] makes, and for the same reason.
-    fn is_current_run_class(&mut self, sym: SymbolId) -> bool {
+    pub(crate) fn is_current_run_class(&mut self, sym: SymbolId) -> bool {
         let jvm = self.st.jvm_internal(sym);
         !jvm.is_empty() && !matches!(self.binary.find_class(&jvm), Ok(Some(_)))
     }
