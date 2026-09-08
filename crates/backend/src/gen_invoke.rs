@@ -2669,6 +2669,34 @@ pub(crate) fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &
         let from_desc = jvm_desc(ctx.st, from);
         if from_desc == "Ljava/lang/Object;" {
             asm.checkcast(&cn);
+            return;
+        }
+        // `Object` is not the only descriptor that can be wider than the type
+        // the typer settled on. A field declared at a *bounded* type parameter
+        // erases to its bound, not to `Object`: `class Holder[F[X] <: Boxy[X],
+        // A](val f: F[A])` gives `f` the descriptor `LBoxy;`, and so does the
+        // first-order `class BHolder[T <: Boxy[Int]](val f: T)`. Read back at
+        // `Holder[OneBox, Int]`, the tree's type is `OneBox[Int]` and the value
+        // on the stack is only known to be a `Boxy`, so `h.f.get` emitted
+        // `getfield OneBox.get` on a `Boxy` and the JVM verifier threw the
+        // whole method out: `VerifyError: Bad type on operand stack`.
+        //
+        // This is the same question `maybe_unbox_erased_result` asks on the
+        // *method* result path, and the same answer: ask whether the declared
+        // erasure is *known* to conform to what we want, and cast when we
+        // cannot show that. scalac 2.13.16 emits `checkcast OneBox` here, on
+        // the accessor result, for both the higher-kinded and the first-order
+        // bound; it is only the `Object` case that this path had covered.
+        if let Some(declared) = from_desc
+            .strip_prefix('L')
+            .and_then(|s| s.strip_suffix(';'))
+        {
+            if declared != cn
+                && has_class_sym(ctx.st, want)
+                && !internal_conforms(ctx.st, declared, &cn)
+            {
+                asm.checkcast(&cn);
+            }
         }
     }
 }

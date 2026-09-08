@@ -2853,7 +2853,8 @@ claim a rejection rule needs and a count cannot make.
   binary emits the identical bad method -- in both `--scala-library` and
   private-runtime modes, and no compile-time measure can see it. It is why
   `ovsc_legal.scala` builds its `Holder` and then declines to read the field
-  back.
+  back. **Closed by `agent/hkfield`** -- and it is not a higher-kinded defect;
+  see that section below.
 * **Java statics are still inherited into a Scala subclass's scope.** Untouched
   by this slice; see the `triemapjava` list above.
 
@@ -3353,3 +3354,86 @@ SCALALIB_LOG=$MYDIR/measure.txt SCALALIB_RUN=$MYDIR/run \
 `SCALALIB_MODE=jar` switches to `--scala-library`, and `SCALALIB_DIRS` picks a
 different source set. The script clones scala/scala at the pinned revision and
 rebuilds the Java classpath whenever either is missing.
+
+## The `agent/hkfield` slice: a load whose descriptor is a *bound*, not `Object`
+
+`agent/overscore` left one item reduced and unfixed (above): reading a field of
+a higher-kinded type emits no `checkcast`, and the JVM verifier rejects the
+method. Closed here, in one arm of `maybe_cast_erased_load`.
+
+**The defect is not higher-kinded**, and the brief that handed it over said it
+was. The measurement says otherwise in one line of a probe:
+
+```scala
+trait Boxy[X] { def get: X }
+class OneBox[X](val get: X) extends Boxy[X] { val tag: String = "one" }
+
+class Holder[F[X] <: Boxy[X], A](val f: F[A])   // descriptor LBoxy;  -- broken
+class BHolder[T <: Boxy[Int]](val f: T)         // descriptor LBoxy;  -- broken
+class OHolder[T](val f: T)                      // descriptor LObject; -- fine
+```
+
+`BHolder` is first-order and fails identically on the pre-fix binary. What the
+two broken cases share is not their kind, it is that a *bounded* parameter
+erases to its bound; what made the defect look higher-kinded is that the
+unbounded parameter people usually write erases to `Object`, and `Object` was
+the one case the load path cast for:
+
+```rust
+if let Some(cn) = checkcast_internal(ctx.st, want) {
+    let from_desc = jvm_desc(ctx.st, from);
+    if from_desc == "Ljava/lang/Object;" {   // <- the whole test
+        asm.checkcast(&cn);
+    }
+}
+```
+
+### The rule was already written, one path over
+
+`maybe_unbox_erased_result` — the *method result* path — had been given the
+general form of this two waves earlier, for slick's `TreeMap[K, V] - key` being
+declared to return `Map` on the JVM, with the reasoning recorded in its comment:
+ask whether the declared erasure is *known* to conform to what we want, and cast
+when that cannot be shown. That is why `class MHolder[F[X] <: Boxy[X], A](g:
+F[A]) { def m: F[A] = g }` was already correct while the field beside it was
+not. The fix is that question, asked on the load path; the two had simply
+drifted apart.
+
+### What it is worth, and what it is not
+
+Nothing on any compile measure, by construction — the class files were always
+emitted and the compiler never reported anything. slick is
+`errors=0 files_with_errors=0 classes=1490` with all **1490 class files
+byte-identical** to the pre-fix binary's (`SLICK_OUT` on both saved binaries,
+`diff -r` empty), so slick never reads a member off a value declared at a
+bounded parameter. The yield is the fixture and the six shapes it pins:
+the higher-kinded field, the first-order bounded field, the `Object` field
+(so a later change cannot silently drop *its* cast), the method result, a read
+through a pattern, and a bound that is itself higher-kinded.
+
+### The divergence from scalac that this does *not* close
+
+scalac's erasure adapts to the **expected** type; this compiler's load path
+casts to the **tree's** type. So
+
+```scala
+val hb: Boxy[Int] = h.f     // scalac: no cast.  here: checkcast OneBox
+```
+
+emits three bytes scalac does not. That is not introduced here — the pre-fix
+binary does exactly the same at `val ob: Boxy[Int] = oholder.f` (the `Object`
+arm of the very same function) and at `val mb: Boxy[Int] = mholder.m` (the
+method-result sibling), both checked against scalac 2.13.16 on the *pre-fix*
+binary before the change was written. This slice makes the bounded case behave
+like the two arms beside it. Narrowing all three to the expected type is a
+different change: `maybe_cast_erased_load` is not handed the expected type, and
+the three call sites that would have to supply it are the qualified, static and
+unqualified `Select` paths. Worth doing for code size — the `Method too large`
+ceiling is the standing reason to care — and not worth folding into a
+verifier fix.
+
+`crates/cli/tests/hkfield.rs`, three tests, fixture `hkfield`. The fixture
+**fails on the pre-fix binary in both modes** with `VerifyError: Bad type on
+operand stack`, and the third test reads `javap -c` to pin the cast *and* its
+absence after `Plain.c`, whose descriptor already is `Lhkf/OneBox;` — an
+unnecessary cast is a divergence too, and running green cannot see one.
