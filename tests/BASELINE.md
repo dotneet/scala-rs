@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `b83e06a8` |
+| commit | `56b81c21` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-six slices have merged this session**, in twenty-two composed gates. From
+**Sixty-seven slices have merged this session**, in twenty-three composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -44,6 +44,7 @@ coordinator measured the merged tree each time, not the branches.
 | `a723e8b1` | `lowerbound` | 265 | 177 -> **168** |
 | `e0212fb7` | `basetypeargs` | 265 | 168 -> **167** |
 | `b83e06a8` | `preludelb` | 265 -> **264** | 167 -> **166** |
+| `56b81c21` | `samconv` | 264 | 166 -> **163** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -250,7 +251,7 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **166** | **65** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **264** | **77** | — |
 | `tests/scalalib_measure.sh` (538) | **604** | **130** | — |
 
@@ -801,6 +802,49 @@ bound. And a lower bound naming **another variable of the same call**
 (`def put[V, V1 >: V](m: List[V], v: V1)`) is solved from its argument alone
 instead of jointly; that one is defined in source, not the prelude, and is the
 sharpest remaining item in this area.
+
+## Gate twenty-three: a flag two supply paths cannot set
+
+`agent/samconv` was briefed on missing SAM conversion. **It is not missing** --
+it works for source-declared traits and for Java interfaces, and has since
+`sam_runnable_and_comparator_typecheck`. What did not work was a SAM type the
+compiler *read*. `SymbolTable::sam_sig` counts abstract methods by
+`Flags::ABSTRACT`, and **neither path that builds a library class can set that
+flag**: `prelude::method` forces `FINAL` on every member and `PickleSupply`
+reserves with `EMPTY`. Both are deliberate, for reasons already written in
+`override_check::modifiers_are_known`. So `scala.math.Equiv` was read as having
+zero abstract methods and was not a SAM type at all -- and neither was anything
+else that arrives through the pickle.
+
+`Ordering` needed a second answer underneath: `PickleSupply` enters members by
+name **on demand**, so an override nobody has asked for cannot be told apart
+from an absent one, and `Ordering`'s concrete `equiv` (inherited deferred from
+`Equiv` through `PartialOrdering`) was missing until something requested it.
+The fix reads the pickle for the answer rather than entering the members --
+**decided by measurement**: the version that actually completed them regressed
+cats' `NonEmptyVector.scala` from 4 diagnostics to 5, because completion is
+additive global state, a hazard its own doc comment already records.
+
+Two pre-existing defects surfaced with it, both reproducible at the branch
+point through a source-defined trait: an arity guard that **could never fail**
+(`param_tys.len() == pts.len()`, forty lines after `pts` has already been
+collapsed), so `val e: Equiv[Int] = (x: Int) => x > 0` compiled; and a
+polymorphic abstract method treated as a SAM, which nsc's `samOf` refuses by
+requiring `sam.typeParams.isEmpty`.
+
+**Two of this brief's claims were the coordinator's, and both were wrong.** It
+asserted `crates/cli/tests/samfwd.rs` exists at the branch point; it does not,
+and the concern behind `agent/samfwd` (a trait's concrete methods living in a
+`T$class` static, needing forwarders in the anonymous class) has since
+evaporated -- this backend emits JVM `default` methods now. The lesson is the
+same as gate twenty-one's: a documented next step has to be re-checked against
+the tree before it is handed to a slice.
+
+Left named: our SAM literals are always anonymous classes, where scalac 2.13.16
+uses `invokedynamic` for `Equiv`, `Hashing` and `Runnable` in the same file and
+an anonymous class only for `Ordering`. Behaviour is identical (the fixture
+executes against scalac's own output); the divergence belongs to
+`crates/cli/tests/indy.rs`.
 
 ## What is deliberately red
 
