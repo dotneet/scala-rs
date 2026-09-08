@@ -124,12 +124,27 @@ impl Typer {
                 let gid = self
                     .st
                     .alloc(&gname, owner, SymKind::Method, Flags::SYNTHETIC, "");
+                // With nothing preceding it the getter is *nullary* -- nsc's
+                // `def apply$default$1: Int`, a `NullaryMethodType`, not a
+                // method over an empty list. The two are different types to a
+                // reader, and pickled as `apply$default$1()` real scalac warns
+                // "Auto-application to `()` is deprecated" at every call that
+                // omits the argument. See `check_member::synthesize_default_
+                // getters`, which says the same for `copy$default$n`.
                 self.st.get_mut(gid).ty = Type::Method {
-                    paramss: vec![preceding_tys.clone()],
+                    paramss: if preceding_tys.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![preceding_tys.clone()]
+                    },
                     ret: Box::new(ret.clone()),
                 };
                 self.st.get_mut(gid).params = preceding.clone();
-                self.st.get_mut(gid).paramss = vec![preceding.clone()];
+                self.st.get_mut(gid).paramss = if preceding.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![preceding.clone()]
+                };
                 // A generic class's default may name the class's own type
                 // parameters (`class C[A](xs: List[A] = Nil)`); nsc's getter
                 // repeats them, and they are erased away by codegen.

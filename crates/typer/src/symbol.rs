@@ -483,6 +483,17 @@ pub struct Symbol {
     /// Constructor / method parameter symbols (flat, first clause).
     pub params: Vec<SymbolId>,
     pub paramss: Vec<Vec<SymbolId>>,
+    /// The number of parameters in each clause the source actually wrote,
+    /// recorded before `uncurry` joins the clauses into one.
+    ///
+    /// nsc's pickler runs *before* `uncurry`, so a class file carries
+    /// `def f()(implicit e: E): T` as nested `MethodType`s. Ours flattens the
+    /// clauses off the symbol long before the backend sees it, and a pickle
+    /// written from the flattened shape tells a reader -- scalac included --
+    /// that the method is `def f(e: E): T`, which rejects the call site that
+    /// writes `f()`. Empty when the method still carries its own clauses
+    /// (`Symbol::ty`), which is every method `uncurry` left alone.
+    pub pickle_clauses: Vec<usize>,
     /// For case classes / classes: constructor parameter field names.
     pub ctor_fields: Vec<SymbolId>,
     pub parents: Vec<Type>,
@@ -1131,6 +1142,7 @@ impl SymbolTable {
                 intrinsic: Intrinsic::None,
                 params: vec![],
                 paramss: vec![],
+                pickle_clauses: vec![],
                 ctor_fields: vec![],
                 parents: vec![],
                 default_rhs: None,
@@ -1250,6 +1262,7 @@ impl SymbolTable {
             intrinsic: Intrinsic::None,
             params: vec![],
             paramss: vec![],
+            pickle_clauses: vec![],
             ctor_fields: vec![],
             parents: vec![],
             default_rhs: None,

@@ -413,6 +413,29 @@ fn flatten_defdef(tree: &mut Tree, st: &mut SymbolTable) {
 }
 
 fn flatten_one_method(st: &mut SymbolTable, id: SymbolId) {
+    // Record the clause shape before destroying it. nsc pickles *before*
+    // uncurry, so `def f()(implicit e: E): T` reaches a class file as nested
+    // `MethodType`s; written from the flattened shape it reads as
+    // `def f(e: E): T` and scalac rejects the caller's `f()`.
+    if st.get(id).pickle_clauses.is_empty() {
+        let from_ty = match &st.get(id).ty {
+            Type::Method { paramss, .. } if paramss.len() > 1 => {
+                Some(paramss.iter().map(|c| c.len()).collect::<Vec<_>>())
+            }
+            _ => None,
+        };
+        let arities = from_ty.unwrap_or_else(|| {
+            let ps = &st.get(id).paramss;
+            if ps.len() > 1 {
+                ps.iter().map(|c| c.len()).collect()
+            } else {
+                Vec::new()
+            }
+        });
+        if !arities.is_empty() {
+            st.get_mut(id).pickle_clauses = arities;
+        }
+    }
     // Test before taking. `flatten_method_symbols` runs once per compilation
     // unit over the whole symbol table, and all but a handful of the symbols it
     // visits have a single parameter list already: cloning `paramss` and the

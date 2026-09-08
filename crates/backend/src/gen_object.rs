@@ -1549,7 +1549,13 @@ pub(crate) fn emit_case_copy(b: &mut ClassBuilder, st: &SymbolTable, class_id: S
         return;
     };
     let copy_params = st.get(copy_id).params.clone();
-    if copy_params.is_empty() {
+    // A zero-field case class still gets `def copy(): C` -- nsc emits one, and
+    // the pickle we write advertises it. Skipping it left a member that a
+    // reader could resolve and no class file could answer: real scalac
+    // compiled `Empty().copy()` and the run died with `NoSuchMethodError:
+    // 'Empty Empty.copy()'`. The guard is only for a `copy` whose parameters
+    // the typer never filled in, which a case class with fields would need.
+    if copy_params.is_empty() && !st.get(class_id).ctor_fields.is_empty() {
         return;
     }
     let class_jvm = class_internal(st, class_id);
