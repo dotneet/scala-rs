@@ -2688,6 +2688,175 @@ until /tmp is wiped. All three scripts now set the property and rewrite the
 launcher on every run, through a temp file and `mv` so a scalac another
 measurement is running cannot see a half-written one.
 
+## Fixed: three things a class file cannot say (`agent/gbopt`)
+
+**337 -> 281 errors, 81 -> 80 files.** slick unmoved at `errors=0
+files_with_errors=0 classes=1490`, cats unmoved at 196 / 73, the scala library
+unmoved at 1420 / 166. Measured on `2fdfe302` and on the same tree with this
+slice.
+
+The brief that opened this slice named `OptionMapper2` (13),
+`CanBeQueryCondition[Any]` (13), `TypedType[Option[…]]` (14),
+`ExecutionContext` (8) and `Shape[FlatShapeLevel, O2, U2, _]` (6) and asked
+how many roots they are. **`OptionMapper2` and `CanBeQueryCondition` are not
+roots at all** -- both went to zero without a line being written about either.
+
+| family | before | after |
+|---|---:|---:|
+| `no implicit … OptionMapper2[Boolean, Boolean, Boolean, Boolean, P2, R]` | 13 | **0** |
+| `no implicit … CanBeQueryCondition[Any]` | 13 | **2** |
+| `no implicit … TypedType[Option[String] / Option[Int] / Option[Date]]` | 14 | **0** |
+| `no implicit … ExecutionContext` (+ `value Implicits is not a member of ExecutionContext$`) | 8 (+3) | **0** |
+| `no matching overload for <overload (Query[Rep[P2], _, C], OptionMapper2[…])Rep[R] \| …>` | 6 | **0** |
+| `no matching overload for (Iterable[String], OptionMapper2[Any, String, Any, Any, String, R])Rep[R]` | 5 | **0** |
+| `no implicit … Shape[FlatShapeLevel, O2, U2, _]` | 6 | 6 |
+
+`no implicit` is 31 of the 281, down from 77.
+
+The three roots are all the same *shape*, and it is not the shape the families
+suggested: **a class file is a lossy description of someone else's code, and
+in each case the lossy answer was reached first and never revisited.** None of
+the three reproduces from source alone; all three reproduce in a page against
+a jar that real scalac wrote (`tests/multi/gbopt_binary/`,
+`crates/cli/tests/gbopt.rs`).
+
+### Root 35: the implicit scope's *candidates* were never warmed
+
+`Typer::warm_implicit_candidates` tops up the pickled parents of every
+implicit in the **lexical** scope, plus the wanted type. It never touched the
+*companion* candidates -- and those are the ones `search_implicit_uncached`
+falls back on when nothing lexical fits, so they are exactly the candidates a
+program is least likely to have named, SLS 7.2 being the rule that says they
+need no import.
+
+slick's only witness for `TypedType[Option[T]]` is
+
+```scala
+object TypedType {
+  implicit def typedTypeToOptionTypedType[T](implicit t: TypedType[T]): OptionTypedType[T]
+}
+```
+
+whose result type is a *subclass* of what is wanted: `OptionTypedType[T]
+extends TypedType[Option[T]]` is written only in `OptionTypedType`'s own class
+file. With that parent list still empty, `plausibly_inhabits` rejected the
+candidate before a single unification ran, and every `column[Option[String]]`
+in gitbucket was "could not find implicit value of type
+TypedType[Option[String]]". Writing `OptionTypedType` **anywhere in the same
+file** fixed it, which is what said it was a completion and not a scoping
+rule.
+
+Fifteen errors on its own (337 -> 322).
+
+### Root 36: a mixin forwarder flattens the parameter clauses
+
+A class carries a class-file method for every concrete method it inherits from
+a trait. That forwarder has one flat parameter list -- a class file has no way
+to say where a clause ends -- and its `Signature` attribute has already turned
+a `Boolean` type *argument* into `Object`. The class's own pickle does not
+declare it, because it is inherited, so `adopt_binary_class`'s name loop never
+asks about it and the flattened copy stays as the class's closest member,
+outranking the correctly clause-split declaration on the trait.
+
+```
+javap slick.lifted.ColumnExtensionMethods
+  default <R> Rep<R> inSet(Iterable<B1>, OptionMapper2<Object, B1, Object, Object, P1, R>)
+javap slick.lifted.BaseColumnExtensionMethods          // the mixin forwarder
+  <R> Rep<R> inSet(Iterable<P1>, OptionMapper2<Object, P1, Object, Object, P1, R>)
+```
+
+so `t.labelName inSetBind labels` was `no matching overload for
+(Iterable[String], OptionMapper2[Any, String, Any, Any, String, R])Rep[R] with
+arguments (Set[String])` -- one argument against a two-parameter clause. Note
+the `Any`s: they are `Object` in the generic signature where the pickle says
+`Boolean`, which is the second half of the loss and the one that would pick
+the wrong `OptionMapper2` if the arity had happened to match.
+
+**`===` escaped only because its JVM name is `$eq$eq$eq`.**
+`classpath::fill_java_members` enters a class-file method under its *JVM*
+name, and nothing decodes that back to `===`, so the forwarder and the pickled
+member never shared a name and never competed. Every operator-named method in
+this family was fine and every alphabetic one was broken, which is why the
+symptom looked like it was about `in` and `inSet` in particular.
+
+`PickleSupply::drop_flattened_forwarders` drops such a member, and only on the
+one piece of evidence that cannot be anything else: the pickle answers the same
+name with a member of **more than one clause and the same total number of
+parameters**. A single-clause disagreement -- an erased type argument, a
+by-name parameter -- is left alone; it is a different problem and dropping on
+it would take out members no pickle replaces.
+
+Thirty errors (322 -> 292), and it is also a **soundness** fix: with one clause
+of two, `7.tagIn(List(1), witness)` -- the implicit passed positionally --
+compiled. scalac 2.13.16 says "too many arguments (found 2, expected 1)".
+`tests/multi/gbopt_binary/Bad_1.scala` line 18.
+
+### Root 37: a class file read once, but for the wrong owner
+
+A JVM name cannot say whether `Outer$Inner$` was declared by `class Outer` or
+by `object Outer`; `classpath::java_class_owner` always answers the class.
+`enter_in_companion_scope` exists for exactly that and has since
+`cats.effect.Resource.ExitCase` -- but it was never called for a nested
+**object** (`install_java_module` did not call it), and, worse,
+`Checker::load_binary_into` short-circuits on `completed_java` and answered
+"already loaded" without checking that the owner now asking can see it.
+
+Measured, in gitbucket: `scala/concurrent/ExecutionContext$Implicits$` is read
+first from `import_path_syms`, walking the prefix
+`scala.concurrent.ExecutionContext` from the **class** symbol -- a stub slick's
+own signatures had already put in the table. It lands under the class. Every
+later `import scala.concurrent.ExecutionContext.Implicits.global` asks the
+companion `ExecutionContext$`, gets the short-circuit, and reports "value
+Implicits is not a member of ExecutionContext$"; the `Future { … }` bodies
+behind it are then a missing `ExecutionContext`. Three of gitbucket's four
+files that write that import failed and the first one did not, which is what
+made it look like a scoping rule.
+
+`classpath::enter_loaded_in_owner` (and `enter_module_in_companion_scope`, the
+nested-object half of `enter_in_companion_scope`, which enters both the module
+class and the module *term*) closes it. Eleven errors (292 -> 281).
+
+### Two defects found here and deliberately **not** fixed
+
+Both are older than this slice -- each reproduces on `2fdfe302` -- and both are
+worth a slice of their own.
+
+* **An explicit type argument is ignored when the type parameter occurs only
+  in an implicit clause.** Seven lines, no jars, no slick:
+
+  ```scala
+  trait Bx[T] { def name: String }
+  object Bx { implicit val s: Bx[String] = new Bx[String] { def name = "str" } }
+  object Main {
+    def want[T](implicit b: Bx[T]): String = b.name
+    def main(args: Array[String]): Unit = println(want[Int])   // prints "str"
+  }
+  ```
+
+  scalac 2.13.16: `could not find implicit value for parameter b: Bx[Int]`.
+  We compile it and hand `want` the `String` witness. This is a *wrong
+  witness*, not a missing one, so nothing downstream can tell.
+
+* **A universal trait's method, inherited by a value class that came off a
+  jar, is called as a `$extension` that does not exist.** nsc emits
+  `$extension` statics only for methods the value class *declares*; an
+  inherited one is a mixin forwarder, and nsc boxes the receiver and calls it.
+  `gen_expr`'s `value_owner` asks only `is_value_class(owner(fun.sym))`, and
+  for a binary value class that owner is whatever installed the member. On
+  `2fdfe302` a one-clause inherited method already miscompiles
+  (`ClassCastException: Integer cannot be cast to Ops`); this slice makes the
+  two-clause ones reachable too, since they no longer stop at a type error.
+  slick's own build is unaffected -- `BaseColumnExtensionMethods` is a
+  *source* value class there, and `st.source_value_classes` takes the right
+  branch -- which is why `tests/slick_run.sh` and `tests/slick_subset.sh` are
+  unmoved. The fix needs the member's owner to be the declaring trait, or a
+  record of which members a binary value class really declares; it is not a
+  one-liner and it does not belong in a slice about implicit search.
+
+  This is why `tests/multi/gbopt_binary/Lib_1.scala` hosts the mixin with a
+  plain `final class` and not a value class. The typer defect is identical
+  either way.
+
 ## Not fixed: a guard after a value definition in a for-comprehension
 
 `controller/PullRequestsController.scala` writes
