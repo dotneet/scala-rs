@@ -1331,7 +1331,36 @@ impl Typer {
                 } else if let TreeKind::Ident { name } = &tpt.kind {
                     let n = name.clone();
                     self.expose_unqualified(&n, tpt.span);
-                    let found = self.st.lookup(&n);
+                    let mut found = self.st.lookup(&n);
+                    // `new X` names a *type*, so a nearer scope that binds `X`
+                    // only as a term must not end the search. `lookup` hands
+                    // back the innermost slot that carries the name at all, so
+                    // the standard library's
+                    //
+                    // ```scala
+                    // class accum extends AbstractFunction2[K, V1, Unit] { … }
+                    // …
+                    // val accum = new accum
+                    // ```
+                    //
+                    // (`HashMap.concat`) found only the `val` being defined,
+                    // fell through to typing `accum` as an expression, and
+                    // came back with the half-built value's own `NoType` --
+                    // no class, and no diagnostic either, so every later
+                    // `accum.current` reported "not a member of <notype>".
+                    // `lookup_type` skips a term-only scope by construction.
+                    if !found.iter().any(|&s| {
+                        matches!(
+                            self.st.get(s).kind,
+                            SymKind::Class | SymKind::TypeParam | SymKind::TypeMember
+                        )
+                    }) {
+                        self.expose_unqualified_type(&n, tpt.span);
+                        let types = self.st.lookup_type(&n);
+                        if !types.is_empty() {
+                            found = types;
+                        }
+                    }
                     if let Some(id) = found
                         .iter()
                         .copied()
