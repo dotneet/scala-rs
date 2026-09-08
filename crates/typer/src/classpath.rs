@@ -1112,6 +1112,66 @@ fn enter_in_companion_scope(st: &mut SymbolTable, id: SymbolId, owner: SymbolId,
     st.get_mut(owner).members.push(id);
 }
 
+/// [`enter_in_companion_scope`] for a nested **object**, which needs both
+/// halves: the module class and the module *term*, since a path
+/// (`ExecutionContext.Implicits.global`) and an import selector both look the
+/// term up.
+///
+/// `install_java_module` did not do this at all, so the defect
+/// `enter_in_companion_scope` fixes for a nested class was still live for a
+/// nested object. [`java_class_owner`] answers the *class*
+/// `scala.concurrent.ExecutionContext` for
+/// `scala/concurrent/ExecutionContext$Implicits$`, so whichever route reaches
+/// that class file first decides where the object lives; when that route was
+/// something reading the trait's descriptors, `import
+/// scala.concurrent.ExecutionContext.Implicits.global` was "value Implicits is
+/// not a member of ExecutionContext$" and every `Future { … }` behind it was a
+/// missing `ExecutionContext`. On its own the same import compiles, which is
+/// what made it look like it needed the whole program.
+pub(crate) fn enter_module_in_companion_scope(
+    st: &mut SymbolTable,
+    cls: SymbolId,
+    owner: SymbolId,
+    internal: &str,
+) {
+    enter_in_companion_scope(st, cls, owner, internal);
+    let held_by = st.get(cls).owner;
+    if held_by.is_none() {
+        return;
+    }
+    let term = st
+        .get(held_by)
+        .members
+        .iter()
+        .copied()
+        .find(|&m| st.get(m).kind == SymKind::Module && st.get(m).jvm_name == internal);
+    if let Some(t) = term {
+        enter_in_companion_scope(st, t, owner, internal);
+    }
+}
+
+/// Make `id` -- a class file the table already holds -- reachable from the
+/// owner that is asking for it now.
+///
+/// [`Checker::load_binary_into`] reads each class file once, and its
+/// short-circuit used to answer "yes, it is loaded" without checking that the
+/// caller's owner can see it. That is the same order-dependence
+/// [`enter_in_companion_scope`] exists for, one level up: the first route in
+/// decides the owner, and every later route is told the work is done.
+pub(crate) fn enter_loaded_in_owner(st: &mut SymbolTable, id: SymbolId, owner: SymbolId) {
+    let internal = st.get(id).jvm_name.clone();
+    if internal.is_empty() {
+        return;
+    }
+    match st.get(id).kind {
+        SymKind::ModuleClass | SymKind::Module => {
+            enter_module_in_companion_scope(st, id, owner, &internal)
+        }
+        SymKind::Class => enter_in_companion_scope(st, id, owner, &internal),
+        _ => {}
+    }
+}
+
 fn java_class_flags(c: &crate::javaclass::JavaClass) -> Flags {
     let mut flags = if c.is_scala {
         Flags::EMPTY
@@ -1153,6 +1213,7 @@ fn install_java_module(
     if let Some(id) = find_by_jvm(st, &c.internal_name) {
         apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
+        enter_module_in_companion_scope(st, id, owner, &c.internal_name);
         return id;
     }
     let flags = Flags::MODULE.with(Flags::FINAL);
