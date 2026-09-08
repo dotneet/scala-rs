@@ -481,6 +481,16 @@ fn definitely_different(st: &SymbolTable, a: &Type, b: &Type) -> bool {
     if x == y {
         return false;
     }
+    // Two classfiles with different names are two classes, and `C[..]` is
+    // never `D[..]`. The subtype dance below is only needed when the *names*
+    // agree: that is the duplicate-reading case (`scala.Int` and
+    // `java.lang.Integer` share a JVM name here, `AnyRef` and `Object` share
+    // one too), where nothing may be concluded from the symbols differing.
+    let jx = &st.get(*x).jvm_name;
+    let jy = &st.get(*y).jvm_name;
+    if !jx.is_empty() && !jy.is_empty() && jx != jy {
+        return true;
+    }
     let bare = |s: SymbolId| Type::Class {
         sym: s,
         args: Vec::new(),
@@ -488,11 +498,144 @@ fn definitely_different(st: &SymbolTable, a: &Type, b: &Type) -> bool {
     st.is_sub_type(&bare(*x), &bare(*y)) != st.is_sub_type(&bare(*y), &bare(*x))
 }
 
-fn same_type(st: &SymbolTable, a: &Type, b: &Type) -> bool {
+/// The type parameters that stand for *themselves* while this override pair is
+/// compared: the overriding method's own (`base_type_at` aligns the base
+/// method's onto them) and those of the class the check runs in, with its
+/// enclosing templates.
+///
+/// A `TypeParam` outside this set is a base class's parameter that
+/// `subst_as_seen_from` could not replace, and a comparison that reached one
+/// has to say "undecided" — otherwise `trait T[A] { def f(x: A) }` implemented
+/// by `class C extends T[Int] { def f(x: Int) }` would be read as an overload
+/// the moment the substitution failed.
+fn rigid_tparams(st: &SymbolTable, cls: SymbolId, child: SymbolId) -> Vec<SymbolId> {
+    let mut out = st.get(child).tparams.clone();
+    let mut owner = cls;
+    let mut guard = 0;
+    while !owner.is_none() && guard < 64 {
+        out.extend(st.get(owner).tparams.iter().copied());
+        let next = st.get(owner).owner;
+        if next == owner {
+            break;
+        }
+        owner = next;
+        guard += 1;
+    }
+    out
+}
+
+/// A type constructor applied to arguments. A rigid type variable `T` is not
+/// `(K, T)`, `Array[T]`, `T => T`, `C[T]` or `T*`: no instantiation of the
+/// variables in play makes a bare variable equal to an application, because
+/// the variable is bound, not unified.
+fn is_constructor_app(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Tuple(_)
+            | Type::Function { .. }
+            | Type::Array(_)
+            | Type::Repeated(_)
+            | Type::ByName(_)
+    ) || matches!(ty, Type::Class { args, .. } if !args.is_empty())
+}
+
+/// The `FunctionN` / `TupleN` class a structural arrow or tuple type denotes,
+/// so `PartialFunction[B, C]` and `B => C` can be told apart by their heads.
+fn structural_head(st: &SymbolTable, ty: &Type) -> Option<String> {
+    match ty {
+        Type::Function { params, .. } => Some(format!("scala/Function{}", params.len())),
+        Type::Tuple(ts) => Some(format!("scala/Tuple{}", ts.len())),
+        Type::Array(_) => Some("scala/Array".to_string()),
+        Type::Class { sym, .. } => {
+            let j = &st.get(*sym).jvm_name;
+            if j.is_empty() {
+                None
+            } else {
+                Some(j.clone())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `true` only when no instantiation of the type parameters in play can make
+/// `a` and `b` the same type. `false` means "not decided" — never "the same".
+///
+/// This is the counterweight to [`robust`]. `robust` refuses to compare
+/// anything mentioning a type parameter, which keeps a shaky subtyping query
+/// from inventing a diagnostic; but it also made `IterableOnce[B]` and
+/// `IterableOnce[(K, V2)]` "the same", so `Map.concat` was read as overriding
+/// `IterableOps.concat` rather than overloading it, and the library's own
+/// `Map`, `IntMap`, `LongMap`, `AnyRefMap`, `SortedMap`, `Buffer`,
+/// `PartialFunction`, `Stepper` and `<:<` were all rejected. Deciding these
+/// needs no subtyping at all: they differ in *shape*.
+fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type) -> bool {
+    if a == b {
+        return false;
+    }
+    // Nothing is concluded from a type the signature pass never resolved.
+    if uncertain(a) || uncertain(b) {
+        return false;
+    }
+    match (a, b) {
+        // `A*` is `scala.<repeated>[A]` and `=> A` is `scala.<byname>[A]`:
+        // distinct constructors, whatever `A` turns out to be.
+        (Type::Repeated(x), Type::Repeated(y)) | (Type::ByName(x), Type::ByName(y)) => {
+            certainly_different(st, rigid, x, y)
+        }
+        (Type::Repeated(_), _) | (_, Type::Repeated(_)) => true,
+        (Type::ByName(_), _) | (_, Type::ByName(_)) => true,
+        (Type::Array(x), Type::Array(y)) => certainly_different(st, rigid, x, y),
+        (Type::Tuple(xs), Type::Tuple(ys)) => {
+            xs.len() != ys.len()
+                || xs
+                    .iter()
+                    .zip(ys)
+                    .any(|(x, y)| certainly_different(st, rigid, x, y))
+        }
+        (
+            Type::Function {
+                params: ps,
+                ret: rx,
+            },
+            Type::Function {
+                params: qs,
+                ret: ry,
+            },
+        ) => {
+            ps.len() != qs.len()
+                || ps
+                    .iter()
+                    .zip(qs)
+                    .any(|(x, y)| certainly_different(st, rigid, x, y))
+                || certainly_different(st, rigid, rx, ry)
+        }
+        (Type::Class { sym: x, args: xs }, Type::Class { sym: y, args: ys }) => {
+            if x == y {
+                return xs.len() == ys.len()
+                    && xs
+                        .iter()
+                        .zip(ys)
+                        .any(|(p, q)| certainly_different(st, rigid, p, q));
+            }
+            definitely_different(st, a, b)
+        }
+        // A bound type variable against an application of a constructor.
+        (Type::TypeParam(p), other) | (other, Type::TypeParam(p)) => {
+            rigid.contains(p) && is_constructor_app(other)
+        }
+        _ => match (structural_head(st, a), structural_head(st, b)) {
+            (Some(x), Some(y)) => x != y,
+            _ => false,
+        },
+    }
+}
+
+fn same_type(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
     }
-    if definitely_different(st, a, b) {
+    if definitely_different(st, a, b) || certainly_different(st, rigid, a, b) {
         return false;
     }
     if !robust(a) || !robust(b) {
@@ -512,7 +655,18 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
     if st.get(child).tparams.len() != st.get(base).tparams.len() {
         return false;
     }
-    let cps = paramss_of(st, child);
+    // nsc `matchingSymbols` compares `self.memberType(sym1)` with
+    // `self.memberType(sym2)`: *both* signatures read at the same prefix. The
+    // child is not always owned by `cls` — `check_missing_implementations`
+    // asks whether a member inherited from one base implements a declaration
+    // inherited from another — and reading only the base at `cls` left the
+    // pair in two different frames, `Iterator.filter(p: A => Boolean)` against
+    // `IterableOnceOps.filter(pred: Seq[B] => Boolean)`.
+    let cty = member_type_at(st, cls, child);
+    let cps = match &cty {
+        Type::Method { paramss, .. } => norm_paramss(paramss),
+        _ => Vec::new(),
+    };
     let bty = base_type_at(st, cls, base, child);
     let bps = match &bty {
         Type::Method { paramss, .. } => norm_paramss(paramss),
@@ -521,17 +675,58 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
     if cps.len() != bps.len() {
         return false;
     }
+    let rigid = rigid_tparams(st, cls, child);
     for (c, b) in cps.iter().zip(bps.iter()) {
         if c.len() != b.len() {
             return false;
         }
         for (ct, bt) in c.iter().zip(b.iter()) {
-            if !same_type(st, ct, bt) {
+            if !same_type(st, &rigid, ct, bt) {
                 return false;
             }
         }
     }
     true
+}
+
+/// Whether `child` and `base` are provably *two* methods — an overload no
+/// erasure can reunite into an override.
+///
+/// The backend needs the question in this direction. `bridge_overrides`
+/// compares *erased* descriptors on purpose, because that is what an erasure
+/// bridge exists for (`def f(x: A)` implemented as `f(x: Int)`); but that also
+/// makes `Ops.pp[B](xs: Bag[B])` and `Table.pp[V2](xs: Bag[(K, V2)])` one JVM
+/// parameter, so a bridge `pp(Bag)Bag` was emitted that called
+/// `pp(Bag)String` and checkcast the `String` to `Bag`. scalac emits a mixin
+/// forwarder there instead, because before erasure the two are overloads and
+/// the parent's default implementation is what the wide signature must run.
+/// Only the *positive* answer is usable: `false` means "not proven", never
+/// "these override".
+fn provably_overloaded(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> bool {
+    if child == base || st.get(child).name != st.get(base).name {
+        return false;
+    }
+    if st.get(child).tparams.len() != st.get(base).tparams.len() {
+        return false;
+    }
+    let cps = match &member_type_at(st, cls, child) {
+        Type::Method { paramss, .. } => norm_paramss(paramss),
+        _ => return false,
+    };
+    let bps = match &base_type_at(st, cls, base, child) {
+        Type::Method { paramss, .. } => norm_paramss(paramss),
+        _ => return false,
+    };
+    if cps.len() != bps.len() {
+        return false;
+    }
+    let rigid = rigid_tparams(st, cls, child);
+    cps.iter().zip(bps.iter()).any(|(c, b)| {
+        c.len() == b.len()
+            && c.iter()
+                .zip(b.iter())
+                .any(|(ct, bt)| certainly_different(st, &rigid, ct, bt))
+    })
 }
 
 /// The backend's dispatch relation is deliberately stricter than the
@@ -566,14 +761,88 @@ fn strict_method_matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base:
 /// backend's super accessors and mixin forwarders must not see them. Overriding
 /// does: `override def toString: String` overrides `Any.toString`, and without
 /// them every class that writes one was told it "overrides nothing".
+///
+/// `AnyRef` and `Object` go on only for a class that has them. In nsc
+/// `AnyClass` is `enterNewClass(ScalaPackageClass, tpnme.Any, Nil, ABSTRACT)` —
+/// **no parents** — and `AnyVal extends Any`, so `Object` is not a base class
+/// of `AnyVal`, of the nine primitive value classes, or of a user value class.
+/// Appending it anyway made `AnyVal`'s own
+/// `def getClass(): Class[_ <: AnyVal] = null` (`src/library/scala/AnyVal.scala`)
+/// an unannounced override of the concrete `java.lang.Object.getClass`.
 fn full_lin(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
     let mut out = linearize(st, cls);
-    for u in [st.object_sym, st.anyref_sym, st.any_sym] {
+    let universal = if is_any_rooted(st, cls) {
+        vec![st.any_sym]
+    } else {
+        vec![st.object_sym, st.anyref_sym, st.any_sym]
+    };
+    for u in universal {
         if !u.is_none() && !out.contains(&u) {
             out.push(u);
         }
     }
     out
+}
+
+/// A template whose base classes stop at `Any`: `Any` itself, `AnyVal`, and
+/// everything under `AnyVal` — the nine primitive value classes and every
+/// user-defined value class.
+///
+/// This is exactly nsc's own exemption. `RefChecks.checkAllOverrides` guards
+/// its JVM-motivated ban with `clazz.isTrait && !clazz.isSubClass(AnyValClass)`
+/// and says why in a comment: *"the scala type system understands that an
+/// abstract method here does not override a concrete method in Object. The
+/// jvm, however, does not."* So a **universal trait** (`trait T extends Any`)
+/// is deliberately *not* listed here: nsc's type system leaves `Object` out of
+/// its base classes too, but a second rule then rejects
+/// `trait T extends Any { def notify(): String }` with "trait cannot redefine
+/// final method from class AnyRef" — verified against scalac 2.13.16. Letting
+/// such a trait through here would trade one false rejection for a program
+/// scalac refuses; keeping `Object` in its linearization keeps the rejection,
+/// under the ordinary rule's wording.
+fn is_any_rooted(st: &SymbolTable, cls: SymbolId) -> bool {
+    /// `AnyVal` or something strictly under it. Reaching bare `Any` does
+    /// **not** count on its own — that would sweep in universal traits — and
+    /// the walk never enters `Any`, `AnyRef` or `Object`, whose own parents
+    /// would otherwise make every class qualify.
+    fn walk(st: &SymbolTable, cls: SymbolId, depth: u32) -> bool {
+        if depth > 64
+            || cls.is_none()
+            || cls == st.object_sym
+            || cls == st.anyref_sym
+            || cls == st.any_sym
+        {
+            return false;
+        }
+        if cls == st.anyval_sym {
+            return true;
+        }
+        let parents = &st.get(cls).parents;
+        let names_any = |p: &Type| match p {
+            Type::Any => true,
+            Type::Class { sym, .. } => *sym == st.any_sym,
+            _ => false,
+        };
+        // `abstract class AnyVal extends Any` — as `src/library/scala/AnyVal.scala`
+        // writes it, where it is a source class and not `st.anyval_sym`. It is
+        // the *only* class that can be shaped this way: scalac rejects any
+        // other with "Any does not have a constructor" (verified on 2.13.16),
+        // so nothing a user writes reaches this arm. A **trait** extending
+        // `Any` is a universal trait and is deliberately excluded, matching
+        // nsc's `clazz.isTrait && !clazz.isSubClass(AnyValClass)`.
+        if !is_interface(st, cls) && !parents.is_empty() && parents.iter().all(names_any) {
+            return true;
+        }
+        parents.iter().any(|p| match p {
+            // `class V(val n: Int) extends AnyVal` records the parent as the
+            // `Type::AnyVal` variant; `src/library/scala/Int.scala`, compiled
+            // from source, records a `Class` naming the `AnyVal` it declares.
+            Type::AnyVal => true,
+            Type::Class { sym, .. } => walk(st, *sym, depth + 1),
+            _ => false,
+        })
+    }
+    cls == st.any_sym || walk(st, cls, 0)
 }
 
 /// A `case class` / `case object` really does extend `scala.Product with
@@ -630,6 +899,7 @@ pub fn record_method_override_families(st: &mut SymbolTable) {
         .map(|s| s.id)
         .collect();
     let mut pairs = Vec::new();
+    let mut overloads = Vec::new();
     for child in methods {
         if !is_overridable_kind(st, child) {
             continue;
@@ -652,16 +922,30 @@ pub fn record_method_override_families(st: &mut SymbolTable) {
                 }
                 if strict_method_matches(st, owner, child, base) {
                     pairs.push((child, base));
+                } else if provably_overloaded(st, owner, child, base) {
+                    // Frozen here for the same reason as the families above:
+                    // by the time the backend asks, the type arguments that
+                    // decide it are gone. `Bag[B]` and `Bag[(K, V2)]` are both
+                    // just `Bag` after erasure.
+                    overloads.push((child, base));
                 }
             }
         }
     }
     st.method_override_families.extend(pairs);
+    st.method_overload_pairs.extend(overloads);
 }
 
 /// Whether `child` is in the pre-erasure override family of `base`.
 pub fn method_overrides(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
     child == base || st.method_override_families.contains(&(child, base))
+}
+
+/// Whether `child` and `base` were *proven* to be two methods before erasure.
+/// The backend's bridge emitters ask this to keep from bridging an overload;
+/// `false` means "not proven", never "these override".
+pub fn method_overloads(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
+    child != base && st.method_overload_pairs.contains(&(child, base))
 }
 
 /// Same-named, non-final base members — the "Note:" scalac appends to

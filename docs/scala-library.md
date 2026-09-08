@@ -499,6 +499,167 @@ is expected while errors remain), `tests/slick_run.sh` and `tests/conform/`
 (the two that execute code), the corpus, and the full workspace suite. The
 classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 
+## The `agent/libanyval` slice: an overload is not an override
+
+**1420 errors in 166 files → 1386 in 164**, measured on `agent/libanyval` cut
+from `main` at `fce0a0d8`. Every other target is unchanged; see the table at
+the end of this section. The 34 that went are exactly the two override
+clusters — 22 `` `override` modifier required to override concrete member`` and
+12 `cannot override final member`` — and **no new error appeared anywhere**.
+
+### The question this slice was set, and the answer
+
+The slice was asked to decide, *with evidence*, between two readings of those
+34 errors:
+
+1. nsc never compiles `Any.scala` / `AnyVal.scala` / `Int.scala` at all — they
+   are scaladoc stubs — so the honest fix is to hold them out of the measure
+   the way `gitbucket_measure.sh` holds out `PullRequestsController.scala`;
+2. nsc really does compile them, and our override rules are wrong.
+
+**It is (2), and the framing of the question was itself off by an order of
+magnitude.**
+
+* `Any.scala`, `AnyRef.scala`, `Nothing.scala`, `Null.scala` and
+  `Singleton.scala` live in **`src/library-aux`**, which `scalalib_measure.sh`
+  already does not compile (scala/scala's `build.sbt` passes that directory as
+  `-doc-no-compile`). Nothing to hold out: it was never in.
+* `AnyVal.scala` and the nine value classes live in **`src/library`** and nsc
+  compiles them. `Definitions.scala` proves it —
+  `lazy val AnyValClass: ClassSymbol = (ScalaPackageClass.info member tpnme.AnyVal orElse {…})`
+  *reads `AnyVal` out of the compilation unit* when there is one.
+* And only **one** of the 34 was about the top of the hierarchy at all. The
+  other 33 were `Map`, `SortedMap`, `IntMap`, `LongMap`, `AnyRefMap`,
+  `ArrayBuffer`, `ListBuffer`, `ArrayDeque`, `UnrolledBuffer`,
+  `JavaCollectionWrappers`, `PartialFunction`, `Stepper`, `ArrayBuilder`,
+  `CollisionProofHashMap` and `typeConstraints` — nothing to do with `Any`.
+
+So nothing was held out, and the number below is a real reduction.
+
+### The 33: parameter types are invariant, and we could not tell
+
+`override_check::same_type` gave up and answered **"same type"** whenever
+either side mentioned a type parameter (`robust` refuses to compare those, and
+the comparison defaulted to matching). That is the right default for a *result*
+comparison, where a wrong answer invents a diagnostic; it is the wrong default
+for deciding **whether two methods are the same method at all**, because SLS
+5.1.4 makes parameter types invariant under overriding and a different one is
+an overload.
+
+The library is written in exactly the shape that breaks:
+
+| declaration | its supposed override | why they are two methods |
+|---|---|---|
+| `IterableOps.concat[B >: A](suffix: IterableOnce[B])` | `MapOps.concat[V2 >: V](suffix: IterableOnce[(K, V2)])` | read at `Map`, `IterableOnce[V2]` against `IterableOnce[(K, V2)]` — a bound variable is not a tuple containing it |
+| `Buffer.prepend(elems: A*)` (`final`) | `ArrayBuffer.prepend(elem: A)` | `scala.<repeated>[A]` is not `A` |
+| `Function1.compose[A](g: A => T1)` | `<:<.compose[C](r: C <:< From)` | `<:<` is a *subtype* of `Function1`, not the same type |
+| `Growable.addAll(elems: IterableOnce[A])` | `ArrayBuilder.addAll(xs: Array[_ <: T])` | unrelated classes |
+| `Spliterator.OfInt.tryAdvance(Consumer[_ >: Integer])` | `…tryAdvance(IntConsumer)` | unrelated classes |
+
+`certainly_different` now decides these, and only these — it is the
+counterweight to `robust`, and it answers `false` (undecided) for everything it
+cannot settle by *shape*: repeated against non-repeated, by-name against
+non-by-name, the same head class with a decidably different argument, two
+classes with different JVM names, and a **rigid** type variable against an
+application of a constructor. "Rigid" is guarded by `rigid_tparams`: only the
+overriding method's own parameters and those of the class the check runs in
+count, because a leftover parameter is a `subst_as_seen_from` that failed and
+nothing may be concluded from it.
+
+Two supporting corrections came out of the same measurement:
+
+* **`matches` now reads both signatures at the same prefix**, as nsc's
+  `matchingSymbols` does (`self.memberType(sym1)` against
+  `self.memberType(sym2)`). The child was being read raw. That is invisible
+  while the child is owned by the class, but
+  `check_missing_implementations` asks whether a member inherited from *one*
+  base implements a declaration inherited from *another*, and it was comparing
+  `Iterator.filter(p: A => Boolean)` with
+  `IterableOnceOps.filter(pred: Seq[B] => Boolean)`. Without this, tightening
+  the matcher produced four new `needs to be abstract` / `object creation
+  impossible` errors.
+* **The backend must not bridge an overload.** `bridge_overrides` compares
+  *erased* descriptors on purpose — that is what a bridge exists for — so once
+  `Table.pp[V2](xs: Bag[(K, V2)]): String` was correctly accepted beside
+  `Ops.pp[B](xs: Bag[B]): Bag[B]`, both bridge emitters saw one `(LBag;)`
+  parameter and emitted `pp(LBag;)LBag;` calling `pp(LBag;)Ljava/lang/String;`
+  with a `checkcast`. The class then threw `ClassCastException` on the
+  parent's own signature where scalac emits a mixin forwarder. The relation
+  cannot be recomputed in the backend — by then `Bag[B]` and `Bag[(K, V2)]`
+  are both just `Bag` — so `record_method_override_families` now freezes the
+  *complement* too, in `SymbolTable::method_overload_pairs`, and
+  `method_overloads` is what the emitters ask.
+
+### The 1: `Object` is not a base class of `AnyVal`
+
+```
+error: `override` modifier required to override concrete member:
+def getClass: Class[_] (defined in class Object)
+ --> src/library/scala/AnyVal.scala:57:3
+ 57 |   def getClass(): Class[_ <: AnyVal] = null
+```
+
+nsc's `AnyClass` is `enterNewClass(ScalaPackageClass, tpnme.Any, Nil, ABSTRACT)`
+— **`Nil` parents** — and `AnyVal extends Any`, so `java.lang.Object` is not a
+base class of `AnyVal`, of the nine primitive value classes, or of a
+user-defined value class. `override_check::full_lin` appended `Object` and
+`AnyRef` to *everything*. It no longer does for an `AnyVal`-rooted template.
+
+The boundary is nsc's own, and it is narrower than "extends `Any`".
+`RefChecks.checkAllOverrides` carries a second, JVM-motivated ban whose guard
+is `clazz.isTrait && !clazz.isSubClass(AnyValClass)`:
+
+```
+scala> trait Univ extends Any { def notify(): String = "x" }
+error: trait cannot redefine final method from class AnyRef
+scala> class Meters(val n: Int) extends AnyVal { def notify(): String = "x" }   // accepted, and runs
+```
+
+So a **universal trait** keeps `Object` in its linearization here — that is
+what preserves the rejection, under the ordinary rule's wording — and only
+`AnyVal` and its subclasses are exempt. `is_any_rooted` recognises the
+source-compiled `abstract class AnyVal extends Any` structurally: it is the
+only *class* whose parents are exactly `Any`, because scalac rejects any other
+with `Any does not have a constructor`.
+
+### Fixtures
+
+`tests/fixtures/libanyval_overload.scala` executes five overload pairs and a
+value class; `tests/fixtures/expected/libanyval_overload.txt` is real scalac
+2.13.16's own output for it. Three negative fixtures pin the boundary —
+`libanyval_final_bad` (a base type parameter the subclass *fixes* still
+overrides a `final` member), `libanyval_modreq_bad` (`A*` against `Int*` is not
+a shape difference), `libanyval_univtrait_bad` (a universal trait still may not
+redefine `Object`'s finals). All four are in `crates/cli/tests/override.rs`.
+
+### The other targets, before and after this slice
+
+| target | before | after |
+|---|---|---|
+| scala library | `1420 / 166` | **`1386 / 164`** |
+| gitbucket | `333 / 81` | `333 / 81` |
+| cats | `188 / 72` | `188 / 72` |
+| slick (compile) | `errors=0 classes=1490` | `errors=0 classes=1490` |
+| slick (`MODE=b`) | `progs=12 ok=12 diff=0 fail=0` | `progs=12 ok=12 diff=0 fail=0` |
+| corpus | `pos 1086 / neg 670 / run 618` | `pos 1089 / neg 674 / run 618`, `losses=0` |
+
+### A defect found and not fixed here
+
+A subclass method shadows a same-named **inherited** method entirely when the
+parent is generic, so a legal call to the inherited overload is rejected:
+
+```scala
+trait Bag[+A] { def tag: String }
+trait Ops3[A] { def h(x: Bag[A]): String = "Ops3.h" }
+class T3 extends Ops3[Int] { def h(x: Int): String = "T3.h" }
+new T3().h(new Bag[Int] { def tag = "b" })   // no matching overload for (Int)String
+```
+
+This predates the slice — `Bag[Int]` and `Int` are both fully resolved, so the
+old matcher already treated them as an overload — and it is member-supply, not
+override checking. It is why `libanyval_overload.scala` upcasts before calling
+the inherited alternative.
+
 ## What to do next, in order
 
 1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
@@ -509,12 +670,12 @@ classfile-loader and `javap` sweeps in `slick_subset.sh` were skipped as above.
 2. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
    classes report `class TupleN needs to be abstract` against
    `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
-3. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
-   required`` plus 21 `incompatible type in overriding`) is a second root. It
-   looks like one — `overrides nothing` does not need member lookup to
-   succeed — but the ones sampled were the same bug seen from the other side.
-   It has shrunk from 263 along with everything else, which is consistent with
-   that reading.
+3. The overriding family was *partly* a second root after all. The
+   `agent/libanyval` slice above removed 34 of it — every
+   `` `override` modifier required`` and every `cannot override final
+   member`` — by fixing the matcher rather than by lookup work. What is left
+   of it is 9 `incompatible type in overriding` plus 10 `overrides nothing`,
+   and those *are* the member-lookup bug seen from the other side.
 4. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 

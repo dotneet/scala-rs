@@ -12,7 +12,7 @@ use crate::classfile::{
 use crate::gen::*;
 use crate::ifacebridge::BridgeKind;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::{method_overrides, SymKind};
+use scala_rs_typer::{method_overloads, method_overrides, SymKind};
 use std::collections::{HashMap, HashSet};
 
 impl<'a> Gen<'a> {
@@ -1947,6 +1947,18 @@ impl<'a> Gen<'a> {
     /// `AbstractMethodError`. nsc emits the bridge on the implementing class;
     /// do the same, for every inherited method whose erased descriptor we do
     /// not implement but whose parameters match one we do.
+    /// The class's own method symbol behind an emitted name/descriptor pair.
+    /// `ClassBuilder::Method` carries no symbol, so the bridge paths that work
+    /// on descriptors alone have to find their way back to one before they can
+    /// ask a pre-erasure question.
+    fn own_method_sym(&self, class_id: SymbolId, enc: &str, desc: &str) -> Option<SymbolId> {
+        self.st.get(class_id).members.iter().copied().find(|&id| {
+            self.st.get(id).kind == SymKind::Method
+                && encode_method_name(&self.st.get(id).name) == enc
+                && method_desc_from_sym(self.st, id) == desc
+        })
+    }
+
     pub(crate) fn emit_inherited_covariant_bridges(
         &self,
         b: &mut ClassBuilder,
@@ -2044,6 +2056,19 @@ impl<'a> Gen<'a> {
                         first
                     }
                 };
+                // The chosen implementation may not be an override at all.
+                // Erased descriptors cannot tell `Ops.pp[B](xs: Bag[B]): Bag[B]`
+                // from `Table.pp[V2](xs: Bag[(K, V2)]): String` -- same
+                // parameter, narrower result -- so this emitted
+                // `pp(LBag;)LBag;` calling `pp(LBag;)Ljava/lang/String;` and
+                // the class threw ClassCastException on the parent's own
+                // signature. Before erasure they are two methods, and the
+                // parent's default implementation is what must run.
+                if let Some(cid) = self.own_method_sym(class_id, &enc, &have) {
+                    if method_overloads(self.st, cid, pmid) {
+                        continue;
+                    }
+                }
                 let cparam_strs = desc_param_strs(&have);
                 let mut loads: Vec<(u16, JvmSort, Option<String>)> = Vec::new();
                 let mut locals = 1u16;
@@ -2225,6 +2250,15 @@ impl<'a> Gen<'a> {
                             &method_params_from_sym(self.st, *id),
                             parent_abstract,
                         )
+                        // `bridge_overrides` compares erased descriptors, so
+                        // it cannot tell `Ops.pp[B](xs: Bag[B])` from
+                        // `Table.pp[V2](xs: Bag[(K, V2)])` -- one JVM
+                        // parameter, two Scala methods. Bridging those emitted
+                        // `pp(Bag)Bag` calling `pp(Bag)String` with a
+                        // checkcast, and the class threw ClassCastException on
+                        // the parent's own signature. scalac emits the mixin
+                        // forwarder instead.
+                        && !method_overloads(self.st, *id, pmid)
                 }) else {
                     continue;
                 };
