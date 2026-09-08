@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `8d4cdde0` |
+| commit | `54df4d43` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Seventeen slices have merged this session**, in six composed gates. From
+**Twenty-one slices have merged this session**, in seven composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -29,6 +29,7 @@ coordinator measured the merged tree each time, not the branches.
 | `9a00edce` | `projection`, `selftype`, `hkpath` | 717 | -> 251 |
 | `7aa47c29` | `linterm`, `gbhead`, `hkselfalias`, `macromirror`, `qualfallback`, `subtypeterm`, `catsinfer`, `linorder2` | -> 398 | -> 231 |
 | `8d4cdde0` | `hkunify`, `convimpl` | -> 393 | -> 215 |
+| `54df4d43` | `gbmapto`, `basetypeseq`, `catstail`, `gbshape` | -> 337 | -> 196 |
 
 Four of those fifteen move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -75,6 +76,41 @@ duplicated diagnostic structurally rather than by de-duplicating messages, and
 a case where two views tie on argument type and differ only in their implicit
 clauses now compiles as scalac compiles it.
 
+The seventh gate's four slices each corrected the brief they were given, and
+three of the four found an "accepting too much" defect on the way:
+
+* **`agent/basetypeseq`** — the culprit was `subst_as_seen_from`, not
+  `base_type_seq`: it walks parents in written order and a `seen` set stops the
+  second arrival, so the *first-written* parent's instantiation won. Reordering
+  the walk measured **1551 -> 1579**; recording, per base class, only the
+  instantiation the most derived arrival supplies measured **1551 -> 1420**,
+  26 files improved and none worse. The corpus did not move a single line —
+  this hierarchy shape does not reach its `run` population, so the -131 is an
+  error count and not a test count.
+* **`agent/catstail`** — clustering by *which member selection* rather than by
+  message shape showed that 15 lines counted as three families were one root:
+  a mixin forwarder read from a class file was being treated as a declaration.
+  A JVM generic signature cannot write `[B >: A]` and has only one parameter
+  list, so `IterableOnceOps.reduceLeft[B >: A]` arrives as
+  `<B> B reduceLeft(Function2<B, A, B>)` beside the pickled declaration, and
+  overload resolution had two candidates where nsc has one. Before the fix
+  `xs.foldLeft(0, f)` **compiled**; scalac rejects it. Two looser versions were
+  measured and discarded (slick 0 -> 7 errors; 18 slick class files changed).
+* **`agent/gbshape`** — the four gitbucket families were **three** roots. The
+  large one: `sig_rerun_safe` only rebuilds a signature that failed, and only a
+  rebuild refreshes the scope snapshot, so a member whose own signature was
+  fine kept the snapshot from before `import profile.api._` resolved — measured
+  at 43 implicits in scope with `columnExtensionMethods` absent. Separately,
+  `is_assignment_op` was missing nsc's guards, so `var b = true; b === false`
+  **compiled** as `b = (b != false)`. That fix costs +3 on its own and is in
+  for soundness, not for the count.
+* **`agent/gbmapto`** — the tag descriptor now carries type arguments, and the
+  measurement corrected the standing story: nsc's `macroArgs` wraps every value
+  argument as `Expr[Nothing]`, so we had been building tags nsc never builds.
+  `mapTo` stays refused, with the refusal naming the wall that is actually next
+  (the type arguments written on the macro implementation reference, which
+  `PickleReader::macro_impl_of` discards).
+
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -100,9 +136,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **215** | **73** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **393** | **83** | — |
-| `tests/scalalib_measure.sh` (538) | **1551** | **168** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **196** | **73** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **337** | **81** | — |
+| `tests/scalalib_measure.sh` (538) | **1420** | **166** | — |
 
 ## Execution
 
@@ -123,7 +159,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `run` (2060) | **618** | 889 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-8d4cdde0.tsv`](baselines/corpus-8d4cdde0.tsv): 5324 unique
+[`baselines/corpus-54df4d43.tsv`](baselines/corpus-54df4d43.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -158,7 +194,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-8d4cdde0.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-54df4d43.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -185,12 +221,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **239 result rows, 2379 passed, 0 failed** at `8d4cdde0` |
+| `cargo test --workspace --release --no-fail-fast` | **243 result rows, 2394 passed, 0 failed** at `54df4d43` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
-`cargo clippy --workspace --release` exits 0 with 57 warning messages versus
-57 in the preceding baseline, with no added warning messages. Count the
+`cargo clippy --workspace --release` exits 0 with **58** warning messages,
+counted as messages and not as `^warning:` lines. The figure stood at 57 for
+several gates and was stale: a slice reported 58, and checking out the
+recorded baseline commit into a separate worktree and running the same
+command there gave 58 as well. Count the
 messages, not `^warning:` lines: the six per-crate "generated N warnings"
 summaries make the raw count 63, and a slice reported that as drift. Compare the same command scope;
 `--all-targets` also includes historical warnings from tests.
