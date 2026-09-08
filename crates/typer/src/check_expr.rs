@@ -69,7 +69,7 @@ impl Typer {
                 self.expand_macro_application(tree);
             }
         }
-        self.adapt_implicit_apply(tree, pt);
+        self.adapt_implicit_apply_in(tree, pt, callee);
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
             self.adapt(tree, pt);
         }

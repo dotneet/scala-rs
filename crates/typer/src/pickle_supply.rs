@@ -3822,14 +3822,30 @@ fn read_shape(t: &SigType) -> Option<Shape> {
     }
 }
 
-/// `def max[B >: A](implicit ord: Ordering[B]): A` has nothing at the call site
-/// to infer `B` from; scalac resolves it to the lower bound, `A`. Do the same
-/// here, and drop the parameter.
+/// Decide what to do with a pickled type parameter that no *explicit*
+/// parameter mentions, and refuse the member when nothing can determine it.
 ///
-/// Without this the typer cannot solve `Ordering[B]`, and instead of failing it
-/// eta-expands `xs.max` into a function value — a silently wrong program. Any
-/// type parameter left undetermined after this pass makes the whole member
-/// ineligible, so that shape can never reach the user.
+/// `def max[B >: A](implicit ord: Ordering[B]): A` and
+/// `def sorted[B >: A](implicit ord: Ordering[B]): C` are the shape this is
+/// named for. This function used to substitute `B := A` and drop the type
+/// parameter, on the theory that scalac resolves `B` to its lower bound.
+/// **It does not.** `B` stays undetermined until the implicit clause is
+/// solved, so an explicitly supplied argument determines it:
+/// `xs.sorted(AA.toOrdering)` with `AA >: A` is `B := AA` and compiles, and
+/// scalac's `-Xprint:typer` prints the instantiation. Pinning `B` to `A`
+/// first made us reject that with `found: Ordering[AA] required: Ordering[A]`
+/// — six of cats' errors, every one of them a `.sorted` call. Keeping the
+/// parameter is what the typer wants: `infer_method_tparams_in` already
+/// solves `B` from an explicit argument, and falls back to the lower bound
+/// when the argument comes from implicit search (`xs.max` on a `List[Int]`
+/// still finds `Ordering.Int`), which is the behaviour a source-declared
+/// `def maxX[B >: A](implicit ord: Ordering[B]): A` has always had here.
+///
+/// What remains is the refusal. A type parameter that *nothing* can determine
+/// — no explicit parameter, no lower bound, not named by the result, not what
+/// an implicit is asked for — makes the whole member ineligible, because the
+/// typer would silently eta-expand `xs.max` into a function value rather than
+/// fail. That shape never reaches the user.
 fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
     let determined: HashSet<String> = shape
         .clauses
@@ -3841,82 +3857,82 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
     let mut pin: HashMap<String, SigType> = HashMap::new();
     let mut kept = Vec::new();
     for tp in &shape.tparams {
-        if determined.contains(&tp.name) {
+        let keep = |kept: &mut Vec<ShapeTParam>| {
             kept.push(ShapeTParam {
                 name: tp.name.clone(),
                 lo: tp.lo.clone(),
                 hi: tp.hi.clone(),
                 arity: tp.arity,
-            });
+            })
+        };
+        if determined.contains(&tp.name) {
+            keep(&mut kept);
             continue;
         }
-        match &tp.lo {
-            Some(lo) if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") => {
-                pin.insert(tp.name.clone(), lo.clone());
-            }
-            // No lower bound to pin it to, but the *result* names it: the call
-            // site can still determine it, from an explicit type application
-            // (`classTag[Short]`) or from the expected type. Keep the member.
-            // `max[B >: A](implicit ord: Ordering[B]): A` is the other shape --
-            // `B` is nowhere in the result, and it does have a lower bound.
-            _ if mentioned(&shape.ret).contains(&tp.name) => {
-                kept.push(ShapeTParam {
-                    name: tp.name.clone(),
-                    lo: tp.lo.clone(),
-                    hi: tp.hi.clone(),
-                    arity: tp.arity,
-                });
-            }
-            // A *materialiser*: the whole member is one implicit clause, and
-            // the type parameter is what the implicit is asked for.
-            // `def typeOf[T](implicit ttag: TypeTag[T]): Type`,
-            // `symbolOf[T]`, `weakTypeOf[T]` -- the three slick's macro
-            // implementations are written with. These are always called with
-            // an explicit type argument (`symbolOf[R]`), which is exactly what
-            // the branch above accepts for `classTag[Short]`; the only
-            // difference is that the result type does not happen to name `T`.
-            // With no explicit type argument `T` is `Nothing` and the implicit
-            // search fails, which is a diagnostic, not a wrong program.
-            _ if shape.clauses.iter().all(|c| c.implicit)
-                && shape
-                    .clauses
-                    .iter()
-                    .any(|c| c.params.iter().any(|p| mentioned(&p.ty).contains(&tp.name))) =>
-            {
-                kept.push(ShapeTParam {
-                    name: tp.name.clone(),
-                    lo: tp.lo.clone(),
-                    hi: tp.hi.clone(),
-                    arity: tp.arity,
-                });
-            }
-            // A type parameter the signature never mentions again: no
-            // parameter and no result names it, so nothing the call site does
-            // depends on how it is solved and there is no implicit to fail.
-            // nsc's *default getters* are where this shape comes from -- they
-            // inherit the method's type parameters whether or not the default
-            // expression uses them, so `def halt[T: Manifest](status: Integer
-            // = null, body: T = (), headers: Map[…] = …)` gives
-            // `halt$default$1[T]: Integer`. Declining that getter declined
-            // `halt` itself (`install` refuses a member whose default it
-            // cannot fill), which is how `halt(400)` was left with only the
-            // unrelated `halt(ActionResult)` overload.
-            _ if !shape
-                .clauses
-                .iter()
-                .any(|c| c.params.iter().any(|p| mentioned(&p.ty).contains(&tp.name))) =>
-            {
-                kept.push(ShapeTParam {
-                    name: tp.name.clone(),
-                    lo: tp.lo.clone(),
-                    hi: tp.hi.clone(),
-                    arity: tp.arity,
-                });
-            }
-            // Unconstrained and undeterminable: refuse the member rather than
-            // hand the typer something it will silently eta-expand.
-            _ => return None,
+        let named_by_an_implicit = shape
+            .clauses
+            .iter()
+            .any(|c| c.params.iter().any(|p| mentioned(&p.ty).contains(&tp.name)));
+        let real_lo = matches!(&tp.lo, Some(lo) if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing"));
+        // An implicit parameter names it and it has a lower bound: keep it.
+        // An argument supplied explicitly for that clause is what determines
+        // it -- `xs.sorted(AA.toOrdering)` with `AA >: A` is `B := AA` -- and
+        // when the argument comes from implicit search instead, the typer
+        // instantiates the parameter at its lower bound first
+        // (`pin_lower_bounded_implicit_tparams`), which is what makes
+        // `xs.max` on a `List[Int]` find `Ordering.Int`.
+        if real_lo && named_by_an_implicit {
+            keep(&mut kept);
+            continue;
         }
+        // A lower bound and *no* parameter of any kind names it:
+        // `Resource#allocated[B >: A](implicit F: MonadCancel[F, Throwable]):
+        // F[(B, F[Unit])]`. Nothing at the call site mentions `B`, so nsc's
+        // `inferExprInstance` instantiates it at the bound; do that here and
+        // drop the parameter, because the typer's own instantiation only
+        // reaches parameters an implicit clause names.
+        if real_lo {
+            pin.insert(tp.name.clone(), tp.lo.clone().expect("real_lo"));
+            continue;
+        }
+        // No lower bound, but the *result* names it: the call site can still
+        // determine it, from an explicit type application (`classTag[Short]`)
+        // or from the expected type.
+        if mentioned(&shape.ret).contains(&tp.name) {
+            keep(&mut kept);
+            continue;
+        }
+        // A *materialiser*: the whole member is one implicit clause, and the
+        // type parameter is what the implicit is asked for.
+        // `def typeOf[T](implicit ttag: TypeTag[T]): Type`, `symbolOf[T]`,
+        // `weakTypeOf[T]` -- the three slick's macro implementations are
+        // written with. These are always called with an explicit type argument
+        // (`symbolOf[R]`), which is exactly what the branch above accepts for
+        // `classTag[Short]`; the only difference is that the result type does
+        // not happen to name `T`. With no explicit type argument `T` is
+        // `Nothing` and the implicit search fails, which is a diagnostic, not a
+        // wrong program.
+        if shape.clauses.iter().all(|c| c.implicit) && named_by_an_implicit {
+            keep(&mut kept);
+            continue;
+        }
+        // A type parameter the signature never mentions again: no parameter and
+        // no result names it, so nothing the call site does depends on how it is
+        // solved and there is no implicit to fail. nsc's *default getters* are
+        // where this shape comes from -- they inherit the method's type
+        // parameters whether or not the default expression uses them, so
+        // `def halt[T: Manifest](status: Integer = null, body: T = (),
+        // headers: Map[...] = ...)` gives `halt$default$1[T]: Integer`.
+        // Declining that getter declined `halt` itself (`install` refuses a
+        // member whose default it cannot fill), which is how `halt(400)` was
+        // left with only the unrelated `halt(ActionResult)` overload.
+        if !named_by_an_implicit {
+            keep(&mut kept);
+            continue;
+        }
+        // Unconstrained and undeterminable: refuse the member rather than hand
+        // the typer something it will silently eta-expand.
+        return None;
     }
     if pin.is_empty() {
         return Some(shape);
