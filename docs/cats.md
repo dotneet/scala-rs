@@ -2574,3 +2574,253 @@ scala/scala corpus (`CORPUS_SIZE=full`, 5324 units) the candidate is
 `pos 1086 / neg 670 / run 618` -- identical to `aa707a3f` -- with `losses=0`
 against `tests/baselines/corpus-7aa47c29.tsv` and the nine gains that ledger
 predates, all of them `agent/hkunify`'s.
+
+## The forwarder standing next to the declaration (`agent/catstail`)
+
+**215 -> 200 errors, 73 files unchanged.** Fifteen error locations gone and
+none appeared; gitbucket 393 -> 391 as well. The brief for this slice named
+six families and asked which of them are genuinely separate. The answer is
+that the largest thing in cats was **none of them**: fifteen lines nobody had
+connected to each other, spread over four files, wearing three different
+messages.
+
+### The head was not any of the six named families
+
+Clustering the 215 by *message* put `Ordering[AA]` against `Ordering[A]` (6)
+at the top, and clustering by *file* put `OptionT.scala` (11) there. Both are
+the wrong unit. Grouping by the member being selected instead gives:
+
+| n | lines | member |
+|---:|---|---|
+| 15 | `NonEmptyLazyList.scala` 269/275/281 (x2)/298 (x2)/354, `instances/lazyList.scala` 79/158 (x2), `instances/stream.scala` 67/177 (x2), `instances/arraySeq.scala` 188 (x2) | `reduceLeft` / `foldLeft` / `reduceLeftOption` on a collection |
+
+Three messages -- `found: (A, A) => A  required: Function2[Any, A, Any]`,
+`value apply is not a member of B`, and the `found: B  required: A` /
+`found: Option[B]  required: Option[A]` that follow them -- and one root.
+
+### The root
+
+scalac gives every concrete class a **mixin forwarder** for each default
+method it inherits from a trait, and writes a `Signature` attribute for it.
+A JVM generic signature cannot write `[B >: A]`, and the JVM has one argument
+list, so the forwarder is a *lossy copy* of the declaration:
+
+```text
+scala.collection.IterableOnceOps:  def reduceLeft[B >: A](op: (B, A) => B): B
+scala.collection.AbstractIterable: public <B> B reduceLeft(Function2<B, A, B>)
+
+scala.collection.IterableOnceOps:  def foldLeft[B](z: B)(op: (B, A) => B): B
+scala.collection.AbstractIterable: public <B> B foldLeft(Object, Function2)
+```
+
+`classpath::is_erased_scala_forwarder` drops the forwarders that carry **no**
+signature at all -- the ones `agent/final2` found behind
+`value map is not a member of Any`. These carry one, so `fill_java_members`
+installed them, and a receiver below `AbstractIterable` saw the declaration
+*and* its copy. Overload resolution then had two alternatives where nsc has
+one, and picking the copy left `B` with nothing but `Any` to be:
+`toLazyList.reduceLeft(f)` came out `required: Function2[Any, A, Any]`, and
+`toLazyList.foldLeft(b)(f)` read `(b)` as the whole call and applied its `B`
+result to `(f)` -- `value apply is not a member of B`.
+
+Both copies have to be present for the failure; one alone still types from
+the expected type. That is why it is order-dependent and why it looked like
+four unrelated families: `AbstractIterable`'s class file is read when an
+`import` pulls in a class whose parent chain reaches it (in cats,
+`scala.collection.immutable.ArraySeq`), and `IterableOnceOps`' own
+declaration is installed when some *other* receiver asks for the same name.
+
+`Check::drop_classfile_forwarders` (`check_select.rs`, in `drop_overridden`'s
+chain) drops such a copy when three things hold: it is a member the class
+file reader made (`jvm_name` is a descriptor), a *pickled* declaration with
+the same erased parameter list is in the same candidate set on a class above
+it, and the copy says exactly what that declaration says minus the two losses
+above. The last is `faithful_bytecode_copy`: flatten both parameter lists,
+line the type parameters up **by name** (scalac writes the forwarder from the
+declaration, so the names are the declaration's), read a `FunctionN` and a
+function type as the same thing, and require equality.
+
+### What the narrower forms of the rule cost, measured
+
+Two looser versions were measured and rejected, and both are worth recording
+because they are the obvious ones to reach for:
+
+* **"the declaration has more clauses, or a type parameter with a lower
+  bound"** -- counting the losses instead of comparing the whole signature.
+  That drops copies which say *more* than the declaration: `immutable.List`
+  renders the `++[B >: A](that): CC[B]` it inherits as
+  `++(IterableOnce): List[B]`, `immutable.Map` renders `getOrElse`'s key with
+  the erased `Any`, and `SetOps.++(that: IterableOnce[A]): C` is a genuinely
+  different overload from `IterableOps.++[B >: A]` (2.13 keeps both; the
+  monomorphic one is strictly more specific). cats went to 202 and **slick
+  from 0 to 7 errors**: `xs ++ ys` on a `List` down to `Iterable`, two
+  `getOrElse` candidates left with nothing to separate them.
+* **"an empty `pickled_origin` means the class file made it"** -- it also
+  means *source* made it. slick's `class ProductWrapper extends Product` has
+  its own `productArity`, which is not a forwarder for the declaration it
+  implements; without the descriptor guard **18 slick class files changed**
+  (`invokevirtual ProductWrapper.productArity` became
+  `invokeinterface Product.productArity`). Correct at run time, and exactly
+  the kind of silent codegen change the byte-comparison exists to catch.
+
+### Correctness
+
+`tests/fixtures/cfw_forwarder.scala` runs the three shapes and prints; every
+line is checked by its value, so an instantiation that merely compiles cannot
+pass (`fold` accumulates a `String` over `Int`s, which needs `B` to be the
+caller's own `B` *and* needs the second clause to exist). The expected file is
+what real scalac 2.13.16 prints for the same source, and
+`crates/cli/tests/cfwd.rs` asserts scalac's own run against it as well. On the
+pre-fix binary the fixture does not compile: five errors, every shape among
+them.
+
+`tests/fixtures/cfw_forwarder_bad.scala` is the half that says the rule is a
+restriction. `bad2` is the one that matters: `xs.foldLeft(0, f)` passes both
+of `foldLeft`'s clauses as one argument list, which is precisely what the
+flattened forwarder accepted -- **the pre-fix binary compiles it** and real
+scalac rejects it (`missing argument list for method foldLeft`). Both lines
+are rejected at scalac's own 25 and 29.
+
+### The cost, measured
+
+On the merged tree (`main` at `eb4c9c61`, `agent/gbshape` and
+`agent/gbmapto`): against that same `main` measured on its own, cats
+215 -> **200** / 73 files, gitbucket 393 -> **391** / 83 files, the scala
+library **1551** / 168 unchanged, slick `errors=0 files_with_errors=0
+classes=1490` with **all 1490 class files byte-identical** to `main`'s build
+(`SLICK_OUT` on both binaries, `diff -r` empty). `MODE=b tests/slick_run.sh`
+is `progs=12 ok=12 diff=0 fail=0 attempts=36/36`. `slick_subset.sh` was not
+run: nothing here reaches codegen, and the byte-identical class files say so
+more directly. No new clippy warnings (pickle 0, typer 37, all in untouched
+code).
+
+### The pickle's linearization is not ordered by derivedness (not fixed)
+
+The `SortedMap` family the brief named -- `instances/sortedMap.scala`
+73/78/93/237/242/247, `NonEmptyMapImpl.scala` 114/122 -- was diagnosed in
+full, and a fix was written, measured and **reverted**. Recorded here so the
+next slice starts from the diagnosis rather than the symptom.
+
+`SortedMapOps` overloads `map` / `flatMap` / `collect` with an
+`(implicit ordering: Ordering[K2])` clause returning the *sorted* collection,
+which is why cats writes `implicit val ordering: Ordering[K] = fa.ordering`
+one line above each of them. `PickleSupply::install` keeps one declaration per
+erased *explicit* parameter list -- the two are equally specific under nsc's
+`isAsSpecific`, which looks through an implicit clause, so only their owners
+separate them -- and it keeps the **first** one `SigCache::lookup` offers, on
+the reading that the walk is most-derived-first.
+
+The walk is not. `SigCache::lin_of` folds the parents as
+`acc = L(Ci) ++ (acc minus L(Ci))`, which gives a shared ancestor the
+**later** parent's position; SLS 5.1.2's `+:` replaces the elements of the
+*left* operand, so the earlier parent's position wins
+(`crates/typer/src/lin.rs` states the rule and gets it right).
+`immutable.SortedMap`'s last parent is
+`SortedMapFactoryDefaults extends SortedMapOps[…] with MapOps[…]`, so
+`collection.MapOps` headed the list and `aSortedMap.map(f)` was supplied as
+`MapOps.map[K2, V2](f): Map[K2, V2]`, with `SortedMapOps.map` discarded as
+"shadowed by a more derived declaration" by a declaration that is in fact
+less derived. The trace is one line of `SCALA_RS_PICKLE_DEBUG=1`:
+
+```text
+[pickle] scala.collection.immutable.SortedMap#map: hit from scala.collection.MapOps :: …
+[pickle] scala.collection.immutable.SortedMap#map: hit from scala.collection.SortedMapOps ::
+         [K2, V2](f: …)(implicit ordering: Ordering[K2])scala.collection.immutable.SortedMap[K2, V2]
+[pickle] scala/collection/immutable/SortedMap#map: skipping an overload shadowed by a
+         more derived declaration with the same parameters
+```
+
+Three things were measured on top of that:
+
+1. **Correcting `lin_of` to SLS's `+:`.** It fixes `map`/`flatMap`/`collect`
+   and breaks the *substitution*: a step carries not only a position but the
+   substitution its route produces, and a class reached twice is then read at
+   whichever route holds the position rather than at its most derived
+   instantiation. `immutable.Set` reaches `collection.SetOps` as
+   `C = collection.Set[A]` through its second parent and as
+   `C = immutable.Set[A]` through its third; scalac types `x | y` on two
+   `immutable.Set[A]`s as `immutable.Set[A]` (`-Xprint:typer`), because nsc
+   merges the parents' base type sequences *contravariantly*
+   (`BaseTypeSeqs.CompoundBaseTypeSeq`) rather than picking one by position.
+   With the order corrected and no merge, cats went 215 -> 219 and slick 0 -> 1
+   (`errors += RefId(n1)` in `VerifyTypes.scala`).
+2. **The order plus a most-derived merge of the substitutions.** cats 217
+   (nine lines fixed, eleven appeared), slick back to 0. Of the eleven, six
+   were the forwarder root above, one was `apply is not a member of B`, three
+   were the `lazyZip` ambiguity and one was `Tuple2[A, B]` against `(A, B)`.
+3. **Ordering the *hits* rather than the walk** (`order_by_derivedness`,
+   sorting `lookup`'s answers so a declaration precedes every declaration it
+   overrides, leaving every substitution alone). This is the one to build on:
+   it fixes the whole family in a one-file repro, leaves slick at `errors=0`
+   with byte-identical class files, and leaves gitbucket and the scala library
+   unchanged. Two things stopped it landing here. It is **inert on cats as
+   measured**, because by the time cats reaches `instances/sortedMap.scala`
+   the name is already installed and completion never runs -- it needs
+   `Check::supply_receiver_override` to walk the receiver's *ancestors* (its
+   `declares_other_signature` gate asks only the receiver's own class file,
+   and `immutable.SortedMap`'s declares no `map`, no `collect`, no `keySet`).
+   And with that walk it costs `crates/cli/tests/ambigmap.rs`'s
+   `am_pickledup`, whose two copies of one pickled declaration stop
+   collapsing -- `collapse_pickled_copies` dedups by `pickled_origin`, and
+   re-ordering the hits gives the two receivers different origins.
+
+The one-file repro, which real scalac 2.13.16 accepts in full:
+
+```scala
+import scala.collection.immutable.{SortedMap, SortedSet, BitSet}
+object S1 {
+  def m1[K, A, B](fa: SortedMap[K, A])(f: A => B): SortedMap[K, B] = {
+    implicit val ordering: Ordering[K] = fa.ordering
+    fa.map { case (k, a) => (k, f(a)) }          // found: Map[K, B]
+  }
+  def m5[K, A](fa: SortedMap[K, A]): SortedSet[K] = fa.keySet   // found: Set[K]
+  def m7(x: BitSet, y: BitSet): BitSet = x | y                  // found: SortedSet[Int]
+}
+```
+
+`keySet` and `BitSet`'s `|` are *not* the same root and are not fixed by any
+of the three: `SortedMapOps.keySet: SortedSet[K]` is a plain covariant
+override with the same erasure, which `supply_receiver_override`'s
+`declares_other_signature` refuses by design (installing one renames the call
+target), and `BitSet`'s `C` is the base-type merge of (1) above --
+`agent/basetypeseq`'s subject on the symbol-table side.
+
+### The head after this slice
+
+200 errors in 73 files: **96 `type mismatch`** (73 distinct found/required
+pairs), **61 `no matching overload`**, 22 `no implicit`, 7 `ambiguous
+implicit`. By file: `OptionT.scala` 11, `Kleisli.scala` 10, `Chain.scala` 7,
+`instances/try.scala` 7. The largest single mechanisms, re-clustered:
+
+* **`SortedMap`/`SortedSet` losing their ordering** (15, and *two* roots, not
+  one). The `(implicit Ordering[K2])` overload, diagnosed above with a
+  measured route in, is ten: `sortedMap.scala` 73/78/93/237/242/247,
+  `NonEmptyMapImpl.scala` 114/122, `sortedSet.scala:110`,
+  `NonEmptySet.scala:308`. The other five are the base-type merge, not the
+  hit order: `sortedSet.scala:34` and
+  `kernel/instances/SortedSetInstances.scala:106` (`x | y`, whose `C` is read
+  through `immutable.Set` rather than through `SortedSetOps`),
+  `NonEmptyMapImpl.scala` 129 (`transform`) and 148 (`keySet`, a plain
+  covariant override with the same erasure), and `NonEmptySet.scala:418`.
+* **`Ordering[AA]` against `Ordering[A]`** (6) -- `agent/catseta`'s leftover,
+  untouched by four slices now.
+* **`Iterator[Iterable[A]]` against `Iterator[<the concrete collection>]`**
+  (3, at `NonEmptyLazyList.scala:462`, `NonEmptySeq.scala:364` and
+  `NonEmptyVector.scala:357`, each with a `(Iterable[A]) => Any` companion on
+  the same line, and `instances/stream.scala:64` a fourth) -- a
+  `sliding`/`grouped` result whose element type collapsed to the base.
+* **`no matching overload for (Factory[B, C1])C1`** (6): `arraySeq.scala`
+  107/109/237, `ChainCompanionCompat.scala:44`, `lazyList.scala:76`,
+  `compat/SortedSet.scala:29` -- `to(factory)` / `from(factory)`.
+* **`NonEmptyList[AnyRef]` against `NonEmptyList[C]`** (4).
+* **`Some[To]` against `Option[List[A]]`** (4): `instances/list.scala:45`,
+  `queue.scala:44`, `seq.scala:44`, `vector.scala:43`.
+* **`OptionT.scala` 496/510/524/538** (4) -- the "parameter fixed from the
+  first of two arguments without lubbing the second" root
+  (`EitherT(cata(Left(left), Right.apply))`), unchanged and still unclaimed.
+* **`ambiguous overload for lazyZip`** (4): `ZipLazyList.scala:39`,
+  `ZipStream.scala:41`, `arraySeq.scala` 204/206.
+
+The `(A, A) => A` against `Function2[Any, A, Any]` family the brief listed at
+4 lines is **gone**: it was this slice's root, and it was 15 lines rather than
+4 because two of its three messages had been counted as other things.
