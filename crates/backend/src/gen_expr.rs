@@ -1436,6 +1436,64 @@ pub(crate) fn load_package_object_receiver(
     true
 }
 
+/// The unary value-class intrinsics whose whole implementation is "zero or
+/// more instructions on the operand already on the stack".
+///
+/// Shared by the two spellings that reach codegen by different routes: the
+/// prefix form `-x`, which arrives as an `Apply`, and the selected form
+/// `x.unary_-`, which arrives as a bare `Select`. Returns `false` when `ic`
+/// is not one of them, so a caller can go on down its own chain.
+///
+/// `unary_+` is in here as the identity: `scala.Int` declares
+/// `public abstract int unary_$plus()` and it is the operand unchanged.
+pub(crate) fn emit_prim_unary(asm: &mut Assembler, ic: Intrinsic) -> bool {
+    match ic {
+        Intrinsic::IntUn(op) => {
+            match op {
+                "-" => asm.ineg(),
+                "~" => {
+                    asm.iconst(-1);
+                    asm.ixor();
+                }
+                // `+`
+                _ => {}
+            }
+            true
+        }
+        Intrinsic::LongUn(op) => {
+            match op {
+                "-" => asm.lneg(),
+                "~" => {
+                    asm.lconst(-1);
+                    asm.lxor();
+                }
+                _ => {}
+            }
+            true
+        }
+        Intrinsic::FloatUn(op) => {
+            if op == "-" {
+                asm.fneg();
+            }
+            true
+        }
+        Intrinsic::DoubleUn(op) => {
+            if op == "-" {
+                asm.dneg();
+            }
+            true
+        }
+        Intrinsic::BoolUn(op) => {
+            if op == "!" {
+                asm.iconst(1);
+                asm.ixor();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 pub(crate) fn gen_select(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -1611,6 +1669,15 @@ pub(crate) fn gen_select(
                     asm.i2s();
                 } else if let Intrinsic::NumConv(code) = ic {
                     emit_num_conv(asm, code);
+                } else if emit_prim_unary(asm, ic) {
+                    // `x.unary_-` / `x.unary_~` / `p.unary_!` written out in
+                    // full. The prefix spelling (`-x`) is an `Apply` and has
+                    // always been handled; the *selected* spelling is a bare
+                    // `Select`, fell through this chain to `invoke_method`,
+                    // and emitted `invokevirtual java.lang.Byte.unary_$minus()`
+                    // -- a method that does not exist on the box. It compiled,
+                    // it verified, and it threw `NoSuchMethodError` at run
+                    // time on every one of the nine value-class unary members.
                 } else if matches!(ic, Intrinsic::AsInstanceOf) {
                     // Reached without going through the `TypeApply` special case
                     // in `gen_expr` (e.g. a bare `.asInstanceOf` reference); the
@@ -2382,16 +2449,9 @@ pub(crate) fn gen_apply(
                 emit_int_bin(asm, op);
                 return;
             }
-            Intrinsic::IntUn(op) => {
+            Intrinsic::IntUn(_) => {
                 gen_expr(asm, frame, ctx, qual);
-                match op {
-                    "-" => asm.ineg(),
-                    "~" => {
-                        asm.iconst(-1);
-                        asm.ixor();
-                    }
-                    _ => {}
-                }
+                emit_prim_unary(asm, ic);
                 return;
             }
             Intrinsic::LongBin(op) => {
@@ -2412,15 +2472,9 @@ pub(crate) fn gen_apply(
                 emit_long_bin(asm, op);
                 return;
             }
-            Intrinsic::LongUn("-") => {
+            Intrinsic::LongUn(_) => {
                 gen_expr(asm, frame, ctx, qual);
-                asm.lneg();
-                return;
-            }
-            Intrinsic::LongUn("~") => {
-                gen_expr(asm, frame, ctx, qual);
-                asm.lconst(-1);
-                asm.lxor();
+                emit_prim_unary(asm, ic);
                 return;
             }
             Intrinsic::DoubleBin(op) => {
@@ -2433,9 +2487,9 @@ pub(crate) fn gen_apply(
                 emit_double_bin(asm, op);
                 return;
             }
-            Intrinsic::DoubleUn("-") => {
+            Intrinsic::DoubleUn(_) => {
                 gen_expr(asm, frame, ctx, qual);
-                asm.dneg();
+                emit_prim_unary(asm, ic);
                 return;
             }
             Intrinsic::FloatBin(op) => {
@@ -2448,9 +2502,9 @@ pub(crate) fn gen_apply(
                 emit_float_bin(asm, op);
                 return;
             }
-            Intrinsic::FloatUn("-") => {
+            Intrinsic::FloatUn(_) => {
                 gen_expr(asm, frame, ctx, qual);
-                asm.fneg();
+                emit_prim_unary(asm, ic);
                 return;
             }
             Intrinsic::BoolBin("&&") => {
@@ -2461,18 +2515,25 @@ pub(crate) fn gen_apply(
                 gen_bool_or(asm, frame, ctx, qual, args.first());
                 return;
             }
+            // `==`, `!=` and the three *bitwise* operators `&`, `|`, `^`.
+            // The bitwise three are deliberately not routed through
+            // `gen_bool_and` / `gen_bool_or` above: nsc's `Boolean.&` and
+            // `Boolean.|` evaluate the right operand unconditionally, so
+            // short-circuiting them would silently drop its side effects.
+            // `emit_int_bin` covers both groups -- it forwards the
+            // comparisons to `emit_int_cmp` and emits `iand`/`ior`/`ixor`
+            // for the rest, on two `boolean`s already on the stack as ints.
             Intrinsic::BoolBin(op) => {
                 gen_expr(asm, frame, ctx, qual);
                 if let Some(r) = args.first() {
                     gen_expr(asm, frame, ctx, r);
                 }
-                emit_int_cmp(asm, op);
+                emit_int_bin(asm, op);
                 return;
             }
-            Intrinsic::BoolUn("!") => {
+            Intrinsic::BoolUn(_) => {
                 gen_expr(asm, frame, ctx, qual);
-                asm.iconst(1);
-                asm.ixor();
+                emit_prim_unary(asm, ic);
                 return;
             }
             Intrinsic::StringConcat => {
