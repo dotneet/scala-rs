@@ -1,0 +1,17 @@
+Sec/primary 7
+Sec/inside 4
+Sec/companion 3
+Sec/outside 5
+Pair/primary a 3
+Pair/ss b 4
+Pair/ii i5 9
+Chain/primary 4
+Chain/string 5
+Chain/true 3
+Chain/false 2
+Dist/primary plain
+Dist/vc m12
+Deft/primary 2 q
+Deft/default 5 dq
+Deft/secondary 3 sabc
+Deft/viadefault 1 dq

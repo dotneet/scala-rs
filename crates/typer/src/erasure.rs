@@ -1287,6 +1287,10 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     }
     let param_tys;
     let mut fun_ty;
+    // For `new C(args)` this is the constructor alternative the typer picked;
+    // `method_param_types` adapts the arguments against it. Read before the
+    // `kind` borrow below.
+    let apply_sym = tree.sym;
     {
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
@@ -1300,7 +1304,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         let fun_pre_ty = fun.ty.clone();
         erase_tree(fun, st, None);
         fun_ty = fun.ty.clone();
-        param_tys = method_param_types(st, fun, &fun_pre_ty);
+        param_tys = method_param_types(st, fun, &fun_pre_ty, apply_sym, args.len());
         let pre_params = flat_params(&fun_pre_ty);
         // This application calls whatever the callee *tree* denotes. Once that
         // tree's own type is a function type the call is `FunctionN.apply`,
@@ -1415,8 +1419,34 @@ fn vc_arg_expected(st: &SymbolTable, pre: &[Type], declared: &[Type], i: usize) 
     })
 }
 
-fn method_param_types(st: &SymbolTable, fun: &Tree, fun_pre_ty: &Type) -> Vec<Type> {
+fn method_param_types(
+    st: &SymbolTable,
+    fun: &Tree,
+    fun_pre_ty: &Type,
+    ctor_sym: SymbolId,
+    nargs: usize,
+) -> Vec<Type> {
     if matches!(&fun.kind, TreeKind::New { .. }) {
+        // `new C(args)` where `C` declares secondary constructors: the typer
+        // has already picked the alternative (`pick_ctor_at`) and stamped it
+        // on the `Apply`, and that is the one the backend emits the
+        // `invokespecial` descriptor from. Erasure has to adapt the arguments
+        // against the *same* constructor, or it boxes and unboxes them to the
+        // wrong parameter types while the descriptor names the right ones.
+        //
+        // This used to take the class's *first* `<init>` member and nothing
+        // else. For `class Sec(val a: Int) { def this(s: String) = … }`,
+        // `new Sec("abcd")` therefore erased its argument against the primary
+        // `(Int)`, wrapping the `String` literal in `$unbox` to `Int`: the
+        // emitted call was `ldc "abcd"; checkcast Integer; intValue;
+        // Integer.valueOf` handed to `<init>:(Ljava/lang/String;)V`. It
+        // compiles and it is a `VerifyError: Bad type on operand stack` --
+        // nothing but running the program catches it.
+        if !ctor_sym.is_none() && st.get(ctor_sym).name == "<init>" {
+            if let Type::Method { paramss, .. } = &st.get(ctor_sym).ty {
+                return paramss.iter().flatten().cloned().collect();
+            }
+        }
         let cid = if fun.sym.is_none() {
             st.class_sym_of(&fun.ty)
         } else {
@@ -1424,11 +1454,28 @@ fn method_param_types(st: &SymbolTable, fun: &Tree, fun_pre_ty: &Type) -> Vec<Ty
         }
         .or_else(|| st.class_sym_of(&fun.ty));
         if let Some(c) = cid {
-            for m in &st.get(c).members {
-                if st.get(*m).name == "<init>" {
-                    if let Type::Method { paramss, .. } = &st.get(*m).ty {
-                        return paramss.iter().flatten().cloned().collect();
-                    }
+            // No resolved symbol to go on. Prefer an `<init>` that at least
+            // takes as many parameters as the call passes, so that a
+            // secondary-constructor call does not silently adapt against a
+            // primary of a different arity; fall back to the first one when
+            // none matches, which is what this did unconditionally before.
+            let inits = || {
+                st.get(c)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|m| st.get(*m).name == "<init>")
+            };
+            let arity_of = |m: SymbolId| match &st.get(m).ty {
+                Type::Method { paramss, .. } => Some(paramss.iter().flatten().count()),
+                _ => None,
+            };
+            let pick = inits()
+                .find(|&m| arity_of(m) == Some(nargs))
+                .or_else(|| inits().find(|&m| arity_of(m).is_some()));
+            if let Some(m) = pick {
+                if let Type::Method { paramss, .. } = &st.get(m).ty {
+                    return paramss.iter().flatten().cloned().collect();
                 }
             }
             return st

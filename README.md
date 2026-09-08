@@ -407,6 +407,33 @@ constructor を持つクラスの pickle されたフラグのみ。バイトコ
 分割コンパイル越し（`neg/t6601`）はまだ通ります——コンストラクタの privacy が
 クラスファイルの往復で失われるためで、`pickle_supply.rs` 側の別スライスです。
 
+**secondary constructor への `new C(…)` が正しい引数を渡すようになりました。**
+`class Sec(val a: Int) { def this(s: String) = … }` に対する `new Sec("abcd")` は
+`VerifyError: Bad type on operand stack` でした。**記述子（descriptor）は最初から
+正しく**、`gen_new` は typer が選んだコンストラクタから
+`invokespecial Sec."<init>":(Ljava/lang/String;)V` を——実 scalac と同じものを——
+出しています。誤っていたのはその**引数**で、`erasure::method_param_types` が
+「この `new` は引数を何型に合わせるか」という問いにクラスの**最初の `<init>`
+メンバ**、すなわち常に primary で答えていました。そのため `String` リテラルが
+`Int` に対して消去され、`$unbox` が被さり、`ldc "abcd"; checkcast Integer;
+intValue; valueOf` が `String` を宣言するスロットに `Integer` を渡していました。
+コンパイルは通り、呼び出し箇所の逆アセンブルを読んでも正しく見え、**実行して
+初めて**分かる誤りです。修正は、backend が記述子を作るのに使うのと同じシンボル
+（`Apply` が持つ、`pick_ctor_at` が選んだ alternative）を
+`method_param_types` に渡すことで、両者が食い違えないようにします。
+fixture `tests/fixtures/secondaryctor_new.scala` は**実行**し、両モードで実
+scalac 2.13.16 の出力と一致します。逆向き——primary が参照型で secondary が
+プリミティブ——も同じ欠陥で、こちらは**クラスファイルから読んだ**クラスで起きます。
+コーパスの `run/kmpSliceSearch`（`new scala.util.Random(Integer.parseInt("kmp",
+36))`）は `Integer` が `(I)V` に渡されて `VerifyError` でしたが、`fail` → `pass`
+になり `.check` と一致します（クラスファイルの差は `Integer.valueOf` 1 命令だけ）。
+slick の 1490 クラスファイルは**バイト単位で不変**です——slick の secondary
+constructor 4 か所はいずれも primary との差が参照型どうしで、`box_adaptation` が
+どちらでも `None` を返すためです（詳細は
+[docs/scala-library.md](docs/scala-library.md)）。なお secondary
+constructor 側の**デフォルト引数**は未実装のままで、`<init>$default$n` が宣言
+されず診断になります（分岐元でも同じ。同ドキュメントに記録）。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -617,6 +644,20 @@ scalac の行と文で、正常系（`tests/fixtures/intrinsicqual_ctor.scala`�
 コンパニオン、`extends` 越しの `protected`、`private[p]`、アクセス可能な別の
 オーバーロードを持つクラス）は**実行**して固定します。拒否規則なので、正常系が
 **修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。
+
+`secondaryctor` テストは secondary constructor への `new` を固定します。この種の
+欠陥はエラー数にもクラスファイル数にも現れず、呼び出し箇所の `javap` すら正しく
+見えるので、**10 本すべてが `java -Xverify:all` でプログラムを実行**します。
+fixture `tests/fixtures/secondaryctor_new.scala` は、クラス内部・コンパニオン・
+無関係なオブジェクトからの呼び出し、消去後の記述子が 1 引数だけ違う 2 つの
+secondary、別の secondary へ委譲する secondary、値クラスを取る secondary、
+デフォルト引数、そして同じクラスの `new C(primary の引数)` を 1 本のプログラムに
+まとめ、実 scalac 2.13.16 の出力と両モードで比較します（修正前のバイナリは両
+モードとも `VerifyError`）。答えだけでなく**バイトコード**も固定していて、引数の
+前に unbox/box 対が入らないことを検査します——記述子の方を primary に合わせて
+「一致させる」修正でも答えは変わらないためです。回帰側は、secondary を持たない
+普通の `new`、そして**本来必要な boxing** が消えていないこと（`Any` スロットへの
+プリミティブ、プリミティブスロットへの箱）を実行して確かめます。
 
 線形化（SLS 5.1.2）は `linearization` テストで二重に検査します。正常系は深く広い
 ダイヤモンド継承の `super` 連鎖を実行し、同じソースを実 scalac 2.13.16 で
