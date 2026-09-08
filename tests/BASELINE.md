@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `54df4d43` |
+| commit | `f4b829ec` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Twenty-one slices have merged this session**, in seven composed gates. From
+**Twenty-five slices have merged this session**, in eight composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -30,6 +30,7 @@ coordinator measured the merged tree each time, not the branches.
 | `7aa47c29` | `linterm`, `gbhead`, `hkselfalias`, `macromirror`, `qualfallback`, `subtypeterm`, `catsinfer`, `linorder2` | -> 398 | -> 231 |
 | `8d4cdde0` | `hkunify`, `convimpl` | -> 393 | -> 215 |
 | `54df4d43` | `gbmapto`, `basetypeseq`, `catstail`, `gbshape` | -> 337 | -> 196 |
+| `f4b829ec` | `mapto2`, `impprio`, `sortedmap`, `gbopt` | -> 270 | -> 188 |
 
 Four of those fifteen move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -111,6 +112,44 @@ three of the four found an "accepting too much" defect on the way:
   (the type arguments written on the macro implementation reference, which
   `PickleReader::macro_impl_of` discards).
 
+The eighth gate's four slices again each corrected the brief they were given,
+and three of the four found a program we accepted and scalac rejects:
+
+* **`agent/gbopt`** — of the five gitbucket families it was handed, two were
+  **not roots**: `OptionMapper2` went 13 -> 0 and `CanBeQueryCondition` 13 -> 2
+  without a line written about either. The three real roots share one shape:
+  *a class file is a lossy description of someone else's code, and the lossy
+  answer gets in first and stays.* A mixin forwarder flattens the parameter
+  lists and erases a `Boolean` type argument to `Object`, and it was hiding the
+  trait's own declaration — so `7.tagIn(List(1), witness)`, an implicit passed
+  positionally, **compiled**. `===` survived only because its JVM name is
+  `$eq$eq$eq` and `fill_java_members` does not decode it: operator names were
+  intact and alphabetic ones were not.
+* **`agent/impprio`** — SLS 2's four-level precedence, not a tie-break. The
+  pre-fix compiler resolved `Database()` to a wildcard import over an explicit
+  one and **printed `wild` where scalac prints `explicit`**; the negative
+  fixture emitted 52 class files with no error where scalac reports three. Its
+  first corpus run was `losses=3` and rewrote two of its own rules, after which
+  `neg/import-precedence` — scala/scala's own test for this rule — passes.
+* **`agent/sortedmap`** — built out both surviving variants of the previous
+  slice's three, then **abandoned both**: reordering makes the more derived
+  declaration win everywhere, and `MapOps.map[K2,V2]` is more derived than
+  `IterableOps.map[B]` *without overriding it*, so `Map("a" -> 1).map { case
+  (_, v) => v }` compiled and threw `ClassCastException` at run time. The
+  workspace suite and the corpus caught it; the error counts did not. What
+  landed instead is one narrow rule about an inherited declaration that adds an
+  implicit clause.
+* **`agent/mapto2`** — nsc resolves the type arguments written on the macro
+  *implementation reference*, and the fingerprint it pickles is an index into
+  that list. We discarded them in three places, so when the counts happened to
+  match the tags went over in call-site order: `swapped[Int, String]` printed
+  `R=Int U=String` where scalac prints `R=String U=Int`. All 31 gitbucket
+  `mapTo` sites now invoke `mapToImpl` for real and stop at the next wall.
+
+`tests/verify_merge.sh` earned itself this gate: `agent/gbopt`'s first run
+returned `VERDICT=FAIL` on two workspace tests and two corpus `run` tests that
+none of its own measures or focused suites reached.
+
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -136,8 +175,8 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **196** | **73** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **337** | **81** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **188** | **72** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **270** | **79** | — |
 | `tests/scalalib_measure.sh` (538) | **1420** | **166** | — |
 
 ## Execution
@@ -154,12 +193,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1086** | 428 | 345 |
-| `neg` (1405) | **670** | 366 | 369 |
+| `pos` (1859) | **1088** | 426 | 345 |
+| `neg` (1405) | **673** | 363 | 369 |
 | `run` (2060) | **618** | 889 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-54df4d43.tsv`](baselines/corpus-54df4d43.tsv): 5324 unique
+[`baselines/corpus-f4b829ec.tsv`](baselines/corpus-f4b829ec.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -194,7 +233,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-54df4d43.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-f4b829ec.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -221,7 +260,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **243 result rows, 2394 passed, 0 failed** at `54df4d43` |
+| `cargo test --workspace --release --no-fail-fast` | **247 result rows, 2407 passed, 0 failed** at `f4b829ec` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
