@@ -789,6 +789,153 @@ impl Typer {
         self.st.lookup_member(owner, name)
     }
 
+    /// A member owner as the type to ask `is_sub_type` about.
+    ///
+    /// The universal owners occur as primitive `Type` variants in parent
+    /// lists, not `Class` nodes. Comparing with a synthetic `Class(Any)` makes
+    /// every ordinary override of `Any.hashCode` look like an unrelated
+    /// overload.
+    fn owner_as_type(&self, owner: SymbolId) -> Type {
+        if owner == self.st.any_sym {
+            Type::Any
+        } else if owner == self.st.anyref_sym {
+            Type::AnyRef
+        } else if owner == self.st.anyval_sym {
+            Type::AnyVal
+        } else {
+            Type::Class {
+                sym: owner,
+                args: vec![],
+            }
+        }
+    }
+
+    /// nsc keeps the *definition* when a matching **declaration** stands next
+    /// to it, and it does that even when the declaration is the more derived
+    /// of the two: `trait A { def f: A = null }` with
+    /// `abstract class C extends A { override def f: C }` gives `f` the type
+    /// `A`, not `C` — `findMember` stops replacing a member it has already
+    /// found once either side is `DEFERRED`. Measured against scalac 2.13.16
+    /// (`tests/fixtures/libov_reabstract_bad.scala`).
+    ///
+    /// It stands down for a declaration that only *restates* the definition:
+    /// `LinearSeqOps` re-declares `def tail: C` and `Stream` re-declares
+    /// `def tail: Stream[A]`, and `IterableOps.tail: C` **is** `Stream[A]` at
+    /// that prefix. There nsc's answer and the derived declaration's are one
+    /// type, so which symbol survives cannot be observed -- except that
+    /// getting there through the definition needs the prefix, and choosing
+    /// the prefix for a class with several paths to one base is the part this
+    /// compiler does not get right: `Stream` reaches `IterableOps` as both
+    /// `IterableOps[A, Stream, Stream[A]]` and `IterableOps[A, Iterable,
+    /// Iterable[A]]` and takes the second. So the declaration is preferred
+    /// exactly when it cannot change the answer, because it already carries
+    /// it written out.
+    ///
+    /// `restates` is the whole of the condition, and both halves of it are
+    /// load-bearing. Requiring less -- "the definition's type mentions its
+    /// owner's parameters" -- takes `Box` where nsc takes `Any` for
+    /// `trait Ops[+C] { def f: C = ??? }; class Box extends Ops[Any] {
+    /// override def f: Box }`. Requiring more -- dropping the rule whenever
+    /// the owners are related -- stops `immutable.MapOps`'s
+    /// `final def -(key: K): C = removed(key)` superseding the
+    /// `def -(key: K): Map[K, V]` that `collection.Map` declares, and every
+    /// `map - k` in the library becomes `ambiguous overload` (13 of them).
+    fn definition_outranks_declaration(&self, decl: SymbolId, defn: SymbolId) -> bool {
+        self.is_deferred_member(decl)
+            && !self.is_deferred_member(defn)
+            && self.same_signature(defn, decl)
+            && !self.declaration_restates_definition(decl, defn)
+    }
+
+    /// Whether `decl` says exactly what `defn` says, read at `decl`'s own
+    /// class: the type `defn`'s owner is instantiated with there, substituted
+    /// into `defn`'s type, equals `decl`'s.
+    ///
+    /// No path from `decl`'s owner to `defn`'s -- a self type, or two sibling
+    /// traits -- means the declaration restates nothing.
+    ///
+    /// Every path is tried; see `restated_on_some_path`.
+    fn declaration_restates_definition(&self, decl: SymbolId, defn: SymbolId) -> bool {
+        let decl_owner = self.st.get(decl).owner;
+        let defn_owner = self.st.get(defn).owner;
+        if decl_owner == defn_owner {
+            return false;
+        }
+        let prefix = Type::Class {
+            sym: decl_owner,
+            args: self
+                .st
+                .get(decl_owner)
+                .tparams
+                .iter()
+                .map(|&t| Type::TypeParam(t))
+                .collect(),
+        };
+        let mut budget = 512u32;
+        self.restated_on_some_path(
+            &prefix,
+            defn,
+            defn_owner,
+            &self.st.get(decl).ty,
+            0,
+            &mut budget,
+        )
+    }
+
+    /// Whether some path from `ty` to `defn`'s owner instantiates it so that
+    /// `defn`'s type reads exactly as `want`.
+    ///
+    /// `Check::base_type_instance` answers with the *first* parent that
+    /// reaches the target, and `Stream` reaches `IterableOps` through
+    /// `AbstractSeq` before it reaches it through its own `LinearSeqOps[A,
+    /// Stream, Stream[A]]`, so the first answer is `IterableOps[A, Iterable,
+    /// Iterable[A]]`. nsc's `baseType` takes the meet of the instantiations,
+    /// which for a covariant parameter is the most derived one; asking whether
+    /// *some* path spells `want` gets the same answer here without changing
+    /// what `baseType` means everywhere else.
+    ///
+    /// `budget` bounds the walk. A parent DAG has a path count exponential in
+    /// its depth (see `SymbolTable::walk_parents`, which exists for the same
+    /// reason), and this runs inside overload resolution.
+    fn restated_on_some_path(
+        &self,
+        ty: &Type,
+        defn: SymbolId,
+        defn_owner: SymbolId,
+        want: &Type,
+        depth: u32,
+        budget: &mut u32,
+    ) -> bool {
+        if depth > 16 || *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let (sym, args): (SymbolId, &[Type]) = match ty {
+            Type::Class { sym, args } => (*sym, args),
+            Type::ModuleRef(s) | Type::ThisType(s) => (*s, &[]),
+            Type::Annotated { tpe, .. } => {
+                return self.restated_on_some_path(tpe, defn, defn_owner, want, depth + 1, budget)
+            }
+            _ => return false,
+        };
+        if sym == defn_owner {
+            let at = if args.is_empty() {
+                self.st.get(defn).ty.clone()
+            } else {
+                self.st
+                    .subst_tparams(defn_owner, args, &self.st.get(defn).ty)
+            };
+            return &at == want;
+        }
+        if self.st.class_reaches(sym, defn_owner) == Some(false) {
+            return false;
+        }
+        self.st.get(sym).parents.iter().any(|p| {
+            let p = self.st.subst_tparams_cow(sym, args, p);
+            self.restated_on_some_path(&p, defn, defn_owner, want, depth + 1, budget)
+        })
+    }
+
     /// Prefer a definition on a subclass over the inherited member it overrides.
     pub(crate) fn drop_overridden(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         if found.len() <= 1 {
@@ -828,38 +975,38 @@ impl Typer {
                     // slick `Session` in the program with it. In the class
                     // that has both, one implements the other; nsc's
                     // linearization sees a single member.
-                    if self.is_deferred_member(s)
-                        && !self.is_deferred_member(other)
-                        && self.same_signature(other, s)
-                    {
+                    //
+                    // `definition_outranks_declaration` says when it applies;
+                    // the two rules used to disagree about a declaration that
+                    // is the *more derived* of the pair. `LinearSeqOps`
+                    // re-declares the `tail` that `IterableOps` defines, so
+                    // this rule dropped `LinearSeqOps.tail` for being a
+                    // declaration while the owner test below dropped
+                    // `IterableOps.tail` for being above it: `kept` came out
+                    // empty and the fallback handed the caller back the whole
+                    // unreduced set. That is where the scala library's
+                    // `<overload Iterable[A] | Stream[A] | Stream[A]>`
+                    // receivers came from. Both rules now ask the same
+                    // question, so exactly one of them fires.
+                    if self.definition_outranks_declaration(s, other) {
                         return true;
                     }
                     let child = Type::Class {
                         sym: oo,
                         args: vec![],
                     };
-                    // The universal owners occur as primitive Type variants
-                    // in parent lists, not Class nodes. Comparing with a
-                    // synthetic Class(Any) makes every ordinary override of
-                    // Any.hashCode look like an unrelated overload.
-                    let parent = if owner == self.st.any_sym {
-                        Type::Any
-                    } else if owner == self.st.anyref_sym {
-                        Type::AnyRef
-                    } else if owner == self.st.anyval_sym {
-                        Type::AnyVal
-                    } else {
-                        Type::Class {
-                            sym: owner,
-                            args: vec![],
-                        }
-                    };
+                    let parent = self.owner_as_type(owner);
                     self.st.is_sub_type(&child, &parent)
                         // Inheriting is not overriding: nsc keeps `f(Int)`
                         // declared on the parent as an alternative of `f`
                         // alongside a `f(String)` the subclass adds. Only a
                         // *matching* signature replaces the inherited one.
                         && self.same_signature(other, s)
+                        // ... and a declaration below a definition does not
+                        // replace it, whatever the hierarchy says. This is the
+                        // other half of the rule above: without it the pair
+                        // eliminates itself again, from the other side.
+                        && !self.definition_outranks_declaration(other, s)
                 })
             })
             .collect();
