@@ -1324,6 +1324,15 @@ impl Typer {
                         tpt.sym = id;
                     }
                     self.type_new_prefix(tpt);
+                    // nsc's refchecks `checkBounds`, for the one position this
+                    // compiler can reach it from: a written `new C[…]`. The
+                    // arguments here are the ones the source wrote — an
+                    // un-applied `new C` carries the class's own parameters as
+                    // placeholders, which satisfy their own bounds and so pass
+                    // this silently.
+                    if let Type::Class { sym, args } = tpt.ty.clone() {
+                        self.check_class_tparam_bounds(sym, &args, tpt.span);
+                    }
                 } else if matches!(&tpt.kind, TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE)
                 {
                     // Already a type: `resolved_class_tpt` built this for a

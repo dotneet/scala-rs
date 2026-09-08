@@ -2226,6 +2226,99 @@ impl Typer {
         );
     }
 
+    /// `new C[Int, String]` written out: check the type arguments against the
+    /// *class's* declared bounds.
+    ///
+    /// nsc does this in refchecks (`checkBounds`), which is why a fixture for
+    /// it cannot also contain a typer error -- once typer has reported,
+    /// scalac never reaches refchecks. Nothing checked a written constructor
+    /// type-argument list here at all, so `new B[Int, V]` for
+    /// `class B[K <: AnyRef, V]` compiled, and the class file it produced
+    /// names a type the program is not allowed to build.
+    ///
+    /// The method version is [`Self::check_tparam_bounds`]; the two differ in
+    /// what the bound has to be read through (a receiver, versus the class's
+    /// own arguments) and in the noun the diagnostic uses.
+    pub(crate) fn check_class_tparam_bounds(&mut self, cls: SymbolId, targs: &[Type], span: Span) {
+        if cls.is_none() {
+            return;
+        }
+        let tps = self.st.get(cls).tparams.clone();
+        if tps.is_empty() || tps.len() != targs.len() {
+            return;
+        }
+        if targs
+            .iter()
+            .any(|t| t.is_error() || t.is_no_type() || type_has_wildcard(t))
+        {
+            return;
+        }
+        let mut bad = false;
+        for (tp, actual) in tps.iter().zip(targs) {
+            // A higher-kinded parameter states its bound in its *own* inner
+            // parameters -- `MapCC[X, Y] <: Map[X, Y]` in
+            // `SortedMapOps.WithFilter` -- so there is no proper type to
+            // compare an argument against, and asking `is_sub_type` produced
+            // the one new library error this check first drew
+            // (`Iterable.scala:1044`). nsc checks these with
+            // `checkKindBounds`, which is a different question and one
+            // `apply_types` already answers for kinds.
+            if !self.st.get(*tp).tparams.is_empty() {
+                continue;
+            }
+            for (bound, upper) in [
+                (self.st.get(*tp).bound_hi.clone(), true),
+                (self.st.get(*tp).bound_lo.clone(), false),
+            ] {
+                let Some(bound) = bound else { continue };
+                // `class B[K, V <: K]` states the second bound in the first
+                // parameter, so the arguments have to be substituted in before
+                // it means anything. A bound that still mentions a type
+                // parameter after that belongs to an enclosing scope and is not
+                // this site's to check -- the same rule the method version
+                // draws, with a walk that also reaches inside a `with` type.
+                let bound = crate::symbol::subst_tparams_slice(&tps, targs, &bound);
+                if bound.is_error() || bound.is_no_type() || bound_mentions_tparam(&bound) {
+                    continue;
+                }
+                let ok = if upper {
+                    self.st.is_sub_type(actual, &bound)
+                        || self.st.hk_ctor_meets_proper_bound(actual, &bound)
+                } else {
+                    self.st.is_sub_type(&bound, actual)
+                };
+                if !ok {
+                    bad = true;
+                }
+            }
+        }
+        if !bad {
+            return;
+        }
+        let args_s = targs
+            .iter()
+            .map(|t| self.st.display_type(t))
+            .collect::<Vec<_>>()
+            .join(",");
+        let bounds_s = tps
+            .iter()
+            .map(|tp| self.tparam_bounds_string(*tp))
+            .collect::<Vec<_>>()
+            .join(",");
+        let word = if crate::lin::is_interface(&self.st, cls) {
+            "trait"
+        } else {
+            "class"
+        };
+        let name = self.st.get(cls).name.clone();
+        self.error(
+            span,
+            format!(
+                "type arguments [{args_s}] do not conform to {word} {name}'s type parameter bounds [{bounds_s}]"
+            ),
+        );
+    }
+
     /// `f[Int](…)` written out: check the explicit type arguments against the
     /// method's declared bounds.
     pub(crate) fn check_explicit_tparam_bounds(&mut self, fun: &Tree, targs: &[Type], span: Span) {
@@ -3361,4 +3454,45 @@ fn negated_int_literal(tree: &Tree) -> Option<i32> {
         return None;
     };
     Some(v.wrapping_neg())
+}
+
+/// Whether a bound still names a type parameter, and so is not a proper type
+/// this site can compare an argument against.
+///
+/// [`mentions_any_tparam`] is the same question with a smaller vocabulary: it
+/// stops at a `Refined` type's parents, and `Map[X, Y] with SortedMapOps[X, Y,
+/// CC, _]` -- the shape `SortedMapOps.WithFilter` declares -- is exactly that.
+/// Kept local rather than widening the shared helper, whose callers include
+/// the method-bounds path this slice did not measure.
+fn bound_mentions_tparam(ty: &Type) -> bool {
+    match ty {
+        Type::TypeParam(_) => true,
+        Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
+            args.iter().any(bound_mentions_tparam)
+        }
+        Type::Applied { ctor, args } => {
+            bound_mentions_tparam(ctor) || args.iter().any(bound_mentions_tparam)
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
+            bound_mentions_tparam(t)
+        }
+        Type::Function { params, ret } => {
+            params.iter().any(bound_mentions_tparam) || bound_mentions_tparam(ret)
+        }
+        Type::Method { paramss, ret } => {
+            paramss.iter().flatten().any(bound_mentions_tparam) || bound_mentions_tparam(ret)
+        }
+        Type::Overload(alts) => alts.iter().any(bound_mentions_tparam),
+        Type::BoundedWildcard { lo, hi } => {
+            lo.as_deref().is_some_and(bound_mentions_tparam)
+                || hi.as_deref().is_some_and(bound_mentions_tparam)
+        }
+        Type::SingleType { prefix, .. } => bound_mentions_tparam(prefix),
+        // A refinement's declarations are types too; rather than walk them,
+        // a bound that has any is not one this check will second-guess.
+        Type::Refined { parents, decls } => {
+            !decls.is_empty() || parents.iter().any(bound_mentions_tparam)
+        }
+        _ => false,
+    }
 }
