@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `f4b829ec` |
+| commit | `b15df464` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Twenty-five slices have merged this session**, in eight composed gates. From
+**Twenty-seven slices have merged this session**, in nine composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -31,6 +31,7 @@ coordinator measured the merged tree each time, not the branches.
 | `8d4cdde0` | `hkunify`, `convimpl` | -> 393 | -> 215 |
 | `54df4d43` | `gbmapto`, `basetypeseq`, `catstail`, `gbshape` | -> 337 | -> 196 |
 | `f4b829ec` | `mapto2`, `impprio`, `sortedmap`, `gbopt` | -> 270 | -> 188 |
+| `b15df464` | `anyconstr`, `libmaxmin` | 270 | -> 185 |
 
 Four of those fifteen move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -150,6 +151,40 @@ and three of the four found a program we accepted and scalac rejects:
 returned `VERDICT=FAIL` on two workspace tests and two corpus `run` tests that
 none of its own measures or focused suites reached.
 
+The ninth gate turned on `tests/scalalib_measure.sh`, which had had almost no
+attention: **1554 -> 1173 errors, 168 -> 157 files**, in two slices.
+
+* **`agent/libmaxmin`** (-194) — the brief's hypothesis was wrong twice over.
+  The measure runs `--no-scala-library`, so no jar copy of `RichInt` exists to
+  collide with, and `src/library` is not needed to reproduce: fifteen lines do.
+  The real cause is that `Predef._` was a **snapshot of members taken when the
+  prelude was installed**, not an import, so a run that defines `scala.Predef`
+  from source used a copy of a `Predef` the program does not have. It is the
+  unfixed half of the defect `agent/preludeshadow` closed for `scala._`. Three
+  ways of getting the fix wrong were each measured before being discarded, and
+  the third — recording the import rather than its members — type-checked,
+  passed the JVM verifier and threw `ClassCastException` at run time, which is
+  why that fixture executes instead of compiling.
+* **`agent/anyconstr`** (-53) — `type AnyConstr[X] = Any` is a type constructor
+  whose body ignores its parameter, so every one-parameter constructor conforms
+  to it. Implemented as nsc's general rule (`normalize` + `sameLength`), reusing
+  `agent/hkunify`'s representation rather than adding one: one 65-line function.
+  It also closed a silent wrong answer, an overload picking `sel(x: Any)` over
+  `sel(x: Ops[Int, AnyConstr, _])`.
+
+`agent/libmaxmin` also measured its own **+28 regression** rather than
+attributing it away: `value -> is not a member` is a pre-existing defect,
+reproducible in twelve lines with no `Predef` involved, and two candidate fixes
+for it measured *exactly zero* effect before being dropped. Those lines used to
+die one error earlier.
+
+**`agent/anyconstr` found a defect in this gate itself.** `verify_merge.sh`
+chose its corpus ledger with `ls -t`, and in a git worktree every baseline
+carries the checkout time, so the slice's gate compared against a 106 KB
+ledger from eleven gates ago and still printed `VERDICT=PASS`. The ledger is
+now read from the name recorded in this file, and one that cannot be resolved
+is a `FAIL`. The `gate:` line prints which ledger was used.
+
 Every number below was measured after the last source commit; only this file
 and the saved corpus ledger changed afterwards. Java is Temurin 17 with
 `JAVA_HOME` and `PATH` pinned and `LANG=LC_ALL=LC_CTYPE=C.UTF-8`.
@@ -175,9 +210,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **188** | **72** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **185** | **71** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **270** | **79** | — |
-| `tests/scalalib_measure.sh` (538) | **1420** | **166** | — |
+| `tests/scalalib_measure.sh` (538) | **1173** | **157** | — |
 
 ## Execution
 
@@ -198,7 +233,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `run` (2060) | **618** | 889 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-f4b829ec.tsv`](baselines/corpus-f4b829ec.tsv): 5324 unique
+[`baselines/corpus-b15df464.tsv`](baselines/corpus-b15df464.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -233,7 +268,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-f4b829ec.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-b15df464.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -260,7 +295,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **247 result rows, 2407 passed, 0 failed** at `f4b829ec` |
+| `cargo test --workspace --release --no-fail-fast` | **249 result rows, 2418 passed, 0 failed** at `b15df464` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
