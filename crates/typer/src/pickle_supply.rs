@@ -594,8 +594,13 @@ impl PickleSupply {
         let mut names: Vec<String> = Vec::new();
         for &m in &st.get(class_sym).members {
             let s = st.get(m);
+            // Not gated on `Flags::JAVA`: a `-cp` **directory** is scanned by
+            // `classpath::install_classpath` instead of read as a class file,
+            // and that scan's entries carry no flag of their own -- but they
+            // are just as flat, and just as erased (`(Iterable, Wit)Res`).
+            // Everything reachable here is a binary class: `adopt_binary_class`
+            // has already refused a source class and a prelude one.
             if s.kind != SymKind::Method
-                || !s.flags.contains(Flags::JAVA)
                 || s.flags.contains(Flags::STATIC)
                 || s.paramss.len() > 1
                 || s.params.is_empty()
@@ -617,7 +622,7 @@ impl PickleSupply {
                     let s = st.get(m);
                     s.kind == SymKind::Method
                         && s.name == name
-                        && s.flags.contains(Flags::JAVA)
+                        && !s.flags.contains(Flags::STATIC)
                         && s.paramss.len() <= 1
                 })
                 .map(|m| (m, st.get(m).params.len()))
