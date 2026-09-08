@@ -653,6 +653,98 @@ impl Typer {
         self.place_named_args(args, fun, &ids, repeated_last, false)
     }
 
+    /// Whether this application is a constructor call whose arguments have
+    /// already been flattened across the declaration's parameter clauses, and
+    /// whose missing tail contains a **default**.
+    ///
+    /// The three constructor paths -- `new C(a)(b)`, `this(…)` / `super(…)`
+    /// delegation, and `extends C(a)(b)` -- all flatten the argument list and
+    /// hand over a flattened `param_tys`, because that is the shape the JVM
+    /// descriptor has. So the flattened arity is what says the call is short,
+    /// and matching the declaration's first clause alone cannot see it.
+    ///
+    /// The equal-length test is what distinguishes those callers from an
+    /// ordinary `f(a)(b)`, where `param_tys` is the clause being applied.
+    fn ctor_args_arrive_flat(
+        &self,
+        sym: SymbolId,
+        paramss_ids: &[Vec<SymbolId>],
+        param_tys: &[Type],
+        nargs: usize,
+    ) -> bool {
+        if paramss_ids.len() < 2 || self.st.get(sym).name != "<init>" {
+            return false;
+        }
+        let flat: Vec<SymbolId> = paramss_ids.iter().flatten().copied().collect();
+        if param_tys.len() != flat.len() || nargs >= flat.len() {
+            return false;
+        }
+        // A repeated parameter swallows the shortfall by itself.
+        if param_tys.iter().any(|t| matches!(t, Type::Repeated(_))) {
+            return false;
+        }
+        flat[nargs..]
+            .iter()
+            .any(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM))
+    }
+
+    /// Fill the missing tail of a flattened constructor call: defaults first,
+    /// then any implicit clause behind them.
+    ///
+    /// A default in a later clause is the one shape in which a constructor
+    /// default may legally name an earlier parameter -- nsc rejects a
+    /// same-clause reference outright -- and `$lessinit$greater$default$n`
+    /// takes the preceding clauses' parameters for exactly that reason.
+    /// `default_getter_apply` already passes the arguments that precede it and
+    /// truncates them to the getter's own arity, so `b = "b" + a` is evaluated
+    /// with the `a` this call passed and not with some other instance's.
+    fn fill_flat_ctor_params(
+        &mut self,
+        span: Span,
+        args: &mut Vec<Tree>,
+        param_tys: &[Type],
+        fun: &Tree,
+        paramss_ids: &[Vec<SymbolId>],
+    ) {
+        let flat: Vec<SymbolId> = paramss_ids.iter().flatten().copied().collect();
+        let rest: Vec<SymbolId> = flat[args.len()..].to_vec();
+        // An implicit clause is always last, so the missing tail splits into a
+        // run of ordinary parameters and a run of implicit ones.
+        let n_impl = rest
+            .iter()
+            .rev()
+            .take_while(|p| self.st.get(**p).flags.contains(Flags::IMPLICIT))
+            .count();
+        let (defaults, implicits) = rest.split_at(rest.len() - n_impl);
+        for pid in defaults.iter() {
+            if !self.st.get(*pid).flags.contains(Flags::DEFAULTPARAM) {
+                self.error(
+                    span,
+                    format!(
+                        "not enough arguments: expected {}, found {}",
+                        flat.len(),
+                        args.len()
+                    ),
+                );
+                return;
+            }
+            let idx = self.default_getter_index(fun, *pid);
+            if let Some(filled) = self.default_getter_apply(fun, *pid, idx, args) {
+                args.push(filled);
+            } else if let Some(mut rhs) = self.st.get(*pid).default_rhs.clone() {
+                let pty = self.st.get(*pid).ty.clone();
+                self.type_default_rhs_here(*pid, &mut rhs, &pty);
+                args.push(rhs);
+            } else {
+                return;
+            }
+        }
+        if !implicits.is_empty() {
+            let off = args.len().min(param_tys.len());
+            self.fill_implicit_params(span, args, &param_tys[off..], implicits);
+        }
+    }
+
     pub(crate) fn fill_defaults_and_implicits(
         &mut self,
         span: Span,
@@ -698,6 +790,26 @@ impl Typer {
             return None;
         };
         self.implicit_undet_solved.clear();
+        // A constructor's clauses are flat on the JVM, and every path that
+        // reaches this with an `<init>` has flattened both the arguments
+        // (`flatten_curried_new`, `flatten_curried_ctor_delegation`,
+        // `type_parent_ctor_app`) and the parameter types it hands over.
+        // Measuring the call against the *unflattened* `paramss` read back off
+        // the symbol therefore found `new Curr(7)()` complete against the
+        // first clause and returned a method type for a second clause nobody
+        // was going to apply: its defaults were never filled, and codegen
+        // emitted an `invokespecial` with one argument for a three-parameter
+        // descriptor (`VerifyError: Bad type on operand stack`).
+        //
+        // Only when a default is actually missing. An all-implicit tail is
+        // left to the clause-by-clause path below, which substitutes the
+        // call's type arguments into the searched types (`instantiate_from_call`,
+        // `solve_implicit_only_tparams`) -- `new TypedCase[B, P](…)` in slick
+        // needs that and a flat search would not do it.
+        if self.ctor_args_arrive_flat(sym, &paramss_ids, param_tys, args.len()) {
+            self.fill_flat_ctor_params(span, args, param_tys, fun, &paramss_ids);
+            return None;
+        }
         let first = paramss_ids.first().cloned().unwrap_or_default();
         // A repeated parameter accepts zero arguments (`count()`), so a call
         // that stops right before it is not short at all. Only this clause is

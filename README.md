@@ -553,6 +553,43 @@ constructor 4 か所はいずれも primary との差が参照型どうしで、
 constructor 側の**デフォルト引数**は未実装のままで、`<init>$default$n` が宣言
 されず診断になります（分岐元でも同じ。同ドキュメントに記録）。
 
+**コンストラクタのデフォルト引数が「2 番目以降のパラメータリスト」でも
+埋まるようになりました。** `class Curr(a: Int)(b: String = "b" + a)` を
+`new Curr(7)()` と呼ぶと、3 引数のディスクリプタに対して 1 引数の
+`invokespecial` を出しており、診断なしで通ったうえ実行時に
+`VerifyError: Bad type on operand stack` になっていました（黙ったままの
+ミスコンパイル）。`new` の引数は JVM のディスクリプタの形に合わせて既に
+平坦化されて `fill_defaults_and_implicits` に届くのに、この関数はシンボルから
+**平坦化前の** `paramss` を読み直していたため、第 1 クラスだけを見て「足りて
+いる」と判断していたのが原因です。あわせて、後続クラスのデフォルトは
+先行クラスの引数を**名前で参照してよい唯一の形**（同一クラス内の参照は nsc が
+拒否します）なので、その getter `$lessinit$greater$default$n` は先行クラスの
+パラメータを取ります。呼び出し側に式を展開して済ませられないため、nsc と同じく
+**コンパニオンを合成**して getter を置くようにしました（この形だけ。第 1 クラスの
+デフォルトは従来どおり展開で済ませるので、クラスファイルは増えません）。
+
+**「デフォルトを必要としない候補を優先する」nsc の規則を実装しました。**
+`class Prefer(n: Int) { def this(k: Int, bump: Int = 5) = ... }` に対する
+`new Prefer(1)` は primary で、これまでは両候補を同時に比較して
+`ambiguous overload for constructor` になっていました。ただしこの規則だけでは
+`new Three(2)("m")()` が「拒否」から「黙って間違った候補」に変わります
+（平坦化後の `(2, "m")` を primary がちょうど受け取ってしまう）。nsc は
+**第 1 クラスで**コンストラクタを選ぶので、`flatten_curried_new` が畳んだときの
+第 1 クラスの長さを報告し、`pick_ctor_at_clause` が候補をその集合に限るように
+しました。
+
+**`private[p]` なコンストラクタを、pickle から境界を解決して検査するように
+なりました（読み取り側）。** 記録にあった「nsc は `PRIVATE` フラグ＋
+`privateWithin` 参照で書く」は誤りで、実際には**フラグは立ちません**
+（scalac 2.13.16 が書いた `class Qual private[libp] (...)` の `<init>` は
+`flags=0x200`、`PRIVATE`/`PROTECTED` ともに 0）。`Member::private_within` が
+境界の単純名を持つようになり、診断は nsc と一語一句同じです。パッケージ内部の
+呼び出しは通って**実行**され、slick は `errors=0 classes=1490`／1490 個の
+クラスファイルはバイト単位で不変です（過剰拒否なし）。**書き込み側**は未実装で、
+scala-rs が書いたクラスファイルには境界が入らないため、自分の reader でも
+実 scalac でも通ります（pickle のフォーマット変更が必要。
+[docs/not-implemented.md](docs/not-implemented.md) に記録）。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).

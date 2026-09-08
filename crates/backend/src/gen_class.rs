@@ -108,6 +108,13 @@ impl<'a> Gen<'a> {
                             if mods.flags.contains(Flags::CASE) && !module_names.contains(name) {
                                 self.emit_case_companion(s);
                             }
+                            if !mods.flags.contains(Flags::CASE)
+                                && !module_names.contains(name)
+                                && !self.st.is_value_class(s.sym)
+                                && self.needs_ctor_default_companion(s.sym)
+                            {
+                                self.emit_ctor_default_companion(s);
+                            }
                             // ... and so do the classes and objects declared
                             // *inside* it. `walk_stats` does this for a
                             // top-level class; this walk stopped at the local
@@ -253,6 +260,18 @@ impl<'a> Gen<'a> {
                         && self.st.is_value_class(s.sym)
                     {
                         self.emit_value_companion(s);
+                    }
+                    // ... and so does a plain class whose constructor puts a
+                    // default in a later parameter clause: that getter takes
+                    // the earlier clause's parameters and has nowhere else to
+                    // live. `Typer::needs_ctor_default_companion` is what
+                    // declared the module.
+                    if !module_names.contains(name)
+                        && !mods.flags.contains(Flags::CASE)
+                        && !self.st.is_value_class(s.sym)
+                        && self.needs_ctor_default_companion(s.sym)
+                    {
+                        self.emit_ctor_default_companion(s);
                     }
                     self.walk_stats(&impl_.body);
                 }

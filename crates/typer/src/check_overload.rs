@@ -547,6 +547,26 @@ impl Typer {
             }
         };
         let applicable = self.narrow_by_lambda_shape(applicable, arg_tys, shapes);
+        // nsc fills a default only when no alternative applies without one
+        // (`Infer.inferMethodAlternative`). Applied before the specificity
+        // comparison, because the two alternatives it separates are often
+        // equally specific on the arguments actually written -- which is
+        // exactly how `new Prefer(1)` came out `ambiguous overload for
+        // constructor` rather than the primary.
+        let applicable = if applicable.len() > 1 {
+            let no_default: Vec<(SymbolId, Vec<Type>, Type)> = applicable
+                .iter()
+                .filter(|(sym, ps, _)| !self.needs_a_default(*sym, clause, arg_tys.len(), ps.len()))
+                .cloned()
+                .collect();
+            if no_default.is_empty() {
+                applicable
+            } else {
+                no_default
+            }
+        } else {
+            applicable
+        };
         match applicable.len() {
             0 => OverloadPick::None,
             1 => {
@@ -1722,6 +1742,61 @@ impl Typer {
             }
             None => false,
         }
+    }
+
+    /// Whether this alternative is applicable only because a **default** would
+    /// complete it.
+    ///
+    /// nsc's `Infer.inferMethodAlternative` weighs the alternatives applicable
+    /// to the arguments *as written* first, and reaches for the ones a default
+    /// would complete only when that set is empty. Weighing both at once made
+    /// `new Prefer(1)` on
+    ///
+    /// ```text
+    /// class Prefer(n: Int) { def this(k: Int, bump: Int = 5) = this(k * 100 + bump) }
+    /// ```
+    ///
+    /// `ambiguous overload for constructor`: the primary and the secondary are
+    /// each applicable to one `Int`, the secondary only because `bump` has a
+    /// default. nsc picks the primary and prints `1`.
+    ///
+    /// An *implicit* parameter is not a default. It is filled by a search that
+    /// runs after the alternative has been chosen, and nsc's applicability
+    /// ignores the implicit clause outright -- which is why this asks for
+    /// `DEFAULTPARAM` and not for `trailing_omissible`'s weaker
+    /// "default *or* implicit".
+    pub(crate) fn needs_a_default(
+        &self,
+        sym: SymbolId,
+        clause: usize,
+        given: usize,
+        total: usize,
+    ) -> bool {
+        if sym.is_none() || given >= total {
+            return false;
+        }
+        let s = self.st.get(sym);
+        // The same reading `trailing_omissible` does: a residual clause has to
+        // come out of `paramss`, while `pick_ctor` hands over a constructor
+        // whose clauses are already flattened.
+        let ids = s
+            .paramss
+            .get(clause)
+            .filter(|c| c.len() >= total)
+            .cloned()
+            .unwrap_or_else(|| {
+                if s.params.is_empty() {
+                    s.paramss.first().cloned().unwrap_or_default()
+                } else {
+                    s.params.clone()
+                }
+            });
+        if ids.len() < total {
+            return false;
+        }
+        ids[given..total]
+            .iter()
+            .any(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM))
     }
 
     pub(crate) fn trailing_omissible(
