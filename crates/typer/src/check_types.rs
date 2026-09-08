@@ -2551,8 +2551,25 @@ impl Typer {
     /// implicit value of type Shape[_ <: FlatShapeLevel, Rep[String], T, G]"
     /// while naming `FlatShapeLevel` anywhere in the same file fixed it.
     pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
-        let tys: Vec<Type> = self
-            .implicits_in_scope()
+        let mut cands = self.implicits_in_scope();
+        // The companion candidates too. `search_implicit_uncached` falls back
+        // to `companion_implicits(pt)` when nothing lexical fits, so those are
+        // real candidates and their result types need parents just as much --
+        // and they are the ones the program is *least* likely to have named,
+        // since the whole point of SLS 7.2 is that they need no import.
+        // `TypedType.typedTypeToOptionTypedType[T]: OptionTypedType[T]` is the
+        // case: `OptionTypedType extends TypedType[Option[T]]` is the only
+        // thing that makes it fit `TypedType[Option[String]]`, and with its
+        // parent list still empty `plausibly_inhabits` rejected it before a
+        // single unification ran. Every `column[Option[T]]` in slick was
+        // "could not find implicit value of type TypedType[Option[String]]",
+        // and writing `OptionTypedType` anywhere in the same file fixed it.
+        for w in wanted {
+            cands.extend(self.companion_implicits(w));
+        }
+        cands.sort_unstable_by_key(|id| id.0);
+        cands.dedup_by_key(|id| id.0);
+        let tys: Vec<Type> = cands
             .into_iter()
             .map(|id| self.implicit_candidate_ty(id).into_owned())
             .chain(wanted.iter().cloned())
@@ -2789,7 +2806,13 @@ impl Typer {
             return false;
         }
         if !self.completed_java.insert(internal.to_string()) {
-            return crate::classpath::find_by_jvm(&self.st, internal).is_some();
+            let Some(id) = crate::classpath::find_by_jvm(&self.st, internal) else {
+                return false;
+            };
+            // Read once, but not necessarily *for this owner*: see
+            // `classpath::enter_loaded_in_owner`.
+            crate::classpath::enter_loaded_in_owner(&mut self.st, id, owner);
+            return true;
         }
         match self.binary.find_class(internal) {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
