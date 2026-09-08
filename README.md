@@ -522,6 +522,24 @@ scalac と同じ `not found: value <q>` を同じ行に出します。正常系�
 （停止のためのガードが `true` を 1 つ落とせば、診断は出ないままオーバーロード解決が
 静かに変わるので、実行して出力を比べる以外に気づく方法がありません）。
 
+`neglit` テストは負のリテラル（`val b: Byte = -3`）の狭化変換を固定します。
+`-3` はパーサーの時点で `unary_-` の呼び出し（`Apply(Select(Literal(3),
+"unary_-"), Nil)`）に脱糖され、そのメソッドの宣言戻り値型は狭められていない
+`Int` なので、SLS 6.26.1 の狭化を適用する `Typer::adapt`（正常系の裸のリテラルは
+`Type::Constant` のまま届く箇所）にたどり着いた時点で定数性が失われていました。
+`negated_int_literal`（`crates/typer/src/check_infer.rs`）は木の形からその定数性を
+復元し、既存の一本の狭化ルールに乗せるだけで、狭化ルールを増やしてはいません。
+`tests/fixtures/negl_run.scala` は `Byte`/`Short`/`Char` への境界値（`127`/`-128`）
+と `Long`/`Float`/`Double` への幅拡張を含め、コンパイルするだけでなく**実行**して
+実 scalac 2.13.16 の出力と比較します（狭化が正しい型だが誤った値——符号の欠落や
+切り捨て——を生んでも型検査だけでは見つからないため）。`negl_bad_range.scala`
+（`-300`）と `negl_bad_boundary.scala`（`128`・`-129`）は範囲の境界を、
+`negl_bad_nonconst.scala`（`val n = 3; val b: Byte = -n`）はこの折り畳みが
+リテラルの直接の否定だけに絞られていて非定数式には効かないことを、それぞれ
+scalac と同じ行で固定します。この欠陥は `src/library` の計測を 1 件も動かしません
+（ライブラリは狭化対象への負のリテラルを一度も書かない）——正しさの修正であって、
+歩留まりの修正ではありません。
+
 別コンパイルでは型パラメータの上下限と型エイリアスの宣言種別を
 `ScalaSignature` に保持します。`crates/cli/tests/existential.rs` は実際の
 scalac を読み手にして、正例の JVM 実行と不正な型引数の拒否を検証します。
