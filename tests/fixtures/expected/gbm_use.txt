@@ -1,0 +1,10 @@
+Nothing id:Int,name:String
+List[Int] = List[Int]
+scala.util.Either[String,List[Int]] = scala.util.Either[String, List[Int]]
+scala.collection.immutable.Map[String,List[Int]] = scala.collection.immutable.Map[String, List[Int]]
+(Int, String) = Tuple2[Int, String]
+Int => String = Function1[Int, String]
+Array[Int] = Array[Int]
+scala.reflect.ClassTag[GbmRow] = scala.reflect.ClassTag[GbmRow]
+true
+false

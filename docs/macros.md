@@ -66,6 +66,7 @@ unrealistic, it is stated as such.
   - 7.18 A class the current run is compiling, as a type tag (the `agent/macrotag` slice)
   - 7.19 `val` and `def` definitions bound inside a `reify` body (the `agent/reifydefs` slice)
   - 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
+  - 7.21 A type tag that carries type arguments, and the `Expr[Nothing]` nsc really passes (the `agent/gbmapto` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -578,6 +579,13 @@ parameters, with a field, or with a member whose type has no faithful spelling
 on the wire stays a name and nothing else. The `tag_descriptor` path in
 particular is unchanged, so a *type argument* still goes over as the empty
 placeholder; §7.20 says why that is the right place to stop for now.
+
+§7.21 widened the descriptor to carry type arguments, so the placeholder can
+now appear **inside** one -- `ClassTag[Issues]` travels as
+`(ty "scala.reflect.ClassTag" (syn "a.b.Issues"))`. Nothing else about it
+changed: the placeholder is still empty, and a current-run class *applied* to
+type arguments is refused outright, because a symbol carrying only a name has
+nothing for them to bind to.
 
 The residual, stated plainly: an implementation could inspect a placeholder and
 return a *tree* rather than aborting. Being blackbox, that tree is still
@@ -1687,8 +1695,11 @@ for each failure per span and hangs it there:
 ```
 error: macro expansion is not implemented: cannot expand nameOf
        (implementation EgImpl$.nameOfImpl): scala-rs cannot build a type tag for
-       `List[Int]`, a type constructor applied to type arguments. See docs/macros.md.
+       `Main.type`, a singleton type. See docs/macros.md.
 ```
+
+(`List[Int]` was this example's refusal until §7.21 made a tag descriptor carry
+its type arguments; a singleton type is one of the shapes still refused.)
 
 #### Two-pass compilation is by design
 
@@ -3031,9 +3042,11 @@ accept before.
 1. **`c.inferImplicitValue` / `c.inferImplicitView`**, the other half of what §7.18 said this channel
    is for. The channel is built; implicit search already exists in `crates/typer/src/implicits.rs`;
    what is missing is the query and the same all-or-nothing rule about what may be written back.
-2. **A tag descriptor that carries type arguments** (`Typer::tag_descriptor`). This is what gitbucket's
-   31 `mapTo` sites actually stop at, and it is the first thing anyone chasing `mapTo` should do. The
-   answer direction already reads `(ty "name" <arg>…)`.
+2. ~~**A tag descriptor that carries type arguments** (`Typer::tag_descriptor`).~~ Done in §7.21,
+   where it turned out to be half a phantom: the tag it could not build for `c.Expr[ClassTag[R]]` is
+   one **nsc never builds** (`Expr[Nothing](arg)(TypeTag.Nothing)`). gitbucket's 31 sites now stop
+   one layer later, at the macro implementation reference's own type arguments; §7.21 lists the
+   remaining walls in the order they are hit.
 3. **Fields in a described class.** The single biggest limit on the mirror: a class with a `val` is
    not described at all today. Doing it right means modelling nsc's private-field-plus-stable-accessor
    pair, which is a decision about what `decls` *means*, not a serialisation detail.
@@ -3041,3 +3054,160 @@ accept before.
    implementation. Everything else the proxy does is fine; this one checked exception is the whole
    cost, and it is what stands between `t6814` and a corpus number.
 5. **Rebuilding the trees `mapToImpl` returns** — §7.18's step 2, untouched and unchanged.
+
+### 7.21 A type tag that carries type arguments, and the `Expr[Nothing]` nsc really passes (the `agent/gbmapto` slice)
+
+§7.20 corrected §7.18's diagnosis and named where to start: gitbucket's 31 `mapTo` refusals do not
+stop in the mirror, they stop in `Typer::tag_descriptor`, which could not build the *request*.
+
+```text
+cannot expand mapTo (implementation slick.lifted.ShapedValue$.mapToImpl): scala-rs cannot
+build a type tag for `ClassTag`, a type constructor applied to type arguments
+```
+
+This slice made the descriptor carry type arguments, and — while validating that against real
+scalac — found that the tag it was failing to build is **a tag nsc never builds**.
+
+#### The descriptor
+
+`Typer::tag_wire` (`crates/typer/src/expand.rs`, replacing the body of `tag_descriptor`) writes
+`(ty "a.b.C" <arg>…)` and recurses into the arguments. The engine side needed nothing: `typeFor`
+already read the shape and applies it with `universe.appliedType` — checked rather than assumed.
+
+Three of scala-rs's own `Type` variants are not class applications and had to be written out,
+because nsc's tag for each *is* one: `Type::Tuple(ts)` is `scala.TupleN[ts…]`,
+`Type::Function { params, ret }` is `scala.FunctionN[params…, ret]` and `Type::Array(t)` is
+`scala.Array[t]`. A constant type nested inside an argument stays a constant (`Tag[1]` is not
+`Tag[Int]`); only the outermost type is widened, which is what nsc does for the type it gives an
+`Expr`.
+
+Two things are refused rather than approximated, and both are in `tests/fixtures/gbm_bad.scala`:
+
+* a class **this run is compiling** applied to type arguments. The placeholder such a class travels
+  as (§5.1) carries a name and nothing else, so its type parameters would have nothing to bind; the
+  name would have been handed to `mirror.staticClass`, which fails at run time inside the engine
+  rather than at the call site;
+* a class the current run is compiling as a *bare* type argument at any depth still travels as that
+  placeholder, exactly as before, so `ClassTag[LocalRow]` reaches the implementation with `LocalRow`
+  empty. That is the one that matters for `mapTo` — see below.
+
+#### The `Expr[Nothing]`, which is the part that was not expected
+
+`tests/fixtures/gbm_use.scala` runs an implementation with slick's own opening — `isCaseClass`, then
+every case accessor's `typeSignature` — and prints its `c.Expr`'s `staticType`. Real scalac
+2.13.16 prints **`Nothing`**.
+
+That is not an accident of the fixture. nsc's `Macros.macroArgs` wraps every value argument as
+
+```scala
+case LiftedTyped => context.Expr[Nothing](duplicatedArg)(TypeTag.Nothing) // TODO: SI-5752
+```
+
+so an argument's tag is a **constant** — the same constant `c.prefix` gets, and for the same
+reason. scala-rs was building a tag for the argument's real type instead. That is a silent
+divergence in its own right (an implementation reading `arg.staticType` would be told
+`ClassTag[Row]` here and `Nothing` by nsc), and it is *also* why gitbucket's 31 sites were refused:
+`ShapedValue.mapToImpl` takes a `c.Expr[ClassTag[R]]`, and scala-rs was refusing the expansion
+because it could not build a tag **nsc does not build at all**. The request now sends
+`(ty "scala.Nothing")` for every `Expr` argument, and `gbm_use.scala` pins the `Nothing` against
+scalac's own output.
+
+The descriptor is still needed, and is still exercised, for the `(tags …)` clause — the
+`c.WeakTypeTag[T]`s an implementation really does ask for.
+
+#### A named difference: aliases
+
+`weakTypeOf[Map[String, List[Int]]]` prints `Map[String,List[Int]]` under nsc and
+`scala.collection.immutable.Map[String,List[Int]]` under scala-rs; `Either` behaves the same way
+through `scala.package.Either`. **The types are the same type** — they answer `=:=` and every
+question an implementation asks of them identically — but scala-rs expands an alias away long
+before a type reaches the tag descriptor, so its tag names the class where nsc's names the alias,
+and nsc's printer omits the prefix of an alias owned by `scala` or `Predef` while it does not omit
+`scala.util.` or `scala.collection.immutable.`.
+
+An implementation that *prints* or string-matches a tag therefore sees a different spelling. This
+is stated here, and both spellings are asserted in `gbm_applied_tags_match_real_scalac`, rather
+than being hidden by leaving the two cases out of the fixture. Closing it needs scala-rs to keep
+alias types, which is a type-checker decision and not a macro one.
+
+#### What this is worth, measured
+
+**Nothing on any of the six measures, and the wall moved by exactly one layer.**
+
+| check | before | after |
+| --- | --- | --- |
+| `tests/gitbucket_measure.sh` | 393 errors / 83 files | **393 / 83** |
+| `tests/cats_measure.sh` | 215 / 73 | **215 / 73** |
+| `tests/scalalib_measure.sh` | 1551 / 168 | **1551 / 168** |
+| `tests/slick_measure.sh` | `errors=0 classes=1490` | **unchanged** |
+| `MODE=b tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | **unchanged** |
+
+The gitbucket log's error kinds before and after differ by **exactly one line** (`grep '^error' |
+sort | uniq -c`, diffed): the 31 `mapTo` sites, which now read
+
+```text
+cannot expand mapTo (implementation slick.lifted.ShapedValue$.mapToImpl): the implementation
+asks for 2 type tag(s) and the call site supplies 1 type argument(s); nsc would resolve the type
+arguments written on the implementation reference itself, taking the ones that belong to the
+macro def's owner from the prefix, and scala-rs does not read those type arguments out of the
+`@macroImpl` annotation yet
+```
+
+#### The walls in front of `mapTo`, in the order they are hit
+
+1. ~~a tag descriptor that cannot carry type arguments~~ — closed here, and it turned out to be
+   half a phantom: the `ClassTag[R]` tag is one nsc never builds.
+2. **the macro implementation reference's own type arguments.** `mapTo[R] = macro
+   ShapedValue.mapToImpl[R, U]`: `U` is `ShapedValue`'s type parameter, not `mapTo`'s, so the call
+   site writes one type argument where the implementation asks for two tags. nsc does not line the
+   two up at all — `Macros.macroArgs` reads `binding.targs`, the type arguments written on the
+   implementation reference, and resolves each one: a type parameter of the macro *def* is looked
+   up among the call site's type arguments, and anything else is `asSeenFrom(prefix.tpe,
+   macroDef.owner)`. Those type arguments **are in the pickle** — nsc writes them as a `TypeApply`
+   wrapped around the `@macroImpl` payload, and `PickleReader::macro_impl_of`
+   (`crates/pickle/src/sym.rs`) currently peels it off and throws it away:
+
+   ```rust
+   // `macro(...)[T]`: peel the type application nsc wraps it in.
+   while let Tree::TypeApply { fun, .. } = args {
+       args = self.tree_at(*fun)?;
+   }
+   ```
+
+   Keeping them, converting them with the same scope `install_pickled_macro` already builds (which
+   holds both the macro def's and the owning class's type parameters), and substituting at the call
+   site is the next piece of work. **This is where gitbucket's 31 sites stop today.** The source
+   path (`crates/typer/src/macros.rs`, `split_type_apply`) discards the same thing and needs the
+   same treatment.
+3. **the mirror, on a class with fields.** gitbucket's row classes — `AccessToken`, `Account`,
+   `Issue` — are case classes *this run is compiling*, so they reach the engine as §5.1's empty
+   placeholder, and `mapToImpl` opens by asking one `isCaseClass`. `tests/fixtures/gbm_bad.scala`
+   is that exact situation and is what it produces:
+
+   ```text
+   the type argument `LocalRow` is a class this run is compiling, so the implementation was
+   handed a placeholder symbol carrying only its name; it looked the class up and answered
+   "the macro implementation threw java.lang.AssertionError: assertion failed: LocalRow"
+   ```
+
+   §7.20's remaining item 3 (a described class with fields) is necessary but **not sufficient**
+   here: `mapToImpl` also asks for `rSym.companion`, that companion's `tupled` and `unapply`, and
+   the mirror describes no companion at all. So this wall is two decisions, not one.
+4. **rebuilding the trees `mapToImpl` returns** — §7.18's step 2, untouched.
+
+#### Validation
+
+* `tests/fixtures/gbm_impl.scala` + `gbm_use.scala` — nine tags whose types carry arguments,
+  expanded for real and **executed**. Eight of the ten output lines are byte-identical to real
+  scalac 2.13.16 compiling the same two files against each other; the two that differ are the alias
+  difference above, and the test asserts *both* spellings
+  (`crates/cli/tests/gbmapto.rs`, `gbm_applied_tags_expand_and_run` and
+  `gbm_applied_tags_match_real_scalac`). The first line is slick's `mapToImpl` as far as it reads
+  its type argument, driven by a tag that could not previously be built.
+* `tests/fixtures/gbm_bad.scala` — four tags scala-rs cannot build, each refused by name. **All
+  four are a program real scalac compiles and runs** (`Nothing v:Int` / `LocalBox[Int] =
+  LocalBox[Int]` / `T = T[]` / `Main.type = Main.type[]`); scala-rs accepts none of them.
+* `tests/fixtures/eg_gaps_bad.scala` lost one case and gained another: `nameOf[List[Int]]` was a
+  pinned *refusal* there and is now a pinned acceptance in `gbm_use.scala`, so its place is taken by
+  `nameOf[Main.type]`, a singleton type, which is still refused. Real scalac still compiles and runs
+  that file.

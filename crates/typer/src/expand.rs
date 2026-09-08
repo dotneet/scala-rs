@@ -828,10 +828,24 @@ impl Typer {
                 tree_to_wire(a, &mut out)?;
                 out.push(' ');
                 if as_expr {
-                    // Only an `Expr` carries a tag, and only the tag needs a
-                    // type the engine can rebuild.
-                    let desc = self.tag_descriptor(&a.ty, &mut placeholders)?;
-                    out.push_str(&desc);
+                    // nsc hands the implementation
+                    // `context.Expr[Nothing](arg)(TypeTag.Nothing)` for every
+                    // value argument -- the tag is a *constant*, not the
+                    // argument's own type (`Macros.macroArgs`, whose own
+                    // comment points at scala/bug#5752). It is the same
+                    // constant `c.prefix` gets, and for the same reason.
+                    //
+                    // scala-rs used to build a tag for the argument's real
+                    // type here. That is a silent divergence -- an
+                    // implementation reading `arg.staticType` would be told
+                    // `ClassTag[Row]` here and `Nothing` by nsc -- and it also
+                    // made a *tag* out of a type nobody asked for: slick's
+                    // `mapToImpl` takes a `c.Expr[ClassTag[R]]`, and every one
+                    // of gitbucket's 31 `mapTo` call sites was refused because
+                    // scala-rs could not build the tag nsc never builds.
+                    // `tests/fixtures/gbm_use.scala` pins the `Nothing`
+                    // against real scalac.
+                    out.push_str("(ty \"scala.Nothing\")");
                 } else {
                     out.push_str("(ty \"\")");
                 }
@@ -841,11 +855,39 @@ impl Typer {
         }
         out.push_str(") (tags");
         if binding.tag_params > 0 {
-            if targs.len() != binding.tag_params {
+            if targs.is_empty() {
                 return Err(format!(
                     "the implementation asks for {} type tag(s) and the call site \
-                     supplies {} type argument(s); an inferred type argument is not \
-                     passed to a macro yet",
+                     writes no type arguments; scala-rs does not pass an inferred \
+                     type argument to a macro yet",
+                    binding.tag_params
+                ));
+            }
+            if targs.len() != binding.tag_params {
+                // nsc does not line the tags up with the call site's type
+                // arguments at all. It reads the type arguments written on the
+                // *macro implementation reference* -- `Impl.method[R, U]` on
+                // the macro def's right-hand side, which travels in the
+                // `@macroImpl` annotation as a `TypeApply` wrapped around the
+                // payload -- and resolves each one: a type parameter of the
+                // macro def is looked up among the call site's type arguments,
+                // and anything else, a type parameter of the macro def's
+                // *owner* above all, is `asSeenFrom` the prefix
+                // (`Macros.macroArgs`). slick's
+                // `mapTo[R] = macro ShapedValue.mapToImpl[R, U]` is exactly
+                // that: `U` is `ShapedValue`'s own type parameter, so the call
+                // site writes one type argument where the implementation asks
+                // for two tags. scala-rs discards those type arguments when it
+                // reads the annotation (`PickleReader::macro_impl_of` peels
+                // the `TypeApply` away), so all it can do is line the tags up
+                // one for one -- and say so when that does not fit.
+                return Err(format!(
+                    "the implementation asks for {} type tag(s) and the call site \
+                     supplies {} type argument(s); nsc would resolve the type \
+                     arguments written on the implementation reference itself, \
+                     taking the ones that belong to the macro def's owner from the \
+                     prefix, and scala-rs does not read those type arguments out of \
+                     the `@macroImpl` annotation yet",
                     binding.tag_params,
                     targs.len()
                 ));
@@ -948,9 +990,34 @@ impl Typer {
         ty: &Type,
         placeholders: &mut Vec<String>,
     ) -> Result<String, String> {
+        // `f(42)` types its argument as the *constant* type `42`; the tag nsc
+        // builds for the `Expr` that wraps it is `Int`. Only the outermost
+        // type is widened -- `Tag[1]` is not `Tag[Int]`, so a constant that is
+        // itself a type argument stays one ([`Typer::tag_wire`]).
+        let widened = match ty {
+            Type::Constant(lit) => Type::lit_underlying(lit),
+            other => other.clone(),
+        };
+        self.tag_wire(&widened, placeholders)
+    }
+
+    /// One type as a tag descriptor, type arguments and all.
+    ///
+    /// `(ty "scala.reflect.ClassTag" (ty "a.b.Row"))` is `mirror.staticClass`
+    /// applied to the arguments, written the same way, which is what
+    /// `ScalaRsMacroEngine.typeFor` turns into `universe.appliedType`.
+    ///
+    /// Before this a descriptor was a bare name, and a tag for an applied type
+    /// constructor could not be *requested* at all. That is where every one of
+    /// gitbucket's 31 `mapTo` call sites stopped: `ShapedValue.mapToImpl`
+    /// takes a `c.Expr[ClassTag[R]]`, so the request could not be built and
+    /// the implementation was never invoked (`docs/macros.md` §7.20, §7.21).
+    ///
+    /// A type argument that is a class **this run is compiling** still travels
+    /// as the empty placeholder of §5.1, at whatever depth it occurs.
+    fn tag_wire(&mut self, ty: &Type, placeholders: &mut Vec<String>) -> Result<String, String> {
         if let Some(sym) = plain_class_of(&self.st, ty) {
-            let jvm = self.st.jvm_internal(sym);
-            if !jvm.is_empty() && !matches!(self.binary.find_class(&jvm), Ok(Some(_))) {
+            if self.is_current_run_class(sym) {
                 let full = scala_full_name(&self.st, sym);
                 self.macro_local_tags.insert(full.clone(), ty.clone());
                 placeholders.push(full.clone());
@@ -960,11 +1027,80 @@ impl Typer {
                 return Ok(out);
             }
         }
+        // A constant type nested inside a type argument. nsc's tag for
+        // `Tag[1]` carries `Int(1)`, and widening it here would hand the
+        // implementation a different type from the one it asked about.
+        if let Type::Constant(lit) = ty {
+            let mut out = String::from("(cst ");
+            lit_to_wire(lit, &mut out)?;
+            out.push(')');
+            return Ok(out);
+        }
+        if let Some((name, args)) = self.applied_tag_shape(ty)? {
+            let mut written = Vec::new();
+            for a in &args {
+                written.push(self.tag_wire(a, placeholders)?);
+            }
+            let mut out = String::from("(ty ");
+            quote_into(&mut out, &name);
+            for w in written {
+                out.push(' ');
+                out.push_str(&w);
+            }
+            out.push(')');
+            return Ok(out);
+        }
         let name = static_tag_class(&self.st, ty)?;
         let mut out = String::from("(ty ");
         quote_into(&mut out, &name);
         out.push(')');
         Ok(out)
+    }
+
+    /// A type constructor applied to arguments, as the class the engine's
+    /// mirror resolves plus the arguments to apply it to.
+    ///
+    /// `Ok(None)` means "not an application"; the caller then writes the type
+    /// as a plain name. `Err` is a refusal that names what could not be built,
+    /// the way every other descriptor refusal does.
+    ///
+    /// The three structural shapes are written out because scala-rs models
+    /// them as their own `Type` variants rather than as class applications,
+    /// and nsc's tag for each is exactly the class named here: `(A, B)` is
+    /// `scala.Tuple2[A, B]`, `A => B` is `scala.Function1[A, B]` and
+    /// `Array[A]` is `scala.Array[A]`.
+    fn applied_tag_shape(&mut self, ty: &Type) -> Result<Option<(String, Vec<Type>)>, String> {
+        let named = |n: &str, args: Vec<Type>| Ok(Some((n.to_string(), args)));
+        match ty {
+            Type::Class { sym, args } if !args.is_empty() => {
+                // A class this run is compiling has no class file for
+                // `mirror.staticClass` to find, and the placeholder that
+                // stands in for one carries a name and nothing else -- so its
+                // type parameters would have nothing to bind. Refused by name
+                // rather than sent as a name the mirror fails to resolve.
+                if self.is_current_run_class(*sym) {
+                    return Err(format!(
+                        "scala-rs cannot build a type tag for `{}`, a class this run \
+                         is compiling applied to type arguments; the placeholder the \
+                         engine is given carries a name and nothing else",
+                        scala_full_name(&self.st, *sym)
+                    ));
+                }
+                let name = crate::materialize::static_class_of_sym(&self.st, *sym)
+                    .map_err(|why| format!("scala-rs cannot build a type tag for {why}"))?;
+                Ok(Some((name, args.clone())))
+            }
+            Type::Tuple(ts) if (1..=22).contains(&ts.len()) => {
+                named(&format!("scala.Tuple{}", ts.len()), ts.clone())
+            }
+            Type::Function { params, ret } if params.len() <= 22 => {
+                let mut args = params.clone();
+                args.push((**ret).clone());
+                named(&format!("scala.Function{}", params.len()), args)
+            }
+            Type::Array(t) => named("scala.Array", vec![(**t).clone()]),
+            _ => Ok(None),
+        }
     }
 
     /// Remember why one call site could not be expanded, so
