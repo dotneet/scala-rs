@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `a723e8b1` |
+| commit | `e0212fb7` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-four slices have merged this session**, in twenty composed gates. From
+**Sixty-five slices have merged this session**, in twenty-one composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -42,6 +42,7 @@ coordinator measured the merged tree each time, not the branches.
 | `d0c89fc1` | `ctorgaps2` | 265 | 177 |
 | `80c660c0` | `hkfield` | 265 | 177 |
 | `a723e8b1` | `lowerbound` | 265 | 177 -> **168** |
+| `e0212fb7` | `basetypeargs` | 265 | 168 -> **167** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -248,9 +249,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **168** | **67** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **167** | **66** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **265** | **77** | — |
-| `tests/scalalib_measure.sh` (538) | **612** | **130** | — |
+| `tests/scalalib_measure.sh` (538) | **604** | **130** | — |
 
 ## Execution
 
@@ -271,7 +272,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `run` (2060) | **629** | 878 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-a723e8b1.tsv`](baselines/corpus-a723e8b1.tsv): 5324 unique
+[`baselines/corpus-e0212fb7.tsv`](baselines/corpus-e0212fb7.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -726,6 +727,42 @@ Two things the brief grouped with this root are **not** it: the `Equiv` /
 `NonEmptyVector.scala:287`'s `found: Seq[A] required: Vector[A]` is `sortBy`'s
 return type — the `C` of `IterableOps[A, CC, C]`, which is `agent/basetypeargs`'
 subject. `sortBy[B](f: A => B)(implicit Ordering[B])` has no lower bound at all.
+
+## Gate twenty-one: a symbol that existed twice
+
+`agent/basetypeargs` was sent after `SymbolTable::base_type_args`' first-path
+behaviour, which two earlier slices had named 「本命の修理」. **It was already
+closed**, by `agent/basetypemeet` two gates before, and this file's own record
+said so — the coordinator handed on a documented next step without checking
+whether it was still open. Nothing in this slice is in the base-type walk.
+
+What it found instead is worth more than the eight errors it moved.
+`Iterator.sliding` returns the nested `Iterator.GroupedIterator`, and
+`ensure_class` split `scala/collection/Iterator$GroupedIterator` on the last
+`/` only — producing a **second symbol** whose simple name was
+`Iterator$GroupedIterator` and whose owner was the package, alongside the
+correct `Iterator.GroupedIterator`. Which one a program got depended on **reach
+order**: `def x[A](it: Iterator[A]): Iterator[Seq[A]] = it.sliding(2)` was
+refused, and putting `it.sliding(2).next()` one line above made the same
+expression compile. A test pins both orders now.
+
+**The gate refused two broader versions of the rule before this one.** Applying
+the repair to every nested library class cost slick two errors, ten workspace
+tests and `losses=3`, because `scala.reflect`'s API is hand-built by
+`prelude_reflect` rather than read from the pickle and the macro code depends
+on those symbols; narrowing it to every nested `scala.collection` class then
+broke `MapOps.WithFilter`, which is not an `IterableOnce`. A third version that
+attached parents and rolled them back left `self.parented` marked and killed
+the lazy path. The rule that survives is name-only and decided before any
+symbol is made. All three discarded versions are recorded in `docs/cats.md`.
+
+Two things the slice measured and did **not** fix, both named precisely:
+cats' four remaining `grouped` errors are a different root that **does not
+reproduce outside the full run** — compiling `NonEmptyVector.scala` alone with
+the same flags and classpath produces the other 130 errors and not these — and
+`Iterator.GroupedIterator` is still *accepted* as a spelling scalac rejects,
+because the rule that makes it work is the same one that carries
+`Resource.ExitCase`.
 
 ## What is deliberately red
 
