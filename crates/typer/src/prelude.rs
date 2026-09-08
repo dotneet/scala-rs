@@ -1006,6 +1006,26 @@ pub(crate) fn method(
     id
 }
 
+/// `method`, for a member the real class only *declares*.
+///
+/// `method` stamps `Flags::FINAL` and there is no prelude spelling of
+/// "deferred" -- see `override_check::modifiers_are_known`, which withholds
+/// modifier-shaped diagnostics for prelude symbols for exactly that reason.
+/// The one consumer that cannot work without the distinction is SAM detection
+/// (`SymbolTable::sam_sig` counts a class's abstract methods), so the fact is
+/// recorded on `Symbol::deferred_method` rather than in the flags.
+pub(crate) fn abstract_method(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    params: Vec<Type>,
+    ret: Type,
+) -> SymbolId {
+    let id = method(st, owner, name, params, ret, Intrinsic::None);
+    st.get_mut(id).deferred_method = true;
+    id
+}
+
 /// `method` for sibling prelude modules.
 pub(crate) fn prelude_method(
     st: &mut SymbolTable,

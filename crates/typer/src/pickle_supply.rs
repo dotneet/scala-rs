@@ -122,6 +122,8 @@ pub struct PickleSupply {
     implicits_supplied: HashSet<u32>,
     /// What [`PickleSupply::implicit_member_names`] answered for each class.
     implicit_names: HashMap<u32, Vec<String>>,
+    /// What [`PickleSupply::concrete_method_names`] answered for each class.
+    concrete_names: HashMap<u32, Vec<String>>,
     /// What [`PickleSupply::complete_type_member`] answered for each
     /// `(class, name)`, so a miss costs one pickle walk and a hit stays
     /// stable. A memo of the *answer*, not just of having asked: a nullary
@@ -926,6 +928,61 @@ impl PickleSupply {
             }
         }
         found
+    }
+
+    /// The names of the methods `class_sym`'s pickle declares **with a body**
+    /// -- everything it defines rather than merely declares.
+    ///
+    /// Read-only on purpose. Completion is additive global state (see
+    /// [`PickleSupply::complete`]'s own note about `BigDecimal`, where an
+    /// unrelated completion changed which overload a later expression chose),
+    /// and the one caller here only needs to know *whether* an override
+    /// exists, not to have it. Installing it instead moved cats'
+    /// `NonEmptyVector` from four diagnostics to five: asking `Vector` for
+    /// `coll` / `toIterable` / `fromSpecific` -- all of which it does
+    /// override, and none of which anything had asked for -- changed
+    /// `toVector.grouped(n)` from `Seq` to `Iterable` and made `lazyZip`
+    /// ambiguous.
+    pub fn concrete_method_names(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> Vec<String> {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return Vec::new();
+        }
+        if let Some(cached) = self.concrete_names.get(&class_sym.0) {
+            return cached.clone();
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let mut names: Vec<String> = Vec::new();
+        if !internal.is_empty() && !internal.starts_with("java/") && !internal.starts_with("javax/")
+        {
+            if let Some(full) = self.pickled_full_name(bin, &internal, is_module) {
+                let sig = {
+                    let mut src = BinSource(bin);
+                    self.sigs.class_sig(&mut src, &full, is_module)
+                };
+                if let Ok(sig) = sig {
+                    for m in &sig.members {
+                        if m.kind != MemberKind::Def || m.has(pflags::DEFERRED) {
+                            continue;
+                        }
+                        let src_name = scala_rs_pickle::names::decode_method_name(&m.name);
+                        if src_name.is_empty() || src_name == "<init>" || src_name.contains('$') {
+                            continue;
+                        }
+                        if !names.contains(&src_name) {
+                            names.push(src_name);
+                        }
+                    }
+                }
+            }
+        }
+        self.concrete_names.insert(class_sym.0, names.clone());
+        names
     }
 
     pub fn implicit_member_names(
@@ -1903,6 +1960,15 @@ impl PickleSupply {
                 if m.has(pflags::STABLE) {
                     st.get_mut(id).flags = st.get(id).flags.with(Flags::ACCESSOR);
                 }
+                // A declaration, not a definition. The class file cannot say
+                // so for a trait -- every member of an interface bar its
+                // `default` methods is `ACC_ABSTRACT` -- so the pickle is the
+                // only place it is written down. `Symbol::deferred_method`
+                // rather than `Flags::ABSTRACT` for the reason recorded on
+                // that field: `override_check::modifiers_are_known` withholds
+                // every modifier-shaped diagnostic for pickled members, and
+                // setting the flag here would turn them all on at once.
+                st.get_mut(id).deferred_method = m.has(pflags::DEFERRED);
                 installed.push(id);
             }
         }
