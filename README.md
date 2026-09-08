@@ -43,6 +43,25 @@ makes no claim of conformance to the language specification. What exists today:
 外部 trait の `hashCode` / `toString` と組み込み `Any` の上書き関係も、
 [scalac 相互運用テスト](docs/notes/inherited-universal-override.md) で検査します。
 
+**Java クラスファイルのメンバ**は、`private` 以外——`public` / `protected` に加えて
+**パッケージプライベート（既定アクセス）**——を読み込みます。既定アクセスは Scala の
+`private[<パッケージ>]` として記録するので、同一パッケージからは見え、別パッケージからは
+実 scalac と同じ行・同じ文言で拒否されます。フィールドの `Signature` 属性も読むため、
+`MainNode<K, V> mainnode` のような総称フィールドが消去された生の型で見えることは
+なくなりました。Java の**インスタンスフィールド**の読み出しは `getfield`、`import C._`
+で名前だけ書いた Java の `static` フィールドは `getstatic` を出します（以前はどちらも
+アクセサ呼び出しとして出力していたため、読み出しを 1 つ含むだけでクラスが
+`ClassFormatError` でロードできませんでした）。検査は `triemapjava` テスト
+（`tests/fixtures/tmj_*.scala` と javac でコンパイルする
+`tests/fixtures/java/tmjava/JBase.java`）にあります。
+
+`class C[K, V]` の中で `new C[K, V](…)` と**自分自身を書いた型引数付きで生成**する
+メソッドは、戻り値型を書かなくても `C[K, V]` に推論されます。書かれた型引数は
+「まだ具体化されていない置き換え用の型パラメータ」と型だけでは区別できないため、
+以前はリスト全体（`new C[K, Int]` の `Int` まで）を捨てて値引数から推論し直しており、
+値引数が型パラメータに触れない `scala/collection/concurrent/TrieMap.scala` の
+`CNode.renewed` などでは `C[Nothing, Nothing]` になっていました。
+
 `case class` に合成する `hashCode` は、`--scala-library` では nsc と**同じ値**に
 なりました。以前は両モードとも 31 倍で畳んでいたため、`Point(1, "a").hashCode` が
 scalac の `-1322997830` に対して `128` になり、自前の `equals` とは整合するものの、
@@ -765,6 +784,27 @@ secondary、別の secondary へ委譲する secondary、値クラスを取る s
 停止のためのガードが線形化を黙って切り詰めれば出力から trait が 1 つ消えます）。
 異常系は閉路のある `extends` グラフが scalac と同じ行・同じ文言で拒否されること、
 そして**そもそも停止すること**（60 秒の上限つき）を検査します。
+
+`triemapjava` テストは、`src/library/scala/collection/concurrent/TrieMap.scala`
+——ライブラリ計測で最も errors の多かったファイル（46 件）——を出発点にした 4 つの
+欠陥を固定します。まず計測が Java 側を見ているかを確かめました：
+`tests/scalalib_measure.sh` はライブラリの 32 本の `.java` が生む 33 個の
+クラスファイルを `-cp` に置いて回すので、**Java は見えており、除外は不要**でした
+（`skipped` は 0 です）。4 つのうち最大のものは Java と無関係で、`class C[K, V]` の
+中に書かれた `new C[K, V](…)` の型引数リストが捨てられ、値引数が型パラメータに
+触れないため `C[Nothing, Nothing]` に推論されるというものです。`tmj_selfctor.scala`
+は `CNode` と同じ形——**どのコンストラクタ引数も `K`/`V` に触れない**——で 4 つの
+代入位置を作り、両モードで**実行**して実 scalac 2.13.16 の出力と比較します
+（修正前のバイナリは 4 件のエラーを出します）。異常系
+`tmj_selfctor_bad.scala` は、書かれたリストを信じることで初めて意味を持つ 2 件
+——`Cell[V, K]` を `Cell[K, V]` に代入できないこと、書かれた `[String, V]` に
+`k: K` を渡せないこと——を実 scalac と同じ行・同じ文言で拒否します（修正前は
+1 件しか出ず、しかも文言が違いました）。残り 3 つは Java 側で、
+`tests/fixtures/java/tmjava/JBase.java` を **javac でコンパイルしてクラスファイル
+として読ませ**、パッケージプライベートな static を `import JBase._` と修飾付きの
+両方で読み、総称フィールドを継承した型で読み、そして**実行**します。異常系
+`tmj_java_bad.scala` は同じ static が別パッケージからは拒否されることを、
+実 scalac と同じ行・同じ文言で固定します。
 
 型の**修飾子**が何も指さない場合（`trait AllOps[A] extends Ops[A] with
 Missing.AllOps[A]`）は、`crates/cli/tests/qualfallback.rs` が両方向を固定します。

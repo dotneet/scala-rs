@@ -1176,6 +1176,26 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
     match sym.kind {
         SymKind::Term => {
             let owner = sym.owner;
+            // A Java `static` field named without a qualifier -- what
+            // `import INodeBase._` puts in scope, and how `class INode` reads
+            // `NO_SUCH_ELEMENT_SENTINEL` and `RESTART` in
+            // `scala/collection/concurrent/TrieMap.scala`. There is no
+            // instance to load; `gen_select`'s `STATIC` arm already does this
+            // for the qualified `INodeBase.RESTART`, and without the same arm
+            // here the unqualified form loaded a receiver and emitted
+            // `getfield`, which fails at run time with
+            // `IncompatibleClassChangeError: Expected non-static field`.
+            if sym.flags.contains(Flags::STATIC) && sym.flags.contains(Flags::JAVA) {
+                let owner = class_internal(ctx.st, owner);
+                let desc = if !sym.jvm_name.is_empty() && !sym.jvm_name.starts_with('(') {
+                    sym.jvm_name.clone()
+                } else {
+                    jvm_desc_val(ctx.st, &sym.ty)
+                };
+                asm.getstatic(&owner, &sym.name, &desc);
+                maybe_cast_erased_load(asm, ctx, &sym.ty, &tree.ty);
+                return;
+            }
             // A template's self alias (`trait T { self: P => … }`) denotes the
             // template's own `this`. Read from a class nested inside `T` that
             // is the *outer* instance, not this one, so it has to be reached
@@ -1225,7 +1245,22 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
                         &sym.name,
                         &format!("(){}", jvm_desc(ctx.st, &sym.ty)),
                     );
-                } else if sym.jvm_name.is_empty() {
+                } else if sym.jvm_name.is_empty() || sym.flags.contains(Flags::JAVA) {
+                    // A Java field is a field, and `jvm_name` does not mean
+                    // "accessor to call" for one: `classpath::fill_java_members`
+                    // stores the field *descriptor* there. Falling through to
+                    // the accessor branch emitted
+                    // `invokevirtual jp/Plain."Ljava$divlang$divString;":()…`
+                    // -- an illegal method name, so *any* class reading *any*
+                    // Java instance field failed to load with
+                    // `ClassFormatError`. `Flags::JAVA` reaches a `Term` only
+                    // from the class-file reader, and a Java class has no
+                    // Scala accessor to prefer.
+                    let desc = if sym.flags.contains(Flags::JAVA) && !sym.jvm_name.is_empty() {
+                        sym.jvm_name.clone()
+                    } else {
+                        desc
+                    };
                     emit_getfield(asm, &owner, &sym.name, &desc);
                 } else {
                     let acc = sym.jvm_name.clone();
@@ -1580,7 +1615,18 @@ pub(crate) fn gen_select(
                             &s.name,
                             &format!("(){}", jvm_desc(ctx.st, &s.ty)),
                         );
-                    } else if s.jvm_name.is_empty() {
+                    } else if s.jvm_name.is_empty() || s.flags.contains(Flags::JAVA) {
+                        // See the matching branch on the un-qualified path: a
+                        // Java field's `jvm_name` is its *descriptor*, not an
+                        // accessor to call, exactly as the `STATIC` arm above
+                        // already reads it. Treating it as a method name made
+                        // every read of a Java instance field emit an illegal
+                        // method name.
+                        let desc = if s.flags.contains(Flags::JAVA) && !s.jvm_name.is_empty() {
+                            s.jvm_name.clone()
+                        } else {
+                            desc
+                        };
                         emit_getfield(asm, &owner, &s.name, &desc);
                     } else {
                         let acc = s.jvm_name.clone();

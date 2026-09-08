@@ -2590,6 +2590,161 @@ required: A` (8), and `found: Array[AnyRef] required: Array[Any]` /
 **variance**, not construction: `Array` is invariant and the receiver these
 appear on is `ArrayOps`, so they are a separate question from this slice's.
 
+## The `agent/triemapjava` slice: `TrieMap.scala`, and what the Java half was
+
+The worst file in the measure at `852 / 145` was
+`src/library/scala/collection/concurrent/TrieMap.scala` with **46** errors, a
+Scala source whose classes extend the hand-written Java `INodeBase` /
+`MainNode` / `CNodeBase`. The first question the brief asked was whether the
+measurement even *sees* those.
+
+### It does, so nothing was held out
+
+`tests/scalalib_measure.sh` runs `--no-scala-library` with `-cp` pointing at
+the 33 classfiles the library's 32 `.java` sources compile to, extracted from
+the released jar. `INodeBase.class` is on that classpath. So this was a
+*compiler* defect and not a measurement one; **no file was skipped and the
+summary line carries no `skipped=`.** The four defects below are all real.
+
+### 1. A written self-instantiating type-argument list was discarded
+
+`CNode`'s copying methods -- `updatedAt`, `removedAt`, `insertedAt`,
+`renewed` -- each end in `new CNode[K, V](…)` with no declared result type.
+`check_apply` decides whether to believe a `New` head's type arguments with
+`check::type_args_are_instantiated`, which rejects any argument that *is* one
+of the instantiated class's own type-parameter symbols -- and inside `C`, a
+written `new C[K, V]` is exactly that. It cannot be told from the placeholders
+an un-applied `new C` carries when only the *type* is consulted.
+
+So the whole list was thrown away -- the concrete entries of a mixed
+`new C[K, Int]` along with it -- and re-inferred from the value arguments.
+`CNode` is generic but stores its children erased in an `Array[BasicNode]`, so
+**no constructor parameter mentions `K` or `V`**, both solved to `Nothing`, and
+each method's inferred result type became `CNode[Nothing, Nothing]`. Every
+caller then failed; 13 of the file's 46 errors were the one overload
+`GCAS(cn, cn.renewed(startgen, ct), ct)`.
+
+**Not Java-specific at all** -- five lines of plain Scala reproduce it, and a
+class whose constructor happens to take a `K` recovers by accident, which is
+why it hid. Fixed by asking the *tree* whether the programmer wrote a type
+argument list (`check_apply::new_wrote_type_args`) rather than trying to read
+that off the type. Worth **32 errors and one file** across the whole library
+on its own (`852 / 145` → `820 / 144`).
+
+### 2. Package-private Java members were dropped by the class-file reader
+
+`javaclass::java_member_visible` kept only `public` and `protected`.
+`INodeBase.java` declares `static final Object RESTART` and
+`NO_SUCH_ELEMENT_SENTINEL` with **default access**, and `class INode` reads
+them both as `INodeBase.RESTART` and — the four unqualified uses — through the
+`import INodeBase._` at the top of the class. Eleven more errors.
+
+Real scalac accepts every one of those and rejects the same names from another
+package, at the same lines: it is the *access check*, not the reader, that
+draws the line. Now admitted and recorded as `PRIVATE` with `private_within =
+<package>`, which is Scala's `private[pkg]` and the same rule. (`Flags` is a
+full `u32`; hence the existing qualifier rather than a 33rd bit.)
+
+Note that Scala does **not** inherit Java statics into a subclass's scope --
+scalac rejects a bare `SENTINEL` written in `INode` without the import. This
+compiler accepts it, a pre-existing laxity this slice did not create and did
+not fix.
+
+### 3. A field's `Signature` attribute was read and thrown away
+
+Methods have taken their generic signature since they were first loaded;
+fields took only the erased descriptor (`let _ = attrs;`). So `INodeBase`'s
+`public volatile MainNode<K, V> mainnode` reached the Scala subclass as a raw
+`MainNode`, and an inherited `K key` as `Object`.
+
+This one was a **soundness** hole, not merely a missing type: a raw `JBase`
+conforms to every instantiation, so
+
+```scala
+val t: PropertyType[String] = PropertyType.tab_width   // really <Integer>
+```
+
+was accepted. Real scalac reports `found: PropertyType[Integer] required:
+PropertyType[String]`, and so does this compiler now, at the same line.
+
+### What it cost: gitbucket 270 → 271
+
+Knowing the true type of a Java field is what makes the **one** new gitbucket
+error, and it is worth stating plainly rather than netting out.
+`EditorConfigUtil.scala:129` writes
+
+```scala
+props.getValue[Integer](PropertyType.tab_width, TabSizeDefault, false)
+```
+
+against ec4j's two **public** overloads `(PropertyType[T], T, boolean)T` and
+`(String, T, boolean)T`. `tab_width` is now correctly a
+`PropertyType[Integer]`, which pins `T := Integer`, and `TabSizeDefault` is a
+Scala `Int` -- so both alternatives are scored and both rejected:
+`no matching overload … with arguments (PropertyType[Integer], Int, false)`.
+
+The gap it exposes is **pre-existing and separate**: overload *scoring* does
+not consider the `Int` → `java.lang.Integer` boxing conversion that adaptation
+would go on to apply. Both halves are provably fine on their own -- with the
+default already an `Integer` the same call compiles, and so does the `String`
+overload with the raw `Int`, because with one candidate there is no scoring
+gate to fail. Only a *pair* of candidates plus an `Int` for a solved `T`
+fails. Reproduced standalone in six lines against `ec4j-core-1.2.0.jar`, and
+the pre-fix binary accepts it only because it did not know what `tab_width`
+was.
+
+So: **-49 on the library, +1 on gitbucket, and a soundness hole closed.**
+`tmj_java_bad.scala` locks the closed hole; the overload-scoring gap is left
+on the list above.
+
+### 4. Reading a Java instance field emitted an illegal method name
+
+`classpath::fill_java_members` stores a field's *descriptor* in `jvm_name`,
+but the backend's term-read path reads `jvm_name` as "the accessor to call" --
+which is what it means for a pickled Scala `val`. So
+
+```scala
+class Plain { public final String label; }   // Java
+new jp.Plain("hi").label                     // Scala
+```
+
+emitted `invokevirtual jp/Plain."Ljava$divlang$divString;":()Ljava/lang/String;`
+and the class would not load: `java.lang.ClassFormatError: Illegal method
+name`. Entirely pre-existing, not generic-specific, and not confined to this
+file: **any** Scala read of **any** Java instance field produced an unloadable
+class file, which no compile-time measure could see. The unqualified path
+additionally had no `static` arm at all, so a Java static reached through
+`import C._` emitted `getfield` and died with `IncompatibleClassChangeError:
+Expected non-static field`.
+
+### Found here, not fixed here
+
+- **Constructor type-argument bounds are never checked.**
+  `new Bounded2[Int, String](0, "x")` for `class Bounded2[K <: AnyRef, V]` is
+  accepted; scalac reports "type arguments [Int,String] do not conform to
+  class Bounded2's type parameter bounds". General to every `new`, not only
+  the self-instantiating one, and unchanged by this slice (the pre-fix binary
+  accepts it too). nsc does this in refchecks, which is why the fixture had to
+  drop the case: once typer has errors, scalac never reaches it.
+- **An under-applied type-argument list is accepted.** `new Cell[K](…)` for a
+  two-parameter `Cell` draws nothing; scalac says "wrong number of type
+  arguments for tmj.Cell, should be 2". `apply_types` only reports the
+  *over*-applied direction. Also pre-existing.
+- **Overload scoring ignores the boxing conversion.** An `Int` argument for a
+  parameter whose type is a type variable solved to `java.lang.Integer` fails
+  *scoring*, so a call with two candidates reports "no matching overload"
+  where scalac boxes and picks one. This is the gitbucket +1 above.
+- **Java statics are inherited into a Scala subclass's scope.** Real scalac
+  requires the `import INodeBase._` that `class INode` writes; this compiler
+  resolves a bare `SENTINEL` without it. A laxity, unchanged here.
+
+### Running the fixtures
+
+`crates/cli/tests/triemapjava.rs`, five tests. The Java half compiles
+`tests/fixtures/java/tmjava/JBase.java` with javac and reads it back as a
+class file, the way `tests/multi/` fixtures do it and the way the measurement
+itself gets the library's Java sources.
+
 ## Running it
 
 ```
