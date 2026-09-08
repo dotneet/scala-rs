@@ -1456,6 +1456,70 @@ impl SymbolTable {
         false
     }
 
+    /// SLS 2's *other* ambiguous reference: a definition and an `import`
+    /// clause at a **deeper nesting level** than it.
+    ///
+    /// Precedence alone would let the definition win (level 1 beats 2 and 3),
+    /// but nsc only consults an import that is *inside* the scope the
+    /// definition was found in -- `Contexts.lookupSymbol` walks the import
+    /// list while `imp1.depth > symbolDepth` -- and when such an import also
+    /// offers the name, `defSym` and `impSym` together are
+    /// `ambiguousDefnAndImport` rather than a choice. Returns the definition
+    /// and the [`Binding::origin`] of the import clause, for the message.
+    ///
+    /// `SymbolTable::scopes` carries the nesting level as its own index, so
+    /// "deeper" is a comparison of two scope indices: the innermost scope
+    /// binding `name` at [`BindRank::Definition`] against the innermost one
+    /// binding it through a written `import`. Equal levels are *not*
+    /// ambiguous -- `class C { import p._; def X = 1; def f = X }` is one
+    /// scope in nsc as well as here, and scalac compiles it.
+    ///
+    /// Three things keep this from over-reaching, and each was verified
+    /// against scalac 2.13.16 rather than reasoned about:
+    ///
+    /// * only *visible* bindings count, nsc's `qualifies` filter -- the same
+    ///   rule [`Self::ambiguous_term_import`] needs for `pos/t2133`;
+    /// * only a binding a written clause made (`origin != 0`) is an import.
+    ///   The implicit `scala._` / `java.lang._` every source carries, and
+    ///   every name this compiler enters into whatever scope happens to be
+    ///   current while completing something, are not clauses the program
+    ///   wrote, and nsc's root imports sit at depth 0 where nothing can be
+    ///   deeper than them;
+    /// * [`BindRank::PackageElsewhere`] is nsc's level 4
+    ///   (`isPackageOwnedInDifferentUnit`), the documented exception: there
+    ///   the import simply wins. It is not `Definition`, so it is never the
+    ///   left-hand side of this comparison.
+    ///
+    /// And the definition must come from a scope the *program* opened. The
+    /// prelude's scopes, up to and including [`Self::prelude_scope`], are
+    /// this compiler's model of `java.lang._` / `scala._` / `Predef._` being
+    /// open around every unit -- root imports, which nsc keeps at depth 0
+    /// where nothing can be deeper than them and which are never `defSym`.
+    /// Counting them made `import scala.util.Try` inside a method ambiguous
+    /// against "package scala" (three `tests/conform` fixtures), which is a
+    /// program scalac compiles.
+    pub fn ambiguous_defn_and_deeper_import(&self, name: &str) -> Option<(SymbolId, u64)> {
+        let mut defn: Option<(usize, SymbolId)> = None;
+        let mut imported: Option<(usize, u64)> = None;
+        for (depth, sc) in self.scopes.iter().enumerate().skip(self.prelude_scope + 1) {
+            for b in sc.lookup_ranked(name) {
+                if !self.is_term_namespace(b.sym) || !self.visible_here(b.sym) {
+                    continue;
+                }
+                match b.rank {
+                    BindRank::Definition => defn = Some((depth, b.sym)),
+                    BindRank::Explicit | BindRank::Wildcard if b.origin != 0 => {
+                        imported = Some((depth, b.origin))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (def_depth, def_sym) = defn?;
+        let (imp_depth, origin) = imported?;
+        (imp_depth > def_depth).then_some((def_sym, origin))
+    }
+
     /// Whether a `private` member is reachable from the class being typed.
     /// SLS 5.2: only from inside its own owner (or something nested in it).
     fn visible_here(&self, s: SymbolId) -> bool {

@@ -1448,6 +1448,105 @@ impl Typer {
         true
     }
 
+    /// nsc's `AccessError` for a **constructor**: `new C(…)` where `C`'s
+    /// constructor is `private`, `protected` or qualified-private and the
+    /// call site may not see it.
+    ///
+    /// `type_select`'s access check never runs on a constructor -- `new C(…)`
+    /// is not a member selection, and the constructor is picked by
+    /// `pick_ctor_at` from the class symbol -- so a private constructor was
+    /// simply accepted everywhere. `agent/accessmsg` built the message this
+    /// reports (nsc's `isClassConstructor` branch, `in <enclosing>` in place
+    /// of `as a member of <prefix>`) and found the branch unreachable for
+    /// exactly this reason: it was a missing *check*, not a missing message.
+    ///
+    /// Reports and returns true when the constructor is not accessible.
+    pub(crate) fn ctor_access_error(
+        &mut self,
+        ctor: SymbolId,
+        class_id: SymbolId,
+        span: Span,
+    ) -> bool {
+        if ctor.is_none() || class_id.is_none() {
+            return false;
+        }
+        if !self.st.get(ctor).flags.contains(Flags::CONSTRUCTOR) {
+            return false;
+        }
+        if self.ctor_accessible(ctor, class_id) {
+            return false;
+        }
+        // nsc removes inaccessible alternatives from the candidate set
+        // *before* overload resolution, so a class that also has a
+        // constructor this site may call is resolved among those and never
+        // reaches an access error at all. Reproducing that pick here would
+        // mean re-running resolution; declining to report is the safe half of
+        // it -- the status quo for such a class, and never a rejection of a
+        // program scalac accepts. `class C(x: Any) { private def this(s:
+        // String) = this(s: Any) }` is the shape: nsc resolves `new C("a")`
+        // to `C(Any)`, and our more specific pick lands on the private one.
+        if self.other_accessible_ctor(ctor, class_id) {
+            return false;
+        }
+        let subject = self.access_full_location_string(ctor);
+        let location = if self.st.this_class.is_none() {
+            "<none>".to_string()
+        } else {
+            self.access_sym_string(self.st.this_class)
+        };
+        let from = self.access_from_name();
+        self.error(
+            span,
+            format!("{subject} cannot be accessed in {location} from {from}"),
+        );
+        true
+    }
+
+    /// `accessible` for a constructor reached through `new C(…)`.
+    ///
+    /// The difference from an ordinary member is the **prefix**: nsc weighs a
+    /// `protected` access against `pre.widen`, and for a `new` that prefix is
+    /// the class being constructed. So `class Sub extends Prot("x")` is legal
+    /// -- the parent-constructor call is not a `new` and never comes here --
+    /// while `new Prot("x")` written *inside* `Sub` is not, which is what
+    /// scalac 2.13.16 reports: "Access to protected constructor Prot not
+    /// permitted because prefix type Prot does not conform to class Sub where
+    /// the access takes place". Passing `None` would read as a `this` prefix
+    /// and let every subclass build its parent.
+    fn ctor_accessible(&self, ctor: SymbolId, class_id: SymbolId) -> bool {
+        let mut pre = Tree::dummy(TreeKind::Ident {
+            name: String::new(),
+        });
+        pre.ty = self.st.type_of_class(class_id);
+        self.accessible(ctor, Some(&pre))
+    }
+
+    /// Does `class_id` declare a constructor other than `ctor` that this site
+    /// may call?
+    fn other_accessible_ctor(&self, ctor: SymbolId, class_id: SymbolId) -> bool {
+        self.st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&s| s != ctor && self.st.get(s).owner == class_id)
+            .filter(|&s| self.st.get(s).kind == SymKind::Method)
+            .any(|s| self.ctor_accessible(s, class_id))
+    }
+
+    /// The primary constructor of `class_id`, for the `new C` shape that
+    /// carries no argument list and so never reaches `pick_ctor_at`.
+    pub(crate) fn primary_ctor_of(&self, class_id: SymbolId) -> SymbolId {
+        if class_id.is_none() {
+            return SymbolId::NONE;
+        }
+        let ctors = self.st.lookup_member(class_id, "<init>");
+        // Only when the class has one: with overloads, which one `new C` means
+        // is `pick_ctor_at`'s answer and not this one's.
+        match ctors.len() {
+            1 => ctors[0],
+            _ => SymbolId::NONE,
+        }
+    }
+
     /// nsc-style accessibility. `private[this]` requires a `this` prefix.
     /// `protected[C]` is protected plus everything nested in `C`.
     fn accessible(&self, sym: SymbolId, prefix: Option<&Tree>) -> bool {

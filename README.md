@@ -26,9 +26,11 @@ makes no claim of conformance to the language specification. What exists today:
 - An unqualified name is resolved by SLS 2's four precedence levels —
   definitions of the same compilation unit, explicit imports, wildcard imports,
   then package members of other units — and two bindings of one level in one
-  scope are reported as an ambiguous reference. See
+  scope are reported as an ambiguous reference. So is a definition together
+  with an `import` clause nested more deeply than it, which precedence alone
+  would let the definition win. See
   [docs/gitbucket.md](docs/gitbucket.md) ("Not this cluster: `Database` /
-  `DatabaseFactory`") and the `impprio` test.
+  `DatabaseFactory`") and the `impprio` and `nameamb` tests.
 
 直接自己末尾呼び出しは `final` / `private` / object / ローカル def でループ化します。
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは
@@ -397,6 +399,39 @@ C` と綴ります。`from` 側も同じ規則です（`object Use in package xf
 `object xflags.C`）で、これは `display_type` が**すべての**診断で型を印字する
 やり方であって、この診断の問題ではありません。
 
+**`identity` / `locally` / `implicitly` が受け手を捨てなくなりました。**
+`gen_apply` は `Predef` の多相組み込みを**名前だけ**で振り分けており、
+`gen_predef_poly` は受け手も第 2 引数以降も捨てて
+`scala/Predef$.<name>:(Ljava/lang/Object;)Ljava/lang/Object;`——つまり恒等関数——を
+出していました。そのためユーザー定義の `identity` / `locally` / `implicitly` は
+**自分の引数をそのまま返し**、`mk("m").identity(side("i"), side("j"))` では受け手
+`mk("m")` も第 2 引数 `side("j")` も**一度も評価されません**でした。コンパイルは
+通り、`-Xverify:all` も通り、実行して初めて分かる種類の誤りです
+（`agent/sysout` が直した `println` と同じ根で、同スライスが「独自の dual-run
+証拠が要る」として残していたもの）。組み込みは prelude 自身の `Predef` メンバー
+だけが持つ `Intrinsic::Identity` / `Locally` / `Implicitly` で判定し、名前だけの
+経路はシンボルが解決しなかった呼び出しに限りました。fixture
+`tests/fixtures/intrinsicqual_predef.scala` は**実行**し、`--scala-library` と
+`--no-scala-library` の両モードで実 scalac 2.13.16 の出力と 1 バイト違わず一致
+します。slick の 1490 クラスファイルはこの変更だけでは**バイト単位で不変**です。
+
+**`private` / `protected` なコンストラクタを検査するようになりました。**
+`new C(…)` は member selection ではないので `type_select` のアクセス検査が
+`<init>` を見ることはなく、さらに primary constructor のシンボルはクラスが書いた
+修飾子（`class C private ()` の `ctor_mods`）を**そもそも持っていません**でした。
+両方を閉じ、コーパスの `neg/sensitive`、`neg/t4987`、`neg/protected-constructors`
+を nsc と同じ行・同じ 1 行目で拒否します。`new` の prefix は構築される型なので、
+`class Sub extends Prot("x")`（親コンストラクタ呼び出し）は合法のまま、`Sub` の中に
+書いた `new Prot("x")` は実 scalac と同じく拒否されます。合成された `new`
+（`v.copy(x = 2)` の下ろし先など）は対象外です——そこでのアクセス判断は `copy`
+のものだからです。副作用として `<init>` の修飾子が `ScalaSignature` にも載り、
+slick の 1490 クラスのうち **4 つが 1 バイトずつ**変わります（`private` な primary
+constructor を持つクラスの pickle されたフラグのみ。バイトコードは不変）。
+その 1 バイトが正しいことは、**実 scalac 2.13.16 が我々のクラスファイルを読んで**
+以前は通していた `new SepPriv("x")` を拒否するようになったことで裏付けています。
+分割コンパイル越し（`neg/t6601`）はまだ通ります——コンストラクタの privacy が
+クラスファイルの往復で失われるためで、`pickle_supply.rs` 側の別スライスです。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -596,6 +631,17 @@ scalac 2.13.16 の出力そのもの——9 件の診断を行と文言で——
 （`method x in class C cannot be accessed as a member of C from object C` と
 `value y in class D cannot be accessed as a member of D from object D`）を固定
 します。
+
+`intrinsicqual` テストは 2 つを固定します。ひとつは `identity` / `locally` /
+`implicitly` が受け手と第 2 引数以降を捨てないこと——ユーザー定義の 3 つと
+`Predef` の 3 つを 1 本のプログラムに同居させ、出力の接頭辞で見分けたうえで
+**実行**し、両モードで実 scalac 2.13.16 の出力と比較します（修正前のバイナリは
+jar モードで別の答えを出します）。もうひとつはコンストラクタのアクセス検査で、
+異常系（`tests/fixtures/intrinsicqual_ctor_bad.scala` とコーパス 3 件）は実
+scalac の行と文で、正常系（`tests/fixtures/intrinsicqual_ctor.scala`——自分の
+コンパニオン、`extends` 越しの `protected`、`private[p]`、アクセス可能な別の
+オーバーロードを持つクラス）は**実行**して固定します。拒否規則なので、正常系が
+**修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。
 
 線形化（SLS 5.1.2）は `linearization` テストで二重に検査します。正常系は深く広い
 ダイヤモンド継承の `super` 連鎖を実行し、同じソースを実 scalac 2.13.16 で

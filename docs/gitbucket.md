@@ -2171,6 +2171,44 @@ Worth its own slice, with those two as the acceptance criterion.
 > explicit import, and an outer explicit import vs an inner wildcard — are
 > rejected by scalac and silently resolved by us. They need a depth on each
 > binding, not just a rank, and `Scope` does not carry one.
+>
+> > **Done for the two that are a definition against an import**
+> > (`agent/nameamb`, 2026-09-08). No depth had to be added to `Binding`:
+> > `SymbolTable::scopes` is a stack and its **index is the nesting level**,
+> > so `ambiguous_defn_and_deeper_import` compares the innermost scope binding
+> > the name at `Definition` with the innermost one binding it through a
+> > written `import` clause, and a strictly deeper import is the ambiguity.
+> > The message is nsc's three lines, with the definition's owner
+> > (`class Member` / `trait Base` / `method pick`) and the clause's own
+> > source text, kept in `Typer::import_text` under the `Binding::origin` that
+> > already identified the clause.
+> >
+> > Three rules keep it from over-reaching, and each was measured rather than
+> > reasoned about. Only *visible* bindings count (`qualifies`, as before).
+> > Only a binding a **written** clause made counts as an import: the prelude
+> > scopes up to `prelude_scope` are this compiler's `scala._` /
+> > `java.lang._` / `Predef._`, nsc keeps those at depth 0, and counting them
+> > made `import scala.util.Try` inside a method ambiguous against "package
+> > scala" — three `tests/conform` fixtures, caught on the first run.
+> > `PackageElsewhere` stays nsc's exception: a sibling unit's package member
+> > loses to a deeper wildcard import with no diagnostic, which
+> > `tests/multi/nameamb/Main_1.scala` executes.
+> >
+> > `neg/name-lookup-stable` now matches its `.check` file exactly, and
+> > `neg/ambiguous-same`, `neg/t8024b` and `neg/specification-scopes` came
+> > with it: neg 673 → 677, `losses=0`, and gitbucket 270, cats 185, the
+> > library 917/146 and slick 0/0/1490 unmoved — 1414 files, no false
+> > positive. The third arrangement above (an outer *explicit* import against
+> > an inner wildcard) is `ambiguousImports`, a different message, and is
+> > listed in `docs/not-implemented.md` with the other two shapes still owed.
+> >
+> > Writing the guard fixture found a second wrong program next door:
+> > `import Priv._` was entering `Priv`'s own `private[this]` member and
+> > binding it *over* the importing class's definition, so the file compiled
+> > and printed a member SLS 5.2 does not let out of `Priv`. `import_wildcard`
+> > now applies the same visibility test to a direct member that it already
+> > applied to an inherited one, with a companion allowed through
+> > (`Typer::private_member_visible_here`).
 
 **The next wall behind it: blocking-slick's `BlockingDatabase`.** With the
 precedence fixed, the same 19 lines report `value withTransaction is not a

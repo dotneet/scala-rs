@@ -168,39 +168,44 @@ Compiler flags (`agent/xflags`):
   `isSynthetic`, `isParamAccessor`) that this tree does not carry in the same
   sense, none appears in either `.check` file, and each is a *new rejection*:
   left out rather than guessed at.
-- **An ambiguous reference between a definition and a *deeper* import.** SLS 2
-  gives a definition higher precedence than a wildcard import, but only within
-  one scope; when the import is at a **deeper nesting level** than the
-  definition, nsc reports the reference as ambiguous rather than letting
-  either win (`Contexts.lookupSymbol`: an import is consulted when
-  `imp1.depth > symbolDepth`, and then `defSym` and `impSym` together are
-  `ambiguousDefnAndImport`). We silently take the inner one. Sixteen lines,
-  and it is a *wrong program*, not a missing diagnostic:
+- **`agent/nameamb` closed the definition-vs-deeper-import ambiguity; three
+  narrower shapes of the same rule are still owed.** SLS 2 gives a definition
+  higher precedence than an import, but nsc only lets precedence decide when
+  the two sit at the same nesting level; a **deeper** import is consulted
+  (`Contexts.lookupSymbol`, while `imp1.depth > symbolDepth`) and then
+  `defSym` and `impSym` together are `ambiguousDefnAndImport`.
+  `SymbolTable::ambiguous_defn_and_deeper_import` now reports it, in nsc's
+  three lines, and `neg/name-lookup-stable`, `neg/ambiguous-same`,
+  `neg/t8024b` and `neg/specification-scopes` all match their `.check` files
+  at the lines scalac reports. What is left:
 
-  ```scala
-  object ColumnOption { def PrimaryKey: String = "imported" }
-  class A {
-    def PrimaryKey: String = "defined"
-    def pick: String = { import ColumnOption._; PrimaryKey }
-  }
-  ```
+  1. **A definition made by this unit's own package clause.** `package p;
+     object X; class G { def pick = { import Imp._; X } }` is
+     "reference to X is ambiguous; it is both defined in package p …" to
+     scalac, and we take the definition silently. The binding is not in the
+     package-clause scope when the reference is typed:
+     `Typer::expose_same_unit_package_def` enters it into whatever scope
+     happens to be current, which is the import's own, so the two come out at
+     the same nesting level. Entering it at the depth the clause actually
+     binds it is what closing this needs, and that scope is shared for the
+     whole unit — the reason it is injected lazily today.
+  2. **Two *imports* at different nesting levels.** An outer explicit import
+     and an inner wildcard one are `ambiguousImports` to nsc ("it is imported
+     twice in the same scope by / … / and …"), by
+     `Contexts.resolveAmbiguousImport`'s `!imp1Explicit && imp2Explicit` when
+     the depths differ. `Scope` now has everything this needs;
+     `neg/specification-scopes` line 21 is the case, and we report its line 15
+     and not its 21.
+  3. **The *type* namespace.** The rule is implemented for term references
+     (`Typer::type_ident` and the stable-id pattern) only. Nothing in the
+     corpus's `neg` set turns on the type half, and the type lookup has a
+     module fallback that the term one does not, so it was left rather than
+     guessed at.
 
-  scalac 2.13.16 rejects `pick` ("reference to PrimaryKey is ambiguous; it is
-  both defined in class A and imported subsequently by / import
-  ColumnOption._"); we compile it and print `imported`.
-  `neg/name-lookup-stable` is this program. `agent/impprio` implemented SLS 2's
-  four levels and named this as the piece left over; what it needs is a *depth*
-  comparison, which `SymbolTable::scopes` already carries as the index of each
-  scope — the innermost scope binding the name at `BindRank::Explicit` or
-  `Wildcard` must be compared against the innermost one binding it at
-  `Definition`, and a strictly deeper import is the ambiguity.
-  `BindRank::PackageElsewhere` is nsc's level 4 (`foreignDefined`) and is the
-  documented exception: there the import wins and there is no ambiguity. The
-  message needs two things this compiler does not record yet: the *owner* of
-  the definition ("class A") and the *source text* of the import clause
-  ("import ColumnOption._"). `Binding::origin` already identifies which clause
-  it was, as `(file, byte offset)`, so the text can be attached there in
-  `Typer::type_import`.
+  A fourth difference is cosmetic and recorded so nobody re-derives it: nsc
+  spells the owner of a definition made inside a `locally { … }` block
+  "value <local Y>", and we say "object Y" — the enclosing anonymous value is
+  not a symbol here. `neg/specification-scopes` is the only place it shows.
 - **An *enclosing* template's self type, for a bare name written in a nested
   one.** `trait Q { self: PriorityQueue[Int] => trait Inner { def d = dequeue() } }`
   is `not found: value dequeue`; the same call written directly in `Q`'s body
