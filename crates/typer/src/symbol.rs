@@ -375,7 +375,54 @@ pub enum Intrinsic {
 /// expanded. We keep the same three facts, in the form the expander needs:
 /// the JVM class that holds the implementation, the method name on it, and
 /// whether the def was declared with a `blackbox` or `whitebox` context.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One type argument written on a macro implementation *reference*, resolved
+/// as far as it can be at the point the binding is made.
+///
+/// `def mapTo[R] = macro ShapedValue.mapToImpl[R, U]` writes two: `R`, which
+/// is `mapTo`'s own type parameter, and `U`, which is `ShapedValue`'s. nsc
+/// keeps the pair as `MacroImplBinding.targs` and resolves each one at the
+/// call site (`Macros.macroArgs`) -- it never lines the implementation's tags
+/// up with the call site's type arguments, which is why `mapTo[MyRow]` can
+/// supply one type argument to an implementation that asks for two tags.
+///
+/// The resolution is deliberately split in two: which *kind* of thing the
+/// reference names is settled once, where the macro def is bound and both its
+/// own type parameters and its owner's are in scope; what it stands for is
+/// settled at each call site, where the call's type arguments and its prefix
+/// are.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MacroTarg {
+    /// A type parameter of the macro **def**, at this position in its own type
+    /// parameter list: the call site's type argument at the same position.
+    /// nsc matches it by name (`macroDef.typeParams.indexWhere(_.name ==
+    /// targ.name)`), and so does the code that builds this.
+    DefParam { index: usize, name: String },
+    /// A type parameter of the macro def's **owner**, at this position in the
+    /// owner's type parameter list: `asSeenFrom` the call's prefix. `owner` is
+    /// the class the parameter belongs to, which is the base class the
+    /// receiver's type has to be seen as.
+    OwnerParam {
+        owner: SymbolId,
+        index: usize,
+        name: String,
+    },
+    /// A type written out in full and carrying no type arguments of its own
+    /// (`macro Impl.f[R, Int]`). nsc uses it as it stands.
+    Fixed(Type),
+    /// A type argument scala-rs will not resolve, carrying its spelling for
+    /// the diagnostic. This is not the same as "nsc cannot either": nsc reads
+    /// `binding.targs(i).tpe.typeSymbol` and then that *symbol's* own type, so
+    /// `macro Impl.f[List[R], U]` gives the implementation the raw `List[A]` --
+    /// `A` being `List`'s own type parameter, not anything at the call site.
+    /// Real scalac 2.13.16 prints exactly that, and
+    /// `tests/fixtures/mt2_bad.scala` is the program that shows it. Copying
+    /// that would hand an implementation a type with a free parameter in it;
+    /// substituting instead would hand it `List[String]`, which is not what
+    /// nsc says. So it is refused by name.
+    Unresolved(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MacroBinding {
     /// JVM internal name of the class holding the implementation, e.g. `M$`.
     /// nsc requires the implementation to be a method of an object, so this is
@@ -400,6 +447,18 @@ pub struct MacroBinding {
     /// `mapToImpl` takes `Tree`s). Read off the *source* signature, because a
     /// class file scala-rs writes erases both to `Object`.
     pub expr_args: Vec<bool>,
+    /// What each of the `tag_params` tags stands for, in the order the
+    /// implementation's trailing clause asks for them: the type argument
+    /// written on the implementation reference that nsc's fingerprint for that
+    /// parameter points at.
+    ///
+    /// **Empty means "not known"**, not "no tags". A binding whose reference
+    /// could not be read this way falls back to the older rule -- line the tags
+    /// up one for one with the call site's type arguments -- which is right
+    /// whenever the reference is the usual `macro Impl.f[A]` and is refused
+    /// with a reason when it is not. When this is non-empty it has exactly
+    /// `tag_params` entries.
+    pub tag_targs: Vec<MacroTarg>,
 }
 
 impl MacroBinding {
@@ -600,9 +659,58 @@ fn shadowable_kind(new: SymKind, old: SymKind) -> bool {
     }
 }
 
+/// SLS 2 ("Identifiers, Names and Scopes") ranks the ways a simple name can
+/// be bound, and a binding of higher precedence **hides** one of lower
+/// precedence in the same scope -- it does not merely join it. Lower is
+/// stronger.
+///
+/// Without this, every route into a scope entered its symbol the same way and
+/// the answer was decided by insertion order and symbol id. gitbucket writes
+///
+/// ```text
+/// import gitbucket.core.model.Profile.profile.blockingApi._
+/// import gitbucket.core.servlet.Database
+/// ```
+///
+/// with a comment saying why the second line has to be there, and we bound
+/// `Database` to slick's -- a *wrong program*, not a diagnostic: the eleven-line
+/// reduction in `docs/gitbucket.md` compiles either way and prints the other
+/// object's answer.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
+pub enum BindRank {
+    /// (1) A definition or declaration that is local, inherited, or made
+    /// available by a package clause **in the same compilation unit** as the
+    /// reference.
+    #[default]
+    Definition,
+    /// (2) An explicit import (`import p.X`, `import p.{X => Y}`).
+    Explicit,
+    /// (3) A wildcard import (`import p._`), including the `scala._` and
+    /// `java.lang._` every source carries.
+    Wildcard,
+    /// (4) A definition made available by a package clause, but defined in
+    /// **another** compilation unit. This one ranks *below* a wildcard import,
+    /// which is why the level cannot be collapsed into `Definition`.
+    PackageElsewhere,
+}
+
+/// One binding of a simple name in one scope.
+#[derive(Clone, Copy, Debug)]
+pub struct Binding {
+    pub sym: SymbolId,
+    pub rank: BindRank,
+    /// Which `import` clause put it here, or 0 for anything that is not an
+    /// import. Two bindings of one name at the same precedence are an
+    /// *ambiguous reference* when they come from two different import clauses
+    /// (SLS 2; nsc `Contexts.ambiguousImports`), and an ordinary overload set
+    /// when they come from the same one -- `import p._` over an object with
+    /// two `def f` is one import, however many of its ancestors declare them.
+    pub origin: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
-    map: HashMap<String, Vec<SymbolId>>,
+    map: HashMap<String, Vec<Binding>>,
     /// Owners brought in by a wildcard import (`import p._`) in this scope,
     /// with the names that selector hid (`import p.{X => _, _}`).
     /// A package read from a jar cannot be enumerated up front, so the names
@@ -625,14 +733,37 @@ impl WildcardImport {
 
 impl Scope {
     pub fn enter(&mut self, name: &str, id: SymbolId) {
+        self.enter_ranked(name, id, BindRank::Definition);
+    }
+
+    /// Enter `id` under `name` at SLS 2 precedence `rank`.
+    pub fn enter_ranked(&mut self, name: &str, id: SymbolId, rank: BindRank) {
+        self.enter_binding(name, id, rank, 0);
+    }
+
+    /// [`Self::enter_ranked`] for a binding an `import` clause makes, tagged
+    /// with which clause it was.
+    pub fn enter_binding(&mut self, name: &str, id: SymbolId, rank: BindRank, origin: u64) {
         let slot = self.map.entry(name.to_string()).or_default();
         // One symbol reachable by two routes is still one symbol, not an
         // overload: a template's self alias, for instance, is entered both
         // with the rest of the class's members and by `bind_self_type`.
-        if slot.contains(&id) {
+        // Reached twice at two precedences it binds at the better one -- an
+        // inherited member a wildcard import also offers is still an
+        // inherited member, and two imports naming the same symbol are not
+        // ambiguous (SLS 2), so the better rank keeps its origin.
+        if let Some(e) = slot.iter_mut().find(|b| b.sym == id) {
+            if rank < e.rank {
+                e.rank = rank;
+                e.origin = origin;
+            }
             return;
         }
-        slot.push(id);
+        slot.push(Binding {
+            sym: id,
+            rank,
+            origin,
+        });
     }
 
     /// Put `with` where `victims` stood, under `name`.
@@ -645,12 +776,22 @@ impl Scope {
         let Some(slot) = self.map.get_mut(name) else {
             return false;
         };
-        if !slot.iter().any(|s| victims.contains(s)) {
+        if !slot.iter().any(|b| victims.contains(&b.sym)) {
             return false;
         }
-        slot.retain(|s| !victims.contains(s));
-        if !slot.contains(&with) {
-            slot.push(with);
+        let rank = slot
+            .iter()
+            .filter(|b| victims.contains(&b.sym))
+            .map(|b| b.rank)
+            .min()
+            .unwrap_or_default();
+        slot.retain(|b| !victims.contains(&b.sym));
+        if !slot.iter().any(|b| b.sym == with) {
+            slot.push(Binding {
+                sym: with,
+                rank,
+                origin: 0,
+            });
         }
         true
     }
@@ -670,8 +811,16 @@ impl Scope {
         &self.wildcards
     }
 
-    pub fn lookup(&self, name: &str) -> &[SymbolId] {
+    /// Every binding of `name` in this scope, with its precedence.
+    pub fn lookup_ranked(&self, name: &str) -> &[Binding] {
         self.map.get(name).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// The bindings of `name` a reference in this scope can see: the ones at
+    /// the best precedence present, since a stronger binding *hides* a weaker
+    /// one rather than joining it as an overload (SLS 2).
+    pub fn lookup(&self, name: &str) -> Vec<SymbolId> {
+        best_ranked(self.lookup_ranked(name), |_| true)
     }
 
     pub fn names(&self) -> impl Iterator<Item = &String> {
@@ -690,9 +839,44 @@ impl Scope {
     /// Every binding, in the same order `names` yields. `implicits_in_scope`
     /// walks every name of every enclosing scope on every implicit search;
     /// going through `names` and then `lookup` hashed each name twice.
-    pub fn entries(&self) -> impl Iterator<Item = (&String, &[SymbolId])> {
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &[Binding])> {
         self.map.iter().map(|(k, v)| (k, v.as_slice()))
     }
+}
+
+/// The entries of one scope slot that `pred` accepts, kept down to the best
+/// SLS 2 precedence among them. The namespace filter runs *first*: the two
+/// namespaces are ranked separately, so a `type T` a wildcard import offers is
+/// not hidden by an explicitly imported *value* `T`.
+fn best_ranked(slot: &[Binding], pred: impl Fn(SymbolId) -> bool) -> Vec<SymbolId> {
+    let best = slot.iter().filter(|b| pred(b.sym)).map(|b| b.rank).min();
+    let Some(best) = best else { return Vec::new() };
+    slot.iter()
+        .filter(|b| b.rank == best && pred(b.sym))
+        .map(|b| b.sym)
+        .collect()
+}
+
+/// Whether the surviving bindings of one slot come from two different
+/// `import` clauses -- SLS 2's ambiguous reference, which nsc reports as
+/// "reference to X is ambiguous". Two clauses naming the *same* symbol are
+/// not ambiguous, and neither is an overload set one clause brings in.
+fn two_imports_tie(slot: &[Binding], pred: impl Fn(SymbolId) -> bool) -> bool {
+    let Some(best) = slot.iter().filter(|b| pred(b.sym)).map(|b| b.rank).min() else {
+        return false;
+    };
+    let mut origin: Option<u64> = None;
+    for b in slot.iter().filter(|b| b.rank == best && pred(b.sym)) {
+        if b.origin == 0 {
+            continue;
+        }
+        match origin {
+            None => origin = Some(b.origin),
+            Some(o) if o != b.origin => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 pub struct SymbolTable {
@@ -1170,6 +1354,79 @@ impl SymbolTable {
         self.scopes.last_mut().unwrap().enter(name, id);
     }
 
+    /// [`Self::enter_in_current`] at an SLS 2 precedence other than
+    /// "definition": what an import brings in does not hide a definition, and
+    /// a wildcard import does not hide an explicit one.
+    pub fn enter_in_current_ranked(&mut self, name: &str, id: SymbolId, rank: BindRank) {
+        self.scopes.last_mut().unwrap().enter_ranked(name, id, rank);
+    }
+
+    /// [`Self::enter_in_current_ranked`] for what an `import` clause brings
+    /// in, tagged with which clause it was. See [`Binding::origin`].
+    pub fn enter_import_in_current(
+        &mut self,
+        name: &str,
+        id: SymbolId,
+        rank: BindRank,
+        origin: u64,
+    ) {
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .enter_binding(name, id, rank, origin);
+    }
+
+    /// The precedence a reference here would bind `name` at: the best rank in
+    /// the innermost scope that binds it at all, or `None` when nothing does.
+    pub fn bind_rank(&self, name: &str) -> Option<BindRank> {
+        for sc in self.scopes.iter().rev() {
+            if let Some(r) = sc.lookup_ranked(name).iter().map(|b| b.rank).min() {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    /// Whether a *term* reference to `name` here is SLS 2's ambiguous
+    /// reference: the innermost scope that binds it in the term namespace
+    /// binds it, at one precedence, through two different `import` clauses.
+    ///
+    /// Only bindings that are actually *visible* here count, which is nsc's
+    /// `qualifies` filter in `Context.lookupSymbol`. `pos/t2133` writes
+    /// `import bip._; import bar._` where `bar.fn` is `private[this]`: there
+    /// is one candidate, not two, and scalac compiles it.
+    pub fn ambiguous_term_import(&self, name: &str) -> bool {
+        for sc in self.scopes.iter().rev() {
+            let slot = sc.lookup_ranked(name);
+            if !slot.iter().any(|b| self.is_term_namespace(b.sym)) {
+                continue;
+            }
+            return two_imports_tie(slot, |s| self.is_term_namespace(s) && self.visible_here(s));
+        }
+        false
+    }
+
+    /// Whether a `private` member is reachable from the class being typed.
+    /// SLS 5.2: only from inside its own owner (or something nested in it).
+    fn visible_here(&self, s: SymbolId) -> bool {
+        if !self.private_to_owner(s) {
+            return true;
+        }
+        let owner = self.get(s).owner;
+        let mut cur = self.this_class;
+        while !cur.is_none() {
+            if cur == owner {
+                return true;
+            }
+            let up = self.get(cur).owner;
+            if up == cur {
+                break;
+            }
+            cur = up;
+        }
+        false
+    }
+
     /// Auto-import a source definition that belongs in package `scala`.
     ///
     /// nsc opens `java.lang._`, `scala._` and `Predef._` around every
@@ -1279,7 +1536,7 @@ impl SymbolTable {
         for sc in self.scopes.iter().rev() {
             let found = sc.lookup(name);
             if !found.is_empty() {
-                return found.to_vec();
+                return found;
             }
         }
         Vec::new()
@@ -1298,29 +1555,59 @@ impl SymbolTable {
     pub fn lookup_type(&self, name: &str) -> Vec<SymbolId> {
         let mut module_fallback: Vec<SymbolId> = Vec::new();
         for sc in self.scopes.iter().rev() {
-            let found = sc.lookup(name);
-            if found.is_empty() {
+            let slot = sc.lookup_ranked(name);
+            if slot.is_empty() {
                 continue;
             }
-            if found.iter().any(|&s| self.is_type_namespace(s)) {
-                // A module can share this scope with the real type-namespace
-                // symbol (an object and, elsewhere, a `type` alias of the same
-                // name both named `NonEmptyLazyList` -- cats' `Newtype`
-                // encoding). The module is a fallback only, so it must not
-                // ride along in the answer: the caller picks the *first*
-                // match of a kind it accepts, and an unfiltered vector let the
-                // module win over the alias by accident of insertion order.
-                return found
-                    .iter()
-                    .copied()
-                    .filter(|&s| self.is_type_namespace(s))
-                    .collect();
+            // A module can share this scope with the real type-namespace
+            // symbol (an object and, elsewhere, a `type` alias of the same
+            // name both named `NonEmptyLazyList` -- cats' `Newtype`
+            // encoding). The module is a fallback only, so it must not
+            // ride along in the answer: the caller picks the *first*
+            // match of a kind it accepts, and an unfiltered vector let the
+            // module win over the alias by accident of insertion order.
+            let types = best_ranked(slot, |s| self.is_type_namespace(s));
+            if !types.is_empty() {
+                return types;
             }
-            if module_fallback.is_empty() && found.iter().any(|&s| self.is_module_like(s)) {
-                module_fallback = found.to_vec();
+            if module_fallback.is_empty() {
+                // The whole slot at the precedence the *module* binds at:
+                // `lookup_type` has always handed its callers the slot rather
+                // than the modules alone here.
+                if let Some(best) = slot
+                    .iter()
+                    .filter(|b| self.is_module_like(b.sym))
+                    .map(|b| b.rank)
+                    .min()
+                {
+                    module_fallback = slot
+                        .iter()
+                        .filter(|b| b.rank == best)
+                        .map(|b| b.sym)
+                        .collect();
+                }
             }
         }
         module_fallback
+    }
+
+    /// [`Self::bind_rank`] restricted to the type namespace: the precedence
+    /// the innermost scope that binds `name` as a *type* binds it at. Pairs
+    /// with [`Self::has_real_type_entry`], which answers the same question
+    /// without the rank.
+    pub fn type_bind_rank(&self, name: &str) -> Option<BindRank> {
+        for sc in self.scopes.iter().rev() {
+            let r = sc
+                .lookup_ranked(name)
+                .iter()
+                .filter(|b| self.is_type_namespace(b.sym))
+                .map(|b| b.rank)
+                .min();
+            if r.is_some() {
+                return r;
+            }
+        }
+        None
     }
 
     /// Whether `name` already answers to a genuine type-namespace symbol --
@@ -1331,11 +1618,11 @@ impl SymbolTable {
     /// fallback alone.
     pub fn has_real_type_entry(&self, name: &str) -> bool {
         for sc in self.scopes.iter().rev() {
-            let found = sc.lookup(name);
-            if found.is_empty() {
+            let slot = sc.lookup_ranked(name);
+            if slot.is_empty() {
                 continue;
             }
-            if found.iter().any(|&s| self.is_type_namespace(s)) {
+            if slot.iter().any(|b| self.is_type_namespace(b.sym)) {
                 return true;
             }
         }
@@ -1349,13 +1636,23 @@ impl SymbolTable {
     /// outward.
     pub fn lookup_term(&self, name: &str) -> Vec<SymbolId> {
         for sc in self.scopes.iter().rev() {
-            let found = sc.lookup(name);
-            if found.is_empty() {
+            let slot = sc.lookup_ranked(name);
+            // The precedence the *term* binds at decides which entries of this
+            // slot a term reference sees; the slot is handed back whole at
+            // that rank, as this has always done.
+            let Some(best) = slot
+                .iter()
+                .filter(|b| self.is_term_namespace(b.sym))
+                .map(|b| b.rank)
+                .min()
+            else {
                 continue;
-            }
-            if found.iter().any(|&s| self.is_term_namespace(s)) {
-                return found.to_vec();
-            }
+            };
+            return slot
+                .iter()
+                .filter(|b| b.rank == best)
+                .map(|b| b.sym)
+                .collect();
         }
         Vec::new()
     }
@@ -1380,12 +1677,9 @@ impl SymbolTable {
             return in_package;
         }
         for sc in self.scopes.iter().rev() {
-            let found: Vec<SymbolId> = sc
-                .lookup(name)
-                .iter()
-                .copied()
-                .filter(|&s| self.is_type_namespace(s) || self.is_module_like(s))
-                .collect();
+            let found = best_ranked(sc.lookup_ranked(name), |s| {
+                self.is_type_namespace(s) || self.is_module_like(s)
+            });
             if !found.is_empty() {
                 return found;
             }
@@ -1403,12 +1697,9 @@ impl SymbolTable {
     /// found the method and reported "not found: extractor :@".
     pub fn lookup_extractor(&self, name: &str) -> Vec<SymbolId> {
         for sc in self.scopes.iter().rev() {
-            let found: Vec<SymbolId> = sc
-                .lookup(name)
-                .iter()
-                .copied()
-                .filter(|&s| self.get(s).kind != SymKind::Method)
-                .collect();
+            let found = best_ranked(sc.lookup_ranked(name), |s| {
+                self.get(s).kind != SymKind::Method
+            });
             if !found.is_empty() {
                 return found;
             }

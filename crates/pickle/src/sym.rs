@@ -27,7 +27,7 @@ const MACRO_IMPL_ANNOT: &str = "scala.reflect.macros.internal.macroImpl";
 /// record of the implementation in a published jar. nsc writes it as a typed
 /// tree whose arguments are `name = value` assignments; the four fields below
 /// are the ones an expander needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MacroImpl {
     /// `slick.lifted.TableQueryMacroImpl$` -- the *module class*, dotted.
     pub class_name: String,
@@ -38,11 +38,28 @@ pub struct MacroImpl {
     /// `false` for a whitebox macro.
     pub is_blackbox: bool,
     /// nsc's fingerprint per implementation parameter, clause by clause.
-    /// A non-negative value is a `WeakTypeTag` for the macro def's type
-    /// parameter at that position; the negatives are
-    /// [`fingerprint::UNDETERMINED`], [`fingerprint::LIFTED_TYPED`]
-    /// (`c.Expr[T]`) and [`fingerprint::LIFTED_UNTYPED`] (`c.Tree`).
+    /// A non-negative value indexes [`MacroImpl::targs`] -- the type argument
+    /// written on the implementation reference whose `WeakTypeTag` this
+    /// parameter is; the negatives are [`fingerprint::UNDETERMINED`],
+    /// [`fingerprint::LIFTED_TYPED`] (`c.Expr[T]`) and
+    /// [`fingerprint::LIFTED_UNTYPED`] (`c.Tree`).
     pub signature: Vec<Vec<i32>>,
+    /// The type arguments written on the implementation *reference* itself:
+    /// `[R, U]` of `def mapTo[R] = macro ShapedValue.mapToImpl[R, U]`, in the
+    /// order the reference writes them, which is the order of the
+    /// implementation's own type parameters.
+    ///
+    /// nsc keeps these as `MacroImplBinding.targs` and resolves each one at
+    /// the call site (`Macros.macroArgs`): a type parameter of the macro *def*
+    /// is looked up among the call site's type arguments, and anything else --
+    /// a type parameter of the macro def's *owner* above all -- is
+    /// `asSeenFrom` the prefix. They are not the same list as the call site's
+    /// type arguments and are not even the same length: `mapTo[R]` writes one
+    /// and the implementation asks for two tags.
+    ///
+    /// A type argument whose tree carries no type is kept as [`SigType::None`]
+    /// rather than dropped, so the fingerprint indices above stay valid.
+    pub targs: Vec<SigType>,
 }
 
 /// nsc's `Fingerprint` constants (`scala.tools.nsc.typechecker.Macros`).
@@ -354,7 +371,45 @@ impl Builder<'_> {
     /// `List(List(Int))` literals. Nothing here is guessed: a shape that does
     /// not match returns `None`, and the caller then declines the macro def
     /// exactly as it did before this was read at all.
-    fn macro_impl_of(&self, id: Idx) -> Option<MacroImpl> {
+    ///
+    /// The `[T]` is not decoration. It is `MacroImplBinding.targs`, the type
+    /// arguments written on the implementation reference, which nsc reads back
+    /// in `Macros.macroArgs` to decide what each `WeakTypeTag` the
+    /// implementation asks for stands for. They used to be peeled off and
+    /// thrown away here; they are now read out into [`MacroImpl::targs`].
+    fn macro_impl_of(&mut self, id: Idx) -> Option<MacroImpl> {
+        let mut mi = self.macro_impl_payload(id)?;
+        for t in self.macro_impl_targ_trees(id) {
+            mi.targs.push(match self.tree_tpe_at(t) {
+                Some(tpe) => self.ty(tpe, 0),
+                // No type on the tree: kept as a hole so that the fingerprint
+                // indices into this list stay valid. The typer refuses to
+                // resolve a hole rather than shifting the ones after it.
+                None => SigType::None,
+            });
+        }
+        Some(mi)
+    }
+
+    /// The type-argument trees of the `TypeApply` nsc wraps the `@macroImpl`
+    /// payload in, outermost first -- `gen.mkTypeApply(payload, targs)`, which
+    /// its own `MacroImplBinding.unpickle` matches as `case TypeApply(wrapped,
+    /// targs)` at the top and nowhere deeper.
+    fn macro_impl_targ_trees(&self, id: Idx) -> Vec<Idx> {
+        let Some(annot) = self.macro_impl_annot(id) else {
+            return Vec::new();
+        };
+        let Some(&first) = annot.args.first() else {
+            return Vec::new();
+        };
+        match self.tree_at(first) {
+            Some(Tree::TypeApply { args, .. }) => args.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The `@macroImpl` annotation on the symbol at `id`, if it has one.
+    fn macro_impl_annot(&self, id: Idx) -> Option<&crate::read::AnnotInfo> {
         let annot = self.p.entries.iter().find_map(|e| match e {
             Entry::SymAnnot { sym, annot } if *sym == id => Some(annot),
             _ => None,
@@ -368,8 +423,18 @@ impl Builder<'_> {
                 _ => return None,
             }
         }
+        Some(annot)
+    }
+
+    /// The `className` / `methodName` / `isBundle` / `isBlackbox` /
+    /// `signature` fields of the annotation, with [`MacroImpl::targs`] left
+    /// empty for [`PickleReader::macro_impl_of`] to fill in.
+    fn macro_impl_payload(&self, id: Idx) -> Option<MacroImpl> {
+        let annot = self.macro_impl_annot(id)?;
         let mut args = self.tree_at(*annot.args.first()?)?;
-        // `macro(...)[T]`: peel the type application nsc wraps it in.
+        // `macro(...)[T]`: peel the type application nsc wraps it in. The
+        // arguments it carries are read separately by
+        // [`PickleReader::macro_impl_targ_trees`].
         while let Tree::TypeApply { fun, .. } = args {
             args = self.tree_at(*fun)?;
         }
@@ -415,7 +480,16 @@ impl Builder<'_> {
             is_bundle,
             is_blackbox,
             signature,
+            targs: Vec::new(),
         })
+    }
+
+    /// The type a `TREE` entry carries, if it has one.
+    fn tree_tpe_at(&self, id: Idx) -> Option<Idx> {
+        match self.p.entry(id) {
+            Some(Entry::Tree { tpe, .. }) => *tpe,
+            _ => None,
+        }
     }
 
     /// `List(List(-1), List(0))` as nsc writes it: nested `Apply`s of the

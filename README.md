@@ -23,6 +23,12 @@ makes no claim of conformance to the language specification. What exists today:
 - Lambdas are emitted as `invokedynamic` through `LambdaMetafactory`, like nsc
   2.13. `PartialFunction` literals and arities above 22 are still compiled to
   anonymous classes.
+- An unqualified name is resolved by SLS 2's four precedence levels —
+  definitions of the same compilation unit, explicit imports, wildcard imports,
+  then package members of other units — and two bindings of one level in one
+  scope are reported as an ambiguous reference. See
+  [docs/gitbucket.md](docs/gitbucket.md) ("Not this cluster: `Database` /
+  `DatabaseFactory`") and the `impprio` test.
 
 直接自己末尾呼び出しは `final` / `private` / object / ローカル def でループ化します。
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは
@@ -231,6 +237,21 @@ scala-library を交互に min-of-5 で計測して修正前 3877ms / 修正後 
 `hkselfalias` テスト（`tests/fixtures/hkself_member*.scala`）で scalac 2.13.16 と
 比較します。詳細は [docs/cats.md](docs/cats.md) の「The self alias the prefix
 names」を参照してください。
+
+マクロ実装参照に書かれた**型引数**（`def mapTo[R] = macro ShapedValue.mapToImpl[R, U]`
+の `[R, U]`）を読むようになりました。nsc はこれを呼び出し側の型引数と並べません。
+`R` はマクロ def 自身の型パラメータなので呼び出し側の型引数から、`U` は所有クラスの
+型パラメータなので**レシーバ**（`asSeenFrom`）から取ります。従来は個数を数えて
+1 対 1 に並べていたため、個数が合わない `mapTo` は展開できず、個数が偶然合う
+`swapped[A, B] = macro Impl.pairImpl[B, A]` は**黙って逆順のタグ**を渡していました
+（`swapped[Int, String]` が実 scalac の `R=String U=Int` に対し `R=Int U=String`）。
+jar の `@macroImpl` 注釈側とソース側の両方の読み手を直しています。nsc 自身が
+「書かれた型」ではなくその**シンボルの型**を読むため `Impl.f[List[R], Int]` が
+`List[A]` になる件は、真似も置換もせず理由付きで拒否します。正常系は
+`tests/fixtures/mt2_mdef.scala`（実 scalac でコンパイル）と `mt2_use.scala` を
+**実行**して実 scalac 2.13.16 の出力とバイト単位で比較し、異常系は
+`mt2_bad.scala`（実 scalac は通る 3 例）が名指しで拒否されることを固定します
+（`mapto2` テスト）。詳細は [docs/macros.md](docs/macros.md) §7.22 を参照してください。
 
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
