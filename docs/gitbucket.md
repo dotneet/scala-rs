@@ -2292,18 +2292,21 @@ import-precedence question.
 > eventually) and it is what makes `tests/fixtures/ic_app.scala` compile, so
 > both are in.
 >
-> **gitbucket 265 → 243 errors, 77 → 72 files**, reported as a set rather than
-> a total: 26 gone — `withTransaction` (13), `withSession` (7), `run` on
-> `Rep[Boolean]` (5), `firstOption` (1) — and 4 new, none of them a new kind
-> of wrongness. Three are cascades in `IssuesService.scala` behind an
-> `sql"…"` macro expansion that already fails at the same line (`firstOption`
-> now resolves, so the `Unit` element type from the failed expansion travels
-> two calls further before being rejected); the fourth is the pre-existing
-> `override modifier required to override concrete member: val repository`
-> false diagnostic, which already fired in `RepositoryViewerController.scala`
-> and is now reachable in `ApiRepositoryControllerBase.scala` as well. slick
-> stays 0/0/1490 with **all 1490 class files byte-identical** to a pre-fix
-> build, cats 168/67 and the scala library 612/130 are unmoved.
+> **gitbucket 264 → 242 errors, 77 → 72 files** (measured against `main` at
+> `56b81c21`; the same −22 was measured against `bbc6f235`, where it read
+> 265 → 243), reported as a set rather than as a total: 26 gone —
+> `withTransaction` (13), `withSession` (7), `run` on `Rep[Boolean]` (5),
+> `firstOption` (1) — and 4 new, none of them a new kind of wrongness. Three
+> are cascades in `IssuesService.scala` behind an `sql"…"` macro expansion
+> that already fails at the same line (`firstOption` now resolves, so the
+> `Unit` element type from the failed expansion travels two calls further
+> before being rejected); the fourth is the pre-existing `override modifier
+> required to override concrete member: val repository` false diagnostic,
+> which already fired in `RepositoryViewerController.scala` and is now
+> reachable in `ApiRepositoryControllerBase.scala` as well. slick stays
+> 0/0/1490 with **all 1490 class files byte-identical** to a build of the
+> merge base, cats 163/62 and the scala library 604/130 are unmoved, and the
+> full corpus is `losses=0 changes=0`.
 >
 > **Not fixed, and not the same root: `value returning is not a member of
 > TableQuery[Accounts]`** (10 errors over six tables) and the 31
