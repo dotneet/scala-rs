@@ -8,6 +8,17 @@ use crate::gen::*;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{Intrinsic, SymKind, SymbolTable};
 
+/// The array a Java varargs call builds for its trailing parameter.
+///
+/// The element type is the parameter's, not the arguments': `void f(int...)`
+/// takes a `[I`, and `Array.newInstance(c, 1, 2)` takes a `[I` as well. This
+/// used to `anewarray java/lang/Object` for everything that was not a class or
+/// a `String` and box each argument into it, which for a primitive parameter
+/// is a `VerifyError` at the call (`Type '[Ljava/lang/Object;' is not
+/// assignable to '[I'`) -- so a `String...` call worked and an `int...` call
+/// could not run. `emit_newarray` and `emit_array_store` already spell every
+/// element type; the argument is converted to the element type the same way a
+/// direct assignment to an array slot is.
 pub(crate) fn gen_java_varargs_array(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -15,23 +26,29 @@ pub(crate) fn gen_java_varargs_array(
     args: &[Tree],
     elem: &Type,
 ) {
+    let elem = elem.widen_constant();
     let n = args.len() as i32;
     asm.iconst(n);
-    match elem {
-        Type::String => asm.anewarray("java/lang/String"),
-        Type::Class { sym, .. } | Type::ModuleRef(sym) => {
-            asm.anewarray(&class_internal(ctx.st, *sym));
-        }
-        _ => asm.anewarray("java/lang/Object"),
-    }
+    emit_newarray(asm, ctx, &elem);
+    let arr_ty = Type::Array(Box::new(elem.clone()));
+    let elem_prim = is_jvm_primitive(&elem) && !is_unit_like(&elem);
     for (i, a) in args.iter().enumerate() {
         asm.dup();
         asm.iconst(i as i32);
         gen_expr(asm, frame, ctx, a);
-        if is_jvm_primitive(&a.ty) {
+        if elem_prim {
+            // `f(1)` against `f(long...)` is `i2l`, exactly as it is against
+            // `f(long)`; a non-primitive argument reaching a primitive slot is
+            // an erased value and has to come out of its box first.
+            if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) {
+                emit_prim_qualifier_cast(asm, &a.ty, &elem);
+            } else {
+                emit_unbox(asm, &elem);
+            }
+        } else if is_jvm_primitive(&a.ty) {
             emit_box(asm, &a.ty);
         }
-        asm.aastore();
+        emit_array_store(asm, &arr_ty);
     }
 }
 
