@@ -9,6 +9,7 @@ use std::collections::HashSet;
 pub(crate) struct TailLoop {
     head: Label,
     calls: HashSet<usize>,
+    shortcut: HashSet<usize>,
     params: Vec<(u16, JvmSort)>,
     types: Vec<Type>,
     pending: HashSet<usize>,
@@ -25,22 +26,56 @@ fn call(tree: &Tree, method: SymbolId, nullary: bool) -> Option<(&Tree, Vec<Tree
         .then_some((fun, args))
 }
 
-fn collect(tree: &Tree, method: SymbolId, nullary: bool, calls: &mut HashSet<usize>) {
+#[derive(Default)]
+struct Found {
+    /// Self calls that are to become back edges, by tree address.
+    calls: HashSet<usize>,
+    /// `&&` / `||` applications whose right operand holds one of them.
+    shortcut: HashSet<usize>,
+}
+
+fn collect(
+    st: &scala_rs_typer::SymbolTable,
+    tree: &Tree,
+    method: SymbolId,
+    nullary: bool,
+    found: &mut Found,
+) {
     if call(tree, method, nullary).is_some() {
-        calls.insert(tree as *const Tree as usize);
+        found.calls.insert(tree as *const Tree as usize);
+        return;
+    }
+    // `a && rec(…)` / `a || rec(…)`: `gen_bool_and` and `gen_bool_or` emit the
+    // left operand, branch on it, and `pop` it before the right operand, so
+    // the right operand starts at the same stack depth as the whole
+    // expression and is the last thing the method evaluates. That makes it a
+    // genuine tail position for the back edge, and it is the position nsc's
+    // `TailCalls` transforms for `Boolean_and` / `Boolean_or`.
+    //
+    // The node recorded is the application itself, not the operand: the
+    // ordinary `gen_apply` path reaches an argument only after
+    // `flatten_apply_owned` has *cloned* it, so the operand `gen_expr` sees
+    // has a different address from the one scanned here. `emit_tail_call`
+    // therefore emits the branch itself, from the original subtrees.
+    if let Some(rhs) = scala_rs_typer::bool_shortcircuit_rhs(st, tree) {
+        let before = found.calls.len();
+        collect(st, rhs, method, nullary, found);
+        if found.calls.len() != before {
+            found.shortcut.insert(tree as *const Tree as usize);
+        }
         return;
     }
     match &tree.kind {
         TreeKind::If { thenp, elsep, .. } => {
-            collect(thenp, method, nullary, calls);
-            collect(elsep, method, nullary, calls);
+            collect(st, thenp, method, nullary, found);
+            collect(st, elsep, method, nullary, found);
         }
         TreeKind::Block { expr, .. } | TreeKind::Typed { expr, .. } => {
-            collect(expr, method, nullary, calls);
+            collect(st, expr, method, nullary, found);
         }
         TreeKind::Match { cases, .. } => {
             for c in cases {
-                collect(&c.body, method, nullary, calls);
+                collect(st, &c.body, method, nullary, found);
             }
         }
         _ => {}
@@ -92,8 +127,9 @@ pub(crate) fn begin_tail_loop(
     if ctx.value_ext.is_none() && ctx.st.is_value_class(ctx.class_sym) {
         return None;
     }
-    let mut calls = HashSet::new();
-    collect(rhs, method, s.paramss.is_empty(), &mut calls);
+    let mut found = Found::default();
+    collect(ctx.st, rhs, method, s.paramss.is_empty(), &mut found);
+    let Found { calls, shortcut } = found;
     if calls.is_empty() {
         return unsupported();
     }
@@ -127,6 +163,7 @@ pub(crate) fn begin_tail_loop(
         head,
         pending: calls.clone(),
         calls,
+        shortcut,
         params,
         types,
         annotated,
@@ -143,6 +180,32 @@ pub(crate) fn emit_tail_call(
     let Some(lp) = &frame.tail_loop else {
         return false;
     };
+    // `a && rec(…)` / `a || rec(…)` in tail position. Emit the short circuit
+    // here rather than letting `gen_apply` do it, because that path clones the
+    // argument and the clone's address is not the one `collect` recorded, so
+    // the recursive call inside it would never be recognised.
+    if lp.shortcut.contains(&(tree as *const Tree as usize)) {
+        let TreeKind::Apply { fun, args } = &tree.kind else {
+            return false;
+        };
+        let TreeKind::Select { qual, .. } = &fun.kind else {
+            return false;
+        };
+        let Some(rhs) = args.first() else {
+            return false;
+        };
+        match ctx.st.get(fun.sym).intrinsic {
+            scala_rs_typer::Intrinsic::BoolBin("&&") => {
+                gen_bool_and(asm, frame, ctx, qual, Some(rhs));
+                return true;
+            }
+            scala_rs_typer::Intrinsic::BoolBin("||") => {
+                gen_bool_or(asm, frame, ctx, qual, Some(rhs));
+                return true;
+            }
+            _ => return false,
+        }
+    }
     if !lp.calls.contains(&(tree as *const Tree as usize)) {
         return false;
     }
