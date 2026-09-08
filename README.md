@@ -254,6 +254,31 @@ class file が main と 1 バイトも違いません）。深く広いダイヤ
 `class LinkedHashMap extends HashMap implements Map` のために必要でした）も
 不要になります。
 
+2 つの親から**別々の具体化で**届く基底クラスは、先に届いた方ではなく
+**meet（両者の下限）** で読みます。以前は線形化を歩いて最初の具体化を採って
+いました（最派生の「到達元」が勝つ、という規則）が、それは nsc の規則ではなく、
+足りてもいません。`trait Str[+A] extends LinOps[A, Str[A]] with Iter[A]` は
+`IterOps` に `IterOps[A, Str[A]]` と `IterOps[A, Iter[A]]` の 2 通りで到達し、
+`Iter` と `LinOps` はどちらも他方の上にはいません。SLS 5.1.2 は最後に書かれた
+`Iter` を先に並べるので、`IterOps.tail` は `Iter[A]` と読まれていました——実
+scalac 2.13.16 は `Str[A]` と型付けます。nsc は
+`BaseTypeSeqs.compoundBaseTypeSeq` で到達したすべての具体化を保持し、
+`mergePrefixAndArgs(variants, Variance.Contravariant, _)` で解決します。すなわち
+**共変パラメータでは glb（最派生）、反変パラメータでは lub（最汎化）**であり、
+「常に最派生を採る」規則は反変側を逆に間違えます。`SymbolTable::base_type_args`
+がこの規則になりました。線形化の順序自体は変えていません（`agent/basetypeseq`
+がその案を 1551 → 1579 と計測して捨てています）。`@uncheckedVariance` だけが
+違う 2 つの到達は同じ型なので 1 つに畳み、注釈のない綴りを残します
+（nsc の `=:=` は注釈を見ません）。`Check::base_type_instance` も、対象に到達
+しうる親が 2 つ以上あるときはこの merge 済みの答えを読みます。おかげで
+「宣言が定義を言い直しているだけか」を、宣言の所有者から定義の所有者への
+**すべての経路**を 512 ノードの予算で試して調べる必要がなくなり、親 DAG の深さに
+対して指数的なその走査（オーバーロード解決の内側で走っていました）を削除しました。
+`tests/fixtures/btmeet_basetypemeet.scala` は共変・反変の両側と
+`@uncheckedVariance` の綴りを**実行**して実 scalac 2.13.16 の出力と比較し、
+`btmeet_basetypemeet_bad.scala` は scalac と同じ 3 行（23・44・52 行目）で
+拒否されることを固定します（`btmeet` テスト）。
+
 A library member is read from the pickle on demand, and where two classes in
 the receiver's linearization declare the same name with the same *explicit*
 parameters, only one copy is kept — nsc's `isAsSpecific` looks through an
