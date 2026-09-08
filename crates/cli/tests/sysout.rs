@@ -166,7 +166,10 @@ object Main {
         &["--scala-library", jar_s],
     );
     let (stdout, _) = run_java(&out, Some(jar_s));
-    assert_eq!(stdout, "hello\n", "the qualified call must reach System.out");
+    assert_eq!(
+        stdout, "hello\n",
+        "the qualified call must reach System.out"
+    );
     let _ = fs::remove_dir_all(out.parent().unwrap());
 }
 
@@ -338,6 +341,9 @@ object Main {
         &["--scala-library", jar_s],
     );
     let (stdout, _) = run_java(&out, Some(jar_s));
-    assert_eq!(stdout, "[log] one\n[log] two\n", "the user's method must run");
+    assert_eq!(
+        stdout, "[log] one\n[log] two\n",
+        "the user's method must run"
+    );
     let _ = fs::remove_dir_all(out.parent().unwrap());
 }
