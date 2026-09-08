@@ -3040,26 +3040,44 @@ defects met on it:
    `ensure_class` is the one place that has already opened it. Attaching only
    `AbstractIterator[Seq[B]]` was still not enough: `AbstractIterator`'s own
    stub was standing at `AnyRef`, so `Iterator` was not a base class either.
-   The attachment now walks the chain it has just created, and then asks
-   whether what it built reaches `IterableOnce`; a class that does not is put
-   back the way it was. **Both halves of that are measured, and the second was
-   measured twice.** Attaching to every nested library class costs nine
-   workspace tests and two slick errors: `scala.reflect`'s API is built by hand
-   in `prelude_reflect` and reasoned about by `reify*.rs` and `macros.rs`, so a
-   `scala/reflect/api/...$...` stub with a hierarchy is one those paths do not
-   know, and `ShapedValue.scala`'s quasiquote stops resolving
-   `SyntacticAppliedExtractor`. Attaching to every nested `scala.collection`
-   class costs `fvg.rs::map_with_filter_overloads_match_scalac`:
-   `MapOps.WithFilter` is nested there and is not an `IterableOnce`, and
-   `IterableOps.WithFilter`'s `map` then stands in front of the one
-   `Check::map_with_filter_result` is written against. And *rolling back* has
-   its own half: `attach_parents` marks the class done in `self.parented`, so
-   taking the parents away without clearing that mark is worse than never
-   attaching them -- the lazy path a member lookup would run finds the class
-   already parented and does nothing. `object SortedSet extends
-   SortedIterableFactory.Delegate[SortedSet]` is the case that says so, and
-   `SortedSet.empty(ord)` became `value empty is not a member of SortedSet$`
-   until the mark was cleared too. The fixture runs it.
+   The attachment now walks the chain it creates.
+
+**Both halves are confined to one family: a class nested in `scala.collection`
+whose pickled parent names reach `IterableOnce`.** That is decided in
+`PickleSupply::pickle_reaches`, from names alone, before any symbol exists --
+because what it decides is *how* to build the symbol. Everything about the
+restriction is measured, and three wider versions were built and thrown away:
+
+* **every nested library class** costs nine workspace tests and two slick
+  errors. `scala.reflect`'s API is not read from its pickle here:
+  `prelude_reflect` and `prelude_reflectruntime` build it by hand and
+  `reify*.rs` and `macros.rs` reason about the symbols they build, so a second
+  `Exprs.Expr` under the owner the JVM name implies makes
+  `c.universe.Expr.apply[Int](…)` bind the one with no members, and giving those
+  classes their pickled parents stops `ShapedValue.scala`'s quasiquote
+  resolving `SyntacticAppliedExtractor`. `tests/verify_merge.sh` returned
+  `VERDICT=FAIL` on that version, with `losses=3` on the corpus as well.
+* **every nested `scala.collection` class** costs
+  `fvg.rs::map_with_filter_overloads_match_scalac`. `MapOps.WithFilter` is
+  nested there and is *not* an `IterableOnce`; with its pickled parents,
+  `IterableOps.WithFilter`'s `map` and `flatMap` stand in front of the ones
+  `Check::map_with_filter_result` is written against, and
+  `val pairs: Map[String, Int] = m.withFilter(p).map { case (k, v) => k -> v }`
+  -- which scalac accepts -- becomes `found: Iterable[(String, Int)]`.
+* **attach, then roll back what turns out not to be a collection** looks
+  equivalent and is not, because `attach_parents` marks the class done in
+  `self.parented`: taking the parents away while leaving the mark is worse than
+  never attaching them, since the lazy path a member lookup runs then finds the
+  class already parented and does nothing. `object SortedSet extends
+  SortedIterableFactory.Delegate[SortedSet]` is the case that says so, and
+  `SortedSet.empty(ord)` became `value empty is not a member of SortedSet$` in
+  four lines. Deciding up front has no such half; the fixture keeps that line
+  anyway, because it is the shape the mistake was made on.
+
+The element and the `CC` this slice is about are read off a collection's base
+type, so a nested collection is exactly the family that needs the hierarchy --
+and it is the family whose symbol identity a program can observe.
+
 3. **`elem_type` and `rebuild_from_receiver` guessed.** With the hierarchy in
    place, `Check::elem_type` still answered `args[0]` for the element and
    `rebuild_from_receiver` still put `GroupedIterator` back as the `CC`, so

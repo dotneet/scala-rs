@@ -44,9 +44,10 @@ object Main {
 
   // A nested class that is *not* a collection keeps the lazy path that gives
   // it its parents. `object SortedSet extends SortedIterableFactory.Delegate`,
-  // and `Delegate` is nested in `scala.collection.SortedIterableFactory`: an
-  // earlier version of this slice attached its pickled parents, decided it was
-  // not a collection, took them away again and left it marked done, so
+  // and `Delegate` is nested in `scala.collection.SortedIterableFactory`: a
+  // discarded version of this slice attached its pickled parents, decided it
+  // was not a collection, took them away again and left it marked done in
+  // `PickleSupply::parented`, so the lazy path never ran and
   // `SortedSet.empty(ord)` was `value empty is not a member of SortedSet$`.
   def emptySorted[A](o: Ordering[A]): SortedSet[A] = SortedSet.empty(o)
 

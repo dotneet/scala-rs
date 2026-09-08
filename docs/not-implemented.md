@@ -341,8 +341,9 @@ Compiler flags (`agent/xflags`):
 - **A nested class named in a pickled signature outside `scala.collection` is
   still entered as a package-level class with a `$` in its simple name.**
   `PickleSupply::ensure_class` now splits the JVM name the way
-  `java_class_owner` does -- but only for `scala/collection/`, because that is
-  where the defect was measured and where lifting it is free. Elsewhere the
+  `java_class_owner` does -- but only for a class nested in `scala.collection`
+  whose pickled parents reach `IterableOnce`, because that is the family where
+  the defect was measured and the only one where lifting it is free. Elsewhere the
   twin stands: `scala/reflect/api/Exprs$Expr` is entered beside the `Exprs.Expr`
   that `prelude_reflect` builds by hand, and unifying them costs
   `engine.rs::rd_reify_shape_expands_and_runs` (`value apply is not a member of
