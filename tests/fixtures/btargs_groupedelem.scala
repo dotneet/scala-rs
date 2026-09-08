@@ -13,7 +13,7 @@
 //
 // The controls are `Vector` and `TreeMap`, whose `map` really does return their
 // own class; narrowing must not be lost to fix the two above.
-import scala.collection.immutable.{IntMap, LongMap, TreeMap}
+import scala.collection.immutable.{IntMap, LongMap, SortedSet, TreeMap}
 
 object Main {
   // The result of `sliding` is an `Iterator[Seq[A]]`, two hops up its parents.
@@ -42,6 +42,14 @@ object Main {
     b.sorted
   }
 
+  // A nested class that is *not* a collection keeps the lazy path that gives
+  // it its parents. `object SortedSet extends SortedIterableFactory.Delegate`,
+  // and `Delegate` is nested in `scala.collection.SortedIterableFactory`: an
+  // earlier version of this slice attached its pickled parents, decided it was
+  // not a collection, took them away again and left it marked done, so
+  // `SortedSet.empty(ord)` was `value empty is not a member of SortedSet$`.
+  def emptySorted[A](o: Ordering[A]): SortedSet[A] = SortedSet.empty(o)
+
   // Controls: these two still narrow to the receiver's own class.
   val vec: Vector[Int] = Vector(1, 2, 3).map(_ * 2)
   val tm: TreeMap[Int, String] = TreeMap(1 -> "a", 2 -> "b").map { case (k, v) => (k + 1, v + "!") }
@@ -54,5 +62,6 @@ object Main {
     println(longMapKeys(LongMap(3L -> "c", 1L -> "a")))
     println(vec)
     println(tm)
+    println(emptySorted(Ordering.Int).size)
   }
 }

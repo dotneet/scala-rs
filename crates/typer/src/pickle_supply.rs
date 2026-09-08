@@ -3319,7 +3319,24 @@ impl PickleSupply {
         if simple.is_empty() {
             return None;
         }
-        let owner = crate::classpath::java_class_owner(st, &base);
+        // ... but only into a scope that does not already have the name. The
+        // `scala.reflect` API is built by hand in `prelude_reflect`, and
+        // `Exprs.Expr` is one of the names it builds: entering a second `Expr`
+        // as a member of `Exprs` puts this stub beside the prelude's, and
+        // `c.universe.Expr.apply[Int](...)` then binds the one with no members.
+        // The prelude's own hierarchy is the one existing programs are checked
+        // against -- the same rule the doc comment above states for a class
+        // already in the table, one scope further in.
+        let (owner, simple, nested) = match nested_owner(st, &base, &simple) {
+            Some(o) => (o, simple, true),
+            None => {
+                let (pkg_jvm, flat) = match base.rsplit_once('/') {
+                    Some((p, n)) => (p.to_string(), n.to_string()),
+                    None => (String::new(), base.clone()),
+                };
+                (crate::classpath::ensure_package(st, &pkg_jvm), flat, false)
+            }
+        };
         let id = if module {
             let cls = st.alloc(
                 format!("{simple}$"),
@@ -3380,27 +3397,57 @@ impl PickleSupply {
         // comment above is about, and giving that one a parent chain changes
         // subtyping for hand-written prelude members; a nested class is one
         // nothing hand-writes, and `AnyRef` is never the answer for it.
-        if is_nested_jvm_name(&key) {
+        if nested {
+            // Only for a class that is itself a collection, and the
+            // restriction is measured. `MapOps.WithFilter` is nested in
+            // `scala.collection` too and is *not* an `IterableOnce`; giving it
+            // its pickled parents put `IterableOps.WithFilter`'s `map` in front
+            // of the one `Check::map_with_filter_result` is written against,
+            // and `val pairs: Map[String, Int] = m.withFilter(p).map { case
+            // (k, v) => k -> v }` -- which scalac accepts -- became
+            // `found: Iterable[(String, Int)]`
+            // (`crates/cli/tests/fvg.rs::map_with_filter_overloads_match_scalac`).
+            // The element and the `CC` this slice is about are only read off a
+            // collection's base type, so that is the family that needs the
+            // hierarchy.
+            let before = st.get(id).parents.clone();
             self.attach_parents(st, bin, id, full_name, module);
             // And transitively, because one hop is not a hierarchy.
             // `GroupedIterator` gains `AbstractIterator[Seq[B]]`, whose own
-            // stub is still standing at `AnyRef`, so `Iterator` was still not
-            // a base class and `it.sliding(n)` conformed to no `Iterator`.
-            // `ensure_parents` memoises in `self.parented`, and the classes it
-            // reaches are the ones this hierarchy names, so the walk is the
-            // parent chain and not the library.
+            // stub is still standing at `AnyRef`, so `Iterator` is still not a
+            // base class and `it.sliding(n)` conforms to no `Iterator`. The
+            // walk has to come *before* the test below for the same reason:
+            // whether this class is a collection cannot be read off a chain
+            // that stops at the first stub. `ensure_parents` memoises in
+            // `self.parented` and is what a member lookup on any of these
+            // classes would have run anyway, so the walk is the parent chain
+            // and not the library.
             let mut queue: Vec<SymbolId> = parent_classes(st, id);
-            let mut depth = 0;
+            let mut steps = 0;
             while let Some(p) = queue.pop() {
                 if self.parented.contains(&p.0) {
                     continue;
                 }
                 self.ensure_parents(st, bin, p);
                 queue.extend(parent_classes(st, p));
-                depth += 1;
-                if depth > 256 {
+                steps += 1;
+                if steps > 256 {
                     break;
                 }
+            }
+            let io = crate::classpath::find_by_jvm(st, "scala/collection/IterableOnce");
+            if !io.is_some_and(|io| st.class_reaches(id, io) == Some(true)) {
+                st.get_mut(id).parents = before;
+                // And put the class back where `ensure_parents` can still
+                // reach it. `attach_parents` marks it done in `self.parented`,
+                // so leaving that mark while taking the parents away is worse
+                // than never having attached them: the lazy path a member
+                // lookup runs would find the class already "parented" and do
+                // nothing. `SortedSet$` extends the nested
+                // `SortedIterableFactory.Delegate[SortedSet]`, which is not a
+                // collection and so lands here -- and `SortedSet.empty(ord)`
+                // became `value empty is not a member of SortedSet$`.
+                self.parented.remove(&id.0);
             }
         }
         Some(id)
@@ -5286,6 +5333,35 @@ pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -
 ///
 /// `a/b/Outer$Inner` names `a.b.Outer.Inner`; `a/b/Outer` does not. Trailing
 /// `$` (a module class) does not change the simple name.
+/// The class that encloses a nested JVM name, when entering the class there is
+/// what the rest of the compiler would do with it.
+///
+/// `scala/collection/Iterator$GroupedIterator` answers `Iterator`, which is
+/// where [`crate::classpath::java_class_owner`] -- and so
+/// `install_java_class_in`, and so any program that writes the type -- puts it.
+///
+/// **Confined to `scala.collection`, and the restriction is measured.**
+/// `scala.reflect`'s API is not read from its pickle here: `prelude_reflect`
+/// and `prelude_reflectruntime` build it by hand, `crates/typer/src/reify*.rs`
+/// and `macros.rs` reason about the symbols they build, and a *second* symbol
+/// for `Exprs.Expr` under the owner the JVM name implies is one those paths do
+/// not know. Lifting this to every nested library class costs
+/// `rd_reify_shape_expands_and_runs` (`value apply is not a member of Expr`,
+/// for `c.universe.Expr.apply[Int](...)`), and attaching that class's pickled
+/// parents as well costs nine more workspace tests and two slick errors in
+/// `ShapedValue.scala`'s quasiquote. A narrower guard was tried first --
+/// decline when the enclosing scope already holds the simple name -- and
+/// measured to change nothing, because the prelude's `Expr` is not a member of
+/// `Exprs` at the moment the signature is converted. `docs/not-implemented.md`
+/// records what is left.
+fn nested_owner(st: &mut SymbolTable, base: &str, _simple: &str) -> Option<SymbolId> {
+    if !is_nested_jvm_name(base) || !base.starts_with("scala/collection/") {
+        return None;
+    }
+    let owner = crate::classpath::java_class_owner(st, base);
+    (!owner.is_none() && st.get(owner).is_class_like()).then_some(owner)
+}
+
 /// The class symbols a class's parent list names.
 fn parent_classes(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
     st.get(cls)

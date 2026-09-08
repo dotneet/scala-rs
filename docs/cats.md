@@ -2992,17 +2992,19 @@ stale**: `agent/basetypemeet` closed the first-path defect two gates earlier,
 and this slice measured it — `base_type_args` is correct here, and neither of
 the two roots it found is in the symbol table's base-type walk.
 
-Measured, `SCALA_RS=<baseline binary>` on `5800b6ea` against the same tree
-with the change:
+Measured on the branch merged with `main` at `d0c89fc1`, against a binary built
+from that same `main`:
 
 | | before | after |
 |---|---:|---:|
-| cats (339, 1 skipped) | 182 / 71 files | **181 / 70** |
-| scala library (538) | 672 / 132 | **664 / 132** |
+| cats (339, 1 skipped) | 177 / 69 files | **176 / 68** |
+| scala library (538) | 622 / 131 | **614 / 131** |
 | gitbucket (353, 1 skipped) | 265 / 77 | 265 / 77 |
+| slick (184) | `errors=0 classes=1490` | `errors=0 classes=1490` |
 
 Nine errors go and **no error appears anywhere**, compared line by line rather
-than by total.
+than by total. The same nine, and the same delta, at the branch point
+`5800b6ea` (cats 182 -> 181, library 672 -> 664), so the waves do not overlap.
 
 ### The one shape that breaks every guess at once
 
@@ -3018,7 +3020,11 @@ defects met on it:
    and nothing else, so the symbol was called `Iterator$GroupedIterator` and
    owned by the package `scala.collection` — a **second symbol** for the class
    `install_java_class_in` enters correctly as `GroupedIterator` inside
-   `Iterator`. Which one a program got depended on which path reached the class
+   `Iterator`. This is confined to `scala.collection` for the reason in (2):
+   lifting it to every nested library class costs
+   `engine.rs::rd_reify_shape_expands_and_runs`, where a second `Exprs.Expr`
+   under the owner the JVM name implies makes `c.universe.Expr.apply[Int](…)`
+   bind the one with no members. Which one a program got depended on which path reached the class
    first, and the printed receiver said so: `Iterator$GroupedIterator[A]` where
    scalac prints `it.GroupedIterator[A]`.
 
@@ -3034,11 +3040,26 @@ defects met on it:
    `ensure_class` is the one place that has already opened it. Attaching only
    `AbstractIterator[Seq[B]]` was still not enough: `AbstractIterator`'s own
    stub was standing at `AnyRef`, so `Iterator` was not a base class either.
-   The attachment now walks the chain it has just created. It is deliberately
-   confined to *nested* classes: a top-level stub standing for a library class
-   the prelude also declares is the case `ensure_class`' doc comment is about,
-   and giving that one a parent chain changes subtyping under hand-written
-   prelude members.
+   The attachment now walks the chain it has just created, and then asks
+   whether what it built reaches `IterableOnce`; a class that does not is put
+   back the way it was. **Both halves of that are measured, and the second was
+   measured twice.** Attaching to every nested library class costs nine
+   workspace tests and two slick errors: `scala.reflect`'s API is built by hand
+   in `prelude_reflect` and reasoned about by `reify*.rs` and `macros.rs`, so a
+   `scala/reflect/api/...$...` stub with a hierarchy is one those paths do not
+   know, and `ShapedValue.scala`'s quasiquote stops resolving
+   `SyntacticAppliedExtractor`. Attaching to every nested `scala.collection`
+   class costs `fvg.rs::map_with_filter_overloads_match_scalac`:
+   `MapOps.WithFilter` is nested there and is not an `IterableOnce`, and
+   `IterableOps.WithFilter`'s `map` then stands in front of the one
+   `Check::map_with_filter_result` is written against. And *rolling back* has
+   its own half: `attach_parents` marks the class done in `self.parented`, so
+   taking the parents away without clearing that mark is worse than never
+   attaching them -- the lazy path a member lookup would run finds the class
+   already parented and does nothing. `object SortedSet extends
+   SortedIterableFactory.Delegate[SortedSet]` is the case that says so, and
+   `SortedSet.empty(ord)` became `value empty is not a member of SortedSet$`
+   until the mark was cleared too. The fixture runs it.
 3. **`elem_type` and `rebuild_from_receiver` guessed.** With the hierarchy in
    place, `Check::elem_type` still answered `args[0]` for the element and
    `rebuild_from_receiver` still put `GroupedIterator` back as the `CC`, so
