@@ -11,7 +11,7 @@ use scala_rs_parser::{CaseDef, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
-use crate::symbol::{MacroBinding, SymKind};
+use crate::symbol::{MacroBinding, MacroTarg, SymKind};
 
 /// Fully-qualified names of the two macro `Context` types.
 const BLACKBOX_CONTEXT: &str = "scala.reflect.macros.blackbox.Context";
@@ -30,10 +30,15 @@ fn context_kind_of_name(name: &str) -> Option<bool> {
 }
 
 /// Peel `Impl.method[A, B]` down to the reference and its explicit type args.
-fn split_type_apply(t: &Tree) -> (&Tree, usize) {
+///
+/// The type arguments are **not** decoration and are not thrown away: they are
+/// nsc's `MacroImplBinding.targs`, which decide what each `WeakTypeTag` the
+/// implementation asks for stands for (`docs/macros.md` §7.22). They used to
+/// be reduced to a count here.
+fn split_type_apply(t: &Tree) -> (&Tree, &[Tree]) {
     match &t.kind {
-        TreeKind::TypeApply { fun, args } => (fun, args.len()),
-        _ => (t, 0),
+        TreeKind::TypeApply { fun, args } => (fun, args),
+        _ => (t, &[]),
     }
 }
 
@@ -43,6 +48,62 @@ fn path_of(t: &Tree) -> Option<String> {
         TreeKind::Ident { name } => Some(name.clone()),
         TreeKind::Select { qual, name } => Some(format!("{}.{}", path_of(qual)?, name)),
         _ => None,
+    }
+}
+
+/// Classify one already-resolved type argument of a macro implementation
+/// reference, in the vocabulary [`MacroTarg`] uses.
+///
+/// Shared by the source path ([`Typer::classify_macro_targ`]) and the pickled
+/// one (`crates/typer/src/pickle_supply.rs`), because the two differ only in
+/// how the type is obtained: nsc writes the same `MacroImplBinding.targs`
+/// either way.
+pub(crate) fn macro_targ_of_type(
+    st: &crate::symbol::SymbolTable,
+    ty: &Type,
+    def_sym: SymbolId,
+) -> MacroTarg {
+    if let Type::TypeParam(tp) = ty {
+        let name = st.get(*tp).name.clone();
+        let owner = st.get(*tp).owner;
+        if owner == def_sym {
+            if let Some(index) = st.get(def_sym).tparams.iter().position(|t| t == tp) {
+                return MacroTarg::DefParam { index, name };
+            }
+        } else if !owner.is_none() {
+            if let Some(index) = st.get(owner).tparams.iter().position(|t| t == tp) {
+                return MacroTarg::OwnerParam { owner, index, name };
+            }
+        }
+        return MacroTarg::Unresolved(name);
+    }
+    match ty {
+        // A class with no type arguments of its own, and the primitives. nsc
+        // takes the written type's *symbol* and then that symbol's own type,
+        // which for these is the same type back again.
+        Type::Class { args, .. } if args.is_empty() => MacroTarg::Fixed(ty.clone()),
+        Type::Unit
+        | Type::Boolean
+        | Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::Char
+        | Type::String
+        | Type::Any
+        | Type::AnyRef
+        | Type::AnyVal
+        | Type::Null
+        | Type::Nothing => MacroTarg::Fixed(ty.clone()),
+        // Everything else, and an *applied* type constructor above all. That
+        // last one is where nsc's own reading stops being a reading -- it
+        // reduces `List[R]` to `List[A]`, `A` being `List`'s own type
+        // parameter -- so scala-rs refuses it by name rather than reproducing a
+        // type with a free parameter in it or substituting a different answer.
+        // See [`MacroTarg::Unresolved`].
+        _ => MacroTarg::Unresolved(st.display_type(ty)),
     }
 }
 
@@ -72,7 +133,7 @@ impl Typer {
             );
         }
 
-        if let Some(binding) = self.resolve_macro_impl(&impl_ref, tree.span) {
+        if let Some(binding) = self.resolve_macro_impl(&impl_ref, tree.span, tree.sym) {
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).macro_impl = Some(binding);
                 self.has_macro_defs = true;
@@ -85,8 +146,14 @@ impl Typer {
     ///
     /// Diagnoses and returns `None` when the reference has a shape nsc also
     /// rejects, or when it does not name a method of an object.
-    fn resolve_macro_impl(&mut self, impl_ref: &Tree, span: Span) -> Option<MacroBinding> {
-        let (base, _targs) = split_type_apply(impl_ref);
+    fn resolve_macro_impl(
+        &mut self,
+        impl_ref: &Tree,
+        span: Span,
+        def_sym: SymbolId,
+    ) -> Option<MacroBinding> {
+        let (base, ref_targs) = split_type_apply(impl_ref);
+        let ref_targs = ref_targs.to_vec();
         let Some(path) = path_of(base) else {
             self.error(
                 span,
@@ -162,13 +229,120 @@ impl Typer {
                 jvm.replace('/', ".")
             }
         };
+        let tag_params = self.macro_impl_tag_params(sym);
         Some(MacroBinding {
             impl_class,
             impl_method: name,
             blackbox,
-            tag_params: self.macro_impl_tag_params(sym),
+            tag_params,
             expr_args: self.macro_impl_expr_args(sym),
+            tag_targs: self.macro_ref_tag_targs(sym, def_sym, &ref_targs, tag_params),
         })
+    }
+
+    /// What each tag the implementation asks for stands for, read off the
+    /// type arguments written on the implementation *reference*.
+    ///
+    /// nsc's fingerprint for a tag parameter is the index of the
+    /// implementation type parameter it is a tag for, and the reference's type
+    /// arguments line up one for one with those (nsc refuses the definition
+    /// otherwise: "macro implementation reference has too few type arguments").
+    /// So the tag in position *j* of the trailing clause is resolved by asking
+    /// which implementation type parameter its `WeakTypeTag[T]` names, and
+    /// taking the reference's type argument at that index. The order of the
+    /// trailing clause is *not* assumed to be the order of the type
+    /// parameters: `(implicit uTag: c.WeakTypeTag[U], rTag: c.WeakTypeTag[R])`
+    /// is legal and means the other thing.
+    ///
+    /// Returns an empty vector -- "not known", which leaves the older
+    /// one-for-one rule in place -- when any part of that does not line up,
+    /// rather than resolving some tags and guessing at the rest.
+    fn macro_ref_tag_targs(
+        &mut self,
+        impl_sym: SymbolId,
+        def_sym: SymbolId,
+        ref_targs: &[Tree],
+        tag_params: usize,
+    ) -> Vec<MacroTarg> {
+        if tag_params == 0 || def_sym.is_none() {
+            return Vec::new();
+        }
+        let flat = self.macro_impl_params(impl_sym);
+        let tags: Vec<SymbolId> = flat[flat.len() - tag_params..].to_vec();
+        let impl_tparams = self.st.get(impl_sym).tparams.clone();
+        let mut out = Vec::with_capacity(tag_params);
+        for p in tags {
+            let Some(arg) = self.tag_param_argument(p) else {
+                return Vec::new();
+            };
+            let Type::TypeParam(tp) = arg else {
+                return Vec::new();
+            };
+            let Some(index) = impl_tparams.iter().position(|&t| t == tp) else {
+                return Vec::new();
+            };
+            let Some(written) = ref_targs.get(index) else {
+                return Vec::new();
+            };
+            out.push(self.classify_macro_targ(written, def_sym));
+        }
+        out
+    }
+
+    /// `T` of a `c.WeakTypeTag[T]` parameter.
+    fn tag_param_argument(&self, p: SymbolId) -> Option<Type> {
+        match &self.st.get(p).ty {
+            Type::Class { args, .. } | Type::Named { args, .. } | Type::Applied { args, .. }
+                if args.len() == 1 =>
+            {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Decide what one type argument written on the implementation reference
+    /// is, in the vocabulary [`MacroTarg`] uses.
+    ///
+    /// A bare name is matched against the macro def's own type parameters and
+    /// then its owner's **by name**, which is both what nsc does
+    /// (`macroDef.typeParams.indexWhere(_.name == targ.name)`) and the only
+    /// thing available here: a macro def's right-hand side is resolved in the
+    /// *enclosing* scope, with no parameter scope pushed -- the reference names
+    /// a method of some other object and must not see `R` as anything -- so
+    /// typing `R` here would report "not found: type R" and answer nothing.
+    ///
+    /// Anything else is typed, and the diagnostics that attempt raises are
+    /// rolled back: a type argument this does not recognise is refused at the
+    /// *call site* with a reason, not reported twice at the definition.
+    fn classify_macro_targ(&mut self, written: &Tree, def_sym: SymbolId) -> MacroTarg {
+        if let TreeKind::Ident { name } = &written.kind {
+            if name != "_" && name != crate::materialize::RESOLVED_TYPE {
+                let named =
+                    |syms: &[SymbolId]| syms.iter().position(|&t| self.st.get(t).name == *name);
+                if let Some(index) = named(&self.st.get(def_sym).tparams) {
+                    return MacroTarg::DefParam {
+                        index,
+                        name: name.clone(),
+                    };
+                }
+                let owner = self.st.get(def_sym).owner;
+                if !owner.is_none() {
+                    if let Some(index) = named(&self.st.get(owner).tparams) {
+                        return MacroTarg::OwnerParam {
+                            owner,
+                            index,
+                            name: name.clone(),
+                        };
+                    }
+                }
+            }
+        }
+        let probe = written.clone();
+        let mark = self.diags.len();
+        let ty = self.tree_to_type(&probe);
+        self.diags.truncate(mark);
+        macro_targ_of_type(&self.st, &ty, def_sym)
     }
 
     /// Which of the implementation's value parameters are `c.Expr[T]`.

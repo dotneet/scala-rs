@@ -1,0 +1,7 @@
+R=String U=Int
+R=Double U=List[String]
+R=Int U=Char
+R=String U=Int
+R=Char U=Boolean
+R=Short U=Long
+R=Byte U=Long

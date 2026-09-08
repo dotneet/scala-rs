@@ -45,7 +45,7 @@ use scala_rs_pickle::names::{decode_method_name, encode_method_name};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
-use crate::symbol::{MacroBinding, SymKind, SymbolTable};
+use crate::symbol::{MacroBinding, MacroTarg, SymKind, SymbolTable};
 
 /// The engine's source. Written to a cache directory and compiled with
 /// `javac` on first use, so the repository carries no class files and the
@@ -855,46 +855,9 @@ impl Typer {
         }
         out.push_str(") (tags");
         if binding.tag_params > 0 {
-            if targs.is_empty() {
-                return Err(format!(
-                    "the implementation asks for {} type tag(s) and the call site \
-                     writes no type arguments; scala-rs does not pass an inferred \
-                     type argument to a macro yet",
-                    binding.tag_params
-                ));
-            }
-            if targs.len() != binding.tag_params {
-                // nsc does not line the tags up with the call site's type
-                // arguments at all. It reads the type arguments written on the
-                // *macro implementation reference* -- `Impl.method[R, U]` on
-                // the macro def's right-hand side, which travels in the
-                // `@macroImpl` annotation as a `TypeApply` wrapped around the
-                // payload -- and resolves each one: a type parameter of the
-                // macro def is looked up among the call site's type arguments,
-                // and anything else, a type parameter of the macro def's
-                // *owner* above all, is `asSeenFrom` the prefix
-                // (`Macros.macroArgs`). slick's
-                // `mapTo[R] = macro ShapedValue.mapToImpl[R, U]` is exactly
-                // that: `U` is `ShapedValue`'s own type parameter, so the call
-                // site writes one type argument where the implementation asks
-                // for two tags. scala-rs discards those type arguments when it
-                // reads the annotation (`PickleReader::macro_impl_of` peels
-                // the `TypeApply` away), so all it can do is line the tags up
-                // one for one -- and say so when that does not fit.
-                return Err(format!(
-                    "the implementation asks for {} type tag(s) and the call site \
-                     supplies {} type argument(s); nsc would resolve the type \
-                     arguments written on the implementation reference itself, \
-                     taking the ones that belong to the macro def's owner from the \
-                     prefix, and scala-rs does not read those type arguments out of \
-                     the `@macroImpl` annotation yet",
-                    binding.tag_params,
-                    targs.len()
-                ));
-            }
-            for t in targs {
+            for t in self.tag_types(binding, targs, prefix)? {
                 out.push(' ');
-                let desc = self.tag_descriptor(t, &mut placeholders)?;
+                let desc = self.tag_descriptor(&t, &mut placeholders)?;
                 out.push_str(&desc);
             }
         }
@@ -962,6 +925,137 @@ impl Typer {
         }
         out.push_str("))");
         Ok((out, placeholders))
+    }
+
+    /// The type each `WeakTypeTag` the implementation asks for stands for, at
+    /// **this** call site.
+    ///
+    /// nsc does not line the tags up with the call site's type arguments. It
+    /// resolves `MacroImplBinding.targs` -- the type arguments written on the
+    /// implementation *reference*, `Impl.method[R, U]` on the macro def's
+    /// right-hand side -- and each one separately (`Macros.macroArgs`): a type
+    /// parameter of the macro def is looked up among the call site's type
+    /// arguments, and anything else, a type parameter of the macro def's
+    /// *owner* above all, is `asSeenFrom` the prefix. slick's
+    /// `mapTo[R] = macro ShapedValue.mapToImpl[R, U]` is exactly that -- `U` is
+    /// `ShapedValue`'s own type parameter -- so the call site writes one type
+    /// argument where the implementation asks for two tags, and no lining-up
+    /// could ever have worked.
+    ///
+    /// [`MacroBinding::tag_targs`] is that list, already classified where the
+    /// macro def was bound. When it is empty the reference could not be read
+    /// and the older rule stands: one call-site type argument per tag, and a
+    /// refusal that says so when the counts differ.
+    fn tag_types(
+        &mut self,
+        binding: &MacroBinding,
+        targs: &[Type],
+        prefix: Option<&Tree>,
+    ) -> Result<Vec<Type>, String> {
+        if binding.tag_targs.is_empty() {
+            if targs.is_empty() {
+                return Err(format!(
+                    "the implementation asks for {} type tag(s) and the call site \
+                     writes no type arguments; scala-rs does not pass an inferred \
+                     type argument to a macro yet",
+                    binding.tag_params
+                ));
+            }
+            if targs.len() != binding.tag_params {
+                return Err(format!(
+                    "the implementation asks for {} type tag(s) and the call site \
+                     supplies {} type argument(s); nsc would resolve the type \
+                     arguments written on the implementation reference itself, and \
+                     scala-rs could not read them off this macro def's reference",
+                    binding.tag_params,
+                    targs.len()
+                ));
+            }
+            return Ok(targs.to_vec());
+        }
+        let mut out = Vec::with_capacity(binding.tag_targs.len());
+        for want in &binding.tag_targs {
+            out.push(match want {
+                MacroTarg::DefParam { index, name } => match targs.get(*index) {
+                    Some(t) => t.clone(),
+                    None => {
+                        return Err(format!(
+                            "the implementation reference asks for a tag for `{name}`, \
+                             the macro's own type parameter at position {}, and the \
+                             call site writes {} type argument(s); scala-rs does not \
+                             pass an inferred type argument to a macro yet",
+                            index + 1,
+                            targs.len()
+                        ))
+                    }
+                },
+                MacroTarg::OwnerParam { owner, index, name } => {
+                    self.owner_tag_type(*owner, *index, name, prefix)?
+                }
+                MacroTarg::Fixed(t) => t.clone(),
+                MacroTarg::Unresolved(what) => {
+                    return Err(format!(
+                        "the implementation reference writes `{what}` as a type \
+                         argument, and scala-rs will not resolve that: nsc reads the \
+                         written type's *symbol* and then that symbol's own type, so \
+                         an applied type constructor reaches the implementation with \
+                         the class's own type parameters in it rather than anything \
+                         from this call site, and reproducing that would hand the \
+                         implementation a type with a free parameter in it"
+                    ))
+                }
+            });
+        }
+        Ok(out)
+    }
+
+    /// One tag whose type argument is a type parameter of the macro def's
+    /// **owner**: nsc's `targ.tpe.asSeenFrom(prefix.tpe, macroDef.owner)`.
+    ///
+    /// The prefix is the receiver the macro was called on, so this is a base
+    /// type of its type -- `ShapedValue[T, U]` reached through whatever the
+    /// receiver actually is. Refused by name, not approximated, when the
+    /// receiver is not a class type or does not have the owner among its base
+    /// classes with arguments: an approximation here is a *wrong tag*, and a
+    /// macro that builds a tree from one is wrong silently.
+    fn owner_tag_type(
+        &mut self,
+        owner: SymbolId,
+        index: usize,
+        name: &str,
+        prefix: Option<&Tree>,
+    ) -> Result<Type, String> {
+        let owner_name = self.st.get(owner).name.clone();
+        let Some(p) = prefix else {
+            return Err(format!(
+                "the implementation reference asks for a tag for `{name}`, a type \
+                 parameter of `{owner_name}`, which nsc reads off the receiver the \
+                 macro was called on; this call has no receiver, and scala-rs does \
+                 not synthesise the enclosing `this` for a prefix yet"
+            ));
+        };
+        let Type::Class { sym, args } = &p.ty else {
+            return Err(format!(
+                "the implementation reference asks for a tag for `{name}`, a type \
+                 parameter of `{owner_name}`, which nsc reads off the receiver the \
+                 macro was called on; this receiver's type is `{}`, which is not a \
+                 class applied to type arguments, and scala-rs will not guess what \
+                 `{name}` stands for",
+                self.st.display_type(&p.ty)
+            ));
+        };
+        let seen = self.st.base_type_args(*sym, args);
+        match seen.get(&owner.0).and_then(|a| a.get(index)) {
+            Some(t) => Ok(t.clone()),
+            None => Err(format!(
+                "the implementation reference asks for a tag for `{name}`, the type \
+                 parameter of `{owner_name}` at position {}, and scala-rs cannot see \
+                 `{owner_name}` applied to type arguments in the receiver's type \
+                 `{}`",
+                index + 1,
+                self.st.display_type(&p.ty)
+            )),
+        }
     }
 
     /// The wire descriptor for one type the engine has to turn into a tag.
