@@ -1452,10 +1452,11 @@ were never affected).
 
 ## The `agent/liboverload` slice: re-abstracting is overriding
 
-**971 errors in 147 files → 918 in 146**, measured on this branch merged with
-`main` at `acec3f09` (`agent/libprelude`, `agent/libnotype`) against that same
-`main` measured on its own. The delta is the same **-53** it was at the branch
-point (`fb297e74`, 1104 → 1051), so the two waves do not overlap. Every other
+**970 errors in 147 files → 917 in 146**, measured on this branch merged with
+`main` at `659580a9` (`agent/libprelude`, `agent/libnotype`, `agent/neglit`)
+against that same `main` measured on its own. The delta is the same **-53** it
+was at the branch point (`fb297e74`, 1104 → 1051) and at `acec3f09`
+(971 → 918), so the waves do not overlap. Every other
 target is unchanged to the error, and slick's 1490 class files are
 byte-identical.
 
@@ -1613,20 +1614,21 @@ Nil$>` (7), `<overload Set[A] | TreeSet[A]>` (3), `<overload Iterable[(K, V)]
 
 ### The other targets, before and after
 
-Measured on the merged tree at `acec3f09`, each against that same `main`:
+Measured on the merged tree at `659580a9`, each against that same `main`:
 
 | | before | after |
 |---|---|---|
-| scala library (538) | 971 / 147 | **918 / 146** |
+| scala library (538) | 970 / 147 | **917 / 146** |
 | gitbucket (353) | 270 / 79 | 270 / 79 |
 | cats (339) | 185 / 71 | 185 / 71 |
 | slick (184) | `errors=0 classes=1490` | `errors=0 classes=1490`, all 1490 byte-identical (`SLICK_OUT` on both binaries, `diff -r` empty) |
 
 On the scala/scala corpus (`CORPUS_SIZE=full`, 5324 rows) **every row is
-identical** to `main` at `acec3f09` -- `pos 1095 / neg 670 / run 623`, compared
-row by row for all three kinds, not only by count. `tests/verify_merge.sh`
-still reports `VERDICT=FAIL` there, because its ledger is
-`tests/baselines/corpus-4d613d25.tsv` and `main` has moved twice since: the
+identical** to `main` -- `pos 1095 / neg 670 / run 623`, compared row by row
+for all three kinds at `acec3f09`, not only by count, and unchanged again at
+`659580a9`. `tests/verify_merge.sh` still reports `VERDICT=FAIL` there,
+because its ledger is `tests/baselines/corpus-4d613d25.tsv` and `main` has
+moved three times since: the
 4 `neg` losses (`anytrait`, `name-lookup-stable`, `t8002-nested-scope`,
 `valueclasses-impl-restrictions`, all `accepted-but-should-not-compile`) and
 the 11 `pos`/`run` gains it names all reproduce on unmodified `main`. The
