@@ -924,6 +924,9 @@ impl Typer {
                     } else {
                         self.module_class_of_value(sym, &base_ty)
                     };
+                    // Set when the redirect below lands on an `apply` the
+                    // module *inherits*; see the rewrite after `tree.ty`.
+                    let mut inherited_apply = false;
                     if let (true, Some(cls)) = (self.st.get(sym).tparams.is_empty(), module_cls) {
                         // A library companion's `apply` is read from the
                         // pickle on *selection*, and `Ordering[String]` never
@@ -992,10 +995,27 @@ impl Typer {
                             // value itself, so `RepShape[L, M, U]` must not
                             // keep a nullary method type -- an ordinary
                             // `RepShape.apply[L, M, U]` does not either.
-                            base_ty = match self.st.get(sym).ty.clone() {
+                            //
+                            // As seen from the module, not raw: an *inherited*
+                            // factory states its result in the parameters of
+                            // the trait that declares it. `object HashMap
+                            // extends MapFactory[HashMap]` inherits
+                            // `def apply[K, V](elems: (K, V)*): CC[K, V]`, so
+                            // `mutable.HashMap[A, Int]()` came back as
+                            // `CC[A, Int]` and every use of it was "value … is
+                            // not a member of CC[A, Int]". A `.apply` written
+                            // out goes through `type_select`, which does this
+                            // substitution, which is why only the implicit
+                            // redirect was wrong.
+                            let raw = self.st.get(sym).ty.clone();
+                            let recv = self.st.type_of_class(cls);
+                            let seen = self.st.subst_as_seen_from(&recv, &raw);
+                            base_ty = match seen {
                                 Type::Method { paramss, ret } if paramss.is_empty() => *ret,
                                 other => other,
                             };
+                            inherited_apply = self.st.get(only).owner != cls
+                                && self.st.get(fun.sym).kind == SymKind::Module;
                         }
                     }
                     // nsc (SLS 6.26.3): explicit type arguments first narrow an
@@ -1039,7 +1059,40 @@ impl Typer {
                     // *that* node's `.sym`/`.ty` — propagate the redirect
                     // (module → its `apply` method) down so it sees the
                     // method, not the module itself.
-                    if sym != fun.sym {
+                    //
+                    // An `apply` the module *inherits* needs the receiver
+                    // spelled out as well. `peel_fun` reads the owner off the
+                    // method and the *receiver* off the tree shape, and a bare
+                    // `Ident` inside a class means `this`: `object TM extends
+                    // Fac` with `Fac.apply[K]` compiled `TM[Int](1)` in a
+                    // class body into `invokeinterface Fac.apply` on `this`,
+                    // and threw `ClassCastException: class Uses cannot be cast
+                    // to class Fac` at run time -- the types stayed consistent
+                    // so nothing before execution objected (`.agent-brief.md`,
+                    // *`verify_failures` is a lower bound*). Written out,
+                    // `TM.apply[Int](1)` was correct all along, so this builds
+                    // that tree.
+                    if inherited_apply {
+                        let span = fun.span;
+                        let mut qual = std::mem::replace(
+                            &mut **fun,
+                            Tree::dummy(scala_rs_parser::ast::TreeKind::Empty),
+                        );
+                        qual.ty = self.st.type_of_class(self.st.module_class_of(qual.sym));
+                        **fun = Tree {
+                            id: scala_rs_parser::ast::NodeId(0),
+                            span,
+                            kind: TreeKind::Select {
+                                qual: Box::new(qual),
+                                name: "apply".into(),
+                            },
+                            ty: tree.ty.clone(),
+                            sym,
+                            postfix: false,
+                            scala_ref: false,
+                            stable_pat: false,
+                        };
+                    } else if sym != fun.sym {
                         fun.sym = sym;
                         fun.ty = tree.ty.clone();
                     }
