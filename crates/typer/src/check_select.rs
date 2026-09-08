@@ -868,7 +868,18 @@ impl Typer {
     /// No path from `decl`'s owner to `defn`'s -- a self type, or two sibling
     /// traits -- means the declaration restates nothing.
     ///
-    /// Every path is tried; see `restated_on_some_path`.
+    /// The instantiation asked for is `defn`'s owner as `decl`'s owner sees
+    /// it, which is the base type sequence's entry for it and nothing else.
+    /// This used to try **every** path from one to the other, under a
+    /// 512-node budget, because `Check::base_type_instance` answered with the
+    /// first parent clause that reached the target: `Stream` reaches
+    /// `IterableOps` through `Iterable` before it reaches it through its own
+    /// `LinearSeqOps[A, Stream, Stream[A]]`, so the first answer was
+    /// `IterableOps[A, Iterable, Iterable[A]]` and the restatement was
+    /// invisible. `base_type_instance` now takes the meet, as nsc's `baseType`
+    /// does, so the one answer that means anything is available directly --
+    /// and a walk whose path count is exponential in the depth of the parent
+    /// DAG, run inside overload resolution, is gone with it.
     fn declaration_restates_definition(&self, decl: SymbolId, defn: SymbolId) -> bool {
         let decl_owner = self.st.get(decl).owner;
         let defn_owner = self.st.get(defn).owner;
@@ -885,69 +896,18 @@ impl Typer {
                 .map(|&t| Type::TypeParam(t))
                 .collect(),
         };
-        let mut budget = 512u32;
-        self.restated_on_some_path(
-            &prefix,
-            defn,
-            defn_owner,
-            &self.st.get(decl).ty,
-            0,
-            &mut budget,
-        )
-    }
-
-    /// Whether some path from `ty` to `defn`'s owner instantiates it so that
-    /// `defn`'s type reads exactly as `want`.
-    ///
-    /// `Check::base_type_instance` answers with the *first* parent that
-    /// reaches the target, and `Stream` reaches `IterableOps` through
-    /// `AbstractSeq` before it reaches it through its own `LinearSeqOps[A,
-    /// Stream, Stream[A]]`, so the first answer is `IterableOps[A, Iterable,
-    /// Iterable[A]]`. nsc's `baseType` takes the meet of the instantiations,
-    /// which for a covariant parameter is the most derived one; asking whether
-    /// *some* path spells `want` gets the same answer here without changing
-    /// what `baseType` means everywhere else.
-    ///
-    /// `budget` bounds the walk. A parent DAG has a path count exponential in
-    /// its depth (see `SymbolTable::walk_parents`, which exists for the same
-    /// reason), and this runs inside overload resolution.
-    fn restated_on_some_path(
-        &self,
-        ty: &Type,
-        defn: SymbolId,
-        defn_owner: SymbolId,
-        want: &Type,
-        depth: u32,
-        budget: &mut u32,
-    ) -> bool {
-        if depth > 16 || *budget == 0 {
+        let Some(at) = self.base_type_instance(&prefix, defn_owner, 0) else {
             return false;
-        }
-        *budget -= 1;
-        let (sym, args): (SymbolId, &[Type]) = match ty {
-            Type::Class { sym, args } => (*sym, args),
-            Type::ModuleRef(s) | Type::ThisType(s) => (*s, &[]),
-            Type::Annotated { tpe, .. } => {
-                return self.restated_on_some_path(tpe, defn, defn_owner, want, depth + 1, budget)
-            }
-            _ => return false,
         };
-        if sym == defn_owner {
-            let at = if args.is_empty() {
-                self.st.get(defn).ty.clone()
-            } else {
+        let want = &self.st.get(decl).ty;
+        let seen = match &at {
+            Type::Class { args, .. } if !args.is_empty() => {
                 self.st
                     .subst_tparams(defn_owner, args, &self.st.get(defn).ty)
-            };
-            return &at == want;
-        }
-        if self.st.class_reaches(sym, defn_owner) == Some(false) {
-            return false;
-        }
-        self.st.get(sym).parents.iter().any(|p| {
-            let p = self.st.subst_tparams_cow(sym, args, p);
-            self.restated_on_some_path(&p, defn, defn_owner, want, depth + 1, budget)
-        })
+            }
+            _ => self.st.get(defn).ty.clone(),
+        };
+        &seen == want
     }
 
     /// Prefer a definition on a subclass over the inherited member it overrides.
