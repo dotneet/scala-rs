@@ -441,6 +441,32 @@ impl Typer {
         // (`java.lang.Integer.valueOf(3).parseInt("12")` stopped being an
         // error). The one path that moves the receiver, `search_extension`,
         // leaves `found` non-empty anyway.
+        if found.is_empty() && self.st.is_sub_type(&recv_ty, &Type::AnyRef) {
+            // `AnyRef`'s members -- `eq` and `ne` -- belong to every reference
+            // type, and `lookup_member` finds them only by walking a declared
+            // parent. A class that mixes in a **universal trait** and nothing
+            // else never reaches one:
+            //
+            // ```scala
+            // trait Eqls extends Any { def canEqual(that: Any): Boolean }
+            // trait Prod extends Any with Eqls
+            // final case class T2[+A, +B](_1: A, _2: B) extends Prod
+            // def f(t: T2[Int, Int]) = t eq null   // value eq is not a member
+            // ```
+            //
+            // `rough_parents` supplies `AnyRef` only when the parent list is
+            // *empty*, so the chain here ends at `Any`. That is the whole
+            // `Tuple`/`Product`/`Iterator` family of `src/library`, where
+            // `scala.Equals` is `trait Equals extends scala.Any`.
+            //
+            // The compiler already agrees the receiver is an `AnyRef` -- the
+            // same program's `def g(t: T2[Int, Int]): AnyRef = t` is accepted
+            // -- so this only makes member lookup say what conformance
+            // already says. Asked last, after the declared members and after
+            // any view, so it can only turn a rejection into the answer nsc
+            // gives; it never displaces a member that was found.
+            found = self.st.lookup_member(self.st.anyref_sym, &name);
+        }
         if found.is_empty() {
             // `Any`'s members belong to every type, including the ones with no
             // class symbol to walk: `(f: Int => String).asInstanceOf[…]`.

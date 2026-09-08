@@ -77,7 +77,12 @@ fn drop_non_separating_newlines(tokens: Vec<Token>) -> Vec<Token> {
         let keep = before.is_some_and(|t| can_end_statement(&t.kind))
             && after.is_some_and(|t| can_begin_statement(&t.kind));
         if keep {
-            out.push(tokens[i].clone());
+            // The run collapses to one token, so the `NEWLINES` marker has to
+            // come with it: the flag sits on the *second* break of a blank
+            // line, and only the first is kept.
+            let mut t = tokens[i].clone();
+            t.blank_line = tokens[i..j].iter().any(|t| t.blank_line);
+            out.push(t);
         }
         i = j;
     }
@@ -216,11 +221,30 @@ impl<'a> Lexer<'a> {
     }
 
     fn emit(&mut self, kind: TokenKind, lo: u32, hi: u32) {
+        let blank_line = matches!(kind, TokenKind::Newline) && self.ends_blank_line(lo);
         self.tokens.push(Token {
             kind,
             span: Span::new(lo, hi),
             nl_before: false,
+            blank_line,
         });
+    }
+
+    /// nsc `Scanners.pastBlankLine`: the line this `\n` terminates held
+    /// nothing but whitespace, so the break is a `NEWLINES` and not a
+    /// `NEWLINE`. A comment counts as content, exactly as it does there --
+    /// nsc scans the raw characters, and `/` is not whitespace.
+    fn ends_blank_line(&self, at: u32) -> bool {
+        let bytes = self.src.as_bytes();
+        let mut i = at as usize;
+        while i > 0 {
+            match bytes[i - 1] {
+                b' ' | b'\t' | b'\r' | 0x0c => i -= 1,
+                b'\n' => return true,
+                _ => return false,
+            }
+        }
+        false
     }
 
     fn error(&mut self, lo: u32, hi: u32, msg: impl Into<String>) {

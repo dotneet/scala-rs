@@ -197,8 +197,9 @@ impl BinaryIndex {
                 // `Unknown` too: a path that was neither a directory nor an
                 // archive at startup may have become a directory since.
                 PathKind::Dir | PathKind::Unknown => {
-                    let f = self.paths[i].path.join(&rel);
-                    if f.is_file() {
+                    let root = self.paths[i].path.clone();
+                    let f = root.join(&rel);
+                    if f.is_file() && path_case_matches(&root, &rel) {
                         return std::fs::read(&f)
                             .map(Some)
                             .map_err(|e| format!("cannot read {}: {e}", f.display()));
@@ -224,7 +225,9 @@ impl BinaryIndex {
                     }
                 }
                 PathKind::Dir | PathKind::Unknown => {
-                    if self.paths[i].path.join(dir_rel).is_dir() {
+                    if self.paths[i].path.join(dir_rel).is_dir()
+                        && path_case_matches(&self.paths[i].path, dir_rel)
+                    {
                         return true;
                     }
                 }
@@ -232,6 +235,40 @@ impl BinaryIndex {
         }
         false
     }
+}
+
+/// Does `root/rel` exist under *exactly* the spelling `rel` gives it?
+///
+/// A JVM name is case-sensitive; a file system need not be. macOS's default
+/// APFS volume is not, so `<classpath>/scala/Math` answered `is_dir()` for the
+/// real directory `scala/math` and `<classpath>/scala/Runtime` for
+/// `scala/runtime`. `complete_binary_member` takes a directory under a package
+/// as proof that a *package* of that name exists, so compiling the standard
+/// library invented `package scala.Math` and `package scala.Runtime`, entered
+/// them in scope ahead of the implicit `import java.lang._`, and every
+/// `Math.min` / `Runtime.getRuntime` in the sources selected on a package:
+/// "value min is not a member of <notype>", with nothing said about `Math`.
+/// The same hazard reaches class files (`p/foo.class` answering for `p/Foo`),
+/// so both lookups verify the case.
+///
+/// Only ever called once the cheap `is_dir()` / `is_file()` has said yes, and
+/// `find_class` memoises its answer, so the directory reads are bounded by the
+/// number of distinct names actually found on a directory classpath entry.
+fn path_case_matches(root: &Path, rel: &str) -> bool {
+    let mut at = root.to_path_buf();
+    for comp in rel.split('/') {
+        if comp.is_empty() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            return false;
+        };
+        if !entries.flatten().any(|e| e.file_name() == comp) {
+            return false;
+        }
+        at.push(comp);
+    }
+    true
 }
 
 /// Parse `e`'s archive if it has not been parsed yet, and hand `e` back.

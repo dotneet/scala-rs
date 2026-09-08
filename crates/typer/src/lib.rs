@@ -39,6 +39,7 @@ mod pickle_supply;
 mod predef_reimport;
 mod prelude;
 mod prelude_arrconv;
+mod prelude_boolbit;
 mod prelude_boxed;
 mod prelude_bsops;
 mod prelude_buildfrom;

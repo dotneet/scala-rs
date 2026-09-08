@@ -632,6 +632,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     crate::prelude_universal::install(st);
     crate::prelude_bsops::install(st);
     crate::prelude_numconv::install(st);
+    crate::prelude_boolbit::install(st);
     crate::prelude_numhier::install(st, library_abi);
     crate::prelude_variance::install(st);
     crate::prelude_boxed::install(st);

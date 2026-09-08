@@ -1016,6 +1016,11 @@ pub struct SymbolTable {
     /// members live. A source definition in package `scala` has to join them
     /// there: see [`SymbolTable::enter_in_prelude_scope`].
     pub prelude_scope: usize,
+    /// The run's own sources define `scala.Predef`, and
+    /// `predef_reimport::reimport_source_predef` has imported it over the
+    /// prelude's snapshot. Set once, between the signature pass and the body
+    /// pass; false for every ordinary program.
+    pub predef_superseded: bool,
     /// User-written `unapplySeq`s whose `Option` payload is *not* a `List`.
     ///
     /// The backend reads a sequence pattern's elements off the payload, and
@@ -1214,6 +1219,7 @@ impl SymbolTable {
             prelude_end: 0,
             prelude_shadowed: rustc_hash::FxHashSet::default(),
             prelude_scope: 0,
+            predef_superseded: false,
             seq_extractor_payload: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,

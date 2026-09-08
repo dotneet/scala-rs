@@ -93,6 +93,11 @@ pub(crate) fn reimport_source_predef(st: &mut SymbolTable) {
     for (name, m) in entered {
         enter_replacing_prelude(st, &name, m);
     }
+    // The prelude's `Predef` is now a stand-in whose original has arrived.
+    // `enter_replacing_prelude` above has displaced every member the two
+    // spell the same way; `Check::drop_superseded_prelude_conversions` uses
+    // this flag for the ones they do not.
+    st.predef_superseded = true;
     // Record the import itself, not only what it brought in. A member reached
     // this way is usually *inherited* by `Predef` -- `intWrapper` is declared
     // on `LowPriorityImplicits` -- and its owner is therefore a plain class.
