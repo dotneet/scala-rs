@@ -432,6 +432,21 @@ constructor を持つクラスの pickle されたフラグのみ。バイトコ
 分割コンパイル越し（`neg/t6601`）はまだ通ります——コンストラクタの privacy が
 クラスファイルの往復で失われるためで、`pickle_supply.rs` 側の別スライスです。
 
+**`Unit` を返す `Predef` の多相組み込みが、要る値を捨てなくなりました。**
+`gen_predef_poly` は結果型が `Unit` のとき自分の結果を必ず `pop` していました。
+`identity` / `locally` / `implicitly` は `(Object)Object` に消去されるので、
+`Unit` でも参照（`BoxedUnit.UNIT`）を返します。捨ててよいのは**文の位置**だけで、
+値が**引数**のときは呼び手のスタックが空になり、`println(identity(()))` は
+`VerifyError: Operand stack underflow` でした。nsc と同じく値を残し、`gen_stat`
+の文位置の破棄（`discarded_predef_poly`）が落とすようにしました。私有ランタイム
+側は同じ食い違いの**裏返し**（消去が引数を box するのに誰も pop せず、
+`if (b) identity(()) else side()` が `Inconsistent stackmap frames`）で、同じ述語
+で閉じています。fixture `tests/fixtures/unitpop_intrinsic.scala` は両方の位置を
+1 つのプログラムに持ち、`-Xverify:all` の下で**実行**して両モードとも実 scalac
+2.13.16 の出力と一致します。**コンパイルは通り、実行しなければ分からない**種類の
+誤りなので、テストは必ず走らせて出力を比較します。slick の 1490 クラスファイルは
+修正前後で**バイト単位で不変**です。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -642,6 +657,17 @@ scalac の行と文で、正常系（`tests/fixtures/intrinsicqual_ctor.scala`�
 コンパニオン、`extends` 越しの `protected`、`private[p]`、アクセス可能な別の
 オーバーロードを持つクラス）は**実行**して固定します。拒否規則なので、正常系が
 **修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。
+
+`unitpop` テストは、`Unit` を返す `Predef` の多相組み込みが**値の位置では値を
+残し、文の位置では落とす**ことを固定します。片方だけ直すと必ずもう片方が壊れる
+（残しすぎればスタックに残骸が出て `Inconsistent stackmap frames`、捨てすぎれば
+`Operand stack underflow`）ので、`tests/fixtures/unitpop_intrinsic.scala` は
+両方の位置と、非 `Unit` の同じ 3 つを 1 本のプログラムに入れています。文の位置は
+どれも直後に分岐を置いてあります——残骸は次の stackmap frame まで生き延びて
+初めて見つかるからです。**コンパイルも通り `javap` も通る**種類の誤りなので、
+検査は `java -Xverify:all` での**実行**と実 scalac 2.13.16 との出力比較だけです。
+両モードで回し、修正前のバイナリでは jar モードが `Operand stack underflow`、
+私有ランタイムが `Inconsistent stackmap frames` で落ちることを確認しています。
 
 線形化（SLS 5.1.2）は `linearization` テストで二重に検査します。正常系は深く広い
 ダイヤモンド継承の `super` 連鎖を実行し、同じソースを実 scalac 2.13.16 で
