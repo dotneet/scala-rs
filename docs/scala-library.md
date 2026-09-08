@@ -2059,10 +2059,19 @@ already right.
 ## The `agent/siblingover` slice: the receiver's linearization, and only it
 
 **912 errors in 145 files -> 894 in 145**, measured against `main` at
-`fd65f6f7`. cats **182 -> 182**, gitbucket **270 -> 270**, slick `errors=0
+`fd65f6f7` and again on the tree merged with `main` at `2182094e`
+(`agent/unitpop`, `agent/secondaryctor`), where that `main` is still 912/145
+and the merge is still 894/145 -- the same **-18**, so the waves do not
+overlap. cats **182 -> 182**, gitbucket **270 -> 270**, slick `errors=0
 files_with_errors=0 classes=1490` with all 1490 class files byte-identical
-(`SLICK_OUT` on both binaries, `diff -r` empty). Eighteen lines removed and
-**none added anywhere**.
+(`SLICK_OUT` on both binaries, `diff -r` empty, on both trees). Eighteen lines
+removed and **none added anywhere**.
+
+The scala/scala corpus is unchanged: `pos 1095 / neg 681 / run 627`,
+`CORPUS_SIZE=full`, and `compare_corpus.py` against that same `main`'s own
+full run reports `changes: [] losses: 0`. The merge gate reports nine
+`fail -> pass` changes because its ledger is `corpus-3fd80269.tsv`, three
+merges back; every one of the nine is already there at `2182094e`.
 
 The brief was the section above. It was right about the root and about which
 sites it explains; it was wrong about one family, and the split is below.
