@@ -1374,19 +1374,20 @@ The four corpus tests, run alone before and after on the same tree
 | `neg/t8002-nested-scope` | fail (accepted) | **pass** | T0 (wording, above) |
 | `neg/name-lookup-stable` | fail (accepted) | fail (accepted) | — |
 
-`tests/verify_merge.sh` at `961afe45`, every number against the coordinator's
-`acec3f09` baseline:
+`tests/verify_merge.sh`, run twice: once on this slice alone (`961afe45`) and
+again after `git merge main` brought `agent/neglit` in (`adc144c4`). Every
+number against the coordinator's `acec3f09` baseline:
 
-| | baseline | this slice |
-|---|---|---|
-| `src/library` | 971 / 147 | **971 / 147** |
-| gitbucket | 270 / 79 | **270 / 79** |
-| cats | 185 / 71 | **185 / 71** |
-| slick | `errors=0 files_with_errors=0 classes=1490` | **identical** |
-| `slick_run.sh` (MODE=b) | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | **identical** |
-| slick subset + verify | — | `verified=1490 failed=0 lint_problems=0` |
-| `cargo test --workspace --release` | — | 255 rows, **2457 passed, 0 failed** |
-| corpus full | — | `pos 1095/1859`, `neg 673/1405`, `run 623/2060` |
+| | baseline | `961afe45` | after merging main |
+|---|---|---|---|
+| `src/library` | 971 / 147 | **971 / 147** | 970 / 147 (neglit's gain) |
+| gitbucket | 270 / 79 | **270 / 79** | **270 / 79** |
+| cats | 185 / 71 | **185 / 71** | **185 / 71** |
+| slick | `errors=0 classes=1490` | **identical** | **identical** |
+| `slick_run.sh` (MODE=b) | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | **identical** | **identical** |
+| slick subset + verify | — | `verified=1490 failed=0 lint_problems=0` | same |
+| `cargo test --workspace --release` | — | 255 rows, **2457 passed, 0 failed** | 256 rows, **2469 passed, 0 failed** |
+| corpus full | — | `pos 1095`, `neg 673`, `run 623` | identical |
 
 **Three rejection rules and not one number moved.** That is the result worth
 recording: the direction these rules push is the one that turns working
@@ -1394,12 +1395,14 @@ programs into errors, and 1414 files of real Scala across four projects say
 they do not.
 
 The gate's verdict is nonetheless `VERDICT=FAIL`, `corpus losses=1` against
-`tests/baselines/corpus-4d613d25.tsv`, and the loss is
+`tests/baselines/corpus-4d613d25.tsv`, on both runs. The loss is
 `neg/name-lookup-stable` — the fourth test, which was *already* failing at
-`acec3f09` (the ledger predates `agent/libnotype`, so the ledger still records
-it as a pass earned by a bogus diagnostic). The other eleven changes against
-that ledger are all gains and all `agent/libnotype`'s. Nothing in this slice
-regressed anything.
+`acec3f09` (the ledger predates `agent/libnotype`, so it still records that
+test as a pass earned by a bogus `no matching overload for Nothing`). The
+other eleven changes against that ledger are all gains and all
+`agent/libnotype`'s. Nothing in this slice regressed anything: the loss count
+went from 4 to 1 and the gate will read `PASS` again once the ledger is
+refreshed or the fourth rule lands.
 
 
 
