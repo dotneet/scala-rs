@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `70f349ea` |
+| commit | `5108669a` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Forty-eight slices have merged this session**, in twelve composed gates. From
+**Fifty-seven slices have merged this session**, in fourteen composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -241,8 +241,8 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **182** | **71** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **270** | **79** | — |
-| `tests/scalalib_measure.sh` (538) | **852** | **145** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **271** | **80** | — |
+| `tests/scalalib_measure.sh` (538) | **740** | **138** | — |
 
 ## Execution
 
@@ -258,12 +258,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1099** | 415 | 345 |
-| `neg` (1405) | **681** | 355 | 369 |
-| `run` (2060) | **627** | 880 | 553 |
+| `pos` (1859) | **1101** | 413 | 345 |
+| `neg` (1405) | **683** | 353 | 369 |
+| `run` (2060) | **628** | 879 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-70f349ea.tsv`](baselines/corpus-70f349ea.tsv): 5324 unique
+[`baselines/corpus-5108669a.tsv`](baselines/corpus-5108669a.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -298,7 +298,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-70f349ea.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-5108669a.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -325,7 +325,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **265 result rows, 2530 passed, 0 failed** at `70f349ea` |
+| `cargo test --workspace --release --no-fail-fast` | **269 result rows, 2559 passed, 0 failed** at `5108669a` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -489,6 +489,51 @@ drift.
 `agent/siblingover`'s rule deleted a genuine overload — `same_signature` lets
 an abstract `T` match `Int` — and its own words are the lesson: *the library
 measure did not catch this; a fixture did.*
+
+## Gates thirteen and fourteen: the gate's own two defects
+
+Both were found by slices, not by the coordinator, and both are the same
+failure this script exists to prevent — **a check reporting green over
+nothing**.
+
+1. **The corpus ledger was chosen by `ls -t`.** In a git worktree every
+   baseline carries the checkout time, so `agent/anyconstr`'s gate compared
+   against a 106 KB ledger from eleven gates ago and still printed
+   `VERDICT=PASS`. The ledger now comes from the name recorded in this file,
+   an unresolvable one is a `FAIL`, and the `gate:` line prints which was used.
+2. **Only slick had its measure checked.** `agent/ctorgaps` and
+   `agent/triemapjava` reported, independently, a gate that printed
+   `VERDICT=PASS` while cats said `measurement invalid: no source files` and
+   gitbucket said `files=25` of 353 — both because their **shared checkouts had
+   been gutted**, `.git` reduced to an empty skeleton by something racing in
+   the scratchpad. Worse, the skeleton directory made each script's own
+   re-clone guard (`[[ ! -d $SRCROOT/.git ]]`) never fire, so every later run
+   would have gone on reporting `files=25` in silence. All four measures now
+   have their `files=` count pinned and `measurement invalid` is a `FAIL`,
+   exercised on all three shapes of breakage before landing. The checkouts
+   were repaired — gitbucket in place by `agent/triemapjava`, cats by deleting
+   the skeleton so its script re-cloned.
+
+The library went **852 -> 740** across these two gates. The largest single
+contribution is `agent/triemapjava`, which took the worst file in the measure
+(`TrieMap.scala`, 46 errors) to 10 — and whose root turned out not to be
+Java-specific at all: `type_args_are_instantiated` refused any type argument
+that *is* one of the instantiated class's own type parameters, which is
+exactly what `new C[K, V]` writes from inside `C` and is indistinguishable,
+*from the type alone*, from an un-applied `new C`'s placeholders. It also
+found that reading a Java instance field emitted an illegal method name —
+`ClassFormatError` on any class reading any Java instance field, invisible to
+every compile-time measure — and that field `Signature` attributes were read
+and discarded, so a raw type conformed to every instantiation.
+
+**gitbucket went 270 -> 271, and that is stated rather than netted.**
+`agent/triemapjava` diffed against the saved log: exactly one new site,
+`EditorConfigUtil.scala:129`, nothing fixed. Reading the `Signature` correctly
+makes `PropertyType.tab_width` a `PropertyType[Integer]`, which pins
+`T := Integer` against a Scala `Int` argument — and overload *scoring* does
+not consider the boxing that adaptation would apply. Either candidate alone
+compiles, so the gap is pre-existing and separate; the pre-fix binary accepted
+the call only because it did not know what `tab_width` was.
 
 ## What is deliberately red
 
