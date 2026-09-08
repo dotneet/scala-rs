@@ -4701,6 +4701,23 @@ impl SymbolTable {
                     false
                 }
             }
+            // Annotations are erased for conformance: `Node` is a
+            // `Node @uncheckedVariance`. nsc strips both sides in `firstTry`,
+            // before any of the `TypeRef` cases, and this has to do the same:
+            // the `Applied` arms below match on *one* side and every `other`,
+            // so with these two arms sitting after them `CC[CC[A]]` and
+            // `CC[CC[A] @uncheckedVariance]` never reached the rule that says
+            // the annotation is a spelling. `agent/basetypemeet` established
+            // that reading for base type arguments; conformance is the other
+            // half of it, and `Factory.scala`'s `fill`/`tabulate` ladder wants
+            // it in both directions.
+            //
+            // Above the `Applied` arms but *below* the ones that name
+            // `Annotated` in a pattern list -- `Null <: T @ann` and
+            // `T @ann <: AnyRef` are answered there for every `T`, including
+            // the value classes stripping would then reject.
+            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
+            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             // A wildcard stands for *some* type, so anything is under it --
             // including the application of an abstract type constructor.
             // `Query[B, BU, C]` inherits `Rep[C[BU]]`, and slick's
@@ -4755,7 +4772,18 @@ impl SymbolTable {
                     if expanded != folded {
                         return self.is_sub_type(&expanded, other);
                     }
-                    if let Type::TypeMember(id) = ctor.as_ref() {
+                    // An applied abstract constructor is at least its own
+                    // bound, applied to the same arguments. A higher-kinded
+                    // type *parameter* is that too, not only a type member:
+                    // `BuildFrom` declares `CC[X, Y] <: MapOps[X, Y, CC, _]`,
+                    // so `CC[K0, V0]` *is* a `MapOps[K0, V0, CC, _]` and
+                    // `(from: MapOps[K0, V0, CC, _])` is the ascription of a
+                    // value to its own declared bound. nsc has no such split:
+                    // `isHKSubType` falls through to `isSubType2`'s
+                    // `AbstractTypeRef` case, which reads `sym.info.bounds.hi`
+                    // for a `PolyType`-shaped abstract symbol whatever kind of
+                    // symbol it is.
+                    if let Type::TypeMember(id) | Type::TypeParam(id) = ctor.as_ref() {
                         if let Some(hi) = self.get(*id).bound_hi.clone() {
                             // The bound is written in the member's *own*
                             // parameters: `type CT[T] <: TT[T]` applied to `U`
@@ -4769,8 +4797,15 @@ impl SymbolTable {
                                 Type::Applied { args, .. } => args.clone(),
                                 _ => Vec::new(),
                             };
-                            let hi = self.subst_tparams(*id, &args, &hi);
-                            return self.is_sub_type(&hi, other);
+                            // `CC[X, Y] <: MapOps[X, Y, CC, _]` mentions `CC`
+                            // again, so reading the bound has to be guarded the
+                            // way every other bound arm in this function is --
+                            // an F-bounded constructor would otherwise expand
+                            // its own bound forever.
+                            if let Some(_g) = enter_bound(*id) {
+                                let hi = self.subst_tparams(*id, &args, &hi);
+                                return self.is_sub_type(&hi, other);
+                            }
                         }
                     }
                     false
@@ -4844,13 +4879,6 @@ impl SymbolTable {
                     && !matches!(t, Type::SingleType { sym: s2, .. } if s2 == sym)
                     && self.is_sub_type(a, t)
             }
-            // Annotations are erased for conformance: `Node` is a
-            // `Node @uncheckedVariance`. Like the wildcards below, this has to
-            // come before the Class-parent walk, which matches every `Class`
-            // on the left whatever `b` is and would answer "no" by running out
-            // of parents.
-            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
-            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             // Wildcards before the Class-parent walk: that arm matches every Class
             // and would otherwise treat `Byte <: List[_ <: Byte]` as "walk Byte's
             // parents" instead of the bound.
