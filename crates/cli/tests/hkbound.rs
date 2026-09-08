@@ -19,10 +19,20 @@
 //! merging base type arguments; this is the conformance half of the same fact.
 //!
 //! Correctness, not compilation: `hkbound_appliedbound.scala` prints six lines
-//! whose values a wrong conformance answer changes -- `choose` selects between
-//! two overloads and answered `pick:any` before the fix, where scalac 2.13.16
-//! answers `pick:ops`. [`scalac_agrees_hkbound_runs`] compiles the same source
-//! with real scalac and compares the two programs' output.
+//! whose values a wrong conformance answer changes. `choose` picks between two
+//! overloads, and the applicable one is applicable *only* through the bound, so
+//! a rule that answered the conformance question loosely would rewrite that
+//! line rather than reject it. [`scalac_agrees_hkbound_runs`] compiles the same
+//! source with real scalac and compares the two programs' output, so the
+//! expected values are the oracle's and not a transcription of ours.
+//!
+//! On the pre-fix binary the first three groups do not compile
+//! (`type mismatch; found: CC[K0, V0]  required: MapOps[K0, V0, CC, _]` and two
+//! `no matching overload`) and two of the last three do not either
+//! (`found: CC[CC[A]]  required: CC[CC[A] @uncheckedVariance]`). The negative
+//! fixture is rejected identically on both binaries, at the same four lines --
+//! it is what stops the new arms from over-reaching, not evidence that they
+//! exist.
 //!
 //! Kept out of `crates/cli/tests/e2e.rs` to avoid merge conflicts; see
 //! `.agent-brief.md`. Both fixtures use the `hkbound` prefix and are checked in

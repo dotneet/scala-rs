@@ -2590,6 +2590,143 @@ required: A` (8), and `found: Array[AnyRef] required: Array[Any]` /
 **variance**, not construction: `Array` is invariant and the receiver these
 appear on is `ArrayOps`, so they are a separate question from this slice's.
 
+## The `agent/hkbound` slice: an applied abstract constructor is at least its bound
+
+**852 errors in 145 files -> 807 in 142.** The brief handed this slice one
+cluster -- `CC` was the largest `type mismatch` found-type at 36 -- and asked
+whether the two families inside it are one root. **They are two**, and the
+measurement says so: the first fix takes 852 to **834** and leaves the second
+family untouched at its full size; the second takes 834 to **807**.
+
+cats **182 -> 182**, gitbucket **270 -> 270**, slick `errors=0
+files_with_errors=0 classes=1490` with all 1490 class files **byte-identical**
+(`SLICK_OUT` on both saved binaries, `diff -r` empty). Both A/Bs compare two
+saved binaries (`SCALA_RS=<binary>`), never a revert in the working tree.
+
+### One: the bound of an applied type *parameter* was never read
+
+`BuildFrom.scala` declares
+
+```scala
+implicit def buildFromMapOps[CC[X, Y] <: Map[X, Y] with MapOps[X, Y, CC, _], K0, V0, K, V] = ...
+  def newBuilder(from: CC[K0, V0]) = (from: MapOps[K0, V0, CC, _]).mapFactory.newBuilder[K, V]
+```
+
+-- an ascription of a value to **exactly its own parameter's bound**, which
+therefore holds by the bound and by nothing else. `SortedMapOps` writes the
+same shape twice more.
+
+`SymbolTable::is_sub_type`'s `(Applied, other)` arm reduced an applied abstract
+type *member* to `bound_hi`, substituted at the application's own arguments --
+the rule `type CT[T] <: TT[T]` applied to `U` is bounded by `TT[U]`, which an
+earlier slice added for slick. It did not reduce an applied higher-kinded type
+*parameter* at all, so `CC[K0, V0]` conformed to nothing and fell out of the
+arm as `false`.
+
+nsc has no such split. `isHKSubType` falls through to `isSubType2`, whose
+abstract-type case reads `sym.info.bounds.hi` for any abstract symbol whatever
+kind of symbol it is; a higher-kinded parameter's bounds live inside its
+`PolyType` and come out applied. One pattern -- `TypeMember(id) |
+TypeParam(id)` -- is the whole change, plus an `enter_bound` guard the member
+arm did not have and now shares: `CC[X, Y] <: MapOps[X, Y, CC, _]` mentions
+`CC` again, and every other bound arm in the function is guarded for exactly
+that reason.
+
+**-18 errors.** `CC` as a `type mismatch` found-type went 36 -> 26; the
+remaining 26 were all the second family.
+
+### Two: `@uncheckedVariance` was reachable everywhere except here
+
+`Factory.scala`'s `fill`/`tabulate` ladder is five levels of
+
+```scala
+def fill[A](n1: Int, n2: Int)(elem: => A): CC[CC[A] @uncheckedVariance] = fill(n1)(fill(n2)(elem))
+```
+
+and it reported `found: CC[CC[A]] required: CC[CC[A] @uncheckedVariance]`, the
+reverse, and versions with the annotation at a *different depth* on each side.
+
+`agent/basetypemeet` established that **`@uncheckedVariance` is a spelling, not
+a variant**, and folds annotation-only differences when merging base type
+arguments. Conformance already had the rule too -- `(a, Annotated) =>
+is_sub_type(a, tpe)` and its mirror -- but the two arms sat **below** the
+`Applied` arms. Those match on *one* side and every `other`, so
+`CC[A] <: CC[A] @uncheckedVariance` hit `(Applied, other)` and
+`CC[A] @uncheckedVariance <: CC[A]` hit `(other, Applied)`, and neither ever
+reached the rule. It was a question of arm order, not a design question: nsc
+strips both sides in `firstTry`, ahead of every `TypeRef` case.
+
+The arms moved **above** the `Applied` arms and **below** the ones that name
+`Annotated` in a pattern list. That second half is load-bearing in the other
+direction: `Null <: T @ann` and `T @ann <: AnyRef` are answered by those lists
+for every `T`, value classes included, and stripping first would turn
+`Null <: Int @ann` from true into false. Moving the arms to the very top of the
+function -- which is the obvious reading of "nsc strips both sides first" --
+would have made that change silently.
+
+**-27 errors**, and `CC` as a found-type is down to 2.
+
+### It costs nothing measurable
+
+Min of five interleaved `src/library` runs, user CPU: **1.78 s before, 1.78 s
+after**, spread 1.78-1.83 on either side, on a machine with four other slices
+measuring. `agent/basetypemeet` cost about 10% for its rule because
+`base_type_args` runs on every `subst_as_seen_from`; this one does not, for two
+reasons. The bound read only fires where the arm previously returned `false`,
+so it is on the *rejection* path and not the acceptance path, and it terminates
+in one substitution. The annotation move adds two discriminant compares ahead
+of the `Applied` arms and removes them from further down.
+
+### The silent wrong answer next door, which this does *not* fix
+
+`tests/fixtures/hkbound_appliedbound.scala` writes its type arguments out. With
+them inferred, this still happens, on both binaries:
+
+```scala
+def pick[K0, V0, CC[X, Y] <: MapOps[X, Y, CC, _]](x: MapOps[K0, V0, CC, _]): String = "pick:ops"
+def pick(x: Any): String = "pick:any"
+def choose[K0, V0, CC[X, Y] <: MapOps[X, Y, CC, _]](from: CC[K0, V0]): String = pick(from)
+```
+
+`choose` compiles and runs **`pick:any`**; scalac 2.13.16 runs `pick:ops`. It
+is unchanged by this slice -- measured before and after -- and it is a
+different mechanism: solving `?CC` from an actual `CC[K0, V0]` against a formal
+`MapOps[?K0, ?V0, ?CC, _]` means reading the *base type arguments* of a type
+parameter at its bound, which `base_type_args` does not do. Conformance now
+answers the question when the arguments are given; inference still cannot ask
+it. Whoever takes that next should expect it to be the same size as the
+`readTag`-shaped lines in the log rather than the `CC` cluster, which is gone.
+
+### The fixtures
+
+`hkbound_appliedbound.scala` prints six lines and every one is checked by its
+value, in both modes; `expected/hkbound_appliedbound.txt` is real scalac
+2.13.16's own run of the same source, and `scalac_agrees_hkbound_runs` compiles
+and runs both compilers' output and compares them. On the pre-fix binary five
+of the six do not compile.
+
+`hkbound_appliedbound_bad.scala` is the restriction, and all four lines were
+rejected before the fix as well -- it is what stops the new arms over-reaching,
+not evidence that they exist. The bound is `MapOps` and a `Sink` is not it; two
+F-bounded parameters with the same bound *shape* are still two different
+constructors (`CC[Int, String]` is not a `DD[Int, String]`); the reduction is
+one-way (a `MapOps[K0, V0, CC, _]` is not a `CC[K0, V0]`); and erasing an
+annotation does not erase the type under it (`Box[A] @uncheckedVariance` is not
+a `Box[String]`). Real scalac rejects all four, at the same lines 24, 31, 37
+and 41.
+
+### The head after this slice (807)
+
+`type mismatch` 334, `no matching overload` 178, `X is not a member of Y` 143,
+`incompatible type in overriding` 9, `illegal inheritance` 6, `ambiguous
+overload` 5. The `is not a member of` receivers are `T2` (17), `String` (10),
+`T1` (9), `Int` (6) -- the prelude collision named at the top of this file,
+unmoved, and `Array` has dropped out of the head of that list. The largest
+`type mismatch` found-types are now `T` (41), `Array` (22), `null` (17) and `A`
+(10); the largest single shape is `found: T required: A` (13), the
+`Iterator.empty.next()` item already on the list. `found: CC[...]` is **2**
+lines, down from 36.
+
 ## Running it
 
 ```

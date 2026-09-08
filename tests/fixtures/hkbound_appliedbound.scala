@@ -49,8 +49,15 @@ object Build {
     m.opsTag
 
   // Overload selection, which a conformance rule that reads a bound too
-  // eagerly silently changes. Before the fix `choose` compiled and answered
-  // "pick:any"; scalac 2.13.16 answers "pick:ops".
+  // eagerly silently changes. The applicable alternative is the one that is
+  // only applicable *through the bound*, so this line is what a wrong
+  // conformance answer would rewrite rather than reject: scalac 2.13.16 runs
+  // `pick:ops`, and so must we.
+  //
+  // The type arguments are written out here for the same reason as `tagOf`
+  // above. With them inferred, `pick(from)` still selects the `Any`
+  // alternative -- a silent wrong answer that this slice does *not* fix and
+  // did not introduce, recorded in `docs/scala-library.md`.
   def pick[K0, V0, CC[X, Y] <: MapOps[X, Y, CC, _]](x: MapOps[K0, V0, CC, _]): String =
     "pick:ops"
   def pick(x: Any): String = "pick:any"
