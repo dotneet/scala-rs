@@ -1732,7 +1732,9 @@ impl PickleSupply {
         // which is where the class file's description is all there is.
         let case_synthetic_ok = !(internal.starts_with("scala/") && class_sym.0 < st.prelude_end);
         let mut installed: Vec<SymbolId> = Vec::new();
-        let mut seen_shapes: HashSet<String> = HashSet::new();
+        let mut seen_shapes: HashMap<String, (SymbolId, String, usize)> = HashMap::new();
+        // Members a later, more derived declaration displaced.
+        let mut superseded: Vec<SymbolId> = Vec::new();
         // The arities of the overloads taking a function parameter already in.
         let mut took_function: Vec<usize> = Vec::new();
         for hit in &hits {
@@ -1820,6 +1822,7 @@ impl PickleSupply {
                 &class_scope,
                 &mut seen_shapes,
                 &mut took_function,
+                &mut superseded,
             ) {
                 // A `val`'s accessor is stable; `ident_is_stable` /
                 // `member_is_stable` read this flag to accept it as a path
@@ -1840,6 +1843,12 @@ impl PickleSupply {
             }
         }
         self.self_ty = saved_self;
+        // A member a derived declaration displaced is detached from the class;
+        // handing it back would put it straight into overload resolution as an
+        // alternative nothing can reach.
+        if !superseded.is_empty() {
+            installed.retain(|m| !superseded.contains(m));
+        }
         if !installed.is_empty() && !stale.is_empty() {
             drop_stale_members(st, class_sym, &stale, &installed);
             trace(format_args!(
@@ -2487,6 +2496,25 @@ impl PickleSupply {
         ok.then_some(want)
     }
 
+    /// Whether `anc` is a strict ancestor of `cls`, asked of the *pickle*.
+    ///
+    /// The symbol table cannot answer it: `scala.collection.MapOps` has no
+    /// class symbol at all in a program that never names it, so
+    /// `find_class_by_jvm` returns nothing and every pair reads as unrelated.
+    /// The pickle always has it, because that is where the member was just
+    /// read from.
+    fn declares_above(&mut self, bin: &mut BinaryIndex, anc: &str, cls: &str) -> bool {
+        if anc == cls {
+            return false;
+        }
+        let mut src = BinSource(bin);
+        let mut errs = Vec::new();
+        self.sigs
+            .linearization(&mut src, cls, false, &mut errs)
+            .iter()
+            .any(|s| s.class_name == anc)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn install(
         &mut self,
@@ -2501,8 +2529,12 @@ impl PickleSupply {
         pickle_owner: &str,
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
-        seen_shapes: &mut HashSet<String>,
+        seen_shapes: &mut HashMap<String, (SymbolId, String, usize)>,
         took_function: &mut Vec<usize>,
+        // Members detached again because a later declaration with the same
+        // explicit parameters and an extra implicit clause took their
+        // place; the caller must not hand them back either.
+        superseded: &mut Vec<SymbolId>,
     ) -> Option<SymbolId> {
         // Allocated ownerless, so a failure leaves nothing behind:
         // `SymbolTable::alloc` pushes into the owner's member list.
@@ -2756,12 +2788,47 @@ impl PickleSupply {
         // monomorphic one is strictly more specific and wins wherever it
         // applies.
         let key = format!("{key_want:?}/{}", shape.tparams.is_empty());
-        if seen_shapes.contains(&key) {
-            trace(format_args!(
-                "{internal}#{name}: skipping an overload shadowed by a more \
-                 derived declaration with the same parameters"
-            ));
-            return None;
+        // ...with one exception, which is the whole of the sorted collections.
+        //
+        // `SortedMapOps` declares `map[K2, V2](f)(implicit ordering:
+        // Ordering[K2]): CC[K2, V2]` next to the `MapOps.map[K2, V2](f):
+        // CC[K2, V2]` it inherits. The two have the *same explicit
+        // parameters*, so they share a key here; nsc's `isAsSpecific` looks
+        // through an implicit clause, so specificity does not separate them
+        // either, and the only thing that does is which class declares them.
+        // Whichever the walk offers first is the one kept, and it offered
+        // `MapOps` first -- so `aSortedMap.map(f)` was `MapOps.map`, compiled,
+        // and returned an unordered `Map` with no diagnostic anywhere.
+        //
+        // A declaration that *adds a clause* to one it inherits is the derived
+        // one, and it is the one that can produce the receiver's own
+        // collection: the extra clause is the `Ordering` witness that makes
+        // the result sorted. So it supersedes, and only in that shape. Two
+        // declarations with the *same* number of parameters are left exactly
+        // as they were -- `MapOps.map[K2, V2](f)` against
+        // `IterableOps.map[B](f)` is a pair nsc keeps and picks between by
+        // expected type, and preferring the derived one there rejects
+        // `aMap.map { case (_, v) => v }`, which nsc accepts.
+        let mut supersedes: Option<SymbolId> = None;
+        if let Some((kept, kept_owner, kept_arity)) =
+            seen_shapes.get(&key).map(|(k, o, a)| (*k, o.clone(), *a))
+        {
+            if arity > kept_arity
+                && shape.clauses.iter().any(|c| c.implicit)
+                && self.declares_above(bin, &kept_owner, pickle_owner)
+            {
+                trace(format_args!(
+                    "{internal}#{name}: {pickle_owner} adds an implicit clause to \
+                     {kept_owner}'s declaration, so it supersedes it"
+                ));
+                supersedes = Some(kept);
+            } else {
+                trace(format_args!(
+                    "{internal}#{name}: skipping an overload shadowed by a more \
+                     derived declaration with the same parameters"
+                ));
+                return None;
+            }
         }
         // Resolved before the shape is claimed: an alternative that has no
         // descriptor is not supplied, so it must not shadow the next one
@@ -2802,7 +2869,7 @@ impl PickleSupply {
             ));
             return None;
         };
-        seen_shapes.insert(key);
+        seen_shapes.insert(key, (m, pickle_owner.to_string(), arity));
         // The member is installed on the class it was asked for, because that
         // is where the typer looks it up. The *call* is a different question:
         // a declaration off the bytecode path is not reachable from the
@@ -2868,6 +2935,14 @@ impl PickleSupply {
         if shape.implicit {
             let f = st.get(m).flags.with(Flags::IMPLICIT);
             st.get_mut(m).flags = f;
+        }
+        // Done only now that the derived declaration is known to install: an
+        // alternative with no usable descriptor must not take the place of the
+        // one already in.
+        if let Some(old) = supersedes {
+            st.get_mut(class_sym).members.retain(|&x| x != old);
+            seen_shapes.retain(|_, (k, _, _)| *k != old);
+            superseded.push(old);
         }
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);

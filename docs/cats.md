@@ -2836,3 +2836,150 @@ mechanisms, re-clustered:
 The `(A, A) => A` against `Function2[Any, A, Any]` family the brief listed at
 4 lines is **gone**: it was this slice's root, and it was 15 lines rather than
 4 because two of its three messages had been counted as other things.
+
+## `SortedMap`'s implicit-clause overload (agent/sortedmap)
+
+`agent/catstail` left three measured variants and reverted all of them.
+`agent/basetypeseq` then landed and changed the thing variant 1 tripped over,
+so all three were **re-measured on `2fdfe302`** before anything was chosen.
+The numbers had moved:
+
+| on `2fdfe302` | cats | slick | gitbucket | the one-file repro |
+|---|---:|---:|---:|---|
+| baseline | 196 | 0 / 1490 | 337 | 4 errors |
+| 1. SLS order in `lin_of` alone | **198** | **4** | — | 5, and `BitSet`'s `\|` regressed |
+| 2. that order + a most-derived merge of the substitutions | 196 | 0 / 1490 | **339** | **1** (`keySet` only) |
+| 3. `order_by_derivedness` on the hits | 196 | 0 / 1490 | **339** | **1** (`keySet` only) |
+
+Variant 1 is still wrong: `basetypeseq` fixed the base-type merge on the
+*symbol table* side, and `SigCache::lin_of` has a substitution of its own that
+nothing else repairs -- with the order corrected and no merge, `fa.map(f)` came
+back `found: SortedMap[K, B]  required: SortedMap[K, B]`, the two being
+`collection.SortedMap` and `immutable.SortedMap`.
+
+Variants 2 and 3 are indistinguishable on every number measured, and **both
+were built out in full and then abandoned**. Written down because the second
+half of that work is what says why:
+
+* Both are inert on cats until `Check::supply_receiver_override` walks the
+  receiver's *ancestors* (below). With that, both reach **cats 188**.
+* Both then cost `crates/cli/tests/ambigmap.rs::am_pickledup`. The cause is
+  not the order: it is that `install` keeps **one link of an override chain**
+  and which link depends on where the receiver enters it, so
+  `collection.IndexedSeq` reaches `IndexedSeqOps.map` where `immutable.Seq`
+  reaches the `IterableOps.map` it overrides, and on `immutable.IndexedSeq`
+  the two copies no longer collapse. Recording the chain on the symbol
+  (`Symbol::pickled_shadows`, plus a `drop_pickled_shadowed` rule) fixes that
+  and is a sound piece of work -- comparing the origins by *symbol-table*
+  ancestry is not, because `scala.collection.IterableOps` has no class symbol
+  at all in a program that never names it.
+* What killed them is the rest of the fallout, which the numbers hid.
+  Reordering makes the **more derived** declaration win everywhere, and
+  `MapOps.map[K2, V2](f: ((K, V)) => (K2, V2))` is more derived than
+  `IterableOps.map[B](f: A => B)` **without being an override of it** -- it is
+  an overload with a narrower parameter, and nsc keeps both and picks by
+  expected type. `cargo test --workspace` came back `2396 passed, 3 failed`
+  and the corpus `losses=2`: `crates/cli/tests/buildfrom.rs`'s
+  `bf_coll_runs_against_the_jar` **threw at run time**
+  (`java.lang.ClassCastException ... at MapBuilderImpl.addOne`), because
+  `Map("a" -> 1).map { case (_, v) => v }` compiled and then built a `Map` out
+  of `Int`s. The gitbucket +2 was the same root
+  (`IssuesService.scala` 1141/1152/1156).
+* Two repairs for *that* were measured and rejected in turn: preferring the
+  least derived declaration at equal arity (cats 193 -- five new lines of
+  `value applyOrElse is not a member of (E) => F[A]`), and the same rule
+  extended to the `seen_shapes` key (**gitbucket 1150**).
+
+### What landed
+
+No reordering at all. The linearization the pickle walks is untouched, and so
+is every collapse it drives, with exactly one exception:
+
+> A declaration that adds an **implicit clause** to one it inherits supersedes
+> it.
+
+`SortedMapOps.map[K2, V2](f)(implicit ordering: Ordering[K2])` has the same
+*explicit* parameters as the `MapOps.map[K2, V2](f)` it inherits, so the two
+share `install`'s key; nsc's `isAsSpecific` looks through an implicit clause,
+so specificity does not separate them either, and the walk offered `MapOps`
+first. The extra clause is the `Ordering` witness -- it is the whole reason the
+declaration exists and the only way the result can be the receiver's own sorted
+collection -- so where it is present, and the class declaring it derives from
+the class declaring the other (asked of the *pickle*: the symbol table has no
+`scala.collection.MapOps` in a program that never names it), the longer
+declaration replaces the shorter one. Two declarations with the **same** number
+of parameters are left exactly as they were, which is what keeps
+`IterableOps.map[B]` in front of `MapOps.map[K2, V2]` for a plain `Map`.
+
+The superseded member is detached from the class only once the replacement is
+known to install -- an alternative with no usable descriptor must not take the
+place of the one already in -- and is dropped from what
+`supply_member_from_pickle` hands back, or it would reach overload resolution
+as an alternative nothing can call.
+
+### `supply_receiver_override` asks the ancestors
+
+That alone is inert on cats, for the reason `agent/catstail` gave: by the time
+cats reaches `instances/sortedMap.scala` the name is already installed and
+completion never runs. `Check::supply_receiver_override`'s
+`declares_other_signature` gate asked the receiver's *own* class file, and
+`scala/collection/immutable/SortedMap.class` declares no `map`, no `collect`
+and no `keySet` -- they belong to `collection.SortedMapOps`. So the gate
+answered "no" for exactly the family it exists to admit. It now walks the
+receiver's linearization and stops at the first class that already owns a
+candidate: past that point a declaration is not *newer* than the answer in
+hand, it is the answer in hand or something it overrides.
+
+### The cost, measured
+
+cats **196 -> 188** (`instances/sortedMap.scala` 73/78/93/237/242/247 and
+`NonEmptyMapImpl.scala` 114/122; **no new line anywhere**), gitbucket
+**337 -> 337**, the scala library **1420 -> 1420**, slick `errors=0
+files_with_errors=0 classes=1490`. Of slick's 1490 class files **1489 are
+byte-identical** to the pre-fix build (`SLICK_OUT` on both binaries,
+`diff -r`). The one that differs is
+`slick/basic/ConcurrencyControl$ConnectionArbiter`, where `aTreeMap - k` goes
+out as `invokevirtual TreeMap.$minus(Object)MapOps` instead of
+`invokeinterface immutable.MapOps.$minus` -- the ancestors walk completes
+`$minus` on `TreeMap` itself, and `immutable.AbstractMap`, which `TreeMap`
+extends, declares `public final MapOps $minus(Object)`, so the resolution is a
+class method where it was an interface default. Everything else in that file is
+constant-pool renumbering behind it.
+
+### The second root, and a third
+
+Nothing here touches the other lines `agent/catstail` separated out, and
+`agent/basetypeseq` took `BitSet`'s `|` in the one-file repro but not in cats.
+What is left of the family is seven lines, all on the `SortedSet` side:
+
+* `x | y` on a `SortedSet` (`instances/sortedSet.scala:34`,
+  `kernel/instances/SortedSetInstances.scala:106`, `BitSetInstances.scala:51`)
+  -- `SetOps.|` is read through `immutable.Set`, whose `C` is `Set[A]`, rather
+  than through `SortedSetOps`. That is the base type sequence, not the
+  collapse.
+* `keySet` (`NonEmptyMapImpl.scala:148`) and `transform` (`:129`) -- a plain
+  covariant override with the **same erasure and the same arity**, so neither
+  the rule above nor `supply_receiver_override` will take it:
+  `declares_other_signature` refuses a same-erasure override *by design*,
+  because installing one renames the call target and that turned
+  `aSet.toSeq.length` into a `VerifyError`. What it needs is for the override
+  to be installed *without* renaming the call -- the caller's type from the
+  pickle, the descriptor from the class file, which is the split `install`
+  already performs for `decl_site_want`.
+* `NonEmptySet.scala` 308/418 and `instances/sortedSet.scala:110`, the same two
+  roots seen through cats' `Newtype`.
+
+And a **third root**, found by running the fixture rather than compiling it,
+present on the pre-fix binary as well: `immutable.SortedSet` is hand-written in
+the prelude (`prelude_ordering2::add_sorted_set`) with `contains` and `foreach`
+and nothing else, so `aSortedSet.map(f)` binds the prelude's `Set.map` and
+`Check::rebuild_from_receiver` narrows the result to `SortedSet[B]` -- with no
+`Ordering[B]` witness anywhere. `rebuild_widened` refuses exactly this
+(`needs_ordering_to_rebuild`), but the `method_name == "map"` arm of
+`Typer::type_apply_in` (`check_apply.rs`) reaches `rebuild_from_receiver`
+directly and never asks. The program compiles, the call goes out as
+`IterableOps.map(Function1)`, the value is a `Set$Set3`, and the narrowing is a
+`ClassCastException` at the first use. Gating that arm would turn a silent
+wrong answer into a false rejection, so the fix is the same as `keySet`'s:
+supply `SortedSetOps.map` from the pickle. `tests/fixtures/sm_ordering.scala`
+says in a comment why it does not exercise it.
