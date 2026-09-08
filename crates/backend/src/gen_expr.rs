@@ -2062,6 +2062,40 @@ pub(crate) fn gen_new(
     asm.invokespecial(&internal, "<init>", &desc);
 }
 
+/// May a call spelled `println` / `print` be rewritten into the receiverless
+/// print intrinsic, on the strength of its *name* alone?
+///
+/// Only when nothing else is known about it. Both intrinsic emitters discard
+/// the qualifier outright -- `gen_predef_println` loads `scala/Predef$.MODULE$`
+/// and `gen_println` loads `java/lang/System.out` -- so applying either to a
+/// call that already resolved to some other method silently replaces the
+/// receiver the program wrote.
+///
+/// The guard used to be `fun.name() == Some("println")` with no symbol test at
+/// all, which claimed *every* selection spelled that way:
+///
+/// * `java.lang.System.err.println(x)` was emitted as `Predef.println(x)` and
+///   printed to **stdout**. It compiles, it verifies, and only running it and
+///   looking at which stream the text arrived on says otherwise.
+/// * In `--scala-library` mode, a program whose own sources define
+///   `scala.Predef` -- what compiling scala/scala's `src/library` does --
+///   emits its own `scala/Predef$.class`, which shadows the jar's on the
+///   classpath. A hijacked `java.lang.System.out.println("hello")` then dies
+///   with `NoSuchMethodError: 'void scala.Predef$.println(java.lang.Object)'`.
+///   That is the whole of defect 1 in the `agent/libprelude` section of
+///   `docs/scala-library.md`.
+///
+/// `Intrinsic::Println` / `Intrinsic::Print` are set only on the prelude's own
+/// `Predef` members (`prelude_predef2::add_predef_members`), in both
+/// `--scala-library` and `--no-scala-library`, so the intrinsic is the exact
+/// set that may be rewritten and the name test is needed only where there is
+/// no symbol to consult. A source-defined `scala.Predef.println` carries no
+/// intrinsic and is now emitted as the ordinary call it is, which is what nsc
+/// does.
+fn unresolved_print(fun: &Tree, name: &str) -> bool {
+    fun.sym.is_none() && fun.name() == Some(name)
+}
+
 pub(crate) fn gen_apply(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -2114,20 +2148,20 @@ pub(crate) fn gen_apply(
         Intrinsic::None
     };
 
-    if ctx.library_abi && (matches!(ic, Intrinsic::Println) || fun.name() == Some("println")) {
+    if ctx.library_abi && (matches!(ic, Intrinsic::Println) || unresolved_print(fun, "println")) {
         gen_predef_println(asm, frame, ctx, args, true);
         return;
     }
-    if ctx.library_abi && (matches!(ic, Intrinsic::Print) || fun.name() == Some("print")) {
+    if ctx.library_abi && (matches!(ic, Intrinsic::Print) || unresolved_print(fun, "print")) {
         gen_predef_println(asm, frame, ctx, args, false);
         return;
     }
 
-    if matches!(ic, Intrinsic::Println) || fun.name() == Some("println") {
+    if matches!(ic, Intrinsic::Println) || unresolved_print(fun, "println") {
         gen_println(asm, frame, ctx, args, true);
         return;
     }
-    if matches!(ic, Intrinsic::Print) || fun.name() == Some("print") {
+    if matches!(ic, Intrinsic::Print) || unresolved_print(fun, "print") {
         gen_println(asm, frame, ctx, args, false);
         return;
     }

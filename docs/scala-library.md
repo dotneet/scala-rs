@@ -1094,6 +1094,11 @@ resolved it to `==` would type-check, verify and print the wrong answer.
    so it is the `predef_reimport` wildcard that codegen reads back. It costs
    the measure nothing (the measure is `--no-scala-library`) and it is why
    `libprelude_arrow.scala` is run in one mode only.
+
+   **Fixed by `agent/sysout`; see the section below.** The guess in the last
+   sentence is wrong — no wildcard and no import is involved. The receiver was
+   never read at all: `gen_apply` dispatched the print intrinsic on the name
+   alone.
 2. **`val b: Byte = -3` is rejected** — `type mismatch; found: Int required:
    Byte`, in both modes, while `val b: Byte = 3` is fine. A negated constant
    literal is not folded before the narrowing check. Real scalac accepts it.
@@ -1346,6 +1351,183 @@ question and were not investigated here.
 | 7 | `type mismatch; found: ((K, V)) => U  required: (K) => Any` |
 | 7 | `could not optimize @tailrec annotated method` |
 
+## The `agent/sysout` slice: a qualified `println` is a call on its own receiver
+
+Defect 1 of the list above, and the diagnosis in that list is wrong in an
+instructive way. It reads: "it is the `predef_reimport` wildcard that codegen
+reads back". No wildcard, no import and no `Predef` symbol is involved. The
+receiver was never consulted at all.
+
+`gen_apply` dispatched the print intrinsic on the **name**:
+
+```rust
+if ctx.library_abi && (matches!(ic, Intrinsic::Println) || fun.name() == Some("println")) {
+    gen_predef_println(asm, frame, ctx, args, true);
+```
+
+and both emitters discard the qualifier outright — `gen_predef_println` loads
+`scala/Predef$.MODULE$`, `gen_println` loads `java/lang/System.out`. So every
+selection spelled `println` or `print` became a call on `Predef`, whatever the
+program wrote. `javap` on the eleven-line reproduction says so in four
+instructions, with no trace of `System.out` anywhere:
+
+```
+0: ldc           #15    // String hello
+2: getstatic     #20    // Field scala/Predef$.MODULE$:Lscala/Predef$;
+5: swap
+6: invokevirtual #24    // Method scala/Predef$.println:(Ljava/lang/Object;)V
+```
+
+### Why it needed the combination, and what else it was hiding
+
+Not because the source `Predef` changed the *compilation*: it does not. The
+bytecode above is byte-for-byte what an ordinary program gets too. What the
+source `Predef` changes is the **run**: the compiler emits its own
+`scala/Predef$.class`, which precedes the jar's on the classpath and has no
+`println`, so the hijacked call finally names a method that is not there. In
+every other program the jar's `Predef.println` happens to exist and happens to
+print the same text, so the wrong method was invisible.
+
+That is also why looking only at the reported symptom would have missed the
+larger half. The same root sent **`java.lang.System.err.println(x)` to
+stdout**, in both modes, with or without a source `Predef` — an ordinary
+program silently losing the distinction between its output and its error
+stream. It compiles, it passes `-Xverify:all`, and every compile-only measure
+in this repository is green on it. It is the `verify_failures is a lower bound`
+rule in `.agent-brief.md` again: calling the wrong method of the right shape
+keeps the types consistent and the verifier has no opinion.
+
+### The fix
+
+`Intrinsic::Println` / `Intrinsic::Print` are set **only** on the prelude's own
+`Predef` members (`prelude_predef2::add_predef_members`), and in both
+`--scala-library` and `--no-scala-library` — instrumenting `gen_apply` shows
+`ic=Println owner="Predef$"` for `println(x)` and `scala.Predef.println(x)`,
+and `ic=None owner="PrintStream"` / `owner="Console$"` for everything else, in
+both modes. The intrinsic therefore already names the exact set that may be
+rewritten. The name-only fallback now applies solely to a call with no symbol
+at all (`gen_expr::unresolved_print`), where there is nothing else to emit.
+
+A source-defined `scala.Predef.println` carries no intrinsic and is now emitted
+as the ordinary call it is, which is what nsc does — so a source `Predef` may
+define its own `println` without recursing until the stack runs out.
+`tests/fixtures/libmaxmin_predef.scala` was written around exactly that and
+records it in a comment.
+
+Two shapes that were *not* used, and why:
+
+| shape | why not |
+|---|---|
+| key on the owner's internal name being `scala/Predef$` | a source `scala.Predef` erases to `scala/Predef$` too, so this claims its members back into the intrinsic and emits `(Ljava/lang/Object;)V` whatever the source declared. Measured: `def println(s: String)` in a source `Predef` compiles to `invokevirtual scala/Predef$.println:(Ljava/lang/String;)V` under the fix as shipped, and agrees with scalac; the owner rule would have named a method that is not there |
+| key on the tree shape (a bare `Ident` is Predef's) | loses `scala.Predef.println(x)`, which is the intrinsic and must stay so |
+
+### The test
+
+`tests/fixtures/sysout_predef.scala` **runs**, in `--scala-library` mode, under
+`-Xverify:all`, and both streams are compared against real scalac 2.13.16
+compiling the same file against the same jar. It holds both halves in one
+program on purpose: the qualified calls must reach `System.out` / `System.err`,
+and the *unqualified* `println` must still resolve through the source `Predef`
+that `predef_reimport` put in scope and call **that object's** method — the
+`P:` / `p:` prefixes in the expected output are what tells the source `Predef`
+apart from the jar's. `crates/cli/tests/sysout.rs` adds the reproduction
+verbatim, the `System.err` symptom in both modes, `Console.err`, a user class
+with a method called `println`, slick's `TreePrinter` shape, and an ordinary
+program's `println` in both modes as the regression guard. **Six of the seven
+fail on an unmodified build of `acec3f09`**; the seventh is the guard and
+passes on both.
+
+### It was miscompiling a measured corpus, silently
+
+`slick/util/TreePrinter.scala` is the one file in slick's 184 that writes
+through a `PrintWriter` it is handed:
+
+```scala
+def get(n: Dumpable) = {
+  val buf = new StringWriter
+  print(n, new PrintWriter(buf))     // TreePrinter's own two-argument `print`
+  buf.getBuffer.toString
+}
+def print(n: Dumpable, out: PrintWriter = …): Unit = { …; out.println(…) }
+```
+
+Every one of those was claimed. `gen_predef_println` reads `args[0]` and drops
+the rest, so `print(n, new PrintWriter(buf))` became `Predef.print(n)` — the
+writer was never even constructed, `get` returned the empty string, and the
+dump went to the console instead. Throughout that,
+`tests/slick_measure.sh` reported `errors=0 files_with_errors=0 classes=1490`,
+`tests/verify_all.sh` reported `verified=1490 failed=0`, and the classfile lint
+reported `lint_problems=0`. Nothing short of running the code has an opinion
+about it. It is pinned as `a_writer_passed_as_an_argument_is_written_to`.
+
+### Yield: zero corpus tests, and that is the honest number
+
+The full `scala/scala` corpus is **identical test-for-test** between an
+unmodified `acec3f09` build and this branch — all 5324 rows, `pos` `neg` and
+`run`, measured on both binaries rather than read off a ledger. Nothing in the
+corpus distinguishes `Predef.println(x)` from what the program wrote, because
+`Predef.println` delegates to `Console.println` which writes to `System.out`:
+the text comes out right, through the wrong method, and the `.check` files
+compare text.
+
+So the gate's `losses=4 changes=15` against `tests/baselines/corpus-4d613d25.tsv`
+is entirely `main`'s own drift (`agent/libprelude` and `agent/libnotype`, both
+merged at `acec3f09`) and none of it is this change. The four losses are
+exactly the four `agent/libnotype` declared: `neg/anytrait`,
+`neg/name-lookup-stable`, `neg/t8002-nested-scope`,
+`neg/valueclasses-impl-restrictions`. There is no fifth.
+
+That a fix worth zero corpus tests is still worth making is the point of the
+section: the corpus measures text on stdout, and this defect preserved the text
+while replacing the method, the receiver and — in slick's case — an argument.
+
+### The numbers
+
+`tests/verify_merge.sh` at `38905f33`, this branch with `main` merged in three
+times while it ran (`agent/neglit`, `agent/pickleparams`, `agent/negchecks`):
+
+| check | branch point `acec3f09` | merged tree `38905f33` |
+|---|---|---|
+| scala library | `971 / 147` | `917 / 146` |
+| gitbucket | `270 / 79` | `270 / 79` |
+| cats | `185 / 71` | `185 / 71` |
+| slick (compile) | `errors=0 files_with_errors=0 classes=1490` | same |
+| `slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | same |
+| subset + lint | — | `verified=1490 failed=0 lint_problems=0` |
+| `cargo test --workspace --release` | — | `259 rows, 2487 passed, 0 failed` |
+| corpus (full) | — | `pos 1095 / neg 673 / run 626` |
+
+**None of the movement is this change's**, and there is a measurement for that
+rather than an assumption: a gate run on this branch *before* any of the three
+merges reported `971 / 147`, `270 / 79`, `185 / 71` and `classes=1490` with the
+print fix already in — every figure the brief gave for `acec3f09` — and the
+corpus was identical row for row, all 5324 of them in all three kinds, between
+an unmodified `acec3f09` build and this branch.
+
+`VERDICT=FAIL` on all four gate runs, always and only for `corpus losses`
+against `tests/baselines/corpus-4d613d25.tsv`, which the ledger predates: four
+in the first three runs — exactly the four `agent/libnotype` declared — and one
+in the last, `neg/name-lookup-stable`, after `agent/negchecks` restored the
+other three. No loss outside that set appeared in any run, and no `pos` or
+`run` loss in any of them.
+
+### Not fixed here, same root
+
+`gen_apply` has one more name-only dispatch of the same shape, immediately
+below:
+
+```rust
+if ctx.library_abi
+    && (fun.name() == Some("identity")
+        || fun.name() == Some("locally")
+        || fun.name() == Some("implicitly")
+```
+
+`gen_predef_poly` likewise discards the qualifier and emits
+`scala/Predef$.<name>:(Ljava/lang/Object;)Ljava/lang/Object;`, so a user method
+called `identity` or `locally` is claimed the same way `println` was. It is not
+in this change because it wants its own dual-run evidence, and mixing it in
+would make the `println` numbers unreadable.
 ## The `agent/neglit` slice: a negated constant literal is not folded before the narrowing check
 
 Closes the second of `agent/libprelude`'s "Three defects found and not fixed

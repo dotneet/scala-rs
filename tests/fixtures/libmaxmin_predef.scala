@@ -39,11 +39,13 @@ package scala {
 
   object Predef extends LowPriorityProbe {
     type String = java.lang.String
-    // Not `java.lang.System.out.println`: codegen rewrites *any* call named
-    // `println` into `scala.Predef$.println`, whatever its receiver, so a
-    // `Predef` that defines its own would recurse. That is a pre-existing
-    // defect of the `println` intrinsic and has nothing to do with the import;
-    // `append` steps around it so this fixture measures one thing.
+    // `append` rather than `java.lang.System.out.println`, because codegen
+    // used to rewrite *any* call named `println` into `scala.Predef$.println`
+    // whatever its receiver, so a `Predef` defining its own recursed until the
+    // stack ran out. That was a separate defect of the `println` intrinsic,
+    // not of the import, and `agent/sysout` has since fixed it
+    // (`gen_expr::unresolved_print`, `crates/cli/tests/sysout.rs`). The
+    // spelling is left as it was so this fixture keeps measuring one thing.
     def println(x: Any): Unit = {
       java.lang.System.out.append(x.toString)
       java.lang.System.out.append("\n")
