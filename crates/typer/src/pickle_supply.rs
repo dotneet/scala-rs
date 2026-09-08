@@ -543,8 +543,142 @@ impl PickleSupply {
             }
             drop_stale_members(st, class_sym, &stale, &installed);
         }
+        self.drop_flattened_forwarders(st, bin, class_sym, &sig);
         self.settle_overriding_type_aliases(st, bin, class_sym, &sig, &full, is_module);
         true
+    }
+
+    /// Drop a class file's *mixin forwarder* where the trait that really
+    /// declares the method says it has more than one parameter clause.
+    ///
+    /// A class that mixes in a trait carries a forwarder for every concrete
+    /// method it inherits, and that forwarder is an ordinary class-file
+    /// method: one flat parameter list, and a `Signature` attribute in which
+    /// a `Boolean` type *argument* has already become `Object`. The class's
+    /// own pickle does not declare it -- it is inherited -- so the loop above
+    /// never asks about the name, and the flattened copy stays as the class's
+    /// closest member and wins every lookup over the correctly clause-split
+    /// declaration on the trait.
+    ///
+    /// slick's `BaseColumnExtensionMethods[P1]` is the case. `ColumnExtension
+    /// Methods` declares `def inSet[R](seq: Iterable[B1])(implicit om: …):
+    /// Rep[R]`; the value class's own class file declares
+    /// `inSet(Iterable<P1>, OptionMapper2<Object, P1, Object, Object, P1, R>)`,
+    /// and `t.userName inSet Set("a")` was `no matching overload for
+    /// (Iterable[String], OptionMapper2[Any, String, Any, Any, String, R])
+    /// Rep[R] with arguments (Set[String])` -- one argument against a
+    /// two-parameter clause. `===` escaped only because its JVM name is
+    /// `$eq$eq$eq`, which [`fill_java_members`] never decodes, so the
+    /// forwarder and the pickled member never shared a name.
+    ///
+    /// Deliberately narrow, in three ways, and each one was measured.
+    ///
+    /// * A name is only *considered* when the class file has a member of it
+    ///   with **at least two parameters in one clause**. Splitting a parameter
+    ///   list is the one thing a class file cannot express, and every split
+    ///   form that matters here has two or more; a one-parameter
+    ///   `()(implicit x)` is left alone rather than widening the walk over
+    ///   every inherited unary method.
+    /// * The replacement has to have **more than one clause**, and then
+    ///   **every** class-file member of that name whose total parameter count
+    ///   the replacement also has is dropped, not just the flattened one.
+    ///   `DurationInt` inherits both `seconds: FiniteDuration` and
+    ///   `seconds[C](c: C)(implicit ev: Classifier[C]): C#R`; dropping the
+    ///   flattened two-parameter one and leaving the class file's nullary one
+    ///   beside the pickle's left `2.seconds` an overload of three with a
+    ///   duplicate in it, and `val f: FiniteDuration = 2.seconds` stopped
+    ///   compiling (`crates/cli/tests/durrange.rs`, `setmap1`).
+    /// * `complete_named` is asked of `class_sym`, not of the parent that
+    ///   declares the name. At adoption time this class's parent list holds
+    ///   only what its own pickle said (`AnyVal`, for a value class) --
+    ///   the class file's parents are attached later -- so a walk over
+    ///   `Symbol::parents` here reaches nothing, and `complete_named`'s own
+    ///   walk over the *pickled* parents is what finds the declaration.
+    fn drop_flattened_forwarders(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        sig: &scala_rs_pickle::sym::ClassSig,
+    ) {
+        // Never the standard library, for the reason `ensure_pickled_parents`
+        // and `attach_parents` already give: its hierarchy and its member sets
+        // are the prelude's, hand-written and reasoned about, and topping one
+        // up from a class file changes members that work. Measured:
+        // `scala.collection.AbstractIterable` alone had eleven names this
+        // would touch, and doing so gave `HashMap#toList` a second entry
+        // (`<overload List[Tuple2[String, Any]] | List[(String, Any)]>`, and
+        // `.sortBy` on it "not a member" -- `setmap1`) and `DurationInt`'s
+        // `seconds` a third. What this is for is a *jar* class the program
+        // named.
+        let jvm = st.get(class_sym).jvm_name.clone();
+        if jvm.starts_with("scala/") || jvm.starts_with("java/") {
+            return;
+        }
+        let own: Vec<String> = sig
+            .members
+            .iter()
+            .map(|m| scala_rs_pickle::names::decode_method_name(&m.name))
+            .collect();
+        let mut names: Vec<String> = Vec::new();
+        for &m in &st.get(class_sym).members {
+            let s = st.get(m);
+            // Not gated on `Flags::JAVA`: a `-cp` **directory** is scanned by
+            // `classpath::install_classpath` instead of read as a class file,
+            // and that scan's entries carry no flag of their own -- but they
+            // are just as flat, and just as erased (`(Iterable, Wit)Res`).
+            // Everything reachable here is a binary class: `adopt_binary_class`
+            // has already refused a source class and a prelude one.
+            if s.kind != SymKind::Method
+                || s.flags.contains(Flags::STATIC)
+                || s.paramss.len() > 1
+                || s.params.len() < 2
+                || s.name.contains('$')
+                || own.contains(&s.name)
+                || names.contains(&s.name)
+            {
+                continue;
+            }
+            names.push(s.name.clone());
+        }
+        for name in names {
+            let flat: Vec<(SymbolId, usize)> = st
+                .get(class_sym)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    let s = st.get(m);
+                    s.kind == SymKind::Method
+                        && s.name == name
+                        && !s.flags.contains(Flags::STATIC)
+                        && s.paramss.len() <= 1
+                })
+                .map(|m| (m, st.get(m).params.len()))
+                .collect();
+            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            if !installed.iter().any(|&i| st.get(i).paramss.len() > 1) {
+                continue;
+            }
+            let arities: Vec<usize> = installed
+                .iter()
+                .map(|&i| st.get(i).paramss.iter().map(|c| c.len()).sum())
+                .collect();
+            let stale: Vec<SymbolId> = flat
+                .into_iter()
+                .filter(|(m, n)| arities.contains(n) && !installed.contains(m))
+                .map(|(m, _)| m)
+                .collect();
+            if stale.is_empty() {
+                continue;
+            }
+            trace(format_args!(
+                "{}#{name}: dropping {} flattened mixin forwarder(s)",
+                st.get(class_sym).jvm_name,
+                stale.len()
+            ));
+            drop_stale_members(st, class_sym, &stale, &installed);
+        }
     }
 
     /// Install the type **aliases** this class declares that fix a type
