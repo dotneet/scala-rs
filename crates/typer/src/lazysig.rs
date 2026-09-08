@@ -544,6 +544,47 @@ impl Typer {
         );
     }
 
+    /// `record_default_scope`'s `has_this = false` case, for a *secondary*
+    /// constructor's parameter.
+    ///
+    /// The rule is the primary's: `new C(1)` has no instance, so the default's
+    /// body cannot name anything the class declares. Only the bookkeeping
+    /// differs, because a `def this(...)` is recorded from `type_def_sig`
+    /// rather than from the template header -- `type_def_sig` has already
+    /// pushed the constructor's own scope on top of the class's member scope,
+    /// and `st.owner` is the constructor and not the class. So two scopes come
+    /// off here where the primary drops one, and the owner is the class's
+    /// owner rather than the constructor's.
+    ///
+    /// Measured: with the primary's one-pop rule used here, `class T(v:
+    /// String) { val f = "F"; def this(n: Int, s: String = f) = this(s + n) }`
+    /// dropped the constructor's scope and left the class's, so `f` still
+    /// resolved to the field and `new T(1)` threw
+    /// `ClassCastException: Main$ cannot be cast to T`. scalac 2.13.16 reports
+    /// `not found: value f`.
+    pub(crate) fn record_secondary_ctor_default_scope(&mut self, param: SymbolId) {
+        if param.is_none() {
+            return;
+        }
+        let base = self.lazy_base_scopes.min(self.st.scopes.len());
+        let mut stack = self.st.scopes[base..].to_vec();
+        // The constructor's own scope (its type parameters), then the class's
+        // member scope.
+        stack.pop();
+        stack.pop();
+        let class = self.st.get(self.st.owner).owner;
+        let owner = self.st.get(class).owner;
+        self.default_scopes.insert(
+            param,
+            DefaultScope {
+                owner,
+                this_class: SymbolId::NONE,
+                file_index: self.file_index,
+                scopes: Rc::new(stack),
+            },
+        );
+    }
+
     /// Remember a *constructor* default's body for `type_pending_defaults`.
     ///
     /// No scope stack is captured here: a constructor default is typed where

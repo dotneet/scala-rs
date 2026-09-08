@@ -2472,6 +2472,14 @@ fixed. `crates/cli/tests/secondaryctor.rs` asserts the *rejection*, so the test
 fails and says so when a later slice implements it; the fixture puts its
 default on the primary instead.
 
+**Closed by `agent/ctorgaps` below**, which found a second half to the
+diagnosis: the reason the message names `Main$` is that the *ordinary* method
+path had declared an instance `<init>$default$2` on the class, and
+`default_getter_apply` went looking for a receiver. That slice also found --
+and fixed -- the miscompile the fix would otherwise have unlocked: a default
+that names a field of the class being constructed read it off the caller's own
+`this`. The assertion here is now on the value the default produces.
+
 ## The `agent/arrayelem` slice: `new Array(n)` reads its element from `pt`
 
 **917 errors in 146 files → 875 in 146** at the branch point (`e76b0ebf`).
@@ -2589,6 +2597,239 @@ required: A` (8), and `found: Array[AnyRef] required: Array[Any]` /
 `found: Array[A] required: Array[Any]` (6 each) -- those last two are
 **variance**, not construction: `Array` is invariant and the receiver these
 appear on is `ArrayOps`, so they are a separate question from this slice's.
+
+## The `agent/ctorgaps` slice: two constructor gaps, both left reduced by the slices that found them
+
+Two independent defects, taken in one slice because both end at the same
+seam -- what a constructor's *pickle* says that its class file cannot.
+
+### 1. A default argument on a secondary constructor
+
+`agent/secondaryctor` recorded this at the end of its section:
+
+```scala
+class Deft(val p: Int, val q: String) {
+  def this(p: String, q: String = "dq") = this(p.length, q)
+}
+```
+
+`new Deft("abc")` was `error: value <init>$default$2 is not a member of Main$`.
+
+The diagnosis on record -- "`synthesize_ctor_default_getters` only ever runs
+over the primary's parameters" -- is half of it. The other half is why the
+message names `Main$` rather than saying the getter is missing:
+`check_member::type_def_sig` runs the **ordinary** method path
+(`synthesize_default_getters`) for every `def this(...)`, because a secondary
+constructor *is* a `DefDef`. That declared an instance method
+`<init>$default$2` on `Deft` itself, `default_getter_apply` found it, and --
+finding nothing that looked like a static or companion getter -- asked
+`default_getter_receiver` for a receiver. `new Deft("abc")` has none, so it
+reached for the enclosing object.
+
+So the fix is three pieces, and each one is load-bearing:
+
+* `type_def_sig` no longer calls `synthesize_default_getters` for `<init>`.
+  A constructor's getters are not instance methods of the class being
+  constructed, which is exactly what `check_template` already says in a
+  comment for the primary.
+* `check_template` runs `synthesize_ctor_default_getters` over each `def
+  this(...)` in the body as well, after the body's signatures are typed. The
+  name is nsc's and needed no change: `javap` on scalac 2.13.16's output for
+  `class Chain(v: String) { def this(n: Int, sep: String = "-") = … }` shows
+  one `$lessinit$greater$default$2`, counted over *that* constructor's own
+  flattened parameters. A secondary owes no `apply$default$n` -- a case
+  class's synthetic `apply` mirrors the primary alone -- and `Tagged$` in the
+  fixture has exactly the members scalac's does.
+* `record_secondary_ctor_default_scope`, which is the part that would have
+  been a silent miscompile. `record_default_scope`'s existing
+  `has_this = false` rule drops **one** scope, because the primary is recorded
+  from the template header where the innermost scope is the class's own. A
+  `def this(...)` is recorded from `type_def_sig`, which has already pushed
+  the constructor's scope on top, so one pop left the class's member scope in
+  place. With it there,
+
+  ```scala
+  class T(val v: String) {
+    val f = "F"
+    def this(n: Int, s: String = f) = this(s + n)
+  }
+  ```
+
+  compiled: `f` resolved to the **field**, and the spliced default read it off
+  whatever `this` the caller had. `new T(1)` threw
+  `java.lang.ClassCastException: class Main$ cannot be cast to class T`, with
+  no diagnostic anywhere. scalac 2.13.16 reports `not found: value f`, and
+  this branch now reports it at scalac's line and column
+  (`tests/fixtures/ctorgaps_secthis_bad.scala`).
+
+#### One constructor per class may define defaults
+
+A default getter is named after the parameter *position* and nothing else, so
+two constructors that both define defaults want the same
+`$lessinit$greater$default$2` with different bodies. nsc forbids that for any
+overloaded method, constructors included, and reports
+
+```text
+in class Two, multiple overloaded alternatives of constructor Two define default arguments.
+```
+
+That rejection is implemented here (`check_ctor_default_overloads`), in nsc's
+words at nsc's line. It is not decoration: without it the synthesis has to
+pick one body for the shared name, and a separately compiled caller of the
+other constructor would get the wrong default with nothing to show for it --
+the failure mode an error count cannot see. It can only ever refuse programs
+scalac also refuses. `tests/fixtures/ctorgaps_secdefault_bad.scala`.
+
+#### What it is worth, measured by running it
+
+`tests/fixtures/ctorgaps_secdefault.scala` holds, in one program: a secondary
+whose default is omitted and written; a secondary that delegates to *another*
+secondary and lets that one's default fill in; a default that is a
+*computation* reading a top-level object rather than a literal; a `case class`
+whose secondary must **not** grow an `apply$default$n`; a class with defaults
+on the primary and a secondary side by side; and a generic class whose getter
+repeats the class's type parameters and has its result type inferred. Every
+line prints the value the default actually produced -- a getter that answers
+with the wrong expression is invisible to an error count.
+
+The expected output is what `/tmp/scala-2.13.16/bin/scalac` prints compiling
+that same file, and this branch matches it **in both linking modes**. An
+unmodified build of the branch point reports the `<init>$default$2` error five
+times over the same file.
+
+**Two of the standard library's 852 errors go away, and none appear.** Both
+are `value <init>$default$1 is not a member of ArrayDeque$` --
+`scala.collection.mutable.ArrayDeque` has a secondary constructor with a
+default. `852 / 145 -> 850 / 145`, and the two error sets differ **only by
+those deletions**, checked line by line and not by count. cats (182 / 71) and
+gitbucket (270 / 79) are unchanged to the error, diffed as sets.
+
+### 2. Constructor privacy across the class-file round trip
+
+`agent/intrinsicqual` implemented the access check for `private` and
+`protected` constructors, closed `neg/sensitive`, `neg/t4987` and
+`neg/protected-constructors`, and left `neg/t6601` open because it is a
+*separate compilation*.
+
+```scala
+// PrivateConstructor_1.scala
+class PrivateConstructor private(val s: String) extends AnyVal
+// AccessPrivateConstructor_2.scala
+class AccessPrivateConstructor {
+  new PrivateConstructor("")
+}
+```
+
+The class file cannot carry the answer. nsc emits even a `private` constructor
+`ACC_PUBLIC` -- `javap -p` on scalac 2.13.16's own `PrivateConstructor.class`
+says `public PrivateConstructor(java.lang.String)` -- so the `ScalaSignature`
+is the only record of it, and the *reading* side was the problem.
+`agent/intrinsicqual` had already proved the writing side: real scalac,
+reading our class file, accepts `new SepPriv("x")` against the old pickle and
+refuses it against the new one.
+
+`PickleSupply::supply_ctors` filtered constructors through
+`Member::is_public_api`, which **hides** a private member outright. So the
+private `<init>` was dropped from the pickle's contribution, the class file's
+`ACC_PUBLIC` one stayed as the only alternative, and the call compiled. It is
+now supplied *and marked*: the filter admits any non-bridge, non-synthetic
+`<init>`, and `install_ctor` copies `PRIVATE` / `PROTECTED` off the pickled
+symbol onto the constructor it repairs. `ctor_access_error`, already written,
+does the rest.
+
+`neg/t6601` passes, and it passes for the right reason: our diagnostic is
+`neg/t6601.check`'s sentence word for word, on its line.
+
+```text
+constructor PrivateConstructor in class PrivateConstructor cannot be accessed
+in class AccessPrivateConstructor from class AccessPrivateConstructor
+```
+
+`crates/cli/tests/ctorgaps.rs` runs it **twice** -- once reading a class file
+this compiler wrote, once reading one real scalac wrote -- because our reader
+agreeing with our writer is not evidence that either matches nsc. It also
+asserts nsc's `ACC_PUBLIC` premise with `javap`, so the test says why it
+passes rather than merely that it does.
+
+#### The risk here is over-rejection, so the ladder runs
+
+Hiding a constructor that is genuinely callable breaks separate compilation
+with nothing to catch it, so one separately compiled library carries `private`,
+`private[libp]`, `protected`, a public primary beside a private secondary, and
+a plain public class; several callers then say what must still compile and
+what must now be refused, and the accepted half **runs** and prints. Measured
+against the pre-fix binary, one case at a time:
+
+| call, in a separate compilation | before | after | scalac 2.13.16 |
+|---|---|---|---|
+| `Priv.make("a")` (from the companion) | ok | ok | ok |
+| `new Qual("b")` inside `package libp` | ok | ok | ok |
+| `new SubProt()`, `class SubProt extends Prot("sub")` | ok | ok | ok |
+| `new Mixed("e")` (public primary, private secondary) | ok | ok | ok |
+| `new libp.Priv("x")` from another package | **accepted** | refused | refused |
+| `new libp.Prot("x")` from another package | **accepted** | refused | refused |
+| `new libp.Mixed(5)` from another package | `required: String` | `required: String` | `required: String` |
+
+The last row is nsc's rule that an inaccessible alternative is removed
+*before* overload resolution: the private secondary is now an alternative
+where it used to be dropped, and the call still has to be a type error against
+the surviving `String` constructor rather than an access error.
+
+#### Found here, not fixed here: `private[p]`
+
+nsc pickles a qualified access as the bare `PRIVATE` flag **plus** a
+`privateWithin` reference. `crates/pickle` now records that the reference is
+there (`Member::private_within`, read from `SymInfo`) but does not resolve
+`p`, and `install_ctor` deliberately leaves such a constructor as accessible
+as it was before this change. Guessing "private" from the flag alone would
+refuse every `private[slick]` constructor slick's own code calls, and
+over-rejection is the one failure mode this change must not have. So
+`new libp.Qual("x")` from another package compiles where scalac reports
+`constructor Qual in class Qual cannot be accessed`. Asserted on the
+*acceptance*, so the test fails and says so when a later slice resolves the
+boundary.
+
+### Yield: one corpus `neg` test, two library errors, zero class files of slick
+
+**slick's 1490 class files are byte-identical** between the branch point and
+this branch (`SLICK_OUT=… tests/slick_measure.sh` on both binaries, `diff -r`,
+exit 0). `errors=0 files_with_errors=0 classes=1490` on both. That is the
+expected shape and not a vacuous negative:
+
+* slick has four secondary constructors (`RelationalProfile.Table`,
+  `util.ConstArray`, `jdbc.DriverDataSource`, `compiler.CompilerState` --
+  itemised by `agent/secondaryctor`) and **not one of them takes a default**,
+  so the getter synthesis has nothing to add to any of slick's companions.
+* slick has four classes with a restricted primary constructor
+  (`compiler.CompilerState`, `basic.ConcurrencyControl` and its companion,
+  `ConnectionArbiter`) -- the four whose pickled `<init>` flag byte
+  `agent/intrinsicqual` moved -- and slick is compiled as **one** run, so
+  nothing in it reads its own pickle back. The reading side can only show in a
+  separate compilation, which is what `crates/cli/tests/ctorgaps.rs` is.
+
+### Found here, not fixed here
+
+* **A constructor default in a later parameter clause.** `new Curr(7)()` on
+  `class Curr(a: Int)(b: String = "b" + a)` emits an `invokespecial` with one
+  argument for a two-parameter descriptor: `VerifyError: Bad type on operand
+  stack`. It is *not* a secondary-constructor defect -- it reproduces on the
+  primary of a plain class, with and without a companion, on an unmodified
+  build of the branch point -- and the identical `def m(a: Int)(b: String =
+  "b" + a)` is filled correctly. A `new`'s arguments reach
+  `fill_defaults_and_implicits` already flattened while that function re-reads
+  the callee's *unflattened* `paramss` off the symbol, so the second clause is
+  never short. This is the only shape in which a constructor default may
+  legally name an earlier parameter (nsc rejects a same-clause reference), so
+  it is the one thing the positive fixture cannot cover.
+* **Preferring the alternative that needs no default.** nsc fills a default
+  only when no alternative applies without one, so `new Prefer(1)` on
+  `class Prefer(n: Int) { def this(k: Int, bump: Int = 5) = … }` is the
+  primary. Both are applicable here at once: `ambiguous overload for
+  constructor`. Pre-existing and a rejection, not a wrong pick.
+* **`private[p]` on a constructor**, above.
+
+All three are pinned by assertions on the current behaviour, so a later slice
+that closes one is told by a failing test.
 
 ## Running it
 

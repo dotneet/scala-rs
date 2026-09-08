@@ -497,16 +497,26 @@ The honest diff.
   (`crates/cli/tests/intrinsicqual.rs`,
   `real_scalac_reads_the_constructor_as_private_from_our_classfile`).
 
-- **`neg/t6601` is still accepted**, and it is the one of the four the check
-  above does not reach. It is a separate compilation: `PrivateConstructor_1`
-  is compiled to a class file, and `AccessPrivateConstructor_2` reads it back.
-  Constructor privacy does not survive that round trip — the class file emits
-  `<init>` as `ACC_PUBLIC`, and neither the classfile reader nor the pickle
-  reader puts `PRIVATE` on the `<init>` it supplies. Closing it is a change to
-  `crates/typer/src/pickle_supply.rs` (whose `is_visible` currently *hides*
-  private members outright, so the constructor would have to be supplied and
-  marked rather than dropped, or the access error would become "no such
-  constructor"). That is the supply seam `.agent-brief.md` singles out, and it
-  wants its own slice.
+- **`neg/t6601` is closed** by `agent/ctorgaps`, and it is the one of the four
+  the check above does not reach on its own. It is a separate compilation:
+  `PrivateConstructor_1` is compiled to a class file, and
+  `AccessPrivateConstructor_2` reads it back. The class file cannot carry the
+  answer — nsc emits even a `private` constructor `ACC_PUBLIC`, which `javap
+  -p` on its own output confirms — so the `ScalaSignature` is the only record,
+  and `PickleSupply::supply_ctors` was filtering constructors through
+  `Member::is_public_api`, which *hides* a private member outright. The
+  private `<init>` was dropped, the class file's public one stayed, and the
+  call compiled. It is now supplied **and marked**: `install_ctor` copies
+  `PRIVATE` / `PROTECTED` off the pickled symbol onto the constructor it
+  repairs, and our diagnostic reproduces `neg/t6601.check` word for word —
+  reading a class file we wrote and reading one real scalac wrote
+  (`crates/cli/tests/ctorgaps.rs`).
+
+  One case is deliberately left accessible: `private[p]` / `protected[p]`,
+  which nsc pickles as the bare flag *plus* a `privateWithin` reference this
+  reader does not resolve. Guessing "private" there would refuse every
+  `private[slick]` constructor slick's own code calls, so a constructor with
+  an access boundary keeps the accessibility it had before, and scalac refuses
+  one program we accept. See `docs/not-implemented.md`.
 
 It is not a replacement for scalac. It is a reimplementation of a subset.

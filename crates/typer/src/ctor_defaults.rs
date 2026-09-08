@@ -43,6 +43,7 @@ use crate::check::Typer;
 use crate::symbol::SymKind;
 use scala_rs_parser::ast::Type;
 use scala_rs_parser::{Flags, SymbolId};
+use scala_rs_span::Span;
 
 impl Typer {
     /// Declare `$lessinit$greater$default$n` (and, for a case class with a
@@ -55,6 +56,41 @@ impl Typer {
         &mut self,
         class_id: SymbolId,
         paramss_ids: &[Vec<SymbolId>],
+    ) {
+        self.synthesize_ctor_default_getters_of(class_id, paramss_ids, true)
+    }
+
+    /// The same, for one *secondary* constructor's parameter list.
+    ///
+    /// nsc names a secondary's getters `$lessinit$greater$default$n` too, with
+    /// `n` counted over that constructor's own flattened parameters -- `javap`
+    /// on scalac 2.13.16's output for
+    /// `class Chain(v: String) { def this(n: Int, sep: String = "-") = … }`
+    /// shows one `$lessinit$greater$default$2`. A secondary owes **no**
+    /// `apply$default$n`: a case class's synthetic `apply` mirrors the
+    /// *primary* alone.
+    ///
+    /// Only one constructor of a class may define defaults at all
+    /// (`check_ctor_default_overloads`, which is nsc's own rule), so the two
+    /// callers can never be asked for the same getter name with different
+    /// bodies.
+    pub(crate) fn synthesize_secondary_ctor_default_getters(
+        &mut self,
+        class_id: SymbolId,
+        ctor: SymbolId,
+    ) {
+        if ctor.is_none() {
+            return;
+        }
+        let paramss = self.st.get(ctor).paramss.clone();
+        self.synthesize_ctor_default_getters_of(class_id, &paramss, false)
+    }
+
+    fn synthesize_ctor_default_getters_of(
+        &mut self,
+        class_id: SymbolId,
+        paramss_ids: &[Vec<SymbolId>],
+        primary: bool,
     ) {
         if class_id.is_none() {
             return;
@@ -69,8 +105,8 @@ impl Typer {
         // Only a companion that carries the synthetic `apply` owes an
         // `apply$default$n`: a user-written `apply` suppresses the synthetic
         // one, and its own defaults are ordinary method defaults.
-        let has_case_apply =
-            self.st.get(owner).members.iter().any(|&m| {
+        let has_case_apply = primary
+            && self.st.get(owner).members.iter().any(|&m| {
                 self.st.get(m).name == "apply" && self.st.get(m).flags.contains(Flags::CASE)
             });
         let tparams = self.st.get(class_id).tparams.clone();
@@ -159,6 +195,63 @@ impl Typer {
                 // (`Typer::type_default_rhs_here`).
                 self.defer_ctor_default_getter_rhs(*pid, gid, &ret, &tparams, &preceding);
             }
+        }
+    }
+
+    /// nsc: `in class Two, multiple overloaded alternatives of constructor Two
+    /// define default arguments.`
+    ///
+    /// The getters above are named after the *parameter position* and nothing
+    /// else, so two constructors that both define defaults want the same
+    /// `$lessinit$greater$default$2` with different bodies. nsc forbids that
+    /// outright for any overloaded method, constructors included, which is why
+    /// the name is enough for it too. Checked here rather than left to "first
+    /// declaration wins": the second constructor's caller would silently get
+    /// the first's default, and no error count would show it.
+    ///
+    /// Verified against scalac 2.13.16, which rejects
+    /// `class Two(v: String) { def this(n: Int, sep: String = "-") = …
+    ///                         def this(f: Boolean, tag: String = "t") = … }`
+    /// at the class's own position.
+    pub(crate) fn check_ctor_default_overloads(&mut self, class_id: SymbolId, span: Span) {
+        if class_id.is_none() {
+            return;
+        }
+        let ctors: Vec<SymbolId> = self
+            .st
+            .get(class_id)
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| self.st.get(m).name == "<init>")
+            .collect();
+        let mut with_defaults = 0usize;
+        for c in ctors {
+            let params: Vec<SymbolId> = if self.st.get(c).paramss.is_empty() {
+                self.st.get(c).params.clone()
+            } else {
+                self.st.get(c).paramss.iter().flatten().copied().collect()
+            };
+            if params
+                .iter()
+                .any(|&p| self.st.get(p).flags.contains(Flags::DEFAULTPARAM))
+            {
+                with_defaults += 1;
+            }
+        }
+        if with_defaults > 1 {
+            let name = self.st.get(class_id).name.clone();
+            let kind = if self.st.get(class_id).flags.contains(Flags::TRAIT) {
+                "trait"
+            } else {
+                "class"
+            };
+            self.error(
+                span,
+                format!(
+                    "in {kind} {name}, multiple overloaded alternatives of constructor {name} define default arguments."
+                ),
+            );
         }
     }
 }

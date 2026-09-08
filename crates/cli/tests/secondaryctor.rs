@@ -577,32 +577,71 @@ object Main {
     let _ = fs::remove_dir_all(out.parent().unwrap());
 }
 
-/// Found here, not fixed here: a default argument on a **secondary**
-/// constructor.
+/// The gap this file used to assert the *rejection* of, now closed by
+/// `agent/ctorgaps`: a default argument on a **secondary** constructor.
 ///
-/// `Typer::synthesize_ctor_default_getters` only ever runs over the primary
-/// constructor's parameters, so the getter the call site needs is never
-/// declared and the lookup lands on the enclosing object. This is a hard
-/// error, not a miscompile, it reproduces unchanged on the branch point, and
-/// it is a different mechanism from this slice's defect -- so it is recorded
-/// here rather than fixed, and `tests/fixtures/secondaryctor_new.scala` puts
-/// its default on the primary instead.
+/// `Typer::synthesize_ctor_default_getters` only ever ran over the primary's
+/// parameters, so the getter the call site needed was never declared -- and
+/// `synthesize_default_getters`, which does run for every `def this(...)`,
+/// declared an *instance* `<init>$default$2` on the class being constructed
+/// instead. `new Deft("abc")` has no receiver to select that off, so the
+/// receiver logic reached for the enclosing object:
+/// `value <init>$default$2 is not a member of Main$`.
 ///
-/// The assertion is deliberately on the *rejection*: if a later slice
-/// implements this, the test fails and says so, which is the right way for a
-/// recorded gap to close.
+/// The assertion is now on the *value*, which is the only thing that can
+/// distinguish a right getter from a wrong one. `docs/scala-library.md`'s
+/// wider fixture is `tests/fixtures/ctorgaps_secdefault.scala`; this keeps
+/// the original reduction where it was recorded.
 #[test]
-fn a_default_on_a_secondary_ctor_is_still_unsupported() {
+fn a_default_on_a_secondary_ctor_runs() {
     let src = r#"
 class Deft(val p: Int, val q: String) {
   def this(p: String, q: String = "dq") = this(p.length, q)
 }
 object Main {
-  def main(args: Array[String]): Unit = println(new Deft("abc").q)
+  def main(args: Array[String]): Unit = {
+    println(new Deft("abc").q)
+    println(new Deft("abc", "written").q)
+    println(new Deft(3, "primary").q)
+  }
 }
 "#;
-    let dir = tmp_dir("secdefault");
-    let file = dir.join("secdefault.scala");
+    if !java_available() {
+        return;
+    }
+    for (tag, flags, cp) in both_modes() {
+        let refs: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let out = compile(&format!("secdefault-{tag}"), src, &refs);
+        assert_eq!(
+            run_java(&out, cp.as_deref(), "Main"),
+            "dq\nwritten\nprimary\n",
+            "mode {tag}"
+        );
+        let _ = fs::remove_dir_all(out.parent().unwrap());
+    }
+}
+
+/// Found here, not fixed here, and left as an assertion on the rejection so
+/// the test fails and says so when a later slice closes it.
+///
+/// nsc fills a default only when no alternative applies *without* one, so
+/// `new Prefer(1)` below is the **primary**. This compiler weighs both
+/// alternatives at once and reports `ambiguous overload for constructor`.
+/// Pre-existing: an unmodified build of `agent/ctorgaps`' branch point
+/// reports the same words at the same line, and it is a rejection rather than
+/// a wrong pick, so nothing is silently miscompiled by it.
+#[test]
+fn nsc_prefers_the_alternative_that_needs_no_default() {
+    let src = r#"
+class Prefer(val n: Int) {
+  def this(k: Int, bump: Int = 5) = this(k * 100 + bump)
+}
+object Main {
+  def main(args: Array[String]): Unit = println(new Prefer(1).n)
+}
+"#;
+    let dir = tmp_dir("ctorprefer");
+    let file = dir.join("ctorprefer.scala");
     fs::write(&file, src).unwrap();
     let out = dir.join("out");
     fs::create_dir_all(&out).unwrap();
@@ -622,8 +661,51 @@ object Main {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        !output.status.success() && text.contains("<init>$default$2"),
-        "expected the known `<init>$default$2` gap; got:\n{text}"
+        !output.status.success() && text.contains("ambiguous overload for constructor"),
+        "expected the known overload-vs-default gap; got:\n{text}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Found here, not fixed here: a constructor default in a **later parameter
+/// clause** is never filled at all.
+///
+/// `new Curr(7)()` on `class Curr(a: Int)(b: String = "b" + a)` emits an
+/// `invokespecial` with one argument for a two-parameter descriptor:
+/// `VerifyError: Bad type on operand stack`. The cause is not the secondary
+/// constructor and not the getter -- `fill_defaults_and_implicits` re-reads
+/// the callee's *unflattened* `paramss` while a `new`'s arguments reach it
+/// already flattened, so the second clause is never seen as short. It
+/// reproduces on the **primary** constructor of a plain class, with or
+/// without a companion, and on an unmodified build of the branch point; the
+/// identical `def m(a: Int)(b: String = "b" + a)` is filled correctly.
+///
+/// This is the only shape in which a constructor default may legally name an
+/// earlier parameter (nsc rejects a same-clause reference outright), so it is
+/// what `tests/fixtures/ctorgaps_secdefault.scala` cannot cover.
+#[test]
+fn a_default_in_a_later_ctor_clause_is_not_filled() {
+    let src = r#"
+class Curr(val a: Int, val b: String) {
+  def this(a: Int)(b: String = "b" + a, c: Int = a * 2) = this(a, b + c)
+}
+object Main {
+  def main(args: Array[String]): Unit = println(new Curr(7)().b)
+}
+"#;
+    if !java_available() {
+        return;
+    }
+    let out = compile("ctorcurried", src, &["--no-scala-library"]);
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", out.to_str().unwrap(), "Main"])
+        .output()
+        .expect("java");
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        !output.status.success() && err.contains("VerifyError"),
+        "expected the known later-clause gap; got status {:?}\n{err}",
+        output.status
+    );
+    let _ = fs::remove_dir_all(out.parent().unwrap());
 }

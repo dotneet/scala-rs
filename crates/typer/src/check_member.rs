@@ -596,7 +596,23 @@ impl Typer {
                     if let TreeKind::ValDef { mods, rhs, .. } = &p.kind {
                         if mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty() {
                             self.st.get_mut(p.sym).default_rhs = Some((**rhs).clone());
-                            self.record_default_scope(p.sym, true);
+                            // A *secondary* constructor's default is evaluated
+                            // before the instance exists, exactly like the
+                            // primary's, so the class's own member scope is not
+                            // available to it. nsc puts the getter on the
+                            // companion and reports `not found: value f` for
+                            // `class T(v: String) { val f = "F"
+                            //   def this(n: Int, s: String = f) = this(s + n) }`.
+                            // Leaving `this` in resolved `f` to the *field* and
+                            // spliced a read off the caller's own `this`:
+                            // `ClassCastException: Main$ cannot be cast to T`.
+                            // Same reasoning as `check_template`'s primary-
+                            // constructor call; see `record_default_scope`.
+                            if name == "<init>" {
+                                self.record_secondary_ctor_default_scope(p.sym);
+                            } else {
+                                self.record_default_scope(p.sym, true);
+                            }
                         }
                     }
                     all_params.push(p.sym);
@@ -713,7 +729,19 @@ impl Typer {
             paramss_ids.push(ids);
             vparamss.push(evidence);
         }
-        self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
+        // A *secondary* constructor's defaults are not ordinary method
+        // defaults. `synthesize_default_getters` would declare an instance
+        // method `<init>$default$n` on the class being constructed, and
+        // `new C(x)` has no receiver to select it off: `default_getter_apply`
+        // found that member, fell through to `default_getter_receiver`, and
+        // built `Main$.<init>$default$2()` -- "value <init>$default$2 is not a
+        // member of Main$". nsc puts a constructor's getters on the companion
+        // module under the JVM spelling instead, which is what
+        // `synthesize_ctor_default_getters` does for every constructor,
+        // primary and secondary alike (`crate::ctor_defaults`).
+        if name != "<init>" {
+            self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
+        }
         self.st.owner = saved_owner;
         let ret = if name == "<init>" {
             Type::Unit

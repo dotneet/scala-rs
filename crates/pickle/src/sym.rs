@@ -170,6 +170,16 @@ pub struct Member {
     pub ty: SigType,
     /// Set for a `MACRO` def whose `@macroImpl` annotation could be read.
     pub macro_impl: Option<MacroImpl>,
+    /// The symbol carried a `privateWithin` reference, i.e. it is
+    /// `private[p]` / `protected[p]` and not a plain `private` / `protected`.
+    ///
+    /// nsc pickles `private[p]` as `PRIVATE` **plus** that reference, so the
+    /// flag alone cannot tell the two apart -- and a reader that treats
+    /// `private[p]` as `private` refuses calls scalac accepts. Only the fact
+    /// is kept, not the scope: a consumer that cannot resolve `p` should
+    /// leave the member accessible rather than guess, which is what
+    /// `PickleSupply::install_ctor` does.
+    pub private_within: bool,
 }
 
 impl Member {
@@ -361,6 +371,7 @@ impl Builder<'_> {
             flags: info.flags,
             ty,
             macro_impl,
+            private_within: info.private_within.is_some(),
         })
     }
 
