@@ -451,6 +451,16 @@ impl Typer {
             ) {
                 self.error(v.span, v.msg);
             }
+            // SLS 5.3.3. nsc's *other* `checkEphemeral` caller, which is in
+            // `typedClassDef` and not in `validateDerivedValueClass`: a trait
+            // whose first parent is `Any` may declare `def`s and types and
+            // nothing else. Separate from the value-class call above because
+            // the trigger is different (`extends Any`, not `extends AnyVal`)
+            // and because a value class that mixes a universal trait in is
+            // checked as a value class, not twice.
+            for v in crate::valueclass::universal_trait_violations(&self.st, id, is_trait, body) {
+                self.error(v.span, v.msg);
+            }
         }
         if !self.sigs_only {
             let body_snapshot: Vec<Tree> = body.to_vec();

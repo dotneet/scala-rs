@@ -253,15 +253,17 @@ fn trait_member_object_is_mixed_in() {
 /// A *local* `object` — one written inside a method — is a different shape
 /// (nsc holds it in a per-call `scala.runtime.LazyRef`) and is not compiled
 /// yet. It has to be a diagnostic, not a singleton that dies at run time.
-/// An `object` inside a value class is rejected in scalac's own words.
+///
+/// The `object` inside a value class that this fixture also carried is now
+/// checked in the typer (nsc's `Typers.checkEphemeral`,
+/// `crates/typer/src/valueclass.rs`) and pinned by
+/// `crates/cli/tests/negchecks.rs`. It had to leave this file: the pass
+/// behind `check_local_objects` runs only when nothing has errored yet, so a
+/// typer rejection in the same source suppresses the message below.
 #[test]
 fn nested_object_bad_shapes_are_errors() {
     let text = diagnostics("nestedobj_bad");
-    for needle in [
-        "local `object`",
-        "the enclosing instance",
-        "implementation restriction: nested object is not allowed in value class",
-    ] {
+    for needle in ["local `object`", "the enclosing instance"] {
         assert!(
             text.contains(needle),
             "expected {needle:?} in diagnostics, got:\n{text}"

@@ -1325,23 +1325,28 @@ impl Typer {
     /// class of the same name), for access checks.
     fn companion_scope(&self, c: SymbolId) -> Option<SymbolId> {
         let s = self.st.get(c);
-        match s.kind {
-            SymKind::Class => {
-                let m = self.st.companion_module(c)?;
-                Some(self.st.module_class_of(m))
-            }
-            SymKind::ModuleClass => {
-                let name = s.name.trim_end_matches('$').to_string();
-                let owner = s.owner;
-                self.st
-                    .get(owner)
-                    .members
-                    .iter()
-                    .copied()
-                    .find(|&m| self.st.get(m).kind == SymKind::Class && self.st.get(m).name == name)
-            }
-            _ => None,
-        }
+        let found =
+            match s.kind {
+                SymKind::Class => {
+                    let m = self.st.companion_module(c)?;
+                    Some(self.st.module_class_of(m))
+                }
+                SymKind::ModuleClass => {
+                    let name = s.name.trim_end_matches('$').to_string();
+                    let owner = s.owner;
+                    self.st.get(owner).members.iter().copied().find(|&m| {
+                        self.st.get(m).kind == SymKind::Class && self.st.get(m).name == name
+                    })
+                }
+                _ => None,
+            }?;
+        // nsc `Symbol.isCoDefinedWith` / `Contexts.lookupSibling`: a companion
+        // pair has to be defined in the same *scope*, which for two local
+        // definitions is the same block and not merely the same owner. Two
+        // blocks of one method share an owner, so `Symbol::local_scope` is
+        // what tells them apart; both being `None` (members of a template, or
+        // top level) leaves every ordinary companion pair as it was.
+        (self.st.get(c).local_scope == self.st.get(found).local_scope).then_some(found)
     }
 
     /// `private[X]` names an enclosing class or package **of the definition**,

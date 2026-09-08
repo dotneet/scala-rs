@@ -1,4 +1,13 @@
-// Two nested-`object` shapes that must be diagnosed rather than miscompiled.
+// The nested-`object` shape that must be diagnosed rather than miscompiled.
+//
+// `class VC(val u: Int) extends AnyVal { object Inner }` used to be here too.
+// It is a *rejection rule* -- nsc's "implementation restriction: nested
+// object is not allowed in value class" -- and the pass that reports the
+// shape below runs only when nothing else has errored, so the two cannot
+// share a file: the value-class error suppressed this one. The value-class
+// restriction and its neighbours (nested class, nested trait, and the same
+// rules inside a `def` body) are pinned in
+// `tests/fixtures/negchecks_ephemeral_bad.scala`.
 object Main {
   class Outer(val v: Int) {
     // A local `object` that reads the enclosing instance is not compiled yet
@@ -8,10 +17,6 @@ object Main {
       object L { def g = v + k }
       L.g
     }
-  }
-  // scalac rejects this outright, in these words.
-  class VC(val u: Int) extends AnyVal {
-    object Inner { def f = u + 1 }
   }
   def main(args: Array[String]): Unit = println(new Outer(1).m(2))
 }
