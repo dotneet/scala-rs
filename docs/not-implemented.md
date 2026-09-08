@@ -153,13 +153,54 @@ Compiler flags (`agent/xflags`):
   class may not be nested or local, must have exactly one `val` parameter that
   is neither `private[this]` nor `protected[this]`, may not take a `var`, may
   not declare a field, and may not have a `@specialized` type parameter — are
-  now checked (`crates/typer/src/valueclass.rs`). What is *not* checked is the
-  rest of nsc's `checkEphemeral`, which rejects, all under "implementation
-  restriction: … is not allowed in value class": a nested class, trait or
-  object; a secondary constructor; a redefined `equals` / `hashCode`; a
-  qualified `super` reference; and any body statement that is not a
-  definition. `neg/valueclasses-impl-restrictions` is rejected today for a
-  different reason, not for those.
+  now checked (`crates/typer/src/valueclass.rs`), and so is most of nsc's
+  `checkEphemeral` beside them: a nested class, trait or object (at any depth
+  inside a `def` body) and a body statement that is not a definition, under
+  "implementation restriction: … is not allowed in value class" and its
+  second line. The same function's *other* caller is also implemented — a
+  **universal trait** (`trait T extends Any`, SLS 5.3.3) may declare only
+  `def`s, types and imports. `neg/valueclasses-impl-restrictions` and
+  `neg/anytrait` both match their `.check` files exactly.
+  What is still *not* checked is `checkEphemeral`'s three `DefDef` arms — a
+  secondary constructor, a redefined `equals` / `hashCode`, an "additional
+  parameter" — and the "qualified super reference" arm of its deep traversal.
+  All four read nsc-specific symbol flags (`isAuxiliaryConstructor`,
+  `isSynthetic`, `isParamAccessor`) that this tree does not carry in the same
+  sense, none appears in either `.check` file, and each is a *new rejection*:
+  left out rather than guessed at.
+- **An ambiguous reference between a definition and a *deeper* import.** SLS 2
+  gives a definition higher precedence than a wildcard import, but only within
+  one scope; when the import is at a **deeper nesting level** than the
+  definition, nsc reports the reference as ambiguous rather than letting
+  either win (`Contexts.lookupSymbol`: an import is consulted when
+  `imp1.depth > symbolDepth`, and then `defSym` and `impSym` together are
+  `ambiguousDefnAndImport`). We silently take the inner one. Sixteen lines,
+  and it is a *wrong program*, not a missing diagnostic:
+
+  ```scala
+  object ColumnOption { def PrimaryKey: String = "imported" }
+  class A {
+    def PrimaryKey: String = "defined"
+    def pick: String = { import ColumnOption._; PrimaryKey }
+  }
+  ```
+
+  scalac 2.13.16 rejects `pick` ("reference to PrimaryKey is ambiguous; it is
+  both defined in class A and imported subsequently by / import
+  ColumnOption._"); we compile it and print `imported`.
+  `neg/name-lookup-stable` is this program. `agent/impprio` implemented SLS 2's
+  four levels and named this as the piece left over; what it needs is a *depth*
+  comparison, which `SymbolTable::scopes` already carries as the index of each
+  scope — the innermost scope binding the name at `BindRank::Explicit` or
+  `Wildcard` must be compared against the innermost one binding it at
+  `Definition`, and a strictly deeper import is the ambiguity.
+  `BindRank::PackageElsewhere` is nsc's level 4 (`foreignDefined`) and is the
+  documented exception: there the import wins and there is no ambiguity. The
+  message needs two things this compiler does not record yet: the *owner* of
+  the definition ("class A") and the *source text* of the import clause
+  ("import ColumnOption._"). `Binding::origin` already identifies which clause
+  it was, as `(file, byte offset)`, so the text can be attached there in
+  `Typer::type_import`.
 - **An *enclosing* template's self type, for a bare name written in a nested
   one.** `trait Q { self: PriorityQueue[Int] => trait Inner { def d = dequeue() } }`
   is `not found: value dequeue`; the same call written directly in `Q`'s body

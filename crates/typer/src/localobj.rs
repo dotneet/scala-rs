@@ -1,7 +1,14 @@
-//! Diagnose the nested-`object` shapes that cannot be compiled: an `object`
-//! declared *inside a method* that reads anything outside itself, and an
-//! `object` inside a value class (which nsc rejects outright — "implementation
-//! restriction: nested object is not allowed in value class").
+//! Diagnose the nested-`object` shape that cannot be compiled: an `object`
+//! declared *inside a method* that reads anything outside itself.
+//!
+//! It used to also report `object` inside a **value class**, and that check
+//! has moved to [`crate::valueclass`], where nsc keeps it
+//! (`Typers.checkEphemeral`) and where the neighbouring restrictions on a
+//! nested class and a nested trait live too. It could not stay here: this
+//! whole pass runs from the driver only when nothing has reported an error
+//! yet, so once the typer rejects a value class with a nested *trait* the
+//! nested-`object` message would vanish with it — and the reverse happened
+//! first. A rejection rule cannot live behind `if !has_errors`.
 //!
 //! A member `object` of a class or trait is compiled the way nsc compiles it —
 //! an `$outer` field, a constructor taking the enclosing instance, and a
@@ -95,18 +102,6 @@ fn is_local_case_class(st: &SymbolTable, id: SymbolId) -> bool {
 
 fn walk(file_index: usize, tree: &Tree, st: &SymbolTable, out: &mut Vec<Diagnostic>) {
     if let TreeKind::ModuleDef { name, impl_, .. } = &tree.kind {
-        // nsc's own restriction, word for word: a value class has no instance
-        // to hang the object's `$outer` on.
-        if !tree.sym.is_none() && st.is_value_class(st.get(module_class_of(st, tree.sym)).owner) {
-            out.push(
-                Diagnostic::error(
-                    file_index,
-                    tree.span,
-                    "implementation restriction: nested object is not allowed in value class",
-                )
-                .note("This restriction is planned to be removed in subsequent releases."),
-            );
-        }
         if !tree.sym.is_none() && is_local_module(st, tree.sym) {
             let mcls = module_class_of(st, tree.sym);
             let mut bad = None;

@@ -1210,6 +1210,210 @@ do not contain many value classes: every corpus `pos/` and `run/` source that
 mentions `extends AnyVal` — 131 files, all of which scalac accepts — was
 compiled and grepped for the eight new messages. **Zero hits.**
 
+## Four tests that were passing for the wrong reason (2026-09-08, `agent/negchecks`)
+
+`agent/libnotype` fixed three real defects — a case-insensitive directory
+classpath fabricating `package scala.Math`, a blank line not ending an
+expression, and `new X` resolved in the term namespace — and four `neg` tests
+went from pass to fail as a direct result. They had been "passing" **because
+of** the bogus errors. The coordinator checked each `.check` file first, and
+the diagnostics we used to emit appear in none of them:
+
+| test | what scalac reports | what we used to say |
+|---|---|---|
+| `neg/anytrait` | `field definition is not allowed in universal trait extending from class Any` | `recursive value x needs type` |
+| `neg/valueclasses-impl-restrictions` | `implementation restriction: nested object / trait / class is not allowed in value class` | `no matching overload for String with arguments ((<notype>) => <notype>)` |
+| `neg/t8002-nested-scope` | `method x in class C cannot be accessed as a member of C from object C` | `value x is not a member of C$` |
+| `neg/name-lookup-stable` | `reference to PrimaryKey is ambiguous; …` | `no matching overload for Nothing with arguments (PrimaryKey$)` |
+
+That is the most useful thing a `neg` test can tell you and the pass/fail
+column cannot: **a green `neg` test is not evidence.** Four of them had been
+green for years on diagnostics that had nothing to do with the rule each test
+is named after, and the only reason anyone found out is that the wrong
+diagnostics were removed.
+
+Three of the four are now implemented, and the fourth is reduced.
+
+### `checkEphemeral` is one function with two callers
+
+`neg/anytrait` and `neg/valueclasses-impl-restrictions` look like two rules and
+are one. nsc's `Typers.checkEphemeral` opens with
+
+```scala
+val isValueClass = !clazz.isTrait
+def where = if (isValueClass) "value class" else "universal trait extending from class Any"
+```
+
+and is called twice: from `validateDerivedValueClass` for a value class, and
+from `typedClassDef` for a **universal trait** (`clazz.isTrait &&
+clazz.info.parents.nonEmpty && clazz.info.firstParent.typeSymbol == AnyClass`,
+SLS 5.3.3). The flag does more than pick a noun — when it is false a nested
+class or trait is *allowed*, and the deep traversal of `def` bodies does
+nothing at all (`checkEphemeralDeep.traverse` opens with `if (isValueClass)`).
+Writing the two message sets apart is how they drift, so
+`crates/typer/src/valueclass.rs` takes the flag, exactly as nsc does.
+
+Three things in it were read off nsc rather than assumed, and each would have
+been a wrong rejection:
+
+* **Anonymous classes are exempt** (`!cd.symbol.isAnonymousClass`,
+  scala/bug#7571). `neg/valueclasses-impl-restrictions.scala` contains a `new
+  I2 { val q = x.s }` and a `PartialFunction` literal *inside* value classes,
+  on lines its `.check` file deliberately does not mention, and both are
+  anonymous classes. Our parser builds the first as a `ClassDef` named `$anon`
+  carrying `SYNTHETIC`; both marks are tested, because either alone is a guess.
+* **The deep half runs on `def` right-hand sides only** — not on a `val`'s
+  (already "field definition"), and not into a nested class that was itself
+  just reported. `object X` on line 3 of that file is inside `def lazyString`,
+  which is the only reason it is reported at all.
+* **`Import`, `TypeDef` and `EmptyTree` are on nsc's "OK" list** in both modes,
+  so a value class may declare a type alias and a universal trait may declare
+  a nested class.
+
+Both tests now score **T3** — every message scalac writes, at its line, and
+nothing else.
+
+The nested-object half of this rule already existed, in
+`crates/typer/src/localobj.rs`, where it could not work. That pass runs from
+the driver behind `if !has_errors(&diags)`, so the moment the typer rejected a
+value class for a nested *trait*, the nested-*object* message vanished with
+it — and the reverse had already been true: adding the typer check silently
+suppressed `localobj`'s "a local `object` that reads the enclosing instance"
+message in the same file. **A rejection rule cannot live behind a
+`!has_errors` guard.** It has moved into `valueclass.rs`, and
+`tests/fixtures/nestedobj_bad.scala` now carries only the not-implemented
+shape that check is actually for.
+
+### A companion has to be co-defined, and for locals that means the same block
+
+`neg/t8002-nested-scope` is eleven lines:
+
+```scala
+class C {
+  def foo = {
+    class C { private def x = 0 }
+    { val a = 0
+      object C { new C().x } }
+  }
+}
+```
+
+The inner `object C` is **not** the companion of the inner `class C`, because
+they are in different blocks — and nsc's comment in `Contexts.lookupSibling`
+is this exact program:
+
+```text
+// Must be owned by the same Scope, to ensure that in
+// `{ class C; { ...; object C } }`, the class is not seen as a companion
+// of the object.
+```
+
+Two blocks of one method share an owner, so the owner cannot tell them apart
+and `Checker::companion_scope` granted the pair private access.
+`Symbol::local_scope` now records the block each local class or object was
+declared directly in — `(file index, the block's NodeId)`, written by the
+`Block` arm of `Typer::type_expr_inner`, which is where the namer already runs
+over the block's `ClassDef` / `ModuleDef` statements — and `companion_scope`
+requires a match. Both being `None` (a template member, or top level) leaves
+every ordinary companion pair exactly as it was.
+
+**The wording is ours, not scalac's, and deliberately.** scalac says `method x
+in class C cannot be accessed as a member of C from object C`; we say `value x
+cannot be accessed as a member of C from C$`, at the same line, for the same
+reason. That difference is nsc's `fullLocationString` ("method x in class C")
+and `directObjectString` ("object C" for a module class), and it applies to
+*every* access diagnostic this compiler emits, not to this rule — four other
+test files pin the current spelling. Changing it is one cross-cutting slice of
+its own, and doing it here would have been four other slices' fixtures edited
+while five slices ran in parallel. So this test scores **T0**, not T3, and the
+report says why.
+
+### The fourth is reduced, not implemented
+
+`neg/name-lookup-stable` needs an ambiguity between a definition and an import
+at a *deeper nesting level*. `agent/impprio` implemented SLS 2's four
+precedence levels and named this as the piece it could not reach — it needs a
+depth, not just a rank. Sixteen lines, and it is a **wrong program** rather
+than a missing diagnostic:
+
+```scala
+object ColumnOption { def PrimaryKey: String = "imported" }
+class A {
+  def PrimaryKey: String = "defined"
+  def pick: String = { import ColumnOption._; PrimaryKey }
+}
+```
+
+scalac 2.13.16 rejects `pick`; we compile it and print `imported`. What it
+needs, and the two things the *message* needs that nothing records yet, are
+written up in [docs/not-implemented.md](not-implemented.md). The short version:
+`SymbolTable::scopes` already carries the depth as its own index, so the
+comparison is between the innermost scope binding the name at
+`BindRank::Explicit` / `Wildcard` and the innermost one binding it at
+`Definition`, with `BindRank::PackageElsewhere` as nsc's documented level-4
+exception.
+
+### Measured
+
+Every new rule here **rejects more**, which is the direction that costs working
+programs, so each one ships with the *legal neighbour* of the illegal shape as
+a **running** fixture — a universal trait with only `def`s, a value class with
+a nested type alias and an anonymous class and a `PartialFunction` literal, a
+companion reading `private` state on another instance — whose expected output
+is real scalac 2.13.16's and which the **pre-slice binary also compiles and
+prints unchanged**. That last clause is the guard: a positive fixture that
+only passes after the change proves nothing about over-reach.
+
+The four corpus tests, run alone before and after on the same tree
+(`CORPUS_KINDS=neg CORPUS_SIZE=full`, own `CORPUS_LOG`):
+
+| test | at `acec3f09` | at `961afe45` | scored |
+|---|---|---|---|
+| `neg/anytrait` | fail (accepted) | **pass** | T3 |
+| `neg/valueclasses-impl-restrictions` | fail (accepted) | **pass** | T3 |
+| `neg/t8002-nested-scope` | fail (accepted) | **pass** | T0 (wording, above) |
+| `neg/name-lookup-stable` | fail (accepted) | fail (accepted) | — |
+
+`tests/verify_merge.sh`, run twice: once on this slice alone (`961afe45`) and
+again after `git merge main` brought `agent/neglit` in (`adc144c4`). Every
+number against the coordinator's `acec3f09` baseline:
+
+| | baseline | `961afe45` | after merging main |
+|---|---|---|---|
+| `src/library` | 971 / 147 | **971 / 147** | 970 / 147 (neglit's gain) |
+| gitbucket | 270 / 79 | **270 / 79** | **270 / 79** |
+| cats | 185 / 71 | **185 / 71** | **185 / 71** |
+| slick | `errors=0 classes=1490` | **identical** | **identical** |
+| `slick_run.sh` (MODE=b) | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | **identical** | **identical** |
+| slick subset + verify | — | `verified=1490 failed=0 lint_problems=0` | same |
+| `cargo test --workspace --release` | — | 255 rows, **2457 passed, 0 failed** | 256 rows, **2469 passed, 0 failed** |
+| corpus full | — | `pos 1095`, `neg 673`, `run 623` | identical |
+
+`main` moved again while that second gate ran (`agent/pickleparams`), so the
+branch tip carries a third merge. It is a clean auto-merge — `README.md` and
+`crates/typer/src/symbol.rs` are the two files both sides touched and neither
+conflicted — and `cargo test --workspace --release` on it is 257 rows, **2475
+passed, 0 failed**. The four measures and the corpus were not re-run a third
+time: with five slices landing in parallel that is a treadmill, and the
+coordinator's gate at merge time is the authoritative one.
+
+**Three rejection rules and not one number moved.** That is the result worth
+recording: the direction these rules push is the one that turns working
+programs into errors, and 1414 files of real Scala across four projects say
+they do not.
+
+The gate's verdict is nonetheless `VERDICT=FAIL`, `corpus losses=1` against
+`tests/baselines/corpus-4d613d25.tsv`, on both runs. The loss is
+`neg/name-lookup-stable` — the fourth test, which was *already* failing at
+`acec3f09` (the ledger predates `agent/libnotype`, so it still records that
+test as a pass earned by a bogus `no matching overload for Nothing`). The
+other eleven changes against that ledger are all gains and all
+`agent/libnotype`'s. Nothing in this slice regressed anything: the loss count
+went from 4 to 1 and the gate will read `PASS` again once the ledger is
+refreshed or the fourth rule lands.
+
+
+
 ## What would move the number most
 
 0. **`@specialized`, for real.** With `run` now classified, this is the

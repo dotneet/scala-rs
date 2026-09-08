@@ -57,15 +57,61 @@
 //! `neg/valueclasses.scala` — still get one message each, as scalac gives
 //! them.
 //!
+//! ## `checkEphemeral` runs over two different shapes
+//!
+//! nsc's `checkEphemeral` is *one* function with two callers, and the only
+//! thing that differs is a string:
+//!
+//! ```text
+//! val isValueClass = !clazz.isTrait
+//! def where = if (isValueClass) "value class" else "universal trait extending from class Any"
+//! ```
+//!
+//! The second caller is in `typedClassDef`, not in `validateDerivedValueClass`,
+//! and it fires on a different trigger — `clazz.isTrait &&
+//! clazz.info.parents.nonEmpty && clazz.info.firstParent.typeSymbol ==
+//! AnyClass`, i.e. a *universal trait* (SLS 5.3.3). That is why
+//! [`ephemeral_violations`] takes `is_value_class` rather than being two
+//! functions: writing it twice is how the two message sets drift apart.
+//!
+//! The flag does more than pick a noun. When it is false:
+//!
+//! * a nested `class`/`trait` is **allowed** (nsc's body-level `case
+//!   ClassDef(...) if isValueClass` falls through to the `case _: Import | _:
+//!   ClassDef | _: TypeDef | EmptyTree` that does nothing), and
+//! * the deep traversal of `def` bodies does nothing at all
+//!   (`checkEphemeralDeep.traverse` opens with `if (isValueClass)`).
+//!
+//! So `trait T extends Any { def f = { object O; O } }` is accepted and
+//! `class C(val x: Int) extends AnyVal { def f = { object O; O } }` is not.
+//! Both were verified against scalac 2.13.16.
+//!
+//! ## The deep half, and why anonymous classes are exempt
+//!
+//! `checkEphemeralDeep` is run on a `def`'s right-hand side only — not on a
+//! `val`'s (that is already "field definition"), and not into a nested class
+//! that was itself just reported. It skips `cd.symbol.isAnonymousClass`, with
+//! nsc's own comment pointing at scala/bug#7571: `new I2 { val q = x.s }` and
+//! a `PartialFunction` literal inside a value class are legal, and both are
+//! anonymous classes. `neg/valueclasses-impl-restrictions` contains one of
+//! each, on lines its `.check` file deliberately does not mention. Our parser
+//! builds those as a `ClassDef` named `$anon` carrying `SYNTHETIC`, and both
+//! marks are tested — a rule that is too broad here turns a legal value class
+//! into an error.
+//!
 //! ## What is deliberately not here
 //!
-//! `checkEphemeral` also rejects nested classes and objects, secondary
-//! constructors, a redefined `equals`/`hashCode`, and any statement that is
-//! not a definition — all under "implementation restriction: ... is not
-//! allowed in value class". None of those appears in `neg/valueclasses.check`
-//! and each is a rejection rule of its own, so they are left out rather than
-//! guessed at. `value class may not wrap another user-defined value class` is
-//! already implemented, in [`crate::cyclic::value_class_wraps_value_class`].
+//! `checkEphemeral`'s `DefDef` arm also rejects secondary constructors, a
+//! redefined `equals`/`hashCode`, and an "additional parameter" (a second
+//! parameter accessor). Those three read `stat.symbol`'s nsc-specific flags
+//! (`isAuxiliaryConstructor`, `isSynthetic`, `isParamAccessor`), none of which
+//! this tree carries in the same sense, and none appears in
+//! `neg/valueclasses.check` or `neg/valueclasses-impl-restrictions.check`. The
+//! same goes for the "qualified super reference" arm of the deep traversal.
+//! They are left out rather than guessed at: every one of them is a *new
+//! rejection*, and a wrong one costs a working program.
+//! `value class may not wrap another user-defined value class` is already
+//! implemented, in [`crate::cyclic::value_class_wraps_value_class`].
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_span::Span;
@@ -77,6 +123,199 @@ use crate::symbol::{SymKind, SymbolTable};
 pub struct Violation {
     pub span: Span,
     pub msg: &'static str,
+}
+
+/// The five things `checkEphemeral` can complain about, before the `where`
+/// noun is chosen. Kept as an enum so the two message sets are written once,
+/// side by side, in [`ephemeral_msg`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum What {
+    Field,
+    Statement,
+    NestedObject,
+    NestedClass,
+    NestedTrait,
+}
+
+/// `s"$what is not allowed in $where"`, with `implementation restriction: `
+/// and nsc's second line on the ones it routes through `implRestriction`.
+///
+/// That second line ("This restriction is planned to be removed in subsequent
+/// releases.") is part of the message and not a separate note: nsc calls
+/// `context.error` once with both, so `test/files/neg/*.check` carries them
+/// under one `error:` header. Written out with `concat!` rather than
+/// assembled at run time so every message stays a `&'static str`.
+fn ephemeral_msg(what: What, is_value_class: bool) -> &'static str {
+    match (what, is_value_class) {
+        (What::Field, true) => "field definition is not allowed in value class",
+        (What::Field, false) => {
+            "field definition is not allowed in universal trait extending from class Any"
+        }
+        (What::Statement, true) => "this statement is not allowed in value class",
+        (What::Statement, false) => {
+            "this statement is not allowed in universal trait extending from class Any"
+        }
+        (What::NestedObject, true) => concat!(
+            "implementation restriction: nested object is not allowed in value class",
+            "\nThis restriction is planned to be removed in subsequent releases."
+        ),
+        (What::NestedObject, false) => concat!(
+            "implementation restriction: nested object is not allowed in ",
+            "universal trait extending from class Any",
+            "\nThis restriction is planned to be removed in subsequent releases."
+        ),
+        // Only reachable with `is_value_class`: a nested class or trait in a
+        // universal trait is legal, and `ephemeral_violations` never asks.
+        (What::NestedClass, _) => concat!(
+            "implementation restriction: nested class is not allowed in value class",
+            "\nThis restriction is planned to be removed in subsequent releases."
+        ),
+        (What::NestedTrait, _) => concat!(
+            "implementation restriction: nested trait is not allowed in value class",
+            "\nThis restriction is planned to be removed in subsequent releases."
+        ),
+    }
+}
+
+/// nsc's `!cd.symbol.isAnonymousClass`, on a tree rather than a symbol.
+///
+/// `new I2 { ... }` and `{ case x => x }: PartialFunction[Int, Int]` are the
+/// two shapes `neg/valueclasses-impl-restrictions` marks "allowed"; the parser
+/// turns the first into a `ClassDef` named `$anon` with `SYNTHETIC`, and both
+/// marks are checked because either alone would be a guess.
+fn is_anonymous_class(name: &str, flags: Flags) -> bool {
+    name.starts_with("$anon") || flags.contains(Flags::SYNTHETIC)
+}
+
+/// nsc's `checkEphemeralDeep`: search a `def`'s right-hand side, at any depth,
+/// for a nested object or a nested (non-anonymous) class.
+///
+/// nsc reports and then keeps traversing (`super.traverse(tree)` runs after
+/// the match), so a nested class inside a nested class yields two messages —
+/// which is what scalac 2.13.16 does.
+fn ephemeral_deep(tree: &Tree, out: &mut Vec<Violation>) {
+    match &tree.kind {
+        TreeKind::ModuleDef { .. } => out.push(Violation {
+            span: tree.span,
+            msg: ephemeral_msg(What::NestedObject, true),
+        }),
+        TreeKind::ClassDef { mods, name, .. } if !is_anonymous_class(name, mods.flags) => {
+            out.push(Violation {
+                span: tree.span,
+                msg: ephemeral_msg(
+                    if mods.flags.contains(Flags::TRAIT) {
+                        What::NestedTrait
+                    } else {
+                        What::NestedClass
+                    },
+                    true,
+                ),
+            })
+        }
+        _ => {}
+    }
+    crate::erasure::for_each_child(tree, &mut |c| ephemeral_deep(c, out));
+}
+
+/// nsc's `Typers.checkEphemeral`, over a template body.
+///
+/// `is_value_class` is nsc's `!clazz.isTrait`: `true` for the body of a
+/// derived value class, `false` for the body of a universal trait. See the
+/// module header for everything the flag changes.
+///
+/// Callers: [`violations`] (value classes, in the one branch of nsc's
+/// parameter-accessor `match` that reaches it) and
+/// [`universal_trait_violations`] (universal traits).
+pub fn ephemeral_violations(body: &[Tree], is_value_class: bool) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for stat in body {
+        match &stat.kind {
+            // nsc: `case ClassDef(mods, _, _, _) if isValueClass`. Anonymous
+            // classes cannot appear as a template *statement*, but the same
+            // exemption is applied here so the two arms cannot disagree.
+            TreeKind::ClassDef { mods, name, .. }
+                if is_value_class && !is_anonymous_class(name, mods.flags) =>
+            {
+                out.push(Violation {
+                    span: stat.span,
+                    msg: ephemeral_msg(
+                        if mods.flags.contains(Flags::TRAIT) {
+                            What::NestedTrait
+                        } else {
+                            What::NestedClass
+                        },
+                        true,
+                    ),
+                });
+            }
+            // nsc: `case _: Import | _: ClassDef | _: TypeDef | EmptyTree`.
+            TreeKind::Import { .. }
+            | TreeKind::ClassDef { .. }
+            | TreeKind::TypeDef { .. }
+            | TreeKind::Empty => {}
+            // nsc runs three more checks here (secondary constructor,
+            // redefined equals/hashCode, additional parameter) that are
+            // deliberately not implemented — see the module header — and then
+            // descends into the right-hand side.
+            TreeKind::DefDef { rhs, .. } => {
+                if is_value_class {
+                    ephemeral_deep(rhs, &mut out);
+                }
+            }
+            TreeKind::ValDef { .. } if is_source_field(stat) => out.push(Violation {
+                span: stat.span,
+                msg: ephemeral_msg(What::Field, is_value_class),
+            }),
+            // A `ValDef` the source did not write (a synthesized accessor, a
+            // constructor parameter that stayed in the body) is not a field
+            // definition; nsc does not have one here at all, because it
+            // filtered the parameter accessor out before calling.
+            TreeKind::ValDef { .. } => {}
+            TreeKind::ModuleDef { .. } => out.push(Violation {
+                span: stat.span,
+                msg: ephemeral_msg(What::NestedObject, is_value_class),
+            }),
+            _ => out.push(Violation {
+                span: stat.span,
+                msg: ephemeral_msg(What::Statement, is_value_class),
+            }),
+        }
+    }
+    out
+}
+
+/// nsc's second `checkEphemeral` caller, in `typedClassDef`:
+///
+/// ```text
+/// if (clazz.isTrait && clazz.info.parents.nonEmpty && clazz.info.firstParent.typeSymbol == AnyClass)
+///   checkEphemeral(clazz, impl2.body)
+/// ```
+///
+/// A plain `trait T` has `AnyRef` as its first parent, so only a trait whose
+/// source says `extends Any` (SLS 5.3.3's universal trait) is checked. `Any`
+/// as a *later* parent does not count, and neither does a class.
+pub fn universal_trait_violations(
+    st: &SymbolTable,
+    id: SymbolId,
+    is_trait: bool,
+    body: &[Tree],
+) -> Vec<Violation> {
+    if !is_trait || !first_parent_is_any(st, id) {
+        return Vec::new();
+    }
+    ephemeral_violations(body, false)
+}
+
+/// nsc's `clazz.info.parents.nonEmpty && clazz.info.firstParent.typeSymbol ==
+/// AnyClass`, spelled the way [`first_parent_is_anyval`] spells its own.
+pub fn first_parent_is_any(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    match st.get(id).parents.first() {
+        Some(p) => matches!(p, Type::Any) || st.class_sym_of(p).is_some_and(|c| c == st.any_sym),
+        None => false,
+    }
 }
 
 /// nsc's trigger: the class's **first** parent is `AnyVal`.
@@ -243,14 +482,11 @@ pub fn violations(
                         msg: "value class parameter must not be protected[this]",
                     });
                 } else {
-                    for stat in body {
-                        if is_source_field(stat) {
-                            out.push(Violation {
-                                span: stat.span,
-                                msg: "field definition is not allowed in value class",
-                            });
-                        }
-                    }
+                    // nsc: `checkEphemeral(clazz, body.filterNot(referencesUnderlying))`.
+                    // The parameter accessor it filters out lives in
+                    // `vparamss` here, not in `body`, so there is nothing to
+                    // filter.
+                    out.extend(ephemeral_violations(body, true));
                 }
             }
         }

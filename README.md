@@ -81,6 +81,34 @@ scalac 2.13.16 が受理し実行します。一方 `trait Univ extends Any` の
 （`libanyval_overload` ほか 3 件）と [docs/scala-library.md](docs/scala-library.md)
 の「an overload is not an override」節を参照してください。
 
+**ユニバーサルトレイト（SLS 5.3.3）と値クラスの本体制限**は nsc の
+`Typers.checkEphemeral` をそのまま実装しています（`crates/typer/src/valueclass.rs`）。
+nsc ではこれは 1 つの関数で、`where` の語（"value class" か "universal trait
+extending from class Any"）だけが呼び出し元によって変わります。
+
+- `trait T extends Any` の本体に書けるのは `def`・型・`import`・ネストした
+  クラスだけです。`val` / `var` は
+  `field definition is not allowed in universal trait extending from class Any`、
+  式文は `this statement is not allowed in ...`、ネストした `object` は
+  `implementation restriction: nested object is not allowed in ...` と
+  2 行目の `This restriction is planned to be removed in subsequent releases.`
+  で拒否します。
+- 値クラスの本体（および `def` の本体の**任意の深さ**）にネストした
+  `class` / `trait` / `object` を書くことはできません。ただし**匿名クラス**は
+  nsc と同じく除外します（`!cd.symbol.isAnonymousClass`、scala/bug#7571）。
+  値クラス内の `new I2 { ... }` と `PartialFunction` リテラルは合法です。
+
+`neg/anytrait` と `neg/valueclasses-impl-restrictions` は、scalac の `.check`
+ファイルと**行も文言も完全に一致**するようになりました。
+
+ローカルな `class C` と `object C` が**コンパニオンになるのは同じブロックに
+書かれたときだけ**です（nsc の `Contexts.lookupSibling`。1 つのメソッドの
+2 つのブロックは同じ owner を共有するため、owner では区別できません）。
+`Symbol::local_scope` が各ローカル定義のブロックを記録し、
+`Checker::companion_scope` が一致を要求します。これがないと
+`{ class C { private def x = 0 }; { object C { new C().x } } }` の
+`private` が読めてしまいます（`neg/t8002-nested-scope`）。
+
 同名メソッドと object の `apply` は両方をオーバーロード候補として比較します。
 単一候補の呼び出し結果と曖昧な呼び出しの拒否は、`overload_module` テストで
 scalac 2.13.16 と比較します。集合の結合も含む
@@ -516,6 +544,15 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
 
 How the fixtures, the dual-run harnesses and the pickle-reader regression tests
 are organised is described in [docs/testing.md](docs/testing.md).
+
+`negchecks` テストは、**拒否を増やす**規則（ユニバーサルトレイトと値クラスの
+本体制限、ローカルなコンパニオンのスコープ）を両側から固定します。異常系は実
+scalac 2.13.16 の出力そのもの——9 件の診断を行と文言で——に合わせ、余分な診断が
+1 つも出ないことも検査します。正常系は「違法な形の**合法な隣人**」——`def` だけの
+ユニバーサルトレイト、型エイリアスと匿名クラスと `PartialFunction` リテラルを
+持つ値クラス、`private` を読むコンパニオン——を**実行**して実 scalac の出力と
+比較します。拒否規則は広すぎると動いていたプログラムを壊すので、正常系が
+**修正前のバイナリでも同じ出力を出す**ことを確認した上で追加しています。
 
 線形化（SLS 5.1.2）は `linearization` テストで二重に検査します。正常系は深く広い
 ダイヤモンド継承の `super` 連鎖を実行し、同じソースを実 scalac 2.13.16 で

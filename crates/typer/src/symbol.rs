@@ -631,6 +631,26 @@ pub struct Symbol {
     /// ground truth about which members actually have an accessor: a
     /// `private[this] val` has none and keeps the direct field read.
     pub via_accessor: bool,
+    /// The **block** this class or object was declared directly in, when it
+    /// was declared in one: `(file index, the block's `NodeId`)`, packed.
+    /// `None` for everything that is a member of a template or a package.
+    ///
+    /// A companion pair has to be *co-defined*, and for a local definition
+    /// nsc spells that as the same `Scope`, not the same owner
+    /// (`Contexts.lookupSibling`, whose comment is this exact program):
+    ///
+    /// ```text
+    /// // Must be owned by the same Scope, to ensure that in
+    /// // `{ class C; { ...; object C } }`, the class is not seen as a
+    /// // companion of the object.
+    /// ```
+    ///
+    /// Two local definitions in *different* blocks of one method share an
+    /// owner, so the owner cannot tell them apart, and
+    /// `test/files/neg/t8002-nested-scope.scala` is the program where that
+    /// matters: the inner `object C` is not the companion of the inner
+    /// `class C` and may not read its `private def x`.
+    pub local_scope: Option<u64>,
 }
 
 /// One method-owned specialization entry created after pickling.
@@ -1174,6 +1194,7 @@ impl SymbolTable {
                 via_accessor: false,
                 specialized: None,
                 unspecialized: false,
+                local_scope: None,
             }],
             scopes: vec![Scope::default()],
             root: SymbolId(0),
@@ -1295,6 +1316,7 @@ impl SymbolTable {
             via_accessor: false,
             specialized: None,
             unspecialized: false,
+            local_scope: None,
         });
         if !owner.is_none() && owner.0 as usize <= self.symbols.len() {
             if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
