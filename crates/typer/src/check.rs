@@ -1822,15 +1822,65 @@ pub(crate) fn has_named_dynamic_args(tree: &Tree) -> bool {
     }
 }
 
-/// nsc `isAssignmentOp`: ends with `=`, length > 1, not `==` / `!=` / `<=` / `>=`.
+/// nsc's `Chars.isOperatorPart`: the ASCII operator characters, plus any
+/// Unicode symbol (`Sm` / `So`). Rust's standard library exposes no Unicode
+/// category table, so a non-ASCII character is taken to be an operator part
+/// unless it is alphanumeric -- the same answer for every name that can reach
+/// [`is_assignment_op`], and never narrower than the rule this replaced.
+fn is_operator_part(c: char) -> bool {
+    match c {
+        '~' | '!' | '@' | '#' | '%' | '^' | '*' | '+' | '-' | '<' | '>' | '?' | ':' | '=' | '&'
+        | '|' | '/' | '\\' => true,
+        c if c.is_ascii() => false,
+        c => !c.is_alphanumeric(),
+    }
+}
+
+/// nsc `StdNames.isOpAssignmentName`, which is what `Typers.onError` consults
+/// before rewriting `x op= y` into `x = x op y`:
 ///
-/// `scala_rs_parser::ast` exports a function of the same name that answers a
-/// *different* question (it also rejects an operator starting with `=`, so
-/// `===` is not one). While this lived beside its callers a local item
-/// outranked the `use scala_rs_parser::ast::*` glob and the two never met;
-/// a caller in another file must name this one explicitly, and does.
+/// ```scala
+/// def isOpAssignmentName(name: Name) = name match {
+///   case raw.NE | raw.LE | raw.GE | EMPTY => false
+///   case _ => name.endChar == '=' && name.startChar != '=' && isOperatorPart(name.startChar)
+/// }
+/// ```
+///
+/// The two clauses this used to be missing are load-bearing, not cosmetic.
+/// **`startChar != '='` is what keeps `===` out of the rewrite.** Without it
+/// `a === b` was turned into `a = (a == b)` whenever the `===` member could
+/// not be found on the receiver at that moment, which
+/// * silently accepted a program scalac rejects, whenever the receiver was a
+///   `var` of the operand's type (`var b = true; b === false` compiled, as an
+///   assignment of the comparison's result), and
+/// * poisoned slick's comparisons in gitbucket: `try_rewrite_assignment_op`
+///   asks `search_extension` whether `Rep[String]` has a `===` *before* the
+///   selection is typed, and that search comes back empty inside a nested
+///   lazy signature completion. The rewrite then failed on an unassignable
+///   receiver and set `Type::Error` -- so `(userName === owner.bind) &&
+///   (repositoryName === repository.bind)` inferred `Boolean` (an erroneous
+///   `&&` receiver takes `Predef.Boolean2boolean`) instead of `Rep[Boolean]`,
+///   and every caller of `byRepository` reported
+///   `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])`.
+///
+/// `isOperatorPart(startChar)` keeps a *setter* out of it for the same reason:
+/// `p.x_=(1)` where `x_=` is not a member is "value x_= is not a member",
+/// not an assignment to `p.x`.
+///
+/// `scala_rs_parser::ast` exports a function of the same name that has always
+/// carried the `startChar != '='` clause. While this lived beside its callers
+/// a local item outranked the `use scala_rs_parser::ast::*` glob and the two
+/// never met; a caller in another file must name this one explicitly, and does.
 pub(crate) fn is_assignment_op(name: &str) -> bool {
-    name.len() > 1 && name.ends_with('=') && !matches!(name, "==" | "!=" | "<=" | ">=")
+    let mut cs = name.chars();
+    let Some(first) = cs.next() else {
+        return false;
+    };
+    name.chars().count() > 1
+        && name.ends_with('=')
+        && first != '='
+        && is_operator_part(first)
+        && !matches!(name, "!=" | "<=" | ">=")
 }
 
 pub(crate) fn is_implicit_conversion_shape(vparamss: &[Vec<Tree>]) -> bool {

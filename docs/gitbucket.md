@@ -2488,6 +2488,180 @@ are more than half, and the `Any` in nine of the rows above is what a
 `CanBeQueryCondition` that could not be found leaves behind. The next lever is
 still slick's `Shape` / `CanBeQueryCondition` derivation, not the diagnostics.
 
+## Fixed: a pending signature's scope snapshot went stale (`agent/gbshape`)
+
+**393 -> 339 errors, 83 -> 81 files.** slick unmoved at `errors=0
+files_with_errors=0 classes=1490`, cats unmoved at 215 / 73, the scala library
+unmoved at 1551 / 168. Measured on `23eaf404` and on the same tree with this
+slice.
+
+The brief that opened this slice named four families at the head and asked
+whether they are one root. **They are three**, and the measurement says which:
+
+| family | before | after |
+|---|---:|---:|
+| `no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])` | 19 | **0** |
+| `no implicit ... CanBeQueryCondition[Any]` | 46 | **13** |
+| `no implicit ... OptionMapper2[Boolean, Boolean, Boolean, Boolean, P2, R]` | 12 | 13 |
+| `no implicit ... Shape[FlatShapeLevel, O2, U2, _]` | 6 | 6 |
+
+So the `(Boolean)Boolean` family and **33 of the 46** `CanBeQueryCondition[Any]`
+are one root; the `OptionMapper2` and `Shape` families are not it and did not
+move. (The brief's count of 8 for the `Shape` row is 6 in the log it was taken
+from: `grep -c` over the exact string
+`Shape[FlatShapeLevel, O2, U2, _]` gives 6 on `23eaf404` and 6 after. Worth
+saying because a survey's counts are usually taken from a digit-normalised
+histogram, which merges this row with `Query.join`'s
+`Shape[FlatShapeLevel, ON, UN, _]`; here it does not, and the two rows really
+are one message.)
+
+### Root 33: the second signature round is selective, and only it refreshes the scope
+
+`sig_rerun_safe` rebuilds a `def`'s signature on the second round only when
+the first round *reported* something or left an unresolved name in the
+signature -- deliberately, because widening it to every `def` was measured to
+cost more than it gained (see "Let the body pass build this member's signature
+again"). Rebuilding is also the only thing that calls `register_typed_sig`,
+and that is what stores the **scope snapshot a lazy completion of the body
+will later be typed in**. A member whose own signature has nothing wrong with
+it therefore keeps the *first* round's snapshot, forever.
+
+gitbucket writes both halves of that in one overload set:
+
+```scala
+protected[model] trait TemplateComponent { self: Profile =>
+  import profile.api._                       // `profile` is another unit's abstract val
+  trait BasicTemplate { self: Table[?] =>
+    def byRepository(owner: String, repository: String) =
+      (userName === owner.bind) && (repositoryName === repository.bind)
+    def byRepository(userName: Rep[String], repositoryName: Rep[String]) =
+      (this.userName === userName) && (this.repositoryName === repositoryName)
+  }
+}
+```
+
+`import profile.api._` cannot resolve on the first signature round --
+`Profile.profile` is an abstract `val` of another unit whose own signature
+pass has not run -- so `import_prefix_missed` is set for the run. The
+**second** alternative writes `Rep[String]`, which is unresolved on that
+round, so it is rebuilt and re-registered with a snapshot that has the
+import in it. The **first** alternative's parameters are plain `String`s:
+nothing is wrong with its signature, it is never rebuilt, and its snapshot has
+no `import profile.api._`.
+
+A call from another unit (`IssuesService` and friends) then completes that
+alternative's body on demand, standing in the stale snapshot. Measured, at the
+failure: 43 implicits in scope, and neither `columnExtensionMethods` nor
+`valueToConstColumn` among them. So `===` and `.bind` are both "not a member",
+the operands are `Type::Error`, the erroneous `&&` receiver picks up
+`Predef.Boolean2boolean`, and the method's **inferred result type is cached as
+`Boolean`** instead of `Rep[Boolean]`. Every call site of it is then
+`no matching overload for (Boolean)Boolean with arguments (Rep[Boolean])`, and
+the `filter { t => ... }` bodies that contain those calls are `Any`, which is
+33 of the 46 `CanBeQueryCondition[Any]`.
+
+Almost none of that is visible as a diagnostic, because the completion happens
+inside a context whose diagnostics are discarded -- the *wrong answer* is what
+survives, cached on the symbol.
+
+The fix is `Typer::refresh_pending_scope`, called from `type_member_sig`'s
+already-done branch: a member the signature pass has seen before has its
+pending snapshot (scopes, owner, `this_class`, `file_index`) refreshed to the
+round now running. The signature itself is **not** rebuilt, so nothing
+`sig_rerun_safe` declines to redo -- a second evidence clause, re-typed view
+bounds -- happens. It is the same argument `refresh_alias_sigs` already makes
+for type aliases: every round's snapshot is this template's own, so a later
+one is only ever better.
+
+`tests/fixtures/gbshape_lazyscope.scala` is the shape in fourteen lines with
+no slick and no jars: an overloaded pair in a nested trait under an `import`
+through a self-typed abstract `val`, called from an object written *above* it.
+The pre-fix binary reports six `value mark is not a member of ...`; the fixed
+one executes and prints what real scalac 2.13.16 prints.
+
+### Root 34: `===` was read as an op-assignment, and that accepted a wrong program
+
+`check::is_assignment_op` said "ends with `=`, longer than one character, not
+`==` / `!=` / `<=` / `>=`". nsc's `StdNames.isOpAssignmentName` also requires
+`name.startChar != '='` **and** `isOperatorPart(name.startChar)`. The
+`startChar` clause is what keeps `===` out of `convertToAssignment` entirely.
+
+Two things followed from having it wrong, and they are worth separating:
+
+* **A program real scalac rejects was accepted.** `var b = true; b === false`
+  became `b = (b != false)`: it type-checks, it compiles, and it writes the
+  comparison's result into the variable. scalac 2.13.16 says
+  `value === is not a member of Boolean`. Now so do we.
+* **In gitbucket it destroyed a good `===`.** Ours runs the rewrite
+  *pre-emptively*, from `type_apply_in`, on its own guess at whether the
+  member is there (`receiver_has_term` / `search_extension` /
+  `supply_from_pickle`); nsc runs `convertToAssignment` only from `onError`,
+  after the application has actually failed. With root 33's stale scope the
+  guess came back empty for `Rep[String].===` fifteen times, the rewrite then
+  failed on an unassignable receiver, and the whole comparison became
+  `Type::Error` -- with the diagnostic *suppressed* wherever the receiver was
+  already erroneous.
+
+**Attribution, measured separately.** Root 34 alone is 393 -> **396**: it
+moves the three surviving `does not convert to assignment` reports to the
+plain `value === is not a member of Rep[String]` plus the `value bind is not a
+member of String` behind them, which is the accurate pair of diagnostics for a
+receiver whose conversions are invisible. Root 33 alone is 393 -> **339**, and
+the two together are also 339 -- root 33 removes the condition under which
+root 34 could fire in this codebase. Root 34 is in the tree for the
+unsoundness, not for the count.
+
+`tests/fixtures/gbshape_opassign_bad.scala` pins all four lines real scalac
+rejects (including `p.x_=(2)`, which the `isOperatorPart` clause covers); the
+pre-fix binary misses line 18 entirely -- it compiled -- and reports a type
+mismatch instead of the missing member on line 23.
+`tests/fixtures/gbshape_opassign.scala` executes and prints, and shows every
+*real* op-assignment (`+=` on a `var`, a field, an array element, a `Map`
+entry; `|=` `&=` `^=` `*=` `-=` `++=`; `!==`, which nsc really does treat as
+one) still rewriting, and a user-defined `===` member still being called.
+`crates/cli/tests/gbshape.rs`.
+
+### The head after this slice
+
+| n | message |
+|---:|---|
+| 31 | `macro expansion is not implemented: cannot expand mapTo` |
+| 13 | `no implicit ... OptionMapper2[Boolean, Boolean, Boolean, Boolean, P2, R]` |
+| 13 | `no implicit ... CanBeQueryCondition[Any]` |
+| 13 | `ambiguous overload for constructor` |
+| 12 | `value withTransaction is not a member of BasicBackend.DatabaseFactory` |
+| 8 | `value url is not a member of Any` |
+| 8 | `value _N is not a member of A` |
+| 8 | `no implicit ... TypedType[Option[String]]` |
+| 8 | `no implicit ... ExecutionContext` |
+| 7 | `value withSession is not a member of BasicBackend.DatabaseFactory` |
+| 6 | `no implicit ... Shape[FlatShapeLevel, O2, U2, _]` |
+
+`no implicit` is 77 of the 339 and `is not a member of` 104. The 19
+`withTransaction` / `withSession` are still the *import precedence* defect
+`agent/backendtypes` wrote up (a wildcard import outranking an explicit one),
+which has an acceptance criterion recorded and no slice yet.
+
+### For whoever takes the next one
+
+The stale-snapshot root is worth remembering as a *shape*, not as a slick
+story: **a cached answer computed in a provisional context is worse than no
+answer**, because nothing downstream can tell it apart from a real one. Both
+of this slice's roots are that. The `===` one wrote `Boolean` onto a method
+whose body says `Rep[Boolean]`; the snapshot one made an implicit search come
+back empty in a scope that has the implicit. Neither reported anything at the
+place it went wrong.
+
+The way to find the next one of these is not to read the diagnostic -- it is
+to print the *inferred* type of the definition the diagnostic blames, next to
+the tree it was inferred from. Four `eprintln!`s (the def's inferred type and
+a shallow shape of its typed body; then the implicit scope at the selection
+that failed) took this from "the four families might be one root" to the exact
+line of `sig_rerun_safe` in about an hour, after a backtrace and a
+file-set bisection had both been inconclusive. Release-build backtraces inline
+`type_select` into `type_expr_inner` into `type_expr`, so a stack that seems to
+skip a function is not evidence that it was skipped.
+
 ### Not fixed here, and worth a slice: `Predef.Manifest`
 
 `Manifest` is `type Manifest[T] = scala.reflect.Manifest[T]` in `Predef`, and
