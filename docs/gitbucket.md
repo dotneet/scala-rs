@@ -2507,9 +2507,13 @@ whether they are one root. **They are three**, and the measurement says which:
 
 So the `(Boolean)Boolean` family and **33 of the 46** `CanBeQueryCondition[Any]`
 are one root; the `OptionMapper2` and `Shape` families are not it and did not
-move. (The brief's count of 8 for the `Shape` row was 6 in the log it was
-taken from; the two `Shape[FlatShapeLevel, O2, U2, _]` rows it counted are a
-`ON` / `UN` pair from `Query.join`, already written up above as still open.)
+move. (The brief's count of 8 for the `Shape` row is 6 in the log it was taken
+from: `grep -c` over the exact string
+`Shape[FlatShapeLevel, O2, U2, _]` gives 6 on `23eaf404` and 6 after. Worth
+saying because a survey's counts are usually taken from a digit-normalised
+histogram, which merges this row with `Query.join`'s
+`Shape[FlatShapeLevel, ON, UN, _]`; here it does not, and the two rows really
+are one message.)
 
 ### Root 33: the second signature round is selective, and only it refreshes the scope
 
@@ -2631,7 +2635,7 @@ one) still rewriting, and a user-defined `===` member still being called.
 | 8 | `no implicit ... TypedType[Option[String]]` |
 | 8 | `no implicit ... ExecutionContext` |
 | 7 | `value withSession is not a member of BasicBackend.DatabaseFactory` |
-| 6 | `no implicit ... Shape[FlatShapeLevel, ON, UN, _]` |
+| 6 | `no implicit ... Shape[FlatShapeLevel, O2, U2, _]` |
 
 `no implicit` is 77 of the 339 and `is not a member of` 104. The 19
 `withTransaction` / `withSession` are still the *import precedence* defect
