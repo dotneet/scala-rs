@@ -34,6 +34,7 @@ impl Typer {
                 for stt in stats.iter_mut() {
                     self.namer(stt);
                 }
+                self.record_unit_pkg_defs(pkg, stats);
                 self.st.pop_scope();
                 self.pkg_nest.pop();
                 self.st.owner = saved;
@@ -46,6 +47,54 @@ impl Typer {
                 self.namer_member(tree);
             }
             _ => {}
+        }
+    }
+
+    /// Remember what this file puts into `pkg` directly, for
+    /// [`Typer::unit_pkg_defs`]: the top-level classes, traits and objects of
+    /// one package clause, plus the members of a package object written in the
+    /// same clause (a package object's members are the package's members, and
+    /// they are made available by the same clause).
+    ///
+    /// Only the *name* has to be right for the fast path in
+    /// `expose_unqualified` to run at all; the package recorded beside it is
+    /// what keeps two sibling clauses in one file from seeing each other.
+    fn record_unit_pkg_defs(&mut self, pkg: SymbolId, stats: &[Tree]) {
+        let mut found: Vec<(String, SymbolId)> = Vec::new();
+        for stt in stats {
+            let (name, is_pkg_obj) = match &stt.kind {
+                TreeKind::ClassDef { name, .. } => (name.clone(), false),
+                TreeKind::ModuleDef { name, mods, .. } => (
+                    name.clone(),
+                    name == "package" || mods.flags.contains(Flags::PACKAGE),
+                ),
+                _ => continue,
+            };
+            if stt.sym.is_none() {
+                continue;
+            }
+            if is_pkg_obj {
+                let cls = self.st.module_class_of(stt.sym);
+                for mem in self.st.get(cls).members.clone() {
+                    let n = self.st.get(mem).name.clone();
+                    if n.ends_with('$') || n == "<init>" {
+                        continue;
+                    }
+                    found.push((n, mem));
+                }
+                continue;
+            }
+            found.push((name, stt.sym));
+        }
+        if found.is_empty() {
+            return;
+        }
+        let per_file = self.unit_pkg_defs.entry(self.file_index).or_default();
+        for (n, id) in found {
+            let slot = per_file.entry(n).or_default();
+            if !slot.contains(&(pkg, id)) {
+                slot.push((pkg, id));
+            }
         }
     }
 

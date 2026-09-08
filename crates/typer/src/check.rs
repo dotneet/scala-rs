@@ -288,6 +288,26 @@ pub struct Typer {
     /// { … } }` opens both -- and nsc really does tell the two apart
     /// (2.13.16, with and without `-Xsource:3`). See `expose_unqualified`.
     pub(crate) open_pkgs: HashMap<usize, Vec<SymbolId>>,
+    /// What each compilation unit defines at the top level of its own package
+    /// clauses: `file index -> name -> [(package, symbol)]`.
+    ///
+    /// SLS 2 splits "made available by a package clause" in two. Defined in
+    /// **this** unit it is precedence 1 and outranks a wildcard import;
+    /// defined in another unit it is precedence 4 and does not. gitbucket's
+    /// `TransactionFilter.scala` is the first half -- it writes `object
+    /// Database` at the bottom of the very file whose `import …
+    /// blockingApi._` offers slick's -- and every other file that uses it
+    /// says so with an explicit import instead. Recorded by the namer, which
+    /// is the only pass that knows which file a definition came from.
+    pub(crate) unit_pkg_defs: HashMap<usize, HashMap<String, Vec<(SymbolId, SymbolId)>>>,
+    /// Which `import` clause is being entered, as `(file, byte offset)`, or 0
+    /// when nothing is. Two bindings of one name at one precedence are SLS 2's
+    /// *ambiguous reference* exactly when two different clauses made them; an
+    /// overload set one clause brings in is not ambiguous, however many of the
+    /// imported object's ancestors declare a member of that name. Keyed by
+    /// source position rather than by a counter so that the several passes
+    /// over a unit agree about which clause a binding came from.
+    pub(crate) import_origin: u64,
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     pub(crate) sigs_only: bool,
@@ -886,6 +906,8 @@ impl Typer {
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
+            unit_pkg_defs: HashMap::new(),
+            import_origin: 0,
             sigs_only: false,
             header_pass: false,
             strict_type_names: false,
