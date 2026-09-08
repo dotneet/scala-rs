@@ -347,3 +347,160 @@ fn bitwise_operators_still_need_integral_operands() {
         assert!(!ok, "expected {tag} to be rejected:\n{err}");
     }
 }
+
+// ------------------------------------- `eq`/`ne` under a universal trait
+
+/// `lookup_member` finds `AnyRef`'s members by walking a *declared* parent,
+/// and `rough_parents` supplies `AnyRef` only when the parent list is empty.
+/// A class whose ancestry bottoms out in a **universal trait** therefore had
+/// a chain ending at `Any`, and `t eq null` was `value eq is not a member` --
+/// while the same program's `def conforms(t: T2[Int, Int]): AnyRef = t` was
+/// accepted, so the compiler already agreed the receiver was a reference.
+///
+/// That is `src/library`'s whole `Tuple`/`Product`/`Iterator` family:
+/// `scala.Equals` is `trait Equals extends scala.Any`. Real scalac 2.13.16
+/// accepts `tests/fixtures/libprelude_anyref.scala` and its stdout is the
+/// expected file.
+///
+/// Run, because `eq` is reference identity: `p eq q` is false where `p == q`
+/// is true, so a fallback that resolved it to `==` would type-check, verify,
+/// and print the wrong answer.
+#[test]
+fn eq_and_ne_on_a_universal_trait_run() {
+    if !java_available() {
+        return;
+    }
+    let name = "libprelude_anyref";
+    let out = compile_fixture(name, &["--no-scala-library"]);
+    assert_eq!(run_java(&out, None), expected_stdout(name));
+    let _ = fs::remove_dir_all(&out);
+
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture(name, &["--scala-library", jar_s]);
+    assert_eq!(run_java(&out, Some(jar_s)), expected_stdout(name));
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The fallback is asked last and only supplies what `AnyRef` declares, so it
+/// must not have made `eq` legal on a value class or on `Any`. Real scalac
+/// 2.13.16 rejects both of these.
+#[test]
+fn eq_is_still_refused_where_there_is_no_reference() {
+    for (tag, src) in [
+        (
+            "inteq",
+            "object M { def f(a: Int, b: Int): Boolean = a eq b }",
+        ),
+        (
+            "anyeq",
+            "object M { def f(a: Any, b: AnyRef): Boolean = a eq b }",
+        ),
+    ] {
+        let (ok, err) = compile_src(tag, src, &["--no-scala-library"]);
+        assert!(!ok, "expected {tag} to be rejected:\n{err}");
+        assert!(
+            err.contains("is not a member"),
+            "expected a member diagnostic for {tag}:\n{err}"
+        );
+    }
+}
+
+// ------------------------------------------------- `->` and a source Predef
+
+/// `docs/scala-library.md`'s item 0, at last with the right root.
+///
+/// The doc's twelve-line reproduction is **not** a case this compiler gets
+/// wrong: real scalac 2.13.16 rejects it too, with "implicit conversions are
+/// not applicable because they are ambiguous", because a user conversion
+/// offering `->` genuinely does tie with `Predef.ArrowAssoc`. That shape is
+/// pinned below in `two_real_conversions_are_still_an_ambiguity`.
+///
+/// What `src/library` hits is different: there is only *one* `->` conversion
+/// in the program, `Predef`'s own, and this compiler had a second -- its own
+/// prelude stand-in for it, under 2.10's name `any2ArrowAssoc`, which
+/// `predef_reimport`'s replace-by-name could never displace.
+///
+/// Run in `--no-scala-library` only. In `--scala-library`, a source
+/// `scala.Predef` makes `java.lang.System.out.println(x)` compile to
+/// `scala.Predef$.println` and die with `NoSuchMethodError`; that is a
+/// separate, pre-existing defect of the source-`Predef` path (it reproduces
+/// with no `->` anywhere) and is recorded in `docs/scala-library.md`.
+#[test]
+fn arrow_resolves_when_the_source_supplies_predef() {
+    if !java_available() {
+        return;
+    }
+    let name = "libprelude_arrow";
+    let out = compile_fixture(name, &["--no-scala-library"]);
+    assert_eq!(run_java(&out, None), expected_stdout(name));
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The tie-break fires **only** for a run whose own sources define
+/// `scala.Predef`. Two conversions that are both really in scope stay an
+/// ambiguity, exactly as real scalac 2.13.16 reports it:
+///
+/// ```text
+/// Note that implicit conversions are not applicable because they are ambiguous:
+///  both method ArrowAssoc in object Predef ...
+///  and method ArrowAssocQ in object PredefY ...
+/// ```
+///
+/// A blanket "a source conversion beats a prelude one" would accept this.
+#[test]
+fn two_real_conversions_are_still_an_ambiguity() {
+    let (ok, err) = compile_src(
+        "twoconv",
+        r#"
+package scala
+object PredefY {
+  implicit final class ArrowAssocQ[A](private val self: A) extends AnyVal {
+    def -> [B](y: B): (A, B) = (self, y)
+  }
+}
+package other {
+  import scala.PredefY._
+  object U { val a = 1 -> 2 }
+}
+"#,
+        &["--no-scala-library"],
+    );
+    assert!(
+        !ok,
+        "two conversions offering `->` for the same type is an ambiguity in \
+         scalac 2.13.16 too; it must not be accepted:\n{err}"
+    );
+}
+
+/// And an ordinary program -- one that does not define `scala.Predef` -- is
+/// untouched: the prelude's own conversion still supplies `->`.
+#[test]
+fn an_ordinary_arrow_is_unaffected() {
+    let mut modes: Vec<Vec<String>> = vec![vec!["--no-scala-library".to_string()]];
+    if let Some(j) = scala_library_jar() {
+        modes.push(vec![
+            "--scala-library".to_string(),
+            j.to_str().unwrap().to_string(),
+        ]);
+    }
+    for extra in modes {
+        let args: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+        let (ok, err) = compile_src(
+            "ordinaryarrow",
+            r#"
+object M {
+  def f: (Int, String) = 1 -> "a"
+  def g[A, B](a: A, b: B): (A, B) = a -> b
+}
+"#,
+            &args,
+        );
+        assert!(
+            ok,
+            "the prelude conversion still supplies `->` with {extra:?}:\n{err}"
+        );
+    }
+}
