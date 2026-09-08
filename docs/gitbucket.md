@@ -2805,13 +2805,14 @@ measurement is running cannot see a half-written one.
 
 ## Fixed: three things a class file cannot say (`agent/gbopt`)
 
-**337 -> 274 errors, 81 -> 79 files.** slick unmoved at `errors=0
+**333 -> 270 errors, 81 -> 79 files** on the merged tree (`2fdfe302` + this
+slice was 337 -> 274; `main` had moved to 333 in between, and the slice is
+worth the same -63 either way). slick unmoved at `errors=0
 files_with_errors=0 classes=1490`, cats unmoved at 196 / 73, the scala library
-unmoved at 1420 / 166. Measured on `2fdfe302` and on the same tree with this
-slice.
+unmoved at 1420 / 166.
 
-Attribution, each measured on its own: root 35 is 337 -> **322**, root 37 is
-322 -> **311**, root 36 is 311 -> **274**.
+Attribution, each measured on its own against `2fdfe302`'s 337: root 35 is
+337 -> **322**, root 37 is 322 -> **311**, root 36 is 311 -> **274**.
 
 The brief that opened this slice named `OptionMapper2` (13),
 `CanBeQueryCondition[Any]` (13), `TypedType[Option[…]]` (14),
@@ -2830,7 +2831,7 @@ roots at all** -- both went to zero without a line being written about either.
 | `no implicit … Shape[FlatShapeLevel, O2, U2, _]` | 6 | 6 |
 
 `no implicit` is 31 of the 274, down from 77, and `is not a member of` 101,
-down from 104.
+down from 104 (counted on `2fdfe302` + this slice, before the merge).
 
 The three roots are all the same *shape*, and it is not the shape the families
 suggested: **a class file is a lossy description of someone else's code, and
