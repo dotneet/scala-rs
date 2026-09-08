@@ -1904,12 +1904,15 @@ constructor at all.
 
 ## The `agent/basetypemeet` slice: a base class reached twice is the meet
 
-**917 errors in 146 files -> 912 in 145**, measured on `main` at `e76b0ebf`
-against that same `main` measured on its own. cats **185 -> 182**, gitbucket
+**917 errors in 146 files -> 912 in 145**, measured on this branch merged with
+`main` at `5dc7f703` (`agent/nameamb`, `agent/intrinsicqual`) against that same
+`main` measured on its own, and the same **-5** it was at the branch point
+(`e76b0ebf`), so the waves do not overlap. cats **185 -> 182**, gitbucket
 **270 -> 270**, slick `errors=0 files_with_errors=0 classes=1490` with all
 1490 class files byte-identical (`SLICK_OUT` on both binaries, `diff -r`
 empty). The scala/scala corpus is unchanged: `pos 1095 / neg 673 / run 626`,
-`CORPUS_SIZE=full`.
+`CORPUS_SIZE=full`, `losses=0 changes=0` against
+`tests/baselines/corpus-3fd80269.tsv`.
 
 The brief was item 4 of the list above, and `agent/liboverload`'s claim that
 **every** `<overload ...>` receiver left in the log is this defect. That claim
@@ -2017,10 +2020,15 @@ one of them from a base to something below it -- `found: Iterable[B]` becomes
 scalac agrees with and the `sliding`/`grouped` family `docs/cats.md` separated
 out.
 
-It costs **about 10% of compile time** on `src/library` (1.66s -> 1.82s of user
-CPU, min of five alternating runs; measured again after the tuning below).
+It costs **about 10% of compile time** on `src/library`: 1.66s -> 1.82s of user
+CPU on a quiet machine, min of five alternating runs, and 7-16% on a machine
+with four other slices measuring on it (the numbers here were taken both ways,
+because the spread between the two is larger than the effect).
 `base_type_args` runs on every `subst_as_seen_from`, so the merge is on the
-hot path. Four things were measured and kept: one map with one hash lookup per
+hot path. That it is on the hot path at all was established rather than
+assumed: an env-gated build with the old first-arrival body restored ran at
+`main`'s speed with everything else in place, and `sample` put
+`meet_type -> is_ancestor_of` on the profile. Four things were measured and kept: one map with one hash lookup per
 parent clause instead of two (a second map cost 20% on its own), the arguments
 lifted out of the slot rather than cloned, an allocation-free fast path for the
 argument positions every arrival agrees on (nearly all of them), and
