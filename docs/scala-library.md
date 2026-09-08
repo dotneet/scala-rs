@@ -2697,6 +2697,11 @@ So: **-49 on the library, +1 on gitbucket, and a soundness hole closed.**
 `tmj_java_bad.scala` locks the closed hole; the overload-scoring gap is left
 on the list above.
 
+All the figures in this section were measured from `852 / 145` with this
+slice alone. `agent/hkbound` and `agent/pkgobjdup` were measured from the same
+base in parallel, so their reductions and this one do not simply add up; the
+merged number is whatever the gate reports after all three land.
+
 ### 4. Reading a Java instance field emitted an illegal method name
 
 `classpath::fill_java_members` stores a field's *descriptor* in `jvm_name`,
@@ -2744,6 +2749,240 @@ Expected non-static field`.
 `tests/fixtures/java/tmjava/JBase.java` with javac and reads it back as a
 class file, the way `tests/multi/` fixtures do it and the way the measurement
 itself gets the library's Java sources.
+## The `agent/hkbound` slice: an applied abstract constructor is at least its bound
+
+**852 errors in 145 files -> 807 in 142.** The brief handed this slice one
+cluster -- `CC` was the largest `type mismatch` found-type at 36 -- and asked
+whether the two families inside it are one root. **They are two**, and the
+measurement says so: the first fix takes 852 to **834** and leaves the second
+family untouched at its full size; the second takes 834 to **807**.
+
+cats **182 -> 182**, gitbucket **270 -> 270**, slick `errors=0
+files_with_errors=0 classes=1490` with all 1490 class files **byte-identical**
+(`SLICK_OUT` on both saved binaries, `diff -r` empty). Both A/Bs compare two
+saved binaries (`SCALA_RS=<binary>`), never a revert in the working tree.
+
+### One: the bound of an applied type *parameter* was never read
+
+`BuildFrom.scala` declares
+
+```scala
+implicit def buildFromMapOps[CC[X, Y] <: Map[X, Y] with MapOps[X, Y, CC, _], K0, V0, K, V] = ...
+  def newBuilder(from: CC[K0, V0]) = (from: MapOps[K0, V0, CC, _]).mapFactory.newBuilder[K, V]
+```
+
+-- an ascription of a value to **exactly its own parameter's bound**, which
+therefore holds by the bound and by nothing else. `SortedMapOps` writes the
+same shape twice more.
+
+`SymbolTable::is_sub_type`'s `(Applied, other)` arm reduced an applied abstract
+type *member* to `bound_hi`, substituted at the application's own arguments --
+the rule `type CT[T] <: TT[T]` applied to `U` is bounded by `TT[U]`, which an
+earlier slice added for slick. It did not reduce an applied higher-kinded type
+*parameter* at all, so `CC[K0, V0]` conformed to nothing and fell out of the
+arm as `false`.
+
+nsc has no such split. `isHKSubType` falls through to `isSubType2`, whose
+abstract-type case reads `sym.info.bounds.hi` for any abstract symbol whatever
+kind of symbol it is; a higher-kinded parameter's bounds live inside its
+`PolyType` and come out applied. One pattern -- `TypeMember(id) |
+TypeParam(id)` -- is the whole change, plus an `enter_bound` guard the member
+arm did not have and now shares: `CC[X, Y] <: MapOps[X, Y, CC, _]` mentions
+`CC` again, and every other bound arm in the function is guarded for exactly
+that reason.
+
+**-18 errors.** `CC` as a `type mismatch` found-type went 36 -> 26; the
+remaining 26 were all the second family.
+
+### Two: `@uncheckedVariance` was reachable everywhere except here
+
+`Factory.scala`'s `fill`/`tabulate` ladder is five levels of
+
+```scala
+def fill[A](n1: Int, n2: Int)(elem: => A): CC[CC[A] @uncheckedVariance] = fill(n1)(fill(n2)(elem))
+```
+
+and it reported `found: CC[CC[A]] required: CC[CC[A] @uncheckedVariance]`, the
+reverse, and versions with the annotation at a *different depth* on each side.
+
+`agent/basetypemeet` established that **`@uncheckedVariance` is a spelling, not
+a variant**, and folds annotation-only differences when merging base type
+arguments. Conformance already had the rule too -- `(a, Annotated) =>
+is_sub_type(a, tpe)` and its mirror -- but the two arms sat **below** the
+`Applied` arms. Those match on *one* side and every `other`, so
+`CC[A] <: CC[A] @uncheckedVariance` hit `(Applied, other)` and
+`CC[A] @uncheckedVariance <: CC[A]` hit `(other, Applied)`, and neither ever
+reached the rule. It was a question of arm order, not a design question: nsc
+strips both sides in `firstTry`, ahead of every `TypeRef` case.
+
+The arms moved **above** the `Applied` arms and **below** the ones that name
+`Annotated` in a pattern list. That second half is load-bearing in the other
+direction: `Null <: T @ann` and `T @ann <: AnyRef` are answered by those lists
+for every `T`, value classes included, and stripping first would turn
+`Null <: Int @ann` from true into false. Moving the arms to the very top of the
+function -- which is the obvious reading of "nsc strips both sides first" --
+would have made that change silently.
+
+**-27 errors**, and `CC` as a found-type is down to 2.
+
+### It costs nothing measurable
+
+Min of five interleaved `src/library` runs, user CPU: **1.78 s before, 1.78 s
+after**, spread 1.78-1.83 on either side, on a machine with four other slices
+measuring. `agent/basetypemeet` cost about 10% for its rule because
+`base_type_args` runs on every `subst_as_seen_from`; this one does not, for two
+reasons. The bound read only fires where the arm previously returned `false`,
+so it is on the *rejection* path and not the acceptance path, and it terminates
+in one substitution. The annotation move adds two discriminant compares ahead
+of the `Applied` arms and removes them from further down.
+
+### The silent wrong answer next door, which this does *not* fix
+
+`tests/fixtures/hkbound_appliedbound.scala` writes its type arguments out. With
+them inferred, this still happens, on both binaries:
+
+```scala
+def pick[K0, V0, CC[X, Y] <: MapOps[X, Y, CC, _]](x: MapOps[K0, V0, CC, _]): String = "pick:ops"
+def pick(x: Any): String = "pick:any"
+def choose[K0, V0, CC[X, Y] <: MapOps[X, Y, CC, _]](from: CC[K0, V0]): String = pick(from)
+```
+
+`choose` compiles and runs **`pick:any`**; scalac 2.13.16 runs `pick:ops`. It
+is unchanged by this slice -- measured before and after -- and it is a
+different mechanism: solving `?CC` from an actual `CC[K0, V0]` against a formal
+`MapOps[?K0, ?V0, ?CC, _]` means reading the *base type arguments* of a type
+parameter at its bound, which `base_type_args` does not do. Conformance now
+answers the question when the arguments are given; inference still cannot ask
+it. Whoever takes that next should expect it to be the same size as the
+`readTag`-shaped lines in the log rather than the `CC` cluster, which is gone.
+
+### The fixtures
+
+`hkbound_appliedbound.scala` prints six lines and every one is checked by its
+value, in both modes; `expected/hkbound_appliedbound.txt` is real scalac
+2.13.16's own run of the same source, and `scalac_agrees_hkbound_runs` compiles
+and runs both compilers' output and compares them. On the pre-fix binary five
+of the six do not compile.
+
+`hkbound_appliedbound_bad.scala` is the restriction, and all four lines were
+rejected before the fix as well -- it is what stops the new arms over-reaching,
+not evidence that they exist. The bound is `MapOps` and a `Sink` is not it; two
+F-bounded parameters with the same bound *shape* are still two different
+constructors (`CC[Int, String]` is not a `DD[Int, String]`); the reduction is
+one-way (a `MapOps[K0, V0, CC, _]` is not a `CC[K0, V0]`); and erasing an
+annotation does not erase the type under it (`Box[A] @uncheckedVariance` is not
+a `Box[String]`). Real scalac rejects all four, at the same lines 24, 31, 37
+and 41.
+
+### The head after this slice (807)
+
+`type mismatch` 334, `no matching overload` 178, `X is not a member of Y` 143,
+`incompatible type in overriding` 9, `illegal inheritance` 6, `ambiguous
+overload` 5. The `is not a member of` receivers are `T2` (17), `String` (10),
+`T1` (9), `Int` (6) -- the prelude collision named at the top of this file,
+unmoved, and `Array` has dropped out of the head of that list. The largest
+`type mismatch` found-types are now `T` (41), `Array` (22), `null` (17) and `A`
+(10); the largest single shape is `found: T required: A` (13), the
+`Iterator.empty.next()` item already on the list. `found: CC[...]` is **2**
+lines, down from 36.
+
+## The `agent/pkgobjdup` slice: a package object supplies, the package does not
+
+**852 errors in 145 files -> 836 in 143**, measured on this branch against the
+same tree at `25aeabde` measured with a binary built from it (852/145, which is
+`tests/BASELINE.md`'s figure). cats **182 -> 182** in 71 files, gitbucket
+**270 -> 270** in 79, slick `errors=0 files_with_errors=0 classes=1490` with
+all 1490 class files **byte-identical** (`SLICK_OUT` on both binaries,
+`diff -r` empty). Sixteen errors go and **not one new one arrives**: the
+before/after error multisets differ by deletions only.
+
+The brief was the eight `Nil`/`List` lines `agent/siblingover` split off as
+"not sibling overrides -- a supply-seam question, untouched". It was right.
+
+### One name, two routes, no `extends` relation between them
+
+`fromSpecific(Nil)` in `Iterable.scala` 215 offered two candidates:
+
+```
+sym=53    Nil  kind=Module owner=scala(Package)      jvm=scala/collection/immutable/Nil$
+sym=20049 Nil  kind=Term   owner=package$(ModuleClass) ty=ModuleRef(10498)
+```
+
+The first is the prelude's `scala.Nil`; the second is what
+`src/library/scala/package.scala` writes as `val Nil =
+scala.collection.immutable.Nil`, folded into the package because a package
+object's members *are* the package's members (SLS 9.3). `10498` is the source
+`case object Nil` from `List.scala`, so both print `Nil$` and neither
+`drop_overridden` rule can order them -- a package and a package-object class
+stand in no `extends` relation, and none should be invented. **The repeated
+type in the display is what duplicate supply looks like**, and
+`agent/siblingover`'s instrumentation had already ruled out the
+cancelling-rules mechanism (zero empty-`kept` events across the whole run).
+
+### nsc's answer: the package object's entry replaces the package's
+
+`Symbols.openPackageModule` unlinks the package's existing decl under every
+name the package object declares, and only then enters the package object's
+members; its comment ("todo: handle overlapping definitions in some way ...
+For now the symbol in the package module takes precedence") says it is
+provisional, and scalac 2.13.16 is measurably that way round. Three programs
+say so, and all three are in `tests/fixtures/pkgobjdup_pkgobject*.scala`:
+
+  * `package p { object Impl }` beside `package object p { val Impl: Int = 42 }`
+    compiles and prints **42** -- the object is gone from that name;
+  * writing `val Impl = p.Impl` instead is **"recursive value Impl needs
+    type"**, which is only possible if the `val` *is* the `p.Impl` its own
+    right-hand side names;
+  * `outer.Payload.tag`, where `Payload` is the package's object and the
+    package object declares `val Payload = inner.Payload`, is **"value tag is
+    not a member of object inner.Payload"**.
+
+`SymbolTable::fold_package_object_members` is that rule, called from both
+places the fold happens (`namer_module`'s eager one and `check.rs`'s
+`pending_pkg_folds`, which redoes it once parents are resolved).
+
+### The two halves that were each measured
+
+  * **Both namespaces, separately.** `scala/package.scala` writes `type
+    List[+A] = scala.collection.immutable.List[A]` *and* `val List =
+    scala.collection.immutable.List`. With only the term half the count went
+    852 -> 847: `var res: List[Any] = Nil` then read `List` as the prelude's
+    class and `Nil` as the package object's `val`, whose `case object Nil
+    extends List[Nothing]` names the **source** `List`, and the two do not
+    conform (`found: Nil$ required: List[Any]`, four of them). Conversely a
+    name unlinked in one namespace must stay in the other: the fixture's
+    `object Thing` survives a package object's `type Thing`, and prints, as it
+    does under scalac.
+
+  * **Two passes, not one.** Unlinking as each member is folded has the package
+    object's *own* alternatives remove each other -- `package object math`'s
+    `def abs(x: Int)` and `def abs(x: Double)` are one such pair -- and the
+    library went **836 -> 924**, twenty of them `found: Double required: Int`.
+    The unlink pass therefore runs over the package's pre-existing members
+    only, exactly as nsc's does.
+
+Only a *prelude* victim is added to `prelude_shadowed`: a displaced source or
+classfile symbol has lost a name, not its identity, and `find_class_by_jvm`
+still has to answer with it or its class file stops being loadable.
+
+### What else moved
+
+All eight `<overload Nil$ | Nil$>` / `<overload List$ | List$>` lines are gone,
+and with them eight more that were downstream of the wrong `List`
+(`value corresponds is not a member of List[OptManifest[_]]`, `found:
+List[Nothing] required: List[A]`, `pattern type List[_] is incompatible with
+scrutinee type Seq[_]`, `value :: is not a member of Any`, ...). **No
+`<overload X | X>` -- the same type printed twice -- is left in the log**; the
+51 remaining `<overload ...>` displays are all genuine alternative sets.
+
+### The head after this slice (836)
+
+`type mismatch` 365, `no matching overload` 146, `X is not a member of Y` 140,
+`no matching overload for constructor` 31, `not found: value` 27, `ambiguous
+overload` 15, `illegal inheritance` 11, `incompatible type in overriding` 9.
+The `is not a member of` receivers are `T2` (17), `String` (10), `T1` (9),
+`Int` (6) and `INodeBase` (5) -- the prelude collision named at the top of this
+file, unmoved, and `CC` is no longer among them.
 
 ## Running it
 

@@ -681,6 +681,17 @@ impl Symbol {
 /// `trait Option` does the opposite. A source class also replaces a prelude
 /// *alias* of that name (`type Seq[+A] = …` in the `scala` package object is
 /// what `Seq.scala` defines).
+/// The term half of Scala's two namespaces. `SymKind::ModuleClass` is not in
+/// it: a module class answers to `X$`, never to `X`.
+fn is_term_kind(k: SymKind) -> bool {
+    matches!(k, SymKind::Module | SymKind::Method | SymKind::Term)
+}
+
+/// The type half. `SymKind::ModuleClass` is left out for the same reason.
+fn is_type_kind(k: SymKind) -> bool {
+    matches!(k, SymKind::Class | SymKind::TypeMember)
+}
+
 fn shadowable_kind(new: SymKind, old: SymKind) -> bool {
     match new {
         SymKind::Class => matches!(old, SymKind::Class | SymKind::TypeMember),
@@ -1615,6 +1626,105 @@ impl SymbolTable {
             sc.replace(&name, &victims, id);
         }
         self.prelude_shadowed.extend(victims);
+    }
+
+    /// Fold a package object's members into its package, the way nsc's
+    /// `openPackageModule` does: a name the package object declares
+    /// **unlinks** whatever the package already had under it, in that name's
+    /// own namespace, and only then are the package object's members entered.
+    ///
+    /// A package object's members *are* the package's members (SLS 9.3), so
+    /// two entries under one name are not an overload set — they are one name
+    /// supplied twice by routes that stand in no `extends` relation, which no
+    /// ordering rule can reduce. Compiling `src/library`, `Nil` offered the
+    /// prelude's `Module` owned by package `scala` beside the `Term`
+    /// `scala/package.scala` declares as `val Nil =
+    /// scala.collection.immutable.Nil`, and every use printed
+    /// `<overload Nil$ | Nil$>` — the same type printed twice, which is what a
+    /// duplicate *supply* looks like rather than an overload.
+    ///
+    /// nsc resolves it in the package object's favour, with a comment saying
+    /// it is provisional ("for now the symbol in the package module takes
+    /// precedence"), and real scalac 2.13.16 is measurably that way round:
+    /// `package p { object Impl }` beside `package object p { val Impl: Int =
+    /// 42 }` compiles and prints `42`, and writing `val Impl = p.Impl`
+    /// instead is "recursive value Impl needs type" — the package object's
+    /// entry is the only `p.Impl` there is. Both are
+    /// `tests/fixtures/pkgobjdup_*.scala`.
+    ///
+    /// **Two passes, not one.** nsc unlinks over the package's existing decls
+    /// before entering anything, and the order is load-bearing: done member by
+    /// member, `package object math`'s own `def abs(x: Int)` and `def abs(x:
+    /// Double)` unlink *each other* as the second is folded, and the library
+    /// went from 836 errors to 924 (twenty of them `found: Double required:
+    /// Int`). `already_folded` is what keeps the pending re-fold — which
+    /// re-runs this with the package object's members already in the package —
+    /// from doing the same thing.
+    pub fn fold_package_object_members(&mut self, pkg: SymbolId, mems: &[SymbolId]) {
+        if pkg.is_none() || self.get(pkg).kind != SymKind::Package {
+            return;
+        }
+        let already_folded: rustc_hash::FxHashSet<SymbolId> = mems.iter().copied().collect();
+        // Scala's two namespaces are separate, so `val List` displaces a
+        // module and `type List[+A] = …` displaces a class, and each leaves
+        // the other alone. `scala/package.scala` writes both lines, and both
+        // halves are needed: with only the term half, `var res: List[Any] =
+        // Nil` read `List` as the prelude's class and `Nil` as the package
+        // object's `val` -- whose `case object Nil extends List[Nothing]`
+        // names the *source* `List` -- and the two `List`s do not conform
+        // (measured: four such mismatches, and eleven errors in all).
+        let mut terms: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        let mut types: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        for &m in mems {
+            let s = self.get(m);
+            if is_term_kind(s.kind) {
+                terms.insert(s.name.clone());
+            } else if is_type_kind(s.kind) {
+                types.insert(s.name.clone());
+            }
+        }
+        let victims: Vec<SymbolId> = self
+            .get(pkg)
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                if already_folded.contains(&m) {
+                    return false;
+                }
+                let s = self.get(m);
+                (is_term_kind(s.kind) && terms.contains(&s.name))
+                    || (is_type_kind(s.kind) && types.contains(&s.name))
+            })
+            .collect();
+        if !victims.is_empty() {
+            self.get_mut(pkg).members.retain(|m| !victims.contains(m));
+            let prelude_end = self.prelude_end;
+            for v in victims {
+                let name = self.get(v).name.clone();
+                let winner = mems
+                    .iter()
+                    .copied()
+                    .find(|&m| self.get(m).name == name)
+                    .unwrap_or(v);
+                for sc in self.scopes.iter_mut() {
+                    sc.replace(&name, &[v], winner);
+                }
+                // Only a *prelude* victim stops being the class of its binary
+                // name. A displaced source or classfile symbol is still a real
+                // class `find_class_by_jvm` has to answer with: it has lost a
+                // *name*, not its identity, and `p/Impl$.class` is still
+                // emitted and still loaded.
+                if v.0 < prelude_end {
+                    self.prelude_shadowed.insert(v);
+                }
+            }
+        }
+        for &mem in mems {
+            if !self.get(pkg).members.contains(&mem) {
+                self.get_mut(pkg).members.push(mem);
+            }
+        }
     }
 
     /// Record `import owner._` in the innermost scope.
@@ -4701,6 +4811,23 @@ impl SymbolTable {
                     false
                 }
             }
+            // Annotations are erased for conformance: `Node` is a
+            // `Node @uncheckedVariance`. nsc strips both sides in `firstTry`,
+            // before any of the `TypeRef` cases, and this has to do the same:
+            // the `Applied` arms below match on *one* side and every `other`,
+            // so with these two arms sitting after them `CC[CC[A]]` and
+            // `CC[CC[A] @uncheckedVariance]` never reached the rule that says
+            // the annotation is a spelling. `agent/basetypemeet` established
+            // that reading for base type arguments; conformance is the other
+            // half of it, and `Factory.scala`'s `fill`/`tabulate` ladder wants
+            // it in both directions.
+            //
+            // Above the `Applied` arms but *below* the ones that name
+            // `Annotated` in a pattern list -- `Null <: T @ann` and
+            // `T @ann <: AnyRef` are answered there for every `T`, including
+            // the value classes stripping would then reject.
+            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
+            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             // A wildcard stands for *some* type, so anything is under it --
             // including the application of an abstract type constructor.
             // `Query[B, BU, C]` inherits `Rep[C[BU]]`, and slick's
@@ -4755,7 +4882,18 @@ impl SymbolTable {
                     if expanded != folded {
                         return self.is_sub_type(&expanded, other);
                     }
-                    if let Type::TypeMember(id) = ctor.as_ref() {
+                    // An applied abstract constructor is at least its own
+                    // bound, applied to the same arguments. A higher-kinded
+                    // type *parameter* is that too, not only a type member:
+                    // `BuildFrom` declares `CC[X, Y] <: MapOps[X, Y, CC, _]`,
+                    // so `CC[K0, V0]` *is* a `MapOps[K0, V0, CC, _]` and
+                    // `(from: MapOps[K0, V0, CC, _])` is the ascription of a
+                    // value to its own declared bound. nsc has no such split:
+                    // `isHKSubType` falls through to `isSubType2`'s
+                    // `AbstractTypeRef` case, which reads `sym.info.bounds.hi`
+                    // for a `PolyType`-shaped abstract symbol whatever kind of
+                    // symbol it is.
+                    if let Type::TypeMember(id) | Type::TypeParam(id) = ctor.as_ref() {
                         if let Some(hi) = self.get(*id).bound_hi.clone() {
                             // The bound is written in the member's *own*
                             // parameters: `type CT[T] <: TT[T]` applied to `U`
@@ -4769,8 +4907,15 @@ impl SymbolTable {
                                 Type::Applied { args, .. } => args.clone(),
                                 _ => Vec::new(),
                             };
-                            let hi = self.subst_tparams(*id, &args, &hi);
-                            return self.is_sub_type(&hi, other);
+                            // `CC[X, Y] <: MapOps[X, Y, CC, _]` mentions `CC`
+                            // again, so reading the bound has to be guarded the
+                            // way every other bound arm in this function is --
+                            // an F-bounded constructor would otherwise expand
+                            // its own bound forever.
+                            if let Some(_g) = enter_bound(*id) {
+                                let hi = self.subst_tparams(*id, &args, &hi);
+                                return self.is_sub_type(&hi, other);
+                            }
                         }
                     }
                     false
@@ -4844,13 +4989,6 @@ impl SymbolTable {
                     && !matches!(t, Type::SingleType { sym: s2, .. } if s2 == sym)
                     && self.is_sub_type(a, t)
             }
-            // Annotations are erased for conformance: `Node` is a
-            // `Node @uncheckedVariance`. Like the wildcards below, this has to
-            // come before the Class-parent walk, which matches every `Class`
-            // on the left whatever `b` is and would answer "no" by running out
-            // of parents.
-            (a, Type::Annotated { tpe, .. }) => self.is_sub_type(a, tpe),
-            (Type::Annotated { tpe, .. }, b) => self.is_sub_type(tpe, b),
             // Wildcards before the Class-parent walk: that arm matches every Class
             // and would otherwise treat `Byte <: List[_ <: Byte]` as "walk Byte's
             // parents" instead of the bound.
