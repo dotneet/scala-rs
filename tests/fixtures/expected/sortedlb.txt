@@ -1,0 +1,21 @@
+ace,rex
+ace,rex
+ace,rex
+ace,rex
+rex
+ace
+ace,rex
+ace,rex
+ace,rex
+List(1, 2, 3)
+Vector(1, 2, 3)
+List(a, b)
+3
+1
+6
+6
+Some(3)
+List(a, b)
+Vector(1, 2)
+2
+3
