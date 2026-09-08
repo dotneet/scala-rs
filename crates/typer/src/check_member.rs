@@ -1575,6 +1575,31 @@ impl Typer {
         usable.into_iter().max()
     }
 
+    /// How many parameters a constructor's **first** clause declares, read the
+    /// same way `new_head_ctor_arity` reads the clause shapes so the two
+    /// always agree. `None` when a repeated parameter makes the count
+    /// meaningless.
+    fn ctor_first_clause_len(&self, id: SymbolId) -> Option<usize> {
+        let clauses: Vec<Vec<Type>> = match &self.st.get(id).ty {
+            Type::Method { paramss, .. } => paramss.clone(),
+            _ => vec![self
+                .st
+                .get(id)
+                .params
+                .iter()
+                .map(|p| self.st.get(*p).ty.clone())
+                .collect()],
+        };
+        if clauses
+            .iter()
+            .flatten()
+            .any(|t| matches!(t, Type::Repeated(_)))
+        {
+            return None;
+        }
+        Some(clauses.first().map(|c| c.len()).unwrap_or(0))
+    }
+
     /// `Apply(Apply(New(C), a), b)` -> `Apply(New(C), a ++ b)`, for as many
     /// lists as `C`'s constructor has room for.
     ///
@@ -1585,7 +1610,18 @@ impl Typer {
     /// nsc, and folding those two lists together would construct a
     /// two-argument `Foo` instead -- silently, where the class has such a
     /// constructor too.
-    pub(crate) fn flatten_curried_new(&self, tree: &mut Tree) {
+    /// Returns the length of the **first written clause** when clauses were
+    /// actually folded together, so the pick can be held to it.
+    ///
+    /// nsc selects the constructor on the first clause and applies the rest to
+    /// what that leaves. Folding first loses that, and the flat list can then
+    /// match an alternative the written call never named: `new Three(2)("m")()`
+    /// on a class whose primary is `(Int, String)` folds to `(2, "m")`, which
+    /// the primary accepts exactly. The arity this folded *by* already came
+    /// from the alternatives whose first clause is `first_len` long
+    /// (`new_head_ctor_arity`), so holding the pick to the same set is what
+    /// keeps the two halves consistent.
+    pub(crate) fn flatten_curried_new(&self, tree: &mut Tree) -> Option<usize> {
         fn head_is_new(t: &Tree) -> bool {
             match &t.kind {
                 TreeKind::New { .. } => true,
@@ -1614,7 +1650,7 @@ impl Typer {
         }
         let lists = chain_len(tree);
         if lists < 2 || !head_is_new(tree) {
-            return;
+            return None;
         }
         // Unknown constructor: fold everything, as this always did.
         // `extends A(1)(2)` takes the same view (`type_parent_ctor_app_in`).
@@ -1657,6 +1693,7 @@ impl Typer {
             t.span = span;
             t
         };
+        let folded = take > 1;
         let tail = argss.split_off(take);
         let (ctor_id, ctor_span, _) = *argss.last().expect("at least one clause");
         let flat: Vec<Tree> = argss.into_iter().flat_map(|(_, _, a)| a).collect();
@@ -1665,6 +1702,7 @@ impl Typer {
             out = rebuild(out, id, span, args);
         }
         *tree = out;
+        folded.then_some(first_len)
     }
 
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
@@ -1902,6 +1940,25 @@ impl Typer {
         arg_tys: &[Type],
         skip: Option<SymbolId>,
     ) -> OverloadPick {
+        self.pick_ctor_at_clause(class_id, targs, arg_tys, skip, None)
+    }
+
+    /// The same, restricted to the alternatives whose **first parameter
+    /// clause** is `first_clause_len` long.
+    ///
+    /// Only a curried `new` passes one: `flatten_curried_new` folded its
+    /// clauses into a flat argument list, and without this the flat list can
+    /// match an alternative whose first clause the written call never fitted.
+    /// The restriction is dropped when it would leave nothing, so a class
+    /// whose constructor this cannot describe is picked exactly as before.
+    pub(crate) fn pick_ctor_at_clause(
+        &self,
+        class_id: SymbolId,
+        targs: &[Type],
+        arg_tys: &[Type],
+        skip: Option<SymbolId>,
+        first_clause_len: Option<usize>,
+    ) -> OverloadPick {
         if class_id.is_none() {
             return OverloadPick::None;
         }
@@ -1932,6 +1989,24 @@ impl Typer {
         if alts.is_empty() {
             return OverloadPick::None;
         }
+        // A curried `new` selected its constructor on the first clause before
+        // `flatten_curried_new` folded the rest into it. Keep the pick to that
+        // same set, and only while the set is non-empty.
+        let alts: Vec<SymbolId> = match first_clause_len {
+            Some(n) => {
+                let kept: Vec<SymbolId> = alts
+                    .iter()
+                    .copied()
+                    .filter(|&id| self.ctor_first_clause_len(id) == Some(n))
+                    .collect();
+                if kept.is_empty() {
+                    alts
+                } else {
+                    kept
+                }
+            }
+            None => alts,
+        };
         // `extends A(1)(2)` and `new A(1)(2)` pass one flat argument list, so a
         // multi-clause constructor is matched against its flattened clauses.
         let flatten = |ty: Type| -> Type {
