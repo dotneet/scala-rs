@@ -3186,8 +3186,41 @@ impl Typer {
         true
     }
 
+    /// [`crate::symbol::SymbolTable::sam_sig`], with the overrides a library
+    /// class has but has not been asked for read out of its pickle first.
+    ///
+    /// See `SymbolTable::sam_sig_over` for why a library class arrives here
+    /// with holes in it, and `PickleSupply::concrete_method_names` for why
+    /// the holes are *read* rather than filled.
+    fn sam_sig_here(&mut self, pt: &Type) -> Option<crate::symbol::SamSig> {
+        if let Some(sam) = self.st.sam_sig(pt) {
+            return Some(sam);
+        }
+        if !self.library_abi {
+            return None;
+        }
+        let cls = self.st.class_sym_of(pt)?;
+        // Only where an answer can change: the class reads as having more
+        // than one abstract method, and some of them are inherited.
+        let inherited = self.st.inherited_deferred_method_names(cls);
+        if inherited.is_empty() || self.st.sam_method_count(cls) < 2 {
+            return None;
+        }
+        let concrete = self
+            .pickle
+            .concrete_method_names(&self.st, &mut self.binary, cls);
+        let overridden: Vec<String> = inherited
+            .into_iter()
+            .filter(|n| concrete.contains(n))
+            .collect();
+        if overridden.is_empty() {
+            return None;
+        }
+        self.st.sam_sig_over(pt, &overridden)
+    }
+
     fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {
-        let Some(sam) = self.st.sam_sig(pt) else {
+        let Some(sam) = self.sam_sig_here(pt) else {
             return false;
         };
         let Type::Function { params, ret } = &tree.ty else {

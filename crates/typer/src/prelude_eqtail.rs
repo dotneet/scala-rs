@@ -62,7 +62,52 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     let equiv = ensure_equiv(st, math);
     let partial = ensure_partial_ordering(st, math, equiv);
     add_parent(st, ordering, partial);
+    add_ordering_equiv(st, ordering);
     add_equiv_instances(st, equiv);
+}
+
+/// `Ordering`'s own concrete `equiv`, which the parent added just above makes
+/// visible as a *declaration* it does not have.
+///
+/// `javap -p scala.math.Ordering`:
+///
+/// ```text
+/// public abstract int     compare(T, T);
+/// public default  boolean equiv(T, T);
+/// ```
+///
+/// so `Ordering` has exactly one abstract method, and
+/// `val o: Ordering[Int] = (x, y) => x - y` is a SAM conversion under real
+/// scalac 2.13.16. Without this it has two -- `compare`, plus the deferred
+/// `equiv` it inherits from `Equiv` through `PartialOrdering` -- and no
+/// function literal converts to it. `PickleSupply` would install the override
+/// eventually, but only once some expression names `equiv` on an `Ordering`,
+/// and by then the literal has already been rejected.
+///
+/// The other five members `Ordering` overrides from `PartialOrdering`
+/// (`lteq`, `gteq`, `lt`, `gt`, `tryCompare`) need no counterpart here: the
+/// prelude's `PartialOrdering` declares no members at all, so nothing of
+/// theirs is inherited to be shadowed.
+fn add_ordering_equiv(st: &mut SymbolTable, ordering: SymbolId) {
+    if st
+        .get(ordering)
+        .members
+        .iter()
+        .any(|&m| st.get(m).name == "equiv")
+    {
+        return;
+    }
+    let Some(&t) = st.get(ordering).tparams.first() else {
+        return;
+    };
+    crate::prelude::method(
+        st,
+        ordering,
+        "equiv",
+        vec![Type::TypeParam(t), Type::TypeParam(t)],
+        Type::Boolean,
+        crate::symbol::Intrinsic::None,
+    );
 }
 
 /// Build `trait Equiv[T]` and its companion module inside the prelude and enter both
@@ -78,13 +123,15 @@ fn ensure_equiv(st: &mut SymbolTable, math: SymbolId) -> SymbolId {
     let equiv = crate::prelude::iface(st, math, "Equiv", "scala/math/Equiv");
     let t = crate::prelude::type_param(st, equiv, "T");
     st.get_mut(equiv).tparams = vec![t];
-    crate::prelude::method(
+    // Deferred: `Equiv`'s single abstract method. cats' `EqToEquivConversion`
+    // is `ev.eqv(_, _)` at an expected type of `Equiv[A]`, which only reaches
+    // SAM conversion if this is read as a declaration.
+    crate::prelude::abstract_method(
         st,
         equiv,
         "equiv",
         vec![Type::TypeParam(t), Type::TypeParam(t)],
         Type::Boolean,
-        crate::symbol::Intrinsic::None,
     );
     let m = crate::prelude::module(st, math, "Equiv", "scala/math/Equiv$");
     enter_type(st, "Equiv", equiv);

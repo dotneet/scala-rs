@@ -40,13 +40,14 @@ pub(crate) fn add_ordering(st: &mut SymbolTable) -> SymbolId {
     // `jvm_desc` in `crates/backend/src/gen.rs`), so the erased descriptor
     // `sorted` / `sortBy` codegen expects, `(Ljava/lang/Object;Ljava/lang/
     // Object;)I`, is unchanged -- only the *typed* view becomes generic.
-    method(
+    // Deferred: `Ordering`'s single abstract method, and what makes
+    // `val o: Ordering[Int] = (x, y) => x - y` a SAM conversion.
+    crate::prelude::abstract_method(
         st,
         ordering,
         "compare",
         vec![Type::TypeParam(t), Type::TypeParam(t)],
         Type::Int,
-        Intrinsic::None,
     );
     let ord_mod = module(st, math, "Ordering", "scala/math/Ordering$");
     let ord_cls = st.module_class_of(ord_mod);
