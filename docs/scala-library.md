@@ -922,37 +922,452 @@ measured at zero; neither is in the change.
 See the slice's report for the full table; every measure other than the
 library is unchanged to the error.
 
+## The `agent/libprelude` slice: members the prelude does not declare
+
+**1111 errors in 155 files → 1065 in 154**, on this branch merged with `main`.
+The brief handed this slice one symptom — `value & is not a member of Boolean`
+— and asked for an audit rather than a patch. Three things came out of it, and
+the audit is worth more than any of them.
+
+### The audit
+
+`javap -p` over `scala-library-2.13.16.jar` lists every instance member of
+`scala.{Boolean,Byte,Short,Char,Int,Long,Float,Double,Unit}` — **727** of them,
+counting each overload. A generated probe puts one call to each through both
+compilers, twice, because a *missing* member and a *wrongly typed* one fail
+differently:
+
+| probe | each call ascribed to | catches |
+|---|---|---|
+| positive | the result type javap reports | absent members, and results that are too narrow |
+| negative | the next *narrower* type | results that are too wide (real scalac rejects all 727) |
+
+**The positive probe drew exactly 10 errors and the negative probe none.** In
+both `--scala-library` and `--no-scala-library`, identically. Every other
+declared member, and every result type, already agreed with scalac — which is
+the useful half of the answer, and is not something anyone had checked.
+
+The ten: `Boolean.&`, `Boolean.|`, `Boolean.^`, and `unary_+` on all seven
+numeric classes. `unary_+` costs the library measure nothing; the other three
+cost 15 (`&` 9, `^` 6 — the library writes no `Boolean.|`).
+
+Two things the audit says are *deliberate*, not gaps, and should not be
+"fixed" by the next slice:
+
+* **The value-class companions** (`Int.MaxValue`, `Double.NaN`, `Byte.box`,
+  `int2long`, …) are absent in `--no-scala-library` and present in
+  `--scala-library`. `crates/typer/src/prelude_numeric.rs` gates them on
+  `library_abi` on purpose: the private runtime has no `scala/Int$` classfile,
+  so declaring them there would emit calls to classes that do not exist. The
+  one real gap the probe found is `Boolean.box` / `Boolean.unbox`, which fail
+  in **jar** mode too; nothing in any measured corpus writes them.
+* `Predef.any2ArrowAssoc` is the reverse: a member scalac does **not** declare
+  (2.13's is `ArrowAssoc`), and it is the whole of the `->` defect below.
+
+### `Boolean`'s `&`, `|`, `^` are not `&&` and `||`
+
+`p & q` evaluates `q` unconditionally. Emitting the short-circuiting form
+would type-check, verify, and pass every classfile check in this repository
+while silently dropping `q`'s side effects, so
+`tests/fixtures/libprelude_boolbit.scala` **runs**, with each operand
+appending to a trace: `trace=LR` for `&` against `trace=L` for `&&`. Expected
+output is real scalac 2.13.16's own, and both modes match it.
+
+### `x.unary_-` written out in full never reached its intrinsic
+
+Found while adding `unary_+`, pre-existing, and invisible to every
+compile-only check. The prefix spelling `-x` is an `Apply` and has always
+worked; the *selected* spelling is a bare `Select`, and `gen_select`'s
+intrinsic chain had no case for the five unary value-class families. It fell
+through to `invoke_method` and emitted
+`invokevirtual java.lang.Byte.unary_$minus()` — a method the box does not
+have. **It compiled, it verified, and it threw `NoSuchMethodError` at run
+time**, on all nine members (`unary_-`/`unary_~` on Byte/Short/Char/Int/Long,
+`unary_-` on Float/Double, `unary_!` on Boolean). `emit_prim_unary` is now
+shared by both spellings.
+
+### `->`: the doc's own reproduction was not a bug
+
+The entry above prescribes item 0 with a twelve-line reproduction and two
+fixes measured at zero. One command settles it:
+
+```
+$ scalac -classpath scala-library-2.13.16.jar A.scala B.scala
+B.scala:2: error: type mismatch;
+ found   : Int(1)
+ required: ?{def ->(x$1: ? >: Int(2)): ?}
+Note that implicit conversions are not applicable because they are ambiguous:
+ both method ArrowAssoc in object Predef of type [A](self: A): ArrowAssoc[A]
+ and method ArrowAssocQ in object PredefY of type [A](self: A): PredefY.ArrowAssocQ[A]
+ are possible conversion functions from Int(1) to ?{def ->(x$1: ? >: Int(2)): ?}
+```
+
+**Real scalac rejects that program too.** Two conversions genuinely in scope
+for the same source type *are* an ambiguity; "two candidates, so neither" is
+the right answer there, and the two fixes that measured zero were aimed at a
+case that is not wrong. It is pinned now, as a negative test
+(`two_real_conversions_are_still_an_ambiguity`), so it cannot be "fixed" by a
+later slice.
+
+`src/library` is a different situation, and the difference is the whole
+defect. There the program has exactly **one** `->` conversion, `Predef`'s own.
+This compiler had a second — its own prelude stand-in for it. Instrumenting
+`search_extension`'s tie says so directly:
+
+```
+TIE -> from="ALL" :: [("any2ArrowAssoc", 400, "Predef$", "ArrowAssoc"),
+                      ("ArrowAssoc",    2869, "Predef$", "ArrowAssoc[String]")]
+```
+
+id 400 is the prelude's; id 2869 is the source `implicit final class
+ArrowAssoc`. `predef_reimport` supersedes the prelude's `Predef` snapshot **by
+name**, and these two names never meet, because `any2ArrowAssoc` is 2.10's
+spelling — `javap -p scala.Predef$` on 2.13.16 has `public final <A> A
+ArrowAssoc(A)` and no `any2ArrowAssoc` at all.
+
+`Check::drop_superseded_prelude_conversions` drops a prelude candidate owned
+by the prelude `Predef` when the run's own sources have supplied that object
+(`SymbolTable::predef_superseded`) and some other candidate remains. It never
+fires for an ordinary program, and it never empties a candidate set.
+
+**Two more principled-looking shapes were measured and are not in the change**
+— record them the way the entry above records its two:
+
+| shape | measured |
+|---|---|
+| rename the prelude's copy to `ArrowAssoc`, so replace-by-name reaches it | **1099 / 158** |
+| retire the whole prelude `Predef` snapshot once the source one arrives (nsc's actual model) | **1083 / 156** |
+| drop the prelude candidate only when another remains | **1065 / 154** |
+
+The first two are the same experiment: both remove the stand-in outright, and
+both cost more than they save, because the source `ArrowAssoc` does not reach
+every site the stand-in did — `t.head -> t.tail` on a bare type parameter in
+`collection/package.scala` is one, and there are six of that shape. Keeping
+the stand-in as a *last resort* rather than as a competitor is what gets the
+whole 28 with nothing new in the log.
+
+### `eq` / `ne` under a universal trait
+
+The retirement experiment turned this up, and it is pre-existing:
+
+```scala
+trait Eqls extends Any { def canEqual(that: Any): Boolean }
+trait Prod extends Any with Eqls
+final class T2[A, B](val _1: A, val _2: B) extends Prod
+def f(t: T2[Int, Int]) = t eq null      // value eq is not a member of T2[A, B]
+def g(t: T2[Int, Int]): AnyRef = t      // accepted
+```
+
+`lookup_member` reaches `AnyRef`'s members only by walking a *declared*
+parent, and `rough_parents` supplies `AnyRef` only when the parent list is
+**empty**, so a class whose ancestry bottoms out in a universal trait has a
+chain that ends at `Any`. That is `src/library`'s whole
+`Tuple`/`Product`/`Iterator` family: `scala.Equals` is
+`trait Equals extends scala.Any`. The compiler already agrees the receiver is
+a reference — the second line is accepted — so `check_select` now asks
+`AnyRef` when the receiver conforms to it, last, after the declared members
+and after any view.
+
+In the library this was masked by the stand-in above: `any2ArrowAssoc`'s
+result is the prelude's `ArrowAssoc extends AnyRef`, which *does* have `eq`,
+so `t eq null` was resolving through an `->` conversion. Remove one without
+the other and 19 `eq`/`ne` errors appear.
+
+`tests/fixtures/libprelude_anyref.scala` runs, because `eq` is reference
+identity: `p eq q` is false where `p == q` is true, so a fallback that
+resolved it to `==` would type-check, verify and print the wrong answer.
+
+### Three defects found and not fixed here
+
+1. **A source `scala.Predef` breaks `java.lang.System.out.println` in
+   `--scala-library` mode.** Eleven lines, no `->` anywhere:
+
+   ```scala
+   package scala { object Predef { type String = java.lang.String } }
+   object Main { def main(a: Array[String]): Unit = java.lang.System.out.println("hello") }
+   ```
+
+   compiles, and dies with
+   `NoSuchMethodError: 'void scala.Predef$.println(java.lang.Object)'`. The
+   qualified select is being given the prelude `Predef`'s receiver. Correct in
+   `--no-scala-library`, and correct in jar mode without the source `Predef`,
+   so it is the `predef_reimport` wildcard that codegen reads back. It costs
+   the measure nothing (the measure is `--no-scala-library`) and it is why
+   `libprelude_arrow.scala` is run in one mode only.
+2. **`val b: Byte = -3` is rejected** — `type mismatch; found: Int required:
+   Byte`, in both modes, while `val b: Byte = 3` is fine. A negated constant
+   literal is not folded before the narrowing check. Real scalac accepts it.
+   Zero errors in `src/library`, so it is a correctness item, not a yield one.
+3. **`def f(a: Int, b: Int) = a eq b` is accepted**, boxing through
+   `int2Integer`; scalac rejects it with "the result type of an implicit
+   conversion must be more specific than AnyRef". Pre-existing — an unmodified
+   build of `main` at `8f1df474` accepts it — and it is in implicit search,
+   not in the `AnyRef` fallback above, which asks `is_sub_type(recv, AnyRef)`
+   and is never reached.
+
+### The other targets, before and after
+
+| target | before | after |
+|---|---|---|
+| scala library | `1111 / 155` | **`1065 / 154`** |
+| gitbucket | `270 / 79` | `270 / 79` |
+| cats | `185 / 71` | `185 / 71` |
+| slick (compile) | `errors=0 classes=1490` | `errors=0 classes=1490` |
+
+### The head of what remains, re-clustered on the 1065
+
+18 `value + is not a member of <notype>`, 15 `found: <overload Stream[A] |
+Iterable[A] | Stream[A]> required: Stream[A]`, 13 `found: T required: A`, 13
+`no matching overload for (MainNode[K, V], …)Boolean`, 11 `value min is not a
+member of <notype>`, 9 `incompatible type in overriding`, 8 `value max is not
+a member of <notype>`, 8 `found: null required: A`, 8 `reassignment to val
+initBlank`, 7 `could not optimize @tailrec`, 6 `value tail is not a member of
+<overload Iterable[A] | Stream[A] | Stream[A]>`. The `->` family is gone; the
+`&` / `^` family is gone.
+
+The `<notype>` receiver (18 + 11 + 8 = 37 between `+`, `min` and `max`) is now
+the largest single spelling in the log and has no entry anywhere in this
+document. It is worth a slice of its own: a receiver printed as `<notype>` is
+a symbol whose type was never assigned, so the site of the error is not the
+root and the counts above are what one root is worth.
+
+## The `agent/libnotype` slice: `<notype>` was three roots, and only one owed a diagnostic
+
+**1111 errors in 155 files → 1024 in 150**, measured on this branch against the
+`8f1df474` branch point. The `<notype>` cluster went **56 → 6**. gitbucket
+`270 / 79`, cats `185 / 71` and slick `errors=0 classes=1490` are unmoved.
+
+The brief handed this slice 48 errors under two headings — 18 `value + is not a
+member of <notype>` and 11 `value min` — and asked "why does the receiver have
+no type at all, and why was nothing reported where it was lost?". Instrumenting
+the one report site (`check_select.rs`, printing the qualifier's *symbol* when
+its type is `NoType`) answered it in one run of the measure, and the answer was
+that the 56 errors had three unrelated causes with three different answers to
+the second half of the question.
+
+| receiver, as the symbol table had it | errors |
+|---|---:|
+| `Math` / `Runtime`, `kind=Package`, `jvm="scala/Math"` | 26 |
+| `newCachedHashCode` / `dataToNodeMigrationTargets`, a local `var` | 26 |
+| `accum`, a local `val` | 35 |
+
+The third row is larger than its share of the `<notype>` count because most of
+what it removed says something else (`no matching overload for constructor ::`).
+
+### 1. A directory classpath entry was matched case-insensitively
+
+`jvm="scala/Math"` is the whole diagnosis. `Typer::complete_binary_member`
+treats a directory under a package as proof that a *package* of that name
+exists:
+
+```rust
+if self.binary.has_package_prefix(&prefix) {
+    let _ = crate::classpath::ensure_package(&mut self.st, &internal);
+    return;
+}
+```
+
+and `BinaryIndex::has_package_prefix` answered that with `path.join(rel).is_dir()`.
+macOS's default APFS volume is case-insensitive, and
+`tests/scalalib_measure.sh`'s Java classpath really does contain
+`scala/math/ScalaNumber.class` and `scala/runtime/BoxesRunTime.class` — so
+`<cp>/scala/Math` and `<cp>/scala/Runtime` were directories, `package
+scala.Math` and `package scala.Runtime` were invented, and because the search
+order is `scala` first and *then* the implicit `import java.lang._`, they
+shadowed `java.lang.Math` and `java.lang.Runtime` for the whole run. Every
+`Math.min` / `Math.max` / `Math.nextAfter` / `Math.multiplyExact` /
+`Runtime.getRuntime` in `src/library` then selected on a package.
+
+Nothing was reported where the name was lost, because as far as the typer was
+concerned nothing had failed. The only diagnostic in the run came from the
+*backend* — `cannot load Math`, for the one occurrence in a value position.
+
+`java.lang.Math.max(1, 2)` worked throughout, and so did bare `Integer`,
+`String`, `System`, `Thread`, `Character`, `StrictMath` and `Class`: this only
+ever hit a `java.lang` class whose name collides case-insensitively with a
+`scala.*` package on the classpath. It also only ever hit the `--no-scala-library`
+arrangement, because the jar entries a zip is asked about are matched exactly.
+
+Both directory lookups in `BinaryIndex` — the package prefix and the class file
+— now verify the on-disk spelling of every component (`path_case_matches`).
+It runs only after the cheap `is_dir()`/`is_file()` has said yes, and
+`find_class` memoises, so the cost is bounded by the number of distinct names
+actually found on a directory entry.
+
+### 2. A blank line before a bare block was read as an argument list
+
+nsc's scanner distinguishes `NEWLINE` from `NEWLINES` (`Scanners.pastBlankLine`),
+and `newLineOptWhenFollowedBy(LBRACE)` skips only the former. So in real scalac
+2.13.16
+
+```scala
+g
+{ 41 }          // an application: g { 41 }
+
+g(1)
+
+{ 41 }          // two statements
+```
+
+Our lexer collapsed every run of line breaks into one `Newline` token, so both
+were applications — and `HashMap.concat` and `HashSet.concat` are written as
+
+```scala
+var newCachedHashCode = 0
+
+{
+  …
+  newCachedHashCode += newNode.cachedJavaKeySetHashCode
+```
+
+which parsed as `0 { … }`. The `var` took the failed application's type, and
+all 18 `+=` and both `|=` beneath it reported on `<notype>`.
+
+Here an error *was* printed — `value apply is not a member of 0`, at the `var` —
+so this family was not silent. It was worse than silent in a different way: the
+message describes a program the author did not write, at a line where nothing
+is wrong.
+
+`Token` now carries `blank_line`, set in `Lexer::emit` by the same rule nsc
+uses (scan back over whitespace from the `\n`; a comment counts as content,
+because nsc scans raw characters and `/` is not whitespace), and OR-ed across a
+run when `drop_non_separating_newlines` collapses it. `simple_expr_rest` stops
+its application loop at a blank line.
+
+Deliberately **not** changed: `newline_opt_when_followed_by`, which the
+template and `extends` parsers use. nsc rejects `class A` + blank line + `{ … }`
+too (checked against real scalac), so being faithful there would turn programs
+this compiler currently accepts into errors, with nothing to gain in any
+measure. Worth doing on its own if the `neg` corpus ever asks for it.
+
+### 3. `new X` was resolved in the term namespace
+
+The unqualified-`Ident` arm of `TreeKind::New` used `SymbolTable::lookup`,
+which returns the innermost scope that binds the name *at all*. `HashMap.concat`
+writes
+
+```scala
+class accum extends AbstractFunction2[K, V1, Unit] with Function1[(K, V1), Unit] { … }
+…
+val accum = new accum
+```
+
+and in the nested block the nearest `accum` is the `val` being defined. No
+`Class` among the candidates, so the arm fell through to
+`self.type_expr(tpt, &Type::NoType)` — typing `accum` as an *expression*, which
+found the half-built value and handed back its `NoType`. **This is the one of
+the three where a diagnostic really was owed and never came**: the search
+failed and the tree was left typed as if it had succeeded, which is exactly the
+shape `agent/gbhead` recorded above.
+
+`lookup_type` skips a scope that binds the name only as a term, by
+construction, so the fix is to consult it when the plain lookup found nothing
+in the type namespace. That also fixes the same collision in `List.scala`,
+where `List` declares `def ::` and the class `::` is top-level: `new ::(x, xs)`
+had been finding the method. 35 errors, of which only 2 mentioned `<notype>` —
+the rest were `no matching overload for constructor ::`, `type mismatch; found:
+::[Nothing]`, and `value next is not a member of ::[Nothing]`.
+
+The narrow shape matters. `found` is replaced only when it holds no
+`Class`/`TypeParam`/`TypeMember` at all, so the `only_module` path
+(`object O` alone under the name, which nsc reports as `not found: type O`) and
+the `class type required but T found` path are untouched, and both are pinned
+in `tests/fixtures/libnotype_bad.scala`.
+
+### Verification
+
+`tests/fixtures/libnotype.scala` **executes and prints**, against the private
+runtime and against the real library ABI, and its expected output is real
+scalac 2.13.16's from compiling the same source. `libnotype_bad.scala` is
+rejected at three of scalac's own four lines — 12 (the blank-line one: if the
+blank line did not end the expression, `one { (x: Int) => x }` is well typed
+and the file compiles clean), 16 and 19. Line 10, scalac's `missing argument
+list for method one`, is a separate pre-existing laxity about eta-expansion in
+this compiler and is not asserted. All four tests in
+`crates/cli/tests/libnotype.rs` fail on a build of the branch point.
+
+No error kind in the library log went **up**, and no new kind appeared — which
+is unusual for a cascade fix and is worth saying, because it means none of the
+87 was hiding a further error.
+
+### The four `neg` corpus losses, audited
+
+`tests/verify_merge.sh` reports `VERDICT=FAIL` on this branch for
+`corpus losses=4`. The corpus moved `pos 1089 → 1094`, `run 618 → 621`,
+`neg 674 → 670`. All four `neg` losses are the same thing: the test had been
+"passing" on an error that is not in its `.check` at all, produced by one of
+the three bugs above. Compiled with a build of the branch point and with this
+one, side by side:
+
+| test | what scalac reports | what we reported before | now |
+|---|---|---|---|
+| `anytrait` | 3 × `field/statement not allowed in universal trait` (3, 5, 9) | `recursive value x needs type`; `value apply is not a member of 1` | clean |
+| `name-lookup-stable` | 2 × `reference to PrimaryKey is ambiguous` (15, 17) | `no matching overload for Nothing with arguments (PrimaryKey$)` | clean |
+| `t8002-nested-scope` | `method x in class C cannot be accessed … from object C` (8) | `value x is not a member of C$` | clean |
+| `valueclasses-impl-restrictions` | 3 × `implementation restriction: nested … in value class` (3, 9, 23) | `no matching overload for String with arguments ((<notype>) => <notype>)` | clean |
+
+Three of the four are the blank-line parse (`1 { x += 1 }`, `??? { import …; … }`,
+`i2.z { case x => x }`) and the fourth is `new C()` resolving to `object C`,
+which is the third root exactly. The last row's old message is itself one of
+the `<notype>` symptoms this slice was sent after.
+
+What actually remains unimplemented behind them: universal-trait restrictions,
+value-class nesting restrictions, name-ambiguity between a member and a
+subsequent wildcard import, and `private` access checking on a *nested* class.
+None was ever implemented; the corpus was crediting us for them because a
+different bug happened to reject the same files. This is the `neg` upper bound
+`.agent-brief.md` warns about, seen from the other side.
+
+### What is left of `<notype>`
+
+Six: 2 `ambiguous overload for processFully with arguments ((<notype>) =>
+<notype>)` (the deliberate placeholder for a literal whose parameter types are
+not yet known — `check_overload.rs` documents it), 2 `type Partial is not a
+member of <notype>` (`BigDecimal.scala`'s `Range.Partial[…]`), 1 `type
+BigDecimalAsIfIntegral is not a member of <notype>` (`Range.scala:608`,
+`Numeric.BigDecimalAsIfIntegral`) and 1 `type mismatch; found: <overload Int |
+<notype>>`. The middle two are the *type* namespace's version of the same
+question and were not investigated here.
+
+### The head of the library afterwards
+
+| n | message |
+|---:|---|
+| 15 | `type mismatch; found: <overload Stream[A] \| Iterable[A] \| Stream[A]>  required: Stream[A]` |
+| 13 | `type mismatch; found: T  required: A` |
+| 13 | `no matching overload for (MainNode[K, V], …)Boolean` |
+| 9 | `value & is not a member of Boolean` |
+| 9 | `incompatible type in overriding` |
+| 8 | `type mismatch; found: null  required: A` |
+| 8 | `reassignment to val initBlank` |
+| 8 | `no matching overload for <overload (Array[Long], Long)Unit \| …>` |
+| 7 | `value -> is not a member of TimeUnit` |
+| 7 | `type mismatch; found: Array[Nothing]  required: Array[Array[AnyRef]]` |
+| 7 | `type mismatch; found: ((K, V)) => U  required: (K) => Any` |
+| 7 | `could not optimize @tailrec annotated method` |
+
 ## What to do next, in order
 
-Re-clustered on the 1051 that remain (`agent/liboverload`, below): 451 `type
-mismatch`, 244 `X is not a member of Y`, 45 `no matching overload`, 33 `not
-found`, 18 `ambiguous overload`, 9 `incompatible type in overriding`. The
-four worst files are `HashMap.scala` (48), `TrieMap.scala` (47),
-`Vector.scala` (45) and `HashSet.scala` (35).
-
-0. **`->` when two conversions offer it — 28 errors, 3 files.** The
-   twelve-line reproduction is under `agent/libmaxmin` above. Worth taking
-   before anything else in this list, because "two candidates, so neither" is
-   a wrong answer anywhere it happens. Note the two fixes that look right and
-   are not, recorded there, before starting.
-1. **`new Array(WIDTH)` does not take its element type from the expected
-   type — 43 `found: Array[Nothing]`**, nearly all in `Vector.scala` and
-   `Array.scala`. The largest single `type mismatch` family left.
-2. **41 `found: T`** — the uninstantiated element parameter
-   (`Iterator.empty.next()`), now the second largest.
-3. **`SymbolTable::base_type_args` takes the first path, not the meet.** The
-   second defect `agent/liboverload` found and did not fix; its section below
-   has the trace. It is what makes `IterableOps.tail` read as `Iterable[A]`
-   from `Stream`, and the same shape is behind `<overload Set[A] |
-   TreeSet[A]>` (3), `<overload Iterable[(K, V)] | Map[K, V] | TreeMap[K, V]>`
-   (3) and `<overload Nil$ | Nil$>` (7), which no member-collapse rule can
-   reach because those really are two instantiations of one base.
-4. `TrieMap`'s 13 `no matching overload for (MainNode[K, V], MainNode[K, V],
-   TrieMap[K, V])Boolean` are one root and need no lookup work.
-5. The `case class` synthesis item and the overriding family from the previous
-   list are both smaller than they were: 5 `needs to be abstract` and 9
-   `incompatible type in overriding` remain.
-6. `src/reflect` and `src/compiler` are not worth measuring yet.
+0. ~~**`->` when two conversions offer it — 28 errors, 3 files.**~~ Done by
+   `agent/libprelude`, in the section just above, which also shows that the
+   twelve-line reproduction is **not** a case this compiler gets wrong: real
+   scalac 2.13.16 rejects it too. Read that section before trusting anything
+   in this list that is written as a reproduction rather than a measurement.
+1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
+   `new VectorN(…)` on a generic constructor infers `Any` for the element
+   where the context expects `Vector[B]`. Nothing to do with the prelude; it
+   is constructor type inference. `Tree[A, …]` (73, `RedBlackTree.scala`) and
+   `Array[Any]` (43) look like the same shape and should be checked together.
+2. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
+   classes report `class TupleN needs to be abstract` against
+   `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
+3. The overriding family was *partly* a second root after all. The
+   `agent/libanyval` slice above removed 34 of it — every
+   `` `override` modifier required`` and every `cannot override final
+   member`` — by fixing the matcher rather than by lookup work. What is left
+   of it is 9 `incompatible type in overriding` plus 10 `overrides nothing`,
+   and those *are* the member-lookup bug seen from the other side.
+4. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 
 ## The `agent/liboverload` slice: re-abstracting is overriding

@@ -2255,6 +2255,7 @@ impl Typer {
         self.drop_overridden_conversions(&mut hits);
         self.drop_witnessless_conversions(&mut hits, from, span);
         self.drop_inapplicable_conversions(&mut hits, name);
+        self.drop_superseded_prelude_conversions(&mut hits);
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
             0 => None,
@@ -2298,6 +2299,51 @@ impl Typer {
                 }
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
             }
+        }
+    }
+
+    /// A stand-in for a `Predef` member does not compete with the member
+    /// itself once the run's own sources have supplied it.
+    ///
+    /// `predef_reimport` supersedes the prelude's `Predef` snapshot **by
+    /// name**, which covers every member the two spell the same way. They do
+    /// not always: the prelude calls `Predef`'s `->` conversion
+    /// `any2ArrowAssoc`, which is 2.10's name for it -- `javap -p
+    /// scala.Predef$` on 2.13.16 has `public final <A> A ArrowAssoc(A)` and no
+    /// `any2ArrowAssoc` at all -- while the library's `implicit final class
+    /// ArrowAssoc` synthesizes `ArrowAssoc`. The names never met, both stayed
+    /// in scope offering `->` for the same source type, and every `a -> b` in
+    /// `src/library` tied between them and was reported as `value -> is not a
+    /// member` (28 errors in 3 files, `docs/scala-library.md`'s item 0).
+    ///
+    /// The rule is narrow on purpose, in both directions:
+    ///
+    /// * It fires only in a run whose own sources define `scala.Predef`
+    ///   (`SymbolTable::predef_superseded`). Two conversions genuinely in
+    ///   scope for the same type **are** an ambiguity, and real scalac 2.13.16
+    ///   says so -- a user `implicit class` offering `->` beside the real
+    ///   `Predef.ArrowAssoc` is rejected with "implicit conversions are not
+    ///   applicable because they are ambiguous". A blanket "source beats
+    ///   prelude" would accept that program.
+    /// * It only ever *narrows* a set of two or more, and only by dropping
+    ///   candidates owned by the prelude `Predef`. A lone prelude candidate is
+    ///   left standing, so a shape the source `Predef` cannot serve is not
+    ///   turned into a member error.
+    fn drop_superseded_prelude_conversions(&self, hits: &mut Vec<(SymbolId, SymbolId, Type)>) {
+        if !self.st.predef_superseded || hits.len() < 2 {
+            return;
+        }
+        let predef = self.st.predef;
+        let pcls = self.st.module_class_of(predef);
+        let prelude_end = self.st.prelude_end;
+        let superseded = |c: &SymbolId| {
+            c.0 < prelude_end && {
+                let o = self.st.get(*c).owner;
+                o == predef || o == pcls
+            }
+        };
+        if hits.iter().any(|(c, _, _)| !superseded(c)) {
+            hits.retain(|(c, _, _)| !superseded(c));
         }
     }
 

@@ -1,0 +1,12 @@
+false &  true = false trace=LR
+false && true = false trace=L
+true  |  false = true trace=LR
+true  || false = true trace=L
+true  ^  true = false trace=LR
+true  ^  false = true trace=LR
+&: false false false true
+|: false true true true
+^: false true true false
+explicit: false true true
+unary_+: -3 -4 65 -5 -6 -7.5 -8.25
+prefix: -5 -6 -8.25
