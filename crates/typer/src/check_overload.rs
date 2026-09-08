@@ -2726,7 +2726,21 @@ impl Typer {
                 }
             }
             pt.clone()
-        } else if sam.is_some() && param_tys.len() == pts.len() {
+        } else if sam
+            .as_ref()
+            .is_some_and(|s| s.param_tys.len() == param_tys.len())
+        {
+            // The literal really does have the SAM's arity, so it *is* one.
+            //
+            // This used to read `param_tys.len() == pts.len()`, which cannot
+            // fail: the arity guard forty lines up has already replaced `pts`
+            // with `vec![NoType; vparams.len()]` whenever the two disagreed,
+            // so a literal of the wrong arity claimed the SAM type anyway and
+            // `val e: Equiv[Int] = (x: Int) => x > 0` compiled -- real scalac
+            // 2.13.16 says `found: Int => Boolean  required:
+            // scala.math.Equiv[Int]`. Comparing against the SAM's own arity
+            // is the question that was meant. Pre-existing, and reachable on
+            // the branch point through any source-declared SAM trait.
             pt.clone()
         } else {
             Type::Function {

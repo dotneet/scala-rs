@@ -610,6 +610,22 @@ pub struct Symbol {
     /// looks exactly like a concrete one and `class C extends T` cannot tell
     /// whether `v` still needs implementing.
     pub deferred_val: bool,
+    /// nsc `DEFERRED` for a **method** that this run did not parse: one
+    /// supplied from a library pickle, or one the prelude declares by hand.
+    ///
+    /// A `def` with no body in this run's own sources carries
+    /// `Flags::ABSTRACT` (the namer sets it), and so does one read by the
+    /// eager `-cp` classfile scan (`classpath.rs` copies the pickle's
+    /// `DEFERRED`). Neither the prelude nor `PickleSupply` can say it that
+    /// way: `prelude::method` stamps every member `Flags::FINAL`, and
+    /// `PickleSupply` allocates members `Flags::EMPTY` on purpose -- see
+    /// `override_check::modifiers_are_known`, which withholds every
+    /// modifier-shaped diagnostic for exactly those two groups. Widening
+    /// `Flags::ABSTRACT` to cover them would turn those diagnostics on for a
+    /// whole library at once; this bit records the fact without doing that.
+    ///
+    /// Read through [`SymbolTable::method_is_deferred`].
+    pub deferred_method: bool,
     /// This `val` / `var` lives in a **separately compiled** class whose
     /// backing field scalac made `private`, so every read goes through the
     /// public accessor of the same name and every write through `name_$eq`.
@@ -1202,6 +1218,7 @@ impl SymbolTable {
                 abstract_override: false,
                 super_accessor: false,
                 deferred_val: false,
+                deferred_method: false,
                 via_accessor: false,
                 specialized: None,
                 unspecialized: false,
@@ -1324,6 +1341,7 @@ impl SymbolTable {
             abstract_override: false,
             super_accessor: false,
             deferred_val: false,
+            deferred_method: false,
             via_accessor: false,
             specialized: None,
             unspecialized: false,
@@ -6010,16 +6028,51 @@ impl SymbolTable {
 
     /// SIP-21: exactly one abstract method (not an Object method / FunctionN).
     pub fn sam_sig(&self, ty: &Type) -> Option<SamSig> {
+        self.sam_sig_over(ty, &[])
+    }
+
+    /// [`Self::sam_sig`], told which inherited declarations the class in fact
+    /// **overrides** without the symbol table having been shown the override.
+    ///
+    /// `PickleSupply` installs a library class's members one name at a time,
+    /// on demand, so an override nothing has asked for is indistinguishable
+    /// from an override that is not there. `scala.math.Ordering` is the shape
+    /// that matters: it inherits a deferred `equiv` from `Equiv` (through
+    /// `PartialOrdering`) and overrides it -- `javap -p scala.math.Ordering`
+    /// says `public default boolean equiv(T, T)` -- so until something names
+    /// `equiv` on an `Ordering`, the class reads as having two abstract
+    /// methods and no function literal converts to it.
+    ///
+    /// The caller reads the missing half straight out of the pickle
+    /// (`PickleSupply::concrete_method_names`) and passes it here rather than
+    /// installing it; see that function for what installing it costs.
+    pub fn sam_sig_over(&self, ty: &Type, overridden: &[String]) -> Option<SamSig> {
         let cls = self.class_sym_of(ty)?;
         let jvm = self.get(cls).jvm_name.clone();
         if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
             return None;
         }
-        let abstracts = self.abstract_sam_methods(cls);
+        let mut abstracts = self.abstract_sam_methods(cls);
+        if !overridden.is_empty() {
+            abstracts.retain(|m| {
+                let s = self.get(*m);
+                s.owner == cls || !overridden.iter().any(|n| *n == s.name)
+            });
+        }
         if abstracts.len() != 1 {
             return None;
         }
         let method = abstracts[0];
+        // nsc `definitions.samOf`: `!sam.isOverloaded && sam.typeParams.isEmpty`.
+        // A polymorphic abstract method has no function type to convert from,
+        // and real scalac 2.13.16 says so -- `trait Poly { def f[A](a: A): A }`
+        // with `val p: Poly = x => x` is two errors, `missing parameter type`
+        // and `found: ? => ?  required: Poly`. Without this the literal was
+        // accepted and its parameter silently pinned to whatever the body
+        // wanted.
+        if !self.get(method).tparams.is_empty() {
+            return None;
+        }
         // The abstract method may be declared in a *parent* (`trait C[-T]
         // extends (T => R)` gets its `apply` from `Function1`), so its type has
         // to be read as seen from `ty` -- substituting only `cls`'s own type
@@ -6077,8 +6130,58 @@ impl SymbolTable {
         }
         by_name
             .into_values()
-            .filter(|m| self.get(*m).flags.contains(Flags::ABSTRACT))
+            .filter(|m| self.method_is_deferred(*m))
             .collect()
+    }
+
+    /// Names of deferred methods `cls` inherits from a parent and does not
+    /// itself declare a member for.
+    ///
+    /// `PickleSupply` installs a library class's members one name at a time,
+    /// on demand, so a library trait's symbol carries only what some earlier
+    /// expression asked for -- and an override it has not been asked for is
+    /// indistinguishable from an override that is not there. That is fatal
+    /// exactly for [`Self::sam_sig`], which has to count abstract methods:
+    /// `scala.math.Ordering` inherits a deferred `equiv` from `Equiv` through
+    /// `PartialOrdering` and overrides it concretely (`javap -p
+    /// scala.math.Ordering` says `public default boolean equiv(T, T)`), so
+    /// until that override is installed `Ordering` reads as having *two*
+    /// abstract methods and no function literal converts to it.
+    ///
+    /// The caller completes these names and asks again. The list is bounded
+    /// by what the parents declare, so nothing else is pulled in.
+    pub fn inherited_deferred_method_names(&self, cls: SymbolId) -> Vec<String> {
+        let own: rustc_hash::FxHashSet<&str> = self
+            .get(cls)
+            .members
+            .iter()
+            .map(|m| self.get(*m).name.as_str())
+            .collect();
+        self.abstract_sam_methods(cls)
+            .into_iter()
+            .filter(|m| self.get(*m).owner != cls)
+            .map(|m| self.get(m).name.clone())
+            .filter(|n| !own.contains(n.as_str()))
+            .collect()
+    }
+
+    /// How many abstract methods `cls` reads as having, SAM rules applied.
+    pub fn sam_method_count(&self, cls: SymbolId) -> usize {
+        self.abstract_sam_methods(cls).len()
+    }
+
+    /// Whether a method has no implementation where it is declared.
+    ///
+    /// `Flags::ABSTRACT` alone answers this only for the two supplies that can
+    /// set it: this run's own sources, and the eager `-cp` classfile scan.
+    /// The prelude and `PickleSupply` record the same fact in
+    /// [`Symbol::deferred_method`] instead, so every SAM type that comes out
+    /// of the scala-library jar (`scala.math.Equiv`, `scala.math.Ordering`,
+    /// `scala.util.hashing.Hashing`, ...) was read as having *zero* abstract
+    /// methods and so was not a SAM type at all.
+    pub fn method_is_deferred(&self, m: SymbolId) -> bool {
+        let s = self.get(m);
+        s.flags.contains(Flags::ABSTRACT) || s.deferred_method
     }
 }
 
