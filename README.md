@@ -41,6 +41,29 @@ makes no claim of conformance to the language specification. What exists today:
 外部 trait の `hashCode` / `toString` と組み込み `Any` の上書き関係も、
 [scalac 相互運用テスト](docs/notes/inherited-universal-override.md) で検査します。
 
+同名メソッドのオーバーライド判定は、SLS 5.1.4 のとおりパラメータ型を不変として
+扱います。型パラメータを含む型どうしは以前「同じ」と答えていたため、
+`IterableOps.concat[B >: A](suffix: IterableOnce[B])` と
+`MapOps.concat[V2 >: V](suffix: IterableOnce[(K, V2)])` のような**オーバーロード**を
+オーバーライドと誤認し、scala/scala の `src/library` に scalac が出さない 34 件の
+診断を出していました。現在は形（可変長引数か否か、名前渡しか否か、同じクラスの
+型引数が確実に異なるか、JVM 名の異なるクラスか、束縛された型変数か）で決着する
+場合だけ「別のメソッド」と判定し、決着しない場合は従来どおり黙ります。
+バックエンドのブリッジ生成も消去後の記述子だけでは両者を区別できないため、
+消去前に確定した「オーバーロードである」関係を `method_overload_pairs` に凍結して
+参照します（誤ってブリッジを出すと親の署名で `ClassCastException` になります）。
+
+`AnyVal` とその派生（9 つの値クラスとユーザー定義の値クラス）は
+`java.lang.Object` を基底クラスに持ちません。nsc の `AnyClass` は親なしで
+定義され、`AnyVal extends Any` だからです。そのため
+`class Meters(val n: Int) extends AnyVal { def notify(): String = ... }` は
+scalac 2.13.16 が受理し実行します。一方 `trait Univ extends Any` のような
+**ユニバーサルトレイト**には別の禁止（nsc の
+`clazz.isTrait && !clazz.isSubClass(AnyValClass)`）が働くので、こちらは拒否を
+維持します。正常系・異常系の検証は `override` テスト
+（`libanyval_overload` ほか 3 件）と [docs/scala-library.md](docs/scala-library.md)
+の「an overload is not an override」節を参照してください。
+
 同名メソッドと object の `apply` は両方をオーバーロード候補として比較します。
 単一候補の呼び出し結果と曖昧な呼び出しの拒否は、`overload_module` テストで
 scalac 2.13.16 と比較します。集合の結合も含む

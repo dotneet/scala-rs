@@ -1,0 +1,14 @@
+Table.pp
+bag
+Table.cat
+bag
+Table.addAll
+bag
+SBuf.prep
+Buf.prep*
+Partial.andThen
+8
+IntGen.tryAdv
+Gen.tryAdv
+Meters.notify
+Meters.wait

@@ -919,6 +919,14 @@ pub struct SymbolTable {
     /// erased JVM types: a generic base and an unrelated overload can erase
     /// to the same descriptor.
     pub method_override_families: rustc_hash::FxHashSet<(SymbolId, SymbolId)>,
+    /// The complement, and equally pre-erasure: source method pairs *proven*
+    /// to be two methods -- an overload no erasure can reunite. The backend
+    /// needs this to tell a bridge from an overload, because
+    /// `bridge_overrides` compares erased descriptors on purpose and by then
+    /// `Ops.pp[B](xs: Bag[B])` and `Table.pp[V2](xs: Bag[(K, V2)])` are the
+    /// same `(LBag;)` parameter. Only membership is meaningful: absence means
+    /// "not proven", never "these override".
+    pub method_overload_pairs: rustc_hash::FxHashSet<(SymbolId, SymbolId)>,
     /// Terms whose pre-erasure type was a user value class, and which one.
     /// Erasure replaces the type with the underlying representation, but the
     /// backend still has to know that `case class Box(m: Meters)` prints its
@@ -1180,6 +1188,7 @@ impl SymbolTable {
             this_class: SymbolId(0),
             super_accessor_targets: rustc_hash::FxHashMap::default(),
             method_override_families: rustc_hash::FxHashSet::default(),
+            method_overload_pairs: rustc_hash::FxHashSet::default(),
             value_class_terms: rustc_hash::FxHashMap::default(),
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),

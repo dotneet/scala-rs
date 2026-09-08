@@ -488,3 +488,83 @@ fn ov_anonymous_class_creation_impossible() {
         ],
     );
 }
+
+// -------------------------------------------- 9. overloads are not overrides
+//
+// SLS 5.1.4 makes parameter types invariant under overriding: a *different*
+// parameter type is a second method, not an override of the first. Getting
+// that boundary wrong is expensive in both directions, so all four fixtures
+// below were run through real scalac 2.13.16 first.
+//
+// Before this slice the matcher answered "same type" for any pair of types
+// mentioning a type parameter (`robust` refused to compare them and the
+// comparison defaulted to "matches"). scala/scala's own `src/library` is
+// written in exactly the shape that breaks -- `MapOps.concat[V2](suffix:
+// IterableOnce[(K, V2)])` beside `IterableOps.concat[B](suffix:
+// IterableOnce[B])`, `Buffer.prepend(elem: A)` beside the final
+// `prepend(elems: A*)`, `<:<.compose[C](r: C <:< From)` beside
+// `Function1.compose[A](g: A => T1)` -- and `tests/scalalib_measure.sh`
+// reported 34 errors for it that scalac does not.
+
+/// Five overload pairs and a value class, executed. The expected output is
+/// real scalac 2.13.16's own for the same file.
+///
+/// The private runtime is compiled but not run: its
+/// `scala.collection.immutable.Seq` is not shipped, so the varargs *call*
+/// cannot execute there. The declarations, which are what the override rules
+/// see, are checked in both modes.
+#[test]
+fn ov_overloads_are_not_overrides() {
+    check_library("libanyval_overload");
+    let out = compile_fixture_with("libanyval_overload", &["--no-scala-library"]);
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// The other direction: a base type parameter the subclass *fixes* still
+/// matches, so this is a real override of a `final` member and stays rejected
+/// at scalac's own line and wording.
+#[test]
+fn ov_substituted_parameter_still_overrides() {
+    rejected_once(
+        "libanyval_final_bad",
+        &[
+            "cannot override final member:",
+            "final def put(x: Cell[Int]): Int (defined in trait Box)",
+        ],
+    );
+}
+
+/// A repeated parameter against a repeated parameter is not a shape
+/// difference. `A*` read at `IntSink` is `Int*`, so the `override` modifier is
+/// still required.
+#[test]
+fn ov_repeated_against_repeated_still_overrides() {
+    rejected_once(
+        "libanyval_modreq_bad",
+        &[
+            "`override` modifier required to override concrete member:",
+            "def take(xs: Int*): Int (defined in trait Sink)",
+        ],
+    );
+}
+
+/// The boundary of the `AnyVal` exemption. `Object` is not a base class of a
+/// value class -- `libanyval_overload.scala`'s `Meters` writes `def notify()`
+/// and scalac runs it -- but a *universal trait* gets no such licence: nsc
+/// guards its ban with `clazz.isTrait && !clazz.isSubClass(AnyValClass)`.
+///
+/// scalac 2.13.16 rejects this file with one error,
+/// `trait cannot redefine final method from class AnyRef`. scala-rs rejects it
+/// with one error too, by the ordinary rule, because `Object` stays in a
+/// universal trait's linearization; the wording is the only difference, and
+/// the count and the line are scalac's.
+#[test]
+fn ov_universal_trait_may_not_redefine_object_finals() {
+    rejected_once(
+        "libanyval_univtrait_bad",
+        &[
+            "`override` modifier required to override concrete member:",
+            "(defined in class Object)",
+        ],
+    );
+}
