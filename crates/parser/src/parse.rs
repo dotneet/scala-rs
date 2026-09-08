@@ -3454,6 +3454,15 @@ impl<'a> Parser<'a> {
                     );
                 }
                 TokenKind::Newline if !can_apply => break,
+                // A *blank* line ends the expression. nsc's
+                // `newLineOptWhenFollowedBy(LBRACE)` skips a `NEWLINE` and
+                // never a `NEWLINES`, so `f\n{ … }` is an application while
+                // `f\n\n{ … }` is two statements. Without this,
+                // `var newCachedHashCode = 0` followed by a blank line and a
+                // bare block -- the shape `HashMap.concat` and
+                // `HashSet.concat` are written in -- parsed as `0 { … }`, and
+                // the `var` took the type of that failed application.
+                TokenKind::Newline if self.tokens[self.pos].blank_line => break,
                 TokenKind::Newline => {
                     // `foo \n {` is application; `foo \n +` handled in infix;
                     // `foo \n bar` is two statements — don't consume.

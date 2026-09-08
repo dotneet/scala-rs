@@ -7,6 +7,11 @@ pub struct Token {
     /// A line break preceded this token but did not separate statements.
     /// SIP-27's trailing comma needs it (`f(a, b,\n)` is legal, `f(a, b,)` is not).
     pub nl_before: bool,
+    /// nsc's `NEWLINES` rather than `NEWLINE`: on a [`TokenKind::Newline`],
+    /// that at least one blank line stands here. nsc's `newLineOpt` skips a
+    /// single `NEWLINE` only, so the distinction decides whether a `{` on a
+    /// later line continues the expression before it or starts a statement.
+    pub blank_line: bool,
 }
 
 impl Token {
