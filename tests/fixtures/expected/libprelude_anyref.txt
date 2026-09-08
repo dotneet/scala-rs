@@ -1,0 +1,7 @@
+p eq q: false
+p == q: true
+p eq p: true
+p ne q: true
+n eq null: true
+p ne null: true
+conforms: T2(1,2)
