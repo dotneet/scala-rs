@@ -97,3 +97,75 @@ to its own subject.
   `IterableOnceOps.mkString` through `genericWrapArray`, and the prelude
   declares `mkString` on `ArrayOps` itself. Reading the names off a class that
   does not declare the member would be guessing, so the diagnostic stands.
+
+## The `[B >: A]` members (`agent/lowerbound`, `agent/preludelb`)
+
+The same "the hand-written member wins" rule costs the collections their
+*lower-bounded* type parameters. `IterableOnceOps.reduce[B >: A]` arrives
+through the pickle for every other collection; `List`'s came from
+`prelude_seq`, which wrote it `((A, A) => A): A`, and a monomorphic signature
+reads to the typer like a missing alternative — `no matching overload for
+(Dog)Boolean with arguments (Cat)`.
+
+`agent/lowerbound` closed `sorted` / `min` / `max` / `sum` / `product`.
+`agent/preludelb` re-ran its probe as a two-directional accept/reject
+comparison against real scalac 2.13.16 over 71 calls on `List`, `Map`, `Set`
+and `Option`, and closed the rest in `prelude_lowbound.rs`:
+
+| member | was | is |
+|---|---|---|
+| `List.contains` | `(A): Boolean` | `[A1 >: A](A1): Boolean` |
+| `List.indexOf` | `(A): Int` | `[B >: A](B): Int`, and the `(B, Int)` arity added |
+| `List.reduce` | `((A, A) => A): A` | `[B >: A]((B, B) => B): B` |
+| `List.reduceLeft` | `((A, A) => A): A` | `[B >: A]((B, A) => B): B` |
+| `List.reduceRight` | `((A, A) => A): A` | `[B >: A]((A, B) => B): B` |
+| `List.toArray` | `(implicit ClassTag[A]): Array[A]` | `[B >: A](implicit ClassTag[B]): Array[B]` |
+| `Map.+` | `((K, V)): Map[K, V]` | `[V1 >: V]((K, V1)): Map[K, V1]` |
+| `Map.updated` | `(Any, Any): Map[K, V]` | `[V1 >: V](Any, V1): Map[K, V1]` |
+
+Two of those the enumeration in `tests/BASELINE.md` did not name. `toArray`
+was a sixth member of the `sorted` family's exact shape, and it failed in the
+way that family failed — `found: Array[B]`, with `B` never instantiated,
+because two candidates were in scope and only the pickled one fit the
+argument. `Map.updated` was the worse of the two, because it **accepted** the
+widening call and silently answered at the un-widened type: `Map` is covariant
+in `V`, so `val m: Map[K, Animal] = md.updated(k, cat)` conforms either way and
+only a narrow ascription separates them (`tests/fixtures/preludelb_bad.scala`).
+
+Erasure is unchanged throughout, and this is the part that had to be measured
+rather than argued, because `reduce` and `reduceLeft` take a *function* of the
+widened type. `B`'s upper bound is `Any` exactly as `A`'s is, so the
+descriptors stay `(Lscala/Function2;)Ljava/lang/Object;`,
+`(Ljava/lang/Object;)Z`, `(Ljava/lang/Object;)I` and
+`(Lscala/reflect/ClassTag;)Ljava/lang/Object;`. The class files emitted for
+`List(1,2,3).reduce(_ + _)`, `reduceLeft`, `reduceRight`, `contains`, `indexOf`
+and `toArray` are **byte-identical** to the branch point's, and every box and
+unbox falls where scalac puts it. `crates/cli/tests/preludelb.rs` asserts this
+with `javap -c` per call site rather than per class, because the `$anonfun$`
+bodies do differ — for the unrelated reason in `specialization.md`, that nsc
+gives the lambda an `apply$mcIII$sp` and this compiler emits a plain
+`Function2` whose body unboxes. That gap shows on untouched members such as
+`foldLeft` too.
+
+### What the probe found and this slice did not fix
+
+* **`Map.++` is absent by design.** `md ++ mc` is `found: Iterable[Product]
+  required: Map[String, Animal]`. `prelude_coll::add_immutable_map_extra`
+  declines to declare it, with a recorded runtime reason (the inherited
+  `IterableOps.++` builds through `immutable.Iterable`'s factory and threw
+  `ClassCastException` in both the `MapN` and `HashMap` cases). That reason is
+  worth re-testing, but it is not a lower-bound question.
+* **`Map`'s key parameters are `Any`, not `K`.** `md.apply(1)`, `md.get(1)`,
+  `md.updated(1, dog)`, `md.getOrElse(1, dog)` and `md.contains(1)` on a
+  `Map[String, Dog]` are all accepted here and all rejected by nsc. This is the
+  deliberate approximation `prelude_ovl3::widen_map_get_or_else` already
+  records; tightening it touches five members at once and is independent of the
+  bound.
+* **A lower bound that names another variable of the same call is not solved.**
+  `def put[V, V1 >: V](m: List[V], v: V1)` called as `put(dogs, cat)` gives
+  `inferred type arguments [Dog,Cat] do not conform to method put's type
+  parameter bounds [V,V1 >: V]`: `V1` is solved from its argument alone instead
+  of being joined with the still-undetermined `V`. Writing the bound as a
+  concrete class (`[V1 >: Dog]`) works, and nsc infers `V1 = Animal` for both.
+  Pre-existing, reproduced identically on the branch point, and unrelated to
+  the prelude — the method is defined in source.
