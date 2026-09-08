@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `80c660c0` |
+| commit | `a723e8b1` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-three slices have merged this session**, in nineteen composed gates. From
+**Sixty-four slices have merged this session**, in twenty composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -41,6 +41,7 @@ coordinator measured the merged tree each time, not the branches.
 | `aa38b9e9` | `tuplepat` | 265 | 182 -> **177** |
 | `d0c89fc1` | `ctorgaps2` | 265 | 177 |
 | `80c660c0` | `hkfield` | 265 | 177 |
+| `a723e8b1` | `lowerbound` | 265 | 177 -> **168** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -247,9 +248,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **177** | **69** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **168** | **67** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **265** | **77** | — |
-| `tests/scalalib_measure.sh` (538) | **622** | **131** | — |
+| `tests/scalalib_measure.sh` (538) | **612** | **130** | — |
 
 ## Execution
 
@@ -266,11 +267,11 @@ specialization remain explicitly red; this is not a completion claim.
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
 | `pos` (1859) | **1104** | 410 | 345 |
-| `neg` (1405) | **687** | 349 | 369 |
-| `run` (2060) | **628** | 879 | 553 |
+| `neg` (1405) | **688** | 348 | 369 |
+| `run` (2060) | **629** | 878 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-d0c89fc1.tsv`](baselines/corpus-d0c89fc1.tsv): 5324 unique
+[`baselines/corpus-a723e8b1.tsv`](baselines/corpus-a723e8b1.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -672,6 +673,59 @@ so fixing one site left the other standing and silent.
 Its test reads `javap -c` and asserts not only that a `checkcast` appears where
 scalac puts one, but that **none appears** where scalac emits none -- an
 unnecessary cast is a divergence too, and running green does not show it.
+
+## Gate twenty: the inference was right, the supply was not
+
+`agent/lowerbound` was briefed on `Infer.methTypeArgs` solving a lower-bounded
+`B >: A` to its bound before looking at the argument. It measured that instead:
+a `def sortedX[B >: A](implicit ord: Ordering[B]): C` **defined in source**
+already matched scalac at the branch point, both with an explicit argument
+(`B := AA`) and through implicit search (`B := A`). What diverged was the
+*supply* of signatures.
+
+* `pin_undetermined_tparams` dropped every type parameter no explicit
+  parameter names, pinning it to its lower bound. **Its own doc comment gave
+  `def max[B >: A](implicit ord: Ordering[B]): A` as the example and asserted
+  that scalac solves it that way.** It does not — an argument passed to the
+  implicit clause decides `B`.
+* `List`'s `sorted` / `min` / `max` / `sum` / `product` are hand-written in the
+  prelude with no type parameter at all, while every other collection arrives
+  through the pickle. That is why `List` alone diverged.
+
+The pin is kept for the one shape that genuinely needs it — a bound parameter
+that no parameter mentions, as in cats' `Resource#allocated[B >: A]` — because
+removing it outright cost slick five errors.
+
+**The gate rejected two of the three attempts, each for a different reason,
+and that is the record worth keeping.** Preferring the expected type over the
+lower bound lost `run/t10513` (`Numeric[Any]`): nsc's `solvedTypes` minimises
+covariant variables and an expected type is only an upper constraint. Using
+the declared `bound_lo` unchanged broke a self-type receiver with no receiver
+tree to read the class's type arguments from. The slice's first gate printed
+`VERDICT=FAIL` with four workspace failures and `losses=1`.
+
+Its negative fixtures are the more interesting half. `List[String].sum` was
+**accepted** at the branch point, with no diagnostic, whichever way the
+parameter was handled; and the rejection message for a bound violation matches
+nsc down to naming the join it settles on (`required: Ordering[Any]`) rather
+than the declared bound.
+
+### Left open by this slice, measured and named
+
+`List`'s prelude has four more holes of the same shape, found with a probe that
+enumerated every `[B >: A]` member against a `Sup`/`Sub` pair: `indexOf[B >: A]`
+and `contains[A1 >: A]`, `reduce` / `reduceLeft[B >: A]` / `reduceRight[B >: A]`,
+and `Map.+[V1 >: V](kv: (K, V1))` (one cats error,
+`WrappedMutableMapBase.scala:28`). All close through the same
+`prelude_lowbound.rs` mechanism; they were left because `sum` changing from `A`
+to `B` needs its erasure and unboxing re-checked. `startsWith` was fixed
+incidentally by this slice.
+
+Two things the brief grouped with this root are **not** it: the `Equiv` /
+`Ordering` / `Hashing` mismatches in cats are lambda-to-SAM conversions, and
+`NonEmptyVector.scala:287`'s `found: Seq[A] required: Vector[A]` is `sortBy`'s
+return type — the `C` of `IterableOps[A, CC, C]`, which is `agent/basetypeargs`'
+subject. `sortBy[B](f: A => B)(implicit Ordering[B])` has no lower bound at all.
 
 ## What is deliberately red
 
