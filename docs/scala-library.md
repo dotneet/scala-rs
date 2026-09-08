@@ -1816,6 +1816,91 @@ moved three times since: the
 the 11 `pos`/`run` gains it names all reproduce on unmodified `main`. The
 ledger needs re-taking; none of the 15 is this slice's.
 
+## The `agent/intrinsicqual` slice: the second name-only dispatch, closed
+
+This closes the "Not fixed here, same root" item at the end of the
+`agent/sysout` section above. `gen_apply` had one more dispatch of the same
+shape immediately below the print one:
+
+```rust
+if ctx.library_abi
+    && (fun.name() == Some("identity")
+        || fun.name() == Some("locally")
+        || fun.name() == Some("implicitly")
+        || matches!(ic, Intrinsic::Identity | Intrinsic::Locally | Intrinsic::Implicitly)
+            && fun.name().is_some_and(…))
+```
+
+The second disjunct is subsumed by the first, so the symbol was never
+consulted at all, and `gen_predef_poly` emits
+`scala/Predef$.<name>:(Ljava/lang/Object;)Ljava/lang/Object;` — the identity
+function — **discarding the qualifier and every argument but the first**.
+
+### What that was worth, measured by running it
+
+`tests/fixtures/intrinsicqual_predef.scala` holds a user-defined `identity` /
+`locally` / `implicitly` on an object and on an instance, beside `Predef`'s
+own, in one program. Real scalac 2.13.16 and this branch both print:
+
+```
+O-identity:a … C-identity2:g|h  C-identity2:i|j  <mk:m><arg:i><arg:j>  k l m n o ev 7 8
+```
+
+An unmodified build of the branch point, in `--scala-library` mode, prints
+
+```
+a  b  c  d  e  f  g  i  <arg:i>  k l m n o ev 7 8
+```
+
+— every user method replaced by the identity function, the receiver `mk("m")`
+never evaluated, and the second argument `side("j")` never constructed. In
+`--no-scala-library` mode the branch point is already correct, because the
+whole dispatch sits inside `if ctx.library_abi`; the fixture is run and
+compared in **both** modes anyway, and both now match scalac byte for byte.
+
+The sharpest single case is the exact analogue of `agent/sysout`'s
+reproduction, one intrinsic over: a program that defines its own
+`scala.Predef` with a *monomorphic* `def identity(a: String): String` emits a
+`scala/Predef$.class` that precedes the jar's, and the hijacked call names a
+descriptor that is not there. Before the fix it compiled, verified, and threw
+`NoSuchMethodError: 'java.lang.Object scala.Predef$.identity(java.lang.Object)'`;
+now it prints `P:x`.
+
+### The fix, and why it is the same shape as `unresolved_print`
+
+`gen_expr::predef_poly_name` returns the intrinsic's name only when the call
+either **carries** `Intrinsic::Identity` / `Locally` / `Implicitly` — which
+`prelude_predef2::add_predef_members` sets on the prelude's own `Predef`
+members and nowhere else — or has **no symbol at all**, where there is nothing
+else to emit. The name test stays beside the intrinsic test because
+`Intrinsic::Identity` is shared with unrelated members (`AnyVal.toString`,
+`unary_+`, `Using.resource`) that `gen_predef_poly` must never claim.
+
+### Yield: zero corpus tests, one byte of slick, and neither is the point
+
+**slick's 1490 class files are byte-identical** between the branch point and
+this change alone (`SLICK_OUT=… tests/slick_measure.sh` on both binaries,
+`diff -r`, exit 0): nothing in slick's 184 files names `identity`, `locally`
+or `implicitly` on a receiver of its own. `errors=0 files_with_errors=0
+classes=1490` before and after. The four class files this branch does move are
+the *constructor* change below, and they are one byte each.
+
+### Found here, not fixed here
+
+`println(identity(()))` is a `VerifyError: Operand stack underflow`, on an
+unmodified build of the branch point as well as on this one.
+`gen_predef_poly` pops its own result when the result type is `Unit`, which is
+right in statement position and wrong when the value is an argument. It is one
+line from the fix and is left out because it is not this slice's defect and
+would make the numbers above unreadable; `crates/cli/tests/intrinsicqual.rs`
+names it in the guard test that would otherwise carry it.
+
+`new Sec("abcd")`, where `class Sec(val a: Int)` also declares `def this(s:
+String)`, emits an `invokespecial` at the *primary* constructor's descriptor
+and is a `VerifyError: Bad type on operand stack`. Also pre-existing, also
+unrelated to access: it reproduces with no modifier on the secondary
+constructor at all.
+
 ## The `agent/arrayelem` slice: `new Array(n)` reads its element from `pt`
 
 **917 errors in 146 files → 875 in 146**, measured on this branch against the

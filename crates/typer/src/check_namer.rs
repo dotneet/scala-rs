@@ -417,9 +417,21 @@ impl Typer {
         }
         self.st.get_mut(id).ctor_fields = fields.clone();
         // ctor method
-        let ctor = self
-            .st
-            .alloc("<init>", id, SymKind::Method, Flags::CONSTRUCTOR, "");
+        //
+        // `class C private ()` / `class C protected ()` / `class C
+        // private[p] ()` put their modifier on the *constructor*, not on the
+        // class, so the `<init>` symbol has to carry it: `accessible` reads
+        // the symbol, and with no flag at all every `new C()` was accepted
+        // wherever it was written (`neg/sensitive`, `neg/t4987`,
+        // `neg/t6601`, `neg/protected-constructors`).
+        let ctor = self.st.alloc(
+            "<init>",
+            id,
+            SymKind::Method,
+            Flags::CONSTRUCTOR.with(ctor_mods.ctor_flags()),
+            "",
+        );
+        self.st.get_mut(ctor).private_within = ctor_mods.private_within.clone();
         self.st.get_mut(ctor).params = fields.clone();
         self.st.enter_in_current("<init>", ctor);
 
