@@ -1483,10 +1483,10 @@ while replacing the method, the receiver and — in slick's case — an argument
 
 ### The numbers
 
-`tests/verify_merge.sh` on the merged tree (`agent/neglit` had landed on `main`
-in the meantime):
+`tests/verify_merge.sh` at `8539ff65`, this branch with `main` merged in twice
+while it ran (`agent/neglit`, then `agent/pickleparams`):
 
-| check | branch point `acec3f09` | merged tree |
+| check | branch point `acec3f09` | merged tree `8539ff65` |
 |---|---|---|
 | scala library | `971 / 147` | `970 / 147` |
 | gitbucket | `270 / 79` | `270 / 79` |
@@ -1494,16 +1494,18 @@ in the meantime):
 | slick (compile) | `errors=0 files_with_errors=0 classes=1490` | same |
 | `slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | same |
 | subset + lint | — | `verified=1490 failed=0 lint_problems=0` |
-| `cargo test --workspace --release` | — | `256 rows, 2472 passed, 0 failed` |
-| corpus (full) | — | `pos 1095 / neg 670 / run 623`, identical test-for-test to `acec3f09` |
+| `cargo test --workspace --release` | — | `257 rows, 2478 passed, 0 failed` |
+| corpus (full) | — | `pos 1095 / neg 670 / run 626` |
 
-The library's one-error move is `agent/neglit`'s, not this change: a gate run
-on this branch *before* merging it reported `971 / 147` with the print fix
-already in, and the corpus is identical row for row on both binaries.
+Everything that moved belongs to the other two slices, and there is a
+measurement for that rather than an assumption: a gate run on this branch
+*before* either merge reported `971 / 147` with the print fix already in, and
+the corpus was identical row for row — all 5324 of them, in all three kinds —
+between an unmodified `acec3f09` build and this change.
 
-`VERDICT=FAIL` on both gate runs, for `corpus losses=4` against
+`VERDICT=FAIL` on all three gate runs, always for `corpus losses=4` against
 `tests/baselines/corpus-4d613d25.tsv` — the four `agent/libnotype` losses named
-above, which the ledger predates. Nothing else fails.
+above, which the ledger predates. Nothing else fails in any of them.
 
 ### Not fixed here, same root
 
