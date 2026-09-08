@@ -1486,6 +1486,61 @@ impl Typer {
                         }
                     }
                 }
+                // `new Array(n)` names the class with its element still
+                // undetermined, and nsc solves that parameter against the
+                // expected type the same way it solves any other constructor's
+                // — `val a: Array[Int] = new Array(3)` is `newarray int`, and
+                // `take(new Array(2))` at `(Array[String])Int` is `anewarray
+                // java/lang/String`. `Array` cannot go through the
+                // `Type::Class` rule below because an array type is spelled
+                // `Type::Array`, so it is read here.
+                //
+                // Getting the element wrong is not a compile error but an
+                // `ArrayStoreException`, so the *only* two answers taken are
+                // the expected type's element and, when nothing constrains it,
+                // `Nothing` — which is what nsc's solver also reaches, and
+                // which erases to `anewarray java/lang/Object` on both sides
+                // (`jvm_desc_array_elem`; scalac reaches the same array class
+                // through `ClassTag.Nothing.newArray`). Nothing is guessed:
+                // an element the expected type does not name stays `Nothing`
+                // rather than being widened to `AnyRef`.
+                //
+                // The element is written back onto `tpt` as well as onto the
+                // `New` node: `gen_new` reads the *prefix's* type to decide
+                // between `newarray` and `new`, so leaving `tpt` naming the
+                // class emitted `new "[java/lang/Object"` followed by an
+                // `invokespecial` of a constructor no array class has.
+                //
+                // The written *syntax* is what says the element is open, not
+                // the type: an argument position types its argument twice, and
+                // by the second pass the first pass has already left
+                // `Array[Nothing]` on both trees, so a rule that only asked
+                // "is this the bare `Array` class?" never fired again and
+                // `new C[K, V](0, new Array(0), gen)` kept its `Nothing`. A
+                // written `new Array[Nothing](n)` is an `AppliedTypeTree` and
+                // is left alone.
+                let elem_unwritten = matches!(&tpt.kind,
+                    TreeKind::Ident { name } if name != crate::materialize::RESOLVED_TYPE)
+                    && self.st.is_array_class(tpt.sym);
+                if elem_unwritten
+                    || matches!(&tree.ty, Type::Class { sym, args }
+                        if args.is_empty() && self.st.is_array_class(*sym))
+                {
+                    // An element an earlier pass already found is kept. The
+                    // same tree is typed more than once with *different*
+                    // expected types — a block is typed once for its value and
+                    // once for its statements, and `a1 = new Array(WIDTH)`
+                    // inside one (`immutable/Vector.scala`) came back through
+                    // here with no expected type at all. Reading `pt`
+                    // unconditionally overwrote the `AnyRef` the assignment had
+                    // just supplied with `Nothing` and put 18 errors back.
+                    let elem = match self.array_elem_expected(&tree.ty) {
+                        Some(found) if !matches!(found, Type::Nothing) => found,
+                        _ => self.array_elem_expected(pt).unwrap_or(Type::Nothing),
+                    };
+                    tree.ty = Type::Array(Box::new(elem));
+                    tpt.ty = tree.ty.clone();
+                }
                 // nsc infers `new Q` as `Q[Int]` when the expected type is `Q[Int]`.
                 if let Type::Class { args, sym } = &tree.ty {
                     if args.is_empty() {
@@ -1522,6 +1577,32 @@ impl Typer {
                 // `TypedRep.<init>()` and the program dies with
                 // `NoSuchMethodError` at run time.
                 if !applied {
+                    // `new Array[Int]` with no argument list at all. `Array`'s
+                    // one constructor takes the length, so nsc rejects it in
+                    // the same words it uses for `new Array[Int]()`. This
+                    // compiler accepted it as an `Array[Int]` *value* and
+                    // codegen then emitted `new "[java/lang/Object"` with an
+                    // `invokespecial` of a constructor no array class has --
+                    // bytecode the verifier refuses, reached with no
+                    // diagnostic. The arity check on the applied form lives in
+                    // `type_apply`; this is the same check one node up, where
+                    // there is no application to carry it.
+                    if let Some(elem) = self.array_elem_expected(&tree.ty) {
+                        let shown = if elem_unwritten {
+                            "T".to_string()
+                        } else {
+                            self.st.display_type(&elem)
+                        };
+                        self.error(
+                            tree.span,
+                            format!(
+                                "not enough arguments for constructor Array: \
+                                 (_length: Int): Array[{shown}].\n\
+                                 Unspecified value parameter _length."
+                            ),
+                        );
+                        return;
+                    }
                     let fillable = self
                         .st
                         .class_sym_of(&tree.ty)

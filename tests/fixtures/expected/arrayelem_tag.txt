@@ -1,0 +1,4 @@
+dd 2
+12
+[Ljava.lang.String;
+[I

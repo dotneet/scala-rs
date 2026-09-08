@@ -17,6 +17,62 @@ impl Typer {
     /// variables must not still be in scope when this one weighs its own
     /// alternatives. The body has many exits, so the set is saved and restored
     /// here rather than at each of them.
+    /// The element of an expected type that is an array, whichever of the two
+    /// spellings it arrives in.
+    ///
+    /// `Type::Array` is the usual one; `Type::Class { sym: Array }` is what a
+    /// run that compiles the library's own `scala/Array.scala` produces, since
+    /// the source class shadows the prelude's (`SymbolTable::is_array_class`).
+    pub(crate) fn array_elem_expected(&self, ty: &Type) -> Option<Type> {
+        match strip_annotations(ty) {
+            Type::Class { sym, args } if args.len() == 1 && self.st.is_array_class(*sym) => {
+                Some(args[0].clone())
+            }
+            other => array_elem_of(other),
+        }
+    }
+
+    /// `new Array(n)` written with no type argument, whose element came out
+    /// `Nothing` because nothing had yet said what it should be.
+    ///
+    /// nsc leaves that constructor's `T` *undetermined* until the expression is
+    /// checked against the position it sits in, so `new C[K, V](0, new
+    /// Array(0), gen)` (`concurrent/TrieMap.scala`) reads the element off the
+    /// constructor parameter. This compiler solves `T` at the `New` itself, so
+    /// an argument position — the one place the expected type arrives *after*
+    /// the argument has been typed — has to ask again. Keyed on the written
+    /// syntax, not on the type: an `Array[Nothing]` that some other expression
+    /// really has is not re-typed.
+    pub(crate) fn is_open_array_new(&self, a: &Tree) -> bool {
+        let TreeKind::Apply { fun, .. } = &a.kind else {
+            return false;
+        };
+        self.array_new_elem_unwritten(fun)
+            && matches!(self.array_elem_expected(&a.ty), Some(Type::Nothing))
+    }
+
+    /// Whether the `new Array…` this `New` tree heads wrote no element type.
+    ///
+    /// The tree's *type* cannot answer this once the element has been filled
+    /// in from the expected type, so the written form is what is asked. It is
+    /// also what decides whether nsc's arity diagnosis names `Array[T]` or the
+    /// element itself.
+    pub(crate) fn array_new_elem_unwritten(&self, fun: &Tree) -> bool {
+        let TreeKind::New { tpt } = &fun.kind else {
+            return false;
+        };
+        matches!(&tpt.kind,
+            TreeKind::Ident { name } if name != crate::materialize::RESOLVED_TYPE)
+            && self.st.is_array_class(tpt.sym)
+    }
+
+    /// Whether re-typing this argument against `p` can give a `new Array(n)`
+    /// the element it is still missing.
+    pub(crate) fn array_new_wants(&self, a: &Tree, p: &Type) -> bool {
+        !matches!(self.array_elem_expected(p), None | Some(Type::Nothing))
+            && self.is_open_array_new(a)
+    }
+
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
@@ -102,6 +158,47 @@ impl Typer {
             self.type_expr_inner(fun, pt);
             self.new_is_applied = false;
             if let Some(elem) = array_elem_of(&fun.ty) {
+                // `Array`'s constructor takes exactly one argument, and this
+                // path never checked that: `new Array[Int](10, 10)` — the
+                // multi-dimensional shape removed in 2.10, and `neg/multi-array`
+                // in scala/scala's own corpus — was silently accepted. It went
+                // unnoticed because the *un*-annotated `new Array(10, 10)` was
+                // rejected further down for having no matching constructor at
+                // all, which is not this diagnosis and stopped being reached
+                // once the element could be inferred.
+                //
+                // nsc runs this check before it instantiates the element, which
+                // is why it names `Array[T]` when the element was not written
+                // and `Array[Int]` when it was. The result type is still the
+                // array, so the enclosing `val a: Array[Int] = …` does not add
+                // a second, derived complaint on top of the one real error.
+                if args.len() != 1 {
+                    let shown = if self.array_new_elem_unwritten(fun) {
+                        "T".to_string()
+                    } else {
+                        self.st.display_type(&elem)
+                    };
+                    let msg = if args.len() > 1 {
+                        format!(
+                            "too many arguments (found {}, expected 1) for constructor Array: \
+                             (_length: Int): Array[{shown}]",
+                            args.len()
+                        )
+                    } else {
+                        format!(
+                            "not enough arguments for constructor Array: \
+                             (_length: Int): Array[{shown}].\n\
+                             Unspecified value parameter _length."
+                        )
+                    };
+                    self.error(tree.span, msg);
+                    for a in args.iter_mut() {
+                        self.type_expr(a, &Type::Int);
+                    }
+                    tree.ty = Type::Array(Box::new(elem));
+                    tree.sym = fun.sym;
+                    return;
+                }
                 if needs_classtag_elem(&elem) {
                     self.rewrite_generic_array_new(tree, elem);
                     return;
@@ -438,7 +535,7 @@ impl Typer {
                         p = self.st.subst_tparams(c, &inferred_args, &p);
                     }
                 }
-                if a.ty.is_no_type() {
+                if a.ty.is_no_type() || self.array_new_wants(a, &p) {
                     self.type_expr(a, &p);
                 }
                 if !p.is_no_type() {

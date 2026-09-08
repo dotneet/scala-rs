@@ -3209,3 +3209,69 @@ fn fixtures_subtypeterm_diamond() {
 fn fixtures_subtypeterm_diamond_bad() {
     compile_fails("subtypeterm_diamond_bad", "type mismatch");
 }
+
+/// `new Array(n)` written with no type argument takes its element type from
+/// the expected type. It is not a type-argument default: the element decides
+/// which JVM array class is allocated (`newarray int` vs `anewarray
+/// java/lang/String`), so getting it wrong is an `ArrayStoreException` at run
+/// time rather than a compile error. The fixture therefore *runs*: it builds
+/// one array per shape the standard library writes -- a `val` with an
+/// ascription, an argument position, an assignment, a nested element, and a
+/// constructor argument (`new CNode[K, V](0, new Array(0), gen)`) -- stores
+/// into each, reads back, and prints `getClass.getName` for all of them.
+/// Output is real scalac 2.13.16's. Before the fix every one of these was
+/// `no matching overload for constructor Array`. See
+/// `Typer::array_elem_expected` and `SymbolTable::is_array_class`.
+#[test]
+fn fixtures_arrayelem() {
+    check("arrayelem");
+}
+
+#[test]
+fn scala_library_dual_run_arrayelem() {
+    dual_run_fixture("arrayelem");
+}
+
+/// The same rule where the element is a type parameter the *call site*
+/// instantiates, so the `ClassTag` the array needs is the one the context
+/// bound supplies. Library mode only: the private runtime has no
+/// `scala.reflect.ClassTag`.
+#[test]
+fn scala_library_dual_run_arrayelem_tag() {
+    dual_run_fixture("arrayelem_tag");
+}
+
+/// ... and the element the expected type names still has to be one an array
+/// can be made of. `def mk[K]: Cell[K] = new Cell[K](new Array(0))` has no
+/// `ClassTag[K]`, and scalac 2.13.16 rejects it in exactly these words. This
+/// is the negative case that matters: a `new Array(n)` with nothing at all to
+/// read from is *accepted* by scalac (the element is `Nothing`), so it is in
+/// the positive fixture instead.
+#[test]
+fn fixtures_arrayelem_bad() {
+    compile_fails_lib("arrayelem_bad", "cannot find class tag for element type K");
+}
+
+/// `Array`'s one constructor takes the length, and reading the element off the
+/// expected type does not change that. This is scala/scala's own
+/// `test/files/neg/multi-array.scala` plus the three arities around it, and
+/// scala-rs reports all four with nsc's exact wording -- including nsc's
+/// distinction between `Array[T]` (element inferred, so the arity check runs
+/// before instantiation) and `Array[Int]` (element written). Two of the four
+/// were accepted outright before: `new Array[Int](10, 10)` and the
+/// argument-list-less `new Array[Int]`, both of which reached codegen and
+/// emitted an `invokespecial` of a constructor no array class has.
+#[test]
+fn fixtures_arrayelem_arity_bad() {
+    let err = compile_fails_out(
+        "arrayelem_arity_bad",
+        "too many arguments (found 2, expected 1) for constructor Array: (_length: Int): Array[T]",
+    );
+    for needle in [
+        "too many arguments (found 2, expected 1) for constructor Array: (_length: Int): Array[Int]",
+        "not enough arguments for constructor Array: (_length: Int): Array[Int].",
+        "Unspecified value parameter _length.",
+    ] {
+        assert!(err.contains(needle), "missing {needle:?} in {err}");
+    }
+}

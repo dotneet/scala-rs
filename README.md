@@ -60,6 +60,23 @@ jar モードでは nsc の 2 つの本体（primitive なフィールドが 1 �
 companion の `writeReplace` と、class 側の `apply` / `unapply` / `tupled` /
 `curried` static forwarder は**未実装のまま**です。
 
+型引数を書かない `new Array(n)` は、要素型を**期待型**から取ります。nsc が
+`Array` のコンストラクタの型パラメータを `pt` に対して解くのと同じで、
+`val a: Array[Int] = new Array(3)` は `newarray int`、`take(new Array(2))` が
+`(Array[String])Int` に渡るなら `anewarray java/lang/String` になります。
+要素型はどの JVM 配列クラスを確保するかを決めるので、間違えてもコンパイル
+エラーにはならず、実行時の `ArrayStoreException` になります。したがって
+fixture は**実行**して確かめます（`arrayelem` は両モード、`arrayelem_tag` は
+jar モードのみ。期待出力は実 scalac 2.13.16 のもの）。期待型が何も言わない
+場合の要素は `Nothing` で、これは `anewarray java/lang/Object` に消去され、
+scalac が `ClassTag.Nothing.newArray` で作る配列と同じクラスになります。
+要素が `ClassTag` を必要とする抽象型なら、scalac と同じ
+`cannot find class tag for element type K` で拒否します（`arrayelem_bad`）。
+引数の個数も数えるようになりました。`new Array[Int](10, 10)`（2.10 で消えた
+多次元コンストラクタ）と、引数リストを書かない `new Array[Int]` は、以前は
+どちらも黙って通り、配列クラスに存在しないコンストラクタへの
+`invokespecial` を出していました（`arrayelem_arity_bad`）。
+
 同名メソッドのオーバーライド判定は、SLS 5.1.4 のとおりパラメータ型を不変として
 扱います。型パラメータを含む型どうしは以前「同じ」と答えていたため、
 `IterableOps.concat[B >: A](suffix: IterableOnce[B])` と
