@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `e0212fb7` |
+| commit | `b83e06a8` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-five slices have merged this session**, in twenty-one composed gates. From
+**Sixty-six slices have merged this session**, in twenty-two composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -43,6 +43,7 @@ coordinator measured the merged tree each time, not the branches.
 | `80c660c0` | `hkfield` | 265 | 177 |
 | `a723e8b1` | `lowerbound` | 265 | 177 -> **168** |
 | `e0212fb7` | `basetypeargs` | 265 | 168 -> **167** |
+| `b83e06a8` | `preludelb` | 265 -> **264** | 167 -> **166** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -249,8 +250,8 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **167** | **66** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **265** | **77** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **166** | **65** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **264** | **77** | — |
 | `tests/scalalib_measure.sh` (538) | **604** | **130** | — |
 
 ## Execution
@@ -267,12 +268,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1104** | 410 | 345 |
+| `pos` (1859) | **1105** | 409 | 345 |
 | `neg` (1405) | **688** | 348 | 369 |
 | `run` (2060) | **629** | 878 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-e0212fb7.tsv`](baselines/corpus-e0212fb7.tsv): 5324 unique
+[`baselines/corpus-b83e06a8.tsv`](baselines/corpus-b83e06a8.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -763,6 +764,43 @@ the same flags and classpath produces the other 130 errors and not these — and
 `Iterator.GroupedIterator` is still *accepted* as a spelling scalac rejects,
 because the rule that makes it work is the same one that carries
 `Resource.ExitCase`.
+
+## Gate twenty-two: the one that accepted too much
+
+`agent/preludelb` was handed the four holes `agent/lowerbound` had left named.
+It re-ran the probe as a **two-directional accept/reject comparison** against
+scalac 2.13.16 -- 71 calls over `List`, `Map`, `Set` and `Option`, each
+compiled by both compilers -- and found **eighteen** divergences. The recorded
+list was incomplete in both directions.
+
+The one that matters is `Map.updated`, the only member that **accepted too
+much**: it took the widening argument and answered at the un-widened type.
+`Map` is covariant in `V`, so `val m: Map[K, Animal] = md.updated(k, cat)`
+conforms either way and only a narrow ascription separates the two answers.
+The branch point compiles the negative fixture **with no diagnostic at all**.
+A list built by looking at error messages could never contain this member,
+because it produced none. `List.toArray[B >: A](implicit ClassTag[B])` was the
+other omission -- a sixth member of the `sorted` family's exact shape.
+
+The erasure question that stopped the previous slice is settled by measurement
+rather than argument: **zero bytecode diff lines** against a branch-point
+binary for every call both compilers accept, and boxes and unboxes at the same
+points as scalac. At `List[Int].reduce[Any]` neither unboxes; at
+`List[Dog].contains(cat)` both `checkcast`.
+
+gitbucket moved 265 -> 264 and gained one new error at the same line, which is
+stated rather than netted: `+` now type-checks the pair, so the disagreement
+moves out to the result -- our lub over an invariant `Set` gives
+`Map[A, Set[_ <: A]]` where nsc lands on `Set[A]`. More accurate, not a
+regression. The corpus gain is `pos/t2179`, which only compiles with `[B >: A]`.
+
+Left named and not fixed: `Map`'s key parameters are `Any` rather than `K`, so
+`md.apply(1)` on a `Map[String, Dog]` is accepted here and rejected by nsc --
+five members at once, deliberate per `prelude_ovl3` and independent of the
+bound. And a lower bound naming **another variable of the same call**
+(`def put[V, V1 >: V](m: List[V], v: V1)`) is solved from its argument alone
+instead of jointly; that one is defined in source, not the prelude, and is the
+sharpest remaining item in this area.
 
 ## What is deliberately red
 
