@@ -3672,6 +3672,297 @@ every one of them is this slice's own subject matter --
   rule above to reject a repeated argument at a fixed-arity formal;
 * `pos/t0305`.
 
+## The `agent/tuplepat` slice: `T1`/`T2` was a cascade, not a pattern definition
+
+`scala/collection/Seq.scala` carried 31 of the library's 685 errors at
+`462aeebb`, and 21 of them read `value <x> is not a member of T1` or `T2` --
+`T1`/`T2` being `Tuple2`'s own parameter names. The standing diagnosis was that
+`private[this] val (elms, idxs) = init()` -- a **tuple pattern definition** in
+`SeqOps`' `PermutationsItr` / `CombinationsItr` -- gave its accessors those
+names instead of the components of the right-hand side's type.
+
+**That is not what happens.** A pattern definition whose right-hand side types
+correctly has always worked; six of them are executed in
+`tests/fixtures/tuplepat.scala`, including the `private[this]` and
+three-component shapes, in a class nested in a generic trait. `T1`/`T2` is what
+a *failed* right-hand side leaves behind: a tuple literal one of whose
+components did not type keeps `Tuple2`'s parameter uninstantiated, the pattern
+definition hands that faithfully to every bound name, and every later use of a
+bound name reports it. Twenty-one reports, one root each level up.
+
+Three roots were underneath, and all three reproduce in fifteen lines against
+the real jar -- none of them needs `src/library` and none of them involves a
+pattern definition:
+
+1. **A `private[this]` member reached through the trait's self-alias.**
+   `trait SeqOps[…] { self => … }`, and `self.toGenericSeq` from inside
+   `PermutationsItr`. `Checker::prefix_is_this` asked the *tree* whether the
+   prefix was a `This` node. nsc (`Contexts.isAccessible`) asks the prefix
+   **type**: `pre =:= sym.owner.thisType` for an object-private member. A
+   self-alias is an `Ident` whose type is `SeqOps.this.type`, so the syntactic
+   test missed every one. **5 errors.**
+2. **An inherited factory `apply` reached as `Obj[K, V](…)`.** `object HashMap
+   extends MapFactory[HashMap]` inherits
+   `def apply[K, V](elems: (K, V)*): CC[K, V]`. The redirect in `check_expr`
+   that turns `mutable.HashMap[A, Int]()` into that `apply` took
+   `SymbolTable::get(sym).ty` raw, so the call came back `CC[A, Int]` -- the
+   *declaring trait's* parameter, unsubstituted. Writing `.apply` out went
+   through `type_select`, which does the substitution, which is why only the
+   implicit redirect was wrong. **30 errors.**
+3. **`xs.to(SomeFactory)` with an abstract element type.**
+   `Implicits::open_conversion_fit` ended with
+   `if mentions_any_tparam(&solved_to) { return None }`. The intent was to
+   reject a solution that still contains an *unknown*; what it rejected was any
+   solution mentioning any type parameter, and a type parameter of an enclosing
+   class or method is a fixed type. `List[Int].to(ArrayBuffer)` worked;
+   `class C[A] { def es: List[A] }` and `es.to(ArrayBuffer)` did not. The guard
+   now names the unknowns (`rest` and `open`). **15 errors.**
+
+Together: **685 -> 635** library errors, `Seq.scala` 31 -> 7, and every one of
+the 21 `T1`/`T2` reports gone. cats 182 -> 177; gitbucket and slick unchanged.
+52 errors went, 2 arrived, both of them the same two sites reporting the
+residual below with a better type in the message.
+
+### The miscompilation root 2 was hiding
+
+Making the type right made the call *reachable*, and executing it found the
+receiver wrong. `peel_fun` reads the receiver off the tree shape, and a bare
+`Ident` in a class body means `this`, so
+
+```scala
+trait Fac { def apply[K](x: K): String = "F" + x }
+object TM extends Fac
+class Uses { def two: String = TM[Int](1) }
+```
+
+emitted `Fac.apply` **on `this`** and threw
+`ClassCastException: class Uses cannot be cast to class Fac`. It is present at
+`462aeebb` and at every commit that has the redirect; nothing but execution
+sees it, because the types stay consistent (`.agent-brief.md`, *`verify_failures`
+is a lower bound*). `TM.apply[Int](1)`, `TM(1)` and an `apply` the object
+declares itself were all correct. The redirect now builds the `Select` those
+take.
+
+### Found, not fixed
+
+* **`unzip` in `--no-scala-library` mode infers a nested tuple.** The last two
+  `Seq.scala` errors are `val (es, is) = (… map … sortBy …).unzip` coming back
+  with an element type `Tuple2[Tuple2[Tuple2[Tuple2[Tuple2[Tuple2[A, Int],
+  Int], Int], Int], Int], Int]` -- six levels, one per `Tuple2` in the chain.
+  The same expression against the *jar's* `unzip` is correct, so it is the
+  source-library supply of `IterableOps.unzip` / `sortBy`, not the inference
+  rule as such. 2 errors.
+* **`Obj.apply[K, V]()` with an empty parameter list.** scalac calls it; this
+  compiler reads `Obj.apply[K, V]` as the completed application and the `()` as
+  a second one ("value apply is not a member of QC[Int, Int]"). Independent of
+  the roots above -- it happens whether the `apply` is inherited or declared,
+  and only with the empty clause.
+* **The synthetic holder a pattern definition creates is public.** nsc emits
+  `private static final scala.Tuple2 x$2` and no accessor; this compiler emits
+  a public field *and* a public `x$pat2()` accessor. The programs behave
+  identically -- `tests/fixtures/tuplepat.scala` is that claim, executed,
+  including that the right-hand side is evaluated once -- but the ABI carries
+  members it should not.
+
+All three are pinned by tests in `crates/cli/tests/tuplepat.rs` on their
+current behaviour, so a later slice that closes one is told by a failing test.
+## The `agent/ctorgaps2` slice: two of the three constructor gaps, closed
+
+`agent/ctorgaps` left three, each pinned by a test asserting the *current*
+behaviour so it goes red when closed. Two are closed here and the third is
+closed on its reading side; every pinning test now asserts the new behaviour
+rather than the old.
+
+### 1. A constructor default in a later parameter clause (the `VerifyError`)
+
+The most severe of the three, because it is a **silent miscompile**:
+`new Curr(7)()` on
+
+```scala
+class Curr(val a: Int, val b: String) {
+  def this(a: Int)(b: String = "b" + a, c: Int = a * 2) = this(a, b + c)
+}
+```
+
+compiled with no diagnostic and emitted an `invokespecial` with **one**
+argument for a three-parameter descriptor. `java -Xverify:all` says
+`VerifyError: Bad type on operand stack`.
+
+The diagnosis on record was right, and is worth restating precisely, because
+the fix has two halves and only the first follows from it. A `new`'s arguments
+reach `fill_defaults_and_implicits` already flattened -- `flatten_curried_new`,
+`flatten_curried_ctor_delegation` and `type_parent_ctor_app` all flatten a
+constructor's clauses, because that is the shape the JVM descriptor has --
+while the function measured them against the callee's *unflattened* `paramss`
+read back off the symbol. The first clause was complete, so the call was not
+short, and the function returned a method type describing a second clause that
+nobody was going to apply.
+
+`ctor_args_arrive_flat` recognises that shape -- an `<init>`, more than one
+declared clause, a `param_tys` as long as the flattened parameter list, and a
+**default** among what is missing -- and `fill_flat_ctor_params` fills the
+flattened tail instead: defaults through their getters, then any implicit
+clause behind them. The equal-length test is what separates the constructor
+callers from an ordinary `f(a)(b)`, whose `param_tys` is the one clause being
+applied. An all-implicit tail is deliberately left to the clause-by-clause
+path below it, which substitutes the call's type arguments into the searched
+types (`instantiate_from_call`, `solve_implicit_only_tparams`); slick's
+`new TypedCase[B, P](...)` needs that, and a flat search would not do it.
+
+#### The second half: the getter has nowhere to live
+
+This is the only shape in which a constructor default may legally name an
+earlier parameter -- nsc rejects a same-clause reference outright -- and that
+is exactly why the getter cannot be replaced by splicing the default's
+expression at the call site: `"b" + a` has no `a` in the caller's scope. nsc
+emits a getter that **takes** the preceding clauses' parameters, and `javap`
+on scalac 2.13.16's output for the class above shows it on a companion the
+source never wrote:
+
+```text
+public final class Curr$ {
+  public static final Curr$ MODULE$;
+  public java.lang.String $lessinit$greater$default$2(int);
+  public int $lessinit$greater$default$3(int);
+}
+```
+
+We synthesized no such companion, so with the fill in place the call became
+`error: not found: value a` -- a refusal instead of a `VerifyError`, which is
+better and still wrong. `Typer::needs_ctor_default_companion` now declares one
+for exactly that shape (a default in a clause after the first, on the primary
+or on a `def this(...)` in the body), and
+`Codegen::emit_ctor_default_companion` writes its classfile beside
+`emit_value_companion`, which had the same problem for a different reason.
+`javap` on our `Curr$` and on scalac's agree member for member, descriptors
+included.
+
+**Only that shape.** A first-clause default may legally name nothing, so its
+expression is still spliced at the call site and still adds no classfile --
+which is why slick's class-file count does not move. Synthesizing a companion
+for every class that takes a defaulted argument is the larger gap
+`docs/not-implemented.md` still records.
+
+### 2. Preferring the alternative that needs no default
+
+nsc's `Infer.inferMethodAlternative` weighs the alternatives applicable to the
+arguments *as written* first, and reaches for the ones a default would
+complete only when that set is empty. Weighing both at once made
+`new Prefer(1)` on
+`class Prefer(n: Int) { def this(k: Int, bump: Int = 5) = this(k * 100 + bump) }`
+`ambiguous overload for constructor`. `needs_a_default` asks for
+`DEFAULTPARAM` and not for `trailing_omissible`'s weaker "default *or*
+implicit", because an implicit parameter is filled by a search that runs after
+the alternative has been chosen, and nsc's applicability ignores the implicit
+clause outright.
+
+#### That rule alone turns a refusal into a wrong answer
+
+Which is worse than what it fixes, so it is not the whole change.
+`new Three(2)("m")()` on
+
+```scala
+class Three(val a: Int, val bc: String) {
+  def this(a: Int)(m: String)(tail: String = m + a) = this(a, m + "/" + tail)
+}
+```
+
+folds to `(2, "m")`, which the **primary** accepts exactly. With defaults now
+filled and the no-default alternative now preferred, the primary wins and the
+program prints `m` where scalac prints `m/m2` -- a silent wrong pick where the
+branch point had an `ambiguous overload`.
+
+nsc selects the constructor on the **first clause**, and `(2)` alone is not an
+`(Int, String)`. `flatten_curried_new` already computed the arity it folds by
+from the alternatives whose first clause is `first_len` long
+(`new_head_ctor_arity`); it now *reports* that length, and
+`pick_ctor_at_clause` holds the pick to the same set -- dropped when it would
+leave nothing, so a class this cannot describe is picked exactly as before.
+The two halves of the same decision now read the same alternatives.
+
+### 3. `private[p]`: the reading half, and what the note on record got wrong
+
+`agent/ctorgaps` recorded that nsc pickles a qualified access as "the bare
+`PRIVATE` flag **plus** a `privateWithin` reference", and left the constructor
+accessible so as not to refuse every `private[slick]` constructor slick itself
+calls.
+
+**There is no flag.** scalac 2.13.16's own pickle for
+`class Qual private[libp] (val s: String)` gives its `<init>` `flags=0x200`,
+with `PRIVATE` and `PROTECTED` both clear and `privateWithin` pointing at
+`libp`. So there was never a flag to tighten, and never an over-rejection to
+fear from tightening one: `private[p]` **is** the reference, and closing the
+gap means resolving it -- which is what the brief said.
+
+`Member::private_within` is now the boundary's simple name rather than a bool,
+which is what an access qualifier is: `Typer::access_within_of` walks out from
+the member's own owner until it finds a class or package so named, so two
+packages called `concurrent` cannot be confused -- the same reading
+`classpath::mark_java_package_private` already took for a Java package-private
+member. `Member::has_private_within` is kept beside it because the two
+questions are not the same one: a reference this reader could not name must
+leave the constructor as accessible as it was, since `access_within_of`
+*denies* when it cannot find the boundary.
+
+Two further things were in the way, and both were holes rather than
+trade-offs:
+
+* The constructor `PickleSupply` **installs** -- rather than repairs, when the
+  class file's member table has not yet produced its own -- was allocated as a
+  plain `SymKind::Method` named `<init>` with no `CONSTRUCTOR` flag, and
+  `ctor_access_error` asked for that flag. So every such constructor skipped
+  the access check outright. It now carries the flag, which is also what makes
+  the diagnostic say `constructor Qual in class Qual` rather than
+  `method <init>`.
+* `other_accessible_ctor` counted the descriptorless partial symbol as
+  "another constructor this site may call", and so declined to report.
+  `pick_ctor_at` already knows that shape and filters it; this now applies the
+  same rule.
+
+Our sentence is nsc's, word for word, checked against scalac refusing the same
+program:
+
+```text
+constructor Qual in class Qual cannot be accessed in class BadQual from class BadQual in package other
+```
+
+**The accepted half runs.** A caller inside `libp` still compiles and prints
+`qual:b` / `qual:c`, and slick -- which calls `private[slick]` constructors --
+is unchanged at `errors=0 files_with_errors=0 classes=1490`, with its 1490
+class files byte-identical. Over-rejection is the failure mode this could have
+had and does not.
+
+#### Left open: the writing half
+
+`backend::pickle::pickled_access_flags` drops the flag for a qualified-private
+member on purpose and emits no `privateWithin` entry at all, so the boundary is
+absent from a class file *we* wrote -- our own reader and real scalac both
+accept `new libp.Qual("x")` against it, and both are asserted so the pin says
+what it means. Closing it is a pickle-format change: `SymInfo` gains a symbol
+reference, which moves every entry after it. That is a slice of its own, and
+its measurements are the pickle's rather than the typer's.
+
+### What was measured
+
+* **slick `errors=0 files_with_errors=0 classes=1490`**, and its 1490 class
+  files are **byte-identical** to the branch point's -- `SLICK_OUT` on the
+  pre-fix and post-fix binaries, `diff -r`, exit 0, empty output. Measured
+  twice: once after the first two fixes and once after `private[p]`, because
+  the second is the one that could over-reject.
+* `tests/fixtures/ctorgaps_clause.scala` **runs** under `java -Xverify:all` in
+  **both** linking modes and matches real scalac 2.13.16 line for line. It
+  holds a default in the second clause, one naming an earlier clause's
+  parameter, both of those on a primary and on a secondary, a nullary getter
+  for a default that reads nothing, a clause filled part-way, a companion the
+  source wrote, an inferred getter result on a generic class, a three-clause
+  constructor whose last default names the *first* clause's parameter, and the
+  overload preference. An unmodified build of the branch point compiles it
+  with no diagnostic and throws `VerifyError` on its first line.
+* Every pinning test was rewritten to assert the new behaviour, and each was
+  checked against the pre-fix binary: the branch point accepts
+  `new libp.Qual("x")` from `package other`, refuses `new Prefer(1)` with
+  `ambiguous overload for constructor`, and verifier-errors on `Curr`.
+
 ## Running it
 
 ```

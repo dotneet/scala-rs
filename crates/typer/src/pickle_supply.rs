@@ -1152,14 +1152,39 @@ impl PickleSupply {
         // learn it.
         //
         // `private[p]` is pickled as `PRIVATE` **plus** a `privateWithin`
-        // reference, and this reader does not resolve `p`. Treating it as a
-        // plain `private` would refuse calls scalac accepts -- slick's
-        // `private[slick]` constructors are exactly that shape -- so a member
-        // with an access boundary is left as accessible as it is today.
+        // reference. The reader resolves `p` to its simple name, which is what
+        // an access qualifier *is*: `access_within_of` walks out from the
+        // member's own owner until it finds a class or package so named, so
+        // two packages called `concurrent` cannot be confused. A reference
+        // that did not resolve leaves the constructor accessible
+        // (`ctor_access_flags`), because a boundary nothing can find denies
+        // every call -- slick's own `private[slick]` constructors included.
         let access = ctor_access_flags(member);
+        let within = ctor_access_within(member);
         // A constructor takes no type parameters of its own; nsc writes the
         // class's as a `POLYtpe` wrapper, and those are already in scope.
-        let m = st.alloc("<init>", SymbolId::NONE, SymKind::Method, access, "");
+        // `CONSTRUCTOR`, not merely the name: it is what
+        // `access_full_location_string` reads to call this a *constructor*,
+        // and nsc's diagnostic is "constructor Qual in class Qual cannot be
+        // accessed", never "method <init>".
+        let m = st.alloc(
+            "<init>",
+            SymbolId::NONE,
+            SymKind::Method,
+            access.with(Flags::CONSTRUCTOR),
+            "",
+        );
+        // Independent of the flag, and that is the whole shape of it: nsc
+        // pickles `private[p]` as a `privateWithin` reference with **no**
+        // `PRIVATE` flag at all (`javap`-visible proof is impossible, but the
+        // pickle for `class Qual private[libp] (...)` compiled by scalac
+        // 2.13.16 reads `flags=0x200 private=false privateWithin=libp`).
+        // `Typer::accessible` treats a bare `private_within` as restricted for
+        // exactly that reason. `protected[p]` does carry `PROTECTED`, and
+        // takes the qualifier through the same field.
+        if within.is_some() {
+            st.get_mut(m).private_within = within.clone();
+        }
         let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
         let mut paramss_sym: Vec<Vec<SymbolId>> = Vec::new();
         for clause in &shape.clauses {
@@ -1261,6 +1286,15 @@ impl PickleSupply {
             if access != Flags::EMPTY {
                 let f = st.get(existing).flags.with(access);
                 st.get_mut(existing).flags = f;
+            }
+            // The boundary travels whether or not a flag came with it, or the
+            // pair means the wrong thing: `PRIVATE` alone is `private`, a
+            // qualifier alone is `private[p]`, and `PROTECTED` with a
+            // qualifier is `protected[p]`. Dropping the qualifier at the
+            // moment the descriptor is repaired would turn every
+            // `private[slick]` constructor into a plain public one again.
+            if within.is_some() {
+                st.get_mut(existing).private_within = within.clone();
             }
             st.get_mut(existing).params = source_params.clone();
             st.get_mut(existing).paramss = source_paramss.clone();
@@ -5465,13 +5499,23 @@ fn ctor_params_match(
 /// it is what makes `neg/t6601` -- a *separate* compilation -- reject.
 ///
 /// `private[p]` and `protected[p]` are pickled as the bare flag **plus** a
-/// `privateWithin` reference. This reader does not resolve `p`, and guessing
-/// "private" for one would refuse calls scalac accepts, so a member with an
-/// access boundary keeps the accessibility it had before this existed --
-/// public, as the descriptor said. That is the conservative half: this
-/// function can only ever *add* a restriction the pickle states outright.
+/// `privateWithin` reference, and the reader now resolves `p` to its simple
+/// name (`Member::private_within`). The flag is therefore kept for those too,
+/// and `install_ctor` copies the boundary alongside it so `Typer::accessible`
+/// asks `access_within_of` rather than `nested_in`.
+///
+/// A boundary that did **not** resolve leaves `Flags::EMPTY`, as this did for
+/// every qualified access before: `access_within_of` denies when it cannot
+/// find the boundary, so a name we failed to read would refuse every call --
+/// including the `private[slick]` constructors slick's own code makes -- and
+/// over-rejection is the one failure mode this must not have.
 fn ctor_access_flags(member: &scala_rs_pickle::sym::Member) -> Flags {
-    if member.private_within {
+    // A boundary the pickle states but this reader could not name. Left as
+    // accessible as it was before any of this existed: `access_within_of`
+    // denies when it cannot find the boundary, so marking it `private` on the
+    // strength of the flag alone would refuse every `private[slick]`
+    // constructor slick itself calls.
+    if member.has_private_within && member.private_within.is_none() {
         return Flags::EMPTY;
     }
     if member.has(pflags::PRIVATE) {
@@ -5481,6 +5525,18 @@ fn ctor_access_flags(member: &scala_rs_pickle::sym::Member) -> Flags {
     } else {
         Flags::EMPTY
     }
+}
+
+/// The access boundary a pickled `<init>` names, when the pickle resolved it.
+///
+/// Returned separately from the flag because the two travel to different
+/// fields, and because a boundary that did not resolve must leave the
+/// constructor exactly as accessible as it was: `access_within_of` **denies**
+/// when it cannot find the boundary, so a name we failed to read would refuse
+/// every call -- the `private[slick]` constructors slick's own code makes
+/// included -- and over-rejection is the one failure mode this must not have.
+fn ctor_access_within(member: &scala_rs_pickle::sym::Member) -> Option<String> {
+    member.private_within.clone()
 }
 
 /// Does this constructor symbol carry a parameter whose type never resolved?

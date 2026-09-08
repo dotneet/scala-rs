@@ -2031,7 +2031,16 @@ impl Typer {
         let ids: Vec<SymbolId> = binds.iter().map(|(i, _)| *i).collect();
         let tys: Vec<Type> = binds.iter().map(|(_, t)| t.clone()).collect();
         let solved_to = fold_applied(&crate::symbol::subst_tparams_slice(&ids, &tys, to));
-        if crate::check::mentions_any_tparam(&solved_to) {
+        // Free of the *unknowns* -- this view's own unsolved parameters and
+        // the callee's -- not free of every type parameter. A type parameter
+        // of an enclosing class or method is a fixed type here, and rejecting
+        // it made `xs.to(mutable.ArrayBuffer)` fail for every abstract element
+        // type: `class C[A] { def es: List[A] }` wants
+        // `Factory[A, C1]`, `toFactory` answers `Factory[A, ArrayBuffer[A]]`,
+        // and the `A` in it is C's own. `List[Int]` compiled all along, which
+        // is why the shape survived. See `crates/cli/tests/tuplepat.rs`.
+        let unknowns: Vec<SymbolId> = rest.iter().chain(open.iter()).copied().collect();
+        if crate::check::mentions_tparam(&solved_to, &unknowns) {
             return None;
         }
         if !self.conv_implicits_resolve(id, from) {
