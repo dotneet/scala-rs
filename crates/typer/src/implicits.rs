@@ -2284,8 +2284,10 @@ impl Typer {
                 // nsc priority: a conversion `Predef` declares itself beats one
                 // it inherits from `LowPriorityImplicits`. `0.5.isNaN` is
                 // `double2Double(0.5).isNaN()` in scalac, not `RichDouble`.
-                if pool.iter().any(|(c, _, _)| !self.st.get(*c).low_priority) {
-                    pool.retain(|(c, _, _)| !self.st.get(*c).low_priority);
+                let low = self.inherited_conversions(&pool);
+                if low.iter().any(|l| !l) {
+                    let mut keep = low.iter().map(|l| !l);
+                    pool.retain(|_| keep.next().unwrap_or(true));
                 }
                 if pool.len() == 1 {
                     return Some(pool.into_iter().next().unwrap());
@@ -2508,6 +2510,47 @@ impl Typer {
             let f = self.st.get(*p).flags;
             f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
         })
+    }
+
+    /// Which of `pool`'s conversions nsc would score as *lower* priority.
+    ///
+    /// SLS 6.26.3 breaks a tie between two implicits partly by where they are
+    /// defined: one owned by a class that another candidate's owner inherits
+    /// from is the weaker of the two. `object Predef extends
+    /// LowPriorityImplicits` is the standard library's own use of the rule,
+    /// and it is the whole reason `"abc".slice(0, 2)` compiles: `augmentString`
+    /// (on `Predef`) and `wrapString` (on `LowPriorityImplicits`) both offer a
+    /// `slice`, both *declare* it -- `WrappedString` overrides
+    /// `IndexedSeqOps#slice` -- and both take a bare `String`, so every later
+    /// tie-break here scores them equal and the search gave up with `value
+    /// slice is not a member of String`.
+    ///
+    /// The prelude's hand-written `Predef` snapshot has no base class to
+    /// inherit from, so it carries the same fact as the `low_priority` flag
+    /// on the two conversions that need it. That flag stays; this generalises
+    /// it to every run whose own sources spell the hierarchy out, which is any
+    /// run that compiles `Predef.scala` -- and to user code, which had the
+    /// defect too and is what `crates/cli/tests/strarrayops.rs` pins.
+    fn inherited_conversions(&self, pool: &[(SymbolId, SymbolId, Type)]) -> Vec<bool> {
+        let owners: Vec<SymbolId> = pool.iter().map(|(c, _, _)| self.st.get(*c).owner).collect();
+        pool.iter()
+            .enumerate()
+            .map(|(i, (c, _, _))| {
+                if self.st.get(*c).low_priority {
+                    return true;
+                }
+                let mine = owners[i];
+                if mine.is_none() {
+                    return false;
+                }
+                owners.iter().enumerate().any(|(j, &other)| {
+                    j != i
+                        && !other.is_none()
+                        && other != mine
+                        && self.st.is_ancestor_of(mine, other)
+                })
+            })
+            .collect()
     }
 
     /// One conversion reached by two routes is one candidate, not an ambiguity.
