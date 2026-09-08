@@ -2235,6 +2235,96 @@ that the *result* is an inner class of the imported value's own type
 `import <a val>._`. That is where the next slice starts, and it is not an
 import-precedence question.
 
+> **Done, and the guess in that last paragraph was wrong**
+> (`agent/gbslickmember`, 2026-09-09). The result being an inner class with an
+> `$outer` has nothing to do with it: `queryToQueryInvoker`, which *does*
+> work, returns `api.BlockingQueryInvoker`, an inner class with an `$outer`
+> too. What separates the ten that failed from the eleven that worked is one
+> keyword in blocking-slick's source. The failures are declared
+> `implicit class`; the ones that worked are declared `implicit def`.
+>
+> **nsc marks an `implicit class`'s conversion method `SYNTHETIC`.**
+> `implicit class C(x: T) { … }` expands to a plain `class C` plus
+> `implicit def C(x: T): C`, and that method's pickled flags are
+> `IMPLICIT | METHOD | SYNTHETIC` (measured: `0x200201`).
+> `Member::is_public_api` filtered `SYNTHETIC` out, so the pickle reader
+> dropped it at all four gates that read a member list, and what was left was
+> the *class file's* description of the same method — which cannot say
+> `implicit`, because nothing in bytecode can. The method was therefore in
+> scope under its own name and callable explicitly, and could never be
+> selected as a view. `BlockingDatabase(db).withTransaction { … }` compiled
+> the whole time; `db.withTransaction { … }` did not.
+>
+> This was never about slick. **Every `implicit class` in every library on
+> `-cp` was invisible as a view**, including one declared at the top level of
+> an object, where no nesting and no pickle-placement question arises:
+>
+> ```scala
+> package lib3                                 // compiled by scalac
+> object Flat3 { implicit class RichC(t: T5) { def boomC: Int = 7 } }
+> ```
+> ```scala
+> object F { import lib3.Flat3._; def f(t: lib3.T5): Int = t.boomC }
+> ```
+>
+> `Member::is_implicit_class_conversion` admits exactly that shape, the same
+> way `is_case_synthetic` already admits a case class's synthetic `apply`.
+>
+> **A second, independent root sat behind it.** A *nested* class carries no
+> `ScalaSignature` of its own — nsc writes the pickle once, on the enclosing
+> top-level class file — and `PickleSupply::pickle_readable` is `false` until
+> something calls `adopt_binary_class`, which nothing does for a class the
+> program never writes by name. `import <a val>._` never writes it. The
+> comment on the `pickle_readable` guard in `Typer::import_wildcard` said "a
+> class the walk skips here is not lost — once something adopts it, a later
+> walk of the same import sees `pickle_readable`", and in a large program that
+> is usually true; in three declarations it is not:
+>
+> ```scala
+> trait Outer { trait Api { implicit def eC(t: T3): R = new R(t) }; val api: Api = new Api {} }
+> object HolderNested extends Outer
+> ```
+>
+> `import HolderNested.api._; t.boom` was "value boom is not a member of T3".
+> `import_wildcard` now adopts the class it is about to walk rather than hoping
+> something else will. This half is worth **zero** on gitbucket measured on its
+> own (243 either way, because gitbucket's other files do adopt `BlockingAPI`
+> eventually) and it is what makes `tests/fixtures/ic_app.scala` compile, so
+> both are in.
+>
+> **gitbucket 264 → 242 errors, 77 → 72 files** (measured against `main` at
+> `56b81c21`; the same −22 was measured against `bbc6f235`, where it read
+> 265 → 243), reported as a set rather than as a total: 26 gone —
+> `withTransaction` (13), `withSession` (7), `run` on `Rep[Boolean]` (5),
+> `firstOption` (1) — and 4 new, none of them a new kind of wrongness. Three
+> are cascades in `IssuesService.scala` behind an `sql"…"` macro expansion
+> that already fails at the same line (`firstOption` now resolves, so the
+> `Unit` element type from the failed expansion travels two calls further
+> before being rejected); the fourth is the pre-existing `override modifier
+> required to override concrete member: val repository` false diagnostic,
+> which already fired in `RepositoryViewerController.scala` and is now
+> reachable in `ApiRepositoryControllerBase.scala` as well. slick stays
+> 0/0/1490 with **all 1490 class files byte-identical** to a build of the
+> merge base, cats 163/62 and the scala library 604/130 are unmoved, and the
+> full corpus is `losses=0 changes=0`.
+>
+> **Not fixed, and not the same root: `value returning is not a member of
+> TableQuery[Accounts]`** (10 errors over six tables) and the 31
+> missing-implicit errors naming slick's `Shape`. The brief that produced this
+> slice grouped all four message shapes together; they are at least two roots
+> and the `Shape` ones did not move by a single line.
+>
+> **Found on the way, and separate from all of it: a package wildcard hides
+> the prefix of a later member import.** With `Prof` and `Target` named
+> explicitly, `val profile: Prof; import profile.api._` works. With the same
+> file writing `import iclib._` instead, `import profile.api._` brings in
+> *nothing* — not the implicits, not even the class `RichTarget` under its own
+> name, so `RichTarget(t).bump` is "not found". No implicit is involved and it
+> reproduces in six lines (`/tmp` transcript aside, the shape is
+> `tests/fixtures/ic_app.scala` with its four explicit imports collapsed to
+> one wildcard). gitbucket writes explicit imports and so never hits it, which
+> is why it has not shown up in a measurement.
+
 **Also still owed**, in the same shape as root 2 but on the source side:
 
 ```scala
