@@ -202,16 +202,43 @@ Compiler flags (`agent/xflags`):
 
   Making the prefix `this`'s own type is closer to nsc and fixes most of them
   (`1552 -> 1556`, `files_with_errors 168 -> 167`), but four survive, and they
-  are a *third* defect: `SymbolTable::base_type_seq` resolves a base class
-  reachable at two different instantiations to the first one in written-parent
-  order rather than the most derived. `final class HashMap[K, +V] extends
-  AbstractMap[K, V] with StrictOptimizedMapOps[K, V, HashMap, HashMap[K, V]]`
-  reaches `MapOps` as both `MapOps[K, V, Map, Map[K, V]]` (through
-  `AbstractMap`) and `MapOps[K, V, HashMap, HashMap[K, V]]`, and takes the
-  former, so `super.updatedWith` is `Map[K, V1]` where `HashMap[K, V1]` is
-  wanted. That is the one to fix first; the `super` walk can then follow.
+  are a *third* defect. **That third one is now fixed** and this entry is what
+  is left. `SymbolTable::subst_as_seen_from` used to reach a base class through
+  whichever parent its walk arrived at first, so a class reachable at two
+  instantiations was read at the first in written-parent order rather than the
+  most derived; `SymbolTable::base_type_args` now decides that once, per SLS
+  5.1.2's linearization, and the walk uses its answer whatever path it took
+  (`1551 -> 1420` errors on the scala library, `168 -> 166` files, no file
+  worse; cats `215 -> 211`; slick byte-identical but for one redundant
+  `checkcast`, see below). `crates/cli/tests/bts.rs` dual-runs both shapes
+  against scalac 2.13.16. So the `super` walk is now the next step, and it
+  should be re-measured rather than assumed: the five errors it cost were
+  attributed to the prefix and to this, and only one of the two has moved.
+
   Measured on `agent/linorder2` at `66732045`; `crates/typer/src/lin.rs`'s own
   `+:` fix is independent of all three and is byte-identical everywhere.
+- **An override declared by a mixin narrower than the one the member is
+  inherited from.** `TreeMap[Int, String].updatedWith` is
+  `type mismatch; found: Map[Int, String]`, where scalac says
+  `TreeMap[Int, String]`. This is *not* the base-type instantiation above --
+  `immutable.SortedMapOps` genuinely extends `MapOps[K, V, Map, C]`, so
+  `MapOps`' own `updatedWith` really does return `Map[K, V1]` there -- it is
+  that `immutable.SortedMapOps` **overrides** `updatedWith` with the sorted
+  `CC[K, V1]` (`SortedMap.scala:108`) and that declaration is not the one
+  selected. `VectorMap`, which has the same hierarchy shape but no such
+  override, is correct and is pinned in `crates/cli/tests/bts.rs`. Found while
+  fixing the entry above; not attempted in the same slice.
+- **A partial function whose parameter is a written tuple type emits no entry
+  cast.** `gen_lambda::pf_bind_arg_and_captures` casts the incoming `Object`
+  when the parameter is a `Type::Class`, and `emit_unbox` has no case for
+  `Type::Tuple`, so `{ case (p, (_, Some(s))) => … }` over a `Map` gets no
+  `checkcast scala/Tuple2` where the same type spelled `Tuple2[A, B]` does.
+  Nothing observable follows -- the pattern's own `instanceof scala/Tuple2` is
+  emitted either way, `applyOrElse` never had the cast, and slick verifies and
+  runs -- but the two spellings of one type should not emit different code.
+  `checkcast_internal` already has the tuple case; adding it to that branch
+  makes slick's `RewriteJoins$$anonfun$42` byte-identical again and changes two
+  other lambdas instead, which is why it was left out of a typer slice.
 - **Every cycle in a tangle of overlapping `extends` cycles, and nsc's second
   cyclic diagnostic.** A cyclic inheritance graph is now rejected with
   `illegal cyclic reference involving trait X`, at scalac's line and with

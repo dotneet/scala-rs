@@ -2745,18 +2745,27 @@ impl SymbolTable {
             recv: &Type,
             ty: Type,
             seen: &mut rustc_hash::FxHashSet<u32>,
+            base: &rustc_hash::FxHashMap<u32, Vec<Type>>,
         ) -> Type {
             match recv {
                 Type::Class { sym, args } => {
                     if !seen.insert(sym.0) {
                         return ty;
                     }
+                    // A base class reachable through two parents has to be read
+                    // at its **most derived** instantiation, and this walk takes
+                    // whichever path reaches it first. `base` decides that
+                    // independently of the path (see [`base_type_args`]), so the
+                    // arguments the walk arrived with are only used for a class
+                    // the receiver does not have as a base -- one reached
+                    // through a self type, a bound, or a refinement.
+                    let args = base.get(&sym.0).unwrap_or(args);
                     let mut t = if args.is_empty() {
                         ty
                     } else {
                         st.subst_tparams(*sym, args, &ty)
                     };
-                    for p in &st.get(*sym).parents {
+                    for i in 0..st.get(*sym).parents.len() {
                         // The parent is declared in terms of *this* class's
                         // type parameters, so it has to be instantiated before
                         // it can instantiate anything itself. Without this,
@@ -2764,8 +2773,8 @@ impl SymbolTable {
                         // keeps its `implicit TypedType[BR]` raw instead of
                         // resolving `BR` to `Boolean` through
                         // `OptionMapper[BR, R]`.
-                        let p = st.subst_tparams_cow(*sym, args, p);
-                        t = walk(st, &p, t, seen);
+                        let p = st.subst_tparams_cow(*sym, args, &st.get(*sym).parents[i]);
+                        t = walk(st, &p, t, seen, base);
                     }
                     // A self type is a second place `this` inherits members
                     // from, and they are declared in *its* vocabulary:
@@ -2775,7 +2784,7 @@ impl SymbolTable {
                     // unequal -- "type mismatch; found: A required: A".
                     if let Some(sf) = &st.get(*sym).self_type {
                         let sf = st.subst_tparams_cow(*sym, args, sf);
-                        t = walk(st, &sf, t, seen);
+                        t = walk(st, &sf, t, seen, base);
                     }
                     t
                 }
@@ -2784,18 +2793,18 @@ impl SymbolTable {
                         return ty;
                     }
                     let mut t = ty;
-                    for p in &st.get(*sym).parents {
-                        t = walk(st, p, t, seen);
+                    for p in st.get(*sym).parents.clone() {
+                        t = walk(st, &p, t, seen, base);
                     }
                     t
                 }
-                Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen),
+                Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen, base),
                 // `trait C[-T] extends (T => R)` inherits `Function1.apply`,
                 // and reading its type through `C[X]` means walking into
                 // `Function1[X, R]`. A structural function names no class, so
                 // it has to be read back as one first.
                 Type::Function { .. } => match st.function_class_form(recv) {
-                    Some(c) => walk(st, &c, ty, seen),
+                    Some(c) => walk(st, &c, ty, seen, base),
                     None => ty,
                 },
                 // `trait GetResult[+T] extends (PositionedResult => T) { self => }`
@@ -2810,7 +2819,7 @@ impl SymbolTable {
                         .iter()
                         .map(|t| Type::TypeParam(*t))
                         .collect();
-                    walk(st, &Type::Class { sym: *sym, args }, ty, seen)
+                    walk(st, &Type::Class { sym: *sym, args }, ty, seen, base)
                 }
                 // Only heads that `apply_type_ctor` folds may be re-walked: an
                 // abstract type-member head (`ColumnType[U]`) folds to the very
@@ -2829,7 +2838,7 @@ impl SymbolTable {
                         // into. Recursing here would not terminate.
                         return ty;
                     }
-                    walk(st, &t, ty, seen)
+                    walk(st, &t, ty, seen, base)
                 }
                 // A member reached through `Ops[F, A] { type TypeClassType =
                 // FlatMap[F] }` is declared by one of the parents and has to be
@@ -2839,7 +2848,7 @@ impl SymbolTable {
                 Type::Refined { parents, .. } => {
                     let mut t = ty;
                     for p in parents {
-                        t = walk(st, p, t, seen);
+                        t = walk(st, p, t, seen, base);
                     }
                     t
                 }
@@ -2857,15 +2866,72 @@ impl SymbolTable {
                         return ty;
                     }
                     match st.get(*id).bound_hi.clone() {
-                        Some(hi) => walk(st, &hi, ty, seen),
+                        Some(hi) => walk(st, &hi, ty, seen, base),
                         None => ty,
                     }
                 }
                 _ => ty,
             }
         }
+        // Only a receiver that names a class outright is given a base map:
+        // `class_sym_of` chases bounds and aliases, and the walk's own
+        // recursion re-enters here for those shapes anyway.
+        let base = match recv {
+            Type::Class { sym, args } if !sym.is_none() => self.base_type_args(*sym, args),
+            Type::ModuleRef(sym) | Type::ThisType(sym) if !sym.is_none() => {
+                self.base_type_args(*sym, &[])
+            }
+            _ => rustc_hash::FxHashMap::default(),
+        };
         let mut seen = rustc_hash::FxHashSet::default();
-        walk(self, recv, ty.clone(), &mut seen)
+        walk(self, recv, ty.clone(), &mut seen, &base)
+    }
+
+    /// Every base class of `sym[args]`, mapped to the type arguments it is
+    /// instantiated at *there* — the answer nsc reads out of a `BaseTypeSeq`.
+    ///
+    /// A base class reached through two parents at two different
+    /// instantiations must be read at the **most derived** of them, and SLS
+    /// 5.1.2's linearization is what decides which that is. Walking parents in
+    /// written order does not: `final class HashMap[K, +V] extends
+    /// AbstractMap[K, V] with StrictOptimizedMapOps[K, V, HashMap,
+    /// HashMap[K, V]]` reaches `MapOps` as `MapOps[K, V, Map, Map[K, V]]`
+    /// through `AbstractMap` and as `MapOps[K, V, HashMap, HashMap[K, V]]`
+    /// through the mixin, and the written order takes the first — so
+    /// `updatedWith` came back as `Map[K, V1]` where `HashMap[K, V1]` is what
+    /// scalac 2.13.16 types it as.
+    ///
+    /// `linearize` lists every class before all of its own ancestors, so
+    /// walking it in order and keeping the *first* instantiation offered for
+    /// each base class keeps the one its most derived reacher supplies. Every
+    /// entry is expressed in `args`' vocabulary, so a caller substitutes with
+    /// it directly and needs no second pass.
+    pub(crate) fn base_type_args(
+        &self,
+        sym: SymbolId,
+        args: &[Type],
+    ) -> rustc_hash::FxHashMap<u32, Vec<Type>> {
+        let mut map: rustc_hash::FxHashMap<u32, Vec<Type>> = rustc_hash::FxHashMap::default();
+        map.insert(sym.0, args.to_vec());
+        for c in crate::lin::linearize(self, sym) {
+            let Some(cargs) = map.get(&c.0).cloned() else {
+                continue;
+            };
+            for p in &self.get(c).parents {
+                // A parent written as a function type is `scala.FunctionN`,
+                // which is how `linearize` reads it too.
+                let p = self.function_class_form(p).unwrap_or_else(|| p.clone());
+                let p = self.subst_tparams_cow(c, &cargs, &p);
+                if let Type::Class {
+                    sym: ps,
+                    args: pargs,
+                } = &*p
+                {
+                    map.entry(ps.0).or_insert_with(|| pargs.clone());
+                }
+            }
+        }
+        map
     }
 
     pub fn type_of_class(&self, id: SymbolId) -> Type {
