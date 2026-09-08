@@ -2690,10 +2690,13 @@ measurement is running cannot see a half-written one.
 
 ## Fixed: three things a class file cannot say (`agent/gbopt`)
 
-**337 -> 281 errors, 81 -> 80 files.** slick unmoved at `errors=0
+**337 -> 274 errors, 81 -> 79 files.** slick unmoved at `errors=0
 files_with_errors=0 classes=1490`, cats unmoved at 196 / 73, the scala library
 unmoved at 1420 / 166. Measured on `2fdfe302` and on the same tree with this
 slice.
+
+Attribution, each measured on its own: root 35 is 337 -> **322**, root 37 is
+322 -> **311**, root 36 is 311 -> **274**.
 
 The brief that opened this slice named `OptionMapper2` (13),
 `CanBeQueryCondition[Any]` (13), `TypedType[Option[…]]` (14),
@@ -2711,7 +2714,8 @@ roots at all** -- both went to zero without a line being written about either.
 | `no matching overload for (Iterable[String], OptionMapper2[Any, String, Any, Any, String, R])Rep[R]` | 5 | **0** |
 | `no implicit … Shape[FlatShapeLevel, O2, U2, _]` | 6 | 6 |
 
-`no implicit` is 31 of the 281, down from 77.
+`no implicit` is 31 of the 274, down from 77, and `is not a member of` 101,
+down from 104.
 
 The three roots are all the same *shape*, and it is not the shape the families
 suggested: **a class file is a lossy description of someone else's code, and
@@ -2779,14 +2783,36 @@ member never shared a name and never competed. Every operator-named method in
 this family was fine and every alphabetic one was broken, which is why the
 symptom looked like it was about `in` and `inSet` in particular.
 
-`PickleSupply::drop_flattened_forwarders` drops such a member, and only on the
-one piece of evidence that cannot be anything else: the pickle answers the same
-name with a member of **more than one clause and the same total number of
-parameters**. A single-clause disagreement -- an erased type argument, a
-by-name parameter -- is left alone; it is a different problem and dropping on
-it would take out members no pickle replaces.
+`PickleSupply::drop_flattened_forwarders` drops such a member. The scope of
+that drop took three tries, and the two it took to get there are the useful
+part:
 
-Thirty errors (322 -> 292), and it is also a **soundness** fix: with one clause
+* **The standard library is off limits**, for the reason `ensure_pickled_parents`
+  and `attach_parents` already give -- its member sets are the prelude's,
+  hand-written and reasoned about. Run over `scala/`, this touched eleven names
+  on `scala.collection.AbstractIterable` alone and gave `HashMap#toList` a
+  second entry, so `.sortBy` on it was "value sortBy is not a member of
+  <overload List[Tuple2[String, Any]] | List[(String, Any)]>" (`setmap1`).
+* **The whole overload set of the name goes, not only the flattened member.**
+  `DurationInt` inherits both `seconds: FiniteDuration` and `seconds[C](c: C)
+  (implicit ev: Classifier[C]): C#R`; dropping the flattened two-parameter one
+  and leaving the class file's nullary one beside the pickle's left `2.seconds`
+  an overload of three with a duplicate in it, and `val f: FiniteDuration =
+  2.seconds` stopped compiling (`crates/cli/tests/durrange.rs`).
+
+Both of those were caught by `tests/verify_merge.sh`, which is the first time
+this session's gate has printed `VERDICT=FAIL` for a real defect -- two
+workspace tests and two corpus `run` tests (`duration-coarsest`, `t10513`),
+none of which any measure or focused test in this slice had reached.
+
+What is left is narrow: the name must have a class-file member with **at least
+two parameters in one clause**, the pickle must answer it with a member of
+**more than one clause**, and only members whose total parameter count the
+pickle's answer also has are dropped. A single-clause disagreement -- an erased
+type argument, a by-name parameter -- is left alone; it is a different problem
+and dropping on it would take out members no pickle replaces.
+
+Thirty-seven errors (311 -> 274), and it is also a **soundness** fix: with one clause
 of two, `7.tagIn(List(1), witness)` -- the implicit passed positionally --
 compiled. scalac 2.13.16 says "too many arguments (found 2, expected 1)".
 `tests/multi/gbopt_binary/Bad_1.scala` line 18.
@@ -2814,7 +2840,7 @@ made it look like a scoping rule.
 
 `classpath::enter_loaded_in_owner` (and `enter_module_in_companion_scope`, the
 nested-object half of `enter_in_companion_scope`, which enters both the module
-class and the module *term*) closes it. Eleven errors (292 -> 281).
+class and the module *term*) closes it. Eleven errors (322 -> 311).
 
 ### Two defects found here and deliberately **not** fixed
 
