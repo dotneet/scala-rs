@@ -226,8 +226,13 @@ fn mism11_bad_is_still_rejected() {
     let out = tmp_dir("mism11_bad");
     let (ok, msgs) = compile(&out, Some(&jar), &[src]);
     assert!(!ok, "mism11_bad should not compile, got:\n{msgs}");
+    // The result half is `Any` because nothing has decided it yet, which is
+    // what scalac says too: `required: Seq[Int] => ?`. It used to read `Int`,
+    // from a `map` whose result had been rebuilt as a `GroupedIterator[B]`.
+    // The parameter -- the half this fixture is about -- is `Seq[Int]` either
+    // way, and the program is rejected either way.
     for needle in [
-        "required: (Seq[Int]) => Int",
+        "required: (Seq[Int]) => Any",
         "required: Builder[Int, Array[String]]",
         "required: Qry2[String, Box2]",
     ] {

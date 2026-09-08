@@ -318,3 +318,37 @@ Compiler flags (`agent/xflags`):
   is a fidelity gap rather than a wrong acceptance: the program is rejected
   either way. Noted while guarding `SymbolTable::is_sub_type`, whose own
   termination no longer depends on that repair.
+- **`Iterator.GroupedIterator` is reachable as `Iterator.GroupedIterator`, and
+  scalac says it is not.** `object Iterator` has no such member — the class is
+  declared inside `trait Iterator` — but a nested class file's JVM name does
+  not say whether the outer name is the class or the object, so
+  `java_class_owner` answers the class and `enter_in_companion_scope` then puts
+  the same symbol in the object's scope. `def f(g: Iterator.GroupedIterator[Int])
+  = g` compiles here; scalac 2.13.16 reports `type GroupedIterator is not a
+  member of object Iterator`. Found while fixing `agent/basetypeargs`; not
+  attempted, because the rule that puts it there is the one that makes
+  `Resource.ExitCase` work and narrowing it needs the pickle's own owner rather
+  than the JVM name.
+- **`IterableOps.grouped(size): Iterator[C]` reads `C` as a base of the receiver
+  in a large run.** cats' `NonEmptyLazyList.scala:462` gets `Iterable[A]`,
+  `NonEmptyVector.scala:357` gets `Seq[A]`, and `NonEmptySeq.scala:364` and
+  `instances/stream.scala:64` are the same. **It does not reproduce on the file
+  alone** — `NonEmptyVector.scala` compiled by itself with the measure's flags
+  and classpath does not contain the error, and a fifteen-line reproduction of
+  the same value class compiles — so the receiver's shape depends on what else
+  is in the run and this is a supply-order question, not an expression one.
+  `docs/cats.md`'s `agent/basetypeargs` section has the measurement.
+- **A nested class named in a pickled signature outside `scala.collection` is
+  still entered as a package-level class with a `$` in its simple name.**
+  `PickleSupply::ensure_class` now splits the JVM name the way
+  `java_class_owner` does -- but only for a class nested in `scala.collection`
+  whose pickled parents reach `IterableOnce`, because that is the family where
+  the defect was measured and the only one where lifting it is free. Elsewhere the
+  twin stands: `scala/reflect/api/Exprs$Expr` is entered beside the `Exprs.Expr`
+  that `prelude_reflect` builds by hand, and unifying them costs
+  `engine.rs::rd_reify_shape_expands_and_runs` (`value apply is not a member of
+  Expr`, for `c.universe.Expr.apply[Int](...)`) because `reify*.rs` and
+  `macros.rs` reason about the prelude's symbols. The general repair is to make
+  the reflect surface come from the pickle like everything else, or to give
+  those passes the symbol rather than the name; neither is a small change.
+  Measured on `agent/basetypeargs`; `docs/cats.md` has the numbers.
