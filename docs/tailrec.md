@@ -8,9 +8,36 @@ classes. Mutual recursion is outside the scope.
 ## Semantics
 
 `gen_tailrec.rs` selects self calls in `if` branches, each `match` body, the last
-expression in a block, and typed expressions after erasure. Calls in arguments,
-conditions, guards, nested definitions, and `try`/`finally` bodies are not in
-tail position.
+expression in a block, typed expressions after erasure, and the **right operand
+of `scala.Boolean.&&` and `scala.Boolean.||`**. Calls in arguments, conditions,
+guards, `val` right-hand sides, nested definitions, and `try`/`finally` bodies
+are not in tail position.
+
+## `&&` and `||`
+
+nsc's `TailCalls` special-cases two symbols, `Boolean_and` and `Boolean_or`, and
+transforms their argument *in the tail context*. Both compile to a conditional
+branch over the operand rather than to a call, so nothing in the method runs
+after it. Seven `@tailrec` methods of the 2.13.16 library are written this way
+and are rejected without the rule: `LinearSeq.sameElements`, `List.equals`,
+`ListSet.containsInternal`, `StringParsers.forAllBetween`,
+`Promise.tryComplete0`, `ClassManifestDeprecatedApis.subtype` and
+`sys.process.Parser.skipToDelim`.
+
+The test is `Intrinsic::BoolBin("&&") | BoolBin("||")`, which is installed only
+on `scala.Boolean`. A user-defined `&&` or `||` on any other type is an ordinary
+strict method, so its argument stays an argument position — that is nsc's rule
+too, and `trc_bool_bad.scala` pins it.
+
+`gen_bool_and` and `gen_bool_or` emit the left operand, branch on it, and `pop`
+it before the right operand, so the right operand begins at the operand-stack
+depth of the whole expression and the back edge is taken with the stack as it is
+at the method's entry. The backend records the *application*, not the operand:
+the ordinary `gen_apply` path reaches an argument only after
+`flatten_apply_owned` has cloned it, so the tree `gen_expr` receives is at a
+different address from the one `collect` scanned and the recorded pointer would
+never match. `emit_tail_call` therefore emits the short circuit itself, from the
+original subtrees.
 
 Code generation evaluates the receiver and all arguments from left to right,
 then stores them in reverse order in the JVM argument slots. This handles
@@ -59,6 +86,22 @@ calls, compares output with scalac, and checks the emitted `$extension`
 descriptors and loop branches. `trc_valueclass_client.scala` is compiled by
 scalac against scala-rs classfiles to exercise the static extension ABI across a
 compilation boundary.
+
+```sh
+cargo test -p scala-rs-cli --release --test trc_bool
+```
+
+`tests/fixtures/trc_bool.scala` reproduces all seven library `&&` / `||` shapes
+— including one that changes the receiver on every iteration and one that
+stores two-slot `Long` arguments on the back edge — runs the deep ones two
+million times under `-Xss256k`, and compares the output with scalac 2.13.16
+compiling the same source. `javap -c` then checks that no self-`invoke` is left
+in any of the eight methods and that each has a backward branch.
+`trc_bool_bad.scala` holds the six shapes that must stay rejected: the *left*
+operand of a short circuit, an operand consumed by `!`, a short circuit that is
+not itself in tail position, a user-defined `||`, a call in a `val`'s
+right-hand side, and an overridable method whose recursion is reached through
+`||`. scalac rejects the same six.
 
 ## A JIT comparison trap with Zulu 15.0.6
 
