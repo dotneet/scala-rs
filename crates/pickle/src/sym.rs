@@ -233,6 +233,37 @@ impl Member {
             && !self.name.contains("$default$")
             && !self.name.ends_with(' ')
     }
+
+    /// The conversion method nsc derives from an `implicit class`.
+    ///
+    /// `implicit class RichX(x: X) { … }` expands to a plain `class RichX`
+    /// plus `implicit def RichX(x: X): RichX`, and nsc marks that method
+    /// `SYNTHETIC` — so [`Member::is_public_api`] hid it, and with it *every*
+    /// `implicit class` any library on `-cp` declares. The class file cannot
+    /// stand in: nothing in bytecode records `implicit`, so what the class
+    /// file reader installs is an ordinary method that is in scope under its
+    /// own name and can never be selected as a view.
+    ///
+    /// The measured effect was `value withTransaction is not a member of
+    /// DatabaseDef` and nine sibling messages across gitbucket
+    /// (blocking-slick's `BlockingAPI` declares ten of these), and three
+    /// declarations reproduce it with no library at all
+    /// (`tests/multi/implicitclassbinary`).
+    ///
+    /// `IMPLICIT` alongside `SYNTHETIC` on a *method* is what distinguishes
+    /// them. An implicit parameter carries `PARAM` and `LOCAL` rather than
+    /// `METHOD`, and a synthetic bridge or a default getter is excluded by
+    /// name and flag exactly as [`Member::is_case_synthetic`] excludes them.
+    pub fn is_implicit_class_conversion(&self) -> bool {
+        self.has(pflags::IMPLICIT)
+            && self.has(pflags::SYNTHETIC)
+            && self.has(pflags::METHOD)
+            && !self.has(pflags::PRIVATE)
+            && !self.has(pflags::BRIDGE)
+            && !self.has(pflags::LOCAL)
+            && !self.name.contains("$default$")
+            && !self.name.ends_with(' ')
+    }
 }
 
 /// One class or module class recovered from a pickle.
