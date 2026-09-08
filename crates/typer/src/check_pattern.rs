@@ -1377,16 +1377,67 @@ impl Typer {
         if self.st.class_reaches(sym, target) == Some(false) {
             return None;
         }
+        // How many of this class's parent clauses can reach `target` at all.
+        // With one, the instantiation is whatever that clause supplies and the
+        // walk below is both cheap and right. With two, nsc's `baseType` is a
+        // lookup in the `BaseTypeSeq`, whose entry is the *meet* of the
+        // instantiations — not whichever of them a depth-first walk reaches
+        // first. `TreeSet` reaches `SetOps` as `SetOps[A, Set, Set[A]]`
+        // through `AbstractSet` and as `SetOps[A, TreeSet, TreeSet[A]]`
+        // through `SortedSetOps`, and this used to answer with the first
+        // parent clause written.
+        //
+        // The count is what keeps the cost where the ambiguity is:
+        // `base_type_args` linearizes, and this runs inside pattern typing and
+        // overload resolution, where there is nothing to merge — a target with
+        // no type parameters has one possible answer whatever the path, and a
+        // parent chain that reaches it once has one arrival.
+        let mut reaching: Vec<bool> = Vec::new();
+        if !self.st.get(target).tparams.is_empty() {
+            reaching = self
+                .st
+                .get(sym)
+                .parents
+                .iter()
+                .map(|p| self.parent_may_reach(p, target))
+                .collect();
+            if reaching.iter().filter(|r| **r).count() > 1 {
+                if let Some(targs) = self.st.base_type_args(sym, args).get(&target.0) {
+                    return Some(Type::Class {
+                        sym: target,
+                        args: targs.clone(),
+                    });
+                }
+            }
+        }
         // Everything here is borrowed. This walks the whole parent DAG on every
         // call, so the two `Vec<Type>` clones it used to make (the arguments and
         // the parent list) were among the typer's largest sources of allocation.
-        for p in &self.st.get(sym).parents {
+        for (i, p) in self.st.get(sym).parents.iter().enumerate() {
+            if reaching.get(i) == Some(&false) {
+                continue;
+            }
             let p = self.st.subst_tparams_cow(sym, args, p);
             if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
                 return Some(found);
             }
         }
         None
+    }
+
+    /// Whether a parent clause can reach `target` at all. Conservative: a
+    /// shape the walk follows but `class_reaches` has no arm for answers yes,
+    /// so the only thing this rules out is a parent that demonstrably has
+    /// `target` nowhere above it.
+    fn parent_may_reach(&self, p: &Type, target: SymbolId) -> bool {
+        match p {
+            Type::Class { sym, .. } | Type::ModuleRef(sym) | Type::ThisType(sym) => {
+                *sym == target || self.st.class_reaches(*sym, target) != Some(false)
+            }
+            Type::Annotated { tpe, .. } => self.parent_may_reach(tpe, target),
+            Type::Any | Type::AnyRef | Type::AnyVal | Type::Nothing | Type::Null => false,
+            _ => true,
+        }
     }
 
     /// Type arguments for a constructor pattern's class, read off the scrutinee:

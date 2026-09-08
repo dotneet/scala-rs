@@ -3147,7 +3147,7 @@ impl SymbolTable {
             recv: &Type,
             ty: Type,
             seen: &mut rustc_hash::FxHashSet<u32>,
-            base: &rustc_hash::FxHashMap<u32, Vec<Type>>,
+            base: &BaseTypeArgs,
         ) -> Type {
             match recv {
                 Type::Class { sym, args } => {
@@ -3283,7 +3283,7 @@ impl SymbolTable {
             Type::ModuleRef(sym) | Type::ThisType(sym) if !sym.is_none() => {
                 self.base_type_args(*sym, &[])
             }
-            _ => rustc_hash::FxHashMap::default(),
+            _ => BaseTypeArgs::default(),
         };
         let mut seen = rustc_hash::FxHashSet::default();
         walk(self, recv, ty.clone(), &mut seen, &base)
@@ -3303,21 +3303,73 @@ impl SymbolTable {
     /// `updatedWith` came back as `Map[K, V1]` where `HashMap[K, V1]` is what
     /// scalac 2.13.16 types it as.
     ///
-    /// `linearize` lists every class before all of its own ancestors, so
-    /// walking it in order and keeping the *first* instantiation offered for
-    /// each base class keeps the one its most derived reacher supplies. Every
-    /// entry is expressed in `args`' vocabulary, so a caller substitutes with
-    /// it directly and needs no second pass.
-    pub(crate) fn base_type_args(
-        &self,
-        sym: SymbolId,
-        args: &[Type],
-    ) -> rustc_hash::FxHashMap<u32, Vec<Type>> {
-        let mut map: rustc_hash::FxHashMap<u32, Vec<Type>> = rustc_hash::FxHashMap::default();
-        map.insert(sym.0, args.to_vec());
+    /// Keeping only the instantiation the most derived *reacher* supplies is
+    /// not the same thing, and the difference is what this walk used to get
+    /// wrong. Two parents can reach one base without either standing above the
+    /// other: `trait Str[+A] extends LinOps[A, Str[A]] with Iter[A]` reaches
+    /// `IterOps` as `IterOps[A, Str[A]]` through `LinOps` and as `IterOps[A,
+    /// Iter[A]]` through `Iter`, and SLS 5.1.2 puts `Iter` first because it is
+    /// written last. Taking the first arrival read `IterOps.tail` as
+    /// `Iter[A]`, where scalac 2.13.16 types it `Str[A]` — the eight-line
+    /// `Str` above, and `Stream` in the standard library, which reaches
+    /// `IterableOps` as both `IterableOps[A, Stream, Stream[A]]` and
+    /// `IterableOps[A, Iterable, Iterable[A]]`.
+    ///
+    /// nsc's answer is [`meet_base_args`]: `BaseTypeSeqs.compoundBaseTypeSeq`
+    /// keeps *every* variant a base class is reached at and resolves the entry
+    /// with `mergePrefixAndArgs(variants, Variance.Contravariant, _)`, which
+    /// takes the glb at a covariant parameter and the lub at a contravariant
+    /// one. The order the variants are collected in does not matter to that,
+    /// which is why nothing here reorders the linearization —
+    /// `agent/basetypeseq` measured that (scala library 1551 → 1579) and threw
+    /// it away.
+    ///
+    /// `linearize` lists every class before all of its own ancestors, so by
+    /// the time the walk reaches a class every parent clause that names it has
+    /// already been substituted and recorded, and its entry can be settled on
+    /// the spot. Every entry is expressed in `args`' vocabulary, so a caller
+    /// substitutes with it directly and needs no second pass.
+    pub(crate) fn base_type_args(&self, sym: SymbolId, args: &[Type]) -> BaseTypeArgs {
+        // One entry per base class, holding the instantiation settled on and,
+        // only for a class two parent clauses disagree about, the further
+        // instantiations still to merge (nsc's `minTypes`). One map and one
+        // hash lookup per parent clause: this walk runs on every
+        // `subst_as_seen_from`, and a second map cost 20% of the compiler.
+        let mut slots: rustc_hash::FxHashMap<u32, BaseSlot> = rustc_hash::FxHashMap::default();
+        let mut unmerged = 0usize;
+        // Ancestry answers this walk has already paid for. The same pair --
+        // `Stream` against `Iterable`, say -- decides several argument
+        // positions of several base classes, and each answer is a walk of the
+        // parent DAG.
+        let mut anc: AncMemo = Vec::new();
+        slots.insert(
+            sym.0,
+            BaseSlot {
+                args: args.to_vec(),
+                settled: true,
+                more: Vec::new(),
+            },
+        );
         for c in crate::lin::linearize(self, sym) {
-            let Some(cargs) = map.get(&c.0).cloned() else {
-                continue;
+            // Lifted out rather than cloned: the arguments go back into the
+            // slot after the parent clauses have been substituted with them,
+            // and a `Vec<Type>` clone per class of every linearization was one
+            // of the typer's larger sources of allocation.
+            let cargs = {
+                let Some(slot) = slots.get_mut(&c.0) else {
+                    continue;
+                };
+                if !slot.settled {
+                    slot.settled = true;
+                    if !slot.more.is_empty() {
+                        unmerged -= 1;
+                        let mut vs = Vec::with_capacity(slot.more.len() + 1);
+                        vs.push(std::mem::take(&mut slot.args));
+                        vs.append(&mut slot.more);
+                        slot.args = self.meet_base_args(c, &vs, &mut anc);
+                    }
+                }
+                std::mem::take(&mut slot.args)
             };
             for p in &self.get(c).parents {
                 // A parent written as a function type is `scala.FunctionN`,
@@ -3329,11 +3381,323 @@ impl SymbolTable {
                     args: pargs,
                 } = &*p
                 {
-                    map.entry(ps.0).or_insert_with(|| pargs.clone());
+                    match slots.entry(ps.0) {
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            v.insert(BaseSlot {
+                                args: pargs.clone(),
+                                settled: false,
+                                more: Vec::new(),
+                            });
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut o) => {
+                            let slot = o.get_mut();
+                            // Already settled: the linearization lists a class
+                            // before all of its ancestors, so a clause
+                            // arriving after the entry was taken is a cycle,
+                            // not a variant. A base class with no type
+                            // arguments has nothing to merge either.
+                            if slot.settled || pargs.is_empty() {
+                                continue;
+                            }
+                            if &slot.args != pargs && !slot.more.iter().any(|v| v == pargs) {
+                                if slot.more.is_empty() {
+                                    unmerged += 1;
+                                }
+                                slot.more.push(pargs.clone());
+                            }
+                        }
+                    }
                 }
             }
+            if let Some(slot) = slots.get_mut(&c.0) {
+                slot.args = cargs;
+            }
         }
-        map
+        // `linearize` drops `Any`/`AnyRef`/`AnyVal`/`Object`, so those never
+        // come round as walk heads; they still get the entry the parent
+        // clauses named them at, as they did when this walk inserted every
+        // parent directly.
+        if unmerged > 0 {
+            let pending: Vec<u32> = slots
+                .iter()
+                .filter(|(_, s)| !s.settled && !s.more.is_empty())
+                .map(|(k, _)| *k)
+                .collect();
+            for k in pending {
+                let slot = slots.get_mut(&k).expect("just listed");
+                slot.settled = true;
+                let mut vs = Vec::with_capacity(slot.more.len() + 1);
+                vs.push(std::mem::take(&mut slot.args));
+                vs.append(&mut slot.more);
+                slot.args = self.meet_base_args(SymbolId(k), &vs, &mut anc);
+            }
+        }
+        BaseTypeArgs { slots }
+    }
+
+    /// nsc's `mergePrefixAndArgs(variants, Variance.Contravariant, _)`, read
+    /// off the argument lists: the arguments a base class reached at several
+    /// instantiations is seen at.
+    ///
+    /// Position by position, and by the *parameter's* variance against the
+    /// contravariant direction the merge is asked in: a covariant parameter
+    /// takes the glb (the most derived of the arrivals), a contravariant one
+    /// the lub (the least derived). An invariant parameter reached at two
+    /// different arguments is an illegal inheritance, which nsc answers with
+    /// an existential over `TypeBounds(glb, lub)`; the first arrival is kept
+    /// instead, so a program that does not have that error is unaffected and
+    /// one that does is left to the inheritance check to report.
+    fn meet_base_args(
+        &self,
+        cls: SymbolId,
+        variants: &[Vec<Type>],
+        anc: &mut AncMemo,
+    ) -> Vec<Type> {
+        let Some(first) = variants.first() else {
+            return Vec::new();
+        };
+        let n = first.len();
+        if variants.len() < 2
+            || self.get(cls).tparams.len() != n
+            || variants.iter().any(|v| v.len() != n)
+        {
+            return first.clone();
+        }
+        let mut out = Vec::with_capacity(n);
+        let mut column: Vec<&Type> = Vec::with_capacity(variants.len());
+        for i in 0..n {
+            column.clear();
+            column.extend(variants.iter().map(|v| &v[i]));
+            let tp = self.get(cls).tparams[i];
+            out.push(match self.tparam_variance(tp) {
+                Some(true) => self.meet_type(&column, true, 0, anc),
+                Some(false) => self.meet_type(&column, false, 0, anc),
+                None => first[i].clone(),
+            });
+        }
+        out
+    }
+
+    /// `Some(true)` covariant, `Some(false)` contravariant, `None` invariant.
+    fn tparam_variance(&self, tp: SymbolId) -> Option<bool> {
+        let f = self.get(tp).flags;
+        if f.contains(Flags::COVARIANT) {
+            Some(true)
+        } else if f.contains(Flags::CONTRAVARIANT) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// The glb (`most_derived`) or lub of one argument position's arrivals.
+    ///
+    /// Only the two shapes a base-type merge actually produces are computed:
+    /// the same class at different arguments, which recurses position by
+    /// position and flips at a contravariant parameter exactly as nsc's
+    /// `glb`/`lub` do; and different classes on one inheritance chain, where
+    /// the answer is the arrival every other arrival is an ancestor of. When
+    /// there is no such arrival the merge has no answer inside a class
+    /// hierarchy either — nsc would build an intersection — and the first is
+    /// kept, which is what this walk always did.
+    fn meet_type(
+        &self,
+        cands: &[&Type],
+        most_derived: bool,
+        depth: u32,
+        anc: &mut AncMemo,
+    ) -> Type {
+        let Some(first) = cands.first().copied() else {
+            return Type::NoType;
+        };
+        if depth > 4 || cands.len() < 2 {
+            return first.clone();
+        }
+        // Almost every position of a merged base type is the same argument in
+        // every arrival -- only the `C` and `CC` of a collection actually
+        // differ -- so answering that case without allocating is what keeps
+        // this off the profile.
+        if cands[1..].iter().all(|c| Self::eq_unannotated(first, c)) {
+            let plain = cands.iter().find(|c| !Self::has_annotation(c));
+            return plain.copied().unwrap_or(first).clone();
+        }
+        // Two arrivals that differ only by a type annotation are one type --
+        // nsc's `=:=` does not look at `@uncheckedVariance` -- and the
+        // unannotated spelling is the one to keep. `IterableFactoryDefaults[+A,
+        // +CC[x]] extends IterableOps[A, CC, CC[A @uncheckedVariance]]` is
+        // reached before `SeqOps`' `IterableOps[A, CC, C]` in `Stream`'s
+        // linearization, and keeping the annotation would make
+        // `IterableOps.tail` read `Stream[A @uncheckedVariance]` where scalac
+        // 2.13.16 prints `Stream[A]`. Only a merge does this: a base class
+        // reached once keeps the spelling its one parent clause wrote.
+        let mut uniq: Vec<&Type> = Vec::with_capacity(cands.len());
+        for c in cands {
+            match uniq.iter().position(|u| Self::eq_unannotated(u, c)) {
+                Some(k) => {
+                    if !Self::has_annotation(c) {
+                        uniq[k] = c;
+                    }
+                }
+                None => uniq.push(c),
+            }
+        }
+        if uniq.len() < 2 {
+            return uniq.first().copied().unwrap_or(first).clone();
+        }
+        // One representative per class: the same class reached at different
+        // arguments merges position by position, flipping at a contravariant
+        // parameter exactly as nsc's `glb`/`lub` do. Only then can the
+        // representatives be ordered against each other by ancestry.
+        let mut reps: Vec<Type> = Vec::with_capacity(uniq.len());
+        for t in &uniq {
+            let head = self.base_arg_class(t);
+            let at = head.and_then(|h| reps.iter().position(|r| self.base_arg_class(r) == Some(h)));
+            match at {
+                Some(k) => reps[k] = self.merge_same_head(&reps[k], t, most_derived, depth, anc),
+                None => reps.push((*t).clone()),
+            }
+        }
+        if reps.len() == 1 {
+            return reps.remove(0);
+        }
+        for (i, c) in reps.iter().enumerate() {
+            let wins = reps
+                .iter()
+                .enumerate()
+                .all(|(j, o)| i == j || self.arg_outranks(c, o, most_derived, anc));
+            if wins {
+                return c.clone();
+            }
+        }
+        first.clone()
+    }
+
+    /// `a` and `b` name the same class: merge their arguments.
+    fn merge_same_head(
+        &self,
+        a: &Type,
+        b: &Type,
+        most_derived: bool,
+        depth: u32,
+        anc: &mut AncMemo,
+    ) -> Type {
+        let (Type::Class { sym, args: a1 }, Type::Class { args: a2, .. }) = (a, b) else {
+            return a.clone();
+        };
+        if a1.is_empty() || a1.len() != a2.len() || self.get(*sym).tparams.len() != a1.len() {
+            return a.clone();
+        }
+        let args = (0..a1.len())
+            .map(|i| {
+                let col = [&a1[i], &a2[i]];
+                match self.tparam_variance(self.get(*sym).tparams[i]) {
+                    Some(true) => self.meet_type(&col, most_derived, depth + 1, anc),
+                    Some(false) => self.meet_type(&col, !most_derived, depth + 1, anc),
+                    None => a1[i].clone(),
+                }
+            })
+            .collect();
+        Type::Class { sym: *sym, args }
+    }
+
+    /// Whether `a` and `b` are the same type written with different
+    /// annotations. Structural and allocation-free: this runs inside the
+    /// base-type walk, which runs on every `subst_as_seen_from`.
+    fn eq_unannotated(a: &Type, b: &Type) -> bool {
+        match (a, b) {
+            (Type::Annotated { tpe, .. }, _) => Self::eq_unannotated(tpe, b),
+            (_, Type::Annotated { tpe, .. }) => Self::eq_unannotated(a, tpe),
+            (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
+                s1 == s2
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2).all(|(x, y)| Self::eq_unannotated(x, y))
+            }
+            (Type::Applied { ctor: c1, args: a1 }, Type::Applied { ctor: c2, args: a2 }) => {
+                Self::eq_unannotated(c1, c2)
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2).all(|(x, y)| Self::eq_unannotated(x, y))
+            }
+            _ => a == b,
+        }
+    }
+
+    /// Whether `ty` carries a type annotation anywhere, so the plainer of two
+    /// spellings of one type can be preferred.
+    fn has_annotation(ty: &Type) -> bool {
+        match ty {
+            Type::Annotated { .. } => true,
+            Type::Class { args, .. } => args.iter().any(Self::has_annotation),
+            Type::Applied { ctor, args } => {
+                Self::has_annotation(ctor) || args.iter().any(Self::has_annotation)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `a` is the one of the pair a glb (`most_derived`) or a lub
+    /// keeps, judged by class ancestry alone: the arrivals at one base-type
+    /// position come from one hierarchy, so a full `is_sub_type` would answer
+    /// the same question at the cost of re-entering the typer from inside the
+    /// walk every `subst_as_seen_from` runs.
+    fn arg_outranks(&self, a: &Type, b: &Type, most_derived: bool, anc: &mut AncMemo) -> bool {
+        if a == b {
+            return true;
+        }
+        // `Nothing` is below every type and `Any` above every type, and
+        // neither carries the parents that would say so.
+        match (a, most_derived) {
+            (Type::Nothing, true) | (Type::Any, false) => return true,
+            _ => {}
+        }
+        match (b, most_derived) {
+            (Type::Nothing, true) | (Type::Any, false) => return false,
+            _ => {}
+        }
+        let (Some(sa), Some(sb)) = (self.base_arg_class(a), self.base_arg_class(b)) else {
+            return false;
+        };
+        if sa == sb {
+            return false;
+        }
+        if most_derived {
+            self.class_derives_from(sa, sb, anc)
+        } else {
+            self.class_derives_from(sb, sa, anc)
+        }
+    }
+
+    /// Whether `sub` has `sup` above it.
+    ///
+    /// `class_reaches` first, and `is_ancestor_of` only when it declines to
+    /// answer: the two agree on every hierarchy either can read, and
+    /// `is_ancestor_of` allocates a hash set per call. Ordering base-type
+    /// arrivals asks this question a few times per merged type argument and
+    /// the merge runs inside `subst_as_seen_from`, so the allocation showed up
+    /// as 4% of the compiler on the standard library.
+    fn class_derives_from(&self, sub: SymbolId, sup: SymbolId, anc: &mut AncMemo) -> bool {
+        if let Some(&(_, _, r)) = anc.iter().find(|(x, y, _)| *x == sub.0 && *y == sup.0) {
+            return r;
+        }
+        let r = match self.class_reaches(sub, sup) {
+            Some(r) => r,
+            None => self.is_ancestor_of(sup, sub),
+        };
+        anc.push((sub.0, sup.0, r));
+        r
+    }
+
+    /// The class a base-type argument names, for the ancestry test above.
+    /// Deliberately not `class_sym_of`: that chases a type parameter to its
+    /// bound, and an argument standing for an unknown type is not the bound.
+    fn base_arg_class(&self, t: &Type) -> Option<SymbolId> {
+        match t {
+            Type::Class { sym, .. } | Type::ModuleRef(sym) if !sym.is_none() => Some(*sym),
+            Type::Function { .. } => match self.function_class_form(t) {
+                Some(Type::Class { sym, .. }) if !sym.is_none() => Some(sym),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn type_of_class(&self, id: SymbolId) -> Type {
@@ -6136,3 +6500,37 @@ pub fn bool_shortcircuit_rhs<'a>(
     )
     .then(|| &args[0])
 }
+
+/// One base class's entry in a [`BaseTypeArgs`].
+struct BaseSlot {
+    /// The instantiation settled on, or — before the walk reaches this class —
+    /// the first one a parent clause supplied.
+    args: Vec<Type>,
+    /// Whether the linearization has reached this class, which is the point at
+    /// which every clause naming it has been seen and `more` can be merged in.
+    settled: bool,
+    /// Further instantiations the same class was reached at. Empty for every
+    /// base class no two parent clauses disagree about, which is nearly all of
+    /// them.
+    more: Vec<Vec<Type>>,
+}
+
+/// nsc's `BaseTypeSeq`: every base class of an applied class, mapped to the
+/// type arguments it is instantiated at there. Built by
+/// [`SymbolTable::base_type_args`].
+#[derive(Default)]
+pub(crate) struct BaseTypeArgs {
+    slots: rustc_hash::FxHashMap<u32, BaseSlot>,
+}
+
+impl BaseTypeArgs {
+    /// The arguments `sym` is seen at, or `None` when it is not a base class.
+    pub(crate) fn get(&self, sym: &u32) -> Option<&Vec<Type>> {
+        self.slots.get(sym).map(|s| &s.args)
+    }
+}
+
+/// Memo for [`SymbolTable::class_derives_from`], scoped to one base-type
+/// walk: `(sub, sup, answer)`, scanned linearly because it holds a handful of
+/// entries.
+type AncMemo = Vec<(u32, u32, bool)>;
