@@ -2817,6 +2817,18 @@ other constructor would get the wrong default with nothing to show for it --
 the failure mode an error count cannot see. It can only ever refuse programs
 scalac also refuses. `tests/fixtures/ctorgaps_secdefault_bad.scala`.
 
+It also closes a corpus test that was not on the brief. **`neg/t7870` goes
+`fail` -> `pass`**, and its whole content is this rule:
+
+```scala
+class C(a: Int = 0, b: Any) {
+  def this(a: Int = 0) = this(???, ???)
+}
+```
+
+Our diagnostic is `neg/t7870.check`'s, word for word, on its line. An
+unmodified build of the branch point compiles it with no diagnostic at all.
+
 #### What it is worth, measured by running it
 
 `tests/fixtures/ctorgaps_secdefault.scala` holds, in one program: a secondary
@@ -2926,7 +2938,12 @@ over-rejection is the one failure mode this change must not have. So
 *acceptance*, so the test fails and says so when a later slice resolves the
 boundary.
 
-### Yield: one corpus `neg` test, two library errors, zero class files of slick
+### Yield: two corpus `neg` tests, two library errors, zero class files of slick
+
+`neg/t6601` and `neg/t7870`, one from each half of the slice, both matching
+their `.check` file word for word. The full corpus is `losses=0`; the other
+two changes in that run (`pos/t2994a`, `pos/tcpoly_infer_ticket1864`) are
+`agent/hkbound`'s, which this branch was merged with before verifying.
 
 **slick's 1490 class files are byte-identical** between the branch point and
 this branch (`SLICK_OUT=… tests/slick_measure.sh` on both binaries, `diff -r`,

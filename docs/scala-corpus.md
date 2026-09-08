@@ -1362,6 +1362,11 @@ underlyingSymbol(sym).fullLocationString + " cannot be accessed " + location + f
   compilation and needed the *pickle reader* to mark the constructor rather
   than drop it. All four now reproduce their `.check` sentence.
 
+`agent/ctorgaps` also closed `neg/t7870`, which is not an access test at all
+but the same area: `class C(a: Int = 0, b: Any) { def this(a: Int = 0) = … }`
+is nsc's "multiple overloaded alternatives of constructor C define default
+arguments", and we now report it in nsc's words at nsc's line.
+
 Over the 26 `neg` tests whose `.check` contains `cannot be accessed`, the
 wording score moved **T1/T2/T3 = 0 → 3** (13.6% of the 22 scored) with T0
 unchanged at 13: `neg/t8002-nested-scope`, `neg/t3714-neg` and `neg/t3871`
