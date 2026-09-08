@@ -26,7 +26,7 @@ use scala_rs_pickle::sym::{MacroImpl as PickledMacroImpl, MemberKind, SigCache, 
 use scala_rs_pickle::ClassSource;
 
 use crate::javaclass::{parse_java_classfile, BinaryIndex, JavaClass};
-use crate::symbol::{MacroBinding, SymKind, SymbolTable};
+use crate::symbol::{MacroBinding, MacroTarg, SymKind, SymbolTable};
 
 /// `SCALA_RS_PICKLE_DEBUG=1` traces why a member was or was not supplied.
 /// Completion is silent otherwise: a member it declines to supply surfaces as
@@ -1810,6 +1810,7 @@ impl PickleSupply {
             blackbox: true,
             tag_params: 0,
             expr_args: Vec::new(),
+            tag_targs: Vec::new(),
         });
         st.get_mut(class_sym).members.push(id);
         // Same as `install_pickled_macro`: this is the gate on the typer
@@ -1882,7 +1883,7 @@ impl PickleSupply {
             ));
             return None;
         }
-        let Some((tag_params, expr_args)) = macro_signature_shape(&mi.signature) else {
+        let Some((tag_indices, expr_args)) = macro_signature_shape(&mi.signature) else {
             trace(format_args!(
                 "{internal}#{name}: the pickled macro signature {:?} is not a shape \
                  this expander knows",
@@ -1890,6 +1891,7 @@ impl PickleSupply {
             ));
             return None;
         };
+        let tag_params = tag_indices.len();
         let shape = read_shape(ty)?;
         if shape.arity() != expr_args.len() {
             trace(format_args!(
@@ -1983,12 +1985,15 @@ impl PickleSupply {
             let f = st.get(m).flags.with(Flags::IMPLICIT);
             st.get_mut(m).flags = f;
         }
+        let tag_targs =
+            self.pickled_tag_targs(st, bin, m, &scope, mi, &tag_indices, internal, name);
         st.get_mut(m).macro_impl = Some(MacroBinding {
             impl_class: mi.class_name.clone(),
             impl_method: mi.method_name.clone(),
             blackbox: true,
             tag_params,
             expr_args,
+            tag_targs,
         });
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
@@ -1997,6 +2002,59 @@ impl PickleSupply {
             "{internal}#{name}: supplied as a pickled macro def ({origin})"
         ));
         Some(m)
+    }
+
+    /// What each `WeakTypeTag` a pickled macro implementation asks for stands
+    /// for, read out of the type arguments nsc wrote on the implementation
+    /// reference (`docs/macros.md` §7.22).
+    ///
+    /// This is the pickled half of `crates/typer/src/macros.rs`'s
+    /// [`crate::check::Typer::classify_macro_targ`], and it converts in
+    /// exactly the scope `install_pickled_macro` has already built: the macro
+    /// def's own type parameters *and* the owning class's. That is what the
+    /// list needs, because the two kinds are precisely what has to be told
+    /// apart -- `def mapTo[R] = macro ShapedValue.mapToImpl[R, U]` writes one
+    /// of each.
+    ///
+    /// An empty result means "not known" and leaves the older one-for-one rule
+    /// in place; it is returned whenever a fingerprint points past the end of
+    /// the written type arguments, which is a pickle this code does not
+    /// understand rather than a macro it can resolve half of.
+    #[allow(clippy::too_many_arguments)]
+    fn pickled_tag_targs(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        macro_def: SymbolId,
+        scope: &HashMap<String, Type>,
+        mi: &PickledMacroImpl,
+        tag_indices: &[usize],
+        internal: &str,
+        name: &str,
+    ) -> Vec<MacroTarg> {
+        if tag_indices.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(tag_indices.len());
+        for &i in tag_indices {
+            let Some(sig) = mi.targs.get(i) else {
+                trace(format_args!(
+                    "{internal}#{name}: the pickled macro signature asks for the type \
+                     argument at {i} and the implementation reference writes {} -- \
+                     falling back to the call site's own type arguments",
+                    mi.targs.len()
+                ));
+                return Vec::new();
+            };
+            out.push(match self.conv(st, bin, scope, sig) {
+                Some(t) => crate::macros::macro_targ_of_type(st, &t, macro_def),
+                None => MacroTarg::Unresolved(sig_spelling(sig)),
+            });
+        }
+        trace(format_args!(
+            "{internal}#{name}: implementation reference type arguments {out:?}"
+        ));
+        out
     }
 
     /// Supply a nested `object` a pickle declares, as a **module accessor**.
@@ -3390,7 +3448,16 @@ impl Shape {
 /// Returns `(tag_params, expr_args)`, or `None` for a signature this reading
 /// does not cover: no `Context` clause at all, or a tag in the middle of the
 /// value parameters, where "drop the trailing tags" would be a guess.
-fn macro_signature_shape(signature: &[Vec<i32>]) -> Option<(usize, Vec<bool>)> {
+/// A readable name for a pickled type that did not convert, for a diagnostic.
+fn sig_spelling(t: &SigType) -> String {
+    match t {
+        SigType::Ref { sym, args } if args.is_empty() => sym.clone(),
+        SigType::Ref { sym, args } => format!("{sym}[{}]", args.len()),
+        _ => "a type scala-rs cannot read out of the pickle".to_string(),
+    }
+}
+
+fn macro_signature_shape(signature: &[Vec<i32>]) -> Option<(Vec<usize>, Vec<bool>)> {
     use scala_rs_pickle::sym::fingerprint;
     let (context, rest) = signature.split_first()?;
     // nsc's first clause is exactly `(c: Context)`.
@@ -3404,7 +3471,14 @@ fn macro_signature_shape(signature: &[Vec<i32>]) -> Option<(usize, Vec<bool>)> {
         return None;
     }
     Some((
-        tag_params,
+        // The fingerprint of a tag parameter is not a flag: it is the *index*
+        // of the implementation type parameter the tag is for, which is also
+        // the index into the type arguments written on the implementation
+        // reference (`MacroImpl::targs`). It used to be counted and dropped.
+        flat[flat.len() - tag_params..]
+            .iter()
+            .map(|&f| f as usize)
+            .collect(),
         values
             .iter()
             .map(|&f| f == fingerprint::LIFTED_TYPED)

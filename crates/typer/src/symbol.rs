@@ -375,7 +375,54 @@ pub enum Intrinsic {
 /// expanded. We keep the same three facts, in the form the expander needs:
 /// the JVM class that holds the implementation, the method name on it, and
 /// whether the def was declared with a `blackbox` or `whitebox` context.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One type argument written on a macro implementation *reference*, resolved
+/// as far as it can be at the point the binding is made.
+///
+/// `def mapTo[R] = macro ShapedValue.mapToImpl[R, U]` writes two: `R`, which
+/// is `mapTo`'s own type parameter, and `U`, which is `ShapedValue`'s. nsc
+/// keeps the pair as `MacroImplBinding.targs` and resolves each one at the
+/// call site (`Macros.macroArgs`) -- it never lines the implementation's tags
+/// up with the call site's type arguments, which is why `mapTo[MyRow]` can
+/// supply one type argument to an implementation that asks for two tags.
+///
+/// The resolution is deliberately split in two: which *kind* of thing the
+/// reference names is settled once, where the macro def is bound and both its
+/// own type parameters and its owner's are in scope; what it stands for is
+/// settled at each call site, where the call's type arguments and its prefix
+/// are.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MacroTarg {
+    /// A type parameter of the macro **def**, at this position in its own type
+    /// parameter list: the call site's type argument at the same position.
+    /// nsc matches it by name (`macroDef.typeParams.indexWhere(_.name ==
+    /// targ.name)`), and so does the code that builds this.
+    DefParam { index: usize, name: String },
+    /// A type parameter of the macro def's **owner**, at this position in the
+    /// owner's type parameter list: `asSeenFrom` the call's prefix. `owner` is
+    /// the class the parameter belongs to, which is the base class the
+    /// receiver's type has to be seen as.
+    OwnerParam {
+        owner: SymbolId,
+        index: usize,
+        name: String,
+    },
+    /// A type written out in full and carrying no type arguments of its own
+    /// (`macro Impl.f[R, Int]`). nsc uses it as it stands.
+    Fixed(Type),
+    /// A type argument scala-rs will not resolve, carrying its spelling for
+    /// the diagnostic. This is not the same as "nsc cannot either": nsc reads
+    /// `binding.targs(i).tpe.typeSymbol` and then that *symbol's* own type, so
+    /// `macro Impl.f[List[R], U]` gives the implementation the raw `List[A]` --
+    /// `A` being `List`'s own type parameter, not anything at the call site.
+    /// Real scalac 2.13.16 prints exactly that, and
+    /// `tests/fixtures/mt2_bad.scala` is the program that shows it. Copying
+    /// that would hand an implementation a type with a free parameter in it;
+    /// substituting instead would hand it `List[String]`, which is not what
+    /// nsc says. So it is refused by name.
+    Unresolved(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MacroBinding {
     /// JVM internal name of the class holding the implementation, e.g. `M$`.
     /// nsc requires the implementation to be a method of an object, so this is
@@ -400,6 +447,18 @@ pub struct MacroBinding {
     /// `mapToImpl` takes `Tree`s). Read off the *source* signature, because a
     /// class file scala-rs writes erases both to `Object`.
     pub expr_args: Vec<bool>,
+    /// What each of the `tag_params` tags stands for, in the order the
+    /// implementation's trailing clause asks for them: the type argument
+    /// written on the implementation reference that nsc's fingerprint for that
+    /// parameter points at.
+    ///
+    /// **Empty means "not known"**, not "no tags". A binding whose reference
+    /// could not be read this way falls back to the older rule -- line the tags
+    /// up one for one with the call site's type arguments -- which is right
+    /// whenever the reference is the usual `macro Impl.f[A]` and is refused
+    /// with a reason when it is not. When this is non-empty it has exactly
+    /// `tag_params` entries.
+    pub tag_targs: Vec<MacroTarg>,
 }
 
 impl MacroBinding {

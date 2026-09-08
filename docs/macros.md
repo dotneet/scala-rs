@@ -67,6 +67,7 @@ unrealistic, it is stated as such.
   - 7.19 `val` and `def` definitions bound inside a `reify` body (the `agent/reifydefs` slice)
   - 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
   - 7.21 A type tag that carries type arguments, and the `Expr[Nothing]` nsc really passes (the `agent/gbmapto` slice)
+  - 7.22 The type arguments written on the macro implementation reference (the `agent/mapto2` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -3157,7 +3158,7 @@ macro def's owner from the prefix, and scala-rs does not read those type argumen
 
 1. ~~a tag descriptor that cannot carry type arguments~~ — closed here, and it turned out to be
    half a phantom: the `ClassTag[R]` tag is one nsc never builds.
-2. **the macro implementation reference's own type arguments.** `mapTo[R] = macro
+2. **the macro implementation reference's own type arguments** — closed in §7.22. `mapTo[R] = macro
    ShapedValue.mapToImpl[R, U]`: `U` is `ShapedValue`'s type parameter, not `mapTo`'s, so the call
    site writes one type argument where the implementation asks for two tags. nsc does not line the
    two up at all — `Macros.macroArgs` reads `binding.targs`, the type arguments written on the
@@ -3178,7 +3179,7 @@ macro def's owner from the prefix, and scala-rs does not read those type argumen
    holds both the macro def's and the owning class's type parameters), and substituting at the call
    site is the next piece of work. **This is where gitbucket's 31 sites stop today.** The source
    path (`crates/typer/src/macros.rs`, `split_type_apply`) discards the same thing and needs the
-   same treatment.
+   same treatment. — Done in §7.22, in both readers; the 31 sites now stop at wall 3 below.
 3. **the mirror, on a class with fields.** gitbucket's row classes — `AccessToken`, `Account`,
    `Issue` — are case classes *this run is compiling*, so they reach the engine as §5.1's empty
    placeholder, and `mapToImpl` opens by asking one `isCaseClass`. `tests/fixtures/gbm_bad.scala`
@@ -3211,3 +3212,176 @@ macro def's owner from the prefix, and scala-rs does not read those type argumen
   pinned *refusal* there and is now a pinned acceptance in `gbm_use.scala`, so its place is taken by
   `nameOf[Main.type]`, a singleton type, which is still refused. Real scalac still compiles and runs
   that file.
+
+### 7.22 The type arguments written on the macro implementation reference (the `agent/mapto2` slice)
+
+§7.21 closed wall 1 and named wall 2 in the refusal itself:
+
+```text
+cannot expand mapTo (implementation slick.lifted.ShapedValue$.mapToImpl): the implementation
+asks for 2 type tag(s) and the call site supplies 1 type argument(s); nsc would resolve the type
+arguments written on the implementation reference itself, taking the ones that belong to the
+macro def's owner from the prefix, and scala-rs does not read those type arguments out of the
+`@macroImpl` annotation yet
+```
+
+This slice reads them, in both readers, and resolves them the way nsc does. gitbucket's 31 `mapTo`
+sites now **invoke `slick.lifted.ShapedValue.mapToImpl` for real** and stop at wall 3 -- the mirror,
+on a row class this run is compiling -- which is where §7.21 said they would.
+
+#### Lining tags up with the call site was never going to work
+
+`def mapTo[R] = macro ShapedValue.mapToImpl[R, U]`. `R` is `mapTo`'s own type parameter and `U` is
+`ShapedValue`'s, so the implementation asks for two `WeakTypeTag`s where `mapTo[Account]` writes one
+type argument. nsc does not line the two up at any point. `Macros.macroArgs` reads
+`MacroImplBinding.targs` -- the type arguments written on the *implementation reference* -- and
+resolves each one on its own:
+
+```scala
+val targ = binding.targs(paramPos).tpe.typeSymbol
+val tpe = if (targ.isTypeParameterOrSkolem) {
+  if (targ.owner == macroDef) targs(macroDef.typeParams.indexWhere(_.name == targ.name)).tpe
+  else targ.tpe.asSeenFrom(if (prefix == EmptyTree) macroDef.owner.tpe else prefix.tpe, macroDef.owner)
+} else targ.tpe
+context.WeakTypeTag(tpe)
+```
+
+`paramPos` is not a flag: the non-negative fingerprint nsc pickles for a tag parameter **is the
+index** of the implementation type parameter that tag is for, which is also the index into
+`binding.targs`. scala-rs counted those fingerprints and threw the values away
+(`macro_signature_shape`), and threw the type arguments away twice over -- `PickleReader::macro_impl_of`
+peeled the `TypeApply` off the annotation payload, and `macros.rs::split_type_apply` reduced the
+source-side reference's type arguments to a count.
+
+**The old rule was not merely incomplete, it gave wrong answers silently.** With two written type
+arguments and two call-site ones the counts matched and the tags went over in call-site order:
+`def swapped[A, B] = macro Impl.pairImpl[B, A]` called as `swapped[Int, String]` printed
+`R=Int U=String` under scala-rs at `2fdfe302` and prints `R=String U=Int` under real scalac 2.13.16.
+Both spellings are in `tests/fixtures/mt2_use.scala`; the pre-fix binary was run on it to check that
+this is a repair and not a story.
+
+#### The three pieces
+
+* **The pickled reader.** `MacroImpl::targs` (`crates/pickle/src/sym.rs`) is the list nsc wraps the
+  `@macroImpl` payload in, read out of each type-argument tree's own pickled type. A tree with no
+  type is kept as `SigType::None` rather than dropped, so the fingerprint indices into the list stay
+  valid. `PickleReader::macro_impl_targ_trees` matches the `TypeApply` at the top and nowhere
+  deeper, which is exactly what nsc's `MacroImplBinding.unpickle` does.
+* **The source reader.** `split_type_apply` hands back the type-argument *trees*, and
+  `Typer::classify_macro_targ` matches a bare name against the macro def's type parameters and then
+  its owner's **by name**. By name is both what nsc does and the only thing available: a macro def's
+  right-hand side is resolved in the *enclosing* scope with no parameter scope pushed -- the
+  reference names a method of some other object and must not see `R` as anything -- so typing `R`
+  there answers "not found: type R".
+* **The classification.** Both readers end in `macros.rs::macro_targ_of_type`, which decides once,
+  where the binding is made, which *kind* of thing each written type argument is
+  ([`MacroTarg`]): a type parameter of the macro def, a type parameter of its owner, a type written
+  out in full, or one this bridge refuses. What each one *stands for* is decided at every call site
+  by `Typer::tag_types` (`crates/typer/src/expand.rs`), where the call's type arguments and its
+  prefix are: `OwnerParam` is `SymbolTable::base_type_args` on the receiver's type, which is
+  `asSeenFrom` for a class type parameter, so `SubShaped[Char]` is seen as `Shaped[Char]` first.
+
+`MacroBinding::tag_targs` being **empty means "not known"**, not "no tags": a binding whose reference
+could not be read this way keeps the older one-for-one rule, which is right for the usual
+`macro Impl.f[A]` and is refused with a reason when it does not fit. Nothing that expanded before
+stops expanding.
+
+#### What is refused, and why nsc's own answer is not a reading
+
+nsc reads `binding.targs(i).tpe.**typeSymbol**` and then *that symbol's* own type. For a bare type
+parameter or a type with no arguments that is the same type back again. For an applied type
+constructor it is not: `macro Impl.pairImpl[List[R], Int]` hands the implementation `List[A]`, `A`
+being `List`'s own type parameter, related to nothing at the call site. Real scalac 2.13.16 prints
+exactly that (`tests/fixtures/mt2_bad.scala` is the program, and it compiles and runs).
+
+scala-rs refuses it by name. Copying nsc would mean handing an implementation a type with a free
+parameter in it; substituting instead would answer `List[String]`, which is a different answer from
+the compiler this project is a compiler for. The same goes for a type parameter of the owner with
+**no receiver** to see it through: nsc falls back to `macroDef.owner.tpe`, so `U` reaches the
+implementation as the free `U`, and scala-rs says so instead of guessing.
+
+#### A defect this slice found and did not fix
+
+A macro def whose owner is a **class** reached through a class-file *directory* on `-cp` is
+installed by `classpath::install_classpath` -- which reads its own pickle subset eagerly, before
+`pickle_supply` is ever asked -- as an ordinary method returning `Any`, **with no `MacroBinding` at
+all**. Nothing then tries to expand the call, `Typer::report_macro_calls` sees no macro application,
+the compile reports nothing, and the emitted class file calls a method that does not exist
+(`NoSuchMethodError: mt2.Shaped.mapTo()`). It is a silently accepted macro call, which is the one
+thing this area is not allowed to do.
+
+It does not touch slick, gitbucket, cats or the scala library, because a jar goes through
+`pickle_supply`'s lazy path instead, and it does not touch `tq_muse` because that macro def's owner
+is an `object`. Closing it means carrying nsc's `MACRO` flag through
+`scala_rs_backend`'s classpath pickle subset and declining such a member there, which is a change in
+a different crate from this one. `tests/fixtures/mt2_mdef.scala` is packed into a **jar** by
+`crates/cli/tests/mapto2.rs` for exactly this reason, and the reason is written there too.
+
+#### What this is worth, measured
+
+**Nothing on any of the six measures. The wall moved by one layer, and one silent wrong answer
+became a right one.**
+
+| check | before | after |
+| --- | --- | --- |
+| `tests/gitbucket_measure.sh` | 337 errors / 81 files | **337 / 81** |
+| `tests/cats_measure.sh` | 196 / 73 | **196 / 73** |
+| `tests/scalalib_measure.sh` | 1420 / 166 | **1420 / 166** |
+| `tests/slick_measure.sh` | `errors=0 files_with_errors=0 classes=1490` | **unchanged** |
+| `MODE=b tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` | **unchanged** |
+| scala/scala corpus | pos 1086 / neg 670 / run 618 | **unchanged**; `compare_corpus.py` against `corpus-54df4d43.tsv` reports `changes: []`, `losses: 0` |
+| `cargo test --workspace --release` | 243 rows / 2394 passed / 0 failed | **244 / 2397 / 0** -- the three new rows are this slice's |
+
+The gitbucket log's error kinds before and after (`grep '^error' | sort | uniq -c`, diffed, both runs
+measured here rather than taken from the ledger) differ by **exactly the `mapTo` line**: one line
+carrying a count of 31 becomes 31 lines carrying one each, because the refusal now names the row
+class it stopped on. Every other kind is byte-identical. The count of
+`cannot expand mapTo` is 31 before and 31 after.
+
+All 31 now read
+
+```text
+cannot expand mapTo (implementation slick.lifted.ShapedValue$.mapToImpl): the type argument
+`gitbucket.core.model.Account` is a class this run is compiling, so the implementation was handed
+a placeholder symbol carrying only its name; it looked the class up and answered "the macro
+implementation threw java.lang.AssertionError: assertion failed: gitbucket.core.model.Account",
+which says nothing about this program. nsc has no such limit -- it expands in its own universe,
+where the class being compiled is a real symbol.
+```
+
+which is **wall 3**, word for word the diagnostic `tests/fixtures/gbm_bad.scala` was written to
+produce. Both tags are built and the implementation really runs; what it runs into is the empty
+placeholder a current-run class travels as (§5.1). Six of the 31 name two classes, because the
+`U` the prefix supplies is a current-run class as well.
+
+#### The walls in front of `mapTo`, in the order they are hit
+
+1. ~~a tag descriptor that cannot carry type arguments~~ -- §7.21.
+2. ~~the macro implementation reference's own type arguments~~ -- **closed here**, in both readers.
+3. **the mirror, on a class with fields, and a companion it does not describe at all.** This is where
+   all 31 stop now, and it is two decisions rather than one. `mapToImpl` opens with
+   `rSym.asClass.isCaseClass` on a class this run is compiling; §7.20's remaining item 3 (describing
+   a class that has fields, which means modelling nsc's private-field-plus-stable-accessor pair) is
+   necessary but not sufficient, because `mapToImpl` goes on to ask for `rSym.companion`, that
+   companion's `tupled` and its `unapply`, and the mirror describes no companion at all. §7.18's
+   warning still binds: a half-built mirror would let `mapToImpl` build a tree from a class it half
+   understands, which is worse than the refusal.
+4. **rebuilding the trees `mapToImpl` returns** -- §7.18's step 2, untouched. `Typer::tree_from_reply`
+   refuses its `Block` of an anonymous class with `override def`s, its `Match` / `CaseDef` / `Bind`
+   patterns, its `New` with type arguments and its `Super`, each by name.
+
+#### Validation
+
+* `tests/fixtures/mt2_mdef.scala` -- compiled by **real scalac** (only nsc writes the `@macroImpl`
+  annotation) and packed into a jar -- plus `tests/fixtures/mt2_use.scala`, seven implementation
+  references expanded for real and **executed**, byte-identical to real scalac 2.13.16 compiling the
+  same two files against each other (`crates/cli/tests/mapto2.rs`,
+  `mt2_reference_targs_expand_and_run` and `mt2_reference_targs_match_real_scalac`). Six come out of
+  the jar's pickle and one is a macro def compiled in the same run, so both readers are covered.
+  Among them: slick's own shape (`R` from the call site, `U` from the receiver), a receiver whose own
+  argument is applied, the owner's parameter reached through a *subclass*, a reference that writes
+  the macro def's parameters in the other order, a type argument written out in full, and an
+  implementation whose tag clause is in the other order from its type parameters.
+* `tests/fixtures/mt2_bad.scala` -- three references scala-rs refuses, each by name, through both
+  readers. **All three are a program real scalac compiles and runs** (`R=List[A] U=Int` twice and
+  `R=Boolean U=U`); scala-rs accepts none of them.
