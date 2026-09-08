@@ -143,8 +143,8 @@ pub use named_eval_order::restore_named_arg_order;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};
 pub use specialize::{rewrite_specialized_calls, specialize_method_defs};
 pub use symbol::{
-    Intrinsic, MacroBinding, MethodVariant, SamSig, SeqPayload, SymKind, Symbol, SymbolTable,
-    AS_SEEN_FROM_MARK,
+    bool_shortcircuit_rhs, Intrinsic, MacroBinding, MethodVariant, SamSig, SeqPayload, SymKind,
+    Symbol, SymbolTable, AS_SEEN_FROM_MARK,
 };
 pub use uncurry::uncurry;
 pub use value_companion::add_value_class_companions;

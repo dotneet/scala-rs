@@ -169,12 +169,22 @@ Compiler flags (`agent/xflags`):
   whatever `this` happens to be — and entering the symbol alone gives neither.
   Reported, not answered wrongly.
 - **Remaining tail-call shapes.** Direct self tail calls in ordinary methods
-  now become loops, including receiver changes, curried arguments and lifted
-  local definitions. Value-class `$extension` tail calls remain unsupported
-  and annotated methods in that shape are rejected. Explicit returns and
-  try/catch/finally tail positions remain conservatively rejected by the
-  typer. Mutual recursion is not transformed. See [tailrec.md](tailrec.md)
-  for the precise scope and differential execution tests.
+  become loops, including receiver changes, curried arguments, lifted local
+  definitions, value-class `$extension` statics, and the right operand of
+  `Boolean.&&` / `Boolean.||`. Explicit returns and try/catch/finally tail
+  positions remain conservatively rejected by the typer. Mutual recursion is
+  not transformed. See [tailrec.md](tailrec.md) for the precise scope and
+  differential execution tests.
+- **`Stream`'s `tail` does not collapse to one member.** The five remaining
+  `@tailrec` diagnostics on the scala library — `Stream.foreach`, `find`,
+  `foldLeft`, `collect`, `collectFirst` — are *cascades*, not tail-position
+  defects. Each is preceded by `value foreach is not a member of <overload
+  Iterable[A] | Stream[A] | Stream[A]>`: `Stream.tail` arrives as an
+  unresolved three-way overload, so `tail.foreach(f)` binds no symbol at all
+  and the tail-call scan then honestly reports "contains no recursive calls".
+  Reduce `tail` to one member and all five go away together; nothing in
+  `check_tailrec` needs touching. Twenty-three library errors carry that
+  member-of-an-overload message, so the cluster is larger than the five.
 - **`super` in a class whose `with` list is not an antichain.** `class C1
   extends L3 with L1`, where `trait L3 extends L1 with L2`, linearizes to
   `C1 L3 L2 L1 L0` — the typer has this right, and it is scalac's answer — but

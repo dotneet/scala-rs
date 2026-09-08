@@ -6072,3 +6072,32 @@ pub fn apply_type_ctor(ctor: Type, args: Vec<Type>) -> Type {
 fn is_wildcard_arg(t: &Type) -> bool {
     matches!(t, Type::Wildcard | Type::BoundedWildcard { .. })
 }
+
+/// The right operand of `scala.Boolean.&&` or `scala.Boolean.||`, if `tree` is
+/// one of those two applications.
+///
+/// nsc's `TailCalls` phase special-cases exactly these two symbols
+/// (`Boolean_and` / `Boolean_or`) and transforms their argument *in the tail
+/// context*, because both are compiled to a conditional branch over the
+/// operand rather than to a call: nothing in the method runs after it. The
+/// check is on the intrinsic, which is installed only on `scala.Boolean`, so a
+/// user-defined `&&` on any other type is not affected.
+pub fn bool_shortcircuit_rhs<'a>(
+    st: &SymbolTable,
+    tree: &'a scala_rs_parser::Tree,
+) -> Option<&'a scala_rs_parser::Tree> {
+    let scala_rs_parser::TreeKind::Apply { fun, args } = &tree.kind else {
+        return None;
+    };
+    if args.len() != 1 {
+        return None;
+    }
+    if fun.sym.is_none() {
+        return None;
+    }
+    matches!(
+        st.get(fun.sym).intrinsic,
+        Intrinsic::BoolBin("&&") | Intrinsic::BoolBin("||")
+    )
+    .then(|| &args[0])
+}
