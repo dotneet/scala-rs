@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `3fd80269` |
+| commit | `70f349ea` |
 |---|---|
 | updated | 2026-09-08 |
 
-**Thirty-nine slices have merged this session**, in eleven composed gates. From
+**Forty-eight slices have merged this session**, in twelve composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -240,9 +240,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **185** | **71** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **182** | **71** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **270** | **79** | — |
-| `tests/scalalib_measure.sh` (538) | **917** | **146** | — |
+| `tests/scalalib_measure.sh` (538) | **852** | **145** | — |
 
 ## Execution
 
@@ -258,12 +258,12 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1095** | 419 | 345 |
-| `neg` (1405) | **673** | 363 | 369 |
-| `run` (2060) | **626** | 881 | 553 |
+| `pos` (1859) | **1099** | 415 | 345 |
+| `neg` (1405) | **681** | 355 | 369 |
+| `run` (2060) | **627** | 880 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-3fd80269.tsv`](baselines/corpus-3fd80269.tsv): 5324 unique
+[`baselines/corpus-70f349ea.tsv`](baselines/corpus-70f349ea.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
@@ -298,7 +298,7 @@ That separate defect is now fixed in this main baseline, with all four
 nsc/scala-rs producer/consumer combinations tested. Some negative gains still have imprecise diagnostics; status
 acceptance does not establish exact scalac diagnostic compatibility.
 
-Use `python3 tests/compare_corpus.py tests/baselines/corpus-3fd80269.tsv
+Use `python3 tests/compare_corpus.py tests/baselines/corpus-70f349ea.tsv
 <candidate-corpus.tsv>` to compare saved ledgers. It rejects missing or
 duplicate identities, lost passes, and newly skipped tests. A zero exit only
 checks statuses; changed diagnostics and runtime evidence still need review.
@@ -325,7 +325,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **259 result rows, 2487 passed, 0 failed** at `3fd80269` |
+| `cargo test --workspace --release --no-fail-fast` | **265 result rows, 2530 passed, 0 failed** at `70f349ea` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -380,10 +380,18 @@ verified to **fail on the unguarded binary and pass on the guarded one**. The
 ordering is load-bearing — an `object api { implicit def … }` reached by a
 wildcard import compiles either way and proves nothing.
 
-## The one corpus loss, and why it is recorded rather than reverted
+## The one corpus loss, and how it was closed
 
-Every gate before this one was `losses=0`. This one is **`losses=1`**, and it
-is honest: **`neg/name-lookup-stable`**.
+Gate eleven was the session's only `losses=1`, and it was honest:
+**`neg/name-lookup-stable`**. `agent/nameamb` has since closed it, using
+exactly the plan `agent/negchecks` wrote down — `SymbolTable::scopes` already
+carries depth as its own index, so the comparison is innermost-`Explicit` /
+`Wildcard` scope against innermost-`Definition` scope. The corpus is back to
+`losses=0`, `neg` went 673 -> 681, and the fix also closed a *second* wrong
+program nobody had reported: `import Priv._` was bringing `Priv`'s own
+`private[this]` members into scope and binding them ahead of the importing
+class's own definitions, which SLS 5.2 forbids and which compiled and printed.
+The history below is kept because the reasoning is what matters.
 
 `agent/libnotype` removed a set of bogus errors — a case-insensitive directory
 classpath fabricating `package scala.Math`, a blank line not ending an
@@ -436,6 +444,51 @@ and one of them was hiding under every green check this project has:
 `value x … from C$`. It moves no count; it moves three `neg` tests to
 byte-identical with their `.check` and the wording-score of the 26 access
 tests from 0 to 3.
+
+## Gate twelve: six slices, and four of them corrected the brief
+
+The scala library went **917 -> 852** and cats **185 -> 182**, but the
+instructive part is that four of the six found the coordinator's diagnosis
+wrong and said so with a measurement.
+
+* **`agent/unitpop`** and **`agent/secondaryctor`** independently reached the
+  same conclusion about a `VerifyError: Bad type on operand stack`: the
+  `invokespecial` descriptor was **right**, and the argument arrived already
+  adapted to the *primary* constructor's parameter type. `erasure::method_param_types`
+  answered "what does this `new` adapt its arguments to?" with the class's
+  first `<init>` member. One of the two recorded it as unfixed; the other
+  closed it and marked the note as agreed. `run/kmpSliceSearch` is the gain,
+  and it is a jar class — `new scala.util.Random(Integer.parseInt(…))`, whose
+  primary takes a reference and whose picked secondary takes an `Int`, so we
+  had been boxing an `int` into an `(I)V` slot.
+* **`agent/unitpop`** also fixed the mirror image in the private runtime: a
+  discarded `identity(())` left `getstatic BoxedUnit.UNIT` with nothing after
+  it, which merely leaks a slot in straight-line code and is
+  `VerifyError: Inconsistent stackmap frames` inside an `if`. Its fixture puts
+  a branch after every statement-position case for exactly that reason.
+* **`agent/siblingover`** disproved the coordinator's hypothesis with
+  instrumentation — zero empty-`kept` events across the whole library run — and
+  split its twenty candidates twelve/eight. The eight are `Nil` the *module*
+  owned by package `scala` beside `Nil` the *term* owned by `package$`: one
+  entity supplied twice by routes in no `extends` relation. **A repeated type
+  in an `<overload …>` list is what duplicate supply looks like.**
+* **`agent/arrayelem`** found the coordinator's `losses=1` expectation stale
+  and the actual loss its own: `neg/multi-array`. Its root predated the slice —
+  the array path typed every argument as `Int` and never counted them, so
+  `new Array[Int](10, 10)` was **accepted on the pre-fix binary too**.
+
+Two of the six also recorded a *cost*: `agent/basetypemeet` measured its rule
+at about **+10% compile time** on `src/library` and put the quiet-machine and
+loaded-machine numbers on the record rather than choosing the flattering one,
+after four measured tuning changes took it down from +25%. `agent/siblingover`
+measured its own at no detectable cost, alternating both the binary and the
+order within each round because the first attempt had charged the fix for load
+drift.
+
+**And the check that caught the most this gate was not a measure.**
+`agent/siblingover`'s rule deleted a genuine overload — `same_signature` lets
+an abstract `T` match `Int` — and its own words are the lesson: *the library
+measure did not catch this; a fixture did.*
 
 ## What is deliberately red
 
