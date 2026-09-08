@@ -571,14 +571,29 @@ impl PickleSupply {
     /// `$eq$eq$eq`, which [`fill_java_members`] never decodes, so the
     /// forwarder and the pickled member never shared a name.
     ///
-    /// Deliberately narrow. A forwarder is dropped only when the pickle
-    /// answers with a member of **more than one clause and the same total
-    /// number of parameters**: splitting a parameter list is the one thing a
-    /// class file cannot express, so that pair is a flattening and not two
-    /// different methods. A single-clause disagreement -- an erased type
-    /// argument, a by-name parameter -- is left alone here; it is not what
-    /// this is about, and dropping on it would take out members no pickle
-    /// replaces.
+    /// Deliberately narrow, in three ways, and each one was measured.
+    ///
+    /// * A name is only *considered* when the class file has a member of it
+    ///   with **at least two parameters in one clause**. Splitting a parameter
+    ///   list is the one thing a class file cannot express, and every split
+    ///   form that matters here has two or more; a one-parameter
+    ///   `()(implicit x)` is left alone rather than widening the walk over
+    ///   every inherited unary method.
+    /// * The replacement has to have **more than one clause**, and then
+    ///   **every** class-file member of that name whose total parameter count
+    ///   the replacement also has is dropped, not just the flattened one.
+    ///   `DurationInt` inherits both `seconds: FiniteDuration` and
+    ///   `seconds[C](c: C)(implicit ev: Classifier[C]): C#R`; dropping the
+    ///   flattened two-parameter one and leaving the class file's nullary one
+    ///   beside the pickle's left `2.seconds` an overload of three with a
+    ///   duplicate in it, and `val f: FiniteDuration = 2.seconds` stopped
+    ///   compiling (`crates/cli/tests/durrange.rs`, `setmap1`).
+    /// * `complete_named` is asked of `class_sym`, not of the parent that
+    ///   declares the name. At adoption time this class's parent list holds
+    ///   only what its own pickle said (`AnyVal`, for a value class) --
+    ///   the class file's parents are attached later -- so a walk over
+    ///   `Symbol::parents` here reaches nothing, and `complete_named`'s own
+    ///   walk over the *pickled* parents is what finds the declaration.
     fn drop_flattened_forwarders(
         &mut self,
         st: &mut SymbolTable,
@@ -586,6 +601,20 @@ impl PickleSupply {
         class_sym: SymbolId,
         sig: &scala_rs_pickle::sym::ClassSig,
     ) {
+        // Never the standard library, for the reason `ensure_pickled_parents`
+        // and `attach_parents` already give: its hierarchy and its member sets
+        // are the prelude's, hand-written and reasoned about, and topping one
+        // up from a class file changes members that work. Measured:
+        // `scala.collection.AbstractIterable` alone had eleven names this
+        // would touch, and doing so gave `HashMap#toList` a second entry
+        // (`<overload List[Tuple2[String, Any]] | List[(String, Any)]>`, and
+        // `.sortBy` on it "not a member" -- `setmap1`) and `DurationInt`'s
+        // `seconds` a third. What this is for is a *jar* class the program
+        // named.
+        let jvm = st.get(class_sym).jvm_name.clone();
+        if jvm.starts_with("scala/") || jvm.starts_with("java/") {
+            return;
+        }
         let own: Vec<String> = sig
             .members
             .iter()
@@ -603,7 +632,7 @@ impl PickleSupply {
             if s.kind != SymKind::Method
                 || s.flags.contains(Flags::STATIC)
                 || s.paramss.len() > 1
-                || s.params.is_empty()
+                || s.params.len() < 2
                 || s.name.contains('$')
                 || own.contains(&s.name)
                 || names.contains(&s.name)
@@ -628,18 +657,16 @@ impl PickleSupply {
                 .map(|m| (m, st.get(m).params.len()))
                 .collect();
             let installed = self.complete_named(st, bin, class_sym, &name, false);
-            let split: Vec<usize> = installed
-                .iter()
-                .map(|&i| st.get(i))
-                .filter(|s| s.paramss.len() > 1)
-                .map(|s| s.paramss.iter().map(|c| c.len()).sum())
-                .collect();
-            if split.is_empty() {
+            if !installed.iter().any(|&i| st.get(i).paramss.len() > 1) {
                 continue;
             }
+            let arities: Vec<usize> = installed
+                .iter()
+                .map(|&i| st.get(i).paramss.iter().map(|c| c.len()).sum())
+                .collect();
             let stale: Vec<SymbolId> = flat
                 .into_iter()
-                .filter(|(m, n)| split.contains(n) && !installed.contains(m))
+                .filter(|(m, n)| arities.contains(n) && !installed.contains(m))
                 .map(|(m, _)| m)
                 .collect();
             if stale.is_empty() {
