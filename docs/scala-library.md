@@ -4098,3 +4098,130 @@ verifier fix.
 operand stack`, and the third test reads `javap -c` to pin the cast *and* its
 absence after `Plain.c`, whose descriptor already is `Lhkf/OneBox;` — an
 unnecessary cast is a divergence too, and running green cannot see one.
+
+## The `agent/unqualname` slice: the last two `not found: value` clusters
+
+The library measure's 21 remaining `not found: value` errors were handed over
+as one hypothesis -- unqualified lookup failing to walk enclosing scopes and
+then inherited members. **Neither cluster was that.** They are two unrelated
+roots, and measuring which was the first useful thing this slice did.
+
+`tests/scalalib_measure.sh` (538 files): **604 -> 586 errors**,
+`files_with_errors` 130 both sides. The set difference of the two error logs is
+18 removed and **nothing new** -- 7 monitor calls in
+`scala/concurrent/{Channel,SyncVar}.scala` and 11 in
+`scala/collection/immutable/TreeSeqMap.scala`. The three remaining
+`not found: value` errors of the original 21 are neither cluster and are
+untouched.
+
+### (a) is not a name-resolution bug -- the members were absent
+
+`wait` / `notify` / `notifyAll` were not declared on `AnyRef` at all, so they
+failed **qualified** as well:
+
+```scala
+class D {
+  def a(): Unit = this.wait()              // value wait is not a member of D
+  def e(o: AnyRef): Unit = o.notifyAll()   // value notifyAll is not a member of AnyRef
+}
+```
+
+Unqualified lookup was working the whole time; there was nothing for it to
+find. `hashCode()` and `toString()`, in the same position in the same class
+body, always resolved. `crates/typer/src/prelude_anyval2.rs` now declares all
+five overloads (`wait()`, `wait(Long)`, `wait(Long, Int)`, `notify()`,
+`notifyAll()`) on `anyref_sym`, as nsc declares them on `scala.AnyRef`.
+
+This cannot widen the standing laxity recorded above -- *Java statics are
+inherited into a Scala subclass's scope* -- because these are instance methods
+on `AnyRef`, not statics on a Java class a Scala class extends. The laxity is
+unchanged.
+
+The one deliberate divergence from scalac is the constant-pool owner. nsc
+writes `Cell.wait:()V`, naming the current class; this backend writes
+`java/lang/Object.wait:()V`, because `anyref_sym`'s JVM name already is
+`java/lang/Object`. JVM method resolution walks the superclass chain, so both
+name `java.lang.Object.wait` and the two programs run alike -- which is what
+`unqname_runs` and `unqname_expected_output_is_scalacs` check, rather than
+taking it on faith.
+
+### (b) was a *silent* precedence bug, with no diagnostic anywhere
+
+`Checker::resolve_type_name` mapped `Int`, `String`, `Object`, `Any` and the
+rest to their primitive `Type` by the **name**, in a `match` that ran ahead of
+any scope lookup. SLS 2 puts a definition (level 1, inherited ones included)
+and an explicit import (level 2) above the `scala._` / `java.lang._` wildcards
+every source carries (level 3), so a `trait Int` in an enclosing template hides
+`scala.Int`. The standard library writes exactly that:
+
+```scala
+private[collection] object BitOperations {
+  trait Int { type Int = scala.Int; def zero(i: Int, mask: Int) = (i & mask) == 0; … }
+  object Int extends Int
+}
+```
+
+`object Int extends Int` therefore took its parent to be `scala.Int` and
+compiled -- with **no error and no warning** -- to `extends java.lang.Integer`.
+Only `javap` showed it:
+
+```
+public final class Ops$V$ extends java.lang.Integer   // ours, before
+public class        Ops$V$ implements Ops$Int         // scalac 2.13.16
+```
+
+`import BitOperations.Int._` then offered nothing, which is the whole of
+`TreeSeqMap`'s eleven `not found: value zero / mask / hasMatch /
+highestOneBit`. The reported symptom was in a *different file* from the root,
+and the root was in a construct that raised no diagnostic of its own.
+
+`Checker::builtin_type_shadowed` now asks the scope first, and only for the
+builtin names. It defers to the builtin unless `type_bind_rank` says the name
+is bound at `Definition` or `Explicit` -- the two levels that outrank the
+wildcard -- and unless every symbol the lookup found is one the `scala` or
+`java.lang` package supplies. That second filter is what keeps the library's
+*own* `src/library/scala/Int.scala` working: it declares `scala.Int` at level 1
+in its own compilation unit, that symbol **is** the builtin, and a reference to
+it has to stay `Type::Int` rather than becoming a `Type::Class`
+(`SymbolTable::is_prelude_scope_type`, an owner test rather than identity
+against `int_sym`, for exactly that reason).
+
+### Found here, not fixed here: `import <object>._` of an *inherited* member
+
+Narrowing (b) turned up a live, unrelated miscompilation that predates this
+slice and is reachable on `main` without any of it:
+
+```scala
+object Ops { trait IntT { def zero(i: Int, m: Int) = (i & m) == 0 }; object IntT extends IntT }
+object Main { import Ops.IntT._; def main(a: Array[String]): Unit = println(zero(4, 3)) }
+// java.lang.ClassCastException: class Main$ cannot be cast to class Ops$IntT
+```
+
+It compiles clean and throws at run time. `javap -c` shows `aload_0; checkcast
+Ops$IntT; invokeinterface` where scalac emits `getstatic Ops$IntT$.MODULE$;
+invokevirtual`. Only members the object **inherits** are affected -- one it
+declares itself is owned by the module class, so the backend's `getstatic
+MODULE$` path fires and the call is correct.
+
+The mechanism is that `check_name::import_named` records the object an
+inherited member was imported through (`remember_named_import_prefix`, whose
+doc comment describes this same `ClassCastException` for
+`import scala.util.Random.nextInt`) and `qualify_term_import` rewrites the bare
+`Ident` back into a `Select`; `import_wildcard` does none of this and is not
+even passed the prefix tree. A single record per wildcard import is probably
+enough, since `term_import_prefix_for` already matches through
+`inherits_from`. It is not folded in here: it is a third root, it touches
+`implicit_candidate_ty` and so the implicit-search seam, and keying on the
+module class re-opens the `Any`/`AnyRef`/`AnyVal`/`Object` exclusion that
+`import_named` makes explicitly.
+
+This slice does not make any *emitted* artifact worse: the library measure
+still ends with 586 errors, so `TreeSeqMap` is nowhere near being emitted, and
+no other measure moved.
+
+`crates/cli/tests/unqname.rs`, six tests, fixtures `unqname` and
+`unqname_bad`. The positive fixture is **run**, not merely compiled, and its
+expected output is produced again by real scalac 2.13.16 in the same suite.
+`unqname_shadowed_parent_is_the_local_trait` asserts the parent with `javap`
+against both compilers, because a compile is not evidence for a root whose
+failure mode was silent.

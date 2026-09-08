@@ -10,7 +10,7 @@
 
 use crate::check::*;
 use crate::implicits::ImplicitSearch;
-use crate::symbol::{SymKind, SymbolTable};
+use crate::symbol::{BindRank, SymKind, SymbolTable};
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
@@ -3522,24 +3522,57 @@ impl Typer {
         }
     }
 
+    /// The `scala._` / `java.lang._` wildcard imports every source carries
+    /// supply `Int`, `String`, `Object` and the rest. That is SLS 2's level 3,
+    /// so a definition (level 1, including an inherited one) or an explicit
+    /// import (level 2) of the same simple name *hides* them.
+    ///
+    /// This used to be decided by the name alone, ahead of any scope lookup,
+    /// and the standard library's own
+    /// `object BitOperations { trait Int … ; object Int extends Int }` is what
+    /// the miss costs: `object Int extends Int` took its parent to be
+    /// `scala.Int` and compiled, silently, to `extends java.lang.Integer`, so
+    /// `import BitOperations.Int._` offered nothing and `TreeSeqMap` reported
+    /// `not found: value zero` five times over. There was no diagnostic
+    /// anywhere -- only `javap` showed it.
+    ///
+    /// scala/scala's `src/library` declares `scala.Int` itself, at level 1 in
+    /// its own compilation unit; that symbol *is* the builtin and a reference
+    /// to it must stay `Type::Int`, which is what
+    /// [`SymbolTable::is_prelude_scope_type`] filters out here.
+    fn builtin_type_shadowed(&self, name: &str) -> bool {
+        if !matches!(
+            self.st.type_bind_rank(name),
+            Some(BindRank::Definition | BindRank::Explicit)
+        ) {
+            return false;
+        }
+        let found = self.st.lookup_type(name);
+        !found.is_empty() && found.iter().all(|&id| !self.st.is_prelude_scope_type(id))
+    }
+
     fn resolve_type_name(&self, name: &str, args: &[Type]) -> Type {
-        match name {
-            "Int" => Type::Int,
-            "Long" => Type::Long,
-            "Double" => Type::Double,
-            "Float" => Type::Float,
-            "Boolean" => Type::Boolean,
-            "Byte" => Type::Byte,
-            "Short" => Type::Short,
-            "Unit" => Type::Unit,
-            "Char" => Type::Char,
-            "String" => Type::String,
-            "Any" => Type::Any,
-            "AnyRef" => Type::AnyRef,
-            "AnyVal" => Type::AnyVal,
-            "Nothing" => Type::Nothing,
-            "Null" => Type::Null,
-            "Object" => Type::AnyRef,
+        let builtin = match name {
+            "Int" => Some(Type::Int),
+            "Long" => Some(Type::Long),
+            "Double" => Some(Type::Double),
+            "Float" => Some(Type::Float),
+            "Boolean" => Some(Type::Boolean),
+            "Byte" => Some(Type::Byte),
+            "Short" => Some(Type::Short),
+            "Unit" => Some(Type::Unit),
+            "Char" => Some(Type::Char),
+            "String" => Some(Type::String),
+            "Any" => Some(Type::Any),
+            "AnyRef" => Some(Type::AnyRef),
+            "AnyVal" => Some(Type::AnyVal),
+            "Nothing" => Some(Type::Nothing),
+            "Null" => Some(Type::Null),
+            "Object" => Some(Type::AnyRef),
+            _ => None,
+        };
+        match builtin {
+            Some(t) if !self.builtin_type_shadowed(name) => t,
             _ => {
                 let found = self.st.lookup_type(name);
                 // Prefer the class of a case-class/companion pair (`Point` vs `Point$`).
@@ -3568,6 +3601,11 @@ impl Typer {
                             args: args.to_vec(),
                         },
                     }
+                } else if let Some(t) = builtin {
+                    // The shadowing binding was of a kind this arm does not
+                    // answer with. A placeholder `Type::Named { name: "Int" }`
+                    // would be far worse than the builtin, so keep the builtin.
+                    t
                 } else {
                     Type::Named {
                         name: name.into(),

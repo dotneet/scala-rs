@@ -1784,6 +1784,21 @@ impl SymbolTable {
         Vec::new()
     }
 
+    /// Whether `id` is a type the `scala._` / `java.lang._` wildcard imports
+    /// every source carries would supply -- the owner test, not identity
+    /// against `int_sym` and friends, because scala/scala's own `src/library`
+    /// declares `scala.Int`, `scala.Any` and the rest as ordinary source
+    /// classes and a reference to *those* must still resolve to the builtin
+    /// `Type`. Used by `Checker::builtin_type_shadowed`, which is the only
+    /// caller and only ever asks about the fixed set of builtin simple names.
+    pub fn is_prelude_scope_type(&self, id: SymbolId) -> bool {
+        let owner = self.get(id).owner;
+        if owner.is_none() {
+            return false;
+        }
+        owner == self.scala_pkg || self.get(owner).jvm_name == "java/lang"
+    }
+
     /// Look a name up in the *type* namespace. Scala keeps terms and types in
     /// separate namespaces, so `val F = asyncF` inside a class parameterized by
     /// `F[_]` must not hide the type parameter from `val u: F[Unit]`. A scope

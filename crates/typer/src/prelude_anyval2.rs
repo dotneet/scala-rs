@@ -96,6 +96,23 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
         Type::Boolean,
         Intrinsic::Ne,
     );
+    // `java.lang.Object`'s monitor methods. nsc declares them on `scala.AnyRef`
+    // (`final def wait(): Unit`, `wait(Long)`, `wait(Long, Int)`, `notify()`,
+    // `notifyAll()`), so every reference -- `this.wait()`, `o.notifyAll()` and
+    // the bare `wait()` inside a class body alike -- finds them as ordinary
+    // inherited members. They were simply absent here, which is why
+    // `scala/concurrent/{Channel,SyncVar}.scala` reported `not found: value
+    // wait`. `anyref_sym`'s JVM name is already `java/lang/Object`, so the call
+    // comes out as the `invokevirtual java/lang/Object.wait…` scalac emits.
+    for (name, params) in [
+        ("wait", vec![]),
+        ("wait", vec![Type::Long]),
+        ("wait", vec![Type::Long, Type::Int]),
+        ("notify", vec![]),
+        ("notifyAll", vec![]),
+    ] {
+        method(st, anyref, name, params, Type::Unit, Intrinsic::None);
+    }
 }
 pub(crate) fn add_int_members(st: &mut SymbolTable) {
     let c = st.int_sym;
