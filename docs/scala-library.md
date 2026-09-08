@@ -2590,6 +2590,104 @@ required: A` (8), and `found: Array[AnyRef] required: Array[Any]` /
 **variance**, not construction: `Array` is invariant and the receiver these
 appear on is `ArrayOps`, so they are a separate question from this slice's.
 
+## The `agent/pkgobjdup` slice: a package object supplies, the package does not
+
+**852 errors in 145 files -> 836 in 143**, measured on this branch against the
+same tree at `25aeabde` measured with a binary built from it (852/145, which is
+`tests/BASELINE.md`'s figure). cats **182 -> 182** in 71 files, gitbucket
+**270 -> 270** in 79, slick `errors=0 files_with_errors=0 classes=1490` with
+all 1490 class files **byte-identical** (`SLICK_OUT` on both binaries,
+`diff -r` empty). Sixteen errors go and **not one new one arrives**: the
+before/after error multisets differ by deletions only.
+
+The brief was the eight `Nil`/`List` lines `agent/siblingover` split off as
+"not sibling overrides -- a supply-seam question, untouched". It was right.
+
+### One name, two routes, no `extends` relation between them
+
+`fromSpecific(Nil)` in `Iterable.scala` 215 offered two candidates:
+
+```
+sym=53    Nil  kind=Module owner=scala(Package)      jvm=scala/collection/immutable/Nil$
+sym=20049 Nil  kind=Term   owner=package$(ModuleClass) ty=ModuleRef(10498)
+```
+
+The first is the prelude's `scala.Nil`; the second is what
+`src/library/scala/package.scala` writes as `val Nil =
+scala.collection.immutable.Nil`, folded into the package because a package
+object's members *are* the package's members (SLS 9.3). `10498` is the source
+`case object Nil` from `List.scala`, so both print `Nil$` and neither
+`drop_overridden` rule can order them -- a package and a package-object class
+stand in no `extends` relation, and none should be invented. **The repeated
+type in the display is what duplicate supply looks like**, and
+`agent/siblingover`'s instrumentation had already ruled out the
+cancelling-rules mechanism (zero empty-`kept` events across the whole run).
+
+### nsc's answer: the package object's entry replaces the package's
+
+`Symbols.openPackageModule` unlinks the package's existing decl under every
+name the package object declares, and only then enters the package object's
+members; its comment ("todo: handle overlapping definitions in some way ...
+For now the symbol in the package module takes precedence") says it is
+provisional, and scalac 2.13.16 is measurably that way round. Three programs
+say so, and all three are in `tests/fixtures/pkgobjdup_pkgobject*.scala`:
+
+  * `package p { object Impl }` beside `package object p { val Impl: Int = 42 }`
+    compiles and prints **42** -- the object is gone from that name;
+  * writing `val Impl = p.Impl` instead is **"recursive value Impl needs
+    type"**, which is only possible if the `val` *is* the `p.Impl` its own
+    right-hand side names;
+  * `outer.Payload.tag`, where `Payload` is the package's object and the
+    package object declares `val Payload = inner.Payload`, is **"value tag is
+    not a member of object inner.Payload"**.
+
+`SymbolTable::fold_package_object_members` is that rule, called from both
+places the fold happens (`namer_module`'s eager one and `check.rs`'s
+`pending_pkg_folds`, which redoes it once parents are resolved).
+
+### The two halves that were each measured
+
+  * **Both namespaces, separately.** `scala/package.scala` writes `type
+    List[+A] = scala.collection.immutable.List[A]` *and* `val List =
+    scala.collection.immutable.List`. With only the term half the count went
+    852 -> 847: `var res: List[Any] = Nil` then read `List` as the prelude's
+    class and `Nil` as the package object's `val`, whose `case object Nil
+    extends List[Nothing]` names the **source** `List`, and the two do not
+    conform (`found: Nil$ required: List[Any]`, four of them). Conversely a
+    name unlinked in one namespace must stay in the other: the fixture's
+    `object Thing` survives a package object's `type Thing`, and prints, as it
+    does under scalac.
+
+  * **Two passes, not one.** Unlinking as each member is folded has the package
+    object's *own* alternatives remove each other -- `package object math`'s
+    `def abs(x: Int)` and `def abs(x: Double)` are one such pair -- and the
+    library went **836 -> 924**, twenty of them `found: Double required: Int`.
+    The unlink pass therefore runs over the package's pre-existing members
+    only, exactly as nsc's does.
+
+Only a *prelude* victim is added to `prelude_shadowed`: a displaced source or
+classfile symbol has lost a name, not its identity, and `find_class_by_jvm`
+still has to answer with it or its class file stops being loadable.
+
+### What else moved
+
+All eight `<overload Nil$ | Nil$>` / `<overload List$ | List$>` lines are gone,
+and with them eight more that were downstream of the wrong `List`
+(`value corresponds is not a member of List[OptManifest[_]]`, `found:
+List[Nothing] required: List[A]`, `pattern type List[_] is incompatible with
+scrutinee type Seq[_]`, `value :: is not a member of Any`, ...). **No
+`<overload X | X>` -- the same type printed twice -- is left in the log**; the
+51 remaining `<overload ...>` displays are all genuine alternative sets.
+
+### The head after this slice (836)
+
+`type mismatch` 365, `no matching overload` 146, `X is not a member of Y` 140,
+`no matching overload for constructor` 31, `not found: value` 27, `ambiguous
+overload` 15, `illegal inheritance` 11, `incompatible type in overriding` 9.
+The `is not a member of` receivers are `T2` (17), `String` (10), `T1` (9),
+`Int` (6) and `INodeBase` (5) -- the prelude collision named at the top of this
+file, unmoved, and `CC` is no longer among them.
+
 ## Running it
 
 ```
