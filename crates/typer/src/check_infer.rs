@@ -3169,11 +3169,17 @@ impl Typer {
             TreeKind::Apply { args, .. } => std::mem::take(args),
             _ => Vec::new(),
         };
+        // By simple name first, then by the class itself: `new Array(n)` reads
+        // its element from the *expected type*, so a file that never writes
+        // `ClassTag` — and so never imports it — can still land here, and
+        // reporting "unimplemented" for what is really nsc's
+        // `neg/t2775` diagnosis hid a correct rejection behind a wrong word.
         let Some(ct_cls) = self
             .st
             .lookup("ClassTag")
             .into_iter()
             .find(|s| self.st.get(*s).kind == SymKind::Class)
+            .or_else(|| self.st.find_class_by_jvm("scala/reflect/ClassTag"))
         else {
             self.error(
                 span,

@@ -17,6 +17,51 @@ impl Typer {
     /// variables must not still be in scope when this one weighs its own
     /// alternatives. The body has many exits, so the set is saved and restored
     /// here rather than at each of them.
+    /// The element of an expected type that is an array, whichever of the two
+    /// spellings it arrives in.
+    ///
+    /// `Type::Array` is the usual one; `Type::Class { sym: Array }` is what a
+    /// run that compiles the library's own `scala/Array.scala` produces, since
+    /// the source class shadows the prelude's (`SymbolTable::is_array_class`).
+    pub(crate) fn array_elem_expected(&self, ty: &Type) -> Option<Type> {
+        match strip_annotations(ty) {
+            Type::Class { sym, args } if args.len() == 1 && self.st.is_array_class(*sym) => {
+                Some(args[0].clone())
+            }
+            other => array_elem_of(other),
+        }
+    }
+
+    /// `new Array(n)` written with no type argument, whose element came out
+    /// `Nothing` because nothing had yet said what it should be.
+    ///
+    /// nsc leaves that constructor's `T` *undetermined* until the expression is
+    /// checked against the position it sits in, so `new C[K, V](0, new
+    /// Array(0), gen)` (`concurrent/TrieMap.scala`) reads the element off the
+    /// constructor parameter. This compiler solves `T` at the `New` itself, so
+    /// an argument position — the one place the expected type arrives *after*
+    /// the argument has been typed — has to ask again. Keyed on the written
+    /// syntax, not on the type: an `Array[Nothing]` that some other expression
+    /// really has is not re-typed.
+    pub(crate) fn is_open_array_new(&self, a: &Tree) -> bool {
+        let TreeKind::Apply { fun, .. } = &a.kind else {
+            return false;
+        };
+        let TreeKind::New { tpt } = &fun.kind else {
+            return false;
+        };
+        matches!(&tpt.kind, TreeKind::Ident { .. })
+            && self.st.is_array_class(tpt.sym)
+            && matches!(self.array_elem_expected(&a.ty), Some(Type::Nothing))
+    }
+
+    /// Whether re-typing this argument against `p` can give a `new Array(n)`
+    /// the element it is still missing.
+    pub(crate) fn array_new_wants(&self, a: &Tree, p: &Type) -> bool {
+        !matches!(self.array_elem_expected(p), None | Some(Type::Nothing))
+            && self.is_open_array_new(a)
+    }
+
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
@@ -411,7 +456,7 @@ impl Typer {
                         p = self.st.subst_tparams(c, &inferred_args, &p);
                     }
                 }
-                if a.ty.is_no_type() {
+                if a.ty.is_no_type() || self.array_new_wants(a, &p) {
                     self.type_expr(a, &p);
                 }
                 if !p.is_no_type() {

@@ -2994,6 +2994,27 @@ impl SymbolTable {
         }
     }
 
+    /// True for `scala.Array` as a *class symbol*.
+    ///
+    /// `array_sym` alone is not enough. When the standard library's own
+    /// `src/library/scala/Array.scala` is one of the sources under
+    /// compilation, `shadow_supplied_by_source` takes the prelude's `Array`
+    /// out of every scope and puts the source class there instead, but
+    /// deliberately leaves `array_sym` pointing at the prelude symbol —
+    /// its id is written into prelude signatures that are still in use.
+    /// So `new Array(n)` in that run names a symbol that *is* `scala.Array`
+    /// and is not `array_sym`, and asking only about `array_sym` answered
+    /// "no" for every one of the library's own 64 `new Array(n)`s.
+    pub fn is_array_class(&self, sym: SymbolId) -> bool {
+        if sym.is_none() {
+            return false;
+        }
+        sym == self.array_sym
+            || (self.get(sym).name == "Array"
+                && self.get(sym).owner == self.scala_pkg
+                && self.get(sym).kind == SymKind::Class)
+    }
+
     /// How many type parameters a class declares.
     ///
     /// `scala.Array` is the one class whose parameter is not in the symbol
