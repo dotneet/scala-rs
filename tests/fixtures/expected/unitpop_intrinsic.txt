@@ -1,0 +1,32 @@
+()
+()
+side a3
+()
+()
+pair ()()
+side a6
+()
+()
+k
+7
+n
+ev
+6
+side s1t
+side s2
+side s2t
+side s3t
+side s4t
+side s5
+side s5t
+side s6t
+side s7f
+side s8
+side s8f
+side s9f
+side s10f
+side s11t
+side s12-0
+side s12-1
+side s14
+done

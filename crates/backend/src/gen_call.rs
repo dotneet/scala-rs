@@ -689,11 +689,7 @@ pub(crate) fn gen_predef_poly(
             name,
             "(Ljava/lang/Object;)Ljava/lang/Object;",
         );
-        if is_unit_like(result_ty) {
-            asm.pop();
-        } else {
-            maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty));
-        }
+        predef_poly_result(asm, ctx, result_ty);
         return;
     };
     gen_expr(asm, frame, ctx, a);
@@ -713,17 +709,40 @@ pub(crate) fn gen_predef_poly(
         name,
         "(Ljava/lang/Object;)Ljava/lang/Object;",
     );
+    predef_poly_result(asm, ctx, result_ty);
+}
+
+/// What `gen_predef_poly` leaves on the stack: **always a value**, exactly as
+/// the `(Object)Object` descriptor promises.
+///
+/// This used to read `if is_unit_like(result_ty) { asm.pop() }`. A `Unit`
+/// result is the one case where the erased descriptor still returns a
+/// reference — `Predef.identity(())` hands back `BoxedUnit.UNIT` — and popping
+/// it was right only when the call was a *statement*. Wherever the value was
+/// wanted, the caller was handed an empty stack:
+/// `println(identity(()))` compiled and threw
+/// `VerifyError: Operand stack underflow` at run time, because
+/// `gen_predef_println` had already been told by `unit_leaves_boxed_ref` that
+/// the argument left a reference behind.
+///
+/// nsc leaves the `BoxedUnit` here too (`javap`: `invokevirtual identity;
+/// invokevirtual println`) and lets the generic statement-position discard in
+/// `gen_stat` drop it — see `gen_expr::discarded_predef_poly`, which answers
+/// the dispatch question `gen_expr::predef_poly_name` asks, so the two cannot
+/// disagree about which calls this emitter claims.
+fn predef_poly_result(asm: &mut Assembler, ctx: &EmitCtx, result_ty: &Type) {
     if is_unit_like(result_ty) {
-        asm.pop();
-    } else {
-        // `Predef.identity` / `locally` / `implicitly` all erase to
-        // `(Object)Object`, so the result needs the same coercion any other
-        // erased call site gets. Without it a `putfield`/`invokevirtual` on a
-        // *class*-typed result fails the verifier ("Bad type on operand
-        // stack"). An interface-typed one used to slip through only because
-        // the JVM verifier does not check interface types.
-        maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty));
+        // nsc emits no cast at all: the value flows on as the `Object` the
+        // descriptor returns, and `BoxedUnit` is what it really is.
+        return;
     }
+    // `Predef.identity` / `locally` / `implicitly` all erase to
+    // `(Object)Object`, so the result needs the same coercion any other
+    // erased call site gets. Without it a `putfield`/`invokevirtual` on a
+    // *class*-typed result fails the verifier ("Bad type on operand
+    // stack"). An interface-typed one used to slip through only because
+    // the JVM verifier does not check interface types.
+    maybe_unbox_erased_result(asm, ctx, PREDEF_POLY_DESC, Some(result_ty));
 }
 
 pub(crate) fn gen_predef_assert_require(
