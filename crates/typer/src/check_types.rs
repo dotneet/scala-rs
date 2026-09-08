@@ -3091,7 +3091,7 @@ impl Typer {
             .iter()
             .map(|&m| crate::pickle_supply::flat_erased_params(&self.st, &self.st.get(m).ty))
             .collect();
-        if !self.declares_other_signature(cls, name, &have) {
+        if !self.ancestor_declares_other_signature(cls, name, &have, found) {
             return;
         }
         if self.supply_from_pickle_class(cls, name).is_empty() {
@@ -3101,6 +3101,40 @@ impl Typer {
         if now.iter().any(|&m| self.st.get(m).owner == cls) {
             *found = now;
         }
+    }
+
+    /// [`Self::declares_other_signature`], asked of the receiver's class *and*
+    /// of every ancestor more derived than the answer already in hand.
+    ///
+    /// A trait declares nothing in its own class file that a `Ops` trait
+    /// declares for it: `scala/collection/immutable/SortedMap.class` has no
+    /// `map`, no `collect` and no `keySet` -- they are declared by
+    /// `collection.SortedMapOps`, which `immutable.SortedMap` inherits. So
+    /// asking `cls` alone answers "no" for exactly the family this guard
+    /// exists to admit, and `aSortedMap.map(f)` kept whatever a plain
+    /// `aMap.map(f)` earlier in the run had installed on `collection.MapOps`.
+    ///
+    /// The walk stops at the first class that already owns a candidate: past
+    /// that point a declaration is not *newer* than the answer in hand, it
+    /// *is* the answer in hand or something it overrides, and going further
+    /// would re-complete every receiver in the library.
+    fn ancestor_declares_other_signature(
+        &mut self,
+        cls: SymbolId,
+        name: &str,
+        have: &[Vec<Option<String>>],
+        found: &[SymbolId],
+    ) -> bool {
+        let owners: Vec<SymbolId> = found.iter().map(|&m| self.st.get(m).owner).collect();
+        for c in crate::lin::linearize(&self.st, cls) {
+            if owners.contains(&c) {
+                return false;
+            }
+            if self.declares_other_signature(c, name, have) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether `cls`'s own classfile declares an instance method `name` whose
