@@ -1483,29 +1483,33 @@ while replacing the method, the receiver and — in slick's case — an argument
 
 ### The numbers
 
-`tests/verify_merge.sh` at `8539ff65`, this branch with `main` merged in twice
-while it ran (`agent/neglit`, then `agent/pickleparams`):
+`tests/verify_merge.sh` at `38905f33`, this branch with `main` merged in three
+times while it ran (`agent/neglit`, `agent/pickleparams`, `agent/negchecks`):
 
-| check | branch point `acec3f09` | merged tree `8539ff65` |
+| check | branch point `acec3f09` | merged tree `38905f33` |
 |---|---|---|
-| scala library | `971 / 147` | `970 / 147` |
+| scala library | `971 / 147` | `917 / 146` |
 | gitbucket | `270 / 79` | `270 / 79` |
 | cats | `185 / 71` | `185 / 71` |
 | slick (compile) | `errors=0 files_with_errors=0 classes=1490` | same |
 | `slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 attempts=36/36` | same |
 | subset + lint | — | `verified=1490 failed=0 lint_problems=0` |
-| `cargo test --workspace --release` | — | `257 rows, 2478 passed, 0 failed` |
-| corpus (full) | — | `pos 1095 / neg 670 / run 626` |
+| `cargo test --workspace --release` | — | `259 rows, 2487 passed, 0 failed` |
+| corpus (full) | — | `pos 1095 / neg 673 / run 626` |
 
-Everything that moved belongs to the other two slices, and there is a
-measurement for that rather than an assumption: a gate run on this branch
-*before* either merge reported `971 / 147` with the print fix already in, and
-the corpus was identical row for row — all 5324 of them, in all three kinds —
-between an unmodified `acec3f09` build and this change.
+**None of the movement is this change's**, and there is a measurement for that
+rather than an assumption: a gate run on this branch *before* any of the three
+merges reported `971 / 147`, `270 / 79`, `185 / 71` and `classes=1490` with the
+print fix already in — every figure the brief gave for `acec3f09` — and the
+corpus was identical row for row, all 5324 of them in all three kinds, between
+an unmodified `acec3f09` build and this branch.
 
-`VERDICT=FAIL` on all three gate runs, always for `corpus losses=4` against
-`tests/baselines/corpus-4d613d25.tsv` — the four `agent/libnotype` losses named
-above, which the ledger predates. Nothing else fails in any of them.
+`VERDICT=FAIL` on all four gate runs, always and only for `corpus losses`
+against `tests/baselines/corpus-4d613d25.tsv`, which the ledger predates: four
+in the first three runs — exactly the four `agent/libnotype` declared — and one
+in the last, `neg/name-lookup-stable`, after `agent/negchecks` restored the
+other three. No loss outside that set appeared in any run, and no `pos` or
+`run` loss in any of them.
 
 ### Not fixed here, same root
 
