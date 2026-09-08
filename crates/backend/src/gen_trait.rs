@@ -1638,8 +1638,8 @@ impl<'a> Gen<'a> {
     /// `Ordered.compare(Object)`. Emit a public bridge that checkcasts.
     /// A case class's `toString` / `equals` / `hashCode` / `canEqual`. nsc
     /// synthesizes these from the constructor fields; a hand-written one wins.
-    /// `hashCode` folds with 31 rather than nsc's MurmurHash3, so it agrees
-    /// with `equals` without depending on `scala.runtime`.
+    /// `hashCode` is nsc's MurmurHash3 under `--scala-library` and the
+    /// 31-fold under `--no-scala-library`; see `emit_case_hash_code`.
     pub(crate) fn emit_case_object_methods(&self, b: &mut ClassBuilder, class_id: SymbolId) {
         if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
             return;
@@ -1838,23 +1838,7 @@ impl<'a> Gen<'a> {
         }
 
         if !defined.contains("hashCode") {
-            let fi = field_info.clone();
-            let cj = class_jvm.clone();
-            b.add_code(ACC_PUBLIC, "hashCode", "()I", 2, |asm| {
-                asm.iconst(0);
-                for (name, ty, desc) in &fi {
-                    asm.iconst(31);
-                    asm.imul();
-                    asm.aload(0);
-                    asm.getfield(&cj, name, desc);
-                    if is_jvm_primitive(ty) && !erases_to_boxed_unit(ty) {
-                        emit_box(asm, ty);
-                    }
-                    asm.invokestatic("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I");
-                    asm.iadd();
-                }
-                asm.ireturn();
-            });
+            emit_case_hash_code(b, &class_jvm, &field_info, &field_vc, self.library_abi);
         }
     }
 
@@ -3083,4 +3067,209 @@ impl<'a> Gen<'a> {
             b.sign_last_accessor(self.sig_of(stt.sym), true);
         }
     }
+}
+
+/// nsc's `scala.util.hashing.MurmurHash3` seed for a `Product`
+/// (`MurmurHash3.productSeed`, read back as the `ldc` at the head of every
+/// case class `hashCode` scalac emits).
+const PRODUCT_SEED: i32 = -889275714;
+
+/// A *primitive value type* in nsc's sense (`definitions.isPrimitiveValueType`,
+/// i.e. a member of `ScalaValueClasses`). `Unit` counts; `Null`, `Nothing`, a
+/// user value class and every reference type do not. This is exactly the
+/// predicate `SyntheticMethods.chooseHashcode` tests, so it decides which of
+/// nsc's two `hashCode` shapes a case class gets.
+fn is_primitive_value_type(ty: &Type) -> bool {
+    matches!(
+        ty.widen_constant(),
+        Type::Unit
+            | Type::Boolean
+            | Type::Byte
+            | Type::Short
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Char
+    )
+}
+
+/// A case class's `hashCode`.
+///
+/// **Library mode (`--scala-library`) reproduces nsc exactly**, which matters
+/// because a case class we compile and one scalac compiles end up in the same
+/// `HashMap`. Read off `javap -p -c` of real scalac 2.13.16, nsc has *two*
+/// shapes and picks between them in `SyntheticMethods.chooseHashcode`:
+///
+/// * if **no** case accessor has a primitive value type — `case class Zero()`,
+///   `OnlyStr(s: String)`, `Cell[T](t: T)`, `AnyF(a: Any)`, `Arr(a: Array[Int])`,
+///   `Box(m: Meters, b: String)` where `Meters extends AnyVal` — it forwards to
+///   `ScalaRunTime$.MODULE$._hashCode(this)`, which is
+///   `MurmurHash3.productHash` over `productArity` / `productElement`;
+/// * otherwise it writes the mix chain out: seed `productSeed`, mix in
+///   `this.productPrefix.hashCode`, mix in one `Int` per field, then
+///   `Statics.finalizeHash(h, arity)`.
+///
+/// The two agree by construction (`productHash` hashes each element with `##`,
+/// which is what the per-field cases below spell out), so the split is a
+/// bytecode-fidelity question rather than a value one — but reproducing it is
+/// what makes `javap` output match scalac's for the same source.
+///
+/// Per field, nsc's `hashcodeImplementation`:
+/// `Unit`/`Null` → the constant `0`; `Boolean` → `1231`/`1237`; `Int`, and
+/// `Byte`/`Short`/`Char` widened to it → the value itself; `Long`/`Double`/
+/// `Float` → `Statics.longHash`/`doubleHash`/`floatHash` (so `1.0.##` and
+/// `1.##` agree); anything else → `Statics.anyHash`. A field of value-class
+/// type is stored unboxed here but *hashed as an instance* — nsc emits
+/// `new Meters(this.m())` before `anyHash`, the same wrapping `toString` and
+/// `productElement` do, and it has to: the box's own `hashCode` is what
+/// `productHash` would otherwise see.
+///
+/// **Private-runtime mode (`--no-scala-library`) keeps the 31-fold.**
+/// `scala.runtime.Statics` and `scala.runtime.ScalaRunTime$` are library
+/// classes; the private runtime has neither, and nothing in that mode ever
+/// meets a scalac-compiled case class, so there is no hash to agree with. The
+/// 31-fold agrees with our `equals` and is stable within a run, which is all
+/// that mode needs. Its numbers therefore differ from scalac's **by design**
+/// and are pinned separately.
+fn emit_case_hash_code(
+    b: &mut ClassBuilder,
+    class_jvm: &str,
+    field_info: &[(String, Type, String)],
+    field_vc: &[Option<(String, String)>],
+    library_abi: bool,
+) {
+    if !library_abi {
+        let fi = field_info.to_vec();
+        let cj = class_jvm.to_string();
+        b.add_code(ACC_PUBLIC, "hashCode", "()I", 2, |asm| {
+            asm.iconst(0);
+            for (name, ty, desc) in &fi {
+                asm.iconst(31);
+                asm.imul();
+                asm.aload(0);
+                asm.getfield(&cj, name, desc);
+                if is_jvm_primitive(ty) && !erases_to_boxed_unit(ty) {
+                    emit_box(asm, ty);
+                }
+                asm.invokestatic("java/util/Objects", "hashCode", "(Ljava/lang/Object;)I");
+                asm.iadd();
+            }
+            asm.ireturn();
+        });
+        return;
+    }
+
+    // nsc's `chooseHashcode`: no primitive-valued accessor (a zero-field case
+    // class included) means the whole thing goes to the runtime.
+    //
+    // A value-class field is **not** primitive here even though `field_info`
+    // records it by its erased underlying type (`Meters` over `Int` is stored
+    // as `I`): nsc tests the *declared* type, and `Meters` is not a member of
+    // `ScalaValueClasses`. `field_vc` is the only thing that still knows, so it
+    // has to be consulted first — exactly as `toString` and `productElement`
+    // consult it. Getting this wrong sent `case class Box(m: Meters, b: String)`
+    // down the inline chain, where nsc sends it to the runtime.
+    if !field_info
+        .iter()
+        .zip(field_vc.iter().chain(std::iter::repeat(&None)))
+        .any(|((_, ty, _), vc)| vc.is_none() && is_primitive_value_type(ty))
+    {
+        b.add_code(ACC_PUBLIC, "hashCode", "()I", 1, |asm| {
+            asm.getstatic(
+                "scala/runtime/ScalaRunTime$",
+                "MODULE$",
+                "Lscala/runtime/ScalaRunTime$;",
+            );
+            asm.aload(0);
+            asm.invokevirtual(
+                "scala/runtime/ScalaRunTime$",
+                "_hashCode",
+                "(Lscala/Product;)I",
+            );
+            asm.ireturn();
+        });
+        return;
+    }
+
+    let fi = field_info.to_vec();
+    let fvc = field_vc.to_vec();
+    let cj = class_jvm.to_string();
+    let arity = field_info.len() as i32;
+    b.add_code(ACC_PUBLIC, "hashCode", "()I", 2, |asm| {
+        asm.iconst(PRODUCT_SEED);
+        asm.istore(1);
+        // `Statics.mix(h, this.productPrefix.hashCode)`. nsc calls the accessor
+        // rather than folding the name in at compile time, so a hand-written
+        // `productPrefix` changes the hash here exactly as it does there.
+        asm.iload(1);
+        asm.aload(0);
+        asm.invokevirtual(&cj, "productPrefix", "()Ljava/lang/String;");
+        asm.invokevirtual("java/lang/String", "hashCode", "()I");
+        asm.invokestatic("scala/runtime/Statics", "mix", "(II)I");
+        asm.istore(1);
+        for (i, (name, ty, desc)) in fi.iter().enumerate() {
+            asm.iload(1);
+            // A value-class field first, before the type match: it is *stored*
+            // as its underlying primitive but *hashed as an instance*.
+            if let Some(Some((internal, ctor))) = fvc.get(i) {
+                asm.new_obj(internal);
+                asm.dup();
+                asm.aload(0);
+                asm.getfield(&cj, name, desc);
+                asm.invokespecial(internal, "<init>", ctor);
+                asm.invokestatic("scala/runtime/Statics", "anyHash", "(Ljava/lang/Object;)I");
+                asm.invokestatic("scala/runtime/Statics", "mix", "(II)I");
+                asm.istore(1);
+                continue;
+            }
+            match ty.widen_constant() {
+                // `Unit` and `Null` have one inhabitant each, so nsc folds
+                // them to the constant and never reads the field.
+                Type::Unit | Type::NoType | Type::Null => asm.iconst(0),
+                Type::Boolean => {
+                    let f = asm.fresh_label();
+                    let end = asm.fresh_label();
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    asm.ifeq(f);
+                    asm.iconst(1231);
+                    asm.goto(end);
+                    asm.mark(f);
+                    asm.iconst(1237);
+                    asm.mark(end);
+                }
+                Type::Int | Type::Byte | Type::Short | Type::Char => {
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                }
+                Type::Long => {
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    asm.invokestatic("scala/runtime/Statics", "longHash", "(J)I");
+                }
+                Type::Double => {
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    asm.invokestatic("scala/runtime/Statics", "doubleHash", "(D)I");
+                }
+                Type::Float => {
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    asm.invokestatic("scala/runtime/Statics", "floatHash", "(F)I");
+                }
+                _ => {
+                    asm.aload(0);
+                    asm.getfield(&cj, name, desc);
+                    asm.invokestatic("scala/runtime/Statics", "anyHash", "(Ljava/lang/Object;)I");
+                }
+            }
+            asm.invokestatic("scala/runtime/Statics", "mix", "(II)I");
+            asm.istore(1);
+        }
+        asm.iload(1);
+        asm.iconst(arity);
+        asm.invokestatic("scala/runtime/Statics", "finalizeHash", "(II)I");
+        asm.ireturn();
+    });
 }

@@ -41,6 +41,23 @@ makes no claim of conformance to the language specification. What exists today:
 外部 trait の `hashCode` / `toString` と組み込み `Any` の上書き関係も、
 [scalac 相互運用テスト](docs/notes/inherited-universal-override.md) で検査します。
 
+`case class` に合成する `hashCode` は、`--scala-library` では nsc と**同じ値**に
+なりました。以前は両モードとも 31 倍で畳んでいたため、`Point(1, "a").hashCode` が
+scalac の `-1322997830` に対して `128` になり、自前の `equals` とは整合するものの、
+**scala-rs でコンパイルした case class と scalac でコンパイルした case class が
+違うハッシュを持つ**ため、両方が入る `HashMap` / `Map` / `Set` で引けませんでした。
+jar モードでは nsc の 2 つの本体（primitive なフィールドが 1 つも無ければ
+`ScalaRunTime$._hashCode`、あればインラインの `MurmurHash3` mix 列）をそのまま
+再現します。`--no-scala-library` では `scala.runtime.Statics` /
+`ScalaRunTime$` が存在しないので 31 倍畳みのままで、その値は**設計上異なる**ものとして
+別の期待値ファイルに固定してあります。scala-rs が case class を、実 scalac が
+それを `HashMap` に入れるプログラムをコンパイルして一緒に走らせる相互運用テストを
+含め、検証は `caseabi` テスト（`tests/fixtures/caseabi_*.scala`）にあります。
+詳細は [docs/comparison-with-scalac.md](docs/comparison-with-scalac.md) の
+「The synthesized members of a `case class`」を参照してください。
+companion の `writeReplace` と、class 側の `apply` / `unapply` / `tupled` /
+`curried` static forwarder は**未実装のまま**です。
+
 同名メソッドのオーバーライド判定は、SLS 5.1.4 のとおりパラメータ型を不変として
 扱います。型パラメータを含む型どうしは以前「同じ」と答えていたため、
 `IterableOps.concat[B >: A](suffix: IterableOnce[B])` と

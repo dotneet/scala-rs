@@ -309,12 +309,55 @@ The honest diff.
   `writeReplace` and the static forwarders nsc puts on the class for the
   companion's `apply` / `unapply` / `tupled` / `curried`; its case-accessor
   fields are `public final` where nsc's are `private final`.
-  **One synthesized body differs on purpose**: a case class's `hashCode` folds
-  the fields with 31 rather than nsc's `MurmurHash3` mix / `Statics.finalizeHash`,
-  so `Point(1, "a").hashCode` is `128` where scalac gives `-1322997830`. It
-  agrees with `equals` and is stable within a run, but it is not scalac's value,
-  and it does not depend on `scala.runtime`, which is what the private-runtime
-  mode needs. A `case object`'s `hashCode` *is* nsc's (`"Foo".hashCode`).
+  **`hashCode` is nsc's under `--scala-library` and the 31-fold under
+  `--no-scala-library`.** It used to fold with 31 in both modes, so
+  `Point(1, "a").hashCode` was `128` here and `-1322997830` under scalac:
+  consistent with our own `equals`, but a case class we compile and one scalac
+  compiles hashed differently, and any `HashMap`, `Map` or `Set` that saw both
+  missed. Under `--scala-library` the emitted body is now nsc's, and nsc has
+  *two* of them, chosen in `SyntheticMethods.chooseHashcode`:
+  - **no case accessor has a primitive value type** (`Unit` counts) — a
+    zero-field `case class Zero()`, `OnlyStr(s: String)`, `Cell[T](t: T)`,
+    `AnyF(a: Any)`, `Arr(a: Array[Int])`, and `Box(m: Meters, b: String)` where
+    `Meters extends AnyVal` — the whole method is
+    `ScalaRunTime$.MODULE$._hashCode(this)`, i.e. `MurmurHash3.productHash`
+    over `productArity` / `productElement`;
+  - **otherwise** the mix chain is written out: `ldc` `MurmurHash3.productSeed`
+    (`-889275714`), `Statics.mix` with `this.productPrefix.hashCode`, one `Int`
+    per field, then `Statics.finalizeHash(h, arity)`. Per field: `Unit` / `Null`
+    fold to the constant `0`, `Boolean` to `1231` / `1237` inline,
+    `Int` / `Byte` / `Short` / `Char` are the value itself, `Long` / `Double` /
+    `Float` go through `Statics.longHash` / `doubleHash` / `floatHash` (so
+    `1.0.##` and `1.##` agree), and everything else through `Statics.anyHash`.
+    A field of value-class type is stored unboxed but **hashed as an instance**:
+    nsc emits `new Meters(this.m())` before `anyHash`, as `toString` and
+    `productElement` also do.
+
+  The two shapes agree by construction, so the split is bytecode fidelity
+  rather than arithmetic; all 18 shapes checked, and 122 of slick's own case
+  classes, disassemble instruction-for-instruction as scalac's do (modulo
+  scala-rs reading case fields with `getfield` where nsc calls the accessor —
+  the same divergence its `equals`, `toString` and `productElement` already
+  have, and the same value).
+
+  **Under `--no-scala-library` the 31-fold stays**, because
+  `scala.runtime.Statics` and `scala.runtime.ScalaRunTime$` are library classes
+  the private runtime does not have, and nothing in that mode ever meets a
+  scalac-compiled case class. Its numbers are therefore *different by design*
+  and pinned on their own
+  (`tests/fixtures/expected/caseabi_hash_priv.txt` beside
+  `caseabi_hash.txt`); what does not change between the modes is `hashCode`'s
+  agreement with `equals`, which both expected files assert line for line. One
+  consequence of the 31-fold that mode keeps: it reaches
+  `java.util.Objects.hashCode` on the boxed field, so `AnyF(1.0)` and `AnyF(1)`
+  hash *differently* there where Scala's `##` makes them agree.
+
+  A `case object`'s `hashCode` was already nsc's (`"Foo".hashCode`) and is
+  unchanged, in both modes.
+
+  Still missing, and still on the list: the companion's `writeReplace`, and the
+  static forwarders nsc puts on the class for the companion's `apply` /
+  `unapply` / `tupled` / `curried`.
 - **AnyVal**: scalac emits both the value class's class file and the extension
   methods. scala-rs does the same: `new C(x)` erases to the underlying value and
   calls go to the `$extension` static methods. In positions that need a reference
