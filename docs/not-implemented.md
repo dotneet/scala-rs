@@ -352,3 +352,29 @@ Compiler flags (`agent/xflags`):
   the reflect surface come from the pickle like everything else, or to give
   those passes the symbol rather than the name; neither is a small change.
   Measured on `agent/basetypeargs`; `docs/cats.md` has the numbers.
+- **A SAM literal is always an anonymous class; scalac uses `invokedynamic`
+  where it can.** `crates/cli/tests/indy.rs` is the record of the split this
+  compiler makes: a `FunctionN` literal becomes `invokedynamic` +
+  `LambdaMetafactory`, everything else -- `PartialFunction`, and every SAM type
+  -- becomes a closure classfile. scalac 2.13.16 also uses `invokedynamic` for
+  a SAM type it considers a functional interface: for one file declaring
+  `Equiv[Int]`, `Ordering[Int]`, `Hashing[String]` and `Runnable` literals it
+  emits three `invokedynamic` call sites and *one* anonymous class
+  (`S$$anonfun$o$2`, for `Ordering`), so the two compilers agree on one of the
+  four. The difference is in class count and call-site shape, not in
+  behaviour; `crates/cli/tests/samconv.rs` runs the same source under both and
+  the output is identical. Measured on `agent/samconv`.
+- **`SymbolTable::sam_sig` cannot see an override the pickle has not been asked
+  for.** `PickleSupply` installs a library class's members one name at a time,
+  so an override nothing has referenced is indistinguishable from an override
+  that is not there, and a class whose sole abstract method is only sole
+  *because* of such an override reads as having two. `scala.math.Ordering` is
+  the case that mattered (`equiv`, inherited deferred from `Equiv`, overridden
+  concretely) and `Checker::sam_sig_here` handles it by reading the class's
+  concrete member names straight out of the pickle. That answers the question
+  for one class at a time, on the SAM path only. The general form -- any
+  question about a library class's member set is answered against a partial
+  set -- is untouched, and *installing* the missing members instead is not the
+  repair: doing so cost cats' `NonEmptyVector.scala` a diagnostic, because
+  completing `coll` / `toIterable` / `fromSpecific` on `Vector` changed which
+  `grouped` and `lazyZip` later expressions saw. Measured on `agent/samconv`.
