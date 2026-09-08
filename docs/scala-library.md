@@ -605,6 +605,141 @@ abstract`, 22 `` `override` modifier required``, 20 `ambiguous overload`.
    sampled were the same collision seen from the other side, and it has shrunk
    in step with everything else, which is consistent with that reading.
 5. `src/reflect` and `src/compiler` are not worth measuring yet.
+
+## The `agent/libmaxmin` slice: `Predef._` is an import, not a snapshot
+
+**1420 errors in 166 files → 1226 in 157**, measured on this branch merged with
+`main` at `f4b829ec` (`agent/gbopt`). The brief handed this slice 55 errors —
+34 `value max is not a member of Int` and 21 `value min` — together with a
+hypothesis about the pickle seam. The hypothesis was wrong in both halves, and
+saying how is most of the value of the entry.
+
+### What the brief said, and what is actually true
+
+> `Predef`, `RichInt` and `intWrapper` are being *defined* by the files under
+> compilation while also being supplied by the `--scala-library` jar the
+> measure links against, and something about that seam loses the conversion.
+
+Three measurements say otherwise.
+
+* **The measure does not link the jar.** `tests/scalalib_measure.sh` runs
+  `--no-scala-library` by default — the section "The measurement is not run
+  against the jar" above says so — and in that mode `prelude.rs` gates *both*
+  `RichInt` and `intWrapper` on `library_abi`, so neither is built at all.
+  There was no jar copy to win the seam, because there was no second copy.
+* **The source declaration is not shadowed and is not un-implicit.** Writing
+  `import scala.Predef._` by hand in the same file makes both `a xmax b` and an
+  explicit `scala.Predef.xintWrapper(a).xmax(b)` resolve. The conversion was
+  simply not in scope.
+* **It has nothing to do with `src/library`.** It reproduces in fifteen lines
+  with no library source anywhere (`crates/cli/tests/libmaxmin.rs`,
+  `source_predef_conversion_is_in_scope_everywhere`).
+
+### The cause
+
+nsc opens `java.lang._`, `scala._` and `Predef._` around every unit, and
+`Predef` there means whatever `scala.Predef` resolves to. This compiler
+modelled the third by *copying* the prelude's `Predef` members into the base
+scope at install time (`prelude::import_members`), before any source is read.
+A run whose own sources define `scala.Predef` therefore got a scope describing
+a `Predef` the program does not have.
+
+This is the same defect the `agent/preludeshadow` section records for the
+`scala._` half — "`scala._` was a snapshot, not an import" — and that slice's
+`Typer::auto_import_scala_member` fixed only that half: it enters a source
+*class or object* landing directly in package `scala`, and says nothing about
+the *members* of a source `Predef`, which is a different scope.
+`crates/typer/src/predef_reimport.rs` is the missing half. It runs from
+`check::typecheck_units` between the signature pass and the body pass — the
+members of a source `object Predef` do not exist before the signature pass, so
+this cannot be done in the namer the way `auto_import_scala_member` is.
+
+### Three things it has to get right
+
+Each was measured by getting it wrong first.
+
+| what | getting it wrong cost |
+|---|---|
+| **Replace, do not join.** A source member supersedes the prelude's snapshot of that name. | Entering them alongside made every `int2Integer` two candidates: **16** new `ambiguous implicit: X, X`, in a run that had had 2 ambiguities in total. |
+| **Do not dedupe by name.** `Predef` overloads `require` and `assert`. | Keeping only the first binding cost **17** errors reading `no matching overload for (Boolean)Unit with arguments (Boolean, String)`, across nine files — every two-argument `require`/`assert` in the library. |
+| **Record the import, not only its members.** | An inherited conversion's owner is a plain class, so codegen emitted the call on `this`: `3 bigger 7` type-checked and then died with `class Main$ cannot be cast to class scala.LowPriorityProbe`. `Typer::wildcard_module_for` recovers the receiver from a recorded wildcard — against the module **class**, because the module *value* carries no `parents` and `inherits_from` walks those. |
+
+The third is why `tests/fixtures/libmaxmin_predef.scala` is **run**, not merely
+compiled. Nothing else in this repository would have caught it: the JVM
+verifier does not object, and every compile-only measure was green.
+
+### What moved
+
+52 files improved and 3 regressed:
+
+| file | before | after |
+|---|---|---|
+| `scala/collection/immutable/ArraySeq.scala` | 32 | **5** |
+| `scala/collection/Iterator.scala` | 34 | 15 |
+| `scala/collection/View.scala` | 20 | 4 |
+| `scala/collection/concurrent/TrieMap.scala` | 66 | 51 |
+| `scala/collection/LazyZipOps.scala` | 12 | **0** |
+| `scala/math/BigDecimal.scala` | 19 | 9 |
+| `scala/collection/StringOps.scala` | 20 | 10 |
+| `scala/math/BigInt.scala` | 4 | **0** |
+| `scala/annotation/elidable.scala` | 2 | **13** |
+| `scala/concurrent/Future.scala` | 14 | **23** |
+| `scala/concurrent/duration/Duration.scala` | 18 | **22** |
+
+The three regressions are one root and **28 errors of `value -> is not a
+member`**, at sites that previously died one line earlier on `not found: value
+Map`. It is a **pre-existing defect, not this slice's**: two conversions in
+scope offering `->` from the same source type select neither, and it
+reproduces with no `Predef` and no re-import anywhere —
+
+```scala
+package scala
+object PredefY {
+  implicit final class ArrowAssocQ[A](private val self: A) extends AnyVal {
+    def -> [B](y: B): (A, B) = (self, y)
+  }
+}
+// another file
+import scala.PredefY._
+object U { val a = 1 -> 2 }   // value -> is not a member of 1
+```
+
+Removing the prelude's competing conversion by name does not reach it: the
+prelude spells it **`any2ArrowAssoc`** while the library's implicit class
+synthesizes **`ArrowAssoc`**, so the names never meet. A rule keyed on
+`prelude_shadowed` instead does not reach it either — the source `ArrowAssoc`
+is owned by `object Predef`, not by package `scala`, so
+`shadow_supplied_by_source` never records a victim for it. Both were tried and
+measured at zero; neither is in the change.
+
+### The other targets, before and after
+
+See the slice's report for the full table; every measure other than the
+library is unchanged to the error.
+
+## What to do next, in order
+
+0. **`->` when two conversions offer it — 28 errors, 3 files.** The twelve-line
+   reproduction is above. Worth taking before anything else in this list,
+   because it is the only regression standing between the current number and a
+   clean sweep of the `Predef` work, and because "two candidates, so neither"
+   is a wrong answer anywhere it happens, not only here. Note the two fixes
+   that look right and are not, recorded above, before starting.
+1. **`Vector2[Any]` … `Vector6[Any]` — 100 errors, all in `Vector.scala`.**
+   `new VectorN(…)` on a generic constructor infers `Any` for the element
+   where the context expects `Vector[B]`. Nothing to do with the prelude; it
+   is constructor type inference. `Tree[A, …]` (73, `RedBlackTree.scala`) and
+   `Array[Any]` (43) look like the same shape and should be checked together.
+2. `case class` synthesis does not produce `canEqual`, so all 22 `TupleN`
+   classes report `class TupleN needs to be abstract` against
+   `Product`/`Equals`. 22 errors, one root, and it needs no lookup work.
+3. Do **not** assume the overriding family (now 51: 30 `` `override` modifier
+   required`` plus 21 `incompatible type in overriding`) is a second root. It
+   looks like one — `overrides nothing` does not need member lookup to
+   succeed — but the ones sampled were the same bug seen from the other side.
+   It has shrunk from 263 along with everything else, which is consistent with
+   that reading.
+4. `src/reflect` and `src/compiler` are not worth measuring yet.
    `SCALALIB_DIRS` accepts them when they are.
 
 ## Running it
