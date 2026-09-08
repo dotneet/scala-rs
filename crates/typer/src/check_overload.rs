@@ -802,6 +802,7 @@ impl Typer {
         // Without this every polymorphic alternative was as specific as every
         // monomorphic one and the pair came out `ambiguous overload`.
         let a_ps = self.rigidify_own_tparams(a_sym, a_ps);
+        let a_ps = self.spec_argtpes(&a_ps, b_ps);
         // `B`'s type parameters are undetermined, exactly as for a real call.
         let inst = if b_sym.is_none() || self.st.get(b_sym).tparams.is_empty() {
             Vec::new()
@@ -822,6 +823,61 @@ impl Typer {
             && self.function_params_conform(&a_ps, &b_ps);
         self.spec_probe.set(saved);
         out
+    }
+
+    /// `A`'s parameter types read as the *argument* types of the hypothetical
+    /// call that decides specificity -- nsc `Infer.isAsSpecific`'s
+    /// `if (isVarArgsList(params) && isVarArgsList(ftpe2.params))` clause.
+    ///
+    /// A repeated parameter is unwrapped to its element type only when *both*
+    /// signatures are varargs lists (`f(Int, Int*)` against `f(Int*)` compares
+    /// `Int, Int` with `Int*`). When only `A` is a varargs list, its trailing
+    /// `T*` stays a repeated type on the argument side, and `arg_score` under
+    /// [`Typer::spec_probe`] scores it against nothing at all. That single
+    /// asymmetry is what gives a fixed-arity alternative the win over its own
+    /// varargs sibling:
+    ///
+    /// ```text
+    /// def g(x: Int)   as specific as g(Int*)?  Int  vs Int* -> yes
+    /// def g(x: Int*)  as specific as g(Int)?   Int* vs Int  -> no
+    /// ```
+    ///
+    /// "Against nothing at all" is stronger than the `<repeated>[T] <: Seq[T]`
+    /// that nsc's own definition of the wrapper suggests, and it is what
+    /// scalac 2.13.16 does. Six measurements, three of them Java read back
+    /// from a class file, agree on it and on no weaker rule -- the `Any` and
+    /// `Object` rows are the ones a `Seq[T]` model gets wrong:
+    ///
+    /// | alternatives | call | scalac 2.13.16 |
+    /// |---|---|---|
+    /// | `a(Int)`, `a(Int*)` (Java `int...`) | `a(1)` | fixed |
+    /// | `c(Object)`, `c(Object*)` (Java) | `c("z")` | fixed |
+    /// | `e(java.util.List[Object])`, `e(Object*)` (Java) | `e(list)` | fixed |
+    /// | `b(Object)`, `b(Int*)` (Java) | `b(1)` | **ambiguous** |
+    /// | `s(Any)`, `s(Int*)` (Scala) | `s(1)` | **ambiguous** |
+    /// | `u(Int, Int*)`, `u(Int*)` (Scala) | `u(1)` | **ambiguous** |
+    ///
+    /// The last two are why the both-varargs unwrap has to stay, and why the
+    /// rule cannot simply be "a fixed-arity alternative wins": `u` is a tie
+    /// between two varargs lists, and `s`/`b` are ties in which the
+    /// fixed-arity alternative is *not* as specific as the varargs one.
+    ///
+    /// Nothing here is Java-specific. `def g(x: Int)` beside
+    /// `def g(x: Int*)` in plain Scala had the same `ambiguous overload`, and
+    /// scalac resolves both to the fixed-arity alternative; the defect showed
+    /// up on `java.lang.reflect.Array.newInstance`, which declares exactly
+    /// this pair, because that is what the standard library calls.
+    fn spec_argtpes(&self, a_ps: &[Type], b_ps: &[Type]) -> Vec<Type> {
+        let (_, a_rep) = split_repeated(a_ps);
+        let (_, b_rep) = split_repeated(b_ps);
+        match (a_rep, b_rep) {
+            (Some(a_elem), Some(_)) => {
+                let mut out = a_ps[..a_ps.len() - 1].to_vec();
+                out.push(a_elem.clone());
+                out
+            }
+            _ => a_ps.to_vec(),
+        }
     }
 
     /// `arg_score` deliberately scores any two function types with the same
@@ -1572,6 +1628,21 @@ impl Typer {
                     .iter()
                     .all(|a| self.arg_conforms(a, elem, allow_widen, open));
         }
+        // Only a repeated parameter list takes a repeated *argument*. nsc's
+        // `<repeated>[T]` is a type of its own, and it conforms to no ordinary
+        // formal -- not to `T`, not to `Any`, not through a view. Two
+        // different things reach here as one:
+        //
+        //  * an `f(xs: _*)` splice, which must not be accepted by a
+        //    fixed-arity alternative and silently passed as a single element;
+        //  * a declared `T*` weighed as an *argument* type by
+        //    `is_as_specific_method`, which is what makes a varargs
+        //    alternative lose to its fixed-arity sibling. See `spec_argtpes`
+        //    for the six scalac 2.13.16 measurements that pin this, including
+        //    the two ties it must *not* break.
+        if args.iter().any(|a| matches!(a, Type::Repeated(_))) {
+            return false;
+        }
         if args.len() > params.len() {
             return false;
         }
@@ -1913,6 +1984,8 @@ impl Typer {
             return self.arg_score(inner, param);
         }
         // A `xs: _*` argument is already the sequence the parameter wants.
+        // Whether the *parameter list* takes one at all is `is_applicable`'s
+        // question, not this one.
         if let Type::Repeated(inner) = arg {
             return self.arg_score(inner, param);
         }
