@@ -763,6 +763,27 @@ impl Typer {
         self.st.lookup_member(owner, name)
     }
 
+    /// A member owner as the type to ask `is_sub_type` about.
+    ///
+    /// The universal owners occur as primitive `Type` variants in parent
+    /// lists, not `Class` nodes. Comparing with a synthetic `Class(Any)` makes
+    /// every ordinary override of `Any.hashCode` look like an unrelated
+    /// overload.
+    fn owner_as_type(&self, owner: SymbolId) -> Type {
+        if owner == self.st.any_sym {
+            Type::Any
+        } else if owner == self.st.anyref_sym {
+            Type::AnyRef
+        } else if owner == self.st.anyval_sym {
+            Type::AnyVal
+        } else {
+            Type::Class {
+                sym: owner,
+                args: vec![],
+            }
+        }
+    }
+
     /// Prefer a definition on a subclass over the inherited member it overrides.
     pub(crate) fn drop_overridden(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         if found.len() <= 1 {
@@ -802,9 +823,28 @@ impl Typer {
                     // slick `Session` in the program with it. In the class
                     // that has both, one implements the other; nsc's
                     // linearization sees a single member.
+                    //
+                    // It only applies when the hierarchy does not already
+                    // answer the question. **Re-abstracting is overriding**:
+                    // `LinearSeqOps` re-declares the `tail` that `IterableOps`
+                    // defines, and there the deferred member is the *more
+                    // derived* one. Without the guard the two rules point
+                    // opposite ways -- this one drops `LinearSeqOps.tail`
+                    // because it is a declaration, the owner test below drops
+                    // `IterableOps.tail` because `LinearSeqOps` is under it --
+                    // `kept` comes out empty and the fallback hands the caller
+                    // back the whole unreduced set. See
+                    // `docs/scala-library.md`.
                     if self.is_deferred_member(s)
                         && !self.is_deferred_member(other)
                         && self.same_signature(other, s)
+                        && !self.st.is_sub_type(
+                            &Type::Class {
+                                sym: owner,
+                                args: vec![],
+                            },
+                            &self.owner_as_type(oo),
+                        )
                     {
                         return true;
                     }
@@ -812,22 +852,7 @@ impl Typer {
                         sym: oo,
                         args: vec![],
                     };
-                    // The universal owners occur as primitive Type variants
-                    // in parent lists, not Class nodes. Comparing with a
-                    // synthetic Class(Any) makes every ordinary override of
-                    // Any.hashCode look like an unrelated overload.
-                    let parent = if owner == self.st.any_sym {
-                        Type::Any
-                    } else if owner == self.st.anyref_sym {
-                        Type::AnyRef
-                    } else if owner == self.st.anyval_sym {
-                        Type::AnyVal
-                    } else {
-                        Type::Class {
-                            sym: owner,
-                            args: vec![],
-                        }
-                    };
+                    let parent = self.owner_as_type(owner);
                     self.st.is_sub_type(&child, &parent)
                         // Inheriting is not overriding: nsc keeps `f(Int)`
                         // declared on the parent as an alternative of `f`
