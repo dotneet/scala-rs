@@ -3242,6 +3242,195 @@ expected shape and not a vacuous negative:
 All three are pinned by assertions on the current behaviour, so a later slice
 that closes one is told by a failing test.
 
+## The `agent/varargsrecv` slice: `Seq` is a symbol, not a name
+
+**740 errors in 138 files -> 685 in 135**, measured on this branch against the
+branch point (`ba2876a3`) measured on its own, `--no-scala-library`. slick is
+`errors=0 files_with_errors=0 classes=1490` and its **1490 class files are
+byte-identical** (`SLICK_OUT=... tests/slick_measure.sh` on both binaries,
+`diff -r`, exit 0); cats (182 / 71) and gitbucket (271 / 80) are unchanged
+**as error sets**, diffed line by line and not by count. The full corpus is
+`losses=0` with one change, `neg/parstar` `fail` -> `pass`, which is this
+slice's (below). `tests/verify_merge.sh` is `VERDICT=PASS`.
+
+### The brief's split was wrong, and both halves of it
+
+The brief handed this slice two of the three worst files -- `scala/Array.scala`
+(24) and `scala/collection/Seq.scala` (31) -- as one family, "a receiver
+printed with a trailing `*`", and asked whether the printed receivers
+(`Short*`, `Unit*`, `T*`, `Array[_]*`, and `T1` / `T2` in `Seq.scala`) are one
+root or several. They are **two families, and the second one is not varargs at
+all**:
+
+* **37 errors carry a `*` receiver**, in ten files. `Array.scala` has 22 of
+  them; `Seq.scala` has **none**.
+* `Seq.scala`'s `T1` / `T2` are `val (elms, idxs) = init()` in `SeqOps`'
+  `PermutationsItr` and `CombinationsItr` -- a **tuple pattern definition**
+  whose component types are never instantiated (`Seq.scala` 597, 631). 21 of
+  that file's 31 errors are that one shape, and it belongs to whoever takes
+  pattern definitions next.
+
+The brief also said "a simple case already works": `def f(xs: Int*) = xs.length`
+compiles. It does -- in the **default** mode, which auto-finds the jar. Under
+`--no-scala-library`, which is the mode the measurement runs in, it did not.
+
+### The root
+
+`Check::seq_of` answered "what is `xs` inside the body" with a **scope lookup
+for the name `Seq`**, taking the first candidate whose kind is `Class`. nsc
+never asks the scope: `definitions.SeqClass` is `scala.collection.immutable.Seq`,
+a fixed symbol, and the `scala.Seq` a program sees is an alias of it. The
+lookup was wrong in both directions, and the second one is the yield:
+
+| | |
+|---|---|
+| a file that writes `package scala` (`Array.scala`, `StringContext.scala`, `specialized.scala`) | the innermost binding is `scala/package.scala`'s `type Seq[+A] = scala.collection.immutable.Seq[A]` -- an **alias**, which the class filter rejects |
+| a file that writes a single qualified clause (`package scala.jdk`, `package scala.util.matching`, `package scala.sys.process`) | the name is **not bound at all**: a source `type` alias in `scala/package.scala` is not entered into the `scala._` auto-import scope the way a source class or object is (`Typer::auto_import_scala_member`) |
+| a file that writes nested clauses (`package scala` / `package reflect`, as `Manifest.scala` does) | the alias *is* reached, through the enclosing package's scope -- which is why the family looked narrower than it was |
+
+The prelude builds a `Seq` class only under `library_abi`, so in
+`--no-scala-library` mode there was no second copy to win the seam. There was
+no copy at all.
+
+`the_seq_class` now looks for the class whose **binary name** is
+`scala/collection/immutable/Seq`: as a member of package `scala` (where the
+prelude puts it, the jar's alias already collapsed) or, failing that, at
+`scala.collection.immutable` by path, which is where a run that compiles the
+library from source has it. Nothing is looked up by the name in scope any more.
+
+### The scope lookup was also unsound, and that is the part an error count cannot see
+
+A repeated parameter's descriptor is written by `gen_desc` as
+`Lscala/collection/immutable/Seq;` **whatever the typer decided**. So a program
+that binds the name to something of its own type-checked against one class and
+was emitted against another:
+
+```scala
+object Main {
+  class Seq[A] { def tag: String = "MINE" }
+  def f(xs: Int*): String = xs.tag
+  def main(args: Array[String]): Unit = println(f(1, 2, 3))
+}
+```
+
+An unmodified build of the branch point **compiles this** and dies at run time
+with `ClassCastException: class scala.collection.immutable.ArraySeq$ofInt
+cannot be cast to class Main$Seq`, with no diagnostic anywhere. scalac 2.13.16
+reports `value tag is not a member of Seq[Int]`, and this branch now reports
+that sentence (`tests/fixtures/varargsrecv_shadow_bad.scala`). That is why the
+positive fixture *runs* rather than merely compiling: this defect is a wrong
+`invoke`, not a message.
+
+### A rejection that was missing
+
+`def f(xs: Int*, y: Int)` was accepted. A repeated parameter covers every
+argument from its position on, so one that is not last has no meaning, and nsc
+says `*-parameter must come last`. That rejection is implemented here in nsc's
+words at nsc's line and column, for a method, a `case class` and a plain class
+(`tests/fixtures/varargsrecv_last_bad.scala`); scalac's own answer for the same
+file is asserted beside ours, three errors to three. The rule is per **clause**:
+scalac accepts `def g(xs: Int*)(y: Int)`, and so does this, executed.
+
+It closes a corpus test that was not on the brief. **`neg/parstar` goes `fail`
+-> `pass`**, and its whole content is this rule -- three overloads of `m`, of
+which the second and third put a `*`-parameter before another one. Our two
+diagnostics are `parstar.check`'s, word for word, on its lines. An unmodified
+build of the branch point compiles the file with no diagnostic at all.
+
+### What moved
+
+The set difference is **-63 / +8**: all 37 `*` receivers, plus 26 errors that
+died behind them, against eight new ones. Three of the eight are
+`BuildFrom.scala`'s `$anon$215` renumbering to `$anon$216` -- the same three
+errors with a different anonymous-class index -- so five are real, and every
+one of them is a site that used to die one line earlier
+(`Array.scala:349` `ambiguous implicit: wrapRefArray, genericWrapArray`,
+`Manifest.scala:460` `No ClassTag available for B`, `Exception.scala:365`
+`type mismatch; found: Catch[U] required: Catch[T]`, and two
+`no matching overload` in `ProcessImpl.scala` whose callee's return type used
+to be `<error>`).
+
+Eleven files improved and none regressed:
+
+| file | before | after |
+|---|---|---|
+| `scala/Array.scala` | 24 | **3** |
+| `scala/util/control/Exception.scala` | 20 | 11 |
+| `scala/reflect/Manifest.scala` | 14 | 8 |
+| `scala/StringContext.scala` | 14 | 11 |
+| `scala/reflect/ClassManifestDeprecatedApis.scala` | 11 | 8 |
+| `scala/sys/process/Process.scala` | 6 | 1 |
+| `scala/sys/process/ProcessImpl.scala` | 6 | 5 |
+| `scala/util/matching/Regex.scala` | 5 | 3 |
+| `scala/jdk/Accumulator.scala` | 3 | **0** |
+| `scala/sys/process/package.scala` | 1 | **0** |
+| `scala/specialized.scala` | 1 | **0** |
+
+**No `*` receiver is left in the measurement.**
+
+### The head, re-clustered on the 685 that remain
+
+| class | count |
+|---|---|
+| `type mismatch` | 304 |
+| `no matching overload` | 110 |
+| `X is not a member of Y` | 95 |
+| `no matching overload for constructor` | 29 |
+| `not found: value` / `type` | 27 |
+| overriding | 20 |
+| missing implicit (`no implicit` / `No ClassTag`) | 16 |
+| `ambiguous overload` | 15 |
+| `ambiguous implicit` | 6 |
+| `needs to be abstract` | 5 |
+| `type arguments do not conform` | 4 |
+| access | 2 |
+| everything else | 52 |
+
+The receivers in `is not a member of` are now led by `T2` (17), `String` (10)
+and `T1` (9). **21 of the 95 are the tuple pattern definition** described
+above, all of them in `scala/collection/Seq.scala`, which makes it the largest
+single mechanism in that class and the obvious next slice; the other five
+`T1`/`T2` are a different question (`Tuple2Zipped` / `Tuple3Zipped`'s own type
+parameters, where a *bound* member is not found, and one in `SyncChannel`).
+The worst files are `scala/collection/Seq.scala` (31, of which 21 are that
+shape), `scala/collection/immutable/HashMap.scala` (29) and
+`scala/collection/IterableOnce.scala` (20).
+
+### Found here, not fixed here
+
+* **A source `type` alias in `scala/package.scala` is not in the `scala._`
+  auto-import scope.** This is the second row of the table above, and it is
+  not specific to `Seq`: `auto_import_scala_member` enters a source class or
+  object landing directly in package `scala` and says nothing about the
+  package object's type members, which is the same half-fix
+  `docs/scala-library.md`'s `agent/libmaxmin` section records for `Predef._`.
+  Nothing else measured needs it, because the prelude supplies a *class* for
+  every other name in that package object that the library uses; `Seq` in
+  `--no-scala-library` mode was the one that had none. Reaching the class by
+  path settles the varargs question without touching that scope, so the gap
+  stays open and is pinned by
+  `varargsrecv_source_library_seq_is_the_parameters_type`, which fails if it
+  is ever closed *and* the path lookup is removed.
+* **`gen_wrap_varargs` has no primitive but `Int` (and `Unit`).** A `Short*`
+  call boxes and goes through `wrapRefArray` where nsc emits `wrapShortArray`;
+  the sequence is the same and the fixture's output is identical, but the
+  `ArraySeq` is an `ofRef` rather than an `ofShort`. This is the call site,
+  not the receiver. Asserted on the current behaviour in
+  `varargsrecv_descriptors_and_wrapping_match_scalac`.
+* **`T*` in a type-argument position.** nsc refuses `List[Int*]` in the
+  parser; this compiler's `parse_infix_type` accepts a postfix `*` anywhere in
+  a type and builds a `Repeated`. `seq_of` is applied to parameter symbols and
+  to nothing else, so it is an over-acceptance rather than a wrong answer, and
+  closing it is a parser change with its own blast radius. Asserted on the
+  current behaviour.
+* **`--no-scala-library` cannot run varargs at all.** The private runtime
+  (`backend::runtime`) ships neither `scala.collection.immutable.Seq` nor
+  `scala.runtime.ScalaRunTime`, so a repeated parameter used as a value is
+  refused there (and a call could not execute even if it were not).
+  `crates/cli/tests/override.rs` already records this for its own fixture.
+  `varargsrecv_private_runtime_has_no_seq` pins the refusal, so the mode fails
+  loudly rather than silently.
+
 ## Running it
 
 ```

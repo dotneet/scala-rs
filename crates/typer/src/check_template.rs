@@ -215,8 +215,14 @@ impl Typer {
         for clause in vparamss.iter_mut() {
             let mut ct = Vec::new();
             let mut ids = Vec::new();
-            for p in clause.iter_mut() {
+            let last_in_clause = clause.len().saturating_sub(1);
+            for (pi, p) in clause.iter_mut().enumerate() {
                 self.type_val_sig(p);
+                // The same rule a method's parameters obey, in nsc's words at
+                // nsc's position; see `check_member`'s copy.
+                if matches!(p.ty, Type::Repeated(_)) && pi != last_in_clause {
+                    self.error(p.span, "*-parameter must come last");
+                }
                 ct.push(p.ty.clone());
                 if !p.sym.is_none() {
                     // The constructor takes `T*`; the field it becomes holds a

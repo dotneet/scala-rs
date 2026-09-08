@@ -1690,22 +1690,79 @@ impl Typer {
         Some(s)
     }
 
-    /// `Seq[T]` for a repeated parameter's element type, when the prelude has
-    /// `Seq` (it does in both modes).
+    /// `Seq[T]` for a repeated parameter's element type — the type nsc gives
+    /// `xs: T*` *inside* the body.
+    ///
+    /// `None` when this run has no `scala.collection.immutable.Seq` at all,
+    /// which `--no-scala-library` mode has not: the private runtime
+    /// (`backend::runtime`) ships no `Seq`, so a repeated parameter cannot be
+    /// used as a value there, and the caller leaves the `T*` in place and lets
+    /// the member lookup report it.
     pub(crate) fn seq_of(&self, elem: &Type) -> Option<Type> {
-        // `lookup_type`, not `lookup`: the latter stops at the first scope
-        // binding the name at all, so a `def Seq` in scope left every repeated
-        // parameter as the bare `T*` (`value length is not a member of Int*`).
-        // This is the same shape as the `TupleN` capture above.
-        let sym = self
-            .st
-            .lookup_type("Seq")
-            .into_iter()
-            .find(|s| self.st.get(*s).kind == SymKind::Class)?;
-        Some(Type::Class {
+        self.the_seq_class().map(|sym| Type::Class {
             sym,
             args: vec![elem.clone()],
         })
+    }
+
+    /// nsc's `definitions.SeqClass`: the class whose binary name is
+    /// `scala/collection/immutable/Seq`, wherever this run gets it from — the
+    /// prelude (which owns its `Seq` by package `scala`, the jar's `scala.Seq`
+    /// alias already collapsed), or a source `package scala.collection.
+    /// immutable`, which is what `tests/scalalib_measure.sh` compiles.
+    ///
+    /// It is deliberately **not** a scope lookup. nsc's is a fixed symbol, and
+    /// asking the scope was wrong in both directions:
+    ///
+    /// * it found the wrong `Seq`. A program may bind the name to something of
+    ///   its own, and `object Main { class Seq[A] { def tag = "MINE" };
+    ///   def f(xs: Int*) = xs.tag }` then *compiled* — `gen_desc` writes
+    ///   `Lscala/collection/immutable/Seq;` for a repeated parameter whatever
+    ///   the typer decided, so the emitted `invokevirtual Main$Seq.tag` met an
+    ///   `ArraySeq$ofInt` and threw `ClassCastException` with no diagnostic
+    ///   anywhere. scalac 2.13.16 reports `value tag is not a member of
+    ///   Seq[Int]`, and so does this now
+    ///   (`tests/fixtures/varargsrecv_shadow_bad.scala`).
+    /// * it found no `Seq` where there was one. A run that compiles the
+    ///   standard library from source binds the name only as
+    ///   `scala/package.scala`'s `type Seq[+A] = scala.collection.immutable.
+    ///   Seq[A]`, an alias — and in a file that writes a single qualified
+    ///   package clause (`package scala.jdk`) not even that, because a source
+    ///   `type` alias in `scala/package.scala` is not entered into the
+    ///   `scala._` auto-import scope the way a source class or object is
+    ///   (`Typer::auto_import_scala_member`). Every repeated parameter in the
+    ///   library was left as the bare `T*`: `value length is not a member of
+    ///   Short*`, `Unit*`, `T*`, `Array[T]*`, and 48 more.
+    fn the_seq_class(&self) -> Option<SymbolId> {
+        const BINARY: &str = "scala/collection/immutable/Seq";
+        let is_it = |s: &SymbolId| {
+            let info = self.st.get(*s);
+            info.kind == SymKind::Class && info.jvm_name == BINARY
+        };
+        if self.st.scala_pkg.is_none() {
+            return None;
+        }
+        if let Some(s) = self
+            .st
+            .lookup_member(self.st.scala_pkg, "Seq")
+            .iter()
+            .find(|s| is_it(s))
+        {
+            return Some(*s);
+        }
+        let mut pkg = self.st.scala_pkg;
+        for seg in ["collection", "immutable"] {
+            pkg = self
+                .st
+                .lookup_member(pkg, seg)
+                .into_iter()
+                .find(|s| self.st.get(*s).kind == SymKind::Package)?;
+        }
+        self.st
+            .lookup_member(pkg, "Seq")
+            .iter()
+            .find(|s| is_it(s))
+            .copied()
     }
 
     /// `arg` seen as the structural function type it inherits, if it does.
