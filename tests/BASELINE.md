@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `88ab9308` |
+| commit | `172a6525` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy-six slices have merged this session**, in thirty-two accepted composed gates.
+**Seventy-seven slices have merged this session**, in thirty-three accepted composed gates.
 Seven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -55,6 +55,7 @@ coordinator measured the merged tree each time, not the branches.
 | `598ceef1` | `value-class bridges` | 228 | 163 |
 | `218b5340` | `lazyZip declaration origins` | 228 | 163 -> **159** |
 | `88ab9308` | `binary parent prefixes and lexical companions` | 228 | 159 |
+| `172a6525` | `conversion witnesses and singleton inference` | 228 -> **223** | 159 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -262,7 +263,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **159** | **59** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **228** | **69** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **223** | **68** | — |
 | `tests/scalalib_measure.sh` (538) | **541** | **123** | — |
 
 ## Execution
@@ -279,13 +280,16 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1109** | 405 | 345 |
+| `pos` (1859) | **1110** | 404 | 345 |
 | `neg` (1405) | **692** | 344 | 369 |
 | `run` (2060) | **637** | 870 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-88ab9308.tsv`](baselines/corpus-88ab9308.tsv): 5324 unique
+[`baselines/corpus-172a6525.tsv`](baselines/corpus-172a6525.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `172a6525` gate compared against `corpus-88ab9308.tsv`: **losses=0,
+changes=1** (`pos/t6033` fail-to-pass). `pos/t6846` remains pass.
+
 The `88ab9308` gate compared against `corpus-218b5340.tsv`: **losses=0,
 changes=0**.
 
@@ -368,7 +372,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **288 result rows, 2665 passed, 0 failed** at `88ab9308` |
+| `cargo test --workspace --release --no-fail-fast` | **289 result rows, 2667 passed, 0 failed** at `172a6525` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -1343,3 +1347,44 @@ and rejection of an incompatible result. The explicitly typed Slick query
 probe produces 139 SQL bytes matching scalac under JVM verification. The gate
 regression requires further inference investigation before another gate. This
 record changes only this file and the candidate ledger, not main's compiler.
+
+
+## Gate thirty-three: conversion witnesses and singleton inference
+
+Clean composed `172a6525`, containing main `629fcf35`, completed the full
+merge gate with `VERDICT=PASS`, `DONE`, no skipped stages, and losses=0,
+changes=1 against `88ab9308`. Logs:
+`/tmp/scala-rs-gate-172a6525-codex/gate.log`. Main was fast-forwarded to the
+exact tested commit. The following recording commit changes only this baseline
+and the saved corpus ledger.
+
+Gitbucket improves 228/69 -> 223/68: the same five Date-related update-overload
+diagnostics from the rejected gate disappear, with no new error-message entries.
+Cats stays 159/59 and library 541/123, with unchanged diagnostics. Slick retains
+zero errors, 1490 verified classes, no lint problems, and 12/12 execution with
+36/36 attempts. Workspace: 2667 passed, zero failed (289 rows). Corpus: pos 1110,
+neg 692, run 637. The only gain is pos/t6033; pos/t6846 has recovered. Format
+passes; clippy retains 59 existing warnings with no additions.
+
+A typed Slick projection now receives its ProvenShape conversion and generates
+SQL byte-identical to scalac under JVM verification. The initial result-inference
+hypothesis alone did not fix it: binary witness completion was missing. Once
+completion exposed candidates, a negative probe found that result-derived type
+arguments also had to be retained when validating evidence. Otherwise Rep[Int]
+was wrongly accepted as Proven[String]. Both corrections are tested together.
+
+The rejected gate then exposed an older hidden inference defect: a higher-kinded
+parameterless result inferred Nothing[Nothing] against a singleton target.
+Reading the singleton's underlying constructor infers List and Int; ordinary
+adaptation still requires a valid narrowing conversion. The new runtime case
+prints 7/8/8 with scalac and scala-rs, and both reject narrowing without that
+conversion. Focused tests pass 536/536. These tests use the real jar; the private
+runtime does not provide the required <:< type.
+
+Unannotated abstract overrides remain a distinct silent miscompile. A seven-line
+source at `/tmp/scala-rs-abstract-result/Probe.scala` compiles on both the saved
+accepted binary and this candidate, then throws ClassCastException; scalac runs
+and prints 8. The typer only borrows inherited result types with an explicit
+override modifier, missing legal implementations of abstract methods. This is
+pre-existing and explains why unannotated Table projections remain unfinished.
+Gitbucket and cats still have the errors recorded above and are not fully compiled.
