@@ -11,11 +11,12 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `4cc87fb2` |
+| commit | `0828f77b` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy-one slices have merged this session**, in twenty-seven composed gates. From
+**Seventy-two slices have merged this session**, in twenty-eight accepted composed gates.
+One additional wildcard candidate was rejected despite its script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -49,6 +50,7 @@ coordinator measured the merged tree each time, not the branches.
 | `ef33b16f` | `strarrayops` | 242 | 163 |
 | `f428def6` | `varassign` | 242 | 163 |
 | `4cc87fb2` | `unqualname` | 242 | 163 |
+| `0828f77b` | `wildcard-receiver` | 242 -> **239** | 163 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -256,7 +258,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **242** | **72** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **239** | **71** | — |
 | `tests/scalalib_measure.sh` (538) | **541** | **123** | — |
 
 ## Execution
@@ -273,13 +275,16 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1106** | 408 | 345 |
+| `pos` (1859) | **1109** | 405 | 345 |
 | `neg` (1405) | **690** | 346 | 369 |
 | `run` (2060) | **631** | 876 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-4cc87fb2.tsv`](baselines/corpus-4cc87fb2.tsv): 5324 unique
+[`baselines/corpus-0828f77b.tsv`](baselines/corpus-0828f77b.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `0828f77b` gate compared against `corpus-4cc87fb2.tsv`: **losses=0,
+changes=3**, all fail-to-pass: `pos/imports-pos`, `pos/t7233b`, `pos/t8855`.
+
 The `4cc87fb2` gate compared against `corpus-b83e06a8.tsv`: **losses=0,
 changes=5**, all fail-to-pass: `pos/Transactions`, `neg/overload-msg`,
 `neg/typeerror`, `run/Course-2002-03`, and `run/impconvtimes`.
@@ -345,7 +350,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **282 result rows, 2649 passed, 0 failed** at `4cc87fb2` |
+| `cargo test --workspace --release --no-fail-fast` | **283 result rows, 2651 passed, 0 failed** at `0828f77b` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -984,10 +989,10 @@ ledger, not compiler code or test inputs.
   sites, and removing it let the query bodies be type-checked for the first
   time. See the `agent/tablequery` merge.
 
-## Unmerged wildcard receiver candidate: `7220a0ec`
+## Rejected intermediate wildcard receiver candidate: `7220a0ec`
 
 Gate `/tmp/scala-rs-gate-7220a0ec-codex/gate.log` completed without skipped
-stages and printed `VERDICT=PASS`, but the candidate is **not approved for
+stages and printed `VERDICT=PASS`, but that tree was **not approved for
 merge**: gitbucket rose from 242 to 290 errors (72 files). The script checks
 input completeness, not gitbucket error-count regression. An eight-line
 case-class companion with a named custom `apply` compiles on main and scalac
@@ -998,4 +1003,38 @@ Cats stayed 163/62, the library 541/123, slick 0 errors / 1490 classes with
 12/12 execution, zero validation failures and lint problems. Workspace:
 2651 passed, zero failed. Corpus: pos 1109, neg 690, run 631; losses=0,
 changes=3 (`pos/imports-pos`, `pos/t7233b`, `pos/t8855`). The candidate ledger
-is `tests/baselines/corpus-7220a0ec.tsv`; the main reference above is unchanged.
+is `tests/baselines/corpus-7220a0ec.tsv`; it did not replace the accepted baseline.
+
+## Gate twenty-eight: wildcard receivers belong to an import binding
+
+The final `0828f77b` gate completed with `VERDICT=PASS`, `DONE`, no skipped
+stages and corpus losses=0 against `4cc87fb2`. Logs:
+`/tmp/scala-rs-gate-0828f77b-codex/gate.log`. Main was fast-forwarded to this
+exact commit; the subsequent record changes only this file and the ledger.
+Gitbucket improved 242/72 -> 239/71, cats remained 163/62 and the library
+541/123. Slick retained zero errors, 1490 validated classes, no lint problems
+and 12/12 MODE=b programs (36/36 attempts). Workspace: 2651 passed, zero
+failed. The corpus gained the three positive statuses listed above.
+
+The initial diagnosis was incomplete. Direct object-field reads worked, but
+an *inherited* var read also threw `ClassCastException`, alongside direct var
+assignment and inherited method invocation. A binary built from `a63c4d04`
+compiles the new fixture and fails at `WildMain.inheritedRead`; real scalac
+2.13.16 executes it. The fixture now compares stdout bytes in both ABI modes
+with scalac, including reads, writes, inherited calls, aliases, nested imports
+and an overloaded case-class companion. Six accept/reject probes compare both
+directions, and a negative fixture pins assignment to an imported val.
+
+The first fix used the class-to-prefix cache. Nested imports through two
+objects inheriting the same declaration then returned 8 where scalac returned
+14: a class is not an import binding. The final path uses the existing binding
+origin and lexical scopes. Alias selection uses the member's original name.
+A private var which the eager walk excluded was reintroduced by lazy wildcard
+lookup; the latter now applies the same privacy rule. Companion module
+references keep their identity rather than being rewritten as ordinary value
+selections; the intermediate gitbucket regression above motivated that test.
+
+`cargo clippy --workspace --release` exited zero; existing warnings remain,
+with none reported in the changed receiver-resolution code. The gate's format
+check passed. This does not claim that all lazy classpath import paths or
+legacy value-prefix handling are complete; those remain separate probe targets.
