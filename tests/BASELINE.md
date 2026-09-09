@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `172a6525` |
+| commit | `5adf9c87` |
 |---|---|
-| updated | 2026-09-09 |
+| updated | 2026-09-10 |
 
-**Seventy-seven slices have merged this session**, in thirty-three accepted composed gates.
+**Seventy-eight slices have merged this session**, in thirty-four accepted composed gates.
 Eleven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -56,6 +56,7 @@ coordinator measured the merged tree each time, not the branches.
 | `218b5340` | `lazyZip declaration origins` | 228 | 163 -> **159** |
 | `88ab9308` | `binary parent prefixes and lexical companions` | 228 | 159 |
 | `172a6525` | `conversion witnesses and singleton inference` | 228 -> **223** | 159 |
+| `5adf9c87` | `inherited results and constructor evidence` | 223 -> **217** | 159 -> **158** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -261,10 +262,10 @@ specialization remain explicitly red; this is not a completion claim.
 
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
-| `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **159** | **59** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **223** | **68** | — |
-| `tests/scalalib_measure.sh` (538) | **541** | **123** | — |
+| `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
+| `tests/cats_measure.sh` (339, 1 skipped) | **158** | **59** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **217** | **67** | — |
+| `tests/scalalib_measure.sh` (538) | **460** | **119** | — |
 
 ## Execution
 
@@ -272,21 +273,29 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---|
 | `MODE=b tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 runs=3 attempts=36/36` |
 | `MODE=a tests/slick_run.sh` | **RED**: all 12 client programs fail to compile; no execution attempts |
-| `tests/slick_subset.sh` | `subset_files=184 classes=1490 verified=1490 failed=0` |
+| `tests/slick_subset.sh` | `subset_files=184 classes=1492 verified=1492 failed=0` |
 | `tests/classfile_lint.py` (via subset / slick_run) | `lint_problems=0` |
-| `tests/verify_all.sh <slick out>` | `verify_classes=1490 verify_loaded=1490 verify_failures=0 verify_incomplete=0` |
+| `tests/verify_all.sh <slick out>` | `verify_classes=1492 verify_loaded=1492 verify_failures=0 verify_incomplete=0` |
+
+The stronger Slick verification includes the real PostgreSQL 42.7.13 driver,
+Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
+`project/Dependencies.scala`). Driver provenance and SHA-256 are recorded in
+`/tmp/scala-rs-gate-5adf9c87-codex/oracle-driver.txt`. No class remains incomplete.
 
 ## scala/scala corpus (`CORPUS_SIZE=full`, 5324 units)
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1110** | 404 | 345 |
-| `neg` (1405) | **692** | 344 | 369 |
-| `run` (2060) | **637** | 870 | 553 |
+| `pos` (1859) | **1118** | 396 | 345 |
+| `neg` (1405) | **700** | 336 | 369 |
+| `run` (2060) | **640** | 867 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-172a6525.tsv`](baselines/corpus-172a6525.tsv): 5324 unique
+[`baselines/corpus-5adf9c87.tsv`](baselines/corpus-5adf9c87.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `5adf9c87` gate compared against `corpus-172a6525.tsv`: **losses=0,
+changes=19**, all fail-to-pass (8 pos, 8 neg, 3 run).
+
 The `172a6525` gate compared against `corpus-88ab9308.tsv`: **losses=0,
 changes=1** (`pos/t6033` fail-to-pass). `pos/t6846` remains pass.
 
@@ -372,14 +381,14 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **289 result rows, 2667 passed, 0 failed** at `172a6525` |
+| `cargo test --workspace --release --no-fail-fast` | **290 result rows, 2695 passed, 0 failed** at `5adf9c87` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
-No compiler source, Cargo input, or test changed after the full run.
-`cargo clippy --workspace --release` exits zero with **59** individual warning
-messages (excluding per-crate generated-warning summaries). The saved previous
-log has 59; comparison by warning-message multiset finds no additions. Evidence:
-`/tmp/lazyzip-probe/clippy2.log` and `/tmp/lazyzip-origin/clippy.log`.
+No compiler source, Cargo input, or test fixture changed after the full run.
+`cargo clippy --workspace --release` exits zero with **57** individual warning
+messages (excluding per-crate generated-warning summaries). Compared with the
+saved 59-warning log, there are no additions and two removals. Evidence:
+`/tmp/scala-rs-ctor-evidence/clippy.log` and `/tmp/lazyzip-origin/clippy.log`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -1561,3 +1570,61 @@ a new JVM runtime probe also exposed and repaired qualified module-this
 loading from an uninitialized constructor receiver. The remaining three
 corpus regressions and damaged caches must be repaired before another gate.
 This recording commit changes only BASELINE and the raw candidate ledger.
+
+
+## Gate thirty-four: inherited results and constructor evidence
+
+Clean `5adf9c87`, combining `7058f73e` with main `104a217e`, completed the
+full unskipped gate on 2026-09-10 with `VERDICT=PASS`, `DONE`, corpus losses=0
+and changes=19 against accepted `172a6525`. Logs:
+`/tmp/scala-rs-gate-5adf9c87-codex/gate.log`. Main was fast-forwarded to the
+exact tested commit. The recording commit changes only this baseline, its
+raw corpus ledger and the permanent process rules in `.agent-brief.md`.
+
+Gitbucket improves 223/68 -> 217/67, cats 159/59 -> 158/59, and the library
+541/123 -> 460/119. Anonymous-class serial numbers are normalized when
+comparing diagnostic messages: zero additions, respectively 6, 1 and 81
+removals. The three raw library message changes are unchanged BuildFrom
+errors at unchanged locations with shifted anonymous-class numbers. The
+comparison is saved as `diagnostic-comparison.json` in the gate directory.
+Slick retains zero compile errors and produces 1492 classes. The two extra
+classes relative to the accepted 1490 implement Ordering SAMs; the retained
+probes show the old Function2 cast failing and the new behavior matching
+published Slick with a real-scalac client.
+
+Slick MODE=b passes 12/12 programs and 36/36 execution attempts. Subset and
+lint pass all 1492 classes. Strong initialization verification, now using
+real PostgreSQL and Oracle JDBC drivers, passes all 1492 classes with zero
+failures and zero incomplete classes. Exact output is retained in
+`slick-classes/`, with `verify-all.log`. The broken Java support cache was
+regenerated and the scalac-side Slick reference was forcibly rebuilt before
+accepting these measurements. The fresh source checkouts remain pinned to
+the scripts' required revisions.
+
+Workspace passes 2695 tests, zero failed (290 rows). Format passes and
+clippy has no new warnings. Corpus totals (pass/fail/skip): pos 1118/396/345,
+neg 700/336/369, run 640/867/553. All 5324 records are saved in
+`tests/baselines/corpus-5adf9c87.tsv`. All losses from the four rejected
+abstract-result candidates have recovered. The 19 gains are 8 positive,
+8 negative and 3 runtime cases, with no previously passing case lost.
+
+The slice supplies inherited abstract result expectations without requiring
+an explicit override modifier, while preserving narrower inferred results.
+It also fixes owner/type-parameter substitution, recursive implicit evidence
+instantiation, self-typed this results, inherited bridge adaptation, block
+scope re-entry and constructor argument scopes. Fresh class-bound evidence
+on auxiliary constructors replaces illegal reads from uninitializedThis;
+its JVM parameter order and context/view-bound execution match scalac.
+Lexical access privileges remain available when the constructing receiver
+is unavailable. Source-3 InferOverride support remains explicitly partial,
+and gitbucket/cats are still not fully compiled.
+
+The user's process improvements are now permanent rules: run related tests
+and all recorded regressions before a full gate, check pinned sources/jars/
+cache contents before launch, and consolidate monitoring around state changes
+and the same live process handle. Operational checks exercised during this
+run inspected four sources, 121 jars, 33 Java support classes and 1498 scalac
+reference classes. Negative controls detected all 32 missing Java classes and
+1172 missing reference classes in the preserved broken caches. Monitoring
+controls detected both a failing test and DONE. These process checks are
+separate evidence, not claims that they were stages of this compiler gate.
