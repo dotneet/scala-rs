@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `56b81c21` |
+| commit | `7b4673c5` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-seven slices have merged this session**, in twenty-three composed gates. From
+**Sixty-eight slices have merged this session**, in twenty-four composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -45,6 +45,7 @@ coordinator measured the merged tree each time, not the branches.
 | `e0212fb7` | `basetypeargs` | 265 | 168 -> **167** |
 | `b83e06a8` | `preludelb` | 265 -> **264** | 167 -> **166** |
 | `56b81c21` | `samconv` | 264 | 166 -> **163** |
+| `7b4673c5` | `gbslickmember` | 264 -> **242** | 163 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -252,7 +253,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **264** | **77** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **242** | **72** | — |
 | `tests/scalalib_measure.sh` (538) | **604** | **130** | — |
 
 ## Execution
@@ -845,6 +846,55 @@ uses `invokedynamic` for `Equiv`, `Hashing` and `Runnable` in the same file and
 an anonymous class only for `Ordering`. Behaviour is identical (the fixture
 executes against scalac's own output); the divergence belongs to
 `crates/cli/tests/indy.rs`.
+
+## Gate twenty-four: `implicit class` was invisible in every library
+
+`agent/gbslickmember` was sent after 35 gitbucket errors shaped like
+`value withTransaction is not a member of DatabaseDef`, on the observation
+that we compile slick itself to 1490 byte-exact class files, so the members
+exist in what we produced and something loses them on the way back.
+
+The root is one line of filtering. nsc expands `implicit class C(x: T)` into a
+plain `class C` **plus** an `implicit def C(x: T): C`, and marks that
+conversion method `SYNTHETIC` — pickled flags `0x200201` =
+`IMPLICIT|METHOD|SYNTHETIC`. `Member::is_public_api` filtered SYNTHETIC out.
+**The class file cannot stand in for it, because nothing in bytecode records
+`implicit`**, so what the class-file reader installs is an ordinary method:
+in scope under its own name, callable explicitly, and never selectable as a
+view. `BlockingDatabase(db).withTransaction {…}` compiled the whole time and
+`db.withTransaction {…}` did not. This was true of **every `implicit class` in
+every library on `-cp`**, including one declared at top level.
+
+**It corrects the diagnosis this repo carried.** `docs/gitbucket.md` recorded
+the cause as the result being an inner class of the imported value's own type,
+with an `$outer`. `queryToQueryInvoker`, which always worked, returns an inner
+class with an `$outer` too. The separator is `implicit class` against
+`implicit def` — one keyword in blocking-slick's source — and nothing in the
+pickle reader's projection or prefix handling needed to change.
+
+The gate refused two earlier versions, both real:
+
+1. Admitting the rule for `scala.*` owners took `DurationInt` off the
+   hand-written prelude, so `3.seconds` emitted an `invokevirtual` on an `int`
+   — a **VerifyError, not a type error** — and took `Quasiquotes.Quasiquote`
+   off the quasiquote path. Scoped to non-`scala.*` owners, where the prelude
+   is the authority.
+2. Adopting a *module* import prefix re-entered its members beside the
+   class-file ones: `pos/t5639` became `ambiguous implicit: Baz, Baz, Baz`.
+
+Of the 26 errors that went, all are the one root; of the 4 that appeared, three
+are cascades behind an `sql"…"` macro expansion that already fails at the same
+line, and one is a pre-existing false diagnostic becoming reachable in a second
+file. Stated rather than netted.
+
+Left named and not fixed: `value returning is not a member of TableQuery[…]`
+(10) and the 31 `Shape` missing-implicits **did not move by a single line** —
+`returning` is not declared by an `implicit class` at all. The brief grouped
+four message shapes as possibly one root; they are at least two. And a package
+wildcard hides the prefix of a later member import: with `import iclib._`,
+a following `import profile.api._` brings in nothing at all, not even a class
+under its own name. Six lines reproduce it; gitbucket writes explicit imports,
+so no measurement shows it.
 
 ## What is deliberately red
 
