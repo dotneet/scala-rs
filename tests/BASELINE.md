@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-seven slices have merged this session**, in thirty-three accepted composed gates.
-Ten intermediate candidates were rejected, three despite a PASS script verdict. From
+Eleven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1510,3 +1510,54 @@ exponential traversal or changing existing collection signatures, preserve
 Nothing bridges, and adapt primitive arguments in inherited bridges. Each
 loss and existing failing test remains a gate requirement. This record changes
 only BASELINE and the candidate ledger; main's implementation is unchanged.
+
+
+## Rejected constructor-scope candidate: `62fab7e4`
+
+On 2026-09-10, clean `62fab7e4` combined repair commit `305d34c5` with
+main `a0f68dee`. Its full gate completed with no skipped stages,
+`VERDICT=FAIL` and `DONE`:
+`/tmp/scala-rs-gate-62fab7e4-codex/gate.log`. No candidate implementation
+is merged; the accepted compiler baseline remains `172a6525`.
+
+Workspace passes 2693 tests, zero failed (290 rows). Format passes; release
+workspace clippy retains 57 diagnostic warnings. Gitbucket improves from
+223/68 to 217/67 and cats from 159/59 to 158/59, with no added error-message
+entries. Slick compiles 184 files with zero errors and 1492 classes; subset
+reports verified 1492, failed 0, lint problems 0. The stronger initialization
+sweep of the retained exact classes reports verify_classes=1492,
+verify_failures=0, verify_loaded=1491, verify_incomplete=1. Oracle's absent
+JDBC driver still prevents initialization of TimestamptzConverter; this is
+not reported as complete verification. Logs: `verify-all.log`, with class
+output retained as `slick-classes/`.
+
+Two measurements encountered damaged temporary caches. Library reports
+656 errors in 142 files, but its Java classpath contains only one of the
+33 classes required from the released jar: BoxedUnit, Statics and 30 others
+are missing. `java-cache-audit.json` records the inventory. This is not a
+valid comparison with the accepted 541/123; regenerate the cache before
+attributing the increase to compiler code. Slick execution fails all 12
+client compilations (zero runtime attempts) because the reused scalac-side
+class output lacks classes including BasicActionComponent and SqlActionComponent.
+The client compile diagnostics are preserved in `slick-program-logs/`.
+The next gate must force regeneration with REUSE_SCALAC=0. Broken Scala and
+Slick source checkouts were preserved and replaced with fresh clones pinned
+to their scripts' exact revisions before this gate. The fresh corpus path is
+`/tmp/scala-rs-corpus-20260910-codex` at
+3f6bdaeafde17d790023cc3f299b81eaaf876ca3.
+
+Separately from those environment failures, the full 5324-row corpus reports
+losses=3, changes=22 (19 gains). Counts (pass/fail/skip): pos 1116/398/345,
+neg 699/337/369, run 640/867/553. The prior losses neg/t9717, pos/t13013 and
+run/transform recover. New losses are pos/t1798 (companion-private access
+from auxiliary constructor arguments), pos/t12233 and neg/t12233 (class
+context-bound evidence required on auxiliary constructors). These compiler
+regressions independently prohibit merging. Raw candidate ledger:
+`tests/baselines/corpus-62fab7e4.tsv`.
+
+Focused validation before the gate passed 71 related tests and 534 boundary
+tests. Real-scalac probes cover all four t9717 rejection sites separately;
+a new JVM runtime probe also exposed and repaired qualified module-this
+loading from an uninitialized constructor receiver. The remaining three
+corpus regressions and damaged caches must be repaired before another gate.
+This recording commit changes only BASELINE and the raw candidate ledger.
