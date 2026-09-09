@@ -27,7 +27,8 @@ pub(crate) fn invoke_method(
         // for each on `<pkg>/package`, which is the ABI to call.
         owner = format!("{owner}/package");
     }
-    let name = s.name.as_str();
+    let impl_name = value_bridge_impl_name(ctx.st, id);
+    let name = impl_name.as_deref().unwrap_or(&s.name);
     let mut desc = method_desc_boxed(ctx.st, id, ctx.boxed_vars);
     if name == "<init>" {
         // `this(...)` in an auxiliary constructor: the target takes `$outer`

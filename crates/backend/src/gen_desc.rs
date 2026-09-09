@@ -12,7 +12,7 @@ use crate::classfile::{
 use crate::code::Assembler;
 use crate::gen::*;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::{SymKind, SymbolTable};
+use scala_rs_typer::{method_overloads, SymKind, SymbolTable};
 use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
@@ -2388,4 +2388,50 @@ pub(crate) fn has_nullary_accessor(st: &SymbolTable, cls: SymbolId, name: &str) 
             && matches!(&st.get(m).ty, Type::Method { paramss, .. }
                 if paramss.iter().flatten().next().is_none())
     })
+}
+
+/// A boxed bridge and its unboxed implementation can have the same JVM
+/// descriptor when a value class wraps Object. Keep distinct entry points.
+pub(crate) fn value_bridge_clashes(st: &SymbolTable, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    if !st.value_class_results.contains_key(&id)
+        && !s
+            .params
+            .iter()
+            .any(|p| st.value_class_terms.contains_key(p))
+    {
+        return false;
+    }
+    let desc = method_desc_from_sym(st, id);
+    for parent in linearize(st, s.owner).into_iter().skip(1) {
+        for &pm in &st.get(parent).members {
+            let ps = st.get(pm);
+            if ps.kind == SymKind::Method
+                && ps.name == s.name
+                && !st.value_class_results.contains_key(&pm)
+                && (st.value_class_results.contains_key(&id)
+                    || st.erased_abstract_params.get(&pm).copied().unwrap_or(0) != 0)
+                && method_desc_from_sym(st, pm) == desc
+                && !method_overloads(st, id, pm)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn value_bridge_impl_name(st: &SymbolTable, id: SymbolId) -> Option<String> {
+    if id.is_none()
+        || !st.get(st.get(id).owner).name.starts_with("$anon$")
+        || !value_bridge_clashes(st, id)
+    {
+        return None;
+    }
+    let owner = class_internal(st, st.get(id).owner);
+    let (prefix, _) = owner.rsplit_once("$anon$")?;
+    Some(format!("{prefix}$anon$${}", st.get(id).name))
 }

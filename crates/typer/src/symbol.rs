@@ -993,6 +993,10 @@ pub struct SymbolTable {
     /// backend still has to know that `case class Box(m: Meters)` prints its
     /// field as a boxed `Meters`.
     pub value_class_terms: rustc_hash::FxHashMap<SymbolId, SymbolId>,
+    /// Value-class field declarations retained before symbol erasure.
+    pub value_class_underlying_types: rustc_hash::FxHashMap<SymbolId, Type>,
+    /// Methods whose result was a user value class before erasure.
+    pub value_class_results: rustc_hash::FxHashMap<SymbolId, SymbolId>,
     /// Methods with at least one parameter that was a type parameter or an
     /// abstract type member **before** erasure, as a bit per parameter of the
     /// flattened parameter list (bit `i` = parameter `i`; parameters past 32
@@ -1259,6 +1263,8 @@ impl SymbolTable {
             super_accessor_targets: rustc_hash::FxHashMap::default(),
             method_override_families: rustc_hash::FxHashSet::default(),
             method_overload_pairs: rustc_hash::FxHashSet::default(),
+            value_class_underlying_types: rustc_hash::FxHashMap::default(),
+            value_class_results: rustc_hash::FxHashMap::default(),
             value_class_terms: rustc_hash::FxHashMap::default(),
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),

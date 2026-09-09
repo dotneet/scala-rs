@@ -235,6 +235,16 @@ fn erase_symbols(st: &mut SymbolTable) {
     }
     let mut changed = false;
     let n = st.symbols.len();
+    // Save every declaration before erasing any field: later method symbols
+    // may instantiate the same value class at different type arguments.
+    for i in 1..n {
+        let id = SymbolId(i as u32);
+        if !st.value_class_underlying_types.contains_key(&id) {
+            if let Some(under) = st.value_class_underlying(id) {
+                st.value_class_underlying_types.insert(id, under);
+            }
+        }
+    }
     for i in 1..n {
         let id = SymbolId(i as u32);
         let kind = st.get(id).kind;
@@ -264,6 +274,13 @@ fn erase_symbols(st: &mut SymbolTable) {
             };
             (erased, value_class, abstract_params)
         };
+        if kind == crate::symbol::SymKind::Method {
+            if let Type::Method { ret, .. } = &st.get(id).ty {
+                if let Some(c) = value_class_of(ret, st) {
+                    st.value_class_results.insert(id, c);
+                }
+            }
+        }
         if let Some(c) = value_class {
             st.value_class_terms.insert(id, c);
         }
@@ -621,14 +638,19 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         // user-defined value class`); erasure also runs over signatures the
         // typer never saw, so it stops at the second visit and keeps the
         // class boxed rather than unfolding for ever.
-        Type::Class { sym, .. } if st.is_value_class(*sym) => {
+        Type::Class { sym, args } if st.is_value_class(*sym) => {
             match crate::symbol::enter_chase(crate::symbol::Chase::Erase, *sym) {
                 None => Type::Class {
                     sym: *sym,
                     args: vec![],
                 },
-                Some(_g) => match st.value_class_underlying(*sym) {
-                    Some(u) => erase_ty(&u, st),
+                Some(_g) => match st
+                    .value_class_underlying_types
+                    .get(sym)
+                    .cloned()
+                    .or_else(|| st.value_class_underlying(*sym))
+                {
+                    Some(u) => erase_ty(&st.subst_tparams(*sym, args, &u), st),
                     None => Type::Any,
                 },
             }
@@ -1043,7 +1065,12 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             if !tree.sym.is_none() {
                 let owner = st.get(tree.sym).owner;
                 if st.is_value_class(owner)
-                    && st.get(owner).ctor_fields.first().copied() == Some(tree.sym)
+                    && st.get(owner).ctor_fields.first().is_some_and(|&field| {
+                        field == tree.sym
+                            || (st.get(field).name == st.get(tree.sym).name
+                                && st.get(tree.sym).kind == crate::symbol::SymKind::Method
+                                && st.get(tree.sym).params.is_empty())
+                    })
                 {
                     // The result is the underlying value, so what the caller
                     // may still have to box is the *field's* type, not the
@@ -1269,12 +1296,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 TreeKind::Apply { args, .. } => args.remove(0),
                 _ => return,
             };
-            let under = match &tree.ty {
-                Type::Class { sym, .. } => {
-                    st.value_class_underlying(*sym).unwrap_or_else(|| Type::Any)
-                }
-                t => t.clone(),
-            };
+            let under = erase_ty(&tree.ty, st);
             let vc_ty = tree.ty.clone();
             erase_tree(&mut arg, st, Some(&erase_ty(&under, st)));
             *tree = arg;
@@ -1287,6 +1309,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     }
     let param_tys;
     let mut fun_ty;
+    let mut declared_value_result = false;
     // For `new C(args)` this is the constructor alternative the typer picked;
     // `method_param_types` adapts the arguments against it. Read before the
     // `kind` borrow below.
@@ -1322,6 +1345,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             _ => true,
         };
         if !fun.sym.is_none() && sym_denotes_callee {
+            declared_value_result = st.value_class_results.contains_key(&fun.sym);
             match &st.get(fun.sym).ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => {
                     fun_ty = Type::Method {
@@ -1355,7 +1379,14 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         },
         _ => false,
     };
-    if is_primitive(&orig_erased)
+    if let Some(c) = value_class_of(&orig, st)
+        .filter(|_| !array_prim_load && is_ref_erased(&ret_erased) && !declared_value_result)
+    {
+        // A generic result contains the boxed value class even when its
+        // underlying representation is itself a reference (e.g. LazyList).
+        tree.ty = ret_erased;
+        wrap_vc_unbox(tree, c, orig_erased);
+    } else if is_primitive(&orig_erased)
         && is_ref_erased(&ret_erased)
         && !matches!(orig_erased, Type::Unit)
     {
@@ -1645,10 +1676,7 @@ fn box_adaptation(
     // `Integer`. nsc's post-erasure `box`/`unbox` for value classes is
     // `new Meters(n)` / `((Meters) x).n()`.
     if let Some(c) = value_class_of(orig, st) {
-        let under = st
-            .value_class_underlying(c)
-            .map(|u| erase_ty(&u, st))
-            .unwrap_or(Type::Any);
+        let under = erase_ty(orig, st);
         if !matches!(exp, Type::Unit) {
             // The underlying value goes where the underlying is asked for
             // (`describe$extension(int)`); every other reference position -- a

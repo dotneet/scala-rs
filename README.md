@@ -139,6 +139,12 @@ scalac 2.13.16 が受理し実行します。一方 `trait Univ extends Any` の
 （`libanyval_overload` ほか 3 件）と [docs/scala-library.md](docs/scala-library.md)
 の「an overload is not an override」節を参照してください。
 
+値クラスが総称メソッドの境界を通る際は、ブリッジで引数を取り出し、
+戻り値を箱に包みます。内部型が参照型や型パラメータの場合も対象です。
+匿名クラスで内部表現とブリッジの JVM シグネチャが一致する場合は実装名を
+分け、名前付きクラスの同じ衝突は診断します。`vcbridge` は実 scalac と
+受理・拒否および実行出力を比較します。
+
 **ユニバーサルトレイト（SLS 5.3.3）と値クラスの本体制限**は nsc の
 `Typers.checkEphemeral` をそのまま実装しています（`crates/typer/src/valueclass.rs`）。
 nsc ではこれは 1 つの関数で、`where` の語（"value class" か "universal trait

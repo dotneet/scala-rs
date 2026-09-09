@@ -1296,6 +1296,16 @@ impl<'a> Gen<'a> {
         if name == "<init>" && rhs.is_empty() {
             return;
         }
+        let impl_name = value_bridge_impl_name(self.st, def.sym);
+        if impl_name.is_none() && !rhs.is_empty() && value_bridge_clashes(self.st, def.sym) {
+            report_emit_error(
+                &self.emit_errors,
+                def.span,
+                "value-class bridge clashes with the implementation's erased signature",
+            );
+            return;
+        }
+        let name = impl_name.as_ref().unwrap_or(name);
         let mut desc = def_method_desc_boxed(self.st, def, &self.boxed_vars);
         // An *auxiliary* constructor of an inner class takes the enclosing
         // instance too, exactly as the primary one does (`emit_class_ctor`).

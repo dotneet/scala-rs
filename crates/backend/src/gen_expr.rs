@@ -2358,6 +2358,7 @@ pub(crate) fn gen_apply(
         asm.dup();
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
+            emit_adapt(asm, &param_adapt(ctx.st, &a.ty, &under));
         } else {
             push_default(asm, &under);
         }
@@ -2383,6 +2384,7 @@ pub(crate) fn gen_apply(
         }
         asm.checkcast(&internal);
         asm.invokevirtual(&internal, &name, &format!("(){}", jvm_desc(ctx.st, &under)));
+        emit_adapt(asm, &param_adapt(ctx.st, &under, &tree.ty));
         return;
     }
 

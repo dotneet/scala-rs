@@ -2251,7 +2251,8 @@ impl<'a> Gen<'a> {
                 }
                 let pdesc = method_desc_from_sym(self.st, pmid);
                 let cdesc = method_desc_from_sym(self.st, *cid);
-                if pdesc == cdesc {
+                let impl_name = value_bridge_impl_name(self.st, *cid);
+                if pdesc == cdesc && impl_name.is_none() {
                     continue;
                 }
                 let enc = encode_method_name(&ps.name);
@@ -2266,7 +2267,27 @@ impl<'a> Gen<'a> {
                 let child_ret = method_ret_from_sym(self.st, *cid);
                 // The bridge takes the erased parent signature, so a parameter
                 // the subclass narrowed to a primitive arrives boxed.
-                let ret_adapt = if jvm_desc(self.st, &ret) == jvm_desc(self.st, &child_ret) {
+                let result_box = self.st.value_class_results.get(cid).and_then(|&c| {
+                    (impl_name.is_some()
+                        || jvm_desc(self.st, &ret) != jvm_desc(self.st, &child_ret))
+                    .then(|| {
+                        (
+                            class_internal(self.st, c),
+                            format!(
+                                "({})V",
+                                jvm_desc(self.st, &self.st.value_class_underlying(c).unwrap())
+                            ),
+                            param_adapt(
+                                self.st,
+                                &child_ret,
+                                &self.st.value_class_underlying(c).unwrap(),
+                            ),
+                        )
+                    })
+                });
+                let ret_adapt = if result_box.is_some()
+                    || jvm_desc(self.st, &ret) == jvm_desc(self.st, &child_ret)
+                {
                     Adapt::None
                 } else {
                     param_adapt(self.st, &child_ret, &ret)
@@ -2285,6 +2306,8 @@ impl<'a> Gen<'a> {
                 let mut locals = 1u16;
                 let mut loads = Vec::new();
                 let mut casts: Vec<Adapt> = Vec::new();
+                let child_param_syms = &self.st.get(*cid).params;
+                let mut value_unboxes = Vec::new();
                 for (pty, cty) in parent_params.iter().zip(child_params.iter()) {
                     let sort = jvm_slot_sort(pty);
                     loads.push((locals, sort));
@@ -2293,6 +2316,22 @@ impl<'a> Gen<'a> {
                     } else {
                         Adapt::None
                     };
+                    let unbox = child_param_syms
+                        .get(casts.len())
+                        .and_then(|p| self.st.value_class_terms.get(p))
+                        .filter(|_| {
+                            impl_name.is_some() || jvm_desc(self.st, pty) != jvm_desc(self.st, cty)
+                        })
+                        .map(|&c| {
+                            let field = self.st.get(c).ctor_fields[0];
+                            (
+                                class_internal(self.st, c),
+                                self.st.get(field).name.clone(),
+                                format!("(){}", jvm_desc(self.st, &self.st.get(field).ty)),
+                                param_adapt(self.st, &self.st.get(field).ty, cty),
+                            )
+                        });
+                    value_unboxes.push(unbox);
                     casts.push(adapt);
                     locals += sort.slots();
                 }
@@ -2307,19 +2346,35 @@ impl<'a> Gen<'a> {
                     &pdesc_c,
                     locals.max(1),
                     |asm| {
+                        if let Some((class, _, _)) = &result_box {
+                            asm.new_obj(class);
+                            asm.dup();
+                        }
                         asm.aload(0);
                         for (i, (slot, sort)) in loads.iter().enumerate() {
                             load(asm, *slot, *sort);
-                            if let Some(a) = casts.get(i) {
+                            if let Some((class, field, desc, adapt)) = &value_unboxes[i] {
+                                asm.checkcast(class);
+                                asm.invokevirtual(class, field, desc);
+                                emit_adapt(asm, adapt);
+                            } else if let Some(a) = casts.get(i) {
                                 emit_adapt(asm, a);
                             }
                         }
-                        asm.invokevirtual(&class_c, &name, &cdesc_c);
+                        asm.invokevirtual(
+                            &class_c,
+                            impl_name.as_deref().unwrap_or(&name),
+                            &cdesc_c,
+                        );
                         if emit_forwarded_nothing(asm, &cret_desc) {
                             return;
                         }
                         if fill_unit {
                             emit_boxed_unit(asm);
+                        }
+                        if let Some((class, desc, adapt)) = &result_box {
+                            emit_adapt(asm, adapt);
+                            asm.invokespecial(class, "<init>", desc);
                         }
                         emit_adapt(asm, &ret_adapt);
                         emit_return(asm, &ret);
