@@ -861,6 +861,8 @@ pub struct SigCache {
 pub struct MemberHit {
     /// Dotted name of the class that declares it.
     pub owner: String,
+    /// Whether the declaration belongs to the companion module.
+    pub owner_module: bool,
     /// The member, with its type already substituted into the *queried*
     /// class's type-parameter vocabulary: `List#filter` comes back returning
     /// `List[A]`, not `IterableOps`'s opaque `C`.
@@ -930,6 +932,7 @@ impl SigCache {
                 m.ty = apply_subst(&m.ty, &step.subst);
                 found.push(MemberHit {
                     owner: step.class_name.clone(),
+                    owner_module: step.module,
                     member: m,
                 });
             }

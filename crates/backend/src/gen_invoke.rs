@@ -59,6 +59,18 @@ pub(crate) fn invoke_method(
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
+    // A completed pickle identifies a real JVM declaration. Keep its owner
+    // together with its descriptor before applying prelude approximations.
+    // Two overloads may erase alike in their arguments and differ in result.
+    if !s.pickled_origin.is_empty() && !s.declaring_class.is_empty() {
+        if s.declaring_is_interface {
+            asm.invokeinterface(&s.declaring_class, name, &desc);
+        } else {
+            asm.invokevirtual(&s.declaring_class, name, &desc);
+        }
+        maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
+        return;
+    }
     // `MapOps$WithFilter` has a pair-specific override whose erased return is
     // `IterableOps`, alongside the inherited generic `WithFilter.map` whose
     // erased return is `Object`.  scalac selects the latter when a filtered

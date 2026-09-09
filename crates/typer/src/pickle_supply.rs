@@ -1864,7 +1864,7 @@ impl PickleSupply {
         // which is where the class file's description is all there is.
         let case_synthetic_ok = !(internal.starts_with("scala/") && class_sym.0 < st.prelude_end);
         let mut installed: Vec<SymbolId> = Vec::new();
-        let mut seen_shapes: HashMap<String, (SymbolId, String, usize)> = HashMap::new();
+        let mut seen_shapes: Vec<(SymbolId, String, usize, Vec<Type>)> = Vec::new();
         // Members a later, more derived declaration displaced.
         let mut superseded: Vec<SymbolId> = Vec::new();
         for hit in &hits {
@@ -1949,6 +1949,7 @@ impl PickleSupply {
                 name,
                 &jvm_member,
                 &hit.owner,
+                hit.owner_module,
                 &shape,
                 &class_scope,
                 &mut seen_shapes,
@@ -2480,7 +2481,7 @@ impl PickleSupply {
             Flags::ACCESSOR,
             found.desc.clone(),
         );
-        if found.off_the_bytecode_path && found.declared_in != internal {
+        if found.off_the_bytecode_path || found.declared_in != internal {
             st.get_mut(acc).declaring_class = found.declared_in;
             st.get_mut(acc).declaring_is_interface = found.declared_by_interface;
         }
@@ -2666,9 +2667,10 @@ impl PickleSupply {
         // The pickled class that *declares* this member, which is not
         // `internal` whenever the member is inherited.
         pickle_owner: &str,
+        owner_module: bool,
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
-        seen_shapes: &mut HashMap<String, (SymbolId, String, usize)>,
+        seen_shapes: &mut Vec<(SymbolId, String, usize, Vec<Type>)>,
         // Members detached again because a later declaration with the same
         // explicit parameters and an extra implicit clause took their
         // place; the caller must not hand them back either.
@@ -2868,43 +2870,41 @@ impl PickleSupply {
         // `TreeSet.collect(pf)` / `.map(f)` was `ambiguous overload`.
         // Linearization order keeps the more derived one, which is the one
         // whose `Ordering` witness makes the result a `TreeSet`.
-        let key_want: Vec<Option<String>> = shape
+        let explicit_types: Vec<Type> = shape
             .clauses
             .iter()
-            .zip(paramss_ty.iter())
-            .filter(|(c, _)| !c.implicit)
-            .flat_map(|(_, tys)| tys.iter())
-            .map(|t| erased_param_desc(st, t))
+            .zip(&paramss_ty)
+            .filter(|(clause, _)| !clause.implicit)
+            .flat_map(|(_, tys)| tys.iter().cloned())
             .collect();
-        // Different type-parameter counts distinguish genuinely different
-        // overloads, including IterableOps.map[B] and MapOps.map[K2, V2].
-        // Merely distinguishing monomorphic from polymorphic methods loses
-        // the generic alternative for non-pair collection results.
-        let key = format!("{key_want:?}/{}", shape.tparams.len());
-        // ...with one exception, which is the whole of the sorted collections.
-        //
-        // `SortedMapOps` declares `map[K2, V2](f)(implicit ordering:
-        // Ordering[K2]): CC[K2, V2]` next to the `MapOps.map[K2, V2](f):
-        // CC[K2, V2]` it inherits. The two have the *same explicit
-        // parameters*, so they share a key here; nsc's `isAsSpecific` looks
-        // through an implicit clause, so specificity does not separate them
-        // either, and the only thing that does is which class declares them.
-        // Whichever the walk offers first is the one kept, and it offered
-        // `MapOps` first -- so `aSortedMap.map(f)` was `MapOps.map`, compiled,
-        // and returned an unordered `Map` with no diagnostic anywhere.
-        //
-        // A declaration that *adds a clause* to one it inherits is the derived
-        // one, and it is the one that can produce the receiver's own
-        // collection: the extra clause is the `Ordering` witness that makes
-        // the result sorted. So it supersedes, and only in that shape. Two
-        // declarations with the *same* number of parameters are left exactly
-        // as they were -- `MapOps.map[K2, V2](f)` against
-        // `IterableOps.map[B](f)` is a pair nsc keeps and picks between by
-        // expected type, and preferring the derived one there rejects
-        // `aMap.map { case (_, v) => v }`, which nsc accepts.
+        // Compare method variables positionally, preserving the structure
+        // around them. IterableOnce[B] and IterableOnce[(K, V2)] are distinct
+        // overloads even though both have one variable and the same erasure.
+        let same_parameters = |kept: SymbolId, previous: &[Type]| {
+            let old_tparams = &st.get(kept).tparams;
+            old_tparams.len() == tparams.len()
+                && previous.len() == explicit_types.len()
+                && previous.iter().zip(&explicit_types).all(|(old, new)| {
+                    let renamed = crate::symbol::subst_tparams_slice(
+                        old_tparams,
+                        &tparams
+                            .iter()
+                            .copied()
+                            .map(Type::TypeParam)
+                            .collect::<Vec<_>>(),
+                        old,
+                    );
+                    renamed == *new
+                })
+        };
+        // A derived declaration can add an implicit clause to the same
+        // explicit parameters, as SortedMapOps does with Ordering. Preserve
+        // that more specific declaration regardless of traversal order.
         let mut supersedes: Option<SymbolId> = None;
-        if let Some((kept, kept_owner, kept_arity)) =
-            seen_shapes.get(&key).map(|(k, o, a)| (*k, o.clone(), *a))
+        if let Some((kept, kept_owner, kept_arity)) = seen_shapes
+            .iter()
+            .find(|(k, _, _, ps)| same_parameters(*k, ps))
+            .map(|(k, o, a, _)| (*k, o.clone(), *a))
         {
             if arity > kept_arity
                 && shape.clauses.iter().any(|c| c.implicit)
@@ -2927,7 +2927,16 @@ impl PickleSupply {
         // descriptor is not supplied, so it must not shadow the next one
         // either (`TreeMap.collect(pf)` erases to two class-file methods and
         // would otherwise have taken `collect(pf)(Ordering)`'s place).
-        let found = match self.erased_desc(bin, internal, jvm_member, &want) {
+        let owner_file = scala_rs_pickle::sym::pickle_files_for(pickle_owner, owner_module)
+            .into_iter()
+            .find(|file| bin.find_class(file).ok().flatten().is_some());
+        let declared = owner_file.and_then(|owner| {
+            let params = self
+                .decl_site_want(st, bin, &scope, shape)
+                .unwrap_or_else(|| want.clone());
+            self.erased_desc(bin, &owner, jvm_member, &params)
+        });
+        let found = match declared.or_else(|| self.erased_desc(bin, internal, jvm_member, &want)) {
             Some(found) => Some(found),
             // The signature and the descriptor are erased in *different*
             // vocabularies when a more derived class in the linearisation
@@ -2962,15 +2971,12 @@ impl PickleSupply {
             ));
             return None;
         };
-        seen_shapes.insert(key, (m, pickle_owner.to_string(), arity));
-        // The member is installed on the class it was asked for, because that
-        // is where the typer looks it up. The *call* is a different question:
-        // a declaration off the bytecode path is not reachable from the
-        // receiver's class, so naming the receiver is a `NoSuchMethodError` at
-        // the first invocation. nsc emits `checkcast scala/reflect/api/Constants`
-        // and then `invokeinterface scala/reflect/api/Constants.Constant()`;
-        // recording the class here is what lets codegen do the same.
-        if found.off_the_bytecode_path && found.declared_in != internal {
+        seen_shapes.push((m, pickle_owner.to_string(), arity, explicit_types));
+        // Lookup installs the method on the receiver, but invocation must
+        // name the actual JVM declaration together with its descriptor.
+        // An inherited overload can have the same erased arguments and a
+        // different erased return type from a receiver-local declaration.
+        if found.off_the_bytecode_path || found.declared_in != internal {
             trace(format_args!(
                 "{internal}#{name}: declared by {}, which the receiver's class file \
                  does not reach -- the call will name it",
@@ -2988,7 +2994,7 @@ impl PickleSupply {
         let mut errors = Vec::new();
         st.get_mut(m).pickled_owner_bases = self
             .sigs
-            .linearization(&mut source, pickle_owner, false, &mut errors)
+            .linearization(&mut source, pickle_owner, owner_module, &mut errors)
             .into_iter()
             .map(|base| base.class_name)
             .collect();
@@ -3042,7 +3048,7 @@ impl PickleSupply {
         // one already in.
         if let Some(old) = supersedes {
             st.get_mut(class_sym).members.retain(|&x| x != old);
-            seen_shapes.retain(|_, (k, _, _)| *k != old);
+            seen_shapes.retain(|(k, _, _, _)| *k != old);
             superseded.push(old);
         }
         st.get_mut(m).owner = class_sym;

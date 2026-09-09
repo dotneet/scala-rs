@@ -153,3 +153,33 @@ fn outer_type_family_matches_scalac_from_source_and_binary() {
     }
     fs::remove_dir_all(p).unwrap();
 }
+
+#[test]
+fn collection_overloads_keep_the_selected_jvm_declaration() {
+    if !Path::new(NSC).is_file() || !Path::new(JAR).is_file() {
+        eprintln!("SKIP: real Scala 2.13.16 is unavailable");
+        return;
+    }
+    let p = root();
+    let good = [fixture("retfamily_collections.scala")];
+    let bad = [fixture("retfamily_collections_bad.scala")];
+    let mut oracle_stdout = None;
+    for oracle in [true, false] {
+        let out = p.join(if oracle { "nsc" } else { "rs" });
+        check(&compile(&good, &out, JAR, oracle, false));
+        let result = run(&out, JAR);
+        check(&result);
+        let expected = fs::read(fixture("expected/retfamily_collections.txt")).unwrap();
+        assert_eq!(result.stdout, expected);
+        if let Some(ref expected) = oracle_stdout {
+            assert_eq!(&result.stdout, expected);
+        } else {
+            oracle_stdout = Some(result.stdout);
+        }
+        let rejected = compile(&bad, &out.join("bad"), JAR, oracle, false);
+        assert!(
+            !rejected.status.success(),
+            "non-pair concatenation cannot be a Map"
+        );
+    }
+}

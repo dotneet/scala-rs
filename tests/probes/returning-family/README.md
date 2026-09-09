@@ -116,3 +116,25 @@ parameter, so distinguishing generic arities alone cannot preserve them.
 Next inspect the parameter structures (with alpha-renamed method variables),
 not merely erased descriptors or counts. Evidence:
 `/tmp/returning-overloads-corpus/spec.log` and `t3774.log`.
+
+### Structural overloads and JVM targets
+
+The two corpus losses compile after explicit parameter structures are compared
+with method variables renamed by position. Generic arity alone was insufficient
+for `Map.++`. The full required supply-boundary run at that intermediate state
+passed 548 tests (`/tmp/returning-overloads-structure-boundary.log`).
+
+A new execution probe still threw `ClassCastException` when concatenating a
+non-pair. The chosen declaration now carries its actual JVM owner and descriptor
+together, and the backend uses this target before prelude approximations.
+`MemberHit` also retains whether its owner is a companion module: losing this
+bit made `List$.empty` resolve against class `List` and caused eight `conform`
+failures in the intermediate experiment.
+
+With that corrected, `conform` (86), `buildfrom` (13), `ambigmap` (5) and
+`retfamily` (2) pass (`/tmp/returning-overloads-moduletarget.log`). The new
+`retfamily_collections` fixture executes with the JVM verifier and compares
+stdout bytes to real scalac; its negative fixture is rejected by both.
+The clean `78cc806f` binary rejects the positive fixture. Logs and before
+provenance: `/tmp/returning-concat/`. The real Slick returning probe compiles
+(`/tmp/returning-overloads-slick.log`). A new full gate is required before merge.
