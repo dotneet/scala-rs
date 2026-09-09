@@ -168,6 +168,11 @@ pub struct Member {
     /// Raw pickled flags; see [`pflags`].
     pub flags: u64,
     pub ty: SigType,
+    /// Written prefix of a type alias's outermost RHS reference. The ordinary
+    /// type view can erase this path, but constructing an inner class cannot.
+    pub alias_prefix: Option<SigType>,
+    /// Prefix of a value or method result's outermost type reference.
+    pub result_prefix: Option<SigType>,
     /// Set for a `MACRO` def whose `@macroImpl` annotation could be read.
     pub macro_impl: Option<MacroImpl>,
     /// The **simple name** of the symbol's `privateWithin` reference, i.e. the
@@ -412,6 +417,31 @@ impl Builder<'_> {
             .and_then(|w| self.p.sym_name(w))
             .filter(|n| !n.is_empty() && *n != "<root>" && *n != "<empty>")
             .map(|n| n.to_string());
+        let reference_prefix = {
+            let mut rhs = info.info;
+            let mut prefix = None;
+            // Malformed pickles may contain cyclic type references.
+            for _ in 0..64 {
+                match self.p.entry(rhs) {
+                    Some(Entry::PolyTpe { result, .. })
+                    | Some(Entry::MethodTpe { result, .. })
+                    | Some(Entry::ImplicitMethodTpe { result, .. }) => rhs = *result,
+                    Some(Entry::AnnotatedTpe { tpe, .. }) => rhs = *tpe,
+                    Some(Entry::TypeRefTpe { prefix: pre, .. }) => {
+                        prefix = Some(self.ty(*pre, 0));
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            prefix
+        };
+        let alias_prefix = (kind == MemberKind::TypeAlias)
+            .then(|| reference_prefix.clone())
+            .flatten();
+        let result_prefix = matches!(kind, MemberKind::Val | MemberKind::Def)
+            .then_some(reference_prefix)
+            .flatten();
         let ty = self.ty(info.info, 0);
         let macro_impl = if info.has(pflags::MACRO) {
             self.macro_impl_of(id)
@@ -423,6 +453,8 @@ impl Builder<'_> {
             kind,
             flags: info.flags,
             ty,
+            alias_prefix,
+            result_prefix,
             macro_impl,
             private_within,
             has_private_within: info.private_within.is_some(),
@@ -1207,6 +1239,8 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
                 .iter()
                 .map(|d| Member {
                     ty: go(&d.ty),
+                    alias_prefix: d.alias_prefix.as_ref().map(go),
+                    result_prefix: d.result_prefix.as_ref().map(go),
                     ..d.clone()
                 })
                 .collect(),

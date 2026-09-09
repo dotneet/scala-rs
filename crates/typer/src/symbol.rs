@@ -479,6 +479,8 @@ pub struct Symbol {
     pub ty: Type,
     pub members: Vec<SymbolId>,
     pub jvm_name: String,
+    /// Verified hidden enclosing-instance descriptor from a binary constructor.
+    pub binary_outer_desc: Option<String>,
     pub intrinsic: Intrinsic,
     /// Constructor / method parameter symbols (flat, first clause).
     pub params: Vec<SymbolId>,
@@ -782,6 +784,7 @@ pub struct Scope {
 /// `import owner._`, minus the names hidden by `X => _` selectors.
 #[derive(Clone, Debug)]
 pub struct WildcardImport {
+    pub origin: u64,
     pub owner: SymbolId,
     pub hidden: Vec<String>,
 }
@@ -858,11 +861,20 @@ impl Scope {
     }
 
     pub fn enter_wildcard(&mut self, owner: SymbolId, hidden: &[String]) {
-        if let Some(w) = self.wildcards.iter_mut().find(|w| w.owner == owner) {
+        self.enter_wildcard_origin(owner, hidden, 0);
+    }
+
+    pub fn enter_wildcard_origin(&mut self, owner: SymbolId, hidden: &[String], origin: u64) {
+        if let Some(w) = self
+            .wildcards
+            .iter_mut()
+            .find(|w| w.owner == owner && w.origin == origin)
+        {
             w.hidden.retain(|h| hidden.iter().any(|n| n == h));
             return;
         }
         self.wildcards.push(WildcardImport {
+            origin,
             owner,
             hidden: hidden.to_vec(),
         });
@@ -941,6 +953,11 @@ fn two_imports_tie(slot: &[Binding], pred: impl Fn(SymbolId) -> bool) -> bool {
 }
 
 pub struct SymbolTable {
+    /// Stable module outer arguments resolved from a parent's singleton path.
+    pub parent_outer_modules: HashMap<SymbolId, SymbolId>,
+    /// Original RHS prefixes of binary aliases, keyed by declaring owner/name.
+    /// These are declaration metadata, not a cache of call-site receivers.
+    pub binary_alias_prefixes: HashMap<(SymbolId, String), scala_rs_pickle::sym::SigType>,
     pub symbols: Vec<Symbol>,
     pub scopes: Vec<Scope>,
     pub root: SymbolId,
@@ -1189,6 +1206,8 @@ pub enum SeqPayload {
 impl SymbolTable {
     pub fn new() -> Self {
         let mut st = SymbolTable {
+            parent_outer_modules: HashMap::default(),
+            binary_alias_prefixes: HashMap::default(),
             symbols: vec![Symbol {
                 id: SymbolId(0),
                 name: "<none>".into(),
@@ -1198,6 +1217,7 @@ impl SymbolTable {
                 ty: Type::NoType,
                 members: vec![],
                 jvm_name: String::new(),
+                binary_outer_desc: None,
                 intrinsic: Intrinsic::None,
                 params: vec![],
                 paramss: vec![],
@@ -1324,6 +1344,7 @@ impl SymbolTable {
             ty: Type::NoType,
             members: vec![],
             jvm_name: jvm_name.into(),
+            binary_outer_desc: None,
             intrinsic: Intrinsic::None,
             params: vec![],
             paramss: vec![],
@@ -2210,7 +2231,14 @@ impl SymbolTable {
     /// handle -- `class_sym_of` answered `None`, so the singleton conformed
     /// to nothing and erased to `Object`.
     pub fn singleton_underlying(&self, sym: SymbolId) -> Type {
-        match self.get(sym).ty.clone() {
+        let symbol = self.get(sym);
+        // Binary member modules may have only a module-class symbol, with
+        // no companion term installed. Their singleton still widens to that
+        // module class, not to the enclosing prefix's class.
+        if symbol.is_class_like() && symbol.flags.contains(Flags::MODULE) {
+            return Type::ModuleRef(sym);
+        }
+        match symbol.ty.clone() {
             Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => *ret,
             other => other,
         }

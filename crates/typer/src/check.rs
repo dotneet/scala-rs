@@ -588,6 +588,8 @@ pub struct Typer {
     /// Receiver paths keyed by the written import clause, so an inner
     /// wildcard cannot replace the receiver of an outer binding.
     pub(crate) object_import_prefixes: HashMap<u64, Tree>,
+    /// Written import paths for parent type references, keyed by binding origin.
+    pub(crate) parent_import_prefixes: HashMap<u64, Tree>,
     /// Packages whose jar package object's pickled `type` aliases have been
     /// installed (see `install_pickled_package_aliases`). One read per package.
     pub(crate) pkg_aliases_done: HashSet<u32>,
@@ -987,6 +989,7 @@ impl Typer {
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
             object_import_prefixes: HashMap::new(),
+            parent_import_prefixes: HashMap::new(),
             pkg_aliases_done: HashSet::new(),
             pending_pkg_folds: Vec::new(),
             pkg_alias_gaps: HashMap::new(),

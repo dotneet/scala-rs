@@ -1315,6 +1315,7 @@ impl PickleSupply {
         let hidden_outer = self
             .java_class(bin, internal)
             .and_then(|c| hidden_outer_desc(st, class_sym, c));
+        st.get_mut(class_sym).binary_outer_desc = hidden_outer.clone();
         let existing = st.get(class_sym).members.iter().copied().find(|&id| {
             if broken.contains(&id) {
                 return false;
@@ -1595,6 +1596,16 @@ impl PickleSupply {
                 let qualified = format!("{}.{name}", hit.owner);
                 return self.abstract_type_member(st, bin, &qualified, 0);
             }
+            if let Some(prefix) = &hit.member.alias_prefix {
+                trace(format_args!(
+                    "{}#{name}: alias prefix {prefix:?}",
+                    hit.owner
+                ));
+                if let Some(owner) = self.ensure_class(st, bin, &hit.owner, false) {
+                    st.binary_alias_prefixes
+                        .insert((owner, name.to_string()), prefix.clone());
+                }
+            }
             return self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty);
         }
         // A *nested class or trait* named as a **type**, as opposed to a type
@@ -1628,6 +1639,35 @@ impl PickleSupply {
     ///
     /// A *parameterised* alias does need a symbol, to carry the parameters
     /// `expand_applied_hk_alias` substitutes at each use.
+    /// The enclosing instance named by a member object or a result type's
+    /// explicit declaring-this prefix. A matching erased class is insufficient.
+    pub(crate) fn member_module_owner(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        receiver: SymbolId,
+        name: &str,
+    ) -> Option<SymbolId> {
+        let full = st
+            .get(receiver)
+            .jvm_name
+            .trim_end_matches('$')
+            .replace('/', ".");
+        let module = st.get(receiver).flags.contains(Flags::MODULE);
+        let (hits, _) = self.sigs.lookup(&mut BinSource(bin), &full, module, name);
+        for hit in hits {
+            if hit.member.kind == MemberKind::Module {
+                return self.ensure_class(st, bin, &hit.owner, false);
+            }
+            if let Some(SigType::This(owner)) = &hit.member.result_prefix {
+                if *owner == hit.owner {
+                    return self.ensure_class(st, bin, owner, false);
+                }
+            }
+        }
+        None
+    }
+
     fn install_type_alias(
         &mut self,
         st: &mut SymbolTable,
@@ -4371,7 +4411,7 @@ impl PickleSupply {
             // that resolves to something other than a module (a local `val`,
             // `this.type`-like paths this pickle reader has not modelled) has
             // no counterpart to build and is declined like the rest.
-            SigType::Single { sym, .. } => {
+            SigType::Single { prefix, sym } => {
                 // `F.type` where `F` is a parameter of the member being
                 // installed (`def apply[F[_]](implicit F: Async[F]): F.type`):
                 // the parameter's own type is what that singleton widens to.
@@ -4384,6 +4424,27 @@ impl PickleSupply {
                     return Some(t);
                 }
                 if let Some(cls) = self.ensure_class(st, bin, sym, true) {
+                    // A member module belongs to the particular enclosing
+                    // instance named by its singleton prefix. Static package
+                    // modules have no such path-dependent identity.
+                    let owner = st.get(cls).owner;
+                    trace(format_args!(
+                        "singleton {sym}: prefix={prefix:?} owner={owner:?} flags={:?} module={:?}",
+                        st.get(cls).flags,
+                        st.companion_module(cls)
+                    ));
+                    if !owner.is_none()
+                        && st.get(owner).is_class_like()
+                        && !st.get(cls).flags.contains(Flags::STATIC)
+                    {
+                        let module = st.companion_module(cls).unwrap_or(cls);
+                        if let Some(pre) = self.conv_at(st, bin, scope, prefix, d) {
+                            return Some(Type::SingleType {
+                                prefix: Box::new(pre),
+                                sym: module,
+                            });
+                        }
+                    }
                     return Some(Type::ModuleRef(cls));
                 }
                 // Not a module: a `val`'s singleton type, which is what

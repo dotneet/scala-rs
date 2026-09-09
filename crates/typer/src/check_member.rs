@@ -1311,6 +1311,9 @@ impl Typer {
                 // would -- otherwise codegen emits `TypedRep.<init>()`, which
                 // type-checks here and fails with `NoSuchMethodError` at run
                 // time.
+                if !self.sigs_only {
+                    self.supply_binary_ctors(id);
+                }
                 if !self.sigs_only && self.parent_ctor_is_fillable(id) {
                     let head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                     *tree = Tree {
@@ -1388,11 +1391,12 @@ impl Typer {
             return false;
         };
         let params = self.st.get(only).params.clone();
-        !params.is_empty()
-            && params.iter().all(|p| {
-                let f = self.st.get(*p).flags;
-                f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
-            })
+        (params.is_empty() && self.st.get(class_id).binary_outer_desc.is_some())
+            || (!params.is_empty()
+                && params.iter().all(|p| {
+                    let f = self.st.get(*p).flags;
+                    f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
+                }))
     }
 
     /// Append the constructor arguments a parent clause is allowed to leave
@@ -1733,6 +1737,50 @@ impl Typer {
         }
     }
 
+    fn qualify_parent_type_prefix(&mut self, head: &mut Tree) {
+        match &mut head.kind {
+            TreeKind::Select { qual, .. } => {
+                self.type_expr(qual, &Type::NoType);
+                return;
+            }
+            TreeKind::AppliedTypeTree { tpt, .. }
+            | TreeKind::TypeApply { fun: tpt, .. }
+            | TreeKind::AnnotatedTypeTree { tpt, .. } => {
+                self.qualify_parent_type_prefix(tpt);
+                return;
+            }
+            _ => {}
+        }
+        // Preserve the binding's written prefix before dealiasing replaces
+        // the head symbol with the underlying class. Different imports may
+        // name the same member through distinct enclosing instances.
+        if let TreeKind::Ident { name } = &head.kind {
+            self.expose_unqualified_type(name, head.span);
+            let found = self.st.lookup_type(name);
+            let binding = self.st.scopes.iter().rev().find_map(|scope| {
+                scope
+                    .lookup_ranked(name)
+                    .into_iter()
+                    .filter(|b| found.contains(&b.sym))
+                    .min_by_key(|b| b.rank)
+                    .map(|b| (b.origin, b.sym))
+            });
+            if let Some((origin, member)) = binding {
+                if let Some(mut prefix) = self.parent_import_prefixes.get(&origin).cloned() {
+                    self.type_expr(&mut prefix, &Type::NoType);
+                    head.kind = TreeKind::Select {
+                        qual: Box::new(prefix),
+                        name: if self.st.get(member).kind == SymKind::Class {
+                            name.clone()
+                        } else {
+                            self.st.get(member).name.clone()
+                        },
+                    };
+                }
+            }
+        }
+    }
+
     fn type_parent_ctor_app_in(&mut self, tree: &mut Tree) {
         // `extends A(1)(2)` arrives as nested Applies; the constructor takes
         // one flat argument list on the JVM, so flatten the clauses.
@@ -1764,6 +1812,7 @@ impl Typer {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
         };
+        self.qualify_parent_type_prefix(fun);
         let class_ty = {
             let head: &Tree = &**fun;
             self.with_strict_type_names(|s| s.tree_to_type(head))
@@ -1877,6 +1926,78 @@ impl Typer {
                 // otherwise turn one honest "could not find implicit" into a
                 // second, misleading "no matching overload".
                 self.fill_parent_ctor_args(node, tree.span, class_id, &targs, args, sym);
+                fn qualifier(t: &Tree) -> Option<&Tree> {
+                    match &t.kind {
+                        TreeKind::Select { qual, .. } => Some(qual),
+                        TreeKind::AppliedTypeTree { tpt, .. }
+                        | TreeKind::TypeApply { fun: tpt, .. } => qualifier(tpt),
+                        _ => None,
+                    }
+                }
+                let mut parent_path = qualifier(fun).map(|q| q.ty.clone());
+                if let Some(q) = qualifier(fun) {
+                    if let TreeKind::Select { qual, name } = &q.kind {
+                        if let (Some(receiver), Some(member)) =
+                            (self.st.class_sym_of(&qual.ty), self.st.class_sym_of(&q.ty))
+                        {
+                            if let Some(owner) = self.pickle.member_module_owner(
+                                &mut self.st,
+                                &mut self.binary,
+                                receiver,
+                                name,
+                            ) {
+                                if self.st.get(member).owner == owner {
+                                    parent_path = Some(Type::SingleType {
+                                        prefix: Box::new(qual.ty.clone()),
+                                        sym: member,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(Type::SingleType {
+                    prefix,
+                    sym: member,
+                }) = parent_path.as_ref()
+                {
+                    if let Type::ModuleRef(module) = &**prefix {
+                        self.ensure_classfile_members_loaded(*module, "", tree.span);
+                        let member_class = self.st.module_class_of(*member);
+                        let owner = self.st.get(member_class).owner;
+                        let outer = self
+                            .st
+                            .get(class_id)
+                            .binary_outer_desc
+                            .as_deref()
+                            .and_then(|d| d.strip_prefix('L')?.strip_suffix(';'))
+                            .and_then(|jvm| self.st.find_class_by_jvm(jvm));
+                        if let Some(outer) = outer {
+                            self.pickle
+                                .ensure_parents(&mut self.st, &mut self.binary, owner);
+                            if self.st.is_sub_type(
+                                &Type::Class {
+                                    sym: owner,
+                                    args: vec![],
+                                },
+                                &Type::Class {
+                                    sym: outer,
+                                    args: vec![],
+                                },
+                            ) && self.st.is_sub_type(
+                                &Type::ModuleRef(*module),
+                                &Type::Class {
+                                    sym: outer,
+                                    args: vec![],
+                                },
+                            ) {
+                                self.st
+                                    .parent_outer_modules
+                                    .insert(self.st.this_class, *module);
+                            }
+                        }
+                    }
+                }
             }
             OverloadPick::Ambiguous => {
                 self.error(tree.span, "ambiguous overload for constructor");

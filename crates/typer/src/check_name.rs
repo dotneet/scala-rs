@@ -791,6 +791,7 @@ impl Typer {
     /// `import p.n` / `import p.{n => alias}`.
     fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span, qual: &Tree) {
         let origin = self.import_origin;
+        self.parent_import_prefixes.insert(origin, qual.clone());
         let mut entered = false;
         // Owners of members that came in *inherited* from a superclass of the
         // object named in the import; see `remember_named_import_prefix`.
@@ -1072,6 +1073,7 @@ impl Typer {
     /// classfile is still found later (see `expose_unqualified`).
     fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span, qual: &Tree) {
         let origin = self.import_origin;
+        self.parent_import_prefixes.insert(origin, qual.clone());
         // Scope bindings already carry the written clause's origin. Keep
         // its path under that identity, not under the member's class: two
         // objects can inherit the very same symbol and have different state.
@@ -1248,7 +1250,11 @@ impl Typer {
                     }
                 }
             }
-            self.st.enter_wildcard_in_current(o, hidden);
+            self.st
+                .scopes
+                .last_mut()
+                .unwrap()
+                .enter_wildcard_origin(o, hidden, origin);
         }
     }
 
@@ -1398,14 +1404,23 @@ impl Typer {
             return;
         }
         if self.library_abi {
-            for owner in self.st.wildcard_owners_for(name) {
+            let imports: Vec<_> = self
+                .st
+                .scopes
+                .iter()
+                .rev()
+                .flat_map(|sc| sc.wildcards().iter())
+                .filter(|w| w.offers(name))
+                .map(|w| (w.owner, w.origin))
+                .collect();
+            for (owner, origin) in imports {
                 match self
                     .pickle
                     .complete_type_member(&mut self.st, &mut self.binary, owner, name)
                 {
                     Some(Type::TypeMember(id)) => {
                         self.st
-                            .enter_in_current_ranked(name, id, BindRank::Wildcard);
+                            .enter_import_in_current(name, id, BindRank::Wildcard, origin);
                         return;
                     }
                     // A *nullary* alias has no symbol of its own -- it is its
@@ -1422,7 +1437,7 @@ impl Typer {
                     // ("type mismatch; found: Tag required: Tag").
                     Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
                         self.st
-                            .enter_in_current_ranked(name, sym, BindRank::Wildcard);
+                            .enter_import_in_current(name, sym, BindRank::Wildcard, origin);
                         return;
                     }
                     _ => {}

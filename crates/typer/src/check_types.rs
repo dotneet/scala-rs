@@ -574,6 +574,9 @@ impl Typer {
     /// only the module installs. A term/module denotation always wins the
     /// dot, regardless of what else shares the name.
     fn type_select_is_term_prefix(&self, t: &Tree) -> bool {
+        if !t.sym.is_none() && matches!(self.st.get(t.sym).kind, SymKind::Term | SymKind::Method) {
+            return true;
+        }
         match &t.kind {
             TreeKind::This { .. } | TreeKind::Super { .. } => true,
             TreeKind::Ident { name } => {

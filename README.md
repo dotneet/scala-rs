@@ -139,6 +139,14 @@ scalac 2.13.16 が受理し実行します。一方 `trait Univ extends Any` の
 （`libanyval_overload` ほか 3 件）と [docs/scala-library.md](docs/scala-library.md)
 の「an overload is not an override」節を参照してください。
 
+Binary inner-class parent constructors retain the enclosing instance named by
+imported aliases, including generic aliases, omitted constructor parentheses,
+member API objects, forwarded singleton API paths, and API values whose declared
+type refers to the enclosing `this`. The `bparent` regression compiles its
+library with scalac 2.13.16 and compares client execution under JVM verification.
+This does not yet make the Slick query probe fully executable: its `Rep` to
+`ProvenShape` conversion remains unresolved.
+
 継承した `lazyZip` などで、JVM の転送メソッドが失った `this.type` を
 Scala の宣言情報から保持します。登録先のクラスと実際の宣言元を区別し、
 `ArraySeq.lazyZip(...).map(...)` の `BuildFrom` が受け手の型を使うようにします。

@@ -1107,7 +1107,14 @@ impl<'a> Gen<'a> {
         let super_name = b.super_name.clone();
         let (super_owner, super_desc, super_args, super_cls, super_field_tys) =
             parent_super_ctor(self.st, parents, &super_name);
-        let super_outer = outer_field_class(self.st, super_cls);
+        let super_outer = outer_field_class(self.st, super_cls).or_else(|| {
+            self.st
+                .get(super_cls)
+                .binary_outer_desc
+                .as_deref()
+                .and_then(|d| d.strip_prefix('L')?.strip_suffix(';'))
+                .and_then(|jvm| self.st.find_class_by_jvm(jvm))
+        });
         let class_name = b.this_name.clone();
         let st = self.st;
         // `val` initializers *and* the body's bare statements, in source order.
@@ -1182,7 +1189,20 @@ impl<'a> Gen<'a> {
             // A nested superclass takes its enclosing instance first. Our own
             // `$outer` is not stored yet, so read it out of the argument.
             if let Some(o) = super_outer {
-                if has_outer && is_owner_compatible(st, outer.unwrap_or(SymbolId::NONE), o) {
+                let prefix = parents.iter().find_map(|parent| {
+                    let TreeKind::Apply { fun, .. } = &parent.kind else {
+                        return None;
+                    };
+                    if st.class_sym_of(&parent.ty) != Some(super_cls) {
+                        return None;
+                    }
+                    new_prefix_instance(&ctx_early, fun, o)
+                });
+                if let Some(module) = st.parent_outer_modules.get(&class_id) {
+                    load_module_instance(asm, &ctx_early, *module);
+                } else if let Some(prefix) = prefix {
+                    gen_expr(asm, &mut frame, &ctx_early, prefix);
+                } else if has_outer && is_owner_compatible(st, outer.unwrap_or(SymbolId::NONE), o) {
                     asm.aload(1);
                 } else {
                     load_outer_arg(asm, &ctx_early, o);
