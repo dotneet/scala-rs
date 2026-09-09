@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-seven slices have merged this session**, in thirty-three accepted composed gates.
-Eight intermediate candidates were rejected, three despite a PASS script verdict. From
+Nine intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1426,3 +1426,40 @@ The focused source/binary/runtime successes remain valid, but they do not
 establish safety of the broadened inherited-result and lazy-completion paths.
 This recording commit changes only this file and the candidate ledger; main's
 compiler remains unchanged.
+
+
+## Rejected repaired abstract-result candidate: `c51614e2`
+
+Clean `c51614e2` combines repair commit `eb47896d` with main `34d7f807`.
+The full, unskipped gate completed with `VERDICT=FAIL` and `DONE`:
+`/tmp/scala-rs-gate-c51614e2-codex/gate.log`. No compiler changes from this
+candidate are merged; accepted baseline remains `172a6525`.
+
+Gitbucket regresses from 223 errors / 68 files to 234 / 70. Cats improves
+159 / 59 -> 158 / 59; the library improves 541 / 123 -> 475 / 120.
+The library diagnostic location/message comparison has zero additions and
+66 removals. Gitbucket additions include block-local values incorrectly
+inheriting same-named ancestor result types under `-Xsource:3-cross`.
+A six-line reproduction and real-scalac comparison are saved under
+`/tmp/scala-rs-abstract-regression/local-shadow/`. The accepted compiler
+already emits a spurious override diagnostic for that reduced example;
+the candidate additionally imposes the ancestor's type on the local value.
+
+Slick: 184 files, zero errors, 1492 classes; verified 1492, failed 0,
+lint problems 0. Runtime MODE=b passes 12/12 programs and 36/36 attempts.
+The two extra classes implement Ordering SAMs for ScalaBaseType and
+ScalaOptionType; an accepted-class runtime probe throws ClassCastException,
+while candidate output matches the real-scalac client with published Slick.
+Details and fixtures are committed in the candidate's abstract-result probes.
+Workspace: 2685 passed, zero failed (290 rows). Format passes.
+
+Corpus: 5324 rows; pos 1116 / 398 / 345, neg 696 / 340 / 369,
+run 640 / 867 / 553 (pass / fail / skip). Against `172a6525`, there are
+15 status changes: 14 gains and one loss, `neg/t11136_override_conflict`.
+The five losses of the previous `0611af2f` candidate are recovered, but
+this new acceptance regression and the gitbucket increase prohibit merging.
+Candidate ledger: `tests/baselines/corpus-c51614e2.tsv`.
+
+This recording commit changes only BASELINE and the raw candidate ledger.
+The next repair must distinguish local declarations from template members
+and restore rejection of conflicting overrides before another composed gate.
