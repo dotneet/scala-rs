@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `9f3cae13` |
+| commit | `598ceef1` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy-three slices have merged this session**, in twenty-nine accepted composed gates.
+**Seventy-four slices have merged this session**, in thirty accepted composed gates.
 Five intermediate candidates were rejected, two despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -52,6 +52,7 @@ coordinator measured the merged tree each time, not the branches.
 | `4cc87fb2` | `unqualname` | 242 | 163 |
 | `0828f77b` | `wildcard-receiver` | 242 -> **239** | 163 |
 | `9f3cae13` | `returning-family`, collection overload corrections | 239 -> **228** | 163 |
+| `598ceef1` | `value-class bridges` | 228 | 163 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -277,12 +278,16 @@ specialization remain explicitly red; this is not a completion claim.
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
 | `pos` (1859) | **1109** | 405 | 345 |
-| `neg` (1405) | **690** | 346 | 369 |
-| `run` (2060) | **635** | 872 | 553 |
+| `neg` (1405) | **692** | 344 | 369 |
+| `run` (2060) | **637** | 870 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-9f3cae13.tsv`](baselines/corpus-9f3cae13.tsv): 5324 unique
+[`baselines/corpus-598ceef1.tsv`](baselines/corpus-598ceef1.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `598ceef1` gate compared against `corpus-9f3cae13.tsv`: **losses=0,
+changes=4**, all fail-to-pass: `neg/t6260-named`, `neg/t6260c`,
+`run/indylambda-boxing`, and `run/t6260b`.
+
 The `9f3cae13` gate compared against `corpus-0828f77b.tsv`: **losses=0,
 changes=4**, all fail-to-pass: `run/resetattrs-this`, `run/t3327`, `run/t3984`,
 and `run/tuples`.
@@ -355,15 +360,14 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **284 result rows, 2655 passed, 0 failed** at `9f3cae13` |
+| `cargo test --workspace --release --no-fail-fast` | **285 result rows, 2661 passed, 0 failed** at `598ceef1` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
-`cargo clippy --workspace --release` exits zero with **60** individual warning
-messages (excluding per-crate generated-warning summaries). The saved wildcard
-baseline log and current log have the same warning-message multiset; none were
-added by this slice. Evidence: `/tmp/wildcard-receiver-probe/clippy.log` and
-`/tmp/returning-elements-clippy.log`. The old recorded count of 58 was stale.
+`cargo clippy --workspace --release` exits zero with **59** individual warning
+messages (excluding per-crate generated-warning summaries). The saved previous
+log has 60; comparison by warning-message multiset finds no additions. Evidence:
+`/tmp/returning-elements-clippy.log` and `/tmp/lazyzip-probe/clippy2.log`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -1177,3 +1181,30 @@ The remaining failures must be investigated before another gate. Clippy exits
 zero; its warning-message multiset has no additions versus the saved previous
 log (60 -> 59). This recording commit changes only this file and the candidate
 ledger; main's compiler remains unchanged.
+
+
+## Gate thirty: value classes across generic boundaries
+
+Clean composed `598ceef1` completed `tests/verify_merge.sh` with
+`VERDICT=PASS`, `DONE`, no skipped stages, and corpus losses=0 against
+`9f3cae13`. Logs: `/tmp/scala-rs-gate-598ceef1-codex/gate.log`.
+Main was fast-forwarded to that exact tested commit. The following recording
+commit changes only this baseline, the saved ledger and the probe README.
+
+Gitbucket 228/69, cats 163/62, and library 541/123 are unchanged, including
+error-message multisets. Slick: zero errors / 1490 classes, all verified,
+no lint problems, 12/12 execution with 36/36 attempts. Workspace: 2661 passed,
+zero failed (285 rows). Corpus: pos 1109, neg 692, run 637; gains are the four
+statuses listed above. All three losses from the rejected gate are recovered.
+
+The four cats lazyZip BuildFrom diagnostics were not explained by this slice.
+A cats-shaped AnyVal wrapper instead exposed a silent runtime miscompile:
+generic bridges cast the wrapper to its underlying collection and did not box
+results. Preserving declaration metadata corrects argument/result adaptation,
+generic underlying types and binary accessors. Anonymous erased-name collisions
+use expanded implementation names; named collisions are rejected as scalac does.
+The first gate exposed receiver boxing and ordinary-function result boundaries;
+the final candidate fixes those too. Six focused tests compare rejection and
+runtime output against scalac, both ABI modes, and both binary compilation
+directions. This is not a claim that all value-class or collection paths are
+complete; gitbucket and cats still have the compilation errors recorded above.

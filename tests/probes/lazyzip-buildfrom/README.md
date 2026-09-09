@@ -1,3 +1,12 @@
+# Accepted value-class bridge slice
+
+Composed commit `598ceef1` passed the full gate with corpus losses=0;
+main contains the exact tested implementation. See tests/BASELINE.md and
+/tmp/scala-rs-gate-598ceef1-codex/gate.log. The historical notes below describe
+intermediate hypotheses and rejected states; the final gate supersedes their
+"not fixed" and "not ready" status statements. The cats BuildFrom investigation
+remains open.
+
 # LazyZip / value-class investigation (not fixed)
 
 Reference implementation: 9f3cae13 (db059c9b changes records only).
