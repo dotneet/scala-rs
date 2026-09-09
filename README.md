@@ -590,6 +590,33 @@ scala-rs が書いたクラスファイルには境界が入らないため、�
 実 scalac でも通ります（pickle のフォーマット変更が必要。
 [docs/not-implemented.md](docs/not-implemented.md) に記録）。
 
+**補助コンストラクタの `this(...)` でも名前付き引数を使えるようになりました。**
+`def this() = this(AnyRefMap.exceptionDefault, 16, initBlank = true)` の
+`initBlank = true` は**代入ではなく名前付き引数**です。自己委譲の経路だけが
+これを知らず、各ペアを `Assign` として型付けしていたため、primary
+コンストラクタのパラメータ（補助コンストラクタの本体からは見えます）に対して
+`reassignment to val <name>` を出し、残った `Unit` が
+`no matching overload for constructor` を追加で出していました。`new C(b = 2, a = 1)`
+と `extends B(b = 2, a = 1)` は以前から対応済みで、3 つ目のこの経路だけが
+抜けていました。並べ替えられた引数は SLS 6.6.1 のとおり**書かれた順**に評価され、
+省略されたデフォルトは平坦な `<init>` ディスクリプタに届きます。あわせて、
+名前を宣言しているだけの候補ではなく**適用可能な**候補を選ぶようにしました
+（`class C(a: Int, b: Boolean) { def this(a: Int) = … }` に対する `new C(a = 3)`
+は `missing argument for parameter b` になっていました）。
+
+**`var` でないものへの代入を拒否するようになりました。** `check_reassignment` は
+左辺が `Term` でないものを「解決済みの `x_=` セッタ」とみなして素通しして
+いたため、`def v: Int = 1; v = 2` は存在しないフィールドへの `putfield C.v:I` を、
+`object O; O = null` は `putfield scala/runtime.O:LO$;` を出していました
+（型エラーなし）。危険なのは**エラーメッセージが出ない方の半分**です。
+クラスファイルから継承した `var` はアクセサ対 `bv()` / `bv_$eq(int)` と
+**private** フィールドとして届くのに、セッタへの書き換えは `Select` 形
+（`this.bv = 5`）にしかなく、`bv = 5` は他人の private フィールドへの
+`putfield` になり、実 scalac がビルドした親クラスに対して実行時に
+`IllegalAccessError` を投げていました。単純名の形も書き換えるようにしています。
+検査は `varassign` テスト（実 scalac 2.13.16 との 44 ケースの双方向比較と、
+scalac がビルドした親クラスに対する JVM 実行）です。
+
 For what the language subset does and does not cover, see
 [docs/language-support.md](docs/language-support.md) and
 [docs/not-implemented.md](docs/not-implemented.md).
@@ -767,6 +794,14 @@ The scripts under `tests/` are measurement harnesses, not part of `cargo test`:
   program is executed `RUNS` times (default 3) and the per-program `m/n` is
   printed, so an intermittent failure cannot be averaged away. See
   [docs/notes/running-the-slick-we-compiled.md](docs/notes/running-the-slick-we-compiled.md).
+- `tests/assign_probe.sh` — 47 assignment and named-argument snippets, each
+  compiled by this compiler *and* by real scalac 2.13.16 and compared on
+  accept/reject in **both** directions: what scalac accepts and we reject, and
+  what scalac rejects and we accept. The second direction is the one no error
+  count can show, and it is where `agent/varassign` found five silently
+  miscompiled programs. Reports 19 disagreements of 47 at `daa19440` and one
+  after (`b24_setter_only`, recorded in
+  [docs/not-implemented.md](docs/not-implemented.md)); exits non-zero above one.
 - `tests/expand_fm.py` — expand the seven FreeMarker templates slick's build
   generates Scala sources from, so a measurement covers what sbt would compile.
 - `tests/testkit_measure.sh` — the same measurement for `slick-testkit`, slick's

@@ -1785,7 +1785,7 @@ impl Typer {
         if Self::has_named_arg(args) {
             let cid = (!class_id.is_none()).then_some(class_id);
             let mut placed = args.clone();
-            if self.reorder_named_ctor_args(&mut placed, cid, fun) {
+            if self.reorder_named_ctor_args(&mut placed, cid, fun, None) {
                 *args = placed;
             } else {
                 // Leave the `name = value` arguments in the tree. Every parent
@@ -2079,6 +2079,7 @@ impl Typer {
     }
 
     pub(crate) fn type_ctor_delegation(&mut self, tree: &mut Tree) {
+        let tree_id = tree.id;
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
@@ -2098,11 +2099,34 @@ impl Typer {
             return;
         }
         let class_id = self.st.this_class;
+        let skip = self.return_meth;
+        // `def this() = this(a = 1, initBlank = true)`. A `name = value`
+        // argument is a *named argument*, not an assignment, and this path had
+        // no idea: the pairs were typed as `Assign` trees, so every one
+        // reported `reassignment to val <name>` against the primary
+        // constructor's own parameter (which is in scope in an auxiliary
+        // constructor's body), and the `Unit`s they left behind produced a
+        // further `no matching overload for constructor C with arguments
+        // (Unit, Unit)`. `AnyRefMap`'s four auxiliary constructors are eight
+        // of those errors on their own. The names have to be placed before the
+        // overload is picked, since `pick_ctor` is driven by argument types --
+        // the same reason `new C(b = 2, a = 1)` and `extends B(b = 2, a = 1)`
+        // place theirs first.
+        if Self::has_named_arg(args) {
+            let placed = self.reorder_named_ctor_args(args, Some(class_id), fun, skip);
+            self.record_named_arg_order(tree_id);
+            if !placed {
+                for a in args.iter_mut() {
+                    self.type_expr(a, &Type::NoType);
+                }
+                tree.ty = Type::Unit;
+                return;
+            }
+        }
         for a in args.iter_mut() {
             self.type_expr(a, &Type::NoType);
         }
         let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
-        let skip = self.return_meth;
         match self.pick_ctor(class_id, &arg_tys, skip) {
             OverloadPick::Found(sym, param_tys, _) => {
                 if let Some(cur) = skip {

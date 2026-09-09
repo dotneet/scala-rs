@@ -1860,6 +1860,37 @@ impl Typer {
             .any(|m| self.st.get(m).kind == SymKind::Method)
     }
 
+    /// `v = e` written as a bare name, where `v` resolved to a *getter* and the
+    /// class it comes from has a `v_=`.
+    ///
+    /// The sibling of [`Self::setter_assign_lhs`] for the unqualified form. A
+    /// `var` inherited from a **class file** arrives as the pair of accessors
+    /// `bv()` / `bv_$eq(int)` around a *private* field, so `class E extends B
+    /// { def g() = bv = 5 }` has no field it may write: the store this
+    /// compiler emitted (`putfield B.bv`) linked against a scalac-built `B`
+    /// and threw `IllegalAccessError` at the first call. Only the qualified
+    /// form `this.bv = 5` was ever rewritten, because only that one is a
+    /// `Select`.
+    pub(crate) fn ident_setter_assign_lhs(&mut self, lhs: &Tree) -> Option<String> {
+        let TreeKind::Ident { name } = &lhs.kind else {
+            return None;
+        };
+        if lhs.sym.is_none() {
+            return None;
+        }
+        let s = self.st.get(lhs.sym);
+        if s.kind != SymKind::Method || s.name.ends_with("_=") {
+            return None;
+        }
+        let owner = s.owner;
+        let setter = format!("{name}_=");
+        self.st
+            .lookup_member(owner, &setter)
+            .into_iter()
+            .any(|m| self.st.get(m).kind == SymKind::Method)
+            .then_some(setter)
+    }
+
     /// nsc's `reassignment to val`. Without it `d.v = 5` on a trait's `val`
     /// type-checks and then fails at run time: the mixin setter a trait `val`
     /// gets is not a setter a program may call.
@@ -1869,15 +1900,39 @@ impl Typer {
             return;
         }
         let s = self.st.get(id);
-        // Only a term (a field or local) is an l-value here; a `Method` lhs is
-        // an already-resolved `x_=` setter or an unrelated resolution failure.
-        if s.kind != SymKind::Term || s.flags.contains(Flags::MUTABLE) {
+        if s.flags.contains(Flags::MUTABLE) {
             return;
         }
         // Java fields carry no Scala mutability, and the compiler's own
         // synthetic terms (`$outer`, capture fields, …) are written by the
         // phases that create them.
         if s.flags.contains(Flags::JAVA) || s.flags.contains(Flags::SYNTHETIC) {
+            return;
+        }
+        // What the left side actually resolved to. `Term` is the immutable
+        // field or local this check was written for. The rest reach here only
+        // because both setter rewrites above declined them, and every one used
+        // to be *accepted* and then miscompiled:
+        //
+        // * a `def` -- `class C { def v: Int = 1; def f() = v = 2 }` emitted
+        //   `putfield C.v:I` for a field the class does not declare, and
+        //   `d.v = 2` on a `def` did the same through a `Select`;
+        // * a `val` inherited from a class file, which arrives as a getter
+        //   method with no `_=` beside it (`Nil.length = 2` compiled);
+        // * an object -- `object O; O = null` emitted
+        //   `putfield scala/runtime.O:LO$;`.
+        //
+        // nsc reports the first two as `value v_= is not a member of C` when
+        // the left side is a selection and `reassignment to val` when it is a
+        // name; one diagnostic for the family is what this compiler has.
+        let unassignable = match s.kind {
+            SymKind::Term => true,
+            // An already-resolved `x_=` is the call, not a store.
+            SymKind::Method => !s.name.ends_with("_="),
+            SymKind::Module | SymKind::ModuleClass | SymKind::Class | SymKind::Package => true,
+            SymKind::TypeParam | SymKind::TypeMember | SymKind::NoSymbol => false,
+        };
+        if !unassignable {
             return;
         }
         let name = s.name.clone();

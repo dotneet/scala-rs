@@ -378,3 +378,23 @@ Compiler flags (`agent/xflags`):
   repair: doing so cost cats' `NonEmptyVector.scala` a diagnostic, because
   completing `coll` / `toIterable` / `fromSpecific` on `Vector` changed which
   `grouped` and `lazyZip` later expressions saw. Measured on `agent/samconv`.
+- **`val v` beside a hand-written `def v_=` is reported as `reassignment to
+  val`; scalac calls the setter.** `class C { val v = 1; def v_=(x: Int) = () }`
+  followed by `c.v = 2` compiles under scalac 2.13.16 and is refused here.
+  `setter_assign_lhs` asks the setter question only when the left side resolved
+  to a *method* (a getter), and a `val` defined in the same run is a `Term`, so
+  the rewrite is never offered. Widening the test to "a `_=` exists on the
+  qualifier's class, whatever the left side resolved to" would also rewrite
+  `this.v = 3` on a `var` of the enclosing class into an accessor call, which
+  is a codegen change on the commonest assignment there is, so it was measured
+  as out of proportion to the shape. Found by `agent/varassign`'s 44-case
+  two-directional probe; it is the one case of the 44 that still disagrees.
+- **Assignment to a wildcard-imported `var` uses `this` as the receiver.**
+  `object O { var ov = 1 }; import O._; ov = 5` compiles and emits
+  `aload_0; checkcast O$; putfield O$.ov`, which throws `ClassCastException` at
+  run time (`class M$ cannot be cast to class O$`). The *read* of the same name
+  is correct — `println(ov)` emits `getstatic O$.MODULE$` — so the defect is in
+  the assignment path's prefix, not in import resolution. It is not in the
+  mutability family `agent/varassign` closed (the symbol's mutability is read
+  correctly; the receiver is wrong), and the qualified form `O.ov = 5` is
+  correct, which is why no measure has ever shown it.
