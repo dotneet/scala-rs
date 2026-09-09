@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `598ceef1` |
+| commit | `218b5340` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy-four slices have merged this session**, in thirty accepted composed gates.
+**Seventy-five slices have merged this session**, in thirty-one accepted composed gates.
 Five intermediate candidates were rejected, two despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -53,6 +53,7 @@ coordinator measured the merged tree each time, not the branches.
 | `0828f77b` | `wildcard-receiver` | 242 -> **239** | 163 |
 | `9f3cae13` | `returning-family`, collection overload corrections | 239 -> **228** | 163 |
 | `598ceef1` | `value-class bridges` | 228 | 163 |
+| `218b5340` | `lazyZip declaration origins` | 228 | 163 -> **159** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -259,7 +260,7 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **159** | **59** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **228** | **69** | — |
 | `tests/scalalib_measure.sh` (538) | **541** | **123** | — |
 
@@ -282,8 +283,11 @@ specialization remain explicitly red; this is not a completion claim.
 | `run` (2060) | **637** | 870 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-598ceef1.tsv`](baselines/corpus-598ceef1.tsv): 5324 unique
+[`baselines/corpus-218b5340.tsv`](baselines/corpus-218b5340.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `218b5340` gate compared against `corpus-598ceef1.tsv`: **losses=0,
+changes=0**.
+
 The `598ceef1` gate compared against `corpus-9f3cae13.tsv`: **losses=0,
 changes=4**, all fail-to-pass: `neg/t6260-named`, `neg/t6260c`,
 `run/indylambda-boxing`, and `run/t6260b`.
@@ -360,14 +364,14 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **285 result rows, 2661 passed, 0 failed** at `598ceef1` |
+| `cargo test --workspace --release --no-fail-fast` | **286 result rows, 2662 passed, 0 failed** at `218b5340` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
 `cargo clippy --workspace --release` exits zero with **59** individual warning
 messages (excluding per-crate generated-warning summaries). The saved previous
-log has 60; comparison by warning-message multiset finds no additions. Evidence:
-`/tmp/returning-elements-clippy.log` and `/tmp/lazyzip-probe/clippy2.log`.
+log has 59; comparison by warning-message multiset finds no additions. Evidence:
+`/tmp/lazyzip-probe/clippy2.log` and `/tmp/lazyzip-origin/clippy.log`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -1208,3 +1212,38 @@ the final candidate fixes those too. Six focused tests compare rejection and
 runtime output against scalac, both ABI modes, and both binary compilation
 directions. This is not a claim that all value-class or collection paths are
 complete; gitbucket and cats still have the compilation errors recorded above.
+
+
+## Gate thirty-one: original owners and singleton result erasure
+
+Clean `218b5340`, containing main `73a6ca77`, completed the full merge gate
+with `VERDICT=PASS`, `DONE`, no skipped stages, and corpus losses=0,
+changes=0 against `598ceef1`. Logs:
+`/tmp/scala-rs-gate-218b5340-codex/gate.log`. Main was fast-forwarded to the
+exact tested commit. The following record changes only this baseline, the
+saved corpus ledger and the probe README.
+
+Cats improves 163/62 -> 159/59: exactly four BuildFrom[Iterable,...]
+diagnostics disappear, with no new error-message entries. Gitbucket stays
+228/69 and library 541/123, with unchanged error-message multisets. Slick
+retains zero errors, 1490 verified classes, zero lint problems and 12/12
+execution (36/36 attempts). Workspace: 2662 passed, zero failed (286 rows).
+Corpus remains pos 1109, neg 692, run 637. Format checking passes; clippy
+exits zero with 59 individual warnings and no additions versus the prior log.
+
+The general BuildFrom-witness hypothesis was wrong. A Scala-signature member
+installed on Seq retains the original Iterable declaration and its singleton
+receiver result, while a classfile forwarder on AbstractIterable loses that
+singleton. Comparing the installation owners missed their shared declaration.
+Forwarder filtering now uses the original declaring owner and accounts for
+JVM singleton erasure when comparing complete signatures. It does not discard
+all competing classfile methods.
+
+The small ArraySeq regression is rejected by the saved pre-fix binary with
+the same BuildFrom error. The corrected compiler and real scalac 2.13.16
+execute it under java -Xverify:all with byte-identical output; both reject
+the incompatible-result fixture. The required member-supply boundary suites
+plus the new test pass 535/535. Simpler LazyList probes did not reproduce the
+loaded inheritance graph and are not claimed as regression tests. The probe
+README preserves that investigation. Gitbucket and cats are not yet fully
+compilable; the counts above remain the accepted baseline.
