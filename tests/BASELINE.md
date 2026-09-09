@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-five slices have merged this session**, in thirty-one accepted composed gates.
-Five intermediate candidates were rejected, two despite a PASS script verdict. From
+Six intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1247,3 +1247,34 @@ plus the new test pass 535/535. Simpler LazyList probes did not reproduce the
 loaded inheritance graph and are not claimed as regression tests. The probe
 README preserves that investigation. Gitbucket and cats are not yet fully
 compilable; the counts above remain the accepted baseline.
+
+
+## Rejected binary-parent candidate: `07de211b`
+
+Clean `07de211b`, containing main `57accf2b`, completed the full merge gate
+with `VERDICT=PASS`, `DONE`, no skipped stages, and corpus losses=0,
+changes=0 against `218b5340`. Logs:
+`/tmp/scala-rs-gate-07de211b-codex/gate.log`. The candidate is rejected for
+standard-library compilation regression and does not replace the accepted
+baseline or main's compiler. The gate script does not enforce this error count.
+
+Library: 543 errors / 123 files, up from 541/123. The only added error-message
+entries are two `value fromBitMaskNoCopy is not a member of BitSet$` diagnostics
+at immutable/BitSet.scala:373 and mutable/BitSet.scala:390, in readResolve of
+nested SerializationProxy classes. Cats stays 159/59 and gitbucket 228/69;
+their error-message multisets are unchanged.
+
+Slick: zero errors / 1490 classes, all 1490 verified, zero validation failures
+or lint problems, 12/12 execution with 36/36 attempts. Workspace: 2664 passed,
+zero failed (288 rows). Corpus remains pos 1109, neg 692, run 637. Saved
+candidate ledger: `tests/baselines/corpus-07de211b.tsv`. Format check passes;
+clippy exits zero with 59 individual warnings and no additions against the
+saved preceding log.
+
+The candidate fixes verified binary inner-class constructor failures across
+import aliases and direct/forwarded API paths; its permanent tests compare
+stdout bytes and rejection with real scalac. That focused success does not
+excuse the source-library regression. The original Slick query probe advances
+past its constructor but fails at Rep-to-ProvenShape conversion; no complete
+query execution is claimed. This record changes only this baseline and the
+candidate ledger; no implementation from the candidate is merged.
