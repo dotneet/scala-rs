@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-seven slices have merged this session**, in thirty-three accepted composed gates.
-Nine intermediate candidates were rejected, three despite a PASS script verdict. From
+Ten intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1463,3 +1463,50 @@ Candidate ledger: `tests/baselines/corpus-c51614e2.tsv`.
 This recording commit changes only BASELINE and the raw candidate ledger.
 The next repair must distinguish local declarations from template members
 and restore rejection of conflicting overrides before another composed gate.
+
+
+## Rejected inherited-implementation candidate: `4d3bc103`
+
+Clean `4d3bc103` combines `3d1dcfa1` with main `617b6519`. Its full gate
+completed without skips, with `VERDICT=FAIL` and `DONE`:
+`/tmp/scala-rs-gate-4d3bc103-codex/gate.log`. The accepted compiler baseline
+remains `172a6525`; no implementation from this candidate is merged.
+
+Compile measures improve: gitbucket 223/68 -> 217/67, cats 159/59 -> 158/59,
+library 541/123 -> 474/120. All three error-message multisets have no additions.
+Slick compiles 184 files with zero errors and 1492 classes; subset reports
+verified 1492, failed 0, lint problems 0. MODE=b executes 12/12 programs,
+36/36 attempts. Format passes. Clippy has 57 existing diagnostic warnings,
+unchanged from the previous repair checkpoint.
+
+Workspace: 2682 passed, six failed (290 rows). Failures are
+`seqfn_fixture_dual_run`, `deep_diamond_hierarchy_terminates`,
+`diamond_cost_does_not_double_per_level`, `fixtures_vf_nothing`,
+`fixtures_vf_nothing_lib`, and `vf_nothing_bridges_match_scalac`.
+The seqfn test rejects a PartialFunction[Int, Int] as though it required
+PartialFunction[Any, Int]. The diamond comparison takes 0.195 seconds at 22
+levels but 24.995 seconds at 30; the 34-level case exceeds 60 seconds.
+The three verifyfail tests expose a missing String-returning bridge for a
+Nothing-returning implementation.
+
+An additional, stronger initialization sweep of the exact Slick output fails:
+`verify_classes=1492 verify_failures=1 verify_loaded=1490 verify_incomplete=1`.
+QueryInterpreter.StructValue.apply(Object): Object calls apply(Int): Object
+without unboxing its argument, producing VerifyError. TimestamptzConverter
+is incomplete because the Oracle JDBC driver is absent; PostgreSQL's real
+cached driver was provided. The ordinary subset check and 12 runtime programs
+missed this bad bridge. Logs: `verify-all.log`, `verify-all-verbose.log`,
+`structvalue-javap.txt`; the class output is retained as `slick-classes/` in
+the gate directory. No verification success is claimed from the subset alone.
+
+Corpus: 5324 rows, losses=3, changes=20 (17 gains). Counts (pass/fail/skip):
+pos 1118/396/345, neg 696/340/369, run 639/868/553. New losses against the
+accepted reference: neg/t9717, pos/t13013, run/transform. The prior loss
+neg/t11136_override_conflict is recovered. Raw ledger:
+`tests/baselines/corpus-4d3bc103.tsv`.
+
+Next repairs must constrain hierarchy completion without reintroducing
+exponential traversal or changing existing collection signatures, preserve
+Nothing bridges, and adapt primitive arguments in inherited bridges. Each
+loss and existing failing test remains a gate requirement. This record changes
+only BASELINE and the candidate ledger; main's implementation is unchanged.
