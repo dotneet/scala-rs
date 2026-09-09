@@ -35,3 +35,26 @@ source and binary libraries, two owner instances, static nested classes and
 negative invalid-prefix cases. Execute new cases and compare stdout bytes to
 scalac. Do not merge a compiler change without the full composed gate. No full
 gate or new before measurement was run for this investigation.
+
+## Parent-tree trace
+
+A diagnostic build traced type_parent_ctor_app_in before it overwrites
+fun.sym. The unqualified head is Ident("Alias"), sym NONE and NoType;
+tree_to_type returns only Class(Base, []). On the second pass the same head
+has already been assigned Base's symbol and class type. There is no term
+prefix in either tree. Trace: /tmp/scala-rs-shape-join/parent-trace.log.
+Temporary instrumentation was removed after observation.
+
+The relevant loss precedes erasure: tree_to_type resolves the imported type
+member, and resolve_type_name_completing returns its dealiased type. Parent
+constructor typing then replaces the head's symbol with the underlying class.
+The import binding must therefore be consulted before that replacement.
+Existing object_import_prefixes are keyed by written import origin and avoid
+class-wide receiver conflation; term_import_prefixes alone cannot establish
+which of two imports a particular parent named. Backend load_outer_arg can
+only follow lexical owners/modules, so merely removing the JAVA exclusion
+would not establish the required imported instance.
+
+No compiler change is retained, and no full gate was started. The diagnostic
+binary in this worktree was built with tracing and is not an accepted binary;
+use the saved lazyzip-origin binary for pre-fix acceptance/runtime comparisons.
