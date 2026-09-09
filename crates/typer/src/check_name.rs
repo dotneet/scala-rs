@@ -446,6 +446,12 @@ impl Typer {
         {
             return false;
         }
+        // A module reference already carries its singleton receiver. Keep
+        // it intact: rewriting it as a value selection discards the module
+        // identity used by overloaded companion `apply` resolution.
+        let needs_object_receiver = found
+            .iter()
+            .any(|&id| matches!(self.st.get(id).kind, SymKind::Term | SymKind::Method));
         let imported_prefix = self
             .st
             .scopes
@@ -463,7 +469,8 @@ impl Typer {
                     .find(|b| b.rank == rank && found.contains(&b.sym))
                     .map(|b| self.object_import_prefixes.get(&b.origin))
             })
-            .flatten();
+            .flatten()
+            .filter(|_| needs_object_receiver);
         let Some(prefix) =
             imported_prefix.or_else(|| owners.iter().find_map(|&o| self.term_import_prefix_for(o)))
         else {

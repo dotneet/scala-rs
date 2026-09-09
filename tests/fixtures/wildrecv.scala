@@ -3,6 +3,12 @@ class WildBase {
   def plus(x: Int): Int = inherited + x
 }
 object WildSource extends WildBase { var direct: Int = 1 }
+object WildFactory {
+  case class Payload(value: Int)
+  object Payload {
+    def apply(text: String, count: Int): Payload = new Payload(text.length + count)
+  }
+}
 object WildOther extends WildBase
 object WildMain {
   def directRead(): Int = { import WildSource._; direct }
@@ -16,6 +22,10 @@ object WildMain {
     val inner = { import WildOther._; plus(1) }
     inner + plus(1)
   }
+  def companion(): Int = {
+    import WildFactory._
+    Payload(text = "abc", count = 4).value
+  }
   def main(args: Array[String]): Unit = {
     println(directRead())
     println(inheritedRead())
@@ -26,5 +36,6 @@ object WildMain {
     println(inheritedCall())
     println(selectors())
     println(nested())
+    println(companion())
   }
 }

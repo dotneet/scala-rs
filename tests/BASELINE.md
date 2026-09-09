@@ -983,3 +983,19 @@ ledger, not compiler code or test inputs.
   than a regression: a wrong type had been swallowing 269 errors' worth of call
   sites, and removing it let the query bodies be type-checked for the first
   time. See the `agent/tablequery` merge.
+
+## Unmerged wildcard receiver candidate: `7220a0ec`
+
+Gate `/tmp/scala-rs-gate-7220a0ec-codex/gate.log` completed without skipped
+stages and printed `VERDICT=PASS`, but the candidate is **not approved for
+merge**: gitbucket rose from 242 to 290 errors (72 files). The script checks
+input completeness, not gitbucket error-count regression. An eight-line
+case-class companion with a named custom `apply` compiles on main and scalac
+but fails on this candidate: qualifying the imported module loses the custom
+`apply` selection. This is a real regression despite the script verdict.
+
+Cats stayed 163/62, the library 541/123, slick 0 errors / 1490 classes with
+12/12 execution, zero validation failures and lint problems. Workspace:
+2651 passed, zero failed. Corpus: pos 1109, neg 690, run 631; losses=0,
+changes=3 (`pos/imports-pos`, `pos/t7233b`, `pos/t8855`). The candidate ledger
+is `tests/baselines/corpus-7220a0ec.tsv`; the main reference above is unchanged.
