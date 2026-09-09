@@ -809,8 +809,8 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             }
         }
         Type::Function { params, ret } => Type::Function {
-            params: params.iter().map(|p| erase_ty(p, st)).collect(),
-            ret: Box::new(erase_ty(ret, st)),
+            params: params.iter().map(|p| erase_elem_ty(p, st)).collect(),
+            ret: Box::new(erase_elem_ty(ret, st)),
         },
         Type::Method { paramss, ret } => Type::Method {
             paramss: paramss
@@ -983,7 +983,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 erase_tree(p, st, None);
             }
             let ret = match &tree.ty {
-                Type::Function { ret, .. } => Some(erase_ty(ret, st)),
+                Type::Function { ret, .. } => Some(erase_elem_ty(ret, st)),
                 Type::Class { .. } => st.sam_sig(&tree.ty).map(|s| erase_ty(&s.ret_ty, st)),
                 _ => None,
             };
@@ -1397,8 +1397,8 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             match value_class_of(&orig, st) {
                 // `List[Meters].head` hands back a boxed `Meters`, so the
                 // underlying comes out of the accessor, not `Integer.intValue`.
-                Some(c) => wrap_vc_unbox(tree, c, orig_erased),
-                None => wrap_unbox(tree, orig_erased),
+                Some(c) if !declared_value_result => wrap_vc_unbox(tree, c, orig_erased),
+                _ => wrap_unbox(tree, orig_erased),
             }
         }
     } else if matches!(orig_erased, Type::String)

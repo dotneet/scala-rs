@@ -813,6 +813,11 @@ pub(crate) fn gen_tuple2_arrow(
     asm.new_obj("scala/Tuple2");
     asm.dup();
     gen_receiver(asm, frame, ctx, fun);
+    if let TreeKind::Select { qual, .. } = &fun.kind {
+        if is_jvm_primitive(&qual.ty) {
+            emit_box(asm, &qual.ty);
+        }
+    }
     if let Some(a) = args.first() {
         gen_expr(asm, frame, ctx, a);
         if is_jvm_primitive(&a.ty) {

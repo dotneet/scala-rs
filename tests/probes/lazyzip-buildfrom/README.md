@@ -139,3 +139,27 @@ multiset against /tmp/returning-elements-clippy.log: 60 -> 59, no added messages
 The initial BuildFrom hypothesis was not established: this slice fixes an
 independently reproduced silent value-class miscompile, not the four full-cats
 BuildFrom diagnostics. Compilation counts must be measured by the merge gate.
+
+## Corrections after rejected gate 70a2eaff
+
+The composed gate failed: workspace 2658/3; corpus losses t10646, t13022,
+t6385. Main records it at 8851cfa6; candidate code was not merged.
+
+Four corrections recover the measured failures in focused execution:
+- Nullary value-class extension calls box primitive receivers for the
+  declaration's Object receiver slot, just like applied calls.
+- A method declaring a value-class result returns its underlying value;
+  instantiating that underlying T at Int requires ordinary primitive unboxing,
+  not unboxing a value-class wrapper.
+- The private ArrowAssoc tuple path boxes its receiver before Tuple2's Object
+  constructor argument.
+- Function parameter/result type arguments retain boxed value classes; lambda
+  bodies box such results. A normal function differs from a SAM whose own
+  declared result is a value class and uses the underlying ABI.
+
+receiver3.log: 441 passes, zero failures across anonbridge, cpvalueclass, e2e,
+incremental_forwarder, libprelude, ovl_exptype, valueclass, vcbridge. The three
+lost corpus sources each compile and execute successfully with -Xverify:all
+(/tmp/lazyzip-probe/{t10646,t13022,t6385}/run.log). The plain fixture now also
+compares a value class passed into and returned from ordinary functions against
+scalac in both ABI modes. These are focused results, not a new full gate.

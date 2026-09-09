@@ -1748,6 +1748,7 @@ pub(crate) fn gen_select(
                         push_default(asm, &tree.ty);
                     }
                 } else if ctx.st.is_value_class(ctx.st.get(tree.sym).owner) {
+                    box_value_class_receiver(asm, ctx, ctx.st.get(tree.sym).owner, qual);
                     invoke_value_extension(asm, ctx, tree.sym, Some(&tree.ty), false);
                 } else {
                     // `x.toString` on an `Int` dispatches on

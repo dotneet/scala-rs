@@ -7,5 +7,8 @@ object Main {
   val l:Transform[Label]=new Transform[Label] { def apply(a:Label):Label=new Label(a.value+"!") }
   println(m(new Meter(4)).value)
   println(l(new Label("ok")).value)
+  val make: String => Label = s => new Label(s)
+  val read: Label => String = l => l.value
+  println(read(make("function")))
  }
 }
