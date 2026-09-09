@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `218b5340` |
+| commit | `88ab9308` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy-five slices have merged this session**, in thirty-one accepted composed gates.
+**Seventy-six slices have merged this session**, in thirty-two accepted composed gates.
 Six intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -54,6 +54,7 @@ coordinator measured the merged tree each time, not the branches.
 | `9f3cae13` | `returning-family`, collection overload corrections | 239 -> **228** | 163 |
 | `598ceef1` | `value-class bridges` | 228 | 163 |
 | `218b5340` | `lazyZip declaration origins` | 228 | 163 -> **159** |
+| `88ab9308` | `binary parent prefixes and lexical companions` | 228 | 159 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -283,8 +284,11 @@ specialization remain explicitly red; this is not a completion claim.
 | `run` (2060) | **637** | 870 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-218b5340.tsv`](baselines/corpus-218b5340.tsv): 5324 unique
+[`baselines/corpus-88ab9308.tsv`](baselines/corpus-88ab9308.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `88ab9308` gate compared against `corpus-218b5340.tsv`: **losses=0,
+changes=0**.
+
 The `218b5340` gate compared against `corpus-598ceef1.tsv`: **losses=0,
 changes=0**.
 
@@ -364,7 +368,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **286 result rows, 2662 passed, 0 failed** at `218b5340` |
+| `cargo test --workspace --release --no-fail-fast` | **288 result rows, 2665 passed, 0 failed** at `88ab9308` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -1278,3 +1282,36 @@ excuse the source-library regression. The original Slick query probe advances
 past its constructor but fails at Rep-to-ProvenShape conversion; no complete
 query execution is claimed. This record changes only this baseline and the
 candidate ledger; no implementation from the candidate is merged.
+
+
+## Gate thirty-two: binary parent prefixes and lexical companions
+
+Clean composed `88ab9308`, containing main `a90430ca`, completed the full
+merge gate with `VERDICT=PASS`, `DONE`, no skipped stages, and corpus losses=0,
+changes=0 against `218b5340`. Logs:
+`/tmp/scala-rs-gate-88ab9308-codex/gate.log`. Main was fast-forwarded to that
+exact tested commit. The following record changes only this baseline and the
+saved corpus ledger; compiler code and test inputs are identical to the gate.
+
+Gitbucket remains 228/69, cats 159/59 and library 541/123. All three error-message
+multisets match the accepted baseline. Both BitSet errors introduced by rejected
+07de211b are gone. Slick retains zero errors, 1490 verified classes, zero lint
+problems, and 12/12 executed programs with 36/36 attempts. Workspace: 2665 passed,
+zero failed (288 rows). Corpus remains pos 1109, neg 692, run 637 across 5324
+records. Format checking passes; clippy has 59 existing warnings with no additions.
+
+Binary inner-class parent constructors now retain stable outer instances across
+import aliases, direct and forwarded singleton API paths, and API values. The
+fixtures execute under JVM verification and compare stdout bytes with real
+scalac, including omitted parentheses and renamed aliases; both compilers reject
+incompatible arguments. The full gate exposed lexical scope pollution: qualified
+companion lookup installed a bare name and shadowed an enclosing same-name object.
+A small source reproduces that rejection on 07de211b while scalac and the accepted
+baseline compile it. The correction keeps scope insertion in the unqualified
+caller; its execution test matches scalac in both ABI modes. Focused tests total
+536 passed, zero failed.
+
+This fixes a silent constructor VerifyError, not the remaining gitbucket Shape
+family. The Slick query probe advances past construction and exposes an unresolved
+Rep-to-ProvenShape conversion; complete query execution is still unproven. Neither
+gitbucket nor cats is yet fully compilable.
