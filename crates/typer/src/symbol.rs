@@ -6746,7 +6746,7 @@ pub(crate) fn collect_type_members(ty: &Type, out: &mut Vec<SymbolId>) {
 }
 
 /// Replace `cls.this.type` with `to` throughout `ty`.
-fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
+pub(crate) fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
     let go = |t: &Type| subst_this_type(t, cls, to);
     match ty {
         Type::ThisType(c) if *c == cls => to.clone(),

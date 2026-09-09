@@ -139,6 +139,11 @@ scalac 2.13.16 が受理し実行します。一方 `trait Univ extends Any` の
 （`libanyval_overload` ほか 3 件）と [docs/scala-library.md](docs/scala-library.md)
 の「an overload is not an override」節を参照してください。
 
+継承した `lazyZip` などで、JVM の転送メソッドが失った `this.type` を
+Scala の宣言情報から保持します。登録先のクラスと実際の宣言元を区別し、
+`ArraySeq.lazyZip(...).map(...)` の `BuildFrom` が受け手の型を使うようにします。
+`lzorigin` は実 scalac との受理・拒否と実行出力の比較を行います。
+
 値クラスが総称メソッドの境界を通る際は、ブリッジで引数を取り出し、
 戻り値を箱に包みます。内部型が参照型や型パラメータの場合も対象です。
 匿名クラスで内部表現とブリッジの JVM シグネチャが一致する場合は実装名を

@@ -1264,6 +1264,19 @@ impl Typer {
             .collect()
     }
 
+    // Pickled members can be installed on a sibling of a JVM forwarder.
+    // Their original declaration, not that installation site, owns the method.
+    fn pickled_declaration_owner(&self, member: SymbolId) -> SymbolId {
+        let symbol = self.st.get(member);
+        symbol
+            .pickled_origin
+            .split_once('#')
+            .and_then(|(owner, _)| {
+                crate::classpath::find_by_jvm(&self.st, &owner.replace('.', "/"))
+            })
+            .unwrap_or(symbol.owner)
+    }
+
     /// A mixin forwarder read from a class file is not a declaration.
     ///
     /// scalac gives every concrete class a forwarder for each default method
@@ -1338,7 +1351,7 @@ impl Typer {
                         return false;
                     }
                     let o = self.st.get(other);
-                    let oo = o.owner;
+                    let oo = self.pickled_declaration_owner(other);
                     !o.pickled_origin.is_empty()
                         && !oo.is_none()
                         && oo != owner
@@ -1361,7 +1374,7 @@ impl Typer {
     /// This is what makes a mixin forwarder recognisable. scalac writes the
     /// forwarder's signature from the declaration it forwards to, so the two
     /// agree everywhere the signature language allows, and differ in exactly
-    /// two places:
+    /// three places:
     ///
     ///  * **Several parameter clauses become one.** The JVM has a single
     ///    argument list, so `foldLeft[B](z: B)(op: (B, A) => B): B` is
@@ -1370,6 +1383,10 @@ impl Typer {
     ///  * **A type parameter loses its lower bound.** `<B:Ljava/lang/Object;>`
     ///    is all there is for `[B >: A]`, so `reduceLeft`'s `B` had nothing
     ///    but `Any` to be solved to.
+    ///
+    ///  * **A singleton result loses its path.** Iterable.lazyZip's
+    ///    LazyZip2[A,B,this.type] becomes LazyZip2[A,B,Iterable]. This refers
+    ///    to the original declaration owner even when supplied on Seq.
     ///
     /// Anything else the class file states is a difference it is *entitled*
     /// to state, and usually a better answer than the declaration's:
@@ -1427,7 +1444,18 @@ impl Typer {
             from.push(m);
             to.push(Type::TypeParam(t));
         }
-        let at_copy = |t: &Type| crate::symbol::subst_tparams_slice(&from, &to, t);
+        let at_copy = |t: &Type| {
+            let owner = self.pickled_declaration_owner(decl);
+            let widened = crate::symbol::subst_this_type(
+                t,
+                self.st.get(decl).owner,
+                &Type::Class {
+                    sym: owner,
+                    args: vec![],
+                },
+            );
+            crate::symbol::subst_tparams_slice(&from, &to, &widened)
+        };
         dps.iter()
             .zip(&cps)
             .all(|(d, c)| self.same_erased_shape(&at_copy(d), c))
