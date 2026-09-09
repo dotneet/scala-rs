@@ -4098,3 +4098,86 @@ verifier fix.
 operand stack`, and the third test reads `javap -c` to pin the cast *and* its
 absence after `Plain.c`, whose descriptor already is `Lhkf/OneBox;` — an
 unnecessary cast is a divergence too, and running green cannot see one.
+
+## `agent/strarrayops`: the `String` / `Array` receivers were not a prelude collision
+
+**604 -> 592 errors, 130 -> 128 files.** Twenty errors gone, eight new, and
+the eight new ones are the same eight sites one step further along.
+
+The head survey above lists the `is not a member of` receivers as `Array` (17)
+and `String` (10) and calls them "the prelude collision named at the top of
+this file, unmoved". That reading was wrong, and so was the brief built on it,
+which proposed that the conversion to `StringOps` / `ArrayOps` was not
+supplying these members because the *source* `Predef` and `ArrayOps` are
+compiled in the same `--no-scala-library` run. Four measurements say otherwise:
+
+* `Predef.augmentString(s).slice(0, 2)` — the conversion written by hand —
+  already compiled, in the library build.
+* So did direct selection on the ops class: `(o: scala.collection.StringOps)
+  => o.slice(0, 2)`. The member was on the class the whole time.
+* Of 32 `StringOps` / `ArrayOps` members probed inside the library build, 29
+  already worked, `s.head` / `s.take` / `a.map` / `a.sorted` among them. Only
+  `String#apply`, `String#slice` and `Array#iterator` failed.
+* The same failure reproduces in **thirteen lines of ordinary user code that
+  mention neither `String` nor `Array`**, and in **both** modes — so it is not
+  a `--no-scala-library` artefact and not a prelude/source collision.
+
+### The root
+
+`search_extension` had no rule for nsc's owner-based tie-break (SLS 6.26.3):
+of two applicable conversions, one owned by a class the other's owner inherits
+from is the weaker. `object Predef extends LowPriorityImplicits` is the
+standard library's own use of it, with `augmentString` and `genericArrayOps` on
+`Predef` and `wrapString` and `genericWrapArray` on the base class.
+
+That matters for exactly the members `WrappedString` and `ArraySeq` *declare*
+rather than inherit — `WrappedString` defines `apply` and overrides `slice` and
+`stepper`; `ArraySeq` overrides `iterator`, `sorted` and `stepper` — because
+for every other member `drop_inapplicable_conversions` and the
+`conversion_declares_member` filter already left one candidate. For these,
+both conversions declared the member and both took a bare `String` /
+`Array[A]`, so every tie-break scored them equal, `search_extension` returned
+`None`, and the caller printed `value X is not a member of Y`.
+
+The prelude's hand-written `Predef` has no base class to inherit from, so it
+carried the fact as a `low_priority` boolean set on precisely the two
+conversions that needed it (`prelude_predef2.rs`). That boolean is why the
+same selections work in jar mode and why this looked like a library-build
+problem. `Implicits::inherited_conversions` generalises it to any hierarchy
+the run's own sources spell out — and to user code, which had the defect in
+both modes.
+
+### The eight new errors
+
+`StreamExtensions.scala`'s eight `a.stepper` sites now resolve the conversion
+and fail one step further along, on
+`could not find implicit value of type StreamShape[A, IntStream, St]`.
+`Array#stepper` is `def stepper[S <: Stepper[_]](implicit shape:
+StepperShape[A, S])`, and this compiler cannot solve that implicit for an
+undetermined `S`. That is a separate gap and is *not* closed here;
+`crates/cli/tests/strarrayops.rs` says so and deliberately tests
+`String#stepper`, which takes no type parameter, instead.
+
+### What is left of the family, and what was measured about it
+
+Five `is not a member of Array` errors remain — `mkString` (3, in
+`TrieMap.scala`, `UnrolledBuffer.scala`, `Manifest.scala`), `toList`
+(`Duration.scala`) and `toSet` (`ClassManifestDeprecatedApis.scala`).
+`ArrayOps` declares none of the three; nsc reaches them by wrapping the array
+as an `ArraySeq`, which inherits them from `IterableOnceOps`.
+
+What was measured, in the library build, is that the member is **not** the
+problem: `Predef.genericWrapArray(a).mkString(",")`,
+`Predef.wrapRefArray(a).mkString(",")`, `Predef.genericWrapArray(a).toList`
+and direct selection on an `ArraySeq[String]` value all compile, while
+`a.mkString(",")` and `a.toList` do not. So `lookup_member` does find the
+inherited member on the source `ArraySeq` — it walks parents — and the
+failure is again inside `search_extension`.
+
+It is *not* the tie this slice closes: `genericWrapArray` and `wrapRefArray`
+are both declared on `LowPriorityImplicits`, so the owner rule cannot separate
+them, and `ArrayOps` contributes no candidate at all for these three names.
+Whatever separates them is argument specificity between `Array[T]` and
+`Array[T <: AnyRef]` under an invariant `Array`, which is a different
+question and is **not** diagnosed here — only bounded. Do not read the
+paragraph above as a root cause; it is the list of things ruled out.
