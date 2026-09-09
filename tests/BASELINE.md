@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `caf8f284` |
+| commit | `02317f15` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Seventy-nine slices have merged this session**, in thirty-five accepted composed gates.
+**Eighty slices have merged this session**, in thirty-six accepted composed gates.
 Eleven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -58,6 +58,7 @@ coordinator measured the merged tree each time, not the branches.
 | `172a6525` | `conversion witnesses and singleton inference` | 228 -> **223** | 159 |
 | `5adf9c87` | `inherited results and constructor evidence` | 223 -> **217** | 159 -> **158** |
 | `caf8f284` | `early lexical scopes` | 217 -> **202** | 158 |
+| `02317f15` | `inherited factory redirect` | 202 -> **192** | 158 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -265,7 +266,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **158** | **59** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **202** | **64** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **192** | **63** | — |
 | `tests/scalalib_measure.sh` (538) | **460** | **119** | — |
 
 ## Execution
@@ -289,11 +290,14 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 |---|---:|---:|---:|
 | `pos` (1859) | **1118** | 396 | 345 |
 | `neg` (1405) | **700** | 336 | 369 |
-| `run` (2060) | **640** | 867 | 553 |
+| `run` (2060) | **642** | 865 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-caf8f284.tsv`](baselines/corpus-caf8f284.tsv): 5324 unique
+[`baselines/corpus-02317f15.tsv`](baselines/corpus-02317f15.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `02317f15` gate compared against `corpus-caf8f284.tsv`: **losses=0,
+changes=2**, both runtime gains (`sd409`, `t4147`).
+
 The `caf8f284` gate compared against `corpus-5adf9c87.tsv`: **losses=0,
 changes=0**.
 
@@ -385,7 +389,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **291 result rows, 2696 passed, 0 failed** at `caf8f284` |
+| `cargo test --workspace --release --no-fail-fast` | **292 result rows, 2697 passed, 0 failed** at `02317f15` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -1672,3 +1676,42 @@ corpus cases passed their comparisons (corpus changes=0, losses=0). Preflight
 checked four pinned source trees, 121 jar archives, 33 Java support classes
 and 1498 reference classes. Main remains an incomplete Scala compiler;
 gitbucket and cats do not yet compile fully.
+
+
+## Gate thirty-six: inherited factory redirection
+
+Clean `02317f15`, based on main `4ff20d52`, passed the complete unskipped
+merge gate with `VERDICT=PASS`, `DONE`, corpus losses=0 and changes=2.
+Logs: `/tmp/scala-rs-gate-02317f15-codex/gate.log`. Main was fast-forwarded
+to the exact tested commit. The recording commit changes only this baseline
+and `tests/baselines/corpus-02317f15.tsv`.
+
+Gitbucket improves 202/64 -> 192/63, with no added diagnostics. Four String/K
+mismatches, three DirCacheEntry/V mismatches and three downstream errors
+are removed. Cats remains 158/59 and the library remains 460/119, with
+identical diagnostic multisets. Slick remains errors=0, classes=1492,
+subset verified=1492, failed=0 and lint_problems=0. MODE=b passes 12/12
+programs and 36/36 attempts. Strong initialization verification of the
+retained classes, using the real PostgreSQL and Oracle drivers, loads all
+1492 with zero failures and zero incomplete classes.
+
+Workspace passes 2697 tests, zero failures, 292 result rows. Format passes;
+release workspace clippy retains exactly 57 warning messages, none added.
+Corpus: 5324 records; pos 1118/396/345, neg 700/336/369, run 642/865/553
+(pass/fail/skip). The two gains are run/sd409 and run/t4147. No pass is lost.
+
+The failure was not in Map's key checks. Loading MapFactory.Delegate.apply
+made both its inherited method and the prelude companion method visible.
+The omitted `.apply` redirect used an unfiltered lookup; unable to choose
+one candidate, it left explicit type arguments on the module and the later
+call returned Map[K,V]. The redirect now uses the same inherited override
+filter as explicit member selection. No tuple representation or overload
+signature was changed. The one-file warming probe fails on the accepted
+pre-fix compiler and runs identically to scalac after the repair. Tests
+compare explicit and omitted apply, reject wrong type arguments/keys, and
+compare stdout under JVM -Xverify:all.
+
+Before the gate, 535 new/boundary tests and 97 additional related tests
+passed. Seventeen historical corpus cases had losses=0, changes=0. Source,
+jar and cache preflight passed: four sources, 121 jars, 33 Java classes and
+1498 reference classes. Gitbucket and cats still do not compile fully.
