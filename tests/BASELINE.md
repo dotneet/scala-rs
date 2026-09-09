@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-seven slices have merged this session**, in thirty-three accepted composed gates.
-Seven intermediate candidates were rejected, three despite a PASS script verdict. From
+Eight intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1388,3 +1388,41 @@ and prints 8. The typer only borrows inherited result types with an explicit
 override modifier, missing legal implementations of abstract methods. This is
 pre-existing and explains why unannotated Table projections remain unfinished.
 Gitbucket and cats still have the errors recorded above and are not fully compiled.
+
+
+## Rejected abstract-result candidate: `0611af2f`
+
+Clean `0611af2f`, containing main `a900fb05`, completed the full merge gate
+with `VERDICT=FAIL`, `DONE`, and no skipped stages. Logs:
+`/tmp/scala-rs-gate-0611af2f-codex/gate.log`. No implementation from this
+candidate is merged; the accepted baseline remains `172a6525`.
+
+Slick regresses from zero errors to 4 errors in 2 files, producing no classes
+in the full 184-file compile. slick_run fails at compilation, so its runtime
+programs are not validated. The subset shrinks to 111 files / 780 classes
+(verified 780, failed 0, lint problems 0), which fails the 1490-class gate.
+Library regresses 541/123 -> 576/124. Cats stays 159/59 and gitbucket 223/68,
+with no changes to their error-message multisets. Workspace passes 2668 tests,
+zero failed (290 rows). Format passes; focused clippy had 59 existing warnings
+with no additions.
+
+Corpus totals: pos 1110, neg 693, run 637. The full 5324-record comparison
+reports losses=5, changes=11. Losses: neg/t6276; pos/t7212, pos/t7668,
+pos/t8146b; run/t7912. Gains: neg/t4612, neg/val_infer; pos/t3079,
+pos/t6925b, pos/t7200b; run/t7200. The equal positive/run totals and net one
+negative gain hide five individual regressions. Saved candidate ledger:
+`tests/baselines/corpus-0611af2f.tsv`.
+
+The Slick failures include inherited R/RU/T parameters retaining different
+declaring owners in JdbcActionComponent.scala and SimpleFunction.scala. Similar
+owner mismatches account for many library additions. Simple anonymous-class,
+cast, nested-profile and polymorphic-factory controls all compile on both the
+accepted and candidate binaries; they do not reproduce the full-input fault.
+Those controls and logs are in `/tmp/scala-rs-abstract-regression`. The next
+investigation should trace actual signature origins in the failing input and
+also address the negative-test acceptance regression before another gate.
+
+The focused source/binary/runtime successes remain valid, but they do not
+establish safety of the broadened inherited-result and lazy-completion paths.
+This recording commit changes only this file and the candidate ledger; main's
+compiler remains unchanged.
