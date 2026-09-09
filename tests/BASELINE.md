@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-three slices have merged this session**, in twenty-nine accepted composed gates.
-Four intermediate candidates were rejected, two despite a PASS script verdict. From
+Five intermediate candidates were rejected, two despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1145,3 +1145,35 @@ stdout bytes with scalac and both compilers check their negative assignments.
 This closes returning's measured ten-error family, not compilation of gitbucket
 or cats as a whole. Shape-related diagnostics remain unchanged (12 matching
 Shape[ in these logs); MODE=a and specialization obligations remain open.
+
+
+## Rejected value-class bridge candidate: `70a2eaff`
+
+Clean `70a2eaff`, containing current main `db059c9b`, completed the full gate
+with `VERDICT=FAIL`, `DONE`, and no skipped stages. Logs:
+`/tmp/scala-rs-gate-70a2eaff-codex/gate.log`. No implementation from this
+candidate is accepted. The accepted baseline remains `9f3cae13`.
+
+Gitbucket 228/69, cats 163/62, and library 541/123 are unchanged, including
+the error-message multisets. Slick retains zero errors / 1490 classes,
+1490 verified, zero validation failures or lint problems, and 12/12 execution
+with 36/36 attempts. Format checking passed.
+
+Workspace: 2658 passed / 3 failed (285 rows). Failures:
+`arrow_resolves_when_the_source_supplies_predef`,
+`recompilation_preserves_main_forwarder`, and
+`separate_compilation_package_object_value_class_and_operator_name`.
+Corpus: pos 1109, neg 692, run 633; losses=3, changes=6 against `9f3cae13`.
+Losses: `run/t10646`, `run/t13022`, `run/t6385`. Gains:
+`neg/t6260-named`, `neg/t6260c`, `run/t6260b`.
+Saved ledger: `tests/baselines/corpus-70a2eaff.tsv`.
+
+The six focused value-class tests pass, including both binary compilation
+directions and anonymous-vs-named bridge collisions. However, substituting
+generic underlying representations exposes missing receiver adaptation at
+value-class extension calls: the incremental-forwarder test already fails in
+its first compilation at `3.moo`, with an int passed to an Object slot.
+The remaining failures must be investigated before another gate. Clippy exits
+zero; its warning-message multiset has no additions versus the saved previous
+log (60 -> 59). This recording commit changes only this file and the candidate
+ledger; main's compiler remains unchanged.
