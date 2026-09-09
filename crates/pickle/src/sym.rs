@@ -978,8 +978,10 @@ impl SigCache {
                 return vec![here];
             }
         };
-        // acc = L(C1); then acc = L(Ci) ++ (acc minus L(Ci)) for i = 2..n,
-        // which is SLS's `L(Cn) +: ... +: L(C1)` written left to right.
+        // SLS's `L(Cn) +: ... +: L(C1)` removes shared classes from
+        // the prepended linearization, preserving their position after all
+        // subclasses already in the tail. Their type arguments still come
+        // from the later parent's path.
         let mut acc: Vec<LinStep> = Vec::new();
         for p in &sig.parents {
             let SigType::Ref { sym, args } = p else {
@@ -1000,13 +1002,18 @@ impl SigCache {
             walk.depth += 1;
             let plin = self.lin_of(src, sym, false, next, walk);
             walk.depth -= 1;
-            let names: Vec<(&str, bool)> = plin.iter().map(|s| s.key()).collect();
-            let kept: Vec<LinStep> = acc
+            for existing in &mut acc {
+                if let Some(later) = plin.iter().find(|e| e.key() == existing.key()) {
+                    existing.subst = later.subst.clone();
+                }
+            }
+            let names: Vec<(&str, bool)> = acc.iter().map(|s| s.key()).collect();
+            let mut head: Vec<LinStep> = plin
                 .into_iter()
                 .filter(|e| !names.contains(&e.key()))
                 .collect();
-            acc = plin;
-            acc.extend(kept);
+            head.extend(acc);
+            acc = head;
         }
         let mut out = vec![here];
         let mut seen: Vec<(String, bool)> = vec![(class_name.to_string(), module)];

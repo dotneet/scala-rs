@@ -1154,6 +1154,30 @@ impl Typer {
         Type::TypeMember(self.st.path_member(&path, m, pty))
     }
 
+    /// Load the concrete definitions of type members used by an API member.
+    /// A nested API's method can name its outer profile's abstract family;
+    /// the classfile has no entry for the alias that a derived profile fixes.
+    pub(crate) fn warm_receiver_type_members(&mut self, recv: &Type, ty: &Type) {
+        let Some(cls) = self.st.class_sym_of(recv) else {
+            return;
+        };
+        let members = self.st.type_members_in(ty);
+        if members.is_empty() {
+            return;
+        }
+        for outer in self.st.enclosing_classes(cls) {
+            for &member in &members {
+                let owner = self.st.get(member).owner;
+                if owner.is_none() || !(outer == owner || self.st.is_ancestor_of(owner, outer)) {
+                    continue;
+                }
+                let name = self.st.get(member).name.clone();
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, outer, &name);
+            }
+        }
+    }
+
     /// The rewrite that puts a selected member's type behind the path its
     /// receiver was written as: `c.start` on `val start: () => Eval[Start]` is
     /// `() => Eval[c.Start]`, not `() => Eval[Start]`.
@@ -1174,6 +1198,10 @@ impl Typer {
         recv_ty: &Type,
         found: &[SymbolId],
     ) -> Vec<(SymbolId, SymbolId)> {
+        for &id in found {
+            let ty = self.st.get(id).ty.clone();
+            self.warm_receiver_type_members(recv_ty, &ty);
+        }
         let Some(cls) = self.st.class_sym_of(recv_ty) else {
             return Vec::new();
         };

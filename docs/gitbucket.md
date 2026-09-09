@@ -3362,3 +3362,30 @@ lookup and both classpath positive cases fail. These are distinct paths to
 repair; neither an implicit-class filter nor proof that a conversion name is
 in scope closes them. The separate `Shape` cluster remains unproven as related.
 No compiler implementation or accepted baseline changed in this investigation.
+
+### Candidate repair: three independently reproduced gaps
+
+The source implicit path skipped imported APIs with no own type parameters.
+Such APIs still name an outer type family. Expanding the family's definition
+through the import prefix makes source explicit and implicit calls agree.
+
+The classpath path already read the abstract member correctly (a trace shows
+`Type::Applied` over a `TypeMember`, not a fabricated class). The concrete
+higher-kinded alias was missing from the outer profile's symbol table. Member
+selection and conversion search now demand those aliases from the enclosing
+receiver classes that inherit the declaring owner.
+
+Slick then exposed a third gap: pickle linearization put the shared root of
+`Derived extends Left with Right` before `Left`, although `Left` fixed the
+family. `SigCache::lin_of` removed duplicates from the accumulated tail rather
+than from the prepended parent. The repair keeps shared ancestors after all
+their subclasses, while retaining the later path's type substitutions. The
+seven existing pickle/library tests pass, including Set's result constructor.
+
+`retfamily` executes chain and diamond families against scalac-created class
+files and as source in both ABI modes, with named negative cases. The original
+probe on `c8104b12` failed source implicit and binary explicit/implicit; the
+candidate passes all three and matches scalac stdout byte-for-byte. The real
+Slick `returning` reduction now compiles through both routes. Full composed
+measurements are still required before this candidate is accepted; no result
+for the separate Shape family is inferred from these probes.

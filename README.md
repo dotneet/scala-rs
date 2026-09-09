@@ -16,6 +16,10 @@ makes no claim of conformance to the language specification. What exists today:
 - The target is Java 8 class files (major version 52), with a `StackMapTable`
   (`full_frame`) in the `Code` attribute. Frame types for locals are the erasure
   of the slot's declared type, as in scalac.
+- Nested APIs resolve higher-kinded result families through the concrete outer
+  profile, including implicit conversions and separate compilation. The
+  `retfamily` test compares both ABI modes with scalac and checks both orders
+  of a diamond hierarchy.
 - Two ABI modes. By default the compiler links against a real
   `scala-library-2.13.x` jar when it can find one; with `--no-scala-library` it
   emits its own private runtime class files (`scala/Option`, `scala/List`,

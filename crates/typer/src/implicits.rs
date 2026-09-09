@@ -779,17 +779,18 @@ impl Typer {
     /// occurs, however deeply the member is nested.
     pub(crate) fn at_import_prefix_of(&self, id: SymbolId, ty: &Type) -> Option<Type> {
         let owner = self.st.get(id).owner;
-        if owner.is_none()
-            || !self.st.get(owner).is_class_like()
-            || self.st.get(owner).tparams.is_empty()
-        {
+        if owner.is_none() || !self.st.get(owner).is_class_like() {
             return None;
         }
         let prefix = self.term_import_prefix_for(owner).map(|q| q.ty.clone())?;
         if prefix.is_no_type() || prefix.is_error() {
             return None;
         }
-        Some(self.st.subst_as_seen_from(&prefix, ty))
+        // Even a non-generic API can mention its outer profile's type
+        // family. Read aliases through the actual imported API before
+        // substituting the receiver's ordinary type parameters.
+        let expanded = self.st.expand_in_type(&prefix, ty);
+        Some(self.st.subst_as_seen_from(&prefix, &expanded))
     }
 
     /// An inherited implicit is declared in terms of its *owner's* type
@@ -2222,6 +2223,11 @@ impl Typer {
         ids.sort_by_key(|id| id.0);
         ids.dedup();
         for id in ids {
+            let owner = self.st.get(id).owner;
+            if let Some(prefix) = self.term_import_prefix_for(owner).map(|q| q.ty.clone()) {
+                let ty = self.st.get(id).ty.clone();
+                self.warm_receiver_type_members(&prefix, &ty);
+            }
             let Some(to) = self.conversion_result(id, from) else {
                 continue;
             };
