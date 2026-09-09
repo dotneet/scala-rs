@@ -1038,3 +1038,27 @@ selections; the intermediate gitbucket regression above motivated that test.
 with none reported in the changed receiver-resolution code. The gate's format
 check passed. This does not claim that all lazy classpath import paths or
 legacy value-prefix handling are complete; those remain separate probe targets.
+
+## Rejected returning-family candidate: `78cc806f`
+
+The full gate completed with `VERDICT=FAIL` and `DONE` on clean `78cc806f`.
+Logs: `/tmp/scala-rs-gate-78cc806f-codex/gate.log`. This candidate is not
+accepted and does not replace the main baseline above.
+
+Gitbucket: 230 errors / 69 files (accepted baseline 239/71); cats: 163/62;
+library: 541/123. Slick: zero errors / 1490 classes, verified 1490,
+failed 0, lint problems 0, execution 12/12 programs and 36/36 attempts.
+Workspace: 2648 passed, 4 failed (`fixtures_am_pickledup`,
+`bf_coll_bad_is_still_rejected`, `bf_map_map_without_a_pair_is_an_iterable`,
+`bf_coll_runs_against_the_jar`). Corpus: pos 1107, neg 690, run 632;
+losses=2, changes=3 against `0828f77b`. The losses are `pos/spec-asseenfrom`
+and `pos/t3774`; the gain is `run/t3984`. The saved candidate ledger is
+`tests/baselines/corpus-78cc806f.tsv`. Format checking passed.
+
+The error reduction is not sufficient evidence of correctness: non-pair
+`Map.map` now throws `ClassCastException`, and `Vector.map` becomes ambiguous
+after earlier member lookups. The corrected pickle linearization exposes
+existing overload collapsing that discarded `IterableOps` alternatives.
+The ten `returning` errors disappear, but three new gitbucket diagnostics
+appear around a non-pair `Map.collect`. No implementation from this candidate
+has been merged into main.

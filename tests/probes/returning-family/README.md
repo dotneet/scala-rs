@@ -58,3 +58,31 @@ that outer type-member / inner API structure without Slick or its macros.
 * No evidence yet joins this defect to gitbucket's separate `Shape` cluster.
 
 This probe is not a fix, a merge gate, or a claim that gitbucket compiles.
+
+## Rejected gate and overload investigation
+
+`78cc806f` finished the full gate with FAIL: four workspace test failures
+and two corpus losses. See `tests/BASELINE.md`; main remains `c8104b12`.
+The next worktree is `.worktrees/codex-returning-overloads`.
+
+The current changes are experimental, not a merge candidate:
+
+- Preserve different generic arities and remove the one-function-overload
+  limit. This makes `MapCollect.scala` compile and execute with stdout `2\n`,
+  byte-identical to real scalac 2.13.16 under `java -Xverify:all`.
+  `78cc806f` rejected that same program. Evidence is in
+  `/tmp/returning-overloads-collect/`.
+- Trying declaration-site JVM descriptors has not fixed `Map.map` execution.
+  `buildfrom` still has three failures, including `ClassCastException`.
+  Logs: `/tmp/returning-overloads-descriptor.log`.
+- Vector's ambiguous alternatives are distinct declarations:
+  `IndexedSeqOps.map` and `IterableOps.map`, copied onto unrelated receiver
+  symbols. The original declaration owner's hierarchy must survive copying;
+  deduplicating identical `pickled_origin` strings cannot handle overrides.
+  Evidence: `/tmp/returning-vector-probe/newdebug.log`.
+- Both corpus losses (`spec-asseenfrom`, `t3774`) are collection overloads
+  expecting pairs when the argument is not a pair. They must be retested
+  alongside `ambigmap`, `buildfrom` and the required supply-boundary suites.
+
+No test has been weakened. Do not merge or push this experimental branch.
+Do not rerun the full gate until these focused regressions are resolved.

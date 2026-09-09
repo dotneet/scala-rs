@@ -1867,8 +1867,6 @@ impl PickleSupply {
         let mut seen_shapes: HashMap<String, (SymbolId, String, usize)> = HashMap::new();
         // Members a later, more derived declaration displaced.
         let mut superseded: Vec<SymbolId> = Vec::new();
-        // The arities of the overloads taking a function parameter already in.
-        let mut took_function: Vec<usize> = Vec::new();
         for hit in &hits {
             let m = &hit.member;
             // A nested `object`. Not a signature at all: what the class file
@@ -1954,7 +1952,6 @@ impl PickleSupply {
                 &shape,
                 &class_scope,
                 &mut seen_shapes,
-                &mut took_function,
                 &mut superseded,
             ) {
                 // A `val`'s accessor is stable; `ident_is_stable` /
@@ -2672,7 +2669,6 @@ impl PickleSupply {
         shape: &Shape,
         class_scope: &HashMap<String, Type>,
         seen_shapes: &mut HashMap<String, (SymbolId, String, usize)>,
-        took_function: &mut Vec<usize>,
         // Members detached again because a later declaration with the same
         // explicit parameters and an extra implicit clause took their
         // place; the caller must not hand them back either.
@@ -2857,37 +2853,10 @@ impl PickleSupply {
             ));
             return Some(blocker);
         }
-        // One declaration per erased parameter list, the first one
-        // linearization offers, i.e. the most derived. Two declarations that
-        // erase alike are the same JVM method seen through different parents,
-        // and where they are genuinely overloaded on the *result*
-        // (`IterableOps.map[B]: Iterable[B]` vs `MapOps.map[K2,V2]:
-        // Map[K2,V2]`) scalac picks by expected type, which the typer cannot
-        // do -- supplying both would make every call ambiguous. Overloads that
-        // differ in their parameters (`Iterator.from(Int)` vs
-        // `from(IterableOnce)`) have different keys and all survive.
-        // At most one overload per name *and arity* may take a function
-        // parameter. The typer infers a lambda's parameter types from a single
-        // expected type, so a second same-arity overload turns
-        // `xs.segmentLength(_ < 3)` into an unsolvable overload set.
-        // Linearization order means the one kept is the most derived. A
-        // different arity is told apart before any lambda is typed, and 2.13's
-        // `SeqOps` really does declare both `indexWhere(p, from)` and
-        // `indexWhere(p)` -- dropping the shorter one made `xs.indexWhere(p)`
-        // an arity error. Overloads that take no function -- `from(Int)` and
-        // `from(IterableOnce)` -- are unaffected.
-        let has_function = paramss_ty
-            .iter()
-            .flatten()
-            .any(|t| matches!(t, Type::Function { .. }));
+        // Lambda arguments can be pretyped from the common input types of
+        // several alternatives. Preserve those alternatives so their result
+        // types can distinguish scalar and pair-producing collection calls.
         let arity: usize = paramss_ty.iter().map(|c| c.len()).sum();
-        if has_function && took_function.contains(&arity) {
-            trace(format_args!(
-                "{internal}#{name}: skipping a second {arity}-argument overload that \
-                 takes a function"
-            ));
-            return None;
-        }
         // The shape two alternatives are compared by is their *explicit*
         // parameters: nsc's `isAsSpecific` looks through an implicit clause
         // (`case mt: MethodType if mt.isImplicit => isAsSpecific(restpe, …)`),
@@ -2907,29 +2876,11 @@ impl PickleSupply {
             .flat_map(|(_, tys)| tys.iter())
             .map(|t| erased_param_desc(st, t))
             .collect();
-        // ...but a *monomorphic* declaration and a *polymorphic* one with the
-        // same erased parameters are two overloads nsc really does keep apart,
-        // and the argument is what tells them apart. 2.13's `SetOps` declares
-        //
-        //   def ++ (that: IterableOnce[A]): C
-        //
-        // next to `IterableOps`'s
-        //
-        //   def ++ [B >: A](suffix: IterableOnce[B]): CC[B]
-        //
-        // (`javap scala.collection.SetOps` / `scala.collection.IterableOps`).
-        // Both erase to `(Lscala/collection/IterableOnce;)Ljava/lang/Object;`,
-        // so only the `SetOps` one survived and `s ++ anOptionOfSomethingElse`
-        // -- slick's `Set() ++ dbType.map(…) ++ (if(…) Some(…) else None)` --
-        // was `no matching overload`. The danger this key guards against is
-        // two declarations overloaded on nothing but their *result*
-        // (`IterableOps.map[B]` vs `MapOps.map[K2, V2]`), and those are both
-        // polymorphic: they still share a key and still collapse. Where one
-        // side takes the receiver's own element type and the other introduces
-        // a variable, specificity separates them the way nsc's does -- the
-        // monomorphic one is strictly more specific and wins wherever it
-        // applies.
-        let key = format!("{key_want:?}/{}", shape.tparams.is_empty());
+        // Different type-parameter counts distinguish genuinely different
+        // overloads, including IterableOps.map[B] and MapOps.map[K2, V2].
+        // Merely distinguishing monomorphic from polymorphic methods loses
+        // the generic alternative for non-pair collection results.
+        let key = format!("{key_want:?}/{}", shape.tparams.len());
         // ...with one exception, which is the whole of the sorted collections.
         //
         // `SortedMapOps` declares `map[K2, V2](f)(implicit ordering:
@@ -2976,7 +2927,13 @@ impl PickleSupply {
         // descriptor is not supplied, so it must not shadow the next one
         // either (`TreeMap.collect(pf)` erases to two class-file methods and
         // would otherwise have taken `collect(pf)(Ordering)`'s place).
-        let found = match self.erased_desc(bin, internal, jvm_member, &want) {
+        let declared = self.class_file_of(bin, pickle_owner).and_then(|owner| {
+            let declaration_params = self
+                .decl_site_want(st, bin, &scope, shape)
+                .unwrap_or_else(|| want.clone());
+            self.erased_desc(bin, &owner, jvm_member, &declaration_params)
+        });
+        let found = match declared.or_else(|| self.erased_desc(bin, internal, jvm_member, &want)) {
             Some(found) => Some(found),
             // The signature and the descriptor are erased in *different*
             // vocabularies when a more derived class in the linearisation
@@ -3088,9 +3045,6 @@ impl PickleSupply {
         }
         st.get_mut(m).owner = class_sym;
         st.get_mut(class_sym).members.push(m);
-        if has_function && !took_function.contains(&arity) {
-            took_function.push(arity);
-        }
         Some(m)
     }
 
