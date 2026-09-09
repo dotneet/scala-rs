@@ -1725,7 +1725,9 @@ impl Typer {
                                 };
                             }
                         }
-                    } else if method_name == "map" {
+                    } else if method_name == "map"
+                        && (sym.is_none() || self.st.get(sym).pickled_origin.is_empty())
+                    {
                         if self.is_array_ops_ty(recv_ty.as_ref()) {
                             if let Some(a0) = args.first() {
                                 if let Type::Function { ret: fr, .. } = &a0.ty {

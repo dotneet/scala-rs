@@ -2934,7 +2934,13 @@ impl PickleSupply {
             let params = self
                 .decl_site_want(st, bin, &scope, shape)
                 .unwrap_or_else(|| want.clone());
-            self.erased_desc(bin, &owner, jvm_member, &params)
+            self.erased_desc_return(
+                bin,
+                &owner,
+                jvm_member,
+                &params,
+                erased_param_desc(st, &ret).as_deref(),
+            )
         });
         let found = match declared.or_else(|| self.erased_desc(bin, internal, jvm_member, &want)) {
             Some(found) => Some(found),
@@ -3676,6 +3682,17 @@ impl PickleSupply {
         name: &str,
         want: &[Option<String>],
     ) -> Option<ErasedDecl> {
+        self.erased_desc_return(bin, internal, name, want, None)
+    }
+
+    fn erased_desc_return(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        name: &str,
+        want: &[Option<String>],
+        result: Option<&str>,
+    ) -> Option<ErasedDecl> {
         let arity = want.len();
         let mut seen: HashSet<String> = HashSet::new();
         // Each frontier entry remembers whether it was reached through a hop
@@ -3746,7 +3763,18 @@ impl PickleSupply {
             match hits.len() {
                 0 => {}
                 1 => return Some(hits.remove(0)),
-                _ => return None,
+                _ => {
+                    // JVM overloads can differ only in their erased result.
+                    // IntMap.map has both its own IntMap-returning method and
+                    // a MapOps forwarder with identical Function1 arguments.
+                    let expected = result?;
+                    hits.retain(|hit| {
+                        hit.desc
+                            .rsplit_once(')')
+                            .is_some_and(|(_, ret)| ret == expected)
+                    });
+                    return (hits.len() == 1).then(|| hits.remove(0));
+                }
             }
             level = next;
         }

@@ -148,3 +148,30 @@ JVM overloads with different return descriptors; their most specific `map`
 declaration is currently dropped as ambiguous. Preserve all work locally,
 resolve that descriptor ambiguity, and compare key-preserving/key-changing/
 non-pair results against scalac. No process from this gate is still running.
+
+### Fixed-key map return descriptors
+
+The JVM resolver now uses the result descriptor to disambiguate otherwise
+identical parameter lists. This restores IntMap/LongMap's own map declaration
+and `run/t3603` executes successfully.
+
+The wider probe found a second bug that t3603's type-only assertions missed:
+after selecting the correct declaration, the generic collection result rebuild
+changed IntMap[String] into IntMap[(Int, String)] and changed a key-changing
+Map result back into IntMap. The map-specific prelude reconstruction now applies
+only to methods without a pickle declaration; supplied declarations keep their
+inferred result type.
+
+`retfamily_fixedkeys` covers key-preserving, key-changing and non-pair maps
+for both IntMap and LongMap, with eight stdout lines compared byte-for-byte
+against scalac 2.13.16 under `java -Xverify:all`. Both compilers reject the
+key-changing assignments in the negative fixture. The saved intermediate
+compiler `/tmp/returning-intmap/before-compiler` (SHA1
+`acbc8047c92dacacbd4cc68e9f90baa5a06cb91b`) includes the descriptor correction
+but not the result-rebuild correction; it compiles the probe and throws
+ClassCastException. It is not the ebaa481e binary. The latter's failure is
+recorded in the rejected gate and `/tmp/returning-t3603/run.log`.
+
+Required supply-boundary suites plus buildfrom and retfamily: 550 passed,
+zero failed (`/tmp/returning-resultdesc-boundary.log`). Clippy exits zero;
+existing warnings remain. A fresh full gate is still required before merging.
