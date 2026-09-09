@@ -2927,13 +2927,7 @@ impl PickleSupply {
         // descriptor is not supplied, so it must not shadow the next one
         // either (`TreeMap.collect(pf)` erases to two class-file methods and
         // would otherwise have taken `collect(pf)(Ordering)`'s place).
-        let declared = self.class_file_of(bin, pickle_owner).and_then(|owner| {
-            let declaration_params = self
-                .decl_site_want(st, bin, &scope, shape)
-                .unwrap_or_else(|| want.clone());
-            self.erased_desc(bin, &owner, jvm_member, &declaration_params)
-        });
-        let found = match declared.or_else(|| self.erased_desc(bin, internal, jvm_member, &want)) {
+        let found = match self.erased_desc(bin, internal, jvm_member, &want) {
             Some(found) => Some(found),
             // The signature and the descriptor are erased in *different*
             // vocabularies when a more derived class in the linearisation
@@ -2990,6 +2984,14 @@ impl PickleSupply {
         // is *not* part of it: the point is that the same declaration, pulled
         // down onto two different classes, is recognisable as one member.
         st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}{want:?}");
+        let mut source = BinSource(bin);
+        let mut errors = Vec::new();
+        st.get_mut(m).pickled_owner_bases = self
+            .sigs
+            .linearization(&mut source, pickle_owner, false, &mut errors)
+            .into_iter()
+            .map(|base| base.class_name)
+            .collect();
         st.set_jvm_name(m, found.desc);
         st.get_mut(m).tparams = tparams;
         st.get_mut(m).params = paramss_sym.iter().flatten().copied().collect();

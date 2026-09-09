@@ -86,3 +86,33 @@ The current changes are experimental, not a merge candidate:
 
 No test has been weakened. Do not merge or push this experimental branch.
 Do not rerun the full gate until these focused regressions are resolved.
+
+### Follow-up: typed function results and copied declaration owners
+
+The first descriptor diagnosis was incomplete. `/tmp/returning-overloads-picks.log`
+shows that the typer already selected `MapOps.map` for a function returning
+`Int`: its expected tuple contained open type parameters, which disabled the
+entire result check. Replacing only those variables with wildcards retains
+the tuple structure. `buildfrom` now passes all 13 tests, including execution
+and the existing negative diagnostics.
+
+Copied methods now retain their declaration owner's base classes. Specificity
+uses these original owners when both methods came from pickles. This resolves
+`IndexedSeqOps.map` versus `IterableOps.map` despite their installation on
+unrelated receiver symbols. All five `ambigmap` tests pass.
+
+The declaration-descriptor experiment has been removed: it introduced eight
+`conform` failures, including `List$.empty(): IterableOps`, a method absent
+from that receiver. The original receiver descriptor lookup is restored.
+After removal, `conform` (86), `buildfrom` (13), `ambigmap` (5), and `retfamily`
+(1) all pass: `/tmp/returning-overloads-nodecldesc.log`. Before that removal,
+the mandatory supply-boundary run had passed its other eight suites, including
+all 397 `e2e` tests; its failure was confined to `conform`. Full-workspace and
+full-corpus validation have not been repeated. Format and diff checks pass.
+
+The two corpus losses still reproduce and prevent a new gate. Both fail at
+`Map.++`; its pair-specific and generic declarations each have one type
+parameter, so distinguishing generic arities alone cannot preserve them.
+Next inspect the parameter structures (with alpha-renamed method variables),
+not merely erased descriptors or counts. Evidence:
+`/tmp/returning-overloads-corpus/spec.log` and `t3774.log`.

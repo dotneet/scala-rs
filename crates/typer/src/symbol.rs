@@ -578,6 +578,9 @@ pub struct Symbol {
     /// Empty for everything the prelude, a source file or a class file
     /// declares.
     pub pickled_origin: String,
+    /// Ancestors of the original pickle declaration's owner. Completing a
+    /// member on a receiver must not erase the owner's specificity relation.
+    pub pickled_owner_bases: Vec<String>,
     /// nsc `ABSOVERRIDE`: the source wrote `abstract override`, so `super` in
     /// this member is bound by the *linearization* of whatever concrete class
     /// mixes the trait in. `flags` cannot carry this: the namer already sets
@@ -1215,6 +1218,7 @@ impl SymbolTable {
                 declaring_class: String::new(),
                 declaring_is_interface: false,
                 pickled_origin: String::new(),
+                pickled_owner_bases: Vec::new(),
                 abstract_override: false,
                 super_accessor: false,
                 deferred_val: false,
@@ -1338,6 +1342,7 @@ impl SymbolTable {
             declaring_class: String::new(),
             declaring_is_interface: false,
             pickled_origin: String::new(),
+            pickled_owner_bases: Vec::new(),
             abstract_override: false,
             super_accessor: false,
             deferred_val: false,

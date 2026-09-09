@@ -771,6 +771,18 @@ impl Typer {
         if a.is_none() || b.is_none() {
             return false;
         }
+        if let (Some((ao, _)), Some((bo, _))) = (
+            self.st.get(a).pickled_origin.split_once('#'),
+            self.st.get(b).pickled_origin.split_once('#'),
+        ) {
+            return ao != bo
+                && self
+                    .st
+                    .get(a)
+                    .pickled_owner_bases
+                    .iter()
+                    .any(|base| base == bo);
+        }
         let declaration_owner = |m: SymbolId| {
             let symbol = self.st.get(m);
             crate::classpath::find_by_jvm(&self.st, &symbol.declaring_class).unwrap_or(symbol.owner)
@@ -2245,12 +2257,22 @@ impl Typer {
                 // score as a `Char => Char`. A `Unit` (or `Any`) parameter
                 // still takes any result -- that is value discarding, which
                 // nsc allows for function literals too -- and an undetermined
-                // result constrains nothing.
+                // result constrains nothing. Preserve the surrounding shape:
+                // Tuple2[K, V] cannot accept Int just because K and V are open.
+                let mut variables = Vec::new();
+                collect_tparams(pr, &mut variables);
+                let result_shape = crate::symbol::subst_tparams_slice(
+                    &variables,
+                    &vec![Type::Wildcard; variables.len()],
+                    pr,
+                );
                 let strict = !open
                     && is_rigid_type(ar)
-                    && is_rigid_type(pr)
                     && !matches!(**pr, Type::Unit | Type::Any | Type::AnyRef);
-                if strict && !self.st.is_sub_type(ar, pr) && numeric_widen(ar, pr).is_none() {
+                if strict
+                    && !self.st.is_sub_type(ar, &result_shape)
+                    && numeric_widen(ar, &result_shape).is_none()
+                {
                     return None;
                 }
                 return Some(8);
