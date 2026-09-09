@@ -1999,7 +1999,17 @@ impl<'a> Gen<'a> {
                             && m.desc.starts_with(pparams)
                             && m.desc[pparams.len()..].starts_with('L')
                     })
-                    .map(|m| m.desc.clone());
+                    .map(|m| m.desc.clone())
+                    .or_else(|| {
+                        self.st
+                            .inherited_method_implementations
+                            .iter()
+                            .find(|(cls, _, base)| *cls == class_id && *base == pmid)
+                            .map(|(_, implementation, _)| {
+                                method_desc_from_sym(self.st, *implementation)
+                            })
+                            .filter(|desc| desc != &pdesc)
+                    });
                 // The same rule with the parameters narrowed rather than the
                 // result. slick's `RelationalActionComponent` declares
                 // `createSchemaActionExtensionMethods(_: SchemaDescription)`
@@ -2040,6 +2050,13 @@ impl<'a> Gen<'a> {
                         first
                     }
                 };
+                // A bridge added earlier is not a reverse implementation:
+                // Object-returning bridge -> inherited String method is valid;
+                // String-returning bridge -> Object bridge is not.
+                let have_ret = &have[have.find(')').map(|i| i + 1).unwrap_or(0)..];
+                if !self.desc_narrows(pret, have_ret) {
+                    continue;
+                }
                 // The chosen implementation may not be an override at all.
                 // Erased descriptors cannot tell `Ops.pp[B](xs: Bag[B]): Bag[B]`
                 // from `Table.pp[V2](xs: Bag[(K, V2)]): String` -- same

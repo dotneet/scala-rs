@@ -967,6 +967,61 @@ pub fn record_method_override_families(st: &mut SymbolTable) {
             }
         }
     }
+    // A class can inherit its implementation from a superclass while the
+    // required descriptor comes from a separately mixed-in trait. Preserve
+    // this class-specific relation; erasure cannot reconstruct it safely.
+    let classes: Vec<_> = st
+        .symbols
+        .iter()
+        .filter(|s| s.is_class_like() && !is_interface(st, s.id))
+        .map(|s| s.id)
+        .collect();
+    let mut inherited_pairs = Vec::new();
+    for cls in classes {
+        let lin = full_lin(st, cls);
+        let mut by_name: std::collections::HashMap<String, Vec<SymbolId>> =
+            std::collections::HashMap::new();
+        for &owner in &lin {
+            for &m in &st.get(owner).members {
+                if st.get(m).owner == owner
+                    && st.get(m).kind == SymKind::Method
+                    && is_overridable_kind(st, m)
+                    && is_member_of(st, owner, m)
+                    && !is_private_to_owner(st, m)
+                {
+                    by_name.entry(st.get(m).name.clone()).or_default().push(m);
+                }
+            }
+        }
+        for members in by_name.values() {
+            for &base in members {
+                if !is_deferred(st, base) {
+                    continue;
+                }
+                let Some(child) = members.iter().copied().find(|&m| {
+                    if is_deferred(st, m) || st.get(m).tparams.len() != st.get(base).tparams.len() {
+                        return false;
+                    }
+                    let actual = member_type_at(st, cls, m);
+                    let expected = base_type_at(st, cls, base, m);
+                    match (&actual, &expected) {
+                        (Type::Method { paramss: a, .. }, Type::Method { paramss: b, .. }) => {
+                            !uncertain(&actual)
+                                && !uncertain(&expected)
+                                && norm_paramss(a) == norm_paramss(b)
+                        }
+                        _ => false,
+                    }
+                }) else {
+                    continue;
+                };
+                if st.get(child).owner != cls && !is_interface(st, st.get(child).owner) {
+                    inherited_pairs.push((cls, child, base));
+                }
+            }
+        }
+    }
+    st.inherited_method_implementations.extend(inherited_pairs);
     st.method_override_families.extend(pairs);
     st.method_overload_pairs.extend(overloads);
 }
@@ -1082,6 +1137,65 @@ pub fn check_overrides(
                 });
                 break;
             }
+        }
+    }
+    // A concrete method inherited from one parent must satisfy a declaration
+    // from another parent even when this class writes no overriding member.
+    // Match the effective implementation in linearization order, then compare
+    // both results at this class's prefix.
+    let lin = full_lin(st, cls);
+    let inherited: Vec<SymbolId> = lin
+        .iter()
+        .flat_map(|b| st.get(*b).members.iter().copied())
+        .filter(|m| {
+            is_overridable_kind(st, *m)
+                && is_member_of(st, st.get(*m).owner, *m)
+                && !is_private_to_owner(st, *m)
+        })
+        .collect();
+    for &base in &inherited {
+        if !is_deferred(st, base) || st.get(base).owner == cls {
+            continue;
+        }
+        let Some(child) = inherited
+            .iter()
+            .copied()
+            .find(|c| !is_deferred(st, *c) && matches(st, cls, *c, base))
+        else {
+            continue;
+        };
+        if st.get(child).owner == cls {
+            continue;
+        }
+        let result = |ty: Type| match ty {
+            Type::Method { ret, .. } => *ret,
+            other => other,
+        };
+        let actual = result(member_type_at(st, cls, child));
+        let expected = result(base_type_at(st, cls, base, child));
+        // Nominal ancestry can disprove conformance even when generic
+        // arguments cannot be compared reliably by the override checker.
+        let nominal_mismatch = match (&actual, &expected) {
+            (Type::Class { sym: a, .. }, Type::Class { sym: b, .. }) => {
+                a != b && !full_lin(st, *a).contains(b)
+            }
+            _ => false,
+        };
+        if !uncertain(&actual)
+            && !uncertain(&expected)
+            && (nominal_mismatch || (robust(&actual) && robust(&expected)))
+            && !st.is_sub_type(&actual, &expected)
+        {
+            out.push(OverrideError {
+                sym: cls,
+                message: format!(
+                    "incompatible type in overriding\n{} {};\n inherited implementation: {} {}",
+                    show_decl_of_at(st, base, &base_type_at(st, cls, base, child), cls),
+                    defined_in(st, st.get(base).owner),
+                    show_decl_of_at(st, child, &member_type_at(st, cls, child), cls),
+                    defined_in(st, st.get(child).owner),
+                ),
+            });
         }
     }
     out

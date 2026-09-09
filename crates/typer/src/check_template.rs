@@ -1420,6 +1420,33 @@ impl Typer {
     /// with no tree of its own (a constructor field) falls back to the
     /// template's.
     fn check_overrides(&mut self, class_id: SymbolId, body: &[Tree], span: Span) {
+        // Return types may name a binary class whose hierarchy has not been
+        // requested yet. Absence of loaded parents cannot prove that an
+        // inherited implementation has an incompatible nominal result.
+        let mut returns = Vec::new();
+        for base in crate::lin::linearize(&self.st, class_id) {
+            for &member in &self.st.get(base).members {
+                let ty = match &self.st.get(member).ty {
+                    Type::Method { ret, .. } => ret.as_ref(),
+                    other => other,
+                };
+                if let Some(c) = self.st.class_sym_of(ty) {
+                    returns.push(c);
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        while let Some(c) = returns.pop() {
+            if c.is_none() || !seen.insert(c) {
+                continue;
+            }
+            self.ensure_java_loaded(c, span);
+            for parent in self.st.get(c).parents.clone() {
+                if let Some(p) = self.st.class_sym_of(&parent) {
+                    returns.push(p);
+                }
+            }
+        }
         // Which members wrote their result type. nsc types the others *at* the
         // overridden member's result type, so they conform by construction;
         // see `override_check::check_pair`.

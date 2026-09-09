@@ -237,7 +237,10 @@ impl Typer {
         else {
             return;
         };
-        if !tpt.is_empty() || name == "<init>" {
+        if !tpt.is_empty()
+            || name == "<init>"
+            || self.block_local_defs.contains(&(self.file_index, tree.id))
+        {
             return;
         }
         let abstract_only = !mods.flags.contains(Flags::OVERRIDE);
@@ -296,6 +299,7 @@ impl Typer {
     }
 
     pub(crate) fn type_val_sig(&mut self, tree: &mut Tree) {
+        let local = self.block_local_defs.contains(&(self.file_index, tree.id));
         let (tpt, name, flags, within) = match &tree.kind {
             TreeKind::ValDef {
                 tpt, name, mods, ..
@@ -333,6 +337,12 @@ impl Typer {
                 .alloc(name.clone(), self.st.owner, SymKind::Term, flags, "");
             tree.sym = id;
             self.st.enter_in_current(&name, id);
+        }
+        if local && !tree.sym.is_none() {
+            let owner = self.st.get(tree.sym).owner;
+            if !owner.is_none() && self.st.get(owner).is_class_like() {
+                self.st.get_mut(owner).members.retain(|m| *m != tree.sym);
+            }
         }
         if !tree.sym.is_none() {
             self.st.get_mut(tree.sym).ty = ty.clone();
@@ -442,7 +452,11 @@ impl Typer {
         let (inherited, final_value) = match &tree.kind {
             TreeKind::ValDef {
                 tpt, mods, name, ..
-            } if feature && tpt.is_empty() && !tree.sym.is_none() => {
+            } if feature
+                && tpt.is_empty()
+                && !tree.sym.is_none()
+                && !self.block_local_defs.contains(&(self.file_index, tree.id)) =>
+            {
                 let owner = self.st.get(tree.sym).owner;
                 (
                     self.overridden_ret_type(owner, name, &[], &[], &[], false),
@@ -529,6 +543,7 @@ impl Typer {
     }
 
     pub(crate) fn type_def_sig(&mut self, tree: &mut Tree) {
+        let local = self.block_local_defs.contains(&(self.file_index, tree.id));
         let span = tree.span;
         Self::drop_synthesized_evidence(tree);
         let (tparams, vparamss, tpt, name, mods_within, mods_flags, is_conv) = match &mut tree.kind
@@ -569,6 +584,12 @@ impl Typer {
             );
             tree.sym = id;
             self.st.enter_in_current(&name, id);
+        }
+        if local {
+            let owner = self.st.get(tree.sym).owner;
+            if !owner.is_none() && self.st.get(owner).is_class_like() {
+                self.st.get_mut(owner).members.retain(|m| *m != tree.sym);
+            }
         }
         self.st.push_scope();
         let tp_ids = self.enter_tparams(tparams, tree.sym);
@@ -822,6 +843,8 @@ impl Typer {
         self.st.owner = saved_owner;
         let ret = if name == "<init>" {
             Type::Unit
+        } else if tpt.is_empty() && local {
+            Type::NoType
         } else if tpt.is_empty() {
             // A known inherited result guides the body and permits recursive
             // references before the final, possibly narrower result is inferred.
@@ -1201,7 +1224,11 @@ impl Typer {
         // Parent instantiations may have been provisional during the signature
         // pass. Refresh the expected result before checking the body, without
         // treating it as the final inferred result.
-        if infer_result && !is_ctor && !tree.sym.is_none() {
+        if infer_result
+            && !is_ctor
+            && !tree.sym.is_none()
+            && !self.block_local_defs.contains(&(self.file_index, tree.id))
+        {
             let method = self.st.get(tree.sym).clone();
             if let Type::Method { paramss, .. } = &method.ty {
                 if let Some(expected) = self.overridden_ret_type(

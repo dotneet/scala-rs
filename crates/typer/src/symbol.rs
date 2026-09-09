@@ -996,6 +996,8 @@ pub struct SymbolTable {
     /// erasure.  Backend dispatch must not rediscover this relation from the
     /// erased JVM types: a generic base and an unrelated overload can erase
     /// to the same descriptor.
+    /// Class-specific inherited implementations proven before erasure.
+    pub inherited_method_implementations: rustc_hash::FxHashSet<(SymbolId, SymbolId, SymbolId)>,
     pub method_override_families: rustc_hash::FxHashSet<(SymbolId, SymbolId)>,
     /// The complement, and equally pre-erasure: source method pairs *proven*
     /// to be two methods -- an overload no erasure can reunite. The backend
@@ -1281,6 +1283,7 @@ impl SymbolTable {
             owner: SymbolId(0),
             this_class: SymbolId(0),
             super_accessor_targets: rustc_hash::FxHashMap::default(),
+            inherited_method_implementations: rustc_hash::FxHashSet::default(),
             method_override_families: rustc_hash::FxHashSet::default(),
             method_overload_pairs: rustc_hash::FxHashSet::default(),
             value_class_underlying_types: rustc_hash::FxHashMap::default(),

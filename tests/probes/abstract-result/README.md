@@ -444,3 +444,92 @@ JVM execution fails with the same Function2-to-Ordering ClassCastException
 (`slick-ordering-probe/reduced-before.log`). The merge gate's exact Slick
 class-count expectations are updated from 1490 to 1492 for the two verified
 SAM classes; all stages and failure checks remain enabled.
+
+### Block-local declarations after the rejected c51614e2 gate
+
+The gitbucket regression is reduced by `absresult_local.scala`: a local val
+inside a class-initializer by-name block shadows a concrete inherited method.
+Under `-Xsource:3-cross`, c51614e2 incorrectly imposes the inherited Int result
+on the local String. The accepted compiler also reports a spurious override
+error for the reduced case. Block statements now record both vals and defs;
+local signatures are removed from the owner's member list while retaining
+lexical scope bindings, and inherited result inference skips them.
+The new runtime test compares both source-3 modes with scalac, checking the
+local value and the inherited member outside the block. All 56 related tests
+pass (absresult 17, lazysig_impl2 3, lazysig2 9, override 27).
+The first test harness run failed because a colon in its output directory
+was interpreted as a JVM classpath separator; the directory naming is fixed.
+Logs: `/tmp/scala-rs-abstract-regression/local-shadow/`.
+
+The other outstanding c51614e2 regression, `neg/t11136_override_conflict`,
+is independently confirmed by scalac: a concrete inherited `empty: ArDq[A]`
+does not implement the refined `empty: Qu[A]` requirement. Its four reference
+diagnostics are in `override-conflict/nsc.log`; that repair is still pending.
+
+The candidate gitbucket diagnostic run after this repair reports 217 errors
+in 67 files (accepted baseline 223 / 68, rejected candidate 234 / 70).
+This is not a full merge-gate acceptance.
+
+### Inherited override conflict and a newly exposed bridge obligation
+
+`absresult_conflict_bad.scala` reduces t11136 to three lines: covariant
+Factory[C] declares empty: C, Base implements empty: Base, and Child mixes
+Factory[Child] into Base. The pre-fix candidate accepts it; scalac rejects the
+inherited result conflict. Override checking now also compares the effective
+inherited concrete implementation against inherited deferred requirements,
+with both signatures seen from the class being checked. Nominal ancestry can
+prove a mismatch even when generic arguments are outside the existing
+conservative result comparison. The full original corpus source now reports
+four incompatible-override errors, matching the four reference locations.
+Logs: `/tmp/scala-rs-abstract-regression/override-conflict/{fixed,nsc}.log`.
+
+The new positive runtime test deliberately remains failing: class Valid
+inherits Provider.text: String and mixes in Wide.text: Any. Compilation is
+valid, but invoking text through Wide throws AbstractMethodError. The current
+inherited covariance bridge emitter only considers implementations emitted
+on this class, missing the superclass implementation. The negative check is
+repaired; this new normal-case bridge obligation must be fixed before the
+suite or the slice is claimed green. The focused absresult run reports
+17 passes and this one runtime failure; subsequent suites did not run because
+Cargo stopped on that failure. Evidence: `override-conflict/tests.log`.
+
+### Superclass covariance bridges and completed return hierarchies
+
+The failed valid-inheritance runtime case now passes. Before erasure,
+`record_method_override_families` also records class-specific pairs of
+inherited concrete implementations and deferred declarations, using strict
+parameter matching. The inherited bridge emitter can target these superclass
+methods even when no method body is emitted on the subclass itself. A return
+narrowing check prevents the newly emitted wide bridge from becoming the
+reverse target of another bridge. The initial implementation exposed that
+reverse bridge with a JVM VerifyError; the direction check removes it.
+The absresult/anonbridge/ifacebridge/vcbridge/override suites passed all 66
+tests after that repair, including real-scalac/JVM comparisons.
+
+A library diagnostic run then exposed three false inherited conflicts:
+ForkJoinTask's parents had not been loaded before comparing it with Future.
+Override checking now completes the return hierarchy before drawing nominal
+ancestry conclusions. A fourth added error (`Codec._decoder`) came from
+removing method-owned locals from the owner list; only class-owned block
+locals are detached, preserving the method's lexical completion environment.
+The resulting library run has 474 errors in 120 files, with no added error
+messages and 67 removals against accepted 172a6525. Logs use the
+`override-conflict/library-warm` prefix in the evidence directory. These are
+intermediate checks; the broader gate remains required.
+
+### Generic superclass bridge validation
+
+The mandatory supply-boundary suites pass all 534 tests after the inherited
+conflict and superclass bridge changes (`override-conflict/seam-tests.log`).
+A further bidirectional runtime probe exposed the generic-owner case:
+Provider[A].render(A): String inherited by Child extends Provider[Int] with
+Wide[Int] still lacked render(Object): Object. Both compilers accepted it;
+the candidate threw AbstractMethodError while scalac executed successfully.
+`absresult_generic_bridge.scala` now covers this case. Class-specific bridge
+relations compare both parameter signatures at the inheriting class prefix,
+with method type parameters aligned, using exact equality before erasure.
+The repaired probe and all 67 related bridge/override tests pass, including
+JVM verification and byte-identical oracle output. Logs are in
+`/tmp/scala-rs-abstract-regression/generic-inherited-bridge/`.
+The 534-test run precedes this last relation adjustment; the composed gate
+must validate the final combination again.

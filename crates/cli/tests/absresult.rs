@@ -523,3 +523,86 @@ fn inherited_ordering_result_emits_a_sam() {
     assert_eq!(outputs[0], outputs[1]);
     assert_eq!(outputs[0], b"-1\n1\n-1\n-1\n");
 }
+
+#[test]
+fn block_local_value_does_not_override_a_member() {
+    let p = root();
+    for mode in ["-Xsource:3", "-Xsource:3-cross"] {
+        let mut outputs = Vec::new();
+        for oracle in [false, true] {
+            let out = p.join(format!("local-{}-{oracle}", mode.replace(':', "-")));
+            fs::create_dir_all(&out).unwrap();
+            let mut c = if oracle {
+                Command::new(NSC)
+            } else {
+                let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
+                c.args(["compile", "--scala-library", JAR]);
+                c
+            };
+            check(
+                &c.arg(fixture("absresult_local.scala"))
+                    .arg(mode)
+                    .arg("-d")
+                    .arg(&out)
+                    .output()
+                    .unwrap(),
+            );
+            let result = run(&out, JAR);
+            check(&result);
+            outputs.push(result.stdout);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], b"local\n1\n");
+    }
+}
+
+#[test]
+fn inherited_implementation_must_satisfy_other_parent() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let bad = compile(
+            &[fixture("absresult_conflict_bad.scala")],
+            &p.join(format!("conflict-bad-{oracle}")),
+            JAR,
+            oracle,
+            false,
+        );
+        assert!(!bad.status.success());
+        assert!(String::from_utf8_lossy(&bad.stderr).contains("incompatible type in overriding"));
+        let out = p.join(format!("conflict-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_conflict.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"true\ninherited\n");
+}
+
+#[test]
+fn superclass_bridge_substitutes_owner_parameters() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let out = p.join(format!("generic-bridge-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_generic_bridge.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"42\n");
+}
