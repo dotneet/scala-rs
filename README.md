@@ -150,9 +150,11 @@ Value conversions retry after completing their binary implicit witnesses. The
 `proven` fixture checks a bounded Shape witness against scalac, including runtime
 output and an incompatible-result rejection. Higher-kinded parameterless results
 infer their constructor from singleton underlying types, while narrowing still
-requires a valid conversion and subtype evidence. The explicitly typed Slick query
-probe now generates matching SQL; inferred table projections remain a separate
-obligation.
+requires a valid conversion and subtype evidence.
+Abstract implementations without a written `override` use the inherited result
+as an expectation and retain narrower inferred results. The `absresult`
+fixture checks source and binary parents, overloads, generics and recursion.
+The unannotated table projection probe also generates matching SQL.
 
 継承した `lazyZip` などで、JVM の転送メソッドが失った `this.type` を
 Scala の宣言情報から保持します。登録先のクラスと実際の宣言元を区別し、

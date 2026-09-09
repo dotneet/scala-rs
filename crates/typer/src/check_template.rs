@@ -2000,11 +2000,14 @@ impl Typer {
         &self,
         owner: SymbolId,
         name: &str,
-        my_ps: &[Type],
+        my_paramss: &[Vec<Type>],
+        my_tps: &[SymbolId],
+        abstract_only: bool,
     ) -> Option<Type> {
         if owner.is_none() || name.is_empty() {
             return None;
         }
+        let my_ps: Vec<&Type> = my_paramss.iter().flatten().collect();
         // The candidate may be declared on a *generic* ancestor (`trait
         // Base[A] { def f: A }`), so its raw signature has to be read
         // as-seen-from `owner`'s own type -- the same substitution
@@ -2048,6 +2051,9 @@ impl Typer {
                 if cand_name != name || !matches!(cand_kind, SymKind::Method | SymKind::Term) {
                     continue;
                 }
+                if abstract_only && !self.st.method_is_deferred(m) {
+                    continue;
+                }
                 // Deliberately *not* `complete_lazy_sig`: forcing a
                 // still-pending candidate to complete here ran it (and
                 // whatever forward references its own body makes) before
@@ -2072,14 +2078,39 @@ impl Typer {
                 // anything.
                 let cand_ty = self.st.get(m).ty.clone();
                 let cand_ty = self.st.subst_as_seen_from(&owner_ty, &cand_ty);
+                let base_tps = &self.st.get(m).tparams;
+                if abstract_only && base_tps.len() != my_tps.len() {
+                    continue;
+                }
+                let cand_ty = if base_tps.len() == my_tps.len() {
+                    let args: Vec<Type> = my_tps.iter().map(|tp| Type::TypeParam(*tp)).collect();
+                    crate::symbol::subst_tparams_slice(base_tps, &args, &cand_ty)
+                } else {
+                    cand_ty
+                };
+                if abstract_only {
+                    if let Type::Method { paramss, .. } = &cand_ty {
+                        let shape = |ps: &[Vec<Type>]| -> Vec<usize> {
+                            if ps.len() == 1 && ps[0].is_empty() {
+                                vec![]
+                            } else {
+                                ps.iter().map(Vec::len).collect()
+                            }
+                        };
+                        if shape(my_paramss) != shape(paramss) {
+                            continue;
+                        }
+                    }
+                }
                 let ps = method_value_params(&cand_ty);
                 if ps.len() != my_ps.len() {
                     continue;
                 }
-                let ok = my_ps
-                    .iter()
-                    .zip(ps.iter())
-                    .all(|(a, b)| a == b || self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a));
+                let ok = my_ps.iter().zip(ps.iter()).all(|(a, b)| {
+                    self.st.dealias(a) == self.st.dealias(b)
+                        || (!abstract_only
+                            && (self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a)))
+                });
                 if !ok {
                     continue;
                 }

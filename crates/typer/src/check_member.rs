@@ -212,8 +212,7 @@ impl Typer {
         }
     }
 
-    /// Second chance at `overridden_ret_type` for an `override def` that wrote
-    /// no result type.
+    /// Retry the inherited result expectation for an unannotated implementation.
     ///
     /// `overridden_ret_type` deliberately does not force a candidate's
     /// signature (doing so measured 155 slick errors -> 307), so it can only
@@ -238,9 +237,10 @@ impl Typer {
         else {
             return;
         };
-        if !tpt.is_empty() || name == "<init>" || !mods.flags.contains(Flags::OVERRIDE) {
+        if !tpt.is_empty() || name == "<init>" {
             return;
         }
+        let abstract_only = !mods.flags.contains(Flags::OVERRIDE);
         let name = name.clone();
         let sym = tree.sym;
         if sym.is_none() {
@@ -253,8 +253,13 @@ impl Typer {
             return;
         }
         let owner = self.st.get(sym).owner;
-        let my_ps: Vec<Type> = paramss.iter().flatten().cloned().collect();
-        let Some(found) = self.overridden_ret_type(owner, &name, &my_ps) else {
+        let Some(found) = self.overridden_ret_type(
+            owner,
+            &name,
+            &paramss,
+            &self.st.get(sym).tparams,
+            abstract_only,
+        ) else {
             return;
         };
         if found.is_no_type() || found.is_error() {
@@ -756,38 +761,19 @@ impl Typer {
         let ret = if name == "<init>" {
             Type::Unit
         } else if tpt.is_empty() {
-            // An override that omits its own result type takes the
-            // overridden member's: `class Sub extends Base { override def
-            // run(n: Node) = n match { case Wrap(x) => run(x) ... } }`
-            // compiles under real scalac when `Base.run` declares `: Any`,
-            // even though the identical body in a class with no such parent
-            // reports "recursive method run needs result type" (confirmed
-            // against scalac 2.13.16). `type_def_body`'s cycle lock only
-            // fires when this stays `Type::NoType`, so borrowing the
-            // overridden return type here -- and only the return type, the
-            // body is still checked/inferred exactly as written -- is what
-            // lets the self-recursive call through.
-            //
-            // Gated on the written `override` modifier: an ancestor search
-            // for every unannotated method regardless -- most method bodies
-            // never write a result type at all -- forced far more ancestor
-            // signatures/bodies through `complete_lazy_sig` than the real
-            // bug needed, completing them out of their normal top-down order
-            // and, measured end-to-end against slick, actually reporting
-            // *more* errors than before (names other members would have
-            // exposed by the time the normal pass reached them were not
-            // exposed yet). `override` is required by SLS 5.1.3 on every
-            // non-synthetic overriding member other than a case class's
-            // generated ones, and a hand-written override that omits it is
-            // already its own separate diagnostic elsewhere -- not a case
-            // this lookup needs to widen itself to catch.
-            let my_ps: Vec<Type> = paramss_ty.iter().flatten().cloned().collect();
-            if mods_flags.contains(Flags::OVERRIDE) {
-                self.overridden_ret_type(saved_owner, &name, &my_ps)
-                    .unwrap_or(Type::NoType)
-            } else {
-                Type::NoType
-            }
+            // A known inherited result guides the body and permits recursive
+            // references before the final, possibly narrower result is inferred.
+            // Implementing an abstract member does not require a written
+            // override modifier. Reuse known abstract signatures in that case,
+            // without forcing pending source bodies to complete out of order.
+            self.overridden_ret_type(
+                saved_owner,
+                &name,
+                &paramss_ty,
+                &tp_ids,
+                !mods_flags.contains(Flags::OVERRIDE),
+            )
+            .unwrap_or(Type::NoType)
         } else {
             // As in `type_val_sig`: a written result type is fully resolvable
             // by the time nsc looks at it, so an unresolved name is an error
@@ -1144,6 +1130,7 @@ impl Typer {
     }
 
     pub(crate) fn type_def_body(&mut self, tree: &mut Tree) {
+        let infer_result = matches!(&tree.kind, TreeKind::DefDef { tpt, .. } if tpt.is_empty());
         let is_ctor = match &tree.kind {
             TreeKind::DefDef { name, .. } => name == "<init>",
             _ => return,
@@ -1175,7 +1162,7 @@ impl Typer {
             // nsc locks a method while its result type is being inferred, so a
             // definition completed from this body that refers back reports
             // `recursive method f needs result type` at that reference.
-            let locked = ret_pt.is_no_type() && self.lock_lazy_sig(tree.sym);
+            let locked = (ret_pt.is_no_type() || infer_result) && self.lock_lazy_sig(tree.sym);
             self.st.push_scope();
             let saved_owner = self.st.owner;
             let saved_ret = self.return_meth;
@@ -1212,8 +1199,11 @@ impl Typer {
             self.typing_call_args = saved_call_args;
             if !ret_pt.is_no_type() {
                 self.adapt(rhs, &ret_pt);
-            } else if !is_ctor {
-                // infer result type (SIP-23: do not infer singleton/constant types)
+            }
+            if infer_result && !is_ctor {
+                // An inherited result is an expectation, not a written annotation.
+                // Keep a narrower inferred result after any required adaptation.
+                // SIP-23: do not infer singleton/constant types.
                 let inferred = rhs.ty.widen_constant();
                 if let Type::Method { ret, .. } = &mut tree.ty {
                     *ret = Box::new(inferred.clone());

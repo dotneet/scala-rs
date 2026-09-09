@@ -146,23 +146,11 @@ impl Typer {
         if tree.sym.is_none() {
             return;
         }
-        // `needs_lazy_sig` only reads the parsed syntax (no written `: T`),
-        // which stays true for `override def run(n: Node) = ...` even after
-        // `type_def_sig` has already filled in a concrete return type by
-        // borrowing the overridden member's (see its call to
-        // `overridden_ret_type`). Leaving such a symbol pending anyway meant
-        // a self-recursive call inside its own body -- typed moments later
-        // by the body pass -- found itself still in `pending_sigs` and ran
-        // `complete_lazy_sig` on itself: that call locks the symbol and
-        // re-enters `type_def_body` on a cloned copy of the very body
-        // already being typed, whose own self-reference then finds the
-        // symbol locked and reports a spurious "recursive method run needs
-        // result type" -- even though the return type was never actually in
-        // question. A `DefDef` whose signature pass already produced a real
-        // return type has nothing left to infer, so it is not lazy anymore.
-        let ret_known = matches!(&tree.kind, TreeKind::DefDef { name, .. } if name != "<init>")
-            && matches!(&tree.ty, Type::Method { ret, .. } if !ret.is_no_type());
-        if !needs_lazy_sig(tree) || ret_known {
+        // An inherited result supplies an expected type, but the body may
+        // infer a narrower result. Keep unannotated definitions pending even
+        // with that expectation. Body typing holds the completion lock, and
+        // recursive references may use the known inherited result.
+        if !needs_lazy_sig(tree) {
             self.pending_sigs.remove(&tree.sym);
             return;
         }
