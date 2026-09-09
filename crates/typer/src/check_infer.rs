@@ -2832,7 +2832,12 @@ impl Typer {
         // alternative is an error.
         let from_ty = tree.ty.clone();
         self.warm_own_scope_once(&from_ty);
-        match self.search_conversion(&tree.ty, pt) {
+        let mut conversion = self.search_conversion(&tree.ty, pt);
+        if matches!(conversion, ImplicitSearch::None) {
+            self.warm_conversion_witnesses(&tree.ty, pt);
+            conversion = self.search_conversion(&tree.ty, pt);
+        }
+        match conversion {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
                 let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));

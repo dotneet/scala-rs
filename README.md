@@ -146,8 +146,11 @@ type refers to the enclosing `this`. The `bparent` regression compiles its
 library with scalac 2.13.16 and compares client execution under JVM verification.
 Qualified companion lookup preserves enclosing lexical bindings; a source-parent
 regression also compares execution with scalac in both runtime modes.
-This does not yet make the Slick query probe fully executable: its `Rep` to
-`ProvenShape` conversion remains unresolved.
+Value conversions retry after completing their binary implicit witnesses. The
+`proven` fixture checks a bounded Shape witness against scalac, including runtime
+output and an incompatible-result rejection. The explicitly typed Slick query
+probe now generates matching SQL; inferred table projections remain a separate
+obligation.
 
 継承した `lazyZip` などで、JVM の転送メソッドが失った `this.type` を
 Scala の宣言情報から保持します。登録先のクラスと実際の宣言元を区別し、

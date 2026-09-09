@@ -34,3 +34,54 @@ recomputes arguments from the source alone. The next hypothesis is that the
 result-derived U=Int is discarded before checking the Shape witness. This is
 not yet established as the only cause; binary implicit-scope loading must also
 be checked. No compiler correction or new full gate is claimed in this record.
+
+
+## Correction: missing completion, not result inference
+
+Passing result-derived U=Int into open_conversion_fit's witness search still
+fails: target-trace.txt records the correctly substituted Shape request and
+found=None. WarmWitness.scala adds an earlier explicitly requested Shape; the
+accepted baseline then compiles the implicit conversion without any compiler
+changes. Thus the previous result-inference hypothesis is not the cause of
+this Slick failure. That experimental compiler change was removed.
+
+The candidate instead retries a failed value conversion after loading applicable
+conversions' witness scopes and candidate inheritance, as normal implicit
+application already does. The wanted result companion is loaded too. The
+unmodified Implicit.scala now compiles and executes under java -Xverify:all,
+producing the same SQL bytes as the scalac executions. Logs:
+`/tmp/scala-rs-proven-shape/implicit-warm.{log,stdout,stderr}`.
+
+The permanent proven_lib.scala fixture is compiled with real scalac and has a
+bounded Shape level in an existential witness. The saved accepted compiler
+rejects proven.scala with Rep[Int] required Proven[Int], while the candidate
+and nsc accept. The simple source-only control did not expose unloaded binary
+parents. `proven` compares runtime output and requires both compilers to reject
+Proven[String] from Rep[Int]. Full merge-gate validation is still pending.
+
+
+## The negative probe exposes a second fault
+
+Witness completion alone makes the positive Slick and small binary cases run,
+but the permanent negative probe is then incorrectly accepted: Proven[String]
+from Rep[Int]. Both the accepted baseline and scalac reject it. The previous
+claim about result inference therefore needs qualification: it is not sufficient
+to fix the unloaded witness, but after completion it is required for soundness.
+The open conversion path solved the result as String and then recomputed a
+Shape[Rep[Int], Int] from the source, accepting unrelated evidence.
+
+The corrected candidate checks implicit clauses using argument- and result-
+derived substitutions together, retaining source-inferred arguments for any
+parameters not determined by that unification. Logs for the rejected completion-
+only candidate are `/tmp/scala-rs-proven-shape/bad-{before,candidate,nsc}.log`.
+This is a real acceptance regression found before a full gate, not an accepted
+intermediate implementation. Both corrections must survive the runtime and
+rejection tests together.
+
+
+Corrected focused validation: proven 1/1 plus all nine mandatory member-supply
+boundary suites 534/534 pass. The unchanged Slick Implicit.scala probe compiles
+and executes with exit zero; its 139 stdout bytes match scalac exactly after
+the soundness correction. Logs: implicit-corrected.{log,stdout,stderr} and
+boundary-corrected.log under `/tmp/scala-rs-proven-shape`. No baseline counts
+have been remeasured, and full-gate acceptance remains pending.

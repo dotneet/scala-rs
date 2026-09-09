@@ -1868,6 +1868,40 @@ impl Typer {
             .find(|&m| self.st.get(m).name == "$conforms")
     }
 
+    /// Complete witness types before retrying a failed value conversion.
+    /// Search itself is immutable, while normal implicit application loads
+    /// both witness companions and candidate inheritance before rejecting them.
+    pub(crate) fn warm_conversion_witnesses(&mut self, from: &Type, to: &Type) {
+        self.warm_own_scope_once(to);
+        let mut ids = self.implicits_in_scope();
+        ids.extend(self.companion_implicits(from));
+        ids.extend(self.companion_implicits(to));
+        ids.sort_by_key(|id| id.0);
+        ids.dedup();
+        for id in ids {
+            if self.first_clause_is_implicit(id) {
+                continue;
+            }
+            let Some(param) = self.conversion_arg_ty(id) else {
+                continue;
+            };
+            if !self.conv_param_matches(id, from, &param) {
+                continue;
+            }
+            let wanted: Vec<Type> = self
+                .conv_implicit_params(id, from)
+                .into_iter()
+                .flatten()
+                .collect();
+            for want in &wanted {
+                self.warm_implicit_scope(want);
+            }
+            if !wanted.is_empty() {
+                self.warm_implicit_candidates(&wanted);
+            }
+        }
+    }
+
     pub(crate) fn search_conversion(&self, from: &Type, to: &Type) -> ImplicitSearch {
         let _live = self.memo_scope();
         let local: Vec<SymbolId> = self
@@ -2044,8 +2078,25 @@ impl Typer {
         if crate::check::mentions_tparam(&solved_to, &unknowns) {
             return None;
         }
-        if !self.conv_implicits_resolve(id, from) {
-            return None;
+        // The result may solve a parameter the source cannot determine.
+        // Validate witnesses with that solution: a Shape[Rep[Int], Int]
+        // cannot justify a conversion whose wanted result requires String.
+        let source_args = self.conv_targs(id, from);
+        let solved_args: Vec<Type> = tps
+            .iter()
+            .zip(solved_from_arg.iter())
+            .zip(source_args)
+            .map(|((tp, known), fallback)| {
+                known.clone().or_else(|| u.solved(*tp)).unwrap_or(fallback)
+            })
+            .collect();
+        if let Type::Method { paramss, .. } = &*cand_ty {
+            for want in paramss.iter().skip(1).flatten() {
+                let want = crate::symbol::subst_tparams_slice(&tps, &solved_args, want);
+                if !self.search_implicit_at(&want, 1).is_found() {
+                    return None;
+                }
+            }
         }
         Some((solved_to, binds))
     }

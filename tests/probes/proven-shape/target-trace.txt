@@ -1,0 +1,9 @@
+proven wanted=Class { sym: SymbolId(4825), args: [BoundedWildcard { lo: None, hi: Some(Class { sym: SymbolId(4826), args: [] }) }, Class { sym: SymbolId(5874), args: [Int] }, Int, Wildcard] } solved=[Class { sym: SymbolId(5874), args: [Int] }, Int] found=None
+proven wanted=Class { sym: SymbolId(4825), args: [BoundedWildcard { lo: None, hi: Some(Class { sym: SymbolId(4826), args: [] }) }, Class { sym: SymbolId(5874), args: [Int] }, Int, Wildcard] } solved=[Class { sym: SymbolId(5874), args: [Int] }, Int] found=None
+error: type mismatch; found: Rep[Int]  required: ProvenShape[Int]
+  --> /tmp/scala-rs-proven-shape/imported.scala:5:42
+     |
+ 5 |  def * : slick.lifted.ProvenShape[Int] = id
+     |                                          ^^
+
+1 error(s), 0 warning(s)
