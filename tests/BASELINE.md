@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-09 |
 
 **Seventy-six slices have merged this session**, in thirty-two accepted composed gates.
-Six intermediate candidates were rejected, three despite a PASS script verdict. From
+Seven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1315,3 +1315,31 @@ This fixes a silent constructor VerifyError, not the remaining gitbucket Shape
 family. The Slick query probe advances past construction and exposes an unresolved
 Rep-to-ProvenShape conversion; complete query execution is still unproven. Neither
 gitbucket nor cats is yet fully compilable.
+
+
+## Rejected conversion-witness candidate: `9ad530b2`
+
+Clean `9ad530b2`, containing main `0afdfd22`, completed the full merge gate
+with `VERDICT=FAIL`, `DONE`, and no skipped stages. Logs:
+`/tmp/scala-rs-gate-9ad530b2-codex/gate.log`. No implementation from this
+candidate is merged, and the accepted baseline remains `88ab9308`.
+
+Gitbucket improves 228/69 -> 223/68: five update-overload diagnostics involving
+Date disappear, with no added error-message entries. Cats stays 159/59 and
+library 541/123, with unchanged error-message multisets. Slick keeps zero errors,
+1490 verified classes, zero lint problems, and 12/12 runtime programs with
+36/36 attempts. Workspace: 2666 passed, zero failed (289 rows). Format passes;
+clippy has 59 existing warnings and no additions.
+
+Corpus totals are unchanged (pos 1109, neg 692, run 637), but losses=1,
+changes=2 against `88ab9308`: pos/t6033 improves and pos/t6846 regresses.
+The latter reports Carb[Nothing[Nothing]] required Carb[x.type], in a
+higher-kinded implicit conversion with singleton targets and subtype evidence.
+The equal totals do not excuse that pass-to-fail transition. Candidate ledger:
+`tests/baselines/corpus-9ad530b2.tsv`.
+
+Focused tests pass 535/535, including binary Shape witness runtime comparisons
+and rejection of an incompatible result. The explicitly typed Slick query
+probe produces 139 SQL bytes matching scalac under JVM verification. The gate
+regression requires further inference investigation before another gate. This
+record changes only this file and the candidate ledger, not main's compiler.
