@@ -85,3 +85,28 @@ and executes with exit zero; its 139 stdout bytes match scalac exactly after
 the soundness correction. Logs: implicit-corrected.{log,stdout,stderr} and
 boundary-corrected.log under `/tmp/scala-rs-proven-shape`. No baseline counts
 have been remeasured, and full-gate acceptance remains pending.
+
+
+## t6846: failed inference before the conversion
+
+The 9ad530b2 full gate rejects pos/t6846. The new witness check asks for
+x.type <:< Nothing[Nothing], correctly finding no evidence. The earlier
+compiler instead checked a source-only constraint that ignored x.type. The
+underlying issue is that parameterless `bar[M[_], A]: Carb[M[A]]` is
+instantiated before conversion and fails to extract List and Int from x.type.
+
+The actual scalac typer tree (`t6846-nsc-typer.txt`) first instantiates
+bar[List, Int], then applies narrow[x.type, List, Int] with subtype evidence.
+The temporary diagnostic (`t6846-trace.txt`) confirms the candidate's premature
+Nothing instantiation. That tracing code was removed after observation.
+
+Expected-type constraint collection now reads a singleton's underlying type
+when matching an applied higher-kinded result. This infers the constructor and
+arguments without treating Carb[List[Int]] as conforming to Carb[x.type];
+ordinary adaptation must still find the conversion and its evidence.
+The corpus source compiles with this correction. The permanent runtime
+proven_singleton.scala prints 7/8/8 with both scala-rs and scalac under
+java -Xverify:all, proving the conversion is called for the singleton cases.
+Both reject proven_singleton_bad.scala, which has no narrowing conversion.
+This test requires the real jar's <:< definition. An attempted private-runtime
+run failed on the missing <:< type and is not claimed as supported.

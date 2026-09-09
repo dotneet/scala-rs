@@ -1,0 +1,49 @@
+[[syntax trees at end of                     typer]] // t6846.scala
+package <empty> {
+  object Test extends scala.AnyRef {
+    def <init>(): Test.type = {
+      Test.super.<init>();
+      ()
+    };
+    class Arb[_] extends scala.AnyRef {
+      def <init>(): Test.Arb[_] = {
+        Arb.super.<init>();
+        ()
+      }
+    };
+    implicit def foo[M[_] >: [_]Nothing <: [_]Any, A]: Test.Arb[M[A]] = null;
+    (Test.this.foo[List, Int]: Test.Arb[List[Int]]);
+    type ListInt = List[Int];
+    (Test.this.foo[List, Int]: Test.Arb[Test.ListInt])
+  };
+  object Test2 extends scala.AnyRef {
+    def <init>(): Test2.type = {
+      Test2.super.<init>();
+      ()
+    };
+    import scala.collection.immutable.List;
+    class Carb[_] extends scala.AnyRef {
+      def <init>(): Test2.Carb[_] = {
+        Carb.super.<init>();
+        ()
+      }
+    };
+    implicit def narrow[N, M[_] >: [_]Nothing <: [_]Any, A](x: Test2.Carb[M[A]])(implicit ev: N <:< M[A]): Test2.Carb[N] = null;
+    implicit def bar[M[_] >: [_]Nothing <: [_]Any, A]: Test2.Carb[M[A]] = null;
+    type ListInt = List[Int];
+    private[this] val x: List[Int] = scala.collection.immutable.List.apply[Int](1);
+    <stable> <accessor> def x: List[Int] = Test2.this.x;
+    private[this] val y: Test2.ListInt = scala.collection.immutable.List.apply[Int](1);
+    <stable> <accessor> def y: Test2.ListInt = Test2.this.y;
+    type ListSingletonX = Test2.x.type;
+    type ListSingletonY = Test2.y.type;
+    (Test2.this.bar[List, Int]: Test2.Carb[List[Int]]);
+    (Test2.this.bar[List, Int]: Test2.Carb[Test2.ListInt]);
+    (Test2.this.narrow[Test2.ListSingletonX, List, Int](Test2.this.bar[List, Int])(scala.this.<:<.refl[Test2.ListSingletonX]): Test2.Carb[Test2.ListSingletonX]);
+    (Test2.this.narrow[Test2.ListSingletonY, List, Int](Test2.this.bar[List, Int])(scala.this.<:<.refl[Test2.ListSingletonY]): Test2.Carb[Test2.ListSingletonY])
+  }
+}
+
+warning: 2 deprecations (since 2.13.7); re-run with -deprecation for details
+warning: 1 feature warning; re-run with -feature for details
+2 warnings

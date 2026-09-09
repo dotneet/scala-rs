@@ -148,7 +148,9 @@ Qualified companion lookup preserves enclosing lexical bindings; a source-parent
 regression also compares execution with scalac in both runtime modes.
 Value conversions retry after completing their binary implicit witnesses. The
 `proven` fixture checks a bounded Shape witness against scalac, including runtime
-output and an incompatible-result rejection. The explicitly typed Slick query
+output and an incompatible-result rejection. Higher-kinded parameterless results
+infer their constructor from singleton underlying types, while narrowing still
+requires a valid conversion and subtype evidence. The explicitly typed Slick query
 probe now generates matching SQL; inferred table projections remain a separate
 obligation.
 

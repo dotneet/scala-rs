@@ -101,3 +101,40 @@ fn binary_conversion_witnesses_match_scalac() {
     }
     fs::remove_dir_all(p).unwrap();
 }
+
+#[test]
+fn higher_kinded_results_use_singleton_underlying_types() {
+    let p = root();
+    let source = fixture("proven_singleton.scala");
+    let nsc = p.join("nsc");
+    check(&compile(&[source.clone()], &nsc, JAR, true, false));
+    let expected = run(&nsc, JAR);
+    check(&expected);
+    assert_eq!(
+        expected.stdout,
+        fs::read(fixture("expected/proven_singleton.txt")).unwrap()
+    );
+    let out = p.join("ours");
+    check(&compile(&[source], &out, JAR, false, false));
+    let actual = run(&out, JAR);
+    check(&actual);
+    assert_eq!(actual.stdout, expected.stdout);
+    for oracle in [false, true] {
+        let bad = compile(
+            &[fixture("proven_singleton_bad.scala")],
+            &p.join(if oracle { "bad-nsc" } else { "bad-ours" }),
+            JAR,
+            oracle,
+            false,
+        );
+        assert!(
+            !bad.status.success(),
+            "accepted singleton narrowing without a conversion"
+        );
+        assert!(
+            String::from_utf8_lossy(&bad.stderr).contains("type mismatch"),
+            "{bad:?}"
+        );
+    }
+    fs::remove_dir_all(p).unwrap();
+}

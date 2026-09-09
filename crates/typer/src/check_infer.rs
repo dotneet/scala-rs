@@ -1896,6 +1896,21 @@ impl Typer {
                     self.collect_expected(tps, x, y, 0, depth + 1, allow_covariant, out);
                 }
             }
+            // A singleton has no applied constructor of its own. Infer the
+            // constructor and arguments from its underlying type; adaptation
+            // still has to prove that the result fits the original singleton.
+            (Type::Applied { .. }, Type::SingleType { sym, .. }) => {
+                let underlying = self.st.singleton_underlying(*sym);
+                self.collect_expected(
+                    tps,
+                    ret,
+                    &underlying,
+                    variance,
+                    depth + 1,
+                    allow_covariant,
+                    out,
+                );
+            }
             // The same, where the expected type has already settled on a real
             // class (`F[B]` against `List[String]`). The constructor is lined
             // up unapplied so `F` itself is not solved to `List[String]`.
