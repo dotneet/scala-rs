@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `5adf9c87` |
+| commit | `caf8f284` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Seventy-eight slices have merged this session**, in thirty-four accepted composed gates.
+**Seventy-nine slices have merged this session**, in thirty-five accepted composed gates.
 Eleven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -57,6 +57,7 @@ coordinator measured the merged tree each time, not the branches.
 | `88ab9308` | `binary parent prefixes and lexical companions` | 228 | 159 |
 | `172a6525` | `conversion witnesses and singleton inference` | 228 -> **223** | 159 |
 | `5adf9c87` | `inherited results and constructor evidence` | 223 -> **217** | 159 -> **158** |
+| `caf8f284` | `early lexical scopes` | 217 -> **202** | 158 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -264,7 +265,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **158** | **59** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **217** | **67** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **202** | **64** | — |
 | `tests/scalalib_measure.sh` (538) | **460** | **119** | — |
 
 ## Execution
@@ -291,8 +292,11 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 | `run` (2060) | **640** | 867 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-5adf9c87.tsv`](baselines/corpus-5adf9c87.tsv): 5324 unique
+[`baselines/corpus-caf8f284.tsv`](baselines/corpus-caf8f284.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `caf8f284` gate compared against `corpus-5adf9c87.tsv`: **losses=0,
+changes=0**.
+
 The `5adf9c87` gate compared against `corpus-172a6525.tsv`: **losses=0,
 changes=19**, all fail-to-pass (8 pos, 8 neg, 3 run).
 
@@ -381,7 +385,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **290 result rows, 2695 passed, 0 failed** at `5adf9c87` |
+| `cargo test --workspace --release --no-fail-fast` | **291 result rows, 2696 passed, 0 failed** at `caf8f284` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -1628,3 +1632,43 @@ reference classes. Negative controls detected all 32 missing Java classes and
 1172 missing reference classes in the preserved broken caches. Monitoring
 controls detected both a failing test and DONE. These process checks are
 separate evidence, not claims that they were stages of this compiler gate.
+
+
+## Gate thirty-five: lexical scopes for early forward completion
+
+Clean `caf8f284`, based on main `8521dc1f`, passed the complete unskipped
+merge gate with `VERDICT=PASS`, `DONE` and corpus losses=0, changes=0.
+Logs: `/tmp/scala-rs-gate-caf8f284-codex/gate.log`. Main was fast-forwarded
+to the exact tested commit. The following recording commit changes only
+BASELINE and the raw corpus ledger; compiler sources and tests are identical.
+
+Gitbucket improves 217/67 -> 202/64: thirteen ambiguous constructor errors,
+one readLine-on-Any error and one Releasable[Any] error disappear. No error
+messages are added. Cats remains 158/59 and the library remains 460/119,
+with identical error-message multisets. Slick compiles all 184 sources with
+zero errors and 1492 classes. MODE=b passes 12/12 programs, 36/36 attempts;
+subset verifies all 1492 classes with zero failures and lint problems.
+Strong initialization verification with the real PostgreSQL and Oracle jars
+loads all 1492 retained classes, zero failed and zero incomplete.
+
+Workspace: 2696 passed, zero failed, 291 result rows. Format passes. Release
+workspace clippy retains the same 57 warning messages, with none added.
+Corpus: 5324 records; pos 1118/396/345, neg 700/336/369 and run 640/867/553
+(pass/fail/skip), identical to `5adf9c87`. Raw ledger:
+`tests/baselines/corpus-caf8f284.tsv`.
+
+The initial constructor-overload hypothesis was corrected by measurement.
+An anonymous class in a parent constructor argument forced an unannotated
+member in a later unit before its imports had a scope snapshot. File lookup
+failed, Error was cached, and later constructors appeared ambiguous. The
+header pass now preserves lexical scopes for pending values and methods as
+it already did for aliases. No overload refusal was suppressed.
+
+The two-unit reduction fails on the accepted pre-fix compiler. Real scalac
+2.13.16 and the repaired compiler both accept both file orders, reject the
+wrong-result-type case, and produce byte-identical stdout under -Xverify:all.
+Before the full gate, 89 related tests, 534 boundary tests and 17 historical
+corpus cases passed their comparisons (corpus changes=0, losses=0). Preflight
+checked four pinned source trees, 121 jar archives, 33 Java support classes
+and 1498 reference classes. Main remains an incomplete Scala compiler;
+gitbucket and cats do not yet compile fully.
