@@ -4189,13 +4189,19 @@ as one hypothesis -- unqualified lookup failing to walk enclosing scopes and
 then inherited members. **Neither cluster was that.** They are two unrelated
 roots, and measuring which was the first useful thing this slice did.
 
-`tests/scalalib_measure.sh` (538 files): **604 -> 586 errors**,
-`files_with_errors` 130 both sides. The set difference of the two error logs is
-18 removed and **nothing new** -- 7 monitor calls in
-`scala/concurrent/{Channel,SyncVar}.scala` and 11 in
+`tests/scalalib_measure.sh` (538 files): **592 -> 574 errors** against the
+`agent/strarrayops` section above, `files_with_errors` 128 both sides. The set
+difference of the two error logs is 18 removed and **nothing new** -- 7 monitor
+calls in `scala/concurrent/{Channel,SyncVar}.scala` and 11 in
 `scala/collection/immutable/TreeSeqMap.scala`. The three remaining
 `not found: value` errors of the original 21 are neither cluster and are
 untouched.
+
+Measured twice, because `main` moved mid-slice: **604 -> 586** at the branch
+point and **592 -> 574** after merging `agent/strarrayops`. The removed set is
+the same 18 lines both times and nothing new appears in either, so the two
+slices are independent -- worth recording, since "both green alone, red
+together" is the standing failure mode for two slices in one wave.
 
 ### (a) is not a name-resolution bug -- the members were absent
 
