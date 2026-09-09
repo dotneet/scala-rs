@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `f428def6` |
+| commit | `4cc87fb2` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy slices have merged this session**, in twenty-six composed gates. From
+**Seventy-one slices have merged this session**, in twenty-seven composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -48,6 +48,7 @@ coordinator measured the merged tree each time, not the branches.
 | `7b4673c5` | `gbslickmember` | 264 -> **242** | 163 |
 | `ef33b16f` | `strarrayops` | 242 | 163 |
 | `f428def6` | `varassign` | 242 | 163 |
+| `4cc87fb2` | `unqualname` | 242 | 163 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -256,7 +257,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **242** | **72** | — |
-| `tests/scalalib_measure.sh` (538) | **560** | **124** | — |
+| `tests/scalalib_measure.sh` (538) | **541** | **123** | — |
 
 ## Execution
 
@@ -272,13 +273,18 @@ specialization remain explicitly red; this is not a completion claim.
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1105** | 409 | 345 |
-| `neg` (1405) | **688** | 348 | 369 |
-| `run` (2060) | **629** | 878 | 553 |
+| `pos` (1859) | **1106** | 408 | 345 |
+| `neg` (1405) | **690** | 346 | 369 |
+| `run` (2060) | **631** | 876 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-b83e06a8.tsv`](baselines/corpus-b83e06a8.tsv): 5324 unique
+[`baselines/corpus-4cc87fb2.tsv`](baselines/corpus-4cc87fb2.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `4cc87fb2` gate compared against `corpus-b83e06a8.tsv`: **losses=0,
+changes=5**, all fail-to-pass: `pos/Transactions`, `neg/overload-msg`,
+`neg/typeerror`, `run/Course-2002-03`, and `run/impconvtimes`.
+
+Historical comparisons before this gate follow.
 Compared with `7aa47c29`, `losses=0` and **nine statuses improved, nothing
 else moved** — `pos/t2712-{1,3,4,7}`, `neg/t2712-2`, `pos/hk-infer`,
 `pos/t5683`, `pos/tcpoly_infer_implicit_tuple_wrapper` and `pos/fun_undo_eta`,
@@ -339,7 +345,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **269 result rows, 2559 passed, 0 failed** at `5108669a` |
+| `cargo test --workspace --release --no-fail-fast` | **282 result rows, 2649 passed, 0 failed** at `4cc87fb2` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
@@ -945,6 +951,22 @@ name is correct. `import_named` calls `remember_named_import_prefix`;
 `import_wildcard` is not even given the prefix tree. `agent/unqualname` reached
 the same mechanism from the other side (calling an *inherited* member through
 `import <object>._`), so it is one root with two symptoms.
+
+## Gate twenty-seven: unqualified names on the composed tree
+
+`tests/verify_merge.sh` ran once without skipped stages on clean `4cc87fb2`,
+which merges `03ec631e` and `1583aa49`. It completed with `VERDICT=PASS` and
+`DONE`. Logs: `/tmp/scala-rs-gate-4cc87fb2-codex/gate.log`.
+
+The library measure improved from 560 errors in 124 files to **541 in 123**;
+gitbucket remained 242/72 and cats 163/62. Slick remained 184 source files,
+zero errors, and 1490 classes, with `verified=1490 failed=0` and
+`lint_problems=0`. MODE=b executed 12/12 programs with 36/36 attempts.
+Workspace tests passed 2649/2649; the full corpus gained five statuses with
+zero losses, including two negative tests previously accepted. The gate's
+format check passed. Main was fast-forwarded to the exact tested commit;
+the following recording commit changes only this file and the saved corpus
+ledger, not compiler code or test inputs.
 
 ## What is deliberately red
 
