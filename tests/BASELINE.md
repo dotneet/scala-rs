@@ -1062,3 +1062,30 @@ existing overload collapsing that discarded `IterableOps` alternatives.
 The ten `returning` errors disappear, but three new gitbucket diagnostics
 appear around a non-pair `Map.collect`. No implementation from this candidate
 has been merged into main.
+
+## Rejected returning-overload candidate: `ebaa481e`
+
+The full gate completed with `VERDICT=FAIL`, `DONE`, and no skipped stages
+on clean `ebaa481e`. Logs: `/tmp/scala-rs-gate-ebaa481e-codex/gate.log`.
+This does not replace the accepted main baseline.
+
+Gitbucket improved 239/71 -> 228/69; all ten returning diagnostics disappeared
+and the error-message multiset gained no entries. Cats stayed 163/62, library
+541/123. Slick retained zero errors / 1490 classes, verified 1490, failed 0,
+lint problems 0, execution 12/12 programs and 36/36 attempts. Workspace:
+2653 passed / 0 failed. Format checking passed.
+
+Corpus: pos 1109, neg 690, run 634; losses=1, changes=5 against `0828f77b`.
+`run/t3603` regressed. Gains: `run/resetattrs-this`, `run/t3327`, `run/t3984`,
+`run/tuples`. The previous two positive regressions are recovered. The ledger
+is `tests/baselines/corpus-ebaa481e.tsv`; no code from this gate is merged.
+
+The new loss executes `IntMap.map` and `LongMap.map`. Their own declarations
+are dropped because several JVM methods have identical erased parameter lists
+and distinct return descriptors. The generic StrictOptimizedMapOps method then
+builds an ordinary Map, followed by a cast to IntMap: `ClassCastException`.
+Evidence: `/tmp/returning-t3603/debug.log`, `run.log`, and disassembly of Test$.
+The next correction must resolve the JVM declaration's return descriptor too;
+merely preferring a receiver's method would reintroduce the Map concatenation
+miscompile. Key-preserving, key-changing and non-pair transformations need
+execution comparisons with real scalac before another full gate.

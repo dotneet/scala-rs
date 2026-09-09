@@ -138,3 +138,13 @@ stdout bytes to real scalac; its negative fixture is rejected by both.
 The clean `78cc806f` binary rejects the positive fixture. Logs and before
 provenance: `/tmp/returning-concat/`. The real Slick returning probe compiles
 (`/tmp/returning-overloads-slick.log`). A new full gate is required before merge.
+
+### Full gate at ebaa481e
+
+The gate completed with FAIL despite 2653 workspace passes and gitbucket's
+239 -> 228 reduction. `run/t3603` is the sole corpus loss. See BASELINE.md
+for the complete rejected-gate record. `IntMap` and `LongMap` have same-argument
+JVM overloads with different return descriptors; their most specific `map`
+declaration is currently dropped as ambiguous. Preserve all work locally,
+resolve that descriptor ambiguity, and compare key-preserving/key-changing/
+non-pair results against scalac. No process from this gate is still running.
