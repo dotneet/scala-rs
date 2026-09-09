@@ -1320,6 +1320,29 @@ impl Typer {
                     self.type_expr(tree, pt);
                     return;
                 }
+                // The same rewrite for the unqualified form: `bv = 5` where
+                // `bv` is an accessor inherited from a class file, whose field
+                // is private to the class that declares it.
+                if let Some(setter_name) = self.ident_setter_assign_lhs(lhs) {
+                    let lhs = std::mem::replace(lhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let rhs = std::mem::replace(rhs.as_mut(), Tree::dummy(TreeKind::Empty));
+                    let setter = Tree {
+                        id: lhs.id,
+                        span: lhs.span,
+                        kind: TreeKind::Ident { name: setter_name },
+                        ty: Type::NoType,
+                        sym: SymbolId::NONE,
+                        postfix: false,
+                        scala_ref: false,
+                        stable_pat: false,
+                    };
+                    tree.kind = TreeKind::Apply {
+                        fun: Box::new(setter),
+                        args: vec![rhs],
+                    };
+                    self.type_expr(tree, pt);
+                    return;
+                }
                 if structural_select_lhs(lhs) {
                     // nsc: `x.foo = v` on a refinement is `x.foo_=(v)` (reflective).
                     let lhs = std::mem::replace(lhs.as_mut(), Tree::dummy(TreeKind::Empty));

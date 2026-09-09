@@ -300,13 +300,49 @@ impl Typer {
                 }
             })
         };
+        // Covering the names is not enough to be the alternative nsc picks:
+        // the parameters the call leaves *uncovered* have to be ones it is
+        // allowed to leave out. `class C(a: Int, b: Boolean) { def this(a:
+        // Int) = … }` called as `new C(a = 3)` has two alternatives that both
+        // declare `a`, and the primary one came first, so `b` was reported
+        // missing for a call that names the one-parameter constructor
+        // exactly. Positional arguments fill the leading slots (a named
+        // argument that moves an argument makes every later positional one an
+        // error, so the leading run is all there can be), a named one fills
+        // its own, and what is left must carry a default, be implicit, or be
+        // the repeated tail.
+        let leading = nargs.saturating_sub(named.len());
+        let applicable = |ids: &[SymbolId], repeated_last: bool| -> bool {
+            if ids.len() < nargs && !repeated_last {
+                return false;
+            }
+            let last = ids.len().saturating_sub(1);
+            ids.iter().enumerate().all(|(i, p)| {
+                if i < leading {
+                    return true;
+                }
+                let s = self.st.get(*p);
+                named.iter().any(|(n, _)| n.as_str() == s.name.as_str())
+                    || s.flags.contains(Flags::DEFAULTPARAM)
+                    || s.flags.contains(Flags::IMPLICIT)
+                    || (repeated_last && i == last)
+            })
+        };
         let pick = |f: &dyn Fn(&[SymbolId]) -> bool| -> Option<&(Vec<SymbolId>, bool)> {
             cands
                 .iter()
                 .find(|(ids, _)| ids.len() >= nargs && f(ids))
                 .or_else(|| cands.iter().find(|(ids, _)| f(ids)))
         };
-        pick(&|ids| covers(ids) && conforms(ids))
+        cands
+            .iter()
+            .find(|(ids, r)| covers(ids) && conforms(ids) && applicable(ids, *r))
+            .or_else(|| {
+                cands
+                    .iter()
+                    .find(|(ids, r)| covers(ids) && applicable(ids, *r))
+            })
+            .or_else(|| pick(&|ids| covers(ids) && conforms(ids)))
             .or_else(|| pick(&covers))
             .or_else(|| cands.first())
             .cloned()
@@ -422,18 +458,32 @@ impl Typer {
     /// `new C(b = 2, a = 1)`. Constructors are picked by argument type, so the
     /// names have to be resolved first — and against the overload that
     /// actually declares them.
+    ///
+    /// `skip` is the constructor the call is *inside* of, for the
+    /// `def this(…) = this(a = 1)` path: an auxiliary constructor cannot
+    /// delegate to itself, so its own parameter names must not be the ones the
+    /// names are matched against. Without it
+    /// `class C(a: Int) { def this(a: Int, b: Int) = this(a = a) }` matched the
+    /// two-parameter alternative it is standing in and reported a missing
+    /// argument for `b`.
     pub(crate) fn reorder_named_ctor_args(
         &mut self,
         args: &mut Vec<Tree>,
         class_id: Option<SymbolId>,
         fun: &Tree,
+        skip: Option<SymbolId>,
     ) -> bool {
         self.last_named_order = None;
         let Some(class_id) = class_id else {
             Self::strip_named_args(args);
             return true;
         };
-        let alts = self.st.lookup_member(class_id, "<init>");
+        let mut alts = self.st.lookup_member(class_id, "<init>");
+        if let Some(cur) = skip {
+            if alts.iter().any(|&m| m != cur) {
+                alts.retain(|&m| m != cur);
+            }
+        }
         let named = if alts.len() > 1 {
             self.probe_named_arg_types(args)
         } else {
