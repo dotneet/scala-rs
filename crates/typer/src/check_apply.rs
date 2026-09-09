@@ -253,7 +253,7 @@ impl Typer {
             // order before the constructor overload is picked, since the pick
             // is driven by the argument types.
             if Self::has_named_arg(args) {
-                let placed = self.reorder_named_ctor_args(args, class_id, fun);
+                let placed = self.reorder_named_ctor_args(args, class_id, fun, None);
                 self.record_named_arg_order(tree_id);
                 if !placed {
                     for a in args.iter_mut() {
