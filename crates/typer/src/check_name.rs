@@ -1918,7 +1918,13 @@ impl Typer {
             // Nothing in the term namespace under this name, and a class of it
             // is in scope: its companion may simply not have been read yet.
             // See [`Self::expose_class_companion`].
-            self.expose_class_companion(&found, &name, tree.span)
+            let exposed = self.expose_class_companion(&found, tree.span);
+            for &sym in &exposed {
+                if self.st.get(sym).kind == SymKind::Module {
+                    self.st.enter_in_current(&name, sym);
+                }
+            }
+            exposed
         } else {
             terms
         };
@@ -1953,7 +1959,6 @@ impl Typer {
     pub(crate) fn expose_class_companion(
         &mut self,
         found: &[SymbolId],
-        name: &str,
         span: Span,
     ) -> Vec<SymbolId> {
         let classes: Vec<SymbolId> = found
@@ -1983,9 +1988,8 @@ impl Typer {
         if modules.is_empty() {
             return found.to_vec();
         }
-        for &m in &modules {
-            self.st.enter_in_current(name, m);
-        }
+        // Qualified lookup must not introduce a bare lexical binding:
+        // selecting p.C must not shadow an enclosing q.C companion.
         modules
     }
 

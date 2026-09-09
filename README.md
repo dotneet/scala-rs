@@ -144,6 +144,8 @@ imported aliases, including generic aliases, omitted constructor parentheses,
 member API objects, forwarded singleton API paths, and API values whose declared
 type refers to the enclosing `this`. The `bparent` regression compiles its
 library with scalac 2.13.16 and compares client execution under JVM verification.
+Qualified companion lookup preserves enclosing lexical bindings; a source-parent
+regression also compares execution with scalac in both runtime modes.
 This does not yet make the Slick query probe fully executable: its `Rep` to
 `ProvenShape` conversion remains unresolved.
 

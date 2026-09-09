@@ -319,3 +319,27 @@ Clippy exits zero with 59 individual warnings, no additions against the saved
 lazyZip baseline (59). Logs: /tmp/scala-rs-shape-join/{renamed-test,clippy-final}.log.
 The prior 535-test boundary run and this focused rerun cover the current
 candidate; full composed validation remains the merge requirement.
+
+
+### BitSet regression reduced after the rejected 07de211b gate
+
+The two new standard-library diagnostics reduce to a source companion class
+and object in each of two packages. A nested class in the second object
+extends the first object's nested class with constructor arguments. The new
+parent-prefix typing calls qualified companion lookup; that helper incorrectly
+entered the first package's companion as an unqualified binding in the current
+scope, shadowing the enclosing companion. Thus this was lexical-scope pollution,
+not missing BitSet members or binary parent completion.
+
+`/tmp/scala-rs-bitset-regression/Proxy.scala` is accepted by the saved accepted
+compiler and real scalac; 07de211b rejects its `BitSet.fromBitMaskNoCopy` call.
+The before/candidate/nsc-proxy logs preserve those results. With scope insertion
+restricted to the unqualified identifier caller, fixed-proxy.log shows acceptance.
+The permanent `bparent_scope.scala` fixture uses independent package names and
+executes the shadowed method; both ABI modes match scalac's stdout bytes under
+`java -Xverify:all` (17). Both bparent tests pass. Full-gate validation remains
+pending; this evidence does not replace the accepted baseline.
+
+Validation after the scope correction: bparent 2/2 and the nine required
+member-supply boundary suites 534/534 pass. `ScopePollution.scala` preserves
+the exact reduced source used for the accepted/candidate/scalac comparison.

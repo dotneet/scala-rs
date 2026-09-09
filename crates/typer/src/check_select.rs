@@ -264,7 +264,7 @@ impl Typer {
             && !qual.sym.is_none()
             && self.st.get(qual.sym).kind == SymKind::Package
         {
-            let exposed = self.expose_class_companion(&found, &name, tree.span);
+            let exposed = self.expose_class_companion(&found, tree.span);
             if exposed
                 .iter()
                 .any(|&s| self.st.get(s).kind == SymKind::Module)

@@ -99,3 +99,25 @@ fn binary_parent_prefix_matches_scalac() {
         );
     }
 }
+
+#[test]
+fn qualified_parent_companion_does_not_shadow_lexical_companion() {
+    let p = root();
+    let source = fixture("bparent_scope.scala");
+    let nsc = p.join("nsc");
+    check(&compile(&[source.clone()], &nsc, JAR, true, false));
+    let expected = run(&nsc, JAR);
+    check(&expected);
+    assert_eq!(
+        expected.stdout,
+        fs::read(fixture("expected/bparent_scope.txt")).unwrap()
+    );
+    for private in [false, true] {
+        let ours = p.join(if private { "private" } else { "jar" });
+        check(&compile(&[source.clone()], &ours, JAR, false, private));
+        let actual = run(&ours, JAR);
+        check(&actual);
+        assert_eq!(actual.stdout, expected.stdout);
+    }
+    fs::remove_dir_all(p).unwrap();
+}
