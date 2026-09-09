@@ -1540,6 +1540,12 @@ impl Typer {
             }
         }
         self.refresh_alias_sigs(body);
+        // Parent arguments can contain local templates whose bodies force a
+        // value in a later unit before the member-signature pass reaches it.
+        // Preserve that value's lexical imports now, just as for aliases.
+        for stt in body.iter() {
+            self.refresh_pending_scope(stt);
+        }
         for stt in body.iter_mut() {
             if matches!(
                 stt.kind,

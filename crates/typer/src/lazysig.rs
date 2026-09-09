@@ -213,7 +213,7 @@ impl Typer {
     /// declines to redo (a second evidence clause, re-typed view bounds)
     /// happens.
     pub(crate) fn refresh_pending_scope(&mut self, tree: &Tree) {
-        if !self.sigs_only || tree.sym.is_none() {
+        if !(self.sigs_only || self.header_pass) || tree.sym.is_none() {
             return;
         }
         if !self.pending_sigs.contains_key(&tree.sym) {
