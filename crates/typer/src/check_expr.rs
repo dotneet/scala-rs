@@ -960,6 +960,11 @@ impl Typer {
                             .into_iter()
                             .filter(|id| self.st.get(*id).tparams.len() == targs.len())
                             .collect();
+                        // An omitted `.apply` must see the same inherited
+                        // alternatives as an explicit selection. In particular,
+                        // loading a factory delegate must not add its overridden
+                        // declaration beside the companion's factory.
+                        candidates = self.drop_overridden_at(cls, candidates);
                         // Several `apply`s of the same type-parameter count.
                         // Explicit type arguments cannot separate them, so
                         // the position does: SLS 6.26.3 keeps only the

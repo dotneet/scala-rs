@@ -15,6 +15,8 @@ makes no claim of conformance to the language specification. What exists today:
   implicit search), uncurry, lambda-lift and erasure.
 - Early inference of forward members preserves their defining imports, including
   references from anonymous classes passed to parent constructors.
+- Explicit type arguments on factory calls use the same inherited override
+  filtering as an explicit `.apply`, including loaded collection delegates.
 - The target is Java 8 class files (major version 52), with a `StackMapTable`
   (`full_frame`) in the `Code` attribute. Frame types for locals are the erasure
   of the slot's declared type, as in scalac.
