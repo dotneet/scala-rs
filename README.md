@@ -32,6 +32,11 @@ makes no claim of conformance to the language specification. What exists today:
   [docs/gitbucket.md](docs/gitbucket.md) ("Not this cluster: `Database` /
   `DatabaseFactory`") and the `impprio` and `nameamb` tests.
 
+- Object wildcard imports preserve the imported receiver for mutable fields
+  and inherited calls, including nested imports and renamed selectors.
+  `wildrecv` compares execution byte-for-byte with scalac 2.13.16 in both ABI
+  modes and probes acceptance and rejection in both directions.
+
 直接自己末尾呼び出しは `final` / `private` / object / ローカル def でループ化します。
 `@tailrec` の未対応形状は診断します。対応範囲と深い再帰・scalac 相互運用テストは
 [docs/tailrec.md](docs/tailrec.md) を参照してください。

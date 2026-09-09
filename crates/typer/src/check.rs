@@ -579,12 +579,15 @@ pub struct Typer {
     /// `import <a value>._`: the class the members came from, and the typed
     /// prefix tree to select them through.
     ///
-    /// An object or package prefix needs nothing -- its members are reached
-    /// from `MODULE$` or are static -- but `import u._` where `u` is a *value*
+    /// Package members are static; object wildcard receiver paths are stored
+    /// separately by import origin below. `import u._` where `u` is a *value*
     /// leaves an unqualified `Literal` that only means `u.Literal`. Without
     /// the prefix the backend loaded `this`, which is a `ClassCastException`
     /// at run time. This is what `import c.universe._` needs.
     pub(crate) term_import_prefixes: Vec<(SymbolId, Tree)>,
+    /// Receiver paths keyed by the written import clause, so an inner
+    /// wildcard cannot replace the receiver of an outer binding.
+    pub(crate) object_import_prefixes: HashMap<u64, Tree>,
     /// Packages whose jar package object's pickled `type` aliases have been
     /// installed (see `install_pickled_package_aliases`). One read per package.
     pub(crate) pkg_aliases_done: HashSet<u32>,
@@ -983,6 +986,7 @@ impl Typer {
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
+            object_import_prefixes: HashMap::new(),
             pkg_aliases_done: HashSet::new(),
             pending_pkg_folds: Vec::new(),
             pkg_alias_gaps: HashMap::new(),

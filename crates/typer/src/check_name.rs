@@ -86,7 +86,7 @@ impl Typer {
         match &mut expr.kind {
             TreeKind::Select { qual, name } if name == "_" => {
                 let owners = self.import_prefix(qual, span);
-                self.import_wildcard(&owners, &[], span);
+                self.import_wildcard(&owners, &[], span, qual);
             }
             TreeKind::Select { qual, name } if name.starts_with('{') => {
                 let sels = decode_import_selectors(name);
@@ -104,7 +104,7 @@ impl Typer {
                     self.import_named(&owners, from, to, span, &qual);
                 }
                 if sels.iter().any(|(from, _)| from == "_") {
-                    self.import_wildcard(&owners, &hidden, span);
+                    self.import_wildcard(&owners, &hidden, span, &qual);
                 }
             }
             TreeKind::Select { qual, name } => {
@@ -425,7 +425,9 @@ impl Typer {
     /// name reached through `this` already emits correctly, and rewriting it
     /// would change which symbol it means.
     fn qualify_term_import(&mut self, tree: &mut Tree, name: &str, found: &[SymbolId]) -> bool {
-        if self.term_import_prefixes.is_empty() || found.is_empty() {
+        if (self.term_import_prefixes.is_empty() && self.object_import_prefixes.is_empty())
+            || found.is_empty()
+        {
             return false;
         }
         let owners: Vec<SymbolId> = found
@@ -444,14 +446,37 @@ impl Typer {
         {
             return false;
         }
-        let Some(prefix) = owners.iter().find_map(|&o| self.term_import_prefix_for(o)) else {
+        let imported_prefix = self
+            .st
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|scope| {
+                let bindings = scope.lookup_ranked(name);
+                let rank = bindings
+                    .iter()
+                    .filter(|b| found.contains(&b.sym))
+                    .map(|b| b.rank)
+                    .min()?;
+                bindings
+                    .iter()
+                    .find(|b| b.rank == rank && found.contains(&b.sym))
+                    .map(|b| self.object_import_prefixes.get(&b.origin))
+            })
+            .flatten();
+        let Some(prefix) =
+            imported_prefix.or_else(|| owners.iter().find_map(|&o| self.term_import_prefix_for(o)))
+        else {
             return false;
         };
         let qual = prefix.clone();
+        // An import alias belongs to the local scope, not to the receiver.
+        // All alternatives of an imported overload share the original name.
+        let selected_name = self.st.get(found[0]).name.clone();
         let span = tree.span;
         tree.kind = TreeKind::Select {
             qual: Box::new(qual),
-            name: name.to_string(),
+            name: selected_name,
         };
         tree.ty = Type::NoType;
         tree.sym = SymbolId::NONE;
@@ -1038,8 +1063,18 @@ impl Typer {
     /// `import p._` / `import p.*`. Members already known are entered eagerly;
     /// the owner is also recorded so that a name only reachable by reading a
     /// classfile is still found later (see `expose_unqualified`).
-    fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span) {
+    fn import_wildcard(&mut self, owners: &[SymbolId], hidden: &[String], span: Span, qual: &Tree) {
         let origin = self.import_origin;
+        // Scope bindings already carry the written clause's origin. Keep
+        // its path under that identity, not under the member's class: two
+        // objects can inherit the very same symbol and have different state.
+        if !qual.sym.is_none()
+            && owners
+                .iter()
+                .any(|&o| !o.is_none() && self.st.get(o).kind == SymKind::ModuleClass)
+        {
+            self.object_import_prefixes.insert(origin, qual.clone());
+        }
         // A wildcard whose prefix is a package or an object is enumerable: the
         // walk below enters every member it has. Anything else -- a prefix
         // that did not resolve, or a *value* whose type is a jar class read one
@@ -1717,6 +1752,13 @@ impl Typer {
                     .pickle
                     .complete(&mut self.st, &mut self.binary, owner, name);
             }
+            // Lazy completion must respect the same privacy rule as the
+            // eager wildcard walk. Otherwise a rejected private member is
+            // immediately reintroduced when its bare name is requested.
+            found.retain(|&id| {
+                !self.st.private_to_owner(id)
+                    || (self.st.get(id).owner == owner && self.private_member_visible_here(id))
+            });
             if found.is_empty() {
                 continue;
             }
