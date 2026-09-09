@@ -175,3 +175,26 @@ recorded in the rejected gate and `/tmp/returning-t3603/run.log`.
 Required supply-boundary suites plus buildfrom and retfamily: 550 passed,
 zero failed (`/tmp/returning-resultdesc-boundary.log`). Clippy exits zero;
 existing warnings remain. A fresh full gate is still required before merging.
+
+### Element parameters versus fixed-key value parameters
+
+The `edbdfead` gate is complete (PASS, corpus losses=0), but is rejected:
+gitbucket grew to 273 errors and cats to 165. See BASELINE.md. All of its
+processes have finished. Follow-up work is in `.worktrees/codex-returning-elements`.
+
+The broad exclusion of all pickled maps is replaced with a check on the
+already inferred result. Rebuilding is permitted for a single parameter that
+is the mapped element; it must not reinterpret a fixed-key map's value
+parameter as its entire pair, or replace a selected two-parameter Map result.
+The existing `maps_to_own_class` alone cannot establish this: IntMap's lazy
+parent graph returns `class_reaches=None`, which that helper treats as true.
+The failed diagnostic experiment is recorded in `/tmp/returning-elements-trace.log`.
+
+Focused retfamily/buildfrom/conform validation: 102 passed / 0 failed
+(`/tmp/returning-elements-final-focused.log`). The additional element fixture
+covers Seq, Queue, Map and generic LazyList, compares JVM-verified stdout with
+real scalac, and checks negative assignments in both compilers. Its test
+passes (`/tmp/returning-elements-lazyfixture.log`). The old edbdfead binary
+rejects the Queue example (`/tmp/returning-elements-probe/before.log`).
+Format checking and clippy pass; only existing warnings remain. No new full
+gate or full compile measurements have run on this follow-up tree yet.

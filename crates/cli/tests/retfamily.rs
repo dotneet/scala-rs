@@ -164,6 +164,11 @@ fn fixed_key_maps_keep_or_change_their_key_type() {
     collection_fixture_matches_scalac("retfamily_fixedkeys");
 }
 
+#[test]
+fn collection_element_results_keep_the_receiver_constructor() {
+    collection_fixture_matches_scalac("retfamily_elements");
+}
+
 fn collection_fixture_matches_scalac(name: &str) {
     if !Path::new(NSC).is_file() || !Path::new(JAR).is_file() {
         eprintln!("SKIP: real Scala 2.13.16 is unavailable");

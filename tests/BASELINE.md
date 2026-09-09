@@ -1089,3 +1089,24 @@ The next correction must resolve the JVM declaration's return descriptor too;
 merely preferring a receiver's method would reintroduce the Map concatenation
 miscompile. Key-preserving, key-changing and non-pair transformations need
 execution comparisons with real scalac before another full gate.
+
+## Rejected map-result candidate: `edbdfead`
+
+The full gate completed with `VERDICT=PASS` and `DONE` on clean `edbdfead`,
+without skipped stages, but the candidate is rejected for measured library
+compilation regressions. Logs: `/tmp/scala-rs-gate-edbdfead-codex/gate.log`.
+The accepted baseline remains `0828f77b`.
+
+Gitbucket: 273 errors / 77 files (accepted main 239/71; previous candidate
+228/69). Cats: 165/62 (main 163/62). Library: 541/123. Slick: zero errors,
+1490 classes, verified 1490, failed 0, lint problems 0, execution 12/12 with
+36/36 attempts. Workspace: 2654 passed / 0 failed. Format check passed.
+Corpus: pos 1109, neg 690, run 635; losses=0, changes=4. Gains:
+`run/resetattrs-this`, `run/t3327`, `run/t3984`, `run/tuples`. The `t3603`
+regression is recovered. Ledger: `tests/baselines/corpus-edbdfead.tsv`.
+
+Skipping collection-result rebuilding for all pickled map declarations caused
+Seq, Queue, LazyList and Map results to remain wider than the receiver's
+collection constructor. The script does not enforce these error counts, so
+its PASS does not authorize merging this known regression. A minimal generic
+Queue method is rejected by edbdfead and accepted by real scalac.

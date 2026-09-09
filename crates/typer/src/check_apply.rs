@@ -1725,8 +1725,7 @@ impl Typer {
                                 };
                             }
                         }
-                    } else if method_name == "map"
-                        && (sym.is_none() || self.st.get(sym).pickled_origin.is_empty())
+                    } else if method_name == "map" && self.map_result_uses_element(sym, &ret, args)
                     {
                         if self.is_array_ops_ty(recv_ty.as_ref()) {
                             if let Some(a0) = args.first() {
@@ -2437,6 +2436,31 @@ impl Typer {
     /// A receiver that takes any other number of parameters cannot be written
     /// that way -- a user's `def map[R2](f: R => R2): Act[R2, NoStream, E]`
     /// would lose two arguments -- so its declared result type stands.
+    fn map_result_uses_element(&self, method: SymbolId, result: &Type, args: &[Tree]) -> bool {
+        if method.is_none() || self.st.get(method).pickled_origin.is_empty() {
+            return true;
+        }
+        let Type::Class {
+            args: result_args, ..
+        } = result
+        else {
+            return true;
+        };
+        let Some(Type::Function { ret: element, .. }) =
+            args.first().and_then(|arg| match &arg.ty {
+                Type::Function { .. } => Some(arg.ty.clone()),
+                other => self.function_view(other),
+            })
+        else {
+            return true;
+        };
+        // Collection rebuilding can change the constructor around an element,
+        // but cannot reinterpret a different parameter as that element. A
+        // fixed-key map's one parameter is its value, not the whole key/value
+        // pair; a key-changing map can also select a two-parameter result.
+        result_args.len() == 1 && result_args[0].widen_constant() == element.widen_constant()
+    }
+
     fn takes_one_type_parameter(&self, cls: SymbolId) -> bool {
         self.st.get(cls).tparams.len() == 1
     }
