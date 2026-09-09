@@ -11,12 +11,12 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `0828f77b` |
+| commit | `9f3cae13` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Seventy-two slices have merged this session**, in twenty-eight accepted composed gates.
-One additional wildcard candidate was rejected despite its script verdict. From
+**Seventy-three slices have merged this session**, in twenty-nine accepted composed gates.
+Four intermediate candidates were rejected, two despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -51,6 +51,7 @@ coordinator measured the merged tree each time, not the branches.
 | `f428def6` | `varassign` | 242 | 163 |
 | `4cc87fb2` | `unqualname` | 242 | 163 |
 | `0828f77b` | `wildcard-receiver` | 242 -> **239** | 163 |
+| `9f3cae13` | `returning-family`, collection overload corrections | 239 -> **228** | 163 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -258,7 +259,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **239** | **71** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **228** | **69** | — |
 | `tests/scalalib_measure.sh` (538) | **541** | **123** | — |
 
 ## Execution
@@ -277,11 +278,15 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `pos` (1859) | **1109** | 405 | 345 |
 | `neg` (1405) | **690** | 346 | 369 |
-| `run` (2060) | **631** | 876 | 553 |
+| `run` (2060) | **635** | 872 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-0828f77b.tsv`](baselines/corpus-0828f77b.tsv): 5324 unique
+[`baselines/corpus-9f3cae13.tsv`](baselines/corpus-9f3cae13.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `9f3cae13` gate compared against `corpus-0828f77b.tsv`: **losses=0,
+changes=4**, all fail-to-pass: `run/resetattrs-this`, `run/t3327`, `run/t3984`,
+and `run/tuples`.
+
 The `0828f77b` gate compared against `corpus-4cc87fb2.tsv`: **losses=0,
 changes=3**, all fail-to-pass: `pos/imports-pos`, `pos/t7233b`, `pos/t8855`.
 
@@ -300,7 +305,7 @@ statuses improved**: `neg/t7507` (a `self: Cake =>` seeing `Cake`'s `private[thi
 which we used to accept), `pos/t10714`, `pos/t10714b`, `pos/t7753` (dependent
 result types through an inserted `apply`), `pos/t6895` (partial expected-type
 solutions), `pos/t8801`, `run/t102` and `run/t3798`. Every earlier gate was
-`losses=0` as well; across the whole session no corpus status has ever gone
+`losses=0` as well; across the accepted main gates no corpus status has gone
 from pass to fail.
 Compared with `2098c6fe`, all 5324 statuses are unchanged. The two changed
 six-field records are an output path in `run/t8199` and the first reported JVM
@@ -350,18 +355,16 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **283 result rows, 2651 passed, 0 failed** at `0828f77b` |
+| `cargo test --workspace --release --no-fail-fast` | **284 result rows, 2655 passed, 0 failed** at `9f3cae13` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test changed after the full run.
-`cargo clippy --workspace --release` exits 0 with **58** warning messages,
-counted as messages and not as `^warning:` lines. The figure stood at 57 for
-several gates and was stale: a slice reported 58, and checking out the
-recorded baseline commit into a separate worktree and running the same
-command there gave 58 as well. Count the
-messages, not `^warning:` lines: the six per-crate "generated N warnings"
-summaries make the raw count 63, and a slice reported that as drift. Compare the same command scope;
-`--all-targets` also includes historical warnings from tests.
+`cargo clippy --workspace --release` exits zero with **60** individual warning
+messages (excluding per-crate generated-warning summaries). The saved wildcard
+baseline log and current log have the same warning-message multiset; none were
+added by this slice. Evidence: `/tmp/wildcard-receiver-probe/clippy.log` and
+`/tmp/returning-elements-clippy.log`. The old recorded count of 58 was stale.
+Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
 
@@ -1110,3 +1113,35 @@ Seq, Queue, LazyList and Map results to remain wider than the receiver's
 collection constructor. The script does not enforce these error counts, so
 its PASS does not authorize merging this known regression. A minimal generic
 Queue method is rejected by edbdfead and accepted by real scalac.
+
+## Gate twenty-nine: returning families and complete overload identities
+
+Clean `9f3cae13` completed the full gate with `VERDICT=PASS`, `DONE`, and
+corpus losses=0 against `0828f77b`. Logs:
+`/tmp/scala-rs-gate-9f3cae13-codex/gate.log`. Main was fast-forwarded to the
+exact tested commit; the following record changes documentation and the saved
+corpus ledger only, with no compiler, Cargo or test-input changes.
+
+Gitbucket improved 239/71 -> 228/69. All ten returning diagnostics disappear;
+no error-message entries are added. Cats stays 163/62 with no newly failing
+source lines: four lazyZip ambiguity diagnostics advance to the following
+BuildFrom requirement at the same call sites. Library stays 541/123. Slick
+keeps 1490 verified classes, no lint problems and 12/12 execution (36/36
+attempts). Workspace: 2655 passed / 0 failed. Corpus gains four run statuses
+listed above. The rejected intermediate candidates remain recorded separately.
+
+The brief's implicit-class hypothesis did not explain returning. The actual
+conversion is queryInsertActionExtensionMethods. Source import-prefix expansion,
+loading enclosing concrete type aliases, and pickle diamond linearization all
+needed correction. The probes compare source and scalac-produced binary
+libraries in both ABI modes. Correct linearization exposed discarded collection
+overloads: their parameter structures, original declaring owners, companion
+identity and JVM result descriptors must survive member supply together.
+IntMap/LongMap then exposed a silent bad result-type rebuild. The final rebuild
+preserves value parameters and two-parameter Map results, while retaining element
+constructor rebuilding for Seq, Queue and LazyList. Runtime fixtures compare
+stdout bytes with scalac and both compilers check their negative assignments.
+
+This closes returning's measured ten-error family, not compilation of gitbucket
+or cats as a whole. Shape-related diagnostics remain unchanged (12 matching
+Shape[ in these logs); MODE=a and specialization obligations remain open.

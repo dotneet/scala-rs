@@ -3363,7 +3363,7 @@ repair; neither an implicit-class filter nor proof that a conversion name is
 in scope closes them. The separate `Shape` cluster remains unproven as related.
 No compiler implementation or accepted baseline changed in this investigation.
 
-### Candidate repair: three independently reproduced gaps
+### Accepted repair at `9f3cae13`: three independently reproduced gaps
 
 The source implicit path skipped imported APIs with no own type parameters.
 Such APIs still name an outer type family. Expanding the family's definition
@@ -3386,6 +3386,8 @@ seven existing pickle/library tests pass, including Set's result constructor.
 files and as source in both ABI modes, with named negative cases. The original
 probe on `c8104b12` failed source implicit and binary explicit/implicit; the
 candidate passes all three and matches scalac stdout byte-for-byte. The real
-Slick `returning` reduction now compiles through both routes. Full composed
-measurements are still required before this candidate is accepted; no result
-for the separate Shape family is inferred from these probes.
+Slick `returning` reduction compiles through both routes. The full gate passed
+with corpus losses=0 and 2655 workspace tests passing. Gitbucket improved
+239/71 -> 228/69, with all ten returning diagnostics removed and no new
+error-message entries. Cats remains 163/62. Shape-related diagnostics do not
+improve; no result for that separate family is inferred from these probes.

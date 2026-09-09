@@ -1,5 +1,10 @@
 # Nested profile return types: an investigation probe
 
+Current accepted implementation: `9f3cae13`, full gate PASS, corpus losses=0,
+gitbucket 228/69 and cats 163/62. The historical experiments below document
+rejected intermediate trees; their warnings against merging apply to those
+trees. See `tests/BASELINE.md` for the accepted gate and preserved ledgers.
+
 Run from the worktree after building its binary:
 
 ```sh
