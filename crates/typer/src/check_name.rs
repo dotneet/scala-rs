@@ -792,6 +792,8 @@ impl Typer {
     fn import_named(&mut self, owners: &[SymbolId], from: &str, to: &str, span: Span, qual: &Tree) {
         let origin = self.import_origin;
         self.parent_import_prefixes.insert(origin, qual.clone());
+        self.parent_import_names
+            .insert((origin, to.to_string()), from.to_string());
         let mut entered = false;
         // Owners of members that came in *inherited* from a superclass of the
         // object named in the import; see `remember_named_import_prefix`.

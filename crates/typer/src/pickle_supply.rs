@@ -1629,16 +1629,6 @@ impl PickleSupply {
         })
     }
 
-    /// `type T[tps] = U` from a pickle, as the type it stands for.
-    ///
-    /// An alias is *transparent*: a nullary one is simply its right-hand side,
-    /// with no symbol of its own. That matters here — `type Tree =
-    /// universe.Tree` names an abstract type member, and giving the alias a
-    /// `TypeMember` symbol of its own would make `c.Tree` an opaque type that
-    /// conforms to nothing rather than the `Trees.Tree` it is.
-    ///
-    /// A *parameterised* alias does need a symbol, to carry the parameters
-    /// `expand_applied_hk_alias` substitutes at each use.
     /// The enclosing instance named by a member object or a result type's
     /// explicit declaring-this prefix. A matching erased class is insufficient.
     pub(crate) fn member_module_owner(
@@ -1668,6 +1658,16 @@ impl PickleSupply {
         None
     }
 
+    /// `type T[tps] = U` from a pickle, as the type it stands for.
+    ///
+    /// An alias is *transparent*: a nullary one is simply its right-hand side,
+    /// with no symbol of its own. That matters here — `type Tree =
+    /// universe.Tree` names an abstract type member, and giving the alias a
+    /// `TypeMember` symbol of its own would make `c.Tree` an opaque type that
+    /// conforms to nothing rather than the `Trees.Tree` it is.
+    ///
+    /// A *parameterised* alias does need a symbol, to carry the parameters
+    /// `expand_applied_hk_alias` substitutes at each use.
     fn install_type_alias(
         &mut self,
         st: &mut SymbolTable,

@@ -590,6 +590,8 @@ pub struct Typer {
     pub(crate) object_import_prefixes: HashMap<u64, Tree>,
     /// Written import paths for parent type references, keyed by binding origin.
     pub(crate) parent_import_prefixes: HashMap<u64, Tree>,
+    /// Original member names for explicit type-import aliases.
+    pub(crate) parent_import_names: HashMap<(u64, String), String>,
     /// Packages whose jar package object's pickled `type` aliases have been
     /// installed (see `install_pickled_package_aliases`). One read per package.
     pub(crate) pkg_aliases_done: HashSet<u32>,
@@ -990,6 +992,7 @@ impl Typer {
             term_import_prefixes: Vec::new(),
             object_import_prefixes: HashMap::new(),
             parent_import_prefixes: HashMap::new(),
+            parent_import_names: HashMap::new(),
             pkg_aliases_done: HashSet::new(),
             pending_pkg_folds: Vec::new(),
             pkg_alias_gaps: HashMap::new(),

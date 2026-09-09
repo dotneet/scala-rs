@@ -1760,7 +1760,7 @@ impl Typer {
             let binding = self.st.scopes.iter().rev().find_map(|scope| {
                 scope
                     .lookup_ranked(name)
-                    .into_iter()
+                    .iter()
                     .filter(|b| found.contains(&b.sym))
                     .min_by_key(|b| b.rank)
                     .map(|b| (b.origin, b.sym))
@@ -1770,7 +1770,11 @@ impl Typer {
                     self.type_expr(&mut prefix, &Type::NoType);
                     head.kind = TreeKind::Select {
                         qual: Box::new(prefix),
-                        name: if self.st.get(member).kind == SymKind::Class {
+                        name: if let Some(original) =
+                            self.parent_import_names.get(&(origin, name.clone()))
+                        {
+                            original.clone()
+                        } else if self.st.get(member).kind == SymKind::Class {
                             name.clone()
                         } else {
                             self.st.get(member).name.clone()

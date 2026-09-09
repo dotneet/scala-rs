@@ -307,3 +307,15 @@ pass 535 tests, zero failed, on the current candidate. Log:
 /tmp/scala-rs-shape-join/boundary-current.log. This includes the direct,
 forwarded and ordinary API-value runtime cases. Full gate and clippy comparison
 remain pending; no accepted baseline has changed.
+
+## Candidate review before full gate
+
+The review found and repaired explicit renaming of a nullary alias: its
+imported binding contains the underlying class symbol, so recovering only
+that symbol's name or the local alias name is insufficient. Original names
+are now recorded with the written import origin. bparent includes
+EmptyAlias => RenamedEmpty and compares execution with real scalac; it passes.
+Clippy exits zero with 59 individual warnings, no additions against the saved
+lazyZip baseline (59). Logs: /tmp/scala-rs-shape-join/{renamed-test,clippy-final}.log.
+The prior 535-test boundary run and this focused rerun cover the current
+candidate; full composed validation remains the merge requirement.

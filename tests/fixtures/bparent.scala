@@ -4,6 +4,8 @@ class C extends OA[String]("one")
 class D extends PA[String]("two")
 class Q extends bparent.O.Alias[Int](3)
 object W { import bparent.P._; class E extends Alias[Int](5) }
+import bparent.O.{EmptyAlias => RenamedEmpty}
+class E1 extends RenamedEmpty
 class E0 extends bparent.O.EmptyAlias
 class S extends bparent.Static.Base(13)
 import bparent.Holder.other._
@@ -19,6 +21,7 @@ object Main {
     println(new W.E().n)
     println(new S().n)
     println(new E0().n)
+    println(new E1().n)
     println(new Forwarded().n)
     println(new Direct.C().n)
     println(new ValueClient.C().n)
