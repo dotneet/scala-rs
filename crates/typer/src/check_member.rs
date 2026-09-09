@@ -651,6 +651,49 @@ impl Typer {
         let mut paramss_ty = Vec::new();
         let mut all_params = Vec::new();
         let mut paramss_ids: Vec<Vec<SymbolId>> = Vec::new();
+        if name == "<init>" {
+            // Class bounds introduce fresh evidence on every auxiliary
+            // constructor, before any explicitly written implicit parameters.
+            // Reusing the primary constructor's fields would read this before
+            // initialization and would hide ambiguities with explicit evidence.
+            let bound_types = self
+                .class_bound_evidence_types
+                .get(&saved_owner)
+                .cloned()
+                .unwrap_or_default();
+            let mut evidence = Vec::new();
+            for ty in bound_types {
+                self.gensym += 1;
+                let name = format!("evidence${}", self.gensym);
+                let flags = Flags::IMPLICIT.with(Flags::PARAM).with(Flags::SYNTHETIC);
+                let id = self.st.alloc(&name, tree.sym, SymKind::Term, flags, "");
+                self.st.get_mut(id).ty = ty.clone();
+                self.st.enter_in_current(&name, id);
+                let mut param = Tree::dummy(TreeKind::ValDef {
+                    mods: Modifiers::new(flags),
+                    name,
+                    tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+                    rhs: Box::new(Tree::dummy(TreeKind::Empty)),
+                });
+                param.span = span;
+                param.sym = id;
+                param.ty = ty;
+                evidence.push(param);
+            }
+            if !evidence.is_empty() {
+                if let Some(clause) = vparamss.last_mut().filter(|clause| {
+                    clause.first().is_some_and(|p| {
+                        matches!(&p.kind,
+                        TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::IMPLICIT))
+                    })
+                }) {
+                    evidence.append(clause);
+                    *clause = evidence;
+                } else {
+                    vparamss.push(evidence);
+                }
+            }
+        }
         for clause in vparamss.iter_mut() {
             let mut ct = Vec::new();
             let mut ids = Vec::new();
@@ -917,8 +960,9 @@ impl Typer {
 
     /// Undo the one edit `type_def_sig` makes to its own input.
     ///
-    /// A view or context bound desugars to an extra implicit clause that is
-    /// *appended to* `vparamss`. Building the same signature a second time --
+    /// View and context bounds synthesize implicit parameters, either in an
+    /// extra clause or before an auxiliary constructor's written implicits.
+    /// Building the same signature a second time --
     /// which `leave_sig_for_body_pass` asks for when an `import` above the
     /// method did not resolve on the signature pass -- would append a second
     /// copy, and worse, re-type the first as an ordinary clause: a synthesized
@@ -926,8 +970,8 @@ impl Typer {
     /// the tree, so `type_def_sig` would report `missing parameter type for
     /// evidence$1` for a bound the source never wrote. The bounds themselves
     /// live on the type parameters and are untouched, so dropping the clause
-    /// here loses nothing -- it is rebuilt below from the same `view_work` /
-    /// `ctx_work`.
+    /// here loses nothing -- it is rebuilt from `view_work` / `ctx_work`, or
+    /// from the enclosing class's recorded bound evidence.
     ///
     /// A parameter with no written type cannot occur in source, so the shape
     /// identifies the clause on its own.
@@ -935,15 +979,15 @@ impl Typer {
         let TreeKind::DefDef { vparamss, .. } = &mut tree.kind else {
             return;
         };
-        while vparamss.last().is_some_and(|clause| {
-            !clause.is_empty()
-                && clause.iter().all(|p| {
-                    matches!(&p.kind, TreeKind::ValDef { name, tpt, .. }
-                        if name.starts_with("evidence$") && tpt.is_empty())
-                })
-        }) {
-            vparamss.pop();
-        }
+        vparamss.retain_mut(|clause| {
+            let was_empty = clause.is_empty();
+            clause.retain(|p| {
+                !matches!(&p.kind,
+                TreeKind::ValDef { name, tpt, .. }
+                    if name.starts_with("evidence$") && tpt.is_empty())
+            });
+            was_empty || !clause.is_empty()
+        });
     }
 
     pub(crate) fn synthesize_default_getters(

@@ -1661,13 +1661,26 @@ impl Typer {
         self.st.display_type(ty)
     }
 
-    /// nsc's ` from ${owner0.fullLocationString}` -- the class the access
-    /// takes place in, named the way the subject is.
+    /// Lexical access privileges survive even while constructor arguments
+    /// cannot use the instance currently being initialized as their receiver.
+    fn lexical_access_class(&self) -> SymbolId {
+        let mut owner = self.st.owner;
+        while !owner.is_none() {
+            if self.st.get(owner).is_class_like() {
+                return owner;
+            }
+            owner = self.st.get(owner).owner;
+        }
+        self.st.this_class
+    }
+
+    /// nsc's ` from ${owner0.fullLocationString}`.
     fn access_from_name(&self) -> String {
-        if self.st.this_class.is_none() {
+        let current = self.lexical_access_class();
+        if current.is_none() {
             "<none>".into()
         } else {
-            self.access_full_location_string(self.st.this_class)
+            self.access_full_location_string(current)
         }
     }
 
@@ -1853,7 +1866,7 @@ impl Typer {
             return true;
         }
         let owner = s.owner;
-        let current = self.st.this_class;
+        let current = self.lexical_access_class();
         if flags.contains(Flags::PRIVATE) && flags.contains(Flags::LOCAL) {
             return self.prefix_is_this(prefix) && self.nested_in(current, owner);
         }

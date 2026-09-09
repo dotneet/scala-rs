@@ -615,3 +615,41 @@ Boundary verification after these repairs passed 534 tests (overloadshadow,
 ambigmap, setapply, uniteq, integral, ordsummon, mutcoll, conform and e2e).
 Format and release workspace clippy complete successfully; diagnostics remain
 in `/tmp/scala-rs-ctor-scope/{boundary,fmt-final,clippy}.log`.
+
+### Auxiliary constructor privileges and bound evidence
+
+The three losses of `62fab7e4` share the constructor transition but have two
+roots. Access privileges belong to the lexical enclosing class, even while
+constructor arguments cannot use its uninitialized receiver. Resolve the
+access-check class from the symbol owner chain rather than the temporarily
+changed `this_class`. This restores companion-private access without admitting
+an unrelated class's private-member access.
+
+Class view/context bounds introduce independent evidence parameters on every
+auxiliary constructor. Record their resolved types when typing the class and
+synthesize fresh constructor-owned parameters before any written implicit
+parameters. Preserve this order in the method type and JVM descriptor. A
+signature retry removes synthesized evidence even when it shares a clause
+with written parameters, then rebuilds it once. Returning primary-constructor
+fields to scope would instead read uninitializedThis and suppress the real
+ambiguity with an explicitly supplied witness.
+
+Real scalac and the candidate execute `absresult_ctor_evidence.scala` under
+`-Xverify:all` with byte-identical `int:12/55/view:3` output (one item per line).
+Both expose the auxiliary JVM descriptor `(ILCtorTC;I)V`; negative probes
+reject duplicate applicable evidence and unrelated private access separately.
+The saved accepted `172a6525` binary compiles this exact fixture but fails
+at runtime with VerifyError in `BoundCtor.<init>(II)V`, loading a field from
+uninitializedThis. Evidence: `/tmp/scala-rs-ctor-evidence/accepted-before-final*.log`.
+
+The targeted corpus recovers pos/t1798, pos/t12233 and neg/t12233, retaining
+the prior t9717/t13013/transform repairs. Logs and raw targeted ledger are in
+`/tmp/scala-rs-ctor-evidence`. Absresult passes 26 tests; boundary and related
+access/constructor tests pass 624, zero failures. The extended view-bound
+runtime control passes as well. Format passes and clippy retains 57 diagnostic
+warnings. Rebuilding the missing Java cache restores a comparable library
+measurement: 460 errors in 119 files, versus accepted 541/123. Normalizing
+anonymous-class serial numbers yields zero added error-message entries and
+81 removals; the three raw additions are the same existing BuildFrom errors
+at the same source locations, with anonymous-class numbers shifted by two.
+No merge-gate success is claimed by these focused checks.

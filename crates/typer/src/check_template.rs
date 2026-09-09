@@ -206,6 +206,8 @@ impl Typer {
             self.class_bound_evidence(id, &tparams)
         };
         if !evidence.is_empty() {
+            self.class_bound_evidence_types
+                .insert(id, evidence.iter().map(|ev| ev.ty.clone()).collect());
             vparamss.push(evidence);
         }
         // Ctor params must be typed before `extends C(z)` so the argument `z`

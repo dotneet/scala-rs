@@ -705,3 +705,52 @@ fn constructor_delegation_cannot_use_template_scope() {
         }
     }
 }
+
+#[test]
+fn auxiliary_constructor_bounds_and_companion_access_match_scalac() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let out = p.join(format!("ctor-evidence-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_ctor_evidence.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+        let signature = Command::new("javap")
+            .args(["-s", "-p", "-classpath"])
+            .arg(&out)
+            .arg("BoundCtor")
+            .output()
+            .unwrap();
+        check(&signature);
+        assert!(
+            String::from_utf8_lossy(&signature.stdout).contains("(ILCtorTC;I)V"),
+            "{}",
+            String::from_utf8_lossy(&signature.stdout)
+        );
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"int:12\n55\nview:3\n");
+}
+
+#[test]
+fn constructor_evidence_is_independent_and_private_access_stays_lexical() {
+    let p = root();
+    for (i, source) in [
+        "trait TC[T]; class C[T: TC](i: Int, j: Int) { def this(i: Int)(implicit tc: TC[T], j: Int) = this(i, j) }",
+        "object Owner { private def f: Int = 1 }; class Unrelated(i: Int) { def this() = this(Owner.f) }",
+    ].iter().enumerate() {
+        let file = p.join(format!("Bad{i}.scala"));
+        fs::write(&file, source).unwrap();
+        for oracle in [false, true] {
+            let result = compile(&[file.clone()], &p.join(format!("reject-{i}-{oracle}")), JAR, oracle, false);
+            assert!(!result.status.success(), "invalid constructor accepted: {source}");
+        }
+    }
+}

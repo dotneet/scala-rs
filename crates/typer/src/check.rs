@@ -481,6 +481,7 @@ pub struct Typer {
     /// DriverJdbcType[Null]` must not answer its parent's `ClassTag[Null]`
     /// with the `implicit val classTag` it is about to inherit from it.
     pub(crate) parent_ctor_scope: bool,
+    pub(crate) class_bound_evidence_types: HashMap<SymbolId, Vec<Type>>,
     fatal_warnings: bool,
     pub(crate) library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
@@ -971,6 +972,7 @@ impl Typer {
             macro_local_tags: HashMap::new(),
             has_macro_defs: false,
             parent_ctor_scope: false,
+            class_bound_evidence_types: HashMap::new(),
             fatal_warnings: opts.fatal_warnings,
             library_abi: opts.library_abi,
             return_meth: None,
