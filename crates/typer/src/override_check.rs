@@ -840,8 +840,12 @@ fn is_any_rooted(st: &SymbolTable, cls: SymbolId) -> bool {
     /// **not** count on its own — that would sweep in universal traits — and
     /// the walk never enters `Any`, `AnyRef` or `Object`, whose own parents
     /// would otherwise make every class qualify.
-    fn walk(st: &SymbolTable, cls: SymbolId, depth: u32) -> bool {
-        if depth > 64
+    fn walk(
+        st: &SymbolTable,
+        cls: SymbolId,
+        seen: &mut std::collections::HashSet<SymbolId>,
+    ) -> bool {
+        if !seen.insert(cls)
             || cls.is_none()
             || cls == st.object_sym
             || cls == st.anyref_sym
@@ -873,11 +877,11 @@ fn is_any_rooted(st: &SymbolTable, cls: SymbolId) -> bool {
             // `Type::AnyVal` variant; `src/library/scala/Int.scala`, compiled
             // from source, records a `Class` naming the `AnyVal` it declares.
             Type::AnyVal => true,
-            Type::Class { sym, .. } => walk(st, *sym, depth + 1),
+            Type::Class { sym, .. } => walk(st, *sym, seen),
             _ => false,
         })
     }
-    cls == st.any_sym || walk(st, cls, 0)
+    cls == st.any_sym || walk(st, cls, &mut std::collections::HashSet::new())
 }
 
 /// A `case class` / `case object` really does extend `scala.Product with

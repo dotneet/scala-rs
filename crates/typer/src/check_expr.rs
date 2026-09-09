@@ -837,7 +837,14 @@ impl Typer {
                     tree.ty = Type::Error;
                 } else {
                     tree.sym = id;
-                    tree.ty = self.st.self_type_of_class(id);
+                    let own = self.st.self_type_of_class(id);
+                    tree.ty = match self.st.get(id).self_type.clone() {
+                        Some(required) => Type::Refined {
+                            parents: vec![own, required],
+                            decls: vec![],
+                        },
+                        None => own,
+                    };
                 }
             }
             TreeKind::Select { .. } => self.type_select(tree, pt),
@@ -1232,6 +1239,14 @@ impl Typer {
                     }
                 }
                 for s in stats.iter_mut() {
+                    // A repeated body pass rebuilds the block scope, but
+                    // signature completion does not allocate the local again.
+                    // Re-enter its existing symbol at its declaration point.
+                    if let TreeKind::ValDef { name, .. } = &s.kind {
+                        if !s.sym.is_none() {
+                            self.st.enter_in_current(name, s.sym);
+                        }
+                    }
                     self.type_stat(s);
                 }
                 self.type_expr(expr, pt);

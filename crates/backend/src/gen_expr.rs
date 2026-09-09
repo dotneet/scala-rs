@@ -1101,6 +1101,10 @@ pub(crate) fn load_qualified_this(asm: &mut Assembler, ctx: &EmitCtx, name: &str
         .st
         .enclosing_class_named(ctx.class_sym, name)
         .unwrap_or(ctx.class_sym);
+    if target != ctx.class_sym && is_module_class(ctx.st, target) {
+        load_module_instance(asm, ctx, target);
+        return;
+    }
     let (mut cur, _) = start_outer_walk(asm, ctx, ctx.class_sym != target);
     while !cur.is_none() && cur != target {
         let Some(outer) = enclosing_instance(ctx.st, cur) else {

@@ -606,3 +606,102 @@ fn superclass_bridge_substitutes_owner_parameters() {
     assert_eq!(outputs[0], outputs[1]);
     assert_eq!(outputs[0], b"42\n");
 }
+
+#[test]
+fn inherited_function_bridge_unboxes_primitive_arguments() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let out = p.join(format!("primitive-bridge-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_primitive_bridge.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"42\n");
+}
+
+#[test]
+fn this_result_retains_explicit_self_type() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let out = p.join(format!("self-result-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_self.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"true\n");
+}
+
+#[test]
+fn self_type_does_not_supply_unrelated_conformance() {
+    let p = root();
+    for oracle in [false, true] {
+        let result = compile(
+            &[fixture("absresult_self_bad.scala")],
+            &p.join(format!("bad-self-{oracle}")),
+            JAR,
+            oracle,
+            false,
+        );
+        assert!(
+            !result.status.success(),
+            "incompatible self type was accepted"
+        );
+    }
+}
+
+#[test]
+fn constructor_delegation_uses_outer_and_parameter_scopes() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let out = p.join(format!("ctor-scope-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_ctor_scope.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"100\n9\n16\n11\n");
+}
+
+#[test]
+fn constructor_delegation_cannot_use_template_scope() {
+    let p = root();
+    for (i, source) in [
+        "class A(val a: Int)(implicit val F: Int); class B(implicit F: Int) extends A({ implicit val v: Int = 1; implicitly[Int] })",
+        "class C(x: Int) { implicit def f: Int = 1; def this() = this(implicitly[Int]) }",
+        "class C(x: Int) { def f: Int = 1; def this() = this(f) }",
+        "class D(x: Int) { import D.f; def this() = this(implicitly[Int]) }; object D { implicit def f: Int = 1 }",
+    ].iter().enumerate() {
+        let file = p.join(format!("Bad{i}.scala"));
+        fs::write(&file, source).unwrap();
+        for oracle in [false, true] {
+            let result = compile(&[file.clone()], &p.join(format!("bad-ctor-{i}-{oracle}")), JAR, oracle, false);
+            assert!(!result.status.success(), "constructor template scope leaked: {source}");
+        }
+    }
+}

@@ -2362,6 +2362,28 @@ impl Typer {
                 return;
             }
         }
+        // A delegation's arguments precede initialization of this instance.
+        // Keep lexical outer scopes and this constructor's parameters, but
+        // hide template members and imports until the delegation has finished.
+        // Scope ownership survives lazy-signature snapshots.
+        let template_scope = self
+            .st
+            .scopes
+            .iter()
+            .position(|scope| scope.template_owner == Some(class_id));
+        let saved_scope = template_scope.map(|index| {
+            let original = std::mem::take(&mut self.st.scopes[index]);
+            for tp in self.st.get(class_id).tparams.clone() {
+                let name = self.st.get(tp).name.clone();
+                self.st.scopes[index].enter(&name, tp);
+            }
+            (index, original)
+        });
+        let mut outer = self.st.get(class_id).owner;
+        while !outer.is_none() && !self.st.get(outer).is_class_like() {
+            outer = self.st.get(outer).owner;
+        }
+        let saved_this = std::mem::replace(&mut self.st.this_class, outer);
         for a in args.iter_mut() {
             self.type_expr(a, &Type::NoType);
         }
@@ -2433,6 +2455,10 @@ impl Typer {
                 );
                 tree.ty = Type::Unit;
             }
+        }
+        self.st.this_class = saved_this;
+        if let Some((index, scope)) = saved_scope {
+            self.st.scopes[index] = scope;
         }
     }
 

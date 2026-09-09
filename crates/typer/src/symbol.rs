@@ -773,6 +773,8 @@ pub struct Binding {
 
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
+    /// Template whose members and body imports this scope exposes.
+    pub(crate) template_owner: Option<SymbolId>,
     map: HashMap<String, Vec<Binding>>,
     /// Owners brought in by a wildcard import (`import p._`) in this scope,
     /// with the names that selector hid (`import p.{X => _, _}`).

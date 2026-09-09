@@ -2054,7 +2054,7 @@ impl<'a> Gen<'a> {
                 // Object-returning bridge -> inherited String method is valid;
                 // String-returning bridge -> Object bridge is not.
                 let have_ret = &have[have.find(')').map(|i| i + 1).unwrap_or(0)..];
-                if !self.desc_narrows(pret, have_ret) {
+                if have_ret != NOTHING_DESC && !self.desc_narrows(pret, have_ret) {
                     continue;
                 }
                 // The chosen implementation may not be an override at all.
@@ -2071,20 +2071,27 @@ impl<'a> Gen<'a> {
                     }
                 }
                 let cparam_strs = desc_param_strs(&have);
-                let mut loads: Vec<(u16, JvmSort, Option<String>)> = Vec::new();
+                let mut loads: Vec<(u16, JvmSort, Adapt)> = Vec::new();
                 let mut locals = 1u16;
-                for (i, t) in desc_param_sorts(pparams).into_iter().enumerate() {
-                    // A narrowed reference parameter is cast to what the
-                    // implementation declares; everything else is passed on.
-                    let cast = match (pparam_strs.get(i), cparam_strs.get(i)) {
-                        (Some(p), Some(c)) if p != c && c.starts_with('L') => {
-                            Some(c[1..c.len() - 1].to_string())
+                for (i, sort) in desc_param_sorts(pparams).into_iter().enumerate() {
+                    let primitive =
+                        |d: &str| matches!(d, "Z" | "B" | "S" | "C" | "I" | "J" | "F" | "D");
+                    let adapt = match (pparam_strs.get(i), cparam_strs.get(i)) {
+                        (Some(p), Some(c)) if p == c => Adapt::None,
+                        (Some(p), Some(c)) if !primitive(p) && primitive(c) => {
+                            Adapt::Unbox(prim_of_desc(c))
                         }
-                        (Some(p), Some(c)) if p != c && c.starts_with('[') => Some(c.clone()),
-                        _ => None,
+                        (Some(p), Some(c)) if primitive(p) && !primitive(c) => {
+                            Adapt::Box(prim_of_desc(p))
+                        }
+                        (_, Some(c)) if c.starts_with('L') => {
+                            Adapt::Cast(c[1..c.len() - 1].to_string())
+                        }
+                        (_, Some(c)) if c.starts_with('[') => Adapt::Cast(c.clone()),
+                        _ => Adapt::None,
                     };
-                    loads.push((locals, t, cast));
-                    locals += t.slots();
+                    loads.push((locals, sort, adapt));
+                    locals += sort.slots();
                 }
                 let cn = class_name.clone();
                 let target = have.clone();
@@ -2097,11 +2104,9 @@ impl<'a> Gen<'a> {
                     locals.max(1),
                     move |asm| {
                         asm.aload(0);
-                        for (slot, sort, cast) in &loads {
+                        for (slot, sort, adapt) in &loads {
                             load(asm, *slot, *sort);
-                            if let Some(c) = cast {
-                                asm.checkcast(c);
-                            }
+                            emit_adapt(asm, adapt);
                         }
                         asm.invokevirtual(&cn, &name, &target);
                         if !emit_forwarded_nothing(asm, &target_ret) {

@@ -160,6 +160,7 @@ impl Typer {
         self.st.this_class = id;
         self.return_meth = None;
         self.st.push_scope();
+        self.st.scopes.last_mut().unwrap().template_owner = Some(id);
         // re-enter members into local scope
         for m in self.st.get(id).members.clone() {
             let n = self.st.get(m).name.clone();
@@ -1440,7 +1441,12 @@ impl Typer {
             if c.is_none() || !seen.insert(c) {
                 continue;
             }
-            self.ensure_java_loaded(c, span);
+            // Source and prelude symbols already have their authoritative
+            // hierarchy. Loading a classfile here would replace approximated
+            // collection declarations while an unrelated class is checked.
+            if c.0 >= self.st.prelude_end && !self.st.source_classes.contains(&c) {
+                self.ensure_java_loaded(c, span);
+            }
             for parent in self.st.get(c).parents.clone() {
                 if let Some(p) = self.st.class_sym_of(&parent) {
                     returns.push(p);

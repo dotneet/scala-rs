@@ -533,3 +533,85 @@ JVM verification and byte-identical oracle output. Logs are in
 `/tmp/scala-rs-abstract-regression/generic-inherited-bridge/`.
 The 534-test run precedes this last relation adjustment; the composed gate
 must validate the final combination again.
+
+### Repairs after the 4d3bc103 rejection
+
+The exponential regression was not the return-type loader itself. Calling
+`full_lin` for more classes exposed `is_any_rooted`'s depth-only recursion.
+It now visits each symbol once. All three subtypeterm tests pass in 0.17 s,
+including the 34-level diamond that exceeded 60 s in the rejected gate.
+The return hierarchy loader now leaves source/prelude declarations intact;
+this restores all nine seqfn tests while retaining classpath completion.
+
+Inherited bridges now box/unbox primitive arguments using existing Adapt
+emission and preserve Nothing-returning bridges (which end in athrow rather
+than returning a Nothing$ reference as String). The existing verifyfail suite
+passes all 13 tests. The new absresult_primitive_bridge fixture checks a
+subclass of Int => Any against scalac and executes with JVM verification.
+Together absresult 20, seqfn 9, subtypeterm 3 and verifyfail 13 pass 45 tests.
+Logs: `/tmp/scala-rs-abstract-regression/bridge-adaptation-tests.log`.
+
+Fresh Slick output remains 184 files, zero errors, 1492 classes. The stronger
+initialization sweep reports verify_failures=0, verify_loaded=1491,
+verify_incomplete=1: only the missing Oracle driver remains. The previous
+StructValue.apply(Object) VerifyError is gone. Outputs and logs have the
+`bridge-adaptation-slick` and `bridge-adaptation-verify` prefixes.
+
+The filtered corpus run recovers run/transform. neg/t9717 remains wrongly
+accepted and pos/t13013 still fails the inherited-result compatibility check;
+both must be fixed before another merge gate. The first filter attempt used
+regex anchors, but the harness expects a zsh glob and selected zero tests;
+that empty run is not validation. The corrected glob selected five units,
+including the three intended loss cases; results are saved in
+`bridge-adaptation-corpus-filtered.tsv`.
+
+### Self-typed `this` result repair
+
+The `pos/t13013` rejection was not an overly strict override comparison:
+`TreeKind::This` discarded the enclosing trait's explicit self-type constraint.
+Preserve both the enclosing class and its required self type in a refinement.
+The reduced `absresult_self.scala` is rejected by the pre-repair candidate
+(`/tmp/scala-rs-self-result/before.log`) and accepted by scalac 2.13.16.
+After repair, both execute under `-Xverify:all` with byte-identical `true` output.
+An unrelated-conformance negative control is rejected by both compilers.
+The absresult suite passes 22 tests (`/tmp/scala-rs-self-result/suite.log`).
+The targeted corpus ledger (`/tmp/scala-rs-self-result/corpus.tsv`) confirms
+pos/t13013 and run/transform pass; neg/t9717 still incorrectly compiles.
+This is focused evidence only, not a completed merge gate.
+
+### Constructor argument scopes and repeated block typing
+
+Seven independent probes in `/tmp/scala-rs-ctor-scope` distinguish four
+incorrect acceptances from three valid constructor-scope controls. Each was
+compiled with the pre-repair candidate and real scalac 2.13.16. Auxiliary
+constructor delegation must hide the current template's members and imports,
+while retaining outer lexical bindings, type parameters and its own parameters.
+Template scopes now retain their owner through lazy-signature snapshots so the
+delegation can replace and restore precisely that scope.
+
+The parent's ambiguous-implicit case had a different root: tracing showed
+`v` and `F` during signature typing, but only `F` during body typing. A previously
+typed local val was not re-entered into the rebuilt block scope. Re-entering
+its existing symbol at the declaration point restores the ambiguity; changing
+implicit specificity was neither necessary nor correct.
+
+A stronger runtime control exposed a qualified module-this backend error:
+`Outer.this.f` loaded uninitializedThis instead of the module singleton.
+The pre-repair execution failed with VerifyError in
+`/tmp/scala-rs-ctor-scope/final-tests.log`. Qualified module-this now loads the
+module instance. The final control prints `100/9/16/11` (one number per line)
+with byte-identical output under real scalac and JVM `-Xverify:all`.
+
+`repaired-tests.log` records 71 passing tests (24 absresult plus 47 constructor
+tests), zero failures. `corpus-repaired.tsv` confirms neg/t9717, pos/t13013 and
+run/transform all recover. The negative case reports all four failing source
+locations, with one extra cascading constructor-overload diagnostic; exact
+scalac diagnostic wording is not claimed. The corpus was freshly cloned at
+3f6bdaeafde17d790023cc3f299b81eaaf876ca3 into
+`/tmp/scala-rs-corpus-20260910-codex` because the old temporary checkout's Git
+metadata was no longer usable. No full merge gate has been run on these repairs.
+
+Boundary verification after these repairs passed 534 tests (overloadshadow,
+ambigmap, setapply, uniteq, integral, ordsummon, mutcoll, conform and e2e).
+Format and release workspace clippy complete successfully; diagnostics remain
+in `/tmp/scala-rs-ctor-scope/{boundary,fmt-final,clippy}.log`.
