@@ -2600,12 +2600,33 @@ impl Typer {
         }
         cands.sort_unstable_by_key(|id| id.0);
         cands.dedup_by_key(|id| id.0);
+        let mut completed = false;
+        for &id in &cands {
+            let before = self.st.get(id).ty.clone();
+            let unknown = match &before {
+                Type::Method { ret, .. } => ret.is_no_type(),
+                ty => ty.is_no_type(),
+            };
+            if unknown && !self.lazy_completing.contains(&id) {
+                self.complete_lazy_sig(id, Span::DUMMY);
+                completed |= self.st.get(id).ty != before;
+            }
+        }
+        let instance_depth = wanted
+            .iter()
+            .map(crate::implicits::complexity)
+            .max()
+            .unwrap_or(0)
+            .max(crate::implicits::MAX_IMPLICIT_DEPTH);
+        for &id in &cands {
+            completed |= self.prepare_implicit_instances(id, instance_depth);
+        }
         let tys: Vec<Type> = cands
             .into_iter()
             .map(|id| self.implicit_candidate_ty(id).into_owned())
             .chain(wanted.iter().cloned())
             .collect();
-        let mut fresh = false;
+        let mut fresh = completed;
         for t in tys {
             // Parents only. Warming a candidate's *implicit scope* the way
             // `warm_implicit_scope` warms the wanted type's pulls pickled
@@ -3625,7 +3646,38 @@ impl Typer {
                 if let Some(id) = id {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
-                        SymKind::TypeParam => Type::TypeParam(id),
+                        SymKind::TypeParam => {
+                            let this = self.st.this_class;
+                            let owner = self.st.get(id).owner;
+                            let mut lexical = self.st.owner;
+                            let mut lexical_owner = false;
+                            while !lexical.is_none() {
+                                if lexical == owner {
+                                    lexical_owner = true;
+                                    break;
+                                }
+                                lexical = self.st.get(lexical).owner;
+                            }
+                            if !lexical_owner
+                                && !this.is_none()
+                                && owner != this
+                                && self.st.is_ancestor_of(owner, this)
+                            {
+                                let recv = Type::Class {
+                                    sym: this,
+                                    args: self
+                                        .st
+                                        .get(this)
+                                        .tparams
+                                        .iter()
+                                        .map(|p| Type::TypeParam(*p))
+                                        .collect(),
+                                };
+                                self.st.subst_as_seen_from(&recv, &Type::TypeParam(id))
+                            } else {
+                                Type::TypeParam(id)
+                            }
+                        }
                         SymKind::TypeMember => self.type_member_here(id),
                         _ => Type::Class {
                             sym: id,

@@ -2204,12 +2204,31 @@ impl<'a> Gen<'a> {
             .filter(|&id| self.st.get(id).kind == SymKind::Method)
             .map(|id| (self.st.get(id).name.clone(), id))
             .collect();
-        let lin = linearize(self.st, class_id);
+        let mut lin = linearize(self.st, class_id);
+        // The shared linearization omits universal roots. Their JVM methods
+        // still need covariant bridges, e.g. toString(): Nothing overriding
+        // Object.toString(): String.
+        for root in [self.st.anyref_sym, self.st.any_sym] {
+            if !root.is_none() && !lin.contains(&root) {
+                lin.push(root);
+            }
+        }
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for parent in lin.into_iter().skip(1) {
             for pmid in self.st.get(parent).members.clone() {
                 let ps = self.st.get(pmid);
                 if ps.kind != SymKind::Method {
+                    continue;
+                }
+                // Prelude intrinsics use FINAL even for Object.toString.
+                // Universal roots supply only these overridable JVM methods;
+                // wait/notify/getClass and Scala-only operations cannot bridge.
+                if [self.st.anyref_sym, self.st.any_sym].contains(&parent)
+                    && !matches!(
+                        ps.name.as_str(),
+                        "toString" | "equals" | "hashCode" | "clone" | "finalize"
+                    )
+                {
                     continue;
                 }
                 if ps.name == "<init>" || ps.name == "<clinit>" {

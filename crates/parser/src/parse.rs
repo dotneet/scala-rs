@@ -2024,6 +2024,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_infix_type(&mut self) -> Tree {
+        self.parse_infix_type_assoc(None)
+    }
+
+    fn parse_infix_type_assoc(&mut self, mut left_assoc: Option<bool>) -> Tree {
         let mut t = self.parse_compound_type();
         loop {
             // infix type: T ident T  (ident not nl-separated in a way that starts a val)
@@ -2062,7 +2066,19 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if is_operator_name(&name) || self.looks_like_type_start() {
-                let rhs = self.parse_compound_type();
+                let is_left = !name.ends_with(':');
+                if left_assoc.is_some_and(|previous| previous != is_left) {
+                    self.error_span(
+                        nsp,
+                        "left- and right-associative operators cannot be mixed in an infix type",
+                    );
+                }
+                left_assoc = Some(is_left);
+                let rhs = if is_left {
+                    self.parse_compound_type()
+                } else {
+                    self.parse_infix_type_assoc(Some(false))
+                };
                 let tpt = self.alloc(nsp, TreeKind::Ident { name });
                 t = self.alloc(
                     t.span.merge(rhs.span),

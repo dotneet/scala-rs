@@ -237,8 +237,12 @@ impl Drop for MemoLive<'_> {
 }
 
 /// Number of nodes in a type, nsc's `complexity`.
-fn complexity(ty: &Type) -> usize {
+pub(crate) fn complexity(ty: &Type) -> usize {
     match ty {
+        // An annotation does not hide the structural size of its underlying
+        // type. Treating an annotated tail as one node falsely marks shrinking
+        // recursive HList derivations as divergent.
+        Type::Annotated { tpe, .. } => complexity(tpe),
         Type::Class { args, .. } | Type::Named { args, .. } => {
             1 + args.iter().map(complexity).sum::<usize>()
         }
@@ -263,7 +267,7 @@ fn head_sym(typer: &Typer, ty: &Type) -> Option<SymbolId> {
 }
 
 /// nsc `Types#dominates`: same head symbol and no simpler than the open one.
-fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
+pub(crate) fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
     match (head_sym(typer, new_pt), head_sym(typer, open_pt)) {
         (Some(a), Some(b)) => a == b && complexity(new_pt) >= complexity(open_pt),
         // A bare type parameter target (`implicit def loop[A](implicit a: A): A`)
@@ -815,7 +819,12 @@ impl Typer {
         // nothing, which is why `import seq.integral._; increment < zero`
         // (`Numeric[T]#mkOrderingOps`, reached through `Integral[T]`) reported
         // `value < is not a member of T`.
-        if let Some(seen) = self.at_import_prefix_of(id, ty) {
+        let origin = self
+            .implicit_instance_origins
+            .get(&id)
+            .copied()
+            .unwrap_or(id);
+        if let Some(seen) = self.at_import_prefix_of(origin, ty) {
             return std::borrow::Cow::Owned(seen);
         }
         if this.is_none()
@@ -844,6 +853,90 @@ impl Typer {
     /// `undet` are call-site type parameters the search itself has to solve —
     /// nsc infers `K`/`V` of `toMap[K, V](implicit ev: A <:< (K, V))` from the
     /// witness it finds, since they appear nowhere else in the call.
+    /// Prepare detached search signatures. Each recursion depth gets distinct
+    /// type-parameter symbols, including dependent bounds and higher-kinded
+    /// parameters. They are not members of the declaring class and never replace
+    /// the declaration selected for code generation. Divergence and memo masks
+    /// continue to use the original declaration identity.
+    pub(crate) fn prepare_implicit_instances(&mut self, id: SymbolId, depth_limit: usize) -> bool {
+        let source = self.st.get(id).clone();
+        if source.tparams.is_empty() || !self.only_implicit_clauses(id) {
+            return false;
+        }
+        if self
+            .implicit_instances
+            .get(&id)
+            .is_some_and(|(ty, instances)| *ty == source.ty && instances.len() > depth_limit)
+        {
+            return false;
+        }
+        let mut instances = self
+            .implicit_instances
+            .get(&id)
+            .filter(|(ty, _)| *ty == source.ty)
+            .map(|(_, ids)| ids.clone())
+            .unwrap_or_default();
+        for _ in instances.len()..=depth_limit {
+            let instance = self.st.alloc(
+                source.name.clone(),
+                SymbolId::NONE,
+                source.kind,
+                source.flags,
+                source.jvm_name.clone(),
+            );
+            let mut old = source.tparams.clone();
+            let mut at = 0;
+            while at < old.len() {
+                old.extend(self.st.get(old[at]).tparams.clone());
+                at += 1;
+            }
+            let mut fresh = Vec::new();
+            for &tp in &old {
+                let original = self.st.get(tp).clone();
+                let new = self.st.alloc(
+                    original.name.clone(),
+                    SymbolId::NONE,
+                    original.kind,
+                    original.flags,
+                    original.jvm_name.clone(),
+                );
+                fresh.push(new);
+            }
+            let args: Vec<Type> = fresh.iter().copied().map(Type::TypeParam).collect();
+            for (&tp, &new) in old.iter().zip(&fresh) {
+                let mut copy = self.st.get(tp).clone();
+                copy.id = new;
+                copy.owner = old
+                    .iter()
+                    .position(|p| *p == copy.owner)
+                    .map(|i| fresh[i])
+                    .unwrap_or(instance);
+                copy.tparams = copy
+                    .tparams
+                    .iter()
+                    .map(|p| fresh[old.iter().position(|x| x == p).unwrap()])
+                    .collect();
+                copy.ty = crate::symbol::subst_tparams_slice(&old, &args, &copy.ty);
+                copy.bound_lo = copy
+                    .bound_lo
+                    .map(|t| crate::symbol::subst_tparams_slice(&old, &args, &t));
+                copy.bound_hi = copy
+                    .bound_hi
+                    .map(|t| crate::symbol::subst_tparams_slice(&old, &args, &t));
+                *self.st.get_mut(new) = copy;
+            }
+            let mut copy = source.clone();
+            copy.id = instance;
+            copy.tparams = fresh[..source.tparams.len()].to_vec();
+            copy.ty = crate::symbol::subst_tparams_slice(&old, &args, &source.ty);
+            *self.st.get_mut(instance) = copy;
+            self.implicit_instance_origins.insert(instance, id);
+            instances.push(instance);
+        }
+        self.implicit_instances.insert(id, (source.ty, instances));
+        true
+    }
+
     pub(crate) fn implicit_fit_at(
         &self,
         id: SymbolId,
@@ -851,6 +944,12 @@ impl Typer {
         depth: usize,
         undet: &[SymbolId],
     ) -> Option<ImplicitFit> {
+        let id = self
+            .implicit_instances
+            .get(&id)
+            .and_then(|(_, instances)| instances.get(depth))
+            .copied()
+            .unwrap_or(id);
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
@@ -886,7 +985,25 @@ impl Typer {
                     return self.implicit_solve(id, ret, pt, undet);
                 }
                 // A derivation rule: usable when its own implicits resolve.
-                if depth >= MAX_IMPLICIT_DEPTH {
+                let origin = self
+                    .implicit_instance_origins
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(id);
+                let shrinking = self
+                    .open_implicits
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(prior, _)| {
+                        self.implicit_instance_origins
+                            .get(prior)
+                            .copied()
+                            .unwrap_or(*prior)
+                            == origin
+                    })
+                    .is_some_and(|(_, previous)| complexity(pt) < complexity(previous));
+                if depth >= MAX_IMPLICIT_DEPTH && !shrinking {
                     // The enclosing memo entry was decided by the depth limit,
                     // so it does not travel to a shallower search.
                     self.implicit_memo.borrow_mut().cut = true;
@@ -971,14 +1088,24 @@ impl Typer {
     /// expanded for a target with the same head symbol and no smaller
     /// complexity (`implicit def loop[A](implicit a: A): A`).
     fn implicit_diverges(&self, id: SymbolId, pt: &Type) -> bool {
+        let id = self
+            .implicit_instance_origins
+            .get(&id)
+            .copied()
+            .unwrap_or(id);
         // Whatever this answers is an answer about `id` against the open
         // stack, so the enclosing memo entry is only reusable where `id` is
         // not open. See [`ImplicitMemo`].
         self.implicit_memo.borrow_mut().probe |= sym_bit(id);
         let open = self.open_implicits.borrow();
-        let hit = open
-            .iter()
-            .any(|(sid, spt)| *sid == id && dominates(self, pt, spt));
+        let hit = open.iter().any(|(sid, spt)| {
+            self.implicit_instance_origins
+                .get(sid)
+                .copied()
+                .unwrap_or(*sid)
+                == id
+                && dominates(self, pt, spt)
+        });
         drop(open);
         if hit && self.diverged_implicit.borrow().is_none() {
             *self.diverged_implicit.borrow_mut() = Some((id, pt.clone()));
@@ -1760,7 +1887,14 @@ impl Typer {
         self.open_implicits
             .borrow()
             .iter()
-            .fold(0u64, |m, (id, _)| m | sym_bit(*id))
+            .fold(0u64, |m, (id, _)| {
+                m | sym_bit(
+                    self.implicit_instance_origins
+                        .get(id)
+                        .copied()
+                        .unwrap_or(*id),
+                )
+            })
     }
 
     /// A hit also hands the entry's `probe` and `cut` to whatever search is
@@ -3662,6 +3796,56 @@ fn unwrap_byname(t: &Type) -> Type {
 mod memo_tests {
     use super::*;
     use crate::check::TypecheckOptions;
+
+    #[test]
+    fn fresh_search_signatures_do_not_become_declared_candidates() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let owner = typer
+            .st
+            .alloc("Scope", root, SymKind::Class, Flags::EMPTY, "Scope");
+        let method = typer
+            .st
+            .alloc("derive", owner, SymKind::Method, Flags::IMPLICIT, "derive");
+        let tp = typer
+            .st
+            .alloc("A", method, SymKind::TypeParam, Flags::EMPTY, "A");
+        typer.st.get_mut(method).tparams = vec![tp];
+        typer.st.get_mut(method).ty = Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::TypeParam(tp)),
+        };
+        let members = typer.st.get(owner).members.clone();
+        let method_members = typer.st.get(method).members.clone();
+        assert!(typer.prepare_implicit_instances(method, MAX_IMPLICIT_DEPTH));
+        assert_eq!(typer.st.get(owner).members, members);
+        assert_eq!(typer.st.get(method).members, method_members);
+        assert!(!typer.prepare_implicit_instances(method, MAX_IMPLICIT_DEPTH));
+        assert_eq!(typer.st.get(owner).members, members);
+    }
+
+    #[test]
+    fn annotated_recursive_tail_decreases_but_self_loop_does_not() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let list = typer
+            .st
+            .alloc("List", root, SymKind::Class, Flags::EMPTY, "List");
+        let tail = Type::Class {
+            sym: list,
+            args: vec![Type::Int],
+        };
+        let full = Type::Class {
+            sym: list,
+            args: vec![Type::Annotated {
+                tpe: Box::new(tail.clone()),
+                annot: "uncheckedVariance".into(),
+            }],
+        };
+        assert!(!dominates(&typer, &tail, &full));
+        assert!(dominates(&typer, &full, &full));
+        assert!(dominates(&typer, &full, &tail));
+    }
 
     #[test]
     fn memo_replays_inherited_companion_route() {

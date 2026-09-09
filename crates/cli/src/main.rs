@@ -384,6 +384,11 @@ fn reconcile_source_features(
     }
     if !features.is_empty() {
         for f in unimplemented {
+            if *f == "infer-override" {
+                warnings.push("-Xsource-features:infer-override is partially implemented; ordinary methods and fields are supported, macro exceptions remain unverified (see docs/not-implemented.md)".into());
+                continue;
+            }
+
             warnings.push(format!(
                 "-Xsource-features:{f} is accepted but not implemented by scala-rs; \
 it changes nothing (see docs/not-implemented.md)"

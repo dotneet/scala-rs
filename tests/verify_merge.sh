@@ -94,7 +94,7 @@ check_measure slick     "$SLICK" 184
 check_measure cats      "$CATS"  339
 check_measure gitbucket "$GB"    353
 check_measure library   "$LIB"   538
-[[ $SLICK == *"errors=0 files_with_errors=0 classes=1490"* ]] || FAIL+=("slick measure: $SLICK")
+[[ $SLICK == *"errors=0 files_with_errors=0 classes=1492"* ]] || FAIL+=("slick measure: $SLICK")
 
 # --- execution --------------------------------------------------------------
 step "slick execution"
@@ -104,7 +104,7 @@ RUN=$(MODE=b tests/slick_run.sh 2>&1 | tail -1); print "  $RUN"
 if skipped subset; then NOTE+=("slick_subset SKIPPED"); else
   step "slick subset + class validation"
   SUB=$(SLICK_SEED_LOG=$GATE_DIR/slick.txt tests/slick_subset.sh 2>&1 | tail -3 | tr '\n' ' '); print "  $SUB"
-  [[ $SUB == *"verified=1490 failed=0"* && $SUB == *"lint_problems=0"* ]] || FAIL+=("slick_subset: $SUB")
+  [[ $SUB == *"verified=1492 failed=0"* && $SUB == *"lint_problems=0"* ]] || FAIL+=("slick_subset: $SUB")
 fi
 
 # --- workspace suite --------------------------------------------------------

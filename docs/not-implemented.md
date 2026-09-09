@@ -125,9 +125,10 @@ Compiler flags (`agent/xflags`):
   `import scala.async.Async.async` is reported as `value async is not a member
   of object scala.async.Async`, where scalac reports the library's own
   `-Xasync` message.
-- **`-Xsource-features`: ten of the eleven features.** Only
-  `case-apply-copy-access` is implemented. The others
-  (`case-companion-function`, `case-copy-by-name`, `infer-override`,
+- **`-Xsource-features`: nine ignored features and one partial feature.**
+  `case-apply-copy-access` is implemented; `infer-override` is partial (below).
+  The remaining features
+  (`case-companion-function`, `case-copy-by-name`,
   `any2stringadd`, `unicode-escapes-raw`, `string-context-scope`,
   `leading-infix`, `package-prefix-implicits`, `implicit-resolution`,
   `double-definitions`) are parsed and validated, and warn when named one by
@@ -398,3 +399,9 @@ Compiler flags (`agent/xflags`):
   mutability family `agent/varassign` closed (the symbol's mutability is read
   correctly; the receiver is wrong), and the qualified form `O.ov = 5` is
   correct, which is why no measure has ever shown it.
+
+`-Xsource-features:infer-override` now has partial support under `-Xsource:3`:
+ordinary inferred methods, vals and vars adopt the inherited type, while final
+constant vals retain their narrower inferred type. Macro-related exceptions have
+not been validated, so the CLI still reports partial support. It is not an ignored
+flag, and it is not yet advertised as a fully implemented source feature.

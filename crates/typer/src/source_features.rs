@@ -256,12 +256,14 @@ impl SourceFeatures {
         s.push_str("`-Xsource:3-cross` is a shorthand for `-Xsource:3 -Xsource-features:_`.\n\n");
         s.push_str("Features marked with [bin] affect the binary encoding.\n");
         s.push_str("Features marked with [scala-rs] are implemented by this compiler; the\n");
-        s.push_str("others are accepted and ignored (see docs/not-implemented.md).\n\n");
+        s.push_str("[partial] indicates limited support; unmarked features are ignored (see docs/not-implemented.md).\n\n");
         s.push_str("Available features:\n\n");
         let width = FEATURES.iter().map(|(_, n, _)| n.len()).max().unwrap_or(0);
         for (f, name, help) in FEATURES {
             let mark = if IMPLEMENTED.contains(f) {
                 " [scala-rs]"
+            } else if *f == SourceFeature::InferOverride {
+                " [partial]"
             } else {
                 ""
             };

@@ -257,7 +257,8 @@ impl Typer {
             owner,
             &name,
             &paramss,
-            &self.st.get(sym).tparams,
+            &self.st.get(sym).tparams.clone(),
+            &self.st.get(sym).params.clone(),
             abstract_only,
         ) else {
             return;
@@ -390,7 +391,66 @@ impl Typer {
         self.undet_tvars = saved;
     }
 
+    fn warn_trivial_self_reference(&mut self, sym: SymbolId, rhs: &Tree) {
+        if sym.is_none() || rhs.ty.is_error() {
+            return;
+        }
+        let member = self.st.get(sym);
+        if member.flags.contains(Flags::PARAM) || member.paramss.iter().any(|ps| !ps.is_empty()) {
+            return;
+        }
+        let reference = match &rhs.kind {
+            TreeKind::Ident { .. } => Some(rhs),
+            TreeKind::Select { qual, .. } if matches!(qual.kind, TreeKind::This { .. }) => {
+                Some(rhs)
+            }
+            TreeKind::Apply { fun, args } if args.is_empty() => match &fun.kind {
+                TreeKind::Select { qual, .. } if matches!(qual.kind, TreeKind::This { .. }) => {
+                    Some(&**fun)
+                }
+                TreeKind::Ident { .. } if self.st.get(member.owner).is_class_like() => Some(&**fun),
+                _ => None,
+            },
+            _ => None,
+        };
+        if reference.is_none_or(|r| r.sym != sym) {
+            return;
+        }
+        let kind = if member.kind == SymKind::Method {
+            "method"
+        } else {
+            "value"
+        };
+        let message = format!(
+            "{kind} {} does nothing other than call itself recursively",
+            member.name
+        );
+        if !self
+            .diags
+            .iter()
+            .any(|d| d.file_index == self.file_index && d.span == rhs.span && d.message == message)
+        {
+            self.warning(rhs.span, message);
+        }
+    }
+
     fn type_val_body_in(&mut self, tree: &mut Tree) {
+        let feature = self
+            .source_features
+            .contains(crate::source_features::SourceFeature::InferOverride)
+            && self.macro_depth == 0;
+        let (inherited, final_value) = match &tree.kind {
+            TreeKind::ValDef {
+                tpt, mods, name, ..
+            } if feature && tpt.is_empty() && !tree.sym.is_none() => {
+                let owner = self.st.get(tree.sym).owner;
+                (
+                    self.overridden_ret_type(owner, name, &[], &[], &[], false),
+                    mods.flags.contains(Flags::FINAL),
+                )
+            }
+            _ => (None, false),
+        };
         let presuper = matches!(
             &tree.kind,
             TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
@@ -438,19 +498,21 @@ impl Typer {
             tree.ty = declared;
             return;
         }
-        let pt = if declared.is_no_type() {
-            Type::NoType
-        } else {
-            declared.clone()
-        };
+        let pt = inherited.clone().unwrap_or_else(|| declared.clone());
         self.type_expr(rhs, &pt);
+        self.warn_trivial_self_reference(tree.sym, rhs);
         if presuper && tree_contains_this(rhs) {
             self.error(
                 tree.span,
                 "this can be used only in a class, object, or template",
             );
         }
-        if declared.is_no_type() {
+        let preserve_constant = final_value && matches!(rhs.ty, Type::Constant(_));
+        if let Some(expected) = inherited.filter(|_| !preserve_constant) {
+            self.adapt(rhs, &expected);
+            tree.ty = expected;
+            self.st.get_mut(tree.sym).ty = tree.ty.clone();
+        } else if declared.is_no_type() {
             tree.ty = rhs.ty.widen_constant();
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
@@ -771,6 +833,7 @@ impl Typer {
                 &name,
                 &paramss_ty,
                 &tp_ids,
+                &all_params,
                 !mods_flags.contains(Flags::OVERRIDE),
             )
             .unwrap_or(Type::NoType)
@@ -1135,6 +1198,29 @@ impl Typer {
             TreeKind::DefDef { name, .. } => name == "<init>",
             _ => return,
         };
+        // Parent instantiations may have been provisional during the signature
+        // pass. Refresh the expected result before checking the body, without
+        // treating it as the final inferred result.
+        if infer_result && !is_ctor && !tree.sym.is_none() {
+            let method = self.st.get(tree.sym).clone();
+            if let Type::Method { paramss, .. } = &method.ty {
+                if let Some(expected) = self.overridden_ret_type(
+                    method.owner,
+                    &method.name,
+                    paramss,
+                    &method.tparams,
+                    &method.params,
+                    !method.flags.contains(Flags::OVERRIDE),
+                ) {
+                    if !expected.is_error() && !expected.is_no_type() {
+                        if let Type::Method { ret, .. } = &mut tree.ty {
+                            **ret = expected;
+                        }
+                        self.st.get_mut(tree.sym).ty = tree.ty.clone();
+                    }
+                }
+            }
+        }
         {
             let (vparamss, rhs, ret_pt) = match &mut tree.kind {
                 TreeKind::DefDef { vparamss, rhs, .. } => {
@@ -1197,6 +1283,7 @@ impl Typer {
             let saved_call_args = std::mem::take(&mut self.typing_call_args);
             self.type_expr(rhs, &ret_pt);
             self.typing_call_args = saved_call_args;
+            self.warn_trivial_self_reference(tree.sym, rhs);
             if !ret_pt.is_no_type() {
                 self.adapt(rhs, &ret_pt);
             }
@@ -1204,9 +1291,19 @@ impl Typer {
                 // An inherited result is an expectation, not a written annotation.
                 // Keep a narrower inferred result after any required adaptation.
                 // SIP-23: do not infer singleton/constant types.
-                let inferred = rhs.ty.widen_constant();
+                let inferred = if self
+                    .source_features
+                    .contains(crate::source_features::SourceFeature::InferOverride)
+                    && self.macro_depth == 0
+                    && !ret_pt.is_no_type()
+                    && !ret_pt.is_error()
+                {
+                    ret_pt.clone()
+                } else {
+                    rhs.ty.widen_constant()
+                };
                 if let Type::Method { ret, .. } = &mut tree.ty {
-                    *ret = Box::new(inferred.clone());
+                    **ret = inferred.clone();
                 }
                 if !tree.sym.is_none() {
                     self.st.get_mut(tree.sym).ty = tree.ty.clone();
@@ -1808,7 +1905,7 @@ impl Typer {
         };
         self.qualify_parent_type_prefix(fun);
         let class_ty = {
-            let head: &Tree = &**fun;
+            let head: &Tree = fun;
             self.with_strict_type_names(|s| s.tree_to_type(head))
         };
         fun.ty = class_ty.clone();

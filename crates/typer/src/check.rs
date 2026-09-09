@@ -646,7 +646,10 @@ pub struct Typer {
     /// nsc's `openImplicits`: the (implicit symbol, target type) pairs whose
     /// own implicit parameters are being resolved right now. Used to cut off
     /// diverging expansions (`crate::implicits`).
+    pub(crate) building_implicits: Vec<(SymbolId, Type)>,
     pub(crate) open_implicits: std::cell::RefCell<Vec<(SymbolId, Type)>>,
+    pub(crate) implicit_instances: HashMap<SymbolId, (Type, Vec<SymbolId>)>,
+    pub(crate) implicit_instance_origins: HashMap<SymbolId, SymbolId>,
     /// The first expansion cut off as diverging during the current top-level
     /// implicit search, for the diagnostic.
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
@@ -1007,7 +1010,10 @@ impl Typer {
             pending_ctor_defaults: Vec::new(),
             default_scopes: HashMap::new(),
             pending_defaults: Vec::new(),
+            building_implicits: Vec::new(),
             open_implicits: std::cell::RefCell::new(Vec::new()),
+            implicit_instances: HashMap::new(),
+            implicit_instance_origins: HashMap::new(),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),

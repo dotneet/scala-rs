@@ -76,6 +76,11 @@ impl Typer {
                 return;
             }
         }
+        // A parameterless polymorphic receiver has no Apply node to register
+        // its open variables. Keep them available for the selected call's
+        // arguments and expected result, just as for an applied receiver.
+        let open_receiver = self.undetermined_of(qual);
+        self.undet_tvars.extend(open_receiver);
         if name == "_" {
             self.error(
                 tree.span,

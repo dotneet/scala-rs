@@ -1639,6 +1639,29 @@ impl Typer {
         span: Span,
         depth: usize,
     ) -> Tree {
+        if self
+            .building_implicits
+            .iter()
+            .any(|(prior, wanted)| *prior == id && crate::implicits::dominates(self, pt, wanted))
+        {
+            self.error(
+                span,
+                format!(
+                    "diverging implicit expansion starting with method {}",
+                    self.st.get(id).name
+                ),
+            );
+            let mut failed = Tree::dummy(TreeKind::Empty);
+            failed.ty = Type::Error;
+            return failed;
+        }
+        self.building_implicits.push((id, pt.clone()));
+        let result = self.implicit_tree_in(id, pt, span, depth);
+        self.building_implicits.pop();
+        result
+    }
+
+    fn implicit_tree_in(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
         let (paramss, ret) = match self.implicit_candidate_ty(id).into_owned() {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
             _ => return self.ref_implicit(id, span),
@@ -1648,11 +1671,11 @@ impl Typer {
         // (`<:<.refl[A]` fitted to `Int <:< Any` gives `A = Int`), so the tree
         // carries the instantiated type rather than the declared `=:=[A, A]`.
         let targs = self
-            .implicit_fit_at(id, pt, depth, &[])
+            .implicit_fit_at(id, pt, 0, &[])
             .map(|f| f.targs)
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
-        if paramss.iter().all(|c| c.is_empty()) || depth >= crate::implicits::MAX_IMPLICIT_DEPTH {
+        if paramss.iter().all(|c| c.is_empty()) {
             let mut t = self.ref_implicit(id, span);
             if targs.len() == tps.len() && !tps.is_empty() {
                 t.ty = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);

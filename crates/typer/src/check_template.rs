@@ -1997,11 +1997,12 @@ impl Typer {
     /// still-`Type::NoType` overridden signature (itself mid-completion) is
     /// skipped rather than borrowed, same as finding nothing.
     pub(crate) fn overridden_ret_type(
-        &self,
+        &mut self,
         owner: SymbolId,
         name: &str,
         my_paramss: &[Vec<Type>],
         my_tps: &[SymbolId],
+        my_params: &[SymbolId],
         abstract_only: bool,
     ) -> Option<Type> {
         if owner.is_none() || name.is_empty() {
@@ -2106,17 +2107,37 @@ impl Typer {
                 if ps.len() != my_ps.len() {
                     continue;
                 }
-                let ok = my_ps.iter().zip(ps.iter()).all(|(a, b)| {
-                    self.st.dealias(a) == self.st.dealias(b)
-                        || (!abstract_only
-                            && (self.st.is_sub_type(a, b) || self.st.is_sub_type(b, a)))
-                });
+                // Related parameter types still denote distinct overloads.
+                // An override's expected result must come from its matching
+                // parameter signature, never a narrower sibling overload.
+                let ok = my_ps
+                    .iter()
+                    .zip(ps.iter())
+                    .all(|(a, b)| self.st.dealias(a) == self.st.dealias(b));
                 if !ok {
                     continue;
                 }
+                if cand_kind == SymKind::Term && my_ps.is_empty() && !cand_ty.is_no_type() {
+                    return Some(self.own_type_members(owner, &cand_ty));
+                }
                 if let Type::Method { ret, .. } = &cand_ty {
                     if !ret.is_no_type() {
-                        return Some(self.own_type_members(owner, ret));
+                        let ret = self.own_type_members(owner, ret);
+                        let base_params = self.st.get(m).params.clone();
+                        let args: Vec<Tree> = my_params
+                            .iter()
+                            .map(|p| {
+                                let mut arg = Tree::dummy(TreeKind::Ident {
+                                    name: self.st.get(*p).name.clone(),
+                                });
+                                arg.sym = *p;
+                                arg.ty = self.st.get(*p).ty.clone();
+                                arg
+                            })
+                            .collect();
+                        // An inherited dependent result names the implementation's
+                        // parameters, not the ancestor's distinct term symbols.
+                        return Some(self.subst_dependent_paths(&base_params, &args, ret));
                     }
                 }
             }
@@ -2155,6 +2176,19 @@ impl Typer {
                 continue;
             };
             let seen = self.st.dealias(&Type::TypeMember(found));
+            // Only the newly exposed alias needs substitution. Reapplying it
+            // to the entire result can turn an existing Try[R] into Try[Try[R]].
+            let recv = Type::Class {
+                sym: owner,
+                args: self
+                    .st
+                    .get(owner)
+                    .tparams
+                    .iter()
+                    .map(|p| Type::TypeParam(*p))
+                    .collect(),
+            };
+            let seen = self.st.subst_as_seen_from(&recv, &seen);
             if seen.is_no_type()
                 || seen.is_error()
                 || matches!(&seen, Type::TypeMember(x) if *x == m)
