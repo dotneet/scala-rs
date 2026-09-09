@@ -3345,3 +3345,20 @@ harness for that is three lines of shell (`scalac`/`scala-rs` over one file with
   It does not — `enter_tparams` keeps a `tp.sym` that is set. The real
   obstacle was the evidence clause it appends, one function away. Reading the
   code that was blamed took ten minutes and was the whole slice.
+
+## Returning investigation at `c8104b12`: explicit selection fails too
+
+The actual view is `queryInsertActionExtensionMethods`, confirmed with real
+scalac 2.13.16 `-Xprint:typer`; `queryToInsertInvoker` is a false lead (its
+result has no `returning` even in scalac). The explicit correct view fails in
+scala-rs with `RelationalActionComponent.InsertActionExtensionMethods[Int]`,
+before selecting the member on JDBC's concrete `CountingInsertActionComposer`.
+
+[`tests/probes/returning-family`](../tests/probes/returning-family/README.md)
+reduces the outer abstract type family and inner API to a small independent
+library, compares both acceptance directions, and runs accepted programs. The
+source explicit call passes and has byte-identical stdout; source implicit
+lookup and both classpath positive cases fail. These are distinct paths to
+repair; neither an implicit-class filter nor proof that a conversion name is
+in scope closes them. The separate `Shape` cluster remains unproven as related.
+No compiler implementation or accepted baseline changed in this investigation.
