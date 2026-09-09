@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `7b4673c5` |
+| commit | `f428def6` |
 |---|---|
 | updated | 2026-09-09 |
 
-**Sixty-eight slices have merged this session**, in twenty-four composed gates. From
+**Seventy slices have merged this session**, in twenty-six composed gates. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -46,6 +46,8 @@ coordinator measured the merged tree each time, not the branches.
 | `b83e06a8` | `preludelb` | 265 -> **264** | 167 -> **166** |
 | `56b81c21` | `samconv` | 264 | 166 -> **163** |
 | `7b4673c5` | `gbslickmember` | 264 -> **242** | 163 |
+| `ef33b16f` | `strarrayops` | 242 | 163 |
+| `f428def6` | `varassign` | 242 | 163 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -254,7 +256,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1490** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **163** | **62** | — |
 | `tests/gitbucket_measure.sh` (353, 1 skipped) | **242** | **72** | — |
-| `tests/scalalib_measure.sh` (538) | **604** | **130** | — |
+| `tests/scalalib_measure.sh` (538) | **560** | **124** | — |
 
 ## Execution
 
@@ -895,6 +897,54 @@ wildcard hides the prefix of a later member import: with `import iclib._`,
 a following `import profile.api._` brings in nothing at all, not even a class
 under its own name. Six lines reproduce it; gitbucket writes explicit imports,
 so no measurement shows it.
+
+## Gates twenty-five and twenty-six: two probes, six accepted programs
+
+Both slices were briefed on a count of error messages and both returned
+something the count could not contain.
+
+`agent/strarrayops` was sent after 16 `value apply is not a member of String`
+and `stepper` errors, on the theory that `Predef.augmentString` was not
+supplying members and that a **source** `Predef` behaved differently from the
+prelude's. **Every part of that was wrong.** Writing the conversion by hand
+worked; selecting on `StringOps` directly worked; 29 of 32 probed members
+worked. The root is that `search_extension` had **no owner tie-break** — nsc's
+SLS 6.26.3 rule that a member inherited from a base class loses to one declared
+in the derived class. `object Predef extends LowPriorityImplicits` puts
+`augmentString` in `Predef` and `wrapString` in the base; both take a bare
+`String`, so every tie came out level and the search returned `None`. Thirteen
+lines of user code mentioning neither `String` nor `Array` reproduce it in both
+modes. Jar mode appeared healthy only because the hand-written prelude carried
+the same fact as two `low_priority` booleans — **concealment, not a different
+root**.
+
+`agent/varassign` was sent after 8 `reassignment to val initBlank`. Those are
+not a mutability defect at all: they are **named arguments in a
+self-constructor delegation**, typed positionally because
+`type_ctor_delegation` had no named-argument handling, so `initBlank = true`
+became an `Assign` against a primary-constructor parameter that genuinely is in
+scope there. `new C(b = 2, a = 1)` and `extends B(b = 2, a = 1)` were fixed by
+earlier slices; `this(...)` was the third path and nobody had looked at it.
+
+**Its two-directional probe is the part worth keeping.** 47 snippets, each
+compiled here and by scalac 2.13.16 and compared on accept/reject: 19
+disagreements, and six were programs this compiler **accepted and carried to
+the backend**. `def v: Int = 1; v = 2` emitted a `putfield` to a field the
+class does not have. `object O; O = null` likewise. A `val` inherited from a
+class file was assigned through a `putfield` to someone else's private field.
+And the sixth — the one **scalac also accepts**, so the one with no message on
+either side — assigned a `var` inherited from a class file through a `putfield`
+to a private field: `IllegalAccessError` at run time, verified by building the
+superclass with real scalac and running it. The probe is committed as
+`tests/assign_probe.sh`.
+
+Both slices left a live silent mis-compile named rather than half-fixed:
+assignment to a **wildcard-imported** `var` uses `this` as the receiver
+(`import O._; ov = 5` → `ClassCastException`), while the *read* of the same
+name is correct. `import_named` calls `remember_named_import_prefix`;
+`import_wildcard` is not even given the prefix tree. `agent/unqualname` reached
+the same mechanism from the other side (calling an *inherited* member through
+`import <object>._`), so it is one root with two symptoms.
 
 ## What is deliberately red
 
