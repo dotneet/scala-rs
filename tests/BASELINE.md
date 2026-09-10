@@ -11,11 +11,12 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `23031519` |
+| commit | `73f68974` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Ninety-nine slices have merged this session**, in forty-three accepted composed gates.
+**Forty-four composed gates have been accepted this session**, covering the earlier
+ninety-nine slices and this combined type-identity/macro-transport batch.
 Eighteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -66,6 +67,7 @@ coordinator measured the merged tree each time, not the branches.
 | `647afcf2` | `Java completion`, `Unit function arity`, `Either companion` | 191 -> **188** | 152 -> **139** |
 | `3343f368` | seven member/application mechanisms | 188 -> **169** | 139 -> **125** |
 | `23031519` | five evidence/default-import mechanisms with namespace integration | 169 -> **158** | 125 -> **121** |
+| `73f68974` | type identity, binary implicit objects, macro transport and source ownership | 158 -> **157** | 121 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -273,7 +275,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **121** | **54** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **158** | **57** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **157** | **57** | — |
 | `tests/scalalib_measure.sh` (538) | **440** | **118** | — |
 
 ## Execution
@@ -296,12 +298,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
 | `pos` (1859) | **1124** | 390 | 345 |
-| `neg` (1405) | **700** | 336 | 369 |
-| `run` (2060) | **650** | 857 | 553 |
+| `neg` (1405) | **711** | 325 | 369 |
+| `run` (2060) | **677** | 830 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-23031519.tsv`](baselines/corpus-23031519.tsv): 5324 unique
+[`baselines/corpus-73f68974.tsv`](baselines/corpus-73f68974.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `73f68974` gate compared against `corpus-23031519.tsv`: **losses=0,
+changes=38** (27 runtime gains and 11 formerly accepted negative programs now
+rejected). Positive counts are unchanged.
+
 The `23031519` gate compared against `corpus-3343f368.tsv`: **losses=0,
 changes=11**.
 
@@ -417,15 +423,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **300 result rows, 2711 passed, 0 failed** at `23031519` |
+| `cargo test --workspace --release --no-fail-fast` | **302 result rows, 2723 passed, 0 failed** at `73f68974` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-evidence-batch-probe/type-final-clippy.log` and
-`/tmp/scala-rs-evidence-batch-probe/type-final-clippy-compare.json`.
+`/tmp/scala-rs-macro-transport/owner-clippy.jsonl` and
+`/tmp/scala-rs-macro-transport/owner-clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -2443,5 +2449,83 @@ next-macro-inventory/ and next-tuple-inventory/.
   HEAD=2970a6a5  logs=/tmp/scala-rs-gate-2970a6a5-codex
   fail: corpus losses=6 vs tests/baselines/corpus-23031519.tsv
 VERDICT=FAIL
+DONE
+```
+
+
+## Gate forty-four: combined type-identity and macro-transport batch
+
+Clean `73f68974984fde9445a12cdb936a3bf9635df6ab`, tree
+`0e0f48b780decf3e575146e3017511dcebce9cc5`, passed the complete unskipped gate and
+reached DONE. Logs: `/tmp/scala-rs-gate-73f68974-codex/`. The frozen worktree is
+`.worktrees/codex-macro-expansion-integration`. Main fast-forwards to this exact
+commit; only this record and the raw corpus ledger are added afterwards. The
+previous two rejected intermediate candidates remain recorded, not accepted
+retroactively. No full gate was restarted for an observation timeout.
+
+Gitbucket is 158/57 -> 157/57, cats 121/54 and library 440/118 unchanged
+(errors/files). The diagnostic multiset removes GetResult[Int] at
+IssuesService.scala:494. Repeated argument packing moves the same SQL macro
+from an argument-count refusal to an empty-TypeTree refusal; that source
+location is still failing. Cats and library diagnostic multisets are identical.
+See `diagnostic-comparison.json` in the gate directory.
+
+Slick remains 184 sources, errors=0, 1492 classes, MODE=b 12/12 programs and
+36/36 attempts. Subset validates all 1492 with lint_problems=0. The stronger
+initialization sweep loads all 1492, failures=0, incomplete=0, using the same
+real PostgreSQL/Oracle/reflect dependencies as the accepted baseline.
+Workspace: 302 result rows, 2723 passed, zero failed. Format passes. Clippy has
+57 existing warnings with no added or removed warnings.
+
+The complete 5324-row corpus has losses=0, changes=38: run gains 27, neg gains
+11, pos unchanged. The raw ledger is `tests/baselines/corpus-73f68974.tsv`.
+All skip counts remain unchanged. Neg gains include cases accepted before and
+now rejected; they are not runtime tests. Runtime gains are actual harness
+executions, not compile-only counts.
+
+The composed implementation retains real source type identities and written
+bounds, discovers binary implicit objects, exports source macro bindings,
+transports structural macro trees/repeated arguments/source positions, preserves
+attachments and resets local attributes, repairs qualified Context.Expr tag
+materialization, and exports ordinary field storage metadata. Source symbol
+identities and lexical owners survive reverse typechecks, including functions,
+local vals/defs and local class types. Both changeOwner entry points run Scala's
+actual traversal on private synchronized source-symbol adapters; source info is
+completed lazily and recursive inferred-owner info still diagnoses. Console
+output travels as explicit protocol packets. No phantom macro method, no-op
+changeOwner, or dummy owner/type stands in for unsupported behavior.
+
+Before this gate, 852 related tests in 40 suites passed, selected pos/run 452
+rows had losses=0, and all 1405 negatives had losses=0. Four pinned source trees,
+121 jars, 33 Java support classes and 1498 reference classes passed preflight.
+The tested prerequisite binary and gated binary are byte-identical, SHA256
+`e85f6f92b424e205e19227a972b81e7a89e8f52e8faec30f466e45831a710cd2`.
+`macrotransportbatch` compares both API producers and both consumers with real
+scalac 2.13.16, including independent rejections and verifier-enabled exact
+stdout comparisons. The original t12576 macro and consumer are rebuilt by
+both compilers and execute with identical `List()` output. Accepted230 fails
+new valid ownership/transport fixtures and has the separately demonstrated
+inferred-implementation VerifyError and missing storage metadata. Detailed
+pre-gate investigation is in `docs/batches/macro-transport.md`; its checkpoint
+status statements describe the state before this accepted gate.
+
+Next-batch inventory is `/tmp/scala-rs-next-batch-inventory/README.md`. It
+prioritizes real Slick SQL interpolation's empty-TypeTree transport, independent
+String construction failures (three gitbucket sites reproduce without
+Gitbucket), and private-this/bare-constructor storage distinctions. A separate
+reflection inspector executes both API outputs: ordinary private/public/lazy/
+abstract controls match, while Hidden/Plain/Mutable still expose extra getters.
+Accepted230 already has those incorrect getters, so this is a measured remaining
+limitation. The deeper explicit dependent macro-signature export issue and
+full-run cats Tuple2/NonEmptyList inference remain distinct. These diagnoses
+are hypotheses to correct using bidirectional probes, not permission to apply
+name-based approximations or to start one gate per repair.
+
+Exact summary block:
+
+```
+=== summary
+  HEAD=73f68974  logs=/tmp/scala-rs-gate-73f68974-codex
+VERDICT=PASS
 DONE
 ```
