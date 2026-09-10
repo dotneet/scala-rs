@@ -1321,11 +1321,11 @@ impl PickleSupply {
         // and `extends C(a)(b)` both reach overload selection as one argument
         // list). Keep that same view on the installed symbol while retaining
         // each source parameter's flags, including DEFAULTPARAM. The default
-        // getter index is global across clauses, so flattening does not lose
-        // the metadata needed to fill a later clause.
+        // getter index is global across clauses. Keep the symbol clauses
+        // separately so named/default placement respects source boundaries.
         let source_params: Vec<SymbolId> = paramss_sym.iter().flatten().copied().collect();
         let source_param_types: Vec<Type> = paramss_ty.iter().flatten().cloned().collect();
-        let source_paramss = vec![source_params.clone()];
+        let source_paramss = paramss_sym;
         let hidden_outer = self
             .java_class(bin, internal)
             .and_then(|c| hidden_outer_desc(st, class_sym, c));
@@ -3572,7 +3572,7 @@ impl PickleSupply {
                 .tparams
                 .iter()
                 .map(|tp| {
-                    let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+                    let t = st.alloc(&tp.name, id, SymKind::TypeParam, variance_flags(tp), "");
                     st.get_mut(t).ty = Type::TypeParam(t);
                     set_tparam_arity(st, t, tparam_arity(tp));
                     t
@@ -5734,6 +5734,9 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
             Type::Double => return Some("D".into()),
             Type::Unit => return Some("V".into()),
             Type::String => return Some("Ljava/lang/String;".into()),
+            // These Scala top types have a definite erased reference slot.
+            // Leaving AnyVal unknown confuses it with String/NodeSeq overloads.
+            Type::Any | Type::AnyRef | Type::AnyVal => return Some("Ljava/lang/Object;".into()),
             Type::Function { params, .. } => {
                 return Some(format!("Lscala/Function{};", params.len()))
             }

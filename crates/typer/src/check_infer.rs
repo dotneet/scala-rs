@@ -2745,6 +2745,65 @@ impl Typer {
         true
     }
 
+    /// Evaluate an eta-expanded selection's receiver once, at construction.
+    /// The generated binding is typed by the enclosing synthetic block.
+    fn capture_eta_receiver(&mut self, tree: &mut Tree) -> Option<Tree> {
+        let selection = match &mut tree.kind {
+            TreeKind::TypeApply { fun, .. } => fun.as_mut(),
+            _ => tree,
+        };
+        let TreeKind::Select { qual, .. } = &mut selection.kind else {
+            return None;
+        };
+        if matches!(qual.kind, TreeKind::This { .. } | TreeKind::Super { .. })
+            || matches!(qual.ty, Type::ModuleRef(_))
+        {
+            return None;
+        }
+        let name = self.fresh("eta$receiver$");
+        let receiver = std::mem::replace(
+            qual,
+            Box::new(Tree::dummy(TreeKind::Ident { name: name.clone() })),
+        );
+        let mut value = Tree::dummy(TreeKind::ValDef {
+            mods: Modifiers::new(Flags::FINAL.with(Flags::SYNTHETIC)),
+            name,
+            tpt: Box::new(Tree::dummy(TreeKind::Empty)),
+            rhs: receiver,
+        });
+        value.span = selection.span;
+        Some(value)
+    }
+
+    /// A method's final implicit clause is supplied by search inside the
+    /// eta-expanded body, never exposed as another function input.
+    pub(crate) fn implicit_eta_shape(&self, tree: &Tree) -> Option<Type> {
+        let Type::Method { paramss, ret } = &tree.ty else {
+            return None;
+        };
+        if tree.sym.is_none() || paramss.len() != 2 {
+            return None;
+        }
+        let declared = &self.st.get(tree.sym).paramss;
+        let offset = declared.len().checked_sub(paramss.len())?;
+        let first = declared.get(offset)?;
+        let last = declared.get(offset + 1)?;
+        if first
+            .iter()
+            .any(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+            || last.is_empty()
+            || !last
+                .iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        {
+            return None;
+        }
+        Some(Type::Function {
+            params: paramss[0].clone(),
+            ret: ret.clone(),
+        })
+    }
+
     pub(crate) fn adapt(&mut self, tree: &mut Tree, pt: &Type) {
         if matches!(pt, Type::Method { .. }) {
             return;
@@ -2760,7 +2819,6 @@ impl Typer {
             return;
         }
         self.complete_java_type(&tree.ty, tree.span);
-        self.complete_java_type(pt, tree.span);
         // By-name wrap must run before `Nothing <: pt` (Nothing inhabits every
         // type, including `=> T`). Otherwise `tryBreakable { throw e }` would
         // skip Function0 and throw in the caller.
@@ -2929,7 +2987,7 @@ impl Typer {
         if matches!(pt, Type::String) && !matches!(tree.ty, Type::String) {
             // allow via toString in concat contexts only — not general
         }
-        if matches!(pt, Type::Any | Type::AnyRef | Type::AnyVal) {
+        if matches!(pt, Type::Any) {
             return;
         }
         // nsc `inferExprAlternative`: an *overloaded* method named where a
@@ -2939,6 +2997,23 @@ impl Typer {
         // eta-expansion below, which needs a single method type.
         if matches!(tree.ty, Type::Overload(_)) {
             self.pick_overload_for_function(tree, pt);
+        }
+        if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
+            if let Some(Type::Function { params, ret }) = self.implicit_eta_shape(tree) {
+                // Type the generated application normally: that infers method
+                // variables and supplies real evidence in the lexical scope.
+                let captured = self.capture_eta_receiver(tree);
+                eta_expand(&mut self.st, &mut self.gensym, tree, params, *ret);
+                if let Some(value) = captured {
+                    let expr = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                    *tree = Tree::dummy(TreeKind::Block {
+                        stats: vec![value],
+                        expr: Box::new(expr),
+                    });
+                }
+                self.type_expr(tree, pt);
+                return;
+            }
         }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {

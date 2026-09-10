@@ -1212,21 +1212,47 @@ impl<'a> Gen<'a> {
                     load_outer_arg(asm, &ctx_early, o);
                 }
             }
-            for (i, a) in super_args.iter().enumerate() {
-                gen_expr(asm, &mut frame, &ctx_early, a);
-                // `class D extends B((), 5)`: the super constructor takes a
-                // `BoxedUnit` there and the `()` left nothing on the stack.
-                // Erasure has already `$box`ed any `()` that goes to an
-                // `Object` parameter, so a `Unit`-typed argument here really
-                // does mean a `Unit` parameter.
-                adapt_unit_arg(asm, &ctx_early, a, &a.ty);
-                // `class A1 extends AtomicReference[Int](1)`: a generic
-                // (often Java) superclass ctor takes `Object`, but a
-                // primitive argument is still on the stack unboxed. Same
-                // check `gen_new` makes for a plain `new`.
-                let pty = super_field_tys.get(i).unwrap_or(&a.ty);
-                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
-                    emit_box(asm, &a.ty);
+            if super_field_tys
+                .iter()
+                .any(|p| matches!(p, Type::Repeated(_)))
+            {
+                let ctor = parents
+                    .iter()
+                    .find(|p| st.class_sym_of(&p.ty) == Some(super_cls))
+                    .map(|p| p.sym)
+                    .unwrap_or(SymbolId::NONE);
+                let java_varargs = !ctor.is_none() && {
+                    let flags = st.get(ctor).flags;
+                    flags.contains(Flags::JAVA) && flags.contains(Flags::VARARGS)
+                };
+                gen_call_args(
+                    asm,
+                    &mut frame,
+                    &ctx_early,
+                    &super_args,
+                    &super_field_tys,
+                    library_abi,
+                    java_varargs,
+                    ctor,
+                    false,
+                );
+            } else {
+                for (i, a) in super_args.iter().enumerate() {
+                    gen_expr(asm, &mut frame, &ctx_early, a);
+                    // `class D extends B((), 5)`: the super constructor takes a
+                    // `BoxedUnit` there and the `()` left nothing on the stack.
+                    // Erasure has already `$box`ed any `()` that goes to an
+                    // `Object` parameter, so a `Unit`-typed argument here really
+                    // does mean a `Unit` parameter.
+                    adapt_unit_arg(asm, &ctx_early, a, &a.ty);
+                    // `class A1 extends AtomicReference[Int](1)`: a generic
+                    // (often Java) superclass ctor takes `Object`, but a
+                    // primitive argument is still on the stack unboxed. Same
+                    // check `gen_new` makes for a plain `new`.
+                    let pty = super_field_tys.get(i).unwrap_or(&a.ty);
+                    if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
+                        emit_box(asm, &a.ty);
+                    }
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);

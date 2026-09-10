@@ -532,24 +532,52 @@ impl Typer {
             }
             _ => return OverloadPick::None,
         }
-        let applicable: Vec<(SymbolId, Vec<Type>, Type)> = {
+        let (applicable, with_views): (Vec<(SymbolId, Vec<Type>, Type)>, bool) = {
             let no_view: Vec<_> = cands
                 .iter()
                 .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, false, targs))
                 .cloned()
                 .collect();
             if !no_view.is_empty() {
-                no_view
+                (no_view, false)
             } else {
-                cands
-                    .into_iter()
-                    .filter(|(sym, ps, _)| {
-                        self.is_applicable(*sym, clause, ps, arg_tys, true, targs)
-                    })
-                    .collect()
+                (
+                    cands
+                        .into_iter()
+                        .filter(|(sym, ps, _)| {
+                            self.is_applicable(*sym, clause, ps, arg_tys, true, targs)
+                        })
+                        .collect(),
+                    true,
+                )
             }
         };
         let applicable = self.narrow_by_lambda_shape(applicable, arg_tys, shapes);
+        // A value expectation eliminates an unapplied explicit clause when
+        // an alternative with the same first domain supplies that clause
+        // implicitly. FUNmode keeps both: another written application cannot
+        // use its arguments to disambiguate the preceding clause.
+        let applicable = if !matches!(_pt, Type::Method { .. } | Type::Function { .. }) {
+            applicable
+                .iter()
+                .filter(|a| {
+                    if a.0.is_none()
+                        || self.st.get(a.0).paramss.len() != 2
+                        || self.residual_clause_is_implicit(a.0)
+                    {
+                        return true;
+                    }
+                    !applicable.iter().any(|b| {
+                        self.residual_clause_is_implicit(b.0)
+                            && self.canonical_sig(a.0, &a.1, &Type::NoType)
+                                == self.canonical_sig(b.0, &b.1, &Type::NoType)
+                    })
+                })
+                .cloned()
+                .collect()
+        } else {
+            applicable
+        };
         // nsc fills a default only when no alternative applies without one
         // (`Infer.inferMethodAlternative`). Applied before the specificity
         // comparison, because the two alternatives it separates are often
@@ -580,9 +608,10 @@ impl Typer {
                 let winners: Vec<(SymbolId, Vec<Type>, Type)> = applicable
                     .iter()
                     .filter(|a| {
-                        applicable
-                            .iter()
-                            .all(|b| a.0 == b.0 || self.is_as_specific_method(a.0, b.0, &a.1, &b.1))
+                        applicable.iter().all(|b| {
+                            a.0 == b.0
+                                || self.is_as_specific_method(a.0, b.0, &a.1, &b.1, with_views)
+                        })
                     })
                     .cloned()
                     .collect();
@@ -595,6 +624,7 @@ impl Typer {
                         && self.st.get(a.0).name == self.st.get(b.0).name
                         && a.1 == b.1
                         && a.2 == b.2
+                        && self.overload_residual_key(a.0) == self.overload_residual_key(b.0)
                 });
                 // The same test again, but blind to *which* symbols a
                 // candidate's own type parameters are. `mutable.HashMap`
@@ -618,6 +648,7 @@ impl Typer {
                             module_apply_candidates.contains(sym),
                             self.st.get(*sym).name.clone(),
                             keyed[i].clone(),
+                            self.overload_residual_key(*sym),
                         );
                         i += 1;
                         if seen.contains(&k) {
@@ -842,6 +873,35 @@ impl Typer {
         false
     }
 
+    fn residual_clause_is_implicit(&self, sym: SymbolId) -> bool {
+        if sym.is_none() {
+            return false;
+        }
+        let clauses = &self.st.get(sym).paramss;
+        clauses.len() == 2
+            && !clauses[1].is_empty()
+            && clauses[1]
+                .iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+    }
+
+    fn overload_residual_key(&self, sym: SymbolId) -> Vec<Type> {
+        if sym.is_none() {
+            return Vec::new();
+        }
+        match &self.st.get(sym).ty {
+            Type::Method { paramss, .. } if paramss.len() > 1 => self.canonical_sig(
+                sym,
+                &[],
+                &Type::Method {
+                    paramss: paramss[1..].to_vec(),
+                    ret: Box::new(Type::NoType),
+                },
+            ),
+            _ => Vec::new(),
+        }
+    }
+
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.
     ///
     /// `B`'s own type parameters are undetermined for that test, exactly as
@@ -855,6 +915,7 @@ impl Typer {
         b_sym: SymbolId,
         a_ps: &[Type],
         b_ps: &[Type],
+        with_views: bool,
     ) -> bool {
         // `A`'s own type parameters stand in for the *arguments* of this
         // hypothetical call, so they are rigid: `B` in `map[B](Char => B)` is
@@ -879,7 +940,7 @@ impl Typer {
                 .collect()
         };
         let saved = self.spec_probe.replace(true);
-        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true, &[])
+        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[])
             && self.function_params_conform(&a_ps, &b_ps);
         self.spec_probe.set(saved);
         out
@@ -1739,7 +1800,7 @@ impl Typer {
         open: &[SymbolId],
     ) -> bool {
         match self.arg_score(arg, param) {
-            Some(3) if !allow_widen => false, // numeric widen
+            Some(3) if !allow_widen && !self.spec_probe.get() => false, // numeric widen
             Some(_) => true,
             None if allow_widen => {
                 // Narrowing an `Int` literal (`take(3)` on a `Byte` parameter)
@@ -2382,9 +2443,8 @@ impl Typer {
         if numeric_widen(arg, param).is_some() {
             return Some(3);
         }
-        if matches!(param, Type::Any | Type::AnyRef | Type::AnyVal) {
-            return Some(1);
-        }
+        // AnyRef and AnyVal are disjoint domains. Subtyping, inference and
+        // conversions above decide applicability; neither is a catch-all.
         // Last: a class that *is* a function inhabits a function parameter.
         // `MapOps[K, V, …] extends PartialFunction[K, V]`, so `xs.map(aMap)`
         // hands `map` a `K => V`. Only as a fallback -- weighed earlier it
