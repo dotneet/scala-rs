@@ -11,14 +11,15 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `9cc076f6` |
+| commit | `913fb1c0` |
 |---|---|
-| updated | 2026-09-10 |
+| updated | 2026-09-11 |
 
-**Forty-six composed gates have been accepted this session**, covering the earlier
+**Forty-seven composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
-and the Forms inference and Scala/JVM name interoperability batch.
+the Forms inference and Scala/JVM name interoperability batch, and the
+collection result, evidence factory and Java member batch.
 Twenty-one intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -72,6 +73,7 @@ coordinator measured the merged tree each time, not the branches.
 | `73f68974` | type identity, binary implicit objects, macro transport and source ownership | 158 -> **157** | 121 |
 | `603b6451` | SQL macro argument types, Java constructors, storage/access/defaults and reflection parents | 157 -> **148** | 121 |
 | `9cc076f6` | nested Forms inference, encoded names, literal types and nested class ownership | 148 -> **115** | 121 |
+| `913fb1c0` | collection results, evidence factories, Java members and full gitbucket inputs | **108** (115 on historical inputs) | 121 -> **103** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -278,9 +280,14 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **121** | **54** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **115** | **54** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **103** | **45** | — |
+| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **108** | **52** | — |
 | `tests/scalalib_measure.sh` (538) | **439** | **118** | — |
+
+Gitbucket input coverage changed: the candidate on the previous 353-source,
+Java-disabled input still reports **115/54**. The expanded **108/52** result
+includes the previously excluded controller and all three actual Java helpers.
+This difference is not reported as a compiler-only improvement.
 
 ## Execution
 
@@ -301,13 +308,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1128** | 386 | 345 |
+| `pos` (1859) | **1130** | 384 | 345 |
 | `neg` (1405) | **712** | 324 | 369 |
-| `run` (2060) | **680** | 827 | 553 |
+| `run` (2060) | **681** | 826 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-9cc076f6.tsv`](baselines/corpus-9cc076f6.tsv): 5324 unique
+[`baselines/corpus-913fb1c0.tsv`](baselines/corpus-913fb1c0.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `913fb1c0` gate compared against `corpus-9cc076f6.tsv`: **losses=0,
+changes=3**: pos/implicits-old, pos/t8310, run/fors.
+
 The `9cc076f6` gate compared against `corpus-603b6451.tsv`: **losses=0,
 changes=5**: pos/t7532b, pos/t8708, run/exoticnames and run/t9114 now pass;
 neg/t1009 now correctly rejects.
@@ -434,15 +444,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **304 result rows, 2735 passed, 0 failed** at `9cc076f6` |
+| `cargo test --workspace --release --no-fail-fast` | **305 result rows, 2745 passed, 0 failed** at `913fb1c0` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-forms-name/clippy.log` and
-`/tmp/scala-rs-forms-name/clippy-compare.json`.
+`/tmp/scala-rs-collection-followup/clippy-final.log` and
+`/tmp/scala-rs-collection-followup/clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -2886,5 +2896,87 @@ Exact summary block:
   HEAD=a1443e0e  logs=/tmp/scala-rs-gate-a1443e0e-codex
   fail: workspace tests: 305 rows, 2740 passed, 3 failed
 VERDICT=FAIL
+DONE
+```
+
+
+## Gate forty-seven: collection results, evidence factories and Java members
+
+Frozen commit `913fb1c0cc3a9e42ad62deb0408dc7a609e4bc69`, tree
+`f2a578b8e106aa499457ab1a9ea73d37f26b068f`, passed the unskipped full gate and independent
+completion audit. Main was fast-forwarded to that exact commit. The handover
+then changes only BASELINE.md and the raw corpus ledger; compiler sources,
+Cargo inputs, fixtures and scripts match the tested tree. The dedicated
+worktree remains frozen and clean. Logs: `/tmp/scala-rs-gate-913fb1c0-codex/`.
+Raw ledger: [`baselines/corpus-913fb1c0.tsv`](baselines/corpus-913fb1c0.tsv).
+The single owned gate reached DONE in 1337.9 seconds, exit zero.
+
+Cats improves **121/54 -> 103/45**, with 18 diagnostic locations removed and
+none added after normalizing generated anonymous IDs. Library remains
+**439/118**, with its entire diagnostic log byte-identical. Gitbucket under
+historical inputs remains **115/54**; expanded coverage is **108/52** across
+354 Scala/Twirl sources and three actual Java sources compiled with javac.
+The aggregate input correction is separate from compiler gains. Gitbucket
+and cats still do not compile successfully.
+
+Slick remains 184 sources, zero errors and 1504 classes. All 12 runtime
+programs pass, all 36/36 attempts match scalac output. Subset verifies 1504
+classes with lint_problems=0. Independent strong JVM initialization on this
+gate's actual slick-classes loads 1504/1504, failures=0, incomplete=0.
+MODE=a and the separate specialization ledger were not rerun or claimed green.
+Workspace has 305 result rows, 2745 passed and zero failed. Format passes.
+Clippy retains exactly the 57 accepted warning identities, with none added.
+All 5324 corpus identities are present; losses=0, changes=3:
+pos/implicits-old, pos/t8310, run/fors. Counts are recorded above.
+
+The batch follows the broad inventory in docs/batches/collection-results.md:
+receiver-substituted collection results, covariant SortedMap keys, library
+value classes, duplicate nullary overloads, six sorted evidence factories,
+lazy ArraySeq/ClassTag factories, result-constrained implicit clauses, real
+Java String precedence, and complete gitbucket inputs. SortedMap/TreeMap
+additional Ordering overloads survive earlier generic Map loading. Each
+supplied alternative is checked separately rather than discarding the entire
+set. No stubs or subagents were used.
+
+The first composed candidate a1443e0e was rejected and preserved in the preceding record.
+Its follow-up combines the measured overload regressions with the complete
+ArraySeq factory family. The old positive lines.next() is rejected by actual
+JDK17 scalac; both its embedded unit source and fixture now use linesIterator,
+with identical expected output, and the old expression remains a negative
+oracle. A shared Java test directory allocator now uses an atomic counter
+and exclusive creation; the observed missing-class failure alone did not prove
+a timestamp collision. The gate emits DONE on both verdicts and now returns
+nonzero on FAIL; both summary control paths were tested.
+
+Before freezing, 1426 tests in 121 affected CLI suites and 190 typer unit tests
+passed, including the prior mismatch10 regressions. Every new valid program
+runs real scalac and scala-rs under java -Xverify:all with byte-identical stdout,
+in multiple source orders where relevant. Independent invalid programs reject;
+immutable accepted-before probes fail the repaired behaviors. Broad oracle
+results, corrected hypotheses and evidence live under
+/tmp/scala-rs-collection-results and /tmp/scala-rs-collection-followup.
+
+The broad prerequisites used e28fed905f738bd2. After removing a redundant
+function-final return to clear a new clippy warning, the final binary reran
+21 focused tests, two protected-access tests five times, 1292 selected pos/run
+units and all 1405 negatives (zero losses), and cats (byte-identical diagnostics).
+Preflight reconfirmed four pinned source trees, 121 jar archives, 33 Java support
+classes byte-for-byte and 1498 cached reference classes. Actual Temurin17 and
+UTF-8 were used throughout. The final prerequisite and full-gate binary hashes
+match: `b2409aadc8f1b45b3ac32989c08aedc622c2d6b305022af77036aa11af68d761`.
+
+Next inventory: /tmp/scala-rs-collection-followup/next-inventory.md. It contains
+13 families to reproduce, including generic builders, anonymous implicit
+members, deferred functions, Java wildcard SAMs, Slick option operations and
+exception overloads. Deeper constraint solving and source-type macro reflection
+remain separately scoped hypotheses. No new defect is inferred solely from an
+error message; silent runtime and bidirectional rejection probes remain required.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=913fb1c0  logs=/tmp/scala-rs-gate-913fb1c0-codex
+VERDICT=PASS
 DONE
 ```
