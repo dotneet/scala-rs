@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `3343f368` |
+| commit | `23031519` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Ninety-four slices have merged this session**, in forty-two accepted composed gates.
+**Ninety-nine slices have merged this session**, in forty-three accepted composed gates.
 Sixteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -65,6 +65,7 @@ coordinator measured the merged tree each time, not the branches.
 | `5f0d18c2` | `immutable Map key types` | 191 | 152 |
 | `647afcf2` | `Java completion`, `Unit function arity`, `Either companion` | 191 -> **188** | 152 -> **139** |
 | `3343f368` | seven member/application mechanisms | 188 -> **169** | 139 -> **125** |
+| `23031519` | five evidence/default-import mechanisms with namespace integration | 169 -> **158** | 125 -> **121** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -271,9 +272,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **125** | **54** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **169** | **61** | — |
-| `tests/scalalib_measure.sh` (538) | **444** | **118** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **121** | **54** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **158** | **57** | — |
+| `tests/scalalib_measure.sh` (538) | **440** | **118** | — |
 
 ## Execution
 
@@ -294,13 +295,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1120** | 394 | 345 |
+| `pos` (1859) | **1124** | 390 | 345 |
 | `neg` (1405) | **700** | 336 | 369 |
-| `run` (2060) | **643** | 864 | 553 |
+| `run` (2060) | **650** | 857 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-3343f368.tsv`](baselines/corpus-3343f368.tsv): 5324 unique
+[`baselines/corpus-23031519.tsv`](baselines/corpus-23031519.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `23031519` gate compared against `corpus-3343f368.tsv`: **losses=0,
+changes=11**.
+
 The `3343f368` gate compared against `corpus-647afcf2.tsv`: **losses=0,
 changes=0**.
 
@@ -413,14 +417,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **299 result rows, 2709 passed, 0 failed** at `3343f368` |
+| `cargo test --workspace --release --no-fail-fast` | **300 result rows, 2711 passed, 0 failed** at `23031519` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
-saved 59-warning log, there are no additions and two removals. Evidence:
-`/tmp/scala-rs-ctor-evidence/clippy.log` and `/tmp/lazyzip-origin/clippy.log`.
+saved 57-warning log, there are no additions or removals. Evidence:
+`/tmp/scala-rs-evidence-batch-probe/type-final-clippy.log` and
+`/tmp/scala-rs-evidence-batch-probe/type-final-clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -2283,3 +2288,68 @@ from term lookup, breaking wildcard imports. A preceding term-only import
 also hid a package class from later type lookup (IntMap in t3603).
 The next composed candidate repairs these in a separate worktree and must
 pass related regressions and a complete gate before merge.
+
+
+## Gate forty-three: evidence and default-import batch
+
+Clean 23031519, based on accepted main 75f86f78, passed a complete unskipped
+composed gate and reached DONE. The two rejected intermediate gates remain
+recorded above with exact raw ledgers. Their frozen worktrees were not edited.
+Logs: `/tmp/scala-rs-gate-23031519-codex/`. Main is fast-forwarded to the exact
+gated commit; this subsequent record and corpus ledger are metadata only.
+
+Gitbucket improves 169/61 -> 158/57, cats 125/54 -> 121/54, and the library
+444/118 -> 440/118 (errors/files). Slick remains 184 sources, errors=0 and
+1492 classes. MODE=b passes 12/12 programs and 36/36 attempts. All 1492 classes
+verify with lint_problems=0; stronger initialization verification loads all
+1492, failures=0 and incomplete=0. Format passes; clippy has no changes to
+the 57 known warnings. Workspace and corpus totals above are from this gate.
+
+The five mechanisms isolate inferred val RHS typing inside by-name arguments,
+keep explicit TypeApply arguments ahead of implicit application, complete
+default Predef aliases lazily, install aliases on their actual declaring module
+owner, and materialize recursive Manifest/OptManifest with real library
+factories. Full evidence preserves type arguments; unsupported instance paths
+still diagnose. Integration preserves distinct term/type lookup, lazy Java
+static and Scala binary companion discovery, type lookup after a wildcard
+companion use, and nsc's exclusion of universal members from default imports.
+
+New valid fixtures run with the JVM verifier and match real scalac 2.13.16
+stdout byte for byte. Invalid fixtures independently compare rejection.
+Rebuilt accepted 3343f368 fails the repaired behavior probes; the new namespace
+regressions also fail the rejected candidates. The test directory helper uses
+an atomic sequence to prevent timestamp collisions without weakening checks.
+Final prerequisites pass 558 tests across 14 affected suites, all 60 historical
+and newly exposed corpus identities with losses=0, and the full Slick precheck.
+Preflight validates four pinned source trees, 121 jars, 33 Java support classes
+and 1498 known-good nsc reference classes. Each owned gate was followed through
+DONE; no timeout caused a restart and no stage was skipped.
+
+The diagnostic multiset removes 12 gitbucket messages and adds one. SQL evidence
+GetResult[Int] at IssuesService:494 replaces three downstream Unit-result
+errors; this path remains unresolved. Cats changes two messages at already
+failing vector.scala call sites, while ArrayBuilder and Duration change
+diagnostics within previously failing library methods. Exact multisets are
+in diagnostic-comparison.json under the gate directory.
+
+Next-batch inventory corrects another hypothesis: GetResult[Int] reproduces
+without gitbucket. Independent nsc-produced API probes show binary implicit
+val/def work; implicit object search fails even after explicit loading/import,
+though explicit object selection runs correctly. Further bidirectional probes
+find local Array/Function1 classes rejected, while Missing.String, Array type
+argument over-arity, and written class-bound violations are falsely accepted.
+Both accepted 3343f368 and this candidate share these remaining defects.
+Evidence is in `/tmp/scala-rs-evidence-batch-probe/next-implicit-inventory/` and
+`next-builtin-inventory/`. Collect and implement these together with related
+existing regressions; deeper path-dependent Manifest/TypeTag work stays separate.
+Standalone generic Vector scanLeft/scanRight helpers compile and run identically
+in all three compilers. The full cats errors require loading/inference context,
+not a blanket scan signature replacement; see next-vector-inventory/.
+This is measured progress, not a completed Scala compiler.
+
+```text
+=== summary
+  HEAD=23031519  logs=/tmp/scala-rs-gate-23031519-codex
+VERDICT=PASS
+DONE
+```
