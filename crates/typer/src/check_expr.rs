@@ -16,10 +16,17 @@ use scala_rs_span::Span;
 use std::collections::HashMap;
 
 impl Typer {
+    pub(crate) fn type_qualifier(&mut self, tree: &mut Tree, pt: &Type) {
+        let saved = std::mem::replace(&mut self.typing_qualifier, true);
+        self.type_expr(tree, pt);
+        self.typing_qualifier = saved;
+    }
+
     pub(crate) fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
         // Taken, not read: everything typed below this point is no longer the
         // callee of the application that set it. See `typing_callee`.
         let callee = std::mem::take(&mut self.typing_callee);
+        let qualifier = std::mem::take(&mut self.typing_qualifier);
         if tree.id.is_pretyped_default() {
             // A default argument's body, already typed in the scope it was
             // written in (`type_default_rhs_here`). Typing it again here would
@@ -75,6 +82,7 @@ impl Typer {
         // callee references open for explicit type arguments or an inserted
         // apply on the returned value.
         if !callee
+            && !qualifier
             && !tree.sym.is_none()
             && self.is_nullary_method_sym(tree.sym)
             && !matches!(tree.kind, TreeKind::TypeApply { .. })

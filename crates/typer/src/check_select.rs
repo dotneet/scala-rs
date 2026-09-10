@@ -51,7 +51,7 @@ impl Typer {
             if name == "apply" {
                 self.typing_callee = true;
             }
-            self.type_expr(qual, &Type::NoType);
+            self.type_qualifier(qual, &Type::NoType);
             self.typing_callee = saved_callee;
             self.callee_arity = saved_arity;
             // A *qualifier* is never "an argument still waiting for its
@@ -2510,7 +2510,7 @@ impl Typer {
         let TreeKind::Select { qual, .. } = &mut fun.kind else {
             return false;
         };
-        self.type_expr(qual, &Type::NoType);
+        self.type_qualifier(qual, &Type::NoType);
         let qual_ty = qual.ty.clone();
         if self.receiver_has_term(&qual_ty, &name)
             || self.search_extension(&qual_ty, &name, span).is_some()
@@ -2770,10 +2770,10 @@ impl Typer {
                 self.typing_callee = saved;
             } else if dyn_name == "apply" {
                 let saved = std::mem::replace(&mut self.typing_callee, true);
-                self.type_expr(&mut qual, &Type::NoType);
+                self.type_qualifier(&mut qual, &Type::NoType);
                 self.typing_callee = saved;
             } else {
-                self.type_expr(&mut qual, &Type::NoType);
+                self.type_qualifier(&mut qual, &Type::NoType);
             }
         }
         if (direct_type_apply && matches!(qual.ty, Type::Method { .. } | Type::Overload(_)))
@@ -2911,7 +2911,7 @@ impl Typer {
                     ) =>
                 {
                     let dyn_name = name.clone();
-                    self.type_expr(qual, &Type::NoType);
+                    self.type_qualifier(qual, &Type::NoType);
                     if !self.is_dynamic_receiver(&qual.ty)
                         || self.receiver_has_term(&qual.ty, &dyn_name)
                     {
@@ -2927,7 +2927,7 @@ impl Typer {
                         ) =>
                     {
                         let dyn_name = name.clone();
-                        self.type_expr(qual, &Type::NoType);
+                        self.type_qualifier(qual, &Type::NoType);
                         if !self.is_dynamic_receiver(&qual.ty)
                             || self.receiver_has_term(&qual.ty, &dyn_name)
                         {
@@ -3277,7 +3277,7 @@ impl Typer {
                     return false;
                 };
                 if qual.ty.is_no_type() {
-                    self.type_expr(qual, &Type::NoType);
+                    self.type_qualifier(qual, &Type::NoType);
                 }
                 match self.st.class_sym_of(&qual.ty) {
                     Some(c) => c,

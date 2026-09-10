@@ -194,3 +194,33 @@ fn result_only_lower_bounds_are_inferred_at_the_use_site() {
     }
     fs::remove_dir_all(p).unwrap();
 }
+
+#[test]
+fn qualifier_inference_preserves_scalac_rejections() {
+    let p = root();
+    for (bad, source) in [
+        (false, "partfactory_qualifier.scala"),
+        (true, "partfactory_qualifier_plain_bad.scala"),
+        (true, "partfactory_qualifier_alias_bad.scala"),
+    ] {
+        for oracle in [false, true] {
+            let out = p.join(format!("{source}-{oracle}"));
+            let r = compile(&[fixture(source)], &out, JAR, oracle, false);
+            assert_eq!(
+                r.status.success(),
+                !bad,
+                "source={source} oracle={oracle}: {}",
+                String::from_utf8_lossy(&r.stderr)
+            );
+            if !bad {
+                let r = run(&out, JAR);
+                check(&r);
+                assert_eq!(
+                    r.stdout,
+                    fs::read(fixture("expected/partfactory_qualifier.txt")).unwrap()
+                );
+            }
+        }
+    }
+    fs::remove_dir_all(p).unwrap();
+}
