@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `647afcf2` |
+| commit | `3343f368` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Eighty-seven slices have merged this session**, in forty-one accepted composed gates.
+**Ninety-four slices have merged this session**, in forty-two accepted composed gates.
 Fourteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -64,6 +64,7 @@ coordinator measured the merged tree each time, not the branches.
 | `e355ab70` | `directory Scala signatures` | 191 | 152 |
 | `5f0d18c2` | `immutable Map key types` | 191 | 152 |
 | `647afcf2` | `Java completion`, `Unit function arity`, `Either companion` | 191 -> **188** | 152 -> **139** |
+| `3343f368` | seven member/application mechanisms | 188 -> **169** | 139 -> **125** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -270,9 +271,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **139** | **57** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **188** | **63** | — |
-| `tests/scalalib_measure.sh` (538) | **458** | **119** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **125** | **54** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **169** | **61** | — |
+| `tests/scalalib_measure.sh` (538) | **444** | **118** | — |
 
 ## Execution
 
@@ -298,8 +299,11 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 | `run` (2060) | **643** | 864 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-647afcf2.tsv`](baselines/corpus-647afcf2.tsv): 5324 unique
+[`baselines/corpus-3343f368.tsv`](baselines/corpus-3343f368.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `3343f368` gate compared against `corpus-647afcf2.tsv`: **losses=0,
+changes=0**.
+
 The `647afcf2` gate compared against `corpus-5f0d18c2.tsv`: **losses=0,
 changes=1**, the positive gain `delambdafy-patterns`.
 
@@ -409,7 +413,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **298 result rows, 2707 passed, 0 failed** at `647afcf2` |
+| `cargo test --workspace --release --no-fail-fast` | **299 result rows, 2709 passed, 0 failed** at `3343f368` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -2141,3 +2145,83 @@ logs establish both defects, but their implementation roots remain hypotheses.
 The independent unchecked written type-bound defect from the rejected gate
 also remains open. Inventory further candidates and dependencies before the
 next implementation batch, rather than limiting it to these first two probes.
+
+
+## Gate forty-two: seven member/application mechanisms
+
+Clean `3343f368`, based on main `b4431153`, passed one complete unskipped
+composed gate with VERDICT=PASS, DONE, corpus losses=0 and changes=0.
+Logs: `/tmp/scala-rs-gate-3343f368-codex/gate.log`. Main was fast-forwarded
+to the exact tested commit. The recording commit changes only BASELINE and
+the raw corpus ledger; compiler sources, fixtures and tests match the gated tree.
+
+Gitbucket improves 188/63 -> 169/61, cats 139/57 -> 125/54, and the library
+458/119 -> 444/118. Slick remains 184 sources, zero errors and 1492 classes;
+MODE=b passes 12/12 programs and 36/36 attempts. Subset validates all 1492
+classes with zero failures and lint problems. Strong initialization verification
+with real PostgreSQL and Oracle drivers loads all 1492 classes, zero failures
+and zero incomplete. Retained class output and verify-all.log are in the gate
+directory. Workspace: 2709 passed, zero failed, 299 result rows. Format passes.
+Release workspace clippy retains 57 warnings with no additions or removals.
+Corpus: pos 1120/394/345, neg 700/336/369, run 643/864/553 (pass/fail/skip),
+all 5324 identities and statuses unchanged. Raw ledger:
+`tests/baselines/corpus-3343f368.tsv`.
+
+The user requested a broad inventory and as many practical repairs as possible
+before validation. The inventory in docs/batches/member-application.md covers
+18 candidate rows, including hypotheses disproved or left unconfirmed by
+probes. Seven mechanisms were composed before the single full gate:
+
+- Upper-bounded wildcard receivers look up members through their upper bound,
+  including inherited generic members. Runtime checks cover the erased receiver;
+  subtype-only and lower-bound-only member accesses remain rejected.
+- Fallback to an implicit extension goes through ordinary argument inference and
+  remaining-clause handling. The converted receiver substitutes class parameters.
+  This repairs both a rejected curried lambda and an accepted Int argument that
+  previously emitted a VerifyError, plus generic receiver/result combinations.
+- Option.collect, zip and flatten have real polymorphic declarations. zip includes
+  both A1 >: A and B; flatten uses actual <:< evidence rather than an erased-shape
+  approximation and a fabricated backend witness.
+- Try.flatMap, transform and collect retain their independent result parameter;
+  orElse, recover and recoverWith retain widening lower bounds. Tests cover
+  explicit type arguments, generic methods, exception recovery and lazy fallback.
+- Array.toMap carries real <:< evidence and invokes IterableOnceOps through the
+  existing ArraySeq wrapping path. Non-pair arrays and mismatched results reject.
+- Catch patterns are typed against Throwable, including inferred catch bindings,
+  guards and NonFatal extractors, rather than Any.
+- An inferred val/def with an unresolved implicit-only method invokes the same
+  rejection backstop as an explicitly typed value. It can no longer silently
+  become an eta-expanded function. Option[Int].flatten previously compiled and
+  threw ClassCastException; the inferred negative and its def variant now reject.
+
+Three valid fixtures execute under -Xverify:all and compare exact stdout with
+real scalac 2.13.16. Eighteen negative fixtures independently compare rejection;
+no test was removed or weakened. Rebuilt accepted 647afcf2 fails the three valid
+fixtures and falsely accepts the invalid flatten, curried-extension and inferred
+method probes. Before evidence: `/tmp/scala-rs-next-batch-probes/before-final/`.
+The first related suite passes 616 tests; the generic receiver follow-up passes
+28 affected tests, and the final released-signature check passes 108 tests.
+The 18 recorded corpus regressions have zero changes. Preflight validates four
+pinned source trees, 121 jars, 33 Java support classes and 1498 reference classes.
+One owned gate execution was watched through DONE; none was restarted or skipped.
+
+Diagnostic comparison removes 21 gitbucket messages and adds two, for a net
+reduction of 19. Both Array.toMap missing-member errors are removed. The new
+messages are missing toMap evidence in SystemSettingsController: members at
+line 395 replaces its old inferred-function mismatch at use on line 400; SQL
+row construction at line 300 is newly diagnosed. Do not describe both as merely
+relocated diagnostics. The latter exposes an unresolved implicit at an inferred
+value boundary; the valid source still needs its inference defect repaired.
+Cats and the library add no diagnostic messages. Detailed multisets and location
+notes are in diagnostic-comparison.json under the gate directory.
+
+Follow-up evidence in `/tmp/scala-rs-next-batch-probes/` corrects several tempting
+next diagnoses. Plain List/Seq/IndexedSeq/Vector/collect toMap, a generic callback,
+and JDBC/Java String producers all pass in isolation; the full-run evidence
+failure requires tracing loading/inference state, not an assumed missing member
+or a blanket String rewrite. Explicitly imported or qualified Manifest with an
+explicit Manifest.Int executes identically to scalac, while automatic Manifest
+materialization fails. Default alias exposure and materialization are distinct
+next candidates. The independent written class-bound validation hole, full-run
+collection result issues, higher-kinded implicit evidence and source-class macro
+tags remain open. Continue inventory-first batches; this is not compiler completion.
