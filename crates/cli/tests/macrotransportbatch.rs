@@ -33,11 +33,28 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
         "{name} nsc={nsc}: {}",
         String::from_utf8_lossy(&r.stderr)
     );
+    if name == "macrotransport_owner_use" {
+        let stdout = String::from_utf8_lossy(&r.stdout);
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        for owner in ["field", "local", "definitions"] {
+            assert!(
+                stdout.contains(&format!("owner 日本語 {owner}")),
+                "{stdout}"
+            );
+            assert!(
+                stderr.contains(&format!("owner stderr 日本語 {owner}")),
+                "{stderr}"
+            );
+        }
+    }
     if !accepted {
         let error = String::from_utf8_lossy(&r.stderr);
         assert!(
             if name == "macrotransport_bad" {
                 error.contains("cannot be accessed")
+            } else if name == "macrotransport_owner_bad" {
+                error.contains("recursive value field needs type")
+                    && error.contains("recursive value local needs type")
             } else if name == "macrotransport_fields_bad" {
                 error.matches("integer storage is forbidden").count() == 4
             } else {
@@ -218,6 +235,44 @@ fn reflected_storage_fields_drive_macro_rejection() {
             assert_eq!(run(&output, &cp), b"true\ntrue\ntrue\ntrue\nok\nok\n");
             compile(
                 "macrotransport_fields_bad",
+                consumer,
+                &root.join(format!("bad-{producer}-{consumer}")),
+                &cp,
+                false,
+            );
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn source_ownership_and_macro_console_match_scalac() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_owner_impl",
+        true,
+        &implementation,
+        &cp,
+        true,
+    );
+    let cp = format!("{}:{cp}", implementation.display());
+    let expected = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/expected/macrotransport_owner_use.txt"),
+    )
+    .unwrap();
+    for producer in [true, false] {
+        let api = root.join(format!("api-{producer}"));
+        compile("macrotransport_owner_api", producer, &api, &cp, true);
+        let cp = format!("{}:{cp}", api.display());
+        for consumer in [true, false] {
+            let output = root.join(format!("use-{producer}-{consumer}"));
+            compile("macrotransport_owner_use", consumer, &output, &cp, true);
+            assert_eq!(run(&output, &cp), expected);
+            compile(
+                "macrotransport_owner_bad",
                 consumer,
                 &root.join(format!("bad-{producer}-{consumer}")),
                 &cp,

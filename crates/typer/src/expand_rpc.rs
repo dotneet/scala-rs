@@ -42,6 +42,144 @@ use crate::expand::{at, lit_to_wire, quote_into, scala_full_name, Sexp};
 use crate::symbol::{SymKind, SymbolTable};
 
 impl Typer {
+    pub(crate) fn macro_current_owner(&self) -> SymbolId {
+        if self.macro_lexical_owner.is_none() {
+            self.st.owner
+        } else {
+            self.macro_lexical_owner
+        }
+    }
+
+    pub(crate) fn macro_enter_owner(&mut self, sym: SymbolId) -> SymbolId {
+        let saved = self.macro_lexical_owner;
+        if !sym.is_none() {
+            let physical = self.st.get(sym).owner;
+            let parent = if !saved.is_none() && physical == self.st.owner && saved != sym {
+                saved
+            } else {
+                physical
+            };
+            self.macro_mirror_owners.entry(sym).or_insert(parent);
+            self.macro_lexical_owner = sym;
+        }
+        saved
+    }
+
+    pub(crate) fn macro_function_symbol(&mut self, node: scala_rs_parser::NodeId) -> SymbolId {
+        if let Some(&sym) = self.macro_function_symbols.get(&node) {
+            return sym;
+        }
+        let owner = self.macro_current_owner();
+        let sym = self
+            .st
+            .alloc("$anonfun", owner, SymKind::Method, Flags::SYNTHETIC, "");
+        self.macro_function_symbols.insert(node, sym);
+        self.macro_mirror_owners.insert(sym, owner);
+        sym
+    }
+
+    fn answer_mirror_symbol(&mut self, items: &[Sexp]) -> String {
+        let Ok(id) = at(items, 2).and_then(|x| x.text().parse::<u32>().map_err(|e| e.to_string()))
+        else {
+            return refusal("invalid mirror symbol identity");
+        };
+        let kind = items[1].text();
+        if kind == "functionSymbol" {
+            return match self
+                .macro_function_symbols
+                .get(&scala_rs_parser::NodeId(id))
+            {
+                Some(sym) => format!("(a ref {})", sym.0),
+                None => refusal("the function has not been typed at this call site"),
+            };
+        }
+        let sym = SymbolId(id);
+        if sym.is_none() || id as usize >= self.st.symbols.len() {
+            return refusal("unknown mirror symbol identity");
+        }
+        if kind == "symbol" {
+            let s = self.st.get(sym);
+            let owner = self
+                .macro_mirror_owners
+                .get(&sym)
+                .copied()
+                .unwrap_or(s.owner);
+            return format!(
+                "(a symbol {} {} {} {} {}{})",
+                id,
+                quoted(&format!("{:?}", s.kind)),
+                quoted(&s.name),
+                quoted(&scala_full_name(&self.st, sym)),
+                owner.0,
+                if s.is_class_like() {
+                    class_flags_wire(s.flags)
+                } else {
+                    member_flags_wire(s.flags, s.kind, s.name == "<init>")
+                }
+            );
+        }
+        match self.mirror_symbol_info(sym) {
+            Ok(info) => format!("(a info {info})"),
+            Err(why) => refusal(&why),
+        }
+    }
+
+    fn mirror_symbol_info(&mut self, sym: SymbolId) -> Result<String, String> {
+        // nsc's typed anonymous-function symbol intentionally has NoType.
+        if self.macro_function_symbols.values().any(|&id| id == sym) {
+            return Ok("(notype)".to_string());
+        }
+        let s = self.st.get(sym).clone();
+        if s.is_class_like() {
+            let (parents, decls) = self.describe_run_class_body(sym)?;
+            return Ok(format!(
+                "(classinfo (parents {}) (decls {}))",
+                parents.join(" "),
+                decls.join(" ")
+            ));
+        }
+        if !s.tparams.is_empty() {
+            return Err(format!(
+                "mirror info for polymorphic symbol {} is not implemented",
+                s.name
+            ));
+        }
+        let ty = s.ty;
+        if ty.is_no_type() {
+            return Err(format!("recursive value {} needs type", s.name));
+        }
+        if let Type::Method { paramss, ret } = ty {
+            let mut info = self.type_to_wire(&ret)?;
+            if paramss.is_empty() {
+                return Ok(format!("(nullary {info})"));
+            }
+            if s.params.len() != paramss.iter().map(Vec::len).sum::<usize>() {
+                return Err(format!(
+                    "mirror parameter identities are incomplete for {}",
+                    s.name
+                ));
+            }
+            let mut end = s.params.len();
+            for params in paramss.iter().rev() {
+                let start = end - params.len();
+                let mut args = Vec::new();
+                for (&param, ty) in s.params[start..end].iter().zip(params) {
+                    if self.st.get(param).owner != sym {
+                        return Err(format!(
+                            "mirror parameter {} shares its storage symbol",
+                            self.st.get(param).name
+                        ));
+                    }
+                    args.push(format!("(arg {} {})", param.0, self.type_to_wire(ty)?));
+                }
+                info = format!("(method (params {}) {info})", args.join(" "));
+                end = start;
+            }
+            return Ok(info);
+        }
+        self.type_to_wire(&ty)
+    }
+
     /// Answer one `(q …)` the engine wrote, as the line to write back.
     ///
     /// Never `Err`: a question that cannot be answered is answered with
@@ -55,6 +193,8 @@ impl Typer {
         };
         match kind.as_str() {
             "typecheck" => self.answer_typecheck(items),
+            "enclosingOwner" => format!("(a ref {})", self.macro_current_owner().0),
+            "functionSymbol" | "symbol" | "symbolInfo" => self.answer_mirror_symbol(items),
             other => refusal(&format!(
                 "the macro engine asked scala-rs `{other}`, which it does not answer"
             )),
@@ -519,6 +659,13 @@ impl Typer {
 /// `Typer::tree_from_reply` refuses in the other direction. An approximation
 /// here would be a tree the implementation then *splices into its expansion*.
 fn answer_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+    let start = out.len();
+    answer_tree_to_wire_body(st, t, out)?;
+    super::expand::mirror_tree_identity(t, start, out);
+    Ok(())
+}
+
+fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
         TreeKind::Literal { lit } => {
             out.push_str("(t \"Literal\" (s0) ");
@@ -639,6 +786,9 @@ fn class_flags_wire(flags: Flags) -> String {
         (Flags::ABSTRACT, "ABSTRACT"),
         (Flags::FINAL, "FINAL"),
         (Flags::SEALED, "SEALED"),
+        (Flags::PRIVATE, "PRIVATE"),
+        (Flags::PROTECTED, "PROTECTED"),
+        (Flags::LOCAL, "LOCAL"),
     ] {
         if flags.contains(bit) {
             out.push(' ');
@@ -667,6 +817,8 @@ fn member_flags_wire(flags: Flags, kind: SymKind, ctor: bool) -> String {
         out.push_str(" \"CONSTRUCTOR\"");
     }
     for (bit, name) in [
+        (Flags::PARAM, "PARAM"),
+        (Flags::LOCAL, "LOCAL"),
         (Flags::PRIVATE, "PRIVATE"),
         (Flags::PROTECTED, "PROTECTED"),
         (Flags::FINAL, "FINAL"),

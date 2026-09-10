@@ -1161,6 +1161,24 @@ impl Typer {
                         self.block_local_defs.insert((self.file_index, s.id));
                     }
                 }
+                // Retyping a macro tree preserves declaration identities but
+                // rebuilds the block scope. Enter hoisted declarations again;
+                // signature completion only enters newly allocated symbols.
+                for s in stats.iter() {
+                    if !s.sym.is_none()
+                        && matches!(
+                            s.kind,
+                            TreeKind::DefDef { .. }
+                                | TreeKind::ClassDef { .. }
+                                | TreeKind::ModuleDef { .. }
+                                | TreeKind::TypeDef { .. }
+                        )
+                    {
+                        if let Some(name) = s.name() {
+                            self.st.enter_in_current(name, s.sym);
+                        }
+                    }
+                }
                 // Local classes are visible to the whole block, including
                 // statements that precede their definition.
                 //

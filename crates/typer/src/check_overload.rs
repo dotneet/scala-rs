@@ -2687,6 +2687,9 @@ impl Typer {
         } else {
             vec![Type::NoType; vparams.len()]
         };
+        let function = self.macro_function_symbol(body.id);
+        let saved_macro_owner = self.macro_lexical_owner;
+        self.macro_lexical_owner = function;
         self.st.push_scope();
         let mut param_tys = Vec::new();
         for (i, p) in vparams.iter_mut().enumerate() {
@@ -2709,6 +2712,7 @@ impl Typer {
                 }
             }
             if !p.sym.is_none() {
+                self.macro_mirror_owners.insert(p.sym, function);
                 self.st.get_mut(p.sym).ty = p.ty.clone();
                 self.st.enter_in_current(p.name().unwrap_or("_"), p.sym);
             }
@@ -2737,6 +2741,8 @@ impl Typer {
         };
         let body_ty = body.ty.widen_constant();
         self.st.pop_scope();
+        self.macro_function_symbols.insert(body.id, function);
+        self.macro_lexical_owner = saved_macro_owner;
         if let Some((from, _to)) = &pf_result {
             // Keep the expected `PartialFunction` shape, but fill in a result
             // type the caller still has to infer (`xs.collect { case … }`'s `B`,

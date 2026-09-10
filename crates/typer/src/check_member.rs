@@ -396,6 +396,12 @@ impl Typer {
     /// `x`'s type naming `A` as the fixed type it now is, which is what the
     /// mismatch describes.
     pub(crate) fn type_val_body(&mut self, tree: &mut Tree) {
+        let saved = self.macro_enter_owner(tree.sym);
+        self.type_val_body_with_macro_owner(tree);
+        self.macro_lexical_owner = saved;
+    }
+
+    fn type_val_body_with_macro_owner(&mut self, tree: &mut Tree) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_val_body_in(tree);
         self.undet_tvars = saved;
@@ -1269,6 +1275,12 @@ impl Typer {
     }
 
     pub(crate) fn type_def_body(&mut self, tree: &mut Tree) {
+        let saved = self.macro_enter_owner(tree.sym);
+        self.type_def_body_with_macro_owner(tree);
+        self.macro_lexical_owner = saved;
+    }
+
+    fn type_def_body_with_macro_owner(&mut self, tree: &mut Tree) {
         let infer_result = matches!(&tree.kind, TreeKind::DefDef { tpt, .. } if tpt.is_empty());
         let is_ctor = match &tree.kind {
             TreeKind::DefDef { name, .. } => name == "<init>",

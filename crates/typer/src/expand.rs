@@ -775,6 +775,24 @@ impl Typer {
         loop {
             let reply = engine.read_reply(budget)?;
             let items = reply.list()?;
+            if items.first().and_then(|s| s.atom()) == Some("log") {
+                asked += 1;
+                if asked > MAX_ENGINE_QUERIES {
+                    return Err(
+                        "the macro implementation produced too many protocol messages".to_string(),
+                    );
+                }
+                let channel = at(items, 1)?.text();
+                let message = at(items, 2)?.text();
+                if channel == "stdout" {
+                    print!("{message}");
+                } else if channel == "stderr" {
+                    eprint!("{message}");
+                } else {
+                    return Err("unknown macro output channel".to_string());
+                }
+                continue;
+            }
             if items.first().and_then(|s| s.atom()) != Some("q") {
                 return Ok(reply);
             }
@@ -1270,6 +1288,18 @@ impl Typer {
         } else {
             None
         };
+        let source_sym = if sym.first().and_then(|s| s.atom()) == Some("sr") {
+            let id = at(sym, 1)?
+                .text()
+                .parse::<u32>()
+                .map_err(|e| e.to_string())?;
+            if id == 0 || id as usize >= self.st.symbols.len() {
+                return Err("invalid returned source symbol identity".to_string());
+            }
+            SymbolId(id)
+        } else {
+            SymbolId::NONE
+        };
         let kids = items.get(3..).unwrap_or(&[]);
         let id = NodeId(self.macro_next_node);
         self.macro_next_node = self
@@ -1281,7 +1311,7 @@ impl Typer {
             span,
             kind,
             ty: Type::NoType,
-            sym: SymbolId::NONE,
+            sym: source_sym,
             postfix: false,
             scala_ref: false,
             stable_pat: false,
@@ -1530,6 +1560,14 @@ impl Typer {
                     vparams.push(self.tree_from_reply(a, span)?);
                 }
                 let body = self.tree_from_reply(at(kids, 1)?, span)?;
+                if !source_sym.is_none()
+                    && self
+                        .macro_function_symbols
+                        .values()
+                        .any(|&id| id == source_sym)
+                {
+                    self.macro_function_symbols.insert(body.id, source_sym);
+                }
                 Ok(node(TreeKind::Function {
                     vparams,
                     body: Box::new(body),
@@ -1871,6 +1909,13 @@ fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<String> {
 /// type-checked again at the call site -- where an unqualified name still
 /// means what the source meant, and a `This` we did not resolve would not.
 fn typed_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+    let start = out.len();
+    typed_tree_to_wire_body(st, t, out)?;
+    mirror_tree_identity(t, start, out);
+    Ok(())
+}
+
+fn typed_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
         TreeKind::Ident { name } => match this_qualifier_of(st, t.sym) {
             Some(owner) => {
@@ -1919,6 +1964,13 @@ fn typed_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<()
 /// refusing those by name is the honest answer until the bridge carries typed
 /// trees (`docs/macros.md` §4.3).
 pub(crate) fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
+    let start = out.len();
+    tree_to_wire_body(t, out)?;
+    mirror_tree_identity(t, start, out);
+    Ok(())
+}
+
+pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String> {
     let unsupported = |what: &str| {
         Err(format!(
             "scala-rs cannot hand {what} to a macro implementation yet"
@@ -2485,5 +2537,23 @@ mod tests {
         let mut out = String::new();
         quote_into(&mut out, "a\"b\\c\n");
         assert_eq!(Sexp::parse(&out).unwrap().text(), "a\"b\\c\n");
+    }
+}
+
+/// Preserve lexical symbol identities for definition/reference trees. The JVM
+/// only binds references whose definitions it has reconstructed in this exchange.
+pub(crate) fn mirror_tree_identity(t: &Tree, start: usize, out: &mut String) {
+    let marker = if !t.sym.is_none() {
+        format!("(sr {})", t.sym.0)
+    } else if let TreeKind::Function { body, .. } = &t.kind {
+        format!("(fn {})", body.id.0)
+    } else {
+        return;
+    };
+    if let Some(quote) = out[start..].strip_prefix("(t \"").and_then(|s| s.find('"')) {
+        let offset = start + 4 + quote + 2;
+        if out[offset..].starts_with("(s0)") {
+            out.replace_range(offset..offset + 4, &marker);
+        }
     }
 }

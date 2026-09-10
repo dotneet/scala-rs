@@ -3417,3 +3417,36 @@ and argument-type rejections. Former unsupported block/function/new cases from
 counts; the singleton-tag and receiverless-prefix refusal checks remain.
 Whitebox inference, macro bundles and general pattern/anonymous-class transport
 remain incomplete. This section describes the candidate, not an accepted gate.
+
+
+### 7.24 Source symbol ownership in the integration candidate
+
+Source definitions and typed functions now retain symbol identities across the
+engine protocol. `c.internal.enclosingOwner` follows lexical initialization
+owners, including an inferred val inside a method. Function parameters belong
+to the anonymous function symbol. The JVM mirror completes symbol info by
+reverse RPC when requested; an inferred val forced during its own expansion
+reports the recursive-value error rather than acquiring a fabricated NoType.
+The anonymous function's own NoType matches nsc's typed tree representation.
+
+Both `c.internal.changeOwner` and `c.universe.internal.changeOwner` run Scala's
+real ChangeOwnerTraverser. Ordinary scala-reflect runtime symbols disallow owner
+mutation. For fresh source symbols, the bridge copies the loaded synchronized
+symbol implementation under a private class name and supplies an owner setter
+that records originalOwner and updates only that source symbol. The runtime's
+synchronization mixins and constructor checks remain intact; loaded classpath
+symbols retain their original implementation. Unsupported runtime layouts or
+symbol kinds produce diagnostics. This adapter is exercised with 2.13.16, not
+claimed compatible with arbitrary scala-reflect versions.
+
+Repeated typechecks retain definition identities and restore hoisted definitions
+to the new block scope. Local class types use NoPrefix when their lexical owner
+is a method or val; ThisType requires a class owner. Macro stdout and stderr
+travel as explicit protocol messages, so println cannot be mistaken for a tree
+reply. The ownership fixture checks both output channels, UTF-8 text, both
+changeOwner entry points, function/parameter identity, and recursive owner-info
+rejection across both API producers and both consumers.
+
+This remains integration work. Polymorphic source-symbol info and source class
+shapes that cannot be fully described are explicitly refused; general macro
+bundles and whitebox inference remain outside this change.

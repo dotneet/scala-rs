@@ -35,6 +35,30 @@ import java.util.List;
  * scala-rs turns every error reply into a compile diagnostic.
  */
 public final class ScalaRsMacroEngine {
+    static final java.util.Map<Long, Object> sourceSymbols = new java.util.HashMap<>();
+    static final java.util.IdentityHashMap<Object, Long> sourceSymbolIds = new java.util.IdentityHashMap<>();
+    static Class<?> lazyInfoClass;
+    static final java.util.Map<String, Class<?>> sourceSymbolClasses = new java.util.HashMap<>();
+    static final java.util.Set<Object> mutableSourceSymbols = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    static final class MacroOutput extends java.io.OutputStream {
+        final String channel;
+        final java.io.ByteArrayOutputStream pending = new java.io.ByteArrayOutputStream();
+        MacroOutput(String channel) { this.channel = channel; }
+        public synchronized void write(int value) {
+            pending.write(value);
+            if (value == '\n') flush();
+        }
+        public synchronized void write(byte[] bytes, int offset, int length) {
+            for (int i = offset; i < offset + length; i++) write(bytes[i]);
+        }
+        public synchronized void flush() {
+            if (pending.size() == 0) return;
+            String text = new String(pending.toByteArray(), StandardCharsets.UTF_8);
+            pending.reset();
+            out.println("(log " + channel + " " + Sexp.quote(text) + ")");
+        }
+    }
+
     static Object universe;
     static Object mirror;
     static ClassLoader macroCl;
@@ -86,6 +110,10 @@ public final class ScalaRsMacroEngine {
     public static void main(String[] args) throws Exception {
         out = new PrintStream(System.out, true, "UTF-8");
         in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        // Keep the original stream for protocol packets; macro println/Console
+        // output is payload, never another expansion reply.
+        System.setOut(new PrintStream(new MacroOutput("stdout"), true, "UTF-8"));
+        System.setErr(new PrintStream(new MacroOutput("stderr"), true, "UTF-8"));
         macroCl = ScalaRsMacroEngine.class.getClassLoader();
         try {
             Class<?> pkg = Class.forName("scala.reflect.runtime.package$", true, macroCl);
@@ -390,6 +418,30 @@ public final class ScalaRsMacroEngine {
 
     /** A tree the request describes, built in the runtime universe. */
     static Object buildTree(Sexp s) throws Exception {
+        Object symbol = null;
+        if (s.isList() && s.items.size() >= 3 && "t".equals(s.items.get(0).atom)) {
+            String kind = s.items.get(1).text();
+            Sexp meta = s.items.get(2);
+            if (meta.isList() && !meta.items.isEmpty()) {
+                if ("fn".equals(meta.items.get(0).atom)) {
+                    Sexp answer = query("(q functionSymbol " + meta.items.get(1).text() + ")");
+                    symbol = sourceSymbol(Long.parseLong(answer.items.get(2).text()));
+                } else if ("sr".equals(meta.items.get(0).atom)) {
+                    long id = Long.parseLong(meta.items.get(1).text());
+                    if ("ValDef".equals(kind) || "DefDef".equals(kind) || "ClassDef".equals(kind)
+                            || "Function".equals(kind)) symbol = sourceSymbol(id);
+                    else symbol = sourceSymbols.get(id);
+                }
+            }
+        }
+        Object tree = buildTreeBody(s);
+        if (symbol != null && Boolean.TRUE.equals(call(tree, "hasSymbolField", 0))) {
+            call(tree, "setSymbol", 1, symbol);
+        }
+        return tree;
+    }
+
+    static Object buildTreeBody(Sexp s) throws Exception {
         if (!s.isList() || s.items.isEmpty() || !"t".equals(s.items.get(0).atom)) {
             throw new IllegalArgumentException("malformed tree: " + s);
         }
@@ -611,8 +663,8 @@ public final class ScalaRsMacroEngine {
         }
         Object internal = call(universe, "internal", 0);
         Object owner = call(mirror, "EmptyPackageClass", 0);
-        Object sym = call(internal, "newClassSymbol", 4,
-            owner, typeName(fullName), call(universe, "NoPosition", 0), Long.valueOf(0L));
+        Object sym = newSourceSymbol("ClassSymbol", owner, typeName(fullName),
+            call(universe, "NoPosition", 0), 0L);
         // `sym.toType` would ask for the type parameters, and that completes
         // the symbol; the type reference is built directly so that the info
         // stays unset and any real question about the class still throws.
@@ -660,7 +712,7 @@ public final class ScalaRsMacroEngine {
             }
         } else {
             Object owner = call(mirror, "EmptyPackageClass", 0);
-            sym = call(internal, "newClassSymbol", 4, owner, typeName(fullName),
+            sym = newSourceSymbol("ClassSymbol", owner, typeName(fullName),
                 call(universe, "NoPosition", 0), flagsOf(s.items.get(2)));
             tpe = call(internal, "typeRef", 3, call(internal, "thisType", 1, owner), sym,
                 list(new ArrayList<>()));
@@ -745,7 +797,7 @@ public final class ScalaRsMacroEngine {
             if ("METHOD".equals(name) || "CONSTRUCTOR".equals(name)) {
                 continue;
             }
-            flags |= flagValue(name);
+            flags |= "LOCAL".equals(name) ? internalFlag(name) : flagValue(name);
         }
         return flags;
     }
@@ -864,7 +916,12 @@ public final class ScalaRsMacroEngine {
     static void serSym(Object t, StringBuilder sb) {
         try {
             Object sym = call(t, "symbol", 0);
-            if (sym == null || (Boolean) call(sym, "isEmpty", 0)) {
+            Long sourceId = sourceSymbolIds.get(sym);
+            if (sourceId != null) {
+                sb.append("(sr ").append(sourceId).append(')');
+                return;
+            }
+            if (sym == null || sym == call(universe, "NoSymbol", 0)) {
                 sb.append("(s0)");
                 return;
             }
@@ -1064,6 +1121,270 @@ public final class ScalaRsMacroEngine {
         return built;
     }
 
+    /** Mirror an actual source symbol. Its type is completed by reverse RPC,
+     * not guessed while its enclosing definition is still being inferred. */
+    static Object sourceSymbol(long id) throws Exception {
+        Object known = sourceSymbols.get(id);
+        if (known != null) return known;
+        Sexp answer = query("(q symbol " + id + ")");
+        String kind = answer.items.get(3).text();
+        String name = answer.items.get(4).text();
+        String full = answer.items.get(5).text();
+        long parent = Long.parseLong(answer.items.get(6).text());
+        if ("<root>".equals(name) || "<_root_>".equals(name) || "<empty>".equals(name)) {
+            Object root = call(mirror, "EmptyPackageClass", 0);
+            sourceSymbols.put(id, root);
+            sourceSymbolIds.put(root, id);
+            return root;
+        }
+        Object owner = parent == 0 ? call(mirror, "EmptyPackageClass", 0) : sourceSymbol(parent);
+        Object internal = call(universe, "internal", 0);
+        Object pos = call(universe, "NoPosition", 0);
+        long flags = flagsOf(answer.items.get(7));
+        Object symbol;
+        if ("Package".equals(kind) || "ModuleClass".equals(kind) || "Module".equals(kind)) {
+            if ("Package".equals(kind)) flags |= internalFlag("PACKAGE");
+            String simple = name.endsWith("$") ? name.substring(0, name.length() - 1) : name;
+            flags |= internalFlag("MODULE");
+            Object module = newSourceSymbol("ModuleSymbol", owner, termName(simple), pos, flags);
+            Object moduleClass = newSourceSymbol("ModuleClassSymbol", owner, typeName(simple), pos,
+                flags & internalFlag("ModuleToClassFlags"));
+            call(universe, "connectModuleToClass", 2, module, moduleClass);
+            symbol = "Module".equals(kind) ? module : moduleClass;
+        } else if ("Class".equals(kind)) {
+            Object existing = synthetic.get(full);
+            symbol = existing == null
+                ? newSourceSymbol("ClassSymbol", owner, typeName(name), pos, flags)
+                : call(existing, "typeSymbol", 0);
+        } else if ("Method".equals(kind)) {
+            symbol = newSourceSymbol("MethodSymbol", owner, termName(name), pos, flags | internalFlag("METHOD"));
+        } else if ("Term".equals(kind)) {
+            symbol = newSourceSymbol("TermSymbol", owner, termName(name), pos, flags);
+        } else {
+            throw gap("macro mirror cannot describe source symbol kind " + kind);
+        }
+        sourceSymbols.put(id, symbol);
+        sourceSymbolIds.put(symbol, id);
+        if ("Class".equals(kind) || "ModuleClass".equals(kind)) {
+            Object prefix = Boolean.TRUE.equals(call(owner, "isClass", 0))
+                ? call(internal, "thisType", 1, owner) : call(universe, "NoPrefix", 0);
+            Object tpe = call(internal, "typeRef", 3, prefix, symbol, list(new ArrayList<>()));
+            synthetic.put(full, tpe);
+        }
+        Object lazy = lazyInfoConstructor().newInstance(universe, Long.valueOf(id));
+        call(symbol, "setInfo", 1, lazy);
+        return symbol;
+    }
+
+    /** Compiler-owned symbols may change lexical owners. Runtime classpath
+     * symbols must never be mutated. Scala's normal runtime owner setter refuses
+     * all changes; these private symbol adapters implement that operation only for
+     * the fresh source mirror symbols owned by this serial compiler exchange. */
+    static Object newSourceSymbol(String kind, Object owner, Object name, Object pos, long flags) throws Exception {
+        Class<?> adapter = sourceSymbolClasses.get(kind);
+        if (adapter == null) {
+            Object internal = call(universe, "internal", 0);
+            Object prototype;
+            if (kind.equals("ModuleSymbol") || kind.equals("ModuleClassSymbol")) {
+                Object pair = call(internal, "newModuleAndClassSymbol", 4, owner, name, pos, Long.valueOf(flags));
+                prototype = call(pair, kind.equals("ModuleSymbol") ? "_1" : "_2", 0);
+            } else {
+                String factory = kind.equals("MethodSymbol") ? "newMethodSymbol"
+                    : kind.equals("TermSymbol") ? "newTermSymbol" : "newClassSymbol";
+                prototype = call(internal, factory, 4, owner, name, pos, Long.valueOf(flags));
+            }
+            Class<?> template = prototype.getClass();
+            if (!template.getName().startsWith("scala.reflect.runtime.SynchronizedSymbols$")) {
+                throw gap("unsupported source-symbol runtime implementation " + template.getName());
+            }
+            byte[] data = synchronizedSymbolAdapter(template, "ScalaRsSource" + kind);
+            class SourceLoader extends ClassLoader {
+                SourceLoader() { super(macroCl); }
+                Class<?> define(byte[] bytes) { return defineClass(null, bytes, 0, bytes.length); }
+            }
+            adapter = new SourceLoader().define(data);
+            sourceSymbolClasses.put(kind, adapter);
+        }
+        Object symbol = adapter.getConstructors()[0].newInstance(owner, pos, name);
+        mutableSourceSymbols.add(symbol);
+        call(symbol, "setFlag", 1, Long.valueOf(flags));
+        return symbol;
+    }
+
+    /** Preserve the runtime's actual synchronization mixins and constructor.
+     * Its anonymous classes are final, so copy that classfile under a private
+     * name and add exactly one owner setter. All other methods/fields remain
+     * those of the loaded scala-reflect implementation. */
+    static byte[] synchronizedSymbolAdapter(Class<?> template, String renamed) throws Exception {
+        String original = template.getName().replace('.', '/');
+        java.io.InputStream resource = template.getResourceAsStream("/" + original + ".class");
+        if (resource == null) throw gap("missing source-symbol classfile " + original);
+        try (java.io.DataInputStream in = new java.io.DataInputStream(resource)) {
+            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+            java.io.DataOutputStream d = new java.io.DataOutputStream(buffer);
+            if (in.readInt() != 0xcafebabe) throw gap("invalid source-symbol classfile");
+            d.writeInt(0xcafebabe); d.writeShort(in.readUnsignedShort()); d.writeShort(in.readUnsignedShort());
+            int count = in.readUnsignedShort();
+            if (count > 65526) throw gap("source-symbol constant pool is full");
+            d.writeShort(count + 9);
+            String[] strings = new String[count];
+            for (int i = 1; i < count; i++) {
+                int tag = in.readUnsignedByte(); d.writeByte(tag);
+                switch (tag) {
+                    case 1:
+                        strings[i] = in.readUTF();
+                        d.writeUTF(strings[i].replace(original, renamed));
+                        break;
+                    case 3: case 4: case 9: case 10: case 11: case 12: case 18: case 17:
+                        d.writeInt(in.readInt()); break;
+                    case 5: case 6:
+                        d.writeLong(in.readLong()); i++; break;
+                    case 7: case 8: case 16: case 19: case 20:
+                        d.writeShort(in.readUnsignedShort()); break;
+                    case 15:
+                        d.writeByte(in.readUnsignedByte()); d.writeShort(in.readUnsignedShort()); break;
+                    default: throw gap("unsupported source-symbol constant pool tag " + tag);
+                }
+            }
+            utf(d, "owner_$eq"); utf(d, "(Lscala/reflect/internal/Symbols$Symbol;)V");
+            utf(d, "ScalaRsMacroEngine"); pair(d, 7, count + 2, 0);
+            utf(d, "changeSourceOwner"); utf(d, "(Ljava/lang/Object;Ljava/lang/Object;)V");
+            pair(d, 12, count + 4, count + 5); pair(d, 10, count + 3, count + 6); utf(d, "Code");
+            d.writeShort(in.readUnsignedShort()); d.writeShort(in.readUnsignedShort()); d.writeShort(in.readUnsignedShort());
+            int interfaces = in.readUnsignedShort(); d.writeShort(interfaces);
+            for (int i = 0; i < interfaces; i++) d.writeShort(in.readUnsignedShort());
+            int fields = in.readUnsignedShort(); d.writeShort(fields);
+            for (int i = 0; i < fields; i++) copyMember(in, d);
+            int methods = in.readUnsignedShort();
+            List<byte[]> kept = new ArrayList<>();
+            for (int i = 0; i < methods; i++) {
+                java.io.ByteArrayOutputStream method = new java.io.ByteArrayOutputStream();
+                java.io.DataOutputStream m = new java.io.DataOutputStream(method);
+                int access = in.readUnsignedShort(), name = in.readUnsignedShort(), desc = in.readUnsignedShort();
+                m.writeShort(access); m.writeShort(name); m.writeShort(desc); copyAttributes(in, m);
+                if (!("owner_$eq".equals(strings[name]) && "(Lscala/reflect/internal/Symbols$Symbol;)V".equals(strings[desc]))) kept.add(method.toByteArray());
+            }
+            d.writeShort(kept.size() + 1);
+            for (byte[] method : kept) d.write(method);
+            int target = count + 7;
+            code(d, count, count + 1, count + 8, 2, 2,
+                new byte[]{0x2a,0x2b,(byte)0xb8,(byte)(target >>> 8),(byte)target,(byte)0xb1});
+            copyAttributes(in, d);
+            d.flush(); return buffer.toByteArray();
+        }
+    }
+
+    static void copyMember(java.io.DataInputStream in, java.io.DataOutputStream out) throws java.io.IOException {
+        out.writeShort(in.readUnsignedShort()); out.writeShort(in.readUnsignedShort()); out.writeShort(in.readUnsignedShort());
+        copyAttributes(in, out);
+    }
+    static void copyAttributes(java.io.DataInputStream in, java.io.DataOutputStream out) throws java.io.IOException {
+        int count = in.readUnsignedShort(); out.writeShort(count);
+        for (int i = 0; i < count; i++) {
+            out.writeShort(in.readUnsignedShort()); int length = in.readInt();
+            if (length < 0) throw new java.io.IOException("invalid classfile attribute length");
+            byte[] data = new byte[length]; in.readFully(data); out.writeInt(length); out.write(data);
+        }
+    }
+
+    public static void changeSourceOwner(Object symbol, Object next) throws Exception {
+        synchronized (mutableSourceSymbols) {
+            if (!mutableSourceSymbols.contains(symbol)) throw gap("cannot change a runtime classpath symbol's owner");
+            // Match Symbol.owner_=, including originalOwner bookkeeping. The
+            // actual reflection ChangeOwnerTraverser still performs the tree
+            // traversal and also moves a module's class, as nsc does.
+            call(universe, "saveOriginalOwner", 1, symbol);
+            java.lang.reflect.Field owner = Class.forName("scala.reflect.internal.Symbols$Symbol", true, macroCl)
+                .getDeclaredField("_rawowner");
+            owner.setAccessible(true);
+            owner.set(symbol, next);
+        }
+    }
+
+    static long internalFlag(String name) throws Exception {
+        Object flags = Class.forName("scala.reflect.internal.Flags$", true, macroCl).getField("MODULE$").get(null);
+        return ((Number) call(flags, name, 0)).longValue();
+    }
+
+    /** Called by the generated LazyType subclass when reflection forces info. */
+    public static void completeMirrorSymbol(long id, Object symbol) throws Exception {
+        Sexp answer = query("(q symbolInfo " + id + ")");
+        Object info = sourceInfo(symbol, answer.items.get(2));
+        call(symbol, "setInfo", 1, info);
+    }
+
+    static Object sourceInfo(Object owner, Sexp s) throws Exception {
+        String kind = s.items.get(0).text();
+        Object internal = call(universe, "internal", 0);
+        if ("notype".equals(kind)) return call(universe, "NoType", 0);
+        if ("nullary".equals(kind)) return call(internal, "nullaryMethodType", 1, sourceInfo(owner, s.items.get(1)));
+        if ("method".equals(kind)) {
+            List<Object> params = new ArrayList<>();
+            for (Sexp arg : s.items.get(1).items.subList(1, s.items.get(1).items.size())) {
+                Object param = sourceSymbol(Long.parseLong(arg.items.get(1).text()));
+                call(param, "setInfo", 1, typeFor(arg.items.get(2)));
+                params.add(param);
+            }
+            return call(internal, "methodType", 2, list(params), sourceInfo(owner, s.items.get(2)));
+        }
+        if ("classinfo".equals(kind)) {
+            List<Object> parents = new ArrayList<>();
+            for (Sexp ty : s.items.get(1).items.subList(1, s.items.get(1).items.size())) parents.add(typeFor(ty));
+            List<Object> decls = new ArrayList<>();
+            Object tpe = call(internal, "typeRef", 3, call(universe, "NoPrefix", 0), owner, list(new ArrayList<>()));
+            for (Sexp decl : s.items.get(2).items.subList(1, s.items.get(2).items.size())) decls.add(declSymbol(owner, tpe, decl));
+            return call(internal, "classInfoType", 3, list(parents), call(internal, "newScopeWith", 1, seq(decls)), owner);
+        }
+        return typeFor(s);
+    }
+
+    /** A small Java-5 classfile lets the reflection-only bridge subclass
+     * Scala's LazyType without depending on Scala jars at javac time. It only
+     * stores a source ID and forwards completion; no type is fabricated. */
+    static Constructor<?> lazyInfoConstructor() throws Exception {
+        if (lazyInfoClass == null) {
+            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+            java.io.DataOutputStream d = new java.io.DataOutputStream(bytes);
+            d.writeInt(0xcafebabe); d.writeShort(0); d.writeShort(49); d.writeShort(25);
+            utf(d, "ScalaRsMacroLazyInfo"); pair(d, 7, 1, 0);
+            utf(d, "scala/reflect/internal/Types$LazyType"); pair(d, 7, 3, 0);
+            utf(d, "scala/reflect/internal/Types$FlagAgnosticCompleter"); pair(d, 7, 5, 0);
+            utf(d, "id"); utf(d, "J"); utf(d, "<init>");
+            utf(d, "(Lscala/reflect/internal/SymbolTable;J)V"); utf(d, "Code");
+            utf(d, "(Lscala/reflect/internal/SymbolTable;)V"); pair(d, 12, 9, 12); pair(d, 10, 4, 13);
+            pair(d, 12, 7, 8); pair(d, 9, 2, 15);
+            utf(d, "complete"); utf(d, "(Lscala/reflect/internal/Symbols$Symbol;)V");
+            utf(d, "ScalaRsMacroEngine"); pair(d, 7, 19, 0);
+            utf(d, "completeMirrorSymbol"); utf(d, "(JLjava/lang/Object;)V"); pair(d, 12, 21, 22); pair(d, 10, 20, 23);
+            d.writeShort(0x31); d.writeShort(2); d.writeShort(4);
+            d.writeShort(1); d.writeShort(6);
+            d.writeShort(1); d.writeShort(0x12); d.writeShort(7); d.writeShort(8); d.writeShort(0);
+            d.writeShort(2);
+            code(d, 9, 10, 3, 4, new byte[]{0x2a,0x2b,(byte)0xb7,0,14,0x2a,0x20,(byte)0xb5,0,16,(byte)0xb1});
+            code(d, 17, 18, 3, 2, new byte[]{0x2a,(byte)0xb4,0,16,0x2b,(byte)0xb8,0,24,(byte)0xb1});
+            d.writeShort(0); d.flush();
+            class AdapterLoader extends ClassLoader {
+                AdapterLoader() { super(macroCl); }
+                Class<?> define(byte[] data) { return defineClass(null, data, 0, data.length); }
+            }
+            lazyInfoClass = new AdapterLoader().define(bytes.toByteArray());
+        }
+        return lazyInfoClass.getConstructors()[0];
+    }
+
+    static void utf(java.io.DataOutputStream d, String text) throws java.io.IOException { d.writeByte(1); d.writeUTF(text); }
+    static void pair(java.io.DataOutputStream d, int tag, int a, int b) throws java.io.IOException {
+        d.writeByte(tag); d.writeShort(a); if (tag != 7) d.writeShort(b);
+    }
+    static void code(java.io.DataOutputStream d, int name, int desc, int stack, int locals, byte[] bytes) throws java.io.IOException {
+        code(d, name, desc, 11, stack, locals, bytes);
+    }
+    static void code(java.io.DataOutputStream d, int name, int desc, int codeName, int stack, int locals, byte[] bytes) throws java.io.IOException {
+        d.writeShort(1); d.writeShort(name); d.writeShort(desc); d.writeShort(1);
+        d.writeShort(codeName); d.writeInt(12 + bytes.length); d.writeShort(stack); d.writeShort(locals);
+        d.writeInt(bytes.length); d.write(bytes); d.writeShort(0); d.writeShort(0);
+    }
+
     // -------------------------------------------------------------- Context
 
     /** `c.abort` -- the macro asked for a compile error at a position. */
@@ -1086,10 +1407,33 @@ public final class ScalaRsMacroEngine {
         String appWhy;
         /** Built once: `prefix` is a `val` in nsc and is read more than once. */
         Object prefix;
+        Object internalProxy;
 
         public Object invoke(Object proxy, Method m, Object[] a) throws Throwable {
             String n = m.getName();
             int arity = m.getParameterCount();
+            if (n.equals("internal") && arity == 0) {
+                if (internalProxy == null) {
+                    Class<?> api = Class.forName("scala.reflect.macros.Internals$ContextInternalApi", true, macroCl);
+                    internalProxy = Proxy.newProxyInstance(macroCl, new Class<?>[]{api}, (p, method, args) -> {
+                        if (method.getName().equals("enclosingOwner") && method.getParameterCount() == 0) {
+                            Sexp answer = query("(q enclosingOwner)");
+                            return sourceSymbol(Long.parseLong(answer.items.get(2).text()));
+                        }
+                        if (method.getName().equals("scala$reflect$macros$Internals$ContextInternalApi$$$outer")) return proxy;
+                        Object implementation = call(universe, "internal", 0);
+                        try {
+                            return call(implementation, method.getName(), method.getParameterCount(),
+                                args == null ? new Object[0] : args);
+                        } catch (InvocationTargetException wrapped) {
+                            throw wrapped.getCause();
+                        } catch (NoSuchMethodException missing) {
+                            throw gap("Context.internal." + method.getName() + " is not implemented");
+                        }
+                    });
+                }
+                return internalProxy;
+            }
             if (n.equals("prefix") && arity == 0) {
                 if (prefixTree == null) {
                     throw new UnsupportedOperationException(
@@ -1340,7 +1684,8 @@ public final class ScalaRsMacroEngine {
     }
 
     static String describe(Throwable t) {
-        while (t instanceof InvocationTargetException && t.getCause() != null) {
+        while ((t instanceof InvocationTargetException || t instanceof java.lang.reflect.UndeclaredThrowableException)
+                && t.getCause() != null) {
             t = t.getCause();
         }
         String m = t.getMessage();

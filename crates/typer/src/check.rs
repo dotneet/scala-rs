@@ -490,6 +490,10 @@ pub struct Typer {
     /// (`crates/typer/src/expand.rs`, `synthType`); this is how the type is
     /// recognised again in the tree that comes back.
     pub(crate) macro_local_tags: HashMap<String, scala_rs_parser::Type>,
+    /// Lexical ownership exposed to the macro mirror, independent of JVM storage owners.
+    pub(crate) macro_lexical_owner: SymbolId,
+    pub(crate) macro_mirror_owners: HashMap<SymbolId, SymbolId>,
+    pub(crate) macro_function_symbols: HashMap<NodeId, SymbolId>,
     /// Set once any `def f = macro Impl.m` in this run has been resolved.
     /// `type_expr` asks about macro expansion on *every* expression, and
     /// walking an application's spine to find out is not free; almost no
@@ -1012,6 +1016,9 @@ impl Typer {
             macro_rpc_span: Span::DUMMY,
             macro_undescribed: Vec::new(),
             macro_local_tags: HashMap::new(),
+            macro_lexical_owner: SymbolId::NONE,
+            macro_mirror_owners: HashMap::new(),
+            macro_function_symbols: HashMap::new(),
             has_macro_defs: false,
             parent_ctor_scope: false,
             class_bound_evidence_types: HashMap::new(),

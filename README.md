@@ -1119,7 +1119,10 @@ Anonymous ClassDef expansion remains unsupported and diagnoses explicitly.
 The macro transport integration candidate adds structural argument/expansion
 roundtrips, repeated macro arguments, source positions, attachment preservation,
 and `c.untypecheck`. It also repairs private macro access across binary APIs and
-qualified Context.Expr tag materialization. `macrotransportbatch` executes both
+qualified Context.Expr tag materialization. Source symbol identities and lexical
+owners survive reverse typechecks, and both changeOwner entry points operate on
+fresh source symbols. Macro console output is carried separately from tree
+replies. `macrotransportbatch` executes both
 compiler directions against scalac 2.13.16; whitebox inference and general
 pattern/anonymous-class expansion remain incomplete. See the
 [batch inventory](docs/batches/macro-transport.md) and

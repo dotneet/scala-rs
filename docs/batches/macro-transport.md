@@ -154,3 +154,44 @@ NoSymbol/NoType owner is not acceptable. Keep this difficult protocol change
 separate during implementation, then validate the composed batch (all existing
 regressions, the two ownership probes and the complete gate). Main remains at
 accepted95ccb3bc; this work is not merge-ready and has no new full-gate verdict.
+
+
+### Ownership implementation follow-up (not yet gated)
+
+The ownership probe's initial hypothesis was incomplete: transmitting owners
+alone is insufficient because scala-reflect runtime Symbol.owner_= explicitly
+refuses mutation. Real ChangeOwnerTraverser can now operate on private source
+mirror adapters preserving the loaded runtime's synchronized implementation.
+Source info is lazy, and the separate recursive-owner-info negative probe still
+fails. The compiler does not substitute a dummy owner or bypass changeOwner.
+
+`owner-current-v6/` records the actual worktree binary: both ownership sequences
+match nsc, the valid Java verifier run prints 42 twice, recursive inferred owner
+info is refused, and t12576 compiles. `owner-current-v5/` accidentally invoked
+main's binary due to its inherited working directory; those results are not
+candidate evidence. The v6 runner uses the explicit integration worktree cwd.
+
+The first grouped related test run found two neighboring failures before a full
+gate: constructing ThisType for a local class's val/method owner and losing an
+already-allocated local method when retyping a block. Corrections use NoPrefix
+for non-class owners and re-enter existing hoisted declarations in rebuilt
+block scopes. The permanent owner fixture also checks local methods, repeated
+function typechecking, both changeOwner routes and UTF-8 console transport.
+Fresh grouped validation is in progress; no new full-gate verdict is claimed.
+
+
+Ownership follow-up verification before the full gate:
+
+- `owner-suites-v2.log`: 24 passed in the four revised suites, including all six
+  macrotransport tests. `prerequisites-v3/related-final-{0,1}.log`: 828 passed in
+  the other 36 related suites. Together: 852 passed, zero failed, 40 suites.
+- `t12576-owned-runtime/`: both compilers rebuild the original macro and consumer
+  sources; Java -Xverify:all succeeds and stdout is byte-identical `List()\n`.
+- `ownership-evidence/`: accepted230 rejects the new valid ownership fixture.
+- `owner-preflight.log`: four pinned sources, 121 jars, 33 Java support classes
+  and 1498 reference classes pass the integrity check.
+- `owner-clippy-compare.json`: 57 existing warnings, no added or removed warning.
+- `prerequisites-v3/` fixes the tested binary at SHA256
+  `e85f6f92b424e205e19227a972b81e7a89e8f52e8faec30f466e45831a710cd2`.
+  The 452 selected pos/run rows have zero losses. The full negative prerequisite
+  is still running at this checkpoint. No whole-corpus or merge PASS is claimed.

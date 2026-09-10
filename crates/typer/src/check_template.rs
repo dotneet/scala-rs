@@ -126,6 +126,12 @@ impl Typer {
     }
 
     pub(crate) fn type_class(&mut self, tree: &mut Tree) {
+        let saved = self.macro_enter_owner(tree.sym);
+        self.type_class_with_macro_owner(tree);
+        self.macro_lexical_owner = saved;
+    }
+
+    fn type_class_with_macro_owner(&mut self, tree: &mut Tree) {
         let id = tree.sym;
         if let TreeKind::ClassDef { mods, vparamss, .. } = &tree.kind {
             if mods.flags.contains(Flags::IMPLICIT) {
@@ -667,6 +673,12 @@ impl Typer {
     }
 
     pub(crate) fn type_module(&mut self, tree: &mut Tree) {
+        let saved = self.macro_enter_owner(self.st.module_class_of(tree.sym));
+        self.type_module_with_macro_owner(tree);
+        self.macro_lexical_owner = saved;
+    }
+
+    fn type_module_with_macro_owner(&mut self, tree: &mut Tree) {
         let m = tree.sym;
         let cls = match self.st.get(m).ty {
             Type::ModuleRef(c) => c,
