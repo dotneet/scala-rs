@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `176629aa` |
+| commit | `a7f05f48` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Eighty-one slices have merged this session**, in thirty-seven accepted composed gates.
+**Eighty-two slices have merged this session**, in thirty-eight accepted composed gates.
 Thirteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -60,6 +60,7 @@ coordinator measured the merged tree each time, not the branches.
 | `caf8f284` | `early lexical scopes` | 217 -> **202** | 158 |
 | `02317f15` | `inherited factory redirect` | 202 -> **192** | 158 |
 | `176629aa` | `partial factory inference` | 192 -> **191** | 158 -> **152** |
+| `a7f05f48` | `App and DelayedInit identities` | 191 | 152 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -294,8 +295,11 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 | `run` (2060) | **643** | 864 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-176629aa.tsv`](baselines/corpus-176629aa.tsv): 5324 unique
+[`baselines/corpus-a7f05f48.tsv`](baselines/corpus-a7f05f48.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `a7f05f48` gate compared against `corpus-176629aa.tsv`: **losses=0,
+changes=0**.
+
 The `176629aa` gate compared against `corpus-02317f15.tsv`: **losses=0,
 changes=1**, the runtime gain `var-arity-class-symbol`.
 
@@ -393,7 +397,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **293 result rows, 2701 passed, 0 failed** at `176629aa` |
+| `cargo test --workspace --release --no-fail-fast` | **294 result rows, 2702 passed, 0 failed** at `a7f05f48` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -1867,3 +1871,47 @@ support classes and 1498 scalac reference classes. Monitoring retained one
 live handle through DONE. Gitbucket and cats still do not fully compile.
 The separately reproduced user-defined App initialization collision and
 class-directory implicit metadata loss remain open investigations.
+
+
+## Gate thirty-eight: App and DelayedInit runtime identities
+
+Clean `a7f05f48`, based on main `6409e88f`, passed the complete unskipped
+gate with `VERDICT=PASS`, `DONE`, corpus losses=0 and changes=0. Logs:
+`/tmp/scala-rs-gate-a7f05f48-codex/gate.log`. Main was fast-forwarded to
+that exact tested commit. The recording commit changes only BASELINE and
+the raw corpus ledger; all compiler sources and tests match the gated tree.
+
+All four compile measures are unchanged: gitbucket 191/63, cats 152/58,
+library 460/119; Slick 184 sources, zero errors and 1492 classes. The three
+error-message multisets exactly match accepted `176629aa`. Slick MODE=b
+passes 12/12 programs and 36/36 attempts. Subset validates all 1492 classes,
+failed 0 and lint problems 0. Strong initialization verification with the
+real PostgreSQL and Oracle drivers loads all 1492 retained classes, failed
+0 and incomplete 0. Class output and `verify-all.log` are retained in the
+gate directory.
+
+Workspace: 2702 passed, zero failed, 294 rows. Format passes. Release
+workspace clippy retains exactly 57 warning messages with no additions.
+All 5324 corpus identities are unchanged: pos 1118/396/345,
+neg 700/336/369, run 643/864/553 (pass/fail/skip). Raw ledger:
+`tests/baselines/corpus-a7f05f48.tsv`.
+
+The backend selected Scala initialization protocols by the simple parent
+names App and DelayedInit. A user-defined same-named trait therefore caused
+calls to scala.App.$init$ or a nonexistent delayedInit method. The accepted
+pre-fix compiler compiles both reductions but throws IncompatibleClassChangeError
+for App and NoSuchMethodError for DelayedInit. The repair compares fully
+qualified JVM identities throughout the parent traversal. New fixtures cover
+indirect user App inheritance, anonymous implementations, same-named
+DelayedInit, and real scala.App and scala.DelayedInit. Their outputs match
+real scalac byte for byte under JVM -Xverify:all, in both real-library and
+private-runtime modes. A wrong assignment to scala.App remains rejected.
+The independent DelayedInit reduction is in `/tmp/scala-rs-app-identity-probe`.
+
+Before the gate, the new runtime test and 397 existing E2E tests passed;
+all 18 historical corpus identities matched the baseline. Preflight checked
+four pinned source trees, 121 jars, 33 Java support classes and 1498 scalac
+reference classes. One owned live handle was monitored through DONE.
+This fixes the App collision left open by gate thirty-seven despite moving
+none of the four compile counts or corpus totals. Class-directory signature
+metadata loss remains an open investigation; gitbucket and cats are incomplete.
