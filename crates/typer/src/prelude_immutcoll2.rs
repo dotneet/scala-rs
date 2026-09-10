@@ -424,7 +424,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         st,
         map,
         "apply",
-        vec![Type::Any],
+        vec![tk.clone()],
         tv.clone(),
         Intrinsic::None,
     );
@@ -432,7 +432,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         st,
         map,
         "get",
-        vec![Type::Any],
+        vec![tk.clone()],
         Type::Class {
             sym: st.option_sym,
             args: vec![tv.clone()],
@@ -443,7 +443,7 @@ pub(crate) fn add_map_and_vector(st: &mut SymbolTable) {
         st,
         map,
         "updated",
-        vec![Type::Any, Type::Any],
+        vec![tk.clone(), Type::Any],
         map_t.clone(),
         Intrinsic::None,
     );

@@ -821,7 +821,7 @@ fn add_immutable_map_extra(
         st,
         map,
         "getOrElse",
-        vec![Type::Any, Type::ByName(Box::new(tv.clone()))],
+        vec![tk.clone(), Type::ByName(Box::new(tv.clone()))],
         tv.clone(),
         Intrinsic::None,
     );
@@ -829,7 +829,7 @@ fn add_immutable_map_extra(
         st,
         map,
         "contains",
-        vec![Type::Any],
+        vec![tk.clone()],
         Type::Boolean,
         Intrinsic::None,
     );

@@ -24,6 +24,8 @@ makes no claim of conformance to the language specification. What exists today:
   Parameterless results infer their lower bounds in value position; explicit
   and omitted apply both retain factory receiver inference until the arguments.
   Selection qualifiers defer that value-position inference, including aliases.
+- Immutable Map lookup and update members require the declared key type,
+  preserving implicit key conversions and independent value widening.
 - Directory classpaths complete Scala member signatures and parameterized
   parents before selection, preserving implicit and curried argument clauses.
 - Scala App and DelayedInit initialization protocols are selected by their

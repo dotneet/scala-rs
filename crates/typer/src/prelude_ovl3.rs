@@ -166,8 +166,7 @@ fn widen_option(st: &mut SymbolTable) {
 }
 
 /// `getOrElse[V1 >: V](key: K, default: => V1): V1` on every `Map` the prelude
-/// declares it on. The key parameter is left exactly as it was — the immutable
-/// `Map` types it `Any`, which is a separate (deliberate) approximation.
+/// declares it on. Preserve the declared key type while widening only the value.
 fn widen_map_get_or_else(st: &mut SymbolTable) {
     for jvm in [
         "scala/collection/immutable/Map",

@@ -276,12 +276,7 @@ enum Side {
 /// rejected by scalac. Map is covariant in `V`, so nothing downstream of an
 /// ascription to `Map[K, Animal]` could have noticed.
 ///
-/// The key parameter is left exactly as it was — `Any` rather than `K` — which
-/// is the same deliberate approximation `prelude_ovl3::widen_map_get_or_else`
-/// records for `getOrElse`. It is a real divergence (`md.updated(1, dog)` is
-/// accepted here and rejected by nsc) and it is not this slice's: tightening
-/// it is a change to five members at once and has nothing to do with the lower
-/// bound.
+/// Preserve the declared key type while widening only the value.
 ///
 /// Erasure is unchanged: `V1` erases to `java/lang/Object` exactly as `V` did.
 fn install_map_add(st: &mut SymbolTable) {
