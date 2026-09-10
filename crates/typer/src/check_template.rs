@@ -1990,7 +1990,9 @@ impl Typer {
         // Java fields carry no Scala mutability, and the compiler's own
         // synthetic terms (`$outer`, capture fields, …) are written by the
         // phases that create them.
-        if s.flags.contains(Flags::JAVA) || s.flags.contains(Flags::SYNTHETIC) {
+        if (s.flags.contains(Flags::JAVA) && !s.flags.contains(Flags::FINAL))
+            || s.flags.contains(Flags::SYNTHETIC)
+        {
             return;
         }
         // What the left side actually resolved to. `Term` is the immutable
@@ -2242,29 +2244,43 @@ impl Typer {
             if !info.tparams.is_empty() {
                 continue;
             }
-            let name = info.name.clone();
-            let Some(found) = self
-                .st
-                .lookup_member(owner, &name)
-                .into_iter()
-                .find(|&s| s != m && self.st.get(s).kind == SymKind::TypeMember)
-            else {
+            // A prefixed abstract member belongs to that particular value,
+            // not to a same-named lexical alias on this receiver.
+            if self.st.path_member_decl(m).is_some() {
                 continue;
-            };
-            let seen = self.st.dealias(&Type::TypeMember(found));
-            // Only the newly exposed alias needs substitution. Reapplying it
-            // to the entire result can turn an existing Try[R] into Try[Try[R]].
-            let recv = Type::Class {
-                sym: owner,
-                args: self
-                    .st
-                    .get(owner)
-                    .tparams
-                    .iter()
-                    .map(|p| Type::TypeParam(*p))
-                    .collect(),
-            };
-            let seen = self.st.subst_as_seen_from(&recv, &seen);
+            }
+            let name = info.name.clone();
+            let declaration_owner = info.owner;
+            let mut context = owner;
+            let mut replacement = None;
+            let mut visited = std::collections::HashSet::new();
+            while !context.is_none() && visited.insert(context) {
+                if self.st.get(context).is_class_like()
+                    && (context == declaration_owner
+                        || self.st.is_ancestor_of(declaration_owner, context))
+                {
+                    if let Some(found) = self
+                        .st
+                        .lookup_member(context, &name)
+                        .into_iter()
+                        .find(|s| *s != m && self.st.get(*s).kind == SymKind::TypeMember)
+                    {
+                        let seen = self.st.dealias(&Type::TypeMember(found));
+                        // A locally declared alias already refers to its lexical
+                        // variables. Substituting it through this receiver's
+                        // ancestors again can replace outer Eval.this.A with B.
+                        replacement = Some(if self.st.get(found).owner == context {
+                            seen
+                        } else {
+                            let recv = self.st.self_type_of_class(context);
+                            self.st.subst_as_seen_from(&recv, &seen)
+                        });
+                        break;
+                    }
+                }
+                context = self.st.get(context).owner;
+            }
+            let Some(seen) = replacement else { continue };
             if seen.is_no_type()
                 || seen.is_error()
                 || matches!(&seen, Type::TypeMember(x) if *x == m)

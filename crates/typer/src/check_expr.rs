@@ -1447,8 +1447,15 @@ impl Typer {
                     self.type_expr(tree, pt);
                     return;
                 }
-                self.type_expr(rhs, &lhs.ty);
-                self.adapt(rhs, &lhs.ty);
+                // Java Object storage accepts primitive boxing; reading it
+                // remains AnyRef. A substituted generic field is not Object.
+                let write_ty = if !lhs.sym.is_none() && self.st.get(lhs.sym).java_object_field {
+                    Type::Any
+                } else {
+                    lhs.ty.clone()
+                };
+                self.type_expr(rhs, &write_ty);
+                self.adapt(rhs, &write_ty);
                 self.check_reassignment(lhs);
                 tree.ty = Type::Unit;
             }

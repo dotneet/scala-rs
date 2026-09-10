@@ -2207,10 +2207,121 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// An abstract var has a setter as well as a getter. The setter accepts
+    /// the erased parent type and forwards to the concrete field's accessor.
+    fn emit_var_erasure_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            for &pid in &self.st.get(parent).members {
+                let ps = self.st.get(pid);
+                if ps.flags.contains(Flags::PRIVATE) || ps.flags.contains(Flags::STATIC) {
+                    continue;
+                }
+                let (field_name, parent_ty) = match ps.kind {
+                    SymKind::Term if ps.flags.contains(Flags::MUTABLE) => {
+                        (ps.name.as_str(), ps.ty.clone())
+                    }
+                    SymKind::Method => {
+                        let Some(name) = ps
+                            .name
+                            .strip_suffix("_=")
+                            .or_else(|| ps.name.strip_suffix("_$eq"))
+                        else {
+                            continue;
+                        };
+                        let params = method_params_from_sym(self.st, pid);
+                        if params.len() != 1 {
+                            continue;
+                        }
+                        (name, params[0].clone())
+                    }
+                    _ => continue,
+                };
+                let Some(cid) = self.st.get(class_id).members.iter().copied().find(|&id| {
+                    let s = self.st.get(id);
+                    s.kind == SymKind::Term
+                        && s.name == field_name
+                        && s.flags.contains(Flags::MUTABLE)
+                        && !s.flags.contains(Flags::PRIVATE)
+                }) else {
+                    continue;
+                };
+                let child_ty = &self.st.get(cid).ty;
+                let name = var_setter_name(field_name);
+                let pdesc = format!("({})V", jvm_desc_val(self.st, &parent_ty));
+                let cdesc = format!("({})V", jvm_desc_val(self.st, child_ty));
+                if pdesc == cdesc
+                    || b.methods.iter().any(|m| m.name == name && m.desc == pdesc)
+                    || !b.methods.iter().any(|m| {
+                        m.name == name
+                            && m.desc == cdesc
+                            && m.code.is_some()
+                            && m.access & ACC_STATIC == 0
+                    })
+                {
+                    continue;
+                }
+                let adapt = param_adapt(self.st, &parent_ty, child_ty);
+                let vc = self.st.value_class_terms.get(&cid).map(|&c| {
+                    let under = self.st.value_class_underlying(c).unwrap();
+                    (
+                        class_internal(self.st, c),
+                        self.st.value_class_getter(c).to_string(),
+                        format!("(){}", jvm_desc(self.st, &under)),
+                    )
+                });
+                let cn = b.this_name.clone();
+                let sort = jvm_slot_sort(&parent_ty);
+                b.add_code(
+                    ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE,
+                    &name,
+                    &pdesc,
+                    1 + sort.slots(),
+                    |asm| {
+                        asm.aload(0);
+                        load(asm, 1, sort);
+                        if let Some((class, getter, desc)) = &vc {
+                            asm.checkcast(class);
+                            asm.invokevirtual(class, getter, desc);
+                        } else {
+                            emit_adapt(asm, &adapt);
+                        }
+                        asm.invokevirtual(&cn, &name, &cdesc);
+                        asm.vreturn();
+                    },
+                );
+            }
+        }
+    }
+
     pub(crate) fn emit_erasure_bridges(&self, b: &mut ClassBuilder, class_id: SymbolId) {
         if class_id.is_none() {
             return;
         }
+        self.emit_var_erasure_bridges(b, class_id);
+        // Terms implement parameterless members through their emitted getter.
+        // In particular an abstract `val value: T` erases to Object even when
+        // a concrete `type T = Int; val value = 7` implements it with ()I.
+        let params_of = |id| {
+            if self.st.get(id).kind == SymKind::Term {
+                Vec::new()
+            } else {
+                method_params_from_sym(self.st, id)
+            }
+        };
+        let ret_of = |id| {
+            if self.st.get(id).kind == SymKind::Term {
+                self.st.get(id).ty.clone()
+            } else {
+                method_ret_from_sym(self.st, id)
+            }
+        };
+        let desc_of = |id| {
+            if self.st.get(id).kind == SymKind::Term {
+                format!("(){}", jvm_desc(self.st, &self.st.get(id).ty))
+            } else {
+                method_desc_from_sym(self.st, id)
+            }
+        };
         let class_name = b.this_name.clone();
         let existing: HashSet<(String, String)> = b
             .methods
@@ -2223,7 +2334,18 @@ impl<'a> Gen<'a> {
             .members
             .iter()
             .copied()
-            .filter(|&id| self.st.get(id).kind == SymKind::Method)
+            .filter(|&id| {
+                let s = self.st.get(id);
+                s.kind == SymKind::Method
+                    || (s.kind == SymKind::Term
+                        && !s.flags.contains(Flags::PRIVATE)
+                        && b.methods.iter().any(|m| {
+                            m.name == encode_method_name(&s.name)
+                                && m.desc == desc_of(id)
+                                && m.code.is_some()
+                                && m.access & ACC_STATIC == 0
+                        }))
+            })
             .map(|id| (self.st.get(id).name.clone(), id))
             .collect();
         let mut lin = linearize(self.st, class_id);
@@ -2239,7 +2361,10 @@ impl<'a> Gen<'a> {
         for parent in lin.into_iter().skip(1) {
             for pmid in self.st.get(parent).members.clone() {
                 let ps = self.st.get(pmid);
-                if ps.kind != SymKind::Method {
+                if !matches!(ps.kind, SymKind::Method | SymKind::Term)
+                    || ps.flags.contains(Flags::PRIVATE)
+                    || ps.flags.contains(Flags::STATIC)
+                {
                     continue;
                 }
                 // Prelude intrinsics use FINAL even for Object.toString.
@@ -2259,7 +2384,7 @@ impl<'a> Gen<'a> {
                 // Among the class's own alternatives of that name, the one
                 // that overrides this parent method -- not just the first one
                 // spelled the same way.
-                let parent_params = method_params_from_sym(self.st, pmid);
+                let parent_params = params_of(pmid);
                 let parent_abstract = self
                     .st
                     .erased_abstract_params
@@ -2272,7 +2397,7 @@ impl<'a> Gen<'a> {
                         && bridge_overrides(
                             self.st,
                             &parent_params,
-                            &method_params_from_sym(self.st, *id),
+                            &params_of(*id),
                             parent_abstract,
                         )
                         // `bridge_overrides` compares erased descriptors, so
@@ -2283,15 +2408,17 @@ impl<'a> Gen<'a> {
                         // checkcast, and the class threw ClassCastException on
                         // the parent's own signature. scalac emits the mixin
                         // forwarder instead.
-                        && !method_overloads(self.st, *id, pmid)
+                        && (self.st.get(*id).kind == SymKind::Term
+                            || ps.kind == SymKind::Term
+                            || !method_overloads(self.st, *id, pmid))
                 }) else {
                     continue;
                 };
                 if *cid == pmid {
                     continue;
                 }
-                let pdesc = method_desc_from_sym(self.st, pmid);
-                let cdesc = method_desc_from_sym(self.st, *cid);
+                let pdesc = desc_of(pmid);
+                let cdesc = desc_of(*cid);
                 let impl_name = value_bridge_impl_name(self.st, *cid);
                 if pdesc == cdesc && impl_name.is_none() {
                     continue;
@@ -2303,29 +2430,34 @@ impl<'a> Gen<'a> {
                 if !seen.insert((enc.clone(), pdesc.clone())) {
                     continue;
                 }
-                let child_params = method_params_from_sym(self.st, *cid);
-                let ret = method_ret_from_sym(self.st, pmid);
-                let child_ret = method_ret_from_sym(self.st, *cid);
+                let child_params = params_of(*cid);
+                let ret = ret_of(pmid);
+                let child_ret = ret_of(*cid);
                 // The bridge takes the erased parent signature, so a parameter
                 // the subclass narrowed to a primitive arrives boxed.
-                let result_box = self.st.value_class_results.get(cid).and_then(|&c| {
-                    (impl_name.is_some()
-                        || jvm_desc(self.st, &ret) != jvm_desc(self.st, &child_ret))
-                    .then(|| {
-                        (
-                            class_internal(self.st, c),
-                            format!(
-                                "({})V",
-                                jvm_desc(self.st, &self.st.value_class_underlying(c).unwrap())
-                            ),
-                            param_adapt(
-                                self.st,
-                                &child_ret,
-                                &self.st.value_class_underlying(c).unwrap(),
-                            ),
-                        )
-                    })
-                });
+                let result_box = self
+                    .st
+                    .value_class_results
+                    .get(cid)
+                    .or_else(|| self.st.value_class_terms.get(cid))
+                    .and_then(|&c| {
+                        (impl_name.is_some()
+                            || jvm_desc(self.st, &ret) != jvm_desc(self.st, &child_ret))
+                        .then(|| {
+                            (
+                                class_internal(self.st, c),
+                                format!(
+                                    "({})V",
+                                    jvm_desc(self.st, &self.st.value_class_underlying(c).unwrap())
+                                ),
+                                param_adapt(
+                                    self.st,
+                                    &child_ret,
+                                    &self.st.value_class_underlying(c).unwrap(),
+                                ),
+                            )
+                        })
+                    });
                 let ret_adapt = if result_box.is_some()
                     || jvm_desc(self.st, &ret) == jvm_desc(self.st, &child_ret)
                 {

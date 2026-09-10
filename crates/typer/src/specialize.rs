@@ -755,6 +755,7 @@ fn remap_type_symbols(ty: &mut Type, map: &FxHashMap<SymbolId, SymbolId>) {
         | Type::String
         | Type::Any
         | Type::AnyRef
+        | Type::JavaObject
         | Type::AnyVal
         | Type::Null
         | Type::Nothing

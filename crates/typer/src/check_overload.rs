@@ -2750,6 +2750,10 @@ impl Typer {
         let function = self.macro_function_symbol(body.id);
         let saved_macro_owner = self.macro_lexical_owner;
         self.macro_lexical_owner = function;
+        // Parameters and block locals belong to the function even when its
+        // expression is a field initializer. Nested classes must capture them.
+        let saved_owner = self.st.owner;
+        self.st.owner = function;
         self.st.push_scope();
         let mut param_tys = Vec::new();
         for (i, p) in vparams.iter_mut().enumerate() {
@@ -2773,6 +2777,16 @@ impl Typer {
             }
             if !p.sym.is_none() {
                 self.macro_mirror_owners.insert(p.sym, function);
+                let previous = self.st.get(p.sym).owner;
+                if previous != function {
+                    if !previous.is_none() {
+                        self.st.get_mut(previous).members.retain(|s| *s != p.sym);
+                    }
+                    self.st.get_mut(p.sym).owner = function;
+                    if !self.st.get(function).members.contains(&p.sym) {
+                        self.st.get_mut(function).members.push(p.sym);
+                    }
+                }
                 self.st.get_mut(p.sym).ty = p.ty.clone();
                 self.st.enter_in_current(p.name().unwrap_or("_"), p.sym);
             }
@@ -2812,6 +2826,7 @@ impl Typer {
         let body_ty = body.ty.widen_constant();
         self.st.pop_scope();
         self.macro_function_symbols.insert(body.id, function);
+        self.st.owner = saved_owner;
         self.macro_lexical_owner = saved_macro_owner;
         if let Some((from, _to)) = &pf_result {
             // Keep the expected `PartialFunction` shape, but fill in a result

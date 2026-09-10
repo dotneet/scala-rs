@@ -78,6 +78,13 @@ impl Typer {
             return Vec::new();
         }
         let s = self.st.get(fun.sym);
+        // Constructor calls are flattened before default filling. Retaining
+        // source symbol clauses does not mean the first clause was applied.
+        if s.name == "<init>"
+            && matches!(&fun.ty, Type::Method { paramss, .. } if paramss.len() == 1)
+        {
+            return s.params.clone();
+        }
         if s.paramss.is_empty() {
             return s.params.clone();
         }
@@ -229,7 +236,10 @@ impl Typer {
     /// inside the body), so only the method type still says `Repeated`.
     fn first_clause_of(&self, m: SymbolId) -> (Vec<SymbolId>, bool) {
         let s = self.st.get(m);
-        let ids = if s.paramss.is_empty() {
+        let ids = if s.paramss.is_empty()
+            || (s.name == "<init>"
+                && matches!(&s.ty, Type::Method { paramss, .. } if paramss.len() == 1))
+        {
             s.params.clone()
         } else {
             s.paramss.first().cloned().unwrap_or_default()
@@ -1010,7 +1020,9 @@ impl Typer {
         let s_params = self.st.get(sym).params.clone();
         let paramss_ids: Vec<Vec<SymbolId>> = if !s_paramss.is_empty() {
             match fun_ty {
-                Type::Method { paramss, .. } if paramss.len() < s_paramss.len() => {
+                Type::Method { paramss, .. }
+                    if self.st.get(sym).name != "<init>" && paramss.len() < s_paramss.len() =>
+                {
                     let drop = s_paramss.len() - paramss.len();
                     s_paramss[drop..].to_vec()
                 }
@@ -1618,6 +1630,14 @@ impl Typer {
                     continue;
                 }
                 if let Type::Method { paramss, .. } = &fun.ty {
+                    // A flattened constructor has consumed no source clause.
+                    // Index its JVM parameter list before the ordinary partial
+                    // method rule can mistake clause two for clause one.
+                    if decl.name == "<init>" && paramss.len() == 1 {
+                        if let Some(ty) = paramss[0].get(flat) {
+                            return ty.clone();
+                        }
+                    }
                     // `fun.ty` contains only the clauses left after earlier
                     // Apply nodes. Match the declaration's clause index to
                     // that remaining suffix before reading the expected type.

@@ -1748,7 +1748,7 @@ impl<'a> Pickler<'a> {
             Type::Char => self.type_ref_named("Char"),
             Type::String => self.type_ref_named("String"),
             Type::Any => self.type_ref_named("Any"),
-            Type::Wildcard | Type::AnyRef => self.type_ref_named("AnyRef"),
+            Type::Wildcard | Type::AnyRef | Type::JavaObject => self.type_ref_named("AnyRef"),
             Type::BoundedWildcard { hi, .. } => {
                 if let Some(t) = hi.as_deref() {
                     self.pickle_type(t)

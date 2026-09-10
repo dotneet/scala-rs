@@ -452,6 +452,7 @@ fn array_elem_is_abstract(elem: &Type) -> bool {
 
 pub fn erase_type(ty: &Type) -> Type {
     match ty {
+        Type::JavaObject => Type::AnyRef,
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Applied { .. } => Type::Any,
         Type::Class { sym, .. } => Type::Class {
@@ -967,8 +968,22 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             erase_tree(body, st, Some(&Type::Unit));
         }
         TreeKind::Assign { lhs, rhs } => {
-            erase_tree(lhs, st, None);
-            let pt = erase_ty(&lhs.ty, st);
+            // A store uses the declaration's physical slot, not the type
+            // instantiated at this selection (Java T and abstract trait vars
+            // still store Object when this use expects Int or a value class).
+            let pt = if !lhs.sym.is_none() && st.get(lhs.sym).kind == crate::symbol::SymKind::Term {
+                st.get(lhs.sym).ty.clone()
+            } else {
+                erase_ty(&lhs.ty, st)
+            };
+            // The left side is a location, so only its receiver is a read.
+            // Applying the read's unbox wrapper here destroys that location.
+            if let TreeKind::Select { qual, .. } = &mut lhs.kind {
+                erase_tree(qual, st, None);
+                lhs.ty = erase_ty(&lhs.ty, st);
+            } else {
+                erase_tree(lhs, st, None);
+            }
             erase_tree(rhs, st, Some(&pt));
         }
         TreeKind::Match { selector, cases } => {
@@ -1099,11 +1114,20 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 // erased JVM return is `Object` and the specialized type is a
                 // primitive, treat the Select as returning Object so the
                 // backend does not `valueOf` an already-boxed value.
-                if st.get(tree.sym).kind == crate::symbol::SymKind::Method {
+                if matches!(
+                    st.get(tree.sym).kind,
+                    crate::symbol::SymKind::Method | crate::symbol::SymKind::Term
+                ) {
                     let orig = tree.ty.clone();
-                    let ret_erased = match &st.get(tree.sym).ty {
-                        Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
-                        t => erase_ty(t, st),
+                    let ret_erased = if st.get(tree.sym).kind == crate::symbol::SymKind::Term {
+                        st.get(tree.sym).ty.clone()
+                    } else {
+                        match &st.get(tree.sym).ty {
+                            Type::Method { ret, .. } | Type::Function { ret, .. } => {
+                                (**ret).clone()
+                            }
+                            t => erase_ty(t, st),
+                        }
                     };
                     // `opt.get` on an `Option[Meters]` hands back the boxed
                     // instance, so the underlying comes out of the accessor.

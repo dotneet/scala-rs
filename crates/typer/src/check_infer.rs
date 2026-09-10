@@ -3753,12 +3753,9 @@ impl Typer {
     /// — and so is `f.tupled((1, 2))`, since `tupled` is such a method.
     /// The backend already applies a `Type::Function` callee
     /// (`gen_function_apply`), so handing it the method's result is all this
-    /// takes. Only a non-empty argument list is rewritten: `g()` on a
-    /// `() => Int` stays the reference nsc's empty-application rules give it.
+    /// takes. This includes an empty application to a Function0 result;
+    /// the method itself has no written parameter clause.
     pub(crate) fn auto_apply_nullary_function(fun: &mut Tree, nargs: usize) {
-        if nargs == 0 {
-            return;
-        }
         let Type::Method { paramss, ret } = &fun.ty else {
             return;
         };

@@ -24,6 +24,8 @@ makes no claim of conformance to the language specification. What exists today:
   Parameterless results infer their lower bounds in value position; explicit
   and omitted apply both retain factory receiver inference until the arguments.
   Selection qualifiers defer that value-position inference, including aliases.
+- Lexical lambda/type contexts and Java field storage boundaries are covered
+  by the [lexical context batch](docs/batches/lexical-context.md).
 - Immutable Map lookup and update members require the declared key type,
   preserving implicit key conversions and independent value widening.
 - Function types preserve one Unit argument separately from an empty argument
