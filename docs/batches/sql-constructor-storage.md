@@ -203,3 +203,30 @@ getter-loading hypothesis. Investigate TERMNAME encoding as one family with
 constructor special names, setters, fields and type names before changing it.
 The private-this body/lazy and qualified-boundary inventory remains separate;
 this batch does not claim all Scala access control is complete.
+
+
+## Reflection parent integration after b2502886
+
+Gate b2502886 completed FAIL/DONE on one new corpus loss,
+run/var-arity-class-symbol; its workspace2728 and Slick36/36 passed. The
+rejection and ledger are recorded on main; the candidate worktree is frozen.
+Corrections use codex/sql-storage-reflection-integration.
+
+The failure is not a value-class descriptor defect. Pickle conversion turns
+Function1[Int, Symbol] into structural Type::Function, and attach_parents
+previously discarded every non-Class parent other than AnyVal. Raw JVM
+completion happened to restore an erased Function1 parent. Preserving the
+Scala parent list exposed that missing parent. Convert structural functions
+back to their actual FunctionN class form when attaching inheritance, retaining
+the Scala argument/result types. No raw JVM parent replaces those types.
+
+The permanent reflection fixture executes TupleClass, FunctionClass and
+ProductClass at all supported arities and boundary cases, with exact nsc
+stdout. A String argument is independently rejected. Rejected ee80 had
+accepted that incorrect String argument; b250 refused the valid calls. Both
+before results are preserved under vararity-loss/. New focused tests pass
+18 cases in four suites, including all six sqlstoragebatch tests and the
+existing binary/source value-class suites. Related suites, full negatives,
+previous corpus losses and Slick are now checked together against immutable
+binary bd028a67121980c39bea7b2f1a607ad600495154d865266991fdd7da35a66510
+under reflection-prerequisites/. No new full gate is claimed yet.

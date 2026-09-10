@@ -3306,6 +3306,11 @@ impl PickleSupply {
                 }
                 continue;
             }
+            // Function parents are represented structurally by `conv`, but
+            // inheritance requires the actual FunctionN class and arguments.
+            // Retaining the Scala parent list across JVM completion otherwise
+            // drops Function1[Int, Symbol] from VarArityClassApi entirely.
+            let t = st.function_class_form(&t).unwrap_or(t);
             let Type::Class { sym: psym, .. } = &t else {
                 continue;
             };

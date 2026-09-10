@@ -237,3 +237,25 @@ fn qualified_access_and_value_class_defaults_survive_separate_compilation() {
     }
     fs::remove_dir_all(r).unwrap();
 }
+
+#[test]
+fn reflection_function_parents_keep_their_scala_argument_types() {
+    let r = root();
+    let cp = format!("{JAR}:{REFLECT}");
+    let mut reference = None;
+    for nsc in [true, false] {
+        let out = r.join(format!("arities-{nsc}"));
+        compile("sqlstorage_reflection_arities", nsc, &out, &cp, true);
+        let stdout = run(&out, &cp);
+        assert_eq!(stdout, expected("sqlstorage_reflection_arities"));
+        assert_eq!(&stdout, reference.get_or_insert_with(|| stdout.clone()));
+        compile(
+            "sqlstorage_reflection_arities_bad",
+            nsc,
+            &r.join(format!("arities-bad-{nsc}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(r).unwrap();
+}
