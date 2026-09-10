@@ -807,7 +807,11 @@ impl Typer {
                 // the callee sees is the *result*; the clause is filled once
                 // the parameter has told it what `T` is.
                 self.solve_lower_bounded_undet(a);
-                arg_tys.push(self.implicit_only_result(a).unwrap_or_else(|| a.ty.clone()));
+                arg_tys.push(
+                    self.implicit_only_result(a)
+                        .or_else(|| self.implicit_eta_shape(a))
+                        .unwrap_or_else(|| a.ty.clone()),
+                );
             }
         }
         self.typing_call_args = saved_taking_args;

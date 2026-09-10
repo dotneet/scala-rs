@@ -32,6 +32,9 @@ makes no claim of conformance to the language specification. What exists today:
 - Dependent method results preserve actual argument singletons. Function-valued
   results, inherited implicit overrides, self requirements and Java SAM conversion
   are covered by the [dependent adaptation batch](docs/batches/dependent-adaptation.md).
+  Inferred value overrides, implicit method values, residual overload clauses,
+  parent varargs, erased override identities and binary variance are covered by
+  the [contextual inference batch](docs/batches/contextual-inference.md).
 - Java type references complete descriptor-discovered declarations across source
   files, retaining generic parameters and interface identity after wildcard imports.
 - Directory classpaths complete Scala member signatures and parameterized

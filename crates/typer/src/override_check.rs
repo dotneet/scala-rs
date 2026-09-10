@@ -1310,7 +1310,7 @@ fn check_pair(
     // conform. Ours is only an inference, and slick's
     // `override def toString = { … }` came out `Any`; comparing it would
     // reject working code over a gap that is not the programmer's.
-    if inferred_result(child) {
+    if inferred_result(child) && st.get(child).kind == SymKind::Method {
         return None;
     }
     if !robust(&brt) || !robust(&crt) {
