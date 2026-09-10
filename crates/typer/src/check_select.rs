@@ -1519,8 +1519,11 @@ impl Typer {
     /// for `ff._1(fa._1)` ten times, once per `FlatMapTupleN`.
     fn drop_field_behind_accessor(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let is_field = |s: SymbolId| {
-            self.st.get(s).kind == SymKind::Term
-                && self.st.get(self.st.get(s).owner).ctor_fields.contains(&s)
+            let sym = self.st.get(s);
+            sym.kind == SymKind::Term
+                && (self.st.get(sym.owner).ctor_fields.contains(&s)
+                    || sym.via_accessor
+                    || sym.flags.contains(Flags::LAZY))
         };
         if !found.iter().copied().any(is_field) {
             return found;

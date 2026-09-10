@@ -66,14 +66,15 @@ impl Typer {
     }
 
     pub(crate) fn macro_function_symbol(&mut self, node: scala_rs_parser::NodeId) -> SymbolId {
-        if let Some(&sym) = self.macro_function_symbols.get(&node) {
+        if let Some(&sym) = self.macro_function_symbols.get(&(self.file_index, node)) {
             return sym;
         }
         let owner = self.macro_current_owner();
         let sym = self
             .st
             .alloc("$anonfun", owner, SymKind::Method, Flags::SYNTHETIC, "");
-        self.macro_function_symbols.insert(node, sym);
+        self.macro_function_symbols
+            .insert((self.file_index, node), sym);
         self.macro_mirror_owners.insert(sym, owner);
         sym
     }
@@ -87,7 +88,7 @@ impl Typer {
         if kind == "functionSymbol" {
             return match self
                 .macro_function_symbols
-                .get(&scala_rs_parser::NodeId(id))
+                .get(&(self.file_index, scala_rs_parser::NodeId(id)))
             {
                 Some(sym) => format!("(a ref {})", sym.0),
                 None => refusal("the function has not been typed at this call site"),

@@ -166,7 +166,26 @@ impl Typer {
             }
             _ => return false,
         };
-        if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
+        if matches!(*ret, Type::Array(_)) {
+            // A JVM zero-arg descriptor does not tell `def value` from
+            // `def next()`. Keep the source clause identity or a matching
+            // Scala property; Java/approximate prelude methods are not getters.
+            let sym = self.st.get(fun.sym);
+            let owner = self.st.get(sym.owner);
+            let is_getter = sym.flags.contains(Flags::ACCESSOR)
+                || owner.members.iter().any(|&id| {
+                    let field = self.st.get(id);
+                    field.kind == SymKind::Term
+                        && field.name == sym.name
+                        && (field.via_accessor
+                            || field.flags.contains(Flags::LAZY)
+                            || owner.ctor_fields.contains(&id))
+                        && matches!(&sym.ty, Type::Method { ret, .. } if **ret == field.ty)
+                });
+            if !self.source_parameterless_methods.contains(&fun.sym) && !is_getter {
+                return false;
+            }
+        } else if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
             return false;
         }
         self.ensure_apply_supplied(&ret, fun.span);
@@ -2747,6 +2766,14 @@ impl Typer {
         } else {
             vec![Type::NoType; vparams.len()]
         };
+        // Synthesized bodies must not all share the dummy node identity.
+        if body.id.0 == 0 {
+            body.id = scala_rs_parser::NodeId(self.macro_next_node);
+            self.macro_next_node = self
+                .macro_next_node
+                .checked_add(1)
+                .expect("function node identity exhausted");
+        }
         let function = self.macro_function_symbol(body.id);
         let saved_macro_owner = self.macro_lexical_owner;
         self.macro_lexical_owner = function;
@@ -2825,7 +2852,8 @@ impl Typer {
         };
         let body_ty = body.ty.widen_constant();
         self.st.pop_scope();
-        self.macro_function_symbols.insert(body.id, function);
+        self.macro_function_symbols
+            .insert((self.file_index, body.id), function);
         self.st.owner = saved_owner;
         self.macro_lexical_owner = saved_macro_owner;
         if let Some((from, _to)) = &pf_result {

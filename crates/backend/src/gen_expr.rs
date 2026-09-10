@@ -1175,6 +1175,7 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
         } else {
             asm.invokevirtual(&owner, &sym.name, &desc);
         }
+        maybe_cast_erased_load(asm, ctx, &sym.ty, &tree.ty);
         return;
     }
     match sym.kind {
@@ -1271,6 +1272,7 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
                     asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &sym.ty)));
                 }
             }
+            maybe_cast_erased_load(asm, ctx, &sym.ty, &tree.ty);
         }
         SymKind::Module | SymKind::ModuleClass => {
             load_module_instance(asm, ctx, module_class_id(ctx.st, id));
@@ -1584,6 +1586,7 @@ pub(crate) fn gen_select(
             } else {
                 asm.invokevirtual(&owner, &s.name, &desc);
             }
+            maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
             return;
         }
         match s.kind {
@@ -1939,7 +1942,9 @@ pub(crate) fn gen_assign(
             } else {
                 ctx.class_name.to_string()
             };
-            let desc = if !lhs.ty.is_no_type() {
+            let desc = if !lhs.sym.is_none() {
+                jvm_desc_val(ctx.st, &ctx.st.get(lhs.sym).ty)
+            } else if !lhs.ty.is_no_type() {
                 jvm_desc_val(ctx.st, &lhs.ty)
             } else {
                 jvm_desc_val(ctx.st, &rhs.ty)

@@ -26,6 +26,8 @@ makes no claim of conformance to the language specification. What exists today:
   Selection qualifiers defer that value-position inference, including aliases.
 - Lexical lambda/type contexts and Java field storage boundaries are covered
   by the [lexical context batch](docs/batches/lexical-context.md).
+  Source-unit function identities, erased field access and loaded getter
+  application are covered by the [field scope batch](docs/batches/field-scope.md).
 - Immutable Map lookup and update members require the declared key type,
   preserving implicit key conversions and independent value widening.
 - Function types preserve one Unit argument separately from an empty argument

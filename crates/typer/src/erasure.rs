@@ -981,6 +981,8 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             if let TreeKind::Select { qual, .. } = &mut lhs.kind {
                 erase_tree(qual, st, None);
                 lhs.ty = erase_ty(&lhs.ty, st);
+            } else if matches!(lhs.kind, TreeKind::Ident { .. }) {
+                lhs.ty = erase_ty(&lhs.ty, st);
             } else {
                 erase_tree(lhs, st, None);
             }
@@ -1110,58 +1112,8 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                     adapt_box_unbox(tree, expected, &field_ty, st);
                     return;
                 }
-                // Nullary methods (`it.next`, `opt.get`) stay as Select. If the
-                // erased JVM return is `Object` and the specialized type is a
-                // primitive, treat the Select as returning Object so the
-                // backend does not `valueOf` an already-boxed value.
-                if matches!(
-                    st.get(tree.sym).kind,
-                    crate::symbol::SymKind::Method | crate::symbol::SymKind::Term
-                ) {
-                    let orig = tree.ty.clone();
-                    let ret_erased = if st.get(tree.sym).kind == crate::symbol::SymKind::Term {
-                        st.get(tree.sym).ty.clone()
-                    } else {
-                        match &st.get(tree.sym).ty {
-                            Type::Method { ret, .. } | Type::Function { ret, .. } => {
-                                (**ret).clone()
-                            }
-                            t => erase_ty(t, st),
-                        }
-                    };
-                    // `opt.get` on an `Option[Meters]` hands back the boxed
-                    // instance, so the underlying comes out of the accessor.
-                    if let Some(c) = value_class_of(&orig, st) {
-                        if is_ref_erased(&ret_erased) {
-                            let under = erase_ty(&orig, st);
-                            tree.ty = ret_erased;
-                            wrap_vc_unbox(tree, c, under);
-                            adapt_box_unbox(tree, expected, &orig, st);
-                            return;
-                        }
-                    }
-                    if is_primitive(&orig)
-                        && is_ref_erased(&ret_erased)
-                        && !matches!(orig, Type::Unit)
-                    {
-                        tree.ty = ret_erased;
-                        wrap_unbox(tree, orig.clone());
-                        adapt_box_unbox(tree, expected, &orig, st);
-                        return;
-                    }
-                    if matches!(orig, Type::String)
-                        && is_ref_erased(&ret_erased)
-                        && !matches!(ret_erased, Type::String)
-                    {
-                        // `List[String].head` erases to `()Object`; without the
-                        // `$unbox` wrapper the checkcast to String is lost and
-                        // `ws.head.length` fails verification. `erase_apply`
-                        // already does this for the applied form.
-                        tree.ty = ret_erased;
-                        wrap_unbox(tree, orig.clone());
-                        adapt_box_unbox(tree, expected, &orig, st);
-                        return;
-                    }
+                if adapt_member_read(tree, st, expected) {
+                    return;
                 }
             }
         }
@@ -1209,6 +1161,21 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
         }
         TreeKind::Ident { .. } => {
+            // Locals and parameters already use their erased frame slots.
+            // Only template fields cross a declaration/use type boundary here.
+            if !tree.sym.is_none() {
+                let sym = st.get(tree.sym);
+                if sym.kind == crate::symbol::SymKind::Term
+                    && matches!(
+                        st.get(sym.owner).kind,
+                        crate::symbol::SymKind::Class | crate::symbol::SymKind::ModuleClass
+                    )
+                    && !sym.flags.contains(Flags::PARAM)
+                    && adapt_member_read(tree, st, expected)
+                {
+                    return;
+                }
+            }
             erase_ident(tree, st, expected);
         }
         _ => {}
@@ -1230,6 +1197,54 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         return;
     }
     adapt_box_unbox(tree, expected, &orig, st);
+}
+
+fn adapt_member_read(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) -> bool {
+    if matches!(
+        st.get(tree.sym).kind,
+        crate::symbol::SymKind::Method | crate::symbol::SymKind::Term
+    ) {
+        let orig = tree.ty.clone();
+        let ret_erased = if st.get(tree.sym).kind == crate::symbol::SymKind::Term {
+            st.get(tree.sym).ty.clone()
+        } else {
+            match &st.get(tree.sym).ty {
+                Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
+                t => erase_ty(t, st),
+            }
+        };
+        // `opt.get` on an `Option[Meters]` hands back the boxed
+        // instance, so the underlying comes out of the accessor.
+        if let Some(c) = value_class_of(&orig, st) {
+            if is_ref_erased(&ret_erased) {
+                let under = erase_ty(&orig, st);
+                tree.ty = ret_erased;
+                wrap_vc_unbox(tree, c, under);
+                adapt_box_unbox(tree, expected, &orig, st);
+                return true;
+            }
+        }
+        if is_primitive(&orig) && is_ref_erased(&ret_erased) && !matches!(orig, Type::Unit) {
+            tree.ty = ret_erased;
+            wrap_unbox(tree, orig.clone());
+            adapt_box_unbox(tree, expected, &orig, st);
+            return true;
+        }
+        if matches!(orig, Type::String)
+            && is_ref_erased(&ret_erased)
+            && !matches!(ret_erased, Type::String)
+        {
+            // `List[String].head` erases to `()Object`; without the
+            // `$unbox` wrapper the checkcast to String is lost and
+            // `ws.head.length` fails verification. `erase_apply`
+            // already does this for the applied form.
+            tree.ty = ret_erased;
+            wrap_unbox(tree, orig.clone());
+            adapt_box_unbox(tree, expected, &orig, st);
+            return true;
+        }
+    }
+    false
 }
 
 fn boxed_value_class_ref(tree: &Tree, st: &SymbolTable) -> Option<Type> {

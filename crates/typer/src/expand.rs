@@ -1571,7 +1571,8 @@ impl Typer {
                         .values()
                         .any(|&id| id == source_sym)
                 {
-                    self.macro_function_symbols.insert(body.id, source_sym);
+                    self.macro_function_symbols
+                        .insert((self.file_index, body.id), source_sym);
                 }
                 Ok(node(TreeKind::Function {
                     vparams,
