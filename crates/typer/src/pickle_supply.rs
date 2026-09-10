@@ -5738,6 +5738,10 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
                 return Some(format!("Lscala/Function{};", params.len()))
             }
             Type::ByName(_) => return Some("Lscala/Function0;".into()),
+            // Scala 2.13 repeated parameters use immutable.Seq on the JVM.
+            // Leaving this slot unknown drops Class* beside a same-arity
+            // PartialFunction overload (Exception.catching and its siblings).
+            Type::Repeated(_) => return Some("Lscala/collection/immutable/Seq;".into()),
             // A direct value-class parameter uses its underlying JVM slot.
             // Reference/generic containers still keep the boxed class type.
             Type::Class { sym, .. } if st.is_value_class(*sym) => {

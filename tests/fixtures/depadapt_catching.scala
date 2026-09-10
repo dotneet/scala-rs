@@ -1,0 +1,1 @@
+import scala.util.control.Exception.catching; object Main { def number(s:String):Option[Int]=catching(classOf[NumberFormatException]).opt(s.toInt); def main(args:Array[String]):Unit={ println(number("12")); println(number("x")) } }

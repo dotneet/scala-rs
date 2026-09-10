@@ -465,10 +465,37 @@ impl Typer {
     /// the ranks are laid out innermost class outwards -- which is also the
     /// order an unqualified name resolves in.
     fn shadow_inherited_implicits(&self, cands: Vec<SymbolId>) -> Vec<SymbolId> {
-        if cands.len() < 2 {
+        if cands.is_empty() {
             return cands;
         }
-        let lin = self.unqualified_base_order(self.st.this_class);
+        // During a super constructor call, neither this instance's implicit
+        // members nor its ordinary declarations are in scope. Otherwise an
+        // unavailable inherited declaration hides a usable outer implicit.
+        let enclosing = self.this_owner(None);
+        let start = if self.parent_ctor_scope
+            && enclosing == self.st.this_class
+            && !self.st.this_class.is_none()
+        {
+            self.st.get(self.st.this_class).owner
+        } else {
+            enclosing
+        };
+        let lin = self.unqualified_base_order(start);
+        // A non-implicit override removes the inherited implicit too. Looking
+        // only at implicit candidates left abstract `implicit def algebra`
+        // visible behind an ordinary implementing val in an anonymous class.
+        let declarations: Vec<SymbolId> = lin
+            .iter()
+            .flat_map(|id| self.st.get(*id).members.iter().copied())
+            .collect();
+        let receiver = self.st.self_type_of_class(self.st.this_class);
+        let value_type = |id: SymbolId| {
+            let ty = self.st.subst_as_seen_from(&receiver, &self.st.get(id).ty);
+            match ty {
+                Type::Method { paramss, ret } if paramss.is_empty() => *ret,
+                other => other,
+            }
+        };
         let rank = |owner: SymbolId| lin.iter().position(|&b| b == owner);
         cands
             .iter()
@@ -478,12 +505,16 @@ impl Typer {
                 let Some(here) = rank(s.owner) else {
                     return true;
                 };
-                !cands.iter().any(|&other| {
+                !declarations.iter().chain(cands.iter()).any(|&other| {
                     if other == c {
                         return false;
                     }
                     let o = self.st.get(other);
-                    if o.name != s.name || o.owner == s.owner || o.ty != s.ty {
+                    if o.name != s.name
+                        || o.owner == s.owner
+                        || self.st.private_to_owner(other)
+                        || value_type(other) != value_type(c)
+                    {
                         return false;
                     }
                     rank(o.owner).is_some_and(|there| there < here)

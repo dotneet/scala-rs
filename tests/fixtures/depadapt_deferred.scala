@@ -1,0 +1,1 @@
+object Main { case class Deferred[A](fa:()=>Function0[A]) extends Function0[A] { def apply():A=fa()() }; def defer[A](fa: => Function0[A]):Function0[A]={lazy val cachedFa=fa;Deferred(()=>cachedFa)}; def main(args:Array[String]):Unit={var n=0;val f=defer({n+=1;()=>n});println(n);println(f());println(f());println(n)} }

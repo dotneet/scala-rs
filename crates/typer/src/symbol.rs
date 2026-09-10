@@ -6189,8 +6189,27 @@ impl SymbolTable {
         // extends (T => R)` gets its `apply` from `Function1`), so its type has
         // to be read as seen from `ty` -- substituting only `cls`'s own type
         // parameters leaves the parent's untouched.
+        // The function literal is typed against a ground SAM target. A Java
+        // Consumer[_ >: String] accepts a String parameter, not an existential
+        // value whose upper bound is Object. Keep the original expected type
+        // on the adapted tree; only this method signature uses the bounds.
         let recv = match ty {
-            Type::Class { .. } => ty.clone(),
+            Type::Class { sym, args } => Type::Class {
+                sym: *sym,
+                args: args
+                    .iter()
+                    .map(|arg| match arg {
+                        Type::BoundedWildcard { lo, hi } => lo
+                            .as_deref()
+                            .filter(|t| !matches!(t, Type::Nothing))
+                            .or(hi.as_deref())
+                            .cloned()
+                            .unwrap_or(Type::Any),
+                        Type::Wildcard => Type::Any,
+                        other => other.clone(),
+                    })
+                    .collect(),
+            },
             _ => Type::Class {
                 sym: cls,
                 args: Vec::new(),

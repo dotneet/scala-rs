@@ -604,6 +604,7 @@ impl Typer {
                     self.adapt(a, &p);
                 }
             }
+            self.check_instantiated_self_type(&tree.ty, tree.span);
             // String's source type has a structural representation, while
             // constructor selection uses its exact java.lang.String symbol.
             if class_id == Some(self.st.string_sym) {
@@ -692,6 +693,22 @@ impl Typer {
         let mut arg_tys = Vec::new();
         let saved_taking_args = std::mem::replace(&mut self.typing_call_args, true);
         let fun_ty_for_pretype = fun.ty.clone();
+        if args
+            .iter()
+            .any(|a| matches!(a.kind, TreeKind::Function { .. }))
+        {
+            let signatures = match &fun_ty_for_pretype {
+                Type::Overload(alts) => alts.clone(),
+                other => vec![other.clone()],
+            };
+            for ty in signatures {
+                if let Type::Method { paramss, .. } = ty {
+                    for param in paramss.iter().flatten() {
+                        self.complete_java_type(param, fun.span);
+                    }
+                }
+            }
+        }
         for (ai, a) in args.iter_mut().enumerate() {
             if let TreeKind::Function { vparams, .. } = &a.kind {
                 if is_annotated_lambda(a) {
@@ -971,29 +988,11 @@ impl Typer {
                                 .filter(|t| matches!(t, Type::Method { .. }))
                                 .unwrap_or_else(|| self.st.get(sym).ty.clone());
                         }
-                        if let Some(recv @ Type::Class { args, .. }) = recv_ty.as_ref() {
-                            // At the *owner's* arguments, not the receiver's own:
-                            // an inherited member is declared in the parameters of
-                            // the class that declares it, and those line up with
-                            // the receiver's only when the receiver is that class.
-                            // slick's `BaseJoinQuery[E1, E2, U1, U2, C, B1, B2] <:
-                            // Query[+E, U, C[_]]` gave `Query.map`'s result
-                            // `Query[G, T, C]` the receiver's third argument --
-                            // `U1` -- and `zipWith` was `found: Query[G, T, U]
-                            // required: Query[G, T, C]`.
-                            let owner = self.st.get(sym).owner;
-                            let at_owner = match self.base_type_instance(recv, owner, 0) {
-                                Some(Type::Class { args, .. }) => args,
-                                _ => args.clone(),
-                            };
-                            if !at_owner.is_empty() {
-                                param_tys = param_tys
-                                    .iter()
-                                    .map(|p| self.st.subst_tparams(owner, &at_owner, p))
-                                    .collect();
-                                ret = self.st.subst_tparams(owner, &at_owner, &ret);
-                            }
-                        }
+                        // Overload resolution already returns the member as seen
+                        // from its receiver. Applying owner arguments again
+                        // turns FK[E, F]'s G[A] into F[A], then wrongly E[A]
+                        // when the argument names the owner's own F parameter.
+
                         sig_param_tys = param_tys.clone();
                         self.apply_open_views(sym, &param_tys, args, &mut arg_tys);
                         if !self.st.get(sym).tparams.is_empty() {
@@ -1301,15 +1300,24 @@ impl Typer {
                             // S2, E2](f: R => DBIOAction[R2, S2, E2])` is this
                             // shape.
                             let relaxed = match &p {
-                                Type::Function { params, ret }
-                                    if !params.is_empty() && mentions_tparam(ret, &open) =>
-                                {
+                                Type::Function { params, ret } if mentions_tparam(ret, &open) => {
                                     let wilds = vec![Type::Wildcard; open.len()];
+                                    // A function result can determine its own
+                                    // input types too, as in Deferred(() => saved)
+                                    // with saved: A => B. Opening its input to
+                                    // Any (or _) reverses the constraint through
+                                    // contravariance before A can be inferred.
+                                    let result = if matches!(ret.as_ref(),
+                                        Type::Function { params, .. }
+                                            if params.iter().any(|p| mentions_tparam(p, &open)))
+                                    {
+                                        Type::Wildcard
+                                    } else {
+                                        crate::symbol::subst_tparams_slice(&open, &wilds, ret)
+                                    };
                                     Type::Function {
                                         params: params.clone(),
-                                        ret: Box::new(crate::symbol::subst_tparams_slice(
-                                            &open, &wilds, ret,
-                                        )),
+                                        ret: Box::new(result),
                                     }
                                 }
                                 _ => p.clone(),

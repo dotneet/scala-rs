@@ -29,6 +29,9 @@ makes no claim of conformance to the language specification. What exists today:
 - Function types preserve one Unit argument separately from an empty argument
   list, including aliases and overrides. The real Either companion is available
   as a stable singleton and supplies its methods from the library signature.
+- Dependent method results preserve actual argument singletons. Function-valued
+  results, inherited implicit overrides, self requirements and Java SAM conversion
+  are covered by the [dependent adaptation batch](docs/batches/dependent-adaptation.md).
 - Java type references complete descriptor-discovered declarations across source
   files, retaining generic parameters and interface identity after wildcard imports.
 - Directory classpaths complete Scala member signatures and parameterized

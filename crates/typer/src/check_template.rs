@@ -1544,6 +1544,33 @@ impl Typer {
     /// uninhabited), and rejecting it turned slick's
     /// `Query[B, BU, C] & TableQuery[B]` -- where one *is* a subclass of the
     /// other -- into an error scalac does not report.
+    pub(crate) fn check_instantiated_self_type(&mut self, ty: &Type, span: Span) {
+        if self.sigs_only {
+            return;
+        }
+        let Type::Class { sym, args } = ty else {
+            return;
+        };
+        let Some(required) = self.st.get(*sym).self_type.clone() else {
+            return;
+        };
+        // A declaration may assume its own self requirement, but constructing
+        // that class must discharge it without that assumption. Constructor
+        // type arguments have already been inferred at this call boundary.
+        let required = self.st.subst_tparams(*sym, args, &required);
+        let required = self.st.expand_type_members(*sym, &required);
+        if !self.st.is_sub_type(ty, &required) {
+            self.error(
+                span,
+                format!(
+                    "class {} cannot be instantiated because it does not conform to its self-type {}",
+                    self.st.get(*sym).name,
+                    self.st.display_type(&required)
+                ),
+            );
+        }
+    }
+
     fn check_mixin_parents(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
@@ -1599,14 +1626,24 @@ impl Typer {
         // `class C[F[_]] extends P[F]` conforms to `P`'s self type as `C[F]`,
         // not as a bare `C`: dropping the arguments made every parameterized
         // cake class "not conform".
-        let this_ty = self.st.self_type_of_class(class_id);
+        let base_this = self.st.self_type_of_class(class_id);
+        // An explicitly declared self type is an assumption available inside
+        // this template, including while checking its inherited requirements.
+        // Concrete subclasses still have to discharge that requirement.
+        let this_ty = match self.st.get(class_id).self_type.clone() {
+            Some(required) => Type::Refined {
+                parents: vec![base_this.clone(), required],
+                decls: Vec::new(),
+            },
+            None => base_this.clone(),
+        };
         // The worklist carries each base type *applied*, not just its symbol.
         // The same trait can be inherited twice at different arguments --
         // `class WrongArg extends FlatMap[Cup] with FlatMapArity[Box]` reaches
         // `FlatMapArity` as both `[Cup]` and `[Box]` -- and its self type means
         // a different thing on each path. Keying the walk on the bare symbol
         // checked whichever path was popped first and let the other through.
-        let mut work = vec![this_ty.clone()];
+        let mut work = vec![base_this];
         // Compared as types, not as `format!("{bt:?}")` strings. The strings
         // agreed with `==` but cost an allocation and a full rendering of every
         // base type visited, and the rendering grows with the type: exactly the

@@ -1206,7 +1206,54 @@ impl Typer {
     ) -> Type {
         // The arguments have to line up one for one with the parameters, or
         // the index a path names is not the index this call filled.
-        if params.len() != args.len() || !self.st.mentions_path_member_deep(&ret) {
+        if params.len() != args.len() {
+            return ret;
+        }
+        // A result may name the parameter itself (b.type), not just b.Member.
+        // Substitute at the call boundary so an instantiated Builder's result
+        // does not get read through the formal Builder[A, F] again. Stable
+        // actuals retain their singleton identity; fresh expressions widen to
+        // their already inferred type without being evaluated a second time.
+        let ret = if crate::symbol::any_type(
+            &ret,
+            &mut |t| matches!(t, Type::SingleType { sym, .. } if params.contains(sym)),
+        ) {
+            let actuals: Vec<Type> = args
+                .iter()
+                .map(|arg| {
+                    if matches!(
+                        arg.ty,
+                        Type::SingleType { .. } | Type::ThisType(_) | Type::ModuleRef(_)
+                    ) {
+                        return arg.ty.clone();
+                    }
+                    if self.is_stable_path(arg) {
+                        if let Some(sym) = self.term_path_sym(arg) {
+                            let prefix = match &arg.kind {
+                                TreeKind::Select { qual, .. } => qual.ty.clone(),
+                                _ => Type::NoType,
+                            };
+                            return Type::SingleType {
+                                prefix: Box::new(prefix),
+                                sym,
+                            };
+                        }
+                    }
+                    arg.ty.clone()
+                })
+                .collect();
+            crate::symbol::map_type(&ret, &mut |t| {
+                if let Type::SingleType { sym, .. } = t {
+                    if let Some(i) = params.iter().position(|p| p == sym) {
+                        return actuals[i].clone();
+                    }
+                }
+                t.clone()
+            })
+        } else {
+            ret
+        };
+        if !self.st.mentions_path_member_deep(&ret) {
             return ret;
         }
         let skolems: Vec<SymbolId> = self.st.path_members_in(&ret);

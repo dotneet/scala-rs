@@ -1,0 +1,1 @@
+class Box(val n:Int); object Main { def id[A <: AnyRef](a:A):a.type=a; def pair[A <: AnyRef](a:A):(a.type,a.type)=(a,a);def main(args:Array[String]):Unit={val b=new Box(7);val q:b.type=id(b);val p:(b.type,b.type)=pair(b);println(q eq b);println(p._1 eq p._2)} }

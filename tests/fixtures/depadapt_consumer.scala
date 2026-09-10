@@ -1,0 +1,1 @@
+object Main { def main(args:Array[String]):Unit={ val m=new java.util.concurrent.ConcurrentHashMap[String,Int](); m.put("a",1); m.put("b",2); m.keySet().forEach(k => { if(k.startsWith("a")) m.remove(k) }); println(m.size()); println(m.containsKey("b")) } }

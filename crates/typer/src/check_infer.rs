@@ -1615,6 +1615,29 @@ impl Typer {
             } else {
                 unify_one(&self.st, tp, p, a)
             };
+            // An annotated lambda can determine a generic SAM's arguments.
+            // Read the same ground method prototype used by adaptation:
+            // Comparator[_ >: T] against (String, String) => Int pins T to
+            // String before checking the parameter contravariantly.
+            if hit.is_none() && matches!(a, Type::Function { .. }) {
+                if let Some(sam) = self.st.sam_sig(p) {
+                    let prototype = Type::Function {
+                        params: sam.param_tys,
+                        ret: Box::new(sam.ret_ty),
+                    };
+                    hit = unify_one(&self.st, tp, &prototype, a);
+                    if self.tparam_variance_in(&prototype, tp, 1) == Some(-1) {
+                        if let (Some(inferred), Some(upper)) =
+                            (hit.as_ref(), self.st.get(tp).bound_hi.as_ref())
+                        {
+                            // Input positions constrain T from above. Its
+                            // declared upper bound meets that constraint;
+                            // it need not itself be a subtype of the input.
+                            hit = Some(self.st.glb(inferred, upper));
+                        }
+                    }
+                }
+            }
             // The same step for a *function* parameter: a `Map[K, V]` is a
             // `K => V`, and that is the shape `def map[B](f: A => B)` reads
             // `B` out of. Only where the argument as written pinned nothing:
@@ -3356,7 +3379,7 @@ impl Typer {
             if have.is_no_type() {
                 continue;
             }
-            if !self.st.is_sub_type(want, have) && !self.st.is_sub_type(have, want) {
+            if !self.st.is_sub_type(want, have) {
                 return false;
             }
         }
@@ -3688,7 +3711,7 @@ impl Typer {
         if matches!(&fun.kind, TreeKind::Select { .. })
             && !matches!(
                 strip_annotations(&fun.ty),
-                Type::Class { .. } | Type::Array(_)
+                Type::Class { .. } | Type::Array(_) | Type::ThisType(_) | Type::SingleType { .. }
             )
         {
             return;
@@ -3701,7 +3724,11 @@ impl Typer {
         // `value apply is not a member of Map[…] @unchecked`.
         let insert = matches!(
             strip_annotations(&fun.ty),
-            Type::Array(_) | Type::Class { .. } | Type::ModuleRef(_)
+            Type::Array(_)
+                | Type::Class { .. }
+                | Type::ModuleRef(_)
+                | Type::ThisType(_)
+                | Type::SingleType { .. }
         );
         if !insert {
             return;

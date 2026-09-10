@@ -2737,7 +2737,17 @@ impl Typer {
             body.ty.clone()
         } else {
             self.adapt(body, &ret_pt);
-            ret_pt
+            // A function-valued result is already a reference value. Preserve
+            // its inferred type below the prototype's upper bound: replacing
+            // () => A with the provisional () => Any loses A in Deferred.
+            if is_function_pt(&body.ty)
+                && is_function_pt(&ret_pt)
+                && self.st.is_sub_type(&body.ty, &ret_pt)
+            {
+                body.ty.clone()
+            } else {
+                ret_pt
+            }
         };
         let body_ty = body.ty.widen_constant();
         self.st.pop_scope();
@@ -2757,10 +2767,13 @@ impl Typer {
                 }
             }
             pt.clone()
-        } else if sam
-            .as_ref()
-            .is_some_and(|s| s.param_tys.len() == param_tys.len())
-        {
+        } else if sam.as_ref().is_some_and(|s| {
+            s.param_tys.len() == param_tys.len()
+                && s.param_tys
+                    .iter()
+                    .zip(&param_tys)
+                    .all(|(want, have)| self.st.is_sub_type(want, have))
+        }) {
             // The literal really does have the SAM's arity, so it *is* one.
             //
             // This used to read `param_tys.len() == pts.len()`, which cannot

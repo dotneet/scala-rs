@@ -1773,6 +1773,7 @@ impl Typer {
                         self.type_apply(tree, pt);
                         return;
                     }
+                    self.check_instantiated_self_type(&tree.ty, tree.span);
                 }
             }
             TreeKind::Typed { expr, tpt } => {

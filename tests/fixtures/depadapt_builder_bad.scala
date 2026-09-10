@@ -1,0 +1,1 @@
+import scala.collection.mutable.Builder; object Main { def appendAll[F <: Iterable[A], A](it:Iterator[F], b:Builder[A,F]):b.type={ while(it.hasNext) b ++= it.next(); b }; val bad:List[String]=appendAll(Iterator(List(1)),List.newBuilder[Int]).result() }

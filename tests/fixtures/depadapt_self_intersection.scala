@@ -1,0 +1,1 @@
+trait A { def a:Int }; trait B { def b:Int }; trait C { self:A with B => def sum:Int=a+b }; abstract class D extends C { self:A with B => }; object Main { def main(args:Array[String]):Unit=println((new D with A with B { def a:Int=2;def b:Int=3 }).sum) }

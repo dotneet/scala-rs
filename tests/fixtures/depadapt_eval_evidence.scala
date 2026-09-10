@@ -1,0 +1,1 @@
+trait TC[A] { def value:Int }; trait Wrap[A] { implicit def algebra:TC[A]; def get:Int=algebra.value }; object Main { def make[A:TC]:Wrap[A]=new Wrap[A] { val algebra:TC[A]=implicitly[TC[A]] }; def main(args:Array[String]):Unit={implicit val t:TC[Int]=new TC[Int] { def value:Int=7 };println(make[Int].get)} }
