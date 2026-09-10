@@ -17,7 +17,7 @@ is, and both invalidate everything downstream.
 
 **Forty-four composed gates have been accepted this session**, covering the earlier
 ninety-nine slices and this combined type-identity/macro-transport batch.
-Nineteen intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2574,6 +2574,66 @@ metadata only.
   HEAD=ee80efb0  logs=/tmp/scala-rs-gate-ee80efb0-codex
   fail: slick_run: progs=12 ok=0 diff=0 fail=12  runs=3 attempts=0/36  (compile-cp=b, work=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun/w-0d0a058b60)
   fail: workspace tests: 303 rows, 2721 passed, 6 failed
+  fail: corpus losses=1 vs tests/baselines/corpus-73f68974.tsv
+VERDICT=FAIL
+DONE
+```
+
+
+## Rejected candidate twenty: constructor and value-class access integration
+
+Frozen composed commit `b2502886b656035b4b5532ac19a072f5c8cccef0`, tree
+`5840d6d152ec38ca332199a306aac3a8a666f3b0`, completed the entire unskipped
+gate with FAIL/DONE. It is not merged. Accepted compiler 73f68974 and all
+current baseline figures remain unchanged. Candidate branch
+`codex/sql-storage-access-integration` is pushed; its worktree stays frozen.
+Logs: `/tmp/scala-rs-gate-b2502886-codex/`. Complete 5324-row ledger:
+[`baselines/corpus-b2502886.tsv`](baselines/corpus-b2502886.tsv).
+
+Gitbucket improves 157/57 -> 148/54 with nine removed diagnostic locations
+and no added messages. Cats remains121/54 with identical diagnostics; library
+440/118 changes only three anonymous-class numeric identifiers. Slick passes
+184 sources, zero errors,1504 classes,12/12 programs and36/36 runtime attempts.
+Subset verifies1504/lint_problems=0; the stronger initialization sweep loads
+all1504 with failures=0 and incomplete=0. Workspace passes2728 tests with
+zero failures across303 result rows. Format passes; release workspace clippy
+keeps exactly57 existing warning messages with no added or removed warnings.
+The prerequisite and gated binaries are byte-identical, SHA256
+455a89e285fe18e0ed1d8ed07badb0887a2e8b0fedbf45a5fc39f4b033da29e6.
+
+Corpus: pos1126/388/345, neg711/325/369, run677/830/553 (pass/fail/skip),
+losses=1 and changes=4. Gains are pos/sudoku, pos/t1075 and run/verify-ctor.
+run/indylambda-boxing from the previous rejection is recovered; the new loss
+is run/var-arity-class-symbol, rejected at VarArityClassApi.apply(0).
+The matching descriptor/loader diagnosis is still under investigation; the
+next prerequisites must include this exact identity and its reflection API
+family rather than relying on source keywords. The selected768 pos/run
+cases and all1405 negatives passed before this gate, as did639 focused tests
+in24 suites and Slick36/36. That selection did not contain the new loss.
+
+The combined corrections repair actual public fields without getters,
+protected-this and widened accessors, qualified getter JVM access, value-class
+default companions, preservation of Scala parents during classfile completion,
+private value-class unboxing getter names and storage/constructor argument
+name separation. New fixtures execute all four API producer/consumer pairs
+with real scalac2.13.16 and independently compare inaccessible-field rejection.
+The previous rejected candidate's six workspace failures are all recovered.
+No full gate was restarted for observation timeouts. This subsequent record
+and ledger are metadata only, not a compiler merge.
+
+Next-batch inventory under `/tmp/scala-rs-sql-constructor-storage/forms-inventory/`
+reproduces the gitbucket webhook mapping failure using real Scalatra Forms.
+Explicit ValueType return annotation works and executes identically; inferred
+anonymous and named subclasses fail, even when moved before the call. A
+dependency-free nested generic argument and repeated type-variable tuple
+probe also fail where nsc runs. Independent bad-mapper and wrong-result probes
+are rejected by both. Treat nested constraint collection as a hypothesis,
+not a license to zip unrelated types or widen everything to Any. Operator-name
+export and remaining private/lazy boundaries are separately inventoried.
+
+```text
+=== summary
+  HEAD=b2502886  logs=/tmp/scala-rs-gate-b2502886-codex
   fail: corpus losses=1 vs tests/baselines/corpus-73f68974.tsv
 VERDICT=FAIL
 DONE
