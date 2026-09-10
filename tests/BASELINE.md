@@ -11,13 +11,14 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `603b6451` |
+| commit | `9cc076f6` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Forty-five composed gates have been accepted this session**, covering the earlier
+**Forty-six composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
-SQL, constructor-storage, value-class-access and reflection-parent batch.
+SQL, constructor-storage, value-class-access and reflection-parent batch,
+and the Forms inference and Scala/JVM name interoperability batch.
 Twenty intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -70,6 +71,7 @@ coordinator measured the merged tree each time, not the branches.
 | `23031519` | five evidence/default-import mechanisms with namespace integration | 169 -> **158** | 125 -> **121** |
 | `73f68974` | type identity, binary implicit objects, macro transport and source ownership | 158 -> **157** | 121 |
 | `603b6451` | SQL macro argument types, Java constructors, storage/access/defaults and reflection parents | 157 -> **148** | 121 |
+| `9cc076f6` | nested Forms inference, encoded names, literal types and nested class ownership | 148 -> **115** | 121 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -277,15 +279,15 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **121** | **54** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **148** | **54** | — |
-| `tests/scalalib_measure.sh` (538) | **440** | **118** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **115** | **54** | — |
+| `tests/scalalib_measure.sh` (538) | **439** | **118** | — |
 
 ## Execution
 
 | check | result |
 |---|---|
 | `MODE=b tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 runs=3 attempts=36/36` |
-| `MODE=a tests/slick_run.sh` | **RED**: all 12 client programs fail to compile; no execution attempts |
+| `MODE=a tests/slick_run.sh` | Last separate measure: **RED**, all 12 clients fail to compile; not rerun in this gate |
 | `tests/slick_subset.sh` | `subset_files=184 classes=1504 verified=1504 failed=0` |
 | `tests/classfile_lint.py` (via subset / slick_run) | `lint_problems=0` |
 | `tests/verify_all.sh <slick out>` | `verify_classes=1504 verify_loaded=1504 verify_failures=0 verify_incomplete=0` |
@@ -299,13 +301,17 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1126** | 388 | 345 |
-| `neg` (1405) | **711** | 325 | 369 |
-| `run` (2060) | **678** | 829 | 553 |
+| `pos` (1859) | **1128** | 386 | 345 |
+| `neg` (1405) | **712** | 324 | 369 |
+| `run` (2060) | **680** | 827 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-603b6451.tsv`](baselines/corpus-603b6451.tsv): 5324 unique
+[`baselines/corpus-9cc076f6.tsv`](baselines/corpus-9cc076f6.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `9cc076f6` gate compared against `corpus-603b6451.tsv`: **losses=0,
+changes=5**: pos/t7532b, pos/t8708, run/exoticnames and run/t9114 now pass;
+neg/t1009 now correctly rejects.
+
 The `603b6451` gate compared against `corpus-73f68974.tsv`: **losses=0,
 changes=3**: pos/sudoku, pos/t1075 and run/verify-ctor now pass.
 
@@ -428,15 +434,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **303 result rows, 2729 passed, 0 failed** at `603b6451` |
+| `cargo test --workspace --release --no-fail-fast` | **304 result rows, 2735 passed, 0 failed** at `9cc076f6` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-sql-constructor-storage/reflection-prerequisites/clippy.log` and
-`/tmp/scala-rs-sql-constructor-storage/reflection-prerequisites/clippy-compare.json`.
+`/tmp/scala-rs-forms-name/clippy.log` and
+`/tmp/scala-rs-forms-name/clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -2727,6 +2733,93 @@ interacting inference or collection supply redesign separately when warranted.
 ```text
 === summary
   HEAD=603b6451  logs=/tmp/scala-rs-gate-603b6451-codex
+VERDICT=PASS
+DONE
+```
+
+
+## Gate forty-six: nested Forms inference and Scala/JVM name interoperability
+
+Frozen commit `9cc076f6dd0c111036a1c8973cd02869355ad047`, tree
+`521048937ab4db109623a8f23808c2b64c1d04a2`, passed the full unskipped gate
+and the independent completion audit. Main was fast-forwarded to that exact
+commit. The subsequent handover changes only this record and the raw corpus
+ledger; no compiler source, Cargo input, fixture or gate script differs from
+the tested tree. The dedicated worktree remains frozen and clean.
+Logs: `/tmp/scala-rs-gate-9cc076f6-codex/`. Full 5324-row ledger:
+[`baselines/corpus-9cc076f6.tsv`](baselines/corpus-9cc076f6.tsv).
+
+Gitbucket improves **148/54 -> 115/54** (errors/files): 33 diagnostic
+locations disappear and none are added. Cats remains **121/54**, with identical
+diagnostics. Library improves **440/118 -> 439/118**, removing one diagnostic
+with no added messages. Gitbucket and cats still do not compile successfully.
+Slick remains **184 sources, zero errors, 1504 classes**, with lint_problems=0.
+MODE=b executes **12/12 programs, 36/36 attempts**, with exact output matches.
+Subset verification passes all 1504 classes. Strong initialization verification
+on the full gate's actual slick-classes directory loads **1504/1504**, with
+zero failures and zero incomplete loads. MODE=a was not rerun in this gate.
+
+Workspace: **304 result rows, 2735 passed, zero failed**. Format passes;
+release workspace clippy keeps exactly the 57 existing warning messages,
+without additions or removals. Corpus: **pos 1128/386/345, neg 712/324/369,
+run 680/827/553** (pass/fail/skip), all 5324 identities present, **losses=0,
+changes=5**. Gains are pos/t7532b, pos/t8708, run/exoticnames, run/t9114 and
+the newly correct rejection neg/t1009. The gate and prerequisite binaries
+are byte-identical, SHA256
+`f92a0f1db75db9a61f9ec978b5adcbf6557fc157ad93da3ffc31f66b4d1d031a`.
+The single owned gate ran to DONE in 1321 seconds; no observation timeout
+restarted it.
+
+The batch follows a broad prior inventory and combines nested actual-base
+alignment for Forms inference, encoded ScalaSignature symbols, NameTransformer
+operators and Unicode escapes, backquoted literal escapes, named-parameter
+decoding, constant-result types, companion/class alias lookup and nested class
+identity/prefix handling. The released Scala NameTransformer oracle covers
+all non-surrogate BMP characters with JDK 17. Literal string payloads and
+internal storage suffixes retain their raw bytes. ScalaSignature nested class
+references retain Outer.this so scalac substitutes the receiving instance.
+
+Bidirectional probes corrected several hypotheses. Real Forms does not depend
+on anonymous class identity or declaration order: nested actual-base alignment
+is the measured root. Backslash names also needed the lexer's literal escape
+handling. Alias results were qualified, not bare nullary members; a companion
+without the alias was prematurely ending lookup. Nested class matching split
+encoded dollars and invented a different JVM name, independently of the
+writer's missing Outer.this prefix. Temporary tracing was removed before
+validation. No stubs or subagents were used.
+
+Permanent fixtures execute every valid member/class API through all four
+scala-rs/scalac producer-consumer combinations under java -Xverify:all and
+compare stdout byte for byte. Independent invalid arguments, aliases, literal
+values and malformed identifiers preserve nsc rejection. The immutable
+accepted603 binary fails the valid nested-inference/name/alias/literal/nesting
+reductions and accepts the independently invalid quoted identifiers. Before
+proofs, corrected probe-environment logs and the full inventory are retained
+under `/tmp/scala-rs-forms-name/` and the preceding SQL/storage inventory.
+
+Before the full gate, 27 focused cases in four suites and 614 affected existing
+tests in 21 suites passed, as did 22 pickle/lexer tests. Historical regression
+selection covered 1142 positive/runtime identities with losses=0; all 1405
+negative units also had losses=0. Slick runtime and strong verification passed
+before freezing the tree. Preflight confirmed four pinned source trees, 121
+jar archives, 33 Java support classes and 1498 cached scalac reference classes.
+All commands used actual Temurin 17 with a UTF-8 locale; the misleading
+Homebrew openjdk@21 symlink was not used.
+
+Next inventory: `/tmp/scala-rs-forms-name/next-inventory.md`. Remaining work
+includes ArraySeq-warmed collection return types, SortedMap.keySet and the
+deeper repeated-variable constraint solver. Gitbucket's PatchUtil Java source
+exists, but the measure script does not compile Java sources: this is a new
+source-supply hypothesis to test independently, not a claimed compiler repair.
+Any correction of those measurement inputs must be recorded separately from
+compiler gains. Continue inventory-first composed batches, isolating only
+the especially difficult interacting roots.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=9cc076f6  logs=/tmp/scala-rs-gate-9cc076f6-codex
 VERDICT=PASS
 DONE
 ```
