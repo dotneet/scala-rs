@@ -1901,6 +1901,36 @@ impl Typer {
         folded.then_some(first_len)
     }
 
+    fn parent_argument_self_reference(&self, tree: &Tree, module: SymbolId) -> Option<Span> {
+        if matches!(tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+            && !tree.sym.is_none()
+            && self.st.module_class_of(tree.sym) == module
+        {
+            return Some(tree.span);
+        }
+        // Type positions do not evaluate a reference to the module.
+        match &tree.kind {
+            TreeKind::Typed { expr, .. }
+            | TreeKind::TypeApply { fun: expr, .. }
+            | TreeKind::ValDef { rhs: expr, .. } => {
+                return self.parent_argument_self_reference(expr, module)
+            }
+            TreeKind::TypeDef { .. }
+            | TreeKind::SingletonTypeTree { .. }
+            | TreeKind::SelectFromTypeTree { .. }
+            | TreeKind::AppliedTypeTree { .. }
+            | TreeKind::AnnotatedTypeTree { .. } => return None,
+            _ => {}
+        }
+        let mut found = None;
+        crate::erasure::for_each_child(tree, &mut |child| {
+            if found.is_none() {
+                found = self.parent_argument_self_reference(child, module);
+            }
+        });
+        found
+    }
+
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
         // A parent's constructor *arguments* are ordinary expressions, and the
         // signature pass types them before every unit's members have their
@@ -2092,7 +2122,7 @@ impl Typer {
                 // again here is not a no-op when an argument mentions the
                 // parameter it replaces.
                 for (i, a) in args.iter_mut().enumerate() {
-                    if let Some(p) = param_tys.get(i) {
+                    if let Some(p) = param_at(&param_tys, i) {
                         if !p.is_no_type() {
                             if matches!(a.kind, TreeKind::Function { .. })
                                 && !is_annotated_lambda(a)
@@ -2100,6 +2130,12 @@ impl Typer {
                                 self.type_expr(a, p);
                             } else {
                                 self.adapt(a, p);
+                            }
+                        }
+                        let owner = self.st.this_class;
+                        if !owner.is_none() && self.st.get(owner).kind == SymKind::ModuleClass {
+                            if let Some(span) = self.parent_argument_self_reference(a, owner) {
+                                self.error(span, "super constructor cannot be passed a self reference unless parameter is declared by-name");
                             }
                         }
                     }

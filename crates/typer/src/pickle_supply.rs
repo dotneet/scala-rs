@@ -3572,7 +3572,7 @@ impl PickleSupply {
                 .tparams
                 .iter()
                 .map(|tp| {
-                    let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
+                    let t = st.alloc(&tp.name, id, SymKind::TypeParam, variance_flags(tp), "");
                     st.get_mut(t).ty = Type::TypeParam(t);
                     set_tparam_arity(st, t, tparam_arity(tp));
                     t

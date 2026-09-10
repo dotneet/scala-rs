@@ -1001,7 +1001,12 @@ impl Typer {
                 };
                 let rest_tys = self.instantiate_from_call(sym, clause_idx, &first, args, rest_tys);
                 let rest_tys = self.solve_implicit_only_tparams(sym, rest_tys);
+                // Materializing a tag types nested applications with their own
+                // inference state. Keep this call's result bindings across
+                // those applications instead of letting them clear it.
+                let solved = std::mem::take(&mut self.implicit_undet_solved);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
+                self.implicit_undet_solved = solved;
                 return None;
             }
             let rest_tys: Vec<Vec<Type>> = match fun_ty {
@@ -1094,13 +1099,13 @@ impl Typer {
         }
         if solved.is_none()
             && rest_tys.iter().any(|ty| {
-                matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag") || crate::materialize::tag_request(&self.st, ty).is_some()
             })
         {
             // This continuation is needed only for compiler-generated tags.
             // Ordinary unsuccessful searches must not be repeated here.
             // Keep bindings obtained from earlier witnesses even when a later
-            // clause needs compiler-generated ClassTag evidence.
+            // clause needs compiler-generated tag evidence.
             let mut partial: Vec<(SymbolId, Type)> = Vec::new();
             let mut ambiguous = false;
             for ty in &rest_tys {
@@ -1121,7 +1126,7 @@ impl Typer {
                     partial.extend(bindings);
                 } else if matches!(found, ImplicitSearch::None) {
                     // A function-valued implicit may be supplied by a view.
-                    // Keep its bindings when a later ClassTag is materialized,
+                    // Keep its bindings when a later tag is materialized,
                     // just as the ordinary undet_solution path does.
                     if let Some(view) = self.view_undet_bindings(&want, &open) {
                         partial.extend(view);
@@ -1138,9 +1143,9 @@ impl Typer {
                     }
                     // Failed ordinary evidence must retain its open variables
                     // in the diagnostic. Minimize only variables occurring
-                    // exclusively in ClassTag requests, before materialization.
+                    // exclusively in compiler-generated tag requests, before materialization.
                     let only_tags = rest_tys.iter().filter(|ty| type_mentions_tparam_deep(ty, *tp)).all(|ty| {
-                        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag") || crate::materialize::tag_request(&self.st, ty).is_some()
                     });
                     if only_tags {
                         let ids: Vec<_> = partial.iter().map(|(tp, _)| *tp).collect();

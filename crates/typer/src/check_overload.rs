@@ -550,6 +550,31 @@ impl Typer {
             }
         };
         let applicable = self.narrow_by_lambda_shape(applicable, arg_tys, shapes);
+        // A value expectation eliminates an unapplied explicit clause when
+        // an alternative with the same first domain supplies that clause
+        // implicitly. FUNmode keeps both: another written application cannot
+        // use its arguments to disambiguate the preceding clause.
+        let applicable = if !matches!(_pt, Type::Method { .. } | Type::Function { .. }) {
+            applicable
+                .iter()
+                .filter(|a| {
+                    if a.0.is_none()
+                        || self.st.get(a.0).paramss.len() != 2
+                        || self.residual_clause_is_implicit(a.0)
+                    {
+                        return true;
+                    }
+                    !applicable.iter().any(|b| {
+                        self.residual_clause_is_implicit(b.0)
+                            && self.canonical_sig(a.0, &a.1, &Type::NoType)
+                                == self.canonical_sig(b.0, &b.1, &Type::NoType)
+                    })
+                })
+                .cloned()
+                .collect()
+        } else {
+            applicable
+        };
         // nsc fills a default only when no alternative applies without one
         // (`Infer.inferMethodAlternative`). Applied before the specificity
         // comparison, because the two alternatives it separates are often
@@ -595,6 +620,7 @@ impl Typer {
                         && self.st.get(a.0).name == self.st.get(b.0).name
                         && a.1 == b.1
                         && a.2 == b.2
+                        && self.overload_residual_key(a.0) == self.overload_residual_key(b.0)
                 });
                 // The same test again, but blind to *which* symbols a
                 // candidate's own type parameters are. `mutable.HashMap`
@@ -618,6 +644,7 @@ impl Typer {
                             module_apply_candidates.contains(sym),
                             self.st.get(*sym).name.clone(),
                             keyed[i].clone(),
+                            self.overload_residual_key(*sym),
                         );
                         i += 1;
                         if seen.contains(&k) {
@@ -840,6 +867,35 @@ impl Typer {
             }
         }
         false
+    }
+
+    fn residual_clause_is_implicit(&self, sym: SymbolId) -> bool {
+        if sym.is_none() {
+            return false;
+        }
+        let clauses = &self.st.get(sym).paramss;
+        clauses.len() == 2
+            && !clauses[1].is_empty()
+            && clauses[1]
+                .iter()
+                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+    }
+
+    fn overload_residual_key(&self, sym: SymbolId) -> Vec<Type> {
+        if sym.is_none() {
+            return Vec::new();
+        }
+        match &self.st.get(sym).ty {
+            Type::Method { paramss, .. } if paramss.len() > 1 => self.canonical_sig(
+                sym,
+                &[],
+                &Type::Method {
+                    paramss: paramss[1..].to_vec(),
+                    ret: Box::new(Type::NoType),
+                },
+            ),
+            _ => Vec::new(),
+        }
     }
 
     /// nsc: `A` is as specific as `B` when `B` is applicable to `A`'s parameter types.

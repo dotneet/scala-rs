@@ -421,7 +421,11 @@ fn find_overridden_method(st: &SymbolTable, id: SymbolId) -> Option<SymbolId> {
         seen.push(pid.0);
         for m in &st.get(pid).members {
             let mem = st.get(*m);
-            if mem.kind == crate::symbol::SymKind::Method && mem.name == *name && *m != id {
+            if mem.kind == crate::symbol::SymKind::Method
+                && mem.name == *name
+                && *m != id
+                && crate::override_check::method_overrides(st, id, *m)
+            {
                 return Some(*m);
             }
         }
