@@ -1233,6 +1233,31 @@ impl Typer {
         // one of them sits strictly inside an implicit parameter's type
         // (`toMap[K, V](implicit ev: A <:< (K, V))`), only the witness can pin
         // them down, and the search does it.
+        // Result-only variables cannot be solved by the implicit witness.
+        // Infer their lower bounds at this use site, after the receiver has
+        // substituted class parameters, rather than rewriting the binary
+        // declaration. Explicit type arguments and callee mode must remain
+        // available to choose a wider result.
+        if !is_callee && !matches!(tree.kind, TreeKind::TypeApply { .. }) {
+            let result_only: Vec<_> = self
+                .st
+                .get(tree.sym)
+                .tparams
+                .iter()
+                .copied()
+                .filter(|tp| match &tree.ty {
+                    Type::Method { paramss, ret } => {
+                        type_mentions_tparam(ret, *tp)
+                            && !paramss
+                                .iter()
+                                .flatten()
+                                .any(|t| type_mentions_tparam(t, *tp))
+                    }
+                    _ => false,
+                })
+                .collect();
+            self.pin_lower_bounded_implicit_tparams(tree, &result_only);
+        }
         let undet = self.undetermined_tparams(tree, &first);
         let span = tree.span;
         let ret = match &tree.ty {

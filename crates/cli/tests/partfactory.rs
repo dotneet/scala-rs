@@ -136,3 +136,61 @@ fn receiver_constraints_reject_conflicts_and_bound_violations() {
     }
     fs::remove_dir_all(p).unwrap();
 }
+
+#[test]
+fn result_only_lower_bounds_are_inferred_at_the_use_site() {
+    let p = root();
+    let lib = p.join("lib");
+    check(&compile(
+        &[fixture("partfactory_resultlib.scala")],
+        &lib,
+        JAR,
+        true,
+        false,
+    ));
+    let jar = p.join("lib.jar");
+    check(
+        &Command::new("jar")
+            .arg("cf")
+            .arg(&jar)
+            .arg("-C")
+            .arg(&lib)
+            .arg(".")
+            .output()
+            .unwrap(),
+    );
+    let expected = fs::read(fixture("expected/partfactory_result.txt")).unwrap();
+    for binary in [false, true] {
+        let cp = if binary {
+            format!("{}:{JAR}", jar.display())
+        } else {
+            JAR.to_string()
+        };
+        for bad in [false, true] {
+            let mut files = vec![fixture(if bad {
+                "partfactory_result_bad.scala"
+            } else {
+                "partfactory_result.scala"
+            })];
+            if !binary {
+                files.push(fixture("partfactory_resultlib.scala"));
+            }
+            for oracle in [false, true] {
+                let out = p.join(format!("{binary}-{bad}-{oracle}"));
+                let r = compile(&files, &out, &cp, oracle, false);
+                assert_eq!(
+                    r.status.success(),
+                    !bad,
+                    "binary={binary} bad={bad} oracle={oracle}: {}",
+                    String::from_utf8_lossy(&r.stderr)
+                );
+                if !bad {
+                    let r = run(&out, &cp);
+                    check(&r);
+                    assert_eq!(r.stdout, expected);
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(p).unwrap();
+}
