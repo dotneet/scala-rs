@@ -1142,7 +1142,11 @@ impl Typer {
         crate::symbol::subst_tparams_slice(&ids, &vals, &lo)
     }
 
-    fn pin_lower_bounded_implicit_tparams(&mut self, tree: &mut Tree, undet: &[SymbolId]) {
+    pub(crate) fn pin_lower_bounded_implicit_tparams(
+        &mut self,
+        tree: &mut Tree,
+        undet: &[SymbolId],
+    ) {
         // The bound is written in the declaration (`B >: A`); what this call
         // sees is that bound at the receiver.
         let recv = match &tree.kind {

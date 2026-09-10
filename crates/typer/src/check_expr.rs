@@ -70,6 +70,19 @@ impl Typer {
             }
         }
         self.adapt_implicit_apply_in(tree, pt, callee);
+        // A parameterless method in value position has no later argument
+        // clause to solve a real lower bound (`xs.toSet[B >: A]`). Keep
+        // callee references open for explicit type arguments or an inserted
+        // apply on the returned value.
+        if !callee
+            && !tree.sym.is_none()
+            && self.is_nullary_method_sym(tree.sym)
+            && !matches!(tree.kind, TreeKind::TypeApply { .. })
+            && !matches!(tree.ty, Type::Method { .. } | Type::Overload(_))
+        {
+            let tps = self.st.get(tree.sym).tparams.clone();
+            self.pin_lower_bounded_implicit_tparams(tree, &tps);
+        }
         if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
             self.adapt(tree, pt);
         }

@@ -44,7 +44,15 @@ impl Typer {
             // The enclosing application's argument count belongs to *this*
             // selection, not to whatever the qualifier turns out to be.
             let saved_arity = self.callee_arity.take();
+            // An explicit apply has the same receiver-inference boundary as
+            // the inserted apply: its arguments can still constrain the
+            // result of a parameterless factory.
+            let saved_callee = self.typing_callee;
+            if name == "apply" {
+                self.typing_callee = true;
+            }
             self.type_expr(qual, &Type::NoType);
+            self.typing_callee = saved_callee;
             self.callee_arity = saved_arity;
             // A *qualifier* is never "an argument still waiting for its
             // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
@@ -2759,6 +2767,10 @@ impl Typer {
                         ret: Box::new(Type::NoType),
                     },
                 );
+                self.typing_callee = saved;
+            } else if dyn_name == "apply" {
+                let saved = std::mem::replace(&mut self.typing_callee, true);
+                self.type_expr(&mut qual, &Type::NoType);
                 self.typing_callee = saved;
             } else {
                 self.type_expr(&mut qual, &Type::NoType);

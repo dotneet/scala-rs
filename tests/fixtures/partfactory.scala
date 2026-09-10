@@ -10,6 +10,7 @@ object Main {
     val second: Cell[Int] = Factory.make(2)
     val third = Factory.make("three")
     println(Factory.lower(3).value)
+    println(Factory.lower.apply(3).value)
     println(first.value)
     println(second.value)
     println(third.value.length)

@@ -1,2 +1,4 @@
 Some(2)
 Some(ok)
+2
+ok

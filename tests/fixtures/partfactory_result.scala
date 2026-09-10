@@ -6,5 +6,9 @@ object Main {
     val r = new ResultResource[Option, String]("ok")
     println(r.allocated.map(_._1.length))
     println(r.allocated[Any].map(_._1))
+    val c = new ResultCollection[String]("ok")
+    val values = c.values
+    println(values.head.length)
+    println(c.values[Any].head)
   }
 }

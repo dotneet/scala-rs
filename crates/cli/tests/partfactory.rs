@@ -166,17 +166,17 @@ fn result_only_lower_bounds_are_inferred_at_the_use_site() {
         } else {
             JAR.to_string()
         };
-        for bad in [false, true] {
-            let mut files = vec![fixture(if bad {
-                "partfactory_result_bad.scala"
-            } else {
-                "partfactory_result.scala"
-            })];
+        for (bad, source) in [
+            (false, "partfactory_result.scala"),
+            (true, "partfactory_result_bad.scala"),
+            (true, "partfactory_nullary_bad.scala"),
+        ] {
+            let mut files = vec![fixture(source)];
             if !binary {
                 files.push(fixture("partfactory_resultlib.scala"));
             }
             for oracle in [false, true] {
-                let out = p.join(format!("{binary}-{bad}-{oracle}"));
+                let out = p.join(format!("{binary}-{source}-{oracle}"));
                 let r = compile(&files, &out, &cp, oracle, false);
                 assert_eq!(
                     r.status.success(),

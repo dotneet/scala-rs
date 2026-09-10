@@ -21,6 +21,8 @@ makes no claim of conformance to the language specification. What exists today:
   expected results before implicit search. Binary result parameters retain
   their declared bounds until call-site inference. Implicit-only methods infer
   result-only lower bounds at the receiver while preserving explicit type arguments.
+  Parameterless results infer their lower bounds in value position; explicit
+  and omitted apply both retain factory receiver inference until the arguments.
 - The target is Java 8 class files (major version 52), with a `StackMapTable`
   (`full_frame`) in the `Code` attribute. Frame types for locals are the erasure
   of the slot's declared type, as in scalac.

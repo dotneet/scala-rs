@@ -808,6 +808,31 @@ impl Typer {
         if fun_name == "flatMap" && self.is_array_ops_ty(recv_ty.as_ref()) {
             self.bind_array_ops_flat_map(fun, args, recv_ty.as_ref(), &mut arg_tys);
         }
+        // Explicit `.apply` on a polymorphic factory result has the same
+        // receiver variables as an inserted apply. Solve them before overload
+        // applicability replaces open variables with their bounds.
+        let factory_apply = match &fun.kind {
+            TreeKind::Select { qual, name } if name == "apply" => {
+                !self.undetermined_of(qual).is_empty()
+            }
+            _ => false,
+        };
+        if factory_apply {
+            if let Type::Method { paramss, ret } = &fun.ty {
+                if paramss.len() == 1 {
+                    let mut params = paramss[0].clone();
+                    let mut ret = (**ret).clone();
+                    self.instantiate_inserted_apply(
+                        fun,
+                        &mut params,
+                        &mut ret,
+                        &arg_tys,
+                        pt,
+                        tree.span,
+                    );
+                }
+            }
+        }
         let fun_ty = fun.ty.clone();
         self.ensure_apply_supplied(&fun_ty, fun.span);
 
