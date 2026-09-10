@@ -3195,6 +3195,7 @@ pub(crate) fn invoke_super(
 /// Reached at runtime through `scala.LowPriorityImplicits.wrapXArray` +
 /// `scala.collection.IterableOnceOps`'s default methods.
 pub(crate) const ARRAY_OPS_WRAP_METHODS: &[&str] = &[
+    "toMap",
     "toList",
     "toSet",
     "toVector",
@@ -3887,6 +3888,14 @@ pub(crate) fn invoke_value_extension(
             let desc = "(Ljava/lang/Object;Lscala/collection/IterableOnce;Lscala/reflect/ClassTag;)Ljava/lang/Object;";
             asm.invokestatic("scala/collection/ArrayOps", ext_name, desc);
             maybe_unbox_erased_result(asm, ctx, desc, result_ty);
+            return;
+        }
+        if s.name == "toMap" {
+            asm.invokeinterface(
+                "scala/collection/IterableOnceOps",
+                "toMap",
+                "(Lscala/$less$colon$less;)Lscala/collection/immutable/Map;",
+            );
             return;
         }
         if s.name == "toList" {

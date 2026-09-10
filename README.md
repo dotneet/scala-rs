@@ -1060,3 +1060,17 @@ Slick の逆方向テスト（MODE=a）はまだ通っていません。
 ## License
 
 Apache-2.0
+
+
+### Member/application compatibility probes
+
+`memberbatch` tests upper-bounded wildcard receivers (including inherited generic
+members), curried implicit extension fallback, Array.toMap evidence and untyped
+catch bindings. `opttrybatch` tests polymorphic Option.collect/zip/flatten and
+Try.flatMap/transform/orElse/recover/recoverWith/collect, including widening and
+lazy fallback evaluation. The CLI memberbatch suite executes both fixtures with
+real scalac 2.13.16 and scala-rs under JVM verification, comparing exact stdout.
+Independent negative fixtures check element types, lower bounds and missing
+implicit evidence; inferred values and methods cannot turn missing evidence
+into an accepted function value. Candidate inventory and remaining hypotheses
+are recorded in docs/batches/member-application.md.

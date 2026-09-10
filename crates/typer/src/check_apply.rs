@@ -2365,15 +2365,18 @@ impl Typer {
                         }
                     }
                     if self.rewrite_apply_extension(fun) {
+                        recv_ty = match &fun.kind {
+                            TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
+                            _ => None,
+                        };
                         let fun_ty = fun.ty.clone();
                         match self.resolve_overload_shaped(&fun_ty, fun.sym, &arg_tys, pt, &shapes)
                         {
-                            OverloadPick::Found(sym, param_tys, ret) => {
-                                fun.sym = sym;
-                                tree.sym = sym;
-                                self.adapt_args_to_params(args, &param_tys, sym);
-                                tree.ty = ret;
-                                return;
+                            pick @ OverloadPick::Found(..) => {
+                                // A view changes the receiver, not the application
+                                // rules. Preserve type inference and trailing clauses.
+                                chosen = pick;
+                                continue 'resolve;
                             }
                             OverloadPick::Ambiguous => {
                                 self.error(

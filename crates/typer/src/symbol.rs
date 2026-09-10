@@ -2189,6 +2189,7 @@ impl SymbolTable {
         let mut seen: Vec<u32> = Vec::new();
         loop {
             match &t {
+                Type::BoundedWildcard { hi: Some(hi), .. } => t = *hi.clone(),
                 Type::TypeParam(id) => {
                     if seen.contains(&id.0) {
                         return ty.clone();
@@ -2336,7 +2337,8 @@ impl SymbolTable {
                     }
                 }
             }
-            Type::Wildcard | Type::BoundedWildcard { .. } => Some(self.any_sym),
+            Type::BoundedWildcard { hi: Some(hi), .. } => self.class_sym_of(hi),
+            Type::Wildcard | Type::BoundedWildcard { hi: None, .. } => Some(self.any_sym),
             Type::ThisType(sym) => Some(*sym),
             Type::Constant(lit) => self.class_sym_of(&Type::lit_underlying(lit)),
             Type::SingleType { prefix, sym } => {

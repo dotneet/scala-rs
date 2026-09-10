@@ -58,7 +58,15 @@ impl Typer {
 
     pub(crate) fn type_case(&mut self, c: &mut CaseDef, pt: &Type) {
         self.st.push_scope();
-        self.type_pattern(&mut c.pat, &Type::Any);
+        let throwable = crate::classpath::find_by_jvm(&self.st, "java/lang/Throwable")
+            .expect("Throwable is installed by the prelude");
+        self.type_pattern(
+            &mut c.pat,
+            &Type::Class {
+                sym: throwable,
+                args: vec![],
+            },
+        );
         if !c.guard.is_empty() {
             self.type_expr(&mut c.guard, &Type::Boolean);
         }

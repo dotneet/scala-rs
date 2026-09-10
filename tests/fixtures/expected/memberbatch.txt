@@ -1,0 +1,6 @@
+baseabc
+abc!
+adc
+Map(1 -> a)
+caught
+nonfatal

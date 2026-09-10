@@ -34,6 +34,10 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
     if let Some(it) = crate::classpath::find_by_jvm(st, "scala/collection/Iterator") {
         add_to_map(st, it, less, map);
     }
+    if let Some(aops) = crate::classpath::find_by_jvm(st, "scala/collection/ArrayOps") {
+        add_to_map(st, aops, less, map);
+    }
+    add_option_flatten(st, less);
     // Deliberately *not* on `scala.collection.Iterable`: `pickle_supply` hands
     // concrete collections (`HashMap`, `ConstArray`, …) their own pickled
     // `toMap`, and a second inherited one would make every `.toMap` an
@@ -91,4 +95,34 @@ fn type_param(st: &mut SymbolTable, owner: SymbolId, name: &str) -> SymbolId {
     let id = st.alloc(name, owner, SymKind::TypeParam, Flags::EMPTY, "");
     st.get_mut(id).ty = Type::TypeParam(id);
     id
+}
+
+fn add_option_flatten(st: &mut SymbolTable, less: SymbolId) {
+    let owner = st.option_sym;
+    let a = st.get(owner).tparams[0];
+    let m = st.alloc("flatten", owner, SymKind::Method, Flags::FINAL, "");
+    let b = type_param(st, m, "B");
+    let result = Type::Class {
+        sym: owner,
+        args: vec![Type::TypeParam(b)],
+    };
+    let evidence = Type::Class {
+        sym: less,
+        args: vec![Type::TypeParam(a), result.clone()],
+    };
+    let ev = st.alloc(
+        "ev",
+        m,
+        SymKind::Term,
+        Flags::PARAM.with(Flags::IMPLICIT),
+        "",
+    );
+    st.get_mut(ev).ty = evidence.clone();
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = vec![ev];
+    st.get_mut(m).paramss = vec![vec![ev]];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![vec![evidence]],
+        ret: Box::new(result),
+    };
 }

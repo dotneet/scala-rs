@@ -261,16 +261,7 @@ pub(crate) fn invoke_method(
             );
             return;
         }
-        // nsc: `def flatten[B](implicit ev: A <:< Option[B]): Option[B]`. The
-        // evidence is erased, so `<:<.refl` (an `=:=`, hence a `<:<`) is the
-        // witness scalac itself would summon.
         if name == "flatten" && is_stdlib_option(&owner) {
-            asm.getstatic(
-                "scala/$less$colon$less$",
-                "MODULE$",
-                "Lscala/$less$colon$less$;",
-            );
-            asm.invokevirtual("scala/$less$colon$less$", "refl", "()Lscala/$eq$colon$eq;");
             asm.invokevirtual(
                 "scala/Option",
                 "flatten",

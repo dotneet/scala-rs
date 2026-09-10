@@ -2364,7 +2364,8 @@ impl Typer {
         **qual = self.fill_conv_implicits(conv, &from, applied, span);
         fun.sym = member;
         let mty = self.st.get(member).ty.clone();
-        fun.ty = self.at_import_prefix_of(conv, &mty).unwrap_or(mty);
+        let mty = self.at_import_prefix_of(conv, &mty).unwrap_or(mty);
+        fun.ty = self.st.subst_as_seen_from(&qual.ty, &mty);
         true
     }
 

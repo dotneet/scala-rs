@@ -1,0 +1,17 @@
+Some(n7)
+Success(n7)
+Success(ok)
+Some(7)
+None
+Some(n7)
+Some((7,a))
+Some((7,wide))
+Success(n7)
+Success(n7)
+Success(bad)
+Success(fallback)
+Success(7)
+0
+Success(ok)
+Success(ok)
+Success(n7)

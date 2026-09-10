@@ -200,7 +200,6 @@ fn install_option_library(st: &mut SymbolTable) {
         return;
     }
     let ta = Type::TypeParam(a);
-    let opt = ty_of(o, vec![ta.clone()]);
     let either = cls_named(st, "Either");
     let pf = cls_named(st, "PartialFunction");
     let tuple2 = cls_named(st, "Tuple2");
@@ -215,28 +214,34 @@ fn install_option_library(st: &mut SymbolTable) {
         Intrinsic::None,
     );
     if !pf.is_none() {
-        method(
-            st,
-            o,
-            "collect",
-            vec![ty_of(pf, vec![ta.clone(), Type::Any])],
-            opt.clone(),
-            Intrinsic::None,
-        );
+        poly_method(st, o, "collect", None, |b| {
+            (
+                vec![ty_of(pf, vec![ta.clone(), b.clone()])],
+                ty_of(o, vec![b]),
+            )
+        });
     }
     if !tuple2.is_none() {
-        method(
-            st,
-            o,
-            "zip",
-            vec![ty_of(o, vec![Type::Any])],
-            ty_of(o, vec![ty_of(tuple2, vec![ta.clone(), Type::Any])]),
-            Intrinsic::None,
-        );
+        // Scala 2.13: zip[A1 >: A, B](that: Option[B]): Option[(A1, B)].
+        let m = method(st, o, "zip", vec![], Type::NoType, Intrinsic::None);
+        let a1 = type_param(st, m, "A1");
+        st.get_mut(a1).bound_lo = Some(ta.clone());
+        let b = type_param(st, m, "B");
+        let arg = ty_of(o, vec![Type::TypeParam(b)]);
+        let that = st.alloc("that", m, SymKind::Term, Flags::PARAM, "");
+        st.get_mut(that).ty = arg.clone();
+        st.get_mut(m).tparams = vec![a1, b];
+        st.get_mut(m).params = vec![that];
+        st.get_mut(m).paramss = vec![vec![that]];
+        st.get_mut(m).ty = Type::Method {
+            paramss: vec![vec![arg]],
+            ret: Box::new(ty_of(
+                o,
+                vec![ty_of(tuple2, vec![Type::TypeParam(a1), Type::TypeParam(b)])],
+            )),
+        };
     }
-    // `def flatten[B](implicit ev: A <:< Option[B]): Option[B]`. We only have
-    // the erased shape, so the element type is refined in `check.rs`.
-    method(st, o, "flatten", vec![], opt, Intrinsic::None);
+    // flatten is installed after <:< by prelude_impl2, with real evidence.
     if either.is_none() {
         return;
     }
@@ -600,14 +605,10 @@ fn install_try(st: &mut SymbolTable) {
         Type::Unit,
         Intrinsic::None,
     );
-    method(
-        st,
-        try_c,
-        "flatMap",
-        vec![fn1(t_ty.clone(), try_t.clone())],
-        try_t.clone(),
-        Intrinsic::None,
-    );
+    poly_method(st, try_c, "flatMap", None, |b| {
+        let result = ty_of(try_c, vec![b]);
+        (vec![fn1(t_ty.clone(), result.clone())], result)
+    });
     method(
         st,
         try_c,
@@ -616,25 +617,20 @@ fn install_try(st: &mut SymbolTable) {
         try_t.clone(),
         Intrinsic::None,
     );
-    method(
-        st,
-        try_c,
-        "orElse",
-        vec![by_name(try_t.clone())],
-        try_t.clone(),
-        Intrinsic::None,
-    );
-    method(
-        st,
-        try_c,
-        "transform",
-        vec![
-            fn1(t_ty.clone(), try_t.clone()),
-            fn1(throwable_t.clone(), try_t.clone()),
-        ],
-        try_t.clone(),
-        Intrinsic::None,
-    );
+    poly_method(st, try_c, "orElse", Some(t_ty.clone()), |b| {
+        let result = ty_of(try_c, vec![b]);
+        (vec![by_name(result.clone())], result)
+    });
+    poly_method(st, try_c, "transform", None, |b| {
+        let result = ty_of(try_c, vec![b]);
+        (
+            vec![
+                fn1(t_ty.clone(), result.clone()),
+                fn1(throwable_t.clone(), result.clone()),
+            ],
+            result,
+        )
+    });
     if !either.is_none() {
         method(
             st,
@@ -646,30 +642,25 @@ fn install_try(st: &mut SymbolTable) {
         );
     }
     if !pf.is_none() {
-        method(
-            st,
-            try_c,
-            "recover",
-            vec![ty_of(pf, vec![throwable_t.clone(), Type::Any])],
-            try_t.clone(),
-            Intrinsic::None,
-        );
-        method(
-            st,
-            try_c,
-            "recoverWith",
-            vec![ty_of(pf, vec![throwable_t.clone(), try_t.clone()])],
-            try_t.clone(),
-            Intrinsic::None,
-        );
-        method(
-            st,
-            try_c,
-            "collect",
-            vec![ty_of(pf, vec![t_ty.clone(), Type::Any])],
-            try_t.clone(),
-            Intrinsic::None,
-        );
+        poly_method(st, try_c, "recover", Some(t_ty.clone()), |b| {
+            (
+                vec![ty_of(pf, vec![throwable_t.clone(), b.clone()])],
+                ty_of(try_c, vec![b]),
+            )
+        });
+        poly_method(st, try_c, "recoverWith", Some(t_ty.clone()), |b| {
+            let result = ty_of(try_c, vec![b]);
+            (
+                vec![ty_of(pf, vec![throwable_t.clone(), result.clone()])],
+                result,
+            )
+        });
+        poly_method(st, try_c, "collect", None, |b| {
+            (
+                vec![ty_of(pf, vec![t_ty.clone(), b.clone()])],
+                ty_of(try_c, vec![b]),
+            )
+        });
     }
     // nsc: `def fold[U](fa: Throwable => U, fb: T => U): U`
     let fold = method(st, try_c, "fold", vec![], Type::Unit, Intrinsic::None);
@@ -897,4 +888,34 @@ fn add_throwable_ctors(st: &mut SymbolTable, cls: SymbolId) {
         }
         method(st, cls, "<init>", params, self_ty.clone(), Intrinsic::None);
     }
+}
+
+/// One result parameter, optionally bounded below by the receiver element.
+fn poly_method(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    name: &str,
+    lower: Option<Type>,
+    signature: impl FnOnce(Type) -> (Vec<Type>, Type),
+) {
+    let m = method(st, owner, name, vec![], Type::NoType, Intrinsic::None);
+    let b = type_param(st, m, "B");
+    st.get_mut(b).bound_lo = lower;
+    let (params, ret) = signature(Type::TypeParam(b));
+    let ids = params
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let id = st.alloc(format!("x${i}"), m, SymKind::Term, Flags::PARAM, "");
+            st.get_mut(id).ty = ty.clone();
+            id
+        })
+        .collect::<Vec<_>>();
+    st.get_mut(m).tparams = vec![b];
+    st.get_mut(m).params = ids.clone();
+    st.get_mut(m).paramss = vec![ids];
+    st.get_mut(m).ty = Type::Method {
+        paramss: vec![params],
+        ret: Box::new(ret),
+    };
 }
