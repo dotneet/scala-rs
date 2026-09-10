@@ -21,7 +21,7 @@ SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch.
-Twenty-two intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-three intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -3128,5 +3128,99 @@ Exact summary block:
 === summary
   HEAD=b969b0d1  logs=/tmp/scala-rs-gate-b969b0d1-codex
 VERDICT=PASS
+DONE
+```
+
+
+## Rejected contextual inference candidate: `ef3551c6`
+
+Frozen commit `ef3551c6e21a46db83bf393c8766814de71649bf`, tree `4228007b033e04b46472d945e966cf33af632004`, based on local main
+`56bf357f1a9164edf6dff63422b7b33cb86fb678`, completed the unskipped full gate in 1534.8
+seconds, with script VERDICT=FAIL, process exit=1 and DONE.
+Independent acceptance audit is FAIL: gitbucket regresses from 105 to 2675
+errors. This candidate is not merged. The accepted compiler, metrics and
+baseline ledger above remain at b969b0d1. The main handover contains only this
+rejection record and the raw candidate corpus ledger; it is not the gated
+compiler tree. The frozen compiler is retained on
+`codex/contextual-inference-batch`.
+
+Logs and audits: `/tmp/scala-rs-gate-ef3551c6-codex/`. Raw candidate ledger:
+[`baselines/corpus-ef3551c6.tsv`](baselines/corpus-ef3551c6.tsv).
+The script verdict does not enforce the gitbucket error budget; it is not
+sufficient for acceptance. Independent audit problems: ["gate verdict is not PASS", "gate process failed", "gitbucket input or error regression", "new diagnostic locations", "corpus losses"].
+
+Candidate measurements use the unchanged pinned inputs: cats 339 sources,
+one skip, 83/34 errors/reported files (was 90/37); gitbucket 354 Scala/Twirl
+sources plus three real Java files, no skips, 2675/186 (was 105/49); standard
+library 538 sources, 421/114 (unchanged). Complete diagnostic comparison finds
+seven cats removals and no additions, 2572 gitbucket additions and two removals,
+and no library additions/removals. Most new errors are ambiguous Twirl
+`_display_` calls. Reported file counts retain the measurement scripts' grep
+convention; full multiline locations are retained in diagnostic-audit.json.
+
+Workspace: 2762 passed, 0 failed,
+308 result rows. Corpus: 5324 identities,
+losses=1, changes=6; counts:
+{"neg": {"fail": 321, "pass": 715, "skip": 369}, "pos": {"fail": 367, "pass": 1147, "skip": 345}, "run": {"fail": 822, "pass": 685, "skip": 553}}.
+The sole loss is pos/val_infer: an inferred val implementing an Int-returning
+member has a String initializer and a valid implicit String-to-Int conversion.
+The new override result check rejects this case. It was outside the selected
+pos/run prerequisites and is added to the next combined repair inventory.
+Gains are neg/i10715b, neg/t473, pos/t927, run/t6928-run and run/t7436.
+Slick: errors=0, 1504 classes, 12 programs, 36/36 byte-exact runtime attempts,
+subset validation and lint clean. Independent JVM verification loads and
+initializes all 1504 classes: failures=0, incomplete=0. The prerequisite
+clippy comparison retains 57 warning occurrences, with none added or removed.
+
+This was a single full gate after a combined implementation of inferred
+implicit overrides, residual-clause overload handling, implicit method eta
+expansion and receiver capture, parent repeated arguments and JVM packing,
+erased override identity, pickle variance, materialized-tag inference and
+module self references in parent arguments. No subagents or stubs.
+The permanent oracle matrix has 33 Scala programs in seven groups, with real
+scalac 2.13.16 bidirectional acceptance and byte-exact verified JVM execution;
+19 expose a defect in the immutable before executable. Initial prerequisites
+passed 1585 CLI tests in 146 suites and 198 typer tests. Selected corpus and
+full negatives found four intermediate regressions, repaired together before
+the full gate. Final parent prerequisites passed 527 CLI tests in 22 suites,
+198 typer tests, 1418 selected pos/run units and all 1405 negatives, with no
+losses; format, clippy and source/jar/cache preflight also passed. Evidence:
+`/tmp/scala-rs-contextual-inference/parent-prerequisites/`.
+The frozen executable SHA-256 is
+`4cf69f47affaabbaa6d05af309683c7255339450d818a12ddc7bb83e375da4da`.
+
+Read-only diagnosis while the gate ran reproduced the regression against the
+real twirl-api_2.13 2.0.9 jar. A subclass of BaseScalaTemplate[Html, Format[Html]]
+calls `_display_` with Seq[Any], null explicitly typed Any, and Int. Both real
+scalac and the accepted before executable compile and execute it with output
+`&lt;x&gt;1`, an empty line, and `42`; this candidate rejects all three calls as
+ambiguous. Untyped null is correctly ambiguous in scalac too, so it is kept as
+a negative control, not claimed as a regression. Runtime reflection of the
+actual jar distinguishes `(AnyVal)T` from `(Any)(implicit ClassTag[T])T`, which
+share an Object argument after JVM erasure. A source-defined AnyVal/Any pair
+also fails on the accepted before executable, exposing an additional existing
+defect. The initial hypothesis that both first clauses were Any was disproved.
+Evidence and executable probe scripts:
+`/tmp/scala-rs-contextual-inference/twirl-regression/`.
+The next implementation batch must cover both source and binary overload
+origins, retain valid/invalid controls and include other ready repairs before
+another full gate. No edits or rebuilds were made to the frozen tree during
+this gate, and no one-fix full-gate retry was started.
+
+Additional next-batch inventory reduced gitbucket's named curried constructor
+failure to executable case-class programs, with and without defaults in the
+two argument lists. Both are accepted and executed by scalac and rejected by
+the accepted before compiler; a wrong-type control is rejected by both. A
+case companion explicitly inheriting Function2 uses tupled correctly in both
+compilers, so that reduction does not justify a tupled repair. Evidence:
+`/tmp/scala-rs-contextual-inference/next-constructor-probes/`.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=ef3551c6  logs=/tmp/scala-rs-gate-ef3551c6-codex
+  fail: corpus losses=1 vs tests/baselines/corpus-b969b0d1.tsv
+VERDICT=FAIL
 DONE
 ```
