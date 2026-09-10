@@ -1473,7 +1473,10 @@ impl Typer {
         // A term already in scope must not suppress the default imports in
         // the type namespace. In particular, loading the Stream companion
         // first must not hide scala.package's polymorphic Stream type alias.
-        for pkg in [self.scala_package(), self.java_lang_package()]
+        let predef = self
+            .library_abi
+            .then(|| self.st.module_class_of(self.st.predef));
+        for pkg in [predef, self.scala_package(), self.java_lang_package()]
             .into_iter()
             .flatten()
         {
@@ -1481,6 +1484,19 @@ impl Typer {
                 break;
             }
             self.complete_binary_member(pkg, name, span);
+            if Some(pkg) == predef {
+                let alias =
+                    self.pickle
+                        .complete_type_member(&mut self.st, &mut self.binary, pkg, name);
+                let id = match alias {
+                    Some(Type::TypeMember(id)) | Some(Type::Class { sym: id, .. }) => Some(id),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    self.st
+                        .enter_in_current_ranked(name, id, BindRank::Wildcard);
+                }
+            }
             for id in self.st.lookup_member(pkg, name) {
                 if matches!(
                     self.st.get(id).kind,
@@ -1612,6 +1628,26 @@ impl Typer {
         // The eager half of `import_wildcard` is not affected: a name it could
         // enter is already in the current scope and neither branch runs.
         self.expose_from_wildcards(name, span);
+        if self.library_abi && self.st.lookup(name).is_empty() {
+            let predef = self.st.module_class_of(self.st.predef);
+            self.pickle
+                .complete(&mut self.st, &mut self.binary, predef, name);
+            let alias =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, predef, name);
+            let id = match alias {
+                Some(Type::TypeMember(id)) | Some(Type::Class { sym: id, .. }) => Some(id),
+                _ => None,
+            };
+            if let Some(id) = id {
+                self.st
+                    .enter_in_current_ranked(name, id, BindRank::Wildcard);
+            }
+            for id in self.st.lookup_member(predef, name) {
+                self.st
+                    .enter_in_current_ranked(name, id, BindRank::Wildcard);
+            }
+        }
         if self.st.lookup(name).is_empty() {
             // Every Scala source has an implicit `import scala._`, which ranks
             // above `java.lang._`. Almost every name it offers is already in

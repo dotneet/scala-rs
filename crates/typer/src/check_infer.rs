@@ -1490,8 +1490,9 @@ impl Typer {
                 // supplies evidence, not a new constraint on open variables.
                 if matches!(found, ImplicitSearch::None)
                     && !mentions_tparam(&pty, &open)
-                    && matches!(&pty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
-                    && self.classtag_apply_fallback(&pty, Span::DUMMY).is_some()
+                    && (self.manifest_available(&pty, 0)
+                        || (matches!(&pty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                            && self.classtag_apply_fallback(&pty, Span::DUMMY).is_some()))
                 {
                     continue;
                 }

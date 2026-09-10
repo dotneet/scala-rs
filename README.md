@@ -1074,3 +1074,18 @@ Independent negative fixtures check element types, lower bounds and missing
 implicit evidence; inferred values and methods cannot turn missing evidence
 into an accepted function value. Candidate inventory and remaining hypotheses
 are recorded in docs/batches/member-application.md.
+
+
+### Manifest and implicit inference probes
+
+`evidencebatch` exercises full Manifest values for primitive, class, tuple,
+function, array, singleton and intersection types, retaining recursive type
+arguments and local evidence. OptManifest uses partial factories and the real
+NoManifest fallback. Default Predef aliases are completed in the proper type
+namespace, including higher-kinded Function. Explicit type arguments are read
+before implicit application; inferred val initializers inside by-name blocks
+have their own inference boundary. The fixtures execute with real scalac
+2.13.16 and scala-rs and compare stdout exactly, alongside independent rejection
+cases. Path-dependent inner-class/instance-member singleton manifests and
+TypeTag-to-Manifest interoperability remain unsupported. See
+[the candidate inventory](docs/batches/evidence-materialization.md).

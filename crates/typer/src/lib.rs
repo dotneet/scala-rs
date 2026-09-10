@@ -32,6 +32,7 @@ mod lin;
 mod localobj;
 mod macros;
 mod materialize;
+mod materialize_manifest;
 mod named_eval_order;
 mod override_check;
 pub use override_check::{method_overloads, method_overrides, record_method_override_families};

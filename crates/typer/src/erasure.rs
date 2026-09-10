@@ -547,7 +547,7 @@ fn erase_elem_ty(ty: &Type, st: &SymbolTable) -> Type {
 /// taking `parents.first()` produced a `Query`. Every one of the twelve slick
 /// run programs died on that one method with `NoSuchMethodError`, because the
 /// client is compiled against nsc's descriptor.
-fn intersection_dominator(parents: &[Type], st: &SymbolTable) -> Option<Type> {
+pub(crate) fn intersection_dominator(parents: &[Type], st: &SymbolTable) -> Option<Type> {
     if parents.len() < 2 {
         return parents.first().cloned();
     }

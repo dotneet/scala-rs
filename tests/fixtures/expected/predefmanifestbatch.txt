@@ -1,0 +1,14 @@
+3
+Int
+Int
+Int
+<?>
+scala.collection.immutable.List[Int]
+Int
+scala.collection.immutable.List[java.lang.String]
+<?>
+scala.collection.immutable.List[<?>]
+Array[Int]
+<?>
+Array[Int]
+Main$P

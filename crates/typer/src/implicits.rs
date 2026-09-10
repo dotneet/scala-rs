@@ -1025,7 +1025,7 @@ impl Typer {
                 let ok = paramss.iter().flatten().all(|p| {
                     let want = crate::symbol::subst_tparams_slice(&tps, &fit.targs, p);
                     self.search_implicit_at(&want, depth + 1).is_found()
-                        || self.built_not_found(&want)
+                        || self.built_not_found(&want, depth + 1)
                 });
                 self.open_implicits.borrow_mut().pop();
                 if ok {
@@ -1074,7 +1074,10 @@ impl Typer {
     /// `array_wrap_view`, `conversion_view`) run their own searches and would
     /// make a function-typed parameter look satisfiable without saying which
     /// conversion answers it.
-    fn built_not_found(&self, want: &Type) -> bool {
+    fn built_not_found(&self, want: &Type, depth: usize) -> bool {
+        if self.manifest_available(want, depth) {
+            return true;
+        }
         if crate::materialize::tag_request(&self.st, want).is_some() {
             return true;
         }
@@ -2604,7 +2607,10 @@ impl Typer {
             {
                 search = self.search_implicit(want);
             }
-            if search.is_found() || self.classtag_apply_fallback(want, span).is_some() {
+            if search.is_found()
+                || self.classtag_apply_fallback(want, span).is_some()
+                || (matches!(search, ImplicitSearch::None) && self.manifest_available(want, 0))
+            {
                 continue;
             }
             return false;

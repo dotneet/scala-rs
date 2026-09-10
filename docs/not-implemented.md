@@ -405,3 +405,14 @@ ordinary inferred methods, vals and vars adopt the inherited type, while final
 constant vals retain their narrower inferred type. Macro-related exceptions have
 not been validated, so the CLI still reports partial support. It is not an ignored
 flag, and it is not yet advertised as a fully implemented source feature.
+
+
+## Remaining Manifest materialization boundaries
+
+The evidence-materialization batch supports recursive full manifests, partial
+OptManifest factories, canonical values and scoped witnesses. Full manifests
+for instance-dependent inner classes and instance-member singleton types still
+need type prefixes that the current representation drops; materialization
+reports missing evidence instead of emitting an erased or wrong-receiver value.
+TypeTag/ClassTag-to-Manifest interoperability also remains unsupported. See
+[batches/evidence-materialization.md](batches/evidence-materialization.md).

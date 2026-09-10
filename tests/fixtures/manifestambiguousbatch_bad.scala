@@ -1,0 +1,1 @@
+object Main{implicit val a:scala.reflect.Manifest[Int]=scala.reflect.Manifest.Int;implicit val b:scala.reflect.Manifest[Int]=scala.reflect.Manifest.Int;val bad=implicitly[scala.reflect.Manifest[Int]]}

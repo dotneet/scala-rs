@@ -1596,17 +1596,23 @@ impl PickleSupply {
                 let qualified = format!("{}.{name}", hit.owner);
                 return self.abstract_type_member(st, bin, &qualified, 0);
             }
+            // A module's aliases belong to its module class. Looking up
+            // the same name as a non-module can fail (Predef) or attach the
+            // alias to an unrelated companion class.
+            let alias_owner = if hit.owner == full {
+                class_sym
+            } else {
+                self.ensure_class(st, bin, &hit.owner, false)?
+            };
             if let Some(prefix) = &hit.member.alias_prefix {
                 trace(format_args!(
                     "{}#{name}: alias prefix {prefix:?}",
                     hit.owner
                 ));
-                if let Some(owner) = self.ensure_class(st, bin, &hit.owner, false) {
-                    st.binary_alias_prefixes
-                        .insert((owner, name.to_string()), prefix.clone());
-                }
+                st.binary_alias_prefixes
+                    .insert((alias_owner, name.to_string()), prefix.clone());
             }
-            return self.install_type_alias(st, bin, &hit.owner, name, &hit.member.ty);
+            return self.install_type_alias(st, bin, alias_owner, name, &hit.member.ty);
         }
         // A *nested class or trait* named as a **type**, as opposed to a type
         // alias or an abstract type member: `u.TypeTag[T]` (`TypeTags.TypeTag`),
@@ -1672,11 +1678,15 @@ impl PickleSupply {
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,
-        owner_name: &str,
+        owner: SymbolId,
         name: &str,
         ty: &SigType,
     ) -> Option<Type> {
-        let owner = self.ensure_class(st, bin, owner_name, false)?;
+        let owner_name = st
+            .get(owner)
+            .jvm_name
+            .trim_end_matches('$')
+            .replace('/', ".");
         // Only a member of `owner` itself is this alias: the pickle hit named
         // the class that *declares* the alias, so a same-named declaration
         // reached through one of its parents is the deferred member this

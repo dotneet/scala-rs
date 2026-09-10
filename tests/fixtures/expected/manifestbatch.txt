@@ -1,0 +1,29 @@
+Byte
+Short
+Char
+Int
+Long
+Float
+Double
+Boolean
+Unit
+Any
+Object
+AnyVal
+Nothing
+Null
+java.lang.String
+scala.collection.immutable.List[java.lang.String]
+scala.collection.immutable.Map[java.lang.String, Int]
+Main$Box[Int]
+Array[Int]
+Array[Array[java.lang.String]]
+Array[Int]
+scala.collection.immutable.List[Int]
+scala.Tuple2[java.lang.String, Int]
+scala.Function1[Int, java.lang.String]
+true
+Main$P with Main$Q
+scala.collection.immutable.List[Any]
+scala.collection.immutable.List[java.lang.Number]
+scala.collection.immutable.List[Object]

@@ -26,6 +26,7 @@ impl Typer {
         // Taken, not read: everything typed below this point is no longer the
         // callee of the application that set it. See `typing_callee`.
         let callee = std::mem::take(&mut self.typing_callee);
+        let type_callee = std::mem::take(&mut self.typing_type_callee);
         let qualifier = std::mem::take(&mut self.typing_qualifier);
         if tree.id.is_pretyped_default() {
             // A default argument's body, already typed in the scope it was
@@ -76,7 +77,9 @@ impl Typer {
                 self.expand_macro_application(tree);
             }
         }
-        self.adapt_implicit_apply_in(tree, pt, callee);
+        if !type_callee {
+            self.adapt_implicit_apply_in(tree, pt, callee);
+        }
         // A parameterless method in value position has no later argument
         // clause to solve a real lower bound (`xs.toSet[B >: A]`). Keep
         // callee references open for explicit type arguments or an inserted
@@ -890,6 +893,7 @@ impl Typer {
                     _ => Type::NoType,
                 };
                 self.typing_callee = true;
+                self.typing_type_callee = true;
                 self.type_expr(fun, &fun_pt);
                 self.typing_callee = false;
                 // The `Method` expectation is for the overload set's sake

@@ -412,6 +412,8 @@ pub struct Typer {
     /// Everything typed *inside* the callee sees the flag already cleared, so
     /// a macro application nested in a receiver (`M.g(1).h`) still expands.
     pub(crate) typing_callee: bool,
+    /// Consumed only by the reference awaiting explicit type arguments.
+    pub(crate) typing_type_callee: bool,
     // Consumed by the next expression only: a selection receiver is not
     // the final value whose unconstrained lower bounds can be minimized.
     pub(crate) typing_qualifier: bool,
@@ -961,6 +963,7 @@ impl Typer {
             new_is_applied: false,
             typing_call_args: false,
             typing_callee: false,
+            typing_type_callee: false,
             typing_qualifier: false,
             callee_arity: None,
             macro_engine: None,

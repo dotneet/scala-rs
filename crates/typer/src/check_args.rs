@@ -1713,9 +1713,13 @@ impl Typer {
                     // `ClassTag` parameter of its own even though
                     // `implicitly[ClassTag[Seq[Any]]]` written out compiled.
                     _ if self.classtag_apply_fallback(&want, span).is_some()
+                        || self.manifest_available(&want, depth)
                         || crate::materialize::tag_request(&self.st, &want).is_some() =>
                     {
-                        match self.classtag_apply_fallback(&want, span) {
+                        match self
+                            .classtag_apply_fallback(&want, span)
+                            .or_else(|| self.manifest_fallback(&want, span))
+                        {
                             Some(t) => cargs.push(t),
                             None => match self.materialize_tag(&want, span) {
                                 Some(t) => cargs.push(t),
@@ -1805,6 +1809,8 @@ impl Typer {
                     let diverged = self.diverged_implicit.borrow().clone();
                     if let Some(ct) = self.classtag_apply_fallback(&pty, span) {
                         args.push(ct);
+                    } else if let Some(manifest) = self.manifest_fallback(&pty, span) {
+                        args.push(manifest);
                     } else if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
                     } else if let Some(lam) = self.array_wrap_view(&pty, span) {
