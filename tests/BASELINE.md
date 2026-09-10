@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Ninety-four slices have merged this session**, in forty-two accepted composed gates.
-Fifteen intermediate candidates were rejected, three despite a PASS script verdict. From
+Sixteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2258,3 +2258,28 @@ must exclude universal Any/Object members, as nsc's isUnimportableUnlessRenamed
 does; otherwise import ne.scala resolves ne through Predef (t5389).
 Corrections are developed in a separate worktree while this gate's tree stays
 fixed. Their final composed tree requires another complete gate before merge.
+
+
+## Rejected namespace-integration candidate: 20d4c727
+
+One complete unskipped gate reached VERDICT=FAIL and DONE. Main remains at
+accepted compiler 3343f368 (metadata commit 75f86f78). Logs:
+`/tmp/scala-rs-gate-20d4c727-codex/`; exact raw ledger:
+`tests/baselines/corpus-20d4c727.tsv`.
+
+Gitbucket is 184/60, cats 121/54, and library 442/119 (errors/files). Slick
+compiles 184 sources with 9 errors in 2 files and no complete class output.
+MODE=b cannot compile; the subset covers only 38 sources / 169 classes,
+verified=169, failed=0 and lint_problems=0. This is incomplete Slick coverage;
+strong initialization verification of all 1492 classes was not available.
+Workspace passes 2711 tests, zero failed, in 300 rows. Format passes and
+pre-gate clippy retains the same 57 known warnings.
+
+The full 5324-row corpus has pos 1124/390/345, neg 700/336/369 and
+run 647/860/553 (pass/fail/skip). Changes=14, gains=11, losses=3:
+run/t10513, run/t3603, run/t6488. The original four candidate losses are
+recovered. Java class symbols representing static companions were excluded
+from term lookup, breaking wildcard imports. A preceding term-only import
+also hid a package class from later type lookup (IntMap in t3603).
+The next composed candidate repairs these in a separate worktree and must
+pass related regressions and a complete gate before merge.
