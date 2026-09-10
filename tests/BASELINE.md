@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Ninety-nine slices have merged this session**, in forty-three accepted composed gates.
-Sixteen intermediate candidates were rejected, three despite a PASS script verdict. From
+Seventeen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2351,5 +2351,45 @@ This is measured progress, not a completed Scala compiler.
 === summary
   HEAD=23031519  logs=/tmp/scala-rs-gate-23031519-codex
 VERDICT=PASS
+DONE
+```
+
+
+## Rejected candidate seventeen: type identity and implicit objects
+
+Clean candidate `4f3f51ef6dfee788dd867c49db42d642f5c1df30` (tree
+`1c229916def7255216a48b22809e4c883d3e0241`) ran the complete unskipped gate
+and reached DONE. It is not merged. Accepted compiler 23031519 and all current
+baseline figures above remain unchanged. Logs: `/tmp/scala-rs-gate-4f3f51ef-codex/`.
+Raw 5324-row ledger: [`baselines/corpus-4f3f51ef.tsv`](baselines/corpus-4f3f51ef.tsv).
+The candidate branch is pushed and its worktree remains frozen. This record
+and ledger are metadata only, not a compiler merge.
+
+Gitbucket regressed 158/57 -> 352/81 and the library 440/118 -> 443/118;
+cats remains 121/54 (errors/files). Slick remains errors=0, 1492 classes,
+12/12 programs, 36/36 attempts, verified=1492 and lint_problems=0. Stronger
+initialization verification loads 1492 with failures=0 and incomplete=0.
+Workspace: 301 rows, 2713 passed, 2 failed (cyclic::fixture_cyclic_ok_runs and
+gbopt::multi_gbopt_binary_runs). Corpus: pos 1116/398/345, neg 705/331/369,
+run 652/855/553 (pass/fail/skip), losses=9 and changes=17. Format passes.
+
+Losses: neg/macro-blackbox-dynamic-materialization, pos/t1001, pos/t1027, pos/t10708, pos/t1292, pos/t2082, pos/t2712-4, pos/t4063, pos/t4970b.
+
+The gate exposed premature written-bound checks for self-recursive parents,
+a misowned prelude Using.Releasable type, and implicit candidate result parents
+completed after rather than before specificity selection. The negative macro
+case exposes loss of source-produced macro bindings when inherited fallback
+evidence becomes visible. These are hypotheses under correction in the separate
+codex/type-identity-integration worktree; the rejected tree is not edited.
+The next composed batch must include both failed existing suites and all nine
+corpus identities in its prerequisites. The previous 243-case sample omitted
+these nine cases; green focused tests did not establish corpus compatibility.
+
+```text
+=== summary
+  HEAD=4f3f51ef  logs=/tmp/scala-rs-gate-4f3f51ef-codex
+  fail: workspace tests: 301 rows, 2713 passed, 2 failed
+  fail: corpus losses=9 vs tests/baselines/corpus-23031519.tsv
+VERDICT=FAIL
 DONE
 ```
