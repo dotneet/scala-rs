@@ -4121,21 +4121,15 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
             keep(&mut kept);
             continue;
         }
-        // A lower bound and *no* parameter of any kind names it:
-        // `Resource#allocated[B >: A](implicit F: MonadCancel[F, Throwable]):
-        // F[(B, F[Unit])]`. Nothing at the call site mentions `B`, so nsc's
-        // `inferExprInstance` instantiates it at the bound; do that here and
-        // drop the parameter, because the typer's own instantiation only
-        // reaches parameters an implicit clause names.
-        if real_lo {
-            pin.insert(tp.name.clone(), tp.lo.clone().expect("real_lo"));
-            continue;
-        }
-        // No lower bound, but the *result* names it: the call site can still
-        // determine it, from an explicit type application (`classTag[Short]`)
-        // or from the expected type.
+        // A result parameter can still be fixed by explicit type arguments,
+        // an expected result, or an apply on the returned value. Its lower
+        // bound constrains inference; it must not replace the declaration.
         if mentioned(&shape.ret).contains(&tp.name) {
             keep(&mut kept);
+            continue;
+        }
+        if real_lo {
+            pin.insert(tp.name.clone(), tp.lo.clone().expect("real_lo"));
             continue;
         }
         // A *materialiser*: the whole member is one implicit clause, and the

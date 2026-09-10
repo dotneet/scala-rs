@@ -169,7 +169,7 @@ impl Typer {
         if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
             return false;
         }
-        self.ensure_apply_supplied(&ret);
+        self.ensure_apply_supplied(&ret, fun.span);
         let Some(cls) = self.st.class_sym_of(&ret) else {
             return false;
         };
@@ -244,13 +244,13 @@ impl Typer {
     /// members are only ever fetched by `type_select`, which never runs for
     /// the implied `.apply`, so the extractor looked empty and every
     /// `Literal(Constant(x))` in the reflection API was rejected.
-    pub(crate) fn ensure_apply_supplied(&mut self, fun_ty: &Type) {
+    pub(crate) fn ensure_apply_supplied(&mut self, fun_ty: &Type, span: scala_rs_span::Span) {
         // A parameterless accessor can return a module just as it can
         // return an ordinary class instance. Both need their apply members
         // completed before insert_apply_on_nullary decides whether to select.
         if let Type::Overload(alts) = fun_ty {
             for alt in alts {
-                self.ensure_apply_supplied(alt);
+                self.ensure_apply_supplied(alt, span);
             }
             return;
         }
@@ -263,6 +263,9 @@ impl Typer {
         if !self.st.lookup_member(cls, "apply").is_empty() {
             return;
         }
+        // Nested binary classes may have no pickle index until their own
+        // classfile has been loaded. Use the ordinary selection supply path.
+        self.ensure_classfile_members_loaded(cls, "apply", span);
         self.supply_from_pickle(fun_ty, "apply");
     }
 

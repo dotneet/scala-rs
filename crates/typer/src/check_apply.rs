@@ -809,7 +809,8 @@ impl Typer {
             self.bind_array_ops_flat_map(fun, args, recv_ty.as_ref(), &mut arg_tys);
         }
         let fun_ty = fun.ty.clone();
-        self.ensure_apply_supplied(&fun_ty);
+        self.ensure_apply_supplied(&fun_ty, fun.span);
+
         self.complete_overload_owners(fun);
         // Before the alternatives are weighed, not only after they all fail:
         // a call that *resolves* still has to solve its type parameters from
@@ -2257,16 +2258,14 @@ impl Typer {
                             // errors read `found: M[A] required: M[T[A]]`).
                             let mut param_tys = param_tys;
                             let mut ret = ret;
-                            if own.as_deref().is_some_and(|t| !t.is_empty()) {
-                                self.instantiate_inserted_apply(
-                                    fun,
-                                    &mut param_tys,
-                                    &mut ret,
-                                    &arg_tys,
-                                    pt,
-                                    tree.span,
-                                );
-                            }
+                            self.instantiate_inserted_apply(
+                                fun,
+                                &mut param_tys,
+                                &mut ret,
+                                &arg_tys,
+                                pt,
+                                tree.span,
+                            );
                             for (i, a) in args.iter_mut().enumerate() {
                                 let p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                                 let open = self.open_tparams_of(&p, own.as_deref());
@@ -3009,7 +3008,7 @@ impl Typer {
     /// abstract stops doing so.
     pub(crate) fn instantiate_inserted_apply(
         &mut self,
-        fun: &Tree,
+        fun: &mut Tree,
         param_tys: &mut Vec<Type>,
         ret: &mut Type,
         arg_tys: &[Type],
@@ -3018,22 +3017,50 @@ impl Typer {
     ) {
         let sym = fun.sym;
         let recv = match &fun.kind {
-            TreeKind::Select { qual, .. } => Some(&qual.ty),
+            TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
             _ => None,
         };
         // Bounds belong to the inserted apply's receiver, not the original
         // parameterless method's receiver. Infer lower bounds at that type
         // and validate both bounds before substituting the solution: adapting
         // to already substituted parameters cannot catch an invalid solution.
-        let inst = self.infer_method_tparams_in(sym, param_tys, arg_tys, recv);
+        let inst = self.infer_method_tparams_in(sym, param_tys, arg_tys, recv.as_ref());
         // A function literal is still a placeholder here; taking it for a
         // solution would hide the expected type from the lambda.
         let inst: Vec<(SymbolId, Type)> = inst
             .into_iter()
             .filter(|(_, t)| !mentions_no_type(t) && !t.is_error() && !t.is_no_type())
             .collect();
-        let inst = self.add_expected_constraints(sym, ret, pt, inst);
-        self.check_tparam_bounds(sym, &inst, recv, span, true);
+        let mut inst = self.add_expected_constraints(sym, ret, pt, inst);
+        // The factory's variables belong to the receiver rather than apply.
+        // Infer them from value arguments, then use a compatible expected
+        // result before searching the implicit clause.
+        for tp in self.undet_tvars.clone() {
+            if inst.iter().any(|(id, _)| *id == tp) {
+                continue;
+            }
+            let owner = self.st.get(tp).owner;
+            let from_args = self
+                .infer_method_tparams(owner, param_tys, arg_tys)
+                .into_iter()
+                .find_map(|(id, t)| (id == tp).then_some(t))
+                .filter(|t| !mentions_no_type(t) && !t.is_error() && !type_mentions_tparam(t, tp));
+            let expected = unify_one(&self.st, tp, ret, pt)
+                .filter(|t| !mentions_no_type(t) && !t.is_error() && !type_mentions_tparam(t, tp));
+            let solution = match (from_args, expected) {
+                (Some(arg), Some(expected)) if self.st.is_sub_type(&arg, &expected) => {
+                    Some(expected)
+                }
+                (Some(arg), _) => Some(arg),
+                (None, expected) => expected,
+            };
+            if let Some(t) = solution {
+                if self.undet_solution_in_bounds(tp, &t) {
+                    inst.push((tp, t));
+                }
+            }
+        }
+        self.check_tparam_bounds(sym, &inst, recv.as_ref(), span, true);
         if inst.is_empty() {
             return;
         }
@@ -3044,6 +3071,10 @@ impl Typer {
             .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
             .collect();
         *ret = crate::symbol::subst_tparams_slice(&tps, &args_t, ret);
+        fun.ty = crate::symbol::subst_tparams_slice(&tps, &args_t, &fun.ty);
+        if let TreeKind::Select { qual, .. } = &mut fun.kind {
+            qual.ty = crate::symbol::subst_tparams_slice(&tps, &args_t, &qual.ty);
+        }
     }
 
     /// Least upper bound, with the numeric widenings nsc applies before lubbing
