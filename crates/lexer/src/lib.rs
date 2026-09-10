@@ -447,18 +447,36 @@ impl<'a> Lexer<'a> {
     fn lex_backtick(&mut self) {
         let lo = self.pos as u32;
         self.bump(); // `
-        let start = self.pos;
+        let mut text = String::new();
         while let Some(c) = self.peek() {
             if c == '`' {
-                let text = self.src[start..self.pos].to_string();
                 self.bump();
+                if text.is_empty() {
+                    self.error(lo, self.pos as u32, "empty quoted identifier");
+                    return;
+                }
                 self.emit(TokenKind::Ident(text), lo, self.pos as u32);
                 return;
             }
-            if c == '\n' {
+            if matches!(c, '\n' | '\r' | '\u{000C}') {
                 break;
             }
-            self.bump();
+            if c == '\\' {
+                let escape_lo = self.pos as u32;
+                self.bump();
+                // Backquoted identifiers use nsc's ordinary literal escapes.
+                // The interpolated-string dollar extension is not one of them.
+                if self.peek() == Some('$') {
+                    self.error(escape_lo, self.pos as u32 + 1, "invalid escape \\$");
+                    return;
+                }
+                match self.read_escape(escape_lo) {
+                    Some(c) => text.push(c),
+                    None => return,
+                }
+            } else {
+                text.push(self.bump().unwrap());
+            }
         }
         self.error(lo, self.pos as u32, "unterminated backquoted identifier");
     }

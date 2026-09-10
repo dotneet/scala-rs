@@ -88,6 +88,9 @@ pub enum SigType {
     },
     /// SIP-23 literal type.
     Constant(Constant),
+    /// String literal payload resolved from its TERMNAME entry, not decoded
+    /// as a source symbol name.
+    StringConstant(String),
     /// `sym[args]`. `sym` is the dotted full name for classes, or the plain
     /// name for type parameters and abstract type members.
     Ref {
@@ -294,12 +297,18 @@ pub struct ClassSig {
 
 impl ClassSig {
     pub fn member(&self, name: &str) -> Option<&Member> {
-        self.members.iter().find(|m| m.name == name)
+        let encoded = crate::names::encode_method_name(name);
+        self.members
+            .iter()
+            .find(|m| m.name == name || m.name == encoded)
     }
 
     /// All overloads of `name` declared directly on this class.
     pub fn members_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Member> + 'a {
-        self.members.iter().filter(move |m| m.name == name)
+        let encoded = crate::names::encode_method_name(name);
+        self.members
+            .iter()
+            .filter(move |m| m.name == name || m.name == encoded)
     }
 
     /// Full names of the parent classes, ready to be loaded.
@@ -736,6 +745,14 @@ impl Builder<'_> {
                 }
             }
             Some(Entry::ConstantTpe(c)) => match self.p.entry(*c) {
+                Some(Entry::Literal(Constant::Str(name))) => match self.p.name(*name) {
+                    Some(value) => SigType::StringConstant(value.to_string()),
+                    None => {
+                        self.unresolved
+                            .push(format!("String constant #{id} has no name payload"));
+                        SigType::None
+                    }
+                },
                 Some(Entry::Literal(k)) => SigType::Constant(k.clone()),
                 _ => {
                     self.unresolved
@@ -1224,7 +1241,9 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
                 },
             }
         }
-        SigType::This(_) | SigType::Constant(_) | SigType::None => t.clone(),
+        SigType::This(_) | SigType::Constant(_) | SigType::StringConstant(_) | SigType::None => {
+            t.clone()
+        }
         SigType::Single { prefix, sym } => SigType::Single {
             prefix: Box::new(go(prefix)),
             sym: sym.clone(),
@@ -1311,7 +1330,7 @@ fn bare_names(t: &SigType, out: &mut Vec<String>) {
                 bare_names(a, out);
             }
         }
-        SigType::This(_) | SigType::Constant(_) | SigType::None => {}
+        SigType::This(_) | SigType::Constant(_) | SigType::StringConstant(_) | SigType::None => {}
         SigType::Single { prefix, .. } => bare_names(prefix, out),
         SigType::Bounds { lo, hi } => {
             bare_names(lo, out);
@@ -1464,6 +1483,7 @@ pub fn render(t: &SigType) -> String {
             p => format!("{}.{sym}.type", render(p)),
         },
         SigType::Constant(c) => format!("{c:?}"),
+        SigType::StringConstant(s) => format!("{s:?}"),
         SigType::Ref { sym, args } if args.is_empty() => sym.clone(),
         SigType::Ref { sym, args } => {
             let a: Vec<String> = args.iter().map(render).collect();

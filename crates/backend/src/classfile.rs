@@ -575,7 +575,10 @@ impl ClassEmit {
             .map(|e| {
                 let inner = pool.class(&e.inner_class);
                 let outer = e.outer_class.as_deref().map_or(0, |o| pool.class(o));
-                let name = e.inner_name.as_deref().map_or(0, |n| pool.utf8(n));
+                let name = e
+                    .inner_name
+                    .as_deref()
+                    .map_or(0, |n| pool.utf8(&encode_method_name(n)));
                 (inner, outer, name, e.access_flags)
             })
             .collect();
@@ -586,7 +589,9 @@ impl ClassEmit {
         };
         let enclosing_method_idxs = self.enclosing_method.as_ref().map(|(cls, m)| {
             let c = pool.class(cls);
-            let nt = m.as_ref().map_or(0, |(n, d)| pool.name_and_type(n, d));
+            let nt = m
+                .as_ref()
+                .map_or(0, |(n, d)| pool.name_and_type(&encode_method_name(n), d));
             (c, nt)
         });
         // JVMS §4.7.23: a class whose constant pool holds a

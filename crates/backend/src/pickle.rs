@@ -353,6 +353,16 @@ impl<'a> Pickler<'a> {
         i
     }
 
+    /// Symbol names are encoded; literal strings and internal storage suffixes
+    /// share the raw name entry format but must retain their exact bytes.
+    fn symbol_term_name(&mut self, name: &str) -> u32 {
+        self.term_name(&crate::classfile::encode_method_name(name))
+    }
+
+    fn symbol_type_name(&mut self, name: &str) -> u32 {
+        self.type_name(&crate::classfile::encode_method_name(name))
+    }
+
     fn ext_mod(&mut self, name: &str, owner: Option<u32>) -> u32 {
         let key = match owner {
             Some(o) => format!("mod:{name}@{o}"),
@@ -650,7 +660,8 @@ impl<'a> Pickler<'a> {
                         write_nat_to(&mut b, owner);
                         b
                     });
-                    let sym_ref = self.ext_ref_owned(&name, owner);
+                    let sym_ref =
+                        self.ext_ref_owned(&crate::classfile::encode_method_name(&name), owner);
                     let mut b = Vec::new();
                     write_nat_to(&mut b, pref);
                     write_nat_to(&mut b, sym_ref);
@@ -675,6 +686,19 @@ impl<'a> Pickler<'a> {
 
     fn class_type_ref(&mut self, class_sym: SymbolId, arg_refs: &[u32]) -> u32 {
         if let Some(&idx) = self.sym_index.get(&class_sym.0) {
+            let owner = self.st.get(class_sym).owner;
+            // A class declared in this enclosing class has an Outer.this
+            // prefix. NoPrefix loses asSeenFrom substitution in consumers:
+            // Outer.make must return the receiver's Inner, not a bare Inner.
+            if let Some(&prefix) = self.this_tpes.get(&owner.0) {
+                let mut body = Vec::new();
+                write_nat_to(&mut body, prefix);
+                write_nat_to(&mut body, idx);
+                for t in arg_refs {
+                    write_nat_to(&mut body, *t);
+                }
+                return self.add(TYPEREFTPE, body);
+            }
             return self.type_ref_local_refs(idx, arg_refs);
         }
         let n = self
@@ -725,7 +749,7 @@ impl<'a> Pickler<'a> {
             }
             n => {
                 let owner = self.external_owner_ref(class_sym);
-                self.type_ref_in_refs(owner, n, arg_refs)
+                self.type_ref_in_refs(owner, &crate::classfile::encode_method_name(n), arg_refs)
             }
         }
     }
@@ -824,7 +848,9 @@ impl<'a> Pickler<'a> {
             return false;
         };
         let rest = rest.trim_end_matches('$');
-        !rest.is_empty() && !rest.contains('$') && !rest.starts_with(|c: char| c.is_ascii_digit())
+        !rest.is_empty()
+            && scala_rs_pickle::names::last_nesting_separator(rest).is_none()
+            && !rest.starts_with(|c: char| c.is_ascii_digit())
     }
 
     fn owner_chain_ref(&mut self, sym: SymbolId, depth: u32) -> u32 {
@@ -840,11 +866,11 @@ impl<'a> Pickler<'a> {
         match kind {
             SymKind::Module | SymKind::ModuleClass => {
                 let up = self.owner_chain_ref(owner, depth + 1);
-                self.ext_mod(&name, Some(up))
+                self.ext_mod(&crate::classfile::encode_method_name(&name), Some(up))
             }
             SymKind::Class => {
                 let up = self.owner_chain_ref(owner, depth + 1);
-                self.ext_ref_owned(&name, up)
+                self.ext_ref_owned(&crate::classfile::encode_method_name(&name), up)
             }
             // A package (or anything else): the JVM name already spells it.
             _ => self.package_ref_of(&jvm),
@@ -938,7 +964,7 @@ impl<'a> Pickler<'a> {
 
     fn pickle_existential_param_refs(&mut self, lo: Option<u32>, hi: Option<u32>) -> u32 {
         self.exist_n += 1;
-        let name_ref = self.type_name(&format!("_${}", self.exist_n));
+        let name_ref = self.symbol_type_name(&format!("_${}", self.exist_n));
         let idx = self.add(TYPESYM, vec![]);
         let lo = lo.unwrap_or_else(|| self.type_ref_named("Nothing"));
         let hi = hi.unwrap_or_else(|| self.type_ref_named("Any"));
@@ -1000,7 +1026,7 @@ impl<'a> Pickler<'a> {
         paramss: &[Vec<Type>],
         ret: &Type,
     ) {
-        let name_ref = self.term_name(name);
+        let name_ref = self.symbol_term_name(name);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
         self.current_owner = meth_idx;
@@ -1012,7 +1038,7 @@ impl<'a> Pickler<'a> {
             .collect();
         let mut param_refs = Vec::new();
         for (pname, pty) in &params {
-            let pn = self.term_name(pname);
+            let pn = self.symbol_term_name(pname);
             let pty_ref = self.pickle_type(pty);
             let flags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
@@ -1098,7 +1124,7 @@ impl<'a> Pickler<'a> {
         let annotation = self.type_ref_in(internal, "macroImpl");
         let collection = self.ext_mod("collection", Some(scala));
         let immutable = self.ext_mod("immutable", Some(collection));
-        let list_name = self.term_name("List");
+        let list_name = self.symbol_term_name("List");
         let mut symbol = Vec::new();
         write_nat_to(&mut symbol, list_name);
         write_nat_to(&mut symbol, immutable);
@@ -1135,7 +1161,7 @@ impl<'a> Pickler<'a> {
         }
         let lhs = self.pickle_literal_tree(&Lit::String("signature".into()));
         fields.push(self.macro_metadata_tree(22, self.notpe, &[lhs, signature]));
-        let name = self.term_name("macro");
+        let name = self.symbol_term_name("macro");
         let nucleus = self.macro_metadata_tree(IDENTtree, self.notpe, &[self.none, name]);
         let mut refs = vec![nucleus];
         refs.extend(fields);
@@ -1283,7 +1309,7 @@ impl<'a> Pickler<'a> {
         write_nat_to(&mut body, self.type_ref_named(name));
         write_nat_to(&mut body, self.pickle_class(class_id));
         write_nat_to(&mut body, self.pickle_ident_tree("scala", owner));
-        write_nat_to(&mut body, self.term_name(name));
+        write_nat_to(&mut body, self.symbol_term_name(name));
         Some(self.add(TREE, body))
     }
 
@@ -1375,7 +1401,7 @@ impl<'a> Pickler<'a> {
         if let Some(&i) = self.ext_refs.get(&key) {
             return i;
         }
-        let n = self.term_name(name);
+        let n = self.symbol_term_name(name);
         let mut body = Vec::new();
         write_nat_to(&mut body, n);
         write_nat_to(&mut body, owner);
@@ -1415,7 +1441,7 @@ impl<'a> Pickler<'a> {
             Some(id) => self.pickle_member_sym(id),
             None => self.none,
         };
-        let n = self.term_name(name);
+        let n = self.symbol_term_name(name);
         let mut body = Vec::new();
         write_nat_to(&mut body, IDENTtree as u32);
         write_nat_to(&mut body, tpe);
@@ -1460,7 +1486,7 @@ impl<'a> Pickler<'a> {
             Some(id) => self.pickle_member_sym(id),
             None => self.none,
         };
-        let n = self.term_name(name);
+        let n = self.symbol_term_name(name);
         let mut body = Vec::new();
         write_nat_to(&mut body, SELECTtree as u32);
         write_nat_to(&mut body, tpe);
@@ -1508,8 +1534,8 @@ impl<'a> Pickler<'a> {
             self.pickle_class(cls)
         };
         let n = match qual {
-            Some(q) if !q.is_empty() => self.type_name(q),
-            _ => self.type_name(""),
+            Some(q) if !q.is_empty() => self.symbol_type_name(q),
+            _ => self.symbol_type_name(""),
         };
         let mut body = Vec::new();
         write_nat_to(&mut body, THIStree as u32);
@@ -1534,7 +1560,7 @@ impl<'a> Pickler<'a> {
             self.pickle_class(cls)
         };
         let qtree = self.pickle_this_tree(qual, owner);
-        let mix_n = self.type_name(mix.unwrap_or(""));
+        let mix_n = self.symbol_type_name(mix.unwrap_or(""));
         let mut body = Vec::new();
         write_nat_to(&mut body, SUPERtree as u32);
         write_nat_to(&mut body, tpe);
@@ -1846,7 +1872,7 @@ impl<'a> Pickler<'a> {
                     return self.type_ref_named(&n);
                 }
                 let owner = self.package_ref_of(&jvm);
-                let sym = self.ext_mod(&n, Some(owner));
+                let sym = self.ext_mod(&crate::classfile::encode_method_name(&n), Some(owner));
                 let pref = self.noprefix;
                 let mut body = Vec::new();
                 write_nat_to(&mut body, pref);
@@ -1940,7 +1966,7 @@ impl<'a> Pickler<'a> {
         let class_kind = s.kind;
         let raw_name = s.name.trim_end_matches('$').to_string();
         // nsc module classes are CLASSsym + MODULE with a type name, not MODULEsym.
-        let name_ref = self.type_name(&raw_name);
+        let name_ref = self.symbol_type_name(&raw_name);
         let tag = CLASSSYM;
         // Placeholder; fill after children so the class exists as owner.
         let idx = self.add(tag, vec![]);
@@ -2214,7 +2240,7 @@ impl<'a> Pickler<'a> {
             // The term carries source visibility and implicit-search flags;
             // MODULE alone makes a nested implicit object invisible to nsc.
             let mflags = pickled_from_our(class_flags, SymKind::Module, 1 << 8);
-            let mn = self.term_name(&raw_name);
+            let mn = self.symbol_term_name(&raw_name);
             let mbody = self.symbol_info(mn, owner, mflags, mtpe);
             self.add(MODULESYM, mbody);
         } else if let Some(mod_id) = self.st.companion_module(class_id) {
@@ -2301,7 +2327,7 @@ impl<'a> Pickler<'a> {
     }
 
     fn pickle_bridge_method(&mut self, name: &str, owner_ref: u32, params: &[Type], ret: &Type) {
-        let name_ref = self.term_name(name);
+        let name_ref = self.symbol_term_name(name);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
         self.current_owner = meth_idx;
@@ -2311,7 +2337,7 @@ impl<'a> Pickler<'a> {
                 Type::TypeParam(_) => Type::Any,
                 t => t.clone(),
             };
-            let pn = self.term_name(&format!("x${i}"));
+            let pn = self.symbol_term_name(&format!("x${i}"));
             let pty_ref = self.pickle_type(&erased);
             let flags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
@@ -2364,13 +2390,13 @@ impl<'a> Pickler<'a> {
         let params: Vec<Type> = params_override
             .map(|params| params.to_vec())
             .unwrap_or_else(|| method_params_from_sym(self.st, method_id));
-        let name_ref = self.term_name(acc_name);
+        let name_ref = self.symbol_term_name(acc_name);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
         self.current_owner = meth_idx;
         let mut param_refs = Vec::new();
         for (i, p) in params.iter().enumerate() {
-            let pn = self.term_name(&format!("x${}", i + 1));
+            let pn = self.symbol_term_name(&format!("x${}", i + 1));
             let pty = self.pickle_type(p);
             let pflags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
             let pbody = self.symbol_info(pn, meth_idx, pflags, pty);
@@ -2411,7 +2437,7 @@ impl<'a> Pickler<'a> {
     /// list, not a nullary one). It is what tells a reader that the mixing
     /// class owes a `$init$` call.
     fn pickle_mixin_ctor(&mut self, owner_ref: u32) {
-        let name_ref = self.term_name("$init$");
+        let name_ref = self.symbol_term_name("$init$");
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
         self.current_owner = meth_idx;
@@ -2429,7 +2455,7 @@ impl<'a> Pickler<'a> {
     /// `object`'s module class, which nsc emits (`private T$()`) and pickles
     /// but our symbol table does not carry as a member.
     fn pickle_module_ctor(&mut self, owner_ref: u32, class_id: SymbolId) {
-        let name_ref = self.term_name("<init>");
+        let name_ref = self.symbol_term_name("<init>");
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
         self.current_owner = meth_idx;
@@ -2555,7 +2581,7 @@ impl<'a> Pickler<'a> {
                 .map(|(i, t)| (format!("x${i}"), t.clone(), Flags::PARAM))
                 .collect()
         };
-        let name_ref = self.term_name(&meth_name);
+        let name_ref = self.symbol_term_name(&meth_name);
 
         let meth_idx = self.add(VALSYM, vec![]);
         self.sym_index.insert(method_id.0, meth_idx);
@@ -2564,7 +2590,7 @@ impl<'a> Pickler<'a> {
 
         let mut param_refs = Vec::new();
         for (pname, pty, pflags) in &params {
-            let pn = self.term_name(pname);
+            let pn = self.symbol_term_name(pname);
             let pty_ref = self.pickle_type(pty);
             let mut extra = 1u64 << 13; // PARAM
             if pflags.contains(Flags::DEFAULTPARAM) {
@@ -2668,7 +2694,7 @@ impl<'a> Pickler<'a> {
         let own_tparams = s.tparams.clone();
         let bound_lo = s.bound_lo.clone();
         let bound_hi = s.bound_hi.clone();
-        let name_ref = self.type_name(&name);
+        let name_ref = self.symbol_type_name(&name);
         let idx = self.add(TYPESYM, vec![]);
         self.sym_index.insert(id.0, idx);
         let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
@@ -2780,7 +2806,7 @@ impl<'a> Pickler<'a> {
             .unwrap_or(self.noprefix);
         let owner_ref = self.external_class_ref(owner);
         let name = self.st.get(decl).name.clone();
-        let sym = self.ext_ref_owned(&name, owner_ref);
+        let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), owner_ref);
         let mut body = Vec::new();
         write_nat_to(&mut body, pref);
         write_nat_to(&mut body, sym);
@@ -2811,7 +2837,7 @@ impl<'a> Pickler<'a> {
         let bound_hi = s.bound_hi.clone();
         let is_alias = s.is_type_alias;
         let tag = if is_alias { ALIASSYM } else { TYPESYM };
-        let name_ref = self.type_name(&name);
+        let name_ref = self.symbol_type_name(&name);
         let idx = self.add(tag, vec![]);
         self.sym_index.insert(id.0, idx);
         let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
@@ -2868,9 +2894,9 @@ impl<'a> Pickler<'a> {
         let local =
             s.flags.contains(Flags::PRIVATE) && s.flags.contains(Flags::LOCAL) && !s.access_widened;
         let name = if local {
-            s.name.clone()
+            crate::classfile::encode_method_name(&s.name)
         } else {
-            format!("{} ", s.name)
+            format!("{} ", crate::classfile::encode_method_name(&s.name))
         };
         let ty = s.ty.clone();
         // Accessor flags (implicit, override, protected and parameter) do
@@ -2908,7 +2934,7 @@ impl<'a> Pickler<'a> {
         flags_our.set(Flags::PARAM, false);
         flags_our.set(Flags::DEFAULTPARAM, false);
         let kind = s.kind;
-        let name_ref = self.term_name(&name);
+        let name_ref = self.symbol_term_name(&name);
         let idx = self.add(VALSYM, vec![]);
         self.sym_index.insert(val_id.0, idx);
         let ret_ref = self.pickle_type(&ty);
@@ -2978,12 +3004,12 @@ impl<'a> Pickler<'a> {
         param_accessor: bool,
     ) {
         let setter = format!("{}_$eq", crate::classfile::encode_method_name(field));
-        let name_ref = self.term_name(&setter);
+        let name_ref = self.symbol_term_name(&setter);
         let meth_idx = self.add(VALSYM, vec![]);
         let saved = self.current_owner;
         self.current_owner = meth_idx;
         let pty_ref = self.pickle_type(ty);
-        let pn = self.term_name("x$1");
+        let pn = self.symbol_term_name("x$1");
         let pflags = pickled_from_our(Flags::PARAM, SymKind::Term, 1u64 << 13);
         let pbody = self.symbol_info(pn, meth_idx, pflags, pty_ref);
         let param = self.add(VALSYM, pbody);
@@ -3806,7 +3832,7 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         if (*flags & METHOD_PKL) == 0 && (*flags & PARAMACCESSOR) != 0 {
             continue;
         }
-        let mname = name_of(&entries, *name);
+        let mname = crate::classfile::decode_method_name(&name_of(&entries, *name));
         if mname.is_empty() {
             continue;
         }
@@ -3847,7 +3873,9 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                     ..
                 }) = entries.get(*p as usize)
                 {
-                    param_names.push(name_of(&entries, *pn));
+                    param_names.push(crate::classfile::decode_method_name(&name_of(
+                        &entries, *pn,
+                    )));
                     param_types.push(type_of(&entries, *pt, 0));
                     param_flags.push(*pf);
                 } else {

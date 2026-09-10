@@ -420,3 +420,13 @@ need type prefixes that the current representation drops; materialization
 reports missing evidence instead of emitting an erased or wrong-receiver value.
 TypeTag/ClassTag-to-Manifest interoperability also remains unsupported. See
 [batches/evidence-materialization.md](batches/evidence-materialization.md).
+
+
+The Forms/name interoperability batch is tracked in
+[its inventory and validation record](batches/forms-and-names.md). Its nested
+actual-base alignment does not implement general repeated-variable constraint
+solving: first[A]((String, Int)) still fails despite scalac accepting its common
+result type. ArraySeq-warmed grouped/sliding/scan results and SortedMap.keySet
+are independently reproduced remaining collection-supply issues. Name encoding
+uses JDK 17's BMP identifier classification; isolated UTF-16 surrogate strings
+cannot be represented by Rust strings and are not claimed as supported names.

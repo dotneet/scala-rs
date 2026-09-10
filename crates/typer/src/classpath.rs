@@ -649,21 +649,24 @@ fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> boo
 
 fn simple_name(jvm: &str) -> String {
     let last = jvm.rsplit('/').next().unwrap_or(jvm);
-    last.trim_end_matches('$').to_string()
+    scala_rs_pickle::names::decode_method_name(last.trim_end_matches('$'))
 }
 
 fn nest_depth(jvm: &str) -> usize {
     let last = jvm.rsplit('/').next().unwrap_or(jvm);
-    last.trim_end_matches('$')
-        .bytes()
-        .filter(|&b| b == b'$')
-        .count()
+    let mut name = last.trim_end_matches('$');
+    let mut depth = 0;
+    while let Some(i) = scala_rs_pickle::names::last_nesting_separator(name) {
+        depth += 1;
+        name = &name[..i];
+    }
+    depth
 }
 
 fn classpath_nested_parent(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
     let last = jvm.rsplit('/').next().unwrap_or(jvm);
     let last_trim = last.trim_end_matches('$');
-    let idx = last_trim.rfind('$')?;
+    let idx = scala_rs_pickle::names::last_nesting_separator(last_trim)?;
     let outer_simple = &last_trim[..idx];
     let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     let module_jvm = if pkg.is_empty() {
@@ -681,7 +684,7 @@ fn classpath_nested_parent(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
 
 fn classpath_symbol_owner(st: &mut SymbolTable, jvm_name: &str) -> (SymbolId, String) {
     if nest_depth(jvm_name) > 0 {
-        let simple = java_simple_name(jvm_name);
+        let simple = scala_simple_name(jvm_name);
         if let Some(parent) = classpath_nested_parent(st, jvm_name) {
             return (parent, simple);
         }
@@ -1073,7 +1076,11 @@ pub fn install_java_class_in(
     c: &crate::javaclass::JavaClass,
     owner: SymbolId,
 ) -> SymbolId {
-    let simple = java_simple_name(&c.internal_name);
+    let simple = if c.is_scala {
+        scala_simple_name(&c.internal_name)
+    } else {
+        java_simple_name(&c.internal_name)
+    };
     if simple.is_empty() {
         return find_or_stub_java_class(st, &c.internal_name);
     }
@@ -1239,7 +1246,7 @@ fn install_java_module(
     c: &crate::javaclass::JavaClass,
     owner: SymbolId,
 ) -> SymbolId {
-    let simple = java_simple_name(&c.internal_name);
+    let simple = scala_simple_name(&c.internal_name);
     if let Some(m) = st
         .lookup_member(owner, &simple)
         .into_iter()
@@ -1279,6 +1286,17 @@ fn install_java_module(
     apply_java_class_meta(st, cls, c);
     fill_java_members(st, cls, c);
     cls
+}
+
+fn scala_simple_name(internal: &str) -> String {
+    let name = internal
+        .rsplit('/')
+        .next()
+        .unwrap_or(internal)
+        .trim_end_matches('$');
+    let simple =
+        scala_rs_pickle::names::last_nesting_separator(name).map_or(name, |i| &name[i + 1..]);
+    scala_rs_pickle::names::decode_method_name(simple)
 }
 
 pub fn java_simple_name(internal: &str) -> String {
@@ -1321,6 +1339,31 @@ pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId
     }
     let simple = java_simple_name(internal);
     let owner = java_class_owner(st, internal);
+    stub_class_in(st, internal, simple, owner)
+}
+
+/// The signature reader has established that this is a Scala class. Encoded
+/// operators are part of its simple name, not enclosing-class separators.
+pub(crate) fn find_or_stub_scala_class(st: &mut SymbolTable, internal: &str) -> SymbolId {
+    if let Some(id) = find_by_jvm(st, internal) {
+        return id;
+    }
+    let simple = scala_simple_name(internal);
+    let trimmed = internal.trim_end_matches('$');
+    let owner = if let Some(i) = scala_rs_pickle::names::last_nesting_separator(trimmed) {
+        find_or_stub_scala_class(st, &trimmed[..i])
+    } else {
+        ensure_package(st, trimmed.rsplit_once('/').map_or("", |(p, _)| p))
+    };
+    stub_class_in(st, internal, simple, owner)
+}
+
+fn stub_class_in(
+    st: &mut SymbolTable,
+    internal: &str,
+    simple: String,
+    owner: SymbolId,
+) -> SymbolId {
     // `cats/effect/kernel/Ref$` is the *companion*, not the trait. Stubbing it
     // as a `SymKind::Class` called `Ref` -- with the companion's name in
     // `jvm_name` -- made one symbol stand for two things: the object's members

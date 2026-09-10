@@ -2295,6 +2295,7 @@ impl Typer {
         match arg {
             Type::Class { sym: as_, .. } if as_ == ps => return arg.clone(),
             Type::Class { .. }
+            | Type::Refined { .. }
             | Type::ModuleRef(_)
             | Type::ThisType(_)
             | Type::SingleType { .. } => {}
@@ -2335,11 +2336,68 @@ impl Typer {
             if pps.len() == aps.len() {
                 return Type::Function {
                     params: aps.clone(),
-                    ret: Box::new(self.align_to_param_class(pr, ar)),
+                    ret: Box::new(self.align_arg_to_param(pr, ar)),
                 };
             }
         }
-        self.align_to_param_class(param, arg)
+        // Constraints can occur below a tuple/container as well. Align only
+        // matching nominal shapes; the original argument still undergoes
+        // conformance checking, including invariant container arguments.
+        let aligned = self.align_to_param_class(param, arg);
+        match (param, &aligned) {
+            (
+                Type::Class { sym: ps, args: pas },
+                Type::Class {
+                    sym: as_,
+                    args: aas,
+                },
+            ) if ps == as_ && pas.len() == aas.len() => Type::Class {
+                sym: *as_,
+                args: pas
+                    .iter()
+                    .zip(aas)
+                    .map(|(p, a)| self.align_arg_to_param(p, a))
+                    .collect(),
+            },
+            (Type::Tuple(ps), Type::Tuple(as_)) if ps.len() == as_.len() => Type::Tuple(
+                ps.iter()
+                    .zip(as_)
+                    .map(|(p, a)| self.align_arg_to_param(p, a))
+                    .collect(),
+            ),
+            (Type::Tuple(ps), Type::Class { sym, args })
+                if self.st.get(*sym).jvm_name == format!("scala/Tuple{}", ps.len())
+                    && ps.len() == args.len() =>
+            {
+                Type::Class {
+                    sym: *sym,
+                    args: ps
+                        .iter()
+                        .zip(args)
+                        .map(|(p, a)| self.align_arg_to_param(p, a))
+                        .collect(),
+                }
+            }
+            (Type::Class { sym, args }, Type::Tuple(as_))
+                if self.st.get(*sym).jvm_name == format!("scala/Tuple{}", as_.len())
+                    && args.len() == as_.len() =>
+            {
+                Type::Tuple(
+                    args.iter()
+                        .zip(as_)
+                        .map(|(p, a)| self.align_arg_to_param(p, a))
+                        .collect(),
+                )
+            }
+            (Type::Array(p), Type::Array(a)) => {
+                Type::Array(Box::new(self.align_arg_to_param(p, a)))
+            }
+            (Type::ByName(p), Type::ByName(a)) => {
+                Type::ByName(Box::new(self.align_arg_to_param(p, a)))
+            }
+            (Type::ByName(p), a) => self.align_arg_to_param(p, a),
+            _ => aligned,
+        }
     }
 
     fn as_tuple_args(&self, ty: &Type) -> Option<Vec<Type>> {

@@ -920,7 +920,10 @@ impl PickleSupply {
             if ps.len() != arity {
                 continue;
             }
-            let names: Vec<String> = ps.iter().map(|p| p.name.clone()).collect();
+            let names: Vec<String> = ps
+                .iter()
+                .map(|p| scala_rs_pickle::names::decode_method_name(&p.name))
+                .collect();
             // nsc names a parameter the source did not `x$1`; matching an
             // argument against that would accept a name no programmer wrote.
             if names
@@ -1056,7 +1059,7 @@ impl PickleSupply {
         if self.has_pickle(bin, &full, is_module) {
             return Some(full);
         }
-        let dotted = full.replace('$', ".");
+        let dotted = scala_rs_pickle::names::nested_to_dotted(&full);
         if dotted != full && self.has_pickle(bin, &dotted, is_module) {
             return Some(dotted);
         }
@@ -1285,7 +1288,13 @@ impl PickleSupply {
                 if p.flags & pflags::DEFAULTPARAM != 0 {
                     flags = flags.with(Flags::DEFAULTPARAM);
                 }
-                let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
+                let ps = st.alloc(
+                    scala_rs_pickle::names::decode_method_name(&p.name),
+                    m,
+                    SymKind::Term,
+                    flags,
+                    "",
+                );
                 st.get_mut(ps).ty = t.clone();
                 tys.push(t);
                 syms.push(ps);
@@ -1826,7 +1835,7 @@ impl PickleSupply {
         let full = if self.has_pickle(bin, &plain, is_module) {
             plain
         } else {
-            let dotted = plain.replace('$', ".");
+            let dotted = scala_rs_pickle::names::nested_to_dotted(&plain);
             if dotted != plain && self.has_pickle(bin, &dotted, is_module) {
                 nested = true;
                 dotted
@@ -2305,7 +2314,13 @@ impl PickleSupply {
                 } else {
                     Flags::PARAM
                 };
-                let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
+                let ps = st.alloc(
+                    scala_rs_pickle::names::decode_method_name(&p.name),
+                    m,
+                    SymKind::Term,
+                    flags,
+                    "",
+                );
                 st.get_mut(ps).ty = t.clone();
                 tys.push(t);
                 syms.push(ps);
@@ -2846,7 +2861,13 @@ impl PickleSupply {
                     default_slots
                         .push(paramss_ty.iter().map(|c| c.len()).sum::<usize>() + tys.len() + 1);
                 }
-                let ps = st.alloc(&p.name, m, SymKind::Term, flags, "");
+                let ps = st.alloc(
+                    scala_rs_pickle::names::decode_method_name(&p.name),
+                    m,
+                    SymKind::Term,
+                    flags,
+                    "",
+                );
                 st.get_mut(ps).ty = t.clone();
                 tys.push(t);
                 syms.push(ps);
@@ -3447,7 +3468,7 @@ impl PickleSupply {
             if !self.has_pickle(bin, full_name, module) {
                 return None;
             }
-            let id = crate::classpath::find_or_stub_java_class(st, &key);
+            let id = crate::classpath::find_or_stub_scala_class(st, &key);
             // That function also answers by simple name, and a companion's
             // placeholder -- `Async` standing for `.../Async$` -- is not the
             // trait this signature names. Handing it back made
@@ -4441,6 +4462,27 @@ impl PickleSupply {
         }
         let d = depth + 1;
         match t {
+            SigType::StringConstant(value) => Some(Type::Constant(
+                scala_rs_parser::ast::Lit::String(value.clone()),
+            )),
+            SigType::Constant(value) => {
+                use scala_rs_parser::ast::Lit;
+                use scala_rs_pickle::read::Constant;
+                let value = match value {
+                    Constant::Unit => Lit::Unit,
+                    Constant::Boolean(v) => Lit::Boolean(*v),
+                    Constant::Int(v) => Lit::Int(*v),
+                    Constant::Long(v) => Lit::Long(*v),
+                    Constant::Float(v) => Lit::Float(*v),
+                    Constant::Double(v) => Lit::Double(*v),
+                    Constant::Char(v) => Lit::Char(char::from_u32(*v)?),
+                    Constant::Null => Lit::Null,
+                    // Byte/Short and unresolved entry references cannot be
+                    // represented faithfully by the parser's literal types.
+                    _ => return None,
+                };
+                Some(Type::Constant(value))
+            }
             SigType::Annotated(inner) => self.conv_at(st, bin, scope, inner, d),
             SigType::Existential { quantified, result } => {
                 // `List[_]`: the quantified variables stand for wildcards, and
@@ -5206,9 +5248,9 @@ impl PickleSupply {
         let mut owners: Vec<String> = Vec::new();
         let mut cur = internal.trim_end_matches('$').replace('/', ".");
         loop {
-            owners.push(cur.replace('$', "."));
-            match cur.rsplit_once('$') {
-                Some((outer, _)) => cur = outer.to_string(),
+            owners.push(scala_rs_pickle::names::nested_to_dotted(&cur));
+            match scala_rs_pickle::names::last_nesting_separator(&cur) {
+                Some(i) => cur.truncate(i),
                 None => break,
             }
         }
@@ -5423,18 +5465,17 @@ impl PickleSupply {
         d: u32,
     ) -> Option<Type> {
         let (owner, simple) = sym.rsplit_once('.')?;
-        let sig = {
+        // A companion's signature may exist without declaring this alias.
+        // Continue to the class signature instead of treating that as a hit.
+        let alias = [true, false].into_iter().find_map(|module| {
             let mut src = BinSource(bin);
-            self.sigs
-                .class_sig(&mut src, owner, true)
-                .or_else(|_| self.sigs.class_sig(&mut src, owner, false))
-                .ok()?
-        };
-        let alias = sig
-            .members
-            .iter()
-            .find(|m| m.name == simple && m.kind == MemberKind::TypeAlias)?
-            .clone();
+            let sig = self.sigs.class_sig(&mut src, owner, module).ok()?;
+            let alias = sig
+                .members_named(simple)
+                .find(|m| m.kind == MemberKind::TypeAlias)
+                .cloned();
+            alias
+        })?;
         // A parameterised alias (`type List[+A] = immutable.List[A]`) binds its
         // own parameters to our arguments; a plain one has none.
         let (tps, target) = match &alias.ty {
@@ -5640,7 +5681,8 @@ fn names_class(candidate: &str, full_name: &str) -> bool {
     };
     let last = candidate.rsplit('/').next().unwrap_or(candidate);
     let last = last.strip_suffix('$').unwrap_or(last);
-    last == simple || last.rsplit('$').next() == Some(simple)
+    let start = scala_rs_pickle::names::last_nesting_separator(last).map_or(0, |i| i + 1);
+    &last[start..] == simple
 }
 
 /// Every value parameter of a pickled member's type, across all its clauses.

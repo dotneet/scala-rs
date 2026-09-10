@@ -2210,6 +2210,7 @@ impl Typer {
     }
 
     fn binary_member_candidates(&self, owner: SymbolId, name: &str) -> Vec<String> {
+        let name = scala_rs_pickle::names::encode_method_name(name);
         let owner_bin = if owner == self.st.root {
             String::new()
         } else {

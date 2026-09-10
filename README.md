@@ -1144,3 +1144,20 @@ side-effecting defaults. Eager private-this storage has no accessor; ordinary
 private accessors preserve JVM visibility, and directory constructor prototypes
 do not become public fields. `sqlstoragebatch` executes all four combinations
 of API producer/consumer compilers and independently rejects inaccessible reads.
+
+
+### Nested Forms inference and name interoperability
+
+The Forms/name batch aligns nested actual class arguments with the required
+base types before generic inference. Real Scalatra Forms inferred ValueType
+subclasses are covered alongside tuple/container/function-result probes and
+independent invariant-container and wrong-result rejections.
+
+ScalaSignature symbol names, JVM operator/Unicode encoding, backquoted literal
+escapes, named parameters and literal type payloads share tested boundaries.
+`formnamesbatch` exchanges APIs between scala-rs and scalac 2.13.16 and executes
+valid consumers under JVM verification with byte-identical output. A released
+NameTransformer oracle checks all non-surrogate BMP characters against the
+pinned JDK 17. See [the batch record](docs/batches/forms-and-names.md) for current
+validation status and corrected hypotheses. Repeated-variable constraint
+solving and warmed collection return types remain separate unresolved roots.
