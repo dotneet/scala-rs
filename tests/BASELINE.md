@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `e355ab70` |
+| commit | `5f0d18c2` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Eighty-three slices have merged this session**, in thirty-nine accepted composed gates.
+**Eighty-four slices have merged this session**, in forty accepted composed gates.
 Thirteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -62,6 +62,7 @@ coordinator measured the merged tree each time, not the branches.
 | `176629aa` | `partial factory inference` | 192 -> **191** | 158 -> **152** |
 | `a7f05f48` | `App and DelayedInit identities` | 191 | 152 |
 | `e355ab70` | `directory Scala signatures` | 191 | 152 |
+| `5f0d18c2` | `immutable Map key types` | 191 | 152 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -296,8 +297,11 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 | `run` (2060) | **643** | 864 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-e355ab70.tsv`](baselines/corpus-e355ab70.tsv): 5324 unique
+[`baselines/corpus-5f0d18c2.tsv`](baselines/corpus-5f0d18c2.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `5f0d18c2` gate compared against `corpus-e355ab70.tsv`: **losses=0,
+changes=0**.
+
 The `e355ab70` gate compared against `corpus-a7f05f48.tsv`: **losses=0,
 changes=1**, the positive gain `t7264`.
 
@@ -401,7 +405,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **295 result rows, 2703 passed, 0 failed** at `e355ab70` |
+| `cargo test --workspace --release --no-fail-fast` | **296 result rows, 2704 passed, 0 failed** at `5f0d18c2` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -1964,3 +1968,50 @@ corpus regression identities were unchanged. Preflight verified four pinned
 source trees, 121 jars, 33 Java support classes and 1498 reference classes.
 One owned gate execution was followed through DONE with the consolidated
 phase/failure watcher; no gate step was restarted or skipped.
+
+## Gate forty: immutable Map key types
+
+Clean `5f0d18c2`, based on main `a0230911`, passed the complete unskipped
+merge gate with `VERDICT=PASS`, `DONE`, corpus losses=0 and changes=0.
+Logs: `/tmp/scala-rs-gate-5f0d18c2-codex/gate.log`. Main was fast-forwarded
+to the exact tested commit. The recording commit changes only BASELINE and
+the raw corpus ledger; compiler sources and tests match the gated tree.
+
+All compile measures and their error-message multisets are unchanged from
+accepted `e355ab70`: gitbucket 191/63, cats 152/58, library 460/119; Slick
+184 sources, zero errors and 1492 classes. Slick MODE=b passes 12/12 programs
+and 36/36 attempts. Subset validates 1492 classes with zero failures and lint
+problems. Strong initialization verification with the real PostgreSQL and
+Oracle drivers loads all 1492 classes, zero failures and zero incomplete.
+Class output and verify-all.log are retained under the gate directory.
+
+Workspace: 2704 passed, zero failed, 296 rows. Format passes. Release
+workspace clippy retains 57 warning messages with no additions. Corpus:
+pos 1119/395/345, neg 700/336/369, run 643/864/553 (pass/fail/skip), all
+5324 identities unchanged. Raw ledger: `tests/baselines/corpus-5f0d18c2.tsv`.
+
+The immutable Map prelude admitted Any as the key for apply, get, contains,
+updated and getOrElse. The real-scalac bidirectional probe confirmed this
+hypothesis for all five members: the accepted pre-fix compiler accepts Int
+keys on Map[String, String], whereas scalac rejects each independently.
+The declarations now use K. Existing value-widening type parameters and
+lower bounds remain intact. The mapkey fixture compares correct String and
+Int keys, Map[Any, String], widened updated/getOrElse values and implicit
+key conversions against scalac at runtime with -Xverify:all and byte-exact
+stdout. Each wrong-key member is independently checked against both compilers.
+Evidence: `/tmp/scala-rs-mapkey-probe/`, including the rebuilt pre-fix binary's
+five false acceptances in before.json.
+
+Before the gate, 549 new and related tests passed; 18 recorded corpus
+regression identities had no changes. Preflight checked four pinned source
+trees, 121 jars, 33 Java support classes and 1498 reference classes. The gate
+was run once and its owned execution followed through DONE. Compile metrics
+and corpus counts do not expose the repaired false acceptances.
+
+A read-only follow-up investigated gitbucket's RepositoryResolver and
+ReceivePackFactory kind diagnostics. The actual JGit jar declares generic
+interfaces, and isolated real-scalac/scala-rs inheritance probes both pass,
+including preceding GitServlet and ReceivePack subclasses. A simple missing
+generic declaration is therefore not established; investigate full-run
+loading/name-resolution context before changing it. Probe evidence is in
+`/tmp/scala-rs-jgit-generics-probe/`.
