@@ -25,10 +25,9 @@
 //! `object Map extends MapFactory$Delegate<Map>`, a
 //! `scala.collection.MapFactory<Map>`.
 //!
-//! The sorted companions (`TreeSet`, `TreeMap`, `SortedSet`, `SortedMap`,
-//! `ArraySeq`) are deliberately absent: their evidence is
-//! `EvidenceIterableFactory.toFactory(factory)(implicit ev: Ev[A])` /
-//! `SortedMapFactory.toFactory`, which take a further implicit argument.
+//! Sorted companions additionally need EvidenceIterableFactory / SortedMapFactory
+//! edges. Their conversions are recovered from the real pickle, preserving the
+//! extra Ordering clause. ArraySeq's lazy ClassTag factory edge remains separate.
 
 use crate::symbol::SymbolTable;
 use scala_rs_parser::{SymbolId, Type};
@@ -132,6 +131,10 @@ pub(crate) const FACTORY_CLASSES: &[&str] = &[
     "scala/collection/IterableFactory$",
     "scala/collection/MapFactory$",
     "scala/collection/Factory",
+    "scala/collection/EvidenceIterableFactory",
+    "scala/collection/EvidenceIterableFactory$",
+    "scala/collection/SortedMapFactory",
+    "scala/collection/SortedMapFactory$",
 ];
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
@@ -158,9 +161,79 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
             link(st, fac, module_jvm, class_jvm, map_like);
         }
     }
+    link_evidence_factories(st);
     add_to_factory(st);
     widen_set_concat(st);
     add_mutable_map_removed(st);
+}
+
+/// Evidence-bearing companions keep their concrete apply/empty declarations.
+/// Their factory edge supplies the real library conversion, including its
+/// Ordering/ClassTag clause, rather than treating the companion as a Factory.
+fn link_evidence_factories(st: &mut SymbolTable) {
+    for (module, collection, factory, evidence) in [
+        (
+            "scala/collection/immutable/SortedSet$",
+            "scala/collection/immutable/SortedSet",
+            "scala/collection/EvidenceIterableFactory",
+            Some("scala/math/Ordering"),
+        ),
+        (
+            "scala/collection/immutable/TreeSet$",
+            "scala/collection/immutable/TreeSet",
+            "scala/collection/EvidenceIterableFactory",
+            Some("scala/math/Ordering"),
+        ),
+        (
+            "scala/collection/mutable/TreeSet$",
+            "scala/collection/mutable/TreeSet",
+            "scala/collection/EvidenceIterableFactory",
+            Some("scala/math/Ordering"),
+        ),
+        (
+            "scala/collection/immutable/SortedMap$",
+            "scala/collection/immutable/SortedMap",
+            "scala/collection/SortedMapFactory",
+            None,
+        ),
+        (
+            "scala/collection/immutable/TreeMap$",
+            "scala/collection/immutable/TreeMap",
+            "scala/collection/SortedMapFactory",
+            None,
+        ),
+        (
+            "scala/collection/mutable/TreeMap$",
+            "scala/collection/mutable/TreeMap",
+            "scala/collection/SortedMapFactory",
+            None,
+        ),
+    ] {
+        let (Some(module), Some(collection), Some(factory)) = (
+            module_class_by_jvm(st, module),
+            crate::classpath::find_by_jvm(st, collection),
+            crate::classpath::find_by_jvm(st, factory),
+        ) else {
+            continue;
+        };
+        let mut args = vec![Type::Class {
+            sym: collection,
+            args: Vec::new(),
+        }];
+        if let Some(evidence) = evidence {
+            let Some(ev) = crate::classpath::find_by_jvm(st, evidence) else {
+                continue;
+            };
+            args.push(Type::Class {
+                sym: ev,
+                args: Vec::new(),
+            });
+        }
+        let parent = Type::Class { sym: factory, args };
+        if !st.get(module).parents.contains(&parent) {
+            st.get_mut(module).parents.push(parent);
+        }
+    }
 }
 
 /// `SetOps.concat(that: IterableOnce[A]): C` — the prelude declared `++` as

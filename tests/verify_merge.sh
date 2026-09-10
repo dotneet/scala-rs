@@ -92,7 +92,8 @@ check_measure() {  # name, summary line, expected `files=` count
 }
 check_measure slick     "$SLICK" 184
 check_measure cats      "$CATS"  339
-check_measure gitbucket "$GB"    353
+check_measure gitbucket "$GB"    354
+[[ $GB == *"java_sources=3"* ]] || FAIL+=("gitbucket Java inputs missing: $GB")
 check_measure library   "$LIB"   538
 [[ $SLICK == *"errors=0 files_with_errors=0 classes=1504"* ]] || FAIL+=("slick measure: $SLICK")
 

@@ -1,0 +1,1 @@
+object Main {def main(args:Array[String]):Unit={val l:List[Int]=List(1,2).scanRight(0)(_+_);val v:Vector[Int]=Vector(1,2).scanLeft(0)(_+_);val r:Vector[Int]=Vector(1,2).scanRight(0)(_+_);println(l.mkString(","));println(v.mkString(","));println(r.mkString(","))}}

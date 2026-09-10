@@ -1,0 +1,1 @@
+object Main {def main(args:Array[String]):Unit={val a:scala.collection.immutable.TreeSet[Int]=List(3,1,2).to(scala.collection.immutable.TreeSet);val b:scala.collection.mutable.TreeSet[Int]=List(2,1).to(scala.collection.mutable.TreeSet);println(a.mkString(","));println(b.mkString(","))}}

@@ -1,0 +1,1 @@
+object Main {def main(args:Array[String]):Unit={val v:Iterator[Vector[Int]]=Vector(1,2).tails;val l:Iterator[LazyList[Int]]=LazyList(1,2).inits;println(v.map(_.sum).mkString(","));println(l.map(_.sum).mkString(","))}}

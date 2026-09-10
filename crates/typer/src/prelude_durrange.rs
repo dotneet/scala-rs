@@ -208,6 +208,12 @@ const DURATION_BOXES: [(&str, &str, Type); 3] = [
     ),
 ];
 
+/// These lazy library models use NewWrapper, which already constructs their
+/// boxed representation before universal-trait calls.
+pub(crate) fn uses_boxed_conversion(jvm: &str) -> bool {
+    DURATION_BOXES.iter().any(|(_, name, _)| *name == jvm)
+}
+
 impl Typer {
     /// `implicit def DurationInt(n: Int): DurationInt` and its `DurationLong` /
     /// `DurationDouble` siblings, installed on `scala.concurrent.duration`'s

@@ -1,0 +1,1 @@
+object Main {def main(args:Array[String]):Unit={val x=scala.collection.immutable.SortedSet(1,2);val v:scala.collection.immutable.SortedSet[(Int,Int)]=x.zipWithIndex.to(scala.collection.immutable.SortedSet);println(v.mkString(","))}}

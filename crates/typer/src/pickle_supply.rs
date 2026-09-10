@@ -191,7 +191,7 @@ impl PickleSupply {
         class_sym: SymbolId,
         name: &str,
     ) -> Vec<SymbolId> {
-        let mut out = self.complete_on(st, bin, class_sym, name);
+        let mut out = self.complete_on_class(st, bin, class_sym, name);
         // `Iterator.from(1)`: the prelude has the trait but no companion, so
         // the receiver resolved to the class. The member lives on the
         // companion object, which is where it has to be installed -- putting
@@ -217,7 +217,7 @@ impl PickleSupply {
                 let full = internal.replace('/', ".");
                 if let Some(m) = self.ensure_class(st, bin, &full, true) {
                     if m != class_sym {
-                        out.extend(self.complete_on(st, bin, m, name));
+                        out.extend(self.complete_on_class(st, bin, m, name));
                     }
                 }
             }
@@ -289,7 +289,7 @@ impl PickleSupply {
                 && !jvm.starts_with("javax/")
                 && self.adopt_binary_class(st, bin, c);
             if library || adoptable {
-                let out = self.complete_on(st, bin, c, name);
+                let out = self.complete_on_class(st, bin, c, name);
                 if !out.is_empty() {
                     return out;
                 }
@@ -1765,7 +1765,10 @@ impl PickleSupply {
         Some(Type::TypeMember(id))
     }
 
-    fn complete_on(
+    /// Read the receiver's substituted declarations only. Callers already
+    /// holding inherited members must not install fallback members on unrelated
+    /// ancestors or companions when this receiver's pickle cannot supply them.
+    pub(crate) fn complete_on_class(
         &mut self,
         st: &mut SymbolTable,
         bin: &mut BinaryIndex,
@@ -3300,18 +3303,18 @@ impl PickleSupply {
             // The whole of erasure hangs off that answer: `Stream$.fromIterator`
             // really has the descriptor `()Z`, and its result was being cast to
             // `Stream$PartiallyAppliedFromIterator` and called as an instance.
-            // The *library* is left alone, prelude symbol or not: the prelude
-            // models scala-library's value classes by hand, and the ones it
-            // models as ordinary classes it models that way on purpose.
-            // `scala.concurrent.duration.package$DurationInt` is a value class
-            // whose twenty unit methods come from the universal trait
-            // `DurationConversions`, so nsc emits **no** `$extension` for them
-            // and calls them on a real instance; deriving "value class" from
-            // its pickle sent `5.seconds` to a `seconds$extension` that does
-            // not exist (`crates/cli/tests/durrange.rs`).
+            // Prelude models (StringOps, ArrayOps, DurationInt) retain their
+            // chosen representation. Other value classes, including ones in
+            // scala-library, use the same recovered representation as -cp APIs.
             if matches!(t, Type::AnyVal) {
+                // Duration syntax is installed lazily, after prelude_end, and
+                // NewWrapper already boxes it. Ordinary erasure would box it
+                // twice. This exception belongs to those three explicit models,
+                // not to every value class packaged in scala-library.
+                if crate::prelude_durrange::uses_boxed_conversion(&st.get(class_sym).jvm_name) {
+                    continue;
+                }
                 if class_sym.0 >= st.prelude_end
-                    && !st.get(class_sym).jvm_name.starts_with("scala/")
                     && !st.get(class_sym).parents.iter().any(|q| {
                         matches!(q, Type::AnyVal)
                             || st.class_sym_of(q).is_some_and(|c| c == st.anyval_sym)
@@ -3320,9 +3323,7 @@ impl PickleSupply {
                     trace(format_args!("{full}: attaching pickled parent AnyVal"));
                     st.get_mut(class_sym).parents.push(Type::AnyVal);
                 }
-                if class_sym.0 >= st.prelude_end
-                    && !st.get(class_sym).jvm_name.starts_with("scala/")
-                {
+                if class_sym.0 >= st.prelude_end {
                     ensure_value_class_field(st, bin, class_sym);
                 }
                 continue;

@@ -329,6 +329,23 @@ pub(crate) fn add_sorted_map(st: &mut SymbolTable, ordering: SymbolId) {
         Type::Unit,
         Intrinsic::None,
     );
+    // The result refines Map.keySet, while its real JVM declaration lives on
+    // SortedMapOps and returns collection.SortedSet (not immutable.Set).
+    if let Some(sorted_set) =
+        crate::classpath::find_by_jvm(st, "scala/collection/immutable/SortedSet")
+    {
+        let keys = st.alloc(
+            "keySet",
+            sm,
+            SymKind::Method,
+            Flags::EMPTY,
+            "()Lscala/collection/SortedSet;",
+        );
+        st.get_mut(keys).ty = Type::Class {
+            sym: sorted_set,
+            args: vec![tk.clone()],
+        };
+    }
     let sm_mod = module(
         st,
         immp,

@@ -1,0 +1,1 @@
+object Main {def main(args:Array[String]):Unit={val x=scala.collection.immutable.BitSet(1,3);val y=scala.collection.immutable.BitSet(2,3);val u:scala.collection.immutable.BitSet=x|y;val i:scala.collection.immutable.BitSet=x&y;val d:scala.collection.immutable.BitSet=x&~y;println(u.mkString(","));println(i.mkString(","));println(d.mkString(","))}}

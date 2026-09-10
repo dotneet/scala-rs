@@ -890,8 +890,9 @@ impl Typer {
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     return ty;
                 }
-                let nullary: Vec<&Type> = alts
+                let nullary: Vec<&Type> = distinct
                     .iter()
+                    .copied()
                     .filter(|a| match a {
                         Type::Method { paramss, .. } => {
                             paramss.is_empty() || paramss.iter().all(|c| c.is_empty())
@@ -906,7 +907,9 @@ impl Typer {
                 // keeps only the alternatives that take no parameters. A `val`
                 // is not a method type at all, so `object Lib { val == = … }`
                 // reads as the value, not as the inherited `Any.==(x: Any)`.
-                let mut values = alts.iter().filter(|a| !matches!(a, Type::Method { .. }));
+                let mut values = distinct
+                    .into_iter()
+                    .filter(|a| !matches!(a, Type::Method { .. }));
                 match (values.next(), values.next()) {
                     (Some(v), None) if nullary.is_empty() => v.clone(),
                     _ => ty,

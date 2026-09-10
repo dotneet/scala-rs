@@ -1,0 +1,1 @@
+object Main {def main(args:Array[String]):Unit={trait Show[A];implicit val si:Show[Int]=new Show[Int]{};class Src;class Dst[A];implicit def convert[A](s:Src)(implicit ev:Show[A]):Dst[A]=new Dst[A];val d:Dst[String]=new Src;println(d)}}

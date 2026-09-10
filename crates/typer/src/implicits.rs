@@ -1788,7 +1788,7 @@ impl Typer {
 
     /// Every implicit clause of a conversion has a witness.
     fn conv_implicits_resolve(&self, id: SymbolId, from: &Type) -> bool {
-        self.conv_implicit_params(id, from)
+        self.conv_implicit_params(id, from, &Type::NoType)
             .iter()
             .flatten()
             .all(|want| self.search_implicit_at(want, 1).is_found())
@@ -2026,7 +2026,7 @@ impl Typer {
                 continue;
             }
             let wanted: Vec<Type> = self
-                .conv_implicit_params(id, from)
+                .conv_implicit_params(id, from, &Type::NoType)
                 .into_iter()
                 .flatten()
                 .collect();
@@ -2592,7 +2592,7 @@ impl Typer {
     /// applies, and one it accepts that the fill then cannot satisfy is the
     /// duplicate diagnostic this pass exists to remove.
     fn conv_implicits_available(&mut self, id: SymbolId, from: &Type, span: Span) -> bool {
-        let clauses = self.conv_implicit_params(id, from);
+        let clauses = self.conv_implicit_params(id, from, &Type::NoType);
         for want in clauses.iter().flatten() {
             // `ClassTag[A]` with `A` still the conversion's own parameter is
             // `fill_conv_implicits`'s "unresolved spliceable type"; that
@@ -3060,16 +3060,34 @@ impl Typer {
     /// `implicit def toFlatMapOps[F[_], A](fa: F[A])(implicit F: FlatMap[F])`:
     /// applying it to the receiver alone leaves the second clause unfilled, and
     /// the call goes out with fewer arguments than its descriptor declares.
-    pub(crate) fn conv_implicit_params(&self, id: SymbolId, from: &Type) -> Vec<Vec<Type>> {
+    pub(crate) fn conv_implicit_params(
+        &self,
+        id: SymbolId,
+        from: &Type,
+        to: &Type,
+    ) -> Vec<Vec<Type>> {
         let cand_ty = self.implicit_candidate_ty(id);
-        let Type::Method { paramss, .. } = &*cand_ty else {
+        let Type::Method { paramss, ret } = &*cand_ty else {
             return Vec::new();
         };
         if paramss.len() < 2 {
             return Vec::new();
         }
         let tps = self.st.get(id).tparams.clone();
-        let targs = self.conv_targs(id, from);
+        let mut targs = self.conv_targs(id, from);
+        // Open-view inference has already solved the conversion's result.
+        // Parameters absent from the receiver (A in EvidenceIterableFactory)
+        // must use that solution before searching Ordering[A]/ClassTag[A].
+        // Receiver constraints remain authoritative; only still-open slots
+        // are completed from the actual result of the inserted application.
+        let result = crate::symbol::subst_tparams_slice(&tps, &targs, ret);
+        for (tp, arg) in tps.iter().zip(targs.iter_mut()) {
+            if !to.is_no_type() && *arg == Type::TypeParam(*tp) {
+                if let Some(solved) = unify_conv_tparam(*tp, &result, to) {
+                    *arg = solved;
+                }
+            }
+        }
         paramss[1..]
             .iter()
             .map(|c| {

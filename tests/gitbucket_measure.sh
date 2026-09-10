@@ -69,14 +69,10 @@ MODULES=${GITBUCKET_MODULES:-scala+twirl}
 DIRS=()
 [[ $MODULES == *scala* ]] && DIRS+=($SRCROOT/src/main/scala)
 [[ $MODULES == *twirl* ]] && DIRS+=($TWIRL)
-# A parse error stops the run before typing, so one unparseable file hides the
-# other 353. `controller/PullRequestsController.scala` writes a guard after a
-# value definition in a for-comprehension (`name = pullreq...; if hasRole(...)`),
-# which nsc desugars by pairing the value with the generator's element and
-# filtering the pair -- not implemented, and diagnosed rather than desugared
-# wrongly. So it is held out by default and counted as `skipped`. Set
-# GITBUCKET_EXCLUDE='' to measure with it in.
-EXCLUDE=${GITBUCKET_EXCLUDE-PullRequestsController.scala}
+# The parser now lowers value definitions followed by guards. Include the
+# complete source set; an explicit exclusion remains useful for comparisons
+# against historical 353-source measurements.
+EXCLUDE=${GITBUCKET_EXCLUDE-}
 ALL=($(find $DIRS -name '*.scala' | sort))
 if [[ -n $EXCLUDE ]]; then
   FILES=(${ALL:#*$EXCLUDE})
@@ -100,8 +96,26 @@ LOG=${GITBUCKET_LOG:-$SP/measure.txt}
 # `tests/slick_measure.sh` appends it: measuring without it asks for a macro
 # expansion nobody could perform.
 REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
+# Compile the project's actual Java helpers before Scala, as the mixed sbt
+# build does. Per-invocation output prevents stale classes from masking errors.
+# GITBUCKET_JAVA=0 exists only for comparable historical-input measurements.
+DEPS=$(cat $SP/deps.cp)
+JAVA_FILES=($SRCROOT/src/main/java/**/*.java(N))
+JAVA_COUNT=0
+if [[ ${GITBUCKET_JAVA:-1} == 1 ]]; then
+  JAVA_OUT=$RUN/java
+  mkdir -p $JAVA_OUT
+  if (( ${#JAVA_FILES[@]} != 3 )); then
+    print "measurement invalid: expected 3 gitbucket Java sources, found ${#JAVA_FILES[@]}"
+    exit 1
+  fi
+  javac -cp "$DEPS:/tmp/scala-rs-lib/scala-library-2.13.16.jar" -d $JAVA_OUT "${JAVA_FILES[@]}" > $RUN/javac.log 2>&1 \
+    || { cat $RUN/javac.log; print "measurement invalid: gitbucket Java compilation failed"; exit 1; }
+  DEPS="$JAVA_OUT:$DEPS"
+  JAVA_COUNT=${#JAVA_FILES[@]}
+fi
 COMPILER_EXIT=0
-$BIN compile "${FILES[@]}" -d $OUT -cp "$(cat $SP/deps.cp):$REFLECT" -Xsource:3-cross \
+$BIN compile "${FILES[@]}" -d $OUT -cp "$DEPS:$REFLECT" -Xsource:3-cross \
   -language:postfixOps \
   --scala-library /tmp/scala-rs-lib/scala-library-2.13.16.jar "$@" > $LOG 2>&1 || COMPILER_EXIT=$?
 ERRORS=$(grep -c '^error' $LOG || true)
@@ -109,6 +123,6 @@ CLASSES=$(find $OUT -name '*.class' | wc -l | tr -d ' ')
 # Cascades inflate the raw count; files-with-errors is the honest metric.
 BADFILES=$(grep -A 2 '^error' $LOG | grep -oE '(src/main|twirl/main)/[^:]*' | sort -u | wc -l | tr -d ' ')
 rm -rf $RUN
-echo "files=${#FILES[@]} skipped=$SKIPPED errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES compiler_exit=$COMPILER_EXIT"
+echo "files=${#FILES[@]} skipped=$SKIPPED errors=$ERRORS files_with_errors=$BADFILES classes=$CLASSES compiler_exit=$COMPILER_EXIT java_sources=$JAVA_COUNT"
 source "$ROOT/tests/measure_result.sh"
 validate_measure_result $COMPILER_EXIT $ERRORS $CLASSES ${#FILES[@]} "$LOG"

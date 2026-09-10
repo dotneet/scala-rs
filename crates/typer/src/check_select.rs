@@ -216,11 +216,18 @@ impl Typer {
                     !instance_receiver || !self.st.get(m).flags.contains(Flags::STATIC)
                 });
                 found.retain(|&m| crate::check_overload::not_inherited_static(&self.st, m, o));
-                if found.is_empty() && matches!(&recv_ty, Type::Class { .. } | Type::ModuleRef(_)) {
+                if found.is_empty()
+                    && (o == self.st.string_sym
+                        || matches!(
+                            &recv_ty,
+                            Type::Class { .. } | Type::ModuleRef(_) | Type::String
+                        ))
+                {
                     // `asList(...).size()`: the receiver type is a Java stub until
                     // the classfile is completed. `qual.sym` is the method, not List.
-                    // Skip `Type::String` / primitives so StringOps / RichChar views
-                    // are not shadowed by `java.lang.String` / `Character` overloads.
+                    // String has real Java members too: on JDK 17 `lines()`
+                    // wins over the deprecated StringOps view, as in nsc.
+                    // Primitive wrappers still must not shadow RichChar views.
                     self.ensure_java_loaded(o, tree.span);
                     found = self.st.lookup_member(o, &name);
                     found.retain(|&m| {
@@ -315,17 +322,8 @@ impl Typer {
         // term reached it, so try that first and fall back to `qual.sym` for
         // package/Java-static prefixes, which carry no `Type` of their own.
         if found.is_empty() {
-            // Scoped to `Type::ModuleRef` specifically, not every
-            // `class_sym_of` hit: `complete_binary_member` on a *class*
-            // receiver (`Type::Class`, e.g. `Type::String`) calls
-            // `ensure_java_loaded` and pulls in the classfile's own members
-            // -- for `java.lang.String` that is JDK 11's `lines(): Stream
-            // <String>`, which then shadowed 2.13's deprecated `StringOps.
-            // lines: Iterator[String]` and the extension search below never
-            // got a chance to run. A module reference never has that
-            // problem: `complete_binary_member` on a `ModuleClass` owner
-            // only tries nested-class/companion candidates, never eagerly
-            // loads the receiver's own classfile.
+            // Module completion also discovers nested companions. Instance
+            // class files, including String, were completed above before views.
             if let Type::ModuleRef(o) = &recv_ty {
                 let o = *o;
                 self.complete_binary_member(o, &name, tree.span);

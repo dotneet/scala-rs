@@ -2281,6 +2281,17 @@ impl Typer {
             let owner = crate::classpath::ensure_package(&mut self.st, pkg);
             self.load_binary_into(jvm, owner, Span::new(0, 0), false);
         }
+        for jvm in [
+            "scala/collection/EvidenceIterableFactory$",
+            "scala/collection/SortedMapFactory$",
+        ] {
+            if let Some(cls) = crate::classpath::find_by_jvm(&self.st, jvm) {
+                self.pickle
+                    .adopt_binary_class(&mut self.st, &mut self.binary, cls);
+                self.pickle
+                    .complete_on_class(&mut self.st, &mut self.binary, cls, "toFactory");
+            }
+        }
         crate::prelude_buildfrom::install(&mut self.st, true);
     }
 
@@ -2437,7 +2448,7 @@ impl Typer {
         mut tree: Tree,
         span: Span,
     ) -> Tree {
-        for clause in self.conv_implicit_params(conv, from) {
+        for clause in self.conv_implicit_params(conv, from, &tree.ty) {
             let mut args = Vec::with_capacity(clause.len());
             for want in &clause {
                 if let Type::Class { sym, args } = want {
@@ -3165,6 +3176,133 @@ impl Typer {
         };
         // Nothing to add when the receiver's class already declares one.
         if found.iter().any(|&m| self.st.get(m).owner == cls) {
+            return;
+        }
+        let library_collection = self.st.get(cls).jvm_name.starts_with("scala/collection/");
+        // And the hierarchy `drop_overridden` is about to order the candidates
+        // by is the pickled one for the receiver and for every *library*
+        // owner that is not the prelude's. A prelude class is left alone here
+        // on purpose, measured: attaching `immutable.Set`'s pickled parents
+        // put the prelude's crude `Set.map: ((A) => Any)Set[Any]` below
+        // `IterableOps.map[B]` in the same hierarchy, `drop_overridden` then
+        // kept only the prelude's, and `aHashSet.map[Int](f)` had no `B` for
+        // its type argument (`crates/cli/tests/arraygen.rs`). Duplicated nullary
+        // alternatives are resolved in value position by maybe_auto_apply.
+        if library_collection {
+            let owners: Vec<SymbolId> = found.iter().map(|&m| self.st.get(m).owner).collect();
+            for owner in owners.into_iter().chain(std::iter::once(cls)) {
+                if !owner.is_none()
+                    && owner.0 >= self.st.prelude_end
+                    && self.st.get(owner).jvm_name.starts_with("scala/")
+                {
+                    self.pickle
+                        .ensure_parents(&mut self.st, &mut self.binary, owner);
+                }
+            }
+        }
+        let all_from_library_binaries = found.iter().all(|&m| {
+            let s = self.st.get(m);
+            let owner = s.owner;
+            !owner.is_none()
+                && self.st.get(owner).jvm_name.starts_with("scala/")
+                && m.0 >= self.st.prelude_end
+                && (!s.pickled_origin.is_empty() || s.jvm_name.starts_with('('))
+        });
+        // The receiver's copies have to be the *inherited* declarations
+        // re-read at the receiver, shape for shape. `PickleSupply::install`
+        // keeps one member per erased parameter list, the first the walk
+        // offers, so a receiver whose pickle overloads a name on the same
+        // erasure -- `HashMap.++` is `MapOps.++[V2 >: V]: CC[K, V2]` over
+        // `IterableOps.++[B >: A]: CC[B]` -- can come back with the wrong
+        // one (`Iterable[(K, V)]`, and `.get` is not a member of it:
+        // `crates/cli/tests/asttype.rs`). The origin says which declaration
+        // a copy stands for; a class-file forwarder names none and agrees
+        // on its erased parameters instead. A copy of anything else is
+        // taken off the class again, because a member left on the receiver
+        // is found by every later selection whether or not this one used it.
+        if library_collection && all_from_library_binaries {
+            let own: Vec<SymbolId> = self
+                .pickle
+                .complete_on_class(&mut self.st, &mut self.binary, cls, name)
+                .into_iter()
+                .filter(|&m| self.st.get(m).owner == cls)
+                .collect();
+            if own.is_empty() {
+                return;
+            }
+            let inherited: Vec<(String, Vec<Option<String>>)> = found
+                .iter()
+                .map(|&m| {
+                    let s = self.st.get(m);
+                    (
+                        s.pickled_origin.clone(),
+                        crate::pickle_supply::flat_erased_params(&self.st, &s.ty),
+                    )
+                })
+                .collect();
+            // A copy standing for the receiver's *own* declaration is the
+            // override nsc would pick -- `LazyList` redeclares `grouped` and
+            // `sliding(size, step)` itself -- and so is one standing for a
+            // declaration *below* the inherited candidate's: `SortedMap.map`
+            // is `SortedMapOps.map[K2, V2](f)(implicit Ordering[K2])` over
+            // `MapOps.map`, and `SortedMapOps` extends `MapOps`. What is
+            // refused is a copy of a declaration the inherited one does not
+            // reach: `IterableOps.++` next to `MapOps.++` is the sibling the
+            // walk should have passed over.
+            let own_prefix = format!("{}#", self.st.get(cls).jvm_name.replace('/', "."));
+            let declaring = |this: &Self, origin: &str| -> Option<SymbolId> {
+                let dotted = origin.split('#').next()?;
+                crate::classpath::find_by_jvm(&this.st, &dotted.replace('.', "/"))
+            };
+            let mut same_declarations = true;
+            for &m in &own {
+                let s = self.st.get(m);
+                let params = crate::pickle_supply::flat_erased_params(&self.st, &s.ty);
+                let origin = s.pickled_origin.clone();
+                let of_shape: Vec<&String> = inherited
+                    .iter()
+                    .filter(|(_, p)| *p == params)
+                    .map(|(o, _)| o)
+                    .collect();
+                // A shape none of the inherited candidates has is a new
+                // alternative -- `TreeMap.map(f)(implicit Ordering[K2])`
+                // beside `MapOps.map(f)` -- which is what the path below
+                // admits too, and overload resolution then chooses.
+                if of_shape.is_empty() {
+                    continue;
+                }
+                if origin.starts_with(&own_prefix) {
+                    continue;
+                }
+                let Some(below) = declaring(self, &origin) else {
+                    same_declarations = false;
+                    break;
+                };
+                if below.0 >= self.st.prelude_end {
+                    self.pickle
+                        .ensure_parents(&mut self.st, &mut self.binary, below);
+                }
+                for other in of_shape {
+                    if other.is_empty() || *other == origin {
+                        continue;
+                    }
+                    let above = declaring(self, other);
+                    if !above
+                        .is_some_and(|a| crate::pickle_supply::inherits_from(&self.st, below, a))
+                    {
+                        same_declarations = false;
+                        break;
+                    }
+                }
+                if !same_declarations {
+                    break;
+                }
+            }
+            if same_declarations {
+                *found = self.st.lookup_member(cls, name);
+            } else {
+                self.st.get_mut(cls).members.retain(|m| !own.contains(m));
+            }
             return;
         }
         // Only a *new alternative* is worth reading the pickle for. A plain
