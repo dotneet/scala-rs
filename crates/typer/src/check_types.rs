@@ -3478,7 +3478,15 @@ impl Typer {
             return;
         };
         let owner = self.st.get(class_id).owner;
+        // Reloading JVM members must not erase an already-read Scala parent
+        // list: a value class's header says Object, while its pickle says
+        // AnyVal. Pickle completion is memoized and would not restore it.
+        let scala_parents = (jc.is_scala && self.pickle.parents_loaded(class_id))
+            .then(|| self.st.get(class_id).parents.clone());
         let id = crate::classpath::install_java_class_in(&mut self.st, &jc, owner);
+        if let Some(parents) = scala_parents {
+            self.st.get_mut(id).parents = parents;
+        }
         if jc.is_scala {
             self.pickle
                 .adopt_binary_class(&mut self.st, &mut self.binary, id);

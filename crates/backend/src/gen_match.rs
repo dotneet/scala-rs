@@ -1037,12 +1037,15 @@ pub(crate) fn gen_pattern(
                 if binds {
                     let field = ctx.st.get(pat.sym).ctor_fields.first().copied();
                     let (fname, fty) = match field {
-                        Some(f) => (ctx.st.get(f).name.clone(), ctx.st.get(f).ty.clone()),
+                        Some(f) => (
+                            ctx.st.value_class_getter(pat.sym).to_string(),
+                            ctx.st.get(f).ty.clone(),
+                        ),
                         None => (String::new(), Type::Any),
                     };
                     load(asm, tmp, JvmSort::Ref);
                     asm.checkcast(&internal);
-                    asm.getfield(&internal, &fname, &jvm_desc(ctx.st, &fty));
+                    asm.invokevirtual(&internal, &fname, &format!("(){}", jvm_desc(ctx.st, &fty)));
                     let want = jvm_sort(&fty);
                     let narrowed = frame.alloc_tmp(want);
                     store(asm, narrowed, want);

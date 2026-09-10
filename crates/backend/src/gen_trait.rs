@@ -2367,7 +2367,7 @@ impl<'a> Gen<'a> {
                             let field = self.st.get(c).ctor_fields[0];
                             (
                                 class_internal(self.st, c),
-                                self.st.get(field).name.clone(),
+                                self.st.value_class_getter(c).to_string(),
                                 format!("(){}", jvm_desc(self.st, &self.st.get(field).ty)),
                                 param_adapt(self.st, &self.st.get(field).ty, cty),
                             )
@@ -3019,10 +3019,16 @@ impl<'a> Gen<'a> {
                     continue;
                 };
                 // Eager private-this storage has no accessor in Scala's ABI.
-                if mods.flags.contains(Flags::LOCAL) {
+                if mods.flags.contains(Flags::PRIVATE)
+                    && mods.flags.contains(Flags::LOCAL)
+                    && !widened(self.st, p.sym)
+                {
                     continue;
                 }
-                let access = method_access_flags(mods.flags, widened(self.st, p.sym));
+                let access = method_access_flags(
+                    mods.flags,
+                    widened(self.st, p.sym) || mods.private_within.is_some(),
+                );
                 let is_val = mods.flags.contains(Flags::ACCESSOR)
                     || (class_is_case
                         && clause_idx == 0
@@ -3118,10 +3124,17 @@ impl<'a> Gen<'a> {
             let TreeKind::ValDef { name, mods, .. } = &stt.kind else {
                 continue;
             };
-            if mods.flags.contains(Flags::LAZY) || mods.flags.contains(Flags::LOCAL) {
+            if mods.flags.contains(Flags::LAZY)
+                || (mods.flags.contains(Flags::PRIVATE)
+                    && mods.flags.contains(Flags::LOCAL)
+                    && !widened(self.st, stt.sym))
+            {
                 continue;
             }
-            let access = method_access_flags(mods.flags, widened(self.st, stt.sym));
+            let access = method_access_flags(
+                mods.flags,
+                widened(self.st, stt.sym) || mods.private_within.is_some(),
+            );
             let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
                 self.st.get(stt.sym).ty.clone()
             } else {

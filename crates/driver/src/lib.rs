@@ -10,8 +10,8 @@ use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
     expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
     lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes,
-    restore_named_arg_order, typecheck_units_src, uncurry, ClasspathClass, ClasspathMethod,
-    ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
+    restore_named_arg_order, typecheck_units_src, uncurry, ClasspathClass, ClasspathField,
+    ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -836,6 +836,15 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
             ClasspathClass {
                 jvm_name: c.internal_name,
                 is_module: c.is_module,
+                fields: c
+                    .fields
+                    .into_iter()
+                    .map(|f| ClasspathField {
+                        access: f.access,
+                        name: f.name,
+                        desc: f.desc,
+                    })
+                    .collect(),
                 methods: c
                     .methods
                     .into_iter()

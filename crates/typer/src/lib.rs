@@ -130,8 +130,8 @@ mod prelude_xmlenum;
 pub use anon_capture::mark_anon_captures;
 pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, typecheck_opts_src, typecheck_units,
-    typecheck_units_src, ClasspathClass, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
-    ClasspathTypeParam, TypecheckOptions, Typer,
+    typecheck_units_src, ClasspathClass, ClasspathField, ClasspathMethod, ClasspathPickleMethod,
+    ClasspathType, ClasspathTypeParam, TypecheckOptions, Typer,
 };
 pub use default_recv::hoist_default_receivers;
 pub use erasure::{erase, erase_type, note_source_value_classes};
@@ -3021,6 +3021,7 @@ object Main {
         let pkg = ClasspathClass {
             jvm_name: "enrich/package$".into(),
             is_module: true,
+            fields: vec![],
             methods: vec![ClasspathMethod {
                 access: 0x0001,
                 name: "Rich".into(),
@@ -3048,6 +3049,7 @@ object Main {
         let nested = ClasspathClass {
             jvm_name: "enrich/package$Rich".into(),
             is_module: false,
+            fields: vec![],
             methods: vec![ClasspathMethod {
                 access: 0x0001,
                 name: "twice".into(),

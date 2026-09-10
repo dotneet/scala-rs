@@ -2070,7 +2070,9 @@ impl<'a> Pickler<'a> {
                         // `<notype>` and died in its own backend
                         // (`unexpected type representation`) on the first call
                         // it rewrote to `Ops$.MODULE$.inc$extension`.
-                        let storage_only = self.st.get(m).flags.contains(Flags::LOCAL)
+                        let storage_only = self.st.get(m).flags.contains(Flags::PRIVATE)
+                            && self.st.get(m).flags.contains(Flags::LOCAL)
+                            && !self.st.get(m).access_widened
                             && !self.st.get(m).flags.contains(Flags::LAZY)
                             && !class_flags.contains(Flags::TRAIT)
                             && !self.st.get(m).deferred_val;
@@ -2534,7 +2536,15 @@ impl<'a> Pickler<'a> {
                         Some(t @ Type::Repeated(_)) => t.clone(),
                         _ => ps.ty.clone(),
                     };
-                    (ps.name.clone(), ty, ps.flags)
+                    let name = if meth_name == "<init>" {
+                        self.st
+                            .constructor_parameter_names
+                            .get(p)
+                            .unwrap_or(&ps.name)
+                    } else {
+                        &ps.name
+                    };
+                    (name.clone(), ty, ps.flags)
                 })
                 .collect()
         } else {
@@ -2855,7 +2865,8 @@ impl<'a> Pickler<'a> {
     /// Private storage uses nsc's trailing-space name and a direct field type.
     fn pickle_storage_field(&mut self, val_id: SymbolId, owner_ref: u32, param: bool) {
         let s = self.st.get(val_id);
-        let local = s.flags.contains(Flags::LOCAL);
+        let local =
+            s.flags.contains(Flags::PRIVATE) && s.flags.contains(Flags::LOCAL) && !s.access_widened;
         let name = if local {
             s.name.clone()
         } else {
@@ -3119,8 +3130,11 @@ fn annot_string_args(tree: &Tree) -> Vec<String> {
 fn pickled_access_flags(st: &SymbolTable, id: SymbolId) -> Flags {
     let s = st.get(id);
     let mut f = s.flags;
-    if s.private_within.is_some() {
+    if s.private_within.is_some() || s.access_widened {
         f.set(Flags::PRIVATE, false);
+    }
+    if s.access_widened {
+        f.set(Flags::LOCAL, false);
     }
     f
 }

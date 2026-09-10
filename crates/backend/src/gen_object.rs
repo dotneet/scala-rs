@@ -602,6 +602,9 @@ impl<'a> Gen<'a> {
         });
         self.emit_module_init(&mut b, comp, &[], &[], None, Some(comp));
         self.emit_module_clinit(&mut b);
+        // Constructor defaults belong to the companion, even when that
+        // companion also forwards value-class extension methods.
+        self.emit_default_getters(&mut b, comp);
         self.emit_value_extension_forwarders(&mut b, class_id, &impl_.body);
         // The value class's own pickle, which describes the companion too --
         // the same thing `emit_case_companion` attaches. A Scala classfile

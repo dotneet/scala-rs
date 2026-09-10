@@ -503,7 +503,14 @@ impl<'a> Gen<'a> {
                         p.ty.clone()
                     };
                     b.fields.push(Field {
-                        access: field_access_flags(mods.flags, widened(self.st, p.sym)),
+                        access: field_access_flags(
+                            if p.sym.is_none() {
+                                mods.flags
+                            } else {
+                                self.st.get(p.sym).flags
+                            },
+                            widened(self.st, p.sym),
+                        ),
                         name: name.clone(),
                         desc: jvm_desc_val(self.st, &ty),
                     });

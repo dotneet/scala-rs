@@ -156,7 +156,7 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                     continue;
                 }
                 if m.is_ctor {
-                    install_ctor(st, owner, m, &accessors);
+                    install_ctor(st, owner, m, &accessors, &c.fields);
                     continue;
                 }
                 let id = add_method(
@@ -408,6 +408,7 @@ fn install_ctor(
     owner: SymbolId,
     m: &crate::check::ClasspathPickleMethod,
     accessors: &std::collections::HashSet<String>,
+    jvm_fields: &[crate::check::ClasspathField],
 ) {
     let mut fields = Vec::new();
     for (i, (n, tn)) in m.param_names.iter().zip(m.param_types.iter()).enumerate() {
@@ -435,11 +436,22 @@ fn install_ctor(
             st.get_mut(fid).flags = flags;
         }
         mark_via_accessor(st, fid, &pname, accessors);
-        // A constructor argument alone does not declare a public member.
-        // A published getter provides that member; without one this slot is
-        // private storage/prototype information, not an externally readable val.
+        // A constructor prototype alone is not a readable member. A real
+        // public/protected instance field is readable even without a getter.
         if !accessors.contains(&scala_rs_pickle::names::encode_method_name(&pname)) {
-            st.get_mut(fid).flags = st.get(fid).flags.with(Flags::PRIVATE).with(Flags::LOCAL);
+            let exposed = jvm_fields.iter().find(|f| {
+                f.name == scala_rs_pickle::names::encode_method_name(&pname)
+                    && f.access & 0x0008 == 0
+                    && f.access & (0x0001 | 0x0004) != 0
+            });
+            if let Some(field) = exposed {
+                let sym = st.get_mut(fid);
+                sym.flags.set(Flags::PRIVATE, false);
+                sym.flags.set(Flags::LOCAL, false);
+                sym.flags.set(Flags::PROTECTED, field.access & 0x0004 != 0);
+            } else {
+                st.get_mut(fid).flags = st.get(fid).flags.with(Flags::PRIVATE).with(Flags::LOCAL);
+            }
         }
         fields.push(fid);
     }

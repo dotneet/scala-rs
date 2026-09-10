@@ -61,12 +61,15 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
     }
 }
 fn run(out: &Path, cp: &str) -> Vec<u8> {
+    run_main(out, cp, "Main")
+}
+fn run_main(out: &Path, cp: &str, main: &str) -> Vec<u8> {
     let p = Command::new("java")
         .args([
             "-Xverify:all",
             "-cp",
             &format!("{}:{cp}", out.display()),
-            "Main",
+            main,
         ])
         .output()
         .unwrap();
@@ -190,6 +193,47 @@ fn macro_argument_types_cover_literals_and_repeated_splices() {
             &cp,
             false,
         );
+    }
+    fs::remove_dir_all(r).unwrap();
+}
+
+#[test]
+fn qualified_access_and_value_class_defaults_survive_separate_compilation() {
+    let r = root();
+    for (case, main) in [
+        ("qualified", "sqlstoragequalified.Main"),
+        ("value_default", "Main"),
+        ("accessor_abi", "Main"),
+    ] {
+        let mut reference = None;
+        for producer in [true, false] {
+            let api = r.join(format!("{case}-api-{producer}"));
+            compile(&format!("sqlstorage_{case}_api"), producer, &api, JAR, true);
+            let cp = format!("{}:{JAR}", api.display());
+            for consumer in [true, false] {
+                let out = r.join(format!("{case}-use-{producer}-{consumer}"));
+                compile(&format!("sqlstorage_{case}_use"), consumer, &out, &cp, true);
+                if case == "accessor_abi" {
+                    compile(
+                        "sqlstorage_access_bad_captured",
+                        consumer,
+                        &r.join(format!("{case}-bad-captured-{producer}-{consumer}")),
+                        &cp,
+                        false,
+                    );
+                    compile(
+                        "sqlstorage_access_bad_value",
+                        consumer,
+                        &r.join(format!("{case}-bad-{producer}-{consumer}")),
+                        &cp,
+                        false,
+                    );
+                }
+                let stdout = run_main(&out, &cp, main);
+                assert_eq!(stdout, expected(&format!("sqlstorage_{case}_use")));
+                assert_eq!(&stdout, reference.get_or_insert_with(|| stdout.clone()));
+            }
+        }
     }
     fs::remove_dir_all(r).unwrap();
 }

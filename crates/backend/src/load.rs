@@ -13,10 +13,18 @@ pub struct LoadedMethod {
 }
 
 #[derive(Clone, Debug)]
+pub struct LoadedField {
+    pub access: u16,
+    pub name: String,
+    pub desc: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct LoadedClass {
     pub internal_name: String,
     pub is_module: bool,
     pub methods: Vec<LoadedMethod>,
+    pub fields: Vec<LoadedField>,
     pub pickle: Option<PickledClass>,
     /// `ACC_INTERFACE`. A Scala trait compiles to an interface, and calling one
     /// of its members needs `invokeinterface`, not `invokevirtual`.
@@ -61,13 +69,19 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
     }
     let nfields = c.u2()? as usize;
     let mut is_module = false;
+    let mut fields = Vec::new();
     for _ in 0..nfields {
-        let _acc = c.u2()?;
+        let access = c.u2()?;
         let name_i = c.u2()?;
-        let _desc_i = c.u2()?;
+        let desc_i = c.u2()?;
         if cp.utf8(name_i).as_deref() == Some("MODULE$") {
             is_module = true;
         }
+        fields.push(LoadedField {
+            access,
+            name: cp.utf8(name_i)?,
+            desc: cp.utf8(desc_i)?,
+        });
         skip_attrs(&mut c)?;
     }
     if internal_name.ends_with('$') && !internal_name.contains("$anon") {
@@ -105,6 +119,7 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
         internal_name,
         is_module,
         methods,
+        fields,
         pickle,
         is_interface,
         super_name,

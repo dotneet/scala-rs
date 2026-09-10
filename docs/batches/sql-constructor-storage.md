@@ -136,3 +136,70 @@ exist in the pinned nsc reference. The raw and normalized inventories are
 prerequisites-v2/slick-class-delta.json and slick-class-audit.json. The gate's
 exact class-count checks increase1492 to1504 for these real default getters.
 Clippy stays at57 existing warnings, with no added or removed warning identities.
+
+
+## Rejected gate and access integration
+
+Candidate ee80efb0 completed the full gate with FAIL/DONE. Gitbucket reached
+148/54 but Slick runtime was 0/36, six workspace tests failed and the corpus
+lost run/indylambda-boxing. See the rejected candidate nineteen record in
+BASELINE.md; none of this compiler batch is accepted yet. Corrections are in
+the separate codex/sql-storage-access-integration worktree.
+
+The access inventory corrected the initial diagnosis again. LOCAL includes
+protected[this], whose getter must survive; the missing Slick pattern
+accessors are instances of that same rule. Expanded private members also
+retain their accessors. Qualified private getters use JVM-public access,
+while preserving the known limitation of qualified boundary pickle export.
+
+A missing getter does not imply a private constructor prototype: nsc can
+publish an actual field without a getter (the user-written dollar-outer
+fixture). Directory loading now preserves actual field metadata. This exposed
+our bare constructor argument's incorrectly public storage; field emission
+uses the symbol's private-this flags and widens captured constructor storage
+through the existing cross-class access scan.
+
+Value-class defaults require default getters on the special value companion.
+Reloading raw JVM members must preserve already-completed Scala parents;
+otherwise AnyVal becomes Object permanently. Real nsc output also shows a
+private underlying value has an expanded public unboxing getter. Source
+expansion now accounts for implicit boxing calls introduced after the tree
+scan; binary unboxing retains the actual getter name independently of the
+constructor parameter spelling. Pattern unboxing must call that getter too.
+A separate method taking a value class exposed another pre-existing defect:
+pickle-to-descriptor matching expected a boxed reference where the JVM uses
+the underlying slot. The new four-way ABI probe keeps this case, function
+boxing, collections, typed patterns and private-read rejection together.
+
+Prerequisite revisions are recorded in access-v*.log under the evidence root.
+Rejected ee80 compiles the original indylambda-boxing fixture but execution
+fails; scalac compiles and runs it. See access-before/results.json. Accepted73
+also rejects the new binary value-class method call (echo-before.log). These
+are focused before proofs, not aggregate baseline remeasurements.
+
+Final access prerequisites pass 41 tests in six directly affected suites and
+598 tests in 18 related suites, all768 selected pos/run cases with losses=0,
+and all1405 negative cases with losses=0. The original indylambda-boxing loss
+is recovered. Slick passes184 sources, errors=0,1504 classes,12/12 programs
+and36/36 attempts; lint_problems=0 and strong initialization verification
+loads1504 with failures=0/incomplete=0. Binary SHA256:
+455a89e285fe18e0ed1d8ed07badb0887a2e8b0fedbf45a5fc39f4b033da29e6.
+The prerequisite orchestrator's final verifier path omitted slick_run.sh's
+w- prefix and exited2. The actual retained output was separately verified
+once; results.json and verify-all-actual.json record that harness correction.
+No compiler, runtime or corpus stage was restarted.
+
+The final matrix also proves widened getter privacy is reflected in the
+pickle, original constructor argument names survive storage expansion, and
+bare/private-this captured fields work across both producers and consumers.
+A fixture initially invoked a nullary reader without explicit Function0.apply
+and printed the function object under nsc; it was corrected to invoke apply
+explicitly before byte-comparison. Tests retain all actual compiler failures.
+
+Next inventory: operator-inventory demonstrates a pre-existing binary export
+limitation for val/var operator names. Both compilers consume an nsc API, but
+nsc rejects ours; accepted73 reproduces it too. This corrects the initial
+getter-loading hypothesis. Investigate TERMNAME encoding as one family with
+constructor special names, setters, fields and type names before changing it.
+The private-this body/lazy and qualified-boundary inventory remains separate;
+this batch does not claim all Scala access control is complete.

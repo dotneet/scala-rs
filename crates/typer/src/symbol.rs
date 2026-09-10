@@ -1022,6 +1022,10 @@ pub struct SymbolTable {
     /// backend still has to know that `case class Box(m: Meters)` prints its
     /// field as a boxed `Meters`.
     pub value_class_terms: rustc_hash::FxHashMap<SymbolId, SymbolId>,
+    /// Source names of constructor arguments whose storage was expanded.
+    pub constructor_parameter_names: rustc_hash::FxHashMap<SymbolId, String>,
+    /// Actual unboxing getter name of a binary value class.
+    pub value_class_getters: rustc_hash::FxHashMap<SymbolId, String>,
     /// Value-class field declarations retained before symbol erasure.
     pub value_class_underlying_types: rustc_hash::FxHashMap<SymbolId, Type>,
     /// Methods whose result was a user value class before erasure.
@@ -1296,6 +1300,8 @@ impl SymbolTable {
             inherited_method_implementations: rustc_hash::FxHashSet::default(),
             method_override_families: rustc_hash::FxHashSet::default(),
             method_overload_pairs: rustc_hash::FxHashSet::default(),
+            constructor_parameter_names: rustc_hash::FxHashMap::default(),
+            value_class_getters: rustc_hash::FxHashMap::default(),
             value_class_underlying_types: rustc_hash::FxHashMap::default(),
             value_class_results: rustc_hash::FxHashMap::default(),
             value_class_terms: rustc_hash::FxHashMap::default(),
@@ -4149,6 +4155,13 @@ impl SymbolTable {
         s.parents.iter().any(|p| {
             matches!(p, Type::AnyVal) || self.class_sym_of(p).is_some_and(|c| c == self.anyval_sym)
         })
+    }
+
+    pub fn value_class_getter(&self, id: SymbolId) -> &str {
+        self.value_class_getters
+            .get(&id)
+            .map(String::as_str)
+            .unwrap_or_else(|| &self.get(self.get(id).ctor_fields[0]).name)
     }
 
     pub fn value_class_underlying(&self, id: SymbolId) -> Option<Type> {

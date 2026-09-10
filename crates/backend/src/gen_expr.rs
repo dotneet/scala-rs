@@ -2379,7 +2379,10 @@ pub(crate) fn gen_apply(
         let internal = class_internal(ctx.st, cls);
         let field = ctx.st.get(cls).ctor_fields.first().copied();
         let (name, under) = match field {
-            Some(f) => (ctx.st.get(f).name.clone(), ctx.st.get(f).ty.clone()),
+            Some(f) => (
+                ctx.st.value_class_getter(cls).to_string(),
+                ctx.st.get(f).ty.clone(),
+            ),
             None => (String::new(), Type::Any),
         };
         if let Some(a) = args.first() {
@@ -4144,7 +4147,7 @@ pub(crate) fn gen_value_self_receiver(asm: &mut Assembler, ctx: &EmitCtx, fun: &
     load_this(asm, ctx);
     asm.invokevirtual(
         &class_internal(ctx.st, owner),
-        &ctx.st.get(f).name,
+        ctx.st.value_class_getter(owner),
         &format!("(){}", jvm_desc(ctx.st, &under)),
     );
     true

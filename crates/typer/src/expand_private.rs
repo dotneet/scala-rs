@@ -51,6 +51,15 @@ pub fn expand_private_names(tree: &mut Tree, st: &mut SymbolTable) {
         return;
     }
     let mut need = HashSet::new();
+    // Boxing/unboxing introduces calls after this source-tree scan. A value
+    // class's private underlying accessor must therefore be expanded even
+    // when no explicit source selection crosses a classfile boundary.
+    for &id in &candidates {
+        let owner = st.get(id).owner;
+        if st.is_value_class(owner) && st.get(owner).ctor_fields.first() == Some(&id) {
+            need.insert(id);
+        }
+    }
     scan(tree, st, SymbolId::NONE, &candidates, &mut need);
     if need.is_empty() {
         return;
@@ -60,6 +69,11 @@ pub fn expand_private_names(tree: &mut Tree, st: &mut SymbolTable) {
         let owner = st.get(id).owner;
         let old = st.get(id).name.clone();
         let new = expanded_name(st, owner, &old);
+        if st.get(owner).ctor_fields.contains(&id) {
+            st.constructor_parameter_names
+                .entry(id)
+                .or_insert_with(|| old.clone());
+        }
         st.get_mut(id).name = new.clone();
         st.get_mut(id).access_widened = true;
         renames.insert(id, (old, new));
@@ -267,7 +281,7 @@ fn collect_private_members(t: &mut Tree, st: &SymbolTable, out: &mut HashSet<Sym
         let owner_kind = st.get(s.owner).kind;
         if s.flags.contains(Flags::PRIVATE)
             && s.private_within.is_none()
-            && !s.flags.contains(Flags::PARAM)
+            && (!s.flags.contains(Flags::PARAM) || st.get(s.owner).ctor_fields.contains(&t.sym))
             && !s.flags.contains(Flags::CONSTRUCTOR)
             && s.name != "<init>"
             && matches!(s.kind, SymKind::Method | SymKind::Term)

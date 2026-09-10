@@ -1063,6 +1063,11 @@ impl PickleSupply {
         None
     }
 
+    /// Whether a class header has already been refined from its Scala pickle.
+    pub(crate) fn parents_loaded(&self, class_sym: SymbolId) -> bool {
+        self.parented.contains(&class_sym.0)
+    }
+
     /// Give a binary class the constructors its pickle declares, when the
     /// symbol table has none of its own for it.
     ///
@@ -3293,6 +3298,10 @@ impl PickleSupply {
                 {
                     trace(format_args!("{full}: attaching pickled parent AnyVal"));
                     st.get_mut(class_sym).parents.push(Type::AnyVal);
+                }
+                if class_sym.0 >= st.prelude_end
+                    && !st.get(class_sym).jvm_name.starts_with("scala/")
+                {
                     ensure_value_class_field(st, bin, class_sym);
                 }
                 continue;
@@ -5681,6 +5690,11 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
                 return Some(format!("Lscala/Function{};", params.len()))
             }
             Type::ByName(_) => return Some("Lscala/Function0;".into()),
+            // A direct value-class parameter uses its underlying JVM slot.
+            // Reference/generic containers still keep the boxed class type.
+            Type::Class { sym, .. } if st.is_value_class(*sym) => {
+                st.value_class_underlying(*sym)?
+            }
             Type::Class { sym, .. } => {
                 let n = st.get(*sym).jvm_name.clone();
                 return if n.is_empty() || n.starts_with('[') {
@@ -5948,9 +5962,6 @@ fn ctor_has_unresolved_param(st: &SymbolTable, ctor: SymbolId) -> bool {
 /// put a second `blocking` next to the accessor the pickle supplies, and
 /// member lookup would have to choose between them.
 fn ensure_value_class_field(st: &mut SymbolTable, bin: &mut BinaryIndex, class_sym: SymbolId) {
-    if !st.get(class_sym).ctor_fields.is_empty() {
-        return;
-    }
     let internal = st.get(class_sym).jvm_name.clone();
     if internal.is_empty() {
         return;
@@ -5964,6 +5975,19 @@ fn ensure_value_class_field(st: &mut SymbolTable, bin: &mut BinaryIndex, class_s
     let Some(f) = jc.sole_instance_field.clone() else {
         return;
     };
+    // A private underlying accessor has an expanded JVM name. Keep the
+    // constructor parameter's source spelling for named arguments, and read
+    // the actual unboxing entry point from the classfile instead.
+    if jc
+        .methods
+        .iter()
+        .any(|m| m.name == f.name && m.desc == format!("(){}", f.desc))
+    {
+        st.value_class_getters.insert(class_sym, f.name.clone());
+    }
+    if !st.get(class_sym).ctor_fields.is_empty() {
+        return;
+    }
     let name = f.name.rsplit("$$").next().unwrap_or(&f.name).to_string();
     let ty = crate::classpath::field_ty_from_desc(st, &f.desc);
     let fid = st.alloc(&name, SymbolId::NONE, SymKind::Term, Flags::EMPTY, "");

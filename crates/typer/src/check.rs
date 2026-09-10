@@ -152,6 +152,14 @@ pub struct ClasspathMethod {
     pub desc: String,
 }
 
+/// An actual JVM field, distinct from a Scala accessor method.
+#[derive(Clone, Debug)]
+pub struct ClasspathField {
+    pub access: u16,
+    pub name: String,
+    pub desc: String,
+}
+
 /// A type recovered from a pickle: the head name plus its type arguments.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ClasspathType {
@@ -219,6 +227,7 @@ pub struct ClasspathClass {
     pub jvm_name: String,
     pub is_module: bool,
     pub methods: Vec<ClasspathMethod>,
+    pub fields: Vec<ClasspathField>,
     pub pickle: Option<Vec<ClasspathPickleMethod>>,
     /// Class type parameters recovered from the pickle, in order.
     pub pickle_tparams: Vec<ClasspathTypeParam>,

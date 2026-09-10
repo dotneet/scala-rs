@@ -1167,7 +1167,9 @@ impl Typer {
             if self.is_current_run_class(sym) {
                 let full = scala_full_name(&self.st, sym);
                 self.macro_local_tags.insert(full.clone(), ty.clone());
-                placeholders.push(full.clone());
+                if !placeholders.contains(&full) {
+                    placeholders.push(full.clone());
+                }
                 let mut out = String::from("(syn ");
                 quote_into(&mut out, &full);
                 out.push(')');
