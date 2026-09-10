@@ -15,6 +15,9 @@ fn matrix(names: &[(&str, bool)], warm: bool) {
     matrix_cp(names, warm, JAR);
 }
 fn matrix_cp(names: &[(&str, bool)], warm: bool, cp: &str) {
+    matrix_ordered(names, warm.then_some("warm"), cp);
+}
+fn matrix_ordered(names: &[(&str, bool)], warm: Option<&str>, cp: &str) {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
         "collection-results-{}-{}-{}",
@@ -29,7 +32,7 @@ fn matrix_cp(names: &[(&str, bool)], warm: bool, cp: &str) {
     for &(name, accepted) in names {
         let mut oracle = None;
         for nsc in [true, false] {
-            for order in 0..if warm { 3 } else { 1 } {
+            for order in 0..if warm.is_some() { 3 } else { 1 } {
                 let out = root.join(format!("{name}-{nsc}-{order}"));
                 fs::create_dir(&out).unwrap();
                 let mut c = Command::new(if nsc {
@@ -42,11 +45,11 @@ fn matrix_cp(names: &[(&str, bool)], warm: bool, cp: &str) {
                 }
                 c.args(["-cp", cp, "-d"]).arg(&out);
                 if order == 1 {
-                    c.arg(fixture("warm"));
+                    c.arg(fixture(warm.unwrap()));
                 }
                 c.arg(fixture(name));
                 if order == 2 {
-                    c.arg(fixture("warm"));
+                    c.arg(fixture(warm.unwrap()));
                 }
                 let p = c.output().unwrap();
                 assert_eq!(
@@ -187,4 +190,29 @@ fn actual_gitbucket_java_patch_helper_executes() {
 #[test]
 fn result_constrained_conversion_evidence() {
     matrix(&[("conv_result", true), ("conv_result_bad", false)], false);
+}
+
+#[test]
+fn sorted_map_overloads_after_generic_collection_loading() {
+    matrix_ordered(
+        &[
+            ("treemap_map", true),
+            ("sortedmap_map", true),
+            ("sortedmap_flatmap", true),
+            ("sortedmap_collect", true),
+        ],
+        Some("mapwarm"),
+        JAR,
+    );
+}
+#[test]
+fn lazy_class_tag_factory_preserves_required_evidence() {
+    matrix(
+        &[
+            ("class_tag_factory", true),
+            ("class_tag_generic", true),
+            ("factory_bad_tag", false),
+        ],
+        true,
+    );
 }

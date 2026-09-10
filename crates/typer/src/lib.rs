@@ -774,15 +774,19 @@ object Main {
     }
 
     fn compile_jprot_base() -> std::path::PathBuf {
+        // Both protected-access tests run concurrently. A timestamp can repeat
+        // within one process; each test must own the directory it removes.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "scala-rs-jprot-{}-{}",
+            "scala-rs-jprot-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
         let src = dir.join("Base.java");
         std::fs::write(
             &src,
@@ -3304,7 +3308,7 @@ object Main {
   def main(args: Array[String]): Unit = {
     val a: String = "|hello\n|world".stripMargin
     val b: String = "#hello\n#world".stripMargin('#')
-    val c: String = "a\nb".lines.next()
+    val c: String = "a\nb".linesIterator.next()
     val r = 1 to 3
     val u = 1 until 3
     val s: String = r.mkString(",")

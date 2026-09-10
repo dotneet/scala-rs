@@ -2230,7 +2230,12 @@ impl Typer {
         if let Type::Method { paramss, .. } = &*cand_ty {
             for want in paramss.iter().skip(1).flatten() {
                 let want = crate::symbol::subst_tparams_slice(&tps, &solved_args, want);
-                if !self.search_implicit_at(&want, 1).is_found() {
+                // Viability and insertion must agree: a concrete ClassTag
+                // is materialized rather than found in implicit scope.
+                // The same fallback refuses an abstract A without evidence.
+                if !self.search_implicit_at(&want, 1).is_found()
+                    && self.classtag_apply_fallback(&want, Span::DUMMY).is_none()
+                {
                     return None;
                 }
             }

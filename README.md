@@ -1161,3 +1161,17 @@ NameTransformer oracle checks all non-surrogate BMP characters against the
 pinned JDK 17. See [the batch record](docs/batches/forms-and-names.md) for current
 validation status and corrected hypotheses. Repeated-variable constraint
 solving and warmed collection return types remain separate unresolved roots.
+
+
+The collection-result batch preserves receiver-specific results and additional
+Ordering overloads after other source files load generic collection members.
+Runtime comparisons with scalac cover grouped/sliding, scans, tails/inits,
+SortedMap keys, lazy mkString, library value classes and evidence-bearing
+collection factories, including ArraySeq with ClassTag. Java String members
+are resolved before extension views on the pinned JDK17; Scala line iteration
+uses linesIterator. Independent invalid-type and missing-evidence programs
+remain rejection tests. See docs/batches/collection-results.md for the inventory,
+loading-order probes and prerequisites, and tests/BASELINE.md for full gates.
+The gitbucket measure includes every Scala/Twirl source and compiles the three
+real Java helpers; historical Java-disabled input counts remain separately
+comparable. Full gitbucket and cats compilation is still incomplete.

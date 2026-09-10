@@ -152,3 +152,6 @@ else
   print "VERDICT=FAIL"
 fi
 print "DONE"
+# Keep the completion sentinel on both paths, then propagate the verdict to
+# callers that also check the process status.
+(( ${#FAIL[@]} == 0 ))

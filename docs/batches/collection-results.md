@@ -48,7 +48,7 @@ full ledger and record even on rejection. Changing gitbucket measurement inputs
 requires reporting the comparable old-input measure separately from expanded
 coverage and updating the source-count gate from actual evidence.
 
-## Implemented composition and corrections from measurement
+## Initial composition at rejected a1443e0e
 
 - Read receiver-substituted collection declarations without companion or
   ancestor fallback; accept only the inherited declaration or a more-derived
@@ -88,7 +88,8 @@ string-inventory/results.json, factory-inventory/results.json and
 string-legacy-original.log under /tmp/scala-rs-collection-results. The original
 14-family matrix covers 56 compilations and all successful outputs execute;
 additional Java/String/factory probes are separate. Accepted compiler and its
-binary hash are recorded at the top. A full gate has not started yet.
+binary hash are recorded at the top. These were the initial prerequisites;
+the subsequent full gate rejected a1443e0e, as recorded below.
 
 Prerequisites on the composed compiler: 684 tests in 32 related suites pass;
 1288 selected pos/run corpus rows and all 1405 negatives have zero losses and
@@ -99,3 +100,78 @@ Java disabled). This is distinct from the expanded input measure in the gate.
 The first failed duration prerequisite was repaired before this successful set;
 no full gate was spent on it. Full-gate results belong in BASELINE.md and the
 owned gate directory; no success is inferred from these prerequisites alone.
+
+## Follow-up composition after rejected a1443e0e
+
+The full rejected gate and raw ledger are recorded on main at 59ef025f;
+compiler baseline stays 9cc076f6. The original worktree remains frozen.
+This follow-up is based on local main, includes a1443e0e, and merges the
+rejection record before validation. No other agent participates.
+
+Independent two-source probes separate two problems: warmed TreeMap.map is
+an actual regression (accepted baseline and scalac execute it; a144 rejects),
+while warmed generic SortedMap.map already failed on the accepted baseline.
+Preserve the existing extra-JVM-signature path before receiver-result copying.
+Then validate each copied alternative independently: an unrelated IterableOps
+copy must not discard a valid SortedMapOps overload with an Ordering clause.
+Both reductions now execute with exact scalac stdout in development probes.
+
+ArraySeq adds another complete family to this follow-up rather than spending
+another gate on one repair. Its companion enters after startup; complete the
+EvidenceIterableFactory[ArraySeq, ClassTag] edge during its memoized implicit
+scope warmup. Open conversion viability must accept the same concrete
+ClassTag materialization that application insertion performs. It must still
+reject an abstract A lacking ClassTag evidence. Real scalac and the candidate
+agree for primitive, reference and array elements through an [A: ClassTag]
+function, and for the independent missing-ClassTag rejection. The immutable
+accepted binary rejects the valid direct and generic ArraySeq conversions.
+
+The old typer string_ops4 test embedded lines.next() independently of its
+fixture. Correct it to linesIterator.next(); retain the exact old expression
+as a real-scalac rejection test. Nothing is skipped or weakened to retain
+false acceptance.
+
+Related-test selection now follows collection/factory/String/Duration tokens
+in fixture sources back into Rust tests as well as searching test bodies.
+It selects 121 CLI suites, including mismatch10, plus typer unit tests.
+The evidence and rationale are in /tmp/scala-rs-collection-followup, including
+suite-selection.json and the distinct before/nsc/candidate logs. This section
+describes the implemented follow-up; the next full gate is not yet recorded.
+
+The expanded 121-suite prerequisite completes with 1426 passing tests,
+including both mismatch10 regressions and the ten collectionresults tests.
+The first typer unit run had a separate missing-jprot-class failure: both
+protected-access tests used a PID plus wall-clock timestamp for their Java
+output and independently removed it. That allocator allowed two concurrent
+tests to share a path; the failure log did not retain their timestamps, so the
+single observed failure alone is not proof of that collision. The helper now
+adds an atomic process-local counter and creates the directory exclusively.
+Its real javac-backed positive and negative tests are rerun with the unit suite.
+
+The gate summary also returned exit zero on the rejected verdict. Preserve
+DONE on both paths and return nonzero for FAIL. The actual summary tail was
+executed with passing and failing state: both emit DONE, with exits 0 and 1
+respectively. This is a summary-control check, not a claimed full gate.
+
+Follow-up prerequisites: all 190 typer unit tests pass. Selected pos/run
+corpus covers 1292 identities with zero losses and gains at pos/implicits-old,
+pos/t8310 and run/fors; all 1405 negatives retain their statuses. Cats on the
+same full source set moves from 121 errors / 54 files to 103 / 45, with 18
+removed diagnostics and none added after normalizing generated anonymous IDs.
+Gitbucket on historical inputs remains 115 / 54; expanded-input numbers are
+reported separately. Preflight checks four pinned source trees, 121 jars,
+33 byte-identical Java support classes and 1498 cached reference classes.
+
+The broad follow-up prerequisites used immutable binary e28fed905f738bd2.
+Removing only the redundant final return in supply_receiver_override clears
+one new clippy warning; the final build hash is b2409aadc8f1b45b3ac32989c08aedc622c2d6b305022af77036aa11af68d761.
+Clippy now matches all 57 accepted warning identities. The final binary gets
+focused runtime tests, repeated protected-access tests and corpus prerequisites
+again before the one full gate. Those final results and frozen-tree provenance
+live in /tmp/scala-rs-collection-followup/final and the new gate directory.
+
+Final-binary prerequisites completed: 21 focused cases, both protected-access
+tests in each of five runs, 1292 selected pos/run units with three gains and
+zero losses, and 1405 negatives with no status changes. Cats diagnostics are
+byte-identical to the reviewed 103/45 result. No compiler change follows these
+checks. The full gate remains the integration decision.

@@ -2759,6 +2759,11 @@ impl Typer {
         }
         self.load_companion_module(c);
         self.warm_pickled_implicits(c);
+        if self.st.get(c).kind == SymKind::ModuleClass
+            && self.st.get(c).jvm_name.starts_with("scala/collection/")
+        {
+            crate::prelude_buildfrom::link_evidence_factories(&mut self.st);
+        }
         true
     }
 
@@ -3178,6 +3183,23 @@ impl Typer {
         if found.iter().any(|&m| self.st.get(m).owner == cls) {
             return;
         }
+        // A real extra JVM signature is an overload, not merely a receiver
+        // substitution. Preserve the established overload completion first:
+        // TreeMap.map(f)(Ordering) must not disappear when Map.map was loaded
+        // by a preceding unit. The result-only path below must not intercept it.
+        let have: Vec<Vec<Option<String>>> = found
+            .iter()
+            .map(|&m| crate::pickle_supply::flat_erased_params(&self.st, &self.st.get(m).ty))
+            .collect();
+        if self.ancestor_declares_other_signature(cls, name, &have, found) {
+            if !self.supply_from_pickle_class(cls, name).is_empty() {
+                let now = self.st.lookup_member(cls, name);
+                if now.iter().any(|&m| self.st.get(m).owner == cls) {
+                    *found = now;
+                }
+            }
+            return;
+        }
         let library_collection = self.st.get(cls).jvm_name.starts_with("scala/collection/");
         // And the hierarchy `drop_overridden` is about to order the candidates
         // by is the pickled one for the receiver and for every *library*
@@ -3254,7 +3276,7 @@ impl Typer {
                 let dotted = origin.split('#').next()?;
                 crate::classpath::find_by_jvm(&this.st, &dotted.replace('.', "/"))
             };
-            let mut same_declarations = true;
+            let mut rejected = Vec::new();
             for &m in &own {
                 let s = self.st.get(m);
                 let params = crate::pickle_supply::flat_erased_params(&self.st, &s.ty);
@@ -3264,75 +3286,37 @@ impl Typer {
                     .filter(|(_, p)| *p == params)
                     .map(|(o, _)| o)
                     .collect();
-                // A shape none of the inherited candidates has is a new
-                // alternative -- `TreeMap.map(f)(implicit Ordering[K2])`
-                // beside `MapOps.map(f)` -- which is what the path below
-                // admits too, and overload resolution then chooses.
-                if of_shape.is_empty() {
-                    continue;
-                }
-                if origin.starts_with(&own_prefix) {
-                    continue;
-                }
-                let Some(below) = declaring(self, &origin) else {
-                    same_declarations = false;
-                    break;
+                // Judge each alternative independently. An unrelated
+                // IterableOps.map copy must not discard SortedMapOps.map's
+                // genuine additional Ordering clause alongside it.
+                let valid = if of_shape.is_empty() || origin.starts_with(&own_prefix) {
+                    true
+                } else if let Some(below) = declaring(self, &origin) {
+                    if below.0 >= self.st.prelude_end {
+                        self.pickle
+                            .ensure_parents(&mut self.st, &mut self.binary, below);
+                    }
+                    of_shape.iter().all(|other| {
+                        other.is_empty()
+                            || **other == origin
+                            || declaring(self, other).is_some_and(|above| {
+                                crate::pickle_supply::inherits_from(&self.st, below, above)
+                            })
+                    })
+                } else {
+                    false
                 };
-                if below.0 >= self.st.prelude_end {
-                    self.pickle
-                        .ensure_parents(&mut self.st, &mut self.binary, below);
-                }
-                for other in of_shape {
-                    if other.is_empty() || *other == origin {
-                        continue;
-                    }
-                    let above = declaring(self, other);
-                    if !above
-                        .is_some_and(|a| crate::pickle_supply::inherits_from(&self.st, below, a))
-                    {
-                        same_declarations = false;
-                        break;
-                    }
-                }
-                if !same_declarations {
-                    break;
+                if !valid {
+                    rejected.push(m);
                 }
             }
-            if same_declarations {
+            self.st
+                .get_mut(cls)
+                .members
+                .retain(|m| !rejected.contains(m));
+            if rejected.len() < own.len() {
                 *found = self.st.lookup_member(cls, name);
-            } else {
-                self.st.get_mut(cls).members.retain(|m| !own.contains(m));
             }
-            return;
-        }
-        // Only a *new alternative* is worth reading the pickle for. A plain
-        // override -- `List.length` over `Seq.length` -- has the same
-        // descriptor, is dispatched virtually anyway, and installing it would
-        // only rename the call: the prelude types `aSet.toSeq` as `List` while
-        // the pickled `toSeq` it calls returns `Seq`, so `invokevirtual
-        // List.length` on that value is a `VerifyError` where `invokeinterface
-        // Seq.length` was fine. So the *classfile* is asked first, and the
-        // pickle only when it declares a *signature* none of the candidates
-        // has: `TreeMap.collect(PartialFunction, Ordering)` against `MapOps
-        // .collect(PartialFunction)`, and `FiniteDuration.min(FiniteDuration)`
-        // against `Duration.min(Duration)`. Comparing arity alone missed the
-        // second shape, and comparing return types as well would re-admit the
-        // covariant override this is guarding against, so only the erased
-        // *parameters* are compared. Reading a classfile is cheap next to
-        // completing every inherited selection from the pickle.
-        let have: Vec<Vec<Option<String>>> = found
-            .iter()
-            .map(|&m| crate::pickle_supply::flat_erased_params(&self.st, &self.st.get(m).ty))
-            .collect();
-        if !self.ancestor_declares_other_signature(cls, name, &have, found) {
-            return;
-        }
-        if self.supply_from_pickle_class(cls, name).is_empty() {
-            return;
-        }
-        let now = self.st.lookup_member(cls, name);
-        if now.iter().any(|&m| self.st.get(m).owner == cls) {
-            *found = now;
         }
     }
 

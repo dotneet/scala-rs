@@ -27,7 +27,8 @@
 //!
 //! Sorted companions additionally need EvidenceIterableFactory / SortedMapFactory
 //! edges. Their conversions are recovered from the real pickle, preserving the
-//! extra Ordering clause. ArraySeq's lazy ClassTag factory edge remains separate.
+//! extra Ordering clause. The same edge is completed for lazy ArraySeq with
+//! ClassTag evidence before conversion viability is checked.
 
 use crate::symbol::SymbolTable;
 use scala_rs_parser::{SymbolId, Type};
@@ -170,8 +171,14 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
 /// Evidence-bearing companions keep their concrete apply/empty declarations.
 /// Their factory edge supplies the real library conversion, including its
 /// Ordering/ClassTag clause, rather than treating the companion as a Factory.
-fn link_evidence_factories(st: &mut SymbolTable) {
+pub(crate) fn link_evidence_factories(st: &mut SymbolTable) {
     for (module, collection, factory, evidence) in [
+        (
+            "scala/collection/immutable/ArraySeq$",
+            "scala/collection/immutable/ArraySeq",
+            "scala/collection/EvidenceIterableFactory",
+            Some("scala/reflect/ClassTag"),
+        ),
         (
             "scala/collection/immutable/SortedSet$",
             "scala/collection/immutable/SortedSet",
