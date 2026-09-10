@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Eighty slices have merged this session**, in thirty-six accepted composed gates.
-Twelve intermediate candidates were rejected, three despite a PASS script verdict. From
+Thirteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1762,3 +1762,50 @@ It remains unrepaired; evidence is in `/tmp/scala-rs-partial-probe`.
 This recording commit changes only BASELINE and the candidate ledger;
 main's compiler sources and tests remain unchanged. Clippy was not rerun
 for this rejected candidate; no new clippy-success claim is made.
+
+
+## Rejected repaired partial-factory candidate: `ad190a6c`
+
+Clean `ad190a6c` combines repair commits `429b1ec5` and `a04c1e39` with
+main `a254315c`. Its complete unskipped gate reached `VERDICT=FAIL` and
+`DONE`: `/tmp/scala-rs-gate-ad190a6c-codex/gate.log`. No candidate code is
+merged; the accepted compiler baseline remains `02317f15`.
+
+The five Slick errors from `41cd9040` are repaired. All 184 files compile
+with zero errors and 1492 classes. MODE=b passes 12/12 programs and 36/36
+attempts. Subset verification covers all 1492 classes, failed 0 and lint
+problems 0. Strong initialization verification of the retained exact output,
+with real PostgreSQL and Oracle drivers, loads 1492 classes, failed 0 and
+incomplete 0. Classes and `verify-all.log` are in the gate directory.
+
+Cats improves 158/59 -> 152/58, gitbucket 192/63 -> 191/63; the library
+remains 460/119 with identical diagnostics. Diagnostic locations have no
+additions: six cats locations and one gitbucket location disappear. Some
+remaining messages change (Applicative[F] to Applicative[F0], three Query
+application failures to result-type mismatches, and one Set argument's type).
+Both message and location comparisons are saved in the gate directory;
+this is not claimed as an unchanged diagnostic-message multiset.
+
+Workspace passes 2700 tests, zero failed (293 rows). Format passes. Release
+workspace clippy has the same 57 diagnostic warnings, with none added.
+All 5324 corpus identities compare, with losses=1 and changes=2. Totals
+(pass/fail/skip): pos 1118/396/345, neg 699/337/369, run 643/864/553.
+The gain is run/var-arity-class-symbol; the loss is
+neg/typevar_derive_alias, which the candidate incorrectly accepts. Raw ledger:
+`tests/baselines/corpus-ad190a6c.tsv`.
+
+The regression distinguishes binding a parameterless result to a value from
+using it directly as a selection qualifier. The corpus defines
+`Sq[+T].toSt[B >: T]: St[B]` with invariant St and `St.map[U](T => U)`.
+Scalac accepts `val st = ts.toSt; st.map(x => x)`, but rejects the direct
+`ts.toSt.map(x => x)` forms, with and without an alias. The new eager
+lower-bound inference makes the direct forms pass as well. This qualifier
+context and both rejection sites must become focused prerequisites before
+another gate; no workaround should weaken or remove the corpus test.
+
+Before launch, 557 related/boundary tests passed, and 17 historical corpus
+identities had losses=0 and changes=0 on the composed tree. Preflight passed
+four pinned sources, 121 jars, 33 Java support classes and 1498 scalac
+reference classes. One owned process handle was monitored through DONE.
+This recording commit changes only BASELINE and the candidate ledger;
+main's compiler sources and tests remain unchanged.
