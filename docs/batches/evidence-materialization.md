@@ -103,3 +103,65 @@ historical/changed corpus identities have losses=0 and retain all eleven gains.
 Additional name/import/shadowing corpus regressions have losses=0. Final release
 workspace clippy retains exactly the same 57 warnings. The first rejected gate's
 complete raw ledger and rejection record are preserved with the repaired batch.
+
+The second gate exposed the Java half of namespace completion: this compiler
+represents a Java class and its static companion with the same class symbol.
+Filtering all class symbols from term lookup hid DriverManager and ConfigValueType
+behind wildcard imports, producing nine Slick errors. Java class symbols now
+participate in both namespaces. The new wildcard/static fixture executes with
+real scalac and the repaired compiler and preserves accepted-main behavior; the
+rejected namespace candidate fails it.
+
+That probe also found an existing type-name discrepancy: after java.sql._, nsc
+rejects unqualified Array[String] because java.sql.Array shadows scala.Array,
+while the accepted compiler accepts it. The static fixture spells scala.Array
+explicitly. This separate built-in type resolution issue remains inventoried;
+term-namespace changes do not claim to repair type-name precedence.
+
+The Java namespace integration passes 50 related tests across nine suites.
+All 57 historical/namespace corpus identities have losses=0 and retain eleven
+gains. Slick's full 184-source precheck is restored to errors=0 / 1492 classes.
+The refreshed preflight passes; release workspace clippy retains the same 57
+warnings with none added or removed.
+
+The Array discrepancy is traced to two name-only AppliedTypeTree/TypeApply
+fast paths in check_types.rs, before resolving the constructor symbol. FunctionN
+uses a related shortcut, and primitive builtins have a separate shadowing rule.
+A future repair should inventory all of these together, including aliases,
+qualified names and wildcard precedence, before changing the type representation
+chosen by the fast paths.
+
+The final gitbucket precheck reports 158 errors in 57 files, versus accepted
+169/61. Twelve diagnostic entries disappear and one appears: GetResult[Int]
+is now reported at IssuesService.scala:494, replacing three downstream Unit
+result errors in that SQL insertion path. This path is still unresolved. The
+two SystemSettingsController toMap evidence errors and the Manifest diagnostics
+are removed. The comparison is preserved in gitbucket-final-diagnostics.json
+under the probe directory.
+
+The second gate completed with three run losses: t10513, t3603 and t6488.
+The Java static-symbol correction restores Future and ProcessLogger discovery
+(the binary loader also marks shallow Scala declarations JAVA). The remaining
+IntMap failure is the opposite namespace order: term-only wildcard completion
+left the companion in scope, then type completion did not bind its package
+class. Type wildcard completion now loads visible class/type members before
+falling back to aliases. IntMap and LongMap term-then-type uses are included in
+the runtime fixture and match scalac byte for byte. All three gate losses pass
+in the repaired tree.
+
+A separate GetResult[Int] probe reproduces the unresolved SQL evidence failure
+without the gitbucket source set: nsc prints true for identity with GetInt; both
+the accepted and current compiler reject implicit summoning. This corrects the
+hypothesis that the problem only occurs during a full run. supply_implicit_members
+currently considers only Def entries, while GetInt is an implicit nested object;
+its loading, flags, parents and module receiver need to be checked together in
+a future batch. No special-case GetResult witness is installed here.
+
+After the type-namespace correction, all 558 tests in 14 affected suites pass.
+The combined 60 historical and newly exposed corpus identities have losses=0
+and eleven gains. This includes all losses from both rejected candidates.
+
+The final source tree again passes Slick's 184-source precheck with zero errors
+and 1492 classes. Format and refreshed dependency preflight pass; clippy keeps
+the same 57 warnings. Rejected gate 20d4c727's exact ledger and full rejection
+record were committed and pushed before launching the next composed gate.

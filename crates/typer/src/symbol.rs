@@ -2008,6 +2008,14 @@ impl SymbolTable {
     }
 
     fn is_term_namespace(&self, s: SymbolId) -> bool {
+        // The classfile loader uses one class symbol for a Java class and
+        // its static companion. It therefore supplies both namespaces, unlike
+        // a Scala class whose object has a separate module symbol. Shallow
+        // binary Scala declarations also carry JAVA until completion; retaining
+        // them lets final term resolution discover their actual companion.
+        if self.get(s).kind == SymKind::Class && self.get(s).flags.contains(Flags::JAVA) {
+            return true;
+        }
         matches!(
             self.get(s).kind,
             SymKind::Term

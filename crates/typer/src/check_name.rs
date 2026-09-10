@@ -1416,6 +1416,24 @@ impl Typer {
                 .map(|w| (w.owner, w.origin))
                 .collect();
             for (owner, origin) in imports {
+                // A preceding term use may have imported only a companion.
+                // Complete and bind the package's class before falling back to
+                // pickled aliases or the module offered by lookup_type.
+                self.complete_binary_member(owner, name, span);
+                for id in self.st.lookup_member(owner, name) {
+                    if matches!(
+                        self.st.get(id).kind,
+                        SymKind::Class | SymKind::TypeMember | SymKind::TypeParam
+                    ) && (!self.st.private_to_owner(id)
+                        || (self.st.get(id).owner == owner && self.private_member_visible_here(id)))
+                    {
+                        self.st
+                            .enter_import_in_current(name, id, BindRank::Wildcard, origin);
+                    }
+                }
+                if self.st.has_real_type_entry(name) {
+                    return;
+                }
                 match self
                     .pickle
                     .complete_type_member(&mut self.st, &mut self.binary, owner, name)

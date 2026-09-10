@@ -89,6 +89,7 @@ fn byname_definitions_and_default_imports_match_scalac() {
         ("bynameevidencebatch", true),
         ("predefshadowbatch", true),
         ("defaultnamespacebatch", true),
+        ("javastaticnamespacebatch", true),
         ("bynameevidencebatch_bad", false),
         ("defaultuniversalbatch_bad", false),
     ]);
