@@ -3368,9 +3368,16 @@ impl Typer {
         // Remove first because completion can recursively request this class.
         if self.st.pending_classpath_signatures.remove(&class_id)
             && !self.st.source_classes.contains(&class_id)
+            && self
+                .pickle
+                .adopt_binary_class(&mut self.st, &mut self.binary, class_id)
         {
+            // The directory header has only erased parent names. Restore
+            // type arguments before inherited members are viewed through
+            // this receiver, and complete those parents' declarations too.
             self.pickle
-                .adopt_binary_class(&mut self.st, &mut self.binary, class_id);
+                .ensure_parents(&mut self.st, &mut self.binary, class_id);
+            self.complete_java_parents(class_id, span);
         }
         let javaish = self.st.get(class_id).flags.contains(Flags::JAVA)
             || jvm.starts_with("java/")

@@ -110,6 +110,15 @@ impl Typer {
         // `NTupleMonadInstances`, where kind-projector's `(A0, *, *)` is
         // exactly this shape.
         recv_ty = self.st.dealias(&self.st.expand_applied_hk_alias(recv_ty));
+        // Directory discovery installs a shallow signature so names are
+        // available to the header pass. A member selection needs the full
+        // Scala declaration, including implicit clauses and bounds, even
+        // when the shallow scan already installed a member with this name.
+        if let Some(cls) = self.st.class_sym_of(&recv_ty) {
+            if self.st.pending_classpath_signatures.contains(&cls) {
+                self.ensure_java_loaded(cls, tree.span);
+            }
+        }
         // `xs #:: ys` on a `Stream`: `Stream.Deferrer` and the conversion that
         // reaches it can only be declared once `Stream` itself is in the
         // symbol table, which happens no earlier than here.
