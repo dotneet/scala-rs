@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `02317f15` |
+| commit | `176629aa` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Eighty slices have merged this session**, in thirty-six accepted composed gates.
+**Eighty-one slices have merged this session**, in thirty-seven accepted composed gates.
 Thirteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -59,6 +59,7 @@ coordinator measured the merged tree each time, not the branches.
 | `5adf9c87` | `inherited results and constructor evidence` | 223 -> **217** | 159 -> **158** |
 | `caf8f284` | `early lexical scopes` | 217 -> **202** | 158 |
 | `02317f15` | `inherited factory redirect` | 202 -> **192** | 158 |
+| `176629aa` | `partial factory inference` | 192 -> **191** | 158 -> **152** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -265,8 +266,8 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **158** | **59** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **192** | **63** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **152** | **58** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **191** | **63** | — |
 | `tests/scalalib_measure.sh` (538) | **460** | **119** | — |
 
 ## Execution
@@ -290,11 +291,14 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 |---|---:|---:|---:|
 | `pos` (1859) | **1118** | 396 | 345 |
 | `neg` (1405) | **700** | 336 | 369 |
-| `run` (2060) | **642** | 865 | 553 |
+| `run` (2060) | **643** | 864 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-02317f15.tsv`](baselines/corpus-02317f15.tsv): 5324 unique
+[`baselines/corpus-176629aa.tsv`](baselines/corpus-176629aa.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `176629aa` gate compared against `corpus-02317f15.tsv`: **losses=0,
+changes=1**, the runtime gain `var-arity-class-symbol`.
+
 The `02317f15` gate compared against `corpus-caf8f284.tsv`: **losses=0,
 changes=2**, both runtime gains (`sd409`, `t4147`).
 
@@ -389,7 +393,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **292 result rows, 2697 passed, 0 failed** at `02317f15` |
+| `cargo test --workspace --release --no-fail-fast` | **293 result rows, 2701 passed, 0 failed** at `176629aa` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -1809,3 +1813,57 @@ four pinned sources, 121 jars, 33 Java support classes and 1498 scalac
 reference classes. One owned process handle was monitored through DONE.
 This recording commit changes only BASELINE and the candidate ledger;
 main's compiler sources and tests remain unchanged.
+
+
+## Gate thirty-seven: partial factory receiver inference
+
+Clean `176629aa`, combining repair `b7925f4a` with main `6a348052`, passed
+all unskipped gate stages with `VERDICT=PASS`, `DONE`, corpus losses=0 and
+changes=1 against `02317f15`. Logs:
+`/tmp/scala-rs-gate-176629aa-codex/gate.log`. Main was fast-forwarded to the
+exact tested commit; this recording commit changes only BASELINE and the
+raw corpus ledger. No compiler source or fixture changed after the gate.
+
+Cats improves 158/59 -> 152/58 and gitbucket 192/63 -> 191/63. The library
+remains 460/119. Diagnostic messages are identical to rejected `ad190a6c`:
+relative to the accepted baseline, no error location is added, six cats
+locations and one gitbucket location disappear. Several remaining messages
+change as documented in that rejection, so this is not a claim that the
+error-message multiset has no additions. Slick compiles all 184 files with
+zero errors and 1492 classes. MODE=b passes 12/12 programs, 36/36 attempts;
+subset verifies all 1492 classes with zero failures and lint problems.
+Strong initialization verification with real PostgreSQL and Oracle drivers
+loads all 1492 retained classes, zero failed and zero incomplete.
+
+Workspace: 2701 passed, zero failed, 293 rows. Format passes. Release
+workspace clippy has the same 57 diagnostic warnings, with no additions.
+Corpus: 5324 identities; pos 1118/396/345, neg 700/336/369, run 643/864/553
+(pass/fail/skip). The only gain is run/var-arity-class-symbol. The prior
+loss neg/typevar_derive_alias recovers. Raw ledger:
+`tests/baselines/corpus-176629aa.tsv`.
+
+The slice infers receiver parameters of partially applied factories from
+arguments and expected results before implicit search, and loads nested
+binary apply members through the normal classfile path. Lower bounds remain
+on binary declarations and are inferred at use sites. Implicit-only results
+and parameterless values both infer real lower bounds without freezing
+factory receivers before explicit or omitted apply. Dynamic classification
+preserves the same callee context. Selection qualifiers defer value-position
+minimization, retaining scalac's rejection of direct invariant-result map
+chains, including aliases.
+
+The last regression is covered by independent plain and alias rejection
+probes: real scalac rejects both; the saved pre-fix candidate accepts both;
+the final candidate rejects both. Binding the receiver to a local value is
+accepted and executes with byte-identical stdout under JVM -Xverify:all.
+Factory tests also compare source and real-scalac-built binary libraries,
+exercise explicit/omitted apply, and independently reject invalid bounds,
+missing evidence and explicit wide results assigned to narrow types.
+
+Before the gate, 558 related/boundary tests passed, and 18 historical corpus
+identities matched the accepted ledger with changes=0 and losses=0. Source,
+jar and cache preflight passed four pinned checkouts, 121 jars, 33 Java
+support classes and 1498 scalac reference classes. Monitoring retained one
+live handle through DONE. Gitbucket and cats still do not fully compile.
+The separately reproduced user-defined App initialization collision and
+class-directory implicit metadata loss remain open investigations.
