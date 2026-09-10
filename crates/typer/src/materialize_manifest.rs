@@ -52,13 +52,14 @@ impl Typer {
             }
             Type::Refined { parents, .. } => !parents.is_empty() && parents.iter().all(sub),
             Type::TypeParam(_) | Type::TypeMember(_) | Type::Applied { .. } => !full,
-            Type::SingleType { sym, .. } => self.manifest_stable_reference(*sym),
+            Type::SingleType { sym, .. } | Type::ModuleRef(sym) => {
+                self.manifest_stable_reference(*sym)
+            }
+            Type::ThisType(sym) => self.manifest_this_available(*sym),
             Type::Annotated { tpe, .. } => sub(tpe),
             Type::BoundedWildcard { hi, .. } => sub(hi.as_deref().unwrap_or(&Type::Any)),
             Type::Wildcard
             | Type::Constant(_)
-            | Type::ThisType(_)
-            | Type::ModuleRef(_)
             | Type::Unit
             | Type::Boolean
             | Type::Byte
@@ -80,13 +81,41 @@ impl Typer {
 
     fn manifest_static_class(&self, sym: SymbolId) -> bool {
         let s = self.st.get(sym);
-        s.kind == SymKind::Class && self.st.get(s.owner).kind != SymKind::Class
+        s.kind == SymKind::Class && self.manifest_stable_reference(sym)
     }
 
     fn manifest_stable_reference(&self, sym: SymbolId) -> bool {
         // Source singleton types currently discard an instance selection's
         // prefix. Do not materialize that lost receiver as the caller's this.
-        self.st.get(self.st.get(sym).owner).kind != SymKind::Class
+        let mut owner = self.st.get(sym).owner;
+        for _ in 0..64 {
+            if owner.is_none() {
+                return true;
+            }
+            match self.st.get(owner).kind {
+                SymKind::Class => return false,
+                SymKind::Package => return true,
+                SymKind::Method => {
+                    return self.st.lookup_term(&self.st.get(sym).name).contains(&sym)
+                }
+                _ => owner = self.st.get(owner).owner,
+            }
+        }
+        false
+    }
+
+    fn manifest_this_available(&self, sym: SymbolId) -> bool {
+        let mut owner = self.st.owner;
+        for _ in 0..64 {
+            if owner == sym {
+                return true;
+            }
+            if owner.is_none() {
+                return false;
+            }
+            owner = self.st.get(owner).owner;
+        }
+        false
     }
 
     fn no_manifest(&mut self, pt: &Type, span: Span) -> Option<Tree> {
@@ -264,6 +293,9 @@ impl Typer {
                 return self.manifest_factory(full, "singleType", Some(vec![value]), pt, span);
             }
             Type::ThisType(sym) => {
+                if !self.manifest_this_available(*sym) {
+                    return None;
+                }
                 let mut value = Tree::new(
                     NodeId(0),
                     span,

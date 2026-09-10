@@ -1,6 +1,9 @@
 object Main {
   def m[A](implicit ev: scala.reflect.Manifest[A]): scala.reflect.Manifest[A] = ev
   class Box[A]
+  class Self {
+    def same: Boolean = m[this.type] == scala.reflect.Manifest.singleType(this)
+  }
   trait P
   trait Q
   object Key { override def toString: String = "key" }
@@ -15,6 +18,7 @@ object Main {
     println(m[Array[Int]]); println(m[Array[Array[String]]]); println(array[Int])
     println(list[Int]); println(m[(String, Int)]); println(m[Int => String])
     println(m[Key.type] == scala.reflect.Manifest.singleType(Key))
+    println(new Self().same)
     println(m[P with Q])
     println(m[List[_]]); println(m[List[_ <: Number]]); println(m[List[_ >: String <: AnyRef]])
   }

@@ -13,6 +13,9 @@ object Main {
   def main(args: Array[String]): Unit = {
     val f: Function[Int, String] = _.toString
     println(use[Function](f)(3))
+    println(Function.const[String, Int]("ok")(1))
+    println(List(1, 2).collect(Function.unlift((x: Int) => if (x == 2) Some(x) else None)))
+    println(Function.tupled((x: Int, y: Int) => x + y)((2, 3)))
     println(manifest[Int]); println(optManifest[Int]); println(Manifest.Int); println(NoManifest)
     println(go[List[Int]])
     println(optional[Int]); println(optional[List[String]])

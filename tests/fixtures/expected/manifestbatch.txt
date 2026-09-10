@@ -23,6 +23,7 @@ scala.collection.immutable.List[Int]
 scala.Tuple2[java.lang.String, Int]
 scala.Function1[Int, java.lang.String]
 true
+true
 Main$P with Main$Q
 scala.collection.immutable.List[Any]
 scala.collection.immutable.List[java.lang.Number]

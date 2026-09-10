@@ -61,3 +61,45 @@ byte comparisons and 1498 known-good scalac reference classes. Four runnable
 fixtures match real scalac stdout byte for byte; the three repaired behavior
 fixtures fail compilation with the rebuilt accepted 3343f368 binary. The fourth
 fixture preserves explicit-import shadowing and passes both before and after.
+
+The first full composed gate exposed a namespace interaction missed by the
+initial focused suites: after Predef.Function's type alias was loaded, lazy
+term completion stopped at that type-only binding. Function.const/unlift/tupled
+then resolved to the alias, adding cats errors and breaking the two existing
+ctacc_fn runs. Term expressions now use namespace-aware completion through the
+same inherited/package/wildcard/default stages. This is also exercised with a
+user-imported type alias hiding a still-lazy default object. The failing gate's
+worktree remains frozen; the correction was developed in a separate worktree.
+
+The correction passes 556 tests in 13 related suites, including ctoraccessor,
+e2e and the required pickle/prelude supply suites. New Function type-then-term
+calls and user alias/default object calls match real scalac runtime output.
+
+A rerun found a harness race before compilation: two test threads received the
+same wall-clock nanosecond value and tried to create the same temporary output
+directory. The evidencebatch and memberbatch helpers now add an atomic per-process
+sequence to their timestamp/PID directory names. No assertions were weakened.
+
+After the namespace correction, a targeted rerun of all 339 cats sources reports
+121 errors in 54 files, versus accepted 125/54 and rejected candidate 162/58.
+The four resolved diagnostics are the Function kind error, two neighboring
+function-instance errors and the Kleisli instance mismatch. The two changed
+vector diagnostic messages remain at the same previously-failing call sites.
+The user-alias/default-object fixture also fails with the accepted before
+binary and matches scalac stdout after the fix. The final evidencebatch and
+memberbatch harness runs pass together after the directory-race correction.
+
+The first gate ultimately reported 4 corpus losses. In addition to the
+Function import cases (lift-and-unlift and tuples), t3507-old requires rejecting
+an escaped, existential instance receiver through an entire nested-owner chain.
+A current lexical this.type remains materializable and is runtime-tested.
+The t5389 rejection follows nsc's root-import rule: universal Any/Object members
+are not imported from default Predef. Ordinary explicit imports are unaffected.
+Both negatives have independent scalac/scala-rs fixtures. All changed corpus
+identities plus the historical regression set are rerun before the next gate.
+
+Final pre-gate boundary verification passes 22 tests in four suites. The 33
+historical/changed corpus identities have losses=0 and retain all eleven gains.
+Additional name/import/shadowing corpus regressions have losses=0. Final release
+workspace clippy retains exactly the same 57 warnings. The first rejected gate's
+complete raw ledger and rejection record are preserved with the repaired batch.

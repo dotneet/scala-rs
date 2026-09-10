@@ -2,13 +2,15 @@
 use std::{fs, path::Path, process::Command};
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 fn check_cases(cases: &[(&str, bool)]) {
+    static NEXT_DIR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let root = std::env::temp_dir().join(format!(
-        "memberbatch-{}-{}",
+        "memberbatch-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_DIR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::create_dir(&root).unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

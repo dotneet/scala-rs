@@ -1279,7 +1279,7 @@ impl Typer {
     /// Runs only when the name is not in scope at all, and enters exactly
     /// what completion installed, so it can neither shadow nor replace
     /// anything.
-    fn expose_inherited_from_binary(&mut self, name: &str) {
+    fn expose_inherited_from_binary(&mut self, name: &str, terms_only: bool) {
         if !self.library_abi || self.st.this_class.is_none() {
             return;
         }
@@ -1293,8 +1293,8 @@ impl Typer {
         for id in found {
             self.st.enter_in_current(name, id);
         }
-        if self.st.lookup(name).is_empty() {
-            self.expose_from_binary_self_type(name);
+        if self.exposure_lookup(name, terms_only).is_empty() {
+            self.expose_from_binary_self_type(name, terms_only);
         }
     }
 
@@ -1325,7 +1325,7 @@ impl Typer {
     /// than answered wrongly. Like the parent case this runs only when the
     /// name resolves to nothing at all, and enters exactly what completion
     /// installed.
-    fn expose_from_binary_self_type(&mut self, name: &str) {
+    fn expose_from_binary_self_type(&mut self, name: &str, terms_only: bool) {
         let owner = self.st.this_class;
         let Some(st) = self.st.get(owner).self_type.clone() else {
             return;
@@ -1355,7 +1355,7 @@ impl Typer {
             for id in found {
                 self.st.enter_in_current(name, id);
             }
-            if !self.st.lookup(name).is_empty() {
+            if !self.exposure_lookup(name, terms_only).is_empty() {
                 return;
             }
         }
@@ -1550,11 +1550,30 @@ impl Typer {
         out
     }
 
+    fn exposure_lookup(&self, name: &str, terms_only: bool) -> Vec<SymbolId> {
+        if terms_only {
+            self.st.lookup_term(name)
+        } else {
+            self.st.lookup(name)
+        }
+    }
+
     pub(crate) fn expose_unqualified(&mut self, name: &str, span: Span) {
+        self.expose_unqualified_in(name, span, false);
+    }
+
+    // Lazy completion must ask the namespace the expression uses. A type
+    // alias can already be loaded while the same-named object is still lazy.
+    fn expose_unqualified_in(&mut self, name: &str, span: Span, terms_only: bool) {
         if name.is_empty() {
             return;
         }
-        match self.st.bind_rank(name) {
+        let rank = if terms_only && self.st.lookup_term(name).is_empty() {
+            None
+        } else {
+            self.st.bind_rank(name)
+        };
+        match rank {
             // Nothing answers to the name yet: the whole search below runs.
             None => {}
             // Already bound at the strongest precedence there is.
@@ -1586,8 +1605,8 @@ impl Typer {
         } else {
             self.st.owner
         };
-        self.expose_inherited_from_binary(name);
-        if !self.st.lookup(name).is_empty() {
+        self.expose_inherited_from_binary(name, terms_only);
+        if !self.exposure_lookup(name, terms_only).is_empty() {
             return;
         }
         // Only the packages the file's own clauses opened, innermost first.
@@ -1612,7 +1631,7 @@ impl Typer {
             for id in self.st.lookup_member(pkg, name) {
                 self.st.enter_in_current(name, id);
             }
-            if !self.st.lookup(name).is_empty() {
+            if !self.exposure_lookup(name, terms_only).is_empty() {
                 break;
             }
         }
@@ -1627,8 +1646,8 @@ impl Typer {
         //
         // The eager half of `import_wildcard` is not affected: a name it could
         // enter is already in the current scope and neither branch runs.
-        self.expose_from_wildcards(name, span);
-        if self.library_abi && self.st.lookup(name).is_empty() {
+        self.expose_from_wildcards(name, span, terms_only);
+        if self.library_abi && self.exposure_lookup(name, terms_only).is_empty() {
             let predef = self.st.module_class_of(self.st.predef);
             self.pickle
                 .complete(&mut self.st, &mut self.binary, predef, name);
@@ -1644,11 +1663,23 @@ impl Typer {
                     .enter_in_current_ranked(name, id, BindRank::Wildcard);
             }
             for id in self.st.lookup_member(predef, name) {
+                // nsc's root imports exclude universal members (scala/bug#5389).
+                // Otherwise an unknown import prefix such as ne resolves to
+                // Object.ne inherited by Predef, suppressing the real error.
+                let owner = self.st.get(id).owner;
+                if [self.st.object_sym, self.st.any_sym, self.st.anyref_sym].contains(&owner)
+                    || matches!(
+                        self.st.get(owner).jvm_name.as_str(),
+                        "java/lang/Object" | "scala/Any" | "scala/AnyRef"
+                    )
+                {
+                    continue;
+                }
                 self.st
                     .enter_in_current_ranked(name, id, BindRank::Wildcard);
             }
         }
-        if self.st.lookup(name).is_empty() {
+        if self.exposure_lookup(name, terms_only).is_empty() {
             // Every Scala source has an implicit `import scala._`, which ranks
             // above `java.lang._`. Almost every name it offers is already in
             // the prelude, so what this reaches in practice is the `scala`
@@ -1663,7 +1694,7 @@ impl Typer {
                 }
             }
         }
-        if self.st.lookup(name).is_empty() {
+        if self.exposure_lookup(name, terms_only).is_empty() {
             // Every Scala source has an implicit `import java.lang._`.
             if let Some(jl) = self.java_lang_package() {
                 self.complete_binary_member(jl, name, span);
@@ -1673,7 +1704,7 @@ impl Typer {
                 }
             }
         }
-        if self.st.lookup(name).is_empty() && pkg != self.st.root {
+        if self.exposure_lookup(name, terms_only).is_empty() && pkg != self.st.root {
             self.complete_binary_member(self.st.root, name, span);
             for id in self.st.lookup_member(self.st.root, name) {
                 self.st.enter_in_current(name, id);
@@ -1750,13 +1781,16 @@ impl Typer {
     /// from a jar: those members are read one name at a time, so a name
     /// nothing has asked for yet is not on the owner's member list and
     /// `import_wildcard` could not enter it eagerly.
-    fn expose_from_wildcards(&mut self, name: &str, span: Span) {
-        if !self.st.lookup(name).is_empty() {
+    fn expose_from_wildcards(&mut self, name: &str, span: Span, terms_only: bool) {
+        if !self.exposure_lookup(name, terms_only).is_empty() {
             return;
         }
         for owner in self.st.wildcard_owners_for(name) {
             self.complete_binary_member(owner, name, span);
             let mut found = self.st.lookup_member(owner, name);
+            if terms_only {
+                found.retain(|&id| self.st.is_term_namespace_sym(id));
+            }
             if found.is_empty() {
                 // `import <a value>._` where the value's class comes from a
                 // jar. The members of such a class are read from its pickle
@@ -1773,7 +1807,7 @@ impl Typer {
                 // explicitly, did not notice.
                 found = self.supply_from_pickle_class(owner, name);
             }
-            if found.is_empty() && self.library_abi {
+            if found.is_empty() && self.library_abi && !terms_only {
                 // The type namespace, which the reflection API is written
                 // in: `import c.universe._` is what puts `Tree`, `Symbol`
                 // and `TermName` in scope as *types*, and they are
@@ -1816,8 +1850,9 @@ impl Typer {
             // eager wildcard walk. Otherwise a rejected private member is
             // immediately reintroduced when its bare name is requested.
             found.retain(|&id| {
-                !self.st.private_to_owner(id)
-                    || (self.st.get(id).owner == owner && self.private_member_visible_here(id))
+                (!terms_only || self.st.is_term_namespace_sym(id))
+                    && (!self.st.private_to_owner(id)
+                        || (self.st.get(id).owner == owner && self.private_member_visible_here(id)))
             });
             if found.is_empty() {
                 continue;
@@ -1837,7 +1872,7 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
-        self.expose_unqualified(&name, tree.span);
+        self.expose_unqualified_in(&name, tree.span, true);
         // A `TupleN` the parser made up for `(a, b)` is nsc's fully qualified
         // `scala.TupleN`, so it is resolved in package `scala` and cannot be
         // captured -- `object Ordering` declares `implicit def Tuple2[T1, T2]`

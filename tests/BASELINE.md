@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Ninety-four slices have merged this session**, in forty-two accepted composed gates.
-Fourteen intermediate candidates were rejected, three despite a PASS script verdict. From
+Fifteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2225,3 +2225,36 @@ materialization fails. Default alias exposure and materialization are distinct
 next candidates. The independent written class-bound validation hole, full-run
 collection result issues, higher-kinded implicit evidence and source-class macro
 tags remain open. Continue inventory-first batches; this is not compiler completion.
+
+
+## Rejected evidence-materialization candidate: 9f6995e1
+
+The five-mechanism batch based on accepted main 75f86f78 ran one complete,
+unskipped gate and reached VERDICT=FAIL and DONE. It was not merged into main.
+The accepted baseline remains 3343f368. Logs are in
+`/tmp/scala-rs-gate-9f6995e1-codex/`; raw ledger:
+`tests/baselines/corpus-9f6995e1.tsv`.
+
+Gitbucket improves 169/61 -> 158/57 and the library 444/118 -> 440/118, but
+cats regresses 125/54 -> 162/58. Slick remains 184 sources, errors=0 and
+1492 classes. MODE=b passes 12/12 programs, 36/36 attempts; subset verifies
+1492 classes, failed=0 and lint_problems=0. Strong initialization verification
+loads all 1492 classes with failures=0 and incomplete=0. Workspace reports
+300 rows, 2709 passed and 2 failed: ctoraccessor's scala_library_dual_run_ctacc_fn
+and real_scalac_dual_run_ctacc_fn. Format passes; pre-gate release workspace
+clippy retains the same 57 warnings.
+
+All 5324 corpus identities compare: pos 1124/390/345, neg 698/338/369,
+run 648/859/553 (pass/fail/skip). Changes=15, losses=4: neg/t3507-old,
+neg/t5389, run/lift-and-unlift and run/tuples. The other eleven changes
+are gains, including recursive and value-class manifests.
+
+The gate exposed three boundaries. A loaded Predef.Function type alias
+suppressed lazy term completion of scala.Function, causing the cats regression,
+the two workspace failures and two run losses. Source singleton types lose
+instance prefixes; checking only the immediate owner still allowed an object
+nested under another object inside a class (t3507-old). Default Predef imports
+must exclude universal Any/Object members, as nsc's isUnimportableUnlessRenamed
+does; otherwise import ne.scala resolves ne through Predef (t5389).
+Corrections are developed in a separate worktree while this gate's tree stays
+fixed. Their final composed tree requires another complete gate before merge.
