@@ -3540,6 +3540,14 @@ impl Typer {
         for id in self.st.lookup_type(name) {
             if self.st.get(id).kind == SymKind::TypeMember {
                 self.complete_lazy_sig(id, span);
+            } else if id.0 >= self.st.prelude_end
+                && self.st.get(id).is_class_like()
+                && self.st.get(id).flags.contains(Flags::JAVA)
+            {
+                // A preceding unit can introduce a Java class through another
+                // class's member descriptor. A wildcard then binds that shallow
+                // declaration directly, bypassing binary name discovery.
+                self.ensure_java_loaded(id, span);
             }
         }
         self.resolve_type_name(name, args)
