@@ -24,6 +24,8 @@ makes no claim of conformance to the language specification. What exists today:
   Parameterless results infer their lower bounds in value position; explicit
   and omitted apply both retain factory receiver inference until the arguments.
   Selection qualifiers defer that value-position inference, including aliases.
+- Lexical lambda/type contexts and Java field storage boundaries are covered
+  by the [lexical context batch](docs/batches/lexical-context.md).
 - Immutable Map lookup and update members require the declared key type,
   preserving implicit key conversions and independent value widening.
 - Function types preserve one Unit argument separately from an empty argument
@@ -32,6 +34,9 @@ makes no claim of conformance to the language specification. What exists today:
 - Dependent method results preserve actual argument singletons. Function-valued
   results, inherited implicit overrides, self requirements and Java SAM conversion
   are covered by the [dependent adaptation batch](docs/batches/dependent-adaptation.md).
+  Inferred value overrides, implicit method values, residual overload clauses,
+  parent varargs, erased override identities and binary variance are covered by
+  the [contextual inference batch](docs/batches/contextual-inference.md).
 - Java type references complete descriptor-discovered declarations across source
   files, retaining generic parameters and interface identity after wildcard imports.
 - Directory classpaths complete Scala member signatures and parameterized

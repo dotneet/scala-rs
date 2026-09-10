@@ -1636,8 +1636,8 @@ pub(crate) fn gen_select(
                         let acc = s.jvm_name.clone();
                         asm.invokevirtual(&owner, &acc, &format!("(){}", jvm_desc(ctx.st, &s.ty)));
                     }
-                    maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                 }
+                maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);
                 return;
             }
             SymKind::Method => {
@@ -1817,6 +1817,36 @@ pub(crate) fn gen_assign(
     lhs: &Tree,
     rhs: &Tree,
 ) {
+    // A Java field keeps its declaring class and erased descriptor even when
+    // its selected Scala type is instantiated (T may be String at this use).
+    // Static fields have no receiver slot; emitting putfield underflows.
+    if !lhs.sym.is_none() {
+        let s = ctx.st.get(lhs.sym);
+        if s.kind == SymKind::Term && s.flags.contains(Flags::JAVA) && !s.via_accessor {
+            let is_static = s.flags.contains(Flags::STATIC);
+            if !is_static {
+                if let TreeKind::Select { qual, .. } = &lhs.kind {
+                    gen_select_receiver(asm, frame, ctx, qual, s.owner);
+                } else {
+                    load_owner_instance(asm, ctx, s.owner);
+                }
+            }
+            gen_expr(asm, frame, ctx, rhs);
+            let owner = class_internal(ctx.st, s.owner);
+            let desc = if !s.jvm_name.is_empty() && !s.jvm_name.starts_with('(') {
+                s.jvm_name.clone()
+            } else {
+                jvm_desc_val(ctx.st, &s.ty)
+            };
+            fill_boxed_unit_slot(asm, &desc);
+            if is_static {
+                asm.putstatic(&owner, &s.name, &desc);
+            } else {
+                asm.putfield(&owner, &s.name, &desc);
+            }
+            return;
+        }
+    }
     match &lhs.kind {
         TreeKind::Ident { .. } => {
             let id = lhs.sym;

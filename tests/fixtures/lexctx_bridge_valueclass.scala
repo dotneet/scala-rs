@@ -1,0 +1,1 @@
+class Meter(val n:Int) extends AnyVal;trait Box {type T;val value:T};object N extends Box {type T=Meter;val value=new Meter(7)};object Main {def main(args:Array[String]):Unit={val b:Box{type T=Meter}=N;println(b.value.n)}}

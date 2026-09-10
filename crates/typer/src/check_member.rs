@@ -458,14 +458,20 @@ impl Typer {
         let (inherited, final_value) = match &tree.kind {
             TreeKind::ValDef {
                 tpt, mods, name, ..
-            } if feature
-                && tpt.is_empty()
+            } if tpt.is_empty()
                 && !tree.sym.is_none()
                 && !self.block_local_defs.contains(&(self.file_index, tree.id)) =>
             {
                 let owner = self.st.get(tree.sym).owner;
                 (
-                    self.overridden_ret_type(owner, name, &[], &[], &[], false),
+                    self.overridden_ret_type(
+                        owner,
+                        name,
+                        &[],
+                        &[],
+                        &[],
+                        !feature && !mods.flags.contains(Flags::OVERRIDE),
+                    ),
                     mods.flags.contains(Flags::FINAL),
                 )
             }
@@ -537,7 +543,7 @@ impl Typer {
             );
         }
         let preserve_constant = final_value && matches!(rhs.ty, Type::Constant(_));
-        if let Some(expected) = inherited.filter(|_| !preserve_constant) {
+        if let Some(expected) = inherited.filter(|_| feature && !preserve_constant) {
             self.adapt(rhs, &expected);
             tree.ty = expected;
             self.st.get_mut(tree.sym).ty = tree.ty.clone();
@@ -1817,7 +1823,7 @@ impl Typer {
     /// from the alternatives whose first clause is `first_len` long
     /// (`new_head_ctor_arity`), so holding the pick to the same set is what
     /// keeps the two halves consistent.
-    pub(crate) fn flatten_curried_new(&self, tree: &mut Tree) -> Option<usize> {
+    pub(crate) fn flatten_curried_new(&self, tree: &mut Tree) -> Option<Vec<usize>> {
         fn head_is_new(t: &Tree) -> bool {
             match &t.kind {
                 TreeKind::New { .. } => true,
@@ -1892,13 +1898,44 @@ impl Typer {
         let folded = take > 1;
         let tail = argss.split_off(take);
         let (ctor_id, ctor_span, _) = *argss.last().expect("at least one clause");
+        let clause_lengths = argss.iter().map(|(_, _, a)| a.len()).collect();
         let flat: Vec<Tree> = argss.into_iter().flat_map(|(_, _, a)| a).collect();
         let mut out = rebuild(head, ctor_id, ctor_span, flat);
         for (id, span, args) in tail {
             out = rebuild(out, id, span, args);
         }
         *tree = out;
-        folded.then_some(first_len)
+        folded.then_some(clause_lengths)
+    }
+
+    fn parent_argument_self_reference(&self, tree: &Tree, module: SymbolId) -> Option<Span> {
+        if matches!(tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+            && !tree.sym.is_none()
+            && self.st.module_class_of(tree.sym) == module
+        {
+            return Some(tree.span);
+        }
+        // Type positions do not evaluate a reference to the module.
+        match &tree.kind {
+            TreeKind::Typed { expr, .. }
+            | TreeKind::TypeApply { fun: expr, .. }
+            | TreeKind::ValDef { rhs: expr, .. } => {
+                return self.parent_argument_self_reference(expr, module)
+            }
+            TreeKind::TypeDef { .. }
+            | TreeKind::SingletonTypeTree { .. }
+            | TreeKind::SelectFromTypeTree { .. }
+            | TreeKind::AppliedTypeTree { .. }
+            | TreeKind::AnnotatedTypeTree { .. } => return None,
+            _ => {}
+        }
+        let mut found = None;
+        crate::erasure::for_each_child(tree, &mut |child| {
+            if found.is_none() {
+                found = self.parent_argument_self_reference(child, module);
+            }
+        });
+        found
     }
 
     fn type_parent_ctor_app(&mut self, tree: &mut Tree) {
@@ -2092,7 +2129,7 @@ impl Typer {
                 // again here is not a no-op when an argument mentions the
                 // parameter it replaces.
                 for (i, a) in args.iter_mut().enumerate() {
-                    if let Some(p) = param_tys.get(i) {
+                    if let Some(p) = param_at(&param_tys, i) {
                         if !p.is_no_type() {
                             if matches!(a.kind, TreeKind::Function { .. })
                                 && !is_annotated_lambda(a)
@@ -2100,6 +2137,12 @@ impl Typer {
                                 self.type_expr(a, p);
                             } else {
                                 self.adapt(a, p);
+                            }
+                        }
+                        let owner = self.st.this_class;
+                        if !owner.is_none() && self.st.get(owner).kind == SymKind::ModuleClass {
+                            if let Some(span) = self.parent_argument_self_reference(a, owner) {
+                                self.error(span, "super constructor cannot be passed a self reference unless parameter is declared by-name");
                             }
                         }
                     }

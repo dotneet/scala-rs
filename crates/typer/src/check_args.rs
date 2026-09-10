@@ -78,6 +78,13 @@ impl Typer {
             return Vec::new();
         }
         let s = self.st.get(fun.sym);
+        // Constructor calls are flattened before default filling. Retaining
+        // source symbol clauses does not mean the first clause was applied.
+        if s.name == "<init>"
+            && matches!(&fun.ty, Type::Method { paramss, .. } if paramss.len() == 1)
+        {
+            return s.params.clone();
+        }
         if s.paramss.is_empty() {
             return s.params.clone();
         }
@@ -229,7 +236,10 @@ impl Typer {
     /// inside the body), so only the method type still says `Repeated`.
     fn first_clause_of(&self, m: SymbolId) -> (Vec<SymbolId>, bool) {
         let s = self.st.get(m);
-        let ids = if s.paramss.is_empty() {
+        let ids = if s.paramss.is_empty()
+            || (s.name == "<init>"
+                && matches!(&s.ty, Type::Method { paramss, .. } if paramss.len() == 1))
+        {
             s.params.clone()
         } else {
             s.paramss.first().cloned().unwrap_or_default()
@@ -455,6 +465,125 @@ impl Typer {
         ok
     }
 
+    /// Place names and defaults within each written constructor clause.
+    pub(crate) fn reorder_curried_ctor_args(
+        &mut self,
+        args: &mut Vec<Tree>,
+        class_id: Option<SymbolId>,
+        fun: &Tree,
+        lengths: &[usize],
+        node: NodeId,
+    ) -> Option<bool> {
+        let class_id = class_id?;
+        let own: Vec<_> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|m| {
+                self.st.get(*m).owner == class_id && self.st.get(*m).kind == SymKind::Method
+            })
+            .collect();
+        let has_linked = own.iter().any(|m| !self.st.get(*m).jvm_name.is_empty());
+        let own: Vec<_> = own
+            .into_iter()
+            .filter(|m| !has_linked || !self.st.get(*m).jvm_name.is_empty())
+            .collect();
+        let [ctor] = own.as_slice() else { return None };
+        let clauses = self.st.get(*ctor).paramss.clone();
+        if clauses.len() < lengths.len() || lengths.iter().sum::<usize>() != args.len() {
+            return None;
+        }
+        // Preserve the written clause boundaries until names and defaults
+        // are placed. A name in clause two cannot fill a slot in clause one.
+        if !Self::has_named_arg(args) && clauses.iter().zip(lengths).all(|(ps, n)| ps.len() == *n) {
+            return Some(true);
+        }
+        let mut callee = fun.clone();
+        callee.sym = *ctor;
+        callee.ty = self.st.get(*ctor).ty.clone();
+        let mut rest = std::mem::take(args).into_iter();
+        let mut out = Vec::new();
+        let mut order = Vec::new();
+        let mut sequence = 0;
+        let mut parameter_offset = 0;
+        let mut ok = true;
+        for (&n, ids) in lengths.iter().zip(&clauses) {
+            let names: Vec<_> = ids.iter().map(|p| self.st.get(*p).name.clone()).collect();
+            let written: Vec<_> = rest.by_ref().take(n).collect();
+            let (slots, extras, valid) = self.named_arg_slots(written, &names);
+            ok &= valid;
+            let sources = std::mem::take(&mut self.slot_source);
+            let repeated = ids
+                .last()
+                .is_some_and(|p| matches!(self.st.get(*p).ty, Type::Repeated(_)));
+            let default_start = sequence + n;
+            let mut defaults = 0;
+            for (i, slot) in slots.into_iter().enumerate() {
+                let pid = ids[i];
+                let byname = self.st.get(pid).flags.contains(Flags::BYNAME)
+                    || matches!(self.st.get(pid).ty, Type::ByName(_));
+                if let Some(value) = slot {
+                    out.push(value);
+                    order.push(if byname {
+                        None
+                    } else {
+                        sources[i].map(|j| sequence + j)
+                    });
+                } else if self.st.get(pid).flags.contains(Flags::DEFAULTPARAM) {
+                    if let Some(mut value) =
+                        self.default_getter_apply(&callee, pid, parameter_offset + i + 1, &out)
+                    {
+                        // Later getters clone this expression. Share its saved
+                        // value using an identity above all parsed source nodes.
+                        value.id = NodeId(self.macro_next_node);
+                        self.macro_next_node += 1;
+                        out.push(value);
+                        order.push((!byname).then_some(default_start + defaults));
+                        defaults += 1;
+                    } else {
+                        self.error(
+                            fun.span,
+                            format!("cannot resolve default argument {}", names[i]),
+                        );
+                        ok = false;
+                    }
+                } else if repeated && i + 1 == ids.len() {
+                    // An empty repeated tail is packed by ordinary adaptation.
+                } else {
+                    if valid {
+                        self.error(
+                            fun.span,
+                            format!("missing argument for parameter `{}`", names[i]),
+                        );
+                    }
+                    ok = false;
+                }
+            }
+            if repeated {
+                for (i, value) in extras.into_iter().enumerate() {
+                    out.push(value);
+                    order.push(Some(sequence + ids.len() + i));
+                }
+            } else {
+                for value in extras {
+                    self.error(value.span, "too many arguments");
+                    ok = false;
+                }
+            }
+            sequence = default_start + defaults;
+            parameter_offset += ids.len();
+        }
+        // Defaults of a clause execute before the next written clause. Keep
+        // even an identity order: a later getter may reuse an earlier argument.
+        if node != NodeId(0) {
+            self.st
+                .named_arg_order
+                .insert((self.file_index as u32, node.0), order);
+        }
+        *args = out;
+        Some(ok)
+    }
+
     /// `new C(b = 2, a = 1)`. Constructors are picked by argument type, so the
     /// names have to be resolved first — and against the overload that
     /// actually declares them.
@@ -478,7 +607,14 @@ impl Typer {
             Self::strip_named_args(args);
             return true;
         };
-        let mut alts = self.st.lookup_member(class_id, "<init>");
+        // Constructors are not inherited. Ancestor constructors must not
+        // compete with the class's own clauses or their parameter names.
+        let mut alts: Vec<_> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|m| self.st.get(*m).owner == class_id)
+            .collect();
         if let Some(cur) = skip {
             if alts.iter().any(|&m| m != cur) {
                 alts.retain(|&m| m != cur);
@@ -884,7 +1020,9 @@ impl Typer {
         let s_params = self.st.get(sym).params.clone();
         let paramss_ids: Vec<Vec<SymbolId>> = if !s_paramss.is_empty() {
             match fun_ty {
-                Type::Method { paramss, .. } if paramss.len() < s_paramss.len() => {
+                Type::Method { paramss, .. }
+                    if self.st.get(sym).name != "<init>" && paramss.len() < s_paramss.len() =>
+                {
                     let drop = s_paramss.len() - paramss.len();
                     s_paramss[drop..].to_vec()
                 }
@@ -1001,7 +1139,12 @@ impl Typer {
                 };
                 let rest_tys = self.instantiate_from_call(sym, clause_idx, &first, args, rest_tys);
                 let rest_tys = self.solve_implicit_only_tparams(sym, rest_tys);
+                // Materializing a tag types nested applications with their own
+                // inference state. Keep this call's result bindings across
+                // those applications instead of letting them clear it.
+                let solved = std::mem::take(&mut self.implicit_undet_solved);
                 self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
+                self.implicit_undet_solved = solved;
                 return None;
             }
             let rest_tys: Vec<Vec<Type>> = match fun_ty {
@@ -1094,13 +1237,13 @@ impl Typer {
         }
         if solved.is_none()
             && rest_tys.iter().any(|ty| {
-                matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag") || crate::materialize::tag_request(&self.st, ty).is_some()
             })
         {
             // This continuation is needed only for compiler-generated tags.
             // Ordinary unsuccessful searches must not be repeated here.
             // Keep bindings obtained from earlier witnesses even when a later
-            // clause needs compiler-generated ClassTag evidence.
+            // clause needs compiler-generated tag evidence.
             let mut partial: Vec<(SymbolId, Type)> = Vec::new();
             let mut ambiguous = false;
             for ty in &rest_tys {
@@ -1121,7 +1264,7 @@ impl Typer {
                     partial.extend(bindings);
                 } else if matches!(found, ImplicitSearch::None) {
                     // A function-valued implicit may be supplied by a view.
-                    // Keep its bindings when a later ClassTag is materialized,
+                    // Keep its bindings when a later tag is materialized,
                     // just as the ordinary undet_solution path does.
                     if let Some(view) = self.view_undet_bindings(&want, &open) {
                         partial.extend(view);
@@ -1138,9 +1281,9 @@ impl Typer {
                     }
                     // Failed ordinary evidence must retain its open variables
                     // in the diagnostic. Minimize only variables occurring
-                    // exclusively in ClassTag requests, before materialization.
+                    // exclusively in compiler-generated tag requests, before materialization.
                     let only_tags = rest_tys.iter().filter(|ty| type_mentions_tparam_deep(ty, *tp)).all(|ty| {
-                        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag")
+                        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).jvm_name == "scala/reflect/ClassTag") || crate::materialize::tag_request(&self.st, ty).is_some()
                     });
                     if only_tags {
                         let ids: Vec<_> = partial.iter().map(|(tp, _)| *tp).collect();
@@ -1487,6 +1630,14 @@ impl Typer {
                     continue;
                 }
                 if let Type::Method { paramss, .. } = &fun.ty {
+                    // A flattened constructor has consumed no source clause.
+                    // Index its JVM parameter list before the ordinary partial
+                    // method rule can mistake clause two for clause one.
+                    if decl.name == "<init>" && paramss.len() == 1 {
+                        if let Some(ty) = paramss[0].get(flat) {
+                            return ty.clone();
+                        }
+                    }
                     // `fun.ty` contains only the clauses left after earlier
                     // Apply nodes. Match the declaration's clause index to
                     // that remaining suffix before reading the expected type.

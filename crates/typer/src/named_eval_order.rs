@@ -179,10 +179,32 @@ impl Pass<'_> {
                     continue;
                 }
                 let (sym, ident) = self.fresh_local("x$named", span, &ty);
+                let source_id = arg.id;
                 let Some(args) = clause_args_mut(t, id) else {
                     continue;
                 };
-                let bound = std::mem::replace(&mut args[slot], ident);
+                let bound = std::mem::replace(&mut args[slot], ident.clone());
+                // A later-clause default getter reuses earlier arguments.
+                // Its cloned expression must read this same saved value.
+                if source_id != scala_rs_parser::NodeId(0)
+                    && source_id != scala_rs_parser::NodeId::FILLED_ARG
+                    && source_id != scala_rs_parser::NodeId::PRETYPED_DEFAULT
+                {
+                    fn replace_copy(t: &mut Tree, id: scala_rs_parser::NodeId, value: &Tree) {
+                        if t.id == id {
+                            *t = value.clone();
+                        } else {
+                            for child in children_mut(t) {
+                                replace_copy(child, id, value);
+                            }
+                        }
+                    }
+                    for (i, argument) in args.iter_mut().enumerate() {
+                        if i != slot {
+                            replace_copy(argument, source_id, &ident);
+                        }
+                    }
+                }
                 stats.push(self.val_def(sym, span, ty, bound));
             }
         }

@@ -1825,7 +1825,12 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             .and_then(crate::javasign::parse_field_sig)
             .map(|jt| jtype_to_type(st, &jt, &env))
             .unwrap_or_else(|| parse_field_ty_java(st, &f.desc).0);
+        let java_object_field = !c.is_scala && ty == Type::Any;
+        let ty = if !c.is_scala { java_result_obj(ty) } else { ty };
         let mut flags = Flags::JAVA;
+        if f.access & 0x0010 != 0 {
+            flags = flags.with(Flags::FINAL);
+        }
         if crate::javaclass::is_java_static(f.access) {
             flags = flags.with(Flags::STATIC);
         }
@@ -1837,6 +1842,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         }
         let id = add_term(st, owner, &f.name, ty);
         st.get_mut(id).flags = flags;
+        st.get_mut(id).java_object_field = java_object_field;
         mark_java_package_private(st, id, owner, f.access);
         st.set_jvm_name(id, f.desc.clone());
     }
@@ -1925,7 +1931,9 @@ fn jtype_to_type(
 /// `cv.unwrapped eq null` (slick's `GlobalConfig`, on typesafe-config's
 /// `ConfigValue.unwrapped(): Object`) was "value eq is not a member of Any".
 ///
-/// Only the top level of the result is narrowed. Turning `Object` into
+/// Narrow the result and array elements, whose JVM component type remains
+/// Object. Generic class arguments retain their current representation.
+/// Turning `Object` into
 /// `AnyRef` *inside* a signature as well is what nsc does, but it also
 /// rewrites every `Hashtable<Object, Object>` in sight, and that regressed
 /// `IndexedSeq[Any] <: Int => Any` in slick's `HeapBackend`; the wider change
@@ -1933,6 +1941,15 @@ fn jtype_to_type(
 fn java_result_obj(t: Type) -> Type {
     match t {
         Type::Any => Type::AnyRef,
+        Type::Array(elem) => Type::Array(Box::new(java_array_element(*elem))),
+        other => other,
+    }
+}
+
+fn java_array_element(t: Type) -> Type {
+    match t {
+        Type::Any => Type::JavaObject,
+        Type::Array(elem) => Type::Array(Box::new(java_array_element(*elem))),
         other => other,
     }
 }

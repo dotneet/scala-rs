@@ -851,7 +851,20 @@ impl Typer {
         let tree_id = tree.id;
         match &mut tree.kind {
             TreeKind::Literal { lit } => {
-                tree.ty = Type::Constant(lit.clone());
+                tree.ty = if matches!(lit, Lit::Symbol(_)) && self.library_abi {
+                    // A symbol literal constructs scala.Symbol; it is not an
+                    // unresolved type named Symbol (nor a literal type).
+                    let owner = crate::classpath::ensure_package(&mut self.st, "scala");
+                    self.load_binary_into("scala/Symbol", owner, tree.span, false);
+                    if let Some(sym) = crate::classpath::find_by_jvm(&self.st, "scala/Symbol") {
+                        Type::Class { sym, args: vec![] }
+                    } else {
+                        self.error(tree.span, "scala.Symbol is not available on the classpath");
+                        Type::Error
+                    }
+                } else {
+                    Type::Constant(lit.clone())
+                };
             }
             TreeKind::This { qual } => {
                 let q = qual.clone();
@@ -1434,8 +1447,15 @@ impl Typer {
                     self.type_expr(tree, pt);
                     return;
                 }
-                self.type_expr(rhs, &lhs.ty);
-                self.adapt(rhs, &lhs.ty);
+                // Java Object storage accepts primitive boxing; reading it
+                // remains AnyRef. A substituted generic field is not Object.
+                let write_ty = if !lhs.sym.is_none() && self.st.get(lhs.sym).java_object_field {
+                    Type::Any
+                } else {
+                    lhs.ty.clone()
+                };
+                self.type_expr(rhs, &write_ty);
+                self.adapt(rhs, &write_ty);
                 self.check_reassignment(lhs);
                 tree.ty = Type::Unit;
             }

@@ -427,15 +427,41 @@ impl<'a> Gen<'a> {
                     load_outer_arg(asm, &ctx_early, o);
                 }
             }
-            for (i, a) in super_args.iter().enumerate() {
-                gen_expr(asm, &mut frame, &ctx_early, a);
-                adapt_unit_arg(asm, &ctx_early, a, &a.ty);
-                // `object O extends AtomicReference[Int](1)`: same generic /
-                // Java superclass boxing `gen_new` and the class `<init>`
-                // path above apply.
-                let pty = super_field_tys.get(i).unwrap_or(&a.ty);
-                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
-                    emit_box(asm, &a.ty);
+            if super_field_tys
+                .iter()
+                .any(|p| matches!(p, Type::Repeated(_)))
+            {
+                let ctor = parents
+                    .iter()
+                    .find(|p| st.class_sym_of(&p.ty) == Some(super_cls))
+                    .map(|p| p.sym)
+                    .unwrap_or(SymbolId::NONE);
+                let java_varargs = !ctor.is_none() && {
+                    let flags = st.get(ctor).flags;
+                    flags.contains(Flags::JAVA) && flags.contains(Flags::VARARGS)
+                };
+                gen_call_args(
+                    asm,
+                    &mut frame,
+                    &ctx_early,
+                    &super_args,
+                    &super_field_tys,
+                    library_abi,
+                    java_varargs,
+                    ctor,
+                    false,
+                );
+            } else {
+                for (i, a) in super_args.iter().enumerate() {
+                    gen_expr(asm, &mut frame, &ctx_early, a);
+                    adapt_unit_arg(asm, &ctx_early, a, &a.ty);
+                    // `object O extends AtomicReference[Int](1)`: same generic /
+                    // Java superclass boxing `gen_new` and the class `<init>`
+                    // path above apply.
+                    let pty = super_field_tys.get(i).unwrap_or(&a.ty);
+                    if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
+                        emit_box(asm, &a.ty);
+                    }
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);

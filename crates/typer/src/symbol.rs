@@ -533,6 +533,9 @@ pub struct Symbol {
     /// `RichDouble.isNaN`. Modelling the superclass would change the emitted
     /// owner of every wrapper call, so the priority is recorded here instead.
     pub low_priority: bool,
+    /// A Java field declared as Object accepts boxing on writes, while its
+    /// reads have the reference type AnyRef. Generic T fields do not widen.
+    pub java_object_field: bool,
     /// Language annotations (`@deprecated(...)`, `@tailrec`, …) copied from modifiers.
     pub annotations: Vec<scala_rs_parser::Tree>,
     /// Lower bound of an abstract/HK type member (`type F[_] >: Lo`).
@@ -1248,6 +1251,7 @@ impl SymbolTable {
                 private_within: None,
                 access_widened: false,
                 low_priority: false,
+                java_object_field: false,
                 annotations: vec![],
                 bound_lo: None,
                 bound_hi: None,
@@ -1378,6 +1382,7 @@ impl SymbolTable {
             private_within: None,
             access_widened: false,
             low_priority: false,
+            java_object_field: false,
             annotations: vec![],
             bound_lo: None,
             bound_hi: None,
@@ -2308,7 +2313,7 @@ impl SymbolTable {
             Type::Unit => Some(self.unit_sym),
             Type::String => Some(self.string_sym),
             Type::Any => Some(self.any_sym),
-            Type::AnyRef => Some(self.anyref_sym),
+            Type::AnyRef | Type::JavaObject => Some(self.anyref_sym),
             Type::AnyVal => Some(self.anyval_sym),
             Type::Array(_) => Some(self.array_sym),
             // `Null` is a subtype of every reference type; its members are
@@ -4696,6 +4701,12 @@ impl SymbolTable {
     }
 
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
+        if matches!(a, Type::JavaObject) {
+            return self.is_sub_type(&Type::AnyRef, b);
+        }
+        if matches!(b, Type::JavaObject) {
+            return self.is_sub_type(a, &Type::AnyRef);
+        }
         if a == b {
             return true;
         }

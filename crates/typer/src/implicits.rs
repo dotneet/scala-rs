@@ -513,7 +513,15 @@ impl Typer {
                     if o.name != s.name
                         || o.owner == s.owner
                         || self.st.private_to_owner(other)
-                        || value_type(other) != value_type(c)
+                        || (value_type(other) != value_type(c)
+                            // An inferred val already occupies the term name
+                            // while its initializer is being typed. It hides a
+                            // parameterless inherited method before its result
+                            // type is available; override conformance is checked
+                            // after inference.
+                            && !(o.ty.is_no_type()
+                                && o.kind == SymKind::Term
+                                && matches!(&s.ty, Type::Method { paramss, .. } if paramss.is_empty())))
                     {
                         return false;
                     }

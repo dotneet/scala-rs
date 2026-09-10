@@ -145,7 +145,9 @@ pub(crate) fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         Type::Array(t) => format!("[{}", jvm_desc_array_elem(st, t)),
         Type::Class { sym, .. } => format!("L{};", class_internal(st, *sym)),
         Type::ModuleRef(sym) => format!("L{};", class_internal(st, *sym)),
-        Type::Any | Type::AnyRef | Type::AnyVal | Type::Error => "Ljava/lang/Object;".into(),
+        Type::Any | Type::AnyRef | Type::JavaObject | Type::AnyVal | Type::Error => {
+            "Ljava/lang/Object;".into()
+        }
         Type::Function { params, .. } => format!("Lscala/Function{};", params.len()),
         Type::Tuple(ts) => format!("Lscala/Tuple{};", ts.len()),
         Type::Method { ret, .. } => jvm_desc(st, ret),

@@ -167,7 +167,8 @@ impl Typer {
         // The length of the first written clause, when clauses were folded: the
         // pick below is held to the alternatives that clause could name, which
         // is the set the fold already measured its arity against.
-        let curried_first_len = self.flatten_curried_new(tree);
+        let curried_clauses = self.flatten_curried_new(tree);
+        let curried_first_len = curried_clauses.as_ref().and_then(|cs| cs.first()).copied();
         // Kept before the borrow below: `record_named_arg_order` keys the
         // application by it.
         let tree_id = tree.id;
@@ -254,11 +255,21 @@ impl Typer {
             // choosing prototypes or overloads, independent of prior uses.
             if let Some(c) = class_id {
                 self.ensure_java_loaded(c, fun.span);
+                if curried_clauses.is_some() {
+                    self.supply_binary_ctors(c);
+                }
             }
             // `new C(b = 2, a = 1)`: named arguments must be put in parameter
             // order before the constructor overload is picked, since the pick
             // is driven by the argument types.
-            if Self::has_named_arg(args) {
+            let curried_placed = curried_clauses.as_ref().and_then(|clauses| {
+                self.reorder_curried_ctor_args(args, class_id, fun, clauses, tree_id)
+            });
+            if curried_placed == Some(false) {
+                tree.ty = Type::Error;
+                return;
+            }
+            if curried_placed.is_none() && Self::has_named_arg(args) {
                 let placed = self.reorder_named_ctor_args(args, class_id, fun, None);
                 self.record_named_arg_order(tree_id);
                 if !placed {
@@ -807,7 +818,11 @@ impl Typer {
                 // the callee sees is the *result*; the clause is filled once
                 // the parameter has told it what `T` is.
                 self.solve_lower_bounded_undet(a);
-                arg_tys.push(self.implicit_only_result(a).unwrap_or_else(|| a.ty.clone()));
+                arg_tys.push(
+                    self.implicit_only_result(a)
+                        .or_else(|| self.implicit_eta_shape(a))
+                        .unwrap_or_else(|| a.ty.clone()),
+                );
             }
         }
         self.typing_call_args = saved_taking_args;

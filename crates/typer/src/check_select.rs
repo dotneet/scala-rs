@@ -706,7 +706,14 @@ impl Typer {
                     };
                 } else if name == "update" {
                     tree.ty = Type::Method {
-                        paramss: vec![vec![Type::Int, (**elem).clone()]],
+                        paramss: vec![vec![
+                            Type::Int,
+                            if matches!(elem.as_ref(), Type::JavaObject) {
+                                Type::Any
+                            } else {
+                                (**elem).clone()
+                            },
+                        ]],
                         ret: Box::new(Type::Unit),
                     };
                 } else if name == "clone" && self.st.get(s).owner == self.st.array_sym {

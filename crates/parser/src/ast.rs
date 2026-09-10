@@ -184,6 +184,9 @@ pub enum Type {
     String,
     Any,
     AnyRef,
+    /// Object in a Java signature. Reads are references; a Java parameter
+    /// (including an Object[] element store) accepts values through boxing.
+    JavaObject,
     AnyVal,
     Null,
     Nothing,
@@ -312,6 +315,7 @@ impl fmt::Display for Type {
             Type::String => write!(f, "String"),
             Type::Any => write!(f, "Any"),
             Type::AnyRef => write!(f, "AnyRef"),
+            Type::JavaObject => write!(f, "Object"),
             Type::AnyVal => write!(f, "AnyVal"),
             Type::Null => write!(f, "Null"),
             Type::Nothing => write!(f, "Nothing"),
