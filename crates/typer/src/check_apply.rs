@@ -2214,17 +2214,12 @@ impl Typer {
                     // a member of T` and 13 `value map is not a member of O2`
                     // in gitbucket were that cascade.
                     //
-                    // Narrower than nsc's rule, deliberately, and only because
-                    // ours is not a one-pass compiler: the result is poisoned
-                    // only when it still *mentions* one of the callee's type
-                    // parameters, which is exactly the leak. `c.Expr[Any](…)`
-                    // in `pos/annotated-original` also fails this search on the
-                    // pass that infers `impl`'s result type -- the
-                    // `WeakTypeTag[Any]` it wants is brought into scope later by
-                    // the `= macro impl` beside it -- and its result `Expr[Any]`
-                    // is fully determined, so nothing leaks and nothing is
-                    // poisoned. Marking that one an error made a program that
-                    // had compiled stop compiling.
+                    // During signature inference only an unresolved result
+                    // type is poisoned. A fully determined result is retained
+                    // for later body typing; missing evidence must still be
+                    // diagnosed there. Qualified reflection calls materialize
+                    // tags in their receiver's universe (check_args), including
+                    // c.Expr[Any](...) without a wildcard universe import.
                     let leaks = !sym.is_none()
                         && self
                             .st

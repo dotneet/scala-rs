@@ -141,6 +141,14 @@ impl Typer {
                 quoted("the tree does not typecheck at the macro call site")
             );
         }
+        // An unresolved overload is not a value. nsc rejects this TERM query
+        // (and its silent caller receives EmptyTree), before serializing a type.
+        if matches!(tree.ty, Type::Overload(_)) {
+            return format!(
+                "(a fail {})",
+                quoted("missing argument list for overloaded method")
+            );
+        }
         let typed = tree.ty.clone();
         let ty = match self.type_to_wire(&typed) {
             Ok(t) => t,
@@ -238,6 +246,27 @@ impl Typer {
     /// approximate one would have the implementation reasoning about a type
     /// that is not the one it asked about.
     pub(crate) fn type_to_wire(&mut self, ty: &Type) -> Result<String, String> {
+        let structural = match ty {
+            Type::Function { params, ret } if params.len() <= 22 => {
+                let mut args = params.clone();
+                args.push((**ret).clone());
+                Some((format!("scala.Function{}", params.len()), args))
+            }
+            Type::Tuple(args) if (1..=22).contains(&args.len()) => {
+                Some((format!("scala.Tuple{}", args.len()), args.clone()))
+            }
+            Type::Array(elem) => Some(("scala.Array".to_string(), vec![(**elem).clone()])),
+            _ => None,
+        };
+        if let Some((name, args)) = structural {
+            let mut out = format!("(ty {}", quoted(&name));
+            for arg in args {
+                out.push(' ');
+                out.push_str(&self.type_to_wire(&arg)?);
+            }
+            out.push(')');
+            return Ok(out);
+        }
         if let Type::Constant(lit) = ty {
             let mut out = String::from("(cst ");
             lit_to_wire(lit, &mut out)?;
@@ -490,7 +519,6 @@ impl Typer {
 /// `Typer::tree_from_reply` refuses in the other direction. An approximation
 /// here would be a tree the implementation then *splices into its expansion*.
 fn answer_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
-    let unsupported = |what: &str| Err(format!("{what}, which scala-rs cannot write back"));
     match &t.kind {
         TreeKind::Literal { lit } => {
             out.push_str("(t \"Literal\" (s0) ");
@@ -534,7 +562,11 @@ fn answer_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(
         }
         TreeKind::Apply { fun, args } => {
             out.push_str("(t \"Apply\" (s0) ");
-            answer_tree_to_wire(st, fun, out)?;
+            if matches!(fun.kind, TreeKind::New { .. }) {
+                super::expand::application_fun_to_wire(fun, out)?;
+            } else {
+                answer_tree_to_wire(st, fun, out)?;
+            }
             out.push_str(" (l");
             for a in args {
                 out.push(' ');
@@ -568,13 +600,7 @@ fn answer_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(
             out.push_str("(t \"EmptyTree\" (s0))");
             Ok(())
         }
-        TreeKind::Typed { .. } => unsupported("a type ascription"),
-        TreeKind::Function { .. } => unsupported("a function literal"),
-        TreeKind::New { .. } => unsupported("a `new`"),
-        TreeKind::Match { .. } => unsupported("a `match`"),
-        TreeKind::TypeApply { .. } => unsupported("an explicit type application"),
-        TreeKind::ValDef { .. } => unsupported("a `val` definition"),
-        _ => unsupported("a tree of this form"),
+        _ => super::expand::tree_to_wire(t, out).map_err(|why| format!("a tree: {why}")),
     }
 }
 

@@ -1115,3 +1115,13 @@ than silently selecting inherited fallback evidence. Macro-returned applied type
 trees are rebuilt and typechecked. The typeidentitybatch suite compares nsc and
 scala-rs API producers/consumers, including reordered tags and owner parameters.
 Anonymous ClassDef expansion remains unsupported and diagnoses explicitly.
+
+The macro transport integration candidate adds structural argument/expansion
+roundtrips, repeated macro arguments, source positions, attachment preservation,
+and `c.untypecheck`. It also repairs private macro access across binary APIs and
+qualified Context.Expr tag materialization. `macrotransportbatch` executes both
+compiler directions against scalac 2.13.16; whitebox inference and general
+pattern/anonymous-class expansion remain incomplete. See the
+[batch inventory](docs/batches/macro-transport.md) and
+[macro transport details](docs/macros.md#723-structural-transport-and-source-macro-integration)
+for scope and validation status.

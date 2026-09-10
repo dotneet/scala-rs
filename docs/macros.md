@@ -3385,3 +3385,35 @@ placeholder a current-run class travels as (§5.1). Six of the 31 name two class
 * `tests/fixtures/mt2_bad.scala` -- three references scala-rs refuses, each by name, through both
   readers. **All three are a program real scalac compiles and runs** (`R=List[A] U=Int` twice and
   `R=Boolean U=U`); scala-rs accepts none of them.
+
+### 7.23 Structural transport and source macro integration
+
+The integration candidate extends the engine protocol with blocks, local
+methods, functions, conditionals, type ascriptions, constructor applications,
+repeated argument groups, and concrete local classes with empty superclass
+constructor arguments. Every reconstructed node receives a fresh identity;
+sharing NodeId(0) let an earlier block-local declaration hide a later class
+member. Class templates retain initialization statements and constructor
+parameters; unsupported superclass argument transport is still diagnosed.
+
+`c.typecheck` preserves attachments when adapting a tree and rejects unresolved
+TERM overloads before serialization, so `silent = true` returns EmptyTree as
+scalac does. `c.untypecheck` rebuilds trees while clearing local bindings/types
+and retaining external bindings. Source paths, source text and UTF-16 call-site
+points now reach the JVM engine for `macroApplication.pos` and
+`enclosingPosition`. Repeated Expr/Tree arguments are packed using the macro
+declaration's repeated parameter slot, including an empty repeated group.
+
+Binary macro supply retains access flags and boundaries. The eager flat pickle
+reader skips macro declarations: they have no JVM method, and only the full
+supplier can attach their implementation metadata. Qualified reflection calls
+materialize tags in their receiver's universe without requiring a wildcard
+import; this closes the missing WeakTypeTag operand in inferred `c.Expr` bodies.
+
+`macrotransportbatch` compares both API producers and both consumers against
+scalac 2.13.16, executes with `java -Xverify:all`, and checks independent access
+and argument-type rejections. Former unsupported block/function/new cases from
+`engine` now have executable comparisons, including constructor side-effect
+counts; the singleton-tag and receiverless-prefix refusal checks remain.
+Whitebox inference, macro bundles and general pattern/anonymous-class transport
+remain incomplete. This section describes the candidate, not an accepted gate.

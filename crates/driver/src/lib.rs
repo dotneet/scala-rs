@@ -284,6 +284,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 language_features: opts.language_features.clone(),
                 source_features: opts.source_features,
                 compiler_settings: compiler_settings(opts),
+                source_paths: sources
+                    .iter()
+                    .map(|s| s.path.to_string_lossy().into_owned())
+                    .collect(),
             },
             // The typer reads the text under a span for the forms the parser
             // folds together; `reify { … }` is the one whose body is *file*

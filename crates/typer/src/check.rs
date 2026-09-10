@@ -58,6 +58,8 @@ pub struct TypecheckOptions {
     /// were set (`-classpath`, `-d`, `-Xasync`, …); it is how a macro such as
     /// `scala.async.Async.asyncImpl` decides whether `-Xasync` was given.
     pub compiler_settings: Vec<String>,
+    /// Source paths aligned with the source texts for macro positions.
+    pub source_paths: Vec<String>,
 }
 
 pub(crate) enum OverloadPick {
@@ -242,6 +244,7 @@ impl Default for TypecheckOptions {
             language_features: Vec::new(),
             source_features: crate::source_features::SourceFeatures::default(),
             compiler_settings: Vec::new(),
+            source_paths: Vec::new(),
         }
     }
 }
@@ -286,6 +289,8 @@ pub struct Typer {
     /// `Rc` because the reifier borrows one for the length of a build while
     /// the typer is `&mut self` throughout.
     pub(crate) sources: Vec<std::rc::Rc<str>>,
+    pub(crate) source_paths: Vec<String>,
+    pub(crate) macro_next_node: u32,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
     /// Where the argument in each parameter slot was written, as the last call
@@ -809,6 +814,13 @@ pub fn typecheck_units_src(
         .iter()
         .map(|s| std::rc::Rc::from(s.as_str()))
         .collect();
+    // Reconstructed macro trees must not share NodeId(0): block-local and
+    // declaration caches use node identity across all expansions in a unit.
+    let mut pending: Vec<&Tree> = units.iter().map(|(tree, _)| &**tree).collect();
+    while let Some(tree) = pending.pop() {
+        t.macro_next_node = t.macro_next_node.max(tree.id.0.saturating_add(1));
+        crate::macros::push_children(tree, &mut pending);
+    }
     t.fatal_warnings = opts.fatal_warnings;
     crate::classpath::install_classpath(&mut t.st, &opts.classpath);
     t.link_tuple_products();
@@ -959,6 +971,8 @@ impl Typer {
             sig_final_round: false,
             file_index,
             sources: Vec::new(),
+            source_paths: opts.source_paths.clone(),
+            macro_next_node: 1,
             gensym: 0,
             slot_source: Vec::new(),
             last_named_order: None,

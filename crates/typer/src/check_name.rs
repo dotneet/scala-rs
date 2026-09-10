@@ -580,8 +580,10 @@ impl Typer {
             .into_iter()
             .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))
         {
+            let mcls = self.st.module_class_of(id);
+            self.adopt_cp_module_class(mcls);
             self.install_duration_syntax(owner, span);
-            return Some(self.st.module_class_of(id));
+            return Some(mcls);
         }
         if !self.load_binary_into(&format!("{pkg_jvm}/package$"), owner, span, true) {
             return None;
@@ -592,6 +594,9 @@ impl Typer {
             .into_iter()
             .find(|&s| matches!(self.st.get(s).kind, SymKind::Module | SymKind::ModuleClass))?;
         let mcls = self.st.module_class_of(id);
+        // Macro declarations have no JVM method. Complete the package object
+        // before its wildcard scope is populated, just like a named object.
+        self.adopt_cp_module_class(mcls);
         // A package object's members are the package's members.
         for mem in self.st.get(mcls).members.clone() {
             if !self.st.get(owner).members.contains(&mem) {

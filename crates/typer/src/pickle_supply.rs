@@ -1976,6 +1976,8 @@ impl PickleSupply {
                     if m.has(pflags::IMPLICIT) {
                         st.get_mut(id).flags = st.get(id).flags.with(Flags::IMPLICIT);
                     }
+                    st.get_mut(id).flags = st.get(id).flags.with(ctor_access_flags(m));
+                    st.get_mut(id).private_within = ctor_access_within(m);
                     if !installed.contains(&id) {
                         installed.push(id);
                     }

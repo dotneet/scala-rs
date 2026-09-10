@@ -40,7 +40,7 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{atomic::AtomicBool, atomic::Ordering as AtomicOrdering, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_pickle::names::{decode_method_name, encode_method_name};
 use scala_rs_span::Span;
 
@@ -806,52 +806,56 @@ impl Typer {
         quote_into(&mut out, &binding.impl_class);
         out.push(' ');
         quote_into(&mut out, &binding.impl_method);
-        let supplied: usize = argss.iter().map(|c| c.len()).sum();
-        if supplied != binding.expr_args.len() {
-            return Err(format!(
-                "the implementation takes {} argument(s) and the call site supplies {supplied}",
-                binding.expr_args.len()
-            ));
+        let sym = self
+            .macro_symbol_of(application)
+            .ok_or("macro application lost its symbol")?;
+        let paramss = match &self.st.get(sym).ty {
+            Type::Method { paramss, .. } => paramss.clone(),
+            _ => Vec::new(),
+        };
+        // Typing may auto-apply trailing empty clauses without an Apply node.
+        // Nonempty clauses must still be supplied by the typed application.
+        if argss.len() > paramss.len()
+            || paramss[argss.len()..]
+                .iter()
+                .any(|params| !params.is_empty())
+        {
+            return Err("macro argument clauses do not match its declaration".to_string());
         }
         out.push_str(" (argss");
-        let mut at = 0;
-        for clause in argss {
+        let mut slot = 0;
+        for (clause_index, params) in paramss.iter().enumerate() {
+            let clause = argss.get(clause_index).map(Vec::as_slice).unwrap_or(&[]);
             out.push_str(" (args");
-            for a in clause {
-                out.push_str(if binding.expr_args[at] {
-                    " (arg expr "
+            let repeated = params
+                .last()
+                .is_some_and(|p| matches!(p, Type::Repeated(_)));
+            let fixed = params.len() - usize::from(repeated);
+            if clause.len() < fixed || (!repeated && clause.len() != fixed) {
+                return Err("macro arguments do not match its declaration".to_string());
+            }
+            for (index, _) in params.iter().enumerate() {
+                let as_expr = *binding
+                    .expr_args
+                    .get(slot)
+                    .ok_or("macro implementation argument metadata is incomplete")?;
+                slot += 1;
+                if repeated && index == fixed {
+                    out.push_str(" (repeat");
+                    for arg in &clause[index..] {
+                        argument_to_wire(arg, as_expr, &mut out)?;
+                    }
+                    out.push(')');
                 } else {
-                    " (arg tree "
-                });
-                let as_expr = binding.expr_args[at];
-                at += 1;
-                tree_to_wire(a, &mut out)?;
-                out.push(' ');
-                if as_expr {
-                    // nsc hands the implementation
-                    // `context.Expr[Nothing](arg)(TypeTag.Nothing)` for every
-                    // value argument -- the tag is a *constant*, not the
-                    // argument's own type (`Macros.macroArgs`, whose own
-                    // comment points at scala/bug#5752). It is the same
-                    // constant `c.prefix` gets, and for the same reason.
-                    //
-                    // scala-rs used to build a tag for the argument's real
-                    // type here. That is a silent divergence -- an
-                    // implementation reading `arg.staticType` would be told
-                    // `ClassTag[Row]` here and `Nothing` by nsc -- and it also
-                    // made a *tag* out of a type nobody asked for: slick's
-                    // `mapToImpl` takes a `c.Expr[ClassTag[R]]`, and every one
-                    // of gitbucket's 31 `mapTo` call sites was refused because
-                    // scala-rs could not build the tag nsc never builds.
-                    // `tests/fixtures/gbm_use.scala` pins the `Nothing`
-                    // against real scalac.
-                    out.push_str("(ty \"scala.Nothing\")");
-                } else {
-                    out.push_str("(ty \"\")");
+                    argument_to_wire(&clause[index], as_expr, &mut out)?;
                 }
-                out.push(')');
             }
             out.push(')');
+        }
+        if slot != binding.expr_args.len() {
+            return Err(
+                "macro implementation argument metadata does not match its declaration".to_string(),
+            );
         }
         out.push_str(") (tags");
         if binding.tag_params > 0 {
@@ -896,14 +900,42 @@ impl Typer {
             }
         }
         out.push(')');
-        // `c.macroApplication` -- the whole call as written. nsc's own
-        // `Position` travels with it there; here the tree is rebuilt in the
-        // runtime universe and carries `NoPosition`, which costs nothing that
-        // matters: an implementation uses it to place a diagnostic, and
-        // scala-rs reports every diagnostic from a macro at the call site's
-        // own span regardless. Carried the same way as `prefix`: a tree this
-        // bridge cannot serialise is a named refusal when it is *asked for*,
-        // not an error at every call site.
+        // Preserve actual source content and UTF-16 point offsets for macros
+        // that inspect the source line, rather than only placing diagnostics.
+        out.push_str(" (position ");
+        if let Some(source) = self.sources.get(self.file_index) {
+            let mut method = application;
+            while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &method.kind {
+                method = fun;
+            }
+            let mut byte = method.span.lo.to_usize().min(source.len());
+            if let TreeKind::Select { qual, name } = &method.kind {
+                let start = qual.span.hi.to_usize().min(source.len());
+                let end = method.span.hi.to_usize().min(source.len());
+                if let Some(offset) = source.get(start..end).and_then(|text| text.find(name)) {
+                    byte = start + offset;
+                }
+            }
+            let point = source
+                .get(..byte)
+                .ok_or("macro position splits a UTF-8 character")?
+                .encode_utf16()
+                .count();
+            quote_into(&mut out, source);
+            out.push(' ');
+            quote_into(
+                &mut out,
+                self.source_paths
+                    .get(self.file_index)
+                    .map(String::as_str)
+                    .unwrap_or("<macro-source>"),
+            );
+            out.push(' ');
+            out.push_str(&point.to_string());
+        } else {
+            out.push_str("none");
+        }
+        out.push(')');
         out.push_str(" (app ");
         let mut built = String::new();
         match typed_tree_to_wire(&self.st, application, &mut built) {
@@ -1216,6 +1248,14 @@ impl Typer {
 
     // ------------------------------------------------------ reply → our tree
 
+    fn reply_trees(&mut self, s: &Sexp, span: Span) -> Result<Vec<Tree>, String> {
+        s.list()?
+            .iter()
+            .skip(1)
+            .map(|t| self.tree_from_reply(t, span))
+            .collect()
+    }
+
     /// Rebuild the reflect tree the engine wrote as an *untyped* scala-rs
     /// tree, ready to be typechecked at the call site.
     pub(crate) fn tree_from_reply(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
@@ -1231,8 +1271,13 @@ impl Typer {
             None
         };
         let kids = items.get(3..).unwrap_or(&[]);
+        let id = NodeId(self.macro_next_node);
+        self.macro_next_node = self
+            .macro_next_node
+            .checked_add(1)
+            .ok_or("macro node identity exhausted")?;
         let node = |kind| Tree {
-            id: NodeId(0),
+            id,
             span,
             kind,
             ty: Type::NoType,
@@ -1327,6 +1372,10 @@ impl Typer {
                     elsep: Box::new(elsep),
                 }))
             }
+            "Assign" => Ok(node(TreeKind::Assign {
+                lhs: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+                rhs: Box::new(self.tree_from_reply(at(kids, 1)?, span)?),
+            })),
             "Typed" => {
                 let expr = self.tree_from_reply(at(kids, 0)?, span)?;
                 let tpt = self.tree_from_reply(at(kids, 1)?, span)?;
@@ -1369,6 +1418,112 @@ impl Typer {
             // literal whose one parameter is spelled out with a `Modifiers`,
             // a `TermName` and a type `Ident` -- and hands it to
             // `TableQuery.apply[E]`.
+            "Annotated" => {
+                let tpt = if is_empty_type_tree(at(kids, 1)?) {
+                    node(TreeKind::Empty)
+                } else {
+                    self.tree_from_reply(at(kids, 1)?, span)?
+                };
+                Ok(node(TreeKind::AnnotatedTypeTree {
+                    annot: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+                    tpt: Box::new(tpt),
+                }))
+            }
+            "ClassDef" => {
+                let mods = mods_from(at(kids, 0)?)?;
+                let name = name_from(at(kids, 1)?)?;
+                let tparams = self.reply_trees(at(kids, 2)?, span)?;
+                let template = at(kids, 3)?.list()?;
+                if at(template, 1)?.text() != "Template" {
+                    return Err("macro ClassDef has no Template".to_string());
+                }
+                let parents = self.reply_trees(at(template, 3)?, span)?;
+                let self_def = at(template, 4)?.list()?;
+                let self_name = name_from(at(self_def, 4)?)?;
+                let self_tpt = at(self_def, 5)?;
+                let self_tpt = if is_empty_type_tree(self_tpt) {
+                    None
+                } else {
+                    Some(Box::new(self.tree_from_reply(self_tpt, span)?))
+                };
+                let mut body = Vec::new();
+                let mut ctor_mods = Modifiers::default();
+                let mut vparamss = Vec::new();
+                let mut primary = false;
+                for member in at(template, 5)?.list()?.iter().skip(1) {
+                    let fields = member.list()?;
+                    if !primary
+                        && at(fields, 1)?.text() == "DefDef"
+                        && name_from(at(fields, 4)?)? == "<init>"
+                    {
+                        primary = true;
+                        ctor_mods = mods_from(at(fields, 3)?)?;
+                        for clause in at(fields, 6)?.list()?.iter().skip(1) {
+                            vparamss.push(self.reply_trees(clause, span)?);
+                        }
+                        // The primary constructor's super call is represented
+                        // by Template.parents in our AST. Preserve additional
+                        // constructor statements as template initialization.
+                        let rhs = at(fields, 8)?.list()?;
+                        if at(rhs, 1)?.text() != "Block" {
+                            return Err("macro primary constructor is not a block".to_string());
+                        }
+                        let stats = at(rhs, 3)?.list()?;
+                        for (i, stat) in stats.iter().skip(1).enumerate() {
+                            if i == 0 && empty_super_call(stat) {
+                                continue;
+                            }
+                            body.push(self.tree_from_reply(stat, span)?);
+                        }
+                        let result = self.tree_from_reply(at(rhs, 4)?, span)?;
+                        if !matches!(
+                            result.kind,
+                            TreeKind::Literal { lit: Lit::Unit } | TreeKind::Empty
+                        ) {
+                            body.push(result);
+                        }
+                    } else {
+                        body.push(self.tree_from_reply(member, span)?);
+                    }
+                }
+                Ok(node(TreeKind::ClassDef {
+                    mods,
+                    name,
+                    tparams,
+                    ctor_mods,
+                    vparamss,
+                    impl_: Template {
+                        parents,
+                        self_name: (!self_name.is_empty() && self_name != "_").then_some(self_name),
+                        self_tpt,
+                        body,
+                        span,
+                    },
+                }))
+            }
+            "DefDef" => {
+                let mods = mods_from(at(kids, 0)?)?;
+                let name = decode_method_name(&name_from(at(kids, 1)?)?);
+                let tparams = self.reply_trees(at(kids, 2)?, span)?;
+                let mut vparamss = Vec::new();
+                for clause in at(kids, 3)?.list()?.iter().skip(1) {
+                    vparamss.push(self.reply_trees(clause, span)?);
+                }
+                let tpt = if is_empty_type_tree(at(kids, 4)?) {
+                    node(TreeKind::Empty)
+                } else {
+                    self.tree_from_reply(at(kids, 4)?, span)?
+                };
+                let rhs = self.tree_from_reply(at(kids, 5)?, span)?;
+                Ok(node(TreeKind::DefDef {
+                    mods,
+                    name,
+                    tparams,
+                    vparamss,
+                    tpt: Box::new(tpt),
+                    rhs: Box::new(rhs),
+                }))
+            }
             "Function" => {
                 let mut vparams = Vec::new();
                 for a in at(kids, 0)?.list()?.iter().skip(1) {
@@ -1404,7 +1559,12 @@ impl Typer {
                     rhs: Box::new(rhs),
                 }))
             }
-            "This" => Ok(node(TreeKind::This { qual: None })),
+            "This" => {
+                let qual = name_from(at(kids, 0)?)?;
+                Ok(node(TreeKind::This {
+                    qual: (!qual.is_empty()).then_some(qual),
+                }))
+            }
             "EmptyTree" => Ok(node(TreeKind::Empty)),
             other => Err(format!(
                 "the expansion contains a `{other}`, which scala-rs cannot rebuild yet"
@@ -1415,6 +1575,21 @@ impl Typer {
 
 /// Whether the engine sent back a `TypeTree` with no type in it -- nsc's
 /// spelling for "this type was not written; infer it".
+fn empty_super_call(s: &Sexp) -> bool {
+    (|| -> Result<bool, String> {
+        let app = s.list()?;
+        if at(app, 1)?.text() != "Apply" || at(app, 4)?.list()?.len() != 1 {
+            return Ok(false);
+        }
+        let select = at(app, 3)?.list()?;
+        if at(select, 1)?.text() != "Select" || name_from(at(select, 4)?)? != "<init>" {
+            return Ok(false);
+        }
+        Ok(at(at(select, 3)?.list()?, 1)?.text() == "Super")
+    })()
+    .unwrap_or(false)
+}
+
 fn is_empty_type_tree(s: &Sexp) -> bool {
     let Ok(items) = s.list() else {
         return false;
@@ -1718,7 +1893,11 @@ fn typed_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<()
         }
         TreeKind::Apply { fun, args } => {
             out.push_str("(t \"Apply\" (s0) ");
-            typed_tree_to_wire(st, fun, out)?;
+            if matches!(fun.kind, TreeKind::New { .. }) {
+                application_fun_to_wire(fun, out)?;
+            } else {
+                typed_tree_to_wire(st, fun, out)?;
+            }
             out.push_str(" (l");
             for a in args {
                 out.push(' ');
@@ -1739,7 +1918,7 @@ fn typed_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<()
 /// conversion, a desugared for-comprehension) would be typed a second time;
 /// refusing those by name is the honest answer until the bridge carries typed
 /// trees (`docs/macros.md` §4.3).
-fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
+pub(crate) fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
     let unsupported = |what: &str| {
         Err(format!(
             "scala-rs cannot hand {what} to a macro implementation yet"
@@ -1776,7 +1955,7 @@ fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
         }
         TreeKind::Apply { fun, args } => {
             out.push_str("(t \"Apply\" (s0) ");
-            tree_to_wire(fun, out)?;
+            application_fun_to_wire(fun, out)?;
             out.push_str(" (l");
             for a in args {
                 out.push(' ');
@@ -1785,14 +1964,287 @@ fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
             out.push_str("))");
             Ok(())
         }
-        TreeKind::Block { .. } => unsupported("a block"),
-        TreeKind::Function { .. } => unsupported("a function literal"),
-        TreeKind::New { .. } => unsupported("a `new`"),
-        TreeKind::If { .. } => unsupported("an `if`"),
+        TreeKind::Empty => {
+            out.push_str("(t \"EmptyTree\" (s0))");
+            Ok(())
+        }
+        TreeKind::Block { stats, expr } => {
+            out.push_str("(t \"Block\" (s0) ");
+            trees_to_wire(stats, out)?;
+            out.push(' ');
+            tree_to_wire(expr, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::Function { vparams, body } => {
+            out.push_str("(t \"Function\" (s0) ");
+            trees_to_wire(vparams, out)?;
+            out.push(' ');
+            tree_to_wire(body, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::New { tpt } => {
+            out.push_str("(t \"New\" (s0) ");
+            type_tree_to_wire(tpt, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            out.push_str("(t \"If\" (s0) ");
+            tree_to_wire(cond, out)?;
+            out.push(' ');
+            tree_to_wire(thenp, out)?;
+            out.push(' ');
+            tree_to_wire(elsep, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            out.push_str("(t \"Assign\" (s0) ");
+            tree_to_wire(lhs, out)?;
+            out.push(' ');
+            tree_to_wire(rhs, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::Typed { expr, tpt } => {
+            out.push_str("(t \"Typed\" (s0) ");
+            tree_to_wire(expr, out)?;
+            out.push(' ');
+            type_tree_to_wire(tpt, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::TypeApply { fun, args } => {
+            out.push_str("(t \"TypeApply\" (s0) ");
+            tree_to_wire(fun, out)?;
+            out.push_str(" (l");
+            for arg in args {
+                out.push(' ');
+                type_tree_to_wire(arg, out)?;
+            }
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::AppliedTypeTree { .. } | TreeKind::AnnotatedTypeTree { .. } => {
+            type_tree_to_wire(t, out)
+        }
+        TreeKind::ValDef {
+            mods,
+            name,
+            tpt,
+            rhs,
+        } => {
+            out.push_str("(t \"ValDef\" (s0) ");
+            mods_to_wire(mods, out)?;
+            out.push_str(" (n term ");
+            quote_into(out, &encode_method_name(name));
+            out.push_str(") ");
+            type_tree_to_wire(tpt, out)?;
+            out.push(' ');
+            tree_to_wire(rhs, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::ClassDef {
+            mods,
+            name,
+            tparams,
+            ctor_mods,
+            vparamss,
+            impl_,
+        } => {
+            out.push_str("(t \"ClassDef\" (s0) ");
+            mods_to_wire(mods, out)?;
+            out.push_str(" (n type ");
+            quote_into(out, name);
+            out.push_str(") ");
+            trees_to_wire(tparams, out)?;
+            out.push_str(" (t \"Template\" (s0) (l");
+            for parent in &impl_.parents {
+                if matches!(parent.kind, TreeKind::Apply { .. }) {
+                    return Err(
+                        "macro class transport cannot preserve superclass arguments yet"
+                            .to_string(),
+                    );
+                }
+                out.push(' ');
+                type_tree_to_wire(parent, out)?;
+            }
+            out.push_str(") (t \"ValDef\" (s0) (mods (f) (rest \"0\") \"\" (l)) (n term ");
+            quote_into(out, impl_.self_name.as_deref().unwrap_or("_"));
+            out.push_str(") ");
+            if let Some(tpt) = &impl_.self_tpt {
+                type_tree_to_wire(tpt, out)?;
+            } else {
+                out.push_str("(t \"TypeTree\" (s0) (ty \"\"))");
+            }
+            out.push_str(" (t \"EmptyTree\" (s0))) (l (t \"DefDef\" (s0) ");
+            mods_to_wire(ctor_mods, out)?;
+            out.push_str(" (n term \"<init>\") (l) (l");
+            for params in vparamss {
+                out.push(' ');
+                trees_to_wire(params, out)?;
+            }
+            out.push_str(") (t \"TypeTree\" (s0) (ty \"\")) (t \"Block\" (s0) (l (t \"Apply\" (s0) (t \"Select\" (s0) (t \"Super\" (s0) (t \"This\" (s0) (n type \"\")) (n type \"\")) (n term \"<init>\")) (l))) (t \"Literal\" (s0) (c \"Unit\" \"()\"))))");
+            for stat in &impl_.body {
+                out.push(' ');
+                tree_to_wire(stat, out)?;
+            }
+            out.push_str(")))");
+            Ok(())
+        }
+        TreeKind::DefDef {
+            mods,
+            name,
+            tparams,
+            vparamss,
+            tpt,
+            rhs,
+        } => {
+            out.push_str("(t \"DefDef\" (s0) ");
+            mods_to_wire(mods, out)?;
+            out.push_str(" (n term ");
+            quote_into(out, &encode_method_name(name));
+            out.push_str(") ");
+            trees_to_wire(tparams, out)?;
+            out.push_str(" (l");
+            for clause in vparamss {
+                out.push(' ');
+                trees_to_wire(clause, out)?;
+            }
+            out.push_str(") ");
+            type_tree_to_wire(tpt, out)?;
+            out.push(' ');
+            tree_to_wire(rhs, out)?;
+            out.push(')');
+            Ok(())
+        }
         TreeKind::Match { .. } => unsupported("a `match`"),
-        TreeKind::TypeApply { .. } => unsupported("an explicit type application"),
         _ => unsupported("an argument of this form"),
     }
+}
+
+pub(crate) fn application_fun_to_wire(fun: &Tree, out: &mut String) -> Result<(), String> {
+    if matches!(fun.kind, TreeKind::New { .. }) {
+        out.push_str("(t \"Select\" (s0) ");
+        tree_to_wire(fun, out)?;
+        out.push_str(" (n term \"<init>\"))");
+        Ok(())
+    } else {
+        tree_to_wire(fun, out)
+    }
+}
+
+fn argument_to_wire(t: &Tree, as_expr: bool, out: &mut String) -> Result<(), String> {
+    out.push_str(if as_expr {
+        " (arg expr "
+    } else {
+        " (arg tree "
+    });
+    tree_to_wire(t, out)?;
+    // nsc uses Expr[Nothing] for value arguments, not the argument's type.
+    out.push_str(if as_expr {
+        " (ty \"scala.Nothing\"))"
+    } else {
+        " (ty \"\"))"
+    });
+    Ok(())
+}
+
+fn trees_to_wire(trees: &[Tree], out: &mut String) -> Result<(), String> {
+    out.push_str("(l");
+    for tree in trees {
+        out.push(' ');
+        tree_to_wire(tree, out)?;
+    }
+    out.push(')');
+    Ok(())
+}
+
+fn type_tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
+    match &t.kind {
+        TreeKind::Empty => {
+            out.push_str("(t \"TypeTree\" (s0) (ty \"\"))");
+            Ok(())
+        }
+        TreeKind::Ident { name } => {
+            out.push_str("(t \"Ident\" (s0) (n type ");
+            quote_into(out, name);
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::Select { qual, name } => {
+            out.push_str("(t \"Select\" (s0) ");
+            tree_to_wire(qual, out)?;
+            out.push_str(" (n type ");
+            quote_into(out, name);
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            out.push_str("(t \"AppliedTypeTree\" (s0) ");
+            type_tree_to_wire(tpt, out)?;
+            out.push_str(" (l");
+            for arg in args {
+                out.push(' ');
+                type_tree_to_wire(arg, out)?;
+            }
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            out.push_str("(t \"Annotated\" (s0) ");
+            tree_to_wire(annot, out)?;
+            out.push(' ');
+            type_tree_to_wire(tpt, out)?;
+            out.push(')');
+            Ok(())
+        }
+        _ => tree_to_wire(t, out),
+    }
+}
+
+fn mods_to_wire(mods: &Modifiers, out: &mut String) -> Result<(), String> {
+    out.push_str("(mods (f");
+    let mut known = Flags::EMPTY;
+    for (flag, name) in [
+        (Flags::PRIVATE, "PRIVATE"),
+        (Flags::PROTECTED, "PROTECTED"),
+        (Flags::ABSTRACT, "ABSTRACT"),
+        (Flags::FINAL, "FINAL"),
+        (Flags::SEALED, "SEALED"),
+        (Flags::IMPLICIT, "IMPLICIT"),
+        (Flags::LAZY, "LAZY"),
+        (Flags::OVERRIDE, "OVERRIDE"),
+        (Flags::CASE, "CASE"),
+        (Flags::TRAIT, "TRAIT"),
+        (Flags::MUTABLE, "MUTABLE"),
+        (Flags::PARAM, "PARAM"),
+        (Flags::BYNAME, "BYNAMEPARAM"),
+        (Flags::DEFAULTPARAM, "DEFAULTPARAM"),
+        (Flags::SYNTHETIC, "SYNTHETIC"),
+        (Flags::LOCAL, "LOCAL"),
+    ] {
+        if mods.flags.contains(flag) {
+            out.push(' ');
+            quote_into(out, name);
+            known = known.with(flag);
+        }
+    }
+    if mods.flags.0 & !known.0 != 0 {
+        return Err(format!(
+            "cannot send definition modifiers 0x{:x} to macro engine",
+            mods.flags.0 & !known.0
+        ));
+    }
+    out.push_str(") (rest \"0\") ");
+    quote_into(out, mods.private_within.as_deref().unwrap_or(""));
+    out.push(' ');
+    trees_to_wire(&mods.annotations, out)?;
+    out.push(')');
+    Ok(())
 }
 
 pub(crate) fn lit_to_wire(lit: &Lit, out: &mut String) -> Result<(), String> {

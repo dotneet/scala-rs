@@ -171,6 +171,22 @@ public final class ScalaRsMacroEngine {
             handler.appWhy = app.items.get(1).text();
         } else {
             handler.appTree = buildTree(app);
+            Sexp position = req.field("position");
+            if (position.items.size() == 4) {
+                Class<?> virtual = Class.forName("scala.reflect.io.VirtualFile", true, macroCl);
+                String path = position.items.get(2).text();
+                Object file = virtual.getConstructor(String.class, String.class)
+                    .newInstance(new java.io.File(path).getName(), path);
+                Class<?> abstractFile = Class.forName("scala.reflect.io.AbstractFile", true, macroCl);
+                Class<?> sourceClass = Class.forName("scala.reflect.internal.util.SourceFile", true, macroCl);
+                Object source = Class.forName("scala.reflect.internal.util.BatchSourceFile", true, macroCl)
+                    .getConstructor(abstractFile, char[].class)
+                    .newInstance(file, position.items.get(1).text().toCharArray());
+                Object pos = Class.forName("scala.reflect.internal.util.OffsetPosition", true, macroCl)
+                    .getConstructor(sourceClass, int.class)
+                    .newInstance(source, Integer.parseInt(position.items.get(3).text()));
+                call(handler.appTree, "setPos", 1, pos);
+            }
         }
 
         Object ctx = Proxy.newProxyInstance(
@@ -189,9 +205,13 @@ public final class ScalaRsMacroEngine {
         argv.add(ctx);
         for (Sexp clause : argss.items.subList(1, argss.items.size())) {
             for (Sexp a : clause.items.subList(1, clause.items.size())) {
-                boolean asExpr = "expr".equals(a.items.get(1).atom);
-                Object tree = buildTree(a.items.get(2));
-                argv.add(asExpr ? mkExpr(tree, buildTag(a.items.get(3))) : tree);
+                if ("repeat".equals(a.items.get(0).atom)) {
+                    List<Object> values = new ArrayList<>();
+                    for (Sexp value : a.items.subList(1, a.items.size())) values.add(buildArgument(value));
+                    argv.add(list(values));
+                } else {
+                    argv.add(buildArgument(a));
+                }
             }
         }
         for (Sexp t : tags.items.subList(1, tags.items.size())) {
@@ -348,6 +368,9 @@ public final class ScalaRsMacroEngine {
         Object tpe = typeFor(ans.items.get(2));
         Object built = buildTree(ans.items.get(3));
         Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
+        // Attachments belong to the original JVM tree. A typer adaptation may
+        // change its shape (Ident to Select), but must retain those attachments.
+        call(built, "setAttachments", 1, call(tree, "attachments", 0));
         return call(support, "setType", 2, built, tpe);
     }
 
@@ -378,23 +401,22 @@ public final class ScalaRsMacroEngine {
             case "Literal":
                 return call(companion("Literal"), "apply", 1, constant(kids.get(0)));
             case "Ident":
-                return call(companion("Ident"), "apply", 1, termName(nameOf(kids.get(0))));
+                return call(companion("Ident"), "apply", 1, buildName(kids.get(0)));
             case "This":
                 return call(companion("This"), "apply", 1, typeName(nameOf(kids.get(0))));
             case "Select":
                 return call(companion("Select"), "apply", 2,
-                    buildTree(kids.get(0)), termName(nameOf(kids.get(1))));
-            case "Apply": {
+                    buildTree(kids.get(0)), buildName(kids.get(1)));
+            case "Apply":
+            case "TypeApply":
+            case "AppliedTypeTree": {
                 Object fun = buildTree(kids.get(0));
                 List<Object> as = new ArrayList<>();
                 for (Sexp k : kids.get(1).items.subList(1, kids.get(1).items.size())) {
                     as.add(buildTree(k));
                 }
-                return call(companion("Apply"), "apply", 2, fun, list(as));
+                return call(companion(kind), "apply", 2, fun, list(as));
             }
-            // The three below arrive only in an *answer* to `c.typecheck`:
-            // they are shapes scala-rs's typer produces, not shapes a call
-            // site hands to an implementation.
             case "Block": {
                 List<Object> stats = new ArrayList<>();
                 for (Sexp k : kids.get(0).items.subList(1, kids.get(0).items.size())) {
@@ -405,12 +427,71 @@ public final class ScalaRsMacroEngine {
             case "If":
                 return call(companion("If"), "apply", 3, buildTree(kids.get(0)),
                     buildTree(kids.get(1)), buildTree(kids.get(2)));
-            case "TypeTree":
-                return call(companion("TypeTree"), "apply", 0);
+            case "TypeTree": {
+                Object tree = call(companion("TypeTree"), "apply", 0);
+                if (!kids.isEmpty() && !kids.get(0).items.get(1).text().isEmpty()) {
+                    Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
+                    call(support, "setType", 2, tree, typeFor(kids.get(0)));
+                }
+                return tree;
+            }
+            case "Super":
+                return call(companion(kind), "apply", 2, buildTree(kids.get(0)), buildName(kids.get(1)));
+            case "New":
+                return call(companion(kind), "apply", 1, buildTree(kids.get(0)));
+            case "Typed":
+            case "Assign":
+            case "Annotated":
+                return call(companion(kind), "apply", 2,
+                    buildTree(kids.get(0)), buildTree(kids.get(1)));
+            case "Function":
+                return call(companion(kind), "apply", 2,
+                    buildTrees(kids.get(0)), buildTree(kids.get(1)));
+            case "ValDef":
+                return call(companion(kind), "apply", 4, buildMods(kids.get(0)),
+                    buildName(kids.get(1)), buildTree(kids.get(2)), buildTree(kids.get(3)));
+            case "DefDef": {
+                List<Object> clauses = new ArrayList<>();
+                for (Sexp clause : kids.get(3).items.subList(1, kids.get(3).items.size())) {
+                    clauses.add(buildTrees(clause));
+                }
+                return call(companion(kind), "apply", 6, buildMods(kids.get(0)),
+                    buildName(kids.get(1)), buildTrees(kids.get(2)), list(clauses),
+                    buildTree(kids.get(4)), buildTree(kids.get(5)));
+            }
+            case "ClassDef":
+                return call(companion(kind), "apply", 4, buildMods(kids.get(0)),
+                    buildName(kids.get(1)), buildTrees(kids.get(2)), buildTree(kids.get(3)));
+            case "Template":
+                return call(companion(kind), "apply", 3, buildTrees(kids.get(0)),
+                    buildTree(kids.get(1)), buildTrees(kids.get(2)));
             default:
                 throw new IllegalArgumentException(
                     "scala-rs cannot hand a " + kind + " to a macro implementation");
         }
+    }
+
+    static Object buildArgument(Sexp a) throws Exception {
+        boolean asExpr = "expr".equals(a.items.get(1).atom);
+        Object tree = buildTree(a.items.get(2));
+        return asExpr ? mkExpr(tree, buildTag(a.items.get(3))) : tree;
+    }
+
+    static Object buildName(Sexp s) throws Exception {
+        return "type".equals(s.items.get(1).atom) ? typeName(nameOf(s)) : termName(nameOf(s));
+    }
+
+    static Object buildTrees(Sexp s) throws Exception {
+        List<Object> trees = new ArrayList<>();
+        for (Sexp t : s.items.subList(1, s.items.size())) trees.add(buildTree(t));
+        return list(trees);
+    }
+
+    static Object buildMods(Sexp s) throws Exception {
+        long flags = flagsOf(s.items.get(1));
+        flags |= Long.parseUnsignedLong(s.items.get(2).items.get(1).text(), 16);
+        return call(companion("Modifiers"), "apply", 3, Long.valueOf(flags),
+            typeName(s.items.get(3).text()), buildTrees(s.items.get(4)));
     }
 
     /** The text of an `(n term "x")` node. */
@@ -802,7 +883,7 @@ public final class ScalaRsMacroEngine {
     }
 
     static void serType(Object tpe, StringBuilder sb) throws Exception {
-        if (tpe == null) {
+        if (tpe == null || tpe == call(universe, "NoType", 0)) {
             sb.append("(ty \"\")");
             return;
         }
@@ -907,6 +988,82 @@ public final class ScalaRsMacroEngine {
         sb.append(')');
     }
 
+    /** Reset local bindings while preserving symbols defined outside this tree.
+     * Mirrors nsc ResetAttrs: collect definitions first, then rebuild and clear
+     * types. Rebuilding avoids mutating the caller's attributed tree.
+     */
+    static Object untypecheck(Object tree) throws Exception {
+        java.util.Set<Object> locals = java.util.Collections.newSetFromMap(
+            new java.util.IdentityHashMap<Object, Boolean>());
+        collectLocalSymbols(tree, locals);
+        return resetTree(tree, locals);
+    }
+
+    static void collectLocalSymbols(Object tree, java.util.Set<Object> locals) throws Exception {
+        if (tree == call(universe, "EmptyTree", 0)) return;
+        String kind = String.valueOf(call(tree, "productPrefix", 0));
+        if (isA(tree, "scala.reflect.api.Trees$DefTreeApi")
+                || "Function".equals(kind) || "Template".equals(kind)) {
+            Object sym = call(tree, "symbol", 0);
+            if (sym != null && sym != call(universe, "NoSymbol", 0)) {
+                locals.add(sym);
+            }
+        }
+        Object children = call(call(tree, "children", 0), "iterator", 0);
+        while ((Boolean) call(children, "hasNext", 0)) collectLocalSymbols(call(children, "next", 0), locals);
+    }
+
+    static boolean mentionsLocal(Object tpe, java.util.Set<Object> locals) throws Exception {
+        if (tpe == null || tpe == call(universe, "NoType", 0)) return false;
+        if (locals.contains(call(tpe, "typeSymbol", 0))) return true;
+        Object args = call(call(tpe, "typeArgs", 0), "iterator", 0);
+        while ((Boolean) call(args, "hasNext", 0)) {
+            if (mentionsLocal(call(args, "next", 0), locals)) return true;
+        }
+        return false;
+    }
+
+    static Object resetValue(Object value, java.util.Set<Object> locals) throws Exception {
+        if (isA(value, "scala.reflect.api.Trees$TreeApi")) return resetTree(value, locals);
+        if (isA(value, "scala.collection.immutable.List")) {
+            List<Object> values = new ArrayList<>();
+            Object it = call(value, "iterator", 0);
+            while ((Boolean) call(it, "hasNext", 0)) values.add(resetValue(call(it, "next", 0), locals));
+            return list(values);
+        }
+        return value;
+    }
+
+    static Object resetTree(Object tree, java.util.Set<Object> locals) throws Exception {
+        if (tree == call(universe, "EmptyTree", 0)) return tree;
+        String kind = String.valueOf(call(tree, "productPrefix", 0));
+        if ("TypeTree".equals(kind)) {
+            Object original = call(tree, "original", 0);
+            if (original != null) return resetTree(original, locals);
+            if (Boolean.TRUE.equals(call(tree, "wasEmpty", 0))
+                    || mentionsLocal(call(tree, "tpe", 0), locals)) {
+                return call(call(tree, "duplicate", 0), "clearType", 0);
+            }
+            return tree;
+        }
+        int arity = (Integer) call(tree, "productArity", 0);
+        Object[] args = new Object[arity];
+        for (int i = 0; i < arity; i++) args[i] = resetValue(call(tree, "productElement", 1, Integer.valueOf(i)), locals);
+        if ("TypeApply".equals(kind)) {
+            Object it = call(args[1], "iterator", 0);
+            while ((Boolean) call(it, "hasNext", 0)) {
+                if (Boolean.TRUE.equals(call(call(it, "next", 0), "isEmpty", 0))) return args[0];
+            }
+        }
+        Object built = call(companion(kind), "apply", arity, args);
+        if (Boolean.TRUE.equals(call(tree, "hasSymbolField", 0))) {
+            Object sym = call(tree, "symbol", 0);
+            if (sym != null && !locals.contains(sym)) call(built, "setSymbol", 1, sym);
+        }
+        call(built, "setAttachments", 1, call(tree, "attachments", 0));
+        return built;
+    }
+
     // -------------------------------------------------------------- Context
 
     /** `c.abort` -- the macro asked for a compile error at a position. */
@@ -954,6 +1111,9 @@ public final class ScalaRsMacroEngine {
                             + appWhy);
                 }
                 return appTree;
+            }
+            if ((n.equals("untypecheck") || n.equals("resetLocalAttrs")) && arity == 1) {
+                return untypecheck(a[0]);
             }
             if (n.equals("compilerSettings") && arity == 0) {
                 return list(new ArrayList<Object>(compilerSettings));
@@ -1019,14 +1179,9 @@ public final class ScalaRsMacroEngine {
                 return Class.forName("scala.reflect.macros.TypecheckException$", true, macroCl)
                     .getField("MODULE$").get(null);
             }
-            // `c.enclosingPosition` is where an implementation says its
-            // diagnostics belong, and `c.abort(c.enclosingPosition, msg)` is
-            // how nearly all of them are written -- slick's `mapToImpl`
-            // included. `NoPosition` costs nothing: scala-rs reports every
-            // diagnostic out of a macro at the call site's own span whatever
-            // position the implementation names.
+            // Diagnostics and source inspection use the same call-site point.
             if (n.equals("enclosingPosition") && arity == 0) {
-                return call(universe, "NoPosition", 0);
+                return appTree == null ? call(universe, "NoPosition", 0) : call(appTree, "pos", 0);
             }
             if (m.isDefault()) {
                 return invokeDefault(proxy, m, a);

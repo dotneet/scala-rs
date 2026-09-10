@@ -1936,7 +1936,6 @@ impl<'a> Pickler<'a> {
             || s.flags.contains(Flags::MODULE)
             || s.name.ends_with('$');
         let is_case = s.flags.contains(Flags::CASE);
-        let is_value = self.st.is_value_class(class_id);
         let class_flags = s.flags;
         let class_kind = s.kind;
         let raw_name = s.name.trim_end_matches('$').to_string();
@@ -2054,10 +2053,14 @@ impl<'a> Pickler<'a> {
                 SymKind::Term => {
                     if ctor_fields.contains(&m) || !self.st.get(m).flags.contains(Flags::PARAM) {
                         let ctor_field = ctor_fields.contains(&m);
-                        if (is_case || is_value) && ctor_field {
-                            // nsc `caseFieldAccessors` pairs CASEACCESSOR getters
-                            // with non-method PARAMACCESSOR fields.
-                            self.pickle_param_field(m, idx);
+                        if !class_flags.contains(Flags::TRAIT)
+                            && !self.st.get(m).deferred_val
+                            && !self.st.get(m).flags.contains(Flags::LAZY)
+                        {
+                            // Reflection sees a private storage field as well as
+                            // the accessor. Its direct type differs from the
+                            // getter's NullaryMethodType during `=:=` queries.
+                            self.pickle_storage_field(m, idx, ctor_field);
                         }
                         // A value class's *erasure* is the type of its single
                         // parameter accessor, and nsc finds that accessor by
@@ -2067,7 +2070,7 @@ impl<'a> Pickler<'a> {
                         // `<notype>` and died in its own backend
                         // (`unexpected type representation`) on the first call
                         // it rewrote to `Ops$.MODULE$.inc$extension`.
-                        self.pickle_val(m, idx, is_case && ctor_field, is_value && ctor_field);
+                        self.pickle_val(m, idx, is_case && ctor_field, ctor_field);
                     }
                 }
                 SymKind::Method => {
@@ -2551,7 +2554,11 @@ impl<'a> Pickler<'a> {
             if pflags.contains(Flags::DEFAULTPARAM) {
                 extra |= 1 << 25; // DEFAULTPARAM (not remapped)
             }
-            let flags = pickled_from_our(*pflags, SymKind::Term, extra);
+            // A constructor `var` creates mutable storage, not a mutable
+            // method parameter. Reflection must not report `var x` here.
+            let mut parameter_flags = *pflags;
+            parameter_flags.set(Flags::MUTABLE, false);
+            let flags = pickled_from_our(parameter_flags, SymKind::Term, extra);
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
             param_refs.push(self.add(VALSYM, body));
         }
@@ -2826,17 +2833,19 @@ impl<'a> Pickler<'a> {
         idx
     }
 
-    /// nsc case-class ctor field (not the getter): PARAMACCESSOR, not METHOD.
-    fn pickle_param_field(&mut self, val_id: SymbolId, owner_ref: u32) {
+    /// Private storage uses nsc's trailing-space name and a direct field type.
+    fn pickle_storage_field(&mut self, val_id: SymbolId, owner_ref: u32, param: bool) {
         let s = self.st.get(val_id);
-        let name = s.name.clone();
+        let name = format!("{} ", s.name);
         let ty = s.ty.clone();
-        let flags_our = s.flags;
+        // Accessor flags (implicit, override, protected and parameter) do
+        // not describe its private storage. nsc copies only field modifiers.
+        let flags_our = Flags(s.flags.0 & (Flags::MUTABLE.0 | Flags::FINAL.0 | Flags::SYNTHETIC.0));
         let kind = s.kind;
         let name_ref = self.term_name(&name);
         let ty_ref = self.pickle_type(&ty);
         // PRIVATE | LOCAL stay outside bits 0–11; PARAMACCESSOR is not remapped.
-        let extra = (1u64 << 2) | (1 << 19) | (1 << 29); // PRIVATE | LOCAL | PARAMACCESSOR
+        let extra = (1u64 << 2) | (1 << 19) | if param { 1 << 29 } else { 0 };
         let flags = pickled_from_our(flags_our, kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, ty_ref);
         let _ = self.add(VALSYM, body);
@@ -2855,7 +2864,11 @@ impl<'a> Pickler<'a> {
         let s = self.st.get(val_id);
         let name = s.name.clone();
         let ty = s.ty.clone();
-        let flags_our = pickled_access_flags(self.st, val_id);
+        let mut flags_our = pickled_access_flags(self.st, val_id);
+        // Constructor parameter flags belong to the constructor's argument;
+        // its accessor has PARAMACCESSOR instead of PARAM / DEFAULTPARAM.
+        flags_our.set(Flags::PARAM, false);
+        flags_our.set(Flags::DEFAULTPARAM, false);
         let kind = s.kind;
         let name_ref = self.term_name(&name);
         let idx = self.add(VALSYM, vec![]);
@@ -2900,7 +2913,7 @@ impl<'a> Pickler<'a> {
             // name; marking those private would ask the reader to expand a
             // second time.
             let private = flags_our.contains(Flags::PRIVATE) && !self.st.get(val_id).access_widened;
-            self.pickle_var_setter(&name, owner_ref, &ty, private, deferred);
+            self.pickle_var_setter(&name, owner_ref, &ty, private, deferred, param_accessor);
         }
         idx
     }
@@ -2924,6 +2937,7 @@ impl<'a> Pickler<'a> {
         ty: &Type,
         private: bool,
         deferred: bool,
+        param_accessor: bool,
     ) {
         let setter = format!("{}_$eq", crate::classfile::encode_method_name(field));
         let name_ref = self.term_name(&setter);
@@ -2947,6 +2961,9 @@ impl<'a> Pickler<'a> {
         }
         if deferred {
             raw |= 1u64 << 4; // DEFERRED
+        }
+        if param_accessor {
+            raw |= 1u64 << 29; // PARAMACCESSOR
         }
         let flags = raw_to_pickled(raw);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
@@ -3734,6 +3751,12 @@ pub fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             continue;
         };
         if *owner != ci as u32 {
+            continue;
+        }
+        // Macro declarations have no JVM method. Their full signature and
+        // implementation binding are supplied by PickleSupply, never by this
+        // flat eager method reader (which cannot preserve access or macroImpl).
+        if *flags & (1 << 15) != 0 {
             continue;
         }
         // Case-class ctor fields are PARAMACCESSOR without METHOD; skip them.

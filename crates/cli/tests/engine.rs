@@ -579,18 +579,8 @@ fn eg_unsupported_forms_are_named() {
         !out.status.success(),
         "expected eg_gaps_bad to fail, got: {err}"
     );
-    for needle in [
-        // An argument shape the bridge cannot hand over.
-        "cannot hand a block to a macro implementation",
-        "cannot hand a function literal to a macro implementation",
-        // A type argument no `staticClass` call can rebuild.
-        "cannot build a type tag for",
-    ] {
-        assert!(
-            err.contains(needle),
-            "expected {needle:?} in diagnostics, got {err:?}"
-        );
-    }
+    // Block/function cases now execute against scalac in macrotransportbatch.
+    assert!(err.contains("cannot build a type tag for"), "{err}");
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }
@@ -763,17 +753,11 @@ fn ex_unsupported_prefixes_are_named() {
         !out.status.success(),
         "expected ex_gaps_bad to fail, got: {err}"
     );
-    for needle in [
-        // No receiver written at all.
-        "the macro was called without a receiver",
-        // A receiver the bridge will not re-evaluate at the call site.
-        "cannot hand a `new` to a macro implementation",
-    ] {
-        assert!(
-            err.contains(needle),
-            "expected {needle:?} in diagnostics, got {err:?}"
-        );
-    }
+    // New receivers have execution/counting coverage in macrotransportbatch.
+    assert!(
+        err.contains("the macro was called without a receiver"),
+        "{err}"
+    );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&out_dir);
 }

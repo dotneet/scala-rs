@@ -803,6 +803,58 @@ impl Typer {
         fun: &Tree,
         pt: &Type,
     ) -> Option<Type> {
+        // A qualified reflection operation supplies its own universe; a
+        // lexical wildcard import is not required to materialize its tags.
+        let mut head = fun;
+        while let TreeKind::TypeApply { fun, .. } | TreeKind::Apply { fun, .. } = &head.kind {
+            head = fun;
+        }
+        let mut universe = None;
+        if let TreeKind::Select { qual, .. } = &head.kind {
+            if let Some(cls) = self.st.class_sym_of(&qual.ty) {
+                if self.is_reflect_universe(cls) {
+                    universe = Some((**qual).clone());
+                } else if matches!(
+                    self.st.get(cls).jvm_name.as_str(),
+                    "scala/reflect/macros/blackbox/Context"
+                        | "scala/reflect/macros/whitebox/Context"
+                ) {
+                    let mut selected = Tree::dummy(TreeKind::Select {
+                        qual: qual.clone(),
+                        name: "universe".into(),
+                    });
+                    selected.span = span;
+                    self.type_expr(&mut selected, &Type::NoType);
+                    let selected_ty = selected.ty.clone();
+                    self.supply_from_pickle(&selected_ty, "WeakTypeTag");
+                    if self
+                        .st
+                        .class_sym_of(&selected.ty)
+                        .is_some_and(|s| self.is_reflect_universe(s))
+                    {
+                        universe = Some(selected);
+                    }
+                }
+            }
+        }
+        let saved_prefixes = self.term_import_prefixes.len();
+        if let Some(universe) = universe {
+            let owner = self.st.class_sym_of(&universe.ty).unwrap();
+            self.term_import_prefixes.push((owner, universe));
+        }
+        let result = self.fill_defaults_and_implicits_in(span, args, param_tys, fun, pt);
+        self.term_import_prefixes.truncate(saved_prefixes);
+        result
+    }
+
+    fn fill_defaults_and_implicits_in(
+        &mut self,
+        span: Span,
+        args: &mut Vec<Tree>,
+        param_tys: &[Type],
+        fun: &Tree,
+        pt: &Type,
+    ) -> Option<Type> {
         // Before the early returns below, not after: this call's caller reads
         // the flag when this returns, and the arguments were typed *before*
         // this was called. Leaving the reset next to `implicit_undet_solved`'s
