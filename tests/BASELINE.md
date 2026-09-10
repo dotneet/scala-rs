@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Eighty-four slices have merged this session**, in forty accepted composed gates.
-Thirteen intermediate candidates were rejected, three despite a PASS script verdict. From
+Fourteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2015,3 +2015,64 @@ including preceding GitServlet and ReceivePack subclasses. A simple missing
 generic declaration is therefore not established; investigate full-run
 loading/name-resolution context before changing it. Probe evidence is in
 `/tmp/scala-rs-jgit-generics-probe/`.
+
+## Rejected candidate 8a336ad4: cross-unit Java type completion
+
+Candidate `8a336ad4`, based on accepted main `f15945b1`, ran the complete
+unskipped gate once and reached DONE with VERDICT=FAIL. It is not merged.
+Logs: `/tmp/scala-rs-gate-8a336ad4-codex/gate.log`; raw ledger:
+`tests/baselines/corpus-8a336ad4.tsv`. The accepted compiler and top-level
+metrics remain `5f0d18c2`; the recording commit also records the user's new
+batching instruction in `.agent-brief.md`.
+
+The candidate improves gitbucket 191 -> 188 errors (63 files unchanged):
+RepositoryResolver and ReceivePackFactory regain type parameters, and
+PreReceiveHook regains interface identity. Standard-library errors improve
+460 -> 458 (119 files unchanged), removing two AtomicReferenceFieldUpdater
+kind errors. Cats is unchanged at 152/58. No diagnostic messages are added.
+Slick remains 184 sources, zero errors, 1492 classes; MODE=b passes 12/12
+programs and 36/36 attempts, subset verifies 1492 with zero failures and lint
+problems, and initialization verification loads all 1492 classes with zero
+failures and zero incomplete. Retained class output is under the gate directory.
+
+Workspace: 2704 passed, 1 failed, 297 rows. The failure is
+`bparent::binary_parent_prefix_matches_scalac`: the constructors of
+bparent.Owner.Empty, reached as RenamedEmpty and bparent.O.EmptyAlias, no
+longer resolve. All 5324 corpus identities are unchanged (losses=0,
+changes=0); pos 1119/395/345, neg 700/336/369, run 643/864/553. Format passes,
+and release workspace clippy retains 57 warnings with no additions.
+
+Evidence confirms the JGit diagnosis with two source files: an earlier
+GitServlet subclass introduces shallow member-type declarations, then a
+later wildcard import binds RepositoryResolver and ReceivePackFactory without
+completing their generic declarations. One source file does not reproduce it.
+The permanent jwarm fixture uses a real javac-built library to exercise generic
+and nongeneric interfaces in both source orders. Both orders run under
+-Xverify:all with byte-identical scalac output; wrong type-argument arity is
+rejected independently. The pre-fix binary fails the valid fixture with kind
+and mixin errors. Evidence: `/tmp/scala-rs-jgit-generics-probe/`.
+
+Before the gate, 549 related tests passed, the 18 recorded corpus regressions
+were unchanged, and preflight validated all four pinned source trees, 121
+jars, 33 Java classes and 1498 reference classes. Earlier broad completion
+attempts broke string_ops4 by loading JDK String.lines; the final candidate
+excludes prelude symbols and that test passes. The full gate exposed the
+additional Scala parent-alias boundary. Add bparent to the mandatory focused
+suite before the next batch gate. Investigate pickle-first completion rather
+than passing every JAVA-flagged Scala declaration through raw classfile loading;
+that proposal is a hypothesis and has not yet been tested. The bparent trace
+is retained in the probe directory. The gate tree was not edited while running.
+
+An independent bidirectional probe also found unchecked class type bounds:
+for `class B[A <: java.lang.Number]`, `B[String]` is falsely accepted in a
+parent clause, a value annotation and a type alias; a constructor call is
+correctly rejected. Real scalac rejects all four positions. The Java-interface
+variant is also rejected by scalac and accepted by the pre-fix compiler with
+no preceding unit, establishing a separate root. Evidence is in
+`bounds-scope/results.json` and `bound-independent.json` under the probe directory.
+
+Per the user's batching instruction, do not run the next full gate for the
+bparent repair alone. Investigate and combine other low/medium-complexity
+repairs, including the cats Unit-to-Function0 normalization and Either.type
+stability diagnostics, then verify one composed batch. Keep broader type-bound
+validation separate if its interactions warrant it.
