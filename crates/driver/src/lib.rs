@@ -840,6 +840,7 @@ fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
                     .methods
                     .into_iter()
                     .map(|m| ClasspathMethod {
+                        access: m.access,
                         name: m.name,
                         desc: m.desc,
                     })

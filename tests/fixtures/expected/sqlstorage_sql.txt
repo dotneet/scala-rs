@@ -1,0 +1,7 @@
+select ?, ?
+setInt:1:7
+setString:2:日本語
+update x set y=?
+select 1
+select items where id=?
+setInt:1:7

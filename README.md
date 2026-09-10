@@ -624,8 +624,9 @@ constructor 側の**デフォルト引数**は未実装のままで、`<init>$de
 先行クラスの引数を**名前で参照してよい唯一の形**（同一クラス内の参照は nsc が
 拒否します）なので、その getter `$lessinit$greater$default$n` は先行クラスの
 パラメータを取ります。呼び出し側に式を展開して済ませられないため、nsc と同じく
-**コンパニオンを合成**して getter を置くようにしました（この形だけ。第 1 クラスの
-デフォルトは従来どおり展開で済ませるので、クラスファイルは増えません）。
+**コンパニオンを合成**して getter を置くようにしました。
+The constructor/storage batch extends this synthesis to every defaulted clause,
+including the first, so separately compiled clients can also use those defaults.
 
 **「デフォルトを必要としない候補を優先する」nsc の規則を実装しました。**
 `class Prefer(n: Int) { def this(k: Int, bump: Int = 5) = ... }` に対する
@@ -1128,3 +1129,18 @@ pattern/anonymous-class expansion remain incomplete. See the
 [batch inventory](docs/batches/macro-transport.md) and
 [macro transport details](docs/macros.md#723-structural-transport-and-source-macro-integration)
 for scope and validation status.
+
+
+The next constructor/storage integration batch repairs Java String constructor
+loading, argument root types passed to real Slick SQL macros, and private-this
+storage/constructor-argument metadata. Its runtime probes compare scalac output,
+including actual JDBC parameter binding without a database. See
+[the batch inventory](docs/batches/sql-constructor-storage.md) for measured
+hypothesis corrections and validation status; this is not yet an accepted gate.
+
+The constructor/storage batch also publishes ordinary constructor default
+getters for separate compilation, including generic/nested/auxiliary cases and
+side-effecting defaults. Eager private-this storage has no accessor; ordinary
+private accessors preserve JVM visibility, and directory constructor prototypes
+do not become public fields. `sqlstoragebatch` executes all four combinations
+of API producer/consumer compilers and independently rejects inaccessible reads.

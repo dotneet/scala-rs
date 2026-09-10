@@ -261,11 +261,8 @@ impl<'a> Gen<'a> {
                     {
                         self.emit_value_companion(s);
                     }
-                    // ... and so does a plain class whose constructor puts a
-                    // default in a later parameter clause: that getter takes
-                    // the earlier clause's parameters and has nowhere else to
-                    // live. `Typer::needs_ctor_default_companion` is what
-                    // declared the module.
+                    // Constructor defaults on plain classes also need their
+                    // synthesized companion for separately compiled callers.
                     if !module_names.contains(name)
                         && !mods.flags.contains(Flags::CASE)
                         && !self.st.is_value_class(s.sym)

@@ -181,21 +181,8 @@ impl Typer {
                     let class_jvm = jvm.clone();
                     self.ensure_companion(name, &class_jvm, id, true);
                 } else if Self::needs_ctor_default_companion(vparamss, impl_) {
-                    // A constructor default in a *later* clause may name a
-                    // parameter of an earlier one, and
-                    // `$lessinit$greater$default$n` takes those parameters for
-                    // exactly that reason. The getter lives on the companion,
-                    // so a class that has no companion of its own needs the
-                    // one nsc synthesizes here -- `javap` on scalac 2.13.16's
-                    // `class Curr(a: Int)(b: String = "b" + a)` shows a
-                    // `Curr$` holding `$lessinit$greater$default$2(int)`.
-                    //
-                    // Only for that shape. A default in the *first* clause has
-                    // nothing it may legally read (nsc rejects a same-clause
-                    // reference), so its expression can be spliced at the call
-                    // site and no companion is needed; synthesizing one anyway
-                    // would emit a class file for every class in the world
-                    // that takes a defaulted argument.
+                    // All constructor defaults need companion getters for
+                    // separately compiled callers, including the first clause.
                     let class_jvm = jvm.clone();
                     self.ensure_companion(name, &class_jvm, id, false);
                 }
@@ -326,26 +313,21 @@ impl Typer {
     /// `class_jvm` is the companion's *class*'s binary name: a local case
     /// class carries an index (`Main$P$1`) that the companion has to reuse
     /// rather than draw a fresh one for.
-    /// Whether any constructor of this class declares a default in a clause
-    /// **after its first** -- on the primary (`vparamss`) or on a `def
-    /// this(...)` in the body.
-    ///
-    /// That is the only place a constructor default may read another
-    /// parameter, and therefore the only place the getter cannot be replaced
-    /// by splicing the default's expression at the call site.
+    /// Whether a primary or secondary constructor declares a default whose
+    /// getter must be published on a synthesized companion.
     fn needs_ctor_default_companion(vparamss: &[Vec<Tree>], impl_: &Template) -> bool {
-        fn later_clause_default(vparamss: &[Vec<Tree>]) -> bool {
-            vparamss.iter().skip(1).flatten().any(|p| match &p.kind {
+        fn has_default(vparamss: &[Vec<Tree>]) -> bool {
+            vparamss.iter().flatten().any(|p| match &p.kind {
                 TreeKind::ValDef { mods, rhs, .. } => {
                     mods.flags.contains(Flags::DEFAULTPARAM) && !rhs.is_empty()
                 }
                 _ => false,
             })
         }
-        later_clause_default(vparamss)
+        has_default(vparamss)
             || impl_.body.iter().any(|m| match &m.kind {
                 TreeKind::DefDef { name, vparamss, .. } => {
-                    name == "<init>" && later_clause_default(vparamss)
+                    name == "<init>" && has_default(vparamss)
                 }
                 _ => false,
             })

@@ -786,6 +786,10 @@ impl Typer {
                 self.type_default_rhs_here(*pid, &mut rhs, &pty);
                 args.push(rhs);
             } else {
+                self.error(
+                    span,
+                    format!("cannot resolve default argument {}", self.st.get(*pid).name),
+                );
                 return;
             }
         }
@@ -942,6 +946,11 @@ impl Typer {
                         let pty = self.st.get(*pid).ty.clone();
                         self.type_default_rhs_here(*pid, &mut rhs, &pty);
                         args.push(rhs);
+                    } else {
+                        self.error(
+                            span,
+                            format!("cannot resolve default argument {}", self.st.get(*pid).name),
+                        );
                     }
                 }
             } else if !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
@@ -1257,7 +1266,7 @@ impl Typer {
         }
         let span = fun.span;
         if mname == "<init>" {
-            self.ensure_classfile_members_loaded(owner, &jvm_ctor_gname, span);
+            self.ensure_external_ctor_defaults(owner, span);
         }
         let lookup_getter = |st: &crate::symbol::SymbolTable, owner: SymbolId, name: &str| {
             st.lookup_member(owner, name)

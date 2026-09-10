@@ -3022,6 +3022,7 @@ object Main {
             jvm_name: "enrich/package$".into(),
             is_module: true,
             methods: vec![ClasspathMethod {
+                access: 0x0001,
                 name: "Rich".into(),
                 desc: "(I)Lenrich/package$Rich;".into(),
             }],
@@ -3048,6 +3049,7 @@ object Main {
             jvm_name: "enrich/package$Rich".into(),
             is_module: false,
             methods: vec![ClasspathMethod {
+                access: 0x0001,
                 name: "twice".into(),
                 desc: "()I".into(),
             }],

@@ -146,6 +146,8 @@ pub(crate) enum CtorDelegation {
 /// A method recovered from a classfile (JVM descriptor).
 #[derive(Clone, Debug)]
 pub struct ClasspathMethod {
+    /// Actual JVM access flags, retained across the directory classpath reader.
+    pub access: u16,
     pub name: String,
     pub desc: String,
 }

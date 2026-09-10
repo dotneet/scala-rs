@@ -512,18 +512,6 @@ impl<'a> Gen<'a> {
     ///
     /// The module's methods forward to the statics rather than repeating the
     /// bodies, so there is one copy of each and both ABIs work.
-    /// The companion a plain class needs only because a constructor default
-    /// lives in a **later parameter clause**.
-    ///
-    /// Such a default may name a parameter of an earlier clause, so its
-    /// `$lessinit$greater$default$n` takes those parameters and cannot be
-    /// replaced by splicing the default's expression at the call site.
-    /// `Typer::needs_ctor_default_companion` declares the module for exactly
-    /// that shape, as nsc does -- `javap` on scalac 2.13.16's
-    /// `class Curr(a: Int)(b: String = "b" + a)` shows a `Curr$` holding
-    /// `$lessinit$greater$default$2(int)` -- and this writes its classfile.
-    /// Without it the call links against a `Curr$` that was never emitted and
-    /// dies with `NoClassDefFoundError`.
     /// Whether this class's companion exists *only* to hold constructor
     /// default getters, and so has no `ModuleDef` of its own to be emitted
     /// from.

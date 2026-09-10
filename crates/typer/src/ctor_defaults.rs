@@ -28,16 +28,10 @@
 //! picks up every `$default$` member of a class it emits and writes the body
 //! out, so no codegen of its own is needed.
 //!
-//! Two restrictions, both matching what the rest of the compiler already does:
-//!
-//! * only a class that *has* a companion module gets them. nsc synthesizes one
-//!   for a plain `class C(a: Int, b: Int = 7)` with no companion; doing that
-//!   here would add classfiles, so `new C(1)` from a separately compiled
-//!   caller stays unsupported (see `docs/not-implemented.md`).
-//! * a constructor default may not name an earlier constructor parameter --
-//!   `Typer::record_default_scope` drops the class's member scope for exactly
-//!   that reason -- so the body is always closed over the getter's own
-//!   parameter list, which is the preceding *clauses* only, as in nsc.
+//! The namer synthesizes a companion whenever a primary or secondary
+//! constructor declares defaults. A default may refer to parameters in earlier
+//! clauses, but not to parameters in its own clause; the getter carries those
+//! preceding clauses and is typed in the definition's scope.
 
 use crate::check::Typer;
 use crate::symbol::SymKind;

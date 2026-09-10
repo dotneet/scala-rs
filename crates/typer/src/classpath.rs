@@ -199,6 +199,25 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         // (this scan does not read jars at all; `-cp somedir` does) got no
         // `<init>` from any path.
         ensure_interface_ctor(st, owner);
+        // The eager ScalaSignature subset does not carry accessor visibility.
+        // Its term slot corresponds to the actual nullary JVM getter. Match
+        // that getter, not every method in a same-named overload family.
+        for method in &c.methods {
+            if !method.desc.starts_with("()") {
+                continue;
+            }
+            for id in st.lookup_member(owner, &method.name) {
+                if st.get(id).owner != owner || st.get(id).kind != SymKind::Term {
+                    continue;
+                }
+                if method.access & 0x0002 != 0 {
+                    st.get_mut(id).flags = st.get(id).flags.with(Flags::PRIVATE);
+                }
+                if method.access & 0x0004 != 0 {
+                    st.get_mut(id).flags = st.get(id).flags.with(Flags::PROTECTED);
+                }
+            }
+        }
     }
 
     attach_classpath_parents(st, classes, &installed);
@@ -416,6 +435,12 @@ fn install_ctor(
             st.get_mut(fid).flags = flags;
         }
         mark_via_accessor(st, fid, &pname, accessors);
+        // A constructor argument alone does not declare a public member.
+        // A published getter provides that member; without one this slot is
+        // private storage/prototype information, not an externally readable val.
+        if !accessors.contains(&scala_rs_pickle::names::encode_method_name(&pname)) {
+            st.get_mut(fid).flags = st.get(fid).flags.with(Flags::PRIVATE).with(Flags::LOCAL);
+        }
         fields.push(fid);
     }
     st.get_mut(owner).ctor_fields = fields.clone();

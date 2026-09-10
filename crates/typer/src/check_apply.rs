@@ -249,6 +249,12 @@ impl Typer {
                 .or(Some(fun.sym))
                 .filter(|s| !s.is_none());
             let class_id = class_id.or_else(|| self.st.class_sym_of(&fun.ty));
+            // Prelude Java classes may have members without their complete
+            // constructor overload set. Read the actual classfile before
+            // choosing prototypes or overloads, independent of prior uses.
+            if let Some(c) = class_id {
+                self.ensure_java_loaded(c, fun.span);
+            }
             // `new C(b = 2, a = 1)`: named arguments must be put in parameter
             // order before the constructor overload is picked, since the pick
             // is driven by the argument types.
@@ -597,6 +603,11 @@ impl Typer {
                     }
                     self.adapt(a, &p);
                 }
+            }
+            // String's source type has a structural representation, while
+            // constructor selection uses its exact java.lang.String symbol.
+            if class_id == Some(self.st.string_sym) {
+                tree.ty = Type::String;
             }
             tree.sym = ctor_sym.or(class_id).unwrap_or(SymbolId::NONE);
             if let Some(csym) = ctor_sym {

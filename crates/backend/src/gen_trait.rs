@@ -3018,6 +3018,11 @@ impl<'a> Gen<'a> {
                 let TreeKind::ValDef { name, mods, .. } = &p.kind else {
                     continue;
                 };
+                // Eager private-this storage has no accessor in Scala's ABI.
+                if mods.flags.contains(Flags::LOCAL) {
+                    continue;
+                }
+                let access = method_access_flags(mods.flags, widened(self.st, p.sym));
                 let is_val = mods.flags.contains(Flags::ACCESSOR)
                     || (class_is_case
                         && clause_idx == 0
@@ -3043,7 +3048,7 @@ impl<'a> Gen<'a> {
                     let cn = class_name.clone();
                     let fd = fdesc.clone();
                     let ret_ty = ty.clone();
-                    b.add_code(ACC_PUBLIC, name, &getter, 1, move |asm| {
+                    b.add_code(access, name, &getter, 1, move |asm| {
                         asm.aload(0);
                         emit_getfield(asm, &cn, &fname, &fd);
                         emit_return(asm, &ret_ty);
@@ -3095,7 +3100,7 @@ impl<'a> Gen<'a> {
                         let cn = class_name.clone();
                         let fd = fdesc.clone();
                         let sort = jvm_slot_sort(&ty);
-                        b.add_code(ACC_PUBLIC, &setter_name, &setter, 3, move |asm| {
+                        b.add_code(access, &setter_name, &setter, 3, move |asm| {
                             asm.aload(0);
                             load(asm, 1, sort);
                             asm.putfield(&cn, &fname, &fd);
@@ -3113,9 +3118,10 @@ impl<'a> Gen<'a> {
             let TreeKind::ValDef { name, mods, .. } = &stt.kind else {
                 continue;
             };
-            if mods.flags.contains(Flags::LAZY) {
+            if mods.flags.contains(Flags::LAZY) || mods.flags.contains(Flags::LOCAL) {
                 continue;
             }
+            let access = method_access_flags(mods.flags, widened(self.st, stt.sym));
             let ty = if stt.ty.is_no_type() && !stt.sym.is_none() {
                 self.st.get(stt.sym).ty.clone()
             } else {
@@ -3129,7 +3135,7 @@ impl<'a> Gen<'a> {
             let fdesc = jvm_desc_val(self.st, &ty);
             let ret_ty = ty.clone();
             let cls = class_name.clone();
-            b.add_code(ACC_PUBLIC, &fname, &desc, 1, |asm| {
+            b.add_code(access, &fname, &desc, 1, |asm| {
                 asm.aload(0);
                 emit_getfield(asm, &cls, &fname, &fdesc);
                 emit_return(asm, &ret_ty);
@@ -3149,7 +3155,7 @@ impl<'a> Gen<'a> {
             let cls = class_name.clone();
             let sort = jvm_slot_sort(&ty);
             b.add_code(
-                ACC_PUBLIC,
+                access,
                 &setter,
                 &format!("({fdesc})V"),
                 1 + sort.slots(),

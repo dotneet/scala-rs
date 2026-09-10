@@ -526,6 +526,9 @@ public final class ScalaRsMacroEngine {
     static Object buildArgument(Sexp a) throws Exception {
         boolean asExpr = "expr".equals(a.items.get(1).atom);
         Object tree = buildTree(a.items.get(2));
+        // Expr's weak tag remains Nothing, but its already-typed argument
+        // tree carries the actual source type, including literal constants.
+        call(tree, "setType", 1, typeFor(a.items.get(4)));
         return asExpr ? mkExpr(tree, buildTag(a.items.get(3))) : tree;
     }
 

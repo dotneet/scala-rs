@@ -861,11 +861,14 @@ impl Typer {
                 if repeated && index == fixed {
                     out.push_str(" (repeat");
                     for arg in &clause[index..] {
-                        argument_to_wire(arg, as_expr, &mut out)?;
+                        let actual = self.tag_wire(macro_argument_type(arg), &mut placeholders)?;
+                        argument_to_wire(arg, as_expr, &actual, &mut out)?;
                     }
                     out.push(')');
                 } else {
-                    argument_to_wire(&clause[index], as_expr, &mut out)?;
+                    let actual =
+                        self.tag_wire(macro_argument_type(&clause[index]), &mut placeholders)?;
+                    argument_to_wire(&clause[index], as_expr, &actual, &mut out)?;
                 }
             }
             out.push(')');
@@ -2189,7 +2192,16 @@ pub(crate) fn application_fun_to_wire(fun: &Tree, out: &mut String) -> Result<()
     }
 }
 
-fn argument_to_wire(t: &Tree, as_expr: bool, out: &mut String) -> Result<(), String> {
+// nsc passes a spliced repeated argument as one Expr whose tree type is the
+// element type, not the typer's internal repeated-parameter marker.
+fn macro_argument_type(arg: &Tree) -> &Type {
+    match &arg.ty {
+        Type::Repeated(elem) => elem,
+        ty => ty,
+    }
+}
+
+fn argument_to_wire(t: &Tree, as_expr: bool, actual: &str, out: &mut String) -> Result<(), String> {
     out.push_str(if as_expr {
         " (arg expr "
     } else {
@@ -2198,10 +2210,13 @@ fn argument_to_wire(t: &Tree, as_expr: bool, out: &mut String) -> Result<(), Str
     tree_to_wire(t, out)?;
     // nsc uses Expr[Nothing] for value arguments, not the argument's type.
     out.push_str(if as_expr {
-        " (ty \"scala.Nothing\"))"
+        " (ty \"scala.Nothing\")"
     } else {
-        " (ty \"\"))"
+        " (ty \"\")"
     });
+    out.push(' ');
+    out.push_str(actual);
+    out.push(')');
     Ok(())
 }
 

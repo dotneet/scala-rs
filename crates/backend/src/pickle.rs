@@ -2070,7 +2070,13 @@ impl<'a> Pickler<'a> {
                         // `<notype>` and died in its own backend
                         // (`unexpected type representation`) on the first call
                         // it rewrote to `Ops$.MODULE$.inc$extension`.
-                        self.pickle_val(m, idx, is_case && ctor_field, ctor_field);
+                        let storage_only = self.st.get(m).flags.contains(Flags::LOCAL)
+                            && !self.st.get(m).flags.contains(Flags::LAZY)
+                            && !class_flags.contains(Flags::TRAIT)
+                            && !self.st.get(m).deferred_val;
+                        if !storage_only {
+                            self.pickle_val(m, idx, is_case && ctor_field, ctor_field);
+                        }
                     }
                 }
                 SymKind::Method => {
@@ -2558,6 +2564,19 @@ impl<'a> Pickler<'a> {
             // method parameter. Reflection must not report `var x` here.
             let mut parameter_flags = *pflags;
             parameter_flags.set(Flags::MUTABLE, false);
+            if meth_name == "<init>" {
+                // Constructor storage and its argument share a source symbol.
+                // Visibility, finality and accessor bits describe the field,
+                // not the constructor's immutable argument.
+                parameter_flags = Flags(
+                    parameter_flags.0
+                        & (Flags::PARAM.0
+                            | Flags::IMPLICIT.0
+                            | Flags::BYNAME.0
+                            | Flags::DEFAULTPARAM.0
+                            | Flags::SYNTHETIC.0),
+                );
+            }
             let flags = pickled_from_our(parameter_flags, SymKind::Term, extra);
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
             param_refs.push(self.add(VALSYM, body));
@@ -2836,7 +2855,12 @@ impl<'a> Pickler<'a> {
     /// Private storage uses nsc's trailing-space name and a direct field type.
     fn pickle_storage_field(&mut self, val_id: SymbolId, owner_ref: u32, param: bool) {
         let s = self.st.get(val_id);
-        let name = format!("{} ", s.name);
+        let local = s.flags.contains(Flags::LOCAL);
+        let name = if local {
+            s.name.clone()
+        } else {
+            format!("{} ", s.name)
+        };
         let ty = s.ty.clone();
         // Accessor flags (implicit, override, protected and parameter) do
         // not describe its private storage. nsc copies only field modifiers.
@@ -2848,7 +2872,10 @@ impl<'a> Pickler<'a> {
         let extra = (1u64 << 2) | (1 << 19) | if param { 1 << 29 } else { 0 };
         let flags = pickled_from_our(flags_our, kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, ty_ref);
-        let _ = self.add(VALSYM, body);
+        let idx = self.add(VALSYM, body);
+        if local {
+            self.sym_index.insert(val_id.0, idx);
+        }
     }
 
     fn pickle_val(

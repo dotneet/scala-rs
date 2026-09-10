@@ -6,6 +6,8 @@ use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub struct LoadedMethod {
+    /// Actual JVM access flags, retained across the directory classpath reader.
+    pub access: u16,
     pub name: String,
     pub desc: String,
 }
@@ -74,13 +76,14 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
     let nmethods = c.u2()? as usize;
     let mut methods = Vec::new();
     for _ in 0..nmethods {
-        let _acc = c.u2()?;
+        let access = c.u2()?;
         let name_i = c.u2()?;
         let desc_i = c.u2()?;
         let name = cp.utf8(name_i)?;
         let desc = cp.utf8(desc_i)?;
         if name != "<init>" && name != "<clinit>" {
             methods.push(LoadedMethod {
+                access,
                 name: decode_method_name(&name),
                 desc,
             });
