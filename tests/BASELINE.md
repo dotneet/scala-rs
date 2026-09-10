@@ -11,12 +11,13 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `73f68974` |
+| commit | `603b6451` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Forty-four composed gates have been accepted this session**, covering the earlier
-ninety-nine slices and this combined type-identity/macro-transport batch.
+**Forty-five composed gates have been accepted this session**, covering the earlier
+ninety-nine slices, the type-identity/macro-transport batch, and the combined
+SQL, constructor-storage, value-class-access and reflection-parent batch.
 Twenty intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -68,6 +69,7 @@ coordinator measured the merged tree each time, not the branches.
 | `3343f368` | seven member/application mechanisms | 188 -> **169** | 139 -> **125** |
 | `23031519` | five evidence/default-import mechanisms with namespace integration | 169 -> **158** | 125 -> **121** |
 | `73f68974` | type identity, binary implicit objects, macro transport and source ownership | 158 -> **157** | 121 |
+| `603b6451` | SQL macro argument types, Java constructors, storage/access/defaults and reflection parents | 157 -> **148** | 121 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -273,9 +275,9 @@ specialization remain explicitly red; this is not a completion claim.
 
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
-| `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
+| `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **121** | **54** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **157** | **57** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **148** | **54** | — |
 | `tests/scalalib_measure.sh` (538) | **440** | **118** | — |
 
 ## Execution
@@ -284,9 +286,9 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---|
 | `MODE=b tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0 runs=3 attempts=36/36` |
 | `MODE=a tests/slick_run.sh` | **RED**: all 12 client programs fail to compile; no execution attempts |
-| `tests/slick_subset.sh` | `subset_files=184 classes=1492 verified=1492 failed=0` |
+| `tests/slick_subset.sh` | `subset_files=184 classes=1504 verified=1504 failed=0` |
 | `tests/classfile_lint.py` (via subset / slick_run) | `lint_problems=0` |
-| `tests/verify_all.sh <slick out>` | `verify_classes=1492 verify_loaded=1492 verify_failures=0 verify_incomplete=0` |
+| `tests/verify_all.sh <slick out>` | `verify_classes=1504 verify_loaded=1504 verify_failures=0 verify_incomplete=0` |
 
 The stronger Slick verification includes the real PostgreSQL 42.7.13 driver,
 Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
@@ -297,13 +299,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1124** | 390 | 345 |
+| `pos` (1859) | **1126** | 388 | 345 |
 | `neg` (1405) | **711** | 325 | 369 |
-| `run` (2060) | **677** | 830 | 553 |
+| `run` (2060) | **678** | 829 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-73f68974.tsv`](baselines/corpus-73f68974.tsv): 5324 unique
+[`baselines/corpus-603b6451.tsv`](baselines/corpus-603b6451.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `603b6451` gate compared against `corpus-73f68974.tsv`: **losses=0,
+changes=3**: pos/sudoku, pos/t1075 and run/verify-ctor now pass.
+
 The `73f68974` gate compared against `corpus-23031519.tsv`: **losses=0,
 changes=38** (27 runtime gains and 11 formerly accepted negative programs now
 rejected). Positive counts are unchanged.
@@ -423,15 +428,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **302 result rows, 2723 passed, 0 failed** at `73f68974` |
+| `cargo test --workspace --release --no-fail-fast` | **303 result rows, 2729 passed, 0 failed** at `603b6451` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-macro-transport/owner-clippy.jsonl` and
-`/tmp/scala-rs-macro-transport/owner-clippy-compare.json`.
+`/tmp/scala-rs-sql-constructor-storage/reflection-prerequisites/clippy.log` and
+`/tmp/scala-rs-sql-constructor-storage/reflection-prerequisites/clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -2636,5 +2641,92 @@ export and remaining private/lazy boundaries are separately inventoried.
   HEAD=b2502886  logs=/tmp/scala-rs-gate-b2502886-codex
   fail: corpus losses=1 vs tests/baselines/corpus-73f68974.tsv
 VERDICT=FAIL
+DONE
+```
+
+
+## Gate forty-five: SQL, constructor storage, value-class access and reflection parents
+
+Frozen composed commit `603b6451035c5b35daab28a4783437665756552a`, tree
+`8f7afaca580173b406a2b8f08b0c23299708f7a8`, completed the full unskipped
+gate with PASS/DONE. Main was fast-forwarded to that exact tested commit.
+The subsequent handover commit changes only this record and the raw corpus
+ledger; no compiler source, Cargo input, fixture or gate script differs from
+the tested tree. The dedicated integration worktree remains frozen and clean.
+Logs: `/tmp/scala-rs-gate-603b6451-codex/`. Complete ledger:
+[`baselines/corpus-603b6451.tsv`](baselines/corpus-603b6451.tsv).
+
+Gitbucket improves 157 errors / 57 files to **148 / 54**. The diagnostic
+multiset removes nine locations with no added errors. Cats stays **121 / 54**
+with identical diagnostics. Library stays **440 / 118**, with only three
+anonymous-class numeric identifiers changed. These are compile measures;
+gitbucket and cats still do not compile successfully.
+
+Slick compiles all **184 sources**, with **zero errors and 1504 classes**.
+The twelve added named default-companion classes were audited against real
+scalac output before changing the gate's exact class-count expectation.
+MODE=b executes **12/12 programs, 36/36 attempts**, with no output differences.
+Subset byte verification passes 1504 classes and lint_problems=0. The additional
+strong JVM initialization sweep on this gate's actual slick-classes output
+reports verify_classes=1504, verify_loaded=1504, verify_failures=0 and
+verify_incomplete=0. Its binary is byte-identical to the prerequisite binary,
+SHA256 `bd028a67121980c39bea7b2f1a607ad600495154d865266991fdd7da35a66510`.
+
+Workspace: **303 result rows, 2729 passed, zero failed**. Format passes.
+Release workspace clippy retains exactly **57** warning messages, with no
+additions or removals. Corpus: **pos 1126/388/345, neg 711/325/369,
+run 678/829/553** (pass/fail/skip), all 5324 identities present, **losses=0,
+changes=3**. Gains are pos/sudoku, pos/t1075 and run/verify-ctor.
+Both prior rejected candidates' losses, run/indylambda-boxing and
+run/var-arity-class-symbol, are recovered. Their full failed ledgers and
+records remain preserved; only this composed PASS tree is integrated.
+
+The batch completes Java constructor members before selection and preserves
+java.lang.String's canonical result type. Real Slick sql/sqlu macro arguments
+now carry their actual tree types independently of Expr's weak type tag,
+including repeated argument elements. Constructor storage, source visibility,
+qualified/protected-this/widened accessors, actual public classfile fields,
+value-class default companions and unboxing getter identities are handled
+together. Macro placeholder reports are deduplicated without hiding errors.
+Fixtures execute real parameter binding and all four API producer/consumer
+pairs with scalac 2.13.16; independent invalid programs preserve rejection.
+
+The final reflection correction preserves structural FunctionN parents when
+converting pickled class parents, including their Scala argument types.
+The previous preservation of Scala parent lists exposed that omitted parent;
+it was not a simple JVM descriptor mismatch. VarArityClassApi inherits apply
+from Function1 and does not declare it itself. The new positive fixture runs
+Tuple/Function/Product arity checks under both compilers, while an independent
+String-argument probe is rejected by both. The earlier ee80 binary accepted
+that invalid String argument; b250 rejected the valid program. This repairs a
+silent false acceptance in addition to the recorded corpus regression.
+
+Prerequisites were completed before this full gate: 18 focused tests in four
+suites, 595 related tests in twelve suites, all 1405 negative corpus units,
+769 selected positive/runtime units including the exact prior losses, and
+Slick's full runtime and strong class verification. Environment preflight
+validated four pinned source trees, 121 jars, 33 Java support classes and
+1498 cached scalac reference classes. The gate was launched once and followed
+through DONE with its owned handle; observation timeouts did not restart it.
+
+Inventory for the next composed batch is recorded in
+`/tmp/scala-rs-sql-constructor-storage/next-batch-inventory.md` and its
+forms-inventory, operator-inventory and cats-warm-inventory subdirectories.
+Real Forms inferred-subclass mapping, nested repeated type constraints,
+operator/member/type export and escaping, and warmed collection return types
+are separately reproduced. The ArraySeq two-file probe reproduces grouped,
+sliding and scanLeft/scanRight failures in both source orders; SortedMap.keySet
+also fails in one file. These were confirmed with accepted73 and this candidate,
+not assumed from the unmerged worktree report. A dotted backtick method is a
+pre-existing silent ClassFormatError, confirmed on both binaries. Actual nsc
+reflection isolates unencoded ScalaSignature operator names from correctly
+encoded JVM names. None of these future repairs is claimed as implemented.
+Collect the supported low/medium changes into a batch, retaining especially
+interacting inference or collection supply redesign separately when warranted.
+
+```text
+=== summary
+  HEAD=603b6451  logs=/tmp/scala-rs-gate-603b6451-codex
+VERDICT=PASS
 DONE
 ```
