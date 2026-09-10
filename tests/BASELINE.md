@@ -20,7 +20,7 @@ ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch.
-Twenty-one intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-two intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2978,5 +2978,54 @@ Exact summary block:
 === summary
   HEAD=913fb1c0  logs=/tmp/scala-rs-gate-913fb1c0-codex
 VERDICT=PASS
+DONE
+```
+
+
+## Rejected dependent adaptation candidate: `5ddf4fc9`
+
+Frozen commit `5ddf4fc97097a58cb117e946cfa33fe9dda238ae`, tree `f0b49018abe4515be49e07fbcbcdc1c8890b57f6`,
+completed the unskipped full gate with VERDICT=FAIL and DONE in
+1343.6 seconds. It is not approved for main; accepted compile
+numbers and the baseline ledger above remain at 913fb1c0.
+Logs: `/tmp/scala-rs-gate-5ddf4fc9-codex/`; raw ledger:
+[`baselines/corpus-5ddf4fc9.tsv`](baselines/corpus-5ddf4fc9.tsv).
+
+The workspace run has 306 result rows, 2752 passed and 1 failed.
+The sole failure is batchtypes::either_companion_matches_scalac, at creation of
+its root directory: AlreadyExists / File exists at batchtypes.rs:13. This is
+before case compilation. A census finds timestamp-only naming without an
+independent nonce in 40 CLI test files; the follow-up adds a shared monotonic
+process-specific stamp and deterministic same-time/concurrent/reversed-clock
+checks. Compiler sources and Scala fixtures are unchanged in that follow-up.
+
+All 5324 corpus identities are present, losses=0, changes=20.
+Counts: {"neg": {"fail": 323, "pass": 713, "skip": 369}, "pos": {"fail": 367, "pass": 1147, "skip": 345}, "run": {"fail": 824, "pass": 683, "skip": 553}}.
+Slick remains zero errors, 1504 classes, all 12 programs and 36/36 byte-exact
+runtime attempts. Subset class validation and lint pass. Independent strong
+JVM verification loads and initializes all 1504 classes, failures=0,
+incomplete=0. Cats is 90/37, gitbucket 105/49 on the unchanged full 354-source
+input plus three actual Java files, and library 421/114. These are candidate
+measurements, not accepted baseline numbers. Compared with 913fb1c0, diagnostic
+locations remove 13 cats, three gitbucket and 18 library errors, with no new
+locations; three existing library locations have changed type wording.
+
+The seven-mechanism batch was checked against real scalac2.13.16 and exact
+runtime output. Broad prerequisites passed 1567 CLI tests and 198 typer tests.
+Selected corpus prerequisites caught four regressions before the full gate:
+t8310, t3619, saito and t1623. They were repaired together with added independent
+runtime and rejection controls; final prerequisites pass 520 CLI tests,
+198 typer tests, 1390 selected pos/run units (zero losses, 14 gains), all
+1405 negatives (zero losses, one gain), format, unchanged 57 clippy warnings,
+and the source/jar/cache preflight. All intermediate prerequisite ledgers are
+retained under /tmp/scala-rs-dependent-adaptation. No subagents or stubs.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=5ddf4fc9  logs=/tmp/scala-rs-gate-5ddf4fc9-codex
+  fail: workspace tests: 306 rows, 2752 passed, 1 failed
+VERDICT=FAIL
 DONE
 ```
