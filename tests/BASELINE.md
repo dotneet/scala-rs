@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `a7f05f48` |
+| commit | `e355ab70` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Eighty-two slices have merged this session**, in thirty-eight accepted composed gates.
+**Eighty-three slices have merged this session**, in thirty-nine accepted composed gates.
 Thirteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -61,6 +61,7 @@ coordinator measured the merged tree each time, not the branches.
 | `02317f15` | `inherited factory redirect` | 202 -> **192** | 158 |
 | `176629aa` | `partial factory inference` | 192 -> **191** | 158 -> **152** |
 | `a7f05f48` | `App and DelayedInit identities` | 191 | 152 |
+| `e355ab70` | `directory Scala signatures` | 191 | 152 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -290,13 +291,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1118** | 396 | 345 |
+| `pos` (1859) | **1119** | 395 | 345 |
 | `neg` (1405) | **700** | 336 | 369 |
 | `run` (2060) | **643** | 864 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-a7f05f48.tsv`](baselines/corpus-a7f05f48.tsv): 5324 unique
+[`baselines/corpus-e355ab70.tsv`](baselines/corpus-e355ab70.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `e355ab70` gate compared against `corpus-a7f05f48.tsv`: **losses=0,
+changes=1**, the positive gain `t7264`.
+
 The `a7f05f48` gate compared against `corpus-176629aa.tsv`: **losses=0,
 changes=0**.
 
@@ -397,7 +401,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **294 result rows, 2702 passed, 0 failed** at `a7f05f48` |
+| `cargo test --workspace --release --no-fail-fast` | **295 result rows, 2703 passed, 0 failed** at `e355ab70` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -1915,3 +1919,48 @@ reference classes. One owned live handle was monitored through DONE.
 This fixes the App collision left open by gate thirty-seven despite moving
 none of the four compile counts or corpus totals. Class-directory signature
 metadata loss remains an open investigation; gitbucket and cats are incomplete.
+
+## Gate thirty-nine: complete directory Scala signatures
+
+Clean `e355ab70`, based on main `26165bca`, passed the complete unskipped
+merge gate with `VERDICT=PASS`, `DONE`, corpus losses=0 and changes=1.
+Logs: `/tmp/scala-rs-gate-e355ab70-codex/gate.log`. Main was fast-forwarded
+to the exact tested commit. The recording commit changes only BASELINE and
+the raw corpus ledger; compiler sources and tests match the gated tree.
+
+All four compile measures are unchanged: gitbucket 191/63, cats 152/58,
+library 460/119; Slick 184 sources, zero errors and 1492 classes. The three
+error-message multisets exactly match accepted `a7f05f48`. Slick MODE=b
+passes 12/12 programs and 36/36 attempts. Subset validates all 1492 classes,
+failed 0 and lint problems 0. Strong initialization verification with the
+real PostgreSQL and Oracle drivers loads all 1492 retained classes, failed
+0 and incomplete 0. Class output and `verify-all.log` remain in the gate directory.
+
+Workspace: 2703 passed, zero failed, 295 rows. Format passes. Release
+workspace clippy retains exactly 57 warning messages with no additions.
+Corpus: pos 1119/395/345, neg 700/336/369, run 643/864/553 (pass/fail/skip).
+All 5324 identities are present; only pos/t7264 changes from fail to pass.
+Raw ledger: `tests/baselines/corpus-e355ab70.tsv`.
+
+Directory classpath scanning supplied shallow Scala declarations. Existing
+member names then bypassed full signature loading, losing implicit clauses
+and generic parent arguments. Selection now completes pending binary Scala
+signatures, including full parents and ancestor completion. The hypothesis
+was confirmed with fresh real-scalac classfiles: the same bytes behaved
+differently in a directory and a jar. Merely adopting own members was
+insufficient; inherited generic parents also required completion.
+
+The new dirsig test compiles a library with real scalac, packages the same
+classfiles into a jar, and checks both classpath forms against scalac for
+acceptance and rejection. Positive programs run under -Xverify:all and their
+stdout matches byte for byte. The accepted pre-fix binary rejects the valid
+directory program and incorrectly accepts flattened argument lists. The
+repair handles inherited type arguments, lower bounds and implicit evidence;
+missing evidence and flattened clauses remain rejected in both forms.
+Evidence: `/tmp/scala-rs-classdir-probe/`.
+
+Before this gate, 542 focused and related tests passed, and all 18 recorded
+corpus regression identities were unchanged. Preflight verified four pinned
+source trees, 121 jars, 33 Java support classes and 1498 reference classes.
+One owned gate execution was followed through DONE with the consolidated
+phase/failure watcher; no gate step was restarted or skipped.
