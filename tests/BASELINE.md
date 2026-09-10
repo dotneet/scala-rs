@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Eighty slices have merged this session**, in thirty-six accepted composed gates.
-Eleven intermediate candidates were rejected, three despite a PASS script verdict. From
+Twelve intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -1715,3 +1715,50 @@ Before the gate, 535 new/boundary tests and 97 additional related tests
 passed. Seventeen historical corpus cases had losses=0, changes=0. Source,
 jar and cache preflight passed: four sources, 121 jars, 33 Java classes and
 1498 reference classes. Gitbucket and cats still do not compile fully.
+
+
+## Rejected partial-factory inference candidate: `41cd9040`
+
+Clean `41cd9040`, based on main `ac22b8f0`, completed the full unskipped
+merge gate with `VERDICT=FAIL` and `DONE`. Logs:
+`/tmp/scala-rs-gate-41cd9040-codex/gate.log`. No candidate implementation
+is merged; the accepted compiler baseline remains `02317f15`.
+
+Cats improves 158/59 -> 152/58 and gitbucket 192/63 -> 191/63. The library
+remains 460/119. Slick regresses from zero errors and 1492 classes to five
+errors in two files, with zero classes from the full compile. Two errors
+are Resource.allocated results left as implicit method types in BasicBackend;
+three are collection inference failures in RewriteJoins. Slick execution
+cannot compile, so no runtime success is claimed. The subset reaches only
+82 of 184 files and 638 classes (verified 638, failed 0, lint problems 0).
+This is not complete Slick validation and independently prohibits merging.
+
+Workspace passes 2699 tests, zero failed (293 result rows); format passes.
+Corpus compares all 5324 identities with losses=0 and changes=1. Counts
+(pass/fail/skip): pos 1118/396/345, neg 700/336/369, run 643/864/553.
+The only gain is run/var-arity-class-symbol. Raw candidate ledger:
+`tests/baselines/corpus-41cd9040.tsv`.
+
+Before the gate, 22 related tests and 534 supply-boundary tests passed.
+Seventeen historical corpus identities were unchanged against the accepted
+ledger. Preflight checked four pinned source trees, 121 jar archives,
+33 Java support classes and 1498 scalac reference classes. Monitoring used
+one owned live gate handle through DONE. The tested worktree remained clean.
+
+The candidate preserves factory receiver parameters until the returned apply
+can constrain them, and loads binary nested apply members through classfile
+completion. Source/binary runtime probes match scalac 2.13.16 and reject
+missing evidence and conflicting constraints. Preserving lower-bounded
+result parameters also exposes incomplete call-site inference previously
+hidden by declaration-time pinning. That proposed cause must be confirmed
+against the five Slick failures before another gate. The first standalone
+Resource reduction also fails on the accepted compiler, so it is not yet
+a regression-specific reproduction. Evidence is under
+`/tmp/scala-rs-partial-regression-41cd9040`.
+
+A separate real-scalac runtime probe with a user-defined App[F[_]] exposed
+an erroneous scala.App initialization and IncompatibleClassChangeError.
+It remains unrepaired; evidence is in `/tmp/scala-rs-partial-probe`.
+This recording commit changes only BASELINE and the candidate ledger;
+main's compiler sources and tests remain unchanged. Clippy was not rerun
+for this rejected candidate; no new clippy-success claim is made.
