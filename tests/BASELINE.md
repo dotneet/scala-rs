@@ -11,16 +11,17 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `b969b0d1` |
+| commit | `96c0abb3` |
 |---|---|
 | updated | 2026-09-11 |
 
-**Forty-eight composed gates have been accepted this session**, covering the earlier
+**Forty-nine composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch, and the dependent
-result, SAM, implicit override and self-type batch.
+result, SAM, implicit override and self-type batch, and the combined contextual,
+lexical, source-unit ownership and erased field-access batch.
 Twenty-five intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -76,6 +77,7 @@ coordinator measured the merged tree each time, not the branches.
 | `9cc076f6` | nested Forms inference, encoded names, literal types and nested class ownership | 148 -> **115** | 121 |
 | `913fb1c0` | collection results, evidence factories, Java members and full gitbucket inputs | **108** (115 on historical inputs) | 121 -> **103** |
 | `b969b0d1` | dependent results, SAM inference, implicit overrides and self types | 108 -> **105** | 103 -> **90** |
+| `96c0abb3` | contextual inference, lexical scope, source-unit identity and erased field access | 105 -> **99** | 90 -> **83** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -282,9 +284,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **90** | **37** | — |
-| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **105** | **49** | — |
-| `tests/scalalib_measure.sh` (538) | **421** | **114** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **83** | **34** | — |
+| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **99** | **46** | — |
+| `tests/scalalib_measure.sh` (538) | **415** | **113** | — |
 
 Gate `913fb1c0` expanded gitbucket input coverage: that candidate on the previous
 353-source, Java-disabled input reported **115/54**. Its expanded **108/52** result
@@ -293,7 +295,7 @@ This difference is not reported as a compiler-only improvement.
 
 The file counts above are the scripts' reported metric (`grep -A 2` after
 error headers). Multiline diagnostics can escape that two-line window. The
-complete current diagnostic parser finds 37 cats, 50 gitbucket and 123 library
+complete current diagnostic parser finds 34 cats, 49 gitbucket and 122 library
 source paths with errors. Error totals agree exactly; measurement inputs have
 not changed in this gate.
 
@@ -316,13 +318,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1147** | 367 | 345 |
-| `neg` (1405) | **713** | 323 | 369 |
-| `run` (2060) | **683** | 824 | 553 |
+| `pos` (1859) | **1150** | 364 | 345 |
+| `neg` (1405) | **718** | 318 | 369 |
+| `run` (2060) | **689** | 818 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-b969b0d1.tsv`](baselines/corpus-b969b0d1.tsv): 5324 unique
+[`baselines/corpus-96c0abb3.tsv`](baselines/corpus-96c0abb3.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `96c0abb3` gate compared against `corpus-b969b0d1.tsv`: **losses=0,
+changes=14**: neg/i10715b, neg/no-implicit-to-anyref-any-val, neg/t473, neg/unit2anyref, neg/val_sig_infer_match, pos/t2660, pos/t4812, pos/t927, run/reflection-sync-potpourri, run/t11196, run/t3502, run/t6928-run, run/t7223, run/t7436.
+
 The `b969b0d1` gate compared against `corpus-913fb1c0.tsv`: **losses=0,
 changes=20**: neg/sammy_expected, pos/context, pos/depmet_1_pos, pos/sammy_exist, pos/sammy_scope, pos/scoping1, pos/scoping3, pos/t0039, pos/t10418_bounds, pos/t1049, pos/t1050, pos/t10792, pos/t11558, pos/t3371, pos/t360, pos/t361, pos/t372, pos/t3861, run/t6443, run/try-catch-unify.
 
@@ -455,15 +460,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **307 result rows, 2755 passed, 0 failed** at `b969b0d1` |
+| `cargo test --workspace --release --no-fail-fast` | **311 result rows, 2779 passed, 0 failed** at `96c0abb3` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-dependent-adaptation/harness/clippy-phase.log` and
-`/tmp/scala-rs-dependent-adaptation/harness/clippy-compare.json`.
+`/tmp/scala-rs-field-scope/integrated-prerequisites/clippy-phase.log` and
+`/tmp/scala-rs-field-scope/integrated-prerequisites/clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -3439,5 +3444,84 @@ Exact summary block:
   fail: slick_run: slick compile failed; see /private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun/w-lexical-context-693f8966/rs.log
   fail: slick_subset: verified=0 failed=0 classfile_lint: no class files subset_files=120 classes=0 (of 184 sources)
 VERDICT=FAIL
+DONE
+```
+
+
+## Gate forty-nine: contextual, lexical and field-access integration
+
+Frozen candidate `96c0abb3558a561b78c91b9148fa6ddc0cb5e3c1`, tree `dbabc8f5c92428df02ad80d811418b289afb23ff`, contains local main
+18e258a4 and the previously rejected 693f8966 lexical-context candidate.
+No conflicts or extra source edits were introduced by that composition.
+Full gate: `/tmp/scala-rs-gate-96c0abb3-codex`, process exit 0,
+1327.2 seconds, DONE present.
+Script verdict: PASS; independent audit: PASS.
+The composed candidate is accepted on main. The handover adds only this baseline record and the raw ledger after the gate.
+The final handover differs from the gated tree only by those two record files; compiler sources, Cargo inputs and fixtures do not change after the gate.
+Push remains pending explicit destination/payload authorization after automatic
+approval review rejected the earlier attempts; no successful push is claimed.
+
+- Gitbucket: 354 Scala/Twirl sources, three actual Java sources, zero skipped;
+  105/49 -> 99/46.
+- Cats: 339 sources, one skipped; 90/37 ->
+  83/34.
+- Library: 538 sources; 421/114 ->
+  415/113.
+- Slick: 184 sources, 0 errors,
+  1504 emitted classes. Runtime: 12 clients, 36/36 byte-exact
+  attempts. Subset verifies 1504 classes, lint_problems=0. Independent strong
+  verification loads 1504, failures=0, incomplete=0.
+
+Full diagnostic identities: cats removes 7, gitbucket removes 6, library removes
+6; none adds a diagnostic or a location. Script file counts and complete
+multiline diagnostic path counts remain distinguished above.
+Workspace: 2779 passed, 0 failed,
+311 result rows. Corpus: 5324 unique identities,
+losses=0, changes=14: neg/i10715b, neg/no-implicit-to-anyref-any-val, neg/t473, neg/unit2anyref, neg/val_sig_infer_match, pos/t2660, pos/t4812, pos/t927, run/reflection-sync-potpourri, run/t11196, run/t3502, run/t6928-run, run/t7223, run/t7436.
+Counts: {"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 364, "pass": 1150, "skip": 345}, "run": {"fail": 818, "pass": 689, "skip": 553}}.
+Ledger: [`baselines/corpus-96c0abb3.tsv`](baselines/corpus-96c0abb3.tsv), SHA-256
+`a25b464ac20e96db1b8a8418e1a427688dc459b394e8263114987f654e2202d7`. MODE=a and specialization remain red and
+were not rerun. Clippy preserves the existing 57 warning occurrences.
+
+This batch groups source-unit function identities, generic Scala field store
+descriptors, lazy getter result casts, unqualified abstract field adaptation,
+array-result application and loaded lazy field/accessor identity. The earlier
+contextual and lexical candidates are included in the same composed gate.
+There are no stubs or subagents and no aggregate before remeasurement.
+The new fieldscope suite has six groups, 34 acceptance/rejection conditions,
+real scalac 2.13.16 oracles and exact JVM execution comparisons, including all
+four separate producer/consumer combinations. Its initial 25-condition matrix
+exposes 14 disagreements in the immutable pre-batch candidate. Existing
+accepted-before witnesses and the additional failed binary clients are retained.
+
+Prerequisites passed 1615 CLI tests in 153 suites and 198 typer tests; selected
+1986 pos/run identities have zero losses/eight gains, all 1405 negatives have
+zero losses/five gains. Source/jar/cache health passed: four pinned trees,
+121 jars, 33 released Java classes and 1498 reference hashes. Final early
+Slick/library compilation, all 1504 class loads and 36 runtime comparisons
+passed before the full gate. Prerequisite and gate compiler SHA-256 agree:
+`8c98b035f42b758d7ffcdc82ffb9e923e83dde675302025276376e63b82eab65`. Logs: /tmp/scala-rs-field-scope/.
+
+Prerequisite failures corrected the initial getter hypothesis: zero-argument
+Java/prelude methods cannot be inferred to be Scala parameterless getters;
+mutable getters are not identified by a stability flag alone; and Class-result
+application already has open type-parameter tracking. The final repair extends
+that existing path to arrays. Existing empty-clause and factory tests were
+moved to the front of the prerequisite run. Failed owned test groups stopped
+before any full gate was launched. An unavailable scratch test target was
+corrected without rerunning already passed phases on the identical binary.
+
+Remaining hypotheses are recorded in /tmp/scala-rs-field-scope/next-inventory.md:
+loaded non-accessor clause metadata, result-valued overload ambiguity,
+inherited constructor fields at value-class types, discarded generic Unit
+reads, Object-underlying value-class accessor ABI and exported Java Object[]
+origin. These are not claims of fixed behavior or full compiler conformance.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=96c0abb3  logs=/tmp/scala-rs-gate-96c0abb3-codex
+VERDICT=PASS
 DONE
 ```
