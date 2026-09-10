@@ -16,7 +16,7 @@ is, and both invalidate everything downstream.
 | updated | 2026-09-10 |
 
 **Ninety-nine slices have merged this session**, in forty-three accepted composed gates.
-Seventeen intermediate candidates were rejected, three despite a PASS script verdict. From
+Eighteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2390,6 +2390,58 @@ these nine cases; green focused tests did not establish corpus compatibility.
   HEAD=4f3f51ef  logs=/tmp/scala-rs-gate-4f3f51ef-codex
   fail: workspace tests: 301 rows, 2713 passed, 2 failed
   fail: corpus losses=9 vs tests/baselines/corpus-23031519.tsv
+VERDICT=FAIL
+DONE
+```
+
+
+## Rejected candidate eighteen: macro binding integration
+
+Clean composed commit 2970a6a5972599db4d93f076de13d798d215951e (tree
+2cedcb13ccd38157bd6caf4b14e77f9be22470b2) completed the full unskipped gate
+with VERDICT=FAIL and DONE. It is not merged. Accepted compiler 23031519 and
+the baseline figures above remain unchanged. The candidate branch is pushed
+and its worktree remains frozen; corrections use codex/macro-expansion-integration.
+Logs: `/tmp/scala-rs-gate-2970a6a5-codex/`. Exact 5324-row ledger:
+[`baselines/corpus-2970a6a5.tsv`](baselines/corpus-2970a6a5.tsv).
+
+Gitbucket improves 158/57 -> 157/57 by removing GetResult[Int] at
+IssuesService.scala:494, with no added diagnostics. Cats stays 121/54 and the
+library 440/118 without changed diagnostics. Slick passes 184 sources, errors=0,
+1492 classes, 12/12 programs and 36/36 attempts, verified=1492/lint_problems=0.
+Strong initialization verification loads 1492 with zero failures/incomplete
+loads. Workspace: 301 rows, 2717 passed, 0 failed. Format passes; clippy keeps
+the same 57 warnings.
+
+pos: pass=1118, fail=396, skip=345.
+neg: pass=708, fail=328, skip=369.
+run: pass=664, fail=843, skip=553.
+Full corpus: losses=6, changes=28.
+
+The six pos losses are annotated-original, attachments-typed-another-ident,
+attachments-typed-ident, t7461, t8013 and t9392. Source macro bindings now cause
+real expansion where earlier classfiles advertised an ordinary nonexistent
+method. This exposes block-argument transport, preservation of attachments
+through c.typecheck, overloaded-method queries, repeated macro arguments and
+ClassDef reconstruction. All nine losses from 4f3f51ef recovered. The green
+1405-case negative prerequisite and 322-case pos/run prerequisite missed these
+six because their names do not contain macro. Future selection must inspect
+source content and numbered compilation rounds, not only test names. Keep
+focused dual-run execution and all of these identities before another gate.
+
+Additional bidirectional inventory confirms two existing silent defects in both
+rebuilt 23031519 and 2970a6a5: a whitebox implicit macro is skipped for inherited
+fallback (99 rather than nsc's 77), and a private binary macro is externally
+callable (nsc rejects). Decorated blackbox macros work, correcting the annotation
+ordering hypothesis. Standalone generic tuple swap/dimap probes reproduce none
+of the two cats tuple errors; both compilers execute identically and reject
+the wrong-result counterpart. Evidence is in /tmp/scala-rs-type-identity-batch/
+next-macro-inventory/ and next-tuple-inventory/.
+
+```text
+=== summary
+  HEAD=2970a6a5  logs=/tmp/scala-rs-gate-2970a6a5-codex
+  fail: corpus losses=6 vs tests/baselines/corpus-23031519.tsv
 VERDICT=FAIL
 DONE
 ```
