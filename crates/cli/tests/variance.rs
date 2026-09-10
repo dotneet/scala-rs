@@ -4,6 +4,9 @@
 //! variance. A separately compiled nsc consumer therefore reads the
 //! `ScalaSignature` pickle for `+A`, `-A`, and nested `F[+X]` metadata.
 
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -84,10 +87,12 @@ fn scalac(java: &JavaToolchain) -> Option<PathBuf> {
 }
 
 fn tmp_dir() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_nanos();
+    let nanos = temp_nonce::unique_stamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos(),
+    );
     let out = std::env::temp_dir().join(format!("scala-rs-variance-{nanos}"));
     fs::create_dir_all(&out).expect("create variance temp directory");
     out

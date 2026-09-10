@@ -1,4 +1,7 @@
 //! Module apply alternatives and bounded polymorphic overloads match scalac.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     path::PathBuf,
@@ -11,10 +14,12 @@ fn overload_module_matches_scalac() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-overload-module-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir_all(&root).unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

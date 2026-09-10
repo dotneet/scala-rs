@@ -1,4 +1,7 @@
 //! Singleton bounds must survive both directions of separate compilation.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -27,10 +30,12 @@ fn singleton_bounds_survive_separate_compilation() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-singleton-metadata-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     let fixtures =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/multi/singleton_metadata");

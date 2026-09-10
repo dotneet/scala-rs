@@ -1,4 +1,7 @@
 //! JVM descriptors must retain binary class identity even under scala/.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     path::PathBuf,
@@ -11,10 +14,12 @@ fn java_descriptor_identity_matches_scalac() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-java-identity-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     let provider = root.join("provider");
     fs::create_dir_all(&provider).unwrap();

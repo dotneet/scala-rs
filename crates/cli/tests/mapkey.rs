@@ -1,4 +1,7 @@
 //! Map keys retain K independently of widening value type parameters.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{fs, path::Path, process::Command};
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 #[test]
@@ -6,10 +9,12 @@ fn map_key_acceptance_and_execution_match_scalac() {
     let root = std::env::temp_dir().join(format!(
         "mapkey-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir(&root).unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

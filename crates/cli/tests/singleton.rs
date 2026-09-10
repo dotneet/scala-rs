@@ -1,4 +1,7 @@
 //! Compiler-defined Singleton conformance and JVM behavior against scalac.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     path::PathBuf,
@@ -11,10 +14,12 @@ fn singleton_match_scalac() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-singleton-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir_all(&root).unwrap();
     let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";

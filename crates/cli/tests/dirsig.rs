@@ -1,4 +1,7 @@
 //! Directory and jar classpaths preserve the same Scala member signatures.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{fs, path::Path, process::Command};
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 #[test]
@@ -6,10 +9,12 @@ fn directory_and_jar_signatures_match_scalac() {
     let p = std::env::temp_dir().join(format!(
         "dirsig-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir(&p).unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

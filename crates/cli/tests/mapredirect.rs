@@ -1,4 +1,7 @@
 //! Explicit type arguments survive inherited factory lookup after delegate loading.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
@@ -6,10 +9,12 @@ fn inherited_factory_redirect_matches_scalac() {
     let root = std::env::temp_dir().join(format!(
         "mapredirect-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir(&root).unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

@@ -1,4 +1,7 @@
 //! Early completion must retain imports from the definition's own unit.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{fs, path::PathBuf, process::Command};
 
 #[test]
@@ -6,10 +9,12 @@ fn parent_anonymous_body_uses_forward_members_lexical_scope() {
     let root = std::env::temp_dir().join(format!(
         "earlyscope-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir(&root).unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");

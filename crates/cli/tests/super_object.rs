@@ -5,6 +5,9 @@
 //! class then needs the nsc-compatible `T$$super$toString` accessor, whose
 //! legal JVM target is the nearest concrete superclass (or Object itself).
 
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,10 +28,12 @@ fn scalac() -> Option<PathBuf> {
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let nanos = temp_nonce::unique_stamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos(),
+    );
     let dir = std::env::temp_dir().join(format!("scala-rs-super-object-{tag}-{nanos}"));
     fs::create_dir_all(&dir).expect("create test directory");
     dir

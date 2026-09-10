@@ -6,6 +6,9 @@
 //! JVM body from our still incomplete macro/dependent-result ScalaSignature.
 //! Both consumers execute each compiler's implementation. This does not prove
 //! the direct Scala macro-declaration ABI, which has separate recorded failures.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     path::PathBuf,
@@ -18,10 +21,12 @@ fn inferred_macro_local_template_supports_cross_compilation() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-lazy-template-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir_all(&root).unwrap();
     let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");

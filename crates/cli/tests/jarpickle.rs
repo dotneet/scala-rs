@@ -13,6 +13,9 @@
 //! the same shapes crossing a jar boundary, and a real cats/cats-effect jar
 //! from the classpath when one is cached locally.
 
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,10 +30,12 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = temp_nonce::unique_stamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
     let p = std::env::temp_dir().join(format!(
         "scala-rs-jarpickle-{tag}-{}-{nanos}",
         std::process::id()

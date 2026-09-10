@@ -174,3 +174,27 @@ source/jar/cache preflight pass. Final prerequisite evidence is in
 /tmp/scala-rs-dependent-adaptation/final-v2. Its immutable compiler SHA-256 is
 `48f19da0ff44d9d44503fc30f1927bed2f34d5028a6a34519e0020f76d836ef2`. The full gate must use that same compiler and
 the committed tree containing this record.
+
+
+## Clock-independent test directories
+
+The first full gate on 5ddf4fc9 found an actual AlreadyExists failure in
+batchtypes.rs while creating its root directory. This happened before compiling
+the case and is a test harness failure. Nanosecond clock readings are not unique
+identifiers. The gate continues to DONE and its rejected ledger is retained.
+
+A census found 284 timestamp expressions in 282 CLI test files; 40 files had
+no independent nonce. Those clock-only helpers now share a process-local
+monotonic stamp, with the process ID encoded to separate helpers whose old
+path omitted it. Repeated or reversed clocks cannot reuse a stamp. Existing
+file creation, compilation, rejection and exact runtime assertions stay intact.
+The compiler sources and Scala fixtures are unchanged from 5ddf4fc9.
+
+Deterministic tests allocate 3072 stamps concurrently at the same simulated
+clock value and check a repeated/reversed clock sequence. All 169 tests in
+41 affected suites pass, followed by all eight dependentadaptation groups in
+the new worktree. Format, clippy (57 existing warnings, no new occurrences),
+and source/jar/cache preflight pass. Evidence is retained under
+/tmp/scala-rs-dependent-adaptation/harness. The rebuilt compiler SHA-256 is
+cf35c34a0c24c0c27481720074c7a41ada3c923f135cdce6193867826a39234f; it has
+the same compiler sources as the previous gate but is a separate worktree build.

@@ -11,6 +11,9 @@
 //! The fixtures are compiled against the real `scala-library` jar and their output
 //! compared with what nsc 2.13.16 produces for the same source.
 
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,10 +28,12 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = temp_nonce::unique_stamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
     let p = std::env::temp_dir().join(format!(
         "scala-rs-tyvar-{tag}-{}-{nanos}",
         std::process::id()

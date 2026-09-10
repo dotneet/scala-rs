@@ -1,5 +1,8 @@
 //! Cross-unit inference must revisit provisional qualifier errors, while
 //! preserving genuine argument errors at their originating call.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     process::Command,
@@ -11,10 +14,12 @@ fn inferred_parent_argument_qualifier_is_retried() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-qualifier-retry-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir_all(&root).unwrap();
     let scalac = "/tmp/scala-2.13.16/bin/scalac";
@@ -109,10 +114,12 @@ fn erroneous_application_chain_does_not_repeat_dynamic_receiver_typing() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-qualifier-growth-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     fs::create_dir_all(&root).unwrap();
     let source = root.join("Main.scala");

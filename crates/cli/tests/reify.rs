@@ -21,6 +21,9 @@
 //! must we, or no macro implementation can build a tree at run time. See
 //! `docs/macros.md`.
 
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,10 +38,12 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let nanos = temp_nonce::unique_stamp(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    );
     let p = std::env::temp_dir().join(format!(
         "scala-rs-reify-{tag}-{}-{nanos}",
         std::process::id()

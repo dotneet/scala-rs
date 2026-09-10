@@ -1,4 +1,7 @@
 //! Recompiling an object into a classpath directory replaces its static mirror.
+#[path = "support/temp_nonce.rs"]
+mod temp_nonce;
+
 use std::{
     fs,
     path::PathBuf,
@@ -10,10 +13,12 @@ fn recompilation_preserves_main_forwarder() {
     let root = std::env::temp_dir().join(format!(
         "scala-rs-incremental-forwarder-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        temp_nonce::unique_stamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
     ));
     let fixtures =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/multi/incremental_forwarder");
