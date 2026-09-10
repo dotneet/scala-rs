@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `5f0d18c2` |
+| commit | `647afcf2` |
 |---|---|
 | updated | 2026-09-10 |
 
-**Eighty-four slices have merged this session**, in forty accepted composed gates.
+**Eighty-seven slices have merged this session**, in forty-one accepted composed gates.
 Fourteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -63,6 +63,7 @@ coordinator measured the merged tree each time, not the branches.
 | `a7f05f48` | `App and DelayedInit identities` | 191 | 152 |
 | `e355ab70` | `directory Scala signatures` | 191 | 152 |
 | `5f0d18c2` | `immutable Map key types` | 191 | 152 |
+| `647afcf2` | `Java completion`, `Unit function arity`, `Either companion` | 191 -> **188** | 152 -> **139** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -269,9 +270,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1492** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **152** | **58** | — |
-| `tests/gitbucket_measure.sh` (353, 1 skipped) | **191** | **63** | — |
-| `tests/scalalib_measure.sh` (538) | **460** | **119** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **139** | **57** | — |
+| `tests/gitbucket_measure.sh` (353, 1 skipped) | **188** | **63** | — |
+| `tests/scalalib_measure.sh` (538) | **458** | **119** | — |
 
 ## Execution
 
@@ -292,13 +293,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1119** | 395 | 345 |
+| `pos` (1859) | **1120** | 394 | 345 |
 | `neg` (1405) | **700** | 336 | 369 |
 | `run` (2060) | **643** | 864 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-5f0d18c2.tsv`](baselines/corpus-5f0d18c2.tsv): 5324 unique
+[`baselines/corpus-647afcf2.tsv`](baselines/corpus-647afcf2.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `647afcf2` gate compared against `corpus-5f0d18c2.tsv`: **losses=0,
+changes=1**, the positive gain `delambdafy-patterns`.
+
 The `5f0d18c2` gate compared against `corpus-e355ab70.tsv`: **losses=0,
 changes=0**.
 
@@ -405,7 +409,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **296 result rows, 2704 passed, 0 failed** at `5f0d18c2` |
+| `cargo test --workspace --release --no-fail-fast` | **298 result rows, 2707 passed, 0 failed** at `647afcf2` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -2076,3 +2080,64 @@ bparent repair alone. Investigate and combine other low/medium-complexity
 repairs, including the cats Unit-to-Function0 normalization and Either.type
 stability diagnostics, then verify one composed batch. Keep broader type-bound
 validation separate if its interactions warrant it.
+
+
+## Gate forty-one: Java completion, Unit function arity and Either companion
+
+Clean `647afcf2`, containing main `221a2275`, passed one complete unskipped
+composed gate with VERDICT=PASS, DONE, corpus losses=0 and changes=1.
+Logs: `/tmp/scala-rs-gate-647afcf2-codex/gate.log`. Main was fast-forwarded
+to the exact tested commit. The recording commit changes only BASELINE,
+the raw corpus ledger and the user's batch-planning instruction in the brief;
+compiler sources and tests match the gated tree.
+
+Gitbucket improves 191/63 -> 188/63, cats 152/58 -> 139/57, and the library
+460/119 -> 458/119. No diagnostic messages are added in any of these three
+source sets. Slick remains 184 sources, zero errors and 1492 classes;
+MODE=b passes 12/12 programs and 36/36 attempts. Subset validates all 1492
+classes with zero failures and lint problems. Strong initialization verification
+with real PostgreSQL and Oracle drivers loads all 1492 classes, zero failures
+and zero incomplete. Class output and verify-all.log remain in the gate directory.
+
+Workspace: 2707 passed, zero failed, 298 rows. Format passes. Release workspace
+clippy retains 57 warning messages, with no additions or removals. Corpus:
+pos 1120/394/345, neg 700/336/369, run 643/864/553 (pass/fail/skip), 5324
+unique identities. The sole change is pos/delambdafy-patterns, fail -> pass.
+Raw ledger: `tests/baselines/corpus-647afcf2.tsv`.
+
+Three mechanisms were implemented together before the full gate:
+
+- Complete shallow Java type declarations when resolving a type name across
+  source units. Prefer Scala pickle adoption before raw Java loading, recovering
+  the bparent constructor regression from rejected candidate 8a336ad4. Prelude
+  declarations remain excluded. The two-file JGit probe establishes why the
+  earlier one-file probe missed the root. The permanent jwarm test builds a
+  real Java library, checks both source orders and rejects wrong type arity.
+- Preserve the distinction between Unit => A (one argument) and () => A
+  (zero arguments) in the parser. The former had been normalized to Function0,
+  causing false rejections of valid overrides and false acceptance of a
+  zero-argument lambda assigned to Unit => Int. Tests cover aliases, overrides,
+  parenthesized Unit, generic calls and nested function results.
+- Supply the real Either companion module in library ABI mode. Its missing
+  identity caused Either.type stability errors. Tests exercise singleton types,
+  Either.cond, module identity and rejection of a Right value as Either.type.
+
+New valid programs execute under -Xverify:all and compare stdout byte-for-byte
+with real scalac 2.13.16. Invalid cases compare rejection in both directions;
+the rebuilt accepted 5f0d18c2 binary demonstrates each repaired root. Evidence:
+`/tmp/scala-rs-jgit-generics-probe/`, including batch-before/results.json.
+Before the gate, 694 parser and related CLI tests passed, including bparent;
+18 historical corpus regressions had no changes. Preflight validated four
+pinned source trees, 121 jars, 33 Java support classes and 1498 reference
+classes. One owned execution was followed through DONE with the phase/failure
+watcher. No gate step was restarted or skipped.
+
+Read-only probes for the next batch are retained in
+`/tmp/scala-rs-next-batch-probes/`. A List[_ <: Base] element incorrectly loses
+upper-bound members, including an inherited generic result. A curried implicit
+String extension rejects the valid lambda argument and falsely accepts an Int
+argument that produces a JVM VerifyError. Real scalac comparisons and runtime
+logs establish both defects, but their implementation roots remain hypotheses.
+The independent unchecked written type-bound defect from the rejected gate
+also remains open. Inventory further candidates and dependencies before the
+next implementation batch, rather than limiting it to these first two probes.
