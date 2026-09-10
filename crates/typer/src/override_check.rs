@@ -603,14 +603,8 @@ fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type)
         (Type::Repeated(_), _) | (_, Type::Repeated(_)) => true,
         (Type::ByName(_), _) | (_, Type::ByName(_)) => true,
         (Type::Array(x), Type::Array(y)) => certainly_different(st, rigid, x, y),
-        // Arity is *not* decided on, here or for a function below. `Tuple2`
-        // really is not `Tuple3` and `Function0` is not `Function1`, but the
-        // arity scala-rs stores is not always the arity the source wrote:
-        // `Unit => X` arrives as `Function { params: [], ret: X }`, so the ten
-        // `f: Unit => F[A]` parameters in cats (`OptionT`, `EitherT`,
-        // `IorT`, …) read as a different arity from the `E => F[A]` they
-        // override and produced nine "overrides nothing" errors scalac does
-        // not report. Only element-wise differences at an agreed arity count.
+        // Tuple arity mismatches are handled conservatively here; element
+        // differences at a shared arity remain definite mismatches.
         (Type::Tuple(xs), Type::Tuple(ys)) => {
             xs.len() == ys.len()
                 && xs

@@ -3547,7 +3547,18 @@ impl Typer {
                 // A preceding unit can introduce a Java class through another
                 // class's member descriptor. A wildcard then binds that shallow
                 // declaration directly, bypassing binary name discovery.
-                self.ensure_java_loaded(id, span);
+                // JAVA also marks Scala declarations discovered through binary
+                // signatures. Complete those from their pickle, preserving
+                // source constructor clauses and enclosing-instance metadata.
+                if self
+                    .pickle
+                    .adopt_binary_class(&mut self.st, &mut self.binary, id)
+                {
+                    self.pickle
+                        .ensure_parents(&mut self.st, &mut self.binary, id);
+                } else {
+                    self.ensure_java_loaded(id, span);
+                }
             }
         }
         self.resolve_type_name(name, args)

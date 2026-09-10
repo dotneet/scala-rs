@@ -26,6 +26,9 @@ makes no claim of conformance to the language specification. What exists today:
   Selection qualifiers defer that value-position inference, including aliases.
 - Immutable Map lookup and update members require the declared key type,
   preserving implicit key conversions and independent value widening.
+- Function types preserve one Unit argument separately from an empty argument
+  list, including aliases and overrides. The real Either companion is available
+  as a stable singleton and supplies its methods from the library signature.
 - Java type references complete descriptor-discovered declarations across source
   files, retaining generic parameters and interface identity after wildcard imports.
 - Directory classpaths complete Scala member signatures and parameterized

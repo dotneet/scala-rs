@@ -2422,12 +2422,9 @@ impl<'a> Parser<'a> {
                 if matches!(self.kind(), TokenKind::RParen) {
                     let sp = self.span();
                     self.bump();
-                    self.alloc(
-                        sp,
-                        TreeKind::Ident {
-                            name: "Unit".into(),
-                        },
-                    )
+                    // Preserve the empty parameter list separately from the
+                    // named Unit type: Unit => A is Function1, () => A is Function0.
+                    self.alloc(sp, TreeKind::Literal { lit: Lit::Unit })
                 } else {
                     let mut ts = vec![self.parse_type()];
                     while matches!(self.kind(), TokenKind::Comma) {
@@ -5193,8 +5190,7 @@ fn flatten_val_block(t: Tree) -> Vec<Tree> {
 }
 
 fn is_unit_tuple(t: &Tree) -> bool {
-    matches!(&t.kind, TreeKind::Ident { name } if name == "Unit")
-        || matches!(&t.kind, TreeKind::Literal { lit: Lit::Unit })
+    matches!(&t.kind, TreeKind::Literal { lit: Lit::Unit })
 }
 
 fn is_def_start(k: &TokenKind) -> bool {

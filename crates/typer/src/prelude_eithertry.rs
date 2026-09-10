@@ -10,6 +10,9 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
         "scala/util/Either",
         &[Type::AnyRef],
     );
+    // scala's package object re-exports the real scala.util.Either companion.
+    // Its methods are completed from the library pickle when selected.
+    module(st, st.scala_pkg, "Either", "scala/util/Either$");
     let ea = type_param(st, either, "A");
     let eb = type_param(st, either, "B");
     st.get_mut(either).tparams = vec![ea, eb];
