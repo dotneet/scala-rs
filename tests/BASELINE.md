@@ -19,7 +19,7 @@ is, and both invalidate everything downstream.
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 and the Forms inference and Scala/JVM name interoperability batch.
-Twenty intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-one intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2821,5 +2821,70 @@ Exact summary block:
 === summary
   HEAD=9cc076f6  logs=/tmp/scala-rs-gate-9cc076f6-codex
 VERDICT=PASS
+DONE
+```
+
+
+## Rejected collection-result candidate a1443e0e (2026-09-11)
+
+Frozen commit `a1443e0eff02df5b2d5c0acf102d82dae85bf12a`, tree
+`9ed5ff097789d3cb5ef59031dc206f77970f15df`, was not merged. Accepted
+compiler baseline remains **9cc076f6**. This main update records only the
+rejected gate and its complete raw ledger:
+[`baselines/corpus-a1443e0e.tsv`](baselines/corpus-a1443e0e.tsv).
+Logs: `/tmp/scala-rs-gate-a1443e0e-codex/`. The single owned process reached
+DONE in 1408.3 seconds. Its shell exit was zero despite VERDICT=FAIL; the
+verdict and independent audit are authoritative. No gate was restarted.
+
+The candidate combines receiver-substituted collection declarations, nullary
+overload resolution, recovered library value classes, SortedMap.keySet,
+evidence-bearing sorted factories and Java String member lookup. It also
+restores all 354 gitbucket Scala/Twirl sources and compiles all three real Java
+helpers per invocation. Historical-input candidate gitbucket remains **115/54**
+(353 sources, one excluded, no Java). Expanded inputs report **108/52**
+(354 sources, no exclusion, three Java sources); these are different input
+sets and are not presented as a seven-error compiler improvement. Cats reports
+**115/48** versus accepted **121/54**, but introduces sorted map diagnostics.
+Library remains **439/118**.
+
+Slick: 184 sources, zero errors, 1504 classes; subset verifies all 1504 with
+lint_problems=0. MODE=b runs 12/12 programs, 36/36 exact matches. Strong
+initialization verification of the actual gate classes loads 1504/1504 with
+zero failures or incomplete loads. Workspace has **305 result rows, 2740
+passed, three failed**: mismatch10's `mism10_coll_runs_against_the_jar` and
+`mism10_sorted_map_collect_after_a_plain_map`, plus typer's
+`string_ops4_numeric_range_listbuffer_typecheck_with_library`.
+
+All 5324 corpus identities are present, **losses=0, changes=2**:
+pos/t8310 and run/fors gain passes. Counts (pass/fail/skip) are pos
+1129/385/345, neg 712/324/369, run 681/826/553. Format passes and clippy
+retains the same 57 warnings. The candidate binary SHA256 is
+`5354e619961af83805f66729dcca2d6692de70359454ea460d41339d35f9555f`.
+
+Before the gate, 684 tests in 32 suites, 1288 selected pos/run identities and
+all 1405 negatives passed their checks; source/jar/cache preflight was intact.
+The selection omitted mismatch10 and typer's embedded legacy String test.
+Follow-up selection must search fixture contents as well as test names, and
+include typer unit tests. A real two-source TreeMap.map probe independently
+confirms a regression: scalac and the immutable accepted binary compile and
+execute both input orders, while this candidate rejects after Map/ArraySeq
+warming. Generic SortedMap.map also has a pre-existing warm-only failure.
+The legacy lines.next() assertion is false on actual JDK17 scalac; its valid
+positive form is linesIterator.next(), with the old form kept as a rejection
+probe. No expectation is weakened to preserve an invalid program.
+
+Follow-up work is isolated in codex/collection-results-followup. It combines
+preserving additional overload completion, per-alternative origin validation,
+late ClassTag factory edges and materialized ClassTag viability, with the
+corrected legacy test. Do not run another full gate for only one repair.
+The failed gate worktree stays frozen; main compiler sources remain unchanged.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=a1443e0e  logs=/tmp/scala-rs-gate-a1443e0e-codex
+  fail: workspace tests: 305 rows, 2740 passed, 3 failed
+VERDICT=FAIL
 DONE
 ```
