@@ -1971,6 +1971,11 @@ impl PickleSupply {
                     None => self.install_known_macro(st, bin, class_sym, &internal, name, &m.ty),
                 };
                 if let Some(id) = id {
+                    // IMPLICIT belongs to the macro declaration, not to its
+                    // parameter clauses. Preserve it just as for ordinary defs.
+                    if m.has(pflags::IMPLICIT) {
+                        st.get_mut(id).flags = st.get(id).flags.with(Flags::IMPLICIT);
+                    }
                     if !installed.contains(&id) {
                         installed.push(id);
                     }
@@ -2148,6 +2153,7 @@ impl PickleSupply {
             ret: Box::new(ret),
         };
         st.get_mut(id).macro_impl = Some(MacroBinding {
+            pickle: None,
             impl_class: impl_class.to_string(),
             impl_method: impl_method.to_string(),
             blackbox: true,
@@ -2331,6 +2337,7 @@ impl PickleSupply {
         let tag_targs =
             self.pickled_tag_targs(st, bin, m, &scope, mi, &tag_indices, internal, name);
         st.get_mut(m).macro_impl = Some(MacroBinding {
+            pickle: None,
             impl_class: mi.class_name.clone(),
             impl_method: mi.method_name.clone(),
             blackbox: true,

@@ -2633,7 +2633,12 @@ impl Typer {
                 continue;
             }
             let before = self.st.get(c).parents.len();
-            self.ensure_java_loaded(c, Span::DUMMY);
+            // Only parents are needed for a module. Whole-module adoption
+            // can replace the implicit declarations just published by its
+            // companion loader, including nested implicit object identities.
+            if !matches!(self.st.get(c).kind, SymKind::Module | SymKind::ModuleClass) {
+                self.ensure_java_loaded(c, Span::DUMMY);
+            }
             self.pickle
                 .ensure_parents(&mut self.st, &mut self.binary, c);
             fresh |= self.st.get(c).parents.len() != before;
@@ -2758,6 +2763,39 @@ impl Typer {
     /// Only a name the companion has no member for is asked, so a
     /// hand-written prelude declaration still wins and no second copy of one
     /// is installed next to it.
+    pub(crate) fn warm_binary_implicit_result_parents(&mut self, owner: SymbolId) {
+        if owner.0 < self.st.prelude_end
+            || self.st.source_classes.contains(&owner)
+            || (!self.st.pending_classpath_signatures.contains(&owner)
+                && !self.pickle.pickle_readable(&self.st, owner))
+        {
+            return;
+        }
+        // A lazy companion can return a class eagerly found in a directory.
+        // Restore that result hierarchy before an erased parent makes an
+        // inapplicable candidate look like an ambiguous or successful match.
+        let results: Vec<Type> = self
+            .st
+            .get(owner)
+            .members
+            .iter()
+            .filter_map(|&id| {
+                let s = self.st.get(id);
+                if !s.flags.contains(Flags::IMPLICIT) {
+                    return None;
+                }
+                let mut result = &s.ty;
+                while let Type::Method { ret, .. } = result {
+                    result = ret;
+                }
+                Some(result.clone())
+            })
+            .collect();
+        for result in results {
+            self.ensure_pickled_parents(&result);
+        }
+    }
+
     fn warm_pickled_implicits(&mut self, class_id: SymbolId) {
         if !self.library_abi || class_id.is_none() {
             return;
@@ -2819,6 +2857,7 @@ impl Typer {
                     self.supply_from_pickle_class(c, &n);
                 }
             }
+            self.warm_binary_implicit_result_parents(c);
             for p in self.st.get(c).parents.clone() {
                 if let Some(ps) = self.st.class_sym_of(&p) {
                     work.push(ps);

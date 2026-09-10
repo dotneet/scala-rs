@@ -111,3 +111,60 @@ After the header correction, the complete Slick precheck compiles all 184
 sources with zero errors and 1492 classes. The 243 corpus prerequisites still
 have zero losses and one gain; clippy remains at the same 57 warnings. The
 full composed gate has not been substituted with these prerequisites.
+
+
+## Rejected gate and composed integration
+
+Candidate 4f3f51ef reached DONE with VERDICT=FAIL, two workspace failures and
+nine corpus losses. Its frozen worktree is unchanged; main contains only the
+rejected-gate record and raw 5324-row ledger as e35e2e84. Gitbucket 352/81 and
+library 443/118 regress against accepted 158/57 and 440/118; cats stays 121/54.
+Slick's 1492 classes, runtime 36/36 and stronger verification remain green.
+
+The integration batch repairs Using.Releasable's actual nested owner (also
+rejecting the previously accepted nonexistent scala.util.Releasable), defers
+written-bound validation until recursive source parent graphs exist, and
+refreshes inner higher-kinded bounds after later outer parameters enter scope.
+Binary implicit result hierarchies complete before the first candidate fit;
+module parent completion avoids replacing newly supplied implicit declarations.
+The cyclic and gbopt existing failures are now mandatory prerequisites.
+
+The macro-negative regression was broader than the initial missing-pickle
+hypothesis. nsc-produced APIs also silently selected fallback evidence: the
+macro supplier lost the declaration's IMPLICIT flag, and synthesized implicit
+trees bypassed expansion. Both are repaired, carrying the solved type arguments
+and retaining the implicit recursion guard during expansion. Source macro
+bindings now publish nsc's MACRO flag and macroImpl metadata. Fingerprints keep
+Context separate, the macro definition's value clauses, then implementation
+tags; an eager binary method may have flattened away those clause boundaries.
+Reference types include method and owner parameters. Reordered WeakTypeTag
+parameters, curried values and owner type arguments round-trip to real nsc.
+A mismatched implementation shape diagnoses instead of truncating metadata.
+
+The runtime probe's anonymous-class expansion exposed an existing unsupported
+ClassDef reconstruction boundary. This deeper feature stays separate. A normal
+generic class constructor exposed a smaller missing AppliedTypeTree node, now
+rebuilt and checked normally. Good probes execute with -Xverify:all and identical
+stdout; the negative evidence probe verifies the macro's actual abort message.
+All these changes form one composed batch, not one gate per repair.
+
+Final integration prerequisites pass 843 tests across 38 result rows, including
+cyclic, gbopt, macros, engine, mapto2 and macromirror in addition to the original
+shared-supply suites. A fixed binary (SHA256
+cd59a0fa6436ca9dde08a184ef7d747639ace218eeb453d710c9b9935e48c2e5)
+passes all 1405 negative corpus cases relative to the accepted ledger with
+losses=0 (eight gains), plus 322 selected pos/run cases with losses=0 (14 gains).
+These include every loss from 4f3f51ef and the prior candidate history. All 184
+Slick sources compile with errors=0 and 1492 classes. Workspace release clippy
+keeps the same 57 warnings; formatting and whitespace checks pass. Preflight
+validates four pinned source trees, 121 jars, 33 Java support classes and 1498
+reference classes. Evidence: /tmp/scala-rs-type-identity-batch/integration-final/,
+integration-prerequisites/, integration-preflight.log and integration-clippy-compare.json.
+
+Rebuilt accepted 23031519 runs the nsc-produced macro API but prints 99 where
+nsc prints 77; nsc compiles against its emitted API but execution fails with
+NoSuchMethodError. Rejected 4f3f51ef behaves identically. Both falsely accept
+scala.util.Releasable; 4f3f51ef additionally rejects the valid self-bound and
+higher-kinded fixtures. Exact outputs and immutable binary hashes are in
+integration-before/results.json. No aggregate before figures were remeasured.
+These prerequisites do not replace the subsequent full composed merge gate.

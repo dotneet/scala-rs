@@ -56,6 +56,13 @@ fn compile_many(names: &[&str], mode: &str, out: &Path, cp: &str, accepted: bool
         "{name}/{mode}/{cp}: {}",
         String::from_utf8_lossy(&r.stderr)
     );
+    if name == "typeidentitymacro_bad" {
+        assert!(
+            String::from_utf8_lossy(&r.stderr).contains("Int evidence is forbidden"),
+            "{}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+    }
     if name == "implicitidentityambiguous_bad" {
         assert!(
             String::from_utf8_lossy(&r.stderr).contains("ambiguous"),
@@ -95,6 +102,9 @@ fn type_identity_and_written_bounds_match_scalac() {
     for name in [
         "typeidentitybatch",
         "boundidentitybatch",
+        "typeidentityselfbound",
+        "typeidentityhkbound",
+        "typeidentityselfbound_bad",
         "typeidentitymissing_bad",
         "typeidentitypackage_bad",
         "typeidentityarrayarity_bad",
@@ -201,6 +211,60 @@ fn written_bounds_use_declaration_imports_in_both_source_orders() {
                 compile_many(&names, mode, &out, "", !bad);
                 if !bad {
                     run(name, mode, &out, "");
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn using_nested_type_identity_matches_scalac() {
+    let root = root();
+    for name in ["typeidentityusing", "typeidentityusingpackage_bad"] {
+        let good = !name.ends_with("_bad");
+        for mode in ["nsc", "jar"] {
+            let out = root.join(format!("{name}-{mode}"));
+            compile(name, mode, &out, "", good);
+            if good {
+                run(name, mode, &out, "");
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn macro_bindings_round_trip_without_selecting_inherited_fallback() {
+    let root = root();
+    let reflect = "/tmp/scala-2.13.16/lib/scala-reflect.jar";
+    let implementation = root.join("implementation");
+    compile(
+        "typeidentitymacroimpl",
+        "nsc",
+        &implementation,
+        reflect,
+        true,
+    );
+    for producer in ["nsc", "jar"] {
+        let api = root.join(format!("api-{producer}"));
+        let cp = format!("{}:{reflect}", implementation.display());
+        compile("typeidentitymacroapi", producer, &api, &cp, true);
+        compile(
+            "typeidentitymacroshape_bad",
+            producer,
+            &root.join(format!("shape-{producer}")),
+            &cp,
+            false,
+        );
+        for consumer in ["nsc", "jar"] {
+            for name in ["typeidentitymacro", "typeidentitymacro_bad"] {
+                let good = !name.ends_with("_bad");
+                let out = root.join(format!("{producer}-{consumer}-{name}"));
+                let cp = format!("{}:{cp}", api.display());
+                compile(name, consumer, &out, &cp, good);
+                if good {
+                    run(name, consumer, &out, &cp);
                 }
             }
         }

@@ -1106,3 +1106,12 @@ private/ambiguous evidence and source recompilation over old classfiles. Valid
 programs run with JVM verification and byte-identical output. The private
 runtime still has no Array factory companion. See
 [the inventory and boundaries](docs/batches/type-identity-implicit.md).
+
+Source macro definitions retain MACRO and macroImpl metadata across compilation
+runs, with implementation fingerprints, curried clauses and reference type
+arguments. Binary implicit macros retain their declaration flag; selected
+evidence macros receive inferred type arguments and expand before use, rather
+than silently selecting inherited fallback evidence. Macro-returned applied type
+trees are rebuilt and typechecked. The typeidentitybatch suite compares nsc and
+scala-rs API producers/consumers, including reordered tags and owner parameters.
+Anonymous ClassDef expansion remains unsupported and diagnoses explicitly.

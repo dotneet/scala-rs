@@ -11,7 +11,7 @@ use scala_rs_parser::{CaseDef, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
-use crate::symbol::{MacroBinding, MacroTarg, SymKind};
+use crate::symbol::{MacroBinding, MacroPickle, MacroTarg, SymKind};
 
 /// Fully-qualified names of the two macro `Context` types.
 const BLACKBOX_CONTEXT: &str = "scala.reflect.macros.blackbox.Context";
@@ -230,7 +230,9 @@ impl Typer {
             }
         };
         let tag_params = self.macro_impl_tag_params(sym);
+        let pickle = self.macro_pickle_binding(sym, def_sym, &ref_targs, span)?;
         Some(MacroBinding {
+            pickle: Some(pickle),
             impl_class,
             impl_method: name,
             blackbox,
@@ -238,6 +240,88 @@ impl Typer {
             expr_args: self.macro_impl_expr_args(sym),
             tag_targs: self.macro_ref_tag_targs(sym, def_sym, &ref_targs, tag_params),
         })
+    }
+
+    fn macro_pickle_binding(
+        &mut self,
+        impl_sym: SymbolId,
+        def_sym: SymbolId,
+        ref_targs: &[Tree],
+        span: Span,
+    ) -> Option<MacroPickle> {
+        let implementation = self.st.get(impl_sym);
+        let tparams = implementation.tparams.clone();
+        // Binary method symbols may already be uncurried. Macro value clauses
+        // must have the definition's shape; Context is a separate leading
+        // clause and WeakTypeTags form the trailing implementation-only clause.
+        let flat = self.macro_impl_params(impl_sym);
+        let fingerprints: Vec<i32> = flat
+            .iter()
+            .map(|&p| {
+                if self.is_tag_param(p) {
+                    if let Some(Type::TypeParam(tp)) = self.tag_param_argument(p) {
+                        if let Some(index) = tparams.iter().position(|&t| t == tp) {
+                            return index as i32;
+                        }
+                    }
+                }
+                let display = self.st.display_type(&self.st.get(p).ty);
+                if display.contains("Expr") {
+                    -2
+                } else if display.contains("Tree") {
+                    -3
+                } else {
+                    -1
+                }
+            })
+            .collect();
+        let sizes: Vec<usize> = match &self.st.get(def_sym).ty {
+            Type::Method { paramss, .. } => paramss.iter().map(Vec::len).collect(),
+            _ => Vec::new(),
+        };
+        let value_end = 1 + sizes.iter().sum::<usize>();
+        if fingerprints.first() != Some(&-1)
+            || value_end > fingerprints.len()
+            || fingerprints[value_end..].iter().any(|f| *f < 0)
+        {
+            self.error(
+                span,
+                "macro implementation parameter shape does not match the macro definition",
+            );
+            return None;
+        }
+        let mut signature = vec![fingerprints[..1].to_vec()];
+        let mut offset = 1;
+        for size in sizes {
+            let end = offset + size;
+            signature.push(fingerprints[offset..end].to_vec());
+            offset = end;
+        }
+        if offset < fingerprints.len() {
+            signature.push(fingerprints[offset..].to_vec());
+        }
+        self.st.push_scope();
+        let owner = self.st.get(def_sym).owner;
+        for scope in [owner, def_sym] {
+            if !scope.is_none() {
+                for tp in self.st.get(scope).tparams.clone() {
+                    let name = self.st.get(tp).name.clone();
+                    self.st.enter_in_current(&name, tp);
+                }
+            }
+        }
+        let mark = self.diags.len();
+        let targs: Vec<Type> = ref_targs.iter().map(|t| self.tree_to_type(t)).collect();
+        self.diags.truncate(mark);
+        self.st.pop_scope();
+        if targs.iter().any(Type::is_error) {
+            self.error(
+                span,
+                "cannot resolve macro implementation reference type arguments",
+            );
+            return None;
+        }
+        Some(MacroPickle { signature, targs })
     }
 
     /// What each tag the implementation asks for stands for, read off the
@@ -561,9 +645,9 @@ impl Typer {
     /// here means no call site needed expanding, so the def is simply dead.
     ///
     /// The *symbol* stays in the table and is still pickled. Recording the
-    /// binding in the pickle (nsc's `MACRO` flag plus `@macroImpl`) so that a
-    /// separately compiled macro def can be expanded is phase 2; see
-    /// `docs/macros.md` §5.
+    /// binding in the pickle (nsc's `MACRO` flag plus `@macroImpl`) lets a
+    /// separately compiled consumer expand it. The retained payload predates
+    /// uncurry, so its implementation fingerprint keeps the proper clauses.
     pub(crate) fn strip_macro_defs(&self, tree: &mut Tree) {
         let is_macro_def = |t: &Tree| -> bool {
             matches!(&t.kind, TreeKind::DefDef { rhs, .. } if matches!(rhs.kind, TreeKind::MacroRhs { .. }))

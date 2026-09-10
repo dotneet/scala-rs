@@ -13,10 +13,8 @@ Language:
 - **The rest of def macro expansion**. Expansion itself works (see "def macro expansion
   (JVM bridge)" above). What is still missing:
   **whitebox macros** / **macro bundles** (`class B(val c: Context)`) /
-  **pickling of macro bindings** (the `MACRO` flag and `@macroImpl`, which is why a
-  macro def cannot be expanded from a *different run* — only the shape "macro def in
-  the current run, implementation from a previous run" works) / **tags for inferred
-  type arguments** (only an explicit `f[T]` is supported) / **`c.enclosingPosition` /
+  **anonymous class definitions returned by macro expansions** / **general inferred
+  type argument tags outside resolved implicit evidence** / **`c.enclosingPosition` /
   `c.typecheck` / `c.inferImplicitValue`** (calling one makes the engine throw
   `UnsupportedOperationException`, and its name appears in the diagnostic) /
   **passing blocks, function literals, `new` and similar arguments (and the receiver)

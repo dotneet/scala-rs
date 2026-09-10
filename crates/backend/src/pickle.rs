@@ -14,10 +14,9 @@
 //! (`def f(x: 1)`, `val one: 1`) as `CONSTANTtpe` + `LITERALint` against our
 //! classfiles, and `type T = Int` as `ALIASsym` (nsc 2.13 has no `ALIAStpe` tag).
 //! Flags are nsc raw longs run through `rawToPickledFlags`.
-//! MACRO / late / anti are **not** pickled: scalac 2.13.16 typechecks the
-//! classfiles we already emit (`scalac_typechecks_against_our_classfiles_if_present`)
-//! without them. Def macros are out of scope. JAVA is not placed on EXTREF
-//! (no flags field on that pickle form).
+//! Source def macros carry MACRO and nsc's macroImpl annotation, including
+//! parameter fingerprints and reference type arguments. Late / anti flags are
+//! omitted. JAVA is not placed on EXTREF (no flags field on that pickle form).
 //! It is **not** a full nsc pickle — leftover holes are documented in README.
 //!
 //! nsc-facing details in this subset (must match `PickleBuffer` / `UnPickler`):
@@ -1084,6 +1083,86 @@ impl<'a> Pickler<'a> {
             Lit::String(s) => self.pickle_literal_string(s),
             Lit::Symbol(s) => self.pickle_literal_string(s),
         }
+    }
+
+    /// nsc MacroImplBinding.pickle: metadata trees are not executable code.
+    /// Preserve the implementation's actual clauses and reference type arguments.
+    fn pickle_macro_binding(&mut self, target: u32, binding: &scala_rs_typer::MacroBinding) {
+        let Some(payload) = &binding.pickle else {
+            return;
+        };
+        let scala = self.scala_module();
+        let reflect = self.ext_mod("reflect", Some(scala));
+        let macros = self.ext_mod("macros", Some(reflect));
+        let internal = self.ext_mod("internal", Some(macros));
+        let annotation = self.type_ref_in(internal, "macroImpl");
+        let collection = self.ext_mod("collection", Some(scala));
+        let immutable = self.ext_mod("immutable", Some(collection));
+        let list_name = self.term_name("List");
+        let mut symbol = Vec::new();
+        write_nat_to(&mut symbol, list_name);
+        write_nat_to(&mut symbol, immutable);
+        let list_symbol = self.add(EXTREF, symbol);
+        let list = self.macro_metadata_tree(IDENTtree, self.notpe, &[list_symbol, list_name]);
+        let mut clauses = Vec::new();
+        for clause in &payload.signature {
+            let mut refs = vec![list];
+            for value in clause {
+                refs.push(self.pickle_literal_tree(&Lit::Int(*value)));
+            }
+            clauses.push(self.macro_metadata_tree(APPLYtree, self.notpe, &refs));
+        }
+        let mut refs = vec![list];
+        refs.extend(clauses);
+        let signature = self.macro_metadata_tree(APPLYtree, self.notpe, &refs);
+        let mut fields = Vec::new();
+        for (name, value) in [
+            (
+                "macroEngine",
+                Lit::String("v7.0 (implemented in Scala 2.11.0-M8)".into()),
+            ),
+            ("isBundle", Lit::Boolean(false)),
+            ("isBlackbox", Lit::Boolean(binding.blackbox)),
+            (
+                "className",
+                Lit::String(binding.impl_class.replace('/', ".")),
+            ),
+            ("methodName", Lit::String(binding.impl_method.clone())),
+        ] {
+            let lhs = self.pickle_literal_tree(&Lit::String(name.into()));
+            let rhs = self.pickle_literal_tree(&value);
+            fields.push(self.macro_metadata_tree(22, self.notpe, &[lhs, rhs])); // ASSIGNtree
+        }
+        let lhs = self.pickle_literal_tree(&Lit::String("signature".into()));
+        fields.push(self.macro_metadata_tree(22, self.notpe, &[lhs, signature]));
+        let name = self.term_name("macro");
+        let nucleus = self.macro_metadata_tree(IDENTtree, self.notpe, &[self.none, name]);
+        let mut refs = vec![nucleus];
+        refs.extend(fields);
+        let mut wrapped = self.macro_metadata_tree(APPLYtree, self.notpe, &refs);
+        if !payload.targs.is_empty() {
+            let mut refs = vec![wrapped];
+            for arg in &payload.targs {
+                let ty = self.pickle_type(arg);
+                refs.push(self.macro_metadata_tree(38, ty, &[])); // TYPEtree
+            }
+            wrapped = self.macro_metadata_tree(TYPEAPPLYtree, self.notpe, &refs);
+        }
+        let mut body = Vec::new();
+        for value in [target, annotation, wrapped] {
+            write_nat_to(&mut body, value);
+        }
+        self.add(SYMANNOT, body);
+    }
+
+    fn macro_metadata_tree(&mut self, kind: u8, ty: u32, refs: &[u32]) -> u32 {
+        let mut body = Vec::new();
+        write_nat_to(&mut body, kind as u32);
+        write_nat_to(&mut body, ty);
+        for &r in refs {
+            write_nat_to(&mut body, r);
+        }
+        self.add(TREE, body)
     }
 
     fn pickle_symannot(&mut self, target: u32, annot: &Tree, owner: SymbolId) {
@@ -2494,6 +2573,10 @@ impl<'a> Pickler<'a> {
             info = self.add(POLYTPE, tpref);
         }
         let mut extra = 1u64 << 6; // METHOD
+        let macro_binding = self.st.get(method_id).macro_impl.clone();
+        if macro_binding.as_ref().is_some_and(|b| b.pickle.is_some()) {
+            extra |= 1 << 15; // MACRO: no JVM method, expand via macroImpl.
+        }
         if meth_flags.contains(Flags::SYNTHETIC) || meth_name.contains("$default$") {
             extra |= 1 << 21; // SYNTHETIC (not remapped)
         }
@@ -2529,6 +2612,11 @@ impl<'a> Pickler<'a> {
         let flags = pickled_from_our(meth_flags, meth_kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
+        // Keep macroImpl first: readers can discover it independently of
+        // user annotations on the same declaration.
+        if let Some(binding) = &macro_binding {
+            self.pickle_macro_binding(meth_idx, binding);
+        }
         self.pickle_sym_annots(method_id, meth_idx);
         self.current_owner = saved_owner;
         meth_idx
@@ -2994,8 +3082,8 @@ fn pickled_access_flags(st: &SymbolTable, id: SymbolId) -> Flags {
 }
 
 /// Map scala-rs `Flags` onto nsc **raw** bits (before `rawToPickledFlags`).
-/// MACRO / late / anti are omitted: scalac 2.13.16 typechecks our existing
-/// pickles without them (see `scalac_typechecks_against_our_classfiles_if_present`).
+/// MACRO is added by pickle_method when it writes the corresponding binding.
+/// Late / anti flags are omitted.
 fn nsc_raw_from_our(f: Flags, kind: SymKind) -> u64 {
     let mut n = 0u64;
     if f.contains(Flags::PROTECTED) {

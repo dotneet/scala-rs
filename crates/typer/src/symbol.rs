@@ -422,8 +422,16 @@ pub enum MacroTarg {
     Unresolved(String),
 }
 
+/// Source binding payload retained before uncurry for nsc's macroImpl annotation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MacroPickle {
+    pub signature: Vec<Vec<i32>>,
+    pub targs: Vec<Type>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroBinding {
+    pub pickle: Option<MacroPickle>,
     /// JVM internal name of the class holding the implementation, e.g. `M$`.
     /// nsc requires the implementation to be a method of an object, so this is
     /// always a module class.

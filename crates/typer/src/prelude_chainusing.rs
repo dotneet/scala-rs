@@ -107,7 +107,9 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
             ac
         });
 
-    let releasable = iface(st, util, "Releasable", "scala/util/Using$Releasable");
+    let using_mod = module(st, util, "Using", "scala/util/Using$");
+    let using_cls = st.module_class_of(using_mod);
+    let releasable = iface(st, using_cls, "Releasable", "scala/util/Using$Releasable");
     let r = type_param(st, releasable, "R");
     st.get_mut(r).flags = st.get(r).flags.with(Flags::CONTRAVARIANT);
     st.get_mut(releasable).tparams = vec![r];
@@ -123,7 +125,7 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
         ret: Box::new(Type::Unit),
     };
 
-    let rel_mod = module(st, util, "Releasable", "scala/util/Using$Releasable$");
+    let rel_mod = module(st, using_cls, "Releasable", "scala/util/Using$Releasable$");
     let rel_cls = st.module_class_of(rel_mod);
     crate::prelude_ordering2::add_ordering_instance(
         st,
@@ -139,8 +141,6 @@ pub(crate) fn add_using(st: &mut SymbolTable) {
     let mems = st.get(rel_cls).members.clone();
     st.get_mut(rel_mod).members.extend(mems);
 
-    let using_mod = module(st, util, "Using", "scala/util/Using$");
-    let using_cls = st.module_class_of(using_mod);
     let res = method(
         st,
         using_cls,

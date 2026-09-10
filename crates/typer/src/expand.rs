@@ -1288,15 +1288,22 @@ impl Typer {
                     args,
                 }))
             }
-            "TypeApply" => {
+            "TypeApply" | "AppliedTypeTree" => {
                 let fun = self.tree_from_reply(at(kids, 0)?, span)?;
                 let mut args = Vec::new();
                 for a in at(kids, 1)?.list()?.iter().skip(1) {
                     args.push(self.tree_from_reply(a, span)?);
                 }
-                Ok(node(TreeKind::TypeApply {
-                    fun: Box::new(fun),
-                    args,
+                Ok(node(if kind == "AppliedTypeTree" {
+                    TreeKind::AppliedTypeTree {
+                        tpt: Box::new(fun),
+                        args,
+                    }
+                } else {
+                    TreeKind::TypeApply {
+                        fun: Box::new(fun),
+                        args,
+                    }
                 }))
             }
             "Block" => {

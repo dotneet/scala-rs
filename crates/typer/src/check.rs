@@ -30,6 +30,14 @@ use scala_rs_span::{Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+pub(crate) struct PendingTypeBounds {
+    pub class: SymbolId,
+    pub args: Vec<Type>,
+    pub span: Span,
+    pub file: usize,
+    pub quantified: Vec<String>,
+}
+
 pub struct TypecheckOptions {
     pub fatal_warnings: bool,
     /// Type Option/List `withFilter` as the scala-library 2.13 shape, StringOps
@@ -335,6 +343,9 @@ pub struct Typer {
     /// member has a signature. Anything it works out is provisional, the same
     /// way the signature pass's is. See `Typer::complete_lazy_sig`.
     pub(crate) header_pass: bool,
+    /// Written applications seen before source inheritance is complete.
+    pub(crate) pending_type_bounds: Vec<PendingTypeBounds>,
+
     /// While set, an unqualified name in *type* position that resolves to
     /// nothing is reported as `not found: type X` instead of being left as the
     /// `Type::Named` placeholder.
@@ -912,6 +923,15 @@ pub fn typecheck_units_src(
         t.report_macro_calls(tree);
         t.strip_macro_defs(tree);
     }
+    // Signatures can apply a class before its own parent types are complete.
+    // In particular a recursive argument can satisfy its bound through the
+    // parent that is being installed; check it against the finished hierarchy.
+    for pending in std::mem::take(&mut t.pending_type_bounds) {
+        t.file_index = pending.file;
+        t.exist_quantified = pending.quantified;
+        t.check_class_tparam_bounds(pending.class, &pending.args, pending.span);
+    }
+    t.exist_quantified.clear();
     // Class headers are typed by both passes, so the same complaint about a
     // parent or self type is raised twice. Member signatures are built once
     // (see `sig_done`), so their diagnostics survive here.
@@ -950,6 +970,7 @@ impl Typer {
             import_text: HashMap::new(),
             sigs_only: false,
             header_pass: false,
+            pending_type_bounds: Vec::new(),
             strict_type_names: false,
             exist_quantified: Vec::new(),
             pattern_tpt: false,

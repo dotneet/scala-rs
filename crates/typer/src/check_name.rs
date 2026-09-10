@@ -1218,6 +1218,7 @@ impl Typer {
                         }
                     }
                 }
+                self.warm_binary_implicit_result_parents(cur);
                 // `import o._` imports what `o` has, and a `private` member of
                 // a *strict* ancestor of `o` is not one: SLS 5.2 keeps it
                 // inside its own class, so `o` does not inherit it and no

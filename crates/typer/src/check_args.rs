@@ -1656,7 +1656,10 @@ impl Typer {
             return failed;
         }
         self.building_implicits.push((id, pt.clone()));
-        let result = self.implicit_tree_in(id, pt, span, depth);
+        let mut result = self.implicit_tree_in(id, pt, span, depth);
+        // Synthesized evidence does not pass through type_expr. Expand the
+        // selected macro here, while the implicit recursion guard is active.
+        self.expand_macro_application(&mut result);
         self.building_implicits.pop();
         result
     }
@@ -1675,8 +1678,29 @@ impl Typer {
             .map(|f| f.targs)
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
+        let mut reference = self.ref_implicit(id, span);
+        if self.st.get(id).macro_impl.is_some() && !targs.is_empty() {
+            let args = targs
+                .iter()
+                .map(|ty| {
+                    let mut arg = Tree::dummy(TreeKind::Ident {
+                        name: crate::materialize::RESOLVED_TYPE.into(),
+                    });
+                    arg.ty = ty.clone();
+                    arg
+                })
+                .collect();
+            let ty = reference.ty.clone();
+            reference = Tree::dummy(TreeKind::TypeApply {
+                fun: Box::new(reference),
+                args,
+            });
+            reference.sym = id;
+            reference.span = span;
+            reference.ty = ty;
+        }
         if paramss.iter().all(|c| c.is_empty()) {
-            let mut t = self.ref_implicit(id, span);
+            let mut t = reference;
             if targs.len() == tps.len() && !tps.is_empty() {
                 t.ty = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
             }
@@ -1696,7 +1720,7 @@ impl Typer {
         // the case this branch handles -- emitted bare, codegen loaded `this`
         // and cast it: `class Main$ cannot be cast to class
         // BuildFromLowPriority1` from a program that type-checked.
-        let mut tree = self.ref_implicit(id, span);
+        let mut tree = reference;
         tree.ty = inst(&ret);
         for clause in &paramss {
             let mut cargs = Vec::with_capacity(clause.len());

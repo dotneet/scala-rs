@@ -621,7 +621,13 @@ impl Typer {
 
     pub(crate) fn resolve_tparam_bounds(&mut self, tparams: &[Tree]) {
         for tp in tparams.iter() {
-            let TreeKind::TypeDef { lo, hi, .. } = &tp.kind else {
+            let TreeKind::TypeDef {
+                lo,
+                hi,
+                tparams: inner_trees,
+                ..
+            } = &tp.kind
+            else {
                 continue;
             };
             let id = tp.sym;
@@ -638,6 +644,9 @@ impl Typer {
                     }
                 }
             }
+            // An inner bound can name a later outer parameter (M[_ <: A], A).
+            // Re-resolve it after all siblings have been entered.
+            self.resolve_tparam_bounds(inner_trees);
             if let Some(t) = lo {
                 let ty = self.tree_to_type(t);
                 if !ty.is_error() {
@@ -783,10 +792,10 @@ impl Typer {
         let applied = crate::symbol::apply_type_ctor(ctor, args);
         let before_bounds = self.diags.len();
         match &applied {
-            Type::Class { sym, args } => self.check_class_tparam_bounds(*sym, args, span),
+            Type::Class { sym, args } => self.check_written_type_bounds(*sym, args, span),
             Type::Applied { ctor, args } => {
                 if let Type::TypeMember(sym) | Type::TypeParam(sym) = &**ctor {
-                    self.check_class_tparam_bounds(*sym, args, span);
+                    self.check_written_type_bounds(*sym, args, span);
                 }
             }
             _ => {}
@@ -809,6 +818,26 @@ impl Typer {
             self.st.expand_written_type(self.st.this_class, &expanded)
         };
         self.canonical_applied_type(resolved)
+    }
+
+    fn check_written_type_bounds(&mut self, cls: SymbolId, args: &[Type], span: Span) {
+        // Provisional headers must not turn a recursive parent into Error.
+        // A class can satisfy its F-bound through the very parent being typed;
+        // validate after all source hierarchies and signatures are installed.
+        if self.header_pass {
+            return;
+        }
+        if self.sigs_only || self.parent_ctx.is_some() {
+            self.pending_type_bounds.push(PendingTypeBounds {
+                class: cls,
+                args: args.to_vec(),
+                span,
+                file: self.file_index,
+                quantified: self.exist_quantified.clone(),
+            });
+        } else {
+            self.check_class_tparam_bounds(cls, args, span);
+        }
     }
 
     /// Lower canonical library constructors only after resolving their identity
