@@ -1666,11 +1666,13 @@ pub(crate) fn inherited_super_class(st: &SymbolTable, parents: &[Tree]) -> Optio
     None
 }
 
-pub(crate) fn class_extends_named(st: &SymbolTable, id: SymbolId, name: &str) -> bool {
+/// Initialization protocols belong to exact Scala runtime traits. A user
+/// trait with the same simple name does not acquire their constructor ABI.
+pub(crate) fn class_extends_internal(st: &SymbolTable, id: SymbolId, name: &str) -> bool {
     if id.is_none() {
         return false;
     }
-    if st.get(id).name == name {
+    if class_internal(st, id) == name {
         return true;
     }
     let mut work = st.get(id).parents.clone();
@@ -1683,7 +1685,7 @@ pub(crate) fn class_extends_named(st: &SymbolTable, id: SymbolId, name: &str) ->
         if !seen.insert(pid.0) {
             continue;
         }
-        if st.get(pid).name == name {
+        if class_internal(st, pid) == name {
             return true;
         }
         work.extend(st.get(pid).parents.clone());
@@ -1692,11 +1694,12 @@ pub(crate) fn class_extends_named(st: &SymbolTable, id: SymbolId, name: &str) ->
 }
 
 pub(crate) fn extends_delayed_init(st: &SymbolTable, id: SymbolId) -> bool {
-    class_extends_named(st, id, "DelayedInit") || class_extends_named(st, id, "App")
+    class_extends_internal(st, id, "scala/DelayedInit")
+        || class_extends_internal(st, id, "scala/App")
 }
 
 pub(crate) fn extends_app(st: &SymbolTable, id: SymbolId) -> bool {
-    class_extends_named(st, id, "App")
+    class_extends_internal(st, id, "scala/App")
 }
 
 /// A bare expression statement in a template body — anything that is not a

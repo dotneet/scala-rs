@@ -24,6 +24,8 @@ makes no claim of conformance to the language specification. What exists today:
   Parameterless results infer their lower bounds in value position; explicit
   and omitted apply both retain factory receiver inference until the arguments.
   Selection qualifiers defer that value-position inference, including aliases.
+- Scala App and DelayedInit initialization protocols are selected by their
+  fully qualified runtime identities, preserving same-named user traits.
 - The target is Java 8 class files (major version 52), with a `StackMapTable`
   (`full_frame`) in the `Code` attribute. Frame types for locals are the erasure
   of the slot's declared type, as in scalac.
