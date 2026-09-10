@@ -2987,7 +2987,7 @@ impl Typer {
         if matches!(pt, Type::String) && !matches!(tree.ty, Type::String) {
             // allow via toString in concat contexts only — not general
         }
-        if matches!(pt, Type::Any | Type::AnyRef | Type::AnyVal) {
+        if matches!(pt, Type::Any) {
             return;
         }
         // nsc `inferExprAlternative`: an *overloaded* method named where a

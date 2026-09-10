@@ -532,21 +532,24 @@ impl Typer {
             }
             _ => return OverloadPick::None,
         }
-        let applicable: Vec<(SymbolId, Vec<Type>, Type)> = {
+        let (applicable, with_views): (Vec<(SymbolId, Vec<Type>, Type)>, bool) = {
             let no_view: Vec<_> = cands
                 .iter()
                 .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, false, targs))
                 .cloned()
                 .collect();
             if !no_view.is_empty() {
-                no_view
+                (no_view, false)
             } else {
-                cands
-                    .into_iter()
-                    .filter(|(sym, ps, _)| {
-                        self.is_applicable(*sym, clause, ps, arg_tys, true, targs)
-                    })
-                    .collect()
+                (
+                    cands
+                        .into_iter()
+                        .filter(|(sym, ps, _)| {
+                            self.is_applicable(*sym, clause, ps, arg_tys, true, targs)
+                        })
+                        .collect(),
+                    true,
+                )
             }
         };
         let applicable = self.narrow_by_lambda_shape(applicable, arg_tys, shapes);
@@ -605,9 +608,10 @@ impl Typer {
                 let winners: Vec<(SymbolId, Vec<Type>, Type)> = applicable
                     .iter()
                     .filter(|a| {
-                        applicable
-                            .iter()
-                            .all(|b| a.0 == b.0 || self.is_as_specific_method(a.0, b.0, &a.1, &b.1))
+                        applicable.iter().all(|b| {
+                            a.0 == b.0
+                                || self.is_as_specific_method(a.0, b.0, &a.1, &b.1, with_views)
+                        })
                     })
                     .cloned()
                     .collect();
@@ -911,6 +915,7 @@ impl Typer {
         b_sym: SymbolId,
         a_ps: &[Type],
         b_ps: &[Type],
+        with_views: bool,
     ) -> bool {
         // `A`'s own type parameters stand in for the *arguments* of this
         // hypothetical call, so they are rigid: `B` in `map[B](Char => B)` is
@@ -935,7 +940,7 @@ impl Typer {
                 .collect()
         };
         let saved = self.spec_probe.replace(true);
-        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, true, &[])
+        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[])
             && self.function_params_conform(&a_ps, &b_ps);
         self.spec_probe.set(saved);
         out
@@ -1795,7 +1800,7 @@ impl Typer {
         open: &[SymbolId],
     ) -> bool {
         match self.arg_score(arg, param) {
-            Some(3) if !allow_widen => false, // numeric widen
+            Some(3) if !allow_widen && !self.spec_probe.get() => false, // numeric widen
             Some(_) => true,
             None if allow_widen => {
                 // Narrowing an `Int` literal (`take(3)` on a `Byte` parameter)
@@ -2438,9 +2443,8 @@ impl Typer {
         if numeric_widen(arg, param).is_some() {
             return Some(3);
         }
-        if matches!(param, Type::Any | Type::AnyRef | Type::AnyVal) {
-            return Some(1);
-        }
+        // AnyRef and AnyVal are disjoint domains. Subtyping, inference and
+        // conversions above decide applicability; neither is a catch-all.
         // Last: a class that *is* a function inhabits a function parameter.
         // `MapOps[K, V, …] extends PartialFunction[K, V]`, so `xs.map(aMap)`
         // hands `map` a `K => V`. Only as a fallback -- weighed earlier it

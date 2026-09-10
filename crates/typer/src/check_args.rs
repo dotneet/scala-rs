@@ -455,6 +455,125 @@ impl Typer {
         ok
     }
 
+    /// Place names and defaults within each written constructor clause.
+    pub(crate) fn reorder_curried_ctor_args(
+        &mut self,
+        args: &mut Vec<Tree>,
+        class_id: Option<SymbolId>,
+        fun: &Tree,
+        lengths: &[usize],
+        node: NodeId,
+    ) -> Option<bool> {
+        let class_id = class_id?;
+        let own: Vec<_> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|m| {
+                self.st.get(*m).owner == class_id && self.st.get(*m).kind == SymKind::Method
+            })
+            .collect();
+        let has_linked = own.iter().any(|m| !self.st.get(*m).jvm_name.is_empty());
+        let own: Vec<_> = own
+            .into_iter()
+            .filter(|m| !has_linked || !self.st.get(*m).jvm_name.is_empty())
+            .collect();
+        let [ctor] = own.as_slice() else { return None };
+        let clauses = self.st.get(*ctor).paramss.clone();
+        if clauses.len() < lengths.len() || lengths.iter().sum::<usize>() != args.len() {
+            return None;
+        }
+        // Preserve the written clause boundaries until names and defaults
+        // are placed. A name in clause two cannot fill a slot in clause one.
+        if !Self::has_named_arg(args) && clauses.iter().zip(lengths).all(|(ps, n)| ps.len() == *n) {
+            return Some(true);
+        }
+        let mut callee = fun.clone();
+        callee.sym = *ctor;
+        callee.ty = self.st.get(*ctor).ty.clone();
+        let mut rest = std::mem::take(args).into_iter();
+        let mut out = Vec::new();
+        let mut order = Vec::new();
+        let mut sequence = 0;
+        let mut parameter_offset = 0;
+        let mut ok = true;
+        for (&n, ids) in lengths.iter().zip(&clauses) {
+            let names: Vec<_> = ids.iter().map(|p| self.st.get(*p).name.clone()).collect();
+            let written: Vec<_> = rest.by_ref().take(n).collect();
+            let (slots, extras, valid) = self.named_arg_slots(written, &names);
+            ok &= valid;
+            let sources = std::mem::take(&mut self.slot_source);
+            let repeated = ids
+                .last()
+                .is_some_and(|p| matches!(self.st.get(*p).ty, Type::Repeated(_)));
+            let default_start = sequence + n;
+            let mut defaults = 0;
+            for (i, slot) in slots.into_iter().enumerate() {
+                let pid = ids[i];
+                let byname = self.st.get(pid).flags.contains(Flags::BYNAME)
+                    || matches!(self.st.get(pid).ty, Type::ByName(_));
+                if let Some(value) = slot {
+                    out.push(value);
+                    order.push(if byname {
+                        None
+                    } else {
+                        sources[i].map(|j| sequence + j)
+                    });
+                } else if self.st.get(pid).flags.contains(Flags::DEFAULTPARAM) {
+                    if let Some(mut value) =
+                        self.default_getter_apply(&callee, pid, parameter_offset + i + 1, &out)
+                    {
+                        // Later getters clone this expression. Share its saved
+                        // value using an identity above all parsed source nodes.
+                        value.id = NodeId(self.macro_next_node);
+                        self.macro_next_node += 1;
+                        out.push(value);
+                        order.push((!byname).then_some(default_start + defaults));
+                        defaults += 1;
+                    } else {
+                        self.error(
+                            fun.span,
+                            format!("cannot resolve default argument {}", names[i]),
+                        );
+                        ok = false;
+                    }
+                } else if repeated && i + 1 == ids.len() {
+                    // An empty repeated tail is packed by ordinary adaptation.
+                } else {
+                    if valid {
+                        self.error(
+                            fun.span,
+                            format!("missing argument for parameter `{}`", names[i]),
+                        );
+                    }
+                    ok = false;
+                }
+            }
+            if repeated {
+                for (i, value) in extras.into_iter().enumerate() {
+                    out.push(value);
+                    order.push(Some(sequence + ids.len() + i));
+                }
+            } else {
+                for value in extras {
+                    self.error(value.span, "too many arguments");
+                    ok = false;
+                }
+            }
+            sequence = default_start + defaults;
+            parameter_offset += ids.len();
+        }
+        // Defaults of a clause execute before the next written clause. Keep
+        // even an identity order: a later getter may reuse an earlier argument.
+        if node != NodeId(0) {
+            self.st
+                .named_arg_order
+                .insert((self.file_index as u32, node.0), order);
+        }
+        *args = out;
+        Some(ok)
+    }
+
     /// `new C(b = 2, a = 1)`. Constructors are picked by argument type, so the
     /// names have to be resolved first — and against the overload that
     /// actually declares them.
@@ -478,7 +597,14 @@ impl Typer {
             Self::strip_named_args(args);
             return true;
         };
-        let mut alts = self.st.lookup_member(class_id, "<init>");
+        // Constructors are not inherited. Ancestor constructors must not
+        // compete with the class's own clauses or their parameter names.
+        let mut alts: Vec<_> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|m| self.st.get(*m).owner == class_id)
+            .collect();
         if let Some(cur) = skip {
             if alts.iter().any(|&m| m != cur) {
                 alts.retain(|&m| m != cur);

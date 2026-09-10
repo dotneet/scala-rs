@@ -2113,18 +2113,12 @@ impl Typer {
                 .map(|tp| Type::TypeParam(*tp))
                 .collect(),
         };
+        // Use the same Scala linearization as member lookup. A DFS can
+        // reach a shared broad ancestor before a parent's narrower override.
+        let mut work = crate::lin::linearize(&self.st, owner);
+        work.extend([self.st.anyref_sym, self.st.any_sym]);
         let mut seen = std::collections::HashSet::new();
-        let mut work: Vec<SymbolId> = self
-            .st
-            .get(owner)
-            .parents
-            .clone()
-            .iter()
-            .filter_map(|p| self.st.class_sym_of(p))
-            .collect();
-        work.push(self.st.anyref_sym);
-        work.push(self.st.any_sym);
-        while let Some(id) = work.pop() {
+        for id in work {
             if id.is_none() || id == owner || !seen.insert(id.0) {
                 continue;
             }
@@ -2136,7 +2130,10 @@ impl Typer {
                 if cand_name != name || !matches!(cand_kind, SymKind::Method | SymKind::Term) {
                     continue;
                 }
-                if abstract_only && !self.st.method_is_deferred(m) {
+                if abstract_only
+                    && !self.st.method_is_deferred(m)
+                    && !(cand_kind == SymKind::Term && self.st.get(m).deferred_val)
+                {
                     continue;
                 }
                 // Deliberately *not* `complete_lazy_sig`: forcing a
@@ -2223,11 +2220,6 @@ impl Typer {
                         // parameters, not the ancestor's distinct term symbols.
                         return Some(self.subst_dependent_paths(&base_params, &args, ret));
                     }
-                }
-            }
-            for p in self.st.get(id).parents.clone() {
-                if let Some(c) = self.st.class_sym_of(&p) {
-                    work.push(c);
                 }
             }
         }
