@@ -1208,7 +1208,12 @@ impl Typer {
                         .pickle
                         .implicit_member_names(&self.st, &mut self.binary, cur)
                     {
-                        if self.st.lookup_member(cur, &n).is_empty() {
+                        if !self
+                            .st
+                            .lookup_member(cur, &n)
+                            .iter()
+                            .any(|&id| self.st.get(id).flags.contains(Flags::IMPLICIT))
+                        {
                             self.supply_from_pickle_class(cur, &n);
                         }
                     }
@@ -1392,7 +1397,8 @@ impl Typer {
         if name.is_empty() {
             return;
         }
-        if self.st.has_real_type_entry(name) {
+        let default_type = self.st.has_only_default_type_binding(name);
+        if self.st.has_real_type_entry(name) && !default_type {
             // The type namespace has an answer, but an *import's* answer is
             // still outranked by a definition this unit's own package clause
             // makes available. Same rule, and same one stage, as
@@ -1405,7 +1411,7 @@ impl Typer {
             }
             return;
         }
-        if self.library_abi {
+        {
             let imports: Vec<_> = self
                 .st
                 .scopes
@@ -1416,6 +1422,10 @@ impl Typer {
                 .map(|w| (w.owner, w.origin))
                 .collect();
             for (owner, origin) in imports {
+                if default_type && origin == 0 {
+                    continue;
+                }
+                let mut exposed = false;
                 // A preceding term use may have imported only a companion.
                 // Complete and bind the package's class before falling back to
                 // pickled aliases or the module offered by lookup_type.
@@ -1429,10 +1439,14 @@ impl Typer {
                     {
                         self.st
                             .enter_import_in_current(name, id, BindRank::Wildcard, origin);
+                        exposed = true;
                     }
                 }
-                if self.st.has_real_type_entry(name) {
+                if exposed {
                     return;
+                }
+                if !self.library_abi {
+                    continue;
                 }
                 match self
                     .pickle

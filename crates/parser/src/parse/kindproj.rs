@@ -362,7 +362,12 @@ fn split_variance(name: &str) -> (Flags, &str) {
 /// `FunctionN` -> `N`. The type parser folds every `=>` into one of these.
 fn function_arity(kind: &TreeKind) -> Option<usize> {
     match kind {
-        TreeKind::Ident { name } => name.strip_prefix("Function")?.parse::<usize>().ok(),
+        TreeKind::Ident { name } => name
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .strip_prefix("Function")?
+            .parse::<usize>()
+            .ok(),
         _ => None,
     }
 }

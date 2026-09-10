@@ -1646,10 +1646,9 @@ impl SymbolTable {
     /// stays: its id is written into prelude signatures that are still in
     /// use, and rewriting those is not something a namer can do.
     ///
-    /// Only prelude symbols are replaced (`id < prelude_end`). A classfile
-    /// read from the classpath is a different question — a source definition
-    /// and a binary of the same class in one run is a real ambiguity that
-    /// nsc reports — and is left alone.
+    /// Prelude declarations and eagerly loaded classpath declarations are
+    /// replaced. A source recompile supersedes its previous classfiles; two
+    /// source declarations remain distinct and can still be diagnosed.
     pub fn shadow_supplied_by_source(&mut self, id: SymbolId) {
         if id.is_none() || id.0 < self.prelude_end {
             return;
@@ -1668,7 +1667,12 @@ impl SymbolTable {
             .copied()
             .filter(|&m| {
                 m != id
-                    && m.0 < prelude_end
+                    && (m.0 < prelude_end
+                        || self.pending_classpath_signatures.contains(&m)
+                        || (self.get(m).kind == SymKind::Module
+                            && self
+                                .pending_classpath_signatures
+                                .contains(&self.module_class_of(m))))
                     && self.get(m).name == name
                     && shadowable_kind(kind, self.get(m).kind)
             })
@@ -1918,6 +1922,24 @@ impl SymbolTable {
             }
             if slot.iter().any(|b| self.is_type_namespace(b.sym)) {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// A prelude type is a default import, not a completed user wildcard.
+    /// Explicit source imports carry an origin and must retain their rank.
+    pub(crate) fn has_only_default_type_binding(&self, name: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            let bindings: Vec<_> = scope
+                .lookup_ranked(name)
+                .iter()
+                .filter(|b| self.is_type_namespace(b.sym))
+                .collect();
+            if !bindings.is_empty() {
+                return bindings.iter().all(|b| {
+                    b.origin == 0 && b.sym.0 < self.prelude_end && self.is_prelude_scope_type(b.sym)
+                });
             }
         }
         false

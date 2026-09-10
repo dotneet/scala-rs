@@ -1089,3 +1089,20 @@ have their own inference boundary. The fixtures execute with real scalac
 cases. Path-dependent inner-class/instance-member singleton manifests and
 TypeTag-to-Manifest interoperability remain unsupported. See
 [the candidate inventory](docs/batches/evidence-materialization.md).
+
+
+### Type identity, written bounds and binary implicit objects
+
+`typeidentitybatch` compares source type names and written generic bounds with
+real scalac 2.13.16. User Array, Function1, Tuple2, String and wildcard-imported
+Int retain their own identity; arrow syntax remains a canonical function type.
+Written class and alias applications check arity and upper/lower/dependent bounds,
+including a concrete argument beside an existential argument.
+
+Binary implicit objects preserve flags, parents and their actual static module
+or instance accessor ABI. Tests exchange API classfiles in both directions,
+from directories and jars, and check inherited evidence, distinct receivers,
+private/ambiguous evidence and source recompilation over old classfiles. Valid
+programs run with JVM verification and byte-identical output. The private
+runtime still has no Array factory companion. See
+[the inventory and boundaries](docs/batches/type-identity-implicit.md).

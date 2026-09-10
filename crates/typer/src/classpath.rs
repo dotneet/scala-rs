@@ -140,6 +140,9 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                         }
                     }
                     let id = add_term(st, owner, &m.name, ty);
+                    if m.is_implicit {
+                        st.get_mut(id).flags = st.get(id).flags.with(Flags::IMPLICIT);
+                    }
                     // `MUTABLE` and `DEFERRED` live only in the pickle: an
                     // interface declares a `val`'s and a `var`'s getter
                     // identically, and declares a concrete member of a trait
@@ -590,7 +593,7 @@ fn add_method_erased(
 }
 
 fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> bool {
-    if c.is_module {
+    if c.is_module || c.is_interface {
         return false;
     }
     // A case class `Point.class` sits next to companion `Point$.class`. That is

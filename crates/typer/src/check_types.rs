@@ -170,18 +170,17 @@ impl Typer {
                     let q = q.clone();
                     self.expose_unqualified(&q, tpt.span);
                 }
-                if name == "String" && !self.type_select_is_term_prefix(qual) {
-                    Type::String
+                if self.type_select_is_term_prefix(qual) {
+                    self.path_dependent_type(tpt.span, qual, name)
                 } else if let Some(t) = scala_value_type(qual, name) {
                     t
-                } else if self.type_select_is_term_prefix(qual) {
-                    self.path_dependent_type(tpt.span, qual, name)
                 } else if let Some(id) = self.lookup_qualified_type(qual, name) {
                     self.complete_lazy_sig(id, tpt.span);
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
                         SymKind::TypeMember => Type::TypeMember(id),
+                        _ if id == self.st.string_sym => Type::String,
                         _ => Type::Class {
                             sym: id,
                             args: vec![],
@@ -194,6 +193,11 @@ impl Typer {
                     // fallback below would answer with an unrelated class that
                     // merely shares the simple name.
                     self.missing_qualified_type(qual, name, tpt.span)
+                } else if self.qualifier_is_package(qual) {
+                    // A resolved package cannot supply an unrelated bare type.
+                    // Its package-object aliases still need lazy pickle lookup.
+                    self.qualified_pickled_type_member(qual, name)
+                        .unwrap_or_else(|| self.missing_qualified_type(qual, name, tpt.span))
                 } else {
                     // The prefix knows nothing of that name. Falling back on
                     // the *bare* name is deliberate -- a path this pass cannot
@@ -269,72 +273,32 @@ impl Typer {
                 }
                 let head_mark = self.diags.len();
                 let applied = match tpt.name() {
-                    Some("Array") => {
-                        Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
-                    }
+                    // These are parser markers, not source-level names.
                     Some("<repeated>") => {
                         Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
-                    Some(n)
-                        if numbered_arity(n, "Function")
-                            .is_some_and(|k| as_.is_empty() || k + 1 == as_.len()) =>
-                    {
-                        if as_.is_empty() {
-                            Type::Function {
-                                params: vec![],
-                                ret: Box::new(Type::Any),
-                            }
-                        } else {
-                            let ret = Box::new(as_.last().cloned().unwrap());
-                            Type::Function {
-                                params: as_[..as_.len() - 1].to_vec(),
-                                ret,
-                            }
-                        }
-                    }
-                    // `Predef.Function[A, B]` / `scala.Predef.Function[A, B]`
-                    // names the alias explicitly; there is no such member to
-                    // resolve, so answer before `tree_to_type` reports one.
-                    Some("Function")
-                        if as_.len() == 2
-                            && matches!(&tpt.kind, TreeKind::Select { qual, .. }
-                                if qual.name() == Some("Predef")) =>
-                    {
+                    Some("<tuple>") => Type::Tuple(as_),
+                    Some(name) if name.starts_with("<Function") && name.ends_with('>') => {
+                        let ret = as_.pop().unwrap_or(Type::Error);
                         Type::Function {
-                            params: vec![as_[0].clone()],
-                            ret: Box::new(as_[1].clone()),
+                            params: as_,
+                            ret: Box::new(ret),
                         }
                     }
-                    Some("Function") => {
+                    Some(_) => {
                         let ctor = self.tree_to_type(tpt);
-                        // `Predef` aliases `type Function[-A, +B] = Function1[A, B]`,
-                        // so a bare applied `Function[A, B]` is a function type. The
-                        // name otherwise resolves to the `scala.Function` *module*
-                        // class, whose kind arity is 0 -- without this it drew
-                        // "Function does not take type parameters".
+                        // The private runtime's prelude uses the canonical
+                        // Function module as the Function[A,B] alias carrier.
+                        // A user declaration with this name is not that symbol.
                         if as_.len() == 2 && self.is_scala_function_module(&ctor) {
                             Type::Function {
                                 params: vec![as_[0].clone()],
                                 ret: Box::new(as_[1].clone()),
                             }
                         } else {
-                            match ctor {
-                                Type::Class { sym, .. } => {
-                                    self.apply_types(Type::Class { sym, args: vec![] }, as_, span)
-                                }
-                                ctor => self.apply_types(ctor, as_, span),
-                            }
+                            let applied = self.apply_types(ctor.clone(), as_, span);
+                            self.with_prefix_if_type_member(tpt, &ctor, applied)
                         }
-                    }
-                    // `<tuple>` is the parser's marker for a parenthesised
-                    // type list; outside a function type it is just a tuple.
-                    Some(n) if numbered_arity(n, "Tuple") == Some(as_.len()) || n == "<tuple>" => {
-                        Type::Tuple(as_)
-                    }
-                    Some(_) => {
-                        let ctor = self.tree_to_type(tpt);
-                        let applied = self.apply_types(ctor.clone(), as_, span);
-                        self.with_prefix_if_type_member(tpt, &ctor, applied)
                     }
                     None => Type::Error,
                 };
@@ -360,17 +324,10 @@ impl Typer {
                 for a in args {
                     as_.push(self.tree_to_type(a));
                 }
-                match fun.name() {
-                    Some("Array") => {
-                        Type::Array(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
-                    }
-                    Some(n) => {
-                        let ctor = self.resolve_type_name(n, &[]);
-                        self.apply_types(ctor, as_, fun.span)
-                    }
-                    None => Type::Error,
-                }
+                let ctor = self.tree_to_type(fun);
+                self.apply_types(ctor, as_, fun.span)
             }
+
             TreeKind::Literal { lit } => Type::Constant(lit.clone()),
             TreeKind::TypeDef {
                 name,
@@ -2011,6 +1968,14 @@ impl Typer {
     }
 
     /// Every owner a `p.T` prefix can denote, best first (see `type_owner_rank`).
+    fn qualifier_is_package(&mut self, qual: &Tree) -> bool {
+        let owners = self.qualified_type_owners(qual);
+        !owners.is_empty()
+            && owners
+                .iter()
+                .all(|&id| self.st.get(id).kind == SymKind::Package)
+    }
+
     fn qualified_type_owners(&mut self, t: &Tree) -> Vec<SymbolId> {
         let mut out: Vec<SymbolId> = Vec::new();
         match &t.kind {
@@ -2831,11 +2796,26 @@ impl Typer {
             if c.is_none() || !walked.insert(c.0) {
                 continue;
             }
+            // Directory discovery can have installed the companion already.
+            // Read only its implicit declarations, just as lazy jar discovery
+            // does, without adopting an entire module beside existing members.
+            if self.st.pending_classpath_signatures.contains(&c)
+                && !self.st.source_classes.contains(&c)
+                && !self.pickle.pickle_readable(&self.st, c)
+            {
+                self.pickle
+                    .supply_implicit_members(&mut self.st, &mut self.binary, c);
+            }
             for n in self
                 .pickle
                 .implicit_member_names(&self.st, &mut self.binary, c)
             {
-                if self.st.lookup_member(c, &n).is_empty() {
+                if !self
+                    .st
+                    .lookup_member(c, &n)
+                    .iter()
+                    .any(|&id| self.st.get(id).flags.contains(Flags::IMPLICIT))
+                {
                     self.supply_from_pickle_class(c, &n);
                 }
             }
@@ -3621,7 +3601,7 @@ impl Typer {
     fn builtin_type_shadowed(&self, name: &str) -> bool {
         if !matches!(
             self.st.type_bind_rank(name),
-            Some(BindRank::Definition | BindRank::Explicit)
+            Some(BindRank::Definition | BindRank::Explicit | BindRank::Wildcard)
         ) {
             return false;
         }

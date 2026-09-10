@@ -994,7 +994,11 @@ impl<'a> Reifier<'a> {
                     vec![self.list(ts)],
                 ));
             }
-            if let Some(rest) = name.strip_prefix("Function") {
+            if let Some(rest) = name
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .strip_prefix("Function")
+            {
                 let written = self.text(tpt.span) == name.as_str();
                 if !written && rest.chars().all(|c| c.is_ascii_digit()) && !args.is_empty() {
                     // `=> T` (a by-name type) also lands here; nsc's own

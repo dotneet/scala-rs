@@ -2121,7 +2121,9 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut tr, self.noprefix);
             write_nat_to(&mut tr, idx);
             let mtpe = self.add(TYPEREFTPE, tr);
-            let mflags = raw_to_pickled(1 << 8);
+            // The term carries source visibility and implicit-search flags;
+            // MODULE alone makes a nested implicit object invisible to nsc.
+            let mflags = pickled_from_our(class_flags, SymKind::Module, 1 << 8);
             let mn = self.term_name(&raw_name);
             let mbody = self.symbol_info(mn, owner, mflags, mtpe);
             self.add(MODULESYM, mbody);

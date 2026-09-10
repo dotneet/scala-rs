@@ -781,6 +781,19 @@ impl Typer {
             }
         }
         let applied = crate::symbol::apply_type_ctor(ctor, args);
+        let before_bounds = self.diags.len();
+        match &applied {
+            Type::Class { sym, args } => self.check_class_tparam_bounds(*sym, args, span),
+            Type::Applied { ctor, args } => {
+                if let Type::TypeMember(sym) | Type::TypeParam(sym) = &**ctor {
+                    self.check_class_tparam_bounds(*sym, args, span);
+                }
+            }
+            _ => {}
+        }
+        if self.diags.len() != before_bounds {
+            return Type::Error;
+        }
         let expanded = self.st.expand_applied_hk_alias(applied);
         // An alias body may still name an abstract member (`type C[T] = self.C[T]`).
         // The class being typed knows how it implements those, so re-read the
@@ -790,11 +803,42 @@ impl Typer {
         // carry its own prefix, and a `self.C` behind one belongs to the class
         // that prefix names, not to the class being typed. The prefix is still
         // in hand in `with_prefix_if_type_member`, which runs right after this.
-        if self.st.this_class.is_none() {
+        let resolved = if self.st.this_class.is_none() {
             expanded
         } else {
             self.st.expand_written_type(self.st.this_class, &expanded)
+        };
+        self.canonical_applied_type(resolved)
+    }
+
+    /// Lower canonical library constructors only after resolving their identity
+    /// and checking their arguments. A user Array/FunctionN/TupleN is a class.
+    fn canonical_applied_type(&self, ty: Type) -> Type {
+        let Type::Class { sym, args } = &ty else {
+            return ty;
+        };
+        if self.st.is_array_class(*sym) && args.len() == 1 {
+            return Type::Array(Box::new(args[0].clone()));
         }
+        let jvm = self.st.get(*sym).jvm_name.as_str();
+        if jvm
+            .strip_prefix("scala/Function")
+            .and_then(|n| n.parse::<usize>().ok())
+            .is_some_and(|n| n + 1 == args.len())
+        {
+            return Type::Function {
+                params: args[..args.len() - 1].to_vec(),
+                ret: Box::new(args.last().unwrap().clone()),
+            };
+        }
+        if jvm
+            .strip_prefix("scala/Tuple")
+            .and_then(|n| n.parse::<usize>().ok())
+            == Some(args.len())
+        {
+            return Type::Tuple(args.clone());
+        }
+        ty
     }
 
     pub(crate) fn check_proper_type(&mut self, ty: &Type, span: Span) {
@@ -1516,6 +1560,13 @@ impl Typer {
         }
         // An inner template may extend a name inherited by this one.
         self.enter_inherited_members(id);
+        // Earlier units can apply this class before its signature pass runs.
+        // Refresh provisional bounds in the declaration's lexical imports,
+        // alongside the parent headers, rather than compare unresolved names.
+        if let TreeKind::ClassDef { tparams, .. } = &tree.kind {
+            self.resolve_tparam_bounds(tparams);
+        }
+
         if ctors {
             self.header_ctor_sig(tree, id);
         }

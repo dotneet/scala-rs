@@ -4,6 +4,12 @@ The following are not implemented. They are not stubbed out to "pretend they wor
 
 Language:
 
+- Deeper higher-kinded bound conformance remains incomplete. Written proper-type
+  class/alias applications now enforce their upper/lower/dependent bounds, but
+  this does not establish full Scala existential or path-dependent type support.
+- The private runtime does not provide the `scala.Array` factory companion;
+  use the supported array constructor there. Library ABI mode has the real factory.
+
 - **The rest of def macro expansion**. Expansion itself works (see "def macro expansion
   (JVM bridge)" above). What is still missing:
   **whitebox macros** / **macro bundles** (`class B(val c: Context)`) /

@@ -1895,7 +1895,7 @@ impl<'a> Parser<'a> {
             let tpt = self.alloc(
                 lo,
                 TreeKind::Ident {
-                    name: "Function0".into(),
+                    name: "<Function0>".into(),
                 },
             );
             let fn0 = self.alloc(
@@ -1927,7 +1927,7 @@ impl<'a> Parser<'a> {
             let tpt = self.alloc(
                 t.span,
                 TreeKind::Ident {
-                    name: format!("Function{n}"),
+                    name: format!("<Function{n}>"),
                 },
             );
             let fn_ty = self.alloc(

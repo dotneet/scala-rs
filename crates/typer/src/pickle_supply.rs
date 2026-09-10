@@ -826,7 +826,7 @@ impl PickleSupply {
         for m in &sig.members {
             // `is_implicit_class_conversion`: an `implicit class`'s conversion
             // method is `SYNTHETIC`, which `is_public_api` hides.
-            if m.kind != MemberKind::Def
+            if !matches!(m.kind, MemberKind::Def | MemberKind::Module)
                 || !m.has(pflags::IMPLICIT)
                 || (!m.is_public_api() && !implicit_class_conversion_from(&internal, m))
             {
@@ -1020,7 +1020,7 @@ impl PickleSupply {
                         // `is_implicit_class_conversion`: an `implicit class`'s
                         // conversion method is `SYNTHETIC`, which
                         // `is_public_api` hides.
-                        if m.kind != MemberKind::Def
+                        if !matches!(m.kind, MemberKind::Def | MemberKind::Module)
                             || !m.has(pflags::IMPLICIT)
                             || (!m.is_public_api() && !implicit_class_conversion_from(&internal, m))
                         {
@@ -1771,7 +1771,7 @@ impl PickleSupply {
         name: &str,
         synthetic_ok: bool,
     ) -> Vec<SymbolId> {
-        if class_sym.is_none() || name.is_empty() {
+        if class_sym.is_none() || name.is_empty() || !self.pickle_readable(st, class_sym) {
             return Vec::new();
         }
         if !self.tried.insert((class_sym.0, name.to_string())) {
@@ -1926,6 +1926,16 @@ impl PickleSupply {
             if m.kind == MemberKind::Module && m.is_public_api() {
                 let owner = hit.owner.clone();
                 if let Some(id) = self.install_nested_module(st, bin, class_sym, &owner, name) {
+                    if m.has(pflags::IMPLICIT) {
+                        st.get_mut(id).flags = st.get(id).flags.with(Flags::IMPLICIT);
+                        let result = match &st.get(id).ty {
+                            Type::Method { ret, .. } => (**ret).clone(),
+                            ty => ty.clone(),
+                        };
+                        if let Some(module) = st.class_sym_of(&result) {
+                            self.ensure_parents(st, bin, module);
+                        }
+                    }
                     // The same object can be reached through more than one
                     // hit (a trait inherited twice over); one accessor is
                     // one member, not an overload of itself.
@@ -2424,12 +2434,49 @@ impl PickleSupply {
         pickle_owner: &str,
         name: &str,
     ) -> Option<SymbolId> {
-        let decl = self.ensure_class(st, bin, pickle_owner, false)?;
-        let decl_jvm = st.get(decl).jvm_name.clone();
+        let requested_owner = st
+            .get(class_sym)
+            .jvm_name
+            .trim_end_matches('$')
+            .replace('/', ".");
+        let decl = if requested_owner == pickle_owner {
+            class_sym
+        } else {
+            self.ensure_class(st, bin, pickle_owner, false)
+                .or_else(|| self.ensure_class(st, bin, pickle_owner, true))?
+        };
+        let decl_jvm = st.get(decl).jvm_name.trim_end_matches('$').to_string();
         if decl_jvm.is_empty() {
             return None;
         }
         let module_jvm = format!("{decl_jvm}${name}$");
+        // Objects nested in static objects have a real MODULE$ field, while
+        // instance member objects have an accessor on their enclosing receiver.
+        // Choose from the classfile ABI instead of inventing that accessor.
+        let is_static_module = self.java_class(bin, &module_jvm).is_some_and(|jc| {
+            jc.fields.iter().any(|f| {
+                f.name == "MODULE$" && f.access & 0x0008 != 0 && f.desc == format!("L{module_jvm};")
+            })
+        });
+        if is_static_module {
+            let mcls = self.ensure_class(st, bin, &format!("{pickle_owner}.{name}"), true)?;
+            let owner = st.get(mcls).owner;
+            let module = st
+                .get(owner)
+                .members
+                .iter()
+                .copied()
+                .find(|&id| st.get(id).kind == SymKind::Module && st.module_class_of(id) == mcls)
+                .unwrap_or_else(|| {
+                    let id = st.alloc(name, class_sym, SymKind::Module, Flags::MODULE, &module_jvm);
+                    st.get_mut(id).ty = Type::ModuleRef(mcls);
+                    id
+                });
+            if !st.get(class_sym).members.contains(&module) {
+                st.get_mut(class_sym).members.push(module);
+            }
+            return Some(module);
+        }
         // The class file has to be there. Without this the accessor would
         // name a class that does not exist and the call would fail to link at
         // run time rather than at compile time.

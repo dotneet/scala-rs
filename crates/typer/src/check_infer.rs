@@ -2449,14 +2449,17 @@ impl Typer {
         if tps.is_empty() || tps.len() != targs.len() {
             return;
         }
-        if targs
-            .iter()
-            .any(|t| t.is_error() || t.is_no_type() || type_has_wildcard(t))
-        {
+        if targs.iter().any(|t| t.is_error() || t.is_no_type()) {
             return;
         }
         let mut bad = false;
         for (tp, actual) in tps.iter().zip(targs) {
+            // An existential argument does not waive bounds on its siblings.
+            if type_has_wildcard(actual)
+                || matches!(actual, Type::Named { name, args } if args.is_empty() && self.exist_quantified.contains(name))
+            {
+                continue;
+            }
             // A higher-kinded parameter states its bound in its *own* inner
             // parameters -- `MapCC[X, Y] <: Map[X, Y]` in
             // `SortedMapOps.WithFilter` -- so there is no proper type to
@@ -2480,7 +2483,11 @@ impl Typer {
                 // this site's to check -- the same rule the method version
                 // draws, with a walk that also reaches inside a `with` type.
                 let bound = crate::symbol::subst_tparams_slice(&tps, targs, &bound);
-                if bound.is_error() || bound.is_no_type() || bound_mentions_tparam(&bound) {
+                if bound.is_error()
+                    || bound.is_no_type()
+                    || bound_mentions_tparam(&bound)
+                    || type_has_wildcard(&bound)
+                {
                     continue;
                 }
                 let ok = if upper {
@@ -2507,7 +2514,9 @@ impl Typer {
             .map(|tp| self.tparam_bounds_string(*tp))
             .collect::<Vec<_>>()
             .join(",");
-        let word = if crate::lin::is_interface(&self.st, cls) {
+        let word = if self.st.get(cls).kind == SymKind::TypeMember {
+            "type"
+        } else if crate::lin::is_interface(&self.st, cls) {
             "trait"
         } else {
             "class"
