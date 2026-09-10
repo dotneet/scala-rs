@@ -17,7 +17,7 @@ is, and both invalidate everything downstream.
 
 **Forty-four composed gates have been accepted this session**, covering the earlier
 ninety-nine slices and this combined type-identity/macro-transport batch.
-Eighteen intermediate candidates were rejected, three despite a PASS script verdict. From
+Nineteen intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -2527,5 +2527,54 @@ Exact summary block:
 === summary
   HEAD=73f68974  logs=/tmp/scala-rs-gate-73f68974-codex
 VERDICT=PASS
+DONE
+```
+
+
+## Rejected candidate nineteen: SQL and constructor storage batch
+
+Frozen candidate `ee80efb0a3e0341a4551299dd9956faa84e83e21`, tree
+`f37200cdd188e46ad0b5615926b92583c92f9de5`, completed the full gate with
+VERDICT=FAIL and DONE. It is not merged. Accepted compiler 73f68974 and
+all accepted baseline figures remain unchanged. Candidate branch
+`codex/sql-constructor-storage-batch` is pushed. Logs are in
+`/tmp/scala-rs-gate-ee80efb0-codex/`; the complete 5324-row ledger is
+[`baselines/corpus-ee80efb0.tsv`](baselines/corpus-ee80efb0.tsv).
+
+Gitbucket improves 157/57 -> 148/54 (errors/files); cats stays 121/54 and
+the library 440/118. Nine gitbucket diagnostic locations disappear, with no
+new locations. Slick compiles 184 sources with zero errors and 1504 classes;
+subset verification passes all 1504, lint_problems=0. The twelve added named
+companions exist in scalac output and were audited before the gate.
+However, MODE=b runtime fails all 12 programs and all 36 attempts, with
+NoSuchMethodError for synthetic pattern accessors and protected-this pos.
+Strong initialization verification passed the identical prerequisite binary's
+1504 classes; no separate full-gate strong sweep is claimed.
+
+Workspace: 303 rows, 2721 passed, six failed: catseta eta inference, gbmapto
+placeholder diagnostics, outer private-member widening, verify_sql public
+user-dollar-outer field, and both verifyfail outer/lib fixtures. Format passes;
+clippy retains the 57 existing warnings. Corpus: pos 1126/388/345,
+neg 711/325/369, run 677/830/553 (pass/fail/skip), losses=1, changes=4.
+Gains are pos/sudoku, pos/t1075 and run/verify-ctor; run/indylambda-boxing
+regresses with IllegalAccessError.
+
+The storage hypothesis was too broad: LOCAL includes protected-this, a missing
+getter does not imply a private field, and value-class unboxing and widened
+private accessors have JVM accessibility requirements beyond source privacy.
+The next composed batch corrects these mechanisms alongside value-class
+default companions and duplicate macro placeholder reporting. Corrections
+are in `codex/sql-storage-access-integration`; the rejected tree stays frozen.
+Existing failed suites, Slick execution and the lost corpus identity are
+required prerequisites before another full gate. This record and ledger are
+metadata only.
+
+```text
+=== summary
+  HEAD=ee80efb0  logs=/tmp/scala-rs-gate-ee80efb0-codex
+  fail: slick_run: progs=12 ok=0 diff=0 fail=12  runs=3 attempts=0/36  (compile-cp=b, work=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun/w-0d0a058b60)
+  fail: workspace tests: 303 rows, 2721 passed, 6 failed
+  fail: corpus losses=1 vs tests/baselines/corpus-73f68974.tsv
+VERDICT=FAIL
 DONE
 ```
