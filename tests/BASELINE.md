@@ -21,7 +21,7 @@ SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch.
-Twenty-three intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-four intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -3220,6 +3220,123 @@ Exact summary block:
 ```text
 === summary
   HEAD=ef3551c6  logs=/tmp/scala-rs-gate-ef3551c6-codex
+  fail: corpus losses=1 vs tests/baselines/corpus-b969b0d1.tsv
+VERDICT=FAIL
+DONE
+```
+
+
+## Rejected contextual invocation follow-up: `8dc14e22`
+
+The frozen candidate `8dc14e22daaa6b5c498cc70c2c0ff8e72f2456a4`, tree `540965ce395063d715c044232e43ed28198ec687`, contains both
+local main `cbc8320f7f8d6ef3d376b5ea5941d9f33a613414` and the rejected `ef3551c6` candidate as ancestors.
+The requested main merge was already up to date. The full unskipped gate
+finished in 1359.4 seconds, with script VERDICT=FAIL,
+process exit=1 and DONE. Independent acceptance audit: FAIL.
+This compiler candidate is not merged. The accepted compiler, metrics and
+ledger remain b969b0d1; the main handover adds only this rejection record and
+the raw candidate ledger. Its compiler tree is therefore different from the
+gated tree. The exact gated candidate is preserved on
+`codex/contextual-inference-followup` without post-gate source or test edits.
+
+Logs, provenance and audits: `/tmp/scala-rs-gate-8dc14e22-codex/`.
+Raw ledger: [`baselines/corpus-8dc14e22.tsv`](baselines/corpus-8dc14e22.tsv).
+Independent rejection reasons: ["gate verdict is not PASS", "gate process failed", "library input or error regression", "new diagnostic locations", "new cats diagnostics", "corpus losses", "workspace incomplete or failed"].
+
+Candidate compile metrics on unchanged inputs:
+- Gitbucket: 354 Scala/Twirl sources plus three real Java files, no skips;
+  105/49 -> 100/47 errors/reported files.
+- Cats: 339 sources, one documented skip;
+  90/37 -> 85/35.
+- Standard library: 538 sources;
+  421/114 -> 433/114.
+
+The complete multiline diagnostic comparison is {"cats": {"added": 2, "paths": 35, "removed": 7}, "gitbucket": {"added": 0, "paths": 49, "removed": 5}, "scalalib": {"added": 13, "paths": 123, "removed": 1}}.
+Gitbucket has no new diagnostic identities, but cats adds two Eval.scala
+errors at 106:33 and 113:23. Library adds thirteen diagnostics in TrieMap,
+LazyList and CollisionProofHashMap around Java Object values. Net totals
+alone do not qualify the candidate for acceptance.
+The workspace failure is verify_sql::external_constructor_defaults_are_typed_and_companion_backed:
+VSqlCurriedChild extends a real scalac-built VSqlCurriedBase("curried")() and
+omits the later Int default in the JVM super call, causing VerifyError. The
+initial 150-suite run included verify_sql, but the final 30-suite selection
+after preserving binary constructor clauses mistakenly omitted it. This is a
+prerequisite selection error; the next constructor batch must include this
+suite and flattened parent-call argument/default handling alongside new calls.
+
+Workspace: 2767 passed, 1 failed,
+309 result rows. Corpus: 5324 unique identities,
+losses=1, changes=12: neg/i10715b, neg/no-implicit-to-anyref-any-val, neg/t473, neg/unit2anyref, neg/val_sig_infer_match, pos/t1391, pos/t2660, pos/t4812, pos/t927, run/t3502, run/t6928-run, run/t7436.
+Counts: {"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 365, "pass": 1149, "skip": 345}, "run": {"fail": 821, "pass": 686, "skip": 553}}.
+The single corpus loss is pos/t1391: an inherited val inside a nested class
+expects List[AB.TB] instead of viewing TB through the enclosing object alias
+TB=nB. Its initializer List[nB]() is accepted by the baseline and real scalac.
+This is added to the inherited type-member context family, along with Eval's
+outer type-parameter substitution. There are eleven gains and one loss.
+Slick retains zero errors, 1504 generated classes, no subset lint problems,
+12/12 programs and 36/36 byte-exact executions. Independent JVM loading and
+initialization verifies all 1504 classes, with zero failures or incomplete
+checks. Clippy retains 57 warning occurrences, no additions or removals.
+MODE=a and specialization remain explicitly red and were not rerun.
+
+This batch retains the prior contextual inference, eta expansion, parent
+varargs, binary variance, materialized-tag and erasure work and adds precise
+Twirl AnyVal/Object erasure matching; applicability-stage specificity;
+actual AnyRef/AnyVal adaptation; inherited initializer expectations and
+Scala linearization; real Symbol literal identity; source and binary curried
+constructor clause/default placement; and one-time evaluation of arguments
+reused by later default getters. No stubs or subagents. Its inventory and
+corrected hypotheses are in docs/batches/contextual-followup.md on the
+candidate branch.
+
+The new matrix contains 32 Scala acceptance/rejection programs in six groups,
+plus warm-loading/library units. Together with the predecessor's 33 programs
+in seven groups, all 65 programs passed real scalac 2.13.16 comparison.
+Valid cases execute with java -Xverify:all and exact stdout. Nineteen new
+programs (fifteen initial and four later boundaries) expose accepted-before
+misbehavior; the real Twirl regression is witnessed against ef3551c6.
+
+The initial 150-suite prerequisites passed 1599 CLI tests and failed runwrong;
+198 typer tests passed; 1985 selected pos/run identities lost pos/t1001;
+1405 negatives had zero losses and five gains. Both regressions were repaired
+in the combined follow-up. Final prerequisites passed 707 tests in 30 affected
+or mandatory suites and 198 typer tests. The same 1985 pos/run identities had
+zero losses and five gains; all 1405 negatives had zero losses and five gains.
+Source/jar/cache preflight checked four pinned source trees, 121 complete jar
+archives, 33 Java classes against released jar bytes and 1498 known-good Slick
+reference classes. The immutable final prerequisite executable, also used by
+the gate, has SHA-256 `b340dac72378160837166bde7d7aeb86c0e5f858b039846f5ce21daf27d4f4b7`.
+
+Read-only probes while the frozen gate ran preserve the next combined repair
+inventory under `/tmp/scala-rs-contextual-followup/next-inventory/`:
+- A real scala.runtime.Statics.pfMarker assigned to AnyRef executes in scalac
+  and accepted-before, but the candidate rejects it with implicit ambiguity.
+  Assigning the same marker to AnyVal is rightly rejected by scalac/candidate
+  and wrongly accepted before. This is actual Java Object reference identity,
+  not grounds to restore unconditional AnyRef acceptance.
+- The two Eval errors reproduce in a small nested FlatMap program with abstract
+  Start members. A simpler anonymous class alias probe does not reproduce,
+  including a renamed class parameter. The full nested program executes 3 then
+  4 in scalac, but accepted-before prints 3 then throws NoSuchFieldError: s.
+  Its second defect is a latent closure-capture failure, independent of the
+  new compile rejection; restoring acceptance alone is insufficient.
+- Anonymous/local class val closures and a tuple-to-AnyRef control execute
+  identically. A nullary method returning a closure instead prints a function
+  object in both compiler candidates, while scalac prints the returned value.
+  This separate silent call-shape defect belongs in the next inventory.
+- A source-owned scala.Symbol subclass case also fails on accepted-before;
+  it is a pre-existing source/binary ownership issue, not claimed fixed here.
+- The capture failure also reproduces without type aliases when the builder
+  lambda is an object/class val initializer; both scala-rs executables throw NoSuchFieldError,
+  while scalac prints 7. A method-local builder is a passing control.
+  anon_capture's method-owned-only filter is the next ownership hypothesis.
+
+Full script summary (independent acceptance remains FAIL):
+
+```text
+=== summary
+  HEAD=8dc14e22  logs=/tmp/scala-rs-gate-8dc14e22-codex
+  fail: workspace tests: 309 rows, 2767 passed, 1 failed
   fail: corpus losses=1 vs tests/baselines/corpus-b969b0d1.tsv
 VERDICT=FAIL
 DONE
