@@ -21,7 +21,7 @@ SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch.
-Twenty-four intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-five intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -3338,6 +3338,106 @@ Full script summary (independent acceptance remains FAIL):
   HEAD=8dc14e22  logs=/tmp/scala-rs-gate-8dc14e22-codex
   fail: workspace tests: 309 rows, 2767 passed, 1 failed
   fail: corpus losses=1 vs tests/baselines/corpus-b969b0d1.tsv
+VERDICT=FAIL
+DONE
+```
+
+
+## Rejected lexical context and field storage batch: `693f8966`
+
+Frozen candidate `693f8966e42444d96a487dd5cf81c7e0a8c00153`, tree `cc85853435cb59a85f7fe164b76e11f60541bc1b`, contains local main
+`93fcc04031e74915e46757138689d247d5ba2256` and rejected `8dc14e22` as ancestors. The unskipped full gate
+finished in 1279.1 seconds with VERDICT=FAIL, exit=1
+and DONE. Independent acceptance audit: FAIL. This compiler is not merged.
+The accepted compiler, metrics and ledger remain b969b0d1. Main receives only
+this record and the raw candidate corpus ledger; its compiler tree differs
+from the tested candidate. The exact tested tree stays clean and frozen on
+`codex/lexical-context-batch` without post-gate source or test edits.
+
+Evidence: `/tmp/scala-rs-gate-693f8966-codex/`. Raw ledger:
+[`baselines/corpus-693f8966.tsv`](baselines/corpus-693f8966.tsv).
+Independent rejection reasons: ["gate verdict is not PASS", "gate process failed", "slick input or error regression", "library input or error regression", "new diagnostic locations", "strong verification unavailable or failed", "Slick runtime", "Slick subset"].
+
+On unchanged pinned sources:
+- Gitbucket: 354 Scala/Twirl plus three Java sources, no skips;
+  105/49 -> 100/47 errors/reported files.
+- Cats: 339 sources, one documented skip;
+  90/37 -> 83/34.
+- Standard library: 538 sources;
+  421/114 -> 432/114.
+- Slick: 184 sources; 0 errors/1504 classes ->
+  16 errors/0 classes.
+  Slick runtime and subset validation fail because compilation fails. No
+  successful class verification or runtime result is claimed for this gate;
+  strong JVM validation is unavailable without the emitted classes.
+
+Complete multiline diagnostic comparison: {"cats": {"added": 0, "paths": 34, "removed": 7}, "gitbucket": {"added": 0, "paths": 49, "removed": 5}, "scalalib": {"added": 14, "paths": 123, "removed": 3}}.
+Cats and gitbucket add no diagnostic identities. Slick adds sixteen access
+errors, and library adds fourteen diagnostics while removing three. The access
+messages attribute calls to unrelated classes from other input files.
+
+Workspace: 2773 passed, 0 failed,
+310 result rows. Corpus: 5324 unique identities,
+losses=0, changes=14: neg/i10715b, neg/no-implicit-to-anyref-any-val, neg/t473, neg/unit2anyref, neg/val_sig_infer_match, pos/t2660, pos/t4812, pos/t927, run/reflection-sync-potpourri, run/t11196, run/t3502, run/t6928-run, run/t7223, run/t7436.
+Counts: {"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 364, "pass": 1150, "skip": 345}, "run": {"fail": 818, "pass": 689, "skip": 553}}.
+The accepted b969b0d1 corpus remains authoritative. Clippy retains 57 warning
+occurrences, no additions or removals. MODE=a and specialization remain red
+and were not rerun.
+
+The batch groups lexical alias interpretation, physical lambda ownership,
+Function0 invocation, Java Object field/array identity and stores, flattened
+constructor defaults, and abstract val/var getter/setter bridges. Its five
+new groups contain 35 programs: 26 accepted and nine rejected. All match real
+scalac 2.13.16; valid programs execute with java -Xverify:all and byte-exact
+stdout. The accepted-before executable differs on 26 programs, including
+eight false acceptances. No stubs, subagents, or aggregate before measurements.
+Inventory and corrected hypotheses: docs/batches/lexical-context.md on the
+candidate. The simple Java Array[AnyRef] narrowing hypothesis was disproved
+by scalac's legal boxed Object[] stores and replaced by explicit Java element
+identity. Capture ownership was corrected at the lexical binder, rather than
+relaxing capture eligibility.
+
+Prerequisites ran existing constructor tests first (5/5), then 151 related
+CLI suites (1604/1604): 1609 tests in 152 suites, including all previous 150
+boundary suites plus lexicalcontext and erasure3. Typer passed 198 tests.
+Selected 1986 pos/run identities had zero losses and eight gains; pos/t1391
+recovered from the rejected predecessor. All 1405 negatives had zero losses
+and five gains. Format, clippy identity comparison, and fresh preflight passed:
+four pinned source trees, 121 jar archives, 33 Java support classes matching
+released bytes and 1498 known reference classes. The immutable prerequisite
+binary matches the full gate binary, SHA-256 `0e152377dc07fb8991a715d24f26c376fb3e9f5728c7f10e3209a0b5af40c5d5`.
+Evidence: /tmp/scala-rs-lexical-context/prerequisites/.
+
+The missing prerequisite axis was qualified access from same-shaped lambdas
+in multiple source units. Parser NodeIds restart at 1 per file, while
+macro_function_symbols is keyed by NodeId alone. Using the remembered symbol
+as the lambda's physical owner exposes that cross-unit alias. The measured
+reduction uses aaa.Warm and bbb.Live with private[p] methods selected through
+the object name: each file works alone; nsc and accepted-before execute 2,3
+in either combined order, but the candidate rejects the later file as an
+access from the first object's package. Plain unqualified or private controls
+pass and did not reproduce it. A same-shaped illegal aaa.Warm.secret call
+from bbb.Live is rejected by nsc/before in both orders, but candidate accepts
+Warm-then-Live and executes it. This is also a false acceptance, not merely
+wrong diagnostic ownership. No repair is claimed yet.
+
+Read-only executable probes during the frozen gate found additional ready
+families: generic Scala var stores still use the instantiated field descriptor,
+generic lazy array getters omit their result cast, and unqualified abstract
+value reads omit unboxing. nsc runs these; accepted-before and candidate
+compile them but fail JVM execution. The next inventory is
+/tmp/scala-rs-lexical-context/next-inventory.md with exact programs and JSON
+results under next-inventory/. It groups these with the scoped function
+identity repair rather than planning another full gate for one isolated fix.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=693f8966  logs=/tmp/scala-rs-gate-693f8966-codex
+  fail: slick measure: files=184 errors=16 files_with_errors=10 classes=0 compiler_exit=1
+  fail: slick_run: slick compile failed; see /private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun/w-lexical-context-693f8966/rs.log
+  fail: slick_subset: verified=0 failed=0 classfile_lint: no class files subset_files=120 classes=0 (of 184 sources)
 VERDICT=FAIL
 DONE
 ```
