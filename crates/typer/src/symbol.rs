@@ -1180,6 +1180,15 @@ pub struct SymbolTable {
     /// pickle read this so that they see exactly the type they saw before the
     /// typer could tell two paths apart.
     pub(crate) path_member_decl: rustc_hash::FxHashMap<SymbolId, SymbolId>,
+    /// nsc's GADT bounds (`Infer.instantiateTypeVar` / `Context.pushTypeBounds`):
+    /// while a `case` is typed, a method type parameter the scrutinee mentions
+    /// may carry tighter bounds than it declares, because the pattern's type
+    /// says what it is there -- `def ev[T](e: E[T]): T = e match { case I(i)
+    /// => i }` with `I extends E[Int]` has `T` at `Int..Int` inside that case.
+    /// A stack, innermost last, truncated when the case ends; `is_sub_type`
+    /// reads it in both directions. Kept out of the symbol itself so that
+    /// erasure and member supply never see a bound that exists for one case.
+    pub(crate) gadt_bounds: Vec<(SymbolId, Option<Type>, Option<Type>)>,
     /// The path each path-dependent member was projected out of, for the
     /// dependent-method-type substitution in `subst_dependent_paths`.
     pub(crate) path_member_path: rustc_hash::FxHashMap<SymbolId, Vec<SymbolId>>,
@@ -1342,6 +1351,7 @@ impl SymbolTable {
             qualify_tparams: std::cell::RefCell::new(Vec::new()),
             path_members: rustc_hash::FxHashMap::default(),
             path_member_decl: rustc_hash::FxHashMap::default(),
+            gadt_bounds: Vec::new(),
             path_member_path: rustc_hash::FxHashMap::default(),
             path_member_lambdas: rustc_hash::FxHashMap::default(),
             abs_projections: rustc_hash::FxHashMap::default(),
@@ -2242,6 +2252,37 @@ impl SymbolTable {
     /// parameters, so it means nothing until they are replaced -- without this
     /// step `in.iterator` on an `M[A]` came back as `IterableOnce`'s own `A`
     /// and every use of the element was `found: A  required: A`.
+    /// The tighter *lower* bound a method type parameter carries inside the
+    /// `case` being typed (see `gadt_bounds`); innermost case wins.
+    pub fn gadt_lo(&self, tp: SymbolId) -> Option<&Type> {
+        self.gadt_bounds
+            .iter()
+            .rev()
+            .find(|(id, _, _)| *id == tp)
+            .and_then(|(_, lo, _)| lo.as_ref())
+    }
+
+    /// The tighter *upper* bound a method type parameter carries inside the
+    /// `case` being typed (see `gadt_bounds`); innermost case wins.
+    pub fn gadt_hi(&self, tp: SymbolId) -> Option<&Type> {
+        self.gadt_bounds
+            .iter()
+            .rev()
+            .find(|(id, _, _)| *id == tp)
+            .and_then(|(_, _, hi)| hi.as_ref())
+    }
+
+    /// A type parameter the current case has bounded from above is, for
+    /// member selection, that bound: `t + 1` on `t: T` inside `case I(_)`
+    /// with `T` at `Int..Int` selects `Int.+`, as nsc reads members through
+    /// the parameter's (temporarily tightened) `info.bounds.hi`.
+    pub fn gadt_widen(&self, ty: &Type) -> Type {
+        match ty {
+            Type::TypeParam(id) => self.gadt_hi(*id).cloned().unwrap_or_else(|| ty.clone()),
+            _ => ty.clone(),
+        }
+    }
+
     pub fn widen_type_param(&self, ty: &Type) -> Type {
         let mut t = ty.clone();
         // Following a bound that names the parameter it bounds (`A[X] <:
@@ -4475,6 +4516,27 @@ impl SymbolTable {
         if self.is_sub_type(&b, &a) {
             return a;
         }
+        // Two distinct value types meet at `AnyVal`, not `Any`: nsc's lub of
+        // `Int` and `Double` (or `Boolean`) is `AnyVal`, which is what
+        // `Map(1 -> 2, 3 -> 4.5)` is a map *to*. (The *weak* lub, `Double`,
+        // is the branch join's business -- `numeric_branch_lub` -- not this.)
+        let value_type = |t: &Type| {
+            matches!(
+                t,
+                Type::Unit
+                    | Type::Boolean
+                    | Type::Byte
+                    | Type::Short
+                    | Type::Char
+                    | Type::Int
+                    | Type::Long
+                    | Type::Float
+                    | Type::Double
+            )
+        };
+        if value_type(&a) && value_type(&b) {
+            return Type::AnyVal;
+        }
         if depth >= MAX_LUB_DEPTH {
             return if self.is_sub_type(&a, &Type::AnyRef) && self.is_sub_type(&b, &Type::AnyRef) {
                 Type::AnyRef
@@ -4880,6 +4942,26 @@ impl SymbolTable {
                 } else {
                     self.is_sub_type(a, &self.drop_abs_projections(b))
                 };
+            }
+        }
+        // A method type parameter the current `case` has bounded (GADT
+        // refinement, `gadt_bounds`): `T` at `Int..Int` inside `case I(i)`
+        // takes an `Int` (`i` conforms to the result type `T`) and *is* an
+        // `Int` (`ord: Ordering[T]` conforms to the invariant `Ordering[Int]`).
+        if !self.gadt_bounds.is_empty() {
+            if let Type::TypeParam(id) = b {
+                if let Some(lo) = self.gadt_lo(*id) {
+                    if self.is_sub_type(a, lo) {
+                        return true;
+                    }
+                }
+            }
+            if let Type::TypeParam(id) = a {
+                if let Some(hi) = self.gadt_hi(*id) {
+                    if self.is_sub_type(hi, b) {
+                        return true;
+                    }
+                }
             }
         }
         // An abstract type on the *right* is at least its lower bound:
@@ -6304,6 +6386,28 @@ impl SymbolTable {
         let jvm = self.get(cls).jvm_name.clone();
         if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
             return None;
+        }
+        // nsc `samOf`: a SAM *class* must be instantiable by the literal's
+        // anonymous subclass with no arguments -- its constructor takes an
+        // empty parameter list. `abstract class H(x: Int) { def h(s: String):
+        // String }` is not a SAM type; converting to it built a subclass
+        // calling a `<init>()V` that does not exist.
+        let f = self.get(cls).flags;
+        if !f.contains(Flags::TRAIT) && !f.contains(Flags::INTERFACE) {
+            let ctors: Vec<SymbolId> = self
+                .get(cls)
+                .members
+                .iter()
+                .copied()
+                .filter(|m| self.get(*m).name == "<init>")
+                .collect();
+            let nullary = |c: &SymbolId| match &self.get(*c).ty {
+                Type::Method { paramss, .. } => paramss.iter().all(|l| l.is_empty()),
+                _ => self.get(*c).params.is_empty(),
+            };
+            if !ctors.is_empty() && !ctors.iter().any(nullary) {
+                return None;
+            }
         }
         let mut abstracts = self.abstract_sam_methods(cls);
         if !overridden.is_empty() {

@@ -1,0 +1,7 @@
+A.f(Any) A.f(Any) A.g
+B.f(String) A.f(Any)
+T.h T.h C.h(Int)
+false true false 2
+parent-string child-any
+intbox:6 intbox:6
+gintgbox:10 gintgbox:10

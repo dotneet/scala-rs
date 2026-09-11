@@ -886,7 +886,11 @@ pub struct Enumerator {
     pub pat: Tree,
     pub rhs: Tree,
     pub is_val: bool, // `p = e` vs `p <- e`
-    pub guard: Option<Tree>,
+    /// Every `if` that follows this enumerator, in source order. Each one
+    /// becomes its own `withFilter` (nsc desugars `x <- e if a; if b` to
+    /// `e.withFilter(a).withFilter(b)`); keeping only the last one silently
+    /// dropped the earlier filters.
+    pub guards: Vec<Tree>,
 }
 
 /// nsc `Chars.isOperatorPart`.
@@ -910,7 +914,7 @@ fn is_operator_part(c: char) -> bool {
             | '|'
             | '/'
             | '\\'
-    )
+    ) || (!c.is_ascii() && scala_rs_lexer::is_unicode_symbol(c))
 }
 
 /// nsc `nme.isOpAssignmentName`: an operator that ends in `=`, does not start
@@ -937,7 +941,8 @@ pub fn op_precedence(op: &str) -> i32 {
         return 0;
     }
     match op.chars().next().unwrap_or('\0') {
-        c if c.is_ascii_alphabetic() || c == '_' => 1,
+        // nsc `isScalaLetter`: any Unicode letter (`c 𐀀 d`), `$` and `_`.
+        c if c.is_alphabetic() || c == '_' || c == '$' => 1,
         '|' => 2,
         '^' => 3,
         '&' => 4,

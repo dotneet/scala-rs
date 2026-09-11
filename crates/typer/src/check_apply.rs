@@ -969,6 +969,7 @@ impl Typer {
         let mut arg_tys = Vec::new();
         let saved_taking_args = std::mem::replace(&mut self.typing_call_args, true);
         let fun_ty_for_pretype = fun.ty.clone();
+        let nargs = args.len();
         if args
             .iter()
             .any(|a| matches!(a.kind, TreeKind::Function { .. }))
@@ -1080,6 +1081,7 @@ impl Typer {
                     &fun_ty_for_pretype,
                     fun.sym,
                     ai,
+                    nargs,
                     pt,
                     recv_ty.as_ref(),
                     false,
@@ -1092,6 +1094,7 @@ impl Typer {
                         &fun_ty_for_pretype,
                         fun.sym,
                         ai,
+                        nargs,
                         &Type::NoType,
                         recv_ty.as_ref(),
                         false,
@@ -1132,6 +1135,7 @@ impl Typer {
                         &fun_ty_for_pretype,
                         fun.sym,
                         ai,
+                        nargs,
                         pt,
                         recv_ty.as_ref(),
                         true,
@@ -1184,7 +1188,26 @@ impl Typer {
                     // the body reads (153 of them across the benchmark).
                     let saved = a.clone();
                     let mark = self.diags.len();
+                    // A wildcard the lenient prototype put in (`proto_arg_type`)
+                    // is this call's "not decided yet", not an existential the
+                    // program wrote; say so while the argument is typed, as the
+                    // lambda path below does, so calls inside it do not read
+                    // their own parameters out of it.
+                    let declared_p = match &fun_ty_for_pretype {
+                        Type::Method { paramss, .. } => {
+                            paramss.first().and_then(|ps| param_at(ps, ai)).cloned()
+                        }
+                        _ => None,
+                    };
+                    let relaxed_here = type_has_wildcard(&pt_arg)
+                        && !declared_p.as_ref().is_some_and(type_has_wildcard);
+                    if relaxed_here {
+                        self.relaxed_pt_depth += 1;
+                    }
                     self.type_expr_arg_prototype(a, &pt_arg, provisional);
+                    if relaxed_here {
+                        self.relaxed_pt_depth -= 1;
+                    }
                     let with_errs = self.error_count_since(mark);
                     if with_errs > 0
                         || a.ty.is_error()
@@ -1417,17 +1440,25 @@ impl Typer {
                                 &arg_tys,
                                 recv_ty.as_ref(),
                             );
-                            // nsc leaves `tryBreakable { throw … }`'s T undetermined
-                            // (Nothing is bottom). `catchBreak { println }` then
-                            // instantiates T from the handler, not from Nothing.
-                            let inst: Vec<(SymbolId, Type)> =
-                                if self.st.get(sym).name == "tryBreakable" {
-                                    inst.into_iter()
-                                        .filter(|(_, t)| !matches!(t, Type::Nothing))
-                                        .collect()
-                                } else {
-                                    inst
-                                };
+                            // nsc's `adjustTypeArgs`: a `Nothing` the arguments
+                            // inferred is *retracted* -- the parameter stays
+                            // undetermined for the expected type or the enclosing
+                            // expression to decide -- unless the parameter occurs
+                            // covariantly in the result, where `Nothing` is the
+                            // best answer there is. `tryBreakable { throw … }`'s
+                            // `T` (invariant in `TryBlock[T]`) is one the
+                            // following `catchBreak { println }` decides;
+                            // `inv(fail()).or("a")` on `def inv[T](body: => T):
+                            // Inv[T]` is the same shape, and `.or("a")` says
+                            // `T = String`. The rule used to be spelled for
+                            // `tryBreakable` by name.
+                            let inst: Vec<(SymbolId, Type)> = inst
+                                .into_iter()
+                                .filter(|(tp, t)| {
+                                    !matches!(t, Type::Nothing)
+                                        || !self.nothing_solution_retracted(*tp, &ret, pt)
+                                })
+                                .collect();
                             // A function literal has not been typed yet; the
                             // placeholder `(<notype>) => <notype>` standing in for
                             // it is not a solution, and taking it for one hides
@@ -1602,11 +1633,22 @@ impl Typer {
                                 // `List.flatMap[B](f: A => IterableOnce[B])`: B is
                                 // only determined by the lambda body, so the body
                                 // must not be checked against `IterableOnce[B]`.
+                                //
+                                // A `Wildcard`, not `Any`: nsc's `typedFunction`
+                                // types the body against `WildcardType` when the
+                                // result is not fully defined, and `type_function`
+                                // reads a `Wildcard` result as "no expected type".
+                                // Against `Any` the body *was* checked -- `x => if
+                                // (x > 1) 1L else 0` boxed both branches and
+                                // `List(1, 2).map(...)` came out `List[AnyVal]`
+                                // where scalac's weak-conformance lub says
+                                // `List[Long]` (a silent runtime difference:
+                                // `List(Integer, Long)` element classes).
                                 let undetermined = !sym.is_none()
                                     && mentions_tparam(fr, &self.st.get(sym).tparams);
                                 let fret =
                                     if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined {
-                                        Box::new(Type::Any)
+                                        Box::new(Type::Wildcard)
                                     } else {
                                         fr.clone()
                                     };
@@ -1722,13 +1764,23 @@ impl Typer {
                     for (i, a) in args.iter_mut().enumerate() {
                         let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                         // `Using.resource(r)(x => 10)`: A only appears in a later
-                        // clause. Type the lambda against `R => Any` so the body
-                        // is not checked against a raw type parameter.
-                        if let Type::Function { params, ret } = &p {
+                        // clause. Type the lambda against `R => _` so the body
+                        // is not checked against a raw type parameter -- and not
+                        // against `Any` either, which is a real expected type
+                        // that boxes an `if (c) 1L else 0` body instead of
+                        // letting the weak-conformance lub make it a `Long`
+                        // (nsc's `typedFunction` uses `WildcardType` there).
+                        // The parameter may be spelled as the `Function1[A, B]`
+                        // class by a pickled signature; same type, same rule.
+                        let p_fn = match &p {
+                            Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+                            _ => None,
+                        };
+                        if let Type::Function { params, ret } = p_fn.as_ref().unwrap_or(&p) {
                             if !params.is_empty() && matches!(ret.as_ref(), Type::TypeParam(_)) {
                                 p = Type::Function {
                                     params: params.clone(),
-                                    ret: Box::new(Type::Any),
+                                    ret: Box::new(Type::Wildcard),
                                 };
                             }
                         }
@@ -1756,7 +1808,20 @@ impl Typer {
                             // the typed argument. slick's `DBIOAction.flatMap[R2,
                             // S2, E2](f: R => DBIOAction[R2, S2, E2])` is this
                             // shape.
-                            let relaxed = match &p {
+                            // A pickled signature spells the parameter as the
+                            // `Function1[A, B]` class (`Option.map`, `Try.map`);
+                            // it is the same type, and it has to be relaxed the
+                            // same way, or `B` was opened to its bound `Any` and
+                            // the literal's `if (c) 1.0 else 0` body was boxed
+                            // against it instead of taking the numeric lub.
+                            let p_shape = match &p {
+                                Type::Class { sym, args } => self
+                                    .st
+                                    .function_class_shape(*sym, args)
+                                    .unwrap_or_else(|| p.clone()),
+                                _ => p.clone(),
+                            };
+                            let relaxed = match &p_shape {
                                 Type::Function { params, ret } if mentions_tparam(ret, &open) => {
                                     let wilds = vec![Type::Wildcard; open.len()];
                                     // A function result can determine its own
@@ -1881,11 +1946,22 @@ impl Typer {
                                     // callee's *own* parameters already get this
                                     // treatment in `add_expected_constraints`; a
                                     // receiver's did not.
+                                    // A bare wildcard in the expected type is the
+                                    // enclosing call's own undecided variable (a
+                                    // lenient prototype's `WildcardType`), and
+                                    // everything conforms to it; it is not a
+                                    // better answer than the argument's. cats'
+                                    // `leftWiden(rightFunctor.widen(fac))` typed
+                                    // `widen` at `F[_, D]` and took `X := _`.
                                     let t = match unify_one(&self.st, tp, &ret, pt) {
                                         Some(e)
                                             if e != t
                                                 && !e.is_no_type()
                                                 && !e.is_error()
+                                                && !matches!(
+                                                    e,
+                                                    Type::Wildcard | Type::BoundedWildcard { .. }
+                                                )
                                                 && !type_mentions_tparam(&e, tp)
                                                 && self.tparam_variance_in(&ret, tp, 1)
                                                     == Some(0)
@@ -2445,6 +2521,24 @@ impl Typer {
                                 if let Some(t) = rebuilt {
                                     ret = t;
                                 }
+                                // `updated` / `:+` / `+:` / `padTo` take
+                                // `[B >: A]` and return `CC[B]`: the element
+                                // is at least the receiver's. The declarations
+                                // that reach here lose that bound (a prelude
+                                // stand-in's `updated(Int, Any): Vector[A]`, or
+                                // a pickled `B` solved from the argument alone),
+                                // and `Vector(1, 2).updated(0, "s")` came back a
+                                // `Vector[Int]` whose `(0)` was unboxed as an
+                                // `Int` -- ClassCastException.
+                                if let Some(t) = self.widen_to_receiver_elem(
+                                    &method_name,
+                                    sym,
+                                    recv_ty.as_ref(),
+                                    &ret,
+                                    args,
+                                ) {
+                                    ret = t;
+                                }
                             }
                         }
                     } else if method_name == "pipe" {
@@ -2626,6 +2720,29 @@ impl Typer {
                                 };
                                 if let Type::Class { args: targs, .. } = a0ty {
                                     if targs.len() == 2 {
+                                        // Every pair bounds `K` and `V`, not only
+                                        // the first: `Map(1 -> 2, 3 -> 4.5)` is a
+                                        // `Map[Int, AnyVal]`. Reading the first
+                                        // made it a `Map[Int, Int]`, and `m(3)`
+                                        // unboxed a `Double` as an `Int`. The
+                                        // bounds sit inside `Tuple2`, so the join
+                                        // is the plain lub, never the weak one.
+                                        let mut targs = targs.clone();
+                                        for a in args.iter().skip(1) {
+                                            let aty = match &a.ty {
+                                                Type::Repeated(e) => e.as_ref(),
+                                                other => other,
+                                            };
+                                            if let Type::Class { args: more, .. } = aty {
+                                                if more.len() == 2 {
+                                                    targs = vec![
+                                                        self.st.lub(&targs[0], &more[0]),
+                                                        self.st.lub(&targs[1], &more[1]),
+                                                    ];
+                                                }
+                                            }
+                                        }
+                                        let targs = &targs;
                                         if let Some(map) = self.factory_result_class(&ret, "Map", 2)
                                         {
                                             let targs = self
@@ -2892,6 +3009,15 @@ impl Typer {
                             continue 'resolve;
                         }
                     }
+                    // nsc `adaptToArguments` keeps a view of the receiver only
+                    // when the viewed member applies to the arguments *as
+                    // written*. When none does, the call is put back as it was,
+                    // so that the tupling retry below and the diagnostic talk
+                    // about the original callee: `Map(1 -> 2, "x")` kept
+                    // `BuildFrom.toBuildFrom(Map)`, whose one-parameter `apply`
+                    // then accepted the two arguments tupled, and the program
+                    // printed a `MapBuilderImpl`.
+                    let before_view = fun.clone();
                     if self.rewrite_apply_extension(fun) {
                         recv_ty = match &fun.kind {
                             TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
@@ -2922,7 +3048,9 @@ impl Typer {
                                 tree.ty = Type::Error;
                                 return;
                             }
-                            OverloadPick::None => {}
+                            OverloadPick::None => {
+                                *fun = before_view;
+                            }
                         }
                     }
                     // Before any adaptation of the *arguments*: the alternative
@@ -3084,6 +3212,86 @@ impl Typer {
     /// `<K2, V2> CC map(Function1<Tuple2<K, V>, Tuple2<K2, V2>>)`), so the pair
     /// is unwrapped here. A lambda that does *not* return a pair keeps the
     /// `Iterable[B]` the declaration named, which is what nsc infers too.
+    /// The result of an element-widening member (`updated`, `:+`, `+:`,
+    /// `padTo`, …; `[B >: A]` returning `CC[B]`) joined with the receiver's
+    /// element type and the argument that supplies the new element. `None`
+    /// leaves the result alone: another member, or a shape this does not know.
+    fn widen_to_receiver_elem(
+        &self,
+        method: &str,
+        sym: SymbolId,
+        recv: Option<&Type>,
+        ret: &Type,
+        args: &[Tree],
+    ) -> Option<Type> {
+        let (elem_arg, arity) = match method {
+            "updated" | "padTo" => (1, 2),
+            ":+" | "$colon$plus" | "appended" | "+:" | "$plus$colon" | "prepended" => (0, 1),
+            _ => return None,
+        };
+        // Only the library's own shape: a generic member (`[B >: A]`) or a
+        // prelude stand-in for one, at its own arity. A collection-package
+        // class's unrelated `updated` (`HashSet`'s internal
+        // `SetNode.updated(element, originalHash, elementHash, shift)`) is left
+        // alone.
+        if sym.is_none() || args.len() != arity {
+            return None;
+        }
+        let s = self.st.get(sym);
+        let stand_in = sym.0 < self.st.prelude_end && s.pickled_origin.is_empty();
+        if !stand_in && s.tparams.is_empty() {
+            return None;
+        }
+        let arg_ty = args.get(elem_arg)?.ty.widen_constant();
+        if arg_ty.is_no_type() || arg_ty.is_error() {
+            return None;
+        }
+        let Type::Class { sym, args: rargs } = ret else {
+            return None;
+        };
+        let recv_root = self.receiver_collection_root(recv)?;
+        let base = self.base_type_instance(recv?, recv_root, 0)?;
+        let Type::Class { args: bargs, .. } = base else {
+            return None;
+        };
+        // A receiver whose own element is still undetermined
+        // (`Vector.empty :+ a`) contributes its lower bound, `Nothing`, not
+        // a variable for the lub to climb past.
+        let bargs: Vec<Type> = bargs.iter().map(|t| self.minimize_undet(t)).collect();
+        let open_here = |t: &Type| {
+            let mut open = Vec::new();
+            collect_tparams(t, &mut open);
+            open.iter().any(|tp| !self.tparam_in_scope(*tp))
+        };
+        if bargs.iter().any(open_here) || open_here(&arg_ty) {
+            return None;
+        }
+        // The declared element still names the member's own `B` when the
+        // call has not been instantiated yet; `B` *is* the join, so it adds
+        // nothing to it.
+        let join = |declared: &Type, recv_elem: &Type| {
+            let base = self.st.lub(recv_elem, &arg_ty);
+            if open_here(declared) {
+                base
+            } else {
+                self.st.lub(declared, &base)
+            }
+        };
+        match (rargs.len(), bargs.len()) {
+            (1, 1) => Some(Type::Class {
+                sym: *sym,
+                args: vec![join(&rargs[0], &bargs[0])],
+            }),
+            // `MapOps.updated[V1 >: V](key: K, value: V1): Map[K, V1]`: the
+            // key is the receiver's own.
+            (2, 2) if method == "updated" => Some(Type::Class {
+                sym: *sym,
+                args: vec![bargs[0].clone(), join(&rargs[1], &bargs[1])],
+            }),
+            _ => None,
+        }
+    }
+
     fn rebuild_from_receiver(&self, recv_root: SymbolId, declared: &Type) -> Option<Type> {
         let Type::Class {
             sym: d,

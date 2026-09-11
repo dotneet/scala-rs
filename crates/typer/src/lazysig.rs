@@ -649,9 +649,17 @@ impl Typer {
                 self.st.owner = d.0;
                 self.st.this_class = d.1;
                 self.file_index = d.2;
-                if let Some(rhs) =
-                    self.typed_default_body(p.param, &p.ret, &p.tparams, &p.preceding)
+                let getter_owner = self.st.get(p.getter).owner;
+                let access = if !getter_owner.is_none() && self.st.get(getter_owner).is_class_like()
                 {
+                    getter_owner
+                } else {
+                    SymbolId::NONE
+                };
+                let saved_access = std::mem::replace(&mut self.access_class_override, access);
+                let typed = self.typed_default_body(p.param, &p.ret, &p.tparams, &p.preceding);
+                self.access_class_override = saved_access;
+                if let Some(rhs) = typed {
                     // A getter whose result type nsc infers (see
                     // `crate::ctor_defaults`) was declared with none; the
                     // body's own type is the answer.
