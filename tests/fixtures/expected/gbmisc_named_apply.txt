@@ -1,0 +1,6 @@
+Some(P(xx,1,9))
+P(yy,4,3)
+P(p,b,a)
+P(q,b,a)
+Q(x!,2)
+Q(y!,6)

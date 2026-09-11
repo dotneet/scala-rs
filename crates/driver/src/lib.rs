@@ -214,6 +214,9 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                         source3: opts.xsource3,
                         no_specialization: opts.no_specialization,
                         kind_projector: opts.kind_projector,
+                        unicode_escapes_raw: opts
+                            .source_features
+                            .contains(SourceFeature::UnicodeEscapesRaw),
                     },
                 );
                 diags.extend(parsed.diags);
@@ -283,6 +286,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 },
                 language_features: opts.language_features.clone(),
                 source_features: opts.source_features,
+                scala3: opts.xsource3,
                 compiler_settings: compiler_settings(opts),
                 source_paths: sources
                     .iter()

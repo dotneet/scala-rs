@@ -57,6 +57,7 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
     plain_getter(st, mc, "Char", tag(Type::Char));
     plain_getter(st, mc, "Unit", tag(Type::Unit));
     plain_getter(st, mc, "Any", tag(Type::Any));
+    plain_getter(st, mc, "AnyVal", tag(Type::AnyVal));
     plain_getter(st, mc, "AnyRef", tag(Type::AnyRef));
     // These are ordinary getters in Scala 2.13. They are not candidates
     // from which implicit search may infer an unconstrained type argument.

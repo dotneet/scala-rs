@@ -53,6 +53,11 @@ pub struct TypecheckOptions {
     /// (nsc ignores the whole setting below `-Xsource:3`, so the driver hands
     /// an empty set down in that case).
     pub source_features: crate::source_features::SourceFeatures,
+    /// `-Xsource:3` / `-Xsource:3-cross`: nsc's `currentRun.isScala3`, the
+    /// source level itself as opposed to the individual features above.
+    /// Under it an unapplied method is eta-expanded wherever a value is
+    /// required (`Typer::adapt_method_value`).
+    pub scala3: bool,
     /// The compiler's own command line, as a macro implementation sees it
     /// through `c.compilerSettings`. nsc rebuilds this from the settings that
     /// were set (`-classpath`, `-d`, `-Xasync`, …); it is how a macro such as
@@ -254,6 +259,7 @@ impl Default for TypecheckOptions {
             binary_path: Vec::new(),
             language_features: Vec::new(),
             source_features: crate::source_features::SourceFeatures::default(),
+            scala3: false,
             compiler_settings: Vec::new(),
             source_paths: Vec::new(),
         }
@@ -539,6 +545,8 @@ pub struct Typer {
     pub(crate) language_implicit_conversions: bool,
     /// `-Xsource-features:<features>` (already gated on `-Xsource:3`).
     pub(crate) source_features: crate::source_features::SourceFeatures,
+    /// `-Xsource:3` (see `TypecheckOptions::scala3`).
+    pub(crate) scala3: bool,
     /// What `c.compilerSettings` reports to a macro implementation.
     pub(crate) compiler_settings: Vec<String>,
     pub(crate) binary: BinaryIndex,
@@ -1064,6 +1072,7 @@ impl Typer {
                 "implicitConversions",
             ),
             source_features: opts.source_features,
+            scala3: opts.scala3,
             compiler_settings: opts.compiler_settings.clone(),
             binary: BinaryIndex::from_user_paths(opts.binary_path.clone()),
             completed_java: HashSet::new(),
@@ -1420,10 +1429,7 @@ fn switch_pat_key(pat: &Tree) -> Option<SwitchPat> {
         TreeKind::Literal { lit: Lit::Char(c) } => Some(SwitchPat::Key(*c as i32)),
         TreeKind::Wildcard | TreeKind::Empty => Some(SwitchPat::Default),
         TreeKind::Ident { name } => {
-            let is_varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
+            let is_varid = scala_rs_parser::ast::is_variable_name(name);
             if is_varid {
                 Some(SwitchPat::Default)
             } else {

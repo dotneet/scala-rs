@@ -727,11 +727,22 @@ impl Typer {
                     owners.push(*c);
                 }
             }
+            // Both owners' `apply`s are one overload set: a case class's
+            // synthetic `apply` is entered on the module value, and an
+            // `apply` its written companion declares on the module class.
+            // Asking them one at a time answered from the first owner that had
+            // any, so `Svc.P(x, "x", oldId = 1L, newId = 9L)` -- aimed at the
+            // written `apply(…, newId, oldId)` -- was checked against the
+            // synthetic one alone: "unknown parameter name: oldId".
+            let mut alts: Vec<SymbolId> = Vec::new();
             for owner in owners {
-                let alts = self.st.lookup_member(owner, "apply");
-                if alts.is_empty() {
-                    continue;
+                for a in self.st.lookup_member(owner, "apply") {
+                    if !alts.contains(&a) {
+                        alts.push(a);
+                    }
                 }
+            }
+            if !alts.is_empty() {
                 let named = self.probe_named_arg_types(args);
                 if let Some(found) = self.alt_for_named_args(&alts, &named, args.len()) {
                     if self.ids_cover_named(&found.0, &named) {
@@ -2250,6 +2261,9 @@ impl Typer {
             Type::Char => Some("Char"),
             Type::Unit => Some("Unit"),
             Type::Any => Some("Any"),
+            // nsc's `ClassTag.AnyVal`, whose runtime class is `Object`; a
+            // `ClassTag(classOf[AnyVal])` printed `Object` (run/classtags_core).
+            Type::AnyVal => Some("AnyVal"),
             Type::AnyRef => Some("AnyRef"),
             Type::Nothing => Some("Nothing"),
             Type::Null => Some("Null"),

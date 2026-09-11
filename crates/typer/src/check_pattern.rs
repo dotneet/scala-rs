@@ -252,11 +252,7 @@ impl Typer {
                 }
                 // A backquoted name is stable however it is spelled; the
                 // parser has already marked it.
-                let is_varid = !stable_hint
-                    && name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
                 // SLS 8.1.5 wants a *stable* id here. `found[0]` can be a
                 // `def` of the same name, which nsc rejects rather than
                 // calling, so pick the value or module if the scope has one.
@@ -753,6 +749,7 @@ impl Typer {
                     );
                 }
                 self.type_pattern(expr, &ty);
+                self.type_singleton_type_ref(tpt, &ty);
                 if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
                     && !self.st.is_sub_type(sel_ty, &Type::AnyRef)
                 {
@@ -1383,11 +1380,19 @@ impl Typer {
     }
 
     /// A member with no implementation: a body-less `def` (the namer sets
-    /// `ABSTRACT` on those) or a body-less `val` / `var`.
+    /// `ABSTRACT` on those), a pickled one (`Symbol::deferred_method`, the
+    /// pickle's `DEFERRED`), or a body-less `val` / `var`.
+    ///
+    /// The pickled half is what scalatra needs: `ScalatraBase` declares an
+    /// abstract `requestPath(implicit request)`, reached through
+    /// `JacksonJsonSupport` before the class-file `ScalatraFilter` that
+    /// implements it *and* its `requestPath(uri, idx)` overload. Read as
+    /// concrete, the declaration won `super.requestPath(uri, idx)` with the
+    /// wrong arity (gitbucket's `ControllerBase`).
     pub(crate) fn is_deferred_member(&self, m: SymbolId) -> bool {
         let s = self.st.get(m);
         match s.kind {
-            SymKind::Method => s.flags.contains(Flags::ABSTRACT),
+            SymKind::Method => s.flags.contains(Flags::ABSTRACT) || s.deferred_method,
             SymKind::Term => s.deferred_val,
             _ => false,
         }
@@ -2228,10 +2233,7 @@ impl Typer {
             TreeKind::Wildcard | TreeKind::Empty => true,
             TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
             TreeKind::Ident { name } => {
-                let is_varid = name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = scala_rs_parser::ast::is_variable_name(name);
                 is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
             }
             TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),

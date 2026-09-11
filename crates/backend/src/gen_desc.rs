@@ -2259,6 +2259,16 @@ pub(crate) fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type)
             let d = jvm_desc(ctx.st, ty);
             asm.ldc_class(&d);
         }
+        // `classOf[(String, Int)]` is `scala.Tuple2`, `classOf[Int => Boolean]`
+        // `scala.Function1` -- the classes the structural types erase to, not
+        // `Object` (`type_jvm_name` answers that for both).
+        // The private runtime ships `Tuple2` alone.
+        Type::Function { .. } | Type::Tuple(_)
+            if checkcast_internal(ctx.st, ty).is_some()
+                && (ctx.library_abi || !matches!(ty, Type::Tuple(ts) if ts.len() != 2)) =>
+        {
+            asm.ldc_class(&checkcast_internal(ctx.st, ty).unwrap_or_default());
+        }
         other => {
             let n = type_jvm_name(ctx.st, other);
             asm.ldc_class(&n);

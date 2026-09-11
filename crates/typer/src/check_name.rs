@@ -193,7 +193,7 @@ impl Typer {
     /// nsc's `Symbol.toString` spells the owner of a definition in that
     /// message. The *simple* name: nsc prints "package p7", not the full
     /// path, which is why this is not [`Typer::owner_desc`].
-    fn defining_owner_desc(&self, owner: SymbolId) -> String {
+    pub(crate) fn defining_owner_desc(&self, owner: SymbolId) -> String {
         if owner.is_none() {
             return "an enclosing scope".to_string();
         }
@@ -2497,6 +2497,15 @@ impl Typer {
         self.overload_member_types.insert(found[0].0, alts.clone());
         let ov = Type::Overload(alts.iter().map(|(_, t)| t.clone()).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
+        if matches!(tree.ty, Type::Overload(_)) {
+            if let Some(id) = self.function_value_alternative(&alts, pt) {
+                if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                    tree.ty = t.clone();
+                }
+                tree.sym = id;
+                return;
+            }
+        }
         // The same rule the receiver form goes through in `type_select`: one
         // alternative whose parameters are all implicit is what value position
         // keeps, and `maybe_auto_apply` cannot recognise it from the type

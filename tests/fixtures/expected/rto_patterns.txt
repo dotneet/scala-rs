@@ -1,0 +1,15 @@
+(true,false,false)
+(1,2,3)
+(false,true)
+(b!,none,none)
+(true,true)
+true
+(true,true)
+(true,true)
+(eqv,false)
+(4,0)
+(false,true,false,true)
+(m,1)
+(me,other,true,false)
+(outer,no)
+bound foo

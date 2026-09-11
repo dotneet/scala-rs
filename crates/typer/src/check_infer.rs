@@ -980,6 +980,40 @@ impl Typer {
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     return ty;
                 }
+                // A SAM expected type is a function type for this purpose
+                // (nsc `inferExprAlternative` weighs the alternatives against
+                // it): `val f: Fun[String, Unit] = println` keeps
+                // `println(x: Any)`, which eta-expands into the SAM, rather
+                // than applying `println()`. Only when some alternative has
+                // the SAM's arity and no value alternative (a field, or a
+                // nullary method's result) is already of the expected type:
+                // slick's case class `AndThenAction(as: IndexedSeq[…])` also
+                // inherits `as[A](a: => A)`, and `sam_sig` can read a library
+                // class whose members are only partly loaded (`IndexedSeq`) as
+                // a SAM -- the field is what `as` means there.
+                if matches!(pt, Type::Class { .. }) {
+                    if let Some(sam) = self.st.sam_sig(pt) {
+                        let arity = sam.param_tys.len();
+                        let value_fits = distinct.iter().any(|a| match a {
+                            Type::Method { paramss, ret }
+                                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+                            {
+                                self.st.is_sub_type(ret, pt)
+                            }
+                            Type::Method { .. } => false,
+                            _ => true,
+                        });
+                        if arity > 0
+                            && !value_fits
+                            && distinct.iter().any(|a| {
+                                matches!(a, Type::Method { paramss, .. }
+                                    if paramss.first().is_some_and(|c| c.len() == arity))
+                            })
+                        {
+                            return ty;
+                        }
+                    }
+                }
                 let nullary: Vec<&Type> = distinct
                     .iter()
                     .copied()
@@ -2915,6 +2949,12 @@ impl Typer {
         if self.reject_unapplied_implicit_clause(tree) {
             return;
         }
+        // An unapplied method where no function type is expected (nsc
+        // `adaptMethodTypeToExpr`): an error in 2.13, eta-expanded under
+        // `-Xsource:3` and then adapted like any other function value.
+        if !self.expects_function_value(pt) && self.adapt_method_value(tree) && tree.ty.is_error() {
+            return;
+        }
         self.complete_java_type(&tree.ty, tree.span);
         // By-name wrap must run before `Nothing <: pt` (Nothing inhabits every
         // type, including `=> T`). Otherwise `tryBreakable { throw e }` would
@@ -3128,15 +3168,18 @@ impl Typer {
                 let ret = (**ret).clone();
                 let msym = tree.sym;
                 let (params, ret) = self.solve_eta_tparams(tree.sym, params, ret, pt);
-                if paramss.len() > 1 && matches!(pt, Type::Function { .. }) {
-                    // A curried method's value type is a nested function.  The
-                    // old flat expansion made `def f(a)(b)` look like
-                    // `(a, b) => r`, which rejects the legal `A => B => R`
-                    // assignment before codegen ever sees the call.
-                    eta_expand_curried(&mut self.st, &mut self.gensym, tree, &paramss, ret);
-                } else {
-                    eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
-                }
+                let curried = paramss.len() > 1 && matches!(pt, Type::Function { .. });
+                self.eta_with_stable_receiver(tree, |this, tree| {
+                    if curried {
+                        // A curried method's value type is a nested function.
+                        // The old flat expansion made `def f(a)(b)` look like
+                        // `(a, b) => r`, which rejects the legal `A => B => R`
+                        // assignment before codegen ever sees the call.
+                        eta_expand_curried(&mut this.st, &mut this.gensym, tree, &paramss, ret);
+                    } else {
+                        eta_expand(&mut this.st, &mut this.gensym, tree, params, ret);
+                    }
+                });
                 self.record_open_tparams(msym, &tree.ty);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
@@ -3174,8 +3217,14 @@ impl Typer {
         match conversion {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
-                let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let mut arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                 let from = arg.ty.clone();
+                // A by-name view parameter (`booleanBlock2RouteMatcher(block:
+                // => Boolean)`) takes the argument as its thunk; this call is
+                // built here, so the thunk `adapt` would insert is asked for.
+                if let Some(bn @ Type::ByName(_)) = self.conv_first_param(id) {
+                    self.adapt(&mut arg, &bn);
+                }
                 let fun = self.ref_implicit(id, span);
                 let applied = Tree {
                     id: arg.id,
@@ -3848,12 +3897,10 @@ impl Typer {
         let prefix = prefix.clone();
         let parts = parts.clone();
         let args = args.clone();
-        let sc = Tree {
+        let node = |kind: TreeKind| Tree {
             id: NodeId(0),
             span,
-            kind: TreeKind::Ident {
-                name: "StringContext".into(),
-            },
+            kind,
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
@@ -3861,6 +3908,30 @@ impl Typer {
             stable_pat: false,
             byname_thunk: false,
             byname_type_marker: false,
+        };
+        // `-Xsource-features:string-context-scope`: always
+        // `_root_.scala.StringContext`, never a `StringContext` the scope
+        // happens to hold (run/source3Xrun's `SC2`). Without it nsc writes the
+        // bare name, and a local `object StringContext` wins.
+        let sc = if self
+            .source_features
+            .contains(crate::SourceFeature::StringContextScope)
+        {
+            let root = node(TreeKind::Ident {
+                name: "_root_".into(),
+            });
+            let scala = node(TreeKind::Select {
+                qual: Box::new(root),
+                name: "scala".into(),
+            });
+            node(TreeKind::Select {
+                qual: Box::new(scala),
+                name: "StringContext".into(),
+            })
+        } else {
+            node(TreeKind::Ident {
+                name: "StringContext".into(),
+            })
         };
         let apply = Tree {
             id: NodeId(0),

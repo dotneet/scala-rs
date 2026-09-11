@@ -63,6 +63,18 @@ impl<'a> Gen<'a> {
             Some(_) => self.add_serializable(&mut b),
             // `case object Q`: a `Product` in its own right.
             None if mods.flags.contains(Flags::CASE) => self.add_product_interfaces(&mut b),
+            // The companion of a `Serializable` class: the typer added the
+            // parent (`Typer::link_serializable_companion`, nsc's
+            // `typedModuleDef`), but the source's parent trees do not name it.
+            None if !cls.is_none()
+                && self.st.get(cls).parents.iter().any(|p| {
+                    self.st
+                        .class_sym_of(p)
+                        .is_some_and(|s| class_internal(self.st, s) == "java/io/Serializable")
+                }) =>
+            {
+                self.add_serializable(&mut b)
+            }
             None => {}
         }
         // A member `object` lives once per enclosing instance, so it carries
@@ -176,8 +188,16 @@ impl<'a> Gen<'a> {
         // case-class companion: synthetic apply
         let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
+            // The synthetic `apply` is owed exactly when the typer kept it: a
+            // written or inherited concrete `apply` with its signature
+            // unlinked it (`scala_rs_typer`'s `case_apply_unlink`, nsc's
+            // `caseApplyMeth` rule). An overload of another shape --
+            // `WebHookPushPayload.apply(git, …, newId, oldId)` beside the
+            // case class's own -- leaves it in place, and that body's
+            // `WebHookPushPayload(pusher = …)` calls it. `emit_case_apply`
+            // still refuses a descriptor the body already emitted.
             if self.st.get(class_id).flags.contains(Flags::CASE)
-                && !impl_.body.iter().any(|t| t.name() == Some("apply"))
+                && !case_apply_sym(self.st, class_id).is_none()
             {
                 emit_case_apply(&mut b, self.st, class_id);
                 // nsc emits no forwarder for an `apply` that is not public.
@@ -338,6 +358,7 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
+        let delayed_stats = Gen::has_delayed_stats(body);
         let is_app = extends_app(st, class_id);
         let super_name = b.super_name.clone();
         // `object X extends Y(args)` / `case object X extends Y(args)`: the
@@ -480,7 +501,9 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
-                Gen::emit_delayed_init_call(asm, &class_name);
+                if delayed_stats {
+                    Gen::emit_delayed_init_call(asm, &class_name);
+                }
             } else {
                 for vd in &inits {
                     if let TreeKind::ValDef {
@@ -1369,6 +1392,13 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
+    // The companion's own `apply` of this very signature replaces it.
+    if b.methods
+        .iter()
+        .any(|m| m.name == "apply" && m.desc == desc)
+    {
+        return;
+    }
     // A case class nested in a class takes its enclosing instance first; the
     // companion is nested in the same class and holds the same one in its own
     // `$outer`. Reading it off the builder keeps the two in step: a companion

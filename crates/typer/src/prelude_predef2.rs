@@ -72,47 +72,11 @@ pub(crate) fn add_predef_members(
             );
         }
     }
+    // `Predef` declares `println()` and `println(x: Any)` and nothing else.
+    // Typed stand-ins (`println(Int)`, `println(Double)`, …) were once here;
+    // with numeric widening part of overload applicability, as in nsc, they
+    // took `println(c: Char)` as `println(Int)` and printed `66`.
     method(st, owner, "println", vec![], Type::Unit, Intrinsic::Println);
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Int],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Long],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Double],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Boolean],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::String],
-        Type::Unit,
-        Intrinsic::Println,
-    );
     method(
         st,
         owner,

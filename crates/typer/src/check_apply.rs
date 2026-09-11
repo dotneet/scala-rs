@@ -100,6 +100,112 @@ impl Typer {
                 if !args.is_empty())
     }
 
+    /// The prototype a method *reference* argument is typed against when its
+    /// parameter is a function type that only the call's inference can
+    /// finish: the parameter types the callee already fixes, and a wildcard
+    /// result (nsc's `Int => ?` for `foreach[U](f: Int => U)`).
+    ///
+    /// Only for a bare reference (`println`, `Console.println`): it is the
+    /// argument whose typing depends on a function-shaped expectation, since
+    /// an overloaded one otherwise settles on its nullary alternative. Every
+    /// alternative of an overloaded callee has to agree on the parameter
+    /// types, or the prototype would be choosing among the callee's
+    /// alternatives instead of the argument's.
+    pub(crate) fn method_ref_function_proto(
+        &self,
+        arg: &Tree,
+        fun_ty: &Type,
+        fun_sym: SymbolId,
+        idx: usize,
+    ) -> Option<Type> {
+        if !matches!(arg.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) {
+            return None;
+        }
+        let tps: Vec<SymbolId> = if fun_sym.is_none() {
+            Vec::new()
+        } else {
+            self.st.get(fun_sym).tparams.clone()
+        };
+        let open_params = |params: &[Type]| {
+            params
+                .iter()
+                .any(|t| t.is_no_type() || t.is_error() || mentions_tparam(t, &tps))
+        };
+        let one = |alt: &Type| -> Option<Type> {
+            let Type::Method { paramss, .. } = alt else {
+                return None;
+            };
+            let p = match param_at(paramss.first()?, idx)? {
+                Type::ByName(t) => t.as_ref(),
+                t => t,
+            };
+            let p = match p {
+                Type::Class { sym, args } => match self.st.function_class_shape(*sym, args) {
+                    Some(f) => f,
+                    None => {
+                        // A SAM-typed parameter (`foreach[U](f: Fun[String,
+                        // U])`): the method eta-expands into the SAM itself,
+                        // so the prototype is the class, with the callee's
+                        // variables left open.
+                        let sam = self.st.sam_sig(p)?;
+                        if open_params(&sam.param_tys) {
+                            return None;
+                        }
+                        let wild = vec![Type::Wildcard; tps.len()];
+                        return Some(crate::symbol::subst_tparams_slice(&tps, &wild, p));
+                    }
+                },
+                other => other.clone(),
+            };
+            let Type::Function { params, .. } = p else {
+                return None;
+            };
+            if open_params(&params) {
+                return None;
+            }
+            Some(Type::Function {
+                params,
+                ret: Box::new(Type::Wildcard),
+            })
+        };
+        match fun_ty {
+            Type::Method { .. } => one(fun_ty),
+            Type::Overload(alts) if !alts.is_empty() => {
+                let first = one(&alts[0])?;
+                for a in &alts[1..] {
+                    if one(a)? != first {
+                        return None;
+                    }
+                }
+                Some(first)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether no alternative of the callee takes a function (or SAM) at
+    /// argument position `idx`. `false` whenever that cannot be told -- a
+    /// callee that is not a method type, or a position past its parameters.
+    fn no_function_formal_at(&self, fun_ty: &Type, idx: usize) -> bool {
+        let alts: Vec<&Type> = match fun_ty {
+            Type::Method { .. } => vec![fun_ty],
+            Type::Overload(alts) if !alts.is_empty() => alts.iter().collect(),
+            _ => return false,
+        };
+        for alt in alts {
+            let Type::Method { paramss, .. } = alt else {
+                return false;
+            };
+            let Some(p) = paramss.first().and_then(|ps| param_at(ps, idx)) else {
+                return false;
+            };
+            if p.is_no_type() || p.is_error() || self.expects_function_value(p) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
@@ -879,6 +985,15 @@ impl Typer {
                 }
             }
         }
+        // A single-clause callee handed more arguments than it has
+        // parameters (and no repeated one to absorb them): the arguments are
+        // typed without prototypes, see `pt_arg` below.
+        let too_many_args = match &fun_ty_for_pretype {
+            Type::Method { paramss, .. } => paramss.first().is_some_and(|ps| {
+                ps.len() < args.len() && !ps.last().is_some_and(|t| matches!(t, Type::Repeated(_)))
+            }),
+            _ => false,
+        };
         for (ai, a) in args.iter_mut().enumerate() {
             if a.byname_thunk {
                 arg_tys.push(a.argument_type());
@@ -1003,7 +1118,16 @@ impl Typer {
                 let provisional = !has_fixed_shape
                     && (strict_proto.is_no_type()
                         || (inherited_hint && strict_proto != from_declaration));
-                let pt_arg = if provisional || strict_proto.is_no_type() {
+                let pt_arg = if too_many_args {
+                    // More arguments than the one clause has parameters: nsc
+                    // tries the tupled application (`tryTupleApply`) before
+                    // typing any argument against a formal, because position
+                    // `i` of the call is not parameter `i`. Typed against the
+                    // tuple formal, `update("Reopen", "reopen")`'s first
+                    // argument was converted (slick's `anyToShapedValue`) into
+                    // something the tupled retry could no longer repack.
+                    Type::NoType
+                } else if provisional || strict_proto.is_no_type() {
                     self.proto_arg_type(
                         &fun_ty_for_pretype,
                         fun.sym,
@@ -1015,7 +1139,33 @@ impl Typer {
                 } else {
                     strict_proto
                 };
-                if pt_arg.is_no_type() {
+                let method_ref_proto = if pt_arg.is_no_type() && !too_many_args {
+                    self.method_ref_function_proto(a, &fun_ty_for_pretype, fun.sym, ai)
+                } else {
+                    None
+                };
+                if let Some(proto) = method_ref_proto {
+                    // A method named as the argument of a function-typed
+                    // parameter whose result is still a variable
+                    // (`xs.foreach(println)`, `foreach[U](f: A => U)`). nsc
+                    // types it against `Int => ?` and `inferExprAlternative`
+                    // keeps the alternative that eta-expands to that; typed
+                    // against nothing, the overload's nullary `println()` was
+                    // auto-applied and the argument became `Unit`. A
+                    // prototype that does not fit is thrown away, as below.
+                    let saved = a.clone();
+                    let mark = self.diags.len();
+                    self.type_expr(a, &proto);
+                    if self.error_count_since(mark) > 0
+                        || a.ty.is_error()
+                        || a.ty.is_no_type()
+                        || !self.st.is_sub_type(&a.ty, &proto)
+                    {
+                        *a = saved;
+                        self.diags.truncate(mark);
+                        self.type_expr(a, &Type::NoType);
+                    }
+                } else if pt_arg.is_no_type() {
                     self.type_expr(a, &Type::NoType);
                 } else {
                     // A prototype is a hint, never a constraint. An argument
@@ -1052,6 +1202,16 @@ impl Typer {
                             *a = with_tree;
                         }
                     }
+                }
+                // An unapplied method whose parameter is no function type in
+                // any alternative (`foo[F](f: F)`, `Option(add)`, `(add, 1)`):
+                // nsc types it against that formal, so it is "missing
+                // argument list" in 2.13 and the eta-expansion under
+                // `-Xsource:3`, before the alternatives are weighed.
+                if self.unapplied_method_value(a).is_some()
+                    && self.no_function_formal_at(&fun_ty_for_pretype, ai)
+                {
+                    self.adapt_method_value(a);
                 }
                 // `take(Array.empty)`: with no expected type the argument keeps
                 // its residual implicit clause, `(ClassTag[T])Array[T]`. What
@@ -2687,6 +2847,19 @@ impl Typer {
                             // is `(fb: F[B])(implicit F: Functor[F])`.
                             let leftover = self
                                 .fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
+                            // And what the implicit search solved is part of
+                            // the result, exactly as on the ordinary path
+                            // below: slick's `Query(r)` is `Query.apply[E, U,
+                            // R](value: E)(implicit unpack: Shape[_, E, U,
+                            // R]): Query[R, U, Seq]`, with `U` and `R` known
+                            // only to the `Shape` found, and
+                            // `Query(xs.length).first` came out as `U`.
+                            if !self.implicit_undet_solved.is_empty() {
+                                let sol = std::mem::take(&mut self.implicit_undet_solved);
+                                let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
+                                let ts: Vec<Type> = sol.iter().map(|(_, t)| t.clone()).collect();
+                                ret = crate::symbol::subst_tparams_slice(&ids, &ts, &ret);
+                            }
                             tree.ty = leftover.unwrap_or(ret);
                             return;
                         }
