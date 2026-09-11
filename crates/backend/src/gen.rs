@@ -128,9 +128,10 @@ pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpl
 /// `run/t8803`).
 ///
 /// `Q.super[M].m` naming a *trait* `M` needs none: `M.m$` is a public static
-/// that takes `Q`'s instance as an argument. A trait `Q` is not handled
-/// here: its accessor would have to be declared on the interface and
-/// implemented by every class mixing it in.
+/// that takes `Q`'s instance as an argument. For a trait `Q` the accessor is
+/// the trait's own `Q$$super$m`, declared on the interface and implemented by
+/// every class mixing `Q` in, exactly like the one a `super.m` in `Q`'s own
+/// body needs; `Q.super[M].m` with `M` a class is not handled there.
 pub(crate) fn outer_super_accessor(
     st: &SymbolTable,
     current: SymbolId,
@@ -148,10 +149,15 @@ pub(crate) fn outer_super_accessor(
         return None;
     }
     let q = st.enclosing_class_named(current, qname)?;
-    if q == current || is_interface_sym(st, q) {
+    if q == current {
         return None;
     }
     let name = st.get(target).name.clone();
+    if is_interface_sym(st, q) {
+        return mix
+            .is_none()
+            .then(|| (q, super_accessor_name(st, q, &name)));
+    }
     match mix {
         None => Some((q, super_accessor_name(st, q, &name))),
         Some(_) if is_interface_sym(st, st.get(target).owner) => None,
@@ -193,6 +199,18 @@ fn collect_outer_supers(tree: &Tree, st: &SymbolTable, current: SymbolId, into: 
 pub fn mark_super_accessors(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_super_accessors(tree, &mut found);
+    // `T.super.m` from a class nested in trait `T` needs the same accessor on
+    // `T` (see `outer_super_accessor`).
+    let mut nested = TraitImpls::default();
+    collect_outer_supers(tree, st, SymbolId::NONE, &mut nested);
+    for (q, owed) in nested.outer_supers {
+        if !is_interface_sym(st, q) {
+            continue;
+        }
+        for OuterSuper { target, .. } in owed {
+            found.push((q, st.get(target).name.clone(), target, None));
+        }
+    }
     for (trait_id, name, target, selected_params) in found {
         let candidates: Vec<SymbolId> = st
             .get(trait_id)

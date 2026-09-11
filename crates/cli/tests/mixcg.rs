@@ -250,3 +250,46 @@ fn scalac_agrees_mixcg_parent_args_do_not_see_template_members() {
     };
     check_parent_args_rejected(Some(&sc));
 }
+
+/// `mixcg_tsuper/MixcgTs.scala` compiled by `lib_by` (`None`: scala-rs), and
+/// `mixcg_tsuper_use.scala` against it by `use_by`.
+fn check_trait_outer_super(lib_by: Option<&Path>, use_by: Option<&Path>) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let jar = jar.to_str().unwrap().to_string();
+    let dir = tmp_dir("tsuper");
+    let lib = dir.join("lib");
+    let lib_src = fixtures_dir().join("mixcg_tsuper/MixcgTs.scala");
+    assert_ok(&compile(lib_by, &[lib_src], &lib, &jar), "compile lib");
+    let cp = format!("{}:{jar}", lib.display());
+    let out = dir.join("out");
+    let src = fixtures_dir().join("mixcg_tsuper_use.scala");
+    assert_ok(&compile(use_by, &[src], &out, &cp), "compile use");
+    assert_eq!(run_java(&out, &cp), expected("mixcg_tsuper_use"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mixcg_trait_outer_super_runs() {
+    check_trait_outer_super(None, None);
+}
+
+#[test]
+fn mixcg_trait_outer_super_accessor_is_pickled_for_scalac() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    check_trait_outer_super(None, Some(&sc));
+}
+
+#[test]
+fn scalac_agrees_mixcg_trait_outer_super() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    check_trait_outer_super(Some(&sc), Some(&sc));
+}

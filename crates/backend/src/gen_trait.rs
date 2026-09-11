@@ -819,34 +819,16 @@ impl<'a> Gen<'a> {
     pub(crate) fn binary_trait_impls_cf(
         &self,
         trait_id: SymbolId,
-    ) -> Option<Vec<(String, String)>> {
-        if !is_interface_sym(self.st, trait_id) {
+    ) -> Option<Rc<Vec<(String, String)>>> {
+        if trait_id.is_none()
+            || !is_interface_sym(self.st, trait_id)
+            || owner_defined_in_source(self.st, trait_id)
+        {
             return None;
         }
-        let ms = self.binary_methods(trait_id)?;
-        let prefix = format!("(L{};", class_internal(self.st, trait_id));
-        let mut out = Vec::new();
-        for (n, d, a) in ms.iter() {
-            if a & ACC_STATIC == 0 {
-                continue;
-            }
-            let Some(base) = n.strip_suffix('$') else {
-                continue;
-            };
-            let Some(rest) = d.strip_prefix(&prefix) else {
-                continue;
-            };
-            if base.is_empty() || base == "$init" {
-                continue;
-            }
-            let inst = format!("({rest}");
-            if ms.iter().any(|(n2, d2, a2)| {
-                n2 == base && *d2 == inst && a2 & (ACC_STATIC | ACC_ABSTRACT) == 0
-            }) {
-                out.push((base.to_string(), inst));
-            }
-        }
-        Some(out)
+        self.binary_parents
+            .as_ref()?
+            .trait_impls(&class_internal(self.st, trait_id))
     }
 
     /// The `p$q$T$$super$m` accessors a binary trait's class file declares,
@@ -887,9 +869,9 @@ impl<'a> Gen<'a> {
         if is_interface_sym(self.st, s) {
             return self
                 .binary_trait_impls_cf(s)?
-                .into_iter()
+                .iter()
                 .find(|(n, d)| n == enc && desc_params(d) == params)
-                .map(|(_, d)| d);
+                .map(|(_, d)| d.clone());
         }
         self.binary_methods(s)?
             .iter()
@@ -1014,6 +996,26 @@ impl<'a> Gen<'a> {
                                 result: ret,
                             });
                         }
+                    }
+                    // The accessors classes nested in the trait call
+                    // (`T.super.m`, see `outer_super_accessor`).
+                    for OuterSuper { accessor, target } in
+                        self.traits.outer_supers.get(parent).into_iter().flatten()
+                    {
+                        let desc = method_desc_from_sym(self.st, *target);
+                        let name = self.st.get(*target).name.clone();
+                        if !seen.insert((name.clone(), desc.clone())) {
+                            continue;
+                        }
+                        owed.push(SuperAccessor {
+                            name,
+                            accessor: accessor.clone(),
+                            descriptor: desc.clone(),
+                            target_descriptor: desc,
+                            target: *target,
+                            params: method_params_from_sym(self.st, *target),
+                            result: method_ret_from_sym(self.st, *target),
+                        });
                     }
                 }
                 None if self.binary_methods(*parent).is_some() => {
@@ -1583,14 +1585,42 @@ impl<'a> Gen<'a> {
         };
         let mut chosen: Vec<(String, String, Tree)> = Vec::new();
         let mut seen = HashSet::new();
+        // Members a *binary* trait implements ahead of every other trait in
+        // the linearization (`(key, interface, descriptor)`), and the keys
+        // some farther trait implements as well. A binary trait's member is
+        // otherwise left to the JVM's resolution, which does not know the
+        // linearization: `class X extends Base with Src with Loud`, `Loud`
+        // read from a jar and `Src` a trait of this run, forwarded `label` to
+        // `Src` -- the one forwarder emitted -- and `Loud`'s layer never ran.
+        // Two unrelated interfaces with a default each are no better on the
+        // JVM (`IncompatibleClassChangeError`); nsc's `existsCompetingMethod`
+        // gives the class a forwarder in both cases.
+        let mut binary_first: Vec<((String, String), String, String)> = Vec::new();
+        let mut competing: HashSet<(String, String)> = HashSet::new();
         for (pi, parent) in lin.iter().enumerate().skip(1) {
-            let Some(methods) = self.traits.impls.get(parent) else {
-                continue;
-            };
             if !is_interface_sym(self.st, *parent) {
                 continue;
             }
             let past_superclass = super_idx.is_some_and(|si| pi > si);
+            let Some(methods) = self.traits.impls.get(parent) else {
+                if past_superclass {
+                    continue;
+                }
+                let iface = class_internal(self.st, *parent);
+                for (enc, desc) in self
+                    .binary_trait_impls_cf(*parent)
+                    .map(|v| v.to_vec())
+                    .unwrap_or_default()
+                {
+                    let key = (enc, desc_params(&desc).to_string());
+                    if seen.insert(key.clone()) {
+                        binary_first.push((key, iface.clone(), desc));
+                    } else {
+                        competing.insert(key);
+                    }
+                }
+                continue;
+            };
             let iface = class_internal(self.st, *parent);
             for m in methods {
                 let name = m.name().unwrap_or("").to_string();
@@ -1606,7 +1636,8 @@ impl<'a> Gen<'a> {
                     encode_method_name(&name),
                     desc_params(&def_method_desc(self.st, m)).to_string(),
                 );
-                if !seen.insert(key) {
+                if !seen.insert(key.clone()) {
+                    competing.insert(key);
                     continue;
                 }
                 if past_superclass && self.superclass_implements(&super_impls, m) {
@@ -1614,6 +1645,32 @@ impl<'a> Gen<'a> {
                 }
                 chosen.push((name, iface.clone(), m.clone()));
             }
+        }
+        for (key, iface, inst_desc) in binary_first {
+            if !competing.contains(&key) || defined.contains(&key) {
+                continue;
+            }
+            let (enc, _) = key.clone();
+            defined.insert(key);
+            let static_desc = trait_static_desc(&iface, &inst_desc);
+            let ret = inst_desc[inst_desc.find(')').map_or(0, |i| i + 1)..].to_string();
+            let mut locals = 1u16;
+            let mut loads = Vec::new();
+            for sort in desc_param_sorts(desc_params(&inst_desc)) {
+                loads.push((locals, sort));
+                locals += sort.slots();
+            }
+            let static_name = format!("{enc}$");
+            b.add_code(ACC_PUBLIC, &enc, &inst_desc, locals.max(1), |asm| {
+                asm.aload(0);
+                for (slot, sort) in &loads {
+                    load(asm, *slot, *sort);
+                }
+                asm.invokestatic_interface(&iface, &static_name, &static_desc);
+                if !emit_forwarded_nothing(asm, &ret) {
+                    ret_of_sort(asm, ret_str_sort(&ret));
+                }
+            });
         }
         // Everything this class will implement: its own body, and the
         // forwarders about to be emitted. Two clauses of the linearization can
@@ -1779,7 +1836,7 @@ impl<'a> Gen<'a> {
             }
             let iface = class_internal(self.st, *parent);
             if let Some(impls) = self.binary_trait_impls_cf(*parent) {
-                for (enc, inst_desc) in impls {
+                for (enc, inst_desc) in impls.iter().cloned() {
                     let params = desc_params(&inst_desc).to_string();
                     if defined.contains(&(enc.clone(), params.clone()))
                         || !self.superclass_declares_cf(lin, super_idx, &enc, &params)

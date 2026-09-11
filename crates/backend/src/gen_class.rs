@@ -483,6 +483,21 @@ impl<'a> Gen<'a> {
             for (n, d) in self.default_getter_sigs(class_id) {
                 b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT | ACC_SYNTHETIC, &n, &d);
             }
+            // `T.super.m` written in a class nested in this trait: the
+            // accessor is the trait's, declared here and implemented by every
+            // class mixing it in (`emit_super_accessors`).
+            if let Some(owed) = self.traits.outer_supers.get(&class_id) {
+                for OuterSuper { accessor, target } in owed {
+                    let desc = method_desc_from_sym(self.st, *target);
+                    if !b
+                        .methods
+                        .iter()
+                        .any(|m| m.name == *accessor && m.desc == desc)
+                    {
+                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, accessor, &desc);
+                    }
+                }
+            }
             // The concrete half: `default` methods, their `m$` statics and
             // `$init$`, all on the interface itself (nsc 2.13's trait ABI).
             self.emit_trait_bodies(&mut b, class_id, &this_name);

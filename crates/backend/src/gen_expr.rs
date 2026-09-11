@@ -1758,7 +1758,11 @@ pub(crate) fn gen_select(
                     // `Q.super.m` from a class nested in `Q`: the receiver is
                     // `Q`'s instance, and `Q`'s accessor makes the call.
                     let desc = method_desc_from_sym(ctx.st, tree.sym);
-                    asm.invokevirtual(&class_internal(ctx.st, q), &acc, &desc);
+                    if is_interface_sym(ctx.st, q) {
+                        asm.invokeinterface(&class_internal(ctx.st, q), &acc, &desc);
+                    } else {
+                        asm.invokevirtual(&class_internal(ctx.st, q), &acc, &desc);
+                    }
                 } else if matches!(qual.kind, TreeKind::Super { .. }) {
                     let selected_params = method_param_types(&tree.ty);
                     invoke_super(
@@ -3364,7 +3368,11 @@ pub(crate) fn gen_apply(
             // `Q.super.m(…)` from a class nested in `Q`: see
             // `outer_super_accessor`.
             let desc = method_desc_from_sym(ctx.st, fun.sym);
-            asm.invokevirtual(&class_internal(ctx.st, q), &acc, &desc);
+            if is_interface_sym(ctx.st, q) {
+                asm.invokeinterface(&class_internal(ctx.st, q), &acc, &desc);
+            } else {
+                asm.invokevirtual(&class_internal(ctx.st, q), &acc, &desc);
+            }
         } else {
             invoke_super(
                 asm,

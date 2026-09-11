@@ -13,3 +13,9 @@ trait Loud extends Base { override def label: String = "loud(" + super.label + "
 
 abstract class Shape { def sides: Int }
 trait Square extends Shape { def sides: Int = 4 }
+
+// Two traits overriding one member, neither extending the other: two
+// maximally specific defaults to the JVM.
+trait Base0 { def m: Int = 0 }
+trait A0 extends Base0 { override def m: Int = 1 }
+trait B1 extends Base0 { override def m: Int = 2 }

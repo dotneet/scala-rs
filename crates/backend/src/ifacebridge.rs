@@ -163,6 +163,7 @@ fn parse(bytes: &[u8]) -> Option<Info> {
 pub struct BinaryParents {
     idx: RefCell<BinaryIndex>,
     cache: RefCell<HashMap<String, Option<Rc<Info>>>>,
+    impls_cache: RefCell<HashMap<String, Option<Rc<Vec<(String, String)>>>>>,
 }
 
 impl std::fmt::Debug for BinaryParents {
@@ -189,6 +190,7 @@ impl BinaryParents {
         BinaryParents {
             idx: RefCell::new(BinaryIndex::from_user_paths(paths)),
             cache: RefCell::new(HashMap::new()),
+            impls_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -221,6 +223,48 @@ impl BinaryParents {
     /// `p$T$$super$m` accessors. The class file is where both are.
     pub fn methods_of(&self, name: &str) -> Option<Rc<Vec<(String, String, u16)>>> {
         self.info(name).map(|i| i.methods.clone())
+    }
+
+    /// `(name, instance descriptor)` of every member the Scala trait `name`
+    /// implements: nsc puts a `public static m$(Iface, …)` beside the
+    /// `default` method that holds each concrete member's body. Cached: every
+    /// class mixing a library trait in asks, and `IterableOps` alone has a
+    /// few hundred members.
+    pub fn trait_impls(&self, name: &str) -> Option<Rc<Vec<(String, String)>>> {
+        if let Some(hit) = self.impls_cache.borrow().get(name) {
+            return hit.clone();
+        }
+        let computed = self.info(name).filter(|i| i.is_interface).map(|info| {
+            let defaults: HashSet<(&str, &str)> = info
+                .methods
+                .iter()
+                .filter(|(_, _, a)| a & (ACC_STATIC | ACC_ABSTRACT) == 0)
+                .map(|(n, d, _)| (n.as_str(), d.as_str()))
+                .collect();
+            let prefix = format!("(L{name};");
+            let mut out = Vec::new();
+            for (n, d, a) in info.methods.iter() {
+                if a & ACC_STATIC == 0 {
+                    continue;
+                }
+                let (Some(base), Some(rest)) = (n.strip_suffix('$'), d.strip_prefix(&prefix))
+                else {
+                    continue;
+                };
+                if base.is_empty() || base == "$init" {
+                    continue;
+                }
+                let inst = format!("({rest}");
+                if defaults.contains(&(base, inst.as_str())) {
+                    out.push((base.to_string(), inst));
+                }
+            }
+            Rc::new(out)
+        });
+        self.impls_cache
+            .borrow_mut()
+            .insert(name.to_string(), computed.clone());
+        computed
     }
 
     /// Is `a` a sub-type of `b`? Everything is a sub-type of `java/lang/Object`.
