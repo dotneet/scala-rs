@@ -1,0 +1,25 @@
+Object[] int[]
+Object[] a,b
+Object[]
+Object[] int[]
+int[] Object[]
+String[] Object[]
+Object[]3
+1 2.0
+Object[]
+int[],int[]
+Object[]5
+Object[] long[]
+Object[] long[]
+Some(int[])
+None
+-2147483648
+97
+1.0
+List(1, a)
+1
+Map()
+3
+A
+Object[]
+Object[][]

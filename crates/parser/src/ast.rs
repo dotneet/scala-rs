@@ -597,6 +597,14 @@ impl Tree {
         matches!(self.kind, TreeKind::Empty)
     }
 
+    /// Asked of a `ValDef`'s right-hand side: is it the `_` of
+    /// `var x: T = _` (nsc `DEFAULTINIT`)? The parser keeps that `_` as the
+    /// rhs only for a typed `var` of a plain name, so the definition is
+    /// concrete (a field) but has no initializer to run.
+    pub fn is_default_init(&self) -> bool {
+        matches!(self.kind, TreeKind::Wildcard)
+    }
+
     pub fn name(&self) -> Option<&str> {
         match &self.kind {
             TreeKind::Ident { name } => Some(name),

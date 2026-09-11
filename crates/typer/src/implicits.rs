@@ -2627,6 +2627,30 @@ impl Typer {
             1 => Some(hits.pop().unwrap()),
             0 => None,
             _ => {
+                // nsc `improves` first: a view whose parameter is strictly more
+                // specific than every other candidate's wins outright, however
+                // the members are spread over the results. `import num._`
+                // over an `Integral[T]` brings `mkNumericOps(lhs: T):
+                // IntegralOps`, which *inherits* `+` from `NumericOps`, next to
+                // `Predef.any2stringadd[A](self: A)`, which declares its own;
+                // the declaration rule below picked the latter and every
+                // `start + step` in `NumericRange` was "no matching overload
+                // for (String)String with arguments (T)". A candidate the
+                // owner rule ranks lower (`LowPriorityImplicits`) scores one
+                // point each way in nsc, so it is left to the rules below.
+                let low = self.inherited_conversions(&hits);
+                let dominant: Vec<usize> = (0..hits.len())
+                    .filter(|&i| {
+                        (0..hits.len()).all(|j| {
+                            j == i || self.conv_param_strictly_more_specific(hits[i].0, hits[j].0)
+                        })
+                    })
+                    .collect();
+                if let [i] = dominant[..] {
+                    if !low[i] || low.iter().all(|l| *l) {
+                        return Some(hits.swap_remove(i));
+                    }
+                }
                 // nsc Predef: `augmentString` (StringOps) wins over `wrapString`
                 // (WrappedString / Seq) because wrapString is lower priority.
                 // Prefer the conversion whose result *declares* the member.
@@ -3053,6 +3077,27 @@ impl Typer {
             }
     }
 
+    /// nsc `isAsSpecific` for two one-parameter views, both ways: `a`'s
+    /// parameter, its own type parameters kept abstract, must be accepted by
+    /// `b`'s with `b`'s type parameters free to be inferred -- and not the
+    /// other way round. `(T)IntegralOps` is strictly more specific than
+    /// `[A](A)any2stringadd[A]`: `A := T` accepts a `T`, while an arbitrary
+    /// `A` is no `T`. [`Self::conv_arg_strictly_more_specific`] frees the
+    /// type parameters on *both* sides, which makes those two equal.
+    fn conv_param_strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
+        let as_specific = |x: SymbolId, y: SymbolId| -> bool {
+            match (self.conversion_arg_ty(x), self.conversion_arg_ty(y)) {
+                (Some(px), Some(py)) => {
+                    let px = unwrap_byname(&px);
+                    let py = self.erase_method_tparams(y, &unwrap_byname(&py));
+                    self.st.is_sub_type(&px, &py)
+                }
+                _ => false,
+            }
+        };
+        a != b && as_specific(a, b) && !as_specific(b, a)
+    }
+
     fn erase_method_tparams(&self, id: SymbolId, ty: &Type) -> Type {
         let tps = self.st.get(id).tparams.clone();
         if tps.is_empty() {
@@ -3348,7 +3393,7 @@ impl Typer {
                     id: scala_rs_parser::NodeId(0),
                     span,
                     kind: TreeKind::Select {
-                        qual: Box::new(prefix.clone()),
+                        qual: Box::new(prefix),
                         name,
                     },
                     ty,

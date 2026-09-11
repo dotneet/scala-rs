@@ -1613,7 +1613,13 @@ impl<'a> Parser<'a> {
             self.skip_nl();
             // `var x: T = _` is the zero of `T`; `val f: Int => Int = _ + 1`
             // is still a placeholder lambda, so the `_` must be the whole rhs.
-            let bare_underscore = !tpt.is_empty()
+            // nsc's `patDefOrDcl` takes the default initializer only for a
+            // typed `var` whose left-hand sides are plain names: in a `val`,
+            // a `lazy val` or a pattern definition the `_` is an ordinary
+            // expression and so an unbound placeholder.
+            let bare_underscore = is_var
+                && matches!(&pat.kind, TreeKind::Ident { .. })
+                && !tpt.is_empty()
                 && matches!(self.kind(), TokenKind::Underscore)
                 && matches!(
                     self.tokens.get(self.pos + 1).map(|t| &t.kind),

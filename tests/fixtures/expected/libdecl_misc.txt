@@ -1,0 +1,21 @@
+true false
+3 20
+7
+ok
+Sized(-4) 5
+7
+true false 7 false
+42 true
+true 7
+[a, b, c]
+List(null, null, null)
+List(3, 3)
+[[x], y]
+List(q, q)
+13
+Long 2
+Double 97.0
+Integer 3
+Float 2.0
+Long
+Integer

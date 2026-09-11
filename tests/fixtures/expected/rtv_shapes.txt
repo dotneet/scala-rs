@@ -1,0 +1,13 @@
+8
+List(one, other, three)
+w
+in finally 1
+in finally 2
+10
+()
+3
+hello
+null
+()
+java.lang.Deprecated
+Z

@@ -106,7 +106,7 @@ impl<'a> Gen<'a> {
         let binary_lazies = self.binary_mixin_lazy_vals(cls, &impl_.body);
         for v in &self.mixin_lazy_vals(cls, &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PRIVATE,
+                access: Self::mixin_lazy_field_access(v),
                 name: v.name().unwrap_or("").to_string(),
                 desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
@@ -418,6 +418,7 @@ impl<'a> Gen<'a> {
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
+            ctx_early.presuper = true;
             if own_outer.is_some() {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);
             }
@@ -489,7 +490,11 @@ impl<'a> Gen<'a> {
                         name, mods, rhs, ..
                     } = &vd.kind
                     {
-                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        // `var x: T = _`: no store (see `emit_ctor`).
+                        if rhs.is_empty()
+                            || rhs.is_default_init()
+                            || mods.flags.contains(Flags::LAZY)
+                        {
                             continue;
                         }
                         asm.aload(0);

@@ -118,7 +118,11 @@ impl<'a> Gen<'a> {
                         name, mods, rhs, ..
                     } = &vd.kind
                     {
-                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        // `var x: T = _`: `$init$` does not call the setter.
+                        if rhs.is_empty()
+                            || rhs.is_default_init()
+                            || mods.flags.contains(Flags::LAZY)
+                        {
                             continue;
                         }
                         asm.aload(0);
@@ -332,6 +336,12 @@ impl<'a> Gen<'a> {
             }
         }
         out
+    }
+
+    /// The JVM field flags of a mixed-in `lazy val`'s field: private, plus
+    /// what the trait declared (`@transient` above all, `run/t10075`).
+    pub(crate) fn mixin_lazy_field_access(v: &Tree) -> u16 {
+        ACC_PRIVATE | Self::mixin_field_extra_access(v)
     }
 
     /// The extra JVM field flags a mixed-in `val`/`var` keeps from the trait
@@ -574,24 +584,40 @@ impl<'a> Gen<'a> {
     /// `run/t3038c` in scala/scala is exactly that program -- 70 `lazy val`s,
     /// of which we printed the first 32 and then zeros.
     pub(crate) fn lazy_bitmap_fields(&self, lazies: &[Tree], binary: usize) -> Vec<Field> {
-        let n = binary
-            + lazies
-                .iter()
-                .filter(|stt| match &stt.kind {
-                    TreeKind::ValDef { mods, rhs, .. } => {
-                        mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
-                    }
-                    _ => false,
-                })
-                .count();
-        let words = n.div_ceil(32).max(1);
-        (0..words)
+        let lazy: Vec<&Tree> = lazies
+            .iter()
+            .filter(|stt| match &stt.kind {
+                TreeKind::ValDef { mods, rhs, .. } => {
+                    mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
+                }
+                _ => false,
+            })
+            .collect();
+        let transient = lazy.iter().filter(|s| is_transient_val(s)).count();
+        let n = binary + lazy.len() - transient;
+        let words = if transient > 0 {
+            n.div_ceil(32)
+        } else {
+            n.div_ceil(32).max(1)
+        };
+        let mut out: Vec<Field> = (0..words)
             .map(|w| Field {
                 access: ACC_PRIVATE,
                 name: format!("bitmap${w}"),
                 desc: "I".into(),
             })
-            .collect()
+            .collect();
+        // A `@transient lazy val`'s bits live in a transient word of their
+        // own, as nsc's `bitmap$trans$N`: the field is not serialized, so the
+        // copy that is read back has to see "not yet initialised" and compute
+        // the value again. Sharing the plain bitmap, it saw "initialised" and
+        // returned the `null` the stream left there (`run/t10244`).
+        out.extend((0..transient.div_ceil(32)).map(|w| Field {
+            access: ACC_PRIVATE | ACC_TRANSIENT,
+            name: format!("bitmap$trans${w}"),
+            desc: "I".into(),
+        }));
+        out
     }
 
     pub(crate) fn emit_trait_val_accessors(
@@ -1709,6 +1735,27 @@ impl<'a> Gen<'a> {
             self.library_abi,
             false,
         );
+        // nsc's SyntheticMethods gives every non-public case field a public
+        // `<name>$access$<index>` twin, and the pattern matcher reads the
+        // field through it from outside the class (`case Foo(x, _)` on
+        // `case class Foo(private val x: Int, …)`). It is part of the ABI:
+        // a client compiled against nsc's class calls it by that name.
+        for (i, f) in fields.iter().enumerate() {
+            let Some(acc) = case_field_access_name(self.st, *f, i) else {
+                continue;
+            };
+            if defined.contains(&acc) {
+                continue;
+            }
+            let (name, ty, desc) = field_info[i].clone();
+            let cj = class_jvm.clone();
+            let ret_desc = format!("(){}", jvm_desc(self.st, &ty));
+            b.add_code(ACC_PUBLIC, &acc, &ret_desc, 1, move |asm| {
+                asm.aload(0);
+                emit_getfield(asm, &cj, &name, &desc);
+                emit_return(asm, &ty);
+            });
+        }
 
         if !defined.contains("toString") {
             let fi = field_info.clone();
@@ -2992,7 +3039,7 @@ impl<'a> Gen<'a> {
         // traits carry their initialiser as a tree; one inherited from a trait
         // that arrived as a class file is a call to that trait's `d$` static,
         // which is where nsc put the initialiser. Both share the bitmap words.
-        let mut items: Vec<(String, Type, LazyInit)> = Vec::new();
+        let mut items: Vec<(String, Type, LazyInit, bool)> = Vec::new();
         for stt in lazies {
             let TreeKind::ValDef {
                 name, mods, rhs, ..
@@ -3008,7 +3055,12 @@ impl<'a> Gen<'a> {
             } else {
                 stt.ty.clone()
             };
-            items.push((name.clone(), ty, LazyInit::Rhs(rhs.clone())));
+            items.push((
+                name.clone(),
+                ty,
+                LazyInit::Rhs(rhs.clone()),
+                is_transient_val(stt),
+            ));
         }
         for v in binary {
             let iface = class_internal(self.st, v.owner);
@@ -3021,9 +3073,20 @@ impl<'a> Gen<'a> {
                     static_name: trait_static_name(&v.name),
                     iface,
                 },
+                false,
             ));
         }
-        for (bit, (name, ty, init)) in items.into_iter().enumerate() {
+        // Plain and transient `lazy val`s number their bits separately; see
+        // `lazy_bitmap_fields`.
+        let (mut plain_bits, mut trans_bits) = (0usize, 0usize);
+        for (name, ty, init, transient) in items.into_iter() {
+            let (bit, word_prefix) = if transient {
+                trans_bits += 1;
+                (trans_bits - 1, "bitmap$trans$")
+            } else {
+                plain_bits += 1;
+                (plain_bits - 1, "bitmap$")
+            };
             let name = &name;
             let desc = format!("(){}", jvm_desc(self.st, &ty));
             let class_name = b.this_name.clone();
@@ -3038,7 +3101,7 @@ impl<'a> Gen<'a> {
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
             let mask = 1i32 << (bit % 32);
-            let bitmap = format!("bitmap${}", bit / 32);
+            let bitmap = format!("{word_prefix}{}", bit / 32);
             let ret_ty = ty.clone();
             let caps = capture_slots(self.st, &self.boxed_vars, class_id);
             b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
@@ -3331,6 +3394,11 @@ impl<'a> Gen<'a> {
 /// (`MurmurHash3.productSeed`, read back as the `ldc` at the head of every
 /// case class `hashCode` scalac emits).
 const PRODUCT_SEED: i32 = -889275714;
+
+/// `@transient` on a `val` / `lazy val` definition.
+pub(crate) fn is_transient_val(v: &Tree) -> bool {
+    matches!(&v.kind, TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::TRANSIENT))
+}
 
 /// A *primitive value type* in nsc's sense (`definitions.isPrimitiveValueType`,
 /// i.e. a member of `ScalaValueClasses`). `Unit` counts; `Null`, `Nothing`, a
