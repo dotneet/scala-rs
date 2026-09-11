@@ -345,6 +345,36 @@ impl<'a> Lexer<'a> {
             .push(Diagnostic::error(self.file_index, Span::new(lo, hi), msg));
     }
 
+    /// A unicode escape nsc deprecates (since 2.13.2) in a string whose
+    /// escapes it will stop processing: reported at the first character the
+    /// processing changed, `content_lo` being where the raw content starts.
+    fn unicode_escape_deprecation(
+        &mut self,
+        raw: &str,
+        processed: &str,
+        content_lo: u32,
+        msg: &str,
+        phase: scala_rs_span::Phase,
+    ) {
+        if raw == processed {
+            return;
+        }
+        let prefix: usize = raw
+            .chars()
+            .zip(processed.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum();
+        let at = content_lo + prefix as u32;
+        self.diags.push(
+            Diagnostic::warning(self.file_index, Span::new(at, at + 1), msg)
+                .with_category(scala_rs_span::WarnCategory::Deprecation {
+                    since: "2.13.2".into(),
+                })
+                .in_phase(phase),
+        );
+    }
+
     fn lex_normal(&mut self) {
         let Some(c) = self.peek() else { return };
         match c {
@@ -860,7 +890,16 @@ impl<'a> Lexer<'a> {
                 let s = if self.unicode_escapes_raw {
                     s
                 } else {
-                    self.process_unicode(s, lo)
+                    let raw = s.clone();
+                    let processed = self.process_unicode(s, lo);
+                    self.unicode_escape_deprecation(
+                        &raw,
+                        &processed,
+                        lo + 3,
+                        "Unicode escapes in triple quoted strings are deprecated; use the literal character instead",
+                        scala_rs_span::Phase::Parser,
+                    );
+                    processed
                 };
                 self.emit(TokenKind::StringLit(s), lo, self.pos as u32);
             } else {
@@ -1071,7 +1110,19 @@ impl<'a> Lexer<'a> {
             return buf;
         };
         match (frame.escapes, frame.triple) {
-            (InterpEscapes::Unicode, _) => self.process_unicode(buf, lo),
+            (InterpEscapes::Unicode, _) => {
+                // nsc's `FastStringInterpolator` (a typer warning).
+                let raw = buf.clone();
+                let processed = self.process_unicode(buf, lo);
+                self.unicode_escape_deprecation(
+                    &raw,
+                    &processed,
+                    lo,
+                    "Unicode escapes in raw interpolations are deprecated; use literal characters instead",
+                    scala_rs_span::Phase::Typer,
+                );
+                processed
+            }
             (InterpEscapes::Standard, true) => self.process_escapes(buf, lo),
             _ => buf,
         }

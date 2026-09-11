@@ -297,6 +297,9 @@ impl<'a> Refchecks<'a> {
                         _ => 1,
                     })
                     .sum();
+                if mods.flags.contains(Flags::TRAIT) {
+                    self.early_defs_in_trait(impl_);
+                }
                 self.template(impl_, params);
             }
             TreeKind::ModuleDef { mods, impl_, .. } => {
@@ -342,8 +345,46 @@ impl<'a> Refchecks<'a> {
                 }
             }
             TreeKind::Try { block, catches, finalizer } => {
+                if catches.is_empty() && finalizer.is_empty() {
+                    // `Typers.issueTryWarnings`, a typer warning at `try`.
+                    let d = warning_at(
+                        self.file,
+                        t.span.lo.0,
+                        t.span.hi.0,
+                        "A try without a catch or finally is equivalent to putting its body in a block; no exceptions are handled.",
+                        Phase::Typer,
+                        self.fatal,
+                    );
+                    self.out.push(d);
+                }
                 self.tree(block, unit_pt);
                 for c in catches {
+                    // `checkForCatchAll`: `case e =>` / `case _ =>` catches
+                    // every `Throwable`.
+                    if c.guard.is_empty() {
+                        let name = match &c.pat.kind {
+                            TreeKind::Wildcard => Some("_".to_string()),
+                            TreeKind::Ident { name } if !c.pat.stable_pat => Some(name.clone()),
+                            TreeKind::Bind { name, body }
+                                if matches!(&body.kind, TreeKind::Wildcard)
+                                    || matches!(&body.kind, TreeKind::Ident { name } if name == "_") =>
+                            {
+                                Some(name.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(n) = name.filter(|n| n == "_" || scala_rs_parser::ast::is_variable_name(n)) {
+                            let d = warning_at(
+                                self.file,
+                                c.pat.span.lo.0,
+                                c.pat.span.hi.0,
+                                format!("This catches all Throwables. If this is really intended, use `case {n} : Throwable` to clear this warning."),
+                                Phase::Typer,
+                                self.fatal,
+                            );
+                            self.out.push(d);
+                        }
+                    }
                     self.tree(&c.pat, false);
                     self.tree(&c.guard, false);
                     self.tree(&c.body, unit_pt);
@@ -433,6 +474,40 @@ impl<'a> Refchecks<'a> {
             self.leaf_children(expr);
         } else {
             self.tree(expr, unit_pt);
+        }
+    }
+
+    /// `Typers.typedClassDef`: an early-initialized value of a trait (a
+    /// typer warning, at the value's name).
+    fn early_defs_in_trait(&mut self, impl_: &Template) {
+        for s in &impl_.body {
+            if let TreeKind::ValDef { mods, name, .. } = &s.kind {
+                if !mods.flags.contains(Flags::PRESUPER) {
+                    continue;
+                }
+                let lo = s.span.lo.0 as usize;
+                let hi = (s.span.hi.0 as usize).min(self.src.len());
+                let text = self.src.get(lo..hi).unwrap_or("");
+                let at = ["val ", "var "]
+                    .iter()
+                    .filter_map(|k| text.find(k).map(|i| i + k.len()))
+                    .min()
+                    .and_then(|i| {
+                        let rest = &text[i..];
+                        let skip = rest.len() - rest.trim_start().len();
+                        rest.trim_start().starts_with(name.as_str()).then_some(lo + i + skip)
+                    })
+                    .unwrap_or(lo) as u32;
+                let d = warning_at(
+                    self.file,
+                    at,
+                    at + 1,
+                    "Implementation restriction: early definitions in traits are not initialized before the super class is initialized.",
+                    Phase::Typer,
+                    self.fatal,
+                );
+                self.out.push(d);
+            }
         }
     }
 

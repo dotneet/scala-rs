@@ -392,11 +392,11 @@ impl<'a> Parser<'a> {
     /// unless `-deprecation`), at the point `span.lo`.
     fn deprecation(&mut self, span: Span, msg: impl Into<String>, since: &str) {
         self.diags.push(
-            Diagnostic::warning(self.file_index, span, msg).with_category(
-                scala_rs_span::WarnCategory::Deprecation {
+            Diagnostic::warning(self.file_index, span, msg)
+                .with_category(scala_rs_span::WarnCategory::Deprecation {
                     since: since.to_string(),
-                },
-            ),
+                })
+                .in_phase(scala_rs_span::Phase::Parser),
         );
     }
 
@@ -1486,7 +1486,26 @@ impl<'a> Parser<'a> {
                 {
                     mods.flags = mods.flags.with(Flags::PRESUPER);
                 }
-                TreeKind::TypeDef { .. } => {}
+                TreeKind::TypeDef { name, .. } => {
+                    // nsc `ensureEarlyDef`, at the type's name.
+                    if !self.opts.source3 {
+                        let lo = s.span.lo.0;
+                        let name = name.clone();
+                        let at = self
+                            .tokens
+                            .iter()
+                            .find(|t| {
+                                t.span.lo.0 >= lo && matches!(&t.kind, TokenKind::Ident(n) if *n == name)
+                            })
+                            .map(|t| t.span)
+                            .unwrap_or(s.span);
+                        self.deprecation(
+                            at,
+                            "early type members are deprecated: move them to the regular body; the semantics are the same",
+                            "2.11.0",
+                        );
+                    }
+                }
                 _ => {
                     self.error_span(
                         s.span,

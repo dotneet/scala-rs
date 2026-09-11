@@ -26,8 +26,11 @@ use crate::{Diagnostic, Level, SourceFile, Span};
 /// inside a phase unit by unit (command-line order).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Phase {
-    /// `parser` and `typer` (their warnings are suspended until the unit's
-    /// typer finishes, so they share one slot).
+    /// The scanner and parser: suspended with the typer's warnings, and
+    /// issued before them.
+    Parser,
+    /// `typer` (its warnings and the parser's are suspended until the unit's
+    /// typer finishes, so the two are released unit by unit).
     #[default]
     Typer,
     Refchecks,
@@ -75,12 +78,12 @@ pub fn finish_diagnostics(diags: Vec<Diagnostic>, settings: &WarnSettings) -> Ve
         // nothing of a later phase exists; the order of what is there is the
         // order it was issued in. Without errors every phase ran, and the
         // suspension described above decides the order.
-        diags.sort_by_key(|d| {
-            if d.phase == Phase::Summary {
-                (d.phase, usize::MAX)
-            } else {
-                (d.phase, d.file_index)
-            }
+        diags.sort_by_key(|d| match d.phase {
+            Phase::Summary => (d.phase, usize::MAX, d.phase),
+            // Suspended until the unit's typer is done: per unit, the
+            // parser's warnings, then the typer's.
+            Phase::Parser | Phase::Typer => (Phase::Typer, d.file_index, d.phase),
+            _ => (d.phase, d.file_index, d.phase),
         });
     }
     let mut out = Vec::with_capacity(diags.len());

@@ -359,6 +359,21 @@ impl<'a> Depr<'a> {
             }
             TreeKind::Apply { fun, args } => {
                 self.check_varargs_array(fun, args);
+                // `1 << 2L`: the typer's constant folder reports the
+                // deprecated operation it folds, before refchecks.
+                if let TreeKind::Select { qual, .. } = &fun.kind {
+                    let lit = |t: &Tree| matches!(t.kind, TreeKind::Literal { .. });
+                    if lit(qual) && !args.is_empty() && args.iter().all(lit) && self.in_deprecated == 0 {
+                        if let Some((msg, since)) = self.deprecation_of(fun.sym) {
+                            let p = point_of(fun, self.src);
+                            self.push(p, msg, since, Phase::Typer);
+                        }
+                        for a in args {
+                            self.visit(a);
+                        }
+                        return;
+                    }
+                }
                 self.visit(fun);
                 for a in args {
                     self.visit(a);

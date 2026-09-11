@@ -79,6 +79,9 @@ impl Typer {
         if import_enables_feature(expr, "implicitConversions") {
             self.language_implicit_conversions = true;
         }
+        if import_enables_feature(expr, "reflectiveCalls") {
+            self.language_reflective_calls = true;
+        }
         let span = tree.span;
         let saved_origin = self.import_origin;
         self.import_origin = ((self.file_index as u64 + 1) << 32) | (span.lo.0 as u64 + 1);

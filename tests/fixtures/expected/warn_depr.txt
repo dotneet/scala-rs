@@ -1,0 +1,6 @@
+warning: 1 deprecation (since 1.0)
+warning: 1 deprecation (since 2.11.0)
+warning: 1 deprecation (since 2.12.7)
+warning: 4 deprecations (since 2.13.0)
+warning: 7 deprecations in total; re-run with -deprecation for details
+5 warnings

@@ -543,6 +543,11 @@ pub struct Typer {
     pub(crate) language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     pub(crate) language_implicit_conversions: bool,
+    /// `import scala.language.reflectiveCalls` / `-language:reflectiveCalls`.
+    pub(crate) language_reflective_calls: bool,
+    /// Features a warning has already explained (nsc `reportedFeature`):
+    /// the "This can be achieved by ..." paragraph comes once per run.
+    pub(crate) reported_features: HashSet<String>,
     /// `-Xsource-features:<features>` (already gated on `-Xsource:3`).
     pub(crate) source_features: crate::source_features::SourceFeatures,
     /// `-Xsource:3` (see `TypecheckOptions::scala3`).
@@ -1078,6 +1083,8 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
+            language_reflective_calls: language_flag_enabled(&opts.language_features, "reflectiveCalls"),
+            reported_features: HashSet::new(),
             source_features: opts.source_features,
             scala3: opts.scala3,
             compiler_settings: opts.compiler_settings.clone(),
@@ -1139,6 +1146,29 @@ impl Typer {
 
     pub(crate) fn warning(&mut self, span: Span, msg: impl Into<String>) {
         self.warning_in(scala_rs_span::Phase::Typer, span, msg);
+    }
+
+    /// nsc `Reporting.featureWarning` for a feature that `should` be enabled
+    /// (`cat=feature`, summarized unless `-feature`). The explanation is
+    /// given the first time a feature is reported in the run.
+    pub(crate) fn feature_warning(&mut self, span: Span, feature: &str, desc: &str) {
+        let fq = format!("scala.language.{feature}");
+        let explain = if self.reported_features.insert(feature.to_string()) {
+            format!(
+                "\nThis can be achieved by adding the import clause 'import {fq}'\nor by setting the compiler option -language:{feature}.\nSee the Scaladoc for value {fq} for a discussion\nwhy the feature should be explicitly enabled."
+            )
+        } else {
+            String::new()
+        };
+        let msg = format!("{desc} should be enabled\nby making the implicit value {fq} visible.{explain}");
+        if self.fatal_warnings {
+            self.error(span, msg);
+        } else {
+            self.diags.push(
+                Diagnostic::warning(self.file_index, span, msg)
+                    .with_category(scala_rs_span::WarnCategory::Feature),
+            );
+        }
     }
 
     /// A warning nsc issues in `phase` (which decides where it is reported;
