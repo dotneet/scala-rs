@@ -617,6 +617,15 @@ fn is_scala_owned(st: &SymbolTable, s: SymbolId) -> bool {
     st.get(s).jvm_name.starts_with("scala/")
 }
 
+/// A library class's pickled flags (`pflags`): the prelude's hand-written
+/// `Option` and `List` do not carry `sealed` / `abstract`, the pickles do.
+pub(crate) fn pickled_flags(t: &mut Typer, cls: SymbolId) -> Option<u64> {
+    if !t.library_abi || cls.is_none() || !t.st.get(cls).jvm_name.starts_with("scala/") {
+        return None;
+    }
+    t.pickle.class_sig_of(&t.st, &mut t.binary, cls).map(|s| s.flags)
+}
+
 /// The sealed children of a class: the source's own record, or the pickle's
 /// `CHILDREN` for a library class. `None` when a library class's children
 /// cannot be read (the analysis then gives up on the match).

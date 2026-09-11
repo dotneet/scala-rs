@@ -63,26 +63,10 @@ impl Typer {
         } else {
             tree.ty = self.branch_result_ty(pt, &branch_tys, res);
         }
-        if let TreeKind::Match { selector, cases } = &tree.kind {
-            // The pattern-matching function a `for` generator desugars to is
-            // guarded by the `withFilter` the parser puts in front of it, so
-            // nsc marks it synthetic and never reports it as inexhaustive.
-            // Its scrutinee is the parser's own `x$forN` / `x$forfN`, a name
-            // no source writes.
-            let for_desugaring = selector
-                .name()
-                .is_some_and(|n| n.starts_with("x$for") && n.len() > 5);
-            if !for_desugaring {
-                self.check_match_exhaustive(span, &sel_ty, cases);
-            }
-            self.warn_duplicate_alternatives(&sel_ty, cases);
-            if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
-                self.warning(
-                    selector.span,
-                    "could not emit switch for @switch annotated match",
-                );
-            }
-        }
+        // Exhaustivity, reachability and switch emission are reported by the
+        // patmat pass after typing (`crate::warn_patmat`), as nsc's `patmat`
+        // phase does.
+        let _ = span;
     }
 
     pub(crate) fn type_case(&mut self, c: &mut CaseDef, pt: &Type) {

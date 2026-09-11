@@ -11,6 +11,18 @@ use std::collections::HashMap;
 /// A pattern shape the port does not model: the match is not analysed.
 pub(crate) struct Unsupported;
 
+/// `Unsupported`, noting where it came from when `SCALA_RS_PATMAT_DEBUG`
+/// is set (which of the modelling gaps a match fell into).
+macro_rules! bail {
+    () => {{
+        if std::env::var_os("SCALA_RS_PATMAT_DEBUG").is_some() {
+            eprintln!("patmat: not analysed ({}:{})", file!(), line!());
+        }
+        $crate::warn_patmat_translate::Unsupported
+    }};
+}
+pub(crate) use bail;
+
 pub(crate) struct Translator<'t> {
     pub(crate) tys: Types<'t>,
     pub(crate) binders: Vec<Binder>,
@@ -110,7 +122,7 @@ impl<'t> Translator<'t> {
             TreeKind::Ident { .. } if Self::is_var_pattern(pat) => {
                 // nsc's `Bind(x, _)`: a binding step, then `_`.
                 if pat.sym.is_none() {
-                    return Err(Unsupported);
+                    return Err(bail!());
                 }
                 let tp = self.binders[b].tp.clone();
                 let x = self.sym_binder(pat.sym, tp);
@@ -121,7 +133,7 @@ impl<'t> Translator<'t> {
             }
             TreeKind::Bind { body, .. } => {
                 if pat.sym.is_none() {
-                    return Err(Unsupported);
+                    return Err(bail!());
                 }
                 if let TreeKind::Typed { expr, .. } = &body.kind {
                     if Self::is_wildcard(expr) {
@@ -147,7 +159,7 @@ impl<'t> Translator<'t> {
                     let x = self.sym_binder_keep(expr.sym, tpe.clone());
                     Ok(self.type_test_step(x, b, tpe))
                 } else {
-                    Err(Unsupported)
+                    Err(bail!())
                 }
             }
             TreeKind::Apply { .. } | TreeKind::UnApply { .. } => self.extractor_step(b, pat),
@@ -178,7 +190,7 @@ impl<'t> Translator<'t> {
                     .collect::<Option<Vec<_>>>();
                 Ok(vec![Maker::new(TM::Alts { prev: b, alts, pos, switch })])
             }
-            _ => Err(Unsupported),
+            _ => Err(bail!()),
         }
     }
 
@@ -198,7 +210,7 @@ impl<'t> Translator<'t> {
     fn pat_val(&mut self, pat: &Tree) -> Result<PatVal, Unsupported> {
         match &pat.kind {
             TreeKind::Literal { lit } => {
-                let c = CVal::from_lit(lit).ok_or(Unsupported)?;
+                let c = CVal::from_lit(lit).ok_or_else(|| bail!())?;
                 let tp = if c == CVal::Null {
                     NTy::Null
                 } else {
@@ -214,7 +226,7 @@ impl<'t> Translator<'t> {
             }
             TreeKind::Ident { name } | TreeKind::Select { name, .. } => {
                 if pat.sym.is_none() {
-                    return Err(Unsupported);
+                    return Err(bail!());
                 }
                 let st = self.tys.st;
                 let s = st.get(pat.sym);
@@ -234,24 +246,24 @@ impl<'t> Translator<'t> {
                             Some(l) => match CVal::from_lit(&l) {
                                 Some(CVal::Null) => NTy::Null,
                                 Some(c) => NTy::Const(c),
-                                None => return Err(Unsupported),
+                                None => return Err(bail!()),
                             },
                             None if stable => NTy::Single(pat.sym),
                             None => {
                                 *self.fresh += 1;
                                 let w = self.ty(&vt);
                                 if w.is_unknown() {
-                                    return Err(Unsupported);
+                                    return Err(bail!());
                                 }
                                 NTy::Fresh(*self.fresh, Box::new(w))
                             }
                         };
                         (tp, stable)
                     }
-                    _ => return Err(Unsupported),
+                    _ => return Err(bail!()),
                 };
                 if matches!(&tp, NTy::Single(_)) && self.tys.widen(&tp).is_unknown() {
-                    return Err(Unsupported);
+                    return Err(bail!());
                 }
                 let prefix = match &pat.kind {
                     TreeKind::Select { qual, .. } if !qual.sym.is_none() => {
@@ -277,7 +289,7 @@ impl<'t> Translator<'t> {
                     switch_const,
                 })
             }
-            _ => Err(Unsupported),
+            _ => Err(bail!()),
         }
     }
 
@@ -289,10 +301,10 @@ impl<'t> Translator<'t> {
         let (args, is_ctor) = match &pat.kind {
             TreeKind::Apply { args, .. } => (args, true),
             TreeKind::UnApply { args, .. } => (args, false),
-            _ => return Err(Unsupported),
+            _ => return Err(bail!()),
         };
         if pat.sym.is_none() {
-            return Err(Unsupported);
+            return Err(bail!());
         }
         let is_star = args.last().is_some_and(is_star_pattern);
         let non_star_arity = args.len() - usize::from(is_star);
@@ -309,7 +321,7 @@ impl<'t> Translator<'t> {
             let cls = pat.sym;
             let s = st.get(cls);
             if s.kind != SymKind::Class || !s.flags.contains(Flags::CASE) {
-                return Err(Unsupported);
+                return Err(bail!());
             }
             param_type = self.ty(&pat.ty);
             let cargs = match &pat.ty {
@@ -347,7 +359,7 @@ impl<'t> Translator<'t> {
                 }
                 None => {
                     if total_arity == 1 && field_tys.len() > 1 {
-                        return Err(Unsupported);
+                        return Err(bail!());
                     }
                     product_types = field_tys;
                     elem_type = None;
@@ -358,19 +370,64 @@ impl<'t> Translator<'t> {
             let us = st.get(u);
             let is_seq_ex = us.name == "unapplySeq";
             if !is_seq_ex && us.name != "unapply" {
-                return Err(Unsupported);
+                return Err(bail!());
             }
             let Type::Method { paramss, ret } = &us.ty else {
-                return Err(Unsupported);
+                return Err(bail!());
             };
-            if !us.tparams.is_empty() {
-                // A polymorphic extractor: its instantiation is not recorded.
-                return Err(Unsupported);
-            }
-            let param = paramss.first().and_then(|c| c.first()).ok_or(Unsupported)?;
-            param_type = self.ty(param);
+            let param = paramss.first().and_then(|c| c.first()).ok_or_else(|| bail!())?;
+            let (param, ret) = if us.tparams.is_empty() {
+                (param.clone(), (**ret).clone())
+            } else {
+                // A polymorphic extractor (`List.unapplySeq[A](x: List[A])`):
+                // instantiate it from the scrutinee, as the typer did (the
+                // pattern's own type is the scrutinee's).
+                let tps = us.tparams.clone();
+                let mut found: Vec<Option<Type>> = vec![None; tps.len()];
+                unify_tparams(param, &pat.ty, &tps, &mut found);
+                let Some(args) = found.into_iter().collect::<Option<Vec<Type>>>() else {
+                    return Err(bail!());
+                };
+                (st.subst_tparams(u, &args, param), st.subst_tparams(u, &args, ret))
+            };
+            let mut ret = ret;
+            param_type = {
+                let p = self.ty(&param);
+                if p.is_unknown() {
+                    // `SeqFactory.unapplySeq[A](x: CC[A])` seen through a
+                    // companion (`List(a, b)`): `CC` is the companion's own
+                    // class, so the parameter is the scrutinee's type when
+                    // that is the class, and nothing we can name otherwise.
+                    let owner = us.owner;
+                    let sel = self.ty(&pat.ty);
+                    let companion = if owner.is_none() {
+                        None
+                    } else {
+                        let o = st.get(owner);
+                        let cname = o.jvm_name.strip_suffix('$').unwrap_or("").to_string();
+                        crate::classpath::find_by_jvm(st, &cname)
+                    };
+                    match (&sel, companion) {
+                        (NTy::Class(c, args), Some(comp)) if *c == comp => {
+                            // The wrapper's element type is the scrutinee's.
+                            if let (Type::Class { sym, args: rargs }, Some(first)) = (&ret, args.first()) {
+                                if rargs.len() == 1 && !first.is_unknown() {
+                                    if let Type::Class { args: sargs, .. } = &pat.ty {
+                                        ret = Type::Class { sym: *sym, args: vec![sargs[0].clone()] };
+                                    }
+                                }
+                            }
+                            sel
+                        }
+                        _ => p,
+                    }
+                } else {
+                    p
+                }
+            };
+            let ret = &ret;
             let ret_ty = self.ty(ret);
-            let boolean = matches!(**ret, Type::Boolean);
+            let boolean = matches!(*ret, Type::Boolean);
             let is_wrapper =
                 |c: SymbolId| st.get(c).name == "UnapplySeqWrapper" && st.get(c).jvm_name.starts_with("scala/");
             let (get_ty, irrefutable) = match &ret_ty {
@@ -378,7 +435,7 @@ impl<'t> Translator<'t> {
                 NTy::Class(c, a) if *c == st.some_sym && a.len() == 1 => (a[0].clone(), true),
                 NTy::Class(c, a) if a.len() == 1 && is_wrapper(*c) && is_seq_ex => (ret_ty.clone(), false),
                 _ if boolean && !is_seq_ex => (NTy::Unknown, false),
-                _ => return Err(Unsupported),
+                _ => return Err(bail!()),
             };
             let seq_wrapper = matches!(&get_ty, NTy::Class(c, _) if is_wrapper(*c));
             let equiv: Vec<NTy> = if boolean && !is_seq_ex {
@@ -397,10 +454,10 @@ impl<'t> Translator<'t> {
             };
             if is_seq_ex {
                 let mut p = equiv.clone();
-                let last = p.pop().ok_or(Unsupported)?;
+                let last = p.pop().ok_or_else(|| bail!())?;
                 let elem = match &last {
                     NTy::Class(_, a) if a.len() == 1 => a[0].clone(),
-                    _ => return Err(Unsupported),
+                    _ => return Err(bail!()),
                 };
                 product_types = p;
                 elem_type = Some(elem);
@@ -424,12 +481,12 @@ impl<'t> Translator<'t> {
             });
         }
         if param_type.is_unknown() {
-            return Err(Unsupported);
+            return Err(bail!());
         }
         let product_arity = product_types.len();
         let is_seq = elem_type.is_some();
         if non_star_arity < product_arity || (non_star_arity > product_arity && !is_seq) {
-            return Err(Unsupported);
+            return Err(bail!());
         }
         let element_arity = non_star_arity - product_arity;
         let checked_length = if !is_seq || element_arity < star_arity {
@@ -458,7 +515,7 @@ impl<'t> Translator<'t> {
                 }));
                 next
             }
-            None => return Err(Unsupported),
+            None => return Err(bail!()),
         };
 
         // Sub-pattern binders and their types (`subPatTypes`).
@@ -536,7 +593,7 @@ impl<'t> Translator<'t> {
             elems_to_n(total_arity)
         };
         if refs.len() != subs.len() {
-            return Err(Unsupported);
+            return Err(bail!());
         }
         if is_ctor {
             makers.push(Maker::new(TM::Product {
@@ -560,6 +617,29 @@ impl<'t> Translator<'t> {
             makers.extend(self.translate(bind, p)?);
         }
         Ok(makers)
+    }
+}
+
+/// Bind `tps` by matching the declared type `p` against the actual `s`.
+fn unify_tparams(p: &Type, s: &Type, tps: &[SymbolId], out: &mut [Option<Type>]) {
+    match (p, s) {
+        (Type::TypeParam(id), _) => {
+            if let Some(i) = tps.iter().position(|t| t == id) {
+                if out[i].is_none() {
+                    out[i] = Some(s.clone());
+                }
+            }
+        }
+        (Type::Class { sym: a, args: pa }, Type::Class { sym: b, args: sa })
+            if a == b && pa.len() == sa.len() =>
+        {
+            for (x, y) in pa.iter().zip(sa) {
+                unify_tparams(x, y, tps, out);
+            }
+        }
+        (Type::Annotated { tpe, .. }, _) => unify_tparams(tpe, s, tps, out),
+        (_, Type::Annotated { tpe, .. }) => unify_tparams(p, tpe, tps, out),
+        _ => {}
     }
 }
 

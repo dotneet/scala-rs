@@ -8,7 +8,7 @@ use crate::check::Typer;
 use crate::symbol::SymKind;
 use crate::warn_patmat::*;
 use crate::warn_patmat_logic::*;
-use crate::warn_patmat_translate::Unsupported;
+use crate::warn_patmat_translate::{bail, Unsupported};
 use crate::warn_patmat_types::{sealed_children, CVal, NTy, Types};
 use scala_rs_parser::ast::*;
 use std::collections::{HashMap, HashSet};
@@ -78,6 +78,7 @@ pub(crate) struct Approx<'x> {
     syms: Vec<SymInfo>,
     backoff: bool,
     children_cache: HashMap<SymbolId, Option<Vec<SymbolId>>>,
+    pickled_cache: HashMap<SymbolId, u64>,
 }
 
 impl<'x> Approx<'x> {
@@ -105,6 +106,7 @@ impl<'x> Approx<'x> {
             syms: Vec::new(),
             backoff: false,
             children_cache: HashMap::new(),
+            pickled_cache: HashMap::new(),
         };
         a.consts.push(ConstInfo {
             tp: NTy::Null,
@@ -368,18 +370,46 @@ impl<'x> Approx<'x> {
         if s.kind == SymKind::ModuleClass {
             return Ok(vec![vec![tp.clone()]]);
         }
-        if s.flags.contains(Flags::SEALED) {
+        let is_case = s.flags.contains(Flags::CASE) && s.kind == SymKind::Class;
+        if self.is_sealed(sym) {
             return self.enumerate_sealed(tp, sym, grouped);
         }
-        if s.flags.contains(Flags::CASE) && s.kind == SymKind::Class {
+        if is_case {
             return Ok(vec![vec![tp.clone()]]);
         }
         Ok(Vec::new())
     }
 
-    fn is_abstract_class(&self, c: SymbolId) -> bool {
-        let f = self.t.st.get(c).flags;
-        f.contains(Flags::TRAIT) || f.contains(Flags::ABSTRACT) || f.contains(Flags::INTERFACE)
+    /// Our flags, completed from the pickle for a library class.
+    fn class_flags(&mut self, c: SymbolId) -> (Flags, u64) {
+        let ours = self.t.st.get(c).flags;
+        if let Some(f) = self.pickled_cache.get(&c) {
+            return (ours, *f);
+        }
+        let f = crate::warn_patmat_types::pickled_flags(self.t, c).unwrap_or(0);
+        self.pickled_cache.insert(c, f);
+        (ours, f)
+    }
+
+    fn is_sealed(&mut self, c: SymbolId) -> bool {
+        use scala_rs_pickle::read::pflags;
+        let (f, p) = self.class_flags(c);
+        f.contains(Flags::SEALED) || p & pflags::SEALED != 0
+    }
+
+    fn is_trait(&mut self, c: SymbolId) -> bool {
+        use scala_rs_pickle::read::pflags;
+        let (f, p) = self.class_flags(c);
+        f.contains(Flags::TRAIT) || p & pflags::TRAIT != 0
+    }
+
+    fn is_abstract_class(&mut self, c: SymbolId) -> bool {
+        use scala_rs_pickle::read::pflags;
+        let (f, p) = self.class_flags(c);
+        f.contains(Flags::TRAIT)
+            || f.contains(Flags::ABSTRACT)
+            || f.contains(Flags::INTERFACE)
+            || p & (pflags::TRAIT | pflags::ABSTRACT | pflags::INTERFACE) != 0
     }
 
     fn sort_name(&self, c: SymbolId) -> String {
@@ -387,26 +417,30 @@ impl<'x> Approx<'x> {
     }
 
     fn filter_and_sort(&mut self, children: Vec<SymbolId>) -> Vec<SymbolId> {
-        let mut c1: Vec<SymbolId> = children
-            .into_iter()
-            .filter(|c| {
-                let f = self.t.st.get(*c).flags;
-                !(f.contains(Flags::SEALED) && (self.is_abstract_class(*c) || f.contains(Flags::ENUM)))
-            })
-            .collect();
+        let mut c1: Vec<SymbolId> = Vec::new();
+        for c in children {
+            let enum_flag = self.t.st.get(c).flags.contains(Flags::ENUM);
+            let drop = self.is_sealed(c) && (self.is_abstract_class(c) || enum_flag);
+            if !drop {
+                c1.push(c);
+            }
+        }
         c1.sort_by_key(|c| self.sort_name(*c));
         c1.dedup();
         let all = c1.clone();
-        c1.into_iter()
-            .filter(|c| {
-                let f = self.t.st.get(*c).flags;
-                !(f.contains(Flags::PRIVATE)
-                    && self.is_abstract_class(*c)
-                    && all.iter().any(|o| {
-                        o != c && crate::pickle_supply::inherits_from(&self.t.st, *o, *c)
-                    }))
-            })
-            .collect()
+        let mut out = Vec::new();
+        for c in c1 {
+            let private = self.t.st.get(c).flags.contains(Flags::PRIVATE);
+            let drop = private
+                && self.is_abstract_class(c)
+                && all
+                    .iter()
+                    .any(|o| *o != c && crate::pickle_supply::inherits_from(&self.t.st, *o, c));
+            if !drop {
+                out.push(c);
+            }
+        }
+        out
     }
 
     fn sealed_descendants(&mut self, c: SymbolId, out: &mut Vec<SymbolId>) -> Result<(), Unsupported> {
@@ -415,8 +449,8 @@ impl<'x> Approx<'x> {
         } else {
             return Ok(());
         }
-        if self.t.st.get(c).flags.contains(Flags::SEALED) {
-            let kids = self.children(c).ok_or(Unsupported)?;
+        if self.is_sealed(c) {
+            let kids = self.children(c).ok_or_else(|| bail!())?;
             for k in kids {
                 self.sealed_descendants(k, out)?;
             }
@@ -432,17 +466,23 @@ impl<'x> Approx<'x> {
             while let Some(hd) = wl.pop_front() {
                 guard += 1;
                 if guard > 1000 {
-                    return Err(Unsupported);
+                    return Err(bail!());
                 }
-                let kids = if self.t.st.get(hd).flags.contains(Flags::SEALED) {
-                    self.children(hd).ok_or(Unsupported)?
+                let kids = if self.is_sealed(hd) {
+                    self.children(hd).ok_or_else(|| bail!())?
                 } else {
                     Vec::new()
                 };
                 let children = self.filter_and_sort(kids);
-                let (traits, non_traits): (Vec<SymbolId>, Vec<SymbolId>) = children
-                    .iter()
-                    .partition(|c| self.t.st.get(**c).flags.contains(Flags::TRAIT));
+                let mut traits = Vec::new();
+                let mut non_traits = Vec::new();
+                for c in &children {
+                    if self.is_trait(*c) {
+                        traits.push(*c);
+                    } else {
+                        non_traits.push(*c);
+                    }
+                }
                 for t in traits {
                     acc.push(vec![t]);
                 }
@@ -464,12 +504,12 @@ impl<'x> Approx<'x> {
                     SymKind::ModuleClass => NTy::Module(c),
                     SymKind::Module => NTy::Module(self.t.st.module_class_of(c)),
                     SymKind::Class => NTy::Class(c, vec![NTy::Wild; s.tparams.len()]),
-                    _ => return Err(Unsupported),
+                    _ => return Err(bail!()),
                 };
                 match self.tys().sub(&sub_tp, tp) {
                     Some(true) => tps.push(self.tys().checkable(&sub_tp)),
                     Some(false) => {}
-                    None => return Err(Unsupported),
+                    None => return Err(bail!()),
                 }
             }
             out.push(tps);
@@ -556,7 +596,7 @@ impl<'x> Approx<'x> {
             return Ok(false);
         }
         let ltp = if l.is_value { &l.wide } else { &l.tp };
-        self.tys().instance_of_implies(ltp, &u.tp).ok_or(Unsupported)
+        self.tys().instance_of_implies(ltp, &u.tp).ok_or_else(|| bail!())
     }
 
     /// `excludes(a, b)`
@@ -844,14 +884,14 @@ impl<'x> Approx<'x> {
         let tys = self.tys();
         let tested_wide = tys.widen(&self.binders[tested].tp);
         if tested_wide.is_unknown() || expected.is_unknown() {
-            return Err(Unsupported);
+            return Err(bail!());
         }
-        let is_as_expected = tys.sub(&tested_wide, expected).ok_or(Unsupported)?;
+        let is_as_expected = tys.sub(&tested_wide, expected).ok_or_else(|| bail!())?;
         let is_prim = is_as_expected && tys.is_primitive_value_type(expected);
-        let is_ref = is_as_expected && tys.sub(expected, &NTy::AnyRef).ok_or(Unsupported)?;
+        let is_ref = is_as_expected && tys.sub(expected, &NTy::AnyRef).ok_or_else(|| bail!())?;
         if !extractor_arg && expected.is_singleton() {
             // `case _: x.type` and friends.
-            return Err(Unsupported);
+            return Err(bail!());
         }
         let expected_wide = tys.widen(expected);
         Ok(if is_prim {
@@ -919,7 +959,7 @@ impl<'x> Approx<'x> {
                 let mut ops = vec![current[0].clone()];
                 ops.extend(prefix.iter().cloned());
                 let and = and_create(ops);
-                let solvable = eq_free_prop_to_solvable(&and).map_err(|_| Unsupported)?;
+                let solvable = eq_free_prop_to_solvable(&and).map_err(|_| bail!())?;
                 reachable = has_model(&solvable);
             }
         }
@@ -1053,9 +1093,25 @@ impl<'x> Approx<'x> {
         let match_fails = Prop::Not(Box::new(big_or(symbolic)));
         let (ax, pure) = self.remove_var_eq(&[match_fails], false)?;
         let pure = pure.into_iter().next().unwrap_or(Prop::True);
-        let solvable = eq_free_prop_to_solvable(&and_create([ax, pure])).map_err(|_| Unsupported)?;
+        let solvable = eq_free_prop_to_solvable(&and_create([ax, pure])).map_err(|_| bail!())?;
         let (models, depth_reached) = find_all_models(&solvable);
         let scrut_var = self.var(&root_tree);
+        // The classes a counter-example may be built from, with their pickled
+        // flags at hand (`to_counter_example` only reads them).
+        let mut classes: Vec<SymbolId> = Vec::new();
+        for v in &self.vars {
+            if let Some(c) = self.tys().type_symbol(&v.checkable) {
+                classes.push(c);
+            }
+        }
+        for c in &self.consts {
+            if let Some(s) = self.tys().type_symbol(&c.tp) {
+                classes.push(s);
+            }
+        }
+        for c in classes {
+            self.class_flags(c);
+        }
         let mut examples: Vec<CEx> = Vec::new();
         'models: for model in &models {
             for va in self.expand_model(model) {
@@ -1299,7 +1355,13 @@ impl<'x> Approx<'x> {
         let sym = self.tys().type_symbol(&tp)?;
         let s = self.t.st.get(sym);
         match s.kind {
-            SymKind::Class if !s.flags.contains(Flags::TRAIT) && !s.flags.contains(Flags::INTERFACE) => {
+            SymKind::Class
+                if !s.flags.contains(Flags::TRAIT)
+                    && !s.flags.contains(Flags::INTERFACE)
+                    && self.pickled_cache.get(&sym).is_none_or(|p| {
+                        p & (scala_rs_pickle::read::pflags::TRAIT | scala_rs_pickle::read::pflags::INTERFACE) == 0
+                    }) =>
+            {
                 if sym == self.t.st.any_sym || sym == self.t.st.anyval_sym {
                     None
                 } else {
@@ -1367,10 +1429,17 @@ impl<'x> Approx<'x> {
                 if is_tuple {
                     return Ok(args(true)?.map(CEx::Tuple));
                 }
-                if s.flags.contains(Flags::SEALED)
-                    && (s.flags.contains(Flags::ABSTRACT) || s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::ENUM))
+                let pickled = self.pickled_cache.get(&c).copied().unwrap_or(0);
                 {
-                    return Ok(None);
+                    use scala_rs_pickle::read::pflags;
+                    let sealed = s.flags.contains(Flags::SEALED) || pickled & pflags::SEALED != 0;
+                    let abstract_ = s.flags.contains(Flags::ABSTRACT)
+                        || s.flags.contains(Flags::TRAIT)
+                        || s.flags.contains(Flags::ENUM)
+                        || pickled & (pflags::ABSTRACT | pflags::TRAIT) != 0;
+                    if sealed && abstract_ {
+                        return Ok(None);
+                    }
                 }
                 let module = s.kind == SymKind::ModuleClass;
                 let name = s.name.trim_end_matches('$').to_string();
