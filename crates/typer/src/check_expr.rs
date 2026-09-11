@@ -80,7 +80,7 @@ impl Typer {
         if tree.byname_thunk {
             return;
         }
-        if tree.id.is_pretyped_default() {
+        if tree.id.is_pretyped() {
             // A default argument's body, already typed in the scope it was
             // written in (`type_default_rhs_here`). Typing it again here would
             // resolve its names in the caller's scope -- which is the bug that

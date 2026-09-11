@@ -19,6 +19,7 @@ mod default_recv;
 mod double_def;
 mod erasure;
 mod expand;
+mod expand_mirror;
 mod expand_private;
 mod expand_rpc;
 mod fasttrack_mirror;

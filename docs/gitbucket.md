@@ -3391,3 +3391,19 @@ with corpus losses=0 and 2655 workspace tests passing. Gitbucket improved
 239/71 -> 228/69, with all ten returning diagnostics removed and no new
 error-message entries. Cats remains 163/62. Shape-related diagnostics do not
 improve; no result for that separate family is inferred from these probes.
+
+### `mapTo` expands (the `agent/gbmacro` slice)
+
+The 31 `macro expansion is not implemented: cannot expand mapTo` diagnostics --
+one per table whose row class this run compiles -- are gone: 92/43 -> 61/15 on
+`9cac778e`, and 36 -> 5 composed with `agent/gbmisc`. The other 61 errors are
+unchanged, kind for kind; nothing downstream of `mapTo` moved, because the
+`Shape`/`OptionLift` cluster was an implicit-unification root (`agent/gbmisc`),
+not a cascade. What it took -- a lazy mirror over the run's own classes in
+nsc's shape, the reply shapes `mapToImpl` returns, splicing the typed receiver
+back instead of typing it again, and three typer repairs -- is
+`docs/macros.md` §7.25, with the defects found on the way. One of those is a
+silent miscompile in exactly gitbucket's table shape: a table class that
+extends `Table` through `import profile.api._` gets the component, not the
+profile, as its superclass's outer instance, and its constructor throws
+`ClassCastException` at run time.

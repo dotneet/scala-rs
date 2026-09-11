@@ -1484,6 +1484,15 @@ impl Typer {
                 }
             }
         }
+        // A type member an enclosing class inherits from a jar ancestor. The
+        // template scope holds what `enter_inherited_members` found in the
+        // symbol table, and a jar class's aliases are not there: an alias
+        // leaves no trace in the bytecode. Only asked when the name has no
+        // binding at all -- a default import (`scala._`, `Predef`) keeps
+        // answering as it always has.
+        if !default_type && self.library_abi && self.expose_inherited_binary_type(name) {
+            return;
+        }
         // Not from a jar: a source package member. `lookup_member` already
         // sees a package object's members through the package (see
         // `package_object_of`'s "a package object's members are the
@@ -1545,6 +1554,57 @@ impl Typer {
                 }
             }
         }
+    }
+
+    /// Bind `name` to a type member one of the enclosing classes inherits
+    /// from a class read from a jar, innermost class first
+    /// ([`crate::pickle_supply::PickleSupply::complete_inherited_type_member`]).
+    ///
+    /// The walk visits each enclosing class's ancestors breadth-first, the
+    /// order `enter_inherited_members` uses. A source ancestor's own members
+    /// are already in the template scope, so only a *binary* ancestor is
+    /// asked, and not its parents: its pickle lookup walks its whole
+    /// linearisation itself.
+    fn expose_inherited_binary_type(&mut self, name: &str) -> bool {
+        let mut enclosing = Vec::new();
+        let mut cur = self.st.this_class;
+        for _ in 0..64 {
+            if cur.is_none() {
+                break;
+            }
+            if self.st.get(cur).is_class_like() {
+                enclosing.push(cur);
+            }
+            cur = self.st.get(cur).owner;
+        }
+        for cls in enclosing {
+            let mut work: std::collections::VecDeque<Type> =
+                self.st.get(cls).parents.iter().rev().cloned().collect();
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(cls.0);
+            while let Some(p) = work.pop_front() {
+                let Some(pid) = self.st.class_sym_of(&p) else {
+                    continue;
+                };
+                if !seen.insert(pid.0) {
+                    continue;
+                }
+                if self.is_current_run_class(pid) {
+                    work.extend(self.st.get(pid).parents.iter().rev().cloned());
+                    continue;
+                }
+                if let Some(id) = self.pickle.complete_inherited_type_member(
+                    &mut self.st,
+                    &mut self.binary,
+                    pid,
+                    name,
+                ) {
+                    self.st.enter_in_current(name, id);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Is `outer` `inner` itself, or one of its enclosing packages?
