@@ -96,6 +96,7 @@ impl Typer {
                 _ => unreachable!(),
             };
             self.type_ident(tree, name, pt);
+            self.spell_out_inferred_class_of(tree);
         } else if matches!(&tree.kind, TreeKind::Function { .. }) {
             let ty = {
                 let (vparams, body) = match &mut tree.kind {
@@ -1212,6 +1213,11 @@ impl Typer {
                             return;
                         }
                         crate::symbol::Intrinsic::IsInstanceOf => {
+                            // `x.isInstanceOf[p.type]` compares with `p`, so
+                            // codegen needs `p` as a typed term.
+                            if let (Some(a), Some(t)) = (args.first_mut(), targs.first()) {
+                                self.type_singleton_type_ref(a, t);
+                            }
                             tree.ty = Type::Boolean;
                             return;
                         }

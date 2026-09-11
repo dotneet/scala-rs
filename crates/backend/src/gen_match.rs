@@ -56,10 +56,7 @@ pub(crate) fn switch_pat_key(pat: &Tree) -> Option<SwitchPat> {
         TreeKind::Literal { lit: Lit::Char(c) } => Some(SwitchPat::Key(*c as i32)),
         TreeKind::Wildcard | TreeKind::Empty => Some(SwitchPat::Default),
         TreeKind::Ident { name } => {
-            let is_varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
+            let is_varid = scala_rs_parser::ast::is_variable_name(name);
             if is_varid {
                 Some(SwitchPat::Default)
             } else {
@@ -689,10 +686,7 @@ pub(crate) fn is_binding_ident(ctx: &EmitCtx, pat: &Tree, name: &str) -> bool {
     // resolved `val` and a fresh pattern variable are both `SymKind::Term`
     // and the test below would call every constant pattern a binding.
     !pat.stable_pat
-        && (name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_lowercase() || c == '_')
+        && (scala_rs_parser::ast::is_variable_name(name)
             || pat.sym.is_none()
             || ctx.st.get(pat.sym).kind == SymKind::Term)
 }
@@ -1086,9 +1080,46 @@ pub(crate) fn gen_pattern(
             };
             store(asm, slot, sort);
         }
-        TreeKind::Typed { expr, .. } => {
+        TreeKind::Typed { expr, tpt } => {
             if pat.sym == ctx.st.singleton_sym {
                 gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
+            // A singleton type pattern is a comparison, not a class test
+            // (nsc `TypeTestTreeMaker`): `_: p.type` is `p eq x` when `p` is
+            // an `AnyRef` and `p == x` otherwise, `_: 1` is `1 == x`. The
+            // comparison implies the class, so a binder is only narrowed.
+            if let Some(stable) = singleton_pattern_ref(tpt)
+                .filter(|s| sel_sort == JvmSort::Ref || is_jvm_primitive(&s.ty))
+            {
+                gen_expr(asm, frame, ctx, stable);
+                if sel_sort == JvmSort::Ref && ctx.st.is_sub_type(&stable.ty, &Type::AnyRef) {
+                    load(asm, tmp, sel_sort);
+                    asm.if_acmpne(fail);
+                } else {
+                    emit_const_pattern_test(asm, ctx, &stable.ty, tmp, sel_sort, fail);
+                }
+                bind_singleton_pattern(asm, frame, ctx, pat, expr, tmp, sel_sort, fail);
+                return;
+            }
+            let literal_type = match (&tpt.kind, peel_type_annot(&pat.ty)) {
+                (TreeKind::Literal { lit }, _) | (_, Type::Constant(lit)) => Some(lit),
+                _ => None,
+            };
+            if let Some(lit) = literal_type {
+                if matches!(lit, Lit::Null) {
+                    if sel_sort == JvmSort::Ref {
+                        load(asm, tmp, sel_sort);
+                        asm.ifnonnull(fail);
+                    } else {
+                        asm.goto(fail);
+                    }
+                } else {
+                    gen_literal(asm, lit);
+                    let lit_ty = Type::Constant(lit.clone());
+                    emit_const_pattern_test(asm, ctx, &lit_ty, tmp, sel_sort, fail);
+                }
+                bind_singleton_pattern(asm, frame, ctx, pat, expr, tmp, sel_sort, fail);
                 return;
             }
             // `case x: Meters` on an `Any` tests for the boxed value class and
@@ -1194,6 +1225,106 @@ pub(crate) fn gen_pattern(
         }
         _ => {}
     }
+}
+
+/// The term a singleton type tree (`p.type`, `this.type`) names, when the
+/// typer typed it for comparison (`Typer::type_singleton_type_ref`).
+pub(crate) fn singleton_pattern_ref(tpt: &Tree) -> Option<&Tree> {
+    match &tpt.kind {
+        TreeKind::AnnotatedTypeTree { tpt, .. } => singleton_pattern_ref(tpt),
+        TreeKind::SingletonTypeTree { ref_ } if !ref_.ty.is_no_type() && !ref_.ty.is_error() => {
+            Some(ref_)
+        }
+        _ => None,
+    }
+}
+
+/// `x.isInstanceOf[p.type]` / `x.isInstanceOf[1]`, which nsc's erasure
+/// (`SingletonInstanceCheck`) turns into `p eq x` -- `p.equals(x)` when the
+/// type's class is an `AnyVal` -- rather than a class test. The comparand is
+/// evaluated first, as there. Returns false, emitting nothing, for any other
+/// type argument.
+pub(crate) fn gen_singleton_instance_test(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    qual: &Tree,
+    targs: &[Tree],
+) -> bool {
+    let Some(targ) = targs.first() else {
+        return false;
+    };
+    let by_value = if let Some(stable) = singleton_pattern_ref(targ) {
+        gen_expr(asm, frame, ctx, stable);
+        if is_jvm_primitive(&stable.ty) {
+            emit_box(asm, &stable.ty.widen_constant());
+        }
+        // `pt.typeSymbol.isSubClass(AnyValClass)`: a path of type `Any` is
+        // compared by `eq` here, though a pattern would use `==`.
+        is_jvm_primitive(&stable.ty)
+            || is_unit_like(&stable.ty)
+            || ctx.st.is_sub_type(&stable.ty, &Type::AnyVal)
+    } else {
+        let lit = match (&targ.kind, peel_type_annot(&targ.ty)) {
+            (_, Type::Constant(lit)) | (TreeKind::Literal { lit }, _) => lit.clone(),
+            _ => return false,
+        };
+        gen_literal(asm, &lit);
+        let lit_ty = Type::Constant(lit.clone()).widen_constant();
+        if is_jvm_primitive(&lit_ty) {
+            emit_box(asm, &lit_ty);
+        }
+        // nsc compares with `==` exactly when the literal's class is an
+        // `AnyVal`; a `String` or `null` literal type is compared by `eq`.
+        is_jvm_primitive(&lit_ty) || is_unit_like(&lit_ty)
+    };
+    gen_expr(asm, frame, ctx, qual);
+    adapt_unit_qualifier(asm, ctx, qual);
+    if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
+        emit_box(asm, &qual.ty.widen_constant());
+    }
+    if by_value {
+        // `Any_equals`, the `equals` method -- not `==`: nsc answers false
+        // for `(1L: Any).isInstanceOf[1]`.
+        asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+    } else {
+        crate::gen_lambda::emit_bool_from_jump(asm, |asm, l| asm.if_acmpne(l));
+    }
+    true
+}
+
+/// After a singleton type pattern's comparison succeeded, bind `expr` (the
+/// `x` of `x: p.type`) to the scrutinee, narrowed to the pattern's type.
+#[allow(clippy::too_many_arguments)]
+fn bind_singleton_pattern(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    pat: &Tree,
+    expr: &Tree,
+    tmp: u16,
+    sel_sort: JvmSort,
+    fail: crate::code::Label,
+) {
+    // `_: 1` binds nothing; unboxing for it anyway threw on `(1L: Any)`, which
+    // `==` lets through.
+    if matches!(&expr.kind, TreeKind::Wildcard | TreeKind::Empty)
+        || matches!(&expr.kind, TreeKind::Ident { name } if name == "_")
+    {
+        return;
+    }
+    let want = jvm_sort(&pat.ty);
+    if want == sel_sort && sel_sort != JvmSort::Ref {
+        gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+        return;
+    }
+    load(asm, tmp, sel_sort);
+    if sel_sort == JvmSort::Ref {
+        emit_from_erased_object(asm, ctx.st, &pat.ty);
+    }
+    let narrowed = frame.alloc_tmp(want);
+    store(asm, narrowed, want);
+    gen_pattern(asm, frame, ctx, expr, narrowed, want, fail);
 }
 
 /// Bind the value on top of the stack to `pat`. `sort` is the sort that value

@@ -645,6 +645,42 @@ impl<'a> Gen<'a> {
         format!("{}$delayedInit$body", class_name.replace('/', "$"))
     }
 
+    /// nsc's `delayedEndpoint$<fullName with $>$1` (`Constructors.
+    /// delayedEndpointDef`). The name has to be the class's own: every
+    /// `DelayedInit` class in a hierarchy has an endpoint, and a shared
+    /// `delayedEndpoint$body` made a subclass's override answer the parent's
+    /// `delayedInit` call as well, running the subclass body twice (run/t6481).
+    pub(crate) fn delayed_endpoint_name(
+        st: &scala_rs_typer::SymbolTable,
+        class_id: SymbolId,
+        class_name: &str,
+    ) -> String {
+        let mut full = class_name.replace('/', "$");
+        if !class_id.is_none() && st.get(class_id).kind == SymKind::ModuleClass {
+            if let Some(stripped) = full.strip_suffix('$') {
+                full = stripped.to_string();
+            }
+        }
+        format!("delayedEndpoint${full}$1")
+    }
+
+    /// nsc wraps a `DelayedInit` class's constructor statements only when
+    /// there are some (`isDelayedInitSubclass && remainingConstrStats.
+    /// nonEmpty`): an abstract `class Foo extends DelayedInit` with no body
+    /// calls no `delayedInit` of its own.
+    pub(crate) fn has_delayed_stats(body: &[Tree]) -> bool {
+        body.iter().any(|t| {
+            is_delayed_ctor_stat(t)
+                && !is_presuper_val(t)
+                && match &t.kind {
+                    TreeKind::ValDef { mods, rhs, .. } => {
+                        !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                    }
+                    _ => true,
+                }
+        })
+    }
+
     pub(crate) fn emit_delayed_init_support(
         &self,
         b: &mut ClassBuilder,
@@ -664,8 +700,12 @@ impl<'a> Gen<'a> {
                 self.emit_app_private_members(b, &class_name);
             }
         }
+        if !Self::has_delayed_stats(body) {
+            return;
+        }
         self.emit_delayed_endpoint(b, class_id, body);
-        self.emit_delayed_init_lambda(&class_name);
+        let endpoint = Self::delayed_endpoint_name(self.st, class_id, &class_name);
+        self.emit_delayed_init_lambda(&class_name, &endpoint);
     }
 
     pub(crate) fn emit_app_private_members(&self, b: &mut ClassBuilder, class_name: &str) {
@@ -972,7 +1012,8 @@ impl<'a> Gen<'a> {
             .filter(|t| is_delayed_ctor_stat(t) && !is_presuper_val(t))
             .cloned()
             .collect();
-        b.add_code(ACC_PUBLIC, "delayedEndpoint$body", "()V", 4, |asm| {
+        let endpoint = Self::delayed_endpoint_name(st, class_id, &class_name);
+        b.add_code(ACC_PUBLIC | ACC_FINAL, &endpoint, "()V", 4, |asm| {
             let mut frame = Frame::instance();
             let ctx = emit_ctx(
                 st,
@@ -1016,7 +1057,7 @@ impl<'a> Gen<'a> {
         });
     }
 
-    pub(crate) fn emit_delayed_init_lambda(&self, class_name: &str) {
+    pub(crate) fn emit_delayed_init_lambda(&self, class_name: &str, endpoint: &str) {
         let lam = Self::delayed_body_class(class_name);
         let mut b = ClassBuilder::new(lam.clone(), self.source_name);
         b.access = ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL;
@@ -1040,7 +1081,7 @@ impl<'a> Gen<'a> {
         b.add_code(ACC_PUBLIC, "apply", "()Ljava/lang/Object;", 1, |asm| {
             asm.aload(0);
             asm.getfield(&lam, "$outer", &format!("L{cn};"));
-            asm.invokevirtual(&cn, "delayedEndpoint$body", "()V");
+            asm.invokevirtual(&cn, endpoint, "()V");
             asm.aconst_null();
             asm.areturn();
         });
@@ -1147,6 +1188,7 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
+        let delayed_stats = Gen::has_delayed_stats(body);
         let is_app = extends_app(st, class_id);
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
@@ -1316,7 +1358,9 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
-                Gen::emit_delayed_init_call(asm, &class_name);
+                if delayed_stats {
+                    Gen::emit_delayed_init_call(asm, &class_name);
+                }
             } else {
                 for vd in &inits {
                     if is_presuper_val(vd) {
@@ -1745,6 +1789,14 @@ impl<'a> Gen<'a> {
         let fty = self.st.get(f).ty.clone();
         let fdesc = jvm_desc(self.st, &fty);
         let cj = b.this_name.clone();
+        // nsc generates these two even over an implementation inherited from
+        // a universal trait ("overridden … to enforce value class semantics");
+        // a value class cannot write its own (`valueclass.rs` rejects it). So
+        // a mixin forwarder to `Foo.equals$` is replaced, not kept (run/t6534).
+        b.methods.retain(|m| {
+            !((m.name == "equals" && m.desc == "(Ljava/lang/Object;)Z")
+                || (m.name == "hashCode" && m.desc == "()I"))
+        });
         let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
         let wide = matches!(fty, Type::Long | Type::Double);
         let fslots = if wide { 2u16 } else { 1 };

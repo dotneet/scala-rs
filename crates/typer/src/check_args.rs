@@ -2261,6 +2261,9 @@ impl Typer {
             Type::Char => Some("Char"),
             Type::Unit => Some("Unit"),
             Type::Any => Some("Any"),
+            // nsc's `ClassTag.AnyVal`, whose runtime class is `Object`; a
+            // `ClassTag(classOf[AnyVal])` printed `Object` (run/classtags_core).
+            Type::AnyVal => Some("AnyVal"),
             Type::AnyRef => Some("AnyRef"),
             Type::Nothing => Some("Nothing"),
             Type::Null => Some("Null"),

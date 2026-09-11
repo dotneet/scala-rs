@@ -251,11 +251,7 @@ impl Typer {
                 }
                 // A backquoted name is stable however it is spelled; the
                 // parser has already marked it.
-                let is_varid = !stable_hint
-                    && name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
                 // SLS 8.1.5 wants a *stable* id here. `found[0]` can be a
                 // `def` of the same name, which nsc rejects rather than
                 // calling, so pick the value or module if the scope has one.
@@ -751,6 +747,7 @@ impl Typer {
                     );
                 }
                 self.type_pattern(expr, &ty);
+                self.type_singleton_type_ref(tpt, &ty);
                 if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
                     && !self.st.is_sub_type(sel_ty, &Type::AnyRef)
                 {
@@ -2234,10 +2231,7 @@ impl Typer {
             TreeKind::Wildcard | TreeKind::Empty => true,
             TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
             TreeKind::Ident { name } => {
-                let is_varid = name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = scala_rs_parser::ast::is_variable_name(name);
                 is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
             }
             TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),

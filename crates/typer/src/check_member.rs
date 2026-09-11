@@ -948,6 +948,9 @@ impl Typer {
         // module under the JVM spelling instead, which is what
         // `synthesize_ctor_default_getters` does for every constructor,
         // primary and secondary alike (`crate::ctor_defaults`).
+        if name == "apply" {
+            self.unlink_suppressed_case_apply(saved_owner, tree.sym, &tp_ids, &paramss_ty);
+        }
         if name != "<init>" {
             self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
         }
