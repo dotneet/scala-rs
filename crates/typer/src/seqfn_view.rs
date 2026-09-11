@@ -203,6 +203,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         *tree = Tree {
             id: NodeId(0),
@@ -216,6 +217,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         self.adapt(tree, pt);
     }

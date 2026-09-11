@@ -377,6 +377,19 @@ fn which_java() -> std::io::Result<PathBuf> {
 }
 
 pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
+    parse_classfile_members(bytes, false)
+}
+
+/// ScalaSignature completion needs descriptors even for inaccessible methods:
+/// installing their actual declaration lets the typer enforce Scala access.
+pub(crate) fn parse_classfile_for_scala_signature(bytes: &[u8]) -> Result<JavaClass, String> {
+    parse_classfile_members(bytes, true)
+}
+
+fn parse_classfile_members(
+    bytes: &[u8],
+    include_private_methods: bool,
+) -> Result<JavaClass, String> {
     let mut c = CursorJ::new(bytes);
     if c.u4().ok_or("truncated classfile")? != 0xCAFEBABE {
         return Err("not a classfile (bad magic)".into());
@@ -491,7 +504,8 @@ pub fn parse_java_classfile(bytes: &[u8]) -> Result<JavaClass, String> {
         if acc & ACC_SYNTHETIC != 0 || acc & ACC_BRIDGE != 0 {
             continue;
         }
-        if !java_member_visible(acc) {
+        // Constructors have their own signature/access completion path.
+        if (!include_private_methods || name == "<init>") && !java_member_visible(acc) {
             continue;
         }
         methods.push(JavaMethod {

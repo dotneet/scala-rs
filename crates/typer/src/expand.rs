@@ -1320,6 +1320,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         match kind.as_str() {
             "Literal" => Ok(node(TreeKind::Literal {
@@ -1733,6 +1734,7 @@ fn path_tree(full: &str, span: Span) -> Tree {
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
     for p in parts {
         t = Tree {
@@ -1747,6 +1749,7 @@ fn path_tree(full: &str, span: Span) -> Tree {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
     }
     t

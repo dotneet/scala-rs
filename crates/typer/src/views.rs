@@ -127,6 +127,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -142,6 +143,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         Tree {
             id: NodeId(0),
@@ -158,6 +160,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         }
     }
 }

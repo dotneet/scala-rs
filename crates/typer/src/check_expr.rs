@@ -75,6 +75,11 @@ impl Typer {
         let callee = std::mem::take(&mut self.typing_callee);
         let type_callee = std::mem::take(&mut self.typing_type_callee);
         let qualifier = std::mem::take(&mut self.typing_qualifier);
+        // Generated thunk bodies were typed in the argument's lexical scope.
+        // Reusing one for defaults must not reinterpret it as a source lambda.
+        if tree.byname_thunk {
+            return;
+        }
         if tree.id.is_pretyped_default() {
             // A default argument's body, already typed in the scope it was
             // written in (`type_default_rhs_here`). Typing it again here would
@@ -1188,6 +1193,7 @@ impl Typer {
                             postfix: false,
                             scala_ref: false,
                             stable_pat: false,
+                            byname_thunk: false,
                         };
                     } else if sym != fun.sym {
                         fun.sym = sym;
@@ -1327,9 +1333,13 @@ impl Typer {
                 // context. Restore imports before typing executable statements;
                 // only the completed local declarations are block-wide.
                 let before_imports = self.st.scopes.last().cloned().unwrap();
+                let mut unresolved_local_import = false;
                 for s in stats.iter_mut() {
                     if matches!(s.kind, TreeKind::Import { .. }) {
                         self.type_stat(s);
+                        if let TreeKind::Import { expr, .. } = &s.kind {
+                            unresolved_local_import |= expr.sym.is_none() || expr.ty.is_error();
+                        }
                     }
                     if matches!(s.kind, TreeKind::TypeDef { .. }) {
                         if s.sym.is_none() {
@@ -1340,7 +1350,15 @@ impl Typer {
                     }
                     if let TreeKind::DefDef { tpt, name, .. } = &s.kind {
                         if name != "<init>" && !tpt.is_empty() {
+                            let mark = self.diags.len();
                             self.type_member_sig(s);
+                            // A preceding eager local val is unavailable during
+                            // hoisting. Complete this provisional signature again
+                            // at its declaration, after that import has resolved.
+                            if unresolved_local_import {
+                                self.sig_done.remove(&(self.file_index, s.id));
+                                self.diags.truncate(mark);
+                            }
                         }
                     }
                     // A local `lazy val` is in scope for the whole block as well:
@@ -1367,7 +1385,9 @@ impl Typer {
                         }
                     }
                 }
-                for s in stats.iter_mut() {
+                for index in 0..stats.len() {
+                    let (through, rest) = stats.split_at_mut(index + 1);
+                    let s = &mut through[index];
                     // A repeated body pass rebuilds the block scope, but
                     // signature completion does not allocate the local again.
                     // Re-enter its existing symbol at its declaration point.
@@ -1377,6 +1397,21 @@ impl Typer {
                         }
                     }
                     self.type_stat(s);
+                    if unresolved_local_import && matches!(s.kind, TreeKind::Import { .. }) {
+                        // Once its stable prefix is available, complete hoisted
+                        // methods before any following statement can call them.
+                        // The next import starts a distinct lexical context.
+                        for later in rest
+                            .iter_mut()
+                            .take_while(|s| !matches!(s.kind, TreeKind::Import { .. }))
+                        {
+                            if matches!(&later.kind, TreeKind::DefDef { name, tpt, .. }
+                                if name != "<init>" && !tpt.is_empty())
+                            {
+                                self.type_member_sig(later);
+                            }
+                        }
+                    }
                 }
                 self.type_expr(expr, pt);
                 tree.ty = expr.ty.clone();
@@ -1425,6 +1460,7 @@ impl Typer {
                         postfix: false,
                         scala_ref: false,
                         stable_pat: false,
+                        byname_thunk: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(update),
@@ -1456,6 +1492,7 @@ impl Typer {
                         postfix: false,
                         scala_ref: false,
                         stable_pat: false,
+                        byname_thunk: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -1479,6 +1516,7 @@ impl Typer {
                         postfix: false,
                         scala_ref: false,
                         stable_pat: false,
+                        byname_thunk: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -1507,6 +1545,7 @@ impl Typer {
                         postfix: false,
                         scala_ref: false,
                         stable_pat: false,
+                        byname_thunk: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -1857,6 +1896,7 @@ impl Typer {
                             postfix: false,
                             scala_ref: false,
                             stable_pat: false,
+                            byname_thunk: false,
                         };
                         self.type_apply(tree, pt);
                         return;

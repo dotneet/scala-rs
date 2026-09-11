@@ -154,3 +154,99 @@ fn secondary_constructor_and_written_copy() {
 fn provisional_values_preserve_written_constraints() {
     matrix(&[("recovery_value_hints", true)]);
 }
+
+#[test]
+fn byname_source_functions_and_generated_thunks() {
+    matrix(&[
+        ("byname_values", true),
+        ("byname_source_bad", false),
+        ("byname_result_bad", false),
+    ]);
+}
+
+#[test]
+fn provisional_arguments_keep_fixed_type_structure() {
+    matrix(&[("fixed_shape", true)]);
+}
+
+#[test]
+fn stable_local_alias_imports() {
+    matrix(&[("local_alias", true), ("local_alias_bad", false)]);
+}
+
+#[test]
+fn prelude_copy_rewrite_keeps_all_arities() {
+    matrix(&[("prelude_copy", true)]);
+}
+
+#[test]
+fn imported_copy_declarations() {
+    let api = root();
+    let p = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .args(["-cp", JAR, "-d"])
+        .arg(&api)
+        .arg(fixture("copy_api"))
+        .output()
+        .unwrap();
+    assert!(p.status.success(), "{}", String::from_utf8_lossy(&p.stderr));
+    let cp = format!("{}:{JAR}", api.display());
+    compare(
+        &["imported_copy"],
+        Some(b"1\n7\ncustom\ninherited\nprotected\n"),
+        &cp,
+    );
+    compare(&["imported_copy_bad"], None, &cp);
+    compare(&["imported_private_copy_bad"], None, &cp);
+    compare(&["imported_private_method_bad"], None, &cp);
+    compare(&["imported_protected_method_bad"], None, &cp);
+    fs::remove_dir_all(api).unwrap();
+}
+
+#[test]
+fn byname_parameters_in_function_types() {
+    matrix(&[
+        ("byname_function_types", true),
+        ("byname_function_types_bad", false),
+    ]);
+}
+
+#[test]
+fn byname_signatures_cross_compiler_boundary() {
+    for nsc in [true, false] {
+        let api = root();
+        let mut c = Command::new(if nsc {
+            "/tmp/scala-2.13.16/bin/scalac"
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            c.args(["compile", "--scala-library", JAR]);
+        }
+        let p = c
+            .args(["-cp", JAR, "-d"])
+            .arg(&api)
+            .arg(fixture("byname_api"))
+            .output()
+            .unwrap();
+        assert!(
+            p.status.success(),
+            "nsc={nsc}: {}",
+            String::from_utf8_lossy(&p.stderr)
+        );
+        compare(
+            &["byname_client"],
+            Some(b"3\n2\n7\n4\n7\n"),
+            &format!("{}:{JAR}", api.display()),
+        );
+        fs::remove_dir_all(api).unwrap();
+    }
+}
+
+#[test]
+fn byname_eta_modes_and_unit_discard() {
+    matrix(&[
+        ("byname_unit", true),
+        ("byname_eta_bad", false),
+        ("byname_unit_overload_bad", false),
+    ]);
+}

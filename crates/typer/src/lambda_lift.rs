@@ -1024,6 +1024,7 @@ fn rewrite_auto_apply(tree: &mut Tree, caps: &HashMap<SymbolId, Vec<SymbolId>>, 
         postfix: false,
         scala_ref: false,
         stable_pat,
+        byname_thunk: false,
     };
 }
 
@@ -1047,5 +1048,6 @@ fn capture_ident(id: SymbolId, span: scala_rs_span::Span, st: &SymbolTable) -> T
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     }
 }

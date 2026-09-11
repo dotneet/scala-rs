@@ -1913,7 +1913,11 @@ impl<'a> Pickler<'a> {
                 let array = self.type_ref_in_refs(sc, "Array", &[inner]);
                 self.pickle_existential_tpe(array, &quantified)
             }
-            Type::ByName(t) => self.pickle_type(t),
+            Type::ByName(t) => {
+                let inner = self.pickle_type(t);
+                let sc = self.scala_module();
+                self.type_ref_in_refs(sc, "<byname>", &[inner])
+            }
             Type::Repeated(t) => {
                 let inner = self.pickle_type(t);
                 let sc = self.scala_module();

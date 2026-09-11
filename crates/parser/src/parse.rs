@@ -1888,14 +1888,14 @@ impl<'a> Parser<'a> {
     fn parse_type(&mut self) -> Tree {
         self.skip_nl();
         if matches!(self.kind(), TokenKind::Arrow) {
-            // by-name type in param already handled; here `=> T` as function 0
+            // Keep a by-name function parameter distinct from a Function0 value.
             let lo = self.span();
             self.bump();
             let rhs = self.parse_type();
             let tpt = self.alloc(
                 lo,
                 TreeKind::Ident {
-                    name: "<Function0>".into(),
+                    name: "<ByName>".into(),
                 },
             );
             let fn0 = self.alloc(
@@ -5388,6 +5388,7 @@ fn desugar_for(
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         }
     }
     /// A generator pattern that always matches is a variable or `_`. nsc
@@ -6010,6 +6011,7 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     }
 }
 

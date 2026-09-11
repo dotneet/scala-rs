@@ -916,10 +916,7 @@ impl Typer {
                 }
             }
             Type::ByName(inner) => {
-                if matches!(
-                    pt,
-                    Type::Function { .. } | Type::ByName(_) | Type::Method { .. }
-                ) {
+                if matches!(pt, Type::ByName(_)) {
                     ty
                 } else {
                     (**inner).clone()
@@ -1471,6 +1468,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
     }
 
@@ -2692,6 +2690,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
     }
 
@@ -2847,7 +2846,7 @@ impl Typer {
                 }
                 self.adapt(tree, inner);
             }
-            if !matches!(&tree.kind, TreeKind::Function { .. }) {
+            if !tree.byname_thunk {
                 // A by-name parameter still has a type, and this arm used to
                 // wrap whatever it was given in a thunk and return without
                 // asking whether the thunk produces an `inner`: it is the one
@@ -2873,7 +2872,10 @@ impl Typer {
                 // its receiver's arguments substituted in asks for
                 // `LazyList[A]`), and a tree that is *already* a thunk is one
                 // being forwarded, so what has to conform is what it yields.
-                let found = unwrap_fn0_or_byname(&tree.ty);
+                let found = match &tree.ty {
+                    Type::ByName(t) => (**t).clone(),
+                    t => t.clone(),
+                };
                 if type_has_wildcard(&found)
                     && !found.is_no_type()
                     && !found.is_error()
@@ -2892,7 +2894,11 @@ impl Typer {
                 }
                 let span = tree.span;
                 let inner_tree = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
-                let ret = if inner_tree.ty.is_no_type() || inner_tree.ty.is_error() {
+                let ret = if matches!(inner.as_ref(), Type::Unit) {
+                    // Discard the source value inside the delaying thunk. A
+                    // function value must not become the thunk being forced.
+                    Type::Unit
+                } else if inner_tree.ty.is_no_type() || inner_tree.ty.is_error() {
                     (**inner).clone()
                 } else {
                     inner_tree.ty.clone()
@@ -2912,6 +2918,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: true,
                 };
             }
             return;
@@ -3080,6 +3087,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 *tree = self.fill_conv_implicits(id, &from, applied, span);
                 return;
@@ -3252,6 +3260,16 @@ impl Typer {
         if tps.is_empty() || pt_params.len() != params.len() {
             return (params, ret);
         }
+        // By-name is a parameter mode, never an instantiation of an
+        // ordinary method type parameter. identity must remain Int => Int
+        // when the expected domain is => Int; its final conformance then fails.
+        let pt_params: Vec<Type> = pt_params
+            .into_iter()
+            .map(|p| match p {
+                Type::ByName(t) => *t,
+                p => p,
+            })
+            .collect();
         let mut inst = self.infer_method_tparams(sym, &params, &pt_params);
         if inst.len() < tps.len() {
             let mut sig = params.clone();
@@ -3502,6 +3520,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         if !matches!(&tree.kind, TreeKind::This { .. }) {
             return false;
@@ -3606,6 +3625,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let apply = Tree {
             id: NodeId(0),
@@ -3619,6 +3639,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let part_lits: Vec<Tree> = parts
             .into_iter()
@@ -3633,6 +3654,7 @@ impl Typer {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             })
             .collect();
         let sc_apply = Tree {
@@ -3647,6 +3669,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let sel = Tree {
             id: NodeId(0),
@@ -3660,6 +3683,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         *tree = Tree {
             id: tree.id,
@@ -3673,6 +3697,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
     }
 
@@ -3721,6 +3746,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 *tree = Tree {
                     id: tree.id,
@@ -3734,6 +3760,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 self.type_expr_inner(tree, &Type::NoType);
             }
@@ -3832,6 +3859,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         self.type_select(
             fun,

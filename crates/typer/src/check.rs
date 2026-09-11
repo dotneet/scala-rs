@@ -2436,6 +2436,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             })
             .collect();
         let cls_ident = |sym| Tree {
@@ -2447,6 +2448,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         // `C` when the class is monomorphic, `C[T1, .., Tn]` otherwise.
         let cls_type = |sym| {
@@ -2465,6 +2467,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 }
             }
         };
@@ -2478,6 +2481,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let rhs = Tree {
             id: NodeId(0),
@@ -2494,6 +2498,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 }),
                 args: vec![arg],
             },
@@ -2502,6 +2507,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         // nsc keeps the class's *remaining* clauses on the conversion and
         // passes them straight through:
@@ -2543,6 +2549,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 });
             }
             if decls.is_empty() {
@@ -2560,6 +2567,7 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             };
             vparamss_conv.push(decls);
         }

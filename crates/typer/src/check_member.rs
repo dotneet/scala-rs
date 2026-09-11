@@ -519,6 +519,7 @@ impl Typer {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             };
             self.type_expr(rhs, &declared);
             tree.ty = declared;
@@ -1517,6 +1518,7 @@ impl Typer {
                         postfix: false,
                         scala_ref: false,
                         stable_pat: false,
+                        byname_thunk: false,
                     };
                     self.type_parent_ctor_app(tree);
                     return;
@@ -1674,6 +1676,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let saved = std::mem::replace(&mut self.parent_ctor_scope, true);
         let _ = self.fill_defaults_and_implicits(span, args, &param_tys, &ctor_fun, &Type::NoType);
@@ -2112,9 +2115,7 @@ impl Typer {
                 // An earlier parent signature pass may already have wrapped
                 // this argument in a Function0 thunk. Its type is checked by
                 // the selected by-name formal below, not as the raw value.
-                Type::ByName(_) if matches!(&a.kind, TreeKind::Function { vparams, .. } if vparams.is_empty()) => {
-                    Type::NoType
-                }
+                Type::ByName(_) if a.byname_thunk => Type::NoType,
                 Type::ByName(t) | Type::Repeated(t) => *t,
                 t => t,
             };
@@ -2122,7 +2123,7 @@ impl Typer {
             // parent (a filled implicit or default) is already bound to its
             // symbol. Re-typing it would resolve the name again, in a scope
             // where the evidence parameter it refers to is no longer entered.
-            if a.id == NodeId(0) && !a.ty.is_no_type() {
+            if a.byname_thunk || (a.id == NodeId(0) && !a.ty.is_no_type()) {
                 continue;
             }
             if let TreeKind::Function { vparams, .. } = &a.kind {
@@ -2145,7 +2146,7 @@ impl Typer {
         if class_id.is_none() {
             return;
         }
-        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+        let arg_tys: Vec<Type> = args.iter().map(Tree::argument_type).collect();
         // `class Derived[T](s: Seqn[T]) extends Base(s)` writes no type
         // arguments for `Base`, so nsc infers them from the constructor
         // arguments, exactly as `new Base(s)` would. Without that the
@@ -2563,7 +2564,7 @@ impl Typer {
         for a in args.iter_mut() {
             self.type_expr(a, &Type::NoType);
         }
-        let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+        let arg_tys: Vec<Type> = args.iter().map(Tree::argument_type).collect();
         match self.pick_ctor(class_id, &arg_tys, skip) {
             OverloadPick::Found(sym, param_tys, _) => {
                 if let Some(cur) = skip {
@@ -2593,6 +2594,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 let _ = self.fill_defaults_and_implicits(
                     tree.span,

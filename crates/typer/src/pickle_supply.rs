@@ -516,6 +516,7 @@ impl PickleSupply {
             // say "implicit clause" or "this parameter has a default" -- is
             // dropped here rather than left to shadow the pickled one.
             if !m.is_public_api()
+                && !(m.has(pflags::PRIVATE) && !m.has(pflags::BRIDGE) && !m.has(pflags::SYNTHETIC))
                 && !m.is_case_synthetic()
                 && !implicit_class_conversion_from(&internal, m)
             {
@@ -2005,6 +2006,10 @@ impl PickleSupply {
                 continue;
             }
             if !m.is_public_api()
+                && !(m.has(pflags::PRIVATE)
+                    && hit.owner == full
+                    && !m.has(pflags::BRIDGE)
+                    && !m.has(pflags::SYNTHETIC))
                 && !(case_synthetic_ok && m.is_case_synthetic())
                 && !implicit_class_conversion_from(&hit.owner, m)
                 && !(synthetic_ok && is_default_getter(&m.name))
@@ -2039,6 +2044,14 @@ impl PickleSupply {
                 &mut seen_shapes,
                 &mut superseded,
             ) {
+                // Keep access from the Scala declaration when replacing the
+                // eager classpath signature. JVM access alone cannot express
+                // protected[p], private[p], or private[this].
+                st.get_mut(id).flags = st.get(id).flags.with(ctor_access_flags(m));
+                st.get_mut(id).private_within = ctor_access_within(m);
+                if m.has(pflags::LOCAL) && m.has(pflags::PRIVATE) {
+                    st.get_mut(id).flags = st.get(id).flags.with(Flags::LOCAL);
+                }
                 st.get_mut(id).parameterless_method = Some(shape.clauses.is_empty());
                 // A `val`'s accessor is stable; `ident_is_stable` /
                 // `member_is_stable` read this flag to accept it as a path
@@ -3997,7 +4010,7 @@ impl PickleSupply {
                 .find_class(internal)
                 .ok()
                 .flatten()
-                .and_then(|b| parse_java_classfile(&b).ok());
+                .and_then(|b| crate::javaclass::parse_classfile_for_scala_signature(&b).ok());
             self.classes.insert(internal.to_string(), parsed);
         }
         self.classes.get(internal).and_then(|c| c.as_ref())

@@ -345,10 +345,14 @@ impl Typer {
                 })
                 .unwrap_or_default();
             for (ai, a) in args.iter_mut().enumerate() {
+                if a.byname_thunk {
+                    arg_tys.push(a.argument_type());
+                    continue;
+                }
                 if let TreeKind::Function { vparams, .. } = &a.kind {
                     if is_annotated_lambda(a) {
                         self.type_expr(a, &Type::NoType);
-                        arg_tys.push(a.ty.clone());
+                        arg_tys.push(a.argument_type());
                         continue;
                     }
                     arg_tys.push(Type::Function {
@@ -383,7 +387,7 @@ impl Typer {
                             self.type_expr(a, &Type::NoType);
                         }
                     }
-                    arg_tys.push(a.ty.clone());
+                    arg_tys.push(a.argument_type());
                 }
             }
             // Same as the method path: what the arguments left undetermined is
@@ -659,6 +663,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 // The picked constructor still speaks the class's own type
                 // parameters. `new TypedRep[Int]()` has to search for
@@ -740,10 +745,39 @@ impl Typer {
             }
         }
         for (ai, a) in args.iter_mut().enumerate() {
+            if a.byname_thunk {
+                arg_tys.push(a.argument_type());
+                continue;
+            }
             if let TreeKind::Function { vparams, .. } = &a.kind {
+                // A source Function0 supplied to a by-name value parameter
+                // can contribute its whole function type before lower bounds
+                // are solved. Its body is not the by-name thunk's result.
+                let source_arity = vparams.len();
+                let source_fn0_value = source_arity == 0
+                    && matches!(
+                        &fun_ty_for_pretype,
+                        Type::Method { paramss, .. } if paramss.first()
+                            .and_then(|ps| param_at(ps, ai))
+                            .is_some_and(|p| matches!(p, Type::ByName(_)))
+                    );
+                if source_fn0_value {
+                    let saved = a.clone();
+                    let mark = self.diags.len();
+                    self.type_expr(a, &Type::NoType);
+                    if self.error_count_since(mark) == 0
+                        && !a.ty.is_error()
+                        && !mentions_no_type(&a.ty)
+                    {
+                        arg_tys.push(a.argument_type());
+                        continue;
+                    }
+                    *a = saved;
+                    self.diags.truncate(mark);
+                }
                 if is_annotated_lambda(a) {
                     self.type_expr(a, &Type::NoType);
-                    arg_tys.push(a.ty.clone());
+                    arg_tys.push(a.argument_type());
                     continue;
                 }
                 // nsc `Infer.pretypeArgs`: when every alternative wants the
@@ -771,12 +805,11 @@ impl Typer {
                 if pf_literal {
                     if let Some(pt_arg) = self.agreed_pf_param(&fun_ty_for_pretype, ai) {
                         self.type_expr(a, &pt_arg);
-                        arg_tys.push(a.ty.clone());
+                        arg_tys.push(a.argument_type());
                         continue;
                     }
                 }
-                if let Some(ps) = self.agreed_lambda_params(&fun_ty_for_pretype, ai, vparams.len())
-                {
+                if let Some(ps) = self.agreed_lambda_params(&fun_ty_for_pretype, ai, source_arity) {
                     // `Wildcard`, not `NoType`: the parameters are what this
                     // pre-typing fixes, the result is whatever the body says
                     // and must not be checked against anything yet.
@@ -785,11 +818,11 @@ impl Typer {
                         ret: Box::new(Type::Wildcard),
                     };
                     self.type_expr(a, &pt_arg);
-                    arg_tys.push(a.ty.clone());
+                    arg_tys.push(a.argument_type());
                     continue;
                 }
                 arg_tys.push(Type::Function {
-                    params: vec![Type::NoType; vparams.len()],
+                    params: vec![Type::NoType; source_arity],
                     ret: Box::new(Type::NoType),
                 });
             } else {
@@ -816,9 +849,26 @@ impl Typer {
                 } else {
                     strict_proto.clone()
                 };
-                let provisional = strict_proto.is_no_type()
-                    || (inherited_hint && strict_proto != from_declaration);
-                let pt_arg = if provisional {
+                let has_fixed_shape = match &fun_ty_for_pretype {
+                    Type::Method { paramss, .. } => paramss
+                        .first()
+                        .and_then(|ps| param_at(ps, ai))
+                        .is_some_and(|p| {
+                            let p = match p {
+                                Type::ByName(t) => t.as_ref(),
+                                t => t,
+                            };
+                            matches!(
+                                p,
+                                Type::Class { .. } | Type::Array(_) | Type::Function { .. }
+                            )
+                        }),
+                    _ => false,
+                };
+                let provisional = !has_fixed_shape
+                    && (strict_proto.is_no_type()
+                        || (inherited_hint && strict_proto != from_declaration));
+                let pt_arg = if provisional || strict_proto.is_no_type() {
                     self.proto_arg_type(
                         &fun_ty_for_pretype,
                         fun.sym,
@@ -876,7 +926,7 @@ impl Typer {
                 arg_tys.push(
                     self.implicit_only_result(a)
                         .or_else(|| self.implicit_eta_shape(a))
-                        .unwrap_or_else(|| a.ty.clone()),
+                        .unwrap_or_else(|| a.argument_type()),
                 );
             }
         }
@@ -1597,7 +1647,7 @@ impl Typer {
                         // still open, and the check falls back to its bound.
                         if !p.is_no_type() {
                             let p_check = self
-                                .solve_open_from_arg(&a.ty, &p, &open)
+                                .solve_open_from_arg(&a.argument_type(), &p, &open)
                                 .unwrap_or_else(|| self.open_to_bounds(&p, &open));
                             // Now that the parameter is known, an argument that
                             // still carries an all-implicit clause can have it
@@ -1781,22 +1831,23 @@ impl Typer {
                     if !sym.is_none() {
                         let tps = self.st.get(sym).tparams.clone();
                         if mentions_tparam(&ret, &tps) {
-                            let now: Vec<Type> =
-                                args.iter()
-                                    .enumerate()
-                                    .map(|(i, a)| {
-                                        // A by-name argument is carried as a thunk;
-                                        // `=> T` is solved against what the thunk
-                                        // yields, not against `() => T`.
-                                        match (param_at(&sig_param_tys, i), &a.ty) {
-                                            (
-                                                Some(Type::ByName(_)),
-                                                Type::Function { params, ret },
-                                            ) if params.is_empty() => (**ret).clone(),
-                                            _ => a.ty.clone(),
+                            let now: Vec<Type> = args
+                                .iter()
+                                .enumerate()
+                                .map(|(i, a)| {
+                                    // A by-name argument is carried as a thunk;
+                                    // `=> T` is solved against what the thunk
+                                    // yields, not against `() => T`.
+                                    match (param_at(&sig_param_tys, i), &a.ty) {
+                                        (Some(Type::ByName(_)), Type::Function { params, ret })
+                                            if a.byname_thunk && params.is_empty() =>
+                                        {
+                                            (**ret).clone()
                                         }
-                                    })
-                                    .collect();
+                                        _ => a.ty.clone(),
+                                    }
+                                })
+                                .collect();
                             let inst: Vec<(SymbolId, Type)> = self
                                 .infer_method_tparams(sym, &sig_param_tys, &now)
                                 .into_iter()
@@ -2318,7 +2369,7 @@ impl Typer {
                         }
                     }
                     let ret = leftover.unwrap_or(ret);
-                    let arg_tys: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                    let arg_tys: Vec<Type> = args.iter().map(Tree::argument_type).collect();
                     let ret = self.subst_dependent_members(&param_tys, &arg_tys, &ret);
                     let params: Vec<SymbolId> =
                         self.st.get(sym).paramss.iter().flatten().copied().collect();
@@ -2417,7 +2468,7 @@ impl Typer {
                                 }
                                 if !p.is_no_type() {
                                     let p_check = self
-                                        .solve_open_from_arg(&a.ty, &p, &open)
+                                        .solve_open_from_arg(&a.argument_type(), &p, &open)
                                         .unwrap_or_else(|| self.open_to_bounds(&p, &open));
                                     self.adapt(a, &p_check);
                                 }
@@ -2428,7 +2479,7 @@ impl Typer {
                             if own.as_deref().is_some_and(|t| !t.is_empty())
                                 && mentions_tparam(&ret, own.as_deref().unwrap_or(&[]))
                             {
-                                let now: Vec<Type> = args.iter().map(|a| a.ty.clone()).collect();
+                                let now: Vec<Type> = args.iter().map(Tree::argument_type).collect();
                                 self.instantiate_inserted_apply(
                                     fun,
                                     &mut param_tys,

@@ -1338,7 +1338,6 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         let span = tree.span;
         let inner_ty = match &tree.ty {
             Type::ByName(t) => erase_ty(t, st),
-            Type::Function { ret, .. } => erase_ty(ret, st),
             t => erase_ty(t, st),
         };
         let mut fun = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
@@ -1358,6 +1357,7 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
     }
 }
@@ -1875,6 +1875,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1888,6 +1889,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
 }
 
@@ -1929,6 +1931,7 @@ fn wrap_box(tree: &mut Tree) {
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1942,6 +1945,7 @@ fn wrap_box(tree: &mut Tree) {
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
 }
 
@@ -1962,6 +1966,7 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1975,5 +1980,6 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
 }

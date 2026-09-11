@@ -225,6 +225,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         self.type_select(fun, &Type::NoType);
         !fun.ty.is_error() && !fun.ty.is_no_type()
@@ -1765,6 +1766,13 @@ impl Typer {
         targs: &[Type],
         expected: Option<(&Type, &Type)>,
     ) -> bool {
+        // Context may rescue a singleton, but must not discard an ordinarily
+        // applicable call before adaptation can diagnose its precise mismatch.
+        if expected.is_some()
+            && self.is_applicable(sym, clause, params, args, allow_widen, targs, None)
+        {
+            return true;
+        }
         let instantiated;
         let params = if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
             // Explicit type arguments *are* the instantiation (SLS 6.26.3);
@@ -1807,18 +1815,21 @@ impl Typer {
             self.st.get(sym).tparams.clone()
         };
         let open = &open[..];
+        let conforms = |a: &Type, p: &Type| {
+            self.arg_conforms(a, p, allow_widen, open)
+                // Unit value discarding belongs to a resolved call, not to
+                // choosing among overloads. expected is supplied only for a
+                // singleton, after the ordinary applicability attempt.
+                || (expected.is_some()
+                    && matches!(p, Type::ByName(t) if matches!(t.as_ref(), Type::Unit)))
+        };
         let (fixed, repeated) = split_repeated(params);
         if let Some(elem) = repeated {
             if args.len() < fixed.len() {
                 return false;
             }
-            return args
-                .iter()
-                .zip(fixed)
-                .all(|(a, p)| self.arg_conforms(a, p, allow_widen, open))
-                && args[fixed.len()..]
-                    .iter()
-                    .all(|a| self.arg_conforms(a, elem, allow_widen, open));
+            return args.iter().zip(fixed).all(|(a, p)| conforms(a, p))
+                && args[fixed.len()..].iter().all(|a| conforms(a, elem));
         }
         // Only a repeated parameter list takes a repeated *argument*. nsc's
         // `<repeated>[T]` is a type of its own, and it conforms to no ordinary
@@ -1843,9 +1854,7 @@ impl Typer {
         {
             return false;
         }
-        args.iter()
-            .zip(params)
-            .all(|(a, p)| self.arg_conforms(a, p, allow_widen, open))
+        args.iter().zip(params).all(|(a, p)| conforms(a, p))
     }
 
     /// `open` are the callee's type parameters this call has not settled;
@@ -2200,6 +2209,7 @@ impl Typer {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             };
             let mut filled = self.fill_conv_implicits(id, &from, applied, span);
             filled.ty = solved.clone();
@@ -2256,26 +2266,6 @@ impl Typer {
         if let Type::ByName(inner) = param {
             if let Some(s) = self.arg_score(arg, inner) {
                 return Some(s);
-            }
-            // The argument is already the thunk `adapt` wrapped it in: this
-            // call is being typed a *second* time, which is what filling a
-            // `name$default$n` getter does -- the getter takes the parameters
-            // that precede the default, so the arguments already given are
-            // handed to it and typed again. `() => T` is what a `=> T`
-            // parameter ends up holding, so score it as `T`. Nothing matched
-            // it before, and slick's `copy(where = w2.orElse(where), …)` came
-            // out as `no matching overload for (=> Option[Node])Option[Node]
-            // with arguments (() => <notype>)`.
-            if let Type::Function { params, ret } = arg {
-                if params.is_empty() {
-                    // The body is re-typed by this very pass, so on the way in
-                    // it is the `<notype>` placeholder and constrains nothing —
-                    // exactly like an un-inferred function literal.
-                    if ret.is_no_type() {
-                        return Some(6);
-                    }
-                    return self.arg_score(ret, inner);
-                }
             }
             return None;
         }
@@ -2712,6 +2702,10 @@ impl Typer {
         // a literal passed to one of those was left with no parameter types at
         // all: `xs.reduceLeft[Node]((a, b) => …)` reported
         // `no matching overload … with arguments ((<notype>, <notype>) => <notype>)`.
+        let pt = match pt {
+            Type::ByName(inner) => inner.as_ref(),
+            other => other,
+        };
         let as_fn = match pt {
             Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
             _ => None,
@@ -2840,6 +2834,14 @@ impl Typer {
                         .alloc(n.clone(), self.st.owner, SymKind::Term, flags, "");
                     p.sym = id;
                     let _ = n;
+                }
+            }
+            if matches!(p.ty, Type::ByName(_)) {
+                if let TreeKind::ValDef { mods, .. } = &mut p.kind {
+                    mods.flags = mods.flags.with(Flags::BYNAME);
+                }
+                if !p.sym.is_none() {
+                    self.st.get_mut(p.sym).flags = self.st.get(p.sym).flags.with(Flags::BYNAME);
                 }
             }
             if !p.sym.is_none() {

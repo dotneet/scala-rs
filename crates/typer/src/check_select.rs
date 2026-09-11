@@ -432,6 +432,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 **qual = self.fill_conv_implicits(conv, &from, applied, span);
                 found = if let Some(cls) = self.st.class_sym_of(&to) {
@@ -2368,6 +2369,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         **qual = self.fill_conv_implicits(conv, &from, applied, span);
         fun.sym = member;
@@ -2487,6 +2489,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         let sel = Tree {
             id,
@@ -2500,6 +2503,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         tree.kind = TreeKind::Apply {
             fun: Box::new(sel),
@@ -2576,6 +2580,7 @@ impl Typer {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             };
             let rhs = Tree {
                 id,
@@ -2589,6 +2594,7 @@ impl Typer {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             };
             tree.kind = TreeKind::Assign {
                 lhs: Box::new(lhs),
@@ -2909,6 +2915,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         }
     }
 
@@ -2996,6 +3003,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 let inner = Tree {
                     id: lhs.id,
@@ -3009,6 +3017,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 tree.kind = TreeKind::Apply {
                     fun: Box::new(inner),
@@ -3042,6 +3051,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 let selected = Tree {
                     id: fun.id,
@@ -3055,6 +3065,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 let update = Tree {
                     id: fun.id,
@@ -3068,6 +3079,7 @@ impl Typer {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 tree.kind = TreeKind::Apply {
                     fun: Box::new(update),
@@ -3192,9 +3204,11 @@ impl Typer {
             }
         };
         if !self.st.get(class_id).flags.contains(Flags::CASE)
-            || !self.st.get(class_id).members.iter().any(|m| {
-                self.st.get(*m).name == "copy" && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
-            })
+            || (class_id.0 >= self.st.prelude_end
+                && !self.st.get(class_id).members.iter().any(|m| {
+                    self.st.get(*m).name == "copy"
+                        && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
+                }))
         {
             return false;
         }
@@ -3347,9 +3361,11 @@ impl Typer {
             }
         };
         if !self.st.get(class_id).flags.contains(Flags::CASE)
-            || !self.st.get(class_id).members.iter().any(|m| {
-                self.st.get(*m).name == "copy" && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
-            })
+            || (class_id.0 >= self.st.prelude_end
+                && !self.st.get(class_id).members.iter().any(|m| {
+                    self.st.get(*m).name == "copy"
+                        && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
+                }))
         {
             return false;
         }
@@ -3531,6 +3547,7 @@ impl Typer {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         };
         self.type_expr(tree, pt);
         true

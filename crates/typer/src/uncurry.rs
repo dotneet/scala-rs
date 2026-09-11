@@ -292,6 +292,7 @@ pub(crate) fn eta_expand(
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
     *tree = Tree {
         id: apply.id,
@@ -308,6 +309,7 @@ pub(crate) fn eta_expand(
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
 }
 
@@ -359,6 +361,7 @@ fn flatten_apply(tree: &mut Tree) {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
             }
             other => {
@@ -374,6 +377,7 @@ fn flatten_apply(tree: &mut Tree) {
                     postfix: false,
                     scala_ref: false,
                     stable_pat: false,
+                    byname_thunk: false,
                 };
                 return;
             }
@@ -544,6 +548,7 @@ pub(crate) fn eta_expand_curried(
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
     eta_expand_curried(st, gensym, &mut body, rest, ret);
     let body_ty = body.ty.clone();
@@ -562,5 +567,6 @@ pub(crate) fn eta_expand_curried(
         postfix: false,
         scala_ref: false,
         stable_pat: false,
+        byname_thunk: false,
     };
 }

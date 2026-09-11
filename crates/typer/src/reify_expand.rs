@@ -226,6 +226,7 @@ impl ReifyExpander<'_> {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         }
     }
 

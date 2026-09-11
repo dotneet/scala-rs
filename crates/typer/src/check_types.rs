@@ -277,6 +277,7 @@ impl Typer {
                     Some("<repeated>") => {
                         Type::Repeated(Box::new(as_.first().cloned().unwrap_or(Type::Any)))
                     }
+                    Some("<ByName>") => Type::ByName(Box::new(as_.remove(0))),
                     Some("<tuple>") => Type::Tuple(as_),
                     Some(name) if name.starts_with("<Function") && name.ends_with('>') => {
                         let ret = as_.pop().unwrap_or(Type::Error);
@@ -2558,6 +2559,7 @@ impl Typer {
                 postfix: false,
                 scala_ref: false,
                 stable_pat: false,
+                byname_thunk: false,
             };
         }
         // This application was synthesized rather than passed through

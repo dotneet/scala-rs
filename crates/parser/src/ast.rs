@@ -557,6 +557,8 @@ pub struct Tree {
     /// pattern variable -- both are `SymKind::Term` -- and compiled
     /// `case VAL =>` into a binding that matches everything.
     pub stable_pat: bool,
+    /// A Function generated to delay a by-name argument, never a source literal.
+    pub byname_thunk: bool,
 }
 
 impl Tree {
@@ -570,11 +572,22 @@ impl Tree {
             postfix: false,
             scala_ref: false,
             stable_pat: false,
+            byname_thunk: false,
         }
     }
 
     pub fn dummy(kind: TreeKind) -> Self {
         Tree::new(NodeId(0), Span::DUMMY, kind)
+    }
+
+    /// Value type presented to argument inference before thunk lowering.
+    pub fn argument_type(&self) -> Type {
+        if self.byname_thunk {
+            if let Type::Function { ret, .. } = &self.ty {
+                return Type::ByName(ret.clone());
+            }
+        }
+        self.ty.clone()
     }
 
     pub fn is_empty(&self) -> bool {

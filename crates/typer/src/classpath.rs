@@ -187,7 +187,16 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
             }
             let (params, ret) = parse_method_desc(st, &m.desc);
             let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
-            add_method_erased(st, owner, &m.name, names, params, ret);
+            let id = add_method_erased(st, owner, &m.name, names, params, ret);
+            // Non-public methods can be absent from the pickle API subset.
+            // Their classfile fallback still has real access restrictions;
+            // treating it as public allowed calls that fail on the JVM.
+            if m.access & 0x0002 != 0 {
+                st.get_mut(id).flags = st.get(id).flags.with(Flags::PRIVATE);
+            }
+            if m.access & 0x0004 != 0 {
+                st.get_mut(id).flags = st.get(id).flags.with(Flags::PROTECTED);
+            }
         }
         mark_defaults_from_getters(st, owner);
         copy_package_object_members(st, owner, c);
