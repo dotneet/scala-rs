@@ -34,7 +34,17 @@ impl Typer {
             self.st.pop_scope();
         }
         let span = tree.span;
-        tree.ty = self.branch_result_ty(pt, &branch_tys, res);
+        // `numericLub`, as for an `if` (see `numeric_branch_lub`).
+        if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+            if let TreeKind::Match { cases, .. } = &mut tree.kind {
+                for c in cases.iter_mut() {
+                    self.adapt(&mut c.body, &num);
+                }
+            }
+            tree.ty = num;
+        } else {
+            tree.ty = self.branch_result_ty(pt, &branch_tys, res);
+        }
         if let TreeKind::Match { selector, cases } = &tree.kind {
             // The pattern-matching function a `for` generator desugars to is
             // guarded by the `withFilter` the parser puts in front of it, so

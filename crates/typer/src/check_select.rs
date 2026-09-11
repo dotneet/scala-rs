@@ -2701,7 +2701,34 @@ impl Typer {
             return false;
         }
         let s = self.st.get(tree.sym);
-        s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE)
+        if s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE) {
+            return true;
+        }
+        // nsc `isVariableOrGetter`: a getter (`mayBeVarGetter` -- a
+        // parameterless, non-lazy `def` of a class) whose owner also has a
+        // `name_=`. `x += 1` then becomes `x = x + 1`, which the assignment
+        // turns into the setter call. OpenHashMap writes `size += 1` over
+        // `override def size = _size` / `private[this] def size_=(s: Int)`,
+        // and PriorityQueue `resarr.p_size0 += 1` over a `def p_size0` /
+        // `def p_size0_=` pair; both were "receiver is not assignable".
+        // `def x()` (empty parentheses) and a `val` are not getters, and
+        // scalac rejects `+=` on them even with a setter beside them.
+        if s.kind != SymKind::Method
+            || s.name.ends_with("_=")
+            || s.flags.contains(Flags::LAZY)
+            || matches!(&s.ty, Type::Method { paramss, .. } if !paramss.is_empty())
+            || !matches!(
+                self.st.get(s.owner).kind,
+                SymKind::Class | SymKind::ModuleClass | SymKind::Module
+            )
+        {
+            return false;
+        }
+        let setter = format!("{}_=", s.name);
+        self.st
+            .lookup_member(s.owner, &setter)
+            .into_iter()
+            .any(|m| self.st.get(m).kind == SymKind::Method)
     }
 
     /// nsc `convertToAssignment`'s `mkUpdate`: `t(i) op= x` is

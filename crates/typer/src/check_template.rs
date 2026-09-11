@@ -1513,6 +1513,56 @@ impl Typer {
             };
             self.error(at, e.message);
         }
+        self.check_var_setter_twice(body);
+    }
+
+    /// A template `var x: T` has the setter `x_=(T): Unit`, so a `def x_=`
+    /// of the same parameter type beside it is that setter written twice
+    /// (nsc's namer: "method x_= is defined twice; the conflicting variable x
+    /// was defined at ..."; `neg/t591`). Only an exact match of the one
+    /// parameter's type is reported; a `def x_=` taking some other type is an
+    /// overload.
+    fn check_var_setter_twice(&mut self, body: &[Tree]) {
+        let vars: Vec<(String, Type)> = body
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TreeKind::ValDef { mods, name, .. }
+                    if mods.flags.contains(Flags::MUTABLE)
+                        && !t.sym.is_none()
+                        && !self.block_local_defs.contains(&(self.file_index, t.id)) =>
+                {
+                    let ty = self.st.get(t.sym).ty.clone();
+                    (!ty.is_no_type() && !ty.is_error()).then(|| (name.clone(), ty))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, ty) in vars {
+            let setter = format!("{name}_=");
+            for t in body {
+                let TreeKind::DefDef { name: dname, .. } = &t.kind else {
+                    continue;
+                };
+                if *dname != setter || t.sym.is_none() {
+                    continue;
+                }
+                let s = self.st.get(t.sym);
+                if s.flags.contains(Flags::SYNTHETIC) || s.flags.contains(Flags::ACCESSOR) {
+                    continue;
+                }
+                let same = matches!(&s.ty, Type::Method { paramss, .. }
+                    if paramss.len() == 1 && paramss[0].len() == 1 && paramss[0][0] == ty);
+                if same {
+                    self.error(
+                        t.span,
+                        format!(
+                            "method {setter} is defined twice;\n  the conflicting variable \
+                             {name} was defined earlier in the same template"
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     /// SLS 5.2.6: a concrete template must implement every deferred member it

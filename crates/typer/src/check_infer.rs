@@ -427,6 +427,68 @@ impl Typer {
         plain
     }
 
+    /// nsc `weakLub`'s numeric half (`numericLub`), for the branches of an
+    /// `if` or a `match` typed without an expected type: when every branch is
+    /// a numeric value type, the result is the one the others weakly conform
+    /// to, and the branches are widened to it (`typedIf`'s `needAdapt`).
+    ///
+    /// `(if (h > 0) cumulative(h - 1) else 0) + index`, with `cumulative`
+    /// returning `Long`, is `Long` in scalac; here it was the plain `lub`
+    /// `AnyVal`, whose `+` is `any2stringadd`'s -- "no matching overload for
+    /// (String)String with arguments (Int)" in every `scala.jdk` accumulator.
+    ///
+    /// `None` when an expected type is given (nsc's `isFullyDefined(pt)`: the
+    /// branches were already typed against it, and `val x: Any = if (c) 1L
+    /// else 0` keeps the `0` an `Int`), when a branch is not numeric, or when
+    /// all branches already agree.
+    pub(crate) fn numeric_branch_lub(&self, pt: &Type, branch_tys: &[Type]) -> Option<Type> {
+        if !(pt.is_no_type() || matches!(pt, Type::Wildcard)) {
+            return None;
+        }
+        let rank = |t: &Type| -> Option<u8> {
+            match t {
+                Type::Byte => Some(0),
+                Type::Short => Some(1),
+                Type::Char => Some(1),
+                Type::Int => Some(2),
+                Type::Long => Some(3),
+                Type::Float => Some(4),
+                Type::Double => Some(5),
+                _ => None,
+            }
+        };
+        // Weak conformance (SLS 3.5.3): `Byte <: Short <: Int <: Long <:
+        // Float <: Double` and `Char <: Int`; `Char` and `Short` (or `Byte`)
+        // meet only at `Int`.
+        let weak_sub = |a: &Type, b: &Type| -> bool {
+            a == b
+                || match (a, b) {
+                    (Type::Char, _) | (_, Type::Char) => {
+                        matches!(a, Type::Char) && rank(b).is_some_and(|r| r >= 2)
+                    }
+                    _ => rank(a).zip(rank(b)).is_some_and(|(x, y)| x <= y),
+                }
+        };
+        let widened: Vec<Type> = branch_tys
+            .iter()
+            .filter(|t| !matches!(t, Type::Nothing))
+            .map(|t| t.widen_constant())
+            .collect();
+        if widened.len() < 2 || widened.iter().any(|t| rank(t).is_none()) {
+            return None;
+        }
+        let lub = widened[1..].iter().fold(widened[0].clone(), |acc, t| {
+            if weak_sub(&acc, t) {
+                t.clone()
+            } else if weak_sub(t, &acc) {
+                acc
+            } else {
+                Type::Int
+            }
+        });
+        widened.iter().any(|t| *t != lub).then_some(lub)
+    }
+
     /// The type an `if` or a `match` takes: [`pt_or_lub`], except that an
     /// expected type which is still a stand-in for an undetermined variable
     /// ([`pt_is_undecided`]) does not get to be the answer. Adopting `F[_]`
