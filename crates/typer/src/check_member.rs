@@ -579,8 +579,8 @@ impl Typer {
         self.type_expr(rhs, &pt);
         // An inferred value has no expected type to trigger adapt's backstop.
         // A missing implicit is still an error, not a function to eta-expand.
-        if pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
-            self.reject_unapplied_method(rhs);
+        if pt.is_no_type() {
+            self.reject_unapplied_implicit_clause(rhs);
         }
         if let Some(saved) = ctor_ctx {
             self.leave_presuper_scope(saved);

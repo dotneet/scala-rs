@@ -108,7 +108,6 @@ mod specialize;
 mod strictfp;
 mod symbol;
 mod traitparent;
-mod unapplied;
 mod uncurry;
 mod value_companion;
 mod valueclass;
