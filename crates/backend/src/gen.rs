@@ -92,14 +92,93 @@ pub struct TraitImpls {
     pub(crate) inits: HashMap<SymbolId, Vec<Tree>>,
     pub(crate) lazy_vals: HashMap<SymbolId, Vec<Tree>>,
     pub(crate) modules: HashMap<SymbolId, Vec<Tree>>,
+    /// The super accessors a class owes the classes nested in it, keyed by
+    /// that class: see [`outer_super_accessor`].
+    pub(crate) outer_supers: HashMap<SymbolId, Vec<OuterSuper>>,
 }
 
-/// Collect the concrete trait members of one unit into a shared map.
-///
-/// `st` is unused — the harvest reads the tree only — and is kept so callers
-/// need not change.
-pub fn collect_trait_members(tree: &Tree, _st: &SymbolTable, into: &mut TraitImpls) {
+/// One `Q$$super$m` accessor on the class `Q`, standing in for a `Q.super.m`
+/// (or `Q.super[M].m`, `M` a class) written in a class nested in `Q`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OuterSuper {
+    /// nsc's expanded name: `Q$$super$m`, or `Q$$super$m$M` for `super[M]`.
+    pub(crate) accessor: String,
+    /// The method the `super` selection resolved to.
+    pub(crate) target: SymbolId,
+}
+
+/// Collect the concrete trait members of one unit into a shared map, and the
+/// super accessors its classes owe their nested classes.
+pub fn collect_trait_members(tree: &Tree, st: &SymbolTable, into: &mut TraitImpls) {
     collect_trait_impls(tree, into);
+    collect_outer_supers(tree, st, SymbolId::NONE, into);
+}
+
+/// The accessor through which a `Q.super.m` selection has to be made, when
+/// the code doing it is compiled into a class other than `Q` -- a class,
+/// object or anonymous class nested in `Q` -- as `(Q, accessor)`.
+///
+/// `invokespecial` may only name a method of the *current* class's
+/// superclass chain on the current class's own instance (JVMS 4.10.1.9), so
+/// the nested class cannot make that call on `Q`'s instance itself. nsc's
+/// `SuperAccessors` phase gives `Q` a `Q$$super$m` that makes it, and the
+/// nested class calls that through its `$outer`. Emitting the
+/// `invokespecial` with `$outer` as the receiver instead failed to verify
+/// (`run/NestedClasses`: "Type 'AAA1' is not assignable to 'AAA1$BBB1'",
+/// `run/t8803`).
+///
+/// `Q.super[M].m` naming a *trait* `M` needs none: `M.m$` is a public static
+/// that takes `Q`'s instance as an argument. A trait `Q` is not handled
+/// here: its accessor would have to be declared on the interface and
+/// implemented by every class mixing it in.
+pub(crate) fn outer_super_accessor(
+    st: &SymbolTable,
+    current: SymbolId,
+    sup: &TreeKind,
+    target: SymbolId,
+) -> Option<(SymbolId, String)> {
+    let TreeKind::Super {
+        qual: Some(qname),
+        mix,
+    } = sup
+    else {
+        return None;
+    };
+    if current.is_none() || target.is_none() {
+        return None;
+    }
+    let q = st.enclosing_class_named(current, qname)?;
+    if q == current || is_interface_sym(st, q) {
+        return None;
+    }
+    let name = st.get(target).name.clone();
+    match mix {
+        None => Some((q, super_accessor_name(st, q, &name))),
+        Some(_) if is_interface_sym(st, st.get(target).owner) => None,
+        Some(m) => Some((q, format!("{}${}", super_accessor_name(st, q, &name), m))),
+    }
+}
+
+fn collect_outer_supers(tree: &Tree, st: &SymbolTable, current: SymbolId, into: &mut TraitImpls) {
+    let current = match &tree.kind {
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } if !tree.sym.is_none() => {
+            module_class_id(st, tree.sym)
+        }
+        _ => current,
+    };
+    if let TreeKind::Select { qual, .. } = &tree.kind {
+        if let Some((q, accessor)) = outer_super_accessor(st, current, &qual.kind, tree.sym) {
+            let entry = OuterSuper {
+                accessor,
+                target: tree.sym,
+            };
+            let list = into.outer_supers.entry(q).or_default();
+            if !list.contains(&entry) {
+                list.push(entry);
+            }
+        }
+    }
+    for_each_term_child(tree, &mut |c| collect_outer_supers(c, st, current, into));
 }
 
 /// Record on the symbol which trait members write `super.m` in their body,

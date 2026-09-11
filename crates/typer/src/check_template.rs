@@ -358,10 +358,14 @@ impl Typer {
         }
         let mut pts = Vec::new();
         let saved_parent_ctx = self.parent_ctx.replace((id, saved_this));
+        let mut visible_in_args: Vec<SymbolId> = self.st.get(id).tparams.clone();
+        visible_in_args.extend(all_ctor_params.iter().copied());
+        let saved_arg_scope = self.parent_arg_scope.replace((id, visible_in_args));
         for p in parents.iter_mut() {
             self.type_parent(p);
             pts.push(p.ty.clone());
         }
+        self.parent_arg_scope = saved_arg_scope;
         self.parent_ctx = saved_parent_ctx;
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
@@ -700,6 +704,7 @@ impl Typer {
         self.st.this_class = cls;
         self.return_meth = None;
         self.st.push_scope();
+        self.st.scopes.last_mut().unwrap().template_owner = Some(cls);
         for mem in self.st.get(cls).members.clone() {
             let n = self.st.get(mem).name.clone();
             self.st.enter_in_current(&n, mem);
@@ -715,6 +720,7 @@ impl Typer {
         };
         let mut pts = Vec::new();
         let saved_parent_ctx = self.parent_ctx.replace((cls, saved_this));
+        let saved_arg_scope = self.parent_arg_scope.replace((cls, Vec::new()));
         for p in parents.iter_mut() {
             // Parents are types: `object B extends B` extends the *trait* B,
             // not itself. Typing them as expressions picks the module.
@@ -722,6 +728,7 @@ impl Typer {
             pts.push(p.ty.clone());
         }
         pts.retain(|t| !matches!(t, Type::ModuleRef(m) if *m == cls));
+        self.parent_arg_scope = saved_arg_scope;
         self.parent_ctx = saved_parent_ctx;
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;

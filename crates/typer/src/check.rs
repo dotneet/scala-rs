@@ -627,6 +627,13 @@ pub struct Typer {
     /// that encloses it)`. nsc types parents in the *outer* context, so
     /// `class B extends super.B` inside `trait Mid` means `Mid`'s `super`.
     pub(crate) parent_ctx: Option<(SymbolId, SymbolId)>,
+    /// While a template's parent list is being typed: the template, and the
+    /// symbols its parents' constructor *arguments* may still see among its
+    /// own -- type parameters and primary constructor parameters. Everything
+    /// else the template declares is out of scope there (nsc types those
+    /// arguments in the constructor's context, outside the template body):
+    /// see `Typer::hide_template_for_parent_args`.
+    pub(crate) parent_arg_scope: Option<(SymbolId, Vec<SymbolId>)>,
     /// Fills library members the hand-written prelude does not declare, from
     /// their `ScalaSignature` pickles. Only consulted when resolution failed.
     pub(crate) pickle: crate::pickle_supply::PickleSupply,
@@ -1076,6 +1083,7 @@ impl Typer {
             spec_probe: std::cell::Cell::new(false),
             tupling: false,
             parent_ctx: None,
+            parent_arg_scope: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
             object_import_prefixes: HashMap::new(),

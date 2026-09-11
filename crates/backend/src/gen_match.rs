@@ -37,6 +37,7 @@ pub(crate) fn gen_match(
             gen_stat(asm, frame, ctx, &c.body);
         } else {
             gen_expr(asm, frame, ctx, &c.body);
+            cast_branch_to_join(asm, ctx.st, result_ty);
         }
         asm.goto(end);
         asm.mark(fail);
@@ -161,6 +162,7 @@ pub(crate) fn gen_int_switch(
             gen_stat(asm, frame, ctx, &c.body);
         } else {
             gen_expr(asm, frame, ctx, &c.body);
+            cast_branch_to_join(asm, ctx.st, result_ty);
         }
         asm.goto(end);
     }

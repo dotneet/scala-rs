@@ -102,7 +102,7 @@ struct Info {
     supers: Vec<String>,
     /// name, descriptor, access flags — synthetic and bridge members included,
     /// because a trait's `m$` static implementation is `ACC_SYNTHETIC`.
-    methods: Vec<(String, String, u16)>,
+    methods: Rc<Vec<(String, String, u16)>>,
 }
 
 /// Class name, super types and method table. Deliberately not
@@ -155,7 +155,7 @@ fn parse(bytes: &[u8]) -> Option<Info> {
     Some(Info {
         is_interface: access & ACC_INTERFACE != 0,
         supers,
-        methods,
+        methods: Rc::new(methods),
     })
 }
 
@@ -208,6 +208,19 @@ impl BinaryParents {
             .borrow_mut()
             .insert(name.to_string(), parsed.clone());
         parsed
+    }
+
+    /// The method table of the class file `name` (internal spelling) on the
+    /// binary path -- synthetic, bridge and static members included -- or
+    /// `None` when there is no such class file.
+    ///
+    /// A Scala class read from a *jar* reaches the symbol table only through
+    /// its pickle, member by member as the typer asks for them, so the
+    /// symbol table never holds the members nsc's mixin phase is keyed on: a
+    /// trait's `m$` static implementations and its abstract
+    /// `p$T$$super$m` accessors. The class file is where both are.
+    pub fn methods_of(&self, name: &str) -> Option<Rc<Vec<(String, String, u16)>>> {
+        self.info(name).map(|i| i.methods.clone())
     }
 
     /// Is `a` a sub-type of `b`? Everything is a sub-type of `java/lang/Object`.
@@ -287,7 +300,7 @@ impl BinaryParents {
             let Some(info) = self.info(owner) else {
                 continue;
             };
-            for (name, desc, acc) in &info.methods {
+            for (name, desc, acc) in info.methods.iter() {
                 if acc & (ACC_STATIC | ACC_BRIDGE) != 0 {
                     continue;
                 }

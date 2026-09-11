@@ -452,6 +452,7 @@ pub(crate) fn emit_body_return(
         pop_if_value(asm, &rhs.ty);
         asm.vreturn();
     } else {
+        cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, ret));
         emit_return(asm, ret);
     }
 }
@@ -696,6 +697,9 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
             // merges at the loop head, and the merge has to see the declared
             // class on both paths or it degrades to `java/lang/Object`.
             declare_local_ty(asm, ctx.st, slot, &ty);
+            if sort == JvmSort::Ref {
+                cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ty));
+            }
             store(asm, slot, sort);
         }
         TreeKind::DefDef { .. } | TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
@@ -996,6 +1000,8 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                     gen_expr(asm, frame, ctx, expr);
                     if is_unit_like(&ctx.ret_ty) {
                         pop_if_value(asm, &expr.ty);
+                    } else {
+                        cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ctx.ret_ty));
                     }
                 }
                 match frame.finally_exits.last().copied() {
@@ -1021,6 +1027,10 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
         }
         TreeKind::Throw { expr } => {
             gen_expr(asm, frame, ctx, expr);
+            // `athrow` wants a `Throwable`, a class: a trait extending one
+            // is an interface to the verifier (`trait Boom extends
+            // RuntimeException { def boom() = throw this }`).
+            cast_trait_to_class(asm, ctx.st, "Ljava/lang/Throwable;");
             asm.athrow();
             push_default(asm, &tree.ty);
         }
@@ -1742,7 +1752,14 @@ pub(crate) fn gen_select(
                         emit_array_wrap_to_iterable_ops(asm, ctx);
                     }
                 }
-                if matches!(qual.kind, TreeKind::Super { .. }) {
+                if let Some((q, acc)) =
+                    outer_super_accessor(ctx.st, ctx.class_sym, &qual.kind, tree.sym)
+                {
+                    // `Q.super.m` from a class nested in `Q`: the receiver is
+                    // `Q`'s instance, and `Q`'s accessor makes the call.
+                    let desc = method_desc_from_sym(ctx.st, tree.sym);
+                    asm.invokevirtual(&class_internal(ctx.st, q), &acc, &desc);
+                } else if matches!(qual.kind, TreeKind::Super { .. }) {
                     let selected_params = method_param_types(&tree.ty);
                     invoke_super(
                         asm,
@@ -1909,6 +1926,7 @@ pub(crate) fn gen_assign(
                 jvm_desc_val(ctx.st, &s.ty)
             };
             fill_boxed_unit_slot(asm, &desc);
+            cast_trait_to_class(asm, ctx.st, &desc);
             if is_static {
                 asm.putstatic(&owner, &s.name, &desc);
             } else {
@@ -1936,6 +1954,9 @@ pub(crate) fn gen_assign(
             }
             if let Some((slot, sort)) = frame.get(id) {
                 gen_expr(asm, frame, ctx, rhs);
+                if sort == JvmSort::Ref {
+                    cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ctx.st.get(id).ty));
+                }
                 store(asm, slot, sort);
                 return;
             }
@@ -1950,6 +1971,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
+                    cast_trait_to_class(asm, ctx.st, &vd);
                     asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -1966,6 +1988,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
+                    cast_trait_to_class(asm, ctx.st, &vd);
                     asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -1977,6 +2000,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
+                    cast_trait_to_class(asm, ctx.st, &vd);
                     asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -1993,6 +2017,7 @@ pub(crate) fn gen_assign(
                 gen_expr(asm, frame, ctx, rhs);
                 emit_putfield_from_expr(
                     asm,
+                    ctx.st,
                     &class_internal(ctx.st, s.owner),
                     &s.name,
                     &jvm_desc_val(ctx.st, &s.ty),
@@ -2010,6 +2035,7 @@ pub(crate) fn gen_assign(
                 let owner = class_internal(ctx.st, s.owner);
                 let vd = jvm_desc_val(ctx.st, &s.ty);
                 fill_boxed_unit_slot(asm, &vd);
+                cast_trait_to_class(asm, ctx.st, &vd);
                 asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
@@ -2025,6 +2051,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
+                    cast_trait_to_class(asm, ctx.st, &vd);
                     asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -2037,6 +2064,7 @@ pub(crate) fn gen_assign(
                 let owner = class_internal(ctx.st, s.owner);
                 let vd = jvm_desc_val(ctx.st, &s.ty);
                 fill_boxed_unit_slot(asm, &vd);
+                cast_trait_to_class(asm, ctx.st, &vd);
                 asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
@@ -2054,7 +2082,7 @@ pub(crate) fn gen_assign(
             } else {
                 jvm_desc_val(ctx.st, &rhs.ty)
             };
-            emit_putfield_from_expr(asm, &owner, name, &desc);
+            emit_putfield_from_expr(asm, ctx.st, &owner, name, &desc);
         }
         _ => {
             gen_expr(asm, frame, ctx, rhs);
@@ -2091,6 +2119,7 @@ pub(crate) fn gen_if(
     } else {
         gen_expr(asm, frame, ctx, thenp);
         pad_unit_branch(asm, thenp, result_ty);
+        cast_branch_to_join(asm, ctx.st, result_ty);
     }
     asm.goto(end_l);
     asm.mark(else_l);
@@ -2099,6 +2128,7 @@ pub(crate) fn gen_if(
     } else {
         gen_expr(asm, frame, ctx, elsep);
         pad_unit_branch(asm, elsep, result_ty);
+        cast_branch_to_join(asm, ctx.st, result_ty);
     }
     asm.mark(end_l);
 }
@@ -2115,6 +2145,43 @@ pub(crate) fn pad_unit_branch(asm: &mut Assembler, branch: &Tree, result_ty: &Ty
         return;
     }
     push_unit_result(asm, result_ty);
+}
+
+/// The term prefix of one parent of a template (`p` in `extends p.C(…)`,
+/// `p.C`, `p.C[T]`), when it is an instance of `outer` -- the enclosing
+/// instance a class nested in `outer` has to be given. See
+/// [`new_prefix_instance`].
+pub(crate) fn parent_prefix_instance<'t>(
+    st: &SymbolTable,
+    parent: &'t Tree,
+    outer: SymbolId,
+) -> Option<&'t Tree> {
+    let mut head = parent;
+    while let TreeKind::Apply { fun, .. } = &head.kind {
+        head = fun;
+    }
+    prefix_instance_in(st, head, outer)
+}
+
+fn prefix_instance_in<'t>(st: &SymbolTable, tpt: &'t Tree, outer: SymbolId) -> Option<&'t Tree> {
+    let qual = match &tpt.kind {
+        TreeKind::Select { qual, .. } => qual,
+        TreeKind::AppliedTypeTree { tpt, .. }
+        | TreeKind::TypeApply { fun: tpt, .. }
+        | TreeKind::AnnotatedTypeTree { tpt, .. } => return prefix_instance_in(st, tpt, outer),
+        _ => return None,
+    };
+    if qual.ty.is_no_type() || qual.ty.is_error() {
+        return None;
+    }
+    // An `object` prefix is an instance like any other: `class C extends
+    // O.Base` for `object O extends Owner` holds `O` as its enclosing
+    // `Owner`.
+    let p = st.class_sym_of(&qual.ty)?;
+    if !is_owner_compatible(st, p, outer) {
+        return None;
+    }
+    Some(qual)
 }
 
 /// `new p.Inner(…)` names its enclosing instance explicitly. The prefix is a
@@ -3287,13 +3354,26 @@ pub(crate) fn gen_apply(
         } else {
             None
         };
-        invoke_super(
-            asm,
-            ctx,
-            fun.sym,
-            super_is_qualified(fun),
-            selected_params.as_deref(),
-        );
+        let outer_acc = match &peel_fun(fun).kind {
+            TreeKind::Select { qual, .. } => {
+                outer_super_accessor(ctx.st, ctx.class_sym, &qual.kind, fun.sym)
+            }
+            _ => None,
+        };
+        if let Some((q, acc)) = outer_acc {
+            // `Q.super.m(…)` from a class nested in `Q`: see
+            // `outer_super_accessor`.
+            let desc = method_desc_from_sym(ctx.st, fun.sym);
+            asm.invokevirtual(&class_internal(ctx.st, q), &acc, &desc);
+        } else {
+            invoke_super(
+                asm,
+                ctx,
+                fun.sym,
+                super_is_qualified(fun),
+                selected_params.as_deref(),
+            );
+        }
         // `override def addAll(xs): this.type = super.addAll(xs)`: the parent
         // returns its own erasure (`Growable`) and the tree is this class's
         // `this.type`, erased to this class. scalac casts, as it does for any

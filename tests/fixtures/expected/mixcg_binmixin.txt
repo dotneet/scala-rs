@@ -1,0 +1,11 @@
+0
+0
+0
+true
+true
+List(1, 9, 8, 2) List(insertAll@1)
+t0 t0 take:t0
+t0 t0 t0 t0
+t0 t0 c0
+t0 t0
+caught x

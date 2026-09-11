@@ -1537,6 +1537,18 @@ impl Typer {
         self.check_proper_type(&tree.ty, tree.span);
         if let Some(id) = self.st.class_sym_of(&tree.ty) {
             tree.sym = id;
+            // `new p.C {}` / `extends p.C` with no argument list, `C` a class
+            // or trait nested in a class: `p` is the enclosing instance the
+            // new class has to hold -- for a trait, the value its
+            // `B$C$$$outer()` returns. The argument-list form types the
+            // prefix as an expression (`qualify_parent_type_prefix`); this
+            // one left `p` untyped, so nothing captured it and the backend
+            // had no instance to hand over (`AbstractMethodError` on
+            // `B$C$$$outer()`, run/t4300).
+            let owner = self.st.get(id).owner;
+            if !self.sigs_only && !owner.is_none() && self.st.get(owner).kind == SymKind::Class {
+                type_parent_path_prefix(self, tree);
+            }
             if !self.st.get(id).flags.contains(Flags::TRAIT)
                 && !self.st.get(id).flags.contains(Flags::INTERFACE)
                 && !self.in_trait_parents()
@@ -2010,6 +2022,12 @@ impl Typer {
         }
     }
 
+    pub(crate) fn type_parent_path_prefix_expr(&mut self, qual: &mut Tree) {
+        if qual.ty.is_no_type() && qual.sym.is_none() {
+            self.type_expr(qual, &Type::NoType);
+        }
+    }
+
     fn qualify_parent_type_prefix(&mut self, head: &mut Tree) {
         match &mut head.kind {
             TreeKind::Select { qual, .. } => {
@@ -2085,8 +2103,8 @@ impl Typer {
             }
         }
         let node = (tree.id, tree.span);
-        let (fun, args) = match &mut tree.kind {
-            TreeKind::Apply { fun, args } => (fun, args),
+        let fun = match &mut tree.kind {
+            TreeKind::Apply { fun, .. } => fun,
             _ => return,
         };
         self.qualify_parent_type_prefix(fun);
@@ -2099,6 +2117,51 @@ impl Typer {
         if !class_id.is_none() {
             fun.sym = class_id;
         }
+        let hidden = self.hide_template_for_parent_args();
+        self.type_parent_ctor_args(node, tree, class_ty, class_id);
+        if let Some((index, original)) = hidden {
+            self.st.scopes[index] = original;
+        }
+    }
+
+    /// The template members a parent constructor's arguments must not see.
+    ///
+    /// nsc types those arguments in the constructor's context, which is
+    /// *outside* the template: `class D extends P(a) with A { def a = 1 }`
+    /// finds the enclosing `a`, or reports `not found: value a` when there is
+    /// none -- never `D`'s own, which would be a call on an instance whose
+    /// superclass constructor has not run (a `VerifyError` on
+    /// `uninitializedThis` as we emitted it). The template's type parameters
+    /// and primary constructor parameters stay visible. Returns the scope to
+    /// put back.
+    pub(crate) fn hide_template_for_parent_args(
+        &mut self,
+    ) -> Option<(usize, crate::symbol::Scope)> {
+        let (template, keep) = self.parent_arg_scope.clone()?;
+        let index = self
+            .st
+            .scopes
+            .iter()
+            .rposition(|scope| scope.template_owner == Some(template))?;
+        let original = std::mem::take(&mut self.st.scopes[index]);
+        for id in keep {
+            let name = self.st.get(id).name.clone();
+            self.st.scopes[index].enter(&name, id);
+        }
+        Some((index, original))
+    }
+
+    fn type_parent_ctor_args(
+        &mut self,
+        node: (NodeId, Span),
+        tree: &mut Tree,
+        class_ty: Type,
+        class_id: SymbolId,
+    ) {
+        let (fun, args) = match &mut tree.kind {
+            TreeKind::Apply { fun, args } => (fun, args),
+            _ => return,
+        };
         // `extends Base(_name = "…", statements = …)` (slick's
         // `MultiInsertAction`). A parent constructor takes named arguments
         // like any other, and for the same reason as `new C(b = 2, a = 1)`
@@ -2746,5 +2809,19 @@ impl Typer {
                 );
             }
         }
+    }
+}
+
+/// Type the term prefix of a parent written as a type path (`p.C`,
+/// `p.C[T]`, `p.C @ann`) -- see the call in `Typer::type_parent`. Only a
+/// prefix the type pass left without a type or symbol is typed, so a path
+/// already attributed is not typed twice.
+fn type_parent_path_prefix(t: &mut Typer, head: &mut Tree) {
+    match &mut head.kind {
+        TreeKind::Select { qual, .. } => t.type_parent_path_prefix_expr(qual),
+        TreeKind::AppliedTypeTree { tpt, .. }
+        | TreeKind::TypeApply { fun: tpt, .. }
+        | TreeKind::AnnotatedTypeTree { tpt, .. } => type_parent_path_prefix(t, tpt),
+        _ => {}
     }
 }

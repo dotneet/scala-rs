@@ -608,7 +608,7 @@ impl<'a> Gen<'a> {
         let mixin_modules = self.mixin_member_modules(class_id, &own_modules);
         self.emit_member_module_accessors(&mut b, &own_modules);
         self.emit_member_module_accessors(&mut b, &mixin_modules);
-        self.emit_trait_outer_accessors(&mut b, class_id);
+        self.emit_trait_outer_accessors(&mut b, class_id, &impl_.parents);
         self.emit_lazy_accessors(&mut b, class_id, &lazies, &binary_lazies);
         self.emit_val_getters(&mut b, &impl_.body);
         self.emit_ctor_val_getters(&mut b, class_id, vparamss);
@@ -628,6 +628,7 @@ impl<'a> Gen<'a> {
         self.emit_default_getters(&mut b, class_id);
         self.emit_trait_val_accessors(&mut b, class_id, &impl_.body);
         self.emit_super_accessors(&mut b, class_id);
+        self.emit_outer_super_accessors(&mut b, class_id);
         self.emit_mixin_forwarders(&mut b, class_id, &impl_.body);
         self.emit_delayed_init_support(&mut b, class_id, &impl_.body, false);
         self.emit_case_object_methods(&mut b, class_id);
@@ -1047,7 +1048,7 @@ impl<'a> Gen<'a> {
                     } else {
                         stt.ty.clone()
                     };
-                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 } else {
                     gen_expr(asm, &mut frame, &ctx, stt);
                     pop_if_value(asm, &stt.ty);
@@ -1247,21 +1248,22 @@ impl<'a> Gen<'a> {
                     } else {
                         vd.ty.clone()
                     };
-                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
             asm.aload(0);
             // A nested superclass takes its enclosing instance first. Our own
             // `$outer` is not stored yet, so read it out of the argument.
             if let Some(o) = super_outer {
+                // With or without an argument list: `new b.K {}` names its
+                // enclosing instance as plainly as `new b.K() {}`, and
+                // falling through to `load_outer_arg` handed the superclass
+                // constructor this class's own uninitialised `this`.
                 let prefix = parents.iter().find_map(|parent| {
-                    let TreeKind::Apply { fun, .. } = &parent.kind else {
-                        return None;
-                    };
                     if st.class_sym_of(&parent.ty) != Some(super_cls) {
                         return None;
                     }
-                    new_prefix_instance(&ctx_early, fun, o)
+                    parent_prefix_instance(st, parent, o)
                 });
                 if let Some(module) = st.parent_outer_modules.get(&class_id) {
                     load_module_instance(asm, &ctx_early, *module);
@@ -1313,6 +1315,8 @@ impl<'a> Gen<'a> {
                     let pty = super_field_tys.get(i).unwrap_or(&a.ty);
                     if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                         emit_box(asm, &a.ty);
+                    } else if !is_jvm_primitive(pty) {
+                        cast_trait_to_class(asm, st, &jvm_desc(st, pty));
                     }
                 }
             }
@@ -1386,7 +1390,7 @@ impl<'a> Gen<'a> {
                         } else {
                             vd.ty.clone()
                         };
-                        emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                        emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                     } else {
                         // A bare statement of the template body (SLS 5.1),
                         // in its source position among the `val` stores.

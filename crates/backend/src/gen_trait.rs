@@ -6,14 +6,15 @@
 //! and the getters of `val` members.
 
 use crate::classfile::{
-    decode_method_name, encode_method_name, Field, ACC_BRIDGE, ACC_FINAL, ACC_INTERFACE,
-    ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
+    decode_method_name, encode_method_name, Field, ACC_ABSTRACT, ACC_BRIDGE, ACC_FINAL,
+    ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SYNTHETIC, ACC_TRANSIENT, ACC_VOLATILE,
 };
 use crate::gen::*;
 use crate::ifacebridge::BridgeKind;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{method_overloads, method_overrides, SymKind};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 impl<'a> Gen<'a> {
     /// The concrete half of a trait, emitted **onto the interface itself**,
@@ -138,6 +139,7 @@ impl<'a> Gen<'a> {
                         // position erases to `BoxedUnit`, not to `V`.
                         let sdesc = jvm_desc_val(st, &ty);
                         fill_boxed_unit_slot(asm, &sdesc);
+                        cast_trait_to_class(asm, st, &sdesc);
                         asm.invokeinterface(&iface_owned, &setter, &format!("({sdesc})V"));
                     } else {
                         // A bare statement of the trait body (SLS 5.1): it runs
@@ -770,13 +772,133 @@ impl<'a> Gen<'a> {
     /// and every `super` call goes through), and nothing else on an interface
     /// carries that name. So the static *is* the mark of a definition, and it
     /// is in the symbol table because the class file scanner installs an
-    /// interface's methods whole.
+    /// interface's methods whole -- for a loose class file directory. A trait
+    /// read from a *jar* is supplied from its pickle instead, which has no
+    /// statics at all, so its class file is asked directly
+    /// ([`Gen::binary_trait_impls_cf`]).
     pub(crate) fn binary_trait_defines(&self, trait_id: SymbolId, method: &str) -> bool {
+        if let Some(impls) = self.binary_trait_impls_cf(trait_id) {
+            let enc = encode_method_name(method);
+            return impls.iter().any(|(n, _)| *n == enc);
+        }
         let want = trait_static_name(method);
         self.st.get(trait_id).members.iter().any(|&m| {
             let s = self.st.get(m);
             s.kind == SymKind::Method && s.name == want
         })
+    }
+
+    /// The class-file method table of `id` -- `(name, descriptor, access)`,
+    /// synthetic and static members included -- for a class or trait this
+    /// run did not compile, when its class file is on the binary path.
+    ///
+    /// The symbol table is not a substitute. A Scala class read from a jar is
+    /// completed from its pickle one member at a time, as the typer asks for
+    /// them, and a pickle carries neither a trait's `m$` statics nor its
+    /// `p$T$$super$m` accessors. The mixin decisions below are keyed on
+    /// exactly those, so for `class E extends RuntimeException("x") with
+    /// scala.util.control.NoStackTrace` neither the `fillInStackTrace`
+    /// forwarder nor the `NoStackTrace$$super$fillInStackTrace` accessor was
+    /// emitted: `getStackTrace.length` was 2 where scalac gives 0, and
+    /// `Seq.lengthCompare` on an `object Foo extends Seq[Int]` died with
+    /// `AbstractMethodError` on `SeqOps$$super$sizeCompare` (run/t2544).
+    pub(crate) fn binary_methods(&self, id: SymbolId) -> Option<Rc<Vec<(String, String, u16)>>> {
+        if id.is_none() || owner_defined_in_source(self.st, id) {
+            return None;
+        }
+        self.binary_parents
+            .as_ref()?
+            .methods_of(&class_internal(self.st, id))
+    }
+
+    /// `(encoded name, instance descriptor)` of every member a binary trait
+    /// implements, read from its class file: nsc puts a `public static
+    /// m$(Iface, …)` beside each concrete trait method, next to the `default`
+    /// one that holds its body. `None` when the class file is not available,
+    /// and the caller falls back to the symbol table.
+    pub(crate) fn binary_trait_impls_cf(
+        &self,
+        trait_id: SymbolId,
+    ) -> Option<Vec<(String, String)>> {
+        if !is_interface_sym(self.st, trait_id) {
+            return None;
+        }
+        let ms = self.binary_methods(trait_id)?;
+        let prefix = format!("(L{};", class_internal(self.st, trait_id));
+        let mut out = Vec::new();
+        for (n, d, a) in ms.iter() {
+            if a & ACC_STATIC == 0 {
+                continue;
+            }
+            let Some(base) = n.strip_suffix('$') else {
+                continue;
+            };
+            let Some(rest) = d.strip_prefix(&prefix) else {
+                continue;
+            };
+            if base.is_empty() || base == "$init" {
+                continue;
+            }
+            let inst = format!("({rest}");
+            if ms.iter().any(|(n2, d2, a2)| {
+                n2 == base && *d2 == inst && a2 & (ACC_STATIC | ACC_ABSTRACT) == 0
+            }) {
+                out.push((base.to_string(), inst));
+            }
+        }
+        Some(out)
+    }
+
+    /// The `p$q$T$$super$m` accessors a binary trait's class file declares,
+    /// as `(accessor name, descriptor, encoded m)`. See
+    /// [`Gen::binary_methods`] for why the symbol table cannot answer this
+    /// for a trait read from a jar.
+    pub(crate) fn binary_trait_super_accessors_cf(
+        &self,
+        trait_id: SymbolId,
+    ) -> Option<Vec<(String, String, String)>> {
+        let ms = self.binary_methods(trait_id)?;
+        let prefix = format!(
+            "{}$$super$",
+            class_internal(self.st, trait_id).replace('/', "$")
+        );
+        Some(
+            ms.iter()
+                .filter(|(_, _, a)| a & ACC_STATIC == 0 && a & ACC_ABSTRACT != 0)
+                .filter_map(|(n, d, _)| {
+                    let enc = n.strip_prefix(&prefix)?;
+                    Some((n.clone(), d.clone(), enc.to_string()))
+                })
+                .collect(),
+        )
+    }
+
+    /// The descriptor at which a binary class or trait in the linearization
+    /// implements `enc` with the erased parameters `params`, read from its
+    /// class file: for a trait, a member with an `m$` static; for a class, a
+    /// concrete instance method. `None` when it does not, or when there is no
+    /// class file to ask.
+    pub(crate) fn binary_impl_desc_cf(
+        &self,
+        s: SymbolId,
+        enc: &str,
+        params: &str,
+    ) -> Option<String> {
+        if is_interface_sym(self.st, s) {
+            return self
+                .binary_trait_impls_cf(s)?
+                .into_iter()
+                .find(|(n, d)| n == enc && desc_params(d) == params)
+                .map(|(_, d)| d);
+        }
+        self.binary_methods(s)?
+            .iter()
+            .find(|(n, d, a)| {
+                n == enc
+                    && desc_params(d) == params
+                    && a & (ACC_STATIC | ACC_ABSTRACT | ACC_PRIVATE) == 0
+            })
+            .map(|(_, d, _)| d.clone())
     }
 
     /// The `p$q$T$$super$m` accessors a trait read from `-cp` declares, as
@@ -892,6 +1014,45 @@ impl<'a> Gen<'a> {
                                 result: ret,
                             });
                         }
+                    }
+                }
+                None if self.binary_methods(*parent).is_some() => {
+                    // The class file's own list: a trait read from a jar has
+                    // none of these in the symbol table (see
+                    // `binary_methods`).
+                    let any_members = &self.st.get(self.st.any_sym).members;
+                    for (aname, desc, enc) in self
+                        .binary_trait_super_accessors_cf(*parent)
+                        .unwrap_or_default()
+                    {
+                        if b.methods.iter().any(|m| m.name == aname && m.desc == desc) {
+                            continue;
+                        }
+                        let name = decode_method_name(&enc);
+                        let object_method =
+                            matches!(name.as_str(), "equals" | "hashCode" | "toString");
+                        let target = if object_method {
+                            any_members
+                                .iter()
+                                .copied()
+                                .find(|&mid| self.st.get(mid).name == name)
+                                .unwrap_or(SymbolId::NONE)
+                        } else {
+                            SymbolId::NONE
+                        };
+                        let ret = desc
+                            .find(')')
+                            .map(|i| desc_value_type(self.st, &desc[i + 1..]))
+                            .unwrap_or(Type::Unit);
+                        owed.push(SuperAccessor {
+                            name,
+                            accessor: aname,
+                            descriptor: desc.clone(),
+                            target_descriptor: desc.clone(),
+                            target,
+                            params: desc_value_types(self.st, &desc),
+                            result: ret,
+                        });
                     }
                 }
                 None => {
@@ -1013,6 +1174,52 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// The `Q$$super$m` accessors this class owes the classes nested in it
+    /// (see [`outer_super_accessor`]): `aload_0`, the arguments, and the
+    /// `super` call `Q` itself would make -- `invokespecial` of a class
+    /// member, or the trait's `m$` static.
+    pub(crate) fn emit_outer_super_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        let Some(owed) = self.traits.outer_supers.get(&class_id) else {
+            return;
+        };
+        for OuterSuper { accessor, target } in owed {
+            let desc = method_desc_from_sym(self.st, *target);
+            if b.methods
+                .iter()
+                .any(|m| m.name == *accessor && m.desc == desc)
+            {
+                continue;
+            }
+            let s = self.st.get(*target);
+            let owner = class_internal(self.st, s.owner);
+            let owner_is_trait = is_interface_sym(self.st, s.owner);
+            let name = s.name.clone();
+            let ret = desc[desc.find(')').map_or(0, |i| i + 1)..].to_string();
+            let mut locals = 1u16;
+            let mut loads = Vec::new();
+            for sort in desc_param_sorts(desc_params(&desc)) {
+                loads.push((locals, sort));
+                locals += sort.slots();
+            }
+            let desc_c = desc.clone();
+            b.add_code(ACC_PUBLIC, accessor, &desc, locals.max(1), |asm| {
+                asm.aload(0);
+                for (slot, sort) in &loads {
+                    load(asm, *slot, *sort);
+                }
+                if owner_is_trait {
+                    let static_desc = trait_static_desc(&owner, &desc_c);
+                    asm.invokestatic_interface(&owner, &trait_static_name(&name), &static_desc);
+                } else {
+                    asm.invokespecial(&owner, &name, &desc_c);
+                }
+                if !emit_forwarded_nothing(asm, &ret) {
+                    ret_of_sort(asm, ret_str_sort(&ret));
+                }
+            });
+        }
+    }
+
     /// The descriptor the `super` target was compiled with, when it can be
     /// found. `arity` disambiguates overloads; the target symbol permits only
     /// the selected source declaration (or one of its real overrides) as a
@@ -1026,6 +1233,19 @@ impl<'a> Gen<'a> {
         expected_desc: &str,
         target_id: SymbolId,
     ) -> Option<(String, Vec<Type>)> {
+        let (next, _) = target?;
+        if let Some(d) = self.binary_impl_desc_cf(
+            next,
+            &encode_method_name(method),
+            desc_params(expected_desc),
+        ) {
+            // Same parameters by construction; only the result can be
+            // narrower, and the caller casts for that.
+            let params = desc_value_types(self.st, &d);
+            if params.len() == arity {
+                return Some((d, params));
+            }
+        }
         match target? {
             (next, true) => match self.traits.impls.get(&next) {
                 Some(ms) => ms
@@ -1138,6 +1358,18 @@ impl<'a> Gen<'a> {
                 {
                     return Some((s, true));
                 }
+            } else if self
+                .binary_impl_desc_cf(s, &encode_method_name(method), desc_params(expected_desc))
+                .is_some()
+            {
+                // A class or trait read from `-cp` whose class file is at
+                // hand: that is where its erased members are, all of them.
+                // The symbol table holds only what the typer asked the
+                // pickle for, so `new ArrayBuffer[Int] with SB[Int]` found
+                // no `insertAll` above `SB`'s `super.insertAll` (run/t2503).
+                // No match here still falls through to the symbol table,
+                // which can prove an override at a different erasure.
+                return Some((s, is_interface_sym(self.st, s)));
             } else if is_interface_sym(self.st, s) && self.binary_trait_defines(s, method) {
                 // A trait read from `-cp` sitting between two stackable layers
                 // of ours: without this the `super` chain skipped it and went
@@ -1546,6 +1778,38 @@ impl<'a> Gen<'a> {
                 continue;
             }
             let iface = class_internal(self.st, *parent);
+            if let Some(impls) = self.binary_trait_impls_cf(*parent) {
+                for (enc, inst_desc) in impls {
+                    let params = desc_params(&inst_desc).to_string();
+                    if defined.contains(&(enc.clone(), params.clone()))
+                        || !self.superclass_declares_cf(lin, super_idx, &enc, &params)
+                    {
+                        continue;
+                    }
+                    defined.insert((enc.clone(), params));
+                    let static_desc = trait_static_desc(&iface, &inst_desc);
+                    let ret = inst_desc[inst_desc.find(')').map_or(0, |i| i + 1)..].to_string();
+                    let mut locals = 1u16;
+                    let mut loads = Vec::new();
+                    for sort in desc_param_sorts(desc_params(&inst_desc)) {
+                        loads.push((locals, sort));
+                        locals += sort.slots();
+                    }
+                    let iface_c = iface.clone();
+                    let static_name = format!("{enc}$");
+                    b.add_code(ACC_PUBLIC, &enc, &inst_desc, locals.max(1), |asm| {
+                        asm.aload(0);
+                        for (slot, sort) in &loads {
+                            load(asm, *slot, *sort);
+                        }
+                        asm.invokestatic_interface(&iface_c, &static_name, &static_desc);
+                        if !emit_forwarded_nothing(asm, &ret) {
+                            ret_of_sort(asm, ret_str_sort(&ret));
+                        }
+                    });
+                }
+                continue;
+            }
             for mid in self.st.get(*parent).members.clone() {
                 let s = self.st.get(mid);
                 if s.kind != SymKind::Method || s.name == "<init>" {
@@ -1585,6 +1849,40 @@ impl<'a> Gen<'a> {
                 });
             }
         }
+    }
+
+    /// Whether a class on the superclass chain (`lin[super_idx..]`, classes
+    /// only) declares the instance method `enc` with erased parameters
+    /// `params` -- concrete *or abstract*. Either way the JVM resolves the
+    /// class's method ahead of any interface `default` (JVMS 5.4.3.3), so a
+    /// trait member that overrides it runs only through a forwarder on the
+    /// class: nsc's mixin phase says the same ("Even if C.f is abstract, the
+    /// forwarder in D is needed"). A class compiled in this run is read from
+    /// the symbol table, a binary one from its class file when there is one.
+    pub(crate) fn superclass_declares_cf(
+        &self,
+        lin: &[SymbolId],
+        super_idx: usize,
+        enc: &str,
+        params: &str,
+    ) -> bool {
+        lin.iter()
+            .skip(super_idx)
+            .filter(|&&c| !is_interface_sym(self.st, c))
+            .any(|&c| match self.binary_methods(c) {
+                Some(ms) => ms.iter().any(|(n, d, a)| {
+                    n == enc && desc_params(d) == params && a & (ACC_STATIC | ACC_PRIVATE) == 0
+                }),
+                None => self.st.get(c).members.iter().any(|&mid| {
+                    let s = self.st.get(mid);
+                    s.kind == SymKind::Method
+                        && s.name != "<init>"
+                        && !s.flags.contains(Flags::STATIC)
+                        && !s.flags.contains(Flags::PRIVATE)
+                        && encode_method_name(&s.name) == enc
+                        && desc_params(&method_desc_from_sym(self.st, mid)) == params
+                }),
+            })
     }
 
     /// [`Gen::superclass_implements`], for a member known by symbol rather
@@ -1853,6 +2151,22 @@ impl<'a> Gen<'a> {
         if !defined.contains("equals") {
             let fi = field_info.clone();
             let cj = class_jvm.clone();
+            // An inner case class is a different type per enclosing instance
+            // (`Foo.CC` and `Bar.CC` for `object Foo extends K`, `object Bar
+            // extends K`), and nsc's `case that: CC` in the synthetic
+            // `equals` tests the outer pointer along with the class:
+            // `that.$outer eq this.$outer`. Without it `Foo.CC("b") ==
+            // Bar.CC("b")` was `true` (run/t6911). A case class local to a
+            // method has no path-dependent type and nsc tests no outer there.
+            let member_of_class = {
+                let owner = self.st.get(class_id).owner;
+                !owner.is_none()
+                    && matches!(
+                        self.st.get(owner).kind,
+                        SymKind::Class | SymKind::ModuleClass
+                    )
+            };
+            let outer_desc = outer_field_desc(self.st, class_id).filter(|_| member_of_class);
             b.add_code(ACC_PUBLIC, "equals", "(Ljava/lang/Object;)Z", 3, |asm| {
                 let yes = asm.fresh_label();
                 let no = asm.fresh_label();
@@ -1865,6 +2179,13 @@ impl<'a> Gen<'a> {
                 asm.aload(1);
                 asm.checkcast(&cj);
                 asm.astore(2);
+                if let Some(od) = &outer_desc {
+                    asm.aload(2);
+                    asm.getfield(&cj, "$outer", od);
+                    asm.aload(0);
+                    asm.getfield(&cj, "$outer", od);
+                    asm.if_acmpne(no);
+                }
                 for (name, ty, desc) in &fi {
                     asm.aload(0);
                     asm.getfield(&cj, name, desc);
@@ -2992,7 +3313,12 @@ impl<'a> Gen<'a> {
     /// Implement `<Trait>$$$outer()` for every mixed-in trait that is nested
     /// in a class. nsc's mixin phase puts one on each implementing class; the
     /// trait's own code calls it instead of reading a field it cannot have.
-    pub(crate) fn emit_trait_outer_accessors(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+    pub(crate) fn emit_trait_outer_accessors(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        parents: &[Tree],
+    ) {
         if class_id.is_none() {
             return;
         }
@@ -3015,8 +3341,20 @@ impl<'a> Gen<'a> {
             // `AbstractMethodError` at the first `createIndex`.
             // `H2Profile.TableDDLBuilder()` is the instance, which is what
             // `load_module_instance` reaches.
-            let via_module = member_module_outer(self.st, o)
-                .is_some_and(|m| outer_chain_reaches(self.st, class_id, m));
+            // A parent written with a term prefix -- `new b.C {}`, `extends
+            // p.D` for a `D` nested in the same class as this trait -- names
+            // the enclosing instance outright, and nsc's `ExplicitOuter`
+            // returns exactly that path from the accessor. It is not
+            // necessarily on this class's own `$outer` chain at all: in
+            // `object Test { val b = new B; new b.C {} }` nothing encloses
+            // the anonymous class but `Test`, and `B$C$$$outer()` stayed
+            // unimplemented (`AbstractMethodError`, run/t4300).
+            let prefix = parents
+                .iter()
+                .find_map(|p| parent_prefix_instance(self.st, p, o));
+            let via_module = prefix.is_none()
+                && member_module_outer(self.st, o)
+                    .is_some_and(|m| outer_chain_reaches(self.st, class_id, m));
             // A trait nested in a *trait* (`trait T { trait NT }`) mixed into a
             // class that is not itself nested: `object Test extends T { new NT
             // {} }`. The anonymous class has no `$outer` field and nothing on
@@ -3026,7 +3364,7 @@ impl<'a> Gen<'a> {
             // unimplemented and the trait's own `$init$` threw
             // `AbstractMethodError` on the first instantiation.
             let mut via_enclosing = SymbolId::NONE;
-            if !via_module && !outer_chain_reaches(self.st, class_id, o) {
+            if prefix.is_none() && !via_module && !outer_chain_reaches(self.st, class_id, o) {
                 match enclosing_module_conforming(self.st, class_id, o) {
                     Some(m) => via_enclosing = m,
                     None => continue,
@@ -3046,7 +3384,16 @@ impl<'a> Gen<'a> {
             let source = self.source_name;
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
-            b.add_code(ACC_PUBLIC, &name, &desc, 2, |asm| {
+            // The prefix may be a local of the enclosing method, captured
+            // into a field of this class (`anon_capture`): read the captures
+            // into the frame first, as every method body of the class does.
+            let caps = if prefix.is_some() {
+                capture_slots(self.st, &self.boxed_vars, class_id)
+            } else {
+                CaptureSlots::new()
+            };
+            let max_locals = 2 + caps.iter().map(|c| c.3.slots()).sum::<u16>();
+            b.add_code(ACC_PUBLIC, &name, &desc, max_locals, |asm| {
                 let ctx = emit_ctx(
                     st,
                     class_id,
@@ -3061,7 +3408,14 @@ impl<'a> Gen<'a> {
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );
-                if via_module {
+                if let Some(prefix) = prefix {
+                    let mut frame = Frame::instance();
+                    emit_capture_prologue(asm, &mut frame, &class_name, &caps);
+                    gen_expr(asm, &mut frame, &ctx, prefix);
+                    if st.class_sym_of(&prefix.ty) != Some(o) {
+                        asm.checkcast(&class_internal(st, o));
+                    }
+                } else if via_module {
                     load_module_instance(asm, &ctx, o);
                 } else if !via_enclosing.is_none() {
                     load_module_instance(asm, &ctx, via_enclosing);
@@ -3205,7 +3559,7 @@ impl<'a> Gen<'a> {
                         asm.invokestatic_interface(iface, static_name, static_desc);
                     }
                 }
-                emit_putfield_from_expr(asm, &class_name, &fname, &fdesc);
+                emit_putfield_from_expr(asm, st, &class_name, &fname, &fdesc);
                 asm.aload(0);
                 asm.aload(0);
                 asm.getfield(&class_name, &bitmap, "I");

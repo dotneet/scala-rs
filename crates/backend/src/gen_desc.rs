@@ -2132,6 +2132,44 @@ pub(crate) fn is_boxed_primitive(jvm: &str) -> bool {
     )
 }
 
+/// The parameter types of a class-file method descriptor, as `Type`s whose
+/// [`jvm_desc`] is the descriptor they came from. Only the erased shape
+/// survives: a class is a bare `Type::Class` (or `Type::Named` when the
+/// symbol table does not know it), `Object` is `Any`. For a member known
+/// only from a class file (see `Gen::binary_methods`), where the descriptor
+/// is all there is.
+pub(crate) fn desc_value_types(st: &SymbolTable, desc: &str) -> Vec<Type> {
+    desc_param_strs(desc)
+        .iter()
+        .map(|d| desc_value_type(st, d))
+        .collect()
+}
+
+/// [`desc_value_types`] for one field (or return) descriptor.
+pub(crate) fn desc_value_type(st: &SymbolTable, d: &str) -> Type {
+    match d.as_bytes().first() {
+        Some(b'[') => Type::Array(Box::new(desc_value_type(st, &d[1..]))),
+        Some(b'L') if d.ends_with(';') => {
+            let inner = &d[1..d.len() - 1];
+            match inner {
+                "java/lang/Object" => Type::Any,
+                "java/lang/String" => Type::String,
+                _ => match st.find_class_by_jvm(inner) {
+                    Some(sym) if class_internal(st, sym) == inner => {
+                        Type::Class { sym, args: vec![] }
+                    }
+                    _ => Type::Named {
+                        name: inner.to_string(),
+                        args: vec![],
+                    },
+                },
+            }
+        }
+        Some(b'V') => Type::Unit,
+        _ => prim_of_desc(d),
+    }
+}
+
 /// The primitive a `BoxValue` / `UnboxValue` intrinsic names.
 pub(crate) fn prim_of_desc(desc: &str) -> Type {
     match desc {

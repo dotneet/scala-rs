@@ -296,11 +296,66 @@ pub(crate) fn adapt_type_member_arg(
         // Only a *class* target is cast: JVMS 4.10.1.2 makes every class type
         // assignable to an interface type, so an interface parameter never
         // owes one, and casting there would be noise on every call.
-        if is_interface_jvm(ctx.st, cls) || jvm_assignable(ctx.st, top, cls) {
+        //
+        // `verifier_accepts_receiver` rather than `jvm_assignable`: the
+        // symbol table's hierarchy is Scala's, where a trait may extend a
+        // class, and the JVM's is not -- `def f(x: T): Unit = take(x)` with
+        // `trait T extends C` and `take(c: C)` needs the cast nsc emits.
+        if verifier_accepts_receiver(ctx.st, top, cls) {
             return;
         }
     }
     asm.checkcast(cls);
+}
+
+/// Cast the reference on top of the stack to the class `want_desc` names when
+/// the assembler tracks it as an *interface* the Scala hierarchy puts below
+/// that class: a trait that extends a class.
+///
+/// The JVM has no such hop. The trait compiles to an interface whose
+/// superclass is `Object`, so a value of the trait's type is not assignable
+/// to the class wherever one is declared -- a method's result, a field -- and
+/// nsc's `BCodeBodyBuilder.adapt` casts it there (its `BType.conformsTo`
+/// lets an interface conform only to `Object` and its super-interfaces).
+/// `trait T extends Throwable { override def fillInStackTrace(): Throwable =
+/// this }` -- `NoStackTrace`'s own shape -- failed to verify with "Type 'T'
+/// is not assignable to 'java/lang/Throwable' (from method signature)".
+///
+/// Only that hop: a value the assembler does not track, one of a class type,
+/// or a target that is itself an interface (JVMS 4.10.1.2 accepts any
+/// reference there) is left as it is.
+pub(crate) fn cast_trait_to_class(asm: &mut Assembler, st: &SymbolTable, want_desc: &str) {
+    let Some(want) = want_desc
+        .strip_prefix('L')
+        .and_then(|d| d.strip_suffix(';'))
+    else {
+        return;
+    };
+    if want == "java/lang/Object" || is_interface_jvm(st, want) {
+        return;
+    }
+    let Some(top) = asm.top_object() else {
+        return;
+    };
+    if top == want || st.find_class_by_jvm(top).is_none() || !is_interface_jvm(st, top) {
+        return;
+    }
+    if jvm_assignable(st, top, want) {
+        let want = want.to_string();
+        asm.checkcast(&want);
+    }
+}
+
+/// [`cast_trait_to_class`] at the end of one branch of an `if`, a `match` or
+/// a `try` whose result is `result_ty`: the frame at the join declares that
+/// type's class ([`join_class_of`]), and a trait-typed branch value has to
+/// reach it as that class.
+pub(crate) fn cast_branch_to_join(asm: &mut Assembler, st: &SymbolTable, result_ty: &Type) {
+    if let Some(n) = join_class_of(st, result_ty) {
+        if !n.starts_with('[') {
+            cast_trait_to_class(asm, st, &format!("L{n};"));
+        }
+    }
 }
 
 /// Whether the JVM class named `jvm` is an interface, as far as the symbol
@@ -571,8 +626,18 @@ pub(crate) fn emit_getfield(asm: &mut Assembler, owner: &str, name: &str, desc: 
 /// Store into a field whose Scala type may be `Unit`, when the value comes
 /// from an *expression* rather than from a slot: a `Unit` expression leaves
 /// nothing behind, so the singleton is materialised here.
-pub(crate) fn emit_putfield_from_expr(asm: &mut Assembler, owner: &str, name: &str, desc: &str) {
+///
+/// `st` is for [`cast_trait_to_class`]: a trait-typed value stored into a
+/// field of a class type the trait extends needs nsc's cast.
+pub(crate) fn emit_putfield_from_expr(
+    asm: &mut Assembler,
+    st: &SymbolTable,
+    owner: &str,
+    name: &str,
+    desc: &str,
+) {
     fill_boxed_unit_slot(asm, desc);
+    cast_trait_to_class(asm, st, desc);
     asm.putfield(owner, name, desc);
 }
 

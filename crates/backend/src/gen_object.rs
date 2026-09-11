@@ -150,7 +150,7 @@ impl<'a> Gen<'a> {
         let mixin_modules = self.mixin_member_modules(cls, &own_modules);
         self.emit_member_module_accessors(&mut b, &own_modules);
         self.emit_member_module_accessors(&mut b, &mixin_modules);
-        self.emit_trait_outer_accessors(&mut b, cls);
+        self.emit_trait_outer_accessors(&mut b, cls, &impl_.parents);
         self.emit_lazy_accessors(&mut b, cls, &lazies, &binary_lazies);
         self.emit_val_getters(&mut b, &impl_.body);
 
@@ -172,6 +172,7 @@ impl<'a> Gen<'a> {
         // body gets one, whether it is ultimately mixed into a `class` or an
         // `object`) and no concrete class ever provided it.
         self.emit_super_accessors(&mut b, cls);
+        self.emit_outer_super_accessors(&mut b, cls);
         self.emit_mixin_forwarders(&mut b, cls, &impl_.body);
         self.emit_delayed_init_support(&mut b, cls, &impl_.body, true);
         // `object Main extends App`: `main` is the one forwarder the module's
@@ -523,7 +524,7 @@ impl<'a> Gen<'a> {
                         } else {
                             vd.ty.clone()
                         };
-                        emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                        emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                     } else {
                         // A bare statement of the module body (SLS 5.1): part
                         // of module initialization, so it runs exactly once,

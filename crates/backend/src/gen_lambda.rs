@@ -2034,6 +2034,7 @@ pub(crate) fn gen_try(
             push_default(asm, result_ty);
         }
         box_for_result_slot(asm, &block.ty, sel_sort);
+        cast_branch_to_join(asm, ctx.st, result_ty);
         store(asm, result_slot.unwrap(), sel_sort);
     }
     if ret_exit.is_some() {
@@ -2088,6 +2089,7 @@ pub(crate) fn gen_try(
         } else {
             gen_expr(asm, frame, ctx, &c.body);
             box_for_result_slot(asm, &c.body.ty, sel_sort);
+            cast_branch_to_join(asm, ctx.st, result_ty);
             if let Some(slot) = result_slot {
                 store(asm, slot, sel_sort);
             }
