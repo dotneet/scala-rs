@@ -1604,7 +1604,7 @@ impl Typer {
     /// the same name, so what decides it is the parameter list. A
     /// parameterless `val` matches a nullary `def` (that is how `override val
     /// sqlType` implements `def sqlType: Int`).
-    fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
+    pub(crate) fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
         let sub_ps = flat_param_types(&self.st.get(sub).ty);
         let base_ps = flat_param_types(&self.st.get(base).ty);
         if sub_ps.len() != base_ps.len() {

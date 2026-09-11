@@ -331,6 +331,11 @@ pub struct Typer {
     /// { … } }` opens both -- and nsc really does tell the two apart
     /// (2.13.16, with and without `-Xsource:3`). See `expose_unqualified`.
     pub(crate) open_pkgs: HashMap<usize, Vec<SymbolId>>,
+    /// The same, clause by clause: for each `package` clause of a file, the
+    /// packages open inside it, outermost first. `package p { class Top }`
+    /// beside `package p.q.r { … }` in one file opens `p` for the first
+    /// clause only; the flat list above cannot tell the second clause that.
+    pub(crate) open_pkg_chains: HashMap<usize, Vec<Vec<SymbolId>>>,
     /// What each compilation unit defines at the top level of its own package
     /// clauses: `file index -> name -> [(package, symbol)]`.
     ///
@@ -865,8 +870,13 @@ pub fn typecheck_units_src(
     t.link_tuple_products();
     t.link_string_parents();
     t.defer_default_rhs = true;
+    {
+        let refs: Vec<(&Tree, usize)> = units.iter().map(|(t, i)| (&**t, *i)).collect();
+        t.check_duplicate_names(&refs);
+    }
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
+        t.validate_modifiers(tree);
         t.namer(tree);
         t.register_sealed_from_namer(tree);
     }
@@ -1021,6 +1031,7 @@ impl Typer {
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
+            open_pkg_chains: HashMap::new(),
             unit_pkg_defs: HashMap::new(),
             import_origin: 0,
             import_text: HashMap::new(),

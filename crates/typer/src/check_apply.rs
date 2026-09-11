@@ -641,7 +641,16 @@ impl Typer {
                         (None, Vec::new())
                     }
                     OverloadPick::None => {
-                        if field_tys.len() != arg_tys.len() {
+                        // `new C()` against constructors that all need
+                        // arguments: nsc's wording, as for an unapplied `new C`.
+                        let no_args = if arg_tys.is_empty() {
+                            self.unapplied_new_error(c)
+                        } else {
+                            None
+                        };
+                        if let Some(msg) = no_args {
+                            self.error(tree.span, msg);
+                        } else if field_tys.len() != arg_tys.len() {
                             self.error(
                                 tree.span,
                                 format!(
