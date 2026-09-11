@@ -1264,7 +1264,9 @@ impl<'a> Lexer<'a> {
             Some('\\') => Some('\\'),
             Some('"') => Some('"'),
             Some('\'') => Some('\''),
-            Some('$') => Some('$'),
+            // `\$` is no escape: nsc reports "invalid escape character" in a
+            // literal, and inside an interpolation the backslash stays a
+            // backslash and the `$` starts a hole.
             Some('u') => {
                 let mut hex = String::new();
                 for _ in 0..4 {
@@ -1285,9 +1287,12 @@ impl<'a> Lexer<'a> {
                     None
                 })
             }
+            // Reported, and the literal read on: the rest of it is still a
+            // literal, and giving up here made the closing quote open a new
+            // one.
             Some(c) => {
                 self.error(lo, self.pos as u32, format!("invalid escape \\{c}"));
-                None
+                Some(c)
             }
             None => {
                 self.error(lo, self.pos as u32, "unterminated escape");

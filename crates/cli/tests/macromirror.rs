@@ -166,9 +166,9 @@ fn mtc_typecheck_expands_and_runs() {
 
 /// Every question the mirror cannot answer is refused *by name*.
 ///
-/// This is the half that keeps the other half honest. Five of these seven call
+/// This is the half that keeps the other half honest. Four of these six call
 /// sites are programs real scalac 2.13.16 compiles and runs (printing
-/// `Int(1) / Int(1) / Int(1) / caught / Bag`); scala-rs answers none of them,
+/// `Int(1) / Int(1) / Int(1) / caught`); scala-rs answers none of them,
 /// and each refusal says which capability was missing. An approximate answer
 /// would compile here and be wrong, and nothing downstream would notice --
 /// which is exactly what `docs/macros.md` §7.18 warns a half-built mirror
@@ -201,13 +201,14 @@ fn mtc_unanswerable_questions_are_named() {
         // A `TypecheckException` cannot cross a `java.lang.reflect.Proxy`, so
         // an implementation that catches one did not see what nsc shows it.
         "scala-rs cannot hand a TypecheckException to an implementation",
-        // A node the reply rebuilder has no scala-rs tree for.
+        // A node the reply rebuilder has no scala-rs tree for, outside the
+        // pattern it could stand in.
         "contains a `Star`, which scala-rs cannot rebuild yet",
-        // The mirror's own limit: a class with a field is not described, and
-        // the refusal names the class *and the reason*, not the reflect
-        // internals' `AssertionError`.
-        "the implementation asked about `Bag`",
-        "`size` is a field",
+        // A class with a `val` used to be the mirror's limit here (`class
+        // Bag(val size: Int)`, "`size` is a field"). The mirror now answers in
+        // nsc's shape, field and accessor both, so that call site left this
+        // file; `crates/cli/tests/gbmac.rs` compares such answers with real
+        // scalac's and pins the refusals that remain.
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
@@ -215,7 +216,7 @@ fn mtc_unanswerable_questions_are_named() {
     assert!(!out.status.success() || text.contains("error:"), "{text}");
     assert_eq!(
         text.matches("macro expansion is not implemented").count(),
-        7,
+        6,
         "every call site must be refused:\n{text}"
     );
     let _ = fs::remove_dir_all(&impls);

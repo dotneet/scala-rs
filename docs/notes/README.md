@@ -24,6 +24,7 @@ Chapter headings carry the slice they came from (`agent/xxx`).
 | [application-chains-and-copy.md](application-chains-and-copy.md) | Why an application chain has to be typed as a whole: `super` and self-types, bound types under `x @ Extractor(...)`, curried `copy` and `new`. |
 | [array-and-collection-typing.md](array-and-collection-typing.md) | The type-checking side of `Array`, `Set` / `Map`, and collection arguments. |
 | [rejection-rules-and-differential-probes.md](rejection-rules-and-differential-probes.md) | The rules that *reject* — variance, self-type conformance, wildcard bounds, lub — where a bug shows up as a false positive on legal code. Plus a round of differential probing. |
+| [prefix-types-design.md](prefix-types-design.md) | Type prefixes for inner classes (`a.In` vs `b.In`, `Outer#In`, outer type arguments through `o.In`): the as-seen-from-view encoding, where prefixes are attached and rewritten, the conformance rule, the probe battery and the remaining steps. |
 
 ## Symbols, companions, and separate compilation
 

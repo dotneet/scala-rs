@@ -1106,6 +1106,11 @@ impl<'a> Parser<'a> {
         // definition (`class B` + newline + `@E(x) val b`) a constructor
         // annotation of `B`.
         self.newline_opt_when_followed_by(|k| matches!(k, TokenKind::LBracket));
+        // nsc's scanner puts a NEWLINE in front of a token that can begin a
+        // statement, and `@` can: `class O2` + newline + `@compileTimeOnly("O2")
+        // object O2` annotates the *object*, not `O2`'s constructor.
+        let annot_next = matches!(self.kind(), TokenKind::Newline)
+            && matches!(self.peek_non_nl(), TokenKind::At);
         let tparams = self.parse_type_param_clause();
         // A constructor modifier (`class C private (x: Int)`) sits on the same
         // line as the class name, so the decision has to be taken *before* the
@@ -1118,13 +1123,17 @@ impl<'a> Parser<'a> {
                 self.kind(),
                 TokenKind::Private | TokenKind::Protected | TokenKind::At
             );
-        self.skip_nl();
+        if !annot_next {
+            self.skip_nl();
+        }
         let ctor_mods = if has_ctor_mods {
             self.parse_modifiers()
         } else {
             Modifiers::default()
         };
-        self.skip_nl();
+        if !annot_next {
+            self.skip_nl();
+        }
         let vparamss = if is_trait {
             if matches!(self.kind(), TokenKind::LParen) {
                 self.parse_param_clauses()

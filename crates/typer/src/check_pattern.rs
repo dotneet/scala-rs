@@ -163,6 +163,22 @@ impl Typer {
                 return ts.clone();
             }
         }
+        // A function scrutinee is its `FunctionN` class: cats'
+        // `final case class StrictConstFunction1[A](a: A) extends Function1[Any,
+        // A]` is matched against a `run: A => F[B]`, and `case
+        // StrictConstFunction1(fb)` binds `fb: F[B]`. With no class symbol to
+        // walk to, the field kept the case class's own `A`.
+        let as_class;
+        let sel_ty = match sel_ty {
+            Type::Function { .. } => match self.st.function_class_form(sel_ty) {
+                Some(c) => {
+                    as_class = c;
+                    &as_class
+                }
+                None => sel_ty,
+            },
+            _ => sel_ty,
+        };
         let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
             return Vec::new();
         };
@@ -599,6 +615,16 @@ impl Typer {
                         } else {
                             self.st.subst_tparams(class_id, &cargs, &ft)
                         };
+                        // A scrutinee that is an inner case class behind a
+                        // prefix (`prefix.rs`): a field written in the
+                        // enclosing class's vocabulary is read through the
+                        // prefix -- `case o.Rec(n, t)` on an `o.Rec` with
+                        // `o: Outer[String]` binds `t: String`.
+                        let ft = if crate::prefix::view_prefix(sel_ty).is_some() {
+                            self.st.subst_as_seen_from(sel_ty, &ft)
+                        } else {
+                            ft
+                        };
                         let ft = match ft {
                             Type::Repeated(elem) if pattern_has_star(a) => {
                                 self.seq_of(&elem).unwrap_or(Type::Class {
@@ -616,6 +642,19 @@ impl Typer {
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
                     let extracted = self.unapply_extracted_types(u);
                     let extracted = self.subst_unapply_tparams(u, sel_ty, extracted);
+                    // A scrutinee that is an inner class behind a prefix
+                    // (`prefix.rs`): what its companion's `unapply` extracts
+                    // is written in the enclosing class's vocabulary, and the
+                    // prefix instantiates it -- `case o.Rec(a, t)` on an
+                    // `o.Rec` with `o: Outer[String]` binds `t: String`.
+                    let extracted: Vec<Type> = if crate::prefix::view_prefix(sel_ty).is_some() {
+                        extracted
+                            .iter()
+                            .map(|t| self.st.subst_as_seen_from(sel_ty, t))
+                            .collect()
+                    } else {
+                        extracted
+                    };
                     if args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
@@ -1230,6 +1269,20 @@ impl Typer {
         if tps.len() != args.len() {
             return pat_ty.clone();
         }
+        // A function scrutinee is its `FunctionN` class, as in
+        // `pattern_class_args`: cats' `case run: StrictConstFunction1[?]` on a
+        // `run: A => F[B]` is a `StrictConstFunction1[F[B]]`.
+        let as_class;
+        let sel_ty = match sel_ty {
+            Type::Function { .. } => match self.st.function_class_form(sel_ty) {
+                Some(c) => {
+                    as_class = c;
+                    &as_class
+                }
+                None => sel_ty,
+            },
+            _ => sel_ty,
+        };
         let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
             return pat_ty.clone();
         };
@@ -1573,6 +1626,28 @@ impl Typer {
             Type::Annotated { tpe, .. } => {
                 return self.base_type_instance(tpe, target, depth + 1);
             }
+            // An inner class behind a prefix (`prefix.rs`): its parents are
+            // written in the enclosing class's vocabulary, and the prefix is
+            // what instantiates them -- `hm.KeySet` for `class KeySet extends
+            // MySet[K]` inside `MapOps[K]` is a `MySet[Int]`, not a `MySet[K]`.
+            Type::Refined { .. } if crate::symbol::SymbolTable::as_seen_from_view(ty).is_some() => {
+                let core = crate::prefix::strip_view(ty).clone();
+                let Some(pre) = crate::prefix::view_prefix(ty).cloned() else {
+                    return self.base_type_instance(&core, target, depth + 1);
+                };
+                let Type::Class { sym, args } = &core else {
+                    return self.base_type_instance(&core, target, depth + 1);
+                };
+                if *sym == target {
+                    return Some(core);
+                }
+                let parents = self.st.get(*sym).parents.clone();
+                return parents.iter().find_map(|p| {
+                    let p = self.st.subst_tparams(*sym, args, p);
+                    let p = self.st.subst_as_seen_from(&pre, &p);
+                    self.base_type_instance(&p, target, depth + 1)
+                });
+            }
             _ => return None,
         };
         if sym == target {
@@ -1629,6 +1704,15 @@ impl Typer {
                 continue;
             }
             let p = self.st.subst_tparams_cow(sym, args, p);
+            // A parent written as a function type (`extends Function1[Any, A]`
+            // is stored as `Any => A`) is its `FunctionN` class here.
+            let p = match p.as_ref() {
+                Type::Function { .. } => match self.st.function_class_form(&p) {
+                    Some(c) => std::borrow::Cow::Owned(c),
+                    None => p,
+                },
+                _ => p,
+            };
             if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
                 return Some(found);
             }

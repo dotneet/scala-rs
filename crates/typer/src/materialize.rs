@@ -193,6 +193,12 @@ pub(crate) fn static_class_name(st: &SymbolTable, ty: &Type) -> Result<String, S
         Type::ModuleRef(_) | Type::ThisType(_) | Type::SingleType { .. } => {
             Err(format!("`{}`, a singleton type", st.display_type(ty)))
         }
+        // An inner class behind a prefix (`prefix.rs`) is that class: the
+        // tag nsc builds for `RepositoryComponent.this.Repositories` names
+        // the class, and the prefix is not something `staticClass` carries.
+        Type::Refined { .. } if SymbolTable::as_seen_from_view(ty).is_some() => {
+            static_class_name(st, crate::prefix::strip_view(ty))
+        }
         Type::Refined { .. } => Err(format!("`{}`, a structural type", st.display_type(ty))),
         Type::Function { .. } | Type::Tuple(_) | Type::Array(_) => Err(format!(
             "`{}`, whose type arguments would have to be reified too",

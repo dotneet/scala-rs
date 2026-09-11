@@ -79,6 +79,112 @@ impl Typer {
         hits.next().is_none().then(|| (first.0, first.1.clone()))
     }
 
+    /// The alternative nsc's `inferExprAlternative` picks for `x.m[T1, …, Tn]`
+    /// in value position, when value position has already collapsed the set to
+    /// its nullary alternative but it also holds one whose only clause is
+    /// implicit (and that takes the same `n` type parameters).
+    ///
+    /// cats declares exactly that pair on `Alternative`: `MonoidK.compose[G[_]]:
+    /// MonoidK[λ[α => F[G[α]]]]` beside `Alternative.compose[G[_]:
+    /// Applicative]: Alternative[λ[α => F[G[α]]]]`. The nullary one is not
+    /// "the" value-position alternative: nsc's `isAsSpecific` looks straight
+    /// through an implicit clause, so the two are compared by their results
+    /// once the type arguments are in, and the owner that is a proper subclass
+    /// scores a point too (`isStrictlyMoreSpecific`). An alternative the
+    /// expected type rules out and the other does not loses first.
+    /// `Alternative[F].compose[G]` is therefore the `Alternative`, and at a
+    /// declared `MonoidK[…]` it still is -- scalac then reports the missing
+    /// `Applicative[G]` instead of quietly taking the `MonoidK`.
+    ///
+    /// `None` leaves the collapse as it was, including the tie nsc would
+    /// report as ambiguous.
+    pub(crate) fn implicit_alt_beats_nullary(
+        &self,
+        fun: &Tree,
+        targs: &[Type],
+        pt: &Type,
+    ) -> Option<(SymbolId, Type)> {
+        let sym = fun.sym;
+        if sym.is_none() || !self.is_nullary_method_sym(sym) {
+            return None;
+        }
+        // `overload_member_types` is keyed by symbol, not by selection: the set
+        // recorded when `Alternative[F].compose` collapsed to `MonoidK.compose`
+        // is still filed under that symbol when a plain `MonoidK[F].compose`
+        // selects it later. Only a receiver that really has the implicit
+        // alternative as a member may be steered to it.
+        let TreeKind::Select { qual, .. } = &fun.kind else {
+            return None;
+        };
+        let recv = self.st.class_sym_of(&self.st.widen_type_param(&qual.ty))?;
+        let alts = self.overload_member_types.get(&sym.0)?;
+        let nullary = alts.iter().find(|(s, _)| *s == sym)?.1.clone();
+        let implicit_only = |s: SymbolId| {
+            let decl = &self.st.get(s).paramss;
+            decl.len() == 1
+                && !decl[0].is_empty()
+                && decl[0]
+                    .iter()
+                    .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        };
+        let mut hits = alts.iter().filter(|(s, t)| {
+            *s != sym
+                && self.st.get(*s).tparams.len() == targs.len()
+                && matches!(t, Type::Method { .. })
+                && implicit_only(*s)
+        });
+        let (isym, ity) = hits.next()?;
+        if hits.next().is_some() || self.st.get(sym).tparams.len() != targs.len() {
+            return None;
+        }
+        let owner_i = self.st.get(*isym).owner;
+        if owner_i != recv && !self.st.is_ancestor_of(owner_i, recv) {
+            return None;
+        }
+        let result = |s: SymbolId, t: &Type| {
+            let t = self.st.subst_tparams(s, targs, t);
+            match t {
+                Type::Method { ret, .. } => *ret,
+                other => other,
+            }
+        };
+        let r_imp = result(*isym, ity);
+        let r_nul = result(sym, &nullary);
+        if r_imp.is_error() || r_nul.is_error() {
+            return None;
+        }
+        let value_pt = !matches!(
+            pt,
+            Type::NoType
+                | Type::Error
+                | Type::Wildcard
+                | Type::Method { .. }
+                | Type::Function { .. }
+        );
+        if value_pt {
+            let imp_fits = self.st.is_sub_type(&r_imp, pt);
+            let nul_fits = self.st.is_sub_type(&r_nul, pt);
+            if imp_fits != nul_fits {
+                return imp_fits.then(|| (*isym, ity.clone()));
+            }
+        }
+        let owner_n = self.st.get(sym).owner;
+        let mut score = 0i32;
+        if self.st.is_sub_type(&r_imp, &r_nul) {
+            score += 1;
+        }
+        if self.st.is_sub_type(&r_nul, &r_imp) {
+            score -= 1;
+        }
+        if owner_i != owner_n && self.st.is_ancestor_of(owner_n, owner_i) {
+            score += 1;
+        }
+        if owner_i != owner_n && self.st.is_ancestor_of(owner_i, owner_n) {
+            score -= 1;
+        }
+        (score > 0).then(|| (*isym, ity.clone()))
+    }
+
     /// `chosen`'s declared type, as seen from the receiver of `fun`, with its
     /// own type parameters still un-instantiated.
     ///
@@ -140,6 +246,9 @@ impl Typer {
     /// Returns `false` — leaving `fun` untouched — for anything else, so the
     /// caller reports the original failure.
     pub(crate) fn insert_apply_on_nullary(&mut self, fun: &mut Tree) -> bool {
+        if self.apply_function_value_alternative(fun) {
+            return true;
+        }
         let ret = match fun.ty.clone() {
             Type::Method { paramss, ret }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
@@ -230,6 +339,85 @@ impl Typer {
         };
         self.type_select(fun, &Type::NoType);
         !fun.ty.is_error() && !fun.ty.is_no_type()
+    }
+
+    /// An overload set whose only value-shaped alternative is a function-typed
+    /// `val`, applied to arguments no method alternative takes: nsc's
+    /// `followApply` makes the value an alternative through its `apply`.
+    ///
+    /// ```scala
+    /// val h: Any => String = _ => "value"
+    /// def h(s: String): String = "method"
+    /// h(1)   // the value: h.apply(1)
+    /// ```
+    ///
+    /// scala-rs offered only the method and reported "no matching overload".
+    /// The receiver is rebuilt on the value's own symbol: the overloaded
+    /// reference carries the group's first alternative, which may be the
+    /// method.
+    fn apply_function_value_alternative(&mut self, fun: &mut Tree) -> bool {
+        let Type::Overload(alts) = &fun.ty else {
+            return false;
+        };
+        if fun.sym.is_none()
+            || !matches!(fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+        {
+            return false;
+        }
+        let value_shaped = alts
+            .iter()
+            .filter(|a| match a {
+                Type::Method { paramss, .. } => {
+                    paramss.is_empty() || paramss.iter().all(|c| c.is_empty())
+                }
+                Type::Class { .. } | Type::ModuleRef(_) | Type::Function { .. } => true,
+                _ => false,
+            })
+            .count();
+        let fns: Vec<&Type> = alts
+            .iter()
+            .filter(|a| matches!(a, Type::Function { .. }))
+            .collect();
+        let ([fn_ty], 1) = (fns.as_slice(), value_shaped) else {
+            return false;
+        };
+        let fn_ty = (*fn_ty).clone();
+        let Some(group) = self.overload_member_types.get(&fun.sym.0) else {
+            return false;
+        };
+        let mut owners = group
+            .iter()
+            .filter(|(s, t)| *t == fn_ty && self.st.get(*s).kind == SymKind::Term);
+        let (Some((vsym, _)), None) = (owners.next(), owners.next()) else {
+            return false;
+        };
+        let vsym = *vsym;
+        let mut inner = fun.clone();
+        inner.sym = vsym;
+        inner.ty = fn_ty;
+        let span = fun.span;
+        let saved = fun.clone();
+        *fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(inner),
+                name: "apply".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+            postfix: false,
+            scala_ref: false,
+            stable_pat: false,
+            byname_thunk: false,
+            byname_type_marker: false,
+        };
+        self.type_select(fun, &Type::NoType);
+        if fun.ty.is_error() || fun.ty.is_no_type() {
+            *fun = saved;
+            return false;
+        }
+        true
     }
 
     /// An overloaded module member competes through its apply methods. Once
@@ -373,6 +561,10 @@ impl Typer {
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         let mut module_apply_candidates = Vec::new();
+        // Value alternatives of function type (`val f: String => Int` beside
+        // `def f(s: String)`): nsc's `followApply` makes them compete through
+        // their `apply`. Only used to detect a tie below.
+        let mut function_values: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         // Which parameter clause these candidates come from: `f(a)(b = 1)`
         // applied as `f(1)()` leaves a residual method type whose only clause
         // is the *second* one, and that is where the defaults live.
@@ -443,6 +635,11 @@ impl Typer {
                                 paramss.first().cloned().unwrap_or_default(),
                                 (**ret).clone(),
                             ));
+                        }
+                        if let Type::Function { params, ret } = ty {
+                            if self.st.get(m).kind == SymKind::Term {
+                                function_values.push((m, params.clone(), (**ret).clone()));
+                            }
                         }
                         if let Type::ModuleRef(module) = ty {
                             for apply in
@@ -647,6 +844,14 @@ impl Typer {
             0 => OverloadPick::None,
             1 => {
                 let (s, p, r) = applicable.into_iter().next().unwrap();
+                if self.function_value_ties(
+                    &(s, p.clone(), r.clone()),
+                    &function_values,
+                    arg_tys,
+                    with_views,
+                ) {
+                    return OverloadPick::Ambiguous;
+                }
                 OverloadPick::Found(s, p, r)
             }
             _ => {
@@ -789,6 +994,11 @@ impl Typer {
                         winners = mono;
                     }
                 }
+                if let [w] = winners.as_slice() {
+                    if self.function_value_ties(w, &function_values, arg_tys, with_views) {
+                        return OverloadPick::Ambiguous;
+                    }
+                }
                 // nsc `isStrictlyMoreSpecific` weighs the owners too: an
                 // alternative earns a point for being as specific as the
                 // other and another for being defined in a proper subclass of
@@ -838,6 +1048,46 @@ impl Typer {
         }
     }
 
+    /// Whether a function-typed value alternative is applicable to the call
+    /// and ties with the method alternative `w` that won: nsc weighs the
+    /// value through its `apply` (`followApply`), and two alternatives of
+    /// the same owner whose parameter lists are each as specific as the
+    /// other are ambiguous.
+    ///
+    /// ```scala
+    /// val f: String => Int = _.length
+    /// def f(s: String): Int = 2
+    /// f("")   // ambiguous reference to overloaded definition
+    /// ```
+    ///
+    /// scala-rs never offered the value as an alternative and called the
+    /// method. Only the tie is reported here; a value alternative that is
+    /// strictly *more* specific than every method is not selected by this
+    /// resolver, and is left as it was.
+    fn function_value_ties(
+        &self,
+        w: &(SymbolId, Vec<Type>, Type),
+        values: &[(SymbolId, Vec<Type>, Type)],
+        arg_tys: &[Type],
+        with_views: bool,
+    ) -> bool {
+        if w.0.is_none() || values.is_empty() {
+            return false;
+        }
+        values.iter().any(|v| {
+            if v.1.len() != arg_tys.len()
+                || !self.is_applicable(v.0, 0, &v.1, arg_tys, with_views, &[], None)
+            {
+                return false;
+            }
+            let weight = |a: &(SymbolId, Vec<Type>, Type), b: &(SymbolId, Vec<Type>, Type)| {
+                u8::from(self.is_as_specific_method(a.0, b.0, &a.1, &b.1, with_views))
+                    + u8::from(self.owner_is_proper_subclass(a.0, b.0))
+            };
+            weight(w, v) <= weight(v, w) && weight(v, w) <= weight(w, v)
+        })
+    }
+
     /// One alternative's parameter and result types with its *own* type
     /// parameters rewritten to positional markers, so two declarations of the
     /// same signature compare equal however their type parameters were
@@ -884,7 +1134,7 @@ impl Typer {
     /// different class, and the first is a subclass of the second. Only real
     /// classes count -- two alternatives owned by the same class, or by
     /// anything that is not a class, are not ordered by this rule.
-    fn owner_is_proper_subclass(&self, a: SymbolId, b: SymbolId) -> bool {
+    pub(crate) fn owner_is_proper_subclass(&self, a: SymbolId, b: SymbolId) -> bool {
         if a.is_none() || b.is_none() {
             return false;
         }
@@ -992,7 +1242,7 @@ impl Typer {
     /// `map(f: Char => Char): String` and `map[B](f: Char => B): IndexedSeq[B]`;
     /// without instantiating `B := Char` neither alternative is as specific as
     /// the other and every `"…".map(…)` was `ambiguous overload`.
-    fn is_as_specific_method(
+    pub(crate) fn is_as_specific_method(
         &self,
         a_sym: SymbolId,
         b_sym: SymbolId,
@@ -1220,12 +1470,15 @@ impl Typer {
             // `html.edithook(hook, Set(WebHook.Push), …)` typed its `Set`
             // argument with no prototype and missed the invariant
             // `Set[WebHook.Event]` parameter.
-            let alts: Vec<Type> = self
+            let syms: Vec<SymbolId> = self
                 .st
                 .lookup_member(*cls, "apply")
                 .into_iter()
                 .filter(|a| !self.st.get(*a).flags.contains(Flags::STATIC))
-                .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(a).ty))
+                .collect();
+            let alts: Vec<Type> = syms
+                .iter()
+                .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(*a).ty))
                 .collect();
             if alts.is_empty() {
                 return Type::NoType;
@@ -1234,7 +1487,26 @@ impl Typer {
             if !f.is_no_type() {
                 return f;
             }
-            return self.agreed_value_param(&alts, idx);
+            let v = self.agreed_value_param(&alts, idx);
+            if !v.is_no_type() {
+                return v;
+            }
+            // A generic case class's companion has one `apply`, and it is
+            // polymorphic: what the expected type settles about its type
+            // parameters is the argument's prototype, exactly as for any other
+            // polymorphic method (nsc's `protoTypeArgs` does not care how the
+            // callee was spelled). cats' `EitherK(run match { case Right(ga) =>
+            // Right(G.coflatMap(ga)(x => rightc(x))) … })` at a declared
+            // `EitherK[F, G, EitherK[F, G, A]]` has no other way to tell
+            // `rightc` its `F`, and `Kleisli((fe: Either[A, B]) => …)` no other
+            // way to give the literal's body its `F[Either[C, D]]`.
+            let mut poly = syms.iter().zip(&alts).filter(|(s, t)| {
+                !self.st.get(**s).tparams.is_empty() && matches!(t, Type::Method { .. })
+            });
+            if let (Some((s, t)), None) = (poly.next(), poly.next()) {
+                return self.proto_arg_type(t, *s, idx, nargs, pt, Some(&recv), use_lower_bounds);
+            }
+            return Type::NoType;
         }
         let Type::Method { paramss, ret } = fun_ty else {
             return Type::NoType;
@@ -1390,6 +1662,74 @@ impl Typer {
             Type::ByName(inner) => *inner,
             other => other,
         }
+    }
+
+    /// nsc's *lenient* `protoTypeArgs`: the formal with what the expected type
+    /// settles substituted in and every parameter it leaves open read as a
+    /// wildcard. [`Self::proto_arg_type`] declines such a formal outright, and
+    /// that is right for most arguments; this is for a nested *call*, whose
+    /// own inference has nothing else to go on. cats' `Arrow.second` writes
+    /// `compose(swap, compose(first[A, B, C](fa), swap))` at a declared
+    /// `F[(C, A), (C, B)]`: the outer `compose` settles its `A` from that and
+    /// hands the inner call `F[(C, A), ?]`, and only that `(C, A)` tells the
+    /// inner `swap[X, Y]` what `X` and `Y` are. Typed against nothing, the
+    /// inner call is ill-typed in nsc too.
+    ///
+    /// `NoType` unless the callee is one polymorphic method, the formal is not
+    /// a bare type parameter, and the expected type settles at least one of
+    /// the parameters the formal mentions.
+    pub(crate) fn lenient_proto_arg_type(
+        &self,
+        fun_ty: &Type,
+        sym: SymbolId,
+        idx: usize,
+        pt: &Type,
+    ) -> Type {
+        if sym.is_none() || pt.is_no_type() || pt.is_error() {
+            return Type::NoType;
+        }
+        let Type::Method { paramss, ret } = fun_ty else {
+            return Type::NoType;
+        };
+        let tps = self.st.get(sym).tparams.clone();
+        let Some(param) = paramss.first().and_then(|ps| param_at(ps, idx)) else {
+            return Type::NoType;
+        };
+        let param = match param {
+            Type::ByName(inner) => inner.as_ref(),
+            other => other,
+        };
+        if tps.is_empty() || matches!(param, Type::TypeParam(_)) || !mentions_tparam(param, &tps) {
+            return Type::NoType;
+        }
+        let solved: Vec<(SymbolId, Type)> = self
+            .add_expected_constraints_in(sym, ret, pt, Vec::new(), false)
+            .into_iter()
+            .filter(|(tp, t)| {
+                type_mentions_tparam(param, *tp)
+                    && !t.is_no_type()
+                    && !t.is_error()
+                    && !matches!(t, Type::Nothing | Type::Any | Type::Wildcard)
+                    && !type_has_wildcard(t)
+                    && !mentions_tparam(t, &tps)
+            })
+            .collect();
+        if solved.is_empty() {
+            return Type::NoType;
+        }
+        let ids: Vec<SymbolId> = solved.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
+        let out = crate::symbol::subst_tparams_slice(&ids, &vals, param);
+        let rest: Vec<SymbolId> = tps
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(&out, *tp))
+            .collect();
+        // A type *constructor* left open is not a wildcard's kind.
+        if rest.iter().any(|tp| !self.st.get(*tp).tparams.is_empty()) {
+            return Type::NoType;
+        }
+        crate::symbol::subst_tparams_slice(&rest, &vec![Type::Wildcard; rest.len()], &out)
     }
 
     /// Explicit type arguments for a *Java* method, with `Any` read as the
@@ -2413,9 +2753,25 @@ impl Typer {
             }
         }
         if let Type::Method { paramss, ret } = arg {
-            let f = Type::Function {
-                params: paramss.iter().flatten().cloned().collect(),
-                ret: ret.clone(),
+            // A curried method eta-expands to a curried function:
+            // `def ite(b: Boolean)(x: A, y: A): A` is `Boolean => (A, A) => A`
+            // (cats' `Apply.ifA` passes it to `map(fcond)(ite)`), not the
+            // `(Boolean, A, A) => A` flattening every clause gave, which no
+            // one-parameter function parameter could take.
+            let f = paramss
+                .iter()
+                .rev()
+                .fold((**ret).clone(), |acc, clause| Type::Function {
+                    params: clause.clone(),
+                    ret: Box::new(acc),
+                });
+            let f = if paramss.is_empty() {
+                Type::Function {
+                    params: Vec::new(),
+                    ret: ret.clone(),
+                }
+            } else {
+                f
             };
             return self.arg_score(&f, param);
         }

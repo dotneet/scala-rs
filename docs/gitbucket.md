@@ -3467,3 +3467,28 @@ Left, with reproductions:
   resolves to `Rep.Some`; does not reproduce outside the table projection.
 * `DatabaseConfig.scala:124`: `object … extends PostgresProfile with
   BlockingJdbcProfile` "needs 15 members".
+
+## Fixed: `mapTo` expands (the `agent/gbmacro` slice)
+
+The 31 `macro expansion is not implemented: cannot expand mapTo` diagnostics --
+one per table whose row class this run compiles -- are gone: 92/43 -> 61/15 on
+`9cac778e`, and 36 -> 5 composed with `agent/gbmisc`. The other 61 errors are
+unchanged, kind for kind; nothing downstream of `mapTo` moved, because the
+`Shape`/`OptionLift` cluster was an implicit-unification root (`agent/gbmisc`),
+not a cascade. What it took -- a lazy mirror over the run's own classes in
+nsc's shape, the reply shapes `mapToImpl` returns, splicing the typed receiver
+back instead of typing it again, and three typer repairs -- is
+`docs/macros.md` §7.25, with the defects found on the way. One of those is a
+silent miscompile in exactly gitbucket's table shape: a table class that
+extends `Table` through `import profile.api._` gets the component, not the
+profile, as its superclass's outer instance, and its constructor throws
+`ClassCastException` at run time. It needs prefix-carrying class types
+(`agent/prefixtypes`); the reduction is item 1 of §7.25's list.
+
+A second one is fixed: a service's `import
+gitbucket.core.model.Profile.currentDate` was taken, run-wide, as the receiver
+of every component's own `profile` (and of the `dateColumnType` its tables
+take from the self type), so they read the object's where nsc reads
+`XComponent.this`'s -- the same value in gitbucket, which has one instance.
+All 31 `mapTo` prefixes now arrive as `XComponent.this.profile.api`
+(`gbmac_selfimport.scala`, §7.25 "The receiver of a self-type member").

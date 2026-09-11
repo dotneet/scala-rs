@@ -1,0 +1,6 @@
+read 42
+direct 42
+anon 7
+DumpInfo(b,main,,Vector())
+DumpInfo(a,m2,x,Vector())
+DumpInfo(renamed,leaf,,Vector())

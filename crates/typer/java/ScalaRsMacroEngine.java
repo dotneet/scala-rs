@@ -184,6 +184,7 @@ public final class ScalaRsMacroEngine {
             return err("no method " + methodName + " on " + className);
         }
 
+        origTrees.clear();
         Ctx handler = new Ctx();
         // `c.prefix`: the receiver of the macro application, or the reason
         // there is none -- which is raised only if the implementation reads it.
@@ -416,8 +417,22 @@ public final class ScalaRsMacroEngine {
 
     // ------------------------------------------------------- building trees
 
+    /**
+     * The receiver and arguments of the macro application, by the index
+     * scala-rs sent each under (`(orig K <tree>)`). A tree the implementation
+     * returns unchanged -- the same object -- goes back as `(t "Orig" (s0) K
+     * <tree>)`, and scala-rs puts its own *typed* tree in its place, the way
+     * nsc splices a typed tree without typing it again.
+     */
+    static final java.util.IdentityHashMap<Object, Long> origTrees = new java.util.IdentityHashMap<>();
+
     /** A tree the request describes, built in the runtime universe. */
     static Object buildTree(Sexp s) throws Exception {
+        if (s.isList() && s.items.size() == 3 && "orig".equals(s.items.get(0).atom)) {
+            Object tree = buildTree(s.items.get(2));
+            origTrees.put(tree, Long.parseLong(s.items.get(1).text()));
+            return tree;
+        }
         Object symbol = null;
         if (s.isList() && s.items.size() >= 3 && "t".equals(s.items.get(0).atom)) {
             String kind = s.items.get(1).text();
@@ -578,12 +593,7 @@ public final class ScalaRsMacroEngine {
     }
 
     /**
-     * A type descriptor as a `universe.WeakTypeTag`.
-     *
-     * `(ty "java.lang.String")` is a class the mirror can find on the macro
-     * classpath. `(syn "Pkg.Outer.Local")` is one this compilation run is
-     * itself defining, for which there is no class file yet -- see
-     * {@link #synthType}.
+     * A type descriptor as a `universe.WeakTypeTag` ({@link #typeFor}).
      */
     static Object buildTag(Sexp s) throws Exception {
         return tagOf(typeFor(s));
@@ -593,10 +603,12 @@ public final class ScalaRsMacroEngine {
      * The `universe.Type` a type descriptor names.
      *
      * `(ty "a.b.C" <arg>…)` is a class the mirror finds on the macro
-     * classpath, applied to its type arguments; `(syn "a.b.C")` is one this
-     * run is compiling ({@link #synthType}); `(cst (c "Int" "1"))` is the
-     * constant type nsc gives a literal, which `c.typecheck(q"1").tpe` has to
-     * be if it is to be the type nsc reports.
+     * classpath, applied to its type arguments; `(src <id>)` is one the
+     * calling run is compiling, which has no class file for the mirror to
+     * find, built by {@link #sourceSymbol} with its info asked for only when
+     * forced; `(annot "A" <type>)` is `<type> @A`; `(cst (c "Int" "1"))` is
+     * the constant type nsc gives a literal, which `c.typecheck(q"1").tpe`
+     * has to be if it is to be the type nsc reports.
      */
     static Object typeFor(Sexp s) throws Exception {
         String head = s.items.get(0).atom;
@@ -605,11 +617,22 @@ public final class ScalaRsMacroEngine {
                 constant(s.items.get(1)));
         }
         String name = s.items.get(1).text();
-        if ("syn".equals(head)) {
-            return synthType(name);
+        if ("src".equals(head)) {
+            Object sym = sourceSymbol(Long.parseLong(name));
+            return ownedTypeRef(call(sym, "owner", 0), sym);
         }
-        if ("run".equals(head)) {
-            return runClassType(s);
+        if ("annot".equals(head)) {
+            // `T @A` for an annotation class `A` taking no arguments -- the
+            // `@uncheckedVariance` nsc puts on a default getter's result.
+            Object under = typeFor(s.items.get(2));
+            Object annTpe = call(call(call(mirror, "staticClass", 1, name), "asType", 0), "toType", 0);
+            Object noJavaArgs = call(Class.forName("scala.collection.immutable.ListMap$", true, macroCl)
+                .getField("MODULE$").get(null), "empty", 0);
+            Object ann = call(companion("Annotation"), "apply", 3, annTpe,
+                list(new ArrayList<>()), noJavaArgs);
+            List<Object> anns = new ArrayList<>();
+            anns.add(ann);
+            return call(call(universe, "internal", 0), "annotatedType", 2, list(anns), under);
         }
         Object cls = call(mirror, "staticClass", 1, name);
         if (s.items.size() <= 2) {
@@ -632,154 +655,10 @@ public final class ScalaRsMacroEngine {
 
     /**
      * Types standing for classes the *calling* compilation run is defining,
-     * keyed by the full name scala-rs sent. One per name per engine process,
-     * so the same class is always the same symbol and an expansion that
-     * mentions it twice mentions one type.
+     * keyed by their full names, so the same class is always the same symbol
+     * and an expansion that mentions it twice mentions one type.
      */
     static final java.util.HashMap<String, Object> synthetic = new java.util.HashMap<>();
-
-    /**
-     * A placeholder symbol for a class this run is compiling.
-     *
-     * The mirror resolves a class *by name against the macro classpath*, so a
-     * class whose class file does not exist yet -- gitbucket's
-     * `TableQuery[Issues]`, where `Issues` is declared a few lines away -- can
-     * never be reached that way. nsc has no such problem: it expands in its
-     * own universe, where the symbol is the very one the typer is building.
-     *
-     * What is built here carries the class's **identity and nothing else**:
-     * its name, and no info at all. That is deliberate, and it is why the
-     * symbol is safe to hand over. scala-rs cannot describe the class truly at
-     * this point in its own run -- while `lazy val Issues = TableQuery[Issues]`
-     * is being typed, the members of `class Issues` are still un-inferred --
-     * so an info here would be a guess. Leaving it unset means an
-     * implementation that asks for one gets an exception, which scala-rs turns
-     * into a diagnostic, rather than a quiet wrong answer.
-     *
-     * The name is the class's real full name, which is how scala-rs recognises
-     * the type again in the tree that comes back.
-     */
-    static Object synthType(String fullName) throws Exception {
-        Object known = synthetic.get(fullName);
-        if (known != null) {
-            return known;
-        }
-        Object internal = call(universe, "internal", 0);
-        Object owner = call(mirror, "EmptyPackageClass", 0);
-        Object sym = newSourceSymbol("ClassSymbol", owner, typeName(fullName),
-            call(universe, "NoPosition", 0), 0L);
-        // `sym.toType` would ask for the type parameters, and that completes
-        // the symbol; the type reference is built directly so that the info
-        // stays unset and any real question about the class still throws.
-        Object tpe = call(internal, "typeRef", 3,
-            call(internal, "thisType", 1, owner), sym, list(new ArrayList<>()));
-        synthetic.put(fullName, tpe);
-        return tpe;
-    }
-
-    /**
-     * A class the calling run is compiling, **described**.
-     *
-     * {@link #synthType} builds the same symbol with no info at all, which is
-     * all scala-rs could offer before the bridge could ask questions
-     * backwards (`docs/macros.md` §5.1): identity and nothing else, so that an
-     * implementation asking a real question got an exception instead of a
-     * quiet wrong answer. It got one for `tpe.toString` too, because the
-     * reflect internals need an info to print a type at all.
-     *
-     * scala-rs now sends the description with the name, and it does so only
-     * when it can describe the class *completely* -- every parent, every
-     * declared member, every one of their types. A `(syn ...)` still arrives
-     * whenever it cannot, and that stays the empty placeholder. So there is no
-     * middle state here: the symbol is either fully described or not described
-     * at all, and this method is only reached in the first case.
-     *
-     * The symbol is cached under the same key as {@link #synthType}'s, so a
-     * class named twice in one expansion is one symbol. A name that arrived
-     * first as an empty placeholder is completed in place rather than
-     * duplicated -- completing a symbol that had no info is monotone, and two
-     * symbols for one class would break every identity comparison an
-     * implementation makes.
-     */
-    static Object runClassType(Sexp s) throws Exception {
-        String fullName = s.items.get(1).text();
-        Object known = synthetic.get(fullName);
-        Object internal = call(universe, "internal", 0);
-        Object sym;
-        Object tpe;
-        if (known != null) {
-            tpe = known;
-            sym = call(tpe, "typeSymbol", 0);
-            if (Boolean.TRUE.equals(call(sym, "isInitialized", 0))) {
-                return tpe;
-            }
-        } else {
-            Object owner = call(mirror, "EmptyPackageClass", 0);
-            sym = newSourceSymbol("ClassSymbol", owner, typeName(fullName),
-                call(universe, "NoPosition", 0), flagsOf(s.items.get(2)));
-            tpe = call(internal, "typeRef", 3, call(internal, "thisType", 1, owner), sym,
-                list(new ArrayList<>()));
-            synthetic.put(fullName, tpe);
-        }
-        Object support = call(internal, "reificationSupport", 0);
-        List<Object> parents = new ArrayList<>();
-        Sexp ps = s.field("parents");
-        for (Sexp x : ps.items.subList(1, ps.items.size())) {
-            parents.add(typeFor(x));
-        }
-        List<Object> decls = new ArrayList<>();
-        Sexp ds = s.field("decls");
-        for (Sexp d : ds.items.subList(1, ds.items.size())) {
-            decls.add(declSymbol(sym, tpe, d));
-        }
-        Object scope = call(internal, "newScopeWith", 1, seq(decls));
-        Object info = call(internal, "classInfoType", 3, list(parents), scope, sym);
-        call(support, "setInfo", 2, sym, info);
-        return tpe;
-    }
-
-    /**
-     * One declared member of such a class.
-     *
-     * The constructor is spelled out rather than described: scala-rs models it
-     * as returning `Unit` with no parameter clause and nsc as returning the
-     * class with one, so the wire carries the marker and the *class's own
-     * type* is filled in here, where it is to hand.
-     */
-    static Object declSymbol(Object owner, Object ownerType, Sexp d) throws Exception {
-        String name = d.items.get(1).text();
-        Sexp flagNames = d.items.get(2);
-        long flags = flagsOf(flagNames);
-        boolean isMethod = hasFlagName(flagNames, "METHOD");
-        boolean isCtor = hasFlagName(flagNames, "CONSTRUCTOR");
-        Object internal = call(universe, "internal", 0);
-        Object support = call(internal, "reificationSupport", 0);
-        Sexp shape = d.items.get(3);
-        boolean nullary = "nullary".equals(shape.items.get(0).atom);
-        Object result = isCtor ? ownerType : typeFor(d.items.get(4));
-        Object sym = isMethod
-            ? call(internal, "newMethodSymbol", 4, owner, termName(name),
-                call(universe, "NoPosition", 0), Long.valueOf(flags))
-            : call(internal, "newTermSymbol", 4, owner, termName(name),
-                call(universe, "NoPosition", 0), Long.valueOf(flags));
-        Object info;
-        if (!isMethod) {
-            info = result;
-        } else if (nullary) {
-            info = call(internal, "nullaryMethodType", 1, result);
-        } else {
-            List<Object> params = new ArrayList<>();
-            int i = 0;
-            for (Sexp pt : shape.items.subList(1, shape.items.size())) {
-                Object p = call(internal, "newTermSymbol", 4, sym, termName("x$" + (++i)),
-                    call(universe, "NoPosition", 0), Long.valueOf(flagValue("PARAM")));
-                call(support, "setInfo", 2, p, typeFor(pt));
-                params.add(p);
-            }
-            info = call(internal, "methodType", 2, list(params), result);
-        }
-        return call(support, "setInfo", 2, sym, info);
-    }
 
     /**
      * A `(f "NAME" ...)` list as nsc's flag bits.
@@ -800,7 +679,14 @@ public final class ScalaRsMacroEngine {
             if ("METHOD".equals(name) || "CONSTRUCTOR".equals(name)) {
                 continue;
             }
-            flags |= "LOCAL".equals(name) ? internalFlag(name) : flagValue(name);
+            // `universe.Flag` publishes the flags a macro may *build* with;
+            // the ones only nsc's own namer sets (`ACCESSOR`) are read off
+            // the internal table instead.
+            if ("LOCAL".equals(name) || "ACCESSOR".equals(name)) {
+                flags |= internalFlag(name);
+            } else {
+                flags |= flagValue(name);
+            }
         }
         return flags;
     }
@@ -891,6 +777,18 @@ public final class ScalaRsMacroEngine {
             sb.append("(t \"EmptyTree\" (s0))");
             return;
         }
+        Long orig = origTrees.get(t);
+        if (orig != null) {
+            // Its shape goes too: scala-rs uses it for a second mention.
+            sb.append("(t \"Orig\" (s0) ").append(orig).append(' ');
+            serTreeShape(t, sb);
+            sb.append(')');
+            return;
+        }
+        serTreeShape(t, sb);
+    }
+
+    static void serTreeShape(Object t, StringBuilder sb) throws Exception {
         String prefix;
         try {
             prefix = String.valueOf(call(t, "productPrefix", 0));
@@ -942,21 +840,96 @@ public final class ScalaRsMacroEngine {
         }
     }
 
+    /**
+     * The type a `TypeTree` carries, as a class name applied to arguments.
+     *
+     * scala-rs rebuilds `(ty "a.b.C" <arg>...)` as the path `a.b.C` applied
+     * to its arguments, so only a type that path really denotes may be
+     * written that way: a class type, after aliases are expanded, whose class
+     * is static. Anything else -- a singleton type, a refinement, an
+     * existential, an abstract type or type parameter, a class nested in a
+     * class -- is written as `(tyx "shown")`, which scala-rs refuses by name.
+     * Its `typeSymbol` would otherwise name a *different* type: the
+     * underlying class of `x.type`, the first parent of a refinement, the
+     * bound of an abstract type.
+     */
     static void serType(Object tpe, StringBuilder sb) throws Exception {
         if (tpe == null || tpe == call(universe, "NoType", 0)) {
             sb.append("(ty \"\")");
             return;
         }
-        Object sym = call(tpe, "typeSymbol", 0);
+        if (!isA(tpe, "scala.reflect.internal.Types$TypeRef")) {
+            sb.append("(tyx ").append(Sexp.quote(String.valueOf(tpe))).append(')');
+            return;
+        }
+        // Nothing here may ask a symbol for its info: a class the calling
+        // run is compiling completes its info by asking scala-rs, which may
+        // refuse ({@link #sourceSymbol}), and `isStatic`, `typeSymbol` and
+        // `dealias` all read it. A class type is never an alias, so only a
+        // non-class is dealiased, and staticness is read off the owner
+        // chain's flags.
+        Object d = tpe;
+        Object sym = call(d, "typeSymbolDirect", 0);
+        if (sourceSymbolIds.containsKey(sym) && Boolean.TRUE.equals(call(sym, "isClass", 0))) {
+            // A class the calling run is compiling, which scala-rs sent as
+            // its identity: it recognises it again by its full name, wherever
+            // the class is nested (a table class inside a component trait has
+            // no static path at all).
+            sb.append("(ty ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))));
+            Object args = call(d, "typeArgs", 0);
+            Object it = call(args, "iterator", 0);
+            while ((Boolean) call(it, "hasNext", 0)) {
+                sb.append(' ');
+                serType(call(it, "next", 0), sb);
+            }
+            sb.append(')');
+            return;
+        }
+        if (!Boolean.TRUE.equals(call(sym, "isClass", 0))) {
+            d = call(tpe, "dealias", 0);
+            if (!isA(d, "scala.reflect.internal.Types$TypeRef")) {
+                sb.append("(tyx ").append(Sexp.quote(String.valueOf(tpe))).append(')');
+                return;
+            }
+            sym = call(d, "typeSymbolDirect", 0);
+        }
+        if (!Boolean.TRUE.equals(call(sym, "isClass", 0))
+                || Boolean.TRUE.equals(call(sym, "isModuleClass", 0))
+                || Boolean.TRUE.equals(call(sym, "isRefinementClass", 0))
+                || !staticByOwners(sym)) {
+            // Named by the symbol's full name: printing the type could force
+            // the info of a class whose description scala-rs refuses.
+            sb.append("(tyx ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))))
+              .append(')');
+            return;
+        }
         String name = String.valueOf(call(sym, "fullName", 0));
         sb.append("(ty ").append(Sexp.quote(name));
-        Object args = call(tpe, "typeArgs", 0);
+        Object args = call(d, "typeArgs", 0);
         Object it = call(args, "iterator", 0);
         while ((Boolean) call(it, "hasNext", 0)) {
             sb.append(' ');
             serType(call(it, "next", 0), sb);
         }
         sb.append(')');
+    }
+
+    /** Every owner up to the root is a package or an object: `sym` has a path. */
+    static boolean staticByOwners(Object sym) throws Exception {
+        Object none = call(universe, "NoSymbol", 0);
+        Object o = call(sym, "owner", 0);
+        for (int i = 0; i < 64 && o != null && o != none; i++) {
+            if (Boolean.TRUE.equals(call(o, "isRoot", 0))
+                    || Boolean.TRUE.equals(call(o, "isEmptyPackageClass", 0))) {
+                return true;
+            }
+            if (!Boolean.TRUE.equals(call(o, "isPackageClass", 0))
+                    && !Boolean.TRUE.equals(call(o, "isModuleClass", 0))) {
+                return false;
+            }
+            o = call(o, "owner", 0);
+        }
+        return false;
     }
 
     static void serConstant(Object c, StringBuilder sb) throws Exception {
@@ -1125,7 +1098,15 @@ public final class ScalaRsMacroEngine {
     }
 
     /** Mirror an actual source symbol. Its type is completed by reverse RPC,
-     * not guessed while its enclosing definition is still being inferred. */
+     * not guessed while its enclosing definition is still being inferred.
+     *
+     * A package is the runtime mirror's own package of that name, so that a
+     * class this run is compiling sits in a real scope beside its companion:
+     * nsc finds a companion by looking its name up in the owner's
+     * declarations (`Symbol.companionModule0`), and slick's `mapToImpl` asks
+     * for exactly that. The runtime package's scope is looked up by name and
+     * falls back to class loading only for a name nobody entered, so a class
+     * entered here is found and a class file is never looked for. */
     static Object sourceSymbol(long id) throws Exception {
         Object known = sourceSymbols.get(id);
         if (known != null) return known;
@@ -1140,25 +1121,27 @@ public final class ScalaRsMacroEngine {
             sourceSymbolIds.put(root, id);
             return root;
         }
+        if ("Package".equals(kind)) {
+            Object pkgClass = call(call(mirror, "staticPackage", 1, full), "moduleClass", 0);
+            sourceSymbols.put(id, pkgClass);
+            sourceSymbolIds.put(pkgClass, id);
+            return pkgClass;
+        }
         Object owner = parent == 0 ? call(mirror, "EmptyPackageClass", 0) : sourceSymbol(parent);
+        known = sourceSymbols.get(id);
+        if (known != null) return known;
         Object internal = call(universe, "internal", 0);
         Object pos = call(universe, "NoPosition", 0);
         long flags = flagsOf(answer.items.get(7));
+        if ("ModuleClass".equals(kind) || "Module".equals(kind)) {
+            return sourceModule(id, kind, name, full, owner, flags);
+        }
         Object symbol;
-        if ("Package".equals(kind) || "ModuleClass".equals(kind) || "Module".equals(kind)) {
-            if ("Package".equals(kind)) flags |= internalFlag("PACKAGE");
-            String simple = name.endsWith("$") ? name.substring(0, name.length() - 1) : name;
-            flags |= internalFlag("MODULE");
-            Object module = newSourceSymbol("ModuleSymbol", owner, termName(simple), pos, flags);
-            Object moduleClass = newSourceSymbol("ModuleClassSymbol", owner, typeName(simple), pos,
-                flags & internalFlag("ModuleToClassFlags"));
-            call(universe, "connectModuleToClass", 2, module, moduleClass);
-            symbol = "Module".equals(kind) ? module : moduleClass;
-        } else if ("Class".equals(kind)) {
+        if ("Class".equals(kind)) {
             Object existing = synthetic.get(full);
             symbol = existing == null
                 ? newSourceSymbol("ClassSymbol", owner, typeName(name), pos, flags)
-                : call(existing, "typeSymbol", 0);
+                : call(existing, "typeSymbolDirect", 0);
         } else if ("Method".equals(kind)) {
             symbol = newSourceSymbol("MethodSymbol", owner, termName(name), pos, flags | internalFlag("METHOD"));
         } else if ("Term".equals(kind)) {
@@ -1168,15 +1151,70 @@ public final class ScalaRsMacroEngine {
         }
         sourceSymbols.put(id, symbol);
         sourceSymbolIds.put(symbol, id);
-        if ("Class".equals(kind) || "ModuleClass".equals(kind)) {
-            Object prefix = Boolean.TRUE.equals(call(owner, "isClass", 0))
-                ? call(internal, "thisType", 1, owner) : call(universe, "NoPrefix", 0);
-            Object tpe = call(internal, "typeRef", 3, prefix, symbol, list(new ArrayList<>()));
-            synthetic.put(full, tpe);
+        if ("Class".equals(kind)) {
+            synthetic.put(full, ownedTypeRef(owner, symbol));
         }
         Object lazy = lazyInfoConstructor().newInstance(universe, Long.valueOf(id));
         call(symbol, "setInfo", 1, lazy);
+        if ("Class".equals(kind)) {
+            enterInOwner(owner, symbol);
+            long companion = Long.parseLong(query("(q companion " + id + ")").items.get(2).text());
+            if (companion != 0) sourceSymbol(companion);
+        }
         return symbol;
+    }
+
+    /** An object: its module symbol and its module class, made once, both
+     * registered under their scala-rs identities. The module's info is the
+     * module class's type; the module class's info is asked for lazily. */
+    static Object sourceModule(long id, String kind, String name, String full, Object owner,
+                               long flags) throws Exception {
+        Sexp pair = query("(q modulePair " + id + ")");
+        long moduleId = Long.parseLong(pair.items.get(2).text());
+        long classId = Long.parseLong(pair.items.get(3).text());
+        Object known = sourceSymbols.get(id);
+        if (known != null) return known;
+        Object internal = call(universe, "internal", 0);
+        Object pos = call(universe, "NoPosition", 0);
+        String simple = name.endsWith("$") ? name.substring(0, name.length() - 1) : name;
+        flags |= internalFlag("MODULE");
+        Object module = newSourceSymbol("ModuleSymbol", owner, termName(simple), pos, flags);
+        Object moduleClass = newSourceSymbol("ModuleClassSymbol", owner, typeName(simple), pos,
+            flags & internalFlag("ModuleToClassFlags"));
+        call(universe, "connectModuleToClass", 2, module, moduleClass);
+        sourceSymbols.put(moduleId, module);
+        sourceSymbolIds.put(module, moduleId);
+        sourceSymbols.put(classId, moduleClass);
+        sourceSymbolIds.put(moduleClass, classId);
+        Object classType = ownedTypeRef(owner, moduleClass);
+        synthetic.put(full, classType);
+        call(call(internal, "reificationSupport", 0), "setInfo", 2, module, classType);
+        Object lazy = lazyInfoConstructor().newInstance(universe, Long.valueOf(classId));
+        call(moduleClass, "setInfo", 1, lazy);
+        enterInOwner(owner, module);
+        long companion = Long.parseLong(query("(q companion " + moduleId + ")").items.get(2).text());
+        if (companion != 0) sourceSymbol(companion);
+        return "Module".equals(kind) ? module : moduleClass;
+    }
+
+    /** `owner.this.C`, or `C` with no prefix for a local class. */
+    static Object ownedTypeRef(Object owner, Object symbol) throws Exception {
+        Object internal = call(universe, "internal", 0);
+        Object prefix = Boolean.TRUE.equals(call(owner, "isClass", 0))
+            ? call(internal, "thisType", 1, owner) : call(universe, "NoPrefix", 0);
+        return call(internal, "typeRef", 3, prefix, symbol, list(new ArrayList<>()));
+    }
+
+    /** Enter a class or an object into its package's scope, where nsc's
+     * companion lookup and the mirror's own name lookup find it. Only a
+     * package owner has a scope that outlives this exchange; a member of a
+     * class is found through that class's info instead. */
+    static void enterInOwner(Object owner, Object symbol) throws Exception {
+        if (!Boolean.TRUE.equals(call(owner, "isPackageClass", 0))) return;
+        Object decls = call(call(owner, "info", 0), "decls", 0);
+        Object existing = call(decls, "lookup", 1, call(symbol, "name", 0));
+        if (existing == symbol) return;
+        call(decls, "enter", 1, symbol);
     }
 
     /** Compiler-owned symbols may change lexical owners. Runtime classpath
@@ -1309,11 +1347,77 @@ public final class ScalaRsMacroEngine {
         return ((Number) call(flags, name, 0)).longValue();
     }
 
+    /**
+     * The views of a scala-rs `val` a class declaration was described with
+     * (getter, setter, field), by the negative code their lazy info carries.
+     * nsc makes two or three symbols of one `val`; each one's info is asked
+     * for as that view of the one scala-rs symbol.
+     */
+    static final java.util.Map<Long, Object[]> viewCodes = new java.util.HashMap<>();
+    static long nextViewCode = -1;
+
     /** Called by the generated LazyType subclass when reflection forces info. */
     public static void completeMirrorSymbol(long id, Object symbol) throws Exception {
-        Sexp answer = query("(q symbolInfo " + id + ")");
+        Sexp answer;
+        if (id < 0) {
+            Object[] view = viewCodes.get(id);
+            answer = query("(q viewInfo " + view[0] + " " + view[1] + ")");
+        } else {
+            answer = query("(q symbolInfo " + id + ")");
+        }
         Object info = sourceInfo(symbol, answer.items.get(2));
         call(symbol, "setInfo", 1, info);
+    }
+
+    /** A declaration of a class described lazily (`crate::expand_mirror`). */
+    static Object lazyDecl(Object owner, Sexp d) throws Exception {
+        String form = d.items.get(0).atom;
+        Object pos = call(universe, "NoPosition", 0);
+        if ("dm".equals(form)) {
+            long id = Long.parseLong(d.items.get(1).text());
+            String name = d.items.get(2).text();
+            long flags = flagsOf(d.items.get(3));
+            Object known = sourceSymbols.get(id);
+            if (known != null && call(known, "owner", 0) == owner) {
+                call(known, "setFlag", 1, Long.valueOf(flags));
+                return known;
+            }
+            Object sym = newSourceSymbol("MethodSymbol", owner, termName(name), pos,
+                flags | internalFlag("METHOD"));
+            if (known == null) {
+                sourceSymbols.put(id, sym);
+                sourceSymbolIds.put(sym, id);
+            }
+            call(sym, "setInfo", 1, lazyInfoConstructor().newInstance(universe, Long.valueOf(id)));
+            return sym;
+        }
+        if ("dv".equals(form)) {
+            long id = Long.parseLong(d.items.get(1).text());
+            String name = d.items.get(2).text();
+            String view = d.items.get(3).atom;
+            long flags = flagsOf(d.items.get(4));
+            Object sym = "field".equals(view)
+                ? newSourceSymbol("TermSymbol", owner, termName(name), pos, flags)
+                : newSourceSymbol("MethodSymbol", owner, termName(name), pos,
+                    flags | internalFlag("METHOD"));
+            if (!sourceSymbols.containsKey(id)) {
+                sourceSymbols.put(id, sym);
+                sourceSymbolIds.put(sym, id);
+            }
+            long code = nextViewCode--;
+            viewCodes.put(code, new Object[]{view, Long.valueOf(id)});
+            call(sym, "setInfo", 1, lazyInfoConstructor().newInstance(universe, Long.valueOf(code)));
+            return sym;
+        }
+        if ("de".equals(form)) {
+            String name = d.items.get(1).text();
+            long flags = flagsOf(d.items.get(2));
+            Object sym = newSourceSymbol("MethodSymbol", owner, termName(name), pos,
+                flags | internalFlag("METHOD"));
+            call(sym, "setInfo", 1, sourceInfo(sym, d.items.get(3)));
+            return sym;
+        }
+        throw gap("the macro mirror cannot read the declaration " + d);
     }
 
     static Object sourceInfo(Object owner, Sexp s) throws Exception {
@@ -1324,18 +1428,35 @@ public final class ScalaRsMacroEngine {
         if ("method".equals(kind)) {
             List<Object> params = new ArrayList<>();
             for (Sexp arg : s.items.get(1).items.subList(1, s.items.get(1).items.size())) {
+                if ("argn".equals(arg.items.get(0).atom)) {
+                    // A parameter with no scala-rs symbol of its own: nsc's
+                    // `x$1`, or a case constructor's parameter, whose symbol
+                    // in scala-rs is the field it initialises.
+                    Object param = newSourceSymbol("TermSymbol", owner,
+                        termName(arg.items.get(1).text()), call(universe, "NoPosition", 0),
+                        flagsOf(arg.items.get(2)) | flagValue("PARAM"));
+                    call(param, "setInfo", 1, typeFor(arg.items.get(3)));
+                    params.add(param);
+                    continue;
+                }
                 Object param = sourceSymbol(Long.parseLong(arg.items.get(1).text()));
                 call(param, "setInfo", 1, typeFor(arg.items.get(2)));
                 params.add(param);
             }
             return call(internal, "methodType", 2, list(params), sourceInfo(owner, s.items.get(2)));
         }
+        if ("selftype".equals(kind)) {
+            // An object's constructor returns the object's own type.
+            Object cls = call(owner, "owner", 0);
+            return ownedTypeRef(call(cls, "owner", 0), cls);
+        }
         if ("classinfo".equals(kind)) {
             List<Object> parents = new ArrayList<>();
             for (Sexp ty : s.items.get(1).items.subList(1, s.items.get(1).items.size())) parents.add(typeFor(ty));
             List<Object> decls = new ArrayList<>();
-            Object tpe = call(internal, "typeRef", 3, call(universe, "NoPrefix", 0), owner, list(new ArrayList<>()));
-            for (Sexp decl : s.items.get(2).items.subList(1, s.items.get(2).items.size())) decls.add(declSymbol(owner, tpe, decl));
+            for (Sexp decl : s.items.get(2).items.subList(1, s.items.get(2).items.size())) {
+                decls.add(lazyDecl(owner, decl));
+            }
             return call(internal, "classInfoType", 3, list(parents), call(internal, "newScopeWith", 1, seq(decls)), owner);
         }
         return typeFor(s);
