@@ -1017,6 +1017,11 @@ impl Typer {
                     if let Some((only, ty)) = self.alt_taking_targs(sym, targs.len()) {
                         sym = only;
                         base_ty = ty;
+                    } else if !matches!(fun_pt, Type::Method { .. }) {
+                        if let Some((only, ty)) = self.implicit_alt_beats_nullary(fun, &targs, pt) {
+                            sym = only;
+                            base_ty = ty;
+                        }
                     }
                     // `Module[T1, T2]` with no explicit `.apply` written still
                     // means the type args target the module's generic `apply`
@@ -1636,7 +1641,7 @@ impl Typer {
                     // un-applied `new C` carries the class's own parameters as
                     // placeholders, which satisfy their own bounds and so pass
                     // this silently.
-                    if let Type::Class { sym, args } = tpt.ty.clone() {
+                    if let Type::Class { sym, args } = crate::prefix::strip_view(&tpt.ty).clone() {
                         self.check_class_tparam_bounds(sym, &args, tpt.span);
                     }
                 } else if matches!(&tpt.kind, TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE)
@@ -1706,10 +1711,14 @@ impl Typer {
                         .find(|s| self.st.get(*s).kind == SymKind::Class)
                     {
                         tpt.sym = id;
-                        tpt.ty = Type::Class {
+                        // `new In` inside `Outer` is a `C.this.In`, the same
+                        // as the type `In` written there (`prefix.rs`).
+                        tpt.ty = self.this_prefixed(Type::Class {
                             sym: id,
                             args: vec![],
-                        };
+                        });
+                        // A written `new C1` names the class.
+                        self.note_cto_ref(id, tpt.span);
                     } else if let Some(alias) = self.new_alias_target(&found, tpt.span) {
                         // `new A(…)` where `type A = C`: nsc constructs the
                         // alias's right-hand side. The alias symbol has no

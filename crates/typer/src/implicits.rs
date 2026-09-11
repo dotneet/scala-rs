@@ -325,7 +325,26 @@ impl Typer {
             );
         for sc in self.st.scopes.iter().rev() {
             for (name, ids) in sc.entries() {
-                if !shadowed_names.insert(name.as_str()) {
+                // Types and terms are separate namespaces (SLS 2): a *type*
+                // named `F` hides no term `F`. cats' `new Parallel[IorT[F0, E,
+                // *]] { type F[x] = IorT[F0, E, x]; … }` sits inside a method
+                // whose `implicit F: Monad[F0]` is the `Applicative[F0]` the
+                // body's `IorT.pure(a)` needs, and the anonymous class's type
+                // member took it out of the search.
+                let binds_term = ids.iter().any(|b| {
+                    !matches!(
+                        self.st.get(b.sym).kind,
+                        crate::symbol::SymKind::Class
+                            | crate::symbol::SymKind::TypeParam
+                            | crate::symbol::SymKind::TypeMember
+                    )
+                });
+                let hidden = if binds_term {
+                    !shadowed_names.insert(name.as_str())
+                } else {
+                    shadowed_names.contains(name.as_str())
+                };
+                if hidden {
                     continue;
                 }
                 // Every binding of the name, whatever its SLS 2 precedence:
@@ -707,6 +726,20 @@ impl Typer {
             Type::Refined { parents, .. } => {
                 for p in parents {
                     self.collect_type_parts(p, out, seen);
+                }
+                // SLS 7.2: the parts of `p.T` include the parts of `p.type`,
+                // and those of `S#T` the parts of `S`. An inner class behind
+                // a prefix (`prefix.rs`) carries exactly that prefix, so
+                // `StrTypes.BCT[String]` sees the implicits `object StrTypes`
+                // declares.
+                if let Some(pre) = crate::prefix::view_prefix(ty) {
+                    let pre = match pre {
+                        Type::ThisType(c) if !c.is_none() => self.st.type_of_class(*c),
+                        other => self.st.widen_prefix(other),
+                    };
+                    if !pre.is_no_type() {
+                        self.collect_type_parts(&pre, out, seen);
+                    }
                 }
             }
             // A still-abstract type member offers only its upper bound's
@@ -3773,6 +3806,35 @@ impl<'a> Unify<'a> {
                 Some(prev) => self.unify_at(a, &prev, depth + 1),
                 None => self.bind(id, a),
             };
+        }
+        // An inner class behind a prefix (`prefix.rs`) unifies as the class it
+        // is -- the prefix decides conformance, not what the arguments are.
+        // Against a *different* class its base type there is read through the
+        // prefix, which is what instantiates the enclosing class's parameters:
+        // `refl: A =:= A` fitted to `hm.KeySet <:< MySet[?T]` solves `?T` from
+        // `MySet[Int]`, not `MySet[K]`.
+        let (av, bv) = (
+            crate::symbol::SymbolTable::as_seen_from_view(a).is_some(),
+            crate::symbol::SymbolTable::as_seen_from_view(b).is_some(),
+        );
+        if av || bv {
+            let ca = crate::prefix::strip_view(a).clone();
+            let cb = crate::prefix::strip_view(b).clone();
+            if let (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) = (&ca, &cb) {
+                if s1 != s2 {
+                    if av {
+                        if let Some(bt) = self.typer.base_type_instance(a, *s2, 0) {
+                            return self.unify_at(&bt, &cb, depth + 1);
+                        }
+                    }
+                    if bv {
+                        if let Some(bt) = self.typer.base_type_instance(b, *s1, 0) {
+                            return self.unify_at(&ca, &bt, depth + 1);
+                        }
+                    }
+                }
+            }
+            return self.unify_at(&ca, &cb, depth + 1);
         }
         // `_` in the wanted type is a position the search is not asking about.
         // slick writes `packedValue[R](implicit ev: Shape[? <: Level, T, ?, R])`

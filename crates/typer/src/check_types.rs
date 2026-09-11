@@ -163,7 +163,27 @@ impl Typer {
                 self.expose_unqualified_type(name, tpt.span);
                 let name = name.clone();
                 let ty = self.resolve_type_name_completing(&name, &[], tpt.span);
-                self.reject_unresolved_type(ty, &name, tpt.span)
+                // Only a *written* name: a tree the compiler built (the
+                // conversion an implicit class desugars to) arrives resolved.
+                if self.any_cto && tpt.sym.is_none() {
+                    // The name is the reference: an alias `type Al = K` is
+                    // not a reference to `K` (nsc checks the symbol the tree
+                    // names), and by now it has been expanded.
+                    let named = self.st.lookup_type(&name).first().copied();
+                    let sym = match (named, &ty) {
+                        (Some(n), _) if self.st.get(n).kind == SymKind::TypeMember => Some(n),
+                        (
+                            _,
+                            Type::Class { sym, .. } | Type::TypeMember(sym) | Type::ModuleRef(sym),
+                        ) => Some(*sym),
+                        (n, _) => n,
+                    };
+                    if let Some(sym) = sym {
+                        self.note_cto_ref(sym, tpt.span);
+                    }
+                }
+                let ty = self.reject_unresolved_type(ty, &name, tpt.span);
+                self.this_prefixed(ty)
             }
             TreeKind::Select { name, qual } => {
                 if let TreeKind::Ident { name: q } = &qual.kind {
@@ -176,6 +196,7 @@ impl Typer {
                     t
                 } else if let Some(id) = self.lookup_qualified_type(qual, name) {
                     self.complete_lazy_sig(id, tpt.span);
+                    self.note_cto_ref(id, tpt.span);
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
@@ -262,6 +283,7 @@ impl Typer {
             TreeKind::SingletonTypeTree { ref_ } => self.singleton_to_type(tpt.span, ref_),
             TreeKind::AnnotatedTypeTree { tpt: inner, annot } => {
                 let ty = self.tree_to_type(inner);
+                self.note_cto_type_name(annot, annot.span);
                 let path = annot.annotation_path();
                 let simple = path.rsplit('.').next().unwrap_or(path.as_str()).to_string();
                 Type::Annotated {
@@ -615,7 +637,142 @@ impl Typer {
             args: vec![],
         };
         let decls = self.projection_refinements(prefix, pcls, member);
-        Self::as_seen_from(base, decls)
+        let t = Self::as_seen_from(base, decls);
+        // An inner class of a class is a different type per enclosing
+        // instance, and the prefix is what tells them apart and what
+        // instantiates the enclosing class's type parameters in its members
+        // (`prefix.rs`). A type prefix is the projection `P#In`; a stable
+        // path gets its singleton from `path_dependent_type`.
+        if self.st.is_inner_class_of_class(member) {
+            crate::prefix::with_prefix(t, prefix.clone())
+        } else {
+            t
+        }
+    }
+
+    /// The singleton type of a stable path written as a type prefix
+    /// (`p.In`, `a.b.In`, `this.In`, `O.In`), or `None` when the path is
+    /// not one this compiler can name (a `super`, a package).
+    ///
+    /// Unlike `singleton_to_type`, which keeps only the last term, every
+    /// term of the path is kept: `x.p.In` and `p.In` are two types.
+    pub(crate) fn singleton_prefix_of(&self, path: &Tree) -> Option<Type> {
+        match &path.kind {
+            TreeKind::This { qual } => {
+                let id = match qual {
+                    Some(name) => self
+                        .st
+                        .enclosing_class_named(self.st.this_class, name)
+                        .unwrap_or(self.st.this_class),
+                    None => self.st.this_class,
+                };
+                (!id.is_none()).then_some(Type::ThisType(id))
+            }
+            TreeKind::Ident { name } => {
+                let sym = if !path.sym.is_none()
+                    && matches!(
+                        self.st.get(path.sym).kind,
+                        SymKind::Term | SymKind::Method | SymKind::Module | SymKind::ModuleClass
+                    ) {
+                    path.sym
+                } else {
+                    self.st
+                        .lookup_term(name)
+                        .into_iter()
+                        .find(|s| self.names_a_singleton(*s))?
+                };
+                Some(self.singleton_of_sym(sym, None))
+            }
+            TreeKind::Select { qual, name }
+            | TreeKind::SelectFromTypeTree {
+                qual,
+                name,
+                hash: false,
+            } => {
+                let qpre = self.singleton_prefix_of(qual);
+                let sym = if !path.sym.is_none()
+                    && matches!(
+                        self.st.get(path.sym).kind,
+                        SymKind::Term | SymKind::Method | SymKind::Module | SymKind::ModuleClass
+                    ) {
+                    path.sym
+                } else {
+                    let qty = self.term_path_type(qual)?;
+                    let cls = self.st.class_sym_of(&qty)?;
+                    self.st
+                        .lookup_member(cls, name)
+                        .into_iter()
+                        .find(|s| self.names_a_singleton(*s))?
+                };
+                Some(self.singleton_of_sym(sym, qpre))
+            }
+            _ => None,
+        }
+    }
+
+    /// `sym.type` under the prefix `qpre` (the enclosing path), or under the
+    /// owner's `this` for a member reached bare, or under nothing for a local.
+    fn singleton_of_sym(&self, sym: SymbolId, qpre: Option<Type>) -> Type {
+        let s = self.st.get(sym);
+        if matches!(s.kind, SymKind::Module | SymKind::ModuleClass) {
+            // An object nested in a class is one value *per enclosing
+            // instance*, so `p.O` keeps `p` (`rewrite_view_this` steps out
+            // through it); a top-level or object-nested object is one value.
+            let mcls = self.st.module_class_of(sym);
+            let owner = s.owner;
+            let per_instance = !owner.is_none()
+                && self.st.get(owner).kind == SymKind::Class
+                && !self.st.get(owner).flags.contains(Flags::MODULE);
+            return match qpre {
+                Some(p) if per_instance => Type::SingleType {
+                    prefix: Box::new(p),
+                    sym: mcls,
+                },
+                None if per_instance => Type::SingleType {
+                    prefix: Box::new(Type::ThisType(owner)),
+                    sym: mcls,
+                },
+                _ => Type::ModuleRef(mcls),
+            };
+        }
+        // A class's self alias is another spelling of its `this`.
+        if qpre.is_none() && !s.owner.is_none() && self.st.get(s.owner).self_alias == Some(sym) {
+            return Type::ThisType(s.owner);
+        }
+        let prefix = match qpre {
+            Some(p) => p,
+            None => {
+                let owner = s.owner;
+                if owner.is_none() || !self.st.get(owner).is_class_like() {
+                    Type::NoType
+                } else {
+                    Type::ThisType(owner)
+                }
+            }
+        };
+        Type::SingleType {
+            prefix: Box::new(prefix),
+            sym,
+        }
+    }
+
+    /// `In` written bare inside a class that has it as a member (declared or
+    /// inherited): nsc's `C.this.In` for the innermost such enclosing class
+    /// `C`. A class reached some other way (an import, a local) keeps its
+    /// bare, unknown prefix.
+    pub(crate) fn this_prefixed(&self, ty: Type) -> Type {
+        let Type::Class { sym, .. } = &ty else {
+            return ty;
+        };
+        if !self.st.is_inner_class_of_class(*sym) || self.st.this_class.is_none() {
+            return ty;
+        }
+        let owner = self.st.get(*sym).owner;
+        let c = self.ident_prefix_class(owner);
+        if c.is_none() || (c != owner && !self.st.is_ancestor_of(owner, c)) {
+            return ty;
+        }
+        crate::prefix::with_prefix(ty, Type::ThisType(c))
     }
 
     /// `M.C` where `M` is an object and `C` a class it *inherits* from the
@@ -917,6 +1074,24 @@ impl Typer {
     }
 
     fn project_from_prefix(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
+        self.project_from_prefix_at(span, prefix, name, prefix)
+    }
+
+    /// `project_from_prefix`, reading the member as seen from `at`: the
+    /// prefix itself for `P#T`, the path's singleton for `p.T`. A member
+    /// written in terms of the enclosing class's `this` -- `type Session =
+    /// JdbcSessionDef`, an inner class -- means that class's instance *at
+    /// the prefix* once projected (`prefix.rs`): `JdbcBackend#Session` is
+    /// `JdbcBackend#JdbcSessionDef`, and `p.Session` is `p.JdbcSessionDef`.
+    fn project_from_prefix_at(&mut self, span: Span, prefix: &Type, name: &str, at: &Type) -> Type {
+        let t = self.project_from_prefix_in(span, prefix, name);
+        if t.is_error() || !self.st.mentions_inner_class(&t) {
+            return t;
+        }
+        self.st.rewrite_view_this(prefix, Some(at), &t)
+    }
+
+    fn project_from_prefix_in(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
         // A projection out of a prefix that already failed reports nothing new.
         if prefix.is_error() {
             return Type::Error;
@@ -1076,6 +1251,7 @@ impl Typer {
                 SymKind::Class | SymKind::ModuleClass => self.projected_class_type(prefix, cls, m),
                 _ => continue,
             };
+            self.note_cto_ref(m, span);
             return self.st.expand_in_type(prefix, &ty);
         }
         // Nothing under that name yet. A class read from a jar has its members
@@ -1102,6 +1278,13 @@ impl Typer {
     }
 
     fn path_dependent_type(&mut self, span: Span, prefix: &Tree, name: &str) -> Type {
+        // The path's head may be a member whose type is still inferred from its
+        // right-hand side. A template types its type aliases before its other
+        // signatures, so cats' `new Representable[…] { val FG =
+        // F0.compose(G0); type Representation = FG.Representation }` read
+        // `FG` as `<notype>` (`type Representation is not a member of
+        // <notype>`). nsc's lazy completer types `FG` right there.
+        self.complete_path_head(prefix, span);
         if !self.is_stable_path(prefix) {
             self.error(
                 span,
@@ -1122,8 +1305,39 @@ impl Typer {
             );
             return Type::Error;
         };
-        let t = self.project_from_prefix(span, &pty, name);
+        // `p.In` for an inner class: the type prefix `projected_class_type`
+        // recorded is the projection; the path names one instance.
+        let spre = self.singleton_prefix_of(prefix);
+        let t = match &spre {
+            Some(sp) => self.project_from_prefix_at(span, &pty, name, sp),
+            None => self.project_from_prefix(span, &pty, name),
+        };
+        let t = match (crate::prefix::strip_view(&t), spre) {
+            (Type::Class { sym, .. }, Some(pre)) if self.st.is_inner_class_of_class(*sym) => {
+                crate::prefix::with_prefix(t, pre)
+            }
+            _ => t,
+        };
         self.at_term_path(prefix, &pty, t)
+    }
+
+    /// Complete the signature of the term a type path starts from, when it is
+    /// still pending (an unannotated `val` of the template being typed).
+    fn complete_path_head(&mut self, prefix: &Tree, span: Span) {
+        let mut head = prefix;
+        while let TreeKind::Select { qual, .. } = &head.kind {
+            head = qual;
+        }
+        let TreeKind::Ident { name } = &head.kind else {
+            return;
+        };
+        let pending = self.st.lookup_term(name).into_iter().find(|s| {
+            let sy = self.st.get(*s);
+            matches!(sy.kind, SymKind::Term | SymKind::Method) && sy.ty.is_no_type()
+        });
+        if let Some(s) = pending {
+            self.complete_lazy_sig(s, span);
+        }
     }
 
     /// The chain of term symbols a stable path names (`a.b.c` -> `[a, b, c]`),

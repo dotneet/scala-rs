@@ -2312,23 +2312,29 @@ impl Typer {
         if prefix == owner {
             return ty;
         }
-        self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty)
+        // Selected on `prefix.this`: that is the prefix an inner class in
+        // the member's type gets (`prefix.rs`), not the class type it is
+        // read through -- `def use: In = mk` inside `Sub` reads `mk`'s `In`
+        // as `Sub.this.In`.
+        self.st.subst_as_seen_from_at(
+            &self.class_this_ty(prefix),
+            Some(&Type::ThisType(prefix)),
+            &ty,
+        )
     }
 
-    /// The class whose `this` an unqualified reference to a member of
-    /// `owner` is selected on: the innermost enclosing class that has `owner`
-    /// as a base class (or is `owner`), which is not always the class the
-    /// reference is written in.
+    /// The enclosing class an unqualified reference to a member of `owner`
+    /// is made through -- nsc's `C.this` for the innermost enclosing `C` that
+    /// has the member, by inheritance or through its self type. Usually that
+    /// is `this_class` itself; it is an *outer* class when the name was found
+    /// in an enclosing template. cats' `trait Parallel[M[_]] extends
+    /// NonEmptyParallel[M]` writes `new ApplicativeError[F, E] { … parallel(…)
+    /// … }`, and `parallel: M ~> F` read through the anonymous class kept
+    /// `NonEmptyParallel`'s own `M` -- `no matching overload for (M[A])F[A]
+    /// with arguments (M[A])`, two `M`s printed alike.
     ///
-    /// `SetOps[A, CC, C]` declares `private class SubsetsItr` whose `next()`
-    /// calls the inherited `newSpecificBuilder` bare. That member is
-    /// `IterableOps`', and the reference means `SetOps.this.newSpecificBuilder`
-    /// -- `SubsetsItr` does not extend `IterableOps` at all. Reading it through
-    /// `SubsetsItr` left `IterableOps`' own `A` and `C` in place, so
-    /// `buf += elms(idx)` was "no matching overload ... with arguments (A)".
-    ///
-    /// Falls back to the current class when no enclosing class derives from
-    /// `owner` (a member reached some other way keeps what it did before).
+    /// Falls back to `this_class` when no enclosing class has the member, so
+    /// every shape that was read through `this_class` before still is.
     pub(crate) fn ident_prefix_class(&self, owner: SymbolId) -> SymbolId {
         self.st
             .enclosing_class_reaching(owner)
@@ -2354,6 +2360,13 @@ impl Typer {
     pub(crate) fn ctor_outer_prefix(&self, class_id: SymbolId, tpt: &Tree) -> Option<Type> {
         if class_id.is_none() {
             return None;
+        }
+        // The head already carries the prefix (`prefix.rs`): `new o.In(…)`,
+        // or the `new Rec(…)` the `copy` rewrite builds for an `r: o.Rec`.
+        if let Some(pre) = crate::prefix::view_prefix(&tpt.ty) {
+            if !pre.is_no_type() {
+                return Some(pre.clone());
+            }
         }
         let owner = self.st.get(class_id).owner;
         if owner.is_none()
@@ -2493,7 +2506,11 @@ impl Typer {
                 {
                     let prefix = self.ident_prefix_class(owner);
                     if prefix != owner {
-                        ty = self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty);
+                        ty = self.st.subst_as_seen_from_at(
+                            &self.class_this_ty(prefix),
+                            Some(&Type::ThisType(prefix)),
+                            &ty,
+                        );
                     }
                 }
             }

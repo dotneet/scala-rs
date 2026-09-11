@@ -15,6 +15,7 @@ mod check_select;
 mod check_template;
 mod check_types;
 mod classpath;
+mod compile_time_only;
 mod ctor_defaults;
 mod cyclic;
 mod default_recv;
@@ -45,6 +46,7 @@ pub use override_check::{method_overloads, method_overrides, record_method_overr
 mod interp_pattern;
 mod pickle_supply;
 mod predef_reimport;
+mod prefix;
 mod prelude;
 mod prelude_arrconv;
 mod prelude_boolbit;
