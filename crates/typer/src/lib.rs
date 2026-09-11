@@ -103,7 +103,6 @@ mod quasiquote;
 mod reify;
 mod reify_expand;
 mod seqfn_view;
-mod setter_conflict;
 mod source_features;
 mod specialize;
 mod strictfp;

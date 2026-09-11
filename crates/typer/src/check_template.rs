@@ -1209,8 +1209,17 @@ impl Typer {
                 // The signature pass and the body pass both bind the alias;
                 // allocating twice would make `self` look like an overload.
                 let sid = self.st.get(class_id).self_alias.unwrap_or_else(|| {
-                    self.st
-                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "")
+                    let sid = self
+                        .st
+                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "");
+                    // Owned by the template (the `self_alias` checks read the
+                    // owner) but not one of its members: `(x: F).self` is
+                    // `value self is not a member of F` in nsc, and a member
+                    // lookup that walked into `Function1`'s `self =>` made
+                    // `s.self` on `WrappedString(private val self: String)`
+                    // an overload of the field and `Function1.this.type`.
+                    self.st.get_mut(class_id).members.retain(|&m| m != sid);
+                    sid
                 });
                 self.st.get_mut(class_id).self_alias = Some(sid);
                 self.st.get_mut(sid).ty = st;
@@ -1503,7 +1512,6 @@ impl Typer {
             .filter(|t| matches!(t.kind, TreeKind::DefDef { .. }))
             .map(|t| t.sym)
             .collect();
-        self.check_setter_conflicts(class_id, body);
         for e in crate::double_def::check_double_defs(&self.st, class_id, &members) {
             let Some(at) = body
                 .iter()
@@ -1513,6 +1521,60 @@ impl Typer {
                 continue;
             };
             self.error(at, e.message);
+        }
+        self.check_var_setter_twice(body);
+    }
+
+    /// A template `var x: T` has the setter `x_=(T): Unit`, so a `def x_=`
+    /// of the same parameter type beside it is that setter written twice
+    /// (nsc's namer: "method x_= is defined twice; the conflicting variable x
+    /// was defined at ..."; `neg/t591`). Only an exact match of the one
+    /// parameter's type is reported; a `def x_=` taking some other type is an
+    /// overload.
+    fn check_var_setter_twice(&mut self, body: &[Tree]) {
+        let vars: Vec<(String, Type)> = body
+            .iter()
+            .filter_map(|t| match &t.kind {
+                // A `private[this] var` is a bare field with no setter, so
+                // nothing conflicts with it (scalac 2.13.16 accepts
+                // `private[this] var x: Int = 0; def x_=(v: Int) = ()`).
+                TreeKind::ValDef { mods, name, .. }
+                    if mods.flags.contains(Flags::MUTABLE)
+                        && !mods.flags.contains(Flags::LOCAL)
+                        && !t.sym.is_none()
+                        && !self.block_local_defs.contains(&(self.file_index, t.id)) =>
+                {
+                    let ty = self.st.get(t.sym).ty.clone();
+                    (!ty.is_no_type() && !ty.is_error()).then(|| (name.clone(), ty))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, ty) in vars {
+            let setter = format!("{name}_=");
+            for t in body {
+                let TreeKind::DefDef { name: dname, .. } = &t.kind else {
+                    continue;
+                };
+                if *dname != setter || t.sym.is_none() {
+                    continue;
+                }
+                let s = self.st.get(t.sym);
+                if s.flags.contains(Flags::SYNTHETIC) || s.flags.contains(Flags::ACCESSOR) {
+                    continue;
+                }
+                let same = matches!(&s.ty, Type::Method { paramss, .. }
+                    if paramss.len() == 1 && paramss[0].len() == 1 && paramss[0][0] == ty);
+                if same {
+                    self.error(
+                        t.span,
+                        format!(
+                            "method {setter} is defined twice;\n  the conflicting variable \
+                             {name} was defined earlier in the same template"
+                        ),
+                    );
+                }
+            }
         }
     }
 
@@ -1591,6 +1653,45 @@ impl Typer {
                 format!("class {name} needs to be a trait to be mixed in"),
             );
         }
+    }
+
+    /// A member trait's self type read from the class that mixes it in.
+    ///
+    /// `protected trait GenKeySet { this: Set[K] => }` is declared inside
+    /// `MapOps[K, …]`, so its `K` is `MapOps`'s. A class nested in a subclass
+    /// of `MapOps` -- `SortedMapOps[K, …]`'s `class KeySortedSet extends
+    /// SortedSet[K] with GenKeySet`, `HashMap[K, V]`'s `class HashKeySet` --
+    /// mixes it in through its *enclosing* `this`, where that `K` is the
+    /// subclass's own. Without reading it there, all four key-set classes in
+    /// scala/scala's `src/library` were "self-type … does not conform to
+    /// Set[K]": one `K` against another.
+    fn outer_self_type_at(&self, class_id: SymbolId, trait_id: SymbolId, ty: Type) -> Type {
+        let decl_owner = self.st.get(trait_id).owner;
+        if decl_owner.is_none()
+            || !matches!(
+                self.st.get(decl_owner).kind,
+                SymKind::Class | SymKind::ModuleClass
+            )
+        {
+            return ty;
+        }
+        let mut c = self.st.get(class_id).owner;
+        for _ in 0..32 {
+            if c.is_none() {
+                return ty;
+            }
+            let s = self.st.get(c);
+            if matches!(s.kind, SymKind::Class | SymKind::ModuleClass)
+                && (c == decl_owner || self.st.is_ancestor_of(decl_owner, c))
+            {
+                if c == decl_owner {
+                    return ty;
+                }
+                return self.st.subst_as_seen_from(&Type::ThisType(c), &ty);
+            }
+            c = s.owner;
+        }
+        ty
     }
 
     fn check_self_conformance(&mut self, class_id: SymbolId, span: Span) {
@@ -1695,8 +1796,16 @@ impl Typer {
                 // cats' `Nested` self types came out as the doubly-applied
                 // `Apply[[α][F, G, α]F[G[α]][F, G, G[α]]]` and were rejected.
                 let st = self.st.subst_tparams(id, &args, &st);
-                let st = self.st.expand_type_members(class_id, &st);
-                if !self.st.is_sub_type(&this_ty, &st) {
+                // Read at the enclosing `this` (see `outer_self_type_at`) *or*
+                // as declared: a class type carries no prefix here, so a base
+                // class nested in the same outer (`LinkedHashMap`'s
+                // `LinkedKeySet extends KeySet`, `KeySet` declared in `MapOps`)
+                // still reaches `Set[K]` in `MapOps`'s own vocabulary.
+                let declared = self.st.expand_type_members(class_id, &st);
+                let seen = self.outer_self_type_at(class_id, id, st);
+                let st = self.st.expand_type_members(class_id, &seen);
+                if !self.st.is_sub_type(&this_ty, &st) && !self.st.is_sub_type(&this_ty, &declared)
+                {
                     self.error(
                         span,
                         format!(

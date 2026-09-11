@@ -1058,12 +1058,78 @@ pub(crate) fn outer_chain_reaches_owner(st: &SymbolTable, from: SymbolId, owner:
     false
 }
 
+/// The statically reachable singleton, lexically around `from`, that
+/// inherits the members of `owner`: an enclosing top-level (or
+/// object-nested) `object`, or the package object of an enclosing package.
+///
+/// Neither has an `$outer` link from the classes written inside it, so the
+/// instance walk in [`load_owner_instance`] cannot reach one; a bare name that
+/// the typer resolved to a member such an object *inherits* (`duh` from
+/// `object O extends Duh`, or from `package object bar extends Duh`) used to
+/// be called on `this` -- `ClassCastException: O$Main$ cannot be cast to Duh`
+/// (`run/t1987`, `run/t1987b`, `run/t5604`). Only a singleton reached
+/// through `MODULE$` qualifies; one nested in a class has an owner instance
+/// and is the walk's business.
+pub(crate) fn static_module_supplying(
+    st: &SymbolTable,
+    from: SymbolId,
+    owner: SymbolId,
+) -> Option<SymbolId> {
+    // A `self: Duh =>` annotation supplies the member on `this` itself.
+    if self_type_supplies(st, from, owner) {
+        return None;
+    }
+    let mut cur = st.get(from).owner;
+    let mut seen = HashSet::new();
+    while !cur.is_none() && seen.insert(cur.0) {
+        let s = st.get(cur);
+        match s.kind {
+            SymKind::ModuleClass | SymKind::Module => {
+                let m = module_class_id(st, cur);
+                if member_module_outer(st, m).is_some() {
+                    return None;
+                }
+                if self_reaches_owner(st, m, owner) {
+                    return Some(m);
+                }
+            }
+            SymKind::Package => {
+                if let Some(m) = package_object_module(st, cur) {
+                    if self_reaches_owner(st, m, owner) {
+                        return Some(m);
+                    }
+                }
+            }
+            // An instance class stops the search: whatever is further out is
+            // reached through its `$outer`, not statically.
+            SymKind::Class
+                if !s.flags.contains(Flags::MODULE) && enclosing_instance(st, cur).is_some() =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        cur = s.owner;
+    }
+    None
+}
+
 /// Push the instance that owns `owner`'s members: `this`, or the `$outer`
 /// chain of the class being emitted when the member lives further out.
 /// `cur` is the class we are lexically inside (it decides the next hop),
 /// `held` the static type on the stack — the two differ when a trait's
 /// `$outer` is typed as the trait's self type.
 pub(crate) fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: SymbolId) {
+    if !ctx.class_sym.is_none()
+        && !owner.is_none()
+        && !self_reaches_owner(ctx.st, ctx.class_sym, owner)
+        && !outer_chain_reaches_owner(ctx.st, ctx.class_sym, owner)
+    {
+        if let Some(m) = static_module_supplying(ctx.st, ctx.class_sym, owner) {
+            load_module_instance(asm, ctx, m);
+            return;
+        }
+    }
     let hops = !ctx.class_sym.is_none()
         && !owner.is_none()
         && (!self_reaches_owner(ctx.st, ctx.class_sym, owner)

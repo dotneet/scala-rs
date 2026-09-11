@@ -398,7 +398,7 @@ impl Typer {
     /// an imported implicit at the prefix's type
     /// (`Typer::implicit_candidate_ty`). A member the enclosing class already
     /// has is reached through `this` and is not this import's.
-    pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<&Tree> {
+    pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<Tree> {
         if owner.is_none() || self.term_import_prefixes.is_empty() {
             return None;
         }
@@ -411,11 +411,74 @@ impl Typer {
         self.term_import_prefixes
             .iter()
             .rev()
-            .find(|(o, q)| {
-                (*o == owner || crate::pickle_supply::inherits_from(&self.st, *o, owner))
-                    && self.prefix_in_scope(q)
+            .filter(|(o, _)| {
+                *o == owner || crate::pickle_supply::inherits_from(&self.st, *o, owner)
             })
-            .map(|(_, q)| q)
+            .find_map(|(_, q)| self.writable_import_prefix(q))
+    }
+
+    /// The import prefix `q` as it can be written here: itself when its root
+    /// name still resolves to the same symbol ([`Self::prefix_in_scope`]),
+    /// or, when a nearer binding shadows that name, the same member read
+    /// through the enclosing class's `this`.
+    ///
+    /// An import's qualifier is resolved where the import stands (SLS 4.7);
+    /// a later binding of the same name hides the *name*, not what the import
+    /// already means. `NumericRange[T](...)(implicit num: Integral[T])` writes
+    /// `import num._` in its body and then `def sum[B >: T](implicit num:
+    /// Numeric[B])`, whose `i = i + step` still goes through the class's
+    /// `num.mkNumericOps`. Requiring the name to resolve unshadowed dropped
+    /// that view, and `+` fell to `any2stringadd`. Only a member of a class
+    /// the reference sits inside can be re-spelled this way; a shadowed
+    /// local has no other spelling and stays out of reach.
+    fn writable_import_prefix(&self, q: &Tree) -> Option<Tree> {
+        if self.prefix_in_scope(q) {
+            return Some(q.clone());
+        }
+        fn root_mut(t: &mut Tree) -> &mut Tree {
+            if matches!(t.kind, TreeKind::Select { .. }) {
+                match &mut t.kind {
+                    TreeKind::Select { qual, .. } => root_mut(qual),
+                    _ => unreachable!(),
+                }
+            } else {
+                t
+            }
+        }
+        let mut out = q.clone();
+        let root = root_mut(&mut out);
+        let TreeKind::Ident { name } = &root.kind else {
+            return None;
+        };
+        let sym = root.sym;
+        if sym.is_none() || !matches!(self.st.get(sym).kind, SymKind::Term | SymKind::Method) {
+            return None;
+        }
+        let cls = self.st.get(sym).owner;
+        if cls.is_none() || !self.st.get(cls).is_class_like() {
+            return None;
+        }
+        let mut c = self.st.this_class;
+        while !c.is_none() && c != cls {
+            c = self.st.get(c).owner;
+        }
+        if c.is_none() {
+            return None;
+        }
+        let this = Tree {
+            span: root.span,
+            sym: cls,
+            ty: self.st.self_type_of_class(cls),
+            ..Tree::dummy(TreeKind::This {
+                qual: (cls != self.st.this_class).then(|| self.st.get(cls).name.clone()),
+            })
+        };
+        let name = name.clone();
+        root.kind = TreeKind::Select {
+            qual: Box::new(this),
+            name,
+        };
+        Some(out)
     }
 
     /// Turn an unqualified `Literal` that came from `import u._` back into
@@ -471,12 +534,13 @@ impl Typer {
             })
             .flatten()
             .filter(|_| needs_object_receiver);
-        let Some(prefix) =
-            imported_prefix.or_else(|| owners.iter().find_map(|&o| self.term_import_prefix_for(o)))
+        let Some(prefix) = imported_prefix
+            .cloned()
+            .or_else(|| owners.iter().find_map(|&o| self.term_import_prefix_for(o)))
         else {
             return false;
         };
-        let qual = prefix.clone();
+        let qual = prefix;
         // An import alias belongs to the local scope, not to the receiver.
         // All alternatives of an imported overload share the original name.
         let selected_name = self.st.get(found[0]).name.clone();
@@ -2044,6 +2108,26 @@ impl Typer {
         self.bind_found(tree, found, pt);
     }
 
+    /// The module term compiled to `<jvm>$`, wherever the table installed it.
+    fn binary_companion_module(&self, jvm: &str) -> Option<SymbolId> {
+        if jvm.is_empty() || jvm.starts_with('[') {
+            return None;
+        }
+        let internal = format!("{jvm}$");
+        let mc = crate::classpath::find_by_jvm(&self.st, &internal)?;
+        if self.st.get(mc).kind == SymKind::Module {
+            return Some(mc);
+        }
+        let held_by = self.st.get(mc).owner;
+        if held_by.is_none() {
+            return None;
+        }
+        self.st.get(held_by).members.iter().copied().find(|&m| {
+            self.st.get(m).kind == SymKind::Module
+                && (self.st.module_class_of(m) == mc || self.st.get(m).jvm_name == internal)
+        })
+    }
+
     /// The companion object of a class that is in scope under this name, read
     /// from its class file if nothing has read it yet.
     ///
@@ -2080,15 +2164,30 @@ impl Typer {
         }
         let mut modules = Vec::new();
         for cls in classes {
+            let jvm = self.st.get(cls).jvm_name.clone();
             if self.st.companion_module(cls).is_none() {
-                let jvm = self.st.get(cls).jvm_name.clone();
                 if jvm.is_empty() || jvm.starts_with('[') {
                     continue;
                 }
                 let owner = self.st.get(cls).owner;
                 self.load_binary_into(&format!("{jvm}$"), owner, span, true);
             }
-            if let Some(m) = self.st.companion_module(cls) {
+            // The prelude declares some library classes under a package they
+            // are only aliased into (`scala.Iterator` is
+            // `scala.collection.Iterator`). When the companion's class file was
+            // first read on another route -- `IterableOnce.iterator`'s result
+            // type, while typing `x.iterator` earlier in the file -- it was
+            // installed under its real package, the load above answers "already
+            // loaded", and the class's own owner still has no module of that
+            // name. The term then bound the *class*, and `Iterator.empty` went
+            // out with no receiver at all (`VerifyError: Operand stack
+            // underflow`, `run/t3269`). The class file decides: the module
+            // compiled as `<jvm>$` is the companion.
+            let companion = self
+                .st
+                .companion_module(cls)
+                .or_else(|| self.binary_companion_module(&jvm));
+            if let Some(m) = companion {
                 if !modules.contains(&m) {
                     modules.push(m);
                 }
@@ -2139,17 +2238,113 @@ impl Typer {
         if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
             return ty;
         }
-        let this_ty = Type::Class {
-            sym: self.st.this_class,
+        let prefix = self.ident_prefix_class(owner);
+        if prefix == owner {
+            return ty;
+        }
+        self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty)
+    }
+
+    /// The class whose `this` an unqualified reference to a member of
+    /// `owner` is selected on: the innermost enclosing class that has `owner`
+    /// as a base class (or is `owner`), which is not always the class the
+    /// reference is written in.
+    ///
+    /// `SetOps[A, CC, C]` declares `private class SubsetsItr` whose `next()`
+    /// calls the inherited `newSpecificBuilder` bare. That member is
+    /// `IterableOps`', and the reference means `SetOps.this.newSpecificBuilder`
+    /// -- `SubsetsItr` does not extend `IterableOps` at all. Reading it through
+    /// `SubsetsItr` left `IterableOps`' own `A` and `C` in place, so
+    /// `buf += elms(idx)` was "no matching overload ... with arguments (A)".
+    ///
+    /// Falls back to the current class when no enclosing class derives from
+    /// `owner` (a member reached some other way keeps what it did before).
+    pub(crate) fn ident_prefix_class(&self, owner: SymbolId) -> SymbolId {
+        let mut c = self.st.this_class;
+        while !c.is_none() {
+            if matches!(
+                self.st.get(c).kind,
+                SymKind::Class | SymKind::ModuleClass | SymKind::Module
+            ) && (c == owner || self.st.is_ancestor_of(owner, c))
+            {
+                return c;
+            }
+            c = self.st.get(c).owner;
+        }
+        self.st.this_class
+    }
+
+    /// The prefix an inner class is instantiated through, for reading its
+    /// constructor: `p.C(…)` / `new p.C(…)` is `p`'s type, and a bare `C(…)`
+    /// is the enclosing class that has `C`'s owner as a base
+    /// ([`Self::ident_prefix_class`]).
+    ///
+    /// A constructor parameter of a class nested in a generic trait is
+    /// written in that trait's type parameters. `Integral[T]` declares
+    /// `class IntegralOps(lhs: T) extends NumericOps(lhs)`, and `NumericOps`
+    /// is `Numeric`'s, so its `lhs: T` is `Numeric`'s `T` until it is read
+    /// through `Integral.this` -- "found: T (defined in trait Integral)
+    /// required: T (defined in trait Numeric)". `new StrNum.Ops(x)` reads
+    /// `Ops(lhs: T)` at `StrNum`'s `T = String` the same way.
+    ///
+    /// `None` when there is nothing to read through: a top-level or local
+    /// class, an outer class without type parameters, or a prefix that is a
+    /// type or package rather than a value.
+    pub(crate) fn ctor_outer_prefix(&self, class_id: SymbolId, tpt: &Tree) -> Option<Type> {
+        if class_id.is_none() {
+            return None;
+        }
+        let owner = self.st.get(class_id).owner;
+        if owner.is_none()
+            || !matches!(
+                self.st.get(owner).kind,
+                SymKind::Class | SymKind::ModuleClass
+            )
+            || self.st.get(owner).tparams.is_empty()
+        {
+            return None;
+        }
+        let mut head = tpt;
+        loop {
+            match &head.kind {
+                TreeKind::AppliedTypeTree { tpt, .. }
+                | TreeKind::TypeApply { fun: tpt, .. }
+                | TreeKind::AnnotatedTypeTree { tpt, .. } => head = tpt,
+                TreeKind::New { tpt } => head = tpt,
+                _ => break,
+            }
+        }
+        match &head.kind {
+            TreeKind::Ident { .. } => {
+                let prefix = self.ident_prefix_class(owner);
+                (prefix != owner && !prefix.is_none() && self.st.is_ancestor_of(owner, prefix))
+                    .then(|| self.class_this_ty(prefix))
+            }
+            TreeKind::Select { qual, .. } => {
+                let t = &qual.ty;
+                (!t.is_no_type()
+                    && !t.is_error()
+                    && self
+                        .st
+                        .class_sym_of(t)
+                        .is_some_and(|c| self.st.is_ancestor_of(owner, c)))
+                .then(|| t.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn class_this_ty(&self, cls: SymbolId) -> Type {
+        Type::Class {
+            sym: cls,
             args: self
                 .st
-                .get(self.st.this_class)
+                .get(cls)
                 .tparams
                 .iter()
                 .map(|t| Type::TypeParam(*t))
                 .collect(),
-        };
-        self.st.subst_as_seen_from(&this_ty, &ty)
+        }
     }
 
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
@@ -2235,17 +2430,10 @@ impl Typer {
                     && !private_this
                     && owner_is_class
                 {
-                    let this_ty = Type::Class {
-                        sym: self.st.this_class,
-                        args: self
-                            .st
-                            .get(self.st.this_class)
-                            .tparams
-                            .iter()
-                            .map(|t| Type::TypeParam(*t))
-                            .collect(),
-                    };
-                    ty = self.st.subst_as_seen_from(&this_ty, &ty);
+                    let prefix = self.ident_prefix_class(owner);
+                    if prefix != owner {
+                        ty = self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty);
+                    }
                 }
             }
             ty = self.maybe_auto_apply(ty, pt);
@@ -2299,9 +2487,14 @@ impl Typer {
                 (s, self.ident_ty_as_seen_from_this(s, t))
             })
             .collect();
-        if alts.iter().any(|(s, t)| &self.st.get(*s).ty != t) {
-            self.overload_member_types.insert(found[0].0, alts.clone());
-        }
+        // Filed unconditionally, as `type_select` does. The table is keyed by
+        // the first alternative's symbol alone, so skipping the insert when
+        // the types are already the declarations' left whatever an earlier
+        // *selection* of the same group had filed there: `addOne(it.next())`
+        // written bare inside `HashMapBuilder[K, V]` was resolved against the
+        // group as seen from some other `HashMapBuilder[K1, V1]` receiver,
+        // and nothing fit ("no matching overload ... with arguments ((K, V))").
+        self.overload_member_types.insert(found[0].0, alts.clone());
         let ov = Type::Overload(alts.iter().map(|(_, t)| t.clone()).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
         // The same rule the receiver form goes through in `type_select`: one

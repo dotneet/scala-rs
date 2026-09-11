@@ -147,6 +147,10 @@ pub struct Pool {
     /// `BootstrapMethods` (JVMS §4.7.23) entries, in attribute order:
     /// `(method handle index, static argument indices)`.
     bootstraps: Vec<(u16, Vec<u16>)>,
+    /// Method handles of the bodies of this class's *serializable* lambdas,
+    /// in first-use order: the argument list of the class's
+    /// `$deserializeLambda$` (see `ClassBuilder::finish_inner`).
+    pub serializable_lambdas: Vec<u16>,
 }
 
 impl Pool {

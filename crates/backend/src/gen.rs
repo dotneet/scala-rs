@@ -2,7 +2,8 @@
 
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool, ACC_FINAL,
-    ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_STRICT, ACC_SUPER, MAX_CODE_LENGTH,
+    ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_STRICT, ACC_SUPER, ACC_SYNTHETIC,
+    MAX_CODE_LENGTH,
 };
 use crate::code::{Assembler, Label};
 use crate::companion_fwd::{self};
@@ -242,13 +243,17 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
                     into.vals.insert(tree.sym, vals);
                 }
                 // `$init$` runs the `val` initializers *and* the trait
-                // body's bare statements, in source order (SLS 5.1).
+                // body's bare statements, in source order (SLS 5.1). A
+                // `var x: T = _` has a field (`vals` above) but nothing to
+                // run.
                 let init_stats: Vec<Tree> = impl_
                     .body
                     .iter()
                     .filter(|s| match &s.kind {
                         TreeKind::ValDef { rhs, mods, .. } => {
-                            !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                            !rhs.is_empty()
+                                && !rhs.is_default_init()
+                                && !mods.flags.contains(Flags::LAZY)
                         }
                         _ => is_template_stat(s),
                     })
@@ -306,8 +311,23 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
     }
 }
 
+thread_local! {
+    /// Whether the unit being emitted on this thread links against the real
+    /// scala-library, for the few emitters that are too far down the call
+    /// graph to be handed an [`EmitCtx`] (see [`emit_unbox`]). Emission of a
+    /// unit runs on one thread, and [`emit_opts`] sets this before any code is
+    /// generated.
+    static LIBRARY_ABI: Cell<bool> = const { Cell::new(false) };
+}
+
+/// See [`LIBRARY_ABI`].
+pub(crate) fn emitting_library_abi() -> bool {
+    LIBRARY_ABI.with(Cell::get)
+}
+
 /// Walk a typed compilation unit and emit classes.
 pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpts) -> EmitResult {
+    LIBRARY_ABI.with(|c| c.set(opts.library_abi));
     // A shared map already holds this unit's own trait members: the driver
     // harvests every unit of the run before emitting any, and the harvest is a
     // function of the tree alone, so doing it again here would insert the same
@@ -469,6 +489,7 @@ pub(crate) struct PendingBody {
     pub(crate) ret_ty: Type,
 }
 
+#[derive(Clone)]
 pub(crate) struct EmitCtx<'a> {
     pub(crate) st: &'a SymbolTable,
     pub(crate) class_sym: SymbolId,
@@ -497,6 +518,11 @@ pub(crate) struct EmitCtx<'a> {
     /// parameter it arrived in, which is what nsc reads there too.
     /// `(slot, class we step into, static type on the stack)`.
     pub(crate) presuper_outer: Option<(u16, SymbolId, SymbolId)>,
+    /// Set for the same region as `presuper_outer` -- the code of an `<init>`
+    /// that runs before its super (or self) constructor call -- whether or not
+    /// the class has an enclosing instance. `this` cannot be handed to
+    /// anything there.
+    pub(crate) presuper: bool,
     /// Inside a hoisted lambda body the enclosing instance is an ordinary
     /// parameter of a *static* method, not a field of a closure object:
     /// `load_this` reads this local slot instead of `this.$outer`.
@@ -541,6 +567,7 @@ pub(crate) fn emit_ctx<'a>(
         source,
         outer: None,
         presuper_outer: None,
+        presuper: false,
         outer_slot: None,
         library_abi,
         method_sym: SymbolId::NONE,
@@ -1257,6 +1284,80 @@ impl ClassBuilder {
         }
     }
 
+    /// nsc's `$deserializeLambda$`: a class whose code creates a serializable
+    /// lambda must be able to read one back. `SerializedLambda.readResolve`
+    /// calls this method of the *capturing* class reflectively, and it hands
+    /// the serialized form to `scala.runtime.LambdaDeserialize`, which finds
+    /// the body among the method handles listed as the call site's static
+    /// arguments. Those are split into groups the way nsc splits them (a
+    /// bootstrap method takes at most 251 static arguments); a group that
+    /// does not hold the body throws `IllegalArgumentException`, and nsc's
+    /// handler for it asks the next group (`run/t10232`, 300 lambdas).
+    fn add_deserialize_lambda(&mut self) {
+        const NAME: &str = "$deserializeLambda$";
+        const DESC: &str = "(Ljava/lang/invoke/SerializedLambda;)Ljava/lang/Object;";
+        const GROUP: usize = 255 - 1 - 3;
+        if self.pool.serializable_lambdas.is_empty() || self.methods.iter().any(|m| m.name == NAME)
+        {
+            return;
+        }
+        let handles = self.pool.serializable_lambdas.clone();
+        self.add_code(
+            ACC_PRIVATE | ACC_STATIC | ACC_SYNTHETIC,
+            NAME,
+            DESC,
+            1,
+            |asm| {
+                let groups: Vec<&[u16]> = handles.chunks(GROUP).collect();
+                let mut handler: Option<Label> = None;
+                for (i, g) in groups.iter().enumerate() {
+                    if let Some(h) = handler.take() {
+                        asm.mark(h);
+                        asm.enter_handler();
+                        asm.pop();
+                    }
+                    let start = asm.fresh_label();
+                    let end = asm.fresh_label();
+                    asm.mark(start);
+                    asm.aload(0);
+                    asm.invokedynamic_lambda_deserialize(g);
+                    asm.areturn();
+                    asm.mark(end);
+                    if i + 1 < groups.len() {
+                        let h = asm.fresh_label();
+                        asm.exception(start, end, h, Some("java/lang/IllegalArgumentException"));
+                        handler = Some(h);
+                    }
+                }
+            },
+        );
+    }
+
+    /// nsc's erasure gives a bridge the annotations of the method it bridges
+    /// to, so reflection sees `@Deprecated` on either one (`run/t10527`
+    /// reads it off the bridge `getDeclaredMethods.filter(_.isBridge)`).
+    /// Every bridge emitter adds its method bare; the member it forwards to
+    /// has the same name, so the annotations are copied from there here.
+    fn copy_annotations_to_bridges(&mut self) {
+        const ACC_BRIDGE: u16 = 0x0040;
+        let annotated: HashMap<String, Vec<String>> = self
+            .methods
+            .iter()
+            .filter(|m| m.access & ACC_BRIDGE == 0 && !m.java_annots.is_empty())
+            .map(|m| (m.name.clone(), m.java_annots.clone()))
+            .collect();
+        if annotated.is_empty() {
+            return;
+        }
+        for m in &mut self.methods {
+            if m.access & ACC_BRIDGE != 0 && m.java_annots.is_empty() {
+                if let Some(a) = annotated.get(&m.name) {
+                    m.java_annots = a.clone();
+                }
+            }
+        }
+    }
+
     /// Plain finish, with no `InnerClasses`/`EnclosingMethod` attribute.
     /// Used for classfiles with no corresponding [`SymbolId`] (synthetic
     /// helper classes: `DelayedInit` lambda
@@ -1302,10 +1403,12 @@ impl ClassBuilder {
     }
 
     pub(crate) fn finish_inner(
-        self,
+        mut self,
         inner_classes: Vec<InnerClassEntry>,
         enclosing_method: Option<EnclosingMethod>,
     ) -> EmittedClass {
+        self.add_deserialize_lambda();
+        self.copy_annotations_to_bridges();
         let this_name = self.this_name.clone();
         let class = ClassEmit {
             access: self.access,

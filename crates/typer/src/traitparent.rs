@@ -75,12 +75,25 @@ pub fn superclass_chain(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
     let mut out = vec![cls];
     let mut cur = cls;
     for _ in 0..64 {
-        let next = st
+        // A Java class file's parent list is `[AnyRef, <superclass>,
+        // <interfaces>…]` here, so the first class parent is not always the
+        // superclass: `java.util.AbstractList` read as extending `AnyRef`
+        // made `class SW extends ju.AbstractList[A] with IWT[A]` (`trait IWT
+        // extends ju.AbstractCollection[A]`, scala/scala's own
+        // `JavaCollectionWrappers`) an illegal inheritance. A top class is
+        // the superclass only when there is no other.
+        let classes: Vec<SymbolId> = st
             .get(cur)
             .parents
             .iter()
             .filter_map(|p| st.class_sym_of(p))
-            .find(|&p| !is_interface(st, p));
+            .filter(|&p| !is_interface(st, p))
+            .collect();
+        let next = classes
+            .iter()
+            .copied()
+            .find(|&p| !is_top(st, p))
+            .or_else(|| classes.first().copied());
         match next {
             Some(n) if n != cur && !out.contains(&n) => {
                 out.push(n);
