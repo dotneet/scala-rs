@@ -1715,6 +1715,8 @@ impl Typer {
                             sym: id,
                             args: vec![],
                         });
+                        // A written `new C1` names the class.
+                        self.note_cto_ref(id, tpt.span);
                     } else if let Some(alias) = self.new_alias_target(&found, tpt.span) {
                         // `new A(…)` where `type A = C`: nsc constructs the
                         // alias's right-hand side. The alias symbol has no

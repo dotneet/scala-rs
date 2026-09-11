@@ -451,6 +451,15 @@ impl Typer {
                     }
                     let fid = self.st.alloc(name, id, SymKind::Term, flags, "");
                     self.st.get_mut(fid).private_within = mods.private_within.clone();
+                    // `class C6(@compileTimeOnly("C6.x") val x: Int)`: the
+                    // annotation reaches the accessor (`@meta.getter`); the
+                    // other parameter annotations stay where they were.
+                    self.st.get_mut(fid).annotations = mods
+                        .annotations
+                        .iter()
+                        .filter(|a| crate::compile_time_only::is_cto_path(&a.annotation_path()))
+                        .cloned()
+                        .collect();
                     self.st.enter_in_current(name, fid);
                     p.sym = fid;
                     fields.push(fid);

@@ -361,6 +361,14 @@ pub struct Typer {
     /// Signature pass: fill member types across the whole run before any body
     /// is typed, so a unit can call into one that comes later.
     pub(crate) sigs_only: bool,
+    /// Some source mentions `@compileTimeOnly`; see `crate::compile_time_only`.
+    pub(crate) any_cto: bool,
+    /// The definition whose written result type is being resolved; its own
+    /// `@compileTimeOnly` covers it (the owner has been restored by then).
+    pub(crate) cto_sig_owner: SymbolId,
+    /// `@compileTimeOnly` reports held back while a `List[T]()` is typed:
+    /// nsc rewrites that call to `Nil` before it checks the type arguments.
+    pub(crate) cto_deferred: Option<Vec<(scala_rs_span::Span, String)>>,
     /// The header pass is running: parents and imports only, before any
     /// member has a signature. Anything it works out is provisional, the same
     /// way the signature pass's is. See `Typer::complete_lazy_sig`.
@@ -870,6 +878,10 @@ pub fn typecheck_units_src(
         t.namer(tree);
         t.register_sealed_from_namer(tree);
     }
+    // `@compileTimeOnly` is checked only when some source can carry it (only
+    // source definitions keep annotations). A caller with no source text
+    // checks unconditionally.
+    t.any_cto = t.sources.is_empty() || t.sources.iter().any(|s| s.contains("compileTimeOnly"));
     {
         // Class headers before member types, across every unit: a class can
         // inherit from one whose own superclass chain is declared in a file
@@ -977,6 +989,10 @@ pub fn typecheck_units_src(
         t.report_macro_calls(tree);
         t.strip_macro_defs(tree);
     }
+    for (tree, file_index) in units.iter() {
+        t.file_index = *file_index;
+        t.check_compile_time_only(tree);
+    }
     // Signatures can apply a class before its own parent types are complete.
     // In particular a recursive argument can satisfy its bound through the
     // parent that is being installed; check it against the finished hierarchy.
@@ -1025,6 +1041,9 @@ impl Typer {
             import_origin: 0,
             import_text: HashMap::new(),
             sigs_only: false,
+            any_cto: false,
+            cto_sig_owner: SymbolId::NONE,
+            cto_deferred: None,
             header_pass: false,
             pending_type_bounds: Vec::new(),
             strict_type_names: false,
@@ -2656,8 +2675,19 @@ pub(crate) fn implicit_class_conversions(body: &[Tree]) -> Vec<Tree> {
             };
             vparamss_conv.push(decls);
         }
+        // `@compileTimeOnly` is meta-annotated `@companionMethod`: nsc puts
+        // it on the conversion too, so `2.ext` through an annotated implicit
+        // class is the reference that is reported, and the conversion's own
+        // `new C(x)` is not.
+        let mut conv_mods = Modifiers::new(Flags::IMPLICIT.with(Flags::SYNTHETIC));
+        conv_mods.annotations = mods
+            .annotations
+            .iter()
+            .filter(|a| crate::compile_time_only::is_cto_path(&a.annotation_path()))
+            .cloned()
+            .collect();
         let mut conv = Tree::dummy(TreeKind::DefDef {
-            mods: Modifiers::new(Flags::IMPLICIT.with(Flags::SYNTHETIC)),
+            mods: conv_mods,
             name: name.clone(),
             tparams: conv_tparams,
             vparamss: vparamss_conv,
