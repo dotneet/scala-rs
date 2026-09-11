@@ -23,7 +23,7 @@ collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch, and the combined contextual,
 lexical, source-unit ownership and erased field-access batch, and the combined
 Scala declaration, array signature, value-class storage and implicit-view batch.
-Twenty-five intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-six intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -3605,5 +3605,88 @@ Exact summary block:
 === summary
   HEAD=e608c7dc  logs=/tmp/scala-rs-gate-e608c7dc-codex
 VERDICT=PASS
+DONE
+```
+
+
+## Rejected contextual evidence candidate: 18b8e5d7
+
+Frozen candidate `18b8e5d791b201e52974d7721c47a06129e9576b`, tree `4a84cabbb1eab8fa67bcfe811c6b00d4ffd6d357`,
+contains local main 6557829d. `git merge main` reported already up to date.
+Full gate `/tmp/scala-rs-gate-18b8e5d7-codex` completed with exit 1 in
+1421.6 seconds. DONE is present; both the script and independent
+audit reject the candidate. It is NOT merged into main. The accepted compiler
+and baseline remain e608c7dc (gitbucket 96/45, cats 83/34, library 415/113,
+Slick 0 errors/1504 classes). This record, the rejected raw ledger and recovery
+inventory are documentation/evidence changes only. No push was attempted:
+previous automatic approval review still requires explicit destination/payload
+authorization, which has not been provided.
+
+Candidate measurements (not an accepted baseline):
+
+- Gitbucket: 354 Scala/Twirl sources and three Java sources, none skipped;
+  96/45 -> 93/43. Four diagnostics removed, one same-location replacement.
+- Cats: 339 sources, one skipped; 83/34 -> 48/27. Thirty-six diagnostics
+  removed, one new diagnostic location at IndexedReaderWriterStateT.scala:559.
+- Library: 538 sources; 415/113 -> 389/107. Twenty-six diagnostics removed,
+  no added diagnostics or failing locations.
+- Slick: 184 sources, one error in StatementInvoker.scala:26, zero emitted
+  classes from the complete measure. Its fold(..., identity) result is inferred
+  too narrowly. Full Slick execution could not start because compilation failed;
+  the subset does not satisfy the required 1504-class verification. No successful
+  full strong class verification is claimed for this candidate.
+- Workspace: 2786 passed, 1 failed,
+  313 result rows. The failure is
+  mapkey::map_key_acceptance_and_execution_match_scalac: an implicit key
+  conversion incorrectly converts widened values 2 and 3 to the string a.
+  This is a silent wrong-output regression, not just a diagnostic difference.
+- Corpus: 5324 unique identities, losses=0,
+  changes=4. Counts: {"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 363, "pass": 1151, "skip": 345}, "run": {"fail": 807, "pass": 700, "skip": 553}}.
+  Losses: [].
+  Other changes: [{"kind": "pos", "test": "t5727", "before": "fail", "after": "pass", "loss": false}, {"kind": "run", "test": "phantomValueClass", "before": "fail", "after": "pass", "loss": false}, {"kind": "run", "test": "t7859", "before": "fail", "after": "pass", "loss": false}, {"kind": "run", "test": "valueclasses-pavlov", "before": "fail", "after": "pass", "loss": false}].
+
+Rejected raw ledger [`baselines/corpus-18b8e5d7.tsv`](baselines/corpus-18b8e5d7.tsv),
+SHA-256 `973d577aac0b7c947c91a2f846e2f5b15cb87286c9079c797a31c839649e4893`. Do not use it as GATE_LEDGER for the next candidate;
+continue comparing against `tests/baselines/corpus-e608c7dc.tsv`.
+Prerequisite/gate binary SHA-256: `cc8692624bd6c41df9e649dfecc3b1a63d3af8775fabf56fb0aefc4ee7bd1635`.
+Clippy remains at 57 existing warning occurrences, zero new identities.
+Source/jar/cache preflight passed four pinned trees, 121 jar archives,
+33 byte-exact released Java classes and 1498 reference class hashes.
+
+The implementation grouped contextual parent prototypes and parent inference,
+FunctionN structural inference, import-visible local signatures/aliases,
+lower-bound argument prototypes, term namespace selection, and value-class
+argument/local storage. Four new E2E groups cover 25 positive programs and six
+negative fixtures through real scalac 2.13.16, JVM execution and byte comparisons.
+Accepted-before binaries reject three grouped units and misexecute the value-class
+unit. Seven mechanisms were kept together; no subagents or stubs were used.
+
+Initial prerequisites found run/t9223b before the gate; a by-name parent thunk
+was mistaken for its raw value. The corrected candidate passed 706 CLI tests in
+40 suites, 190 typer tests and 674 selected corpus identities (zero losses,
+two gains). The selected CLI list omitted mapkey even though getOrElse changed;
+that omission is recorded and corrected in the next prerequisite inventory.
+Passing those subsets did not justify bypassing the full gate.
+
+The two compile regressions now have reduced runtime probes: scalac and the
+accepted-before compiler execute, while this candidate refuses fold(identity)
+and nested higher-kinded Now/Eval inference. Explicit type-argument controls
+agree. Existing generic implicit-factory and same-arity secondary-constructor
+defects are also reduced: scalac executes; both binaries refuse them. Include
+these supported fixes together with recovery of the three regressions in the
+next batch, rather than paying another full gate for one repair alone.
+See [recovery inventory](../docs/batches/contextual-recovery-inventory.md).
+Scratch proofs and owned terminal results are in /tmp/scala-rs-contextual-evidence.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=18b8e5d7  logs=/tmp/scala-rs-gate-18b8e5d7-codex
+  fail: slick measure: files=184 errors=1 files_with_errors=1 classes=0 compiler_exit=1
+  fail: slick_run: slick compile failed; see /private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun/w-contextual-evidence-18b8e5d7/rs.log
+  fail: slick_subset: verified=0 failed=0 classfile_lint: no class files subset_files=115 classes=0 (of 184 sources)
+  fail: workspace tests: 313 rows, 2786 passed, 1 failed
+VERDICT=FAIL
 DONE
 ```
