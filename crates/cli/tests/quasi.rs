@@ -1145,9 +1145,6 @@ fn lf2_lift_bad_names_every_hole_it_cannot_lift() {
         // A `Symbol` is lifted on its own but has no `Liftable`, so `..$` over
         // symbols is refused -- nsc refuses it too.
         "a hole of type `Symbols.ModuleSymbol` is not lifted",
-        // `reify` is expanded now (§7.14); what it cannot build it names.
-        "cannot expand reify { ... }: `f` is a local",
-        "cannot expand reify { ... }: `xs` is a local",
         "docs/macros.md",
     ] {
         assert!(
@@ -1592,12 +1589,12 @@ fn tt_tags_bad_names_every_tag_it_cannot_build() {
         // `tt_tags.scala` runs those against real scalac. What is refused is
         // a constructor (or a tuple) whose *argument* has no body, and a
         // shape with no `staticClass` at all.
-        "cannot build a WeakTypeTag for `Inner`, a class nested in a class or an object",
-        "cannot build a TypeTag for `Inner`, a class nested in a class or an object",
-        "cannot build a TypeTag for `AnyRef`, which is an alias rather than a class",
+        // A `TypeTag` for an abstract type with no tag is refused, as nsc
+        // refuses it ("No TypeTag available"); a `WeakTypeTag` for the same
+        // is built with a free type, as are nested classes, aliases and
+        // singletons -- `tests/fixtures/reify2_tags.scala` runs those.
         "cannot build a TypeTag for `T`, an abstract type with no tag in scope",
-        "cannot build a WeakTypeTag for `T`, an abstract type with no tag in scope",
-        "cannot build a TypeTag for `Main.type`, a singleton type",
+        "a structural type",
         "docs/macros.md",
     ] {
         assert!(

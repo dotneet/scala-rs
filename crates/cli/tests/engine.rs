@@ -708,27 +708,24 @@ fn ex_macros_match_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// A tag that cannot be composed is named, not approximated.
+/// A tag over a type parameter with no tag in scope is built with a *free
+/// type* (`docs/notes/reify-design.md`), as nsc builds it.
 ///
 /// `c.Expr[ExnBox[E]]` needs a `WeakTypeTag[ExnBox[E]]`, and `E` has no tag in
-/// scope. nsc goes further and builds one with a free type symbol; scala-rs
-/// does not, and the diagnostic says which part is missing. Real scalac
-/// compiles this file, so it records a gap rather than an error in the source.
+/// scope. This used to be refused by name; the type reifier now writes
+/// `newFreeType("E", ...)` into the tag's creator, and real scalac has always
+/// compiled the file.
 #[test]
-fn ex_uncomposable_tag_is_named() {
-    if !prerequisites("ex_notag_bad") {
+fn ex_free_type_tag_is_built() {
+    if !prerequisites("ex_notag") {
         return;
     }
-    let out_dir = tmp_dir("ex_notag_bad");
-    let out = compile("ex_notag_bad", &out_dir, &[]);
-    let err = diagnostics(&out);
+    let out_dir = tmp_dir("ex_notag");
+    let out = compile("ex_notag", &out_dir, &[]);
     assert!(
-        !out.status.success(),
-        "expected ex_notag_bad to fail, got: {err}"
-    );
-    assert!(
-        err.contains("cannot build a WeakTypeTag for `E`, an abstract type with no tag in scope"),
-        "expected the missing-tag reason, got {err:?}"
+        out.status.success(),
+        "compile ex_notag failed: {}",
+        diagnostics(&out)
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
@@ -1224,35 +1221,21 @@ fn rb_reify_matches_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The bodies `reify` refuses, each named. Real scalac accepts all five (it
-/// reifies a local as a *free term*, and its type reifier does not need a tag
-/// in scope); scala-rs does not build those, and says so rather than reifying
-/// the bare name -- which would compile, run, and mean whatever stood at the
-/// call site.
+/// The bodies `rb_bad.scala` once refused -- a parameter, a local, a type
+/// ascription, a pattern `val`, a type argument with no tag -- all reified now
+/// (`docs/notes/reify-design.md`): the first two as free terms, the last as a
+/// free type. Real scalac compiles the file; so does scala-rs.
 #[test]
-fn rb_reify_gaps_are_named() {
-    if !prerequisites("rb_bad") {
+fn rb_free_terms_and_types_compile() {
+    if !prerequisites("rb_free") {
         return;
     }
-    let out_dir = tmp_dir("rb_bad");
-    let out = compile("rb_bad", &out_dir, &[]);
-    assert!(!out.status.success(), "rb_bad.scala should not compile");
-    let text = diagnostics(&out);
-    for want in [
-        "`x` is a local, a parameter, or a name that does not stand for a static `object`",
-        "`n` is a local, a parameter, or a name that does not stand for a static `object`",
-        "a type ascription is not reified yet",
-        // A block, and an ordinary `val` bound inside one, are reified since
-        // §7.17 and the `agent/reifydefs` slice; what `useBlock` is refused
-        // for is the *pattern* `val` it binds, a different tree in nsc.
-        "a pattern definition (`val (a, b) = ...`) is not reified yet",
-        "a type argument cannot be rebuilt: `T`, an abstract type with no tag in scope",
-    ] {
-        assert!(text.contains(want), "missing {want:?} in:\n{text}");
-    }
+    let out_dir = tmp_dir("rb_free");
+    let out = compile("rb_free", &out_dir, &[]);
     assert!(
-        text.contains("cannot expand reify { ... }"),
-        "the report should name reify:\n{text}"
+        out.status.success(),
+        "compile rb_free failed: {}",
+        diagnostics(&out)
     );
     let _ = fs::remove_dir_all(&out_dir);
 }

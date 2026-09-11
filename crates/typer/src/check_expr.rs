@@ -9,11 +9,11 @@
 //! assignments, `new`, lambdas and the rest.
 
 use crate::check::*;
-use crate::symbol::SymKind;
+use crate::symbol::{SymKind, SymbolTable};
 use crate::uncurry::is_eta_marker;
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 impl Typer {
     pub(crate) fn type_qualifier(&mut self, tree: &mut Tree, pt: &Type) {
@@ -250,17 +250,52 @@ impl Typer {
     }
 
     /// Expand `reify { … }` in place (`docs/macros.md` §7.14,
-    /// `crate::reify_expand`).
+    /// `crate::reify_expand`, `crate::reify::tree`).
     ///
     /// Returns false only when this is not a `reify` application at all. A
     /// body reify cannot build is an *error* here, never a silent pass: an
     /// expansion that reified a local as the bare name it was written with
     /// would compile, run, and mean whatever stood at the call site.
+    ///
+    /// The body is typed once, on a clone, and it is that **typed** clone the
+    /// reifier walks: every reference is rebuilt from the symbol it resolved
+    /// to, which is nsc's own rule (`docs/notes/reify-design.md`).
     pub(crate) fn try_expand_reify(&mut self, tree: &mut Tree, pt: &Type) -> bool {
         let Some(universe) = self.reify_universe(tree) else {
             return false;
         };
         let span = tree.span;
+        // A `reify` nested in the body of another: it is typed here, so the
+        // outer reifier can read its body's symbols, but *not* expanded --
+        // the outer expansion reifies it as the call it is, and the toolbox
+        // that compiles that tree expands it in turn.
+        if self.reify_depth > 0 {
+            let Some(expr_cls) = self.reflect_class(
+                "scala.reflect.api.Exprs.Expr",
+                "scala/reflect/api/Exprs$Expr",
+            ) else {
+                return false;
+            };
+            let TreeKind::Apply { args, .. } = &mut tree.kind else {
+                return false;
+            };
+            if args.len() != 1 {
+                return false;
+            }
+            self.reify_depth += 1;
+            self.type_expr(&mut args[0], &Type::NoType);
+            self.reify_depth -= 1;
+            let arg = match &args[0].ty {
+                Type::Constant(l) => Type::lit_underlying(l),
+                t => t.clone(),
+            };
+            tree.ty = Type::Class {
+                sym: expr_cls,
+                args: vec![arg],
+            };
+            self.nested_reifies.insert(tree.id, universe);
+            return true;
+        }
         let TreeKind::Apply { args, .. } = &tree.kind else {
             return false;
         };
@@ -273,7 +308,10 @@ impl Typer {
         // reported from here, with the probe's own diagnostics.
         let mark = self.diags.len();
         let mut probe = body.clone();
+        self.reify_depth += 1;
         self.type_expr(&mut probe, &Type::NoType);
+        self.reify_depth -= 1;
+        let nested = std::mem::take(&mut self.nested_reifies);
         if self.diags[mark..]
             .iter()
             .any(|d| d.level == scala_rs_span::Level::Error)
@@ -296,17 +334,38 @@ impl Typer {
             return true;
         }
 
+        let Some(expr_cls) = self.reflect_class(
+            "scala.reflect.api.Exprs.Expr",
+            "scala/reflect/api/Exprs$Expr",
+        ) else {
+            return false;
+        };
         self.gensym += 1;
         let n = self.gensym;
         let (universe_local, mirror_local) = (format!("$u${n}"), format!("$m${n}"));
-        let refs = self.reify_refs(&body);
-        let needs_mirror = !refs.is_empty();
         let src = self
             .sources
             .get(self.file_index)
             .cloned()
             .unwrap_or_else(|| std::rc::Rc::from(""));
+        let mut facts = self.reify_facts(&body, &probe, &arg, span);
+        let strong_tags = self.strong_reify_tags(&facts.tags);
+        let tag_bindings = self.bind_reify_tags(&mut facts.tags, span);
         let built = {
+            let env = crate::reify::ReifyEnv {
+                st: &self.st,
+                local_syms: facts.local_syms,
+                local_type_names: facts.local_type_names,
+                this_classes: facts.this_classes,
+                tags: facts.tags,
+                strong_tags,
+                types: facts.types,
+                nested,
+                splices: facts.splices,
+                def_spans: self.def_spans.clone(),
+                file_name: facts.file_name,
+                expr_class: expr_cls,
+            };
             let universe_ident = Tree::new(
                 NodeId(0),
                 span,
@@ -316,18 +375,37 @@ impl Typer {
             );
             let r = crate::reify::Reifier::new(universe_ident, &[], &[], &[], span, &src).in_reify(
                 crate::reify::ReifyCtx {
-                    refs,
+                    env,
                     mirror_local: mirror_local.clone(),
                     universe_local: universe_local.clone(),
                 },
             );
-            match r.reify(crate::quasiquote::QuasiKind::Term, &body) {
-                Ok(t) => t,
-                Err(why) => {
-                    self.report_reify_gap(span, &why);
-                    tree.ty = Type::Error;
-                    return true;
+            match r.reify(crate::quasiquote::QuasiKind::Term, &probe) {
+                Ok(t) => {
+                    // The tag of the expression: materialised by implicit
+                    // search unless the type mentions a free type, in which
+                    // case only a creator sharing this body's symbol table
+                    // can build it.
+                    if r.needs_free_types(&arg) {
+                        match r.standalone_type_value(&arg) {
+                            Ok(v) => Ok((t, Some(v))),
+                            Err(why) => Err(format!(
+                                "the type of the expression cannot be rebuilt: {why}"
+                            )),
+                        }
+                    } else {
+                        Ok((t, None))
+                    }
                 }
+                Err(why) => Err(why),
+            }
+        };
+        let (built, tag) = match built {
+            Ok(x) => x,
+            Err(why) => {
+                self.report_reify_gap(span, &why);
+                tree.ty = Type::Error;
+                return true;
             }
         };
 
@@ -342,11 +420,20 @@ impl Typer {
         ) else {
             return false;
         };
+        let Some(type_api) = self.reflect_class(
+            "scala.reflect.api.Types.TypeApi",
+            "scala/reflect/api/Types$TypeApi",
+        ) else {
+            return false;
+        };
         // `Expr` is a nested `object` of the universe, supplied on demand
         // (`PickleSupply::install_nested_module`); nothing has asked for it
         // on this receiver yet.
         let universe_ty = universe.ty.clone();
         let _ = self.supply_from_pickle(&universe_ty, "Expr");
+        if tag.is_some() && !self.ensure_weak_tag_module(&universe) {
+            return false;
+        }
         let mut built = crate::reify_expand::ReifyExpander {
             universe: &universe,
             creator_name: format!("$treecreator{n}"),
@@ -360,9 +447,15 @@ impl Typer {
                 sym: tree_api,
                 args: vec![],
             },
+            type_api: Type::Class {
+                sym: type_api,
+                args: vec![],
+            },
             universe_local,
             mirror_local,
-            needs_mirror,
+            tag,
+            tag_creator_name: format!("$typecreator{n}"),
+            tag_bindings,
             span,
         }
         .build();
@@ -392,300 +485,526 @@ impl Typer {
         true
     }
 
+    /// A type on its own, reified the way a `reify { … }` body's types are
+    /// (`crate::reify::tree`): the value of `arg` as a `$u.Type`, with the
+    /// free symbols it needs bound in front, against fresh `$u` / `$m`
+    /// locals whose names are returned with it. `None` when the reifier
+    /// cannot build it -- or, for a `TypeTag`, when it would need a free
+    /// type, which nsc refuses too ("No TypeTag available"). The last
+    /// element says whether the reification is concrete.
+    pub(crate) fn reify_type_standalone(
+        &mut self,
+        universe: &Tree,
+        arg: &Type,
+        span: Span,
+        tag: crate::materialize::Tag,
+    ) -> Option<StandaloneType> {
+        if !self.library_abi {
+            return None;
+        }
+        let expr_cls = self.reflect_class(
+            "scala.reflect.api.Exprs.Expr",
+            "scala/reflect/api/Exprs$Expr",
+        )?;
+        self.gensym += 1;
+        let n = self.gensym;
+        let (universe_local, mirror_local) = (format!("$u${n}"), format!("$m${n}"));
+        let empty = Tree::new(NodeId(0), span, TreeKind::Empty);
+        let mut facts = self.reify_facts(&empty, &empty, arg, span);
+        let strong_tags = self.strong_reify_tags(&facts.tags);
+        let tag_bindings = self.bind_reify_tags(&mut facts.tags, span);
+        let src = self
+            .sources
+            .get(self.file_index)
+            .cloned()
+            .unwrap_or_else(|| std::rc::Rc::from(""));
+        let env = crate::reify::ReifyEnv {
+            st: &self.st,
+            local_syms: facts.local_syms,
+            local_type_names: facts.local_type_names,
+            this_classes: facts.this_classes,
+            tags: facts.tags,
+            strong_tags,
+            types: facts.types,
+            nested: HashMap::new(),
+            splices: HashMap::new(),
+            def_spans: self.def_spans.clone(),
+            file_name: facts.file_name,
+            expr_class: expr_cls,
+        };
+        let universe_ident = Tree::new(
+            NodeId(0),
+            span,
+            TreeKind::Ident {
+                name: universe_local.clone(),
+            },
+        );
+        let r = crate::reify::Reifier::new(universe_ident, &[], &[], &[], span, &src).in_reify(
+            crate::reify::ReifyCtx {
+                env,
+                mirror_local: mirror_local.clone(),
+                universe_local: universe_local.clone(),
+            },
+        );
+        if tag == crate::materialize::Tag::Strong && r.needs_free_types(arg) {
+            return None;
+        }
+        let concrete = r.is_concrete(arg);
+        let tree = r.standalone_type_value(arg).ok()?;
+        let _ = universe;
+        Some((tree, universe_local, mirror_local, concrete, tag_bindings))
+    }
+
+    /// The tags among `tags` that are `TypeTag`s, by the type of the
+    /// expression each is.
+    fn strong_reify_tags(&self, tags: &HashMap<SymbolId, Tree>) -> HashSet<SymbolId> {
+        tags.iter()
+            .filter(|(_, t)| match &t.ty {
+                Type::Class { sym, .. } => {
+                    self.st.jvm_internal(*sym) == crate::materialize::Tag::Strong.jvm()
+                }
+                _ => false,
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Bind each tag in scope to a local of the expansion (`val $tag1 =
+    /// evidence$1`) and refer to the local from the creator. A creator is a
+    /// local class; a class parameter's field -- `class C[T: TypeTag]` keeps
+    /// its evidence in a private field -- is not readable from there, a
+    /// local is.
+    fn bind_reify_tags(
+        &mut self,
+        tags: &mut HashMap<SymbolId, Tree>,
+        span: Span,
+    ) -> Vec<(String, Tree)> {
+        let mut out = Vec::new();
+        let mut ids: Vec<SymbolId> = tags.keys().copied().collect();
+        ids.sort_by_key(|s| s.0);
+        for id in ids {
+            self.gensym += 1;
+            let name = format!("$tag{}", self.gensym);
+            // Untyped, so the expansion's typing resolves it to the `val`.
+            let local = Tree::new(NodeId(0), span, TreeKind::Ident { name: name.clone() });
+            let tree = tags.remove(&id).expect("key from keys");
+            out.push((name, tree));
+            tags.insert(id, local);
+        }
+        out
+    }
+
+    /// Make `<universe>.WeakTypeTag.apply` callable, the way
+    /// `Self::materialize_tag` does for a tag it builds itself.
+    fn ensure_weak_tag_module(&mut self, universe: &Tree) -> bool {
+        let tag = crate::materialize::Tag::Weak;
+        let Some(tag_cls) = self.reflect_class(tag.pickle_name(), tag.jvm()) else {
+            return false;
+        };
+        let Some(type_tags) =
+            self.reflect_class("scala.reflect.api.TypeTags", "scala/reflect/api/TypeTags")
+        else {
+            return false;
+        };
+        let Some(mirror) =
+            self.reflect_class("scala.reflect.api.Mirror", "scala/reflect/api/Mirror")
+        else {
+            return false;
+        };
+        let Some(creator) = self.reflect_class(
+            "scala.reflect.api.TypeCreator",
+            "scala/reflect/api/TypeCreator",
+        ) else {
+            return false;
+        };
+        let classes = crate::materialize::TagClasses {
+            tag_cls,
+            type_tags,
+            mirror,
+            creator,
+        };
+        if crate::materialize::ensure_tag_module(&mut self.st, tag, classes).is_none() {
+            return false;
+        }
+        let universe_ty = universe.ty.clone();
+        let _ = self.supply_from_pickle(&universe_ty, tag.simple());
+        true
+    }
+
     /// A form `reify` does not build. Named, with the reason, and pointed at
     /// the design note -- never accepted.
     fn report_reify_gap(&mut self, span: Span, why: &str) {
         self.error(
             span,
             format!(
-                "cannot expand reify {{ ... }}: {why}. scala-rs reifies literals, \
-                 applications and selections over static `object` references, \
-                 `.splice`d expressions, and type arguments it can rebuild from a \
-                 tag; see docs/macros.md \u{a7}7.15."
+                "cannot expand reify {{ ... }}: {why}. scala-rs reifies the typed \
+                 body by symbol -- static objects and their members, members of \
+                 the enclosing object, locals and parameters as free terms, \
+                 definitions inside the body by name, type arguments from a tag \
+                 in scope or as free types; see docs/notes/reify-design.md."
             ),
         );
     }
 
-    /// Classify every identifier of a `reify { … }` body; see
-    /// `crate::reify::ReifyRef`.
-    ///
-    /// Each candidate is typed on a *clone* and rolled back, the way
-    /// `Self::hole_lifts` types a hole's argument: what a name means is a
-    /// question only the typer can answer, and asking it must not type the
-    /// body twice for real. A name this does not classify is left out, and
-    /// `crate::reify` refuses it by name.
-    fn reify_refs(&mut self, body: &Tree) -> HashMap<NodeId, crate::reify::ReifyRef> {
-        let mut out = HashMap::new();
-        self.reify_refs_in(body, &mut out);
-        out
+    /// Everything the reifier needs to know about a body that only the typer
+    /// can answer, gathered while `self` is still mutably available: the
+    /// symbols the body defines, the classes enclosing it, the type each
+    /// written type resolved to, and the tags in scope for the abstract
+    /// types it mentions.
+    fn reify_facts(&mut self, body: &Tree, probe: &Tree, arg: &Type, span: Span) -> ReifyFacts {
+        let file_name = self
+            .source_paths
+            .get(self.file_index)
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.clone())
+            })
+            .unwrap_or_default();
+        let this_classes = self
+            .st
+            .enclosing_classes(self.st.owner)
+            .into_iter()
+            .filter(|c| self.st.get(*c).is_class_like())
+            .collect();
+        let mut facts = ReifyFacts {
+            file_name,
+            this_classes,
+            ..ReifyFacts::default()
+        };
+        collect_reify_locals(probe, &mut facts.local_syms, &mut facts.local_type_names);
+        // A local class's synthetic companion, and a local object's module
+        // class, are local with it: neither has a definition in the tree.
+        for sym in facts.local_syms.clone() {
+            match self.st.get(sym).kind {
+                SymKind::Class => {
+                    if let Some(m) = self.st.companion_module(sym) {
+                        facts.local_syms.insert(m);
+                        facts.local_syms.insert(self.st.module_class_of(m));
+                    }
+                }
+                SymKind::Module => {
+                    facts.local_syms.insert(self.st.module_class_of(sym));
+                }
+                _ => {}
+            }
+        }
+        collect_reify_splices(body, &mut facts.splices);
+        self.collect_reify_types(probe, &facts.local_type_names.clone(), &mut facts.types);
+        // Every abstract type the body mentions, in a node's type, a written
+        // type, or the type of a value bound outside the body.
+        let mut abstract_ids = Vec::new();
+        crate::reify::collect_abstract(arg, &mut abstract_ids);
+        for ty in facts.types.values() {
+            crate::reify::collect_abstract(ty, &mut abstract_ids);
+        }
+        collect_reify_abstract_in_tree(&self.st, probe, &mut abstract_ids);
+        abstract_ids.sort_by_key(|s| s.0);
+        abstract_ids.dedup();
+        for id in abstract_ids {
+            if facts.local_syms.contains(&id) {
+                continue;
+            }
+            if let Some(tag) = self.reify_tag_in_scope(id, span) {
+                facts.tags.insert(id, tag);
+            }
+        }
+        facts
     }
 
-    fn reify_refs_in(&mut self, t: &Tree, out: &mut HashMap<NodeId, crate::reify::ReifyRef>) {
+    /// The `WeakTypeTag[T]` in scope for the abstract type `id`, if any --
+    /// found by ordinary implicit search, as `Self::tag_body` finds it.
+    fn reify_tag_in_scope(&mut self, id: SymbolId, span: Span) -> Option<Tree> {
+        let flat = match self.st.get(id).kind {
+            SymKind::TypeParam => Type::TypeParam(id),
+            _ => Type::TypeMember(id),
+        };
+        // A `TypeTag` is a `WeakTypeTag`, but only once its parent -- which
+        // lives in the pickle of `TypeTags` -- has been read; asking for the
+        // stronger tag first needs no such knowledge.
+        for tag in [
+            crate::materialize::Tag::Strong,
+            crate::materialize::Tag::Weak,
+        ] {
+            let tag_cls = self.reflect_class(tag.pickle_name(), tag.jvm())?;
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, tag_cls);
+            let want = Type::Class {
+                sym: tag_cls,
+                args: vec![flat.clone()],
+            };
+            let mark = self.diags.len();
+            self.warm_implicit_scope(&want);
+            let found = match self.search_implicit(&want) {
+                crate::implicits::ImplicitSearch::Found(sid) => {
+                    Some(self.implicit_tree(sid, &want, span, 0))
+                }
+                _ => None,
+            };
+            self.diags.truncate(mark);
+            if found.is_some() {
+                return found;
+            }
+        }
+        None
+    }
+
+    /// The type each written type tree of the body resolved to, keyed by the
+    /// tree's node. Where the typer left the type on the enclosing node
+    /// (`Typed`, `New`, a parameter) it is read from there; elsewhere the
+    /// type tree is resolved again here, in the scope the `reify` was
+    /// written in -- unless it names a type the body itself defines, which
+    /// only the body's own scope could resolve and which the reifier builds
+    /// by name anyway.
+    fn collect_reify_types(
+        &mut self,
+        t: &Tree,
+        local_type_names: &HashSet<String>,
+        out: &mut HashMap<NodeId, Type>,
+    ) {
+        let usable = |ty: &Type| !ty.is_no_type() && !ty.is_error();
+        let record = |out: &mut HashMap<NodeId, Type>, tpt: &Tree, ty: &Type| {
+            if !tpt.is_empty() && tpt.id != NodeId(0) && usable(ty) {
+                out.insert(tpt.id, ty.clone());
+            }
+        };
         match &t.kind {
-            // `x.splice`: `Expr[T].splice` is the marker nsc replaces with the
-            // argument's own tree. The receiver is left as it was written --
-            // it names something in the macro implementation, and the
-            // expansion keeps it there.
-            TreeKind::Select { qual, name } if name == "splice" => {
-                let probed = self.reify_probe(qual).ty;
-                if matches!(&probed, Type::Class { sym, .. }
-                    if self.st.get(*sym).jvm_name == "scala/reflect/api/Exprs$Expr")
-                {
-                    out.insert(
-                        t.id,
-                        crate::reify::ReifyRef::Splice(Box::new((**qual).clone())),
-                    );
-                    return;
-                }
-                self.reify_refs_in(qual, out);
-            }
-            TreeKind::Ident { .. } | TreeKind::Select { .. } => {
-                let probe = self.reify_probe(t);
-                if let Some(name) = self.static_module_name(&probe.ty) {
-                    out.insert(t.id, crate::reify::ReifyRef::StaticModule(name));
-                    return;
-                }
-                if matches!(t.kind, TreeKind::Ident { .. }) {
-                    if let Some(r) = self.static_member_ref(probe.sym) {
-                        out.insert(t.id, r);
-                        return;
-                    }
-                }
-                if let TreeKind::Select { qual, .. } = &t.kind {
-                    self.reify_refs_in(qual, out);
-                }
-            }
-            TreeKind::Apply { fun, args } => {
-                self.reify_refs_in(fun, out);
-                // A bare `println` is overloaded, so typing it on its own
-                // settles nothing and the walk above left it unclassified.
-                // The *application* settles it, so the callee is resolved
-                // from the typed whole and recorded against the node that
-                // was written.
-                let callee = reify_callee(fun);
-                if matches!(callee.kind, TreeKind::Ident { .. }) && !out.contains_key(&callee.id) {
-                    if let Some(r) = self.applied_static_member(t) {
-                        out.insert(callee.id, r);
-                    }
-                }
-                for a in args {
-                    self.reify_refs_in(a, out);
-                }
-            }
-            TreeKind::Block { stats, expr } => {
-                for s in stats {
-                    self.reify_refs_in(s, out);
-                }
-                self.reify_refs_in(expr, out);
-            }
-            // A type argument is rebuilt rather than named: `f[E]` inside a
-            // macro implementation means the `E` *that implementation* was
-            // instantiated at, which is knowable only through the tag in
-            // scope. Same three shapes a `TypeTag` is built from, so the same
-            // builder answers -- and the same refusal when it cannot.
-            TreeKind::TypeApply { fun, args } => {
-                self.reify_refs_in(fun, out);
-                for a in args {
-                    let ty = self.tree_to_type(a);
-                    if ty.is_no_type() || ty.is_error() {
-                        continue;
-                    }
-                    let mark = self.diags.len();
-                    let body = self.tag_body(crate::materialize::Tag::Weak, &ty, a.span);
-                    self.diags.truncate(mark);
-                    out.insert(
-                        a.id,
-                        match body {
-                            Ok(b) => crate::reify::ReifyRef::Type(Box::new(b)),
-                            Err(why) => crate::reify::ReifyRef::TypeGap(why),
-                        },
-                    );
-                }
-            }
-            TreeKind::If { cond, thenp, elsep } => {
-                self.reify_refs_in(cond, out);
-                self.reify_refs_in(thenp, out);
-                self.reify_refs_in(elsep, out);
-            }
-            // A `val` / `def` bound *inside* the reify body is reified by
-            // name (`crate::reify_defs::definition`, `Reifier::local_bound`)
-            // and needs no classification of its own -- but its declared
-            // type(s), if any, and its right-hand side are ordinary
-            // sub-positions and have to be walked into just the same as
-            // everywhere else, or a static reference or a splice used only
-            // there would never be recorded.
-            //
-            // The declared type itself is classified by
-            // `classify_value_type`, *not* the type-argument builder just
-            // above: measurement (`docs/macros.md` §7.17) shows nsc rebuilds
-            // a written value type structurally, not as `mkTypeTree(...)`.
             TreeKind::ValDef { tpt, rhs, .. } => {
-                self.classify_value_type(tpt, out);
-                self.reify_refs_in(rhs, out);
+                if !tpt.is_empty() && !mentions_name(tpt, local_type_names) {
+                    let ty = if usable(&t.ty) {
+                        t.ty.clone()
+                    } else {
+                        self.reify_tree_to_type(tpt)
+                    };
+                    record(out, tpt, &ty);
+                }
+                self.collect_reify_types(rhs, local_type_names, out);
             }
             TreeKind::DefDef {
-                vparamss, tpt, rhs, ..
+                tparams,
+                vparamss,
+                tpt,
+                rhs,
+                ..
             } => {
+                for tp in tparams {
+                    self.collect_reify_tparam_bounds(tp, local_type_names, out);
+                }
                 for p in vparamss.iter().flatten() {
-                    if let TreeKind::ValDef { tpt, .. } = &p.kind {
-                        self.classify_value_type(tpt, out);
+                    self.collect_reify_types(p, local_type_names, out);
+                }
+                if !tpt.is_empty() && !mentions_name(tpt, local_type_names) {
+                    let ty = self.reify_tree_to_type(tpt);
+                    record(out, tpt, &ty);
+                }
+                self.collect_reify_types(rhs, local_type_names, out);
+            }
+            TreeKind::TypeDef {
+                tparams,
+                rhs,
+                lo,
+                hi,
+                ..
+            } => {
+                for tp in tparams {
+                    self.collect_reify_tparam_bounds(tp, local_type_names, out);
+                }
+                for b in [Some(rhs), lo.as_ref(), hi.as_ref()].into_iter().flatten() {
+                    if !b.is_empty() && !mentions_name(b, local_type_names) {
+                        let ty = self.reify_tree_to_type(b);
+                        record(out, b, &ty);
                     }
                 }
-                self.classify_value_type(tpt, out);
-                self.reify_refs_in(rhs, out);
+            }
+            TreeKind::ClassDef {
+                tparams,
+                vparamss,
+                impl_,
+                ..
+            } => {
+                for tp in tparams {
+                    self.collect_reify_tparam_bounds(tp, local_type_names, out);
+                }
+                for p in vparamss.iter().flatten() {
+                    self.collect_reify_types(p, local_type_names, out);
+                }
+                self.collect_reify_template(impl_, local_type_names, out);
+            }
+            TreeKind::ModuleDef { impl_, .. } => {
+                self.collect_reify_template(impl_, local_type_names, out);
+            }
+            TreeKind::Function { vparams, body } => {
+                for p in vparams {
+                    self.collect_reify_types(p, local_type_names, out);
+                }
+                self.collect_reify_types(body, local_type_names, out);
+            }
+            TreeKind::Typed { expr, tpt } => {
+                if !mentions_name(tpt, local_type_names) {
+                    let ty = if usable(&t.ty) {
+                        t.ty.clone()
+                    } else {
+                        self.reify_tree_to_type(tpt)
+                    };
+                    record(out, tpt, &ty);
+                }
+                self.collect_reify_types(expr, local_type_names, out);
+            }
+            TreeKind::New { tpt } => {
+                let mut head = tpt.as_ref();
+                while let TreeKind::Apply { fun, args } = &head.kind {
+                    for a in args {
+                        self.collect_reify_types(a, local_type_names, out);
+                    }
+                    head = fun;
+                }
+                if let TreeKind::ClassDef { .. } = &head.kind {
+                    self.collect_reify_types(head, local_type_names, out);
+                } else if !mentions_name(head, local_type_names) {
+                    let ty = if usable(&t.ty) {
+                        t.ty.clone()
+                    } else {
+                        self.reify_tree_to_type(head)
+                    };
+                    record(out, head, &ty);
+                }
+            }
+            TreeKind::TypeApply { fun, args } => {
+                self.collect_reify_types(fun, local_type_names, out);
+                for a in args {
+                    if !mentions_name(a, local_type_names) {
+                        let ty = self.reify_tree_to_type(a);
+                        record(out, a, &ty);
+                    }
+                }
+            }
+            TreeKind::Match { selector, cases } => {
+                self.collect_reify_types(selector, local_type_names, out);
+                for c in cases {
+                    self.collect_reify_case(c, local_type_names, out);
+                }
+            }
+            TreeKind::Try {
+                block,
+                catches,
+                finalizer,
+            } => {
+                self.collect_reify_types(block, local_type_names, out);
+                for c in catches {
+                    self.collect_reify_case(c, local_type_names, out);
+                }
+                self.collect_reify_types(finalizer, local_type_names, out);
+            }
+            TreeKind::Bind { body, .. } => self.collect_reify_types(body, local_type_names, out),
+            TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
+                self.collect_reify_types(fun, local_type_names, out);
+                for a in args {
+                    self.collect_reify_types(a, local_type_names, out);
+                }
+            }
+            TreeKind::Select { qual, .. } => self.collect_reify_types(qual, local_type_names, out),
+            TreeKind::Block { stats, expr } => {
+                for s in stats {
+                    self.collect_reify_types(s, local_type_names, out);
+                }
+                self.collect_reify_types(expr, local_type_names, out);
+            }
+            TreeKind::If { cond, thenp, elsep } => {
+                self.collect_reify_types(cond, local_type_names, out);
+                self.collect_reify_types(thenp, local_type_names, out);
+                self.collect_reify_types(elsep, local_type_names, out);
+            }
+            TreeKind::Assign { lhs, rhs } => {
+                self.collect_reify_types(lhs, local_type_names, out);
+                self.collect_reify_types(rhs, local_type_names, out);
+            }
+            TreeKind::While { cond, body } | TreeKind::DoWhile { body, cond } => {
+                self.collect_reify_types(cond, local_type_names, out);
+                self.collect_reify_types(body, local_type_names, out);
+            }
+            TreeKind::Return { expr } | TreeKind::Throw { expr } => {
+                self.collect_reify_types(expr, local_type_names, out)
+            }
+            TreeKind::Alternative { trees } => {
+                for a in trees {
+                    self.collect_reify_types(a, local_type_names, out);
+                }
+            }
+            TreeKind::Star { elem } => self.collect_reify_types(elem, local_type_names, out),
+            TreeKind::InterpolatedString { args, .. } => {
+                for a in args {
+                    self.collect_reify_types(a, local_type_names, out);
+                }
             }
             _ => {}
         }
     }
 
-    /// A `val` / parameter / `def` result type inside a `reify { … }` body.
-    ///
-    /// **Not** the same shape as a type *argument* (`TreeKind::TypeApply`
-    /// above, `ReifyRef::Type`): measured with `-Ymacro-debug-lite` on
-    /// `reify { def f(y: Int): Int = y + 1; f(1) }`, a written value type is
-    /// rebuilt *structurally* -- the same way a quasiquote builds one -- and
-    /// only a leaf naming a class is resolved by symbol, as
-    /// `mkIdent($m.staticClass(...))` rather than `mkTypeTree(...)`. This
-    /// module has no structural type reifier yet (`Reifier::typ`'s ordinary,
-    /// non-reify branch is what a quasiquote uses), so only the single-leaf
-    /// case -- the whole type is one monomorphic class, `Int`, `Boolean`, a
-    /// plain user class -- is classified; anything with its own structure
-    /// (`List[Int]`, a function type, a member of a package object type
-    /// alias) is a `TypeGap`, refused rather than guessed at.
-    ///
-    /// `tpt` being empty (no type was written at all) needs no entry: that
-    /// is not a reference to classify, and `Reifier::typ` reads the absence
-    /// directly.
-    fn classify_value_type(
+    fn collect_reify_case(
         &mut self,
-        tpt: &Tree,
-        out: &mut HashMap<NodeId, crate::reify::ReifyRef>,
+        c: &CaseDef,
+        local_type_names: &HashSet<String>,
+        out: &mut HashMap<NodeId, Type>,
     ) {
-        if tpt.is_empty() {
-            return;
-        }
-        let ty = self.tree_to_type(tpt);
-        if ty.is_no_type() || ty.is_error() {
-            return;
-        }
-        let flat = self.st.dealias(&ty);
-        out.insert(
-            tpt.id,
-            match crate::materialize::static_class_name(&self.st, &flat) {
-                Ok(name) => crate::reify::ReifyRef::StaticClass(name),
-                Err(why) => crate::reify::ReifyRef::TypeGap(why),
-            },
-        );
+        self.collect_reify_types(&c.pat, local_type_names, out);
+        self.collect_reify_types(&c.guard, local_type_names, out);
+        self.collect_reify_types(&c.body, local_type_names, out);
     }
 
-    /// One subtree of a reify body, typed speculatively on a clone: the
-    /// result carries both the type it has and the symbol it resolved to,
-    /// and the call site's own tree is untouched.
-    fn reify_probe(&mut self, t: &Tree) -> Tree {
-        let mark = self.diags.len();
-        let mut probe = t.clone();
-        self.type_expr(&mut probe, &Type::NoType);
-        self.diags.truncate(mark);
-        probe
+    fn collect_reify_template(
+        &mut self,
+        impl_: &Template,
+        local_type_names: &HashSet<String>,
+        out: &mut HashMap<NodeId, Type>,
+    ) {
+        for p in &impl_.parents {
+            let mut head = p;
+            while let TreeKind::Apply { fun, args } = &head.kind {
+                for a in args {
+                    self.collect_reify_types(a, local_type_names, out);
+                }
+                head = fun;
+            }
+            if !mentions_name(head, local_type_names) {
+                let ty = self.reify_tree_to_type(head);
+                if !ty.is_no_type() && !ty.is_error() && head.id != NodeId(0) {
+                    out.insert(head.id, ty);
+                }
+            }
+        }
+        for s in &impl_.body {
+            self.collect_reify_types(s, local_type_names, out);
+        }
     }
 
-    /// The full name `Mirror.staticModule` is given for a reference to a
-    /// static `object`, if that is what `ty` is.
-    ///
-    /// Static means reachable through packages alone, which is what
-    /// `staticModule` walks: an `object` nested in a class or another object
-    /// has a `$` in its class file's simple name and is reached by
-    /// `selectTerm` on the enclosing symbol instead -- a second shape, and
-    /// `crate::reify` refuses the name rather than building the wrong one.
-    fn static_module_name(&self, ty: &Type) -> Option<String> {
-        let Type::ModuleRef(mcls) = ty else {
-            return None;
+    fn collect_reify_tparam_bounds(
+        &mut self,
+        tp: &Tree,
+        local_type_names: &HashSet<String>,
+        out: &mut HashMap<NodeId, Type>,
+    ) {
+        let TreeKind::TypeDef { lo, hi, .. } = &tp.kind else {
+            return;
         };
-        self.static_module_full_name(*mcls)
+        for b in [lo.as_ref(), hi.as_ref()].into_iter().flatten() {
+            if !mentions_name(b, local_type_names) {
+                let ty = self.reify_tree_to_type(b);
+                if !ty.is_no_type() && !ty.is_error() && b.id != NodeId(0) {
+                    out.insert(b.id, ty);
+                }
+            }
+        }
     }
 
-    /// The same, from the module class itself.
-    fn static_module_full_name(&self, mcls: SymbolId) -> Option<String> {
-        if self.st.get(mcls).kind != SymKind::ModuleClass {
-            return None;
-        }
-        let jvm = self.st.jvm_internal(mcls);
-        let full = jvm.strip_suffix('$').unwrap_or(&jvm);
-        if full.is_empty() || full.rsplit('/').next().is_some_and(|s| s.contains('$')) {
-            return None;
-        }
-        Some(full.replace('/', "."))
+    /// `tree_to_type` with its diagnostics rolled back: a type that does not
+    /// resolve here is simply not recorded, and the reifier reports it.
+    fn reify_tree_to_type(&mut self, tpt: &Tree) -> Type {
+        let mark = self.diags.len();
+        let ty = self.tree_to_type(tpt);
+        self.diags.truncate(mark);
+        ty
     }
-
-    /// A term member *declared by* a static `object` and named without its
-    /// owner -- `println`, or a name an `import P4Helper._` brought in.
-    ///
-    /// This is what lets a name that is not itself an `object` be reified by
-    /// symbol: nsc's typer has already turned `println` into
-    /// `scala.Predef.println` by the time its reifier sees it, and it builds
-    /// `Select(mkIdent(staticModule("scala.Predef")), TermName("println"))`
-    /// (measured with `-Xprint:typer`). Requiring the *declaring* owner to be
-    /// a static `object` is what keeps this honest: a local, a parameter, a
-    /// member of a class, or a member of an `object` nested in one all fail
-    /// the test and stay refused, because none of them can be found again
-    /// through a mirror.
-    ///
-    /// Two members of a static `object` are still refused.
-    ///
-    /// * One whose owner **lexically encloses** the `reify` -- a `val` of the
-    ///   very `object` the macro implementation is written in. nsc's typer
-    ///   spells that `Impls.this.x`, and its reifier builds a *different*
-    ///   tree for it (`mkThis(staticModule("Impls").asModule.moduleClass)`,
-    ///   measured on `test/files/run/macro-reify-ref-to-packageless`).
-    ///   Building the `mkIdent` form would evaluate to the same member but
-    ///   print as a different tree, and would lose access to a `private` one.
-    /// * One whose name is not a legal JVM identifier once encoded. nsc
-    ///   escapes the rest (` ` is `$u0020`) and `NameTransformer` here does
-    ///   not, so the `TermName` would name a member that does not exist.
-    fn static_member_ref(&self, sym: SymbolId) -> Option<crate::reify::ReifyRef> {
-        if sym.is_none() {
-            return None;
-        }
-        let s = self.st.get(sym);
-        if !matches!(s.kind, SymKind::Method | SymKind::Term) {
-            return None;
-        }
-        if s.flags.contains(Flags::PARAM) {
-            return None;
-        }
-        let (owner_sym, name) = (s.owner, s.name.clone());
-        if name.is_empty()
-            || !scala_rs_pickle::names::encode_method_name(&name)
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-        {
-            return None;
-        }
-        let owner = self.static_module_full_name(owner_sym)?;
-        if self
-            .st
-            .enclosing_classes(self.st.owner)
-            .contains(&owner_sym)
-        {
-            return None;
-        }
-        Some(crate::reify::ReifyRef::StaticMember { owner, name })
-    }
-
-    /// The callee of an application, resolved by typing the application --
-    /// which is the only thing that picks between overloads.
-    fn applied_static_member(&mut self, apply: &Tree) -> Option<crate::reify::ReifyRef> {
-        let probe = self.reify_probe(apply);
-        let mut head = &probe;
-        while let TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } = &head.kind {
-            head = fun;
-        }
-        if !matches!(head.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) {
-            return None;
-        }
-        self.static_member_ref(head.sym)
-    }
-
     /// How each hole's argument becomes a reflect `Tree` -- `Liftable`.
     ///
     /// A hole is not required to be a `Tree`: nsc infers an implicit
@@ -2292,4 +2611,371 @@ impl Typer {
             .into_iter()
             .find(|&s| self.st.get(s).kind == SymKind::Package)
     }
+}
+
+/// What `Check::reify_type_standalone` answers: the type value, the `$u`
+/// and `$m` locals it is written against, whether the reification is
+/// concrete, and the tag bindings to emit ahead of the creator.
+pub(crate) type StandaloneType = (Tree, String, String, bool, Vec<(String, Tree)>);
+
+/// What `Check::reify_facts` gathers.
+#[derive(Default)]
+struct ReifyFacts {
+    local_syms: HashSet<SymbolId>,
+    local_type_names: HashSet<String>,
+    this_classes: Vec<SymbolId>,
+    tags: HashMap<SymbolId, Tree>,
+    types: HashMap<NodeId, Type>,
+    splices: HashMap<NodeId, Tree>,
+    file_name: String,
+}
+
+/// Every symbol the body defines, and the names of the types among them.
+fn collect_reify_locals(t: &Tree, syms: &mut HashSet<SymbolId>, type_names: &mut HashSet<String>) {
+    let mut note = |sym: SymbolId| {
+        if !sym.is_none() {
+            syms.insert(sym);
+        }
+    };
+    match &t.kind {
+        TreeKind::ValDef { rhs, .. } => {
+            note(t.sym);
+            collect_reify_locals(rhs, syms, type_names);
+        }
+        TreeKind::DefDef {
+            tparams,
+            vparamss,
+            rhs,
+            ..
+        } => {
+            note(t.sym);
+            for tp in tparams {
+                collect_reify_locals(tp, syms, type_names);
+            }
+            for p in vparamss.iter().flatten() {
+                collect_reify_locals(p, syms, type_names);
+            }
+            collect_reify_locals(rhs, syms, type_names);
+        }
+        TreeKind::TypeDef { name, tparams, .. } => {
+            note(t.sym);
+            type_names.insert(name.clone());
+            for tp in tparams {
+                collect_reify_locals(tp, syms, type_names);
+            }
+        }
+        TreeKind::ClassDef {
+            name,
+            tparams,
+            vparamss,
+            impl_,
+            ..
+        } => {
+            note(t.sym);
+            type_names.insert(name.clone());
+            for tp in tparams {
+                collect_reify_locals(tp, syms, type_names);
+            }
+            for p in vparamss.iter().flatten() {
+                collect_reify_locals(p, syms, type_names);
+            }
+            for s in &impl_.body {
+                collect_reify_locals(s, syms, type_names);
+            }
+        }
+        TreeKind::ModuleDef { name, impl_, .. } => {
+            note(t.sym);
+            type_names.insert(name.clone());
+            for s in &impl_.body {
+                collect_reify_locals(s, syms, type_names);
+            }
+        }
+        TreeKind::Function { vparams, body } => {
+            for p in vparams {
+                collect_reify_locals(p, syms, type_names);
+            }
+            collect_reify_locals(body, syms, type_names);
+        }
+        TreeKind::Bind { body, .. } => {
+            note(t.sym);
+            collect_reify_locals(body, syms, type_names);
+        }
+        TreeKind::Match { selector, cases } => {
+            collect_reify_locals(selector, syms, type_names);
+            for c in cases {
+                collect_reify_locals(&c.pat, syms, type_names);
+                collect_reify_locals(&c.guard, syms, type_names);
+                collect_reify_locals(&c.body, syms, type_names);
+            }
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            collect_reify_locals(block, syms, type_names);
+            for c in catches {
+                collect_reify_locals(&c.pat, syms, type_names);
+                collect_reify_locals(&c.guard, syms, type_names);
+                collect_reify_locals(&c.body, syms, type_names);
+            }
+            collect_reify_locals(finalizer, syms, type_names);
+        }
+        TreeKind::Block { stats, expr } => {
+            for s in stats {
+                collect_reify_locals(s, syms, type_names);
+            }
+            collect_reify_locals(expr, syms, type_names);
+        }
+        TreeKind::Apply { fun, args } | TreeKind::UnApply { fun, args } => {
+            collect_reify_locals(fun, syms, type_names);
+            for a in args {
+                collect_reify_locals(a, syms, type_names);
+            }
+        }
+        TreeKind::TypeApply { fun, .. } => collect_reify_locals(fun, syms, type_names),
+        TreeKind::Select { qual, .. } => collect_reify_locals(qual, syms, type_names),
+        TreeKind::New { tpt } => collect_reify_locals(tpt, syms, type_names),
+        TreeKind::Typed { expr, .. } => collect_reify_locals(expr, syms, type_names),
+        TreeKind::If { cond, thenp, elsep } => {
+            collect_reify_locals(cond, syms, type_names);
+            collect_reify_locals(thenp, syms, type_names);
+            collect_reify_locals(elsep, syms, type_names);
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            collect_reify_locals(lhs, syms, type_names);
+            collect_reify_locals(rhs, syms, type_names);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { body, cond } => {
+            collect_reify_locals(cond, syms, type_names);
+            collect_reify_locals(body, syms, type_names);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => {
+            collect_reify_locals(expr, syms, type_names)
+        }
+        TreeKind::Alternative { trees } => {
+            for a in trees {
+                collect_reify_locals(a, syms, type_names);
+            }
+        }
+        TreeKind::Star { elem } => collect_reify_locals(elem, syms, type_names),
+        TreeKind::InterpolatedString { args, .. } => {
+            for a in args {
+                collect_reify_locals(a, syms, type_names);
+            }
+        }
+        TreeKind::Ident { .. } if t.stable_pat => {}
+        _ => {}
+    }
+}
+
+/// The qualifier of every `<e>.splice` in the *untyped* body, by the
+/// selection's node: what `.splice` becomes is `<e>.in[$u.type]($m).tree`,
+/// and `<e>` is typed again as part of the expansion, so it must be the
+/// tree as written and not the typed clone's.
+fn collect_reify_splices(t: &Tree, out: &mut HashMap<NodeId, Tree>) {
+    if let TreeKind::Select { qual, name } = &t.kind {
+        if name == "splice" {
+            out.insert(t.id, (**qual).clone());
+        }
+    }
+    for c in tree_children(t) {
+        collect_reify_splices(c, out);
+    }
+}
+
+/// Every abstract type mentioned by a node's type, or by the type of a value
+/// the body refers to.
+fn collect_reify_abstract_in_tree(st: &SymbolTable, t: &Tree, out: &mut Vec<SymbolId>) {
+    crate::reify::collect_abstract(&t.ty, out);
+    if let TreeKind::Ident { .. } | TreeKind::Select { .. } = &t.kind {
+        if !t.sym.is_none() {
+            let s = st.get(t.sym);
+            if matches!(s.kind, SymKind::Term | SymKind::Method) {
+                crate::reify::collect_abstract(&s.ty, out);
+            }
+        }
+    }
+    for c in tree_children(t) {
+        collect_reify_abstract_in_tree(st, c, out);
+    }
+}
+
+/// Whether a written type mentions one of `names` as a leaf.
+fn mentions_name(t: &Tree, names: &HashSet<String>) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    match &t.kind {
+        TreeKind::Ident { name } => names.contains(name),
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            mentions_name(tpt, names) || args.iter().any(|a| mentions_name(a, names))
+        }
+        TreeKind::SelectFromTypeTree { qual, .. } => mentions_name(qual, names),
+        TreeKind::CompoundTypeTree { parents, .. } => {
+            parents.iter().any(|p| mentions_name(p, names))
+        }
+        TreeKind::ExistentialTypeTree { tpt, .. } => mentions_name(tpt, names),
+        TreeKind::AnnotatedTypeTree { tpt, .. } => mentions_name(tpt, names),
+        TreeKind::SingletonTypeTree { ref_ } => match &ref_.kind {
+            TreeKind::Ident { name } => names.contains(name),
+            _ => false,
+        },
+        TreeKind::Select { qual, .. } => mentions_name(qual, names),
+        TreeKind::TypeDef { lo, hi, .. } => {
+            lo.as_ref().is_some_and(|b| mentions_name(b, names))
+                || hi.as_ref().is_some_and(|b| mentions_name(b, names))
+        }
+        _ => false,
+    }
+}
+
+/// The direct subtrees of `t`, for the walks above.
+fn tree_children(t: &Tree) -> Vec<&Tree> {
+    let mut out: Vec<&Tree> = Vec::new();
+    match &t.kind {
+        TreeKind::PackageDef { pid, stats } => {
+            out.push(pid);
+            out.extend(stats.iter());
+        }
+        TreeKind::Import { expr, .. } => out.push(expr),
+        TreeKind::ClassDef {
+            tparams,
+            vparamss,
+            impl_,
+            ..
+        } => {
+            out.extend(tparams.iter());
+            out.extend(vparamss.iter().flatten());
+            out.extend(impl_.parents.iter());
+            out.extend(impl_.body.iter());
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            out.extend(impl_.parents.iter());
+            out.extend(impl_.body.iter());
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => {
+            out.push(tpt);
+            out.push(rhs);
+        }
+        TreeKind::DefDef {
+            tparams,
+            vparamss,
+            tpt,
+            rhs,
+            ..
+        } => {
+            out.extend(tparams.iter());
+            out.extend(vparamss.iter().flatten());
+            out.push(tpt);
+            out.push(rhs);
+        }
+        TreeKind::MacroRhs { impl_ref } => out.push(impl_ref),
+        TreeKind::TypeDef {
+            tparams,
+            rhs,
+            lo,
+            hi,
+            ..
+        } => {
+            out.extend(tparams.iter());
+            out.push(rhs);
+            out.extend(lo.iter().map(|b| b.as_ref()));
+            out.extend(hi.iter().map(|b| b.as_ref()));
+        }
+        TreeKind::LabelDef { params, rhs, .. } => {
+            out.extend(params.iter());
+            out.push(rhs);
+        }
+        TreeKind::Block { stats, expr } => {
+            out.extend(stats.iter());
+            out.push(expr);
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            out.push(cond);
+            out.push(thenp);
+            out.push(elsep);
+        }
+        TreeKind::Match { selector, cases } => {
+            out.push(selector);
+            for c in cases {
+                out.push(&c.pat);
+                out.push(&c.guard);
+                out.push(&c.body);
+            }
+        }
+        TreeKind::Function { vparams, body } => {
+            out.extend(vparams.iter());
+            out.push(body);
+        }
+        TreeKind::Assign { lhs, rhs } => {
+            out.push(lhs);
+            out.push(rhs);
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { body, cond } => {
+            out.push(cond);
+            out.push(body);
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => out.push(expr),
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            out.push(block);
+            for c in catches {
+                out.push(&c.pat);
+                out.push(&c.guard);
+                out.push(&c.body);
+            }
+            out.push(finalizer);
+        }
+        TreeKind::New { tpt } => out.push(tpt),
+        TreeKind::Typed { expr, tpt } => {
+            out.push(expr);
+            out.push(tpt);
+        }
+        TreeKind::TypeApply { fun, args } | TreeKind::Apply { fun, args } => {
+            out.push(fun);
+            out.extend(args.iter());
+        }
+        TreeKind::Select { qual, .. } => out.push(qual),
+        TreeKind::Bind { body, .. } => out.push(body),
+        TreeKind::Star { elem } => out.push(elem),
+        TreeKind::Alternative { trees } => out.extend(trees.iter()),
+        TreeKind::UnApply { fun, args } => {
+            out.push(fun);
+            out.extend(args.iter());
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            out.push(tpt);
+            out.extend(args.iter());
+        }
+        TreeKind::SingletonTypeTree { ref_ } => out.push(ref_),
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            out.push(tpt);
+            out.push(annot);
+        }
+        TreeKind::SelectFromTypeTree { qual, .. } => out.push(qual),
+        TreeKind::CompoundTypeTree {
+            parents,
+            refinements,
+        } => {
+            out.extend(parents.iter());
+            out.extend(refinements.iter());
+        }
+        TreeKind::ExistentialTypeTree { tpt, clauses } => {
+            out.push(tpt);
+            out.extend(clauses.iter());
+        }
+        TreeKind::InterpolatedString { args, .. } => out.extend(args.iter()),
+        TreeKind::Empty
+        | TreeKind::Super { .. }
+        | TreeKind::This { .. }
+        | TreeKind::Ident { .. }
+        | TreeKind::Literal { .. }
+        | TreeKind::Wildcard
+        | TreeKind::Unimplemented { .. } => {}
+    }
+    out
 }

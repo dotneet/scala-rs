@@ -151,6 +151,16 @@ pub(crate) enum TagBody {
     /// `c.Expr[F[E]]` inside `def impl[E](c: Context)(implicit e:
     /// c.WeakTypeTag[E])` work: `F[E]` is only knowable through `e`.
     FromTag(Box<Tree>),
+    /// The type value `crate::reify`'s type reifier built (`docs/notes/
+    /// reify-design.md`): every shape nsc's `reifyType` builds -- a class
+    /// nested in an object, a singleton, `AnyRef`, a free type -- written
+    /// against `$u` / `$m` locals the creator binds first, the way nsc's
+    /// own `$typecreator` does.
+    Reified {
+        tree: Box<Tree>,
+        universe_local: String,
+        mirror_local: String,
+    },
 }
 
 /// The name `Mirror.staticClass` is given for `ty`, or why there is none.
@@ -406,6 +416,92 @@ pub(crate) fn ensure_tag_module(
 /// value of type TypeTags$TypeTag[Foo]" report was about, and it is also what
 /// erasure would have written the call's descriptor from. Now that the class
 /// symbol exists, every mention of it is repaired.
+/// The name of the tag the companion caches for a core type (`TypeTag.Int`,
+/// `WeakTypeTag.AnyRef`), if `ty` is one. nsc's materialiser answers a
+/// request for such a type with the cached instance rather than a creator
+/// (`Taggers.coreTags`), which is why `implicitly[WeakTypeTag[Int]] eq
+/// WeakTypeTag.Int`.
+pub(crate) fn core_tag_name(ty: &Type) -> Option<&'static str> {
+    Some(match ty {
+        Type::Byte => "Byte",
+        Type::Short => "Short",
+        Type::Char => "Char",
+        Type::Int => "Int",
+        Type::Long => "Long",
+        Type::Float => "Float",
+        Type::Double => "Double",
+        Type::Boolean => "Boolean",
+        Type::Unit => "Unit",
+        Type::Any => "Any",
+        Type::AnyVal => "AnyVal",
+        Type::AnyRef => "AnyRef",
+        Type::JavaObject => "Object",
+        Type::Nothing => "Nothing",
+        Type::Null => "Null",
+        _ => return None,
+    })
+}
+
+/// The core types every `Type` above stands for, by that name.
+fn core_tag_type(name: &str) -> Type {
+    match name {
+        "Byte" => Type::Byte,
+        "Short" => Type::Short,
+        "Char" => Type::Char,
+        "Int" => Type::Int,
+        "Long" => Type::Long,
+        "Float" => Type::Float,
+        "Double" => Type::Double,
+        "Boolean" => Type::Boolean,
+        "Unit" => Type::Unit,
+        "Any" => Type::Any,
+        "AnyVal" => Type::AnyVal,
+        "AnyRef" => Type::AnyRef,
+        "Object" => Type::JavaObject,
+        "Nothing" => Type::Nothing,
+        _ => Type::Null,
+    }
+}
+
+const CORE_TAG_NAMES: [&str; 15] = [
+    "Byte", "Short", "Char", "Int", "Long", "Float", "Double", "Boolean", "Unit", "Any", "AnyVal",
+    "AnyRef", "Object", "Nothing", "Null",
+];
+
+/// Install the companion's cached core tags (`val Int: TypeTag[Int]`, ...)
+/// on the module class `ensure_tag_module` built, once. Their class file
+/// members are the accessors `Int()`, returning the tag class itself.
+pub(crate) fn ensure_core_tags(st: &mut SymbolTable, tag: Tag, mcls: SymbolId, tag_cls: SymbolId) {
+    if st
+        .lookup_member(mcls, "Int")
+        .into_iter()
+        .any(|m| st.get(m).kind == SymKind::Method)
+    {
+        return;
+    }
+    let tag_jvm = tag.jvm();
+    for name in CORE_TAG_NAMES {
+        let acc = st.alloc(
+            name,
+            mcls,
+            SymKind::Method,
+            Flags::ACCESSOR,
+            format!("()L{tag_jvm};"),
+        );
+        st.get_mut(acc).ty = Type::Method {
+            paramss: Vec::new(),
+            ret: Box::new(Type::Class {
+                sym: tag_cls,
+                args: vec![core_tag_type(name)],
+            }),
+        };
+        st.get_mut(acc).parameterless_method = Some(true);
+        if !st.get(mcls).members.contains(&acc) {
+            st.get_mut(mcls).members.push(acc);
+        }
+    }
+}
+
 fn resolve_named_tags(st: &mut SymbolTable, tag: Tag, tag_cls: SymbolId) {
     let unresolved = format!("TypeTags${}", tag.simple());
     let real = Type::Class {
@@ -478,6 +574,9 @@ pub(crate) struct Materialiser<'a> {
     pub(crate) mirror_ty: Type,
     /// `scala.reflect.api.Types.TypeApi`, the creator's erased result.
     pub(crate) type_api: Type,
+    /// Tags in scope a reified body splices, bound to locals ahead of the
+    /// creator; see `crate::reify_expand::ReifyExpander::tag_bindings`.
+    pub(crate) tag_bindings: Vec<(String, Tree)>,
     pub(crate) span: Span,
 }
 
@@ -493,8 +592,21 @@ impl Materialiser<'_> {
             })),
             args: vec![self.mirror(), self.new_creator()],
         });
+        let mut stats: Vec<Tree> = self
+            .tag_bindings
+            .iter()
+            .map(|(name, tree)| {
+                self.node(TreeKind::ValDef {
+                    mods: Modifiers::default(),
+                    name: name.clone(),
+                    tpt: Box::new(self.node(TreeKind::Empty)),
+                    rhs: Box::new(tree.clone()),
+                })
+            })
+            .collect();
+        stats.push(creator);
         self.node(TreeKind::Block {
-            stats: vec![creator],
+            stats,
             expr: Box::new(call),
         })
     }
@@ -627,6 +739,40 @@ impl Materialiser<'_> {
                 }),
                 "tpe",
             ),
+            // `{ val $u = $m$untyped.universe; val $m = $m$untyped
+            //   .asInstanceOf[scala.reflect.api.Mirror[$u.type]]; <tree> }`
+            TagBody::Reified {
+                tree,
+                universe_local,
+                mirror_local,
+            } => {
+                let val_def = |name: &str, rhs: Tree| {
+                    self.node(TreeKind::ValDef {
+                        mods: Modifiers::default(),
+                        name: name.to_string(),
+                        tpt: Box::new(self.node(TreeKind::Empty)),
+                        rhs: Box::new(rhs),
+                    })
+                };
+                let cast = self.node(TreeKind::TypeApply {
+                    fun: Box::new(self.select(self.untyped_mirror(), "asInstanceOf")),
+                    args: vec![self.node(TreeKind::AppliedTypeTree {
+                        tpt: Box::new(self.api_type("Mirror")),
+                        args: vec![self.node(TreeKind::SingletonTypeTree {
+                            ref_: Box::new(self.node(TreeKind::Ident {
+                                name: universe_local.clone(),
+                            })),
+                        })],
+                    })],
+                });
+                self.node(TreeKind::Block {
+                    stats: vec![
+                        val_def(universe_local, self.mirror_universe()),
+                        val_def(mirror_local, cast),
+                    ],
+                    expr: Box::new((**tree).clone()),
+                })
+            }
         }
     }
 

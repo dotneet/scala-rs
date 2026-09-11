@@ -2432,8 +2432,36 @@ impl Typer {
             "scala/reflect/api/Types$TypeApi",
         )?;
         let (tag_cls, mirror) = (classes.tag_cls, classes.mirror);
-        crate::materialize::ensure_tag_module(&mut self.st, tag, classes)?;
+        let mcls = crate::materialize::ensure_tag_module(&mut self.st, tag, classes)?;
         let tag_name = tag.simple().to_string();
+        // A core type's tag is the instance the companion caches
+        // (`TypeTag.Int`), never a creator -- nsc's `Taggers.coreTags`.
+        if let Some(core) = crate::materialize::core_tag_name(&arg) {
+            crate::materialize::ensure_core_tags(&mut self.st, tag, mcls, tag_cls);
+            let universe_ty = universe.ty.clone();
+            let _ = self.supply_from_pickle(&universe_ty, &tag_name);
+            let want = Type::Class {
+                sym: tag_cls,
+                args: vec![arg.clone()],
+            };
+            let mut tree = Tree::new(
+                NodeId(0),
+                span,
+                TreeKind::Select {
+                    qual: Box::new(Tree::new(
+                        NodeId(0),
+                        span,
+                        TreeKind::Select {
+                            qual: Box::new(universe.clone()),
+                            name: tag_name.clone(),
+                        },
+                    )),
+                    name: core.to_string(),
+                },
+            );
+            self.type_expr(&mut tree, &want);
+            return Some(tree);
+        }
         // `TypeTags` is not a *direct* parent of `JavaUniverse` -- it is one
         // of `scala.reflect.api.Universe`'s, and those live only in the
         // pickle. Until something asks the universe for a member it does not
@@ -2443,32 +2471,83 @@ impl Typer {
         // failed lookup itself attached the ancestors. Ask here instead.
         let universe_ty = universe.ty.clone();
         let _ = self.supply_from_pickle(&universe_ty, &tag_name);
-        let body = match self.tag_body(tag, &arg, span) {
-            Ok(b) => b,
-            Err(why) => {
-                self.error(
-                    span,
-                    format!(
-                        "materialisation is not implemented: cannot build a \
+        // The type reifier `reify { … }` uses builds every shape nsc's own
+        // materialiser does -- nested classes, singletons, aliases, free
+        // types -- and is asked first; the three-shape builder below is the
+        // fallback, and the one that names what neither can build.
+        let reified = self.reify_type_standalone(&universe, &arg, span, tag);
+        let mut tag_bindings = Vec::new();
+        let (body, tag, tag_name) = match reified {
+            Some((tree, universe_local, mirror_local, concrete, bindings)) => {
+                tag_bindings = bindings;
+                // nsc: `materializeWeakTypeTag` of a type that mentions no
+                // abstract type at all is a `TypeTag`; one that splices a tag
+                // in stays weak (`reificationIsConcrete`, whose `<:<` against
+                // the bare `TypeTag` constructor never holds for a spliced
+                // tag).
+                let _ = concrete;
+                let mut abstract_ids = Vec::new();
+                crate::reify::collect_abstract(&arg, &mut abstract_ids);
+                let concrete = abstract_ids.is_empty();
+                let tag = if tag == crate::materialize::Tag::Weak && concrete {
+                    crate::materialize::Tag::Strong
+                } else {
+                    tag
+                };
+                if tag != crate::materialize::Tag::Weak {
+                    let strong = self.reflect_class(tag.pickle_name(), tag.jvm())?;
+                    // A `TypeTag` answers a `WeakTypeTag` request only if
+                    // its parent is known, and that parent lives in the
+                    // pickle of `TypeTags`.
+                    self.pickle
+                        .ensure_parents(&mut self.st, &mut self.binary, strong);
+                    let classes = crate::materialize::TagClasses {
+                        tag_cls: strong,
+                        type_tags: classes.type_tags,
+                        mirror: classes.mirror,
+                        creator: classes.creator,
+                    };
+                    crate::materialize::ensure_tag_module(&mut self.st, tag, classes)?;
+                    let _ = self.supply_from_pickle(&universe_ty, tag.simple());
+                }
+                (
+                    crate::materialize::TagBody::Reified {
+                        tree: Box::new(tree),
+                        universe_local,
+                        mirror_local,
+                    },
+                    tag,
+                    tag.simple().to_string(),
+                )
+            }
+            None => match self.tag_body(tag, &arg, span) {
+                Ok(b) => (b, tag, tag_name),
+                Err(why) => {
+                    self.error(
+                        span,
+                        format!(
+                            "materialisation is not implemented: cannot build a \
                          {tag_name} for {why}. scala-rs rebuilds a tag out of \
                          `staticClass` calls, `appliedType` and the tags in \
                          scope; see docs/macros.md \u{a7}7.10 and \u{a7}7.12.",
-                    ),
-                );
-                return Some(Tree {
-                    id: NodeId(0),
-                    span,
-                    kind: TreeKind::Empty,
-                    ty: Type::Error,
-                    sym: SymbolId::NONE,
-                    postfix: false,
-                    scala_ref: false,
-                    stable_pat: false,
-                    byname_thunk: false,
-                    byname_type_marker: false,
-                });
-            }
+                        ),
+                    );
+                    return Some(Tree {
+                        id: NodeId(0),
+                        span,
+                        kind: TreeKind::Empty,
+                        ty: Type::Error,
+                        sym: SymbolId::NONE,
+                        postfix: false,
+                        scala_ref: false,
+                        stable_pat: false,
+                        byname_thunk: false,
+                        byname_type_marker: false,
+                    });
+                }
+            },
         };
+        let _ = tag;
         self.gensym += 1;
         let creator_name = format!("$typecreator{}", self.gensym);
         let want = Type::Class {
@@ -2489,6 +2568,7 @@ impl Typer {
                 sym: type_api,
                 args: vec![],
             },
+            tag_bindings,
             span,
         }
         .build();

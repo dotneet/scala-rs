@@ -164,6 +164,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Class, flags, &jvm);
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).annotations = annots;
                 // `private[jdbc] class`/`object` kept only the PRIVATE flag,
                 // so the access check read it as plain `private` and every
@@ -511,6 +512,7 @@ impl Typer {
             let id = if tp.sym.is_none() {
                 let id = self.st.alloc(&name, owner, SymKind::TypeParam, flags, "");
                 tp.sym = id;
+                self.def_spans.insert(id, tp.span);
                 id
             } else {
                 tp.sym
@@ -1443,6 +1445,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).deferred_val = deferred;
@@ -1474,6 +1477,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Method, flags, "");
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).abstract_override = abs_over;
@@ -1500,6 +1504,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(&name, self.st.owner, SymKind::TypeMember, flags, "");
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).private_within = within;
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).is_type_alias = is_type_alias;
