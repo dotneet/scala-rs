@@ -22,6 +22,53 @@ impl Typer {
         self.typing_qualifier = saved;
     }
 
+    pub(crate) fn type_expr_arg_prototype(
+        &mut self,
+        tree: &mut Tree,
+        pt: &Type,
+        provisional: bool,
+    ) {
+        if !provisional {
+            self.type_expr(tree, pt);
+            return;
+        }
+        fn value_sites(
+            tree: &Tree,
+            file: usize,
+            out: &mut std::collections::HashSet<(usize, NodeId)>,
+        ) {
+            out.insert((file, tree.id));
+            match &tree.kind {
+                TreeKind::Block { expr, .. } | TreeKind::Return { expr } => {
+                    value_sites(expr, file, out)
+                }
+                TreeKind::If { thenp, elsep, .. } => {
+                    value_sites(thenp, file, out);
+                    value_sites(elsep, file, out);
+                }
+                TreeKind::Match { cases, .. } => {
+                    for c in cases {
+                        value_sites(&c.body, file, out);
+                    }
+                }
+                TreeKind::Try { block, catches, .. } => {
+                    value_sites(block, file, out);
+                    for c in catches {
+                        value_sites(&c.body, file, out);
+                    }
+                }
+                TreeKind::Function { body, .. } => value_sites(body, file, out),
+                // A written ascription is an actual constraint. Likewise the
+                // arguments of a nested call obey that callee's declaration.
+                _ => {}
+            }
+        }
+        let saved = self.provisional_arg_sites.clone();
+        value_sites(tree, self.file_index, &mut self.provisional_arg_sites);
+        self.type_expr(tree, pt);
+        self.provisional_arg_sites = saved;
+    }
+
     pub(crate) fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
         // Taken, not read: everything typed below this point is no longer the
         // callee of the application that set it. See `typing_callee`.

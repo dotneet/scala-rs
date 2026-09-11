@@ -33,6 +33,9 @@ makes no claim of conformance to the language specification. What exists today:
   Parent and fallback prototypes, local import signatures, FunctionN inference
   and value-class argument storage are covered by the
   [contextual evidence batch](docs/batches/contextual-evidence.md).
+  Provisional value expectations, sibling-lambda results, rigid factory evidence
+  and constructor/case-copy declaration selection are covered by the
+  [contextual recovery batch](docs/batches/contextual-recovery-inventory.md).
 - Immutable Map lookup and update members require the declared key type,
   preserving implicit key conversions and independent value widening.
 - Function types preserve one Unit argument separately from an empty argument

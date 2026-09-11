@@ -432,6 +432,11 @@ pub struct Typer {
     /// yet what the callee's type parameters are, and `take(empty)` would pick
     /// the one witness in scope instead of the one the parameter asks for.
     pub(crate) typing_call_args: bool,
+    /// Value positions typed under a provisional lower-bound prototype.
+    /// Such a hint may infer type arguments but cannot demand an implicit
+    /// value conversion; explicit ascriptions and nested call arguments keep
+    /// their ordinary, declared expected types.
+    pub(crate) provisional_arg_sites: std::collections::HashSet<(usize, NodeId)>,
     /// Set just before the *callee* of an `Apply` / `TypeApply` is typed, and
     /// taken by the first [`Typer::type_expr`] that sees it. A macro
     /// application is expanded at its outermost node the way nsc's is, so
@@ -1013,6 +1018,7 @@ impl Typer {
             completed_arg_classes: std::collections::HashSet::new(),
             new_is_applied: false,
             typing_call_args: false,
+            provisional_arg_sites: Default::default(),
             typing_callee: false,
             typing_type_callee: false,
             typing_qualifier: false,

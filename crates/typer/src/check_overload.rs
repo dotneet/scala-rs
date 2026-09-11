@@ -556,10 +556,21 @@ impl Typer {
             }
             _ => return OverloadPick::None,
         }
+        let single_candidate = cands.len() == 1;
         let (applicable, with_views): (Vec<(SymbolId, Vec<Type>, Type)>, bool) = {
             let no_view: Vec<_> = cands
                 .iter()
-                .filter(|(sym, ps, _)| self.is_applicable(*sym, clause, ps, arg_tys, false, targs))
+                .filter(|(sym, ps, ret)| {
+                    self.is_applicable(
+                        *sym,
+                        clause,
+                        ps,
+                        arg_tys,
+                        false,
+                        targs,
+                        single_candidate.then_some((ret, _pt)),
+                    )
+                })
                 .cloned()
                 .collect();
             if !no_view.is_empty() {
@@ -568,8 +579,16 @@ impl Typer {
                 (
                     cands
                         .into_iter()
-                        .filter(|(sym, ps, _)| {
-                            self.is_applicable(*sym, clause, ps, arg_tys, true, targs)
+                        .filter(|(sym, ps, ret)| {
+                            self.is_applicable(
+                                *sym,
+                                clause,
+                                ps,
+                                arg_tys,
+                                true,
+                                targs,
+                                single_candidate.then_some((ret, _pt)),
+                            )
                         })
                         .collect(),
                     true,
@@ -964,7 +983,7 @@ impl Typer {
                 .collect()
         };
         let saved = self.spec_probe.replace(true);
-        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[])
+        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[], None)
             && self.function_params_conform(&a_ps, &b_ps);
         self.spec_probe.set(saved);
         out
@@ -1108,6 +1127,7 @@ impl Typer {
         idx: usize,
         pt: &Type,
         recv: Option<&Type>,
+        use_lower_bounds: bool,
     ) -> Type {
         if sym.is_none() {
             return Type::NoType;
@@ -1239,7 +1259,7 @@ impl Typer {
             })
             .collect();
         for &tp in &tps {
-            if !solved.iter().any(|(id, _)| *id == tp) {
+            if use_lower_bounds && !solved.iter().any(|(id, _)| *id == tp) {
                 if let Some(lo) = self.tparam_lower_bound(sym, tp, recv) {
                     solved.push((tp, lo));
                 }
@@ -1734,6 +1754,7 @@ impl Typer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn is_applicable(
         &self,
         sym: SymbolId,
@@ -1742,6 +1763,7 @@ impl Typer {
         args: &[Type],
         allow_widen: bool,
         targs: &[Type],
+        expected: Option<(&Type, &Type)>,
     ) -> bool {
         let instantiated;
         let params = if !sym.is_none() && !self.st.get(sym).tparams.is_empty() {
@@ -1756,6 +1778,14 @@ impl Typer {
                 tps.iter().copied().zip(targs.iter().cloned()).collect()
             } else {
                 self.infer_method_tparams(sym, params, args)
+            };
+            let inst = if targs.len() != tps.len() {
+                match expected {
+                    Some((ret, pt)) => self.add_expected_constraints(sym, ret, pt, inst),
+                    None => inst,
+                }
+            } else {
+                inst
             };
             if inst.is_empty() {
                 params

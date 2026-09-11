@@ -133,6 +133,7 @@ impl Typer {
 
     fn type_class_with_macro_owner(&mut self, tree: &mut Tree) {
         let id = tree.sym;
+        self.suppress_inherited_case_copy(id);
         if let TreeKind::ClassDef { mods, vparamss, .. } = &tree.kind {
             if mods.flags.contains(Flags::IMPLICIT) {
                 let owner_kind = if !id.is_none() {

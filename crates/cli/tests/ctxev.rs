@@ -117,3 +117,40 @@ fn invariant_lower_bound_prototypes() {
 fn value_class_storage_boundaries() {
     matrix(&[("valueclass", true)]);
 }
+
+#[test]
+fn deferred_lambda_results_and_invariant_context() {
+    matrix(&[
+        ("recovery_inference", true),
+        ("recovery_hk_wrong_bad", false),
+        ("recovery_fold_wrong_bad", false),
+        ("recovery_function_domain_bad", false),
+        ("recovery_explicit_result_bad", false),
+        ("recovery_fold_invariant_bad", false),
+    ]);
+}
+#[test]
+fn rigid_factory_evidence() {
+    matrix(&[
+        ("recovery_factory", true),
+        ("recovery_factory_wrong_bad", false),
+        ("recovery_factory_missing_bad", false),
+    ]);
+}
+#[test]
+fn secondary_constructor_and_written_copy() {
+    matrix(&[
+        ("recovery_copy", true),
+        ("recovery_constructor_wrong_bad", false),
+        ("recovery_local_copy_bad", false),
+        ("recovery_private_parent_copy_bad", false),
+        ("recovery_curried_copy_bad", false),
+        ("recovery_own_copy_bad", false),
+        ("recovery_inherited_copy_bad", false),
+        ("recovery_copy_default_bad", false),
+    ]);
+}
+#[test]
+fn provisional_values_preserve_written_constraints() {
+    matrix(&[("recovery_value_hints", true)]);
+}

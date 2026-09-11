@@ -493,7 +493,26 @@ impl Typer {
             // Generic inference must use ctor *fields* (`Tuple2._1: A`) even when
             // the picked `<init>` is erased to `(Any, Any)` in the prelude.
             let nargs = args.len();
-            let unify_params = if infer && field_tys.len() == nargs && !field_tys.is_empty() {
+            // Only the primary constructor's declaration is described by
+            // ctor_fields. Same-arity secondary constructors have their own
+            // parameter types even when class type arguments are inferred.
+            let primary = match (class_id, ctor_sym) {
+                (Some(c), Some(ctor)) => {
+                    self.st.get(ctor).params == self.st.get(c).ctor_fields
+                        || (c.0 < self.st.prelude_end
+                            && self
+                                .st
+                                .get(c)
+                                .members
+                                .iter()
+                                .copied()
+                                .find(|&m| self.st.get(m).name == "<init>")
+                                == Some(ctor))
+                }
+                _ => true,
+            };
+            let use_fields = infer && primary && field_tys.len() == nargs && !field_tys.is_empty();
+            let unify_params = if use_fields {
                 field_tys.clone()
             } else {
                 ctor_params.clone()
@@ -590,7 +609,7 @@ impl Typer {
                 // raw `T*` -- `new SetTupleParameter[(T1, T2)](c1, c2)` on a
                 // `(val children: SetParameter[_]*)` constructor could never
                 // typecheck. The method path has always used `param_at`.
-                let mut p = if infer && field_tys.len() == nargs && !field_tys.is_empty() {
+                let mut p = if use_fields {
                     param_at(&field_tys, i).cloned().unwrap_or(Type::NoType)
                 } else {
                     param_at(&ctor_params, i).cloned().unwrap_or(Type::NoType)
@@ -774,8 +793,43 @@ impl Typer {
                     ret: Box::new(Type::NoType),
                 });
             } else {
-                let pt_arg =
-                    self.proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt, recv_ty.as_ref());
+                let strict_proto = self.proto_arg_type(
+                    &fun_ty_for_pretype,
+                    fun.sym,
+                    ai,
+                    pt,
+                    recv_ty.as_ref(),
+                    false,
+                );
+                let inherited_hint = self
+                    .provisional_arg_sites
+                    .contains(&(self.file_index, tree_id));
+                let from_declaration = if inherited_hint {
+                    self.proto_arg_type(
+                        &fun_ty_for_pretype,
+                        fun.sym,
+                        ai,
+                        &Type::NoType,
+                        recv_ty.as_ref(),
+                        false,
+                    )
+                } else {
+                    strict_proto.clone()
+                };
+                let provisional = strict_proto.is_no_type()
+                    || (inherited_hint && strict_proto != from_declaration);
+                let pt_arg = if provisional {
+                    self.proto_arg_type(
+                        &fun_ty_for_pretype,
+                        fun.sym,
+                        ai,
+                        pt,
+                        recv_ty.as_ref(),
+                        true,
+                    )
+                } else {
+                    strict_proto
+                };
                 if pt_arg.is_no_type() {
                     self.type_expr(a, &Type::NoType);
                 } else {
@@ -795,7 +849,7 @@ impl Typer {
                     // the body reads (153 of them across the benchmark).
                     let saved = a.clone();
                     let mark = self.diags.len();
-                    self.type_expr(a, &pt_arg);
+                    self.type_expr_arg_prototype(a, &pt_arg, provisional);
                     let with_errs = self.error_count_since(mark);
                     if with_errs > 0
                         || a.ty.is_error()
@@ -1053,11 +1107,43 @@ impl Typer {
                                 }
                                 _ => inst,
                             };
+                            // A typed sibling supplies a lower constraint, not a
+                            // final solution for a result still produced by an
+                            // untyped lambda. Keep those variables open until all
+                            // bodies participate in the second inference pass.
+                            let inst: Vec<_> = inst
+                                .into_iter()
+                                .filter(|(tp, _)| {
+                                    pending_targs.is_some()
+                                        || param_tys.iter().zip(&arg_tys).any(|(p, a)| {
+                                            !mentions_no_type(a)
+                                                && matches!(
+                                                    self.tparam_variance_in(p, *tp, 1),
+                                                    Some(0 | -1)
+                                                )
+                                        })
+                                        || !param_tys.iter().zip(&arg_tys).any(|(p, a)| {
+                                            if !mentions_no_type(a) {
+                                                return false;
+                                            }
+                                            match p {
+                                                Type::Function { params, ret } => {
+                                                    self.tparam_variance_in(ret, *tp, 1) == Some(1)
+                                                        && !params
+                                                            .iter()
+                                                            .any(|p| type_mentions_tparam(p, *tp))
+                                                }
+                                                _ => false,
+                                            }
+                                        })
+                                })
+                                .collect();
                             // The expected type is a constraint too. Solve it here,
                             // before the implicit clauses are filled: slick's
                             // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
                             // gets `T` from nowhere else.
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
+
                             // nsc reads the expected type *after* the arguments
                             // are typed. Here the pass runs first, so a solution
                             // the expected type only knows as `_` -- the stand-in

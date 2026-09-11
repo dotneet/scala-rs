@@ -1,0 +1,1 @@
+trait Close[+A]{def value:A};class Single[+A](val value:A)extends Close[A];class Positioned[+A](val value:A)extends Close[A];object Main{val e:Either[Int,Positioned[Int]]=Left(7);val x=e.fold[Positioned[Int]](n=>new Single(n),identity)}

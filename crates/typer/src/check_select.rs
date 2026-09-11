@@ -3125,6 +3125,20 @@ impl Typer {
         if depth_to_copy(tree).is_none_or(|d| d < 2) {
             return false;
         }
+        let saved = tree.clone();
+        let mark = self.diags.len();
+        if self.try_rewrite_case_copy_curried_in(tree, pt) {
+            return true;
+        }
+        // This is a speculative rewrite. Ordinary curried copy methods (or
+        // classes where copy synthesis was suppressed) keep their original
+        // application when it does not describe a generated case-copy call.
+        *tree = saved;
+        self.diags.truncate(mark);
+        false
+    }
+
+    fn try_rewrite_case_copy_curried_in(&mut self, tree: &mut Tree, pt: &Type) -> bool {
         // Peel: unwind one `Apply` layer at a time (outermost first),
         // collecting each layer's own argument list, until the innermost
         // `copy` selection/identifier is reached.
@@ -3177,7 +3191,11 @@ impl Typer {
                 None => return false,
             }
         };
-        if !self.st.get(class_id).flags.contains(Flags::CASE) {
+        if !self.st.get(class_id).flags.contains(Flags::CASE)
+            || !self.st.get(class_id).members.iter().any(|m| {
+                self.st.get(*m).name == "copy" && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
+            })
+        {
             return false;
         }
         if self
@@ -3328,7 +3346,11 @@ impl Typer {
                 cls
             }
         };
-        if !self.st.get(class_id).flags.contains(Flags::CASE) {
+        if !self.st.get(class_id).flags.contains(Flags::CASE)
+            || !self.st.get(class_id).members.iter().any(|m| {
+                self.st.get(*m).name == "copy" && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
+            })
+        {
             return false;
         }
         {

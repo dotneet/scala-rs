@@ -1290,7 +1290,11 @@ impl Typer {
         let from_pt: Vec<(SymbolId, Type)> = self
             .add_expected_constraints_in(tree.sym, &ret, pt, Vec::new(), true)
             .into_iter()
-            .filter(|(_, t)| !t.is_no_type() && !t.is_error() && !matches!(t, Type::TypeParam(_)))
+            .filter(|(_, t)| {
+                !t.is_no_type()
+                    && !t.is_error()
+                    && !mentions_tparam(t, &self.st.get(tree.sym).tparams)
+            })
             .collect();
         // A parameter only a lower bound constrains is instantiated at that
         // bound now -- ahead of `from_pt`, because nsc's `solvedTypes`
@@ -1311,7 +1315,9 @@ impl Typer {
                 .add_expected_constraints_in(tree.sym, &ret, pt, Vec::new(), true)
                 .into_iter()
                 .filter(|(_, t)| {
-                    !t.is_no_type() && !t.is_error() && !matches!(t, Type::TypeParam(_))
+                    !t.is_no_type()
+                        && !t.is_error()
+                        && !mentions_tparam(t, &self.st.get(tree.sym).tparams)
                 })
                 .collect();
             (undet, ret, from_pt)
@@ -3044,11 +3050,17 @@ impl Typer {
         // already declined, so this costs a class file only where the
         // alternative is an error.
         let from_ty = tree.ty.clone();
-        self.warm_own_scope_once(&from_ty);
-        let mut conversion = self.search_conversion(&tree.ty, pt);
-        if matches!(conversion, ImplicitSearch::None) {
-            self.warm_conversion_witnesses(&tree.ty, pt);
+        let provisional = self
+            .provisional_arg_sites
+            .contains(&(self.file_index, tree.id));
+        let mut conversion = ImplicitSearch::None;
+        if !provisional {
+            self.warm_own_scope_once(&from_ty);
             conversion = self.search_conversion(&tree.ty, pt);
+            if matches!(conversion, ImplicitSearch::None) {
+                self.warm_conversion_witnesses(&tree.ty, pt);
+                conversion = self.search_conversion(&tree.ty, pt);
+            }
         }
         match conversion {
             ImplicitSearch::Found(id) => {

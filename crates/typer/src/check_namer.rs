@@ -1174,6 +1174,51 @@ impl Typer {
         }
     }
 
+    /// Parents have been resolved by the header pass before template typing.
+    /// A concrete inherited copy suppresses synthesis by name as well; an
+    /// abstract declaration can still be implemented by the generated copy.
+    pub(crate) fn suppress_inherited_case_copy(&mut self, class_id: SymbolId) {
+        if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
+            return;
+        }
+        // Ask each direct parent, as nsc's parent.member does. Its own
+        // private copy also suppresses synthesis in the child.
+        let members: Vec<_> = self
+            .st
+            .get(class_id)
+            .parents
+            .iter()
+            .filter_map(|p| self.st.class_sym_of(p))
+            .flat_map(|p| self.st.lookup_member(p, "copy"))
+            .collect();
+        let inherited = members.iter().any(|m| {
+            let s = self.st.get(*m);
+            s.owner != class_id
+                && match s.kind {
+                    SymKind::Method => !self.st.method_is_deferred(*m),
+                    SymKind::Term => !s.deferred_val,
+                    _ => false,
+                }
+        });
+        if inherited {
+            let copies: Vec<_> = self
+                .st
+                .get(class_id)
+                .members
+                .iter()
+                .copied()
+                .filter(|m| {
+                    self.st.get(*m).name == "copy"
+                        && self.st.get(*m).flags.contains(Flags::SYNTHETIC)
+                })
+                .collect();
+            self.st
+                .get_mut(class_id)
+                .members
+                .retain(|m| !copies.contains(m));
+        }
+    }
+
     fn synthesize_case_members(&mut self, class_id: SymbolId, name: &str, ctor: &CtorAccess) {
         // `-Xsource-features:case-apply-copy-access`. Off (the 2.13 default)
         // this is `CtorAccess::default()`'s effect: no flags, no qualifier.
@@ -1183,58 +1228,66 @@ impl Typer {
             sym: class_id,
             args: vec![],
         };
-        // copy, productArity, toString, equals, hashCode as methods (backend will emit)
-        let copy = self
-            .st
-            .alloc("copy", class_id, SymKind::Method, Flags::SYNTHETIC, "");
-        if inherit {
-            let flags = self.st.get(copy).flags.with(ctor.copy_flags());
-            self.st.get_mut(copy).flags = flags;
-            self.st.get_mut(copy).private_within = ctor.private_within.clone();
+        // A written member named copy suppresses the synthetic method, even
+        // when its parameter types differ (nsc Namers.hasCopy). Leaving a
+        // phantom overload here can select a method the backend never emits.
+        let has_copy = self.st.get(class_id).members.iter().any(|m| {
+            self.st.get(*m).name == "copy" && !self.st.get(*m).flags.contains(Flags::SYNTHETIC)
+        });
+        if !has_copy {
+            // copy, productArity, toString, equals, hashCode as methods (backend will emit)
+            let copy = self
+                .st
+                .alloc("copy", class_id, SymKind::Method, Flags::SYNTHETIC, "");
+            if inherit {
+                let flags = self.st.get(copy).flags.with(ctor.copy_flags());
+                self.st.get_mut(copy).flags = flags;
+                self.st.get_mut(copy).private_within = ctor.private_within.clone();
+            }
+            // `copy`'s own parameter symbols are distinct from `ctor_fields`: reusing
+            // the constructor's field symbols directly (as the companion `apply`
+            // does below) would mean giving them `DEFAULTPARAM` + a `this.field`
+            // default, which would then also apply to `apply`/`<init>` calls where
+            // there is no `this` to default from. Each param defaults to the
+            // matching field of the receiver, exactly like nsc's synthesized
+            // `copy$default$N` getters (built by `synthesize_default_getters` below,
+            // the same machinery a user-written `def f(x: Int = 5)` uses).
+            let copy_params: Vec<SymbolId> = fields
+                .iter()
+                .map(|f| {
+                    let fname = self.st.get(*f).name.clone();
+                    let fty = self.st.get(*f).ty.clone();
+                    let pid = self.st.alloc(
+                        &fname,
+                        copy,
+                        SymKind::Term,
+                        Flags::PARAM.with(Flags::DEFAULTPARAM),
+                        "",
+                    );
+                    self.st.get_mut(pid).ty = fty;
+                    let this_tree = Tree::dummy(TreeKind::This { qual: None });
+                    let default_rhs = Tree::dummy(TreeKind::Select {
+                        qual: Box::new(this_tree),
+                        name: fname,
+                    });
+                    self.st.get_mut(pid).default_rhs = Some(default_rhs);
+                    pid
+                })
+                .collect();
+            let ptys: Vec<Type> = copy_params
+                .iter()
+                .map(|p| self.st.get(*p).ty.clone())
+                .collect();
+            self.st.get_mut(copy).params = copy_params.clone();
+            self.st.get_mut(copy).paramss = vec![copy_params.clone()];
+            self.st.get_mut(copy).ty = Type::Method {
+                paramss: vec![ptys],
+                ret: Box::new(class_ty.clone()),
+            };
+            // Field types are not resolved yet at this point in the namer pass;
+            // `type_class` re-syncs `copy`'s param types from the real ctor
+            // signature and synthesizes `copy$default$N` there instead.
         }
-        // `copy`'s own parameter symbols are distinct from `ctor_fields`: reusing
-        // the constructor's field symbols directly (as the companion `apply`
-        // does below) would mean giving them `DEFAULTPARAM` + a `this.field`
-        // default, which would then also apply to `apply`/`<init>` calls where
-        // there is no `this` to default from. Each param defaults to the
-        // matching field of the receiver, exactly like nsc's synthesized
-        // `copy$default$N` getters (built by `synthesize_default_getters` below,
-        // the same machinery a user-written `def f(x: Int = 5)` uses).
-        let copy_params: Vec<SymbolId> = fields
-            .iter()
-            .map(|f| {
-                let fname = self.st.get(*f).name.clone();
-                let fty = self.st.get(*f).ty.clone();
-                let pid = self.st.alloc(
-                    &fname,
-                    copy,
-                    SymKind::Term,
-                    Flags::PARAM.with(Flags::DEFAULTPARAM),
-                    "",
-                );
-                self.st.get_mut(pid).ty = fty;
-                let this_tree = Tree::dummy(TreeKind::This { qual: None });
-                let default_rhs = Tree::dummy(TreeKind::Select {
-                    qual: Box::new(this_tree),
-                    name: fname,
-                });
-                self.st.get_mut(pid).default_rhs = Some(default_rhs);
-                pid
-            })
-            .collect();
-        let ptys: Vec<Type> = copy_params
-            .iter()
-            .map(|p| self.st.get(*p).ty.clone())
-            .collect();
-        self.st.get_mut(copy).params = copy_params.clone();
-        self.st.get_mut(copy).paramss = vec![copy_params.clone()];
-        self.st.get_mut(copy).ty = Type::Method {
-            paramss: vec![ptys],
-            ret: Box::new(class_ty.clone()),
-        };
-        // Field types are not resolved yet at this point in the namer pass;
-        // `type_class` re-syncs `copy`'s param types from the real ctor
-        // signature and synthesizes `copy$default$N` there instead.
         self.synthesize_product_members(class_id);
         // companion apply
         let companion = self
