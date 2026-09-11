@@ -750,6 +750,21 @@ pub(crate) fn invoke_method(
                     cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
                     return;
                 }
+                "|" | "&" => {
+                    // `SetOps.union` / `intersect` are erased to `C` and the
+                    // immutable `SortedSet` prelude declarations narrow that
+                    // self type back to `SortedSet[A]` for the source. The
+                    // concrete implementation still lives on the common
+                    // interface, so dispatch through its JVM default method.
+                    let jvm_name = if name == "|" { "$bar" } else { "$amp" };
+                    asm.invokeinterface(
+                        "scala/collection/SetOps",
+                        jvm_name,
+                        "(Lscala/collection/Set;)Lscala/collection/SetOps;",
+                    );
+                    cast_collection_result(asm, ctx, result_ty, "scala/collection/immutable/Set");
+                    return;
+                }
                 "size" => {
                     asm.invokeinterface("scala/collection/IterableOnceOps", "size", "()I");
                     return;

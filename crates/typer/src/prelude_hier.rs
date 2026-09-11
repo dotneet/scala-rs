@@ -345,6 +345,21 @@ fn ensure_link(st: &mut SymbolTable, jvm: &str, variance: &str) {
         }
         i => i,
     };
+    // `scala.collection.Seq` is first encountered through a descriptor-only
+    // prelude helper (`SeqHasAsJava`). That path creates a `JAVA` class
+    // placeholder before this hierarchy is assembled. Normalize that one
+    // placeholder to the interface recorded by scala-library; changing the
+    // flags of the hand-written Set/Map models would alter their self-type
+    // result inference and regress their concrete collection overloads.
+    if jvm == "scala/collection/Seq" {
+        let flags = st
+            .get(id)
+            .flags
+            .with(Flags::INTERFACE)
+            .with(Flags::ABSTRACT)
+            .with(Flags::TRAIT);
+        st.get_mut(id).flags = flags;
+    }
     if !st.get(id).tparams.is_empty() {
         return;
     }

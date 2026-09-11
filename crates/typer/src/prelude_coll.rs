@@ -131,6 +131,7 @@ pub(crate) fn add_collections_extra(
     add_mutable_map(st, tuple2, iterator_sym, coll_iterable);
     add_immutable_map_extra(st, tuple2, ordering, iterator_sym, coll_iterable);
     add_immutable_set_extra(st, ordering, iterator_sym);
+    add_sorted_set_ops(st);
     add_vector_extra(st, ordering, iterator_sym);
 }
 
@@ -1187,6 +1188,45 @@ fn add_immutable_set_extra(st: &mut SymbolTable, _ordering: SymbolId, iterator_s
         Intrinsic::None,
     );
     method(st, set, "head", vec![], ta, Intrinsic::None);
+}
+
+/// `SortedSet` inherits the `SetOps` union and intersection methods, whose
+/// result is the receiver's self type. The generic parent path recovered from
+/// a library pickle can also expose the ordinary immutable `Set` result, so
+/// keep the concrete signatures on the prelude class that source code names.
+/// The backend dispatches both operators to `scala.collection.SetOps` and
+/// checks the result back to `SortedSet`.
+fn add_sorted_set_ops(st: &mut SymbolTable) {
+    let Some(sorted) = crate::classpath::find_by_jvm(st, "scala/collection/immutable/SortedSet")
+    else {
+        return;
+    };
+    let Some(elem) = st.get(sorted).tparams.first().copied() else {
+        return;
+    };
+    let Some(set) = crate::classpath::find_by_jvm(st, "scala/collection/Set") else {
+        return;
+    };
+    let arg = Type::Class {
+        sym: set,
+        args: vec![Type::TypeParam(elem)],
+    };
+    let result = Type::Class {
+        sym: sorted,
+        args: vec![Type::TypeParam(elem)],
+    };
+    for name in ["|", "&"] {
+        if st.lookup_member(sorted, name).is_empty() {
+            method(
+                st,
+                sorted,
+                name,
+                vec![arg.clone()],
+                result.clone(),
+                Intrinsic::None,
+            );
+        }
+    }
 }
 
 /// `scala.collection.immutable.Vector[A]` extras (base defined by

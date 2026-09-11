@@ -3468,8 +3468,18 @@ impl PickleSupply {
         // stopped resolving. Breaking a member that works is worse than not
         // supplying one that does not, so the table is left alone.
         if let Some(id) = crate::classpath::find_by_jvm(st, &key) {
-            self.stubs.insert(key, id);
+            self.stubs.insert(key.clone(), id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
+            // A classfile descriptor can introduce ReusableBuilder as a bare
+            // placeholder before its Scala signature is needed. `Vector`
+            // returns `ReusableBuilder[A, Vector[A]]`, whose pickled parent is
+            // `Builder[A, Vector[A]]` even though the JVM placeholder carried
+            // no generic hierarchy. Complete only this placeholder: applying
+            // arbitrary pickle parents to hand-written collection models
+            // changes their self-type result inference.
+            if key == "scala/collection/mutable/ReusableBuilder" {
+                self.attach_parents(st, bin, id, full_name, module);
+            }
             return Some(id);
         }
         // Outside the library, hand the placeholder to the ordinary classfile
@@ -3606,6 +3616,17 @@ impl PickleSupply {
         // this class again must find the symbol rather than build a second one.
         self.stubs.insert(key.clone(), id);
         self.stub_superclass_from_classfile(st, bin, id, &key);
+        // `ReusableBuilder` is introduced from `Vector.newBuilder`'s return
+        // type before any member lookup asks for it. Its JVM classfile names
+        // only the erased `Builder` parent, while the pickle carries the
+        // applied parent that makes `ReusableBuilder[A, To]` conform to
+        // `Builder[A, To]`. Complete this single collection placeholder here;
+        // the broader nested-collection path below remains intentionally
+        // limited because arbitrary pickle parents can change source-visible
+        // overloads for classes the prelude models by hand.
+        if key == "scala/collection/mutable/ReusableBuilder" {
+            self.attach_parents(st, bin, id, full_name, module);
+        }
         // `stub_superclass_from_classfile` declines a nested class that has
         // type parameters, because a class file cannot say what arguments its
         // superclass is applied at. Its pickle can, and this is the one place

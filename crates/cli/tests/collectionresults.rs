@@ -123,7 +123,14 @@ fn sorted_results_and_existing_set_operations() {
 }
 #[test]
 fn value_class_and_nullary_overload_execute() {
-    matrix(&[("iterable_once", true), ("mkstring", true)], true);
+    matrix(
+        &[
+            ("iterable_once", true),
+            ("mkstring", true),
+            ("indexedseq_trait", true),
+        ],
+        true,
+    );
 }
 #[test]
 fn evidence_bearing_factories() {

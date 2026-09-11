@@ -2475,56 +2475,76 @@ impl Typer {
         // scope here as well: a conversion the receiver's own companion
         // supplies would otherwise be dropped for want of a class file.
         self.warm_implicit_scope(from);
-        let mut hits: Vec<(SymbolId, SymbolId, Type)> = Vec::new();
-        let mut ids = self.implicits_in_scope();
-        ids.extend(
-            self.companion_implicits(from)
-                .into_iter()
-                .chain(self.companion_implicits(&Type::Any)),
-        );
-        ids.sort_by_key(|id| id.0);
-        ids.dedup();
-        for id in ids {
-            let owner = self.st.get(id).owner;
-            if let Some(prefix) = self.term_import_prefix_for(owner).map(|q| q.ty.clone()) {
-                let ty = self.st.get(id).ty.clone();
-                self.warm_receiver_type_members(&prefix, &ty);
-            }
-            let Some(to) = self.conversion_result(id, from) else {
-                continue;
-            };
-            let Some(cls) = self.st.class_sym_of(&to) else {
-                continue;
-            };
-            // Load the conversion *result* (e.g. ListHasAsScala) so `asScala`
-            // is visible. Do not complete the *argument* type: that would
-            // install `java.lang.String#toUpperCase(Locale)` onto Predef
-            // String and shadow StringOps.
-            self.ensure_java_loaded(cls, span);
-            let mut members: Vec<SymbolId> = self
-                .st
-                .lookup_member(cls, name)
-                .into_iter()
-                .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
-                .collect();
-            // The hand-written prelude is not a complete `StringOps` (or
-            // `ArrayOps`, …), and until now nothing asked the library pickle
-            // about the conversion *result*: `supply_from_pickle` only ever
-            // saw the receiver, `java.lang.String`, which has no
-            // `ScalaSignature` at all. Ask the result's own pickle when the
-            // prelude has nothing, so `"abc".groupBy(f)` resolves the same way
-            // `List(1).groupBy(f)` already does. The prelude still wins
-            // whenever it declares the member.
-            if members.is_empty() {
-                members = self
-                    .supply_from_pickle(&to, name)
+        // Lexical implicits have precedence over the implicit scope. This is
+        // observable when a source-defined implicit class deliberately
+        // redeclares a standard extension name: cats' compat layer imports
+        // `iterableOnceExtension.reduceOption` beside the library's
+        // `IterableOnce.iterableOnceExtensionMethods`. The two conversions
+        // have the same receiver shape, but SLS lookup chooses the imported
+        // lexical candidate before consulting companions. Treating both
+        // pools as one overload set made the selection look ambiguous and
+        // reported "value reduceOption is not a member". Keep genuinely
+        // ambiguous candidates within each pool; only fall back to the
+        // companion pool when no lexical candidate can supply the member.
+        let mut lexical_ids = self.implicits_in_scope();
+        lexical_ids.sort_by_key(|id| id.0);
+        lexical_ids.dedup();
+        let mut companion_ids = self
+            .companion_implicits(from)
+            .into_iter()
+            .chain(self.companion_implicits(&Type::Any))
+            .collect::<Vec<_>>();
+        companion_ids.sort_by_key(|id| id.0);
+        companion_ids.dedup();
+        let mut collect = |ids: Vec<SymbolId>| {
+            let mut hits = Vec::new();
+            for id in ids {
+                let owner = self.st.get(id).owner;
+                if let Some(prefix) = self.term_import_prefix_for(owner).map(|q| q.ty.clone()) {
+                    let ty = self.st.get(id).ty.clone();
+                    self.warm_receiver_type_members(&prefix, &ty);
+                }
+                let Some(to) = self.conversion_result(id, from) else {
+                    continue;
+                };
+                let Some(cls) = self.st.class_sym_of(&to) else {
+                    continue;
+                };
+                // Load the conversion *result* (e.g. ListHasAsScala) so `asScala`
+                // is visible. Do not complete the *argument* type: that would
+                // install `java.lang.String#toUpperCase(Locale)` onto Predef
+                // String and shadow StringOps.
+                self.ensure_java_loaded(cls, span);
+                let mut members: Vec<SymbolId> = self
+                    .st
+                    .lookup_member(cls, name)
                     .into_iter()
                     .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
                     .collect();
+                // The hand-written prelude is not a complete `StringOps` (or
+                // `ArrayOps`, …), and until now nothing asked the library pickle
+                // about the conversion *result*: `supply_from_pickle` only ever
+                // saw the receiver, `java.lang.String`, which has no
+                // `ScalaSignature` at all. Ask the result's own pickle when the
+                // prelude has nothing, so `"abc".groupBy(f)` resolves the same way
+                // `List(1).groupBy(f)` already does. The prelude still wins
+                // whenever it declares the member.
+                if members.is_empty() {
+                    members = self
+                        .supply_from_pickle(&to, name)
+                        .into_iter()
+                        .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
+                        .collect();
+                }
+                if let Some(m) = members.first() {
+                    hits.push((id, *m, to));
+                }
             }
-            if let Some(m) = members.first() {
-                hits.push((id, *m, to));
-            }
+            hits
+        };
+        let mut hits = collect(lexical_ids);
+        if hits.is_empty() {
+            hits = collect(companion_ids);
         }
         hits.sort_by_key(|(c, m, _)| (c.0, m.0));
         hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
