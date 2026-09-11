@@ -508,9 +508,25 @@ pub(crate) fn unit_leaves_boxed_ref(tree: &Tree, st: &SymbolTable) -> bool {
         TreeKind::Apply { fun, .. } => {
             peel_fun(fun).name() == Some("$box") || method_erases_unit_to_ref(fun, st)
         }
-        TreeKind::Select { .. } | TreeKind::Ident { .. } => method_erases_unit_to_ref(tree, st),
+        TreeKind::Select { .. } | TreeKind::Ident { .. } => {
+            field_leaves_unit_ref(tree, st) || method_erases_unit_to_ref(tree, st)
+        }
         _ => false,
     }
+}
+
+/// Generic field reads, including lazy accessors and constructor fields,
+/// leave their storage reference when instantiated at Unit. A declaration of
+/// Unit itself is already discarded by the field/accessor emitter.
+fn field_leaves_unit_ref(tree: &Tree, st: &SymbolTable) -> bool {
+    if tree.sym.is_none() {
+        return false;
+    }
+    let s = st.get(tree.sym);
+    s.kind == SymKind::Term
+        && matches!(st.get(s.owner).kind, SymKind::Class | SymKind::ModuleClass)
+        && matches!(s.intrinsic, Intrinsic::None)
+        && !is_jvm_primitive(&s.ty)
 }
 
 pub(crate) fn method_erases_unit_to_ref(fun: &Tree, st: &SymbolTable) -> bool {
@@ -591,7 +607,9 @@ pub(crate) fn unit_stat_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
         // branch after it (a `try`, an `if`, a `while`) is
         // `VerifyError: Inconsistent stackmap frames`. Straight-line code got
         // away with it, which is why this went unnoticed.
-        TreeKind::Select { .. } | TreeKind::Ident { .. } => leaves_ref_sym(tree.sym, st, true),
+        TreeKind::Select { .. } | TreeKind::Ident { .. } => {
+            field_leaves_unit_ref(tree, st) || leaves_ref_sym(tree.sym, st, true)
+        }
         _ => false,
     }
 }

@@ -1,0 +1,1 @@
+class Wrapped(val value:AnyRef) extends AnyVal;trait Base[T]{val get:T};class Child(val get:Wrapped) extends Base[Wrapped];object Main{def main(args:Array[String]):Unit=println((new Child(new Wrapped("hi")):Base[Wrapped]).get.value)}

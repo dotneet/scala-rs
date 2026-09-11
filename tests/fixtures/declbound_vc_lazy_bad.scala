@@ -1,0 +1,1 @@
+class Wrapped(val value:AnyRef) extends AnyVal;trait Base[T]{val get:T};class Child extends Base[Wrapped]{lazy val get:Wrapped=new Wrapped("hi")};object Main{def main(args:Array[String]):Unit=println((new Child:Base[Wrapped]).get.value)}

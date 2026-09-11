@@ -606,11 +606,7 @@ impl Typer {
             tree.sym = id;
             self.st.enter_in_current(&name, id);
         }
-        if vparamss.is_empty() {
-            self.source_parameterless_methods.insert(tree.sym);
-        } else {
-            self.source_parameterless_methods.remove(&tree.sym);
-        }
+        self.st.get_mut(tree.sym).parameterless_method = Some(vparamss.is_empty());
         if local {
             let owner = self.st.get(tree.sym).owner;
             if !owner.is_none() && self.st.get(owner).is_class_like() {

@@ -1906,7 +1906,13 @@ impl<'a> Pickler<'a> {
                 let sc = self.scala_module();
                 self.type_ref_in_args(sc, &format!("Tuple{}", ts.len()), ts)
             }
-            Type::Array(_) => self.type_ref_named("Array"),
+            Type::Array(elem) => {
+                let mut quantified = Vec::new();
+                let inner = self.pickle_type_pack(elem, &mut quantified);
+                let sc = self.scala_module();
+                let array = self.type_ref_in_refs(sc, "Array", &[inner]);
+                self.pickle_existential_tpe(array, &quantified)
+            }
             Type::ByName(t) => self.pickle_type(t),
             Type::Repeated(t) => {
                 let inner = self.pickle_type(t);

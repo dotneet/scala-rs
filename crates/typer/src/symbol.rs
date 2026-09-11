@@ -504,6 +504,9 @@ pub struct Symbol {
     /// writes `f()`. Empty when the method still carries its own clauses
     /// (`Symbol::ty`), which is every method `uncurry` left alone.
     pub pickle_clauses: Vec<usize>,
+    /// Known Scala declaration shape: true for `def f: T`, false for a
+    /// declaration with value clauses. None for descriptor-only/prelude data.
+    pub parameterless_method: Option<bool>,
     /// For case classes / classes: constructor parameter field names.
     pub ctor_fields: Vec<SymbolId>,
     pub parents: Vec<Type>,
@@ -1241,6 +1244,7 @@ impl SymbolTable {
                 params: vec![],
                 paramss: vec![],
                 pickle_clauses: vec![],
+                parameterless_method: None,
                 ctor_fields: vec![],
                 parents: vec![],
                 default_rhs: None,
@@ -1372,6 +1376,7 @@ impl SymbolTable {
             params: vec![],
             paramss: vec![],
             pickle_clauses: vec![],
+            parameterless_method: None,
             ctor_fields: vec![],
             parents: vec![],
             default_rhs: None,

@@ -1819,6 +1819,36 @@ impl Typer {
                 .into_iter()
                 .find(|(id, _)| *id == w)
                 .map(|(_, sol)| sol),
+            ImplicitSearch::None if hits.is_empty() => {
+                // Identity and array wrapping are also view witnesses. Use
+                // the same ordered candidates as adaptation, then verify the
+                // fully instantiated target before committing any bindings.
+                let mut views = vec![from.clone()];
+                if let Type::Array(elem) = from {
+                    views.extend(
+                        self.array_wrap_candidates(elem)
+                            .into_iter()
+                            .map(|(_, ty)| ty),
+                    );
+                }
+                for view in views {
+                    let mut u = Unify::new(self, std::iter::empty(), undet.iter().copied());
+                    if !u.unify(&view, ret) {
+                        continue;
+                    }
+                    let sol: Vec<_> = undet
+                        .iter()
+                        .filter_map(|d| u.solved(*d).map(|t| (*d, t)))
+                        .collect();
+                    let ids: Vec<_> = sol.iter().map(|(id, _)| *id).collect();
+                    let ts: Vec<_> = sol.iter().map(|(_, ty)| ty.clone()).collect();
+                    let to = crate::symbol::subst_tparams_slice(&ids, &ts, ret);
+                    if sol.len() == undet.len() && self.st.is_sub_type(&view, &to) {
+                        return Some(sol);
+                    }
+                }
+                None
+            }
             // Two conversions that disagree about the type argument are an
             // ambiguity, not a guess.
             _ => None,

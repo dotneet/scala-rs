@@ -506,8 +506,6 @@ pub struct Typer {
     pub(crate) macro_mirror_owners: HashMap<SymbolId, SymbolId>,
     /// Parser node IDs are local to a compilation unit.
     pub(crate) macro_function_symbols: HashMap<(usize, NodeId), SymbolId>,
-    /// Methods whose source declares no parameter clauses, distinct from `()`.
-    pub(crate) source_parameterless_methods: HashSet<SymbolId>,
     /// Set once any `def f = macro Impl.m` in this run has been resolved.
     /// `type_expr` asks about macro expansion on *every* expression, and
     /// walking an application's spine to find out is not free; almost no
@@ -1033,7 +1031,6 @@ impl Typer {
             macro_lexical_owner: SymbolId::NONE,
             macro_mirror_owners: HashMap::new(),
             macro_function_symbols: HashMap::new(),
-            source_parameterless_methods: HashSet::new(),
             has_macro_defs: false,
             parent_ctor_scope: false,
             class_bound_evidence_types: HashMap::new(),

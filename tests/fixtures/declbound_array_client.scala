@@ -1,0 +1,1 @@
+object Main{def main(args:Array[String]):Unit={val a=new Arrays[String](Array("generic"));println(a.strings(0));println(a.ints(0));println(a.generic(0));println(a.nested(0)(0));println(a.empty()(0));println(a.poly[Int](0));println(a.existential(0).length)}}

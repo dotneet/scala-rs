@@ -2049,6 +2049,8 @@ impl Typer {
                         args.push(manifest);
                     } else if let Some(lam) = self.identity_view(&pty, span) {
                         args.push(lam);
+                    } else if let Some(lam) = self.array_conversion_view(&pty, span) {
+                        args.push(lam);
                     } else if let Some(lam) = self.array_wrap_view(&pty, span) {
                         args.push(lam);
                     // SLS 7.2: an implicit parameter of type `A => B` is a

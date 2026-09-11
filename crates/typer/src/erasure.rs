@@ -948,6 +948,15 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 _ => None,
             };
             erase_tree(rhs, st, ret.as_ref());
+            // A value-class `this` keeps the boxed receiver type. A method
+            // declared to return the value class must return its underlying
+            // representation, even when that representation is Object.
+            // Methods declared Any or a universal trait keep the box.
+            if let Some(&cls) = st.value_class_results.get(&tree.sym) {
+                if let Some(ret) = ret {
+                    unbox_value_class_result(rhs, cls, &ret);
+                }
+            }
         }
         TreeKind::TypeDef { rhs, .. } => {
             erase_tree(rhs, st, None);
@@ -1123,7 +1132,24 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 erase_tree(a, st, None);
             }
         }
-        TreeKind::Super { .. } | TreeKind::This { .. } => {}
+        TreeKind::This { .. } => {
+            if let Some(cls) = value_class_of(&tree.ty, st) {
+                let orig = tree.ty.clone();
+                let under = erase_ty(&orig, st);
+                tree.ty = Type::Class {
+                    sym: cls,
+                    args: vec![],
+                };
+                // load_this always supplies the box, including inside an
+                // extension method. Object storage is ambiguous with Any;
+                // the declared result boundary resolves that case below.
+                if !matches!(under, Type::Any | Type::AnyRef | Type::AnyVal) {
+                    adapt_box_unbox(tree, expected, &orig, st);
+                }
+                return;
+            }
+        }
+        TreeKind::Super { .. } => {}
         TreeKind::New { tpt } => {
             erase_tree(tpt, st, None);
         }
@@ -1161,16 +1187,17 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
         }
         TreeKind::Ident { .. } => {
-            // Locals and parameters already use their erased frame slots.
-            // Only template fields cross a declaration/use type boundary here.
+            // Template fields, including constructor parameters, cross a
+            // declaration/use type boundary. By-name parameters instead need
+            // erase_ident's thunk forcing/forwarding before value adaptation.
             if !tree.sym.is_none() {
                 let sym = st.get(tree.sym);
                 if sym.kind == crate::symbol::SymKind::Term
+                    && !sym.flags.contains(Flags::BYNAME)
                     && matches!(
                         st.get(sym.owner).kind,
                         crate::symbol::SymKind::Class | crate::symbol::SymKind::ModuleClass
                     )
-                    && !sym.flags.contains(Flags::PARAM)
                     && adapt_member_read(tree, st, expected)
                 {
                     return;
@@ -1199,6 +1226,28 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     adapt_box_unbox(tree, expected, &orig, st);
 }
 
+fn unbox_value_class_result(tree: &mut Tree, cls: SymbolId, ret: &Type) {
+    match &mut tree.kind {
+        TreeKind::Block { expr, .. } | TreeKind::Typed { expr, .. } | TreeKind::Return { expr } => {
+            unbox_value_class_result(expr, cls, ret);
+        }
+        TreeKind::If { thenp, elsep, .. } => {
+            unbox_value_class_result(thenp, cls, ret);
+            unbox_value_class_result(elsep, cls, ret);
+        }
+        TreeKind::Try { block, catches, .. } => {
+            unbox_value_class_result(block, cls, ret);
+            for c in catches {
+                unbox_value_class_result(&mut c.body, cls, ret);
+            }
+        }
+        _ if matches!(&tree.ty, Type::Class { sym, .. } if *sym == cls) => {
+            wrap_vc_unbox(tree, cls, ret.clone());
+        }
+        _ => {}
+    }
+}
+
 fn adapt_member_read(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) -> bool {
     if matches!(
         st.get(tree.sym).kind,
@@ -1216,7 +1265,12 @@ fn adapt_member_read(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>)
         // `opt.get` on an `Option[Meters]` hands back the boxed
         // instance, so the underlying comes out of the accessor.
         if let Some(c) = value_class_of(&orig, st) {
-            if is_ref_erased(&ret_erased) {
+            // A declaration of the value class itself returns its underlying
+            // value, including String/Object. Only an abstract declaration
+            // stores a boxed value class, as on the Apply path below.
+            let declared_value_class = st.value_class_terms.contains_key(&tree.sym)
+                || st.value_class_results.contains_key(&tree.sym);
+            if is_ref_erased(&ret_erased) && !declared_value_class {
                 let under = erase_ty(&orig, st);
                 tree.ty = ret_erased;
                 wrap_vc_unbox(tree, c, under);
@@ -1500,6 +1554,13 @@ fn method_param_types(
     ctor_sym: SymbolId,
     nargs: usize,
 ) -> Vec<Type> {
+    if !ctor_sym.is_none() && st.get(ctor_sym).name == "<init>" {
+        // Parent applications have a type tree as their callee, rather than
+        // New. They must use the selected constructor's storage types too.
+        if let Type::Method { paramss, .. } = &st.get(ctor_sym).ty {
+            return paramss.iter().flatten().cloned().collect();
+        }
+    }
     if matches!(&fun.kind, TreeKind::New { .. }) {
         // `new C(args)` where `C` declares secondary constructors: the typer
         // has already picked the alternative (`pick_ctor_at`) and stamped it

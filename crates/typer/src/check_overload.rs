@@ -182,10 +182,15 @@ impl Typer {
                             || owner.ctor_fields.contains(&id))
                         && matches!(&sym.ty, Type::Method { ret, .. } if **ret == field.ty)
                 });
-            if !self.source_parameterless_methods.contains(&fun.sym) && !is_getter {
+            if sym.parameterless_method != Some(true) && !is_getter {
                 return false;
             }
         } else if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
+            return false;
+        }
+        // A Scala method with an explicit empty clause must be called before
+        // applying its result, even when that result is an ordinary class.
+        if self.st.get(fun.sym).parameterless_method == Some(false) {
             return false;
         }
         self.ensure_apply_supplied(&ret, fun.span);

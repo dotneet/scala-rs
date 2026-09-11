@@ -2039,6 +2039,7 @@ impl PickleSupply {
                 &mut seen_shapes,
                 &mut superseded,
             ) {
+                st.get_mut(id).parameterless_method = Some(shape.clauses.is_empty());
                 // A `val`'s accessor is stable; `ident_is_stable` /
                 // `member_is_stable` read this flag to accept it as a path
                 // prefix in type position (`Resource.ExitCase`) and in

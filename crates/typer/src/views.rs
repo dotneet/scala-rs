@@ -82,6 +82,27 @@ impl Typer {
         Some(lam)
     }
 
+    /// An array view uses the same declaration and priority as ordinary
+    /// argument adaptation, including primitive and reference element types.
+    pub(crate) fn array_conversion_view(&mut self, pt: &Type, span: Span) -> Option<Tree> {
+        let Type::Function { params, ret } = pt else {
+            return None;
+        };
+        let [from @ Type::Array(elem)] = params.as_slice() else {
+            return None;
+        };
+        self.array_wrap_for(elem, ret)?;
+        let mut lam = self.view_identity_lambda(from, ret, span);
+        let mark = self.diags.len();
+        self.type_expr(&mut lam, pt);
+        self.adapt(&mut lam, pt);
+        if self.diags.len() != mark || lam.ty.is_error() {
+            self.diags.truncate(mark);
+            return None;
+        }
+        Some(lam)
+    }
+
     /// `(x$n: from) => x$n`, untyped in the body's expected type: `type_expr`
     /// re-types the body against `to` and `adapt` puts the conversion in.
     fn view_identity_lambda(&mut self, from: &Type, to: &Type, span: Span) -> Tree {

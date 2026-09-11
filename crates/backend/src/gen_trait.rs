@@ -2421,6 +2421,17 @@ impl<'a> Gen<'a> {
                 let cdesc = desc_of(*cid);
                 let impl_name = value_bridge_impl_name(self.st, *cid);
                 if pdesc == cdesc && impl_name.is_none() {
+                    if self.st.get(*cid).kind == SymKind::Term
+                        && self.st.value_class_terms.contains_key(cid)
+                        && !self.st.value_class_terms.contains_key(&pmid)
+                        && !self.st.value_class_results.contains_key(&pmid)
+                    {
+                        report_emit_error(
+                            &self.emit_errors,
+                            scala_rs_span::Span::DUMMY,
+                            "value-class accessor bridge clashes with the implementation's erased signature",
+                        );
+                    }
                     continue;
                 }
                 let enc = encode_method_name(&ps.name);

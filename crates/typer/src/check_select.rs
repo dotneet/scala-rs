@@ -54,35 +54,35 @@ impl Typer {
             self.type_qualifier(qual, &Type::NoType);
             self.typing_callee = saved_callee;
             self.callee_arity = saved_arity;
-            // A *qualifier* is never "an argument still waiting for its
-            // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
-            // value before `to` can be looked up on it, exactly as nsc types
-            // a qualifier in EXPRmode and adapts it. `adapt_implicit_apply`
-            // bails while `typing_call_args` is set, which is about the
-            // *argument* tree, and letting that reach down into a qualifier
-            // inside it left slick's `ShapedValue(pack.to[Seq], …)` with
-            // `value to is not a member of (Shape[…])Query[R, U, C]`.
-            //
-            // Retried here rather than by clearing the flag around
-            // `type_expr` above: the flag also decides how a *tag* request
-            // inside the qualifier is answered, and clearing it wholesale
-            // made `weakTypeOf[ExBox[E]]` in `tests/fixtures/ex_impl.scala`
-            // pick the tag in scope for `E` instead of composing one
-            // (`ExBox[ExRow]` printed as `ExRow`). Only a clause that
-            // actually survived is retried.
-            if self.implicit_only_result(qual).is_some() {
-                let saved = std::mem::replace(&mut self.typing_call_args, false);
-                self.adapt_implicit_apply(qual, &Type::NoType);
-                self.typing_call_args = saved;
-            }
-            // …and a clause that could not be filled even then is the missing
-            // implicit, not `value to is not a member of (Sh[Int, R])Qy[R]`.
-            // `adapt`'s backstop never sees a qualifier: it is typed with no
-            // expected type at all.
-            if self.reject_unapplied_implicit_clause(qual) {
-                tree.ty = Type::Error;
-                return;
-            }
+        }
+        // A *qualifier* is never "an argument still waiting for its
+        // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
+        // value before `to` can be looked up on it, exactly as nsc types
+        // a qualifier in EXPRmode and adapts it. `adapt_implicit_apply`
+        // bails while `typing_call_args` is set, which is about the
+        // *argument* tree, and letting that reach down into a qualifier
+        // inside it left slick's `ShapedValue(pack.to[Seq], …)` with
+        // `value to is not a member of (Shape[…])Query[R, U, C]`.
+        //
+        // Retried here rather than by clearing the flag around
+        // `type_expr` above: the flag also decides how a *tag* request
+        // inside the qualifier is answered, and clearing it wholesale
+        // made `weakTypeOf[ExBox[E]]` in `tests/fixtures/ex_impl.scala`
+        // pick the tag in scope for `E` instead of composing one
+        // (`ExBox[ExRow]` printed as `ExRow`). Only a clause that
+        // actually survived is retried.
+        if self.implicit_only_result(qual).is_some() {
+            let saved = std::mem::replace(&mut self.typing_call_args, false);
+            self.adapt_implicit_apply(qual, &Type::NoType);
+            self.typing_call_args = saved;
+        }
+        // …and a clause that could not be filled even then is the missing
+        // implicit, not `value to is not a member of (Sh[Int, R])Qy[R]`.
+        // `adapt`'s backstop never sees a qualifier: it is typed with no
+        // expected type at all.
+        if self.reject_unapplied_implicit_clause(qual) {
+            tree.ty = Type::Error;
+            return;
         }
         // A parameterless polymorphic receiver has no Apply node to register
         // its open variables. Keep them available for the selected call's
