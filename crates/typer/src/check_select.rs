@@ -237,6 +237,15 @@ impl Typer {
                 }
             }
         }
+        // A template's self alias (`trait Function1[-T1, +R] { self => … }`)
+        // is a name in that template's scope, not a member: `o.self` on an
+        // `F1[Int, Int]` is "value self is not a member", and scala/scala's
+        // `WrappedString` -- whose own `private val self: String` sits beside
+        // `Function1`'s alias -- read `s.self` as an overload of the two.
+        found.retain(|&m| {
+            let owner = self.st.get(m).owner;
+            owner.is_none() || self.st.get(owner).self_alias != Some(m)
+        });
         // Module: members of module class
         if found.is_empty() {
             if let Type::ModuleRef(id) = &recv_ty {
@@ -661,6 +670,22 @@ impl Typer {
         } else {
             Vec::new()
         };
+        // A receiver typed by an abstract type (`clone(): C`, `empty: C`) is
+        // read through its bound, but `this.type` in the member stands for
+        // the receiver itself: `clone() -= key` is a `C`. And `super.m` is
+        // selected on this class's `this` (SLS 6.5), so a `this.type` in its
+        // result is this class's even where it is not the whole result:
+        // `override def lazyZip[B](that): LazyZip2[A, B, LazyList.this.type] =
+        // super.lazyZip(that)`.
+        let this_prefix = match (&qual.ty, super_this) {
+            (_, Some(here)) if ext_conv.is_none() => Some(Type::ThisType(here)),
+            (Type::TypeParam(_) | Type::TypeMember(_), None)
+                if ext_conv.is_none() && recv_ty != qual.ty =>
+            {
+                Some(qual.ty.clone())
+            }
+            _ => None,
+        };
         let subst = |ty: Type| -> Type {
             let ty = apply_path_members(ty, &path_members);
             // `import seq.integral._; increment < zero` is
@@ -672,7 +697,10 @@ impl Typer {
             } else {
                 self.at_import_prefix_of(ext_conv, &ty).unwrap_or(ty)
             };
-            let ty = self.st.subst_as_seen_from(&recv_ty, &ty);
+            let ty = match &this_prefix {
+                Some(p) => self.st.subst_as_seen_from_prefix(&recv_ty, p, &ty),
+                None => self.st.subst_as_seen_from(&recv_ty, &ty),
+            };
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                     return self.st.subst_tparams(owner, &subst_args, &ty);

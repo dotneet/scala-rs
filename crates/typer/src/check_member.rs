@@ -450,6 +450,31 @@ impl Typer {
         }
     }
 
+    /// nsc's `widenIfNecessary` for a `var` or a method: an inferred type is
+    /// never a singleton. `private[this] var origElems = self` in
+    /// `Iterator.patch` is an `Iterator[A]`, not `Iterator.this.type` -- or
+    /// `origElems = origElems drop replaced` could not assign to it -- and
+    /// `def f = addOne(x)` is the class, not `this.type`. A `val` keeps the
+    /// singleton (`val c = b.append(1)` is a `b.type`), and a module's type is
+    /// never widened (`Infer Foo.type instead of "object Foo"`).
+    pub(crate) fn widen_inferred_singleton(&self, ty: Type) -> Type {
+        let mut ty = ty;
+        for _ in 0..8 {
+            ty = match ty {
+                Type::ThisType(c) if !c.is_none() => self.st.self_type_of_class(c),
+                Type::SingleType { sym, .. } => {
+                    let under = self.st.singleton_underlying(sym);
+                    if under.is_no_type() || matches!(under, Type::Method { .. }) {
+                        return ty;
+                    }
+                    under
+                }
+                other => return other,
+            };
+        }
+        ty
+    }
+
     fn type_val_body_in(&mut self, tree: &mut Tree) {
         let feature = self
             .source_features
@@ -480,6 +505,10 @@ impl Typer {
         let presuper = matches!(
             &tree.kind,
             TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
+        );
+        let is_var = matches!(
+            &tree.kind,
+            TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::MUTABLE)
         );
         let (rhs, declared) = match &mut tree.kind {
             TreeKind::ValDef { rhs, .. } => (rhs, tree.ty.clone()),
@@ -551,6 +580,9 @@ impl Typer {
             self.st.get_mut(tree.sym).ty = tree.ty.clone();
         } else if declared.is_no_type() {
             tree.ty = rhs.ty.widen_constant();
+            if is_var {
+                tree.ty = self.widen_inferred_singleton(tree.ty.clone());
+            }
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
             }
@@ -1404,7 +1436,7 @@ impl Typer {
                 {
                     ret_pt.clone()
                 } else {
-                    rhs.ty.widen_constant()
+                    self.widen_inferred_singleton(rhs.ty.widen_constant())
                 };
                 if let Type::Method { ret, .. } = &mut tree.ty {
                     **ret = inferred.clone();

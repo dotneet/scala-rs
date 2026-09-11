@@ -1592,6 +1592,45 @@ impl Typer {
         }
     }
 
+    /// A member trait's self type read from the class that mixes it in.
+    ///
+    /// `protected trait GenKeySet { this: Set[K] => }` is declared inside
+    /// `MapOps[K, …]`, so its `K` is `MapOps`'s. A class nested in a subclass
+    /// of `MapOps` -- `SortedMapOps[K, …]`'s `class KeySortedSet extends
+    /// SortedSet[K] with GenKeySet`, `HashMap[K, V]`'s `class HashKeySet` --
+    /// mixes it in through its *enclosing* `this`, where that `K` is the
+    /// subclass's own. Without reading it there, all four key-set classes in
+    /// scala/scala's `src/library` were "self-type … does not conform to
+    /// Set[K]": one `K` against another.
+    fn outer_self_type_at(&self, class_id: SymbolId, trait_id: SymbolId, ty: Type) -> Type {
+        let decl_owner = self.st.get(trait_id).owner;
+        if decl_owner.is_none()
+            || !matches!(
+                self.st.get(decl_owner).kind,
+                SymKind::Class | SymKind::ModuleClass
+            )
+        {
+            return ty;
+        }
+        let mut c = self.st.get(class_id).owner;
+        for _ in 0..32 {
+            if c.is_none() {
+                return ty;
+            }
+            let s = self.st.get(c);
+            if matches!(s.kind, SymKind::Class | SymKind::ModuleClass)
+                && (c == decl_owner || self.st.is_ancestor_of(decl_owner, c))
+            {
+                if c == decl_owner {
+                    return ty;
+                }
+                return self.st.subst_as_seen_from(&Type::ThisType(c), &ty);
+            }
+            c = s.owner;
+        }
+        ty
+    }
+
     fn check_self_conformance(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
@@ -1694,8 +1733,16 @@ impl Typer {
                 // cats' `Nested` self types came out as the doubly-applied
                 // `Apply[[α][F, G, α]F[G[α]][F, G, G[α]]]` and were rejected.
                 let st = self.st.subst_tparams(id, &args, &st);
-                let st = self.st.expand_type_members(class_id, &st);
-                if !self.st.is_sub_type(&this_ty, &st) {
+                // Read at the enclosing `this` (see `outer_self_type_at`) *or*
+                // as declared: a class type carries no prefix here, so a base
+                // class nested in the same outer (`LinkedHashMap`'s
+                // `LinkedKeySet extends KeySet`, `KeySet` declared in `MapOps`)
+                // still reaches `Set[K]` in `MapOps`'s own vocabulary.
+                let declared = self.st.expand_type_members(class_id, &st);
+                let seen = self.outer_self_type_at(class_id, id, st);
+                let st = self.st.expand_type_members(class_id, &seen);
+                if !self.st.is_sub_type(&this_ty, &st) && !self.st.is_sub_type(&this_ty, &declared)
+                {
                     self.error(
                         span,
                         format!(

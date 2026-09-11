@@ -3455,21 +3455,57 @@ impl SymbolTable {
         // `this.type` in a member's signature means the receiver it was
         // selected on: `def add(v: T): this.type` on a `B[String]` gives back a
         // `B[String]`, not a bare `B` whose argument has to be invented.
-        let ty = &{
-            let mut owners = Vec::new();
-            Self::this_type_owners(ty, &mut owners);
-            let mut out = ty.clone();
-            if !owners.is_empty() && !matches!(recv, Type::ThisType(_)) {
-                if let Some(rc) = self.class_sym_of(recv) {
-                    for c in owners {
-                        if c == rc || self.is_ancestor_of(c, rc) {
-                            out = subst_this_type(&out, c, recv);
-                        }
+        let ty = self.subst_receiver_this_type(recv, recv, ty);
+        self.subst_as_seen_from_walk(recv, &ty)
+    }
+
+    /// `subst_as_seen_from` for a receiver whose *own* type is not the class
+    /// type it is read through: `x.m` on `x: C` with `C <: Ops[A, C]`. Members
+    /// are still read at `Ops[A, C]`'s arguments, but a `this.type` result is
+    /// the prefix's type (SLS 3.2.1: seen from an unstable prefix of type `C`,
+    /// `this.type` is `C`), so `clone() -= key` in `MapOps` is a `C` and not a
+    /// `MapOps[K, V, CC, C]`.
+    ///
+    /// The `this.type` is replaced *after* the walk: `prefix` is written in
+    /// the caller's vocabulary, and the walk substitutes the receiver class's
+    /// type parameters, which may share symbols with it.
+    pub fn subst_as_seen_from_prefix(&self, recv: &Type, prefix: &Type, ty: &Type) -> Type {
+        let mut owners = Vec::new();
+        Self::this_type_owners(ty, &mut owners);
+        let Some(rc) = self.class_sym_of(recv) else {
+            return self.subst_as_seen_from(recv, ty);
+        };
+        owners.retain(|&c| c == rc || self.is_ancestor_of(c, rc));
+        if owners.is_empty() {
+            return self.subst_as_seen_from(recv, ty);
+        }
+        let mut out = self.subst_as_seen_from_walk(recv, ty);
+        for c in owners {
+            out = subst_this_type(&out, c, prefix);
+        }
+        out
+    }
+
+    /// Replaces `this.type` of the receiver's class (and its ancestors) in
+    /// `ty` by `to`.
+    fn subst_receiver_this_type(&self, recv: &Type, to: &Type, ty: &Type) -> Type {
+        let mut owners = Vec::new();
+        Self::this_type_owners(ty, &mut owners);
+        let mut out = ty.clone();
+        if !owners.is_empty() && !matches!(recv, Type::ThisType(_)) {
+            if let Some(rc) = self.class_sym_of(recv) {
+                for c in owners {
+                    if c == rc || self.is_ancestor_of(c, rc) {
+                        out = subst_this_type(&out, c, to);
                     }
                 }
             }
-            out
-        };
+        }
+        out
+    }
+
+    /// The parent walk of `subst_as_seen_from`, without its `this.type` step.
+    fn subst_as_seen_from_walk(&self, recv: &Type, ty: &Type) -> Type {
         fn walk(
             st: &SymbolTable,
             recv: &Type,
@@ -3529,6 +3565,25 @@ impl SymbolTable {
                     t
                 }
                 Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen, base),
+                // `p.type` has the members of `p`'s type, at its arguments:
+                // `def f(b: Buf[Int]): b.type` and then `f(x).add(1)` reads
+                // `add` through `Buf[Int]`. Without this the walk stopped here
+                // and `add` kept its declared `(A)`. (`this.type` in the member
+                // has already become `p.type` above, which is the point of
+                // keeping the singleton as the receiver.)
+                // The prefix is where the term is *declared*, not what it is,
+                // so a term with no type yet gives nothing to walk.
+                Type::SingleType { sym, .. } => {
+                    if !seen.insert(sym.0) {
+                        return ty;
+                    }
+                    let under = st.singleton_underlying(*sym);
+                    if under.is_no_type() || matches!(under, Type::Method { .. }) {
+                        ty
+                    } else {
+                        walk(st, &under, ty, seen, base)
+                    }
+                }
                 // `trait C[-T] extends (T => R)` inherits `Function1.apply`,
                 // and reading its type through `C[X]` means walking into
                 // `Function1[X, R]`. A structural function names no class, so
@@ -3611,6 +3666,10 @@ impl SymbolTable {
             Type::ModuleRef(sym) | Type::ThisType(sym) if !sym.is_none() => {
                 self.base_type_args(*sym, &[])
             }
+            Type::SingleType { sym, .. } => match self.singleton_underlying(*sym) {
+                Type::Class { sym, args } if !sym.is_none() => self.base_type_args(sym, &args),
+                _ => BaseTypeArgs::default(),
+            },
             _ => BaseTypeArgs::default(),
         };
         let mut seen = rustc_hash::FxHashSet::default();
