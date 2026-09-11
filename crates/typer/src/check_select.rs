@@ -107,7 +107,11 @@ impl Typer {
         // nsc: `x.m` on `x: A` where `A <: T` resolves against `T`.
         // An alias member (`type Scope = Map[K, V]`) is dealiased first, or the
         // receiver's type arguments would be invisible to the substitution below.
-        let mut recv_ty = self.st.dealias(&self.st.widen_type_param(&qual.ty));
+        // A GADT-bounded parameter (`t: T` inside a case that pinned `T` at
+        // `Int`) is read at that bound first (`gadt_widen`).
+        let mut recv_ty = self
+            .st
+            .dealias(&self.st.widen_type_param(&self.st.gadt_widen(&qual.ty)));
         // A *fully applied* type lambda is the type its body says it is.
         // `dealias` deliberately keeps a higher-kinded alias folded -- its body
         // means nothing until the arguments arrive -- but here they have, and
@@ -1730,6 +1734,9 @@ impl Typer {
     /// Lexical access privileges survive even while constructor arguments
     /// cannot use the instance currently being initialized as their receiver.
     fn lexical_access_class(&self) -> SymbolId {
+        if !self.access_class_override.is_none() {
+            return self.access_class_override;
+        }
         let mut owner = self.st.owner;
         while !owner.is_none() {
             if self.st.get(owner).is_class_like() {

@@ -1233,7 +1233,7 @@ fn fixtures_tailrec_bad_is_error() {
 
 #[test]
 fn fixtures_annot_bad_is_error() {
-    compile_fails("annot_bad", "annotation");
+    compile_fails("annot_bad", "not found: type strictfp");
 }
 
 #[test]

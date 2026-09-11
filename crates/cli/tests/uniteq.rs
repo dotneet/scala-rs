@@ -270,10 +270,13 @@ fn ue_eq_pushes_both_operands() {
         .lines()
         .skip_while(|l| !l.contains("public void main("))
         .collect();
+    // scalac compares two `BoxedUnit`s with `Object.equals` (neither side can
+    // hold a boxed number, so `BoxesRunTime` is not needed); either call is
+    // the comparison whose operands this checks.
     let idx = main
         .iter()
-        .position(|l| l.contains("BoxesRunTime.equals"))
-        .expect("no BoxesRunTime.equals in main");
+        .position(|l| l.contains("BoxesRunTime.equals") || l.contains("java/lang/Object.equals"))
+        .expect("no equality comparison in main");
     // The two instructions before the first comparison are the two operands.
     let unit = "BoxedUnit.UNIT";
     assert!(

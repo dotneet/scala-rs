@@ -1,0 +1,6 @@
+1 -1 0 1 1 1
+true false false true true true
+3 5 5
+List(Id(4), Id(2)) List(2, 4)
+Id(1) Some(3.0m)
+1110
