@@ -2691,10 +2691,32 @@ impl Typer {
                                     .filter(|&c| self.takes_one_type_parameter(c))
                                     .filter(|&c| self.collect_rebuilds_to(c))
                                 {
-                                    ret = Type::Class {
-                                        sym: cls,
-                                        args: vec![to.widen_constant()],
+                                    // Never in place of a result that is already
+                                    // more specific than `cls`: the receiver's
+                                    // own `SortedSetOps.collect[B](pf)(implicit
+                                    // Ordering[B]): SortedSet[B]` beats its
+                                    // `CC` (`Set`), and replacing it made cats'
+                                    // `NonEmptySet.collect` a `Set[B]` where it
+                                    // declares `SortedSet[B]`.
+                                    let more_specific = match &ret {
+                                        Type::Class { sym: d, .. } if *d != cls => self
+                                            .base_type_instance(
+                                                &Type::Class {
+                                                    sym: *d,
+                                                    args: vec![],
+                                                },
+                                                cls,
+                                                0,
+                                            )
+                                            .is_some(),
+                                        _ => false,
                                     };
+                                    if !more_specific {
+                                        ret = Type::Class {
+                                            sym: cls,
+                                            args: vec![to.widen_constant()],
+                                        };
+                                    }
                                 } else if let Some(r) =
                                     self.receiver_collection_root(recv_ty.as_ref())
                                 {
