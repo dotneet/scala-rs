@@ -2133,6 +2133,10 @@ impl Typer {
         let parent_pre = crate::prefix::view_prefix(&full_ty).cloned();
         let class_ty = crate::prefix::parent_form(&full_ty);
         fun.ty = crate::prefix::with_prefix_opt(class_ty.clone(), parent_pre.as_ref());
+        // `class Mine(k: Int) extends Inner(k)` with `Inner` an alias of
+        // `prof.api`'s: the superclass's enclosing instance is `prof`, and
+        // the backend reads it off the head's qualifier (`prefix.rs`).
+        self.qualify_inner_ctor_head(fun);
         let class_id = self.st.class_sym_of(&class_ty).unwrap_or(SymbolId::NONE);
         if !class_id.is_none() {
             fun.sym = class_id;

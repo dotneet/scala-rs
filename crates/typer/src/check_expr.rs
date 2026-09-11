@@ -1711,10 +1711,11 @@ impl Typer {
                         tpt.sym = id;
                         // `new In` inside `Outer` is a `C.this.In`, the same
                         // as the type `In` written there (`prefix.rs`).
-                        tpt.ty = self.this_prefixed(Type::Class {
+                        let ty = self.this_prefixed(Type::Class {
                             sym: id,
                             args: vec![],
                         });
+                        tpt.ty = self.import_prefixed(&n, ty, tpt.span);
                         // A written `new C1` names the class.
                         self.note_cto_ref(id, tpt.span);
                     } else if let Some(alias) = self.new_alias_target(&found, tpt.span) {
@@ -1725,7 +1726,9 @@ impl Typer {
                         // The qualified form (`new p.A(…)`) already dealiases
                         // through `class_sym_of`; this is the unqualified one.
                         tpt.sym = self.st.class_sym_of(&alias).unwrap_or(SymbolId::NONE);
-                        tpt.ty = alias;
+                        // An alias imported from a value (`import prof.api._`)
+                        // is read through that value (`prefix.rs`).
+                        tpt.ty = self.import_prefixed(&n, alias, tpt.span);
                     } else if let Some(id) = found.iter().copied().find(|&s| {
                         matches!(
                             self.st.get(s).kind,
@@ -1789,6 +1792,9 @@ impl Typer {
                         };
                     }
                 }
+                // An inner class behind a path prefix: write the enclosing
+                // instance into the head for the backend (`prefix.rs`).
+                self.qualify_inner_ctor_head(tpt);
                 tree.ty = tpt.ty.clone();
                 tree.sym = tpt.sym;
                 // SLS 5.2 / nsc `checkInstantiable`: a plain `new C` of an
