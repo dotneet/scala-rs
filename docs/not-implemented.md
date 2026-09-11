@@ -153,7 +153,19 @@ Compiler flags (`agent/xflags`):
   with what real scalac produces for the same source. `tests/spec_classfiles.sh`
   measures the gap: over the corpus's 37 `pos/spec-*` tests scalac emits 700
   specialized classes and we emit none. See
-  [docs/specialization.md](specialization.md).
+  [docs/specialization.md](specialization.md). The phase's one default
+  warning — `type A is unused or used in non-specializable positions.` from
+  `normalizeMember` — is issued (`warn_refchecks.rs`).
+- **Default warnings still not issued.** The `warn_*` passes cover pattern
+  matching (exhaustivity, unreachability, `@switch`, variable patterns),
+  deprecations and their summary, pure expressions, `==` sensibility,
+  feature warnings, uninitialized reads, unused specialized type parameters
+  and the parser's syntax deprecations. Not yet issued:
+  explicitouter's `The outer reference in this type test cannot be checked at
+  run time.` (`run/t7171`, `neg/outer-ref-checks`); patmat's fruitless type
+  tests (`run/patmat-behavior`); warnings about trees a macro expands to
+  (`run/t7047`). `Reference to uninitialized` does not look inside patterns
+  (a stable-identifier pattern naming a later field).
 - **The value class *implementation restrictions*.** The eight rules
   `neg/valueclasses.check` records — a `trait` may not extend `AnyVal`, a value
   class may not be nested or local, must have exactly one `val` parameter that
