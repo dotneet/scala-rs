@@ -1034,7 +1034,26 @@ impl Typer {
                     // the body reads (153 of them across the benchmark).
                     let saved = a.clone();
                     let mark = self.diags.len();
+                    // A wildcard the lenient prototype put in (`proto_arg_type`)
+                    // is this call's "not decided yet", not an existential the
+                    // program wrote; say so while the argument is typed, as the
+                    // lambda path below does, so calls inside it do not read
+                    // their own parameters out of it.
+                    let declared_p = match &fun_ty_for_pretype {
+                        Type::Method { paramss, .. } => {
+                            paramss.first().and_then(|ps| param_at(ps, ai)).cloned()
+                        }
+                        _ => None,
+                    };
+                    let relaxed_here = type_has_wildcard(&pt_arg)
+                        && !declared_p.as_ref().is_some_and(type_has_wildcard);
+                    if relaxed_here {
+                        self.relaxed_pt_depth += 1;
+                    }
                     self.type_expr_arg_prototype(a, &pt_arg, provisional);
+                    if relaxed_here {
+                        self.relaxed_pt_depth -= 1;
+                    }
                     let with_errs = self.error_count_since(mark);
                     if with_errs > 0
                         || a.ty.is_error()
@@ -1257,17 +1276,25 @@ impl Typer {
                                 &arg_tys,
                                 recv_ty.as_ref(),
                             );
-                            // nsc leaves `tryBreakable { throw … }`'s T undetermined
-                            // (Nothing is bottom). `catchBreak { println }` then
-                            // instantiates T from the handler, not from Nothing.
-                            let inst: Vec<(SymbolId, Type)> =
-                                if self.st.get(sym).name == "tryBreakable" {
-                                    inst.into_iter()
-                                        .filter(|(_, t)| !matches!(t, Type::Nothing))
-                                        .collect()
-                                } else {
-                                    inst
-                                };
+                            // nsc's `adjustTypeArgs`: a `Nothing` the arguments
+                            // inferred is *retracted* -- the parameter stays
+                            // undetermined for the expected type or the enclosing
+                            // expression to decide -- unless the parameter occurs
+                            // covariantly in the result, where `Nothing` is the
+                            // best answer there is. `tryBreakable { throw … }`'s
+                            // `T` (invariant in `TryBlock[T]`) is one the
+                            // following `catchBreak { println }` decides;
+                            // `inv(fail()).or("a")` on `def inv[T](body: => T):
+                            // Inv[T]` is the same shape, and `.or("a")` says
+                            // `T = String`. The rule used to be spelled for
+                            // `tryBreakable` by name.
+                            let inst: Vec<(SymbolId, Type)> = inst
+                                .into_iter()
+                                .filter(|(tp, t)| {
+                                    !matches!(t, Type::Nothing)
+                                        || !self.nothing_solution_retracted(*tp, &ret, pt)
+                                })
+                                .collect();
                             // A function literal has not been typed yet; the
                             // placeholder `(<notype>) => <notype>` standing in for
                             // it is not a solution, and taking it for one hides
@@ -1442,11 +1469,22 @@ impl Typer {
                                 // `List.flatMap[B](f: A => IterableOnce[B])`: B is
                                 // only determined by the lambda body, so the body
                                 // must not be checked against `IterableOnce[B]`.
+                                //
+                                // A `Wildcard`, not `Any`: nsc's `typedFunction`
+                                // types the body against `WildcardType` when the
+                                // result is not fully defined, and `type_function`
+                                // reads a `Wildcard` result as "no expected type".
+                                // Against `Any` the body *was* checked -- `x => if
+                                // (x > 1) 1L else 0` boxed both branches and
+                                // `List(1, 2).map(...)` came out `List[AnyVal]`
+                                // where scalac's weak-conformance lub says
+                                // `List[Long]` (a silent runtime difference:
+                                // `List(Integer, Long)` element classes).
                                 let undetermined = !sym.is_none()
                                     && mentions_tparam(fr, &self.st.get(sym).tparams);
                                 let fret =
                                     if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined {
-                                        Box::new(Type::Any)
+                                        Box::new(Type::Wildcard)
                                     } else {
                                         fr.clone()
                                     };
@@ -1562,13 +1600,23 @@ impl Typer {
                     for (i, a) in args.iter_mut().enumerate() {
                         let mut p = param_at(&param_tys, i).cloned().unwrap_or(Type::NoType);
                         // `Using.resource(r)(x => 10)`: A only appears in a later
-                        // clause. Type the lambda against `R => Any` so the body
-                        // is not checked against a raw type parameter.
-                        if let Type::Function { params, ret } = &p {
+                        // clause. Type the lambda against `R => _` so the body
+                        // is not checked against a raw type parameter -- and not
+                        // against `Any` either, which is a real expected type
+                        // that boxes an `if (c) 1L else 0` body instead of
+                        // letting the weak-conformance lub make it a `Long`
+                        // (nsc's `typedFunction` uses `WildcardType` there).
+                        // The parameter may be spelled as the `Function1[A, B]`
+                        // class by a pickled signature; same type, same rule.
+                        let p_fn = match &p {
+                            Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+                            _ => None,
+                        };
+                        if let Type::Function { params, ret } = p_fn.as_ref().unwrap_or(&p) {
                             if !params.is_empty() && matches!(ret.as_ref(), Type::TypeParam(_)) {
                                 p = Type::Function {
                                     params: params.clone(),
-                                    ret: Box::new(Type::Any),
+                                    ret: Box::new(Type::Wildcard),
                                 };
                             }
                         }
@@ -1596,7 +1644,20 @@ impl Typer {
                             // the typed argument. slick's `DBIOAction.flatMap[R2,
                             // S2, E2](f: R => DBIOAction[R2, S2, E2])` is this
                             // shape.
-                            let relaxed = match &p {
+                            // A pickled signature spells the parameter as the
+                            // `Function1[A, B]` class (`Option.map`, `Try.map`);
+                            // it is the same type, and it has to be relaxed the
+                            // same way, or `B` was opened to its bound `Any` and
+                            // the literal's `if (c) 1.0 else 0` body was boxed
+                            // against it instead of taking the numeric lub.
+                            let p_shape = match &p {
+                                Type::Class { sym, args } => self
+                                    .st
+                                    .function_class_shape(*sym, args)
+                                    .unwrap_or_else(|| p.clone()),
+                                _ => p.clone(),
+                            };
+                            let relaxed = match &p_shape {
                                 Type::Function { params, ret } if mentions_tparam(ret, &open) => {
                                     let wilds = vec![Type::Wildcard; open.len()];
                                     // A function result can determine its own
@@ -1721,11 +1782,22 @@ impl Typer {
                                     // callee's *own* parameters already get this
                                     // treatment in `add_expected_constraints`; a
                                     // receiver's did not.
+                                    // A bare wildcard in the expected type is the
+                                    // enclosing call's own undecided variable (a
+                                    // lenient prototype's `WildcardType`), and
+                                    // everything conforms to it; it is not a
+                                    // better answer than the argument's. cats'
+                                    // `leftWiden(rightFunctor.widen(fac))` typed
+                                    // `widen` at `F[_, D]` and took `X := _`.
                                     let t = match unify_one(&self.st, tp, &ret, pt) {
                                         Some(e)
                                             if e != t
                                                 && !e.is_no_type()
                                                 && !e.is_error()
+                                                && !matches!(
+                                                    e,
+                                                    Type::Wildcard | Type::BoundedWildcard { .. }
+                                                )
                                                 && !type_mentions_tparam(&e, tp)
                                                 && self.tparam_variance_in(&ret, tp, 1)
                                                     == Some(0)

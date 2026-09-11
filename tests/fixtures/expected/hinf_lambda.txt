@@ -1,0 +1,18 @@
+List(long, long)
+List(double, double)
+List(int, int)
+long
+List(float, float)
+List(Integer, Long)
+List(Integer, Long)
+List(Integer, String)
+List(List(long), List(long))
+(List(List(), List()),List(None, None),List())
+List(Map(a -> 1), Map(a -> 2))
+List(Integer, Long)
+long
+int
+1
+List(long, long)
+List(b, a)
+List(false, true)

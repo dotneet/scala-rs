@@ -306,6 +306,17 @@ impl Typer {
             if t.is_no_type() || t.is_error() || !self.undet_solution_in_bounds(*tp, &t) {
                 continue;
             }
+            // A bare wildcard in the expected type is a variable *that* call
+            // has not decided (nsc's `WildcardType` in a lenient prototype),
+            // not an answer: `leftWiden(rightFunctor.widen(fac))` typed its
+            // argument at `F[_, D]`, and taking `X := _` for `widen`'s
+            // receiver parameter then failed `leftWiden`'s own bounds check
+            // with `inferred type arguments [_, D, B]` (cats
+            // `VarianceConversions`). The variable stays open for the
+            // enclosing call, which is what pins it.
+            if matches!(t, Type::Wildcard | Type::BoundedWildcard { .. }) {
+                continue;
+            }
             solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
         }
         if self.st.is_sub_type(&solved, pt) {
@@ -628,7 +639,7 @@ impl Typer {
         if open.is_empty() {
             return p.clone();
         }
-        let mut out = p.clone();
+        let mut out = self.relax_function_result(p, open);
         for tp in open {
             // A *type constructor* has no bound that is a type. `Any` is not
             // one of its inhabitants -- it is not even the same kind -- so
@@ -652,6 +663,55 @@ impl Typer {
             out = crate::symbol::subst_tparams_slice(&[*tp], &[hi], &out);
         }
         out
+    }
+
+    /// nsc's `typedFunction`: the result of a function-typed parameter that
+    /// still mentions an undetermined variable is `WildcardType` for the
+    /// literal's body -- the body is what decides the variable -- while the
+    /// parameter positions are still opened to their bounds by the caller.
+    /// Opening the result to `Any` instead made it a real expected type: `x
+    /// => if (x > 1) 1.0 else 0` had both branches boxed and `Option(3).map(…)`
+    /// was an `Option[Any]` where scalac's weak-conformance lub says
+    /// `Option[Double]`. A pickled signature spells the parameter as the
+    /// `Function1[A, B]` class; it is relaxed the same way.
+    ///
+    /// A result that is itself a function whose *parameters* mention the
+    /// variable is relaxed whole: opening those to a bound would reverse the
+    /// constraint through contravariance before the variable is inferred
+    /// (`Deferred(() => saved)` with `saved: A => B`).
+    fn relax_function_result(&self, p: &Type, open: &[SymbolId]) -> Type {
+        let shape = match p {
+            Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+            // A pickled signature may also carry the class by name
+            // (`Function1[Int, B]`), the spelling `type_function` reads too.
+            Type::Named { name, args }
+                if name.starts_with("Function") && name != "Function" && !args.is_empty() =>
+            {
+                Some(Type::Function {
+                    params: args[..args.len() - 1].to_vec(),
+                    ret: Box::new(args[args.len() - 1].clone()),
+                })
+            }
+            _ => None,
+        };
+        let Type::Function { params, ret } = shape.as_ref().unwrap_or(p) else {
+            return p.clone();
+        };
+        if !mentions_tparam(ret, open) {
+            return p.clone();
+        }
+        let result = if matches!(ret.as_ref(),
+            Type::Function { params, .. } if params.iter().any(|q| mentions_tparam(q, open)))
+        {
+            Type::Wildcard
+        } else {
+            let wilds = vec![Type::Wildcard; open.len()];
+            crate::symbol::subst_tparams_slice(open, &wilds, ret)
+        };
+        Type::Function {
+            params: params.clone(),
+            ret: Box::new(result),
+        }
     }
 
     /// Whether an expected *tuple* type constrains nothing, because every one
@@ -1782,6 +1842,41 @@ impl Typer {
             }
         }
         acc
+    }
+
+    /// nsc's `adjustTypeArgs`: whether a `Nothing` the arguments inferred for
+    /// `tp` is retracted -- kept undetermined -- rather than instantiated.
+    /// Only a *covariant* occurrence in the result (or none at all) makes
+    /// `Nothing` the answer; an invariant or contravariant one is a variable
+    /// something later may still pin: `tryBreakable { throw e }` is a
+    /// `TryBlock[?T]` for `catchBreak` to decide, `inv(fail())` on
+    /// `def inv[T](body: => T): Inv[T]` an `Inv[?T]` for `.or("a")`.
+    ///
+    /// An expected type that already says what the parameter is re-pins it
+    /// at once (nsc instantiates the retracted variable against `pt` in
+    /// `adapt` before anything else can see it): `val x: Inv[Nothing] =
+    /// inv(fail())` keeps its `Nothing`, while `val z: Inv[Int] =
+    /// inv(fail())` and `val g: String => String = fn(fail())` retract it so
+    /// that `add_expected_constraints` records the expected type's answer --
+    /// which it does for an invariant or contravariant occurrence, the only
+    /// ones that get here.
+    pub(crate) fn nothing_solution_retracted(&self, tp: SymbolId, ret: &Type, pt: &Type) -> bool {
+        if !matches!(self.tparam_variance_in(ret, tp, 1), Some(0) | Some(-1)) {
+            return false;
+        }
+        if pt.is_no_type() || pt.is_error() || matches!(pt, Type::Wildcard) {
+            return true;
+        }
+        !matches!(unify_one(&self.st, tp, ret, pt), Some(Type::Nothing))
+    }
+
+    /// nsc's mono-mode `instantiate` at a definition: whatever the right-hand
+    /// side left undetermined has nothing further to constrain it once the
+    /// definition's type is fixed, so it is minimised to its lower bound.
+    /// `val y = inv(fail())` is an `Inv[Nothing]`, and `y.or("a")` on a later
+    /// line is the mismatch scalac reports -- not a solution of `T`.
+    pub(crate) fn close_leaked_undet(&self, t: &Type) -> Type {
+        self.minimize_undet(t)
     }
 
     /// Substitute every undetermined variable in `t` by its lower bound
