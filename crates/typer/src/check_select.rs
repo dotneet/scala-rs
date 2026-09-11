@@ -2477,7 +2477,20 @@ impl Typer {
             },
             _ => return false,
         };
+        // These compiler-defined casts are frequent in deeply nested source
+        // and can never be dynamic selections. Avoid traversing their
+        // receiver before the ordinary TypeApply path handles them.
+        if matches!(name.as_str(), "asInstanceOf" | "isInstanceOf") {
+            return false;
+        }
         if qual.ty.is_no_type() {
+            // The outer TypeApply may be typing a nested qualifier. Re-entering
+            // this helper while `type_qualifier` is active would type that
+            // qualifier again before the ordinary path has finished it,
+            // turning a linear chain of casts into repeated traversal.
+            if self.typing_qualifier {
+                return false;
+            }
             self.type_qualifier(&mut qual, &Type::NoType);
         }
         if !self.is_dynamic_receiver(&qual.ty) || self.receiver_has_term(&qual.ty, &name) {

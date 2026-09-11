@@ -1946,15 +1946,6 @@ impl Typer {
                             }
                         }
                     }
-                    // Capture the arguments written by the caller before
-                    // default getters or implicit search append synthetic
-                    // trees. Result-only type parameters of a call such as
-                    // `newBuilder()` must stay open even though its default
-                    // capacity occupies one slot after filling.
-                    let user_nargs = args
-                        .iter()
-                        .filter(|a| !a.id.is_filled_arg() && !a.id.is_pretyped_default())
-                        .count();
                     let leftover =
                         self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
                     // nsc's `applyImplicitArgs`: `if (args contains EmptyTree)
@@ -2455,8 +2446,7 @@ impl Typer {
                     let params: Vec<SymbolId> =
                         self.st.get(sym).paramss.iter().flatten().copied().collect();
                     let ret = self.subst_dependent_paths(&params, args, ret);
-                    let ret =
-                        self.instantiate_leftover_tparams(sym, ret, pt, args.len(), user_nargs);
+                    let ret = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
                     // nsc's `applyImplicitArgs` ends `if (args contains
                     // EmptyTree) setError(tree)`. The witness that was not
                     // found is often the only thing that could have said what
@@ -3210,23 +3200,25 @@ impl Typer {
             }
             Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
             Type::Class { sym, .. } if self.st.get(*sym).name == "BitSet" => Some(Type::Int),
-            Type::Class { sym, args } if !args.is_empty() => self
-                .iterable_once_elem(*sym, args)
+            Type::Class { sym, args } if !args.is_empty() => {
                 // The fallback is only for collection classes whose
                 // `IterableOnce` parent has not been loaded yet. Applying it
                 // to every generic receiver made `Ior[A, B].map` read the
                 // left parameter as the mapped value and rejected a perfectly
-                // valid `B => C` function.
-                .or_else(|| {
-                    let jvm = self.st.get(*sym).jvm_name.as_str();
-                    (jvm.starts_with("scala/collection/")
-                        || jvm.starts_with("scala/ArrayOps")
-                        || matches!(
-                            self.st.get(*sym).name.as_str(),
-                            "Traversable" | "Iterable" | "Seq" | "IndexedSeq" | "LinearSeq"
-                        ))
-                    .then(|| args[0].clone())
-                }),
+                // valid `B => C` function. Prefer it for the standard
+                // collection hierarchy as well: walking a deeply nested
+                // `List` through every `IterableOnce` parent is needlessly
+                // expensive during repeated `asInstanceOf` chains.
+                let jvm = self.st.get(*sym).jvm_name.as_str();
+                let standard = (jvm.starts_with("scala/collection/")
+                    || jvm.starts_with("scala/ArrayOps")
+                    || matches!(
+                        self.st.get(*sym).name.as_str(),
+                        "Traversable" | "Iterable" | "Seq" | "IndexedSeq" | "LinearSeq"
+                    ))
+                .then(|| args[0].clone());
+                standard.or_else(|| self.iterable_once_elem(*sym, args))
+            }
             // cats' syntax layer hands back `Ops[F, A] { type TypeClassType =
             // FlatMap[F] }`; the arguments live on the parent.
             Type::Refined { parents, .. } => parents.iter().find_map(|p| self.elem_type(p)),

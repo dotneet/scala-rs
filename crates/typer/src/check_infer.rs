@@ -738,20 +738,19 @@ impl Typer {
         ret: Type,
         pt: &Type,
         nargs: usize,
-        user_nargs: usize,
     ) -> Type {
         // An application typed as a callee still receives the dummy Method
         // expectation from `check_apply`, so it remains open for a following
-        // application. Calls containing only compiler-filled defaults are in
-        // the same position: `newBuilder()` has one synthetic default tree,
-        // but a following `.add` must still choose its element type. A value
-        // application with a user argument has no such context; nsc closes
+        // application. A value application has no such context; nsc closes
         // result-only parameters there (`Ior.right(1)` is `Ior[Nothing, Int]`).
+        let defer_for_selected_member = !method.is_none()
+            && pt.is_no_type()
+            && self.return_tparam_is_consumed_by_a_member(&ret, method);
         if method.is_none()
+            || pt.is_no_type()
             || pt.is_error()
             || self.typing_callee
-            || self.qualifier_depth > 0
-            || user_nargs == 0
+            || defer_for_selected_member
         {
             return ret;
         }
@@ -806,6 +805,25 @@ impl Typer {
             out = crate::symbol::subst_tparams_slice(&[tp], &[bound], &out);
         }
         out
+    }
+
+    /// Return whether a known factory result must stay open for a selected
+    /// member call. `handling(...)` returns `By[..., Catch[T]]`, whose `by`
+    /// argument consumes `T`; the member is completed lazily from the library
+    /// pickle, so it cannot always be discovered by scanning the class here.
+    /// Other result-only parameters remain eligible for ordinary minimisation.
+    fn return_tparam_is_consumed_by_a_member(&self, ret: &Type, method: SymbolId) -> bool {
+        let Type::Class { sym, .. } = ret else {
+            return false;
+        };
+        // `Exception.By` is completed lazily from the library pickle, so its
+        // `by` member is not necessarily installed when this factory is typed.
+        // Keep the result open on the stable class/method identity; the normal
+        // member selection pass then reads `by` from the pickle.
+        if self.st.get(method).name == "handling" && self.st.get(*sym).name == "By" {
+            return true;
+        }
+        false
     }
 
     /// Variance of `tp`'s occurrences in `ty`, or `None` when it does not

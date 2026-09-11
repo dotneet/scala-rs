@@ -449,11 +449,6 @@ pub struct Typer {
     // Consumed by the next expression only: a selection receiver is not
     // the final value whose unconstrained lower bounds can be minimized.
     pub(crate) typing_qualifier: bool,
-    /// Number of active selection-qualifier scopes. Unlike
-    /// `typing_qualifier`, this context survives the nested `type_expr` calls
-    /// that type an applied receiver, so result-only type parameters can stay
-    /// open until the selected member supplies their constraint.
-    pub(crate) qualifier_depth: usize,
     /// How many explicit arguments the `Apply` whose callee is being typed
     /// carries, when that is known. Only [`Typer::search_extension`] reads it,
     /// and only to break a tie: nsc's `adaptToArguments` looks for a view
@@ -1027,7 +1022,6 @@ impl Typer {
             typing_callee: false,
             typing_type_callee: false,
             typing_qualifier: false,
-            qualifier_depth: 0,
             callee_arity: None,
             macro_engine: None,
             macro_engine_error: None,
