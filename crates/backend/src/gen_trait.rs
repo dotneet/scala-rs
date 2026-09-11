@@ -1390,6 +1390,22 @@ impl<'a> Gen<'a> {
             )) {
                 continue;
             }
+            // The class's own body overrides this trait member at another
+            // erased descriptor -- `class IntBox extends Box[Int] { override
+            // def put(t: Int) }` against `Box[T].put(t: T)`. The wide
+            // descriptor then owes an erasure *bridge* to the override
+            // (`emit_erasure_bridges`), not a forwarder to the trait's body:
+            // with the forwarder, `(b: Box[Int]).put(5)` silently ran the
+            // trait's implementation. The typer froze this relation before
+            // erasure, when `T = Int` was still visible.
+            if body.iter().any(|stt| {
+                matches!(stt.kind, TreeKind::DefDef { .. })
+                    && !stt.sym.is_none()
+                    && scala_rs_typer::method_overrides(self.st, stt.sym, def.sym)
+                    && stt.sym != def.sym
+            }) {
+                continue;
+            }
             // `SynchronousDatabaseAction.openStream(context: C)` with
             // `C <: BasicBackend#BasicActionContext` is *overridden* by
             // `StreamingInvokerAction.openStream(ctx: JdbcBackend#JdbcActionContext)`,
@@ -1770,6 +1786,14 @@ impl<'a> Gen<'a> {
         if !defined.contains("equals") {
             let fi = field_info.clone();
             let cj = class_jvm.clone();
+            // nsc synthesizes `this.x == that.x` per field, and `==` on a
+            // field that may hold a boxed number is `BoxesRunTime.equals`:
+            // `Gen(1, Nil) == Gen(1L, Nil)` and `AnyF(1) == AnyF(1.0)` are
+            // `true`. `Objects.equals` compared the boxes' classes too.
+            let cooperative: Vec<bool> = fi
+                .iter()
+                .map(|(_, ty, _)| self.library_abi && maybe_boxed(self.st, ty))
+                .collect();
             b.add_code(ACC_PUBLIC, "equals", "(Ljava/lang/Object;)Z", 3, |asm| {
                 let yes = asm.fresh_label();
                 let no = asm.fresh_label();
@@ -1782,12 +1806,20 @@ impl<'a> Gen<'a> {
                 asm.aload(1);
                 asm.checkcast(&cj);
                 asm.astore(2);
-                for (name, ty, desc) in &fi {
+                for (fidx, (name, ty, desc)) in fi.iter().enumerate() {
                     asm.aload(0);
                     asm.getfield(&cj, name, desc);
                     asm.aload(2);
                     asm.getfield(&cj, name, desc);
                     match ty {
+                        _ if cooperative[fidx] && !is_jvm_primitive(ty) => {
+                            asm.invokestatic(
+                                "scala/runtime/BoxesRunTime",
+                                "equals",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                            );
+                            asm.ifeq(no);
+                        }
                         Type::Long => {
                             asm.lcmp();
                             asm.ifne(no);

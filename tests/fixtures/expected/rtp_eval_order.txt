@@ -1,0 +1,13 @@
+List(1, 2)
+1 2 List()
+List(a, b, c)
+a List(b) c
+Box(List(10))
+1 Box(List())
+Box(List(1, 2))
+Box(List()) k=2
+before: []
+List(7) after: 7
+List(1, 2, 3)
+List(3, 2, 1) 1 2 3
+name=n n=4 tag=null

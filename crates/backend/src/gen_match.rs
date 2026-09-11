@@ -1069,6 +1069,23 @@ pub(crate) fn gen_pattern(
             // `type_jvm_name` reports `Object` for an array, which tested
             // nothing and left `case a: Array[Int]` reading `arraylength` off
             // an `Object`; `instanceof` takes the array descriptor directly.
+            // `case a: Array[_]` (or `Array[T]` for an abstract `T`) may be an
+            // `int[]` as well as an `Object[]`: no single descriptor tests it,
+            // and nsc emits `ScalaRunTime.isArray(x, 1)`. Testing
+            // `instanceof [Ljava/lang/Object;` missed every primitive array,
+            // and the bound value is then left as the `Object` it is.
+            // Erasure stamps `array_sym` on such a pattern
+            // (`mark_value_class_patterns`): its type is `Object` by now.
+            if ctx.library_abi
+                && (pat.sym == ctx.st.array_sym
+                    || matches!(pat.ty.widen_constant(), Type::Array(ref e) if !is_concrete_array_elem(e)))
+            {
+                load(asm, tmp, JvmSort::Ref);
+                emit_is_array(asm);
+                asm.ifeq(fail);
+                gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
             let jvm = match pat.ty.widen_constant() {
                 Type::Array(_) => jvm_desc(ctx.st, &pat.ty),
                 _ => type_jvm_name(ctx.st, &pat.ty),

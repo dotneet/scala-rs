@@ -859,7 +859,11 @@ pub struct Enumerator {
     pub pat: Tree,
     pub rhs: Tree,
     pub is_val: bool, // `p = e` vs `p <- e`
-    pub guard: Option<Tree>,
+    /// Every `if` that follows this enumerator, in source order. Each one
+    /// becomes its own `withFilter` (nsc desugars `x <- e if a; if b` to
+    /// `e.withFilter(a).withFilter(b)`); keeping only the last one silently
+    /// dropped the earlier filters.
+    pub guards: Vec<Tree>,
 }
 
 /// nsc `Chars.isOperatorPart`.

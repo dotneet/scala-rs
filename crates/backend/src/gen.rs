@@ -308,6 +308,7 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
 
 /// Walk a typed compilation unit and emit classes.
 pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpts) -> EmitResult {
+    let _unbox = crate::gen_call::LibraryUnboxScope::enter(opts.library_abi);
     // A shared map already holds this unit's own trait members: the driver
     // harvests every unit of the run before emitting any, and the harvest is a
     // function of the tree alone, so doing it again here would insert the same

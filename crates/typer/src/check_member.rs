@@ -499,6 +499,38 @@ impl Typer {
                 tree.ty = Type::Error;
                 return;
             }
+            // Only a field has a default value; a local `var x: Int = _`
+            // is nsc's "local variables must be initialized". Accepted, it
+            // compiled to a zero nobody asked for.
+            if self.block_local_defs.contains(&(self.file_index, tree.id)) {
+                self.error(tree.span, "local variables must be initialized");
+                tree.ty = Type::Error;
+                return;
+            }
+            // An abstract `T` (a class type parameter, an abstract type
+            // member) has `null` as its default too, and nsc accepts it
+            // although `Null` does not conform to an unbounded `T`: the
+            // initializer is the default, not an expression to be checked.
+            if matches!(
+                declared.widen_constant(),
+                Type::TypeParam(_) | Type::TypeMember(_)
+            ) {
+                let span = rhs.span;
+                **rhs = Tree {
+                    id: rhs.id,
+                    span,
+                    kind: TreeKind::Literal { lit: Lit::Null },
+                    ty: declared.clone(),
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                    scala_ref: false,
+                    stable_pat: false,
+                    byname_thunk: false,
+                    byname_type_marker: false,
+                };
+                tree.ty = declared;
+                return;
+            }
             let lit = match declared.widen_constant() {
                 Type::Int => Lit::Int(0),
                 Type::Long => Lit::Long(0),
@@ -537,6 +569,23 @@ impl Typer {
             self.reject_unapplied_implicit_clause(rhs);
         }
         self.typing_call_args = saved_call_args;
+        // A strict *local* value may not mention itself in its own
+        // initializer (nsc refchecks: "forward reference extends over
+        // definition of value x"): the slot is read before it is written.
+        // `val fibs: LazyList[BigInt] = 0 #:: fibs.zip(...)` was accepted and
+        // read `null`. A field reads its default instead, and a `lazy val`
+        // is initialized on first use, so both stay legal.
+        if !tree.sym.is_none()
+            && self.block_local_defs.contains(&(self.file_index, tree.id))
+            && !self.st.get(tree.sym).flags.contains(Flags::LAZY)
+            && tree_mentions_sym(rhs, tree.sym)
+        {
+            let name = self.st.get(tree.sym).name.clone();
+            self.error(
+                tree.span,
+                format!("forward reference extends over definition of value {name}"),
+            );
+        }
         self.warn_trivial_self_reference(tree.sym, rhs);
         if presuper && tree_contains_this(rhs) {
             self.error(
@@ -2684,4 +2733,18 @@ impl Typer {
             }
         }
     }
+}
+
+/// Whether `tree` contains a reference (`Ident` or `Select`) to `sym`.
+fn tree_mentions_sym(tree: &Tree, sym: SymbolId) -> bool {
+    if matches!(tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) && tree.sym == sym {
+        return true;
+    }
+    let mut found = false;
+    crate::erasure::for_each_child(tree, &mut |c| {
+        if !found && tree_mentions_sym(c, sym) {
+            found = true;
+        }
+    });
+    found
 }

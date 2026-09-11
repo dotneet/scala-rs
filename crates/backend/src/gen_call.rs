@@ -597,6 +597,15 @@ pub(crate) fn unit_stat_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
         }
         TreeKind::Apply { fun, .. } => {
             let f = peel_fun(fun);
+            // Applying a function *value* goes through `gen_function_apply`,
+            // whose `emit_unbox(Unit)` already dropped `FunctionN.apply`'s
+            // result. `def adder: Int => Unit` is such a value even though
+            // its symbol is a method whose declared result (a function) is
+            // not `Unit`; asking `leaves_ref_sym` about it popped twice
+            // (`VerifyError: Operand stack underflow` on `a.adder(1)`).
+            if matches!(f.ty, Type::Function { .. }) {
+                return false;
+            }
             leaves_ref_sym(f.sym, st, false)
         }
         // A **nilary** `def` has no argument list, so calling it builds a bare
@@ -935,7 +944,42 @@ pub(crate) fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
     }
 }
 
+thread_local! {
+    /// Whether the unit being emitted links against scala-library, so that
+    /// `emit_unbox` may call `scala.runtime.BoxesRunTime`. Set for the whole
+    /// of one `emit_opts` call (`LibraryUnboxScope`); the thirty-odd
+    /// `emit_unbox` sites have no `EmitCtx` to ask.
+    static LIBRARY_UNBOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Holds [`LIBRARY_UNBOX`] for one unit's emission and restores it after.
+pub(crate) struct LibraryUnboxScope(bool);
+
+impl LibraryUnboxScope {
+    pub(crate) fn enter(library_abi: bool) -> Self {
+        LibraryUnboxScope(LIBRARY_UNBOX.with(|c| c.replace(library_abi)))
+    }
+}
+
+impl Drop for LibraryUnboxScope {
+    fn drop(&mut self) {
+        LIBRARY_UNBOX.with(|c| c.set(self.0));
+    }
+}
+
 pub(crate) fn emit_unbox(asm: &mut Assembler, ty: &Type) {
+    // nsc unboxes through `BoxesRunTime.unboxToInt` & co., which read `null`
+    // as the primitive's zero: an erased generic read of a `null` -- a
+    // `var v: T = _` at `T = Int`, `Some(null.asInstanceOf[Int]).get` -- is
+    // `0` there, where `checkcast Integer; intValue` threw
+    // NullPointerException. A value of the wrong box is a
+    // ClassCastException either way.
+    if LIBRARY_UNBOX.with(|c| c.get()) {
+        if let Some((name, desc)) = boxes_runtime_unbox(ty) {
+            asm.invokestatic("scala/runtime/BoxesRunTime", name, desc);
+            return;
+        }
+    }
     emit_unbox_inner(asm, &ty.widen_constant())
 }
 
@@ -986,6 +1030,22 @@ pub(crate) fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
     }
 }
 
+/// `scala.runtime.BoxesRunTime`'s null-tolerant unboxing method for a
+/// primitive: `unboxToInt(Object): int` and so on.
+pub(crate) fn boxes_runtime_unbox(ty: &Type) -> Option<(&'static str, &'static str)> {
+    Some(match ty.widen_constant() {
+        Type::Int => ("unboxToInt", "(Ljava/lang/Object;)I"),
+        Type::Long => ("unboxToLong", "(Ljava/lang/Object;)J"),
+        Type::Double => ("unboxToDouble", "(Ljava/lang/Object;)D"),
+        Type::Float => ("unboxToFloat", "(Ljava/lang/Object;)F"),
+        Type::Boolean => ("unboxToBoolean", "(Ljava/lang/Object;)Z"),
+        Type::Char => ("unboxToChar", "(Ljava/lang/Object;)C"),
+        Type::Byte => ("unboxToByte", "(Ljava/lang/Object;)B"),
+        Type::Short => ("unboxToShort", "(Ljava/lang/Object;)S"),
+        _ => return None,
+    })
+}
+
 /// Boxed wrapper class for a primitive (`Int` -> `java/lang/Integer`, ...),
 /// used by `asInstanceOf`/`isInstanceOf` against an `Any`-erased (`Object`)
 /// receiver that may hold a boxed primitive.
@@ -1011,6 +1071,15 @@ pub(crate) fn boxed_internal_name(ty: &Type) -> Option<&'static str> {
 /// emits `checkcast` against a type with real runtime class information.
 pub(crate) fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
     if boxed_internal_name(target).is_some() {
+        // nsc unboxes through `BoxesRunTime.unboxToInt` & co., which read
+        // `null` as the primitive's zero: `null.asInstanceOf[Int]` is `0`.
+        // `checkcast Integer; intValue` threw `NullPointerException`.
+        if ctx.library_abi {
+            if let Some((name, desc)) = boxes_runtime_unbox(target) {
+                asm.invokestatic("scala/runtime/BoxesRunTime", name, desc);
+                return;
+            }
+        }
         emit_unbox(asm, target);
         return;
     }

@@ -1166,6 +1166,25 @@ impl<'a> Gen<'a> {
                     asm.putfield(&class_name, "$outer", od);
                 }
             }
+            // nsc's constructors phase stores the parameter-accessor fields
+            // (and the lambda-lifted captures, which are parameters too)
+            // *before* the super constructor call, like `$outer` above. A
+            // superclass constructor that dispatches back to an override
+            // reading `class Sub(val name: String)`'s `name` sees the argument
+            // under scalac, and saw `null` here.
+            for (slot, sort, fname, fdesc) in &param_info {
+                if fname.is_empty() {
+                    continue;
+                }
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
+            for (slot, sort, fname, fdesc) in &cap_info {
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
             // nsc: early vals are stored to fields before the superclass ctor so
             // parent / trait `$init$` bodies see the values.
             for vd in &inits {
@@ -1256,19 +1275,6 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
-            for (slot, sort, fname, fdesc) in &param_info {
-                if fname.is_empty() {
-                    continue;
-                }
-                asm.aload(0);
-                load(asm, *slot, *sort);
-                asm.putfield(&class_name, fname, fdesc);
-            }
-            for (slot, sort, fname, fdesc) in &cap_info {
-                asm.aload(0);
-                load(asm, *slot, *sort);
-                asm.putfield(&class_name, fname, fdesc);
-            }
             // From here on the field is the parameter: unbind the local so the
             // body's reads and writes go through it (see `mutable_params`).
             for id in &mutable_params {

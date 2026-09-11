@@ -46,46 +46,13 @@ pub(crate) fn add_predef_members(
         );
     }
     method(st, owner, "println", vec![], Type::Unit, Intrinsic::Println);
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Int],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Long],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Double],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Boolean],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::String],
-        Type::Unit,
-        Intrinsic::Println,
-    );
+    // `Predef.println(x: Any)` is the only one-argument overload nsc has.
+    // Typed stand-ins (`println(Int)`, `println(Double)`, ...) used to sit
+    // beside it; once numeric widening counts toward applicability (as in
+    // nsc), `println(ch)` picked `println(Int)` and printed a `Char` as its
+    // code, and `println(if (c) 1 else 2.0)` gave its branches the expected
+    // type `Double` where nsc gives them `Any` (and prints `1`). The backend
+    // prints from the argument's own type either way.
     method(
         st,
         owner,

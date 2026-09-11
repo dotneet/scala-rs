@@ -1,0 +1,14 @@
+Int Int Int Double Long Any specific-Int D A
+c
+0.33333334
+1.0 97 1 1.0
+Long Int
+1
+1
+1
+List(1.0)
+5 5.0 5 -1 2
+5 1.5 3 c 5 7
+k=5
+0 false 0.0 0 5
+CCE

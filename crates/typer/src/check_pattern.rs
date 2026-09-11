@@ -29,12 +29,18 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = self.lub_branches(&res, &c.body.ty);
+            res = self.join_branches(&res, &c.body.ty, pt);
             branch_tys.push(c.body.ty.clone());
             self.st.pop_scope();
         }
         let span = tree.span;
-        tree.ty = self.branch_result_ty(pt, &branch_tys, res);
+        let result = self.branch_result_ty(pt, &branch_tys, res);
+        if let TreeKind::Match { cases, .. } = &mut tree.kind {
+            for c in cases.iter_mut() {
+                self.widen_numeric_branch(&mut c.body, &result);
+            }
+        }
+        tree.ty = result;
         if let TreeKind::Match { selector, cases } = &tree.kind {
             // The pattern-matching function a `for` generator desugars to is
             // guarded by the `withFilter` the parser puts in front of it, so
@@ -720,6 +726,12 @@ impl Typer {
                 self.pattern_tpt = saved;
                 let ty = self.refine_pattern_type_binders(ty, sel_ty, &binders);
                 let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
+                if matches!(ty, Type::AnyVal) {
+                    self.error(
+                        tpt.span,
+                        "type AnyVal cannot be used in a type pattern or isInstanceOf test",
+                    );
+                }
                 if !self.typed_pattern_compatible(&ty, sel_ty) {
                     self.error(
                         tpt.span,

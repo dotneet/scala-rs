@@ -334,6 +334,35 @@ impl Typer {
     /// is, and stays open), the other branch does not mention it (one both
     /// sides carry is still the enclosing call's to fix), and it occurs
     /// covariantly (an invariant occurrence has no bound to read it at).
+    /// A branch of an `if` / `match` / `try` whose numeric type is narrower
+    /// than the weak lub the whole expression was given: widen it the way an
+    /// expected type would have (`1` in `if (c) 1 else 2.0` becomes `1.0`),
+    /// so every branch leaves the same JVM sort in the result slot.
+    pub(crate) fn widen_numeric_branch(&mut self, branch: &mut Tree, to: &Type) {
+        let from = branch.ty.widen_constant();
+        let to = to.widen_constant();
+        if from != to && weak_numeric_lub(&from, &to).as_ref() == Some(&to) {
+            self.adapt(branch, &to);
+        }
+    }
+
+    /// The join of two branch types of an `if` / `match` / `try` typed
+    /// against `pt`. nsc `ptOrLub`: a fully defined `pt` *is* the result and
+    /// the branches are left as they are (`println(if (c) 1 else 2.0)` prints
+    /// `1`); without one the branches are joined by `weakLub`, so numeric
+    /// value types meet by weak conformance -- `val y = if (c) 1 else 2.0` is
+    /// a `Double` and prints `1.0`. The plain lub of two primitives is
+    /// `AnyVal`, which boxed the value and silently changed both what it
+    /// prints and which overload it picks.
+    pub(crate) fn join_branches(&self, a: &Type, b: &Type, pt: &Type) -> Type {
+        if pt_allows_weak_lub(pt) {
+            if let Some(w) = weak_numeric_lub(a, b) {
+                return w;
+            }
+        }
+        self.lub_branches(a, b)
+    }
+
     pub(crate) fn lub_branches(&self, a: &Type, b: &Type) -> Type {
         if a == b
             || matches!(a, Type::Nothing)
@@ -1616,6 +1645,7 @@ impl Typer {
         args: &[Type],
     ) -> Option<Type> {
         let mut acc: Option<Type> = None;
+        let mut all_direct = true;
         for (i, a) in args.iter().enumerate() {
             let Some(p) = param_at(params, i) else {
                 break;
@@ -1699,6 +1729,22 @@ impl Typer {
                     }
                 }
             }
+            // nsc registers a *numeric* bound (joined by weak lub) only where
+            // the variable is the parameter type itself: `List(1, 2.5)` is a
+            // `List[Double]`, but `f[K, V](xs: (K, V)*)` given `(1, 2)` and
+            // `(3, 4.5)` bounds `V` inside `Tuple2` and joins to `AnyVal`.
+            // Joining those to `Double` left `(1, 2)` inapplicable, and
+            // `Map(1 -> 2, 3 -> 4.5)` fell through to a receiver view.
+            let direct = matches!(
+                match p {
+                    Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                    other => other,
+                },
+                Type::TypeParam(id) if *id == tp
+            );
+            if hit.is_some() && !direct {
+                all_direct = false;
+            }
             if let Some(t) = hit {
                 acc = Some(match acc {
                     None => t,
@@ -1714,7 +1760,11 @@ impl Typer {
                     Some(prev) => {
                         let prev = self.minimize_undet(&prev);
                         let t = self.minimize_undet(&t);
-                        self.lub_ty(&prev, &t)
+                        if all_direct {
+                            self.lub_ty(&prev, &t)
+                        } else {
+                            self.st.lub(&prev, &t)
+                        }
                     }
                 });
             }
@@ -1725,7 +1775,7 @@ impl Typer {
     /// Substitute every undetermined variable in `t` by its lower bound
     /// (`Nothing` when it has none) -- nsc's minimisation of a type variable
     /// nothing constrains from above.
-    fn minimize_undet(&self, t: &Type) -> Type {
+    pub(crate) fn minimize_undet(&self, t: &Type) -> Type {
         if self.undet_tvars.is_empty() {
             return t.clone();
         }
@@ -2329,7 +2379,11 @@ impl Typer {
                 (Some(t), Some(lo)) => {
                     let t = self.minimize_undet(&t);
                     let lo = self.minimize_undet(&lo);
-                    out.push((tp, self.lub_ty(&t, &lo)))
+                    // The plain lub: a declared lower bound is not a numeric
+                    // bound, so `List(1, 2) :+ 2.5` (`:+[B >: A](elem: B)`) is
+                    // a `List[AnyVal]`, not a `List[Double]` holding an `Int`
+                    // -- and `padTo(3, 1.5)` stopped failing its own bound.
+                    out.push((tp, self.st.lub(&t, &lo)))
                 }
                 (Some(t), None) => out.push((tp, t)),
                 (None, Some(lo)) => out.push((tp, lo)),
@@ -3934,6 +3988,42 @@ impl Typer {
 /// literal, not merely constant-typed, so `val n = 3; val b: Byte = -n`
 /// (`n` is a stable reference, not a literal) is left alone and still
 /// reports the type mismatch scalac itself gives.
+/// Whether `pt` leaves the result of a branching expression to the branches
+/// (nsc `isFullyDefined(pt)` is false): no expectation at all, or one still
+/// waiting on inference.
+pub(crate) fn pt_allows_weak_lub(pt: &Type) -> bool {
+    pt.is_no_type() || matches!(pt, Type::Wildcard) || pt_is_undecided(pt)
+}
+
+/// nsc `numericLub`: the least numeric value type both `a` and `b` weakly
+/// conform to (SLS 3.5.3: `Byte <: Short <: Int <: Long <: Float <: Double`,
+/// `Char <: Int`), or `None` when either is not a numeric value type or the two
+/// are the same type. `Char` against `Byte` or `Short` meets at `Int`.
+pub(crate) fn weak_numeric_lub(a: &Type, b: &Type) -> Option<Type> {
+    let rank = |t: &Type| match t {
+        Type::Byte => Some(1),
+        Type::Short => Some(2),
+        Type::Char => Some(2),
+        Type::Int => Some(3),
+        Type::Long => Some(4),
+        Type::Float => Some(5),
+        Type::Double => Some(6),
+        _ => None,
+    };
+    let (a, b) = (a.widen_constant(), b.widen_constant());
+    if a == b {
+        return None;
+    }
+    let (ra, rb) = (rank(&a)?, rank(&b)?);
+    if matches!(
+        (&a, &b),
+        (Type::Char, Type::Byte | Type::Short) | (Type::Byte | Type::Short, Type::Char)
+    ) {
+        return Some(Type::Int);
+    }
+    Some(if ra >= rb { a } else { b })
+}
+
 fn negated_int_literal(tree: &Tree) -> Option<i32> {
     let TreeKind::Apply { fun, args } = &tree.kind else {
         return None;

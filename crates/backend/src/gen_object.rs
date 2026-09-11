@@ -175,9 +175,13 @@ impl<'a> Gen<'a> {
         // case-class companion: synthetic apply
         let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
-            if self.st.get(class_id).flags.contains(Flags::CASE)
-                && !impl_.body.iter().any(|t| t.name() == Some("apply"))
-            {
+            // A hand-written `apply` suppresses the synthetic one only at
+            // the same parameter types (`emit_case_apply` checks the
+            // descriptor); `object Money { def apply(d: Double) }` beside
+            // `case class Money(cents: Long)` keeps `apply(J)`, which the
+            // typer resolves `Money(5L)` to -- skipping it on the name alone
+            // was a `NoSuchMethodError` at that call.
+            if self.st.get(class_id).flags.contains(Flags::CASE) {
                 emit_case_apply(&mut b, self.st, class_id);
                 // nsc emits no forwarder for an `apply` that is not public.
                 // With `-Xsource-features:case-apply-copy-access` the `public
@@ -417,6 +421,32 @@ impl<'a> Gen<'a> {
             if own_outer.is_some() {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);
             }
+            // Early definitions (`object O extends { val name = … } with T`)
+            // are stored before the super constructor and the trait
+            // initializers, as for a class (`emit_class_ctor`). The module
+            // path ran them with the rest of the body, after `T`'s `$init$`
+            // had already read the field as `null`.
+            for vd in &inits {
+                if !is_presuper_val(vd) {
+                    continue;
+                }
+                if let TreeKind::ValDef {
+                    name, mods, rhs, ..
+                } = &vd.kind
+                {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        continue;
+                    }
+                    asm.aload(0);
+                    gen_expr(asm, &mut frame, &ctx_early, rhs);
+                    let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
+                        st.get(vd.sym).ty.clone()
+                    } else {
+                        vd.ty.clone()
+                    };
+                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                }
+            }
             asm.aload(0);
             if let Some(o) = super_outer {
                 // Read the enclosing instance out of the argument when it is
@@ -481,6 +511,9 @@ impl<'a> Gen<'a> {
                 Gen::emit_delayed_init_call(asm, &class_name);
             } else {
                 for vd in &inits {
+                    if is_presuper_val(vd) {
+                        continue;
+                    }
                     if let TreeKind::ValDef {
                         name, mods, rhs, ..
                     } = &vd.kind
@@ -1363,6 +1396,12 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
+    if b.methods
+        .iter()
+        .any(|m| m.name == "apply" && desc_params(&m.desc) == desc_params(&desc))
+    {
+        return;
+    }
     // A case class nested in a class takes its enclosing instance first; the
     // companion is nested in the same class and holds the same one in its own
     // `$outer`. Reading it off the builder keeps the two in step: a companion

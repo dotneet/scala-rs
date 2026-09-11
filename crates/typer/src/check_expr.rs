@@ -1212,6 +1212,16 @@ impl Typer {
                             return;
                         }
                         crate::symbol::Intrinsic::IsInstanceOf => {
+                            // nsc: `AnyVal` has no runtime class to test for
+                            // (every primitive and value class conforms), so
+                            // the test is rejected rather than compiled into
+                            // an `instanceof Object` that is true for everything.
+                            if matches!(targs.first(), Some(Type::AnyVal)) {
+                                self.error(
+                                    tree.span,
+                                    "type AnyVal cannot be used in a type pattern or isInstanceOf test",
+                                );
+                            }
                             tree.ty = Type::Boolean;
                             return;
                         }
@@ -1436,9 +1446,12 @@ impl Typer {
                 // whose branches share no direct subtype relation but do share
                 // `Option[X]` as a common ancestor (sgap fixture; slick's
                 // `PositionedResult.nextXOption()` methods rely on exactly this).
-                let joined = self.lub_branches(&thenp.ty, &elsep.ty);
+                let joined = self.join_branches(&thenp.ty, &elsep.ty, pt);
                 let branch_tys = [thenp.ty.clone(), elsep.ty.clone()];
-                tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
+                let result = self.branch_result_ty(pt, &branch_tys, joined);
+                self.widen_numeric_branch(thenp, &result);
+                self.widen_numeric_branch(elsep, &result);
+                tree.ty = result;
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
@@ -1754,6 +1767,34 @@ impl Typer {
                 }
                 tree.ty = tpt.ty.clone();
                 tree.sym = tpt.sym;
+                // SLS 5.2 / nsc `checkInstantiable`: a plain `new C` of an
+                // abstract class or a trait is an error -- only an anonymous
+                // subclass (`new C { ... }`, typed above) may instantiate one.
+                // Accepted, it emitted `new C; invokespecial C.<init>`, an
+                // `InstantiationError` at run time.
+                // The prelude's hand-written stand-ins (scala-xml's
+                // `NamespaceBinding`, ...) carry flags the real class does not,
+                // so only a class read from a pickle or a class file, or
+                // defined in source, is trusted.
+                let stand_in = !tree.sym.is_none()
+                    && tree.sym.0 < self.st.prelude_end
+                    && self.st.get(tree.sym).pickled_origin.is_empty();
+                if !tree.sym.is_none() && !stand_in && self.st.get(tree.sym).kind == SymKind::Class
+                {
+                    let s = self.st.get(tree.sym);
+                    let is_trait =
+                        s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE);
+                    if is_trait || s.flags.contains(Flags::ABSTRACT) {
+                        let what = if is_trait { "trait" } else { "class" };
+                        let name = s.name.clone();
+                        self.error(
+                            tpt.span,
+                            format!("{what} {name} is abstract; cannot be instantiated"),
+                        );
+                        tree.ty = Type::Error;
+                        return;
+                    }
+                }
                 if tree.sym.is_none() {
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
                         tree.sym = id;
@@ -1995,18 +2036,33 @@ impl Typer {
                     .collect();
                 let no_unit = !matches!(block.ty, Type::Unit)
                     && !handlers.iter().any(|t| matches!(t, Type::Unit));
+                // Numeric handlers meet the body by weak conformance only
+                // without a defined `pt` (`join_branches` says why).
+                let weak = crate::check_infer::pt_allows_weak_lub(pt);
+                let join = |a: &Type, b: &Type| {
+                    if weak {
+                        self.lub_ty(a, b)
+                    } else {
+                        self.st.lub(a, b)
+                    }
+                };
                 tree.ty = if matches!(block.ty, Type::Nothing) {
                     handlers
                         .into_iter()
-                        .reduce(|a, b| self.lub_ty(&a, &b))
+                        .reduce(|a, b| join(&a, &b))
                         .unwrap_or_else(|| block.ty.clone())
                 } else if no_unit && !handlers.iter().all(|t| self.st.is_sub_type(t, &block.ty)) {
                     handlers
                         .into_iter()
-                        .fold(block.ty.clone(), |a, b| self.lub_ty(&a, &b))
+                        .fold(block.ty.clone(), |a, b| join(&a, &b))
                 } else {
                     block.ty.clone()
                 };
+                let result = tree.ty.clone();
+                self.widen_numeric_branch(block, &result);
+                for c in catches.iter_mut() {
+                    self.widen_numeric_branch(&mut c.body, &result);
+                }
             }
             TreeKind::InterpolatedString {
                 prefix,
