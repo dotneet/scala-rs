@@ -1,0 +1,13 @@
+true true
+(true,#41)
+30
+implicit-Sub R2 R2 U1 R1
+List(x, y) one two
+List(3)
+shown 1
+List(hi)
+Some(x) Some(x)
+Some(Left(n4)) Some(Right(3)) Right(4) Right(Some(EK(Right(Some(1)))))
+id 42 List(7) List(List(1), List(2)) List((1,a)) Right(v2)
+(true,#7)
+Right(s)

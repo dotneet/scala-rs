@@ -1,22 +1,20 @@
-// The honest limit of the placeholder (`docs/macros.md` §5.1).
+// An implementation's verdict on a class this run is compiling.
 //
-// A class this run is compiling goes to a macro implementation as a symbol
-// carrying its full name and no info: scala-rs cannot describe it truthfully
-// at that point in its own run -- while `lazy val rows = MgQuery[Row]` above
-// is being typed, the members of `class Row` are still un-inferred. So an
-// implementation that asks the placeholder *what the class is* is answering
-// about a symbol it was never shown.
+// `MgNameImpl.of` asks its type argument what it *is*, the way slick's
+// `mapToImpl` does, and aborts unless it is a case class. `MgPlain` is not.
+// Real scalac 2.13.16 reports `MgPlain must be a case class` and
+// `java.lang.String must be a case class`, and so must scala-rs.
 //
-// `MgNameImpl.of` asks exactly that, the way slick's `mapToImpl` does. Its
-// verdict on `MgPlain` -- "must be a case class" -- is about the placeholder,
-// not about this program, so it must not be reported as the program's error.
-// The call site is still an error: it is a macro that could not be expanded,
-// with the reason.
+// This file used to pin the opposite. A class this run is compiling went to
+// the engine as a placeholder carrying its name and no info, so the verdict
+// was about a symbol the implementation had never been shown, and it was
+// replaced by a note saying so. The class now goes over as its identity and
+// is described in nsc's shape when asked (`docs/macros.md` §7.25): the
+// implementation sees the real class, and its judgement is the program's
+// error, exactly as under nsc.
 //
-// The second call is the control. `java.lang.String` really is on the macro
-// classpath, so the implementation gets the true symbol and its `abort` is the
-// implementation's own judgement of a real class. That one *is* reported as
-// itself.
+// The second call is the control: `java.lang.String` is on the macro
+// classpath, and its verdict has always been reported as itself.
 import mgl.MgName
 
 class MgPlain(x: Int)

@@ -30,14 +30,21 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
         Type::Any,
         Intrinsic::None,
     );
-    method(
-        st,
-        either,
-        "map",
-        vec![fn1(tb, Type::Any)],
-        either_t.clone(),
-        Intrinsic::None,
-    );
+    // `def map[B1](f: B => B1): Either[A, B1]`. The application path still
+    // rewrites the result from the literal (`either_map_result`), but a
+    // *method value* has no application: cats' `that.flatMap(eab.map)` (in
+    // `syntax/either.scala`'s `ap`) eta-expanded the old `(B => Any)Either[A,
+    // B]` and came back `Either[AA, B]` where scalac has `Either[AA, C]`.
+    let either_map = st.alloc("map", either, SymKind::Method, Flags::FINAL, "");
+    let b1 = type_param(st, either_map, "B1");
+    st.get_mut(either_map).tparams = vec![b1];
+    st.get_mut(either_map).ty = Type::Method {
+        paramss: vec![vec![fn1(tb, Type::TypeParam(b1))]],
+        ret: Box::new(Type::Class {
+            sym: either,
+            args: vec![Type::TypeParam(ea), Type::TypeParam(b1)],
+        }),
+    };
 
     // nsc: `class Left[+A, +B](value: A) extends Either[A, B]`
     let left = class(
@@ -70,18 +77,22 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     );
     let left_mod = module(st, st.scala_pkg, "Left", "scala/util/Left$");
     let left_cls = st.module_class_of(left_mod);
-    let left_apply = method(
-        st,
-        left_cls,
-        "apply",
-        vec![Type::Any],
-        Type::Class {
+    // `def apply[A, B](value: A): Left[A, B]`, with the method's own type
+    // parameters. The value parameter used to be `Any`, which left the
+    // argument nothing to be checked against: cats' `Left(F.coflatMap(fa)(x
+    // => leftc(x)))` at an expected `Either[F[EitherK[F, G, A]], …]` could not
+    // hand `leftc` its `G`, and the call came out `EitherK[F, Nothing, A]`.
+    let left_apply = st.alloc("apply", left_cls, SymKind::Method, Flags::FINAL, "");
+    let lma = type_param(st, left_apply, "A");
+    let lmb = type_param(st, left_apply, "B");
+    st.get_mut(left_apply).tparams = vec![lma, lmb];
+    st.get_mut(left_apply).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(lma)]],
+        ret: Box::new(Type::Class {
             sym: left,
-            args: vec![Type::TypeParam(la), Type::TypeParam(lb)],
-        },
-        Intrinsic::None,
-    );
-    st.get_mut(left_apply).tparams = vec![la, lb];
+            args: vec![Type::TypeParam(lma), Type::TypeParam(lmb)],
+        }),
+    };
     let mems = st.get(left_cls).members.clone();
     st.get_mut(left_mod).members.extend(mems);
 
@@ -107,18 +118,18 @@ pub(crate) fn add_either(st: &mut SymbolTable) {
     );
     let right_mod = module(st, st.scala_pkg, "Right", "scala/util/Right$");
     let right_cls = st.module_class_of(right_mod);
-    let right_apply = method(
-        st,
-        right_cls,
-        "apply",
-        vec![Type::Any],
-        Type::Class {
+    // `def apply[A, B](value: B): Right[A, B]`; see `Left.apply` above.
+    let right_apply = st.alloc("apply", right_cls, SymKind::Method, Flags::FINAL, "");
+    let rma = type_param(st, right_apply, "A");
+    let rmb = type_param(st, right_apply, "B");
+    st.get_mut(right_apply).tparams = vec![rma, rmb];
+    st.get_mut(right_apply).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(rmb)]],
+        ret: Box::new(Type::Class {
             sym: right,
-            args: vec![Type::TypeParam(ra), Type::TypeParam(rb)],
-        },
-        Intrinsic::None,
-    );
-    st.get_mut(right_apply).tparams = vec![ra, rb];
+            args: vec![Type::TypeParam(rma), Type::TypeParam(rmb)],
+        }),
+    };
     let mems = st.get(right_cls).members.clone();
     st.get_mut(right_mod).members.extend(mems);
 }

@@ -508,6 +508,20 @@ impl Typer {
             // class symbol to walk: `(f: Int => String).asInstanceOf[…]`.
             found = self.st.lookup_member(self.st.any_sym, &name);
         }
+        // A class is not a value: `new Fixed {}.Inner` selects the *term*
+        // `Inner` on the new instance, and nsc reports "value Inner is not a
+        // member of Fixed". Binding the class here compiled to a field read
+        // that failed at run time (`NoSuchFieldError`).
+        // Only on an instance: `java.lang.Long.toBinaryString(…)` names a
+        // Java class as the prefix of its statics, which is a type
+        // qualifier, not a value.
+        let value_receiver = instance_receiver
+            || !matches!(qual.kind, TreeKind::Ident { .. } | TreeKind::Select { .. });
+        if value_receiver {
+            found.retain(|&m| {
+                self.st.get(m).kind != SymKind::Class || self.st.get(m).flags.contains(Flags::JAVA)
+            });
+        }
         if found.is_empty() {
             // nsc reports the cause once: a selection on a receiver that is
             // already an error adds nothing.
@@ -691,6 +705,21 @@ impl Typer {
             }
             _ => None,
         };
+        // The prefix a bare inner class in the member's type gets: the stable
+        // path the member was selected on (`o.mk` for `def mk: In` is an
+        // `o.In`), when there is one; the receiver's type otherwise
+        // (`prefix.rs`). Only computed when some member could need it.
+        let inner_prefix: Option<Type> = if ext_conv.is_none()
+            && this_prefix.is_none()
+            && found
+                .iter()
+                .any(|s| self.st.mentions_inner_class(&self.st.get(*s).ty))
+            && self.is_stable_path(qual)
+        {
+            self.singleton_prefix_of(qual)
+        } else {
+            None
+        };
         let subst = |ty: Type| -> Type {
             let ty = apply_path_members(ty, &path_members);
             // `import seq.integral._; increment < zero` is
@@ -704,7 +733,9 @@ impl Typer {
             };
             let ty = match &this_prefix {
                 Some(p) => self.st.subst_as_seen_from_prefix(&recv_ty, p, &ty),
-                None => self.st.subst_as_seen_from(&recv_ty, &ty),
+                None => self
+                    .st
+                    .subst_as_seen_from_at(&recv_ty, inner_prefix.as_ref(), &ty),
             };
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
@@ -1605,7 +1636,7 @@ impl Typer {
     /// the same name, so what decides it is the parameter list. A
     /// parameterless `val` matches a nullary `def` (that is how `override val
     /// sqlType` implements `def sqlType: Int`).
-    fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
+    pub(crate) fn same_signature(&self, sub: SymbolId, base: SymbolId) -> bool {
         let sub_ps = flat_param_types(&self.st.get(sub).ty);
         let base_ps = flat_param_types(&self.st.get(base).ty);
         if sub_ps.len() != base_ps.len() {
@@ -3432,6 +3463,8 @@ impl Typer {
         };
         let mut arg_lists = arg_lists_outer_first;
         arg_lists.reverse();
+        // The receiver's prefix, for an inner case class (`prefix.rs`).
+        let mut recv_prefix: Option<Type> = None;
         let class_id = if is_bare {
             let cls = self.st.this_class;
             if cls.is_none() {
@@ -3458,6 +3491,7 @@ impl Typer {
             if q.ty.is_no_type() {
                 self.type_expr(&mut q, &Type::NoType);
             }
+            recv_prefix = crate::prefix::view_prefix(&q.ty).cloned();
             match self.st.class_sym_of(&q.ty) {
                 Some(c) => c,
                 None => return false,
@@ -3528,7 +3562,7 @@ impl Typer {
         // one emitted, so `copy()(buildType)` compiled to a call to a method
         // that is not in the classfile.
         let mut ctor = Tree::dummy(TreeKind::New {
-            tpt: Box::new(self.resolved_class_tpt(class_id)),
+            tpt: Box::new(self.resolved_class_tpt_at(class_id, recv_prefix.as_ref())),
         });
         for args in new_arg_lists {
             ctor = Tree::dummy(TreeKind::Apply {
@@ -3578,6 +3612,7 @@ impl Typer {
             },
             _ => return false,
         };
+        let mut recv_prefix: Option<Type> = None;
         let class_id = match shape {
             CopyCallee::Qualified => {
                 let TreeKind::Apply { fun, .. } = &mut tree.kind else {
@@ -3589,6 +3624,7 @@ impl Typer {
                 if qual.ty.is_no_type() {
                     self.type_qualifier(qual, &Type::NoType);
                 }
+                recv_prefix = crate::prefix::view_prefix(&qual.ty).cloned();
                 match self.st.class_sym_of(&qual.ty) {
                     Some(c) => c,
                     None => return false,
@@ -3695,7 +3731,7 @@ impl Typer {
             });
         }
         let new_tree = Tree::dummy(TreeKind::New {
-            tpt: Box::new(self.resolved_class_tpt(class_id)),
+            tpt: Box::new(self.resolved_class_tpt_at(class_id, recv_prefix.as_ref())),
         });
         let mut ctor = Tree::dummy(TreeKind::Apply {
             fun: Box::new(new_tree),

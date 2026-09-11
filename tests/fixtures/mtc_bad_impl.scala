@@ -1,8 +1,8 @@
 // Macro implementations whose `c.typecheck` asks scala-rs something it
 // genuinely cannot answer. `docs/macros.md` §7.20.
 //
-// Five of the seven call sites in `mtc_bad.scala` compile under real scalac
-// 2.13.16 and print `Int(1) / Int(1) / Int(1) / caught / Bag` there; the point
+// Four of the six call sites in `mtc_bad.scala` compile under real scalac
+// 2.13.16 and print `Int(1) / Int(1) / Int(1) / caught` there; the point
 // of the fixture is that scala-rs **refuses each of them with a reason that
 // names what was missing**, rather than answering approximately. A
 // `c.typecheck` that guessed would have the implementation build its expansion

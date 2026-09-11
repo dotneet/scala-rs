@@ -38,7 +38,7 @@ use scala_rs_pickle::names::encode_method_name;
 use scala_rs_span::Level;
 
 use crate::check::Typer;
-use crate::expand::{at, lit_to_wire, quote_into, scala_full_name, Sexp};
+use crate::expand::{at, lit_to_wire, quote_into, scala_full_name, Sexp, WireCx};
 use crate::symbol::{SymKind, SymbolTable};
 
 impl Typer {
@@ -98,6 +98,15 @@ impl Typer {
         if sym.is_none() || id as usize >= self.st.symbols.len() {
             return refusal("unknown mirror symbol identity");
         }
+        if kind == "companion" {
+            return format!("(a ref {})", self.mirror_companion(sym).0);
+        }
+        if kind == "modulePair" {
+            return match self.mirror_module_pair(sym) {
+                Some((m, c)) => format!("(a pair {} {})", m.0, c.0),
+                None => refusal(&format!("`{}` is not an object", self.st.get(sym).name)),
+            };
+        }
         if kind == "symbol" {
             let s = self.st.get(sym);
             let owner = self
@@ -105,15 +114,30 @@ impl Typer {
                 .get(&sym)
                 .copied()
                 .unwrap_or(s.owner);
+            // A trait is `abstract` in nsc as well, and `<interface>` when
+            // every member of it is abstract.
+            let mut class_flags = s.flags;
+            if s.flags.contains(Flags::TRAIT) {
+                class_flags = class_flags.with(Flags::ABSTRACT);
+                if self.is_pure_interface(sym) {
+                    class_flags = class_flags.with(Flags::INTERFACE);
+                }
+            }
+            // An object's name is `Foo$` here and `Foo` in nsc; so is the
+            // last segment of its full name.
+            let mut full = scala_full_name(&self.st, sym);
+            if matches!(s.kind, SymKind::Module | SymKind::ModuleClass) {
+                full = full.trim_end_matches('.').to_string();
+            }
             return format!(
                 "(a symbol {} {} {} {} {}{})",
                 id,
                 quoted(&format!("{:?}", s.kind)),
                 quoted(&s.name),
-                quoted(&scala_full_name(&self.st, sym)),
+                quoted(&full),
                 owner.0,
                 if s.is_class_like() {
-                    class_flags_wire(s.flags)
+                    class_flags_wire(class_flags)
                 } else {
                     member_flags_wire(s.flags, s.kind, s.name == "<init>")
                 }
@@ -132,12 +156,7 @@ impl Typer {
         }
         let s = self.st.get(sym).clone();
         if s.is_class_like() {
-            let (parents, decls) = self.describe_run_class_body(sym)?;
-            return Ok(format!(
-                "(classinfo (parents {}) (decls {}))",
-                parents.join(" "),
-                decls.join(" ")
-            ));
+            return self.mirror_class_info(sym);
         }
         if !s.tparams.is_empty() {
             return Err(format!(
@@ -150,7 +169,26 @@ impl Typer {
             return Err(format!("recursive value {} needs type", s.name));
         }
         if let Type::Method { paramss, ret } = ty {
+            // A constructor returns `Unit` in scala-rs's model and the class
+            // in nsc's.
+            let ret = if s.name == "<init>" && self.st.get(s.owner).is_class_like() {
+                Type::Class {
+                    sym: s.owner,
+                    args: Vec::new(),
+                }
+            } else {
+                *ret
+            };
+            if ret.is_no_type() {
+                return Err(format!("recursive method {} needs result type", s.name));
+            }
             let mut info = self.type_to_wire(&ret)?;
+            // nsc gives a default getter's result `@uncheckedVariance`, so that
+            // a default may mention a variant type parameter
+            // (`copy$default$1: Int @scala.annotation.unchecked.uncheckedVariance`).
+            if s.name.contains("$default$") && self.st.get(s.owner).is_class_like() {
+                info = format!("(annot \"scala.annotation.unchecked.uncheckedVariance\" {info})");
+            }
             if paramss.is_empty() {
                 return Ok(format!("(nullary {info})"));
             }
@@ -165,13 +203,30 @@ impl Typer {
                 let start = end - params.len();
                 let mut args = Vec::new();
                 for (&param, ty) in s.params[start..end].iter().zip(params) {
+                    let ty = if ty.is_no_type() {
+                        self.st.get(param).ty.clone()
+                    } else {
+                        ty.clone()
+                    };
+                    let wired = self.type_to_wire(&ty)?;
                     if self.st.get(param).owner != sym {
-                        return Err(format!(
-                            "mirror parameter {} shares its storage symbol",
-                            self.st.get(param).name
-                        ));
+                        // A parameter whose symbol belongs to something else:
+                        // a case class's constructor shares its fields'. It
+                        // travels by name and flags, as a parameter of its
+                        // own on the far side, rather than as the field.
+                        let mut named = String::from("(argn ");
+                        quote_into(&mut named, &self.st.get(param).name);
+                        named.push_str(if self.st.get(param).flags.contains(Flags::DEFAULTPARAM) {
+                            " (f \"PARAM\" \"DEFAULTPARAM\") "
+                        } else {
+                            " (f \"PARAM\") "
+                        });
+                        named.push_str(&wired);
+                        named.push(')');
+                        args.push(named);
+                        continue;
                     }
-                    args.push(format!("(arg {} {})", param.0, self.type_to_wire(ty)?));
+                    args.push(format!("(arg {} {})", param.0, wired));
                 }
                 info = format!("(method (params {}) {info})", args.join(" "));
                 end = start;
@@ -179,6 +234,24 @@ impl Typer {
             return Ok(info);
         }
         self.type_to_wire(&ty)
+    }
+
+    /// `(q viewInfo <getter|setter|field> <id>)`: one of the symbols nsc
+    /// makes of a scala-rs `val` ([`Typer::mirror_view_info`]).
+    fn answer_view_info(&mut self, items: &[Sexp]) -> String {
+        let (Ok(view), Ok(id)) = (
+            at(items, 2).map(|v| v.text()),
+            at(items, 3).and_then(|x| x.text().parse::<u32>().map_err(|e| e.to_string())),
+        ) else {
+            return refusal("the macro engine asked a malformed `viewInfo`");
+        };
+        if id == 0 || id as usize >= self.st.symbols.len() {
+            return refusal("unknown mirror symbol identity");
+        }
+        match self.mirror_view_info(&view, SymbolId(id)) {
+            Ok(info) => format!("(a info {info})"),
+            Err(why) => refusal(&why),
+        }
     }
 
     /// Answer one `(q …)` the engine wrote, as the line to write back.
@@ -195,7 +268,10 @@ impl Typer {
         match kind.as_str() {
             "typecheck" => self.answer_typecheck(items),
             "enclosingOwner" => format!("(a ref {})", self.macro_current_owner().0),
-            "functionSymbol" | "symbol" | "symbolInfo" => self.answer_mirror_symbol(items),
+            "functionSymbol" | "symbol" | "symbolInfo" | "companion" | "modulePair" => {
+                self.answer_mirror_symbol(items)
+            }
+            "viewInfo" => self.answer_view_info(items),
             other => refusal(&format!(
                 "the macro engine asked scala-rs `{other}`, which it does not answer"
             )),
@@ -301,7 +377,12 @@ impl Typer {
             }
         };
         let mut built = String::new();
-        match answer_tree_to_wire(&self.st, tree, &mut built) {
+        let types = crate::expand::WireTypes::default();
+        let cx = crate::expand::WireCx {
+            st: &self.st,
+            types: &types,
+        };
+        match answer_tree_to_wire(&cx, tree, &mut built) {
             Ok(()) => format!("(a ok {ty} {built})"),
             Err(why) => refusal(&format!("`c.typecheck` produced {why}")),
         }
@@ -421,12 +502,12 @@ impl Typer {
                 if !args.is_empty() {
                     return Err(format!(
                         "`{full}`, a class this run is compiling applied to type \
-                         arguments; the placeholder the engine is given carries a \
-                         name and nothing else"
+                         arguments; the engine is given such a class as its \
+                         identity, and its type parameters would have nothing to bind"
                     ));
                 }
                 self.macro_local_tags.insert(full.clone(), ty.clone());
-                return Ok(self.run_class_wire(sym, &full));
+                return Ok(format!("(src {})", sym.0));
             }
             if !args.is_empty() {
                 let name = crate::materialize::static_class_of_sym(&self.st, sym)
@@ -452,197 +533,6 @@ impl Typer {
         Ok(out)
     }
 
-    /// A class this run is compiling, described for the engine's mirror.
-    ///
-    /// This is `docs/macros.md` §7.18's step 1: the engine's symbol for a
-    /// current-run class is filled in *by asking scala-rs*, at the moment the
-    /// class is first named to it. Before this, such a class travelled as a
-    /// name and nothing else (`(syn …)`, §5.1), and an implementation that
-    /// asked it any question at all -- even `tpe.toString`, which needs the
-    /// symbol's info -- got an `AssertionError` out of the reflect internals.
-    ///
-    /// **It is all or nothing.** Either scala-rs can describe the class
-    /// completely and truthfully right now -- every parent, every declared
-    /// member, every one of their types -- or the class travels as the empty
-    /// placeholder it always did. A partial description is the one thing that
-    /// must not happen: a `decls` missing a member is not "less information",
-    /// it is the *wrong answer* to `decls`, and an implementation that acts on
-    /// it builds a tree from a class it half understands.
-    ///
-    /// The refusals, each of which leaves the old empty placeholder:
-    ///
-    /// * a class with type parameters -- the engine is given a `typeRef` with
-    ///   no arguments, so its type parameters would have nothing to bind;
-    /// * a member scala-rs cannot describe: a nested class or type member, a
-    ///   polymorphic method, a parameter or result type
-    ///   [`Typer::type_to_wire`] refuses;
-    /// * **a class already being described**, which is the cycle case. A
-    ///   parent or a member type that names the class whose description is
-    ///   being built would recurse for ever. nsc says `illegal cyclic
-    ///   reference` here; this refuses and the class stays a placeholder,
-    ///   which is the same answer one level out.
-    fn run_class_wire(&mut self, sym: SymbolId, full: &str) -> String {
-        match self.describe_run_class(sym, full) {
-            Ok(desc) => desc,
-            Err(why) => {
-                // Remembered so that if the implementation then trips over the
-                // empty placeholder -- which it does the moment it asks the
-                // symbol anything, `tpe.toString` included -- the diagnostic
-                // says *why the mirror had no answer* rather than repeating
-                // an `AssertionError` out of the reflect internals.
-                self.macro_undescribed.push((full.to_string(), why));
-                let mut out = String::from("(syn ");
-                quote_into(&mut out, full);
-                out.push(')');
-                out
-            }
-        }
-    }
-
-    fn describe_run_class(&mut self, sym: SymbolId, full: &str) -> Result<String, String> {
-        if self.macro_rpc_forcing.iter().any(|n| n == full) {
-            return Err(format!("`{full}` is already being described"));
-        }
-        if !self.st.get(sym).tparams.is_empty() {
-            return Err(format!("`{full}` has type parameters"));
-        }
-        self.macro_rpc_forcing.push(full.to_string());
-        let built = self.describe_run_class_body(sym);
-        self.macro_rpc_forcing.pop();
-        let (parents, decls) = built?;
-        let mut out = String::from("(run ");
-        quote_into(&mut out, full);
-        out.push_str(&class_flags_wire(self.st.get(sym).flags));
-        out.push_str(" (parents");
-        for p in parents {
-            out.push(' ');
-            out.push_str(&p);
-        }
-        out.push_str(") (decls");
-        for d in decls {
-            out.push(' ');
-            out.push_str(&d);
-        }
-        out.push_str("))");
-        Ok(out)
-    }
-
-    fn describe_run_class_body(
-        &mut self,
-        sym: SymbolId,
-    ) -> Result<(Vec<String>, Vec<String>), String> {
-        let mut parents = Vec::new();
-        for p in self.st.get(sym).parents.clone() {
-            // `scala.AnyRef` is `java.lang.Object` -- 2.13 declares it as that
-            // alias -- and the engine's mirror has no `staticClass` for the
-            // alias, only for the class it names. Written out here rather than
-            // in `type_to_wire`, which answers *what a tree's type is* and
-            // must keep saying `AnyRef` when that is what the typer said.
-            let p = if matches!(p, Type::AnyRef) {
-                "(ty \"java.lang.Object\")".to_string()
-            } else {
-                self.type_to_wire(&p)?
-            };
-            parents.push(p);
-        }
-        if parents.is_empty() {
-            parents.push("(ty \"java.lang.Object\")".to_string());
-        }
-        let mut decls = Vec::new();
-        for m in self.st.get(sym).members.clone() {
-            decls.push(self.describe_run_member(m)?);
-        }
-        Ok((parents, decls))
-    }
-
-    /// One declared member, or why it cannot be described.
-    fn describe_run_member(&mut self, m: SymbolId) -> Result<String, String> {
-        let (kind, name, flags, tparams, paramss, ty) = {
-            let s = self.st.get(m);
-            (
-                s.kind,
-                s.name.clone(),
-                s.flags,
-                s.tparams.clone(),
-                s.paramss.clone(),
-                s.ty.clone(),
-            )
-        };
-        match kind {
-            SymKind::Method => {}
-            // A `val` is one symbol here and *two* in nsc -- a private field
-            // and a STABLE accessor, both in `decls`. Describing it as either
-            // one would be describing a different class, so a class with a
-            // field is not described at all and stays the empty placeholder.
-            SymKind::Term => {
-                return Err(format!(
-                    "`{name}` is a field, and scala-rs models a `val` as one symbol \
-                     where nsc has a private field and a stable accessor"
-                ))
-            }
-            _ => {
-                return Err(format!(
-                    "`{name}` is a {kind:?}, which scala-rs cannot describe to the engine"
-                ))
-            }
-        }
-        if !tparams.is_empty() {
-            return Err(format!("`{name}` is polymorphic"));
-        }
-        if paramss.len() > 1 {
-            return Err(format!("`{name}` has more than one parameter clause"));
-        }
-        let (params, result) = match &ty {
-            Type::Method { paramss: ps, ret } if ps.len() <= 1 => {
-                (ps.first().cloned().unwrap_or_default(), (**ret).clone())
-            }
-            Type::Method { .. } => {
-                return Err(format!("`{name}` has more than one parameter clause"))
-            }
-            other => (Vec::new(), other.clone()),
-        };
-        // `def f()` and `def f` are different members in nsc; the empty
-        // clause has to survive, so it is written as its own marker.
-        let empty_clause = matches!(&ty, Type::Method { paramss: ps, .. }
-            if ps.len() == 1 && ps[0].is_empty());
-        let mut written = Vec::new();
-        for p in &params {
-            written.push(self.type_to_wire(p)?);
-        }
-        let result = self.type_to_wire(&result)?;
-        // The primary constructor. Its result type is the class itself in
-        // nsc and `Unit` here, and its empty clause is real, so it travels as
-        // a marker and the engine fills the result in.
-        let ctor = name == "<init>";
-        let mut out = String::from("(d ");
-        quote_into(&mut out, &encode_method_name(&name));
-        out.push_str(&member_flags_wire(flags, kind, ctor));
-        if ctor {
-            out.push_str(" (params");
-            for w in &written {
-                out.push(' ');
-                out.push_str(w);
-            }
-            out.push(')');
-            out.push_str(" (ty \"scala.Unit\"))");
-            return Ok(out);
-        }
-        if params.is_empty() && !empty_clause {
-            out.push_str(" (nullary)");
-        } else {
-            out.push_str(" (params");
-            for w in written {
-                out.push(' ');
-                out.push_str(&w);
-            }
-            out.push(')');
-        }
-        out.push(' ');
-        out.push_str(&result);
-        out.push(')');
-        Ok(out)
-    }
-
     /// Whether `sym` is a class this compilation run is itself defining --
     /// that is, one with no class file for the engine's mirror to find. The
     /// same test [`Typer::tag_descriptor`] makes, and for the same reason.
@@ -659,14 +549,14 @@ impl Typer {
 /// refused by name rather than approximated, exactly the way
 /// `Typer::tree_from_reply` refuses in the other direction. An approximation
 /// here would be a tree the implementation then *splices into its expansion*.
-fn answer_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+fn answer_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let start = out.len();
-    answer_tree_to_wire_body(st, t, out)?;
+    answer_tree_to_wire_body(cx, t, out)?;
     super::expand::mirror_tree_identity(t, start, out);
     Ok(())
 }
 
-fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+fn answer_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
         TreeKind::Literal { lit } => {
             out.push_str("(t \"Literal\" (s0) ");
@@ -678,7 +568,7 @@ fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Res
             // A name that resolved to a member of an enclosing class means
             // `C.this.name` in a typed tree, the same way `c.prefix` carries
             // one; a name that resolved to nothing keeps its own spelling.
-            match owner_qualifier(st, t.sym) {
+            match owner_qualifier(cx.st, t.sym) {
                 Some(owner) => {
                     out.push_str("(t \"Select\" (s0) (t \"This\" (s0) (n type ");
                     quote_into(out, &owner);
@@ -702,7 +592,7 @@ fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Res
         }
         TreeKind::Select { qual, name } => {
             out.push_str("(t \"Select\" (s0) ");
-            answer_tree_to_wire(st, qual, out)?;
+            answer_tree_to_wire(cx, qual, out)?;
             out.push_str(" (n term ");
             quote_into(out, &encode_method_name(name));
             out.push_str("))");
@@ -711,14 +601,14 @@ fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Res
         TreeKind::Apply { fun, args } => {
             out.push_str("(t \"Apply\" (s0) ");
             if matches!(fun.kind, TreeKind::New { .. }) {
-                super::expand::application_fun_to_wire(fun, out)?;
+                super::expand::application_fun_to_wire(cx, fun, out)?;
             } else {
-                answer_tree_to_wire(st, fun, out)?;
+                answer_tree_to_wire(cx, fun, out)?;
             }
             out.push_str(" (l");
             for a in args {
                 out.push(' ');
-                answer_tree_to_wire(st, a, out)?;
+                answer_tree_to_wire(cx, a, out)?;
             }
             out.push_str("))");
             Ok(())
@@ -727,20 +617,20 @@ fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Res
             out.push_str("(t \"Block\" (s0) (l");
             for s in stats {
                 out.push(' ');
-                answer_tree_to_wire(st, s, out)?;
+                answer_tree_to_wire(cx, s, out)?;
             }
             out.push_str(") ");
-            answer_tree_to_wire(st, expr, out)?;
+            answer_tree_to_wire(cx, expr, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::If { cond, thenp, elsep } => {
             out.push_str("(t \"If\" (s0) ");
-            answer_tree_to_wire(st, cond, out)?;
+            answer_tree_to_wire(cx, cond, out)?;
             out.push(' ');
-            answer_tree_to_wire(st, thenp, out)?;
+            answer_tree_to_wire(cx, thenp, out)?;
             out.push(' ');
-            answer_tree_to_wire(st, elsep, out)?;
+            answer_tree_to_wire(cx, elsep, out)?;
             out.push(')');
             Ok(())
         }
@@ -748,7 +638,7 @@ fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Res
             out.push_str("(t \"EmptyTree\" (s0))");
             Ok(())
         }
-        _ => super::expand::tree_to_wire(t, out).map_err(|why| format!("a tree: {why}")),
+        _ => super::expand::tree_to_wire(cx, t, out).map_err(|why| format!("a tree: {why}")),
     }
 }
 
@@ -757,19 +647,7 @@ fn answer_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Res
 /// Only a *class* owner: a name owned by a method is a local, and a local has
 /// no path at all -- writing `C.this.x` for one would be a different tree.
 fn owner_qualifier(st: &SymbolTable, sym: SymbolId) -> Option<String> {
-    if sym == SymbolId::NONE {
-        return None;
-    }
-    let owner = st.get(sym).owner;
-    if owner == SymbolId::NONE {
-        return None;
-    }
-    let name = &st.get(owner).name;
-    match st.get(owner).kind {
-        SymKind::Class => Some(name.clone()),
-        SymKind::ModuleClass => Some(name.strip_suffix('$').unwrap_or(name).to_string()),
-        _ => None,
-    }
+    crate::expand::this_qualifier_of(st, sym)
 }
 
 /// The flags of a class this run is compiling, by name.
@@ -787,6 +665,8 @@ fn class_flags_wire(flags: Flags) -> String {
         (Flags::ABSTRACT, "ABSTRACT"),
         (Flags::FINAL, "FINAL"),
         (Flags::SEALED, "SEALED"),
+        (Flags::INTERFACE, "INTERFACE"),
+        (Flags::SYNTHETIC, "SYNTHETIC"),
         (Flags::PRIVATE, "PRIVATE"),
         (Flags::PROTECTED, "PROTECTED"),
         (Flags::LOCAL, "LOCAL"),
@@ -819,6 +699,7 @@ fn member_flags_wire(flags: Flags, kind: SymKind, ctor: bool) -> String {
     }
     for (bit, name) in [
         (Flags::PARAM, "PARAM"),
+        (Flags::DEFAULTPARAM, "DEFAULTPARAM"),
         (Flags::LOCAL, "LOCAL"),
         (Flags::PRIVATE, "PRIVATE"),
         (Flags::PROTECTED, "PROTECTED"),
@@ -836,31 +717,4 @@ fn member_flags_wire(flags: Flags, kind: SymKind, ctor: bool) -> String {
     }
     out.push(')');
     out
-}
-
-/// Why an implementation's own failure may be a consequence of a class the
-/// mirror could not describe.
-///
-/// A class this run is compiling reaches the engine either fully described
-/// ([`Typer::run_class_wire`]) or as the empty placeholder of
-/// `docs/macros.md` §5.1. In the second case *any* question about it throws
-/// out of the reflect internals -- `assertion failed: <name>` from
-/// `Symbol.info`, which is not a sentence about the program being compiled.
-/// This replaces it with the reason scala-rs had, which is.
-pub(crate) fn undescribed_verdict(undescribed: &[(String, String)], msg: &str) -> Option<String> {
-    if undescribed.is_empty() {
-        return None;
-    }
-    let names = undescribed
-        .iter()
-        .map(|(n, why)| format!("`{n}` ({why})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "the implementation asked about {names}, and scala-rs could not \
-         describe {} to the macro engine, so the engine was given a symbol \
-         carrying only a name; asking it anything raised \"{msg}\", which says \
-         nothing about this program",
-        if undescribed.len() == 1 { "it" } else { "them" }
-    ))
 }

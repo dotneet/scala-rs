@@ -325,7 +325,26 @@ impl Typer {
             );
         for sc in self.st.scopes.iter().rev() {
             for (name, ids) in sc.entries() {
-                if !shadowed_names.insert(name.as_str()) {
+                // Types and terms are separate namespaces (SLS 2): a *type*
+                // named `F` hides no term `F`. cats' `new Parallel[IorT[F0, E,
+                // *]] { type F[x] = IorT[F0, E, x]; … }` sits inside a method
+                // whose `implicit F: Monad[F0]` is the `Applicative[F0]` the
+                // body's `IorT.pure(a)` needs, and the anonymous class's type
+                // member took it out of the search.
+                let binds_term = ids.iter().any(|b| {
+                    !matches!(
+                        self.st.get(b.sym).kind,
+                        crate::symbol::SymKind::Class
+                            | crate::symbol::SymKind::TypeParam
+                            | crate::symbol::SymKind::TypeMember
+                    )
+                });
+                let hidden = if binds_term {
+                    !shadowed_names.insert(name.as_str())
+                } else {
+                    shadowed_names.contains(name.as_str())
+                };
+                if hidden {
                     continue;
                 }
                 // Every binding of the name, whatever its SLS 2 precedence:
@@ -707,6 +726,20 @@ impl Typer {
             Type::Refined { parents, .. } => {
                 for p in parents {
                     self.collect_type_parts(p, out, seen);
+                }
+                // SLS 7.2: the parts of `p.T` include the parts of `p.type`,
+                // and those of `S#T` the parts of `S`. An inner class behind
+                // a prefix (`prefix.rs`) carries exactly that prefix, so
+                // `StrTypes.BCT[String]` sees the implicits `object StrTypes`
+                // declares.
+                if let Some(pre) = crate::prefix::view_prefix(ty) {
+                    let pre = match pre {
+                        Type::ThisType(c) if !c.is_none() => self.st.type_of_class(*c),
+                        other => self.st.widen_prefix(other),
+                    };
+                    if !pre.is_no_type() {
+                        self.collect_type_parts(&pre, out, seen);
+                    }
                 }
             }
             // A still-abstract type member offers only its upper bound's
@@ -3381,6 +3414,15 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         };
+        if let Some(prefix) = self.instance_object_import_prefix(id) {
+            return Tree {
+                kind: TreeKind::Select {
+                    qual: Box::new(prefix),
+                    name,
+                },
+                ..ident
+            };
+        }
         let Some(module) = self.wildcard_module_for(id) else {
             // `import b._` where `b` is a *value*: the conversion is an
             // instance member of `b`'s class, so the call needs `b` as its
@@ -3437,6 +3479,69 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         }
+    }
+
+    /// The import path an implicit declared in an `object` that belongs to an
+    /// *instance* was brought in through.
+    ///
+    /// `import profile.api._` where `api` is an `object` of `profile`'s class:
+    /// the object is `profile`'s own, reached only by calling `profile.api`.
+    /// Emitted as a bare name, the view was loaded as the `api` of a cast
+    /// `this` -- a `ClassCastException` from a program that typechecked, where
+    /// nsc's tree is `X.this.profile.api.wrap(…)`. A static object (one only
+    /// packages and objects enclose) is its own receiver and is left to the
+    /// callers below. The path is the one the scope's own binding of the name
+    /// was imported under, so it is this import's and no other file's.
+    fn instance_object_import_prefix(&self, id: SymbolId) -> Option<Tree> {
+        let owner = self.st.get(id).owner;
+        if owner.is_none() || self.st.get(owner).kind != SymKind::ModuleClass {
+            return None;
+        }
+        let mut up = self.st.get(owner).owner;
+        loop {
+            if up.is_none() || up == self.st.root {
+                return None;
+            }
+            match self.st.get(up).kind {
+                SymKind::Package => return None,
+                SymKind::Module | SymKind::ModuleClass => up = self.st.get(up).owner,
+                _ => break,
+            }
+        }
+        // Written inside the object (or a class it encloses): its `this`.
+        if self.st.enclosing_class_reaching(owner).is_some() {
+            return None;
+        }
+        let name = &self.st.get(id).name;
+        for scope in self.st.scopes.iter().rev() {
+            let origin = scope
+                .lookup_ranked(name)
+                .iter()
+                .find(|b| b.sym == id)
+                .map(|b| b.origin)
+                .or_else(|| {
+                    scope
+                        .wildcards()
+                        .iter()
+                        .find(|w| {
+                            w.offers(name)
+                                && (w.owner == owner
+                                    || crate::pickle_supply::inherits_from(
+                                        &self.st, w.owner, owner,
+                                    ))
+                        })
+                        .map(|w| w.origin)
+                });
+            let Some(origin) = origin else {
+                continue;
+            };
+            let prefix = self.object_import_prefixes.get(&origin)?;
+            if prefix.ty.is_no_type() || prefix.ty.is_error() {
+                return None;
+            }
+            return self.writable_import_prefix(prefix);
+        }
+        None
     }
 
     /// The object a wildcard import brought `id` in through, when `id` is
@@ -3701,6 +3806,35 @@ impl<'a> Unify<'a> {
                 Some(prev) => self.unify_at(a, &prev, depth + 1),
                 None => self.bind(id, a),
             };
+        }
+        // An inner class behind a prefix (`prefix.rs`) unifies as the class it
+        // is -- the prefix decides conformance, not what the arguments are.
+        // Against a *different* class its base type there is read through the
+        // prefix, which is what instantiates the enclosing class's parameters:
+        // `refl: A =:= A` fitted to `hm.KeySet <:< MySet[?T]` solves `?T` from
+        // `MySet[Int]`, not `MySet[K]`.
+        let (av, bv) = (
+            crate::symbol::SymbolTable::as_seen_from_view(a).is_some(),
+            crate::symbol::SymbolTable::as_seen_from_view(b).is_some(),
+        );
+        if av || bv {
+            let ca = crate::prefix::strip_view(a).clone();
+            let cb = crate::prefix::strip_view(b).clone();
+            if let (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) = (&ca, &cb) {
+                if s1 != s2 {
+                    if av {
+                        if let Some(bt) = self.typer.base_type_instance(a, *s2, 0) {
+                            return self.unify_at(&bt, &cb, depth + 1);
+                        }
+                    }
+                    if bv {
+                        if let Some(bt) = self.typer.base_type_instance(b, *s1, 0) {
+                            return self.unify_at(&ca, &bt, depth + 1);
+                        }
+                    }
+                }
+            }
+            return self.unify_at(&ca, &cb, depth + 1);
         }
         // `_` in the wanted type is a position the search is not asking about.
         // slick writes `packedValue[R](implicit ev: Shape[? <: Level, T, ?, R])`

@@ -1,3 +1,4 @@
+mod annot_resolve;
 mod anon_capture;
 mod case_apply_unlink;
 mod check;
@@ -14,14 +15,18 @@ mod check_pattern;
 mod check_select;
 mod check_template;
 mod check_types;
+mod class_rules;
 mod classpath;
+mod compile_time_only;
 mod ctor_defaults;
 mod cyclic;
 mod default_recv;
 mod double_def;
+mod double_names;
 mod dup_alternatives;
 mod erasure;
 mod expand;
+mod expand_mirror;
 mod expand_private;
 mod expand_rpc;
 mod fasttrack_mirror;
@@ -36,9 +41,11 @@ mod localobj;
 mod macros;
 mod materialize;
 mod materialize_manifest;
+mod modifier_rules;
 mod name_based;
 mod named_eval_order;
 mod ops_shape;
+mod overload_ref;
 mod overload_value;
 mod override_check;
 mod rassoc;
@@ -46,6 +53,7 @@ pub use override_check::{method_overloads, method_overrides, record_method_overr
 mod interp_pattern;
 mod pickle_supply;
 mod predef_reimport;
+mod prefix;
 mod prelude;
 mod prelude_arrconv;
 mod prelude_boolbit;
@@ -1314,8 +1322,8 @@ object Main {
     val a: Int = 1.abs
     val mx: Int = 1.max(2)
     val r = 1.to(3)
-    val s: String = "ab" * 2
-    val t: String = "hello".take(2)
+    val s2: String = "ab" * 2
+    val t2: String = "hello".take(2)
     val d: String = "hello".drop(1)
     val e: Boolean = "".isEmpty
     val xs2 = List(1, 2, 3)
