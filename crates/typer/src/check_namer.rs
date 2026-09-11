@@ -1069,6 +1069,42 @@ impl Typer {
         );
     }
 
+    /// nsc's `typedModuleDef`: an `object` whose companion class is
+    /// `Serializable` gets `java.io.Serializable` as an extra parent (SD-290).
+    /// A lone `object`, the companion of a non-serializable class, and an
+    /// `object D` next to `type D = Serializable` (an alias, not a linked
+    /// class) are left alone.
+    pub(crate) fn link_serializable_companion(&mut self, module: SymbolId, module_cls: SymbolId) {
+        if module.is_none() || module_cls.is_none() {
+            return;
+        }
+        let name = self.st.get(module).name.clone();
+        let owner = self.st.get(module).owner;
+        let Some(linked) = self
+            .st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&c| self.st.get(c).kind == SymKind::Class && self.st.get(c).name == name)
+        else {
+            return;
+        };
+        let Some(ser) = self.ensure_jvm_class(crate::prelude_product::SERIALIZABLE) else {
+            return;
+        };
+        if crate::pickle_supply::inherits_from(&self.st, module_cls, ser) {
+            return;
+        }
+        // A case class gets its `Product with Serializable` parents when its
+        // own template is typed, which may come after its companion's.
+        let case_class =
+            self.library_abi && crate::prelude_product::wants_product(&self.st, linked);
+        if case_class || crate::pickle_supply::inherits_from(&self.st, linked, ser) {
+            crate::prelude_product::add_parents(&mut self.st, module_cls, &[ser]);
+        }
+    }
+
     /// Load `internal` from the classpath, if it is there, and return its
     /// symbol. Loading is memoized by `load_binary_into`.
     fn ensure_jvm_class(&mut self, internal: &str) -> Option<SymbolId> {

@@ -450,6 +450,31 @@ impl Typer {
         }
     }
 
+    /// nsc's `widenIfNecessary` for a `var` or a method: an inferred type is
+    /// never a singleton. `private[this] var origElems = self` in
+    /// `Iterator.patch` is an `Iterator[A]`, not `Iterator.this.type` -- or
+    /// `origElems = origElems drop replaced` could not assign to it -- and
+    /// `def f = addOne(x)` is the class, not `this.type`. A `val` keeps the
+    /// singleton (`val c = b.append(1)` is a `b.type`), and a module's type is
+    /// never widened (`Infer Foo.type instead of "object Foo"`).
+    pub(crate) fn widen_inferred_singleton(&self, ty: Type) -> Type {
+        let mut ty = ty;
+        for _ in 0..8 {
+            ty = match ty {
+                Type::ThisType(c) if !c.is_none() => self.st.self_type_of_class(c),
+                Type::SingleType { sym, .. } => {
+                    let under = self.st.singleton_underlying(sym);
+                    if under.is_no_type() || matches!(under, Type::Method { .. }) {
+                        return ty;
+                    }
+                    under
+                }
+                other => return other,
+            };
+        }
+        ty
+    }
+
     fn type_val_body_in(&mut self, tree: &mut Tree) {
         let feature = self
             .source_features
@@ -481,8 +506,18 @@ impl Typer {
             &tree.kind,
             TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
         );
-        let (rhs, declared) = match &mut tree.kind {
-            TreeKind::ValDef { rhs, .. } => (rhs, tree.ty.clone()),
+        let is_var = matches!(
+            &tree.kind,
+            TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::MUTABLE)
+        );
+        let (rhs, declared, literal_tpt) = match &mut tree.kind {
+            TreeKind::ValDef { rhs, tpt, .. } => {
+                let literal = match &tpt.kind {
+                    TreeKind::Literal { lit } if !matches!(lit, Lit::Unit) => Some(tpt.span),
+                    _ => None,
+                };
+                (rhs, tree.ty.clone(), literal)
+            }
             _ => return,
         };
         if rhs.is_empty() {
@@ -492,37 +527,41 @@ impl Typer {
             }
             return;
         }
-        // `var x: T = _` is the zero of `T` (nsc's default initializer).
-        if matches!(rhs.kind, TreeKind::Wildcard) {
+        // `var x: T = _` (nsc's DEFAULTINIT, SLS 4.2): the field starts at
+        // the JVM default of its erased type and the constructor never
+        // stores to it -- so a value a superclass constructor wrote through
+        // an overridden method survives, and any `T` qualifies, a type
+        // parameter or a value class included. There is no expression to
+        // type: the `_` stays in the tree, typed as `T`, and the backend
+        // skips the initializer (`Tree::is_default_init`).
+        if rhs.is_default_init() {
             if declared.is_no_type() {
                 self.error(tree.span, "unbound placeholder parameter");
                 tree.ty = Type::Error;
                 return;
             }
-            let lit = match declared.widen_constant() {
-                Type::Int => Lit::Int(0),
-                Type::Long => Lit::Long(0),
-                Type::Double => Lit::Double(0.0),
-                Type::Float => Lit::Float(0.0),
-                Type::Short | Type::Byte | Type::Char => Lit::Int(0),
-                Type::Boolean => Lit::Boolean(false),
-                Type::Unit => Lit::Unit,
-                _ => Lit::Null,
-            };
-            let span = rhs.span;
-            **rhs = Tree {
-                id: rhs.id,
-                span,
-                kind: TreeKind::Literal { lit },
-                ty: declared.clone(),
-                sym: SymbolId::NONE,
-                postfix: false,
-                scala_ref: false,
-                stable_pat: false,
-                byname_thunk: false,
-                byname_type_marker: false,
-            };
-            self.type_expr(rhs, &declared);
+            // nsc `LocalVarUninitializedError`: a local variable has no
+            // default value.
+            if self.block_local_defs.contains(&(self.file_index, tree.id)) {
+                self.error(tree.span, "local variables must be initialized");
+                rhs.ty = declared.clone();
+                tree.ty = declared;
+                return;
+            }
+            // SIP-23: a literal type has one value and no default. nsc asks
+            // the type *as written* -- `var x: One = _` through `type One =
+            // 1` is accepted -- so this reads the tree, not the dealiased
+            // type (`neg/sip23-uninitialized-2`).
+            if let Some(span) = literal_tpt {
+                self.error(
+                    span,
+                    "default initialization prohibited for literal-typed vars",
+                );
+                rhs.ty = declared.clone();
+                tree.ty = declared;
+                return;
+            }
+            rhs.ty = declared.clone();
             tree.ty = declared;
             return;
         }
@@ -533,8 +572,10 @@ impl Typer {
         self.type_expr(rhs, &pt);
         // An inferred value has no expected type to trigger adapt's backstop.
         // A missing implicit is still an error, not a function to eta-expand.
-        if pt.is_no_type() {
-            self.reject_unapplied_implicit_clause(rhs);
+        // Nor is a method with explicit parameters: nsc's "missing argument
+        // list", or its eta-expansion under `-Xsource:3`.
+        if pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
+            self.adapt_method_value(rhs);
         }
         self.typing_call_args = saved_call_args;
         self.warn_trivial_self_reference(tree.sym, rhs);
@@ -551,6 +592,9 @@ impl Typer {
             self.st.get_mut(tree.sym).ty = tree.ty.clone();
         } else if declared.is_no_type() {
             tree.ty = rhs.ty.widen_constant();
+            if is_var {
+                tree.ty = self.widen_inferred_singleton(tree.ty.clone());
+            }
             if !tree.sym.is_none() {
                 self.st.get_mut(tree.sym).ty = tree.ty.clone();
             }
@@ -904,6 +948,9 @@ impl Typer {
         // module under the JVM spelling instead, which is what
         // `synthesize_ctor_default_getters` does for every constructor,
         // primary and secondary alike (`crate::ctor_defaults`).
+        if name == "apply" {
+            self.unlink_suppressed_case_apply(saved_owner, tree.sym, &tp_ids, &paramss_ty);
+        }
         if name != "<init>" {
             self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
         }
@@ -1383,8 +1430,8 @@ impl Typer {
             // above its use compiled fine, which is what gives the flag away.
             let saved_call_args = std::mem::take(&mut self.typing_call_args);
             self.type_expr(rhs, &ret_pt);
-            if ret_pt.is_no_type() {
-                self.reject_unapplied_implicit_clause(rhs);
+            if ret_pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
+                self.adapt_method_value(rhs);
             }
             self.typing_call_args = saved_call_args;
             self.warn_trivial_self_reference(tree.sym, rhs);
@@ -1404,7 +1451,7 @@ impl Typer {
                 {
                     ret_pt.clone()
                 } else {
-                    rhs.ty.widen_constant()
+                    self.widen_inferred_singleton(rhs.ty.widen_constant())
                 };
                 if let Type::Method { ret, .. } = &mut tree.ty {
                     **ret = inferred.clone();
@@ -1560,7 +1607,7 @@ impl Typer {
     /// also reports the *inherited* `<init>`, which is not an overload of it;
     /// and a class with auxiliary constructors is resolved from the arguments
     /// that are written, never filled from an empty list.
-    fn sole_own_ctor(&self, class_id: SymbolId) -> Option<SymbolId> {
+    pub(crate) fn sole_own_ctor(&self, class_id: SymbolId) -> Option<SymbolId> {
         let alts: Vec<SymbolId> = self
             .st
             .lookup_member(class_id, "<init>")
@@ -2088,16 +2135,23 @@ impl Typer {
             _ => Vec::new(),
         };
         let raw_tparams = self.st.get(class_id).tparams.clone();
+        // `extends NumericOps(lhs)` inside `Integral[T]`: the parent is an
+        // inner class of a base trait, read through the enclosing `this`.
+        let outer_prefix = self.ctor_outer_prefix(class_id, fun);
         let prototypes: Vec<Vec<Type>> = self
             .st
             .lookup_member(class_id, "<init>")
             .into_iter()
             .filter(|&id| self.st.get(id).owner == class_id)
             .filter_map(|id| {
-                match self
+                let ty = self
                     .st
-                    .subst_tparams(class_id, &written_targs, &self.st.get(id).ty)
-                {
+                    .subst_tparams(class_id, &written_targs, &self.st.get(id).ty);
+                let ty = match &outer_prefix {
+                    Some(p) => self.st.subst_as_seen_from(p, &ty),
+                    None => ty,
+                };
+                match ty {
                     Type::Method { paramss, .. } => Some(paramss.into_iter().flatten().collect()),
                     _ => None,
                 }
@@ -2170,7 +2224,10 @@ impl Typer {
         // checked through the normal default-argument path.
         self.ensure_external_ctor_defaults(class_id, tree.span);
         self.supply_binary_ctors(class_id);
-        match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
+        let saved_prefix = std::mem::replace(&mut self.ctor_prefix, outer_prefix);
+        let picked = self.pick_ctor_at(class_id, &targs, &arg_tys, None);
+        self.ctor_prefix = saved_prefix;
+        match picked {
             OverloadPick::Found(sym, param_tys, _) => {
                 // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
                 // parameters are stated in `Base`'s own `T`, and
@@ -2443,6 +2500,12 @@ impl Typer {
                 ty
             } else {
                 self.st.subst_tparams(class_id, targs, &ty)
+            };
+            // An inner class's parameters, read through the prefix it is
+            // instantiated on (`Typer::ctor_outer_prefix`).
+            let ty = match &self.ctor_prefix {
+                Some(p) => self.st.subst_as_seen_from(p, &ty),
+                None => ty,
             };
             match ty {
                 Type::Method { paramss, ret } if paramss.len() > 1 => Type::Method {

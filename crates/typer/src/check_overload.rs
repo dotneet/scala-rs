@@ -1162,10 +1162,19 @@ impl Typer {
                 sym: *cls,
                 args: Vec::new(),
             };
+            // A JVM `static` is no member of the object: twirl's templates are
+            // `object edithook extends BaseScalaTemplate(…)`, a case class
+            // from a jar whose class file carries the companion's
+            // `public static BaseScalaTemplate apply(F)` forwarder. Counted as
+            // a second alternative it made the two disagree, so
+            // `html.edithook(hook, Set(WebHook.Push), …)` typed its `Set`
+            // argument with no prototype and missed the invariant
+            // `Set[WebHook.Event]` parameter.
             let alts: Vec<Type> = self
                 .st
                 .lookup_member(*cls, "apply")
                 .into_iter()
+                .filter(|a| !self.st.get(*a).flags.contains(Flags::STATIC))
                 .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(a).ty))
                 .collect();
             if alts.is_empty() {
@@ -1868,8 +1877,12 @@ impl Typer {
         allow_widen: bool,
         open: &[SymbolId],
     ) -> bool {
+        // Numeric widening is weak conformance, which nsc's applicability
+        // (`isWeaklyCompatible`) uses from the first try: `f(3)` against
+        // `f(x: AnyVal)` and `f(x: Double)` has both applicable, and the more
+        // specific `Double` wins (run/t12560). Holding widening back to the
+        // view round made the `AnyVal` one the only candidate.
         match self.arg_score(arg, param) {
-            Some(3) if !allow_widen && !self.spec_probe.get() => false, // numeric widen
             Some(_) => true,
             None if allow_widen => {
                 // Narrowing an `Int` literal (`take(3)` on a `Byte` parameter)
@@ -2195,8 +2208,12 @@ impl Typer {
                 continue;
             };
             let span = args[i].span;
-            let arg = std::mem::replace(&mut args[i], Tree::dummy(TreeKind::Empty));
+            let mut arg = std::mem::replace(&mut args[i], Tree::dummy(TreeKind::Empty));
             let from = arg.ty.clone();
+            // A by-name view parameter takes the argument as its thunk.
+            if let Some(bn @ Type::ByName(_)) = self.conv_first_param(id) {
+                self.adapt(&mut arg, &bn);
+            }
             let fun = self.ref_implicit(id, span);
             let applied = Tree {
                 id: arg.id,
@@ -2864,6 +2881,12 @@ impl Typer {
             param_tys.push(p.ty.clone());
         }
         self.type_expr(body, &ret_pt);
+        // A body with nothing expected of it is still a value: `x => add` is
+        // nsc's "missing argument list" (eta-expanded under `-Xsource:3`).
+        // With an expectation, `adapt` below applies the same rule.
+        if ret_pt.is_no_type() {
+            self.adapt_method_value(body);
+        }
         param_tys.clear();
         for p in vparams.iter_mut() {
             if p.ty.is_no_type() && !p.sym.is_none() {

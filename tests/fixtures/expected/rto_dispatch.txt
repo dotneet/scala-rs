@@ -1,0 +1,16 @@
+init P
+side effect
+init O
+P.i
+again
+N
+value
+(Double,Double,Double,AnyVal,Long,Long)
+class scala.Tuple2
+interface scala.Function1
+class Main$C
+(true,AnyVal)
+delayed init 1
+anon body
+delayed init 2
+sub body

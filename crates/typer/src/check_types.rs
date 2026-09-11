@@ -181,10 +181,10 @@ impl Typer {
                         SymKind::TypeParam => Type::TypeParam(id),
                         SymKind::TypeMember => Type::TypeMember(id),
                         _ if id == self.st.string_sym => Type::String,
-                        _ => Type::Class {
+                        _ => self.module_prefix_view(qual, id).unwrap_or(Type::Class {
                             sym: id,
                             args: vec![],
-                        },
+                        }),
                     }
                 } else if self.qualifier_names_nothing(qual) {
                     // The qualifier itself denotes nothing -- see
@@ -248,7 +248,12 @@ impl Typer {
                     }
                 }
                 let prefix = self.tree_to_type(qual);
-                self.project_from_prefix(tpt.span, &prefix, name)
+                let t = self.project_from_prefix(tpt.span, &prefix, name);
+                if *hash {
+                    self.mark_type_projection(&prefix, t)
+                } else {
+                    t
+                }
             }
             TreeKind::CompoundTypeTree {
                 parents,
@@ -610,6 +615,103 @@ impl Typer {
             args: vec![],
         };
         let decls = self.projection_refinements(prefix, pcls, member);
+        Self::as_seen_from(base, decls)
+    }
+
+    /// `M.C` where `M` is an object and `C` a class it *inherits* from the
+    /// class or trait that declares it: the same as-seen-from view `M.type#C`
+    /// gets ([`Self::projected_class_type`]), so what `M` settles reaches
+    /// `C`'s members. `object IntBase extends Base { type T = Int }` makes
+    /// `(new IntBase.Inner).set(1)` take an `Int`; read as the bare class it
+    /// took `Base`'s abstract `T`. `None` when `M` declares `C` itself or
+    /// the qualifier is not an object.
+    fn module_prefix_view(&mut self, qual: &Tree, id: SymbolId) -> Option<Type> {
+        let owner = self.st.get(id).owner;
+        if owner.is_none() || !matches!(self.st.get(owner).kind, SymKind::Class) {
+            return None;
+        }
+        for o in self.qualified_type_owners(qual) {
+            let mcls = match self.st.get(o).kind {
+                SymKind::Module => self.st.module_class_of(o),
+                SymKind::ModuleClass => o,
+                _ => continue,
+            };
+            if mcls == owner || !self.st.is_ancestor_of(owner, mcls) {
+                continue;
+            }
+            let prefix = Type::ModuleRef(mcls);
+            let t = self.projected_class_type(&prefix, mcls, id);
+            return (!matches!(t, Type::Class { .. })).then_some(t);
+        }
+        None
+    }
+
+    /// `A#B` written with a type prefix, where `B`'s enclosing class leaves an
+    /// abstract type member that `A` does not settle: record that on the view
+    /// ([`crate::symbol::PROJECTION_MARK`]), so that a member selected
+    /// through it reads that type member as a fresh abstract type in
+    /// parameter positions (`Typer::opaque_projection_params`).
+    ///
+    /// nsc: for `a: Base#Inner`, `a.set(y)` with `set(y: T)` expects
+    /// `_1.T forSome { val _1: Base }` -- one particular, unknown `Base`'s
+    /// `T` -- and nothing but `Nothing` conforms (`neg/sabin2`). Anything
+    /// else (a stable path `x.Inner`, a prefix that settles every member)
+    /// is left exactly as it was.
+    fn mark_type_projection(&self, prefix: &Type, t: Type) -> Type {
+        let (base, mut decls) = match &t {
+            Type::Class { .. } => (t.clone(), Vec::new()),
+            Type::Refined { parents, decls } if SymbolTable::as_seen_from_view(&t).is_some() => (
+                parents[0].clone(),
+                decls
+                    .iter()
+                    .filter(|d| {
+                        !matches!(d, RefineDecl::Type { name, .. }
+                            if name == crate::symbol::AS_SEEN_FROM_MARK)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            _ => return t,
+        };
+        let Type::Class { sym: member, .. } = &base else {
+            return t;
+        };
+        // A generic inner class is applied to its arguments after this
+        // (`BasicBackend#BasicDatabaseDef[F]` in slick), and an application
+        // does not see through a view; wrapping it made that "does not take
+        // type parameters". Such a projection keeps its old, unchecked
+        // reading.
+        if !self.st.get(*member).tparams.is_empty() {
+            return t;
+        }
+        let Some(pcls) = self.st.class_sym_of(prefix) else {
+            return t;
+        };
+        let settled: Vec<String> = decls
+            .iter()
+            .filter_map(|d| match d {
+                RefineDecl::Type { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        let unsettled = self
+            .st
+            .enclosing_classes(*member)
+            .into_iter()
+            .skip(1)
+            .filter(|&o| o == pcls || self.st.is_ancestor_of(o, pcls))
+            .flat_map(|o| self.st.abstract_type_member_names(o))
+            .any(|n| !settled.contains(&n));
+        if !unsettled {
+            return t;
+        }
+        decls.push(RefineDecl::Type {
+            name: crate::symbol::PROJECTION_MARK.to_string(),
+            rhs: None,
+            tparams: 0,
+            lo: None,
+            hi: None,
+        });
         Self::as_seen_from(base, decls)
     }
 

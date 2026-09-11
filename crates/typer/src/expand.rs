@@ -2526,35 +2526,16 @@ pub(crate) fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<Strin
     // `mapTo` there is `Tables.this.profile.api.anyToShapedValue(…)`, and a
     // `Profile.this` would name a class the call site is not inside. A name
     // no enclosing class supplies (an imported member) keeps its own spelling.
-    let reaches = |c: SymbolId| {
-        c == owner
-            || st.is_ancestor_of(owner, c)
-            || st
-                .get(c)
-                .self_type
-                .as_ref()
-                .and_then(|t| st.class_sym_of(t))
-                .is_some_and(|s| s == owner || st.is_ancestor_of(owner, s))
-    };
-    let mut cur = st.this_class;
-    for _ in 0..64 {
-        if cur.is_none() {
-            return None;
-        }
-        if st.get(cur).is_class_like() && reaches(cur) {
-            let name = &st.get(cur).name;
-            return match st.get(cur).kind {
-                SymKind::Class => Some(name.clone()),
-                // A module class is `Test$` here and in the JVM, but nsc's
-                // *symbol* for it is named `Test` and that is what `Test.this`
-                // prints as.
-                SymKind::ModuleClass => Some(name.strip_suffix('$').unwrap_or(name).to_string()),
-                _ => None,
-            };
-        }
-        cur = st.get(cur).owner;
+    // The walk is the typer's own (`ident_prefix_class`).
+    let cur = st.enclosing_class_reaching(owner)?;
+    let name = &st.get(cur).name;
+    match st.get(cur).kind {
+        SymKind::Class | SymKind::Module => Some(name.clone()),
+        // A module class is `Test$` here and in the JVM, but nsc's *symbol*
+        // for it is named `Test` and that is what `Test.this` prints as.
+        SymKind::ModuleClass => Some(name.strip_suffix('$').unwrap_or(name).to_string()),
+        _ => None,
     }
-    None
 }
 
 /// Write a tree the implementation reads as one the typer has already been

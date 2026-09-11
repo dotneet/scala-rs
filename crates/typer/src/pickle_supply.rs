@@ -4428,6 +4428,24 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
             keep(&mut kept);
             continue;
         }
+        // Named by an implicit clause *behind an explicit one*: nsc leaves it
+        // undetermined through the application and the implicit search solves
+        // it (`Context.undetparams`), which `implicit_fit_open` /
+        // `search_implicit_undet` do here too. slick's
+        // `AnyOptionExtensionMethods.getOrElse[M, P2 <: P](default: M)(implicit
+        // shape: Shape[FlatShapeLevel, M, _, P2], ol: OptionLift[P2, O]): P`
+        // is the shape: `P2` is whatever the `Shape` found for `M` packs to.
+        // A clause that is never filled is `reject_unapplied_implicit_clause`'s
+        // missing implicit, not an eta-expansion.
+        if named_by_an_implicit
+            && shape
+                .clauses
+                .iter()
+                .any(|c| !c.implicit && !c.params.is_empty())
+        {
+            keep(&mut kept);
+            continue;
+        }
         // A type parameter the signature never mentions again: no parameter and
         // no result names it, so nothing the call site does depends on how it is
         // solved and there is no implicit to fail. nsc's *default getters* are

@@ -30,7 +30,13 @@ pub(crate) fn add_predef_members(
             }),
         };
     }
-    // `Any.getClass(): Class[_]`, inherited from `java.lang.Object`.
+    // `Any.getClass(): Class[_]` -- nsc's `Any_getClass` takes its result
+    // type from `java.lang.Object.getClass`, an existential. It was
+    // `Class[Any]`, and `Class` is invariant, so every primitive class in
+    // scala/scala's own `src/library` (`override def getClass(): Class[Int]`
+    // in `Int.scala`, and the eight others) was "incompatible type in
+    // overriding". A value class may override it; an `AnyRef` class meets
+    // `Object`'s `final` one first.
     if let Some(jclass) = crate::classpath::find_by_jvm(st, "java/lang/Class") {
         let any = st.any_sym;
         method(
@@ -40,52 +46,37 @@ pub(crate) fn add_predef_members(
             vec![],
             Type::Class {
                 sym: jclass,
-                args: vec![Type::Any],
+                args: vec![Type::Wildcard],
             },
             Intrinsic::GetClass,
         );
+        // `abstract class AnyVal extends Any { def getClass(): Class[_ <:
+        // AnyVal] = null }` (`src/library/scala/AnyVal.scala`): the member a
+        // value class's `override def getClass()` is checked against, which
+        // rules out `Class[String]`.
+        let anyval = st.anyval_sym;
+        if !anyval.is_none() {
+            method(
+                st,
+                anyval,
+                "getClass",
+                vec![],
+                Type::Class {
+                    sym: jclass,
+                    args: vec![Type::BoundedWildcard {
+                        lo: None,
+                        hi: Some(Box::new(Type::AnyVal)),
+                    }],
+                },
+                Intrinsic::GetClass,
+            );
+        }
     }
+    // `Predef` declares `println()` and `println(x: Any)` and nothing else.
+    // Typed stand-ins (`println(Int)`, `println(Double)`, …) were once here;
+    // with numeric widening part of overload applicability, as in nsc, they
+    // took `println(c: Char)` as `println(Int)` and printed `66`.
     method(st, owner, "println", vec![], Type::Unit, Intrinsic::Println);
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Int],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Long],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Double],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::Boolean],
-        Type::Unit,
-        Intrinsic::Println,
-    );
-    method(
-        st,
-        owner,
-        "println",
-        vec![Type::String],
-        Type::Unit,
-        Intrinsic::Println,
-    );
     method(
         st,
         owner,

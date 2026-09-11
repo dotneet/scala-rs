@@ -100,6 +100,112 @@ impl Typer {
                 if !args.is_empty())
     }
 
+    /// The prototype a method *reference* argument is typed against when its
+    /// parameter is a function type that only the call's inference can
+    /// finish: the parameter types the callee already fixes, and a wildcard
+    /// result (nsc's `Int => ?` for `foreach[U](f: Int => U)`).
+    ///
+    /// Only for a bare reference (`println`, `Console.println`): it is the
+    /// argument whose typing depends on a function-shaped expectation, since
+    /// an overloaded one otherwise settles on its nullary alternative. Every
+    /// alternative of an overloaded callee has to agree on the parameter
+    /// types, or the prototype would be choosing among the callee's
+    /// alternatives instead of the argument's.
+    pub(crate) fn method_ref_function_proto(
+        &self,
+        arg: &Tree,
+        fun_ty: &Type,
+        fun_sym: SymbolId,
+        idx: usize,
+    ) -> Option<Type> {
+        if !matches!(arg.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) {
+            return None;
+        }
+        let tps: Vec<SymbolId> = if fun_sym.is_none() {
+            Vec::new()
+        } else {
+            self.st.get(fun_sym).tparams.clone()
+        };
+        let open_params = |params: &[Type]| {
+            params
+                .iter()
+                .any(|t| t.is_no_type() || t.is_error() || mentions_tparam(t, &tps))
+        };
+        let one = |alt: &Type| -> Option<Type> {
+            let Type::Method { paramss, .. } = alt else {
+                return None;
+            };
+            let p = match param_at(paramss.first()?, idx)? {
+                Type::ByName(t) => t.as_ref(),
+                t => t,
+            };
+            let p = match p {
+                Type::Class { sym, args } => match self.st.function_class_shape(*sym, args) {
+                    Some(f) => f,
+                    None => {
+                        // A SAM-typed parameter (`foreach[U](f: Fun[String,
+                        // U])`): the method eta-expands into the SAM itself,
+                        // so the prototype is the class, with the callee's
+                        // variables left open.
+                        let sam = self.st.sam_sig(p)?;
+                        if open_params(&sam.param_tys) {
+                            return None;
+                        }
+                        let wild = vec![Type::Wildcard; tps.len()];
+                        return Some(crate::symbol::subst_tparams_slice(&tps, &wild, p));
+                    }
+                },
+                other => other.clone(),
+            };
+            let Type::Function { params, .. } = p else {
+                return None;
+            };
+            if open_params(&params) {
+                return None;
+            }
+            Some(Type::Function {
+                params,
+                ret: Box::new(Type::Wildcard),
+            })
+        };
+        match fun_ty {
+            Type::Method { .. } => one(fun_ty),
+            Type::Overload(alts) if !alts.is_empty() => {
+                let first = one(&alts[0])?;
+                for a in &alts[1..] {
+                    if one(a)? != first {
+                        return None;
+                    }
+                }
+                Some(first)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether no alternative of the callee takes a function (or SAM) at
+    /// argument position `idx`. `false` whenever that cannot be told -- a
+    /// callee that is not a method type, or a position past its parameters.
+    fn no_function_formal_at(&self, fun_ty: &Type, idx: usize) -> bool {
+        let alts: Vec<&Type> = match fun_ty {
+            Type::Method { .. } => vec![fun_ty],
+            Type::Overload(alts) if !alts.is_empty() => alts.iter().collect(),
+            _ => return false,
+        };
+        for alt in alts {
+            let Type::Method { paramss, .. } = alt else {
+                return false;
+            };
+            let Some(p) = paramss.first().and_then(|ps| param_at(ps, idx)) else {
+                return false;
+            };
+            if p.is_no_type() || p.is_error() || self.expects_function_value(p) {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
@@ -319,22 +425,57 @@ impl Typer {
             // function literal *inside* an argument -- slick's
             // `StatementParameters(…, if (…) … else { s => …; … }, …)`, whose
             // case-class `apply` lands on this path -- has nowhere else to
-            // read its parameter types from. Only for a monomorphic class,
-            // only where the arity settles which constructor this is, and only
-            // for a fully determined function-shaped parameter.
-            let ctor_protos: Vec<Type> = class_id
-                .filter(|_| tps.is_empty())
-                .map(|c| self.st.get(c).ctor_fields.clone())
-                .filter(|fs| fs.len() == args.len())
-                .map(|fs| {
+            // read its parameter types from. Only for a monomorphic class (or
+            // one whose type arguments were written), only where the arity
+            // settles which constructor this is, and only for a fully
+            // determined parameter.
+            //
+            // A class with a *single* constructor has nothing to pick, so
+            // every such parameter is the argument's expected type, as it is
+            // for nsc (`doTypedApply` types the arguments of a monomorphic
+            // method against its formals). An invariant one decides the
+            // argument's own inference: `new BitmapIndexedMapNode[K, V1](…,
+            // Array(k, v), …)` passes an `Array[Any]` in scalac, and typed
+            // with no expected type `Array(k, v)` was an `Array[AnyRef]`.
+            // With several constructors a parameter is a hint for a function
+            // literal only: `new C(1)` beside `C(Long)` and `C(Int)` must
+            // still pick on the argument's own type.
+            let outer_prefix = class_id.and_then(|c| self.ctor_outer_prefix(c, fun));
+            let single_ctor = class_id.is_some_and(|c| {
+                self.st
+                    .lookup_member(c, "<init>")
+                    .into_iter()
+                    .filter(|&id| {
+                        self.st.get(id).owner == c
+                            && self.st.get(id).kind == crate::symbol::SymKind::Method
+                    })
+                    .count()
+                    == 1
+            });
+            let mut ctor_protos: Vec<Type> = class_id
+                .filter(|_| tps.is_empty() || explicit.len() == tps.len())
+                .map(|c| (c, self.st.get(c).ctor_fields.clone()))
+                .filter(|(_, fs)| fs.len() == args.len())
+                .map(|(c, fs)| {
                     fs.iter()
                         .map(|f| {
                             let t = self.st.get(*f).ty.clone();
+                            let t = if tps.is_empty() {
+                                t
+                            } else {
+                                self.st.subst_tparams(c, &explicit, &t)
+                            };
+                            let t = match &outer_prefix {
+                                Some(p) => self.st.subst_as_seen_from(p, &t),
+                                None => t,
+                            };
                             if !t.is_no_type()
                                 && !t.is_error()
                                 && !type_mentions_wildcard(&t)
                                 && !mentions_any_tparam(&t)
-                                && self.is_function_shaped(&t)
+                                && (self.is_function_shaped(&t)
+                                    || (single_ctor
+                                        && !matches!(t, Type::ByName(_) | Type::Repeated(_))))
                             {
                                 t
                             } else {
@@ -344,6 +485,51 @@ impl Typer {
                         .collect()
                 })
                 .unwrap_or_default();
+            // The same single-constructor rule where the fields above say
+            // nothing: a *polymorphic* class whose type arguments are being
+            // inferred still has parameters that do not mention them, and
+            // those are fully determined -- `new Node(Array.empty,
+            // Array.empty, 0)` on `Node[A](content: Array[Any], hashes:
+            // Array[Int], n: Int)` builds an `Object[]` and an `int[]` in
+            // scalac (`EmptyMapNode` in `HashMap.scala`), and typed with no
+            // expected type both searched a `ClassTag` for a variable nothing
+            // had solved. The constructor's own signature is read, so a class
+            // with no `ctor_fields` (one read from a class file) is covered
+            // too. Only a closed type (`is_closed_ctor_proto`), and only the
+            // slots still empty.
+            if let (Some(c), None) = (class_id, curried_clauses.as_ref()) {
+                if let Some(ctor) = self.sole_own_ctor(c) {
+                    let first = match &self.st.get(ctor).ty {
+                        Type::Method { paramss, .. } => {
+                            paramss.first().cloned().unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    };
+                    ctor_protos.resize(args.len(), Type::NoType);
+                    for (i, slot) in ctor_protos.iter_mut().enumerate() {
+                        if !slot.is_no_type() {
+                            continue;
+                        }
+                        let declared = match param_at(&first, i) {
+                            Some(Type::ByName(t)) => t.as_ref(),
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        let t = if !explicit.is_empty() && explicit.len() == tps.len() {
+                            self.st.subst_tparams(c, &explicit, declared)
+                        } else {
+                            declared.clone()
+                        };
+                        if self.is_closed_ctor_proto(declared, &tps)
+                            && !mentions_tparam(&t, &tps)
+                            && !t.is_error()
+                            && !type_mentions_wildcard(&t)
+                        {
+                            *slot = t;
+                        }
+                    }
+                }
+            }
             for (ai, a) in args.iter_mut().enumerate() {
                 if a.byname_thunk {
                     arg_tys.push(a.argument_type());
@@ -403,7 +589,13 @@ impl Typer {
                         .get(c)
                         .ctor_fields
                         .iter()
-                        .map(|f| self.st.get(*f).ty.clone())
+                        .map(|f| {
+                            let t = self.st.get(*f).ty.clone();
+                            match &outer_prefix {
+                                Some(p) => self.st.subst_as_seen_from(p, &t),
+                                None => t,
+                            }
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -422,6 +614,7 @@ impl Typer {
                 // its `targs` all along (`pick_ctor_at`); the `new` path did
                 // not.
                 self.supply_binary_ctors(c);
+                let saved_prefix = std::mem::replace(&mut self.ctor_prefix, outer_prefix.clone());
                 let mut picked =
                     self.pick_ctor_at_clause(c, &explicit, &arg_tys, None, curried_first_len);
                 // An argument whose class is still a `-cp` stub is a subtype of
@@ -437,6 +630,7 @@ impl Typer {
                     picked =
                         self.pick_ctor_at_clause(c, &explicit, &arg_tys, None, curried_first_len);
                 }
+                self.ctor_prefix = saved_prefix;
                 match picked {
                     OverloadPick::Found(sym, ps, _) => {
                         params_at_targs = !explicit.is_empty();
@@ -791,6 +985,15 @@ impl Typer {
                 }
             }
         }
+        // A single-clause callee handed more arguments than it has
+        // parameters (and no repeated one to absorb them): the arguments are
+        // typed without prototypes, see `pt_arg` below.
+        let too_many_args = match &fun_ty_for_pretype {
+            Type::Method { paramss, .. } => paramss.first().is_some_and(|ps| {
+                ps.len() < args.len() && !ps.last().is_some_and(|t| matches!(t, Type::Repeated(_)))
+            }),
+            _ => false,
+        };
         for (ai, a) in args.iter_mut().enumerate() {
             if a.byname_thunk {
                 arg_tys.push(a.argument_type());
@@ -915,7 +1118,16 @@ impl Typer {
                 let provisional = !has_fixed_shape
                     && (strict_proto.is_no_type()
                         || (inherited_hint && strict_proto != from_declaration));
-                let pt_arg = if provisional || strict_proto.is_no_type() {
+                let pt_arg = if too_many_args {
+                    // More arguments than the one clause has parameters: nsc
+                    // tries the tupled application (`tryTupleApply`) before
+                    // typing any argument against a formal, because position
+                    // `i` of the call is not parameter `i`. Typed against the
+                    // tuple formal, `update("Reopen", "reopen")`'s first
+                    // argument was converted (slick's `anyToShapedValue`) into
+                    // something the tupled retry could no longer repack.
+                    Type::NoType
+                } else if provisional || strict_proto.is_no_type() {
                     self.proto_arg_type(
                         &fun_ty_for_pretype,
                         fun.sym,
@@ -927,7 +1139,33 @@ impl Typer {
                 } else {
                     strict_proto
                 };
-                if pt_arg.is_no_type() {
+                let method_ref_proto = if pt_arg.is_no_type() && !too_many_args {
+                    self.method_ref_function_proto(a, &fun_ty_for_pretype, fun.sym, ai)
+                } else {
+                    None
+                };
+                if let Some(proto) = method_ref_proto {
+                    // A method named as the argument of a function-typed
+                    // parameter whose result is still a variable
+                    // (`xs.foreach(println)`, `foreach[U](f: A => U)`). nsc
+                    // types it against `Int => ?` and `inferExprAlternative`
+                    // keeps the alternative that eta-expands to that; typed
+                    // against nothing, the overload's nullary `println()` was
+                    // auto-applied and the argument became `Unit`. A
+                    // prototype that does not fit is thrown away, as below.
+                    let saved = a.clone();
+                    let mark = self.diags.len();
+                    self.type_expr(a, &proto);
+                    if self.error_count_since(mark) > 0
+                        || a.ty.is_error()
+                        || a.ty.is_no_type()
+                        || !self.st.is_sub_type(&a.ty, &proto)
+                    {
+                        *a = saved;
+                        self.diags.truncate(mark);
+                        self.type_expr(a, &Type::NoType);
+                    }
+                } else if pt_arg.is_no_type() {
                     self.type_expr(a, &Type::NoType);
                 } else {
                     // A prototype is a hint, never a constraint. An argument
@@ -964,6 +1202,16 @@ impl Typer {
                             *a = with_tree;
                         }
                     }
+                }
+                // An unapplied method whose parameter is no function type in
+                // any alternative (`foo[F](f: F)`, `Option(add)`, `(add, 1)`):
+                // nsc types it against that formal, so it is "missing
+                // argument list" in 2.13 and the eta-expansion under
+                // `-Xsource:3`, before the alternatives are weighed.
+                if self.unapplied_method_value(a).is_some()
+                    && self.no_function_formal_at(&fun_ty_for_pretype, ai)
+                {
+                    self.adapt_method_value(a);
                 }
                 // `take(Array.empty)`: with no expected type the argument keeps
                 // its residual implicit clause, `(ClassTag[T])Array[T]`. What
@@ -1385,19 +1633,7 @@ impl Typer {
                                 // `it.grouped(2).map { case Seq(i, t) => … }` typed
                                 // its lambda against `Int` and emitted a
                                 // `checkcast` that is a `VerifyError` at run time.
-                                let settled = fp.len() == 1 && {
-                                    let mut open = Vec::new();
-                                    collect_tparams(&fp[0], &mut open);
-                                    open.is_empty()
-                                        && !fp[0].is_no_type()
-                                        && !matches!(
-                                            fp[0],
-                                            Type::Named { .. }
-                                                | Type::Any
-                                                | Type::AnyRef
-                                                | Type::TypeMember(_)
-                                        )
-                                };
+                                //
                                 // A *rigid* type parameter is settled too. Read
                                 // through the receiver, `class Vd[+E, +A] { def
                                 // map[B](f: A => B) }` states its parameter as
@@ -1410,11 +1646,33 @@ impl Typer {
                                 // still written in the *declaring* class's own
                                 // parameter, which is not in scope at the call
                                 // site.
-                                let settled = settled
-                                    || matches!(&fp[..], [Type::TypeParam(tp)]
-                                        if self.tparam_in_scope(*tp)
-                                            && !self.undet_tvars.contains(tp)
-                                            && !self.st.get(sym).tparams.contains(tp));
+                                //
+                                // That holds inside a larger type as well:
+                                // `Node[K, V]`'s own
+                                // `foreach[U](f: ((K, V)) => U)`, called as
+                                // `_next.foreach(f)` in mutable `HashMap`, states
+                                // `(K, V)` with both parameters in scope, and the
+                                // guess (`Node` is in `scala/collection/` but no
+                                // collection, so its first argument `K`) made it
+                                // "found: ((K, V)) => U  required: (K) => Any".
+                                let rigid = |tp: &SymbolId| {
+                                    self.tparam_in_scope(*tp)
+                                        && !self.undet_tvars.contains(tp)
+                                        && !self.st.get(sym).tparams.contains(tp)
+                                };
+                                let settled = fp.len() == 1 && {
+                                    let mut open = Vec::new();
+                                    collect_tparams(&fp[0], &mut open);
+                                    open.iter().all(rigid)
+                                        && !fp[0].is_no_type()
+                                        && !matches!(
+                                            fp[0],
+                                            Type::Named { .. }
+                                                | Type::Any
+                                                | Type::AnyRef
+                                                | Type::TypeMember(_)
+                                        )
+                                };
                                 let fparams = if fp.len() == 1
                                     && !settled
                                     && self.st.kind_arity(&elem) == 0
@@ -1923,7 +2181,7 @@ impl Typer {
                             let inst: Vec<(SymbolId, Type)> = self
                                 .infer_method_tparams(sym, &sig_param_tys, &now)
                                 .into_iter()
-                                .filter(|(_, t)| {
+                                .filter(|(id, t)| {
                                     // A solution that is *this* call's own variable
                                     // is no solution -- `T := T` leaves the result
                                     // exactly as it was. The caller's type
@@ -1932,9 +2190,27 @@ impl Typer {
                                     // solves `mk`'s `T` to `const`'s, and
                                     // rejecting every `TypeParam` printed the
                                     // result as `GR[T] required GR[T]`.
+                                    //
+                                    // `Nothing` is held back for the expected
+                                    // type to improve on. With no expected
+                                    // type, nsc's `adjustTypeArgs` keeps a
+                                    // `Nothing` solution undetermined only
+                                    // where the variable is not covariant in
+                                    // the result -- `tryBreakable { throw e }`
+                                    // stays a `TryBlock[?T]` for `catchBreak`
+                                    // to decide -- and instantiates it
+                                    // otherwise: `onError { e => throw e }` on
+                                    // `onError[T](h: Throwable => T):
+                                    // PartialFunction[Throwable, T]` is a
+                                    // `PartialFunction[Throwable, Nothing]`.
+                                    // Leaving `T` in that result made the
+                                    // enclosing `try p catch onError { … }` an
+                                    // `AnyRef` (`sys/process/ProcessImpl.scala`).
+                                    let nothing_ok = pt.is_no_type()
+                                        && self.tparam_variance_in(&ret, *id, 1) == Some(1);
                                     !t.is_no_type()
                                         && !t.is_error()
-                                        && !matches!(t, Type::Nothing)
+                                        && (!matches!(t, Type::Nothing) || nothing_ok)
                                         && !mentions_tparam(t, &tps)
                                 })
                                 .collect();
@@ -2571,6 +2847,19 @@ impl Typer {
                             // is `(fb: F[B])(implicit F: Functor[F])`.
                             let leftover = self
                                 .fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
+                            // And what the implicit search solved is part of
+                            // the result, exactly as on the ordinary path
+                            // below: slick's `Query(r)` is `Query.apply[E, U,
+                            // R](value: E)(implicit unpack: Shape[_, E, U,
+                            // R]): Query[R, U, Seq]`, with `U` and `R` known
+                            // only to the `Shape` found, and
+                            // `Query(xs.length).first` came out as `U`.
+                            if !self.implicit_undet_solved.is_empty() {
+                                let sol = std::mem::take(&mut self.implicit_undet_solved);
+                                let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
+                                let ts: Vec<Type> = sol.iter().map(|(_, t)| t.clone()).collect();
+                                ret = crate::symbol::subst_tparams_slice(&ids, &ts, &ret);
+                            }
                             tree.ty = leftover.unwrap_or(ret);
                             return;
                         }
@@ -3377,5 +3666,43 @@ impl Typer {
             return t;
         }
         self.st.lub(a, b)
+    }
+
+    /// Can a constructor parameter's *declared* type be handed to its
+    /// argument as the expected type without reading it through a prefix?
+    /// Only a type built from classes, arrays, tuples and functions whose
+    /// type parameters are the constructed class's own (`tps`, which the
+    /// caller substitutes or refuses). A type member, a singleton or an
+    /// enclosing class's parameter means something different at every
+    /// `new o.C(…)`, and nothing on this path does the as-seen-from.
+    pub(crate) fn is_closed_ctor_proto(&self, ty: &Type, tps: &[SymbolId]) -> bool {
+        match ty {
+            Type::Unit
+            | Type::Boolean
+            | Type::Byte
+            | Type::Short
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Char
+            | Type::String
+            | Type::Any
+            | Type::AnyRef
+            | Type::JavaObject
+            | Type::AnyVal
+            | Type::Null
+            | Type::Nothing => true,
+            Type::TypeParam(id) => tps.contains(id),
+            Type::Array(t) => self.is_closed_ctor_proto(t, tps),
+            Type::Class { args, .. } | Type::Tuple(args) => {
+                args.iter().all(|a| self.is_closed_ctor_proto(a, tps))
+            }
+            Type::Function { params, ret } => {
+                params.iter().all(|p| self.is_closed_ctor_proto(p, tps))
+                    && self.is_closed_ctor_proto(ret, tps)
+            }
+            _ => false,
+        }
     }
 }

@@ -84,7 +84,9 @@ impl Typer {
             // A default argument's body, already typed in the scope it was
             // written in (`type_default_rhs_here`). Typing it again here would
             // resolve its names in the caller's scope -- which is the bug that
-            // typing it there fixes -- so only fit it to the expectation.
+            // typing it there fixes -- so only fit it to the expectation. The
+            // same holds for a macro's receiver or argument spliced back into
+            // its expansion unchanged (`NodeId::PRETYPED_SPLICE`).
             if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
                 self.adapt(tree, pt);
             }
@@ -96,6 +98,7 @@ impl Typer {
                 _ => unreachable!(),
             };
             self.type_ident(tree, name, pt);
+            self.spell_out_inferred_class_of(tree);
         } else if matches!(&tree.kind, TreeKind::Function { .. }) {
             let ty = {
                 let (vparams, body) = match &mut tree.kind {
@@ -1212,6 +1215,11 @@ impl Typer {
                             return;
                         }
                         crate::symbol::Intrinsic::IsInstanceOf => {
+                            // `x.isInstanceOf[p.type]` compares with `p`, so
+                            // codegen needs `p` as a typed term.
+                            if let (Some(a), Some(t)) = (args.first_mut(), targs.first()) {
+                                self.type_singleton_type_ref(a, t);
+                            }
                             tree.ty = Type::Boolean;
                             return;
                         }
@@ -1436,9 +1444,15 @@ impl Typer {
                 // whose branches share no direct subtype relation but do share
                 // `Option[X]` as a common ancestor (sgap fixture; slick's
                 // `PositionedResult.nextXOption()` methods rely on exactly this).
-                let joined = self.lub_branches(&thenp.ty, &elsep.ty);
                 let branch_tys = [thenp.ty.clone(), elsep.ty.clone()];
-                tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
+                if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+                    self.adapt(thenp, &num);
+                    self.adapt(elsep, &num);
+                    tree.ty = num;
+                } else {
+                    let joined = self.lub_branches(&thenp.ty, &elsep.ty);
+                    tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
+                }
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);

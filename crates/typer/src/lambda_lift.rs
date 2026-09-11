@@ -59,6 +59,45 @@ impl<'a> Lifter<'a> {
                         self.extract_from(p, &mut nested);
                     }
                 }
+                // A `def` written inside the super constructor's arguments,
+                // or inside the arguments of an auxiliary constructor's
+                // `this(...)`, runs while `this` is still uninitialised: the
+                // JVM lets nothing call an instance method on it. nsc lifts
+                // such a def to a `static` method (`private static final int
+                // bippy$1()` for `class Sub extends Base({ def bippy = 5;
+                // bippy })`); left alone it was not lifted at all from the
+                // parents, and from `this(...)` it became an instance method
+                // called on `uninitializedThis` (`run/t1909b`, `run/t1909c`).
+                let mut presuper = Vec::new();
+                for p in &mut impl_.parents {
+                    self.extract_from(p, &mut presuper);
+                }
+                for s in &mut impl_.body {
+                    if let TreeKind::DefDef { name, rhs, .. } = &mut s.kind {
+                        if name == "<init>" {
+                            if let Some(args) = self_ctor_call_args_mut(rhs) {
+                                for a in args {
+                                    self.extract_from(a, &mut presuper);
+                                }
+                            }
+                        }
+                    }
+                }
+                // All or nothing: they may call one another, and a `static`
+                // method cannot call an instance one without a receiver.
+                if presuper
+                    .iter()
+                    .all(|d| !d.sym.is_none() && !refs_instance(d, class_id, self.st))
+                {
+                    for d in &mut presuper {
+                        let f = self.st.get(d.sym).flags.with(Flags::STATIC);
+                        self.st.get_mut(d.sym).flags = f;
+                        if let TreeKind::DefDef { mods, .. } = &mut d.kind {
+                            mods.flags = mods.flags.with(Flags::STATIC);
+                        }
+                    }
+                }
+                nested.extend(presuper);
                 for s in &mut impl_.body {
                     if matches!(
                         s.kind,
@@ -116,6 +155,9 @@ impl<'a> Lifter<'a> {
                     for p in clause {
                         rewrite_calls(p, &cap_map, self.st);
                     }
+                }
+                for p in &mut impl_.parents {
+                    rewrite_calls(p, &cap_map, self.st);
                 }
                 for s in &mut impl_.body {
                     rewrite_calls(s, &cap_map, self.st);
@@ -677,10 +719,7 @@ fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
             }
         }
         TreeKind::Ident { name } => {
-            let varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
+            let varid = scala_rs_parser::ast::is_variable_name(name);
             if varid && !pat.sym.is_none() {
                 out.insert(pat.sym);
             }
@@ -849,8 +888,17 @@ fn consider_capture(
     if s.kind != SymKind::Term {
         return;
     }
-    let owner_kind = st.get(s.owner).kind;
-    if owner_kind != SymKind::Method {
+    let owner = st.get(s.owner);
+    // A local of an expression written directly in a template -- a field
+    // initialiser's block, a bare statement, a super constructor argument --
+    // is owned by the class, yet it is no member of it: it lives in the
+    // constructor's frame. `val x = { val t = 1; def f = t + 1; f }` lifted
+    // `f` with no parameter for `t` and read `t` off `this`
+    // (`NoSuchMethodError: C.t()`).
+    let template_local = matches!(owner.kind, SymKind::Class | SymKind::ModuleClass)
+        && !s.flags.contains(Flags::PARAM)
+        && !owner.members.contains(&id);
+    if owner.kind != SymKind::Method && !template_local {
         return;
     }
     out.push(id);
@@ -1033,6 +1081,62 @@ fn call_sym(tree: &Tree) -> SymbolId {
     match &tree.kind {
         TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => call_sym(fun),
         _ => tree.sym,
+    }
+}
+
+/// The arguments of the `this(...)` call an auxiliary constructor starts
+/// with: its whole body (`def this() = this(1)`), or the first statement of a
+/// block body.
+fn self_ctor_call_args_mut(rhs: &mut Tree) -> Option<&mut Vec<Tree>> {
+    match &mut rhs.kind {
+        TreeKind::Apply { fun, args } if matches!(fun.kind, TreeKind::This { .. }) => Some(args),
+        TreeKind::Block { stats, expr } => match stats.first_mut() {
+            Some(first) => self_ctor_call_args_mut(first),
+            None => self_ctor_call_args_mut(expr),
+        },
+        _ => None,
+    }
+}
+
+/// Does `def` read the instance it would be a method of -- `this`, `super`,
+/// or, by its bare name, a member of `class_id` or of a class around it (an
+/// `object`'s members are reached statically)? Only a def that does not can
+/// be lifted out of a constructor's arguments as a `static` method; nsc
+/// rejects the other kind there ("implementation restriction: requires
+/// premature access").
+fn refs_instance(def: &Tree, class_id: SymbolId, st: &SymbolTable) -> bool {
+    fn instance_member(st: &SymbolTable, sym: SymbolId, class_id: SymbolId) -> bool {
+        let s = st.get(sym);
+        if !matches!(s.kind, SymKind::Term | SymKind::Method) || s.flags.contains(Flags::STATIC) {
+            return false;
+        }
+        // Locals of the argument expression can carry the class as their
+        // owner; only a declared member of an enclosing class reads `this`.
+        let mut c = class_id;
+        while !c.is_none() {
+            let cs = st.get(c);
+            if cs.kind == SymKind::Class && cs.members.contains(&sym) {
+                return true;
+            }
+            c = cs.owner;
+        }
+        false
+    }
+    fn walk(t: &Tree, class_id: SymbolId, st: &SymbolTable) -> bool {
+        match &t.kind {
+            TreeKind::This { .. } | TreeKind::Super { .. } => return true,
+            TreeKind::Ident { .. } if !t.sym.is_none() && instance_member(st, t.sym, class_id) => {
+                return true;
+            }
+            _ => {}
+        }
+        child_trees(t).into_iter().any(|c| walk(c, class_id, st))
+    }
+    match &def.kind {
+        TreeKind::DefDef { vparamss, rhs, .. } => {
+            vparamss.iter().flatten().any(|p| walk(p, class_id, st)) || walk(rhs, class_id, st)
+        }
+        _ => true,
     }
 }
 

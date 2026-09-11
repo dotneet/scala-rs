@@ -32,7 +32,7 @@
 //! between the signature pass and the body pass — the point where every
 //! unit's signatures are built and no body has been typed yet.
 
-use crate::symbol::{SymKind, SymbolTable};
+use crate::symbol::{SymKind, Symbol, SymbolTable};
 use scala_rs_parser::SymbolId;
 
 /// Enter the members of a **source-defined** `scala.Predef` into the prelude
@@ -42,57 +42,9 @@ use scala_rs_parser::SymbolId;
 /// every ordinary program the prelude's own snapshot is the whole story and
 /// this is a no-op.
 pub(crate) fn reimport_source_predef(st: &mut SymbolTable) {
-    let Some(module) = source_predef(st) else {
+    let Some(cls) = reimport_source_predef_where(st, |_| true) else {
         return;
     };
-    // `import o._` imports what `o` *has*, not only what it declares (SLS 4.7):
-    // the library writes `object Predef extends LowPriorityImplicits`, and
-    // `intWrapper` is declared on that parent. Breadth-first from the module,
-    // so a name `Predef` declares itself is entered ahead of the one it
-    // inherits. The module *class* is where the namer hangs the body's
-    // members and the parents; the module value is walked too because some
-    // members are attached there instead (`prelude_conform` does exactly
-    // that with `$conforms`).
-    let cls = st.module_class_of(module);
-    let mut work = std::collections::VecDeque::from([module, cls]);
-    let mut walked = std::collections::HashSet::new();
-    let mut entered: Vec<(String, SymbolId)> = Vec::new();
-    while let Some(cur) = work.pop_front() {
-        if cur.is_none() || !walked.insert(cur.0) {
-            continue;
-        }
-        // A `private` member of a *strict* ancestor is not inherited (SLS
-        // 5.2), so `o` does not have it and no import can name it. Same rule
-        // the real wildcard import in `check_name` applies.
-        let inherited = cur != module && cur != cls;
-        for m in st.get(cur).members.clone() {
-            if inherited && st.private_to_owner(m) {
-                continue;
-            }
-            let name = st.get(m).name.clone();
-            if name.ends_with('$') || name == "<init>" {
-                continue;
-            }
-            // Every member, with no dedupe by name -- exactly what the real
-            // `import o._` in `check_name` does, and for the same reason: a
-            // name may be *overloaded*. `Predef` declares both
-            // `require(Boolean)` and `require(Boolean, => Any)`, and keeping
-            // only the first cost 17 errors reading `no matching overload for
-            // (Boolean)Unit with arguments (Boolean, String)` in nine files --
-            // every two-argument `require` and `assert` in the library.
-            // Breadth-first ordering is what separates an override from what
-            // it overrides; the scope slot keeps the rest as an overload set.
-            entered.push((name, m));
-        }
-        for p in st.get(cur).parents.clone() {
-            if let Some(ps) = st.class_sym_of(&p) {
-                work.push_back(ps);
-            }
-        }
-    }
-    for (name, m) in entered {
-        enter_replacing_prelude(st, &name, m);
-    }
     // The prelude's `Predef` is now a stand-in whose original has arrived.
     // `enter_replacing_prelude` above has displaced every member the two
     // spell the same way; `Check::drop_superseded_prelude_conversions` uses
@@ -121,6 +73,78 @@ pub(crate) fn reimport_source_predef(st: &mut SymbolTable) {
     }
 }
 
+/// The type members of a source `scala.Predef`, ahead of the signature pass.
+///
+/// A term member only exists once the signature pass has built it, but the
+/// namer already allocated every `type` alias (`type Map[K, +V] =
+/// immutable.Map[K, V]`), and a *signature* is where such an alias is used:
+/// `val byName: Map[String, Int]` in `Enumeration.scala`, `def env:
+/// Map[String, String]` in `sys/package.scala`. Imported only after the
+/// signature pass, those read `not found: type Map` while the same name in a
+/// body resolved. An alias's own right-hand side is completed on first use,
+/// exactly as for an alias reached through any other import.
+pub(crate) fn reimport_source_predef_types(st: &mut SymbolTable) {
+    reimport_source_predef_where(st, |sym| sym.kind == SymKind::TypeMember);
+}
+
+/// Enter the members of the source `Predef` that `keep` accepts; the module
+/// class when there is a source `Predef` at all.
+fn reimport_source_predef_where(
+    st: &mut SymbolTable,
+    keep: impl Fn(&Symbol) -> bool,
+) -> Option<SymbolId> {
+    let module = source_predef(st)?;
+    // `import o._` imports what `o` *has*, not only what it declares (SLS 4.7):
+    // the library writes `object Predef extends LowPriorityImplicits`, and
+    // `intWrapper` is declared on that parent. Breadth-first from the module,
+    // so a name `Predef` declares itself is entered ahead of the one it
+    // inherits. The module *class* is where the namer hangs the body's
+    // members and the parents; the module value is walked too because some
+    // members are attached there instead (`prelude_conform` does exactly
+    // that with `$conforms`).
+    let cls = st.module_class_of(module);
+    let mut work = std::collections::VecDeque::from([module, cls]);
+    let mut walked = std::collections::HashSet::new();
+    let mut entered: Vec<(String, SymbolId)> = Vec::new();
+    while let Some(cur) = work.pop_front() {
+        if cur.is_none() || !walked.insert(cur.0) {
+            continue;
+        }
+        // A `private` member of a *strict* ancestor is not inherited (SLS
+        // 5.2), so `o` does not have it and no import can name it. Same rule
+        // the real wildcard import in `check_name` applies.
+        let inherited = cur != module && cur != cls;
+        for m in st.get(cur).members.clone() {
+            if inherited && st.private_to_owner(m) {
+                continue;
+            }
+            let name = st.get(m).name.clone();
+            if name.ends_with('$') || name == "<init>" || !keep(st.get(m)) {
+                continue;
+            }
+            // Every member, with no dedupe by name -- exactly what the real
+            // `import o._` in `check_name` does, and for the same reason: a
+            // name may be *overloaded*. `Predef` declares both
+            // `require(Boolean)` and `require(Boolean, => Any)`, and keeping
+            // only the first cost 17 errors reading `no matching overload for
+            // (Boolean)Unit with arguments (Boolean, String)` in nine files --
+            // every two-argument `require` and `assert` in the library.
+            // Breadth-first ordering is what separates an override from what
+            // it overrides; the scope slot keeps the rest as an overload set.
+            entered.push((name, m));
+        }
+        for p in st.get(cur).parents.clone() {
+            if let Some(ps) = st.class_sym_of(&p) {
+                work.push_back(ps);
+            }
+        }
+    }
+    for (name, m) in entered {
+        enter_replacing_prelude(st, &name, m);
+    }
+    Some(cls)
+}
+
 /// Bind `id` under `name` in the prelude scope, **replacing** the prelude's
 /// own snapshot of that name rather than joining it.
 ///
@@ -147,8 +171,14 @@ fn enter_replacing_prelude(st: &mut SymbolTable, name: &str, id: SymbolId) {
     // Every binding of the name, not `Scope::lookup`'s best-precedence subset:
     // a prelude entry sitting at a worse rank still competes in implicit
     // search, which searches the scope rather than resolving a name.
-    let victims: Vec<SymbolId> = sc
-        .lookup_ranked(name)
+    let bound = sc.lookup_ranked(name);
+    // Already entered: the type members go in once ahead of the signature
+    // pass (`reimport_source_predef_types`) and are met again by the full
+    // import after it. A second binding of one symbol is not an overload.
+    if bound.iter().any(|b| b.sym == id) {
+        return;
+    }
+    let victims: Vec<SymbolId> = bound
         .iter()
         .map(|b| b.sym)
         .filter(|v| v.0 < prelude_end && *v != id)
