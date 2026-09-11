@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `cd35fd83` |
+| commit | `c0c10f08` |
 |---|---|
 | updated | 2026-09-11 |
 
-**Fifty-two composed gates have been accepted this session**, covering the earlier
+**Fifty-three composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
@@ -84,6 +84,7 @@ coordinator measured the merged tree each time, not the branches.
 | `e608c7dc` | declaration clauses, Array signatures, value-class/Unit storage and implicit views | 99 -> **96** | 83 -> **83** |
 | `712279e5` | contextual inference, by-name values/signatures, copy and local imports | 96 -> **92** | 83 -> **34** |
 | `cd35fd83` | nested function application erasure, generic local conversions, README/docs cleanup | 92 | 34 |
+| `c0c10f08` | collection extension precedence, ReusableBuilder parent recovery, SortedSet operators, Seq trait hierarchy, JDK 21 name data | 92 | 34 -> **31** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -290,7 +291,7 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **34** | **23** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **31** | **21** | — |
 | `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **92** | **43** | — |
 | `tests/scalalib_measure.sh` (538) | **383** | **107** | — |
 
@@ -324,13 +325,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1154** | 360 | 345 |
+| `pos` (1859) | **1158** | 356 | 345 |
 | `neg` (1405) | **718** | 318 | 369 |
 | `run` (2060) | **707** | 800 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-cd35fd83.tsv`](baselines/corpus-cd35fd83.tsv): 5324 unique
+[`baselines/corpus-c0c10f08.tsv`](baselines/corpus-c0c10f08.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `c0c10f08` gate compared against `corpus-cd35fd83.tsv`: **losses=0,
+changes=4**: pos/t1203a, pos/t3568, pos/t6648, pos/tcpoly_ticket2096.
+
 The `cd35fd83` gate compared against `corpus-712279e5.tsv`: **losses=0,
 changes=3**: pos/eta, pos/t0438, run/Course-2002-02.
 
@@ -3981,6 +3985,44 @@ Exact summary block:
 ```text
 === summary
   HEAD=0fb2db57  logs=/tmp/scala-rs-gate-contextual-evidence-20260911-retry
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-three: collection extension precedence and library hierarchy recovery
+
+The gate ran on the clean handoff commit `c0c10f08` in
+`/private/tmp/scala-rs-gate-c0c10f08-20260911`. The gate tree and the source
+commit handed off are identical; this baseline update and the saved corpus
+ledger are the only post-gate metadata changes.
+
+Gitbucket remained at 92 errors in 43 files (354 inputs, including 3 Java
+sources). Cats improved from 34 to 31 errors in 21 files (339 inputs, 1
+skipped). The Scala library remained at 383 errors in 107 files (538 inputs).
+Slick compiled with 0 errors and 1504 classes; its 12 execution clients passed
+36/36 attempts and the class subset verified all 1504 classes with zero lint
+problems. The workspace suite passed 2802 tests in 313 result rows.
+
+The corpus retained all 5324 identities with `losses=0` and four positive
+status gains: `pos/t1203a`, `pos/t3568`, `pos/t6648`, and
+`pos/tcpoly_ticket2096`. Counts are pos 1158/356/345, neg 718/318/369 and
+run 707/800/553 for pass/fail/skip. The saved ledger is
+[`baselines/corpus-c0c10f08.tsv`](baselines/corpus-c0c10f08.tsv), SHA-256
+`71fc5133e81a1e1b00708b9e1f86a0417648afedf0dc18f583863f4b5961ea16`.
+
+The implementation gives lexical implicit conversions precedence over
+companion conversions, restores the pickled generic parent for the single
+`ReusableBuilder` placeholder, adds the missing `SortedSet` source signatures
+and JVM dispatch, and normalizes the descriptor-first `scala.collection.Seq`
+placeholder so IndexedSeq subclasses resolve correctly. The NameTransformer
+identifier table and numeric fixture were refreshed from the installed JDK 21
+and scalac 2.13.16 outputs; all related runtime and verifier tests pass.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=c0c10f08  logs=/private/tmp/scala-rs-gate-c0c10f08-20260911
 VERDICT=PASS
 DONE
 ```
