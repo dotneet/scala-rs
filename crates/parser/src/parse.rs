@@ -375,6 +375,31 @@ impl<'a> Parser<'a> {
             .push(Diagnostic::error(self.file_index, span, msg));
     }
 
+    /// nsc `template()`: `extends { ... } with T`, at the brace. Under
+    /// `-Xsource:3` nsc reports a migration error instead, which this parser
+    /// does not model.
+    fn early_initializer_deprecation(&mut self, brace: Span) {
+        if !self.opts.source3 {
+            self.deprecation(
+                brace,
+                "early initializers are deprecated; they will be replaced by trait parameters in 3.0, see the migration guide on avoiding var/val in traits.",
+                "2.13.0",
+            );
+        }
+    }
+
+    /// nsc's parser `deprecationWarning` (`cat=deprecation`, summarized
+    /// unless `-deprecation`), at the point `span.lo`.
+    fn deprecation(&mut self, span: Span, msg: impl Into<String>, since: &str) {
+        self.diags.push(
+            Diagnostic::warning(self.file_index, span, msg).with_category(
+                scala_rs_span::WarnCategory::Deprecation {
+                    since: since.to_string(),
+                },
+            ),
+        );
+    }
+
     fn unimplemented(&mut self, span: Span, what: impl Into<String>) -> Tree {
         let what = what.into();
         self.error_span(span, format!("unimplemented syntax: {what}"));
@@ -1380,10 +1405,12 @@ impl<'a> Parser<'a> {
             self.bump();
             self.skip_nl();
             if matches!(self.kind(), TokenKind::LBrace) {
+                let brace = self.span();
                 let (sn, st, mut stats) = self.parse_template_body();
                 self.skip_nl();
                 if matches!(self.kind(), TokenKind::With) {
                     // nsc EarlyDefs: `extends { val x = 1 } with T`
+                    self.early_initializer_deprecation(brace);
                     self.mark_early_defs(&mut stats);
                     body = stats;
                     self.bump();
@@ -1933,8 +1960,27 @@ impl<'a> Parser<'a> {
             }
         } else if matches!(self.peek_non_nl(), TokenKind::LBrace) {
             self.skip_nl();
+            if matches!(tpt.kind, TreeKind::Empty) && !self.opts.source3 {
+                // nsc `funDefRest`: procedure syntax, at the `{`.
+                let sp = self.span();
+                self.deprecation(
+                    sp,
+                    format!("procedure syntax is deprecated: instead, add `: Unit =` to explicitly declare `{name}`'s return type [quickfixable]"),
+                    "2.13.0",
+                );
+            }
             self.parse_block_expr()
         } else {
+            if matches!(tpt.kind, TreeKind::Empty) && !self.opts.source3 {
+                // A declaration without a result type, at the end of the
+                // last token (`in.lastOffset`).
+                let end = self.prev_span().hi;
+                self.deprecation(
+                    Span { lo: end, hi: end },
+                    format!("procedure syntax is deprecated: instead, add `: Unit` to explicitly declare `{name}`'s return type [quickfixable]"),
+                    "2.13.0",
+                );
+            }
             self.empty(self.span())
         };
         self.alloc(
@@ -2457,7 +2503,14 @@ impl<'a> Parser<'a> {
             TokenKind::DoubleLit(n) => Lit::Double(n),
             TokenKind::CharLit(c) => Lit::Char(c),
             TokenKind::StringLit(s) => Lit::String(s),
-            TokenKind::SymbolLit(s) => Lit::Symbol(s),
+            TokenKind::SymbolLit(s) => {
+                self.deprecation(
+                    sp,
+                    format!("symbol literal is deprecated; use Symbol(\"{s}\") instead [quickfixable]"),
+                    "2.13.0",
+                );
+                Lit::Symbol(s)
+            }
             TokenKind::True => Lit::Boolean(true),
             TokenKind::False => Lit::Boolean(false),
             TokenKind::Null => Lit::Null,
@@ -3549,6 +3602,11 @@ impl<'a> Parser<'a> {
             }
             TokenKind::SymbolLit(s) => {
                 let sp = self.span();
+                self.deprecation(
+                    sp,
+                    format!("symbol literal is deprecated; use Symbol(\"{s}\") instead [quickfixable]"),
+                    "2.13.0",
+                );
                 self.bump();
                 self.alloc(
                     sp,
@@ -3874,6 +3932,7 @@ impl<'a> Parser<'a> {
             // name was dropped, so a nested class referring back to the outer
             // instance through it was "not found: value self" (slick's
             // `new BaseTag { base => … new RefTag(path) { … base.taggedAs … } }`).
+            let brace = self.span();
             let (mut self_name, mut self_tpt, mut body) = self.parse_template_body();
             let mut parents = vec![];
             // nsc `template()`, which `new` shares with a class's `extends`
@@ -3883,6 +3942,7 @@ impl<'a> Parser<'a> {
                 && self_tpt.is_none()
                 && matches!(self.peek_non_nl(), TokenKind::With)
             {
+                self.early_initializer_deprecation(brace);
                 self.mark_early_defs(&mut body);
                 self.skip_nl();
                 self.bump(); // with

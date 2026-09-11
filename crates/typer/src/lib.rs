@@ -117,6 +117,7 @@ mod value_companion;
 mod valueclass;
 mod views;
 // Warnings nsc issues by default (agent/warn).
+mod warn_deprecation;
 mod warn_patmat;
 mod warn_patmat_analysis;
 mod warn_patmat_logic;

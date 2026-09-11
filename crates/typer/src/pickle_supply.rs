@@ -4039,6 +4039,17 @@ impl PickleSupply {
         None
     }
 
+    /// The pickled signature of the library class `full_name` (dotted).
+    pub(crate) fn class_sig_by_name(
+        &mut self,
+        bin: &mut BinaryIndex,
+        full_name: &str,
+        module: bool,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        let mut src = BinSource(bin);
+        self.sigs.class_sig(&mut src, full_name, module).ok()
+    }
+
     fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {
         let mut src = BinSource(bin);
         let r = self.sigs.class_sig(&mut src, full_name, module);

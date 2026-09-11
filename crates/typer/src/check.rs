@@ -994,6 +994,7 @@ pub fn typecheck_units_src(
     // the warnings they issue.
     if !t.diags.iter().any(|d| d.level == scala_rs_span::Level::Error) {
         crate::warn_refchecks::run(&mut t, units);
+        crate::warn_deprecation::run(&mut t, units);
         crate::warn_patmat::run(&mut t, units);
     }
     (t.st, t.diags)

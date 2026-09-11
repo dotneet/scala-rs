@@ -428,16 +428,33 @@ impl Builder<'_> {
             };
             self.p.sym_full_name(tsym).as_deref() == Some("scala.deprecated")
         })?;
-        let arg = |k: usize| -> String {
-            match annot.args.get(k).and_then(|a| self.constant_at(*a)) {
+        // A literal argument is pickled as the constant itself, anything else
+        // (a default getter call) as a tree. The library's `@deprecated`s come
+        // out as named pairs (`message = ..., since = ...`).
+        let text = |a: Idx| -> String {
+            let c = match self.p.entry(a) {
+                Some(Entry::Literal(c)) => Some(c.clone()),
+                _ => self.constant_at(a),
+            };
+            match c {
                 Some(Constant::Str(n)) => self.p.name(n).unwrap_or("").to_string(),
                 _ => String::new(),
             }
         };
-        Some(Deprecation {
-            message: arg(0),
-            since: arg(1),
-        })
+        let named = |key: &str| -> Option<String> {
+            annot
+                .assocs
+                .iter()
+                .find(|(k, _)| self.p.name(*k) == Some(key))
+                .map(|(_, v)| text(*v))
+        };
+        let message = named("message")
+            .or_else(|| annot.args.first().map(|a| text(*a)))
+            .unwrap_or_default();
+        let since = named("since")
+            .or_else(|| annot.args.get(1).map(|a| text(*a)))
+            .unwrap_or_default();
+        Some(Deprecation { message, since })
     }
 
     fn class_info(&mut self, info: Idx) -> (Vec<TParam>, Vec<SigType>) {

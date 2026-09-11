@@ -514,6 +514,12 @@ impl<'a> Types<'a> {
         }
         let tparams = self.st.get(t).tparams.clone();
         for (i, (sa, ta)) in sargs.iter().zip(targs).enumerate() {
+            // `Array` keeps its argument through `checkableType`, so a
+            // wildcard there is the pattern's existential `Array[_]`, which
+            // is no `Array[Double]`.
+            if t == self.st.array_sym && matches!(sa, NTy::Wild) && !matches!(ta, NTy::Wild) {
+                return Some(false);
+            }
             if matches!(sa, NTy::Wild) || matches!(ta, NTy::Wild) || sa == ta {
                 continue;
             }
