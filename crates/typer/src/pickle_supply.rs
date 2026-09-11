@@ -3249,6 +3249,41 @@ impl PickleSupply {
         Some((head(step.subst.get("CC")?)?, head(step.subst.get("C")?)?))
     }
 
+    /// The value-parameter counts (all clauses together) of every `name` the
+    /// pickled linearization of the class `internal` declares -- enough to
+    /// tell `SortedSetOps.map(f)(implicit ord)` from `IterableOps.map(f)`
+    /// when the class files cannot (the `Ops` trait declares it, and the
+    /// receiver's own interface file does not).
+    ///
+    /// Each count comes with the dotted name of the class declaring it, most
+    /// derived first.
+    pub(crate) fn pickled_arities(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        name: &str,
+    ) -> Vec<(usize, String)> {
+        let Some(full) = self.pickled_full_name(bin, internal, false) else {
+            return Vec::new();
+        };
+        let enc = scala_rs_pickle::names::encode_method_name(name);
+        let (hits, _errs) = {
+            let mut src = BinSource(bin);
+            self.sigs.lookup(&mut src, &full, false, &enc)
+        };
+        fn count(t: &SigType) -> usize {
+            match t {
+                SigType::Poly { result, .. } => count(result),
+                SigType::Method { params, result, .. } => params.len() + count(result),
+                _ => 0,
+            }
+        }
+        hits.iter()
+            .filter(|h| h.member.kind == MemberKind::Def && !h.owner_module)
+            .map(|h| (count(&h.member.ty), h.owner.clone()))
+            .collect()
+    }
+
     pub fn ensure_parents(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, cls: SymbolId) {
         if cls.is_none() || self.parented.contains(&cls.0) {
             return;

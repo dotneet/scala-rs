@@ -3499,13 +3499,67 @@ impl Typer {
         let owners: Vec<SymbolId> = found.iter().map(|&m| self.st.get(m).owner).collect();
         for c in crate::lin::linearize(&self.st, cls) {
             if owners.contains(&c) {
-                return false;
+                break;
             }
             if self.declares_other_signature(c, name, have) {
                 return true;
             }
         }
-        false
+        self.pickle_declares_other_arity(cls, name, found)
+    }
+
+    /// The receiver's pickle declares `name` somewhere the candidates in hand
+    /// do not stand for. The prelude leaves the `…Ops` traits out of its
+    /// hierarchy, so the class-file walk above never meets
+    /// `SortedSetOps.map[B](f)(implicit ord: Ordering[B]): SortedSet[B]`, and
+    /// `aSortedSet.map(f)` resolved to the prelude's plain `immutable.Set.map`:
+    /// the call built a `HashSet` (nsc: a `TreeSet`), and a result the typer
+    /// had narrowed back to `SortedSet` failed its `checkcast`.
+    ///
+    /// For each parameter count, the most derived pickled declaration must
+    /// be represented. A prelude member stands for any declaration of its
+    /// count -- the prelude's own types are what existing programs are
+    /// checked against, and `Set.map` does stand for `IterableOps.map` on a
+    /// `HashSet`. Once pickled copies are among the candidates, though, they
+    /// have to be copies of that very declaration: after some
+    /// `aSortedSet.map` has installed `SortedSetOps.map` / `IterableOps.map`
+    /// on `SortedSet`, a `BitSet` inherits them, and its own
+    /// `BitSetOps.map(f: Int => Int): BitSet` (what nsc picks) would never be
+    /// read.
+    fn pickle_declares_other_arity(
+        &mut self,
+        cls: SymbolId,
+        name: &str,
+        found: &[SymbolId],
+    ) -> bool {
+        let internal = self.st.get(cls).jvm_name.clone();
+        if !internal.starts_with("scala/collection/") {
+            return false;
+        }
+        let decls = self
+            .pickle
+            .pickled_arities(&mut self.binary, &internal, name);
+        let mut firsts: Vec<(usize, String)> = Vec::new();
+        for (n, owner) in decls {
+            if !firsts.iter().any(|(k, _)| *k == n) {
+                firsts.push((n, owner));
+            }
+        }
+        let pickled_in_hand = found
+            .iter()
+            .any(|&m| !self.st.get(m).pickled_origin.is_empty());
+        firsts.iter().any(|(n, owner)| {
+            !found.iter().any(|&m| {
+                if self.value_param_count(m) != *n {
+                    return false;
+                }
+                let s = self.st.get(m);
+                match s.pickled_origin.split_once('#') {
+                    Some((origin, _)) => origin == owner,
+                    None => !pickled_in_hand || m.0 >= self.st.prelude_end,
+                }
+            })
+        })
     }
 
     /// Whether `cls`'s own classfile declares an instance method `name` whose
