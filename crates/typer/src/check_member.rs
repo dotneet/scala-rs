@@ -591,7 +591,11 @@ impl Typer {
             tree.ty = expected;
             self.st.get_mut(tree.sym).ty = tree.ty.clone();
         } else if declared.is_no_type() {
-            tree.ty = rhs.ty.widen_constant();
+            // A variable the right-hand side left undetermined is closed here
+            // (nsc's mono-mode `instantiate`): `val b = List.newBuilder` is a
+            // `Builder[Nothing, List[Nothing]]`, not a `Builder[?A, …]` that a
+            // later line could still solve.
+            tree.ty = self.close_leaked_undet(&rhs.ty.widen_constant());
             if is_var {
                 tree.ty = self.widen_inferred_singleton(tree.ty.clone());
             }
@@ -1451,7 +1455,11 @@ impl Typer {
                 {
                     ret_pt.clone()
                 } else {
-                    self.widen_inferred_singleton(rhs.ty.widen_constant())
+                    // Close what the body left undetermined, as for a `val`
+                    // (`close_leaked_undet`): `def d = inv(fail())` is an
+                    // `Inv[Nothing]`.
+                    let closed = self.close_leaked_undet(&rhs.ty.widen_constant());
+                    self.widen_inferred_singleton(closed)
                 };
                 if let Type::Method { ret, .. } = &mut tree.ty {
                     **ret = inferred.clone();

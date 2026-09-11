@@ -851,6 +851,35 @@ fn is_primitive(ty: &Type) -> bool {
     }
 }
 
+/// The primitive type one of the eight numeric/boolean value classes stands
+/// for (`scala.Int` is `Type::Int`), `None` for any other class. `Unit` is
+/// left out: nothing is ever unboxed to it.
+fn primitive_class_type(st: &SymbolTable, cls: SymbolId) -> Option<Type> {
+    if cls.is_none() {
+        return None;
+    }
+    let t = if cls == st.int_sym {
+        Type::Int
+    } else if cls == st.long_sym {
+        Type::Long
+    } else if cls == st.double_sym {
+        Type::Double
+    } else if cls == st.float_sym {
+        Type::Float
+    } else if cls == st.char_sym {
+        Type::Char
+    } else if cls == st.boolean_sym {
+        Type::Boolean
+    } else if cls == st.byte_sym {
+        Type::Byte
+    } else if cls == st.short_sym {
+        Type::Short
+    } else {
+        return None;
+    };
+    Some(t)
+}
+
 fn is_ref_erased(ty: &Type) -> bool {
     matches!(
         ty,
@@ -1110,6 +1139,20 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             erase_tree(qual, st, recv_pt.as_ref());
             if let Some(c) = prelude_box {
                 wrap_vc_box(qual, c);
+            }
+            // A member of a primitive class selected on a receiver whose
+            // *erased* type is a reference: `t + 1` on `t: T` where `T <: Int`
+            // -- a declared bound, or the bound a GADT case put on `T`
+            // (`check_pattern::refine_gadt_bounds`). `T` erases to `Object`
+            // while `+` is `Int`'s, so the receiver has to be unboxed first,
+            // as nsc's erasure does for any selection whose qualifier's
+            // erased type is not the member owner's. Without it the backend
+            // emitted `iadd` on an `Object` (`VerifyError: Bad type on operand
+            // stack`).
+            if !tree.sym.is_none() && is_ref_erased(&qual.ty) {
+                if let Some(prim) = primitive_class_type(st, st.get(tree.sym).owner) {
+                    wrap_unbox(qual, prim);
+                }
             }
             if !tree.sym.is_none() {
                 let owner = st.get(tree.sym).owner;

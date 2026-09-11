@@ -1304,9 +1304,34 @@ impl Typer {
         let ids: Vec<SymbolId> = solved.iter().map(|(id, _)| *id).collect();
         let vals: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
         let out = crate::symbol::subst_tparams_slice(&ids, &vals, param);
-        if mentions_tparam(&out, &tps) || type_mentions_wildcard(&out) {
+        if type_mentions_wildcard(&out) {
             return Type::NoType;
         }
+        // nsc's *lenient* prototype (`protoTypeArgs` / `typedArgToPoly`): a
+        // variable the expected type did not settle is `WildcardType` in the
+        // argument's expected type, which constrains nothing there while the
+        // settled positions still reach the argument. The library's
+        // `override def map[B](f: A => B): CC[B] =
+        // strictOptimizedMap(iterableFactory.newBuilder, f)` is the shape:
+        // `strictOptimizedMap[B', C2](b: Builder[B', C2], f: A => B')` has
+        // `C2 := CC[B]` from the declared result, and `iterableFactory
+        // .newBuilder` typed at `Builder[_, CC[B]]` reads its own `A := B`
+        // out of the invariant `CC[A]` -- which is the only place `A` can be
+        // read from, `Builder` being contravariant in its element. Typed with
+        // no prototype instead it stayed `Builder[?A, CC[?A]]`, and the outer
+        // call reported `found: Builder[A, CC[A]] required: Builder[B, CC[A]]`
+        // (13 errors across `StrictOptimized{Iterable,Map,Seq,SortedMap}Ops`).
+        let out = if mentions_tparam(&out, &tps) {
+            let rest: Vec<SymbolId> = tps
+                .iter()
+                .copied()
+                .filter(|tp| type_mentions_tparam(&out, *tp))
+                .collect();
+            let wilds = vec![Type::Wildcard; rest.len()];
+            crate::symbol::subst_tparams_slice(&rest, &wilds, &out)
+        } else {
+            out
+        };
         // A by-name formal expects the *value*: `is_sub_type(F[Unit],
         // => F[Unit])` is false, and the caller would throw the prototype away
         // as one the argument did not fit. Wrapping in `Function0` is `adapt`'s
