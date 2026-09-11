@@ -11,17 +11,18 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `96c0abb3` |
+| commit | `e608c7dc` |
 |---|---|
 | updated | 2026-09-11 |
 
-**Forty-nine composed gates have been accepted this session**, covering the earlier
+**Fifty composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch, and the combined contextual,
-lexical, source-unit ownership and erased field-access batch.
+lexical, source-unit ownership and erased field-access batch, and the combined
+Scala declaration, array signature, value-class storage and implicit-view batch.
 Twenty-five intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -78,6 +79,7 @@ coordinator measured the merged tree each time, not the branches.
 | `913fb1c0` | collection results, evidence factories, Java members and full gitbucket inputs | **108** (115 on historical inputs) | 121 -> **103** |
 | `b969b0d1` | dependent results, SAM inference, implicit overrides and self types | 108 -> **105** | 103 -> **90** |
 | `96c0abb3` | contextual inference, lexical scope, source-unit identity and erased field access | 105 -> **99** | 90 -> **83** |
+| `e608c7dc` | declaration clauses, Array signatures, value-class/Unit storage and implicit views | 99 -> **96** | 83 -> **83** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -285,7 +287,7 @@ specialization remain explicitly red; this is not a completion claim.
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **83** | **34** | — |
-| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **99** | **46** | — |
+| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **96** | **45** | — |
 | `tests/scalalib_measure.sh` (538) | **415** | **113** | — |
 
 Gate `913fb1c0` expanded gitbucket input coverage: that candidate on the previous
@@ -295,7 +297,7 @@ This difference is not reported as a compiler-only improvement.
 
 The file counts above are the scripts' reported metric (`grep -A 2` after
 error headers). Multiline diagnostics can escape that two-line window. The
-complete current diagnostic parser finds 34 cats, 49 gitbucket and 122 library
+complete current diagnostic parser finds 34 cats, 48 gitbucket and 122 library
 source paths with errors. Error totals agree exactly; measurement inputs have
 not changed in this gate.
 
@@ -320,11 +322,14 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 |---|---:|---:|---:|
 | `pos` (1859) | **1150** | 364 | 345 |
 | `neg` (1405) | **718** | 318 | 369 |
-| `run` (2060) | **689** | 818 | 553 |
+| `run` (2060) | **697** | 810 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-96c0abb3.tsv`](baselines/corpus-96c0abb3.tsv): 5324 unique
+[`baselines/corpus-e608c7dc.tsv`](baselines/corpus-e608c7dc.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `e608c7dc` gate compared against `corpus-96c0abb3.tsv`: **losses=0,
+changes=8**: run/collections-toSelf, run/reflection-valueclasses-magic, run/t12222, run/t2255, run/t6260, run/t6337a, run/t9546, run/t9546b.
+
 The `96c0abb3` gate compared against `corpus-b969b0d1.tsv`: **losses=0,
 changes=14**: neg/i10715b, neg/no-implicit-to-anyref-any-val, neg/t473, neg/unit2anyref, neg/val_sig_infer_match, pos/t2660, pos/t4812, pos/t927, run/reflection-sync-potpourri, run/t11196, run/t3502, run/t6928-run, run/t7223, run/t7436.
 
@@ -460,15 +465,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **311 result rows, 2779 passed, 0 failed** at `96c0abb3` |
+| `cargo test --workspace --release --no-fail-fast` | **312 result rows, 2783 passed, 0 failed** at `e608c7dc` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-field-scope/integrated-prerequisites/clippy-phase.log` and
-`/tmp/scala-rs-field-scope/integrated-prerequisites/clippy-compare.json`.
+`/tmp/scala-rs-declaration-boundaries/final-prerequisites/clippy-phase.log` and
+`/tmp/scala-rs-declaration-boundaries/final-prerequisites/clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -3522,6 +3527,83 @@ Exact summary block:
 ```text
 === summary
   HEAD=96c0abb3  logs=/tmp/scala-rs-gate-96c0abb3-codex
+VERDICT=PASS
+DONE
+```
+
+
+## Gate fifty: declaration, signature and storage boundaries
+
+Frozen candidate `e608c7dc2e205c974cfdecc7a31724a01fd32f17`, tree `a2ac399a997c1621d1d73c1494bb009fcdc43bf9`, contains local main
+6977d6bb. Full gate `/tmp/scala-rs-gate-e608c7dc-codex` completed with exit 0 in
+1423.1 seconds. DONE is present; script verdict and independent audit
+are PASS. The candidate is accepted on main. The handover adds only this
+baseline record and its raw corpus ledger; compiler sources, Cargo inputs and
+fixtures are identical to the gated tree. Push remains pending explicit
+destination/payload authorization after automatic approval review rejected the
+previous attempts; no successful push is claimed.
+
+- Gitbucket: 354 Scala/Twirl sources, three real Java sources, none skipped;
+  99/46 -> 96/45.
+- Cats: 339 sources, one skipped; 83/34 ->
+  83/34.
+- Library: 538 sources; 415/113 ->
+  415/113.
+- Slick: zero errors, 1504 classes, 12 clients and 36/36 byte-exact runtime
+  attempts. Subset verifies 1504, lint_problems=0. Independent strong class
+  loading verifies all 1504, failures=0, incomplete=0.
+
+Diagnostic identity changes: {"cats": {"added": 0, "added_locations": 0, "removed": 0}, "gitbucket": {"added": 0, "added_locations": 0, "removed": 3}, "scalalib": {"added": 2, "added_locations": 0, "removed": 2}}.
+Workspace: 2783 passed, 0 failed,
+312 result rows. Corpus: 5324 unique identities, losses=0,
+changes=8: run/collections-toSelf, run/reflection-valueclasses-magic, run/t12222, run/t2255, run/t6260, run/t6337a, run/t9546, run/t9546b.
+Counts: {"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 364, "pass": 1150, "skip": 345}, "run": {"fail": 810, "pass": 697, "skip": 553}}.
+Ledger [`baselines/corpus-e608c7dc.tsv`](baselines/corpus-e608c7dc.tsv), SHA-256
+`265cc379503904978574bdc8926ca65dd6047d06f83ad80fe1fa9a78ae1e313b`.
+
+The batch inventory and hypothesis corrections are in
+[declaration-boundaries.md](../docs/batches/declaration-boundaries.md).
+Repairs include source/loaded method clause identity, generic and existential
+Array signatures, superclass declaration storage, generic Unit field/lazy
+loads, value-class accessor collisions, implicit clause completion, identity
+and Array wrapping inference, and boxed-this result boundaries. The four
+new declbound test groups use real scalac 2.13.16 acceptance/rejection and JVM
+execution, compare stdout bytes, and cover all four producer/consumer
+combinations for Array and clause declarations. No stubs or subagents were
+used; the aggregate before numbers were read from the accepted baseline.
+
+Before the full gate, the initial frozen candidate passed 1636 CLI tests in
+152 suites and 198 typer tests. Its prerequisite corpus found three by-name
+constructor losses. The next candidate recovered those but exposed t6385,
+where a wrong getter unbox had compensated for an incorrect boxed-this return.
+Both corpus prerequisite failures stopped before any full gate; neither is counted
+as a rejected full gate. The final correction passed 90 directly related tests
+in 12 suites and another 28 tests in five by-name-related suites, then reran
+2851 selected pos/run corpus identities: losses=0, changes=8.
+All 1405 negatives: losses=0, changes=0.
+Initial prerequisite binary SHA-256 `520650d1f64c5b7f1062db93bb49d09e1a82e5c09c1bd5ce2e35b19bd504bf3d` differs from the
+final prerequisite/gate binary `895222eada7b741eb3a7eeb5bdc58ef349bba9da63a13cb60e4a886f8e7a51a1`; earlier broad CLI results
+are not attributed to the final binary. The full workspace and corpus gate
+covers the final binary. Clippy stays at 57 existing warnings, none added.
+Source/jar/cache preflight checks four pinned trees, 121 jars, 33 released Java
+classes and 1498 reference class hashes. Final early Slick/library compilation,
+1504 strong class loads and 36 runtime comparisons passed before the gate.
+The library diagnostic audit reviewed exactly two same-location replacements:
+SortedMap.newBuilder now diagnoses missing Ordering[K] instead of mapResult
+on an unapplied implicit method. No diagnostic location was added; the
+original early audit failure and exact review remain in early/.
+Scratch evidence: /tmp/scala-rs-declaration-boundaries/.
+
+Map.getOrElse invariant Set inference, result-valued overload ambiguity,
+full-run cats Tuple.swap and implicit parent-constructor evidence remain
+unresolved. MODE=a and specialization remain red and were not rerun. These
+results do not claim complete Scala conformance or zero gitbucket/cats errors.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=e608c7dc  logs=/tmp/scala-rs-gate-e608c7dc-codex
 VERDICT=PASS
 DONE
 ```
