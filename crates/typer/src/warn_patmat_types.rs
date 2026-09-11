@@ -617,6 +617,41 @@ fn is_scala_owned(st: &SymbolTable, s: SymbolId) -> bool {
     st.get(s).jvm_name.starts_with("scala/")
 }
 
+/// The constant type nsc gives a library `final val` the prelude declares
+/// with its widened type (`Double.NaN` is `ConstantType(NaN)` in nsc, and a
+/// match on it is decided statically).
+pub(crate) fn library_constant(st: &SymbolTable, sym: SymbolId) -> Option<CVal> {
+    if sym.is_none() {
+        return None;
+    }
+    let s = st.get(sym);
+    if s.owner.is_none() {
+        return None;
+    }
+    let owner = st.get(s.owner).jvm_name.as_str();
+    let name = s.name.as_str();
+    Some(match (owner, name) {
+        ("scala/Double$", "NaN") => CVal::Double(f64::NAN.to_bits()),
+        ("scala/Double$", "PositiveInfinity") => CVal::Double(f64::INFINITY.to_bits()),
+        ("scala/Double$", "NegativeInfinity") => CVal::Double(f64::NEG_INFINITY.to_bits()),
+        ("scala/Double$", "MaxValue") => CVal::Double(f64::MAX.to_bits()),
+        ("scala/Double$", "MinValue") => CVal::Double(f64::MIN.to_bits()),
+        ("scala/Double$", "MinPositiveValue") => CVal::Double(f64::from_bits(1).to_bits()),
+        ("scala/Float$", "NaN") => CVal::Float(f32::NAN.to_bits()),
+        ("scala/Float$", "PositiveInfinity") => CVal::Float(f32::INFINITY.to_bits()),
+        ("scala/Float$", "NegativeInfinity") => CVal::Float(f32::NEG_INFINITY.to_bits()),
+        ("scala/Float$", "MaxValue") => CVal::Float(f32::MAX.to_bits()),
+        ("scala/Float$", "MinValue") => CVal::Float(f32::MIN.to_bits()),
+        ("scala/Int$", "MaxValue") => CVal::Int(i32::MAX),
+        ("scala/Int$", "MinValue") => CVal::Int(i32::MIN),
+        ("scala/Long$", "MaxValue") => CVal::Long(i64::MAX),
+        ("scala/Long$", "MinValue") => CVal::Long(i64::MIN),
+        ("scala/Char$", "MaxValue") => CVal::Char('\u{FFFF}'),
+        ("scala/Char$", "MinValue") => CVal::Char('\0'),
+        _ => return None,
+    })
+}
+
 /// A library class's pickled flags (`pflags`): the prelude's hand-written
 /// `Option` and `List` do not carry `sealed` / `abstract`, the pickles do.
 pub(crate) fn pickled_flags(t: &mut Typer, cls: SymbolId) -> Option<u64> {

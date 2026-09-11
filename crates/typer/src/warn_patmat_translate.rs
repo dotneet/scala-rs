@@ -242,7 +242,10 @@ impl<'t> Translator<'t> {
                             (Type::Constant(l), _) | (_, Type::Constant(l)) => Some(l.clone()),
                             _ => None,
                         };
-                        let tp = match constant {
+                        let library = crate::warn_patmat_types::library_constant(st, pat.sym);
+                        let tp = if let Some(c) = library {
+                            NTy::Const(c)
+                        } else { match constant {
                             Some(l) => match CVal::from_lit(&l) {
                                 Some(CVal::Null) => NTy::Null,
                                 Some(c) => NTy::Const(c),
@@ -257,7 +260,7 @@ impl<'t> Translator<'t> {
                                 }
                                 NTy::Fresh(*self.fresh, Box::new(w))
                             }
-                        };
+                        } };
                         (tp, stable)
                     }
                     _ => return Err(bail!()),
@@ -384,8 +387,21 @@ impl<'t> Translator<'t> {
                 // pattern's own type is the scrutinee's).
                 let tps = us.tparams.clone();
                 let mut found: Vec<Option<Type>> = vec![None; tps.len()];
-                unify_tparams(param, &pat.ty, &tps, &mut found);
+                // Against the scrutinee's base type for the parameter's class
+                // (`Seq[A]` against a `List[String]` is `Seq[String]`).
+                let actual = match (param, &pat.ty) {
+                    (Type::Class { sym: p, .. }, Type::Class { sym: s, .. }) if p != s => st
+                        .base_type_seq(&pat.ty)
+                        .into_iter()
+                        .find(|b| matches!(b, Type::Class { sym, .. } if sym == p))
+                        .unwrap_or_else(|| pat.ty.clone()),
+                    _ => pat.ty.clone(),
+                };
+                unify_tparams(param, &actual, &tps, &mut found);
                 let Some(args) = found.into_iter().collect::<Option<Vec<Type>>>() else {
+                    if std::env::var_os("SCALA_RS_PATMAT_DEBUG").is_some() {
+                        eprintln!("patmat: unify {param:?} with {:?}", pat.ty);
+                    }
                     return Err(bail!());
                 };
                 (st.subst_tparams(u, &args, param), st.subst_tparams(u, &args, ret))
@@ -407,6 +423,10 @@ impl<'t> Translator<'t> {
                         let cname = o.jvm_name.strip_suffix('$').unwrap_or("").to_string();
                         crate::classpath::find_by_jvm(st, &cname)
                     };
+                    let applied_arg = match &param {
+                        Type::Applied { args, .. } if args.len() == 1 => Some(self.ty(&args[0])),
+                        _ => None,
+                    };
                     match (&sel, companion) {
                         (NTy::Class(c, args), Some(comp)) if *c == comp => {
                             // The wrapper's element type is the scrutinee's.
@@ -418,6 +438,14 @@ impl<'t> Translator<'t> {
                                 }
                             }
                             sel
+                        }
+                        // `Seq(x, y)` against a `List[Int]`: the parameter is
+                        // `Seq[Int]`.
+                        (_, Some(comp))
+                            if st.get(comp).tparams.len() == 1
+                                && applied_arg.as_ref().is_some_and(|a| !a.is_unknown()) =>
+                        {
+                            NTy::Class(comp, vec![applied_arg.unwrap()])
                         }
                         _ => p,
                     }
@@ -438,6 +466,7 @@ impl<'t> Translator<'t> {
                 _ => return Err(bail!()),
             };
             let seq_wrapper = matches!(&get_ty, NTy::Class(c, _) if is_wrapper(*c));
+            let mut seq_wrapper_factory = false;
             let equiv: Vec<NTy> = if boolean && !is_seq_ex {
                 Vec::new()
             } else {
@@ -455,10 +484,22 @@ impl<'t> Translator<'t> {
             if is_seq_ex {
                 let mut p = equiv.clone();
                 let last = p.pop().ok_or_else(|| bail!())?;
+                // nsc: the last extracted type is a `Seq[E]` (or the
+                // `UnapplySeqWrapper[E]` a collection factory returns). The
+                // prelude writes a factory's `unapplySeq` with the element
+                // type itself (`Option[A]`).
+                let factory = st
+                    .get(us.owner)
+                    .jvm_name
+                    .starts_with("scala/collection/");
                 let elem = match &last {
-                    NTy::Class(_, a) if a.len() == 1 => a[0].clone(),
+                    NTy::Class(c, a) if a.len() == 1 && !(factory && !is_seq_like(st, *c)) => a[0].clone(),
+                    other if factory && !other.is_unknown() => other.clone(),
                     _ => return Err(bail!()),
                 };
+                if factory {
+                    seq_wrapper_factory = true;
+                }
                 product_types = p;
                 elem_type = Some(elem);
             } else if total_arity == 1 && equiv.len() > 1 {
@@ -477,7 +518,7 @@ impl<'t> Translator<'t> {
             ext = Some(ExtInfo {
                 unapply: u,
                 irrefutable,
-                seq_wrapper,
+                seq_wrapper: seq_wrapper || seq_wrapper_factory,
             });
         }
         if param_type.is_unknown() {
@@ -620,6 +661,19 @@ impl<'t> Translator<'t> {
     }
 }
 
+/// A sequence class (`Seq`, `List`, ...) or `UnapplySeqWrapper`: what the
+/// last type an `unapplySeq` extracts is.
+fn is_seq_like(st: &crate::symbol::SymbolTable, c: SymbolId) -> bool {
+    let s = st.get(c);
+    if s.name == "UnapplySeqWrapper" {
+        return true;
+    }
+    let seq = crate::classpath::find_by_jvm(st, "scala/collection/Seq");
+    c == st.list_sym
+        || seq.is_some_and(|q| q == c || crate::pickle_supply::inherits_from(st, c, q))
+        || matches!(s.name.as_str(), "Seq" | "IndexedSeq" | "LinearSeq" | "List" | "Vector")
+}
+
 /// Bind `tps` by matching the declared type `p` against the actual `s`.
 fn unify_tparams(p: &Type, s: &Type, tps: &[SymbolId], out: &mut [Option<Type>]) {
     match (p, s) {
@@ -633,6 +687,13 @@ fn unify_tparams(p: &Type, s: &Type, tps: &[SymbolId], out: &mut [Option<Type>])
         (Type::Class { sym: a, args: pa }, Type::Class { sym: b, args: sa })
             if a == b && pa.len() == sa.len() =>
         {
+            for (x, y) in pa.iter().zip(sa) {
+                unify_tparams(x, y, tps, out);
+            }
+        }
+        // `CC[A]` against `List[Int]`: the factory's collection type is the
+        // scrutinee's class or one of its parents, with the same argument.
+        (Type::Applied { args: pa, .. }, Type::Class { args: sa, .. }) if pa.len() == sa.len() => {
             for (x, y) in pa.iter().zip(sa) {
                 unify_tparams(x, y, tps, out);
             }

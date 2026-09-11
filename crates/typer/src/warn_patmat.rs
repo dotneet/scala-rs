@@ -589,6 +589,12 @@ impl<'a> Patmat<'a> {
                 Some(c) => NTy::Const(c),
                 None => NTy::Unknown,
             },
+            TreeKind::Ident { .. } | TreeKind::Select { .. } => {
+                match crate::warn_patmat_types::library_constant(&self.t.st, selector.sym) {
+                    Some(c) => NTy::Const(c),
+                    None => tys.of(&selector.ty),
+                }
+            }
             _ => tys.of(&selector.ty),
         }
     }
