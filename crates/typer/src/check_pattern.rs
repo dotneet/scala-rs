@@ -1381,11 +1381,19 @@ impl Typer {
     }
 
     /// A member with no implementation: a body-less `def` (the namer sets
-    /// `ABSTRACT` on those) or a body-less `val` / `var`.
+    /// `ABSTRACT` on those), a pickled one (`Symbol::deferred_method`, the
+    /// pickle's `DEFERRED`), or a body-less `val` / `var`.
+    ///
+    /// The pickled half is what scalatra needs: `ScalatraBase` declares an
+    /// abstract `requestPath(implicit request)`, reached through
+    /// `JacksonJsonSupport` before the class-file `ScalatraFilter` that
+    /// implements it *and* its `requestPath(uri, idx)` overload. Read as
+    /// concrete, the declaration won `super.requestPath(uri, idx)` with the
+    /// wrong arity (gitbucket's `ControllerBase`).
     pub(crate) fn is_deferred_member(&self, m: SymbolId) -> bool {
         let s = self.st.get(m);
         match s.kind {
-            SymKind::Method => s.flags.contains(Flags::ABSTRACT),
+            SymKind::Method => s.flags.contains(Flags::ABSTRACT) || s.deferred_method,
             SymKind::Term => s.deferred_val,
             _ => false,
         }

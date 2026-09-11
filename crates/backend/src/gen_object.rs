@@ -175,9 +175,13 @@ impl<'a> Gen<'a> {
         // case-class companion: synthetic apply
         let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
-            if self.st.get(class_id).flags.contains(Flags::CASE)
-                && !impl_.body.iter().any(|t| t.name() == Some("apply"))
-            {
+            // A written `apply` suppresses the synthetic one only when it has
+            // the synthetic one's signature (`emit_case_apply` checks the
+            // descriptor against what the body already emitted). An overload
+            // of another shape -- `WebHookPushPayload.apply(git, …, newId,
+            // oldId)` beside the case class's own -- leaves it in place, and
+            // that body's `WebHookPushPayload(pusher = …)` calls it.
+            if self.st.get(class_id).flags.contains(Flags::CASE) {
                 emit_case_apply(&mut b, self.st, class_id);
                 // nsc emits no forwarder for an `apply` that is not public.
                 // With `-Xsource-features:case-apply-copy-access` the `public
@@ -1368,6 +1372,13 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
+    // The companion's own `apply` of this very signature replaces it.
+    if b.methods
+        .iter()
+        .any(|m| m.name == "apply" && m.desc == desc)
+    {
+        return;
+    }
     // A case class nested in a class takes its enclosing instance first; the
     // companion is nested in the same class and holds the same one in its own
     // `$outer`. Reading it off the builder keeps the two in step: a companion
