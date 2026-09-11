@@ -3391,3 +3391,79 @@ with corpus losses=0 and 2655 workspace tests passing. Gitbucket improved
 239/71 -> 228/69, with all ten returning diagnostics removed and no new
 error-message entries. Cats remains 163/62. Shape-related diagnostics do not
 improve; no result for that separate family is inferred from these probes.
+
+## Fixed: unapplied methods, method-reference arguments and seven other roots (`agent/gbmisc`)
+
+Measured on the branch point `4ac7c31b` (= `9cac778e` plus the JDK 17 data
+fix): gitbucket 92/43 -> 36/31, of which 31 are the `mapTo` macro errors that
+`agent/gbmacro` owns. Each root below was reduced to a standalone program and
+checked against scalac 2.13.16 in both directions; the fixtures are
+`tests/fixtures/gbmisc_*` and `crates/cli/tests/gbmisc.rs`.
+
+* **Unapplied methods** (`check_method_value.rs`). 2.13: a method with
+  parameters is a function only where a function (or SAM) type is expected;
+  anywhere else -- a `val`/`def` right-hand side, a selection prefix, an
+  argument whose formal is not a function, a branch, a lambda body -- it is
+  nsc's `missing argument list for method m in object O` with nsc's advice
+  lines. `-Xsource:3` (`TypecheckOptions::scala3`): eta-expanded wherever a
+  value is required, curried per clause, open type parameters at `Nothing`
+  (gitbucket's `RepositoryOptions.apply.tupled`). scala-rs used to leave the
+  method type standing and let `uncurry` flatten it, so `val c = curried`
+  made `c(2)(5)` mean `curried(2)` applied to `5`. An eta-expansion now also
+  evaluates an impure receiver once (`val f: Int => Int = mk().m` ran `mk()`
+  per call; slick had five such sites, e.g. `options.find(ct.runtimeClass.isInstance _)`).
+* **Method references as function arguments** (`method_ref_function_proto`):
+  `xs.foreach(println)` is typed against `Int => ?`, so the overload keeps
+  `println(x: Any)` instead of auto-applying `println()`. Also SAM formals
+  (`maybe_auto_apply` keeps an overload whose alternative has the SAM's arity
+  unless a value alternative already fits). Corpus: 12 `run` tests and
+  `pos/sammy_infer_argtype_subtypes` no longer stop at `with arguments (Unit)`.
+* **Named arguments over a companion's `apply` overloads**: the module's and
+  the module class's `apply`s are one set (`named_arg_param_ids`), and the
+  backend emits the synthetic case `apply` unless the companion wrote one of
+  the *same* descriptor (it was suppressed by any `apply`, a
+  `NoSuchMethodError` at run time; slick's own `SimpleLiteral$` now matches
+  the released jar).
+* **Java `Object` in an overridden signature** (`override_check::java_object_paramss`):
+  nsc's `ObjectTpeJava`; a Scala override may write `AnyRef`, `Any` or
+  `Object`. Also removes 13 scala-library errors (`MainNode` subclasses,
+  JavaConverters wrappers). `agent/libdecl` has an overlapping fix.
+* **Auto-tupling before prototypes**: arguments of a single-clause callee
+  given more arguments than parameters are typed without per-position
+  prototypes. **No view into a tuple** from a class that merely has the
+  tuple's arity (`Unify`): `val t: (String, String) = "x"` compiled whenever
+  slick's API was imported.
+* **Wildcards in implicit unification**: an unbound unknown facing `_` no
+  longer fails the unification; `repColumnShape` against
+  `Shape[_ <: FlatShapeLevel, ?M, _, Rep[Int]]` is what solves
+  `OptionLift.repOptionLift`. Together with warming the witness chain of an
+  extension conversion (`warm_witness_chain`) and keeping a pickled type
+  parameter that an implicit clause *behind an explicit one* determines
+  (`AnyOptionExtensionMethods.getOrElse`), this removed the whole
+  `value _1 is not a member of A` / `OptionLift[..., O2]` /
+  `Shape[FlatShapeLevel, O2, U2, _]` family (about 30 errors) that was
+  attributed to the `mapTo` cascade: it reproduces without any `mapTo`.
+* **Smaller roots**: `Query(r)` (an inserted `apply`) now applies what its
+  implicit clause solved to the result; a JVM `static` forwarder is no
+  member of an object extending a binary case class (Twirl templates);
+  `super.m` skips a *pickled* abstract member (`deferred_method`) as it
+  skipped a source one (scalatra `requestPath`); an implicit view with a
+  by-name parameter views the value and receives it as a thunk (scalatra's
+  `booleanBlock2RouteMatcher`).
+
+Left, with reproductions:
+
+* `Profile.scala:15`: `MappedColumnType.base[Date, Timestamp]` asks for
+  `RelationalTypesComponent.BaseColumnType[Timestamp]`, the *abstract* member,
+  which only `JdbcTypesComponent`'s alias makes `JdbcType[T] with
+  BaseTypedType[T]`; `timestampColumnType: TimestampJdbcType` cannot be shown
+  to conform. Reproduces with `import BlockingH2Driver.blockingApi._` and the
+  one definition.
+* `IssuesService.scala:1116`: `o.map(x => x.toSet)` on an `Option[Seq[String]]`
+  is `Option[Set[A]]` (the lower bound of `toSet[B >: A]` is not seen from
+  the receiver inside the lambda); outside a lambda it is `Set[String]`.
+* `IssuesService.scala:867`: the `Tuple2 => Ordered` view for `sortBy`.
+* `Repository.scala:77`: `Some(...)` inside `.shaped.<>(…, r => Some(…))`
+  resolves to `Rep.Some`; does not reproduce outside the table projection.
+* `DatabaseConfig.scala:124`: `object … extends PostgresProfile with
+  BlockingJdbcProfile` "needs 15 members".

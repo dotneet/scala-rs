@@ -4,7 +4,7 @@
 //! comparison, `synchronized`, string concatenation and interpolation, and
 //! `try` / `catch` / `finally`.
 
-use crate::classfile::{EmittedClass, ACC_INTERFACE, ACC_STATIC};
+use crate::classfile::{EmittedClass, ACC_INTERFACE, ACC_PRIVATE, ACC_STATIC};
 use crate::classfile::{Field, ACC_FINAL, ACC_PUBLIC, ACC_SUPER, ACC_SYNTHETIC};
 use crate::code::{Assembler, StackEntry};
 use crate::gen::*;
@@ -428,6 +428,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
                         source,
                         outer: outer_ref,
                         presuper_outer: None,
+                        presuper: false,
                         outer_slot: None,
                         library_abi,
                         method_sym: SymbolId::NONE,
@@ -490,6 +491,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
                             source,
                             outer: outer_ref,
                             presuper_outer: None,
+                            presuper: false,
                             outer_slot: None,
                             library_abi,
                             method_sym: SymbolId::NONE,
@@ -673,6 +675,8 @@ pub(crate) fn gen_function_indy(
     // the interface, and the method handle then has to be an
     // `InterfaceMethodref`.
     let owner_is_iface = owner == ctx.class_name && is_interface_sym(ctx.st, ctx.class_sym);
+    // `$deserializeLambda$` needs `scala.runtime.LambdaDeserialize`, which only
+    // the real library has.
     asm.invokedynamic_lambda(
         "apply",
         &sam_desc,
@@ -681,6 +685,7 @@ pub(crate) fn gen_function_indy(
         &impl_name,
         &impl_desc,
         owner_is_iface,
+        ctx.library_abi,
     );
 
     ctx.lambda_bodies.borrow_mut().push(PendingBody {
@@ -774,6 +779,7 @@ pub(crate) fn emit_lambda_body(
             source,
             outer: None,
             presuper_outer: None,
+            presuper: false,
             outer_slot: if pb.has_outer { Some(0) } else { None },
             library_abi,
             method_sym: SymbolId::NONE,
@@ -942,22 +948,37 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     // Emit the lambda class
     let mut b = ClassBuilder::new(lam_name.clone(), ctx.source);
     b.access = ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL;
-    // A SAM may be an abstract *class* (`abstract class Handler { def
-    // handle(s: String): String }`, SLS 6.26.2 allows it with a no-argument
-    // constructor). The literal's class then extends it and runs its
-    // constructor; naming it as an interface was
-    // `IncompatibleClassChangeError: ... can not implement Main$Handler,
-    // because it is not an interface`.
-    let sam_super = sam
+    // A SAM type may be an abstract *class* (`abstract class F { def
+    // apply(a: Any): Any }`): the lambda then extends it. Listing it as an
+    // interface was an `IncompatibleClassChangeError` when the class loaded
+    // (`run/sammy_seriazable`).
+    let sam_superclass = sam
         .as_ref()
         .filter(|s| !is_interface_sym(ctx.st, s.class))
         .map(|_| iface.clone());
-    if let Some(sup) = &sam_super {
-        b.super_name = sup.clone();
-    } else {
-        b.interfaces.push(iface);
+    let super_ctor_owner = sam_superclass
+        .clone()
+        .unwrap_or_else(|| "java/lang/Object".to_string());
+    match &sam_superclass {
+        Some(sc) => b.super_name = sc.clone(),
+        None => b.interfaces.push(iface),
     }
-    let super_init = sam_super.unwrap_or_else(|| "java/lang/Object".to_string());
+    // nsc pins a serializable lambda class's `serialVersionUID` at 0, as if it
+    // had been written `@SerialVersionUID(0)`; without the field the JVM
+    // derives one from the class's shape.
+    let serializable = sam.as_ref().is_some_and(|s| {
+        ctx.st
+            .find_class_by_jvm("java/io/Serializable")
+            .is_some_and(|ser| self_reaches_owner(ctx.st, s.class, ser))
+    });
+    if serializable {
+        b.fields.push(Field {
+            access: ACC_PRIVATE | ACC_STATIC | ACC_FINAL,
+            name: "serialVersionUID".into(),
+            desc: "J".into(),
+        });
+        b.field_constants.insert("serialVersionUID".into(), 0);
+    }
     if need_outer {
         b.fields.push(Field {
             access: ACC_PUBLIC,
@@ -982,7 +1003,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
         1 + 1 + cap_n as u16,
         |a| {
             a.aload(0);
-            a.invokespecial(&super_init, "<init>", "()V");
+            a.invokespecial(&super_ctor_owner, "<init>", "()V");
             let mut slot = 1u16;
             if need_outer_c {
                 a.aload(0);
@@ -1048,6 +1069,18 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     };
     let ret_ty_pf = ret_ty.clone();
     let sam_ret = sam_emit.as_ref().map(|(_, _, r)| r.clone());
+    // Where each parameter arrives. A `FunctionN.apply` takes `Object`s, one
+    // slot each; a user SAM's method is emitted at its own descriptor, so an
+    // `apply(i: Int)` receives an `int` -- and a `Long`/`Double` takes two
+    // slots. Reading every parameter as an `Object` in slot `1 + i` made
+    // `val l: IntToString = (x: Int) => …` fail verification at its first
+    // instruction (`aload_1` on an `int`, `run/lambda-serialization-security`).
+    let raw_params: Vec<Option<Type>> = match &sam {
+        Some(s) if s.raw_param_tys.len() == arity => {
+            s.raw_param_tys.iter().map(|t| Some(t.clone())).collect()
+        }
+        _ => vec![None; arity],
+    };
     let meth_name_owned = meth_name.to_string();
     let meth_desc_owned = meth_desc.to_string();
 
@@ -1079,57 +1112,21 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
             },
         );
     } else {
-        // Where each parameter arrives. `FunctionN.apply` takes every one as an
-        // `Object`; a SAM's method takes its *declared* erased parameters, so
-        // `trait IntOp { def apply(x: Int): Int }` hands the lambda an `int` in
-        // slot 1 (and a `long`/`double` takes two slots). Reading every slot
-        // as an `Object` was `VerifyError: Bad local variable type` for any
-        // SAM with a primitive parameter.
-        let incoming: Vec<(u16, Option<Type>)> = {
-            let mut slot = 1u16;
-            (0..arity)
-                .map(|i| {
-                    let raw = sam
-                        .as_ref()
-                        .and_then(|s| s.raw_param_tys.get(i))
-                        .filter(|t| is_jvm_primitive(t) && !is_unit_like(t))
-                        .cloned();
-                    let here = slot;
-                    slot += raw.as_ref().map(|t| jvm_sort(t).slots()).unwrap_or(1);
-                    (here, raw)
-                })
-                .collect()
-        };
-        let first_free = incoming
-            .last()
-            .map(|(s, raw)| s + raw.as_ref().map(|t| jvm_sort(t).slots()).unwrap_or(1))
-            .unwrap_or(1);
         b.add_code(ACC_PUBLIC, &meth_name_owned, &meth_desc_owned, 8, |a| {
             let mut fr = Frame::instance();
-            fr.next_slot = first_free;
+            let mut arg_slots = Vec::with_capacity(arity);
+            let mut next = 1u16;
+            for raw in &raw_params {
+                arg_slots.push(next);
+                next += match raw {
+                    Some(t) if is_jvm_primitive(t) && !is_unit_like(t) => jvm_sort(t).slots(),
+                    _ => 1,
+                };
+            }
+            fr.next_slot = next;
             // apply args occupy slots 1..arity as Object; remap param symbols after unbox
             for (i, p) in vparams.iter().enumerate() {
-                let (obj_slot, raw_prim) = incoming[i].clone();
-                if let Some(raw) = raw_prim {
-                    // A primitive the SAM passes as such: widen or box it to
-                    // what the lambda's parameter was typed at.
-                    let pty = if p.sym.is_none() {
-                        p.ty.clone()
-                    } else {
-                        st.get(p.sym).ty.clone()
-                    };
-                    let raw_sort = jvm_sort(&raw);
-                    load(a, obj_slot, raw_sort);
-                    if is_jvm_primitive(&pty) && !is_unit_like(&pty) {
-                        widen_primitive(a, &raw, &pty);
-                    } else {
-                        emit_box(a, &raw);
-                    }
-                    let sort = jvm_sort(&pty);
-                    let slot = fr.alloc(p.sym, sort);
-                    store(a, slot, sort);
-                    continue;
-                }
+                let obj_slot = arg_slots.get(i).copied().unwrap_or(1 + i as u16);
                 // A parameter instantiated at a value class receives the boxed
                 // instance; erasure recorded that on the symbol.
                 let p = &Tree {
@@ -1140,6 +1137,20 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                     },
                     ..p.clone()
                 };
+                if let Some(Some(raw)) = raw_params.get(i) {
+                    if is_jvm_primitive(raw) && !is_unit_like(raw) {
+                        load(a, obj_slot, jvm_sort(raw));
+                        if is_jvm_primitive(&p.ty) && !is_unit_like(&p.ty) {
+                            widen_primitive(a, raw, &p.ty);
+                        } else {
+                            emit_box(a, raw);
+                        }
+                        let sort = jvm_sort(&p.ty);
+                        let slot = fr.alloc(p.sym, sort);
+                        store(a, slot, sort);
+                        continue;
+                    }
+                }
                 a.aload(obj_slot);
                 if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
                     emit_unbox(a, &p.ty);
@@ -1204,6 +1215,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 source,
                 outer: outer_ref,
                 presuper_outer: None,
+                presuper: false,
                 outer_slot: None,
                 library_abi,
                 method_sym: SymbolId::NONE,
@@ -2109,13 +2121,21 @@ pub(crate) fn gen_try(
     asm.goto(after);
 
     asm.mark(handler);
-    asm.enter_handler_captured_locals();
+    // A guarded region that holds no code (the whole `try` sits after a
+    // `return` or a `throw`, as in the copy of a `finally` emitted for the
+    // normal exit of a body that never exits normally) protects nothing: its
+    // table entry is dropped, so the handler stays unreachable and is emitted
+    // as dead code, which `drop_dead` discards.
+    if !asm.guarded_range_is_empty(start, end_try) {
+        asm.enter_handler_captured_locals();
+    }
     store(asm, exn_slot, JvmSort::Ref);
     let catch_rethrow = if has_finally && !catches.is_empty() {
         Some(asm.fresh_label())
     } else {
         None
     };
+    let mut rethrow_live = false;
     for c in catches {
         let fail = asm.fresh_label();
         gen_pattern(asm, frame, ctx, &c.pat, exn_slot, JvmSort::Ref, fail);
@@ -2156,6 +2176,7 @@ pub(crate) fn gen_try(
         }
         asm.goto(after);
         if let Some(rethrow) = catch_rethrow {
+            rethrow_live |= !asm.guarded_range_is_empty(catch_start, catch_end);
             asm.exception(catch_start, catch_end, rethrow, Some("java/lang/Throwable"));
         }
         asm.mark(fail);
@@ -2168,7 +2189,9 @@ pub(crate) fn gen_try(
 
     if let Some(rethrow) = catch_rethrow {
         asm.mark(rethrow);
-        asm.enter_handler_captured_locals();
+        if rethrow_live {
+            asm.enter_handler_captured_locals();
+        }
         store(asm, exn_slot, JvmSort::Ref);
         gen_stat(asm, frame, ctx, finalizer);
         load(asm, exn_slot, JvmSort::Ref);

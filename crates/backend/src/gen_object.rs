@@ -62,6 +62,18 @@ impl<'a> Gen<'a> {
             Some(_) => self.add_serializable(&mut b),
             // `case object Q`: a `Product` in its own right.
             None if mods.flags.contains(Flags::CASE) => self.add_product_interfaces(&mut b),
+            // The companion of a `Serializable` class: the typer added the
+            // parent (`Typer::link_serializable_companion`, nsc's
+            // `typedModuleDef`), but the source's parent trees do not name it.
+            None if !cls.is_none()
+                && self.st.get(cls).parents.iter().any(|p| {
+                    self.st
+                        .class_sym_of(p)
+                        .is_some_and(|s| class_internal(self.st, s) == "java/io/Serializable")
+                }) =>
+            {
+                self.add_serializable(&mut b)
+            }
             None => {}
         }
         // A member `object` lives once per enclosing instance, so it carries
@@ -106,7 +118,7 @@ impl<'a> Gen<'a> {
         let binary_lazies = self.binary_mixin_lazy_vals(cls, &impl_.body);
         for v in &self.mixin_lazy_vals(cls, &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PRIVATE,
+                access: Self::mixin_lazy_field_access(v),
                 name: v.name().unwrap_or("").to_string(),
                 desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
@@ -175,13 +187,17 @@ impl<'a> Gen<'a> {
         // case-class companion: synthetic apply
         let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
-            // A hand-written `apply` suppresses the synthetic one only at
-            // the same parameter types (`emit_case_apply` checks the
-            // descriptor); `object Money { def apply(d: Double) }` beside
-            // `case class Money(cents: Long)` keeps `apply(J)`, which the
-            // typer resolves `Money(5L)` to -- skipping it on the name alone
-            // was a `NoSuchMethodError` at that call.
-            if self.st.get(class_id).flags.contains(Flags::CASE) {
+            // The synthetic `apply` is owed exactly when the typer kept it: a
+            // written or inherited concrete `apply` with its signature
+            // unlinked it (`scala_rs_typer`'s `case_apply_unlink`, nsc's
+            // `caseApplyMeth` rule). An overload of another shape --
+            // `WebHookPushPayload.apply(git, …, newId, oldId)` beside the
+            // case class's own -- leaves it in place, and that body's
+            // `WebHookPushPayload(pusher = …)` calls it. `emit_case_apply`
+            // still refuses a descriptor the body already emitted.
+            if self.st.get(class_id).flags.contains(Flags::CASE)
+                && !case_apply_sym(self.st, class_id).is_none()
+            {
                 emit_case_apply(&mut b, self.st, class_id);
                 // nsc emits no forwarder for an `apply` that is not public.
                 // With `-Xsource-features:case-apply-copy-access` the `public
@@ -341,6 +357,7 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
+        let delayed_stats = Gen::has_delayed_stats(body);
         let is_app = extends_app(st, class_id);
         let super_name = b.super_name.clone();
         // `object X extends Y(args)` / `case object X extends Y(args)`: the
@@ -418,6 +435,7 @@ impl<'a> Gen<'a> {
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
+            ctx_early.presuper = true;
             if own_outer.is_some() {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);
             }
@@ -508,7 +526,9 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
-                Gen::emit_delayed_init_call(asm, &class_name);
+                if delayed_stats {
+                    Gen::emit_delayed_init_call(asm, &class_name);
+                }
             } else {
                 for vd in &inits {
                     if is_presuper_val(vd) {
@@ -518,7 +538,11 @@ impl<'a> Gen<'a> {
                         name, mods, rhs, ..
                     } = &vd.kind
                     {
-                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        // `var x: T = _`: no store (see `emit_ctor`).
+                        if rhs.is_empty()
+                            || rhs.is_default_init()
+                            || mods.flags.contains(Flags::LAZY)
+                        {
                             continue;
                         }
                         asm.aload(0);
@@ -1396,9 +1420,10 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
+    // The companion's own `apply` of this very signature replaces it.
     if b.methods
         .iter()
-        .any(|m| m.name == "apply" && desc_params(&m.desc) == desc_params(&desc))
+        .any(|m| m.name == "apply" && m.desc == desc)
     {
         return;
     }

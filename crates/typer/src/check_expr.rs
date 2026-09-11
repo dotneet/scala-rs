@@ -96,6 +96,7 @@ impl Typer {
                 _ => unreachable!(),
             };
             self.type_ident(tree, name, pt);
+            self.spell_out_inferred_class_of(tree);
         } else if matches!(&tree.kind, TreeKind::Function { .. }) {
             let ty = {
                 let (vparams, body) = match &mut tree.kind {
@@ -1222,6 +1223,11 @@ impl Typer {
                                     "type AnyVal cannot be used in a type pattern or isInstanceOf test",
                                 );
                             }
+                            // `x.isInstanceOf[p.type]` compares with `p`, so
+                            // codegen needs `p` as a typed term.
+                            if let (Some(a), Some(t)) = (args.first_mut(), targs.first()) {
+                                self.type_singleton_type_ref(a, t);
+                            }
                             tree.ty = Type::Boolean;
                             return;
                         }
@@ -1446,12 +1452,15 @@ impl Typer {
                 // whose branches share no direct subtype relation but do share
                 // `Option[X]` as a common ancestor (sgap fixture; slick's
                 // `PositionedResult.nextXOption()` methods rely on exactly this).
-                let joined = self.join_branches(&thenp.ty, &elsep.ty, pt);
                 let branch_tys = [thenp.ty.clone(), elsep.ty.clone()];
-                let result = self.branch_result_ty(pt, &branch_tys, joined);
-                self.widen_numeric_branch(thenp, &result);
-                self.widen_numeric_branch(elsep, &result);
-                tree.ty = result;
+                if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+                    self.adapt(thenp, &num);
+                    self.adapt(elsep, &num);
+                    tree.ty = num;
+                } else {
+                    let joined = self.lub_branches(&thenp.ty, &elsep.ty);
+                    tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
+                }
             }
             TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
                 self.type_expr(cond, &Type::Boolean);
@@ -2036,32 +2045,30 @@ impl Typer {
                     .collect();
                 let no_unit = !matches!(block.ty, Type::Unit)
                     && !handlers.iter().any(|t| matches!(t, Type::Unit));
-                // Numeric handlers meet the body by weak conformance only
-                // without a defined `pt` (`join_branches` says why).
-                let weak = crate::check_infer::pt_allows_weak_lub(pt);
-                let join = |a: &Type, b: &Type| {
-                    if weak {
-                        self.lub_ty(a, b)
-                    } else {
-                        self.st.lub(a, b)
+                // `numericLub`, as for an `if` (see `numeric_branch_lub`):
+                // `val t = try 1 catch { case _: E => 2.0 }` is a `Double`, and
+                // the body is widened to it so that both leave the same JVM
+                // sort in the result slot (it printed `1` where scalac prints
+                // `1.0`).
+                let mut branch_tys = vec![block.ty.clone()];
+                branch_tys.extend(handlers.iter().cloned());
+                if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+                    self.adapt(block, &num);
+                    for c in catches.iter_mut() {
+                        self.adapt(&mut c.body, &num);
                     }
-                };
-                tree.ty = if matches!(block.ty, Type::Nothing) {
-                    handlers
+                    tree.ty = num;
+                } else if matches!(block.ty, Type::Nothing) {
+                    tree.ty = handlers
                         .into_iter()
-                        .reduce(|a, b| join(&a, &b))
-                        .unwrap_or_else(|| block.ty.clone())
+                        .reduce(|a, b| self.lub_ty(&a, &b))
+                        .unwrap_or_else(|| block.ty.clone());
                 } else if no_unit && !handlers.iter().all(|t| self.st.is_sub_type(t, &block.ty)) {
-                    handlers
+                    tree.ty = handlers
                         .into_iter()
-                        .fold(block.ty.clone(), |a, b| join(&a, &b))
+                        .fold(block.ty.clone(), |a, b| self.lub_ty(&a, &b));
                 } else {
-                    block.ty.clone()
-                };
-                let result = tree.ty.clone();
-                self.widen_numeric_branch(block, &result);
-                for c in catches.iter_mut() {
-                    self.widen_numeric_branch(&mut c.body, &result);
+                    tree.ty = block.ty.clone();
                 }
             }
             TreeKind::InterpolatedString {

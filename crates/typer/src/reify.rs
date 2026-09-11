@@ -1659,10 +1659,7 @@ fn dots(rank: u8) -> &'static str {
 
 /// Whether a name is a variable pattern rather than a stable identifier.
 fn starts_lower(name: &str) -> bool {
-    match name.chars().next() {
-        Some(c) => c == '_' || c.is_lowercase(),
-        None => false,
-    }
+    scala_rs_parser::ast::is_variable_name(name)
 }
 
 /// Whether `name` is the `TupleN` the parser synthesises for `(a, ..., z)`

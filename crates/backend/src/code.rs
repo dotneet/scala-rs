@@ -375,6 +375,20 @@ impl Assembler {
             .push((start, end, handler, catch.map(str::to_string)));
     }
 
+    /// Whether the guarded region `[start, end)` -- both already marked --
+    /// holds no code at all: it was emitted while the code was unreachable,
+    /// so `drop_dead` left the two labels at one offset. `finish` drops such
+    /// an exception-table entry, which makes its handler unreachable too, and
+    /// a handler entered anyway revives code that no frame accounts for (a
+    /// `try`/`catch` inside a `finally` whose `try` body ends in `return`:
+    /// `VerifyError: Operand stack underflow`, `run/finally`).
+    pub fn guarded_range_is_empty(&self, start: Label, end: Label) -> bool {
+        match (self.labels[start.0], self.labels[end.0]) {
+            (Some(s), Some(e)) => s >= e,
+            _ => true,
+        }
+    }
+
     /// Snapshot the locals at the start of a guarded region. A handler can be
     /// entered from any point in that region, so its frame may only claim locals
     /// that are already live on entry. Nested `try`s push and pop in order.
@@ -1305,15 +1319,23 @@ impl Assembler {
         // then: with a plain `Methodref` the JVM refuses the whole class with
         // `IncompatibleClassChangeError: Inconsistent constant pool data`.
         impl_owner_is_interface: bool,
+        // nsc makes every `FunctionN` literal serializable: the call site
+        // goes through `altMetafactory` with `FLAG_SERIALIZABLE`, and the
+        // class gets a `$deserializeLambda$` that reads the lambda back (see
+        // `ClassBuilder::finish_inner`). Without it `ObjectOutputStream`
+        // threw `NotSerializableException` on the first closure it met.
+        serializable: bool,
     ) {
         const MF_OWNER: &str = "java/lang/invoke/LambdaMetafactory";
         const MF_DESC: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;\
 Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;\
 Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)\
 Ljava/lang/invoke/CallSite;";
-        let bsm = self
-            .pool
-            .method_handle_static(MF_OWNER, "metafactory", MF_DESC, false);
+        const ALT_MF_DESC: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;\
+Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)\
+Ljava/lang/invoke/CallSite;";
+        // `java.lang.invoke.LambdaMetafactory.FLAG_SERIALIZABLE`.
+        const FLAG_SERIALIZABLE: i32 = 1;
         let a0 = self.pool.method_type(sam_desc);
         let a1 = self.pool.method_handle_static(
             impl_owner,
@@ -1321,13 +1343,51 @@ Ljava/lang/invoke/CallSite;";
             impl_desc,
             impl_owner_is_interface,
         );
-        let bsm_index = self.pool.bootstrap(bsm, vec![a0, a1, a0]);
+        let bsm_index = if serializable {
+            let bsm =
+                self.pool
+                    .method_handle_static(MF_OWNER, "altMetafactory", ALT_MF_DESC, false);
+            let flags = self.pool.integer(FLAG_SERIALIZABLE);
+            if !self.pool.serializable_lambdas.contains(&a1) {
+                self.pool.serializable_lambdas.push(a1);
+            }
+            self.pool.bootstrap(bsm, vec![a0, a1, a0, flags])
+        } else {
+            let bsm = self
+                .pool
+                .method_handle_static(MF_OWNER, "metafactory", MF_DESC, false);
+            self.pool.bootstrap(bsm, vec![a0, a1, a0])
+        };
         let i = self.pool.invoke_dynamic(bsm_index, sam_name, call_desc);
         self.emit_op(0xba);
         self.emit_u16(i);
         self.bytes.push(0);
         self.bytes.push(0);
         self.apply_invoke(call_desc, false, false, MF_OWNER);
+    }
+
+    /// `invokedynamic lambdaDeserialize(SerializedLambda)Object` against
+    /// `scala.runtime.LambdaDeserialize.bootstrap`, with the bodies in
+    /// `handles` as its static arguments -- the body of nsc's
+    /// `$deserializeLambda$`.
+    pub fn invokedynamic_lambda_deserialize(&mut self, handles: &[u16]) {
+        const LD_OWNER: &str = "scala/runtime/LambdaDeserialize";
+        const LD_DESC: &str = "(Ljava/lang/invoke/MethodHandles$Lookup;\
+Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/invoke/MethodHandle;)\
+Ljava/lang/invoke/CallSite;";
+        const CALL_DESC: &str = "(Ljava/lang/invoke/SerializedLambda;)Ljava/lang/Object;";
+        let bsm = self
+            .pool
+            .method_handle_static(LD_OWNER, "bootstrap", LD_DESC, false);
+        let bsm_index = self.pool.bootstrap(bsm, handles.to_vec());
+        let i = self
+            .pool
+            .invoke_dynamic(bsm_index, "lambdaDeserialize", CALL_DESC);
+        self.emit_op(0xba);
+        self.emit_u16(i);
+        self.bytes.push(0);
+        self.bytes.push(0);
+        self.apply_invoke(CALL_DESC, false, false, LD_OWNER);
     }
 
     fn apply_invoke(&mut self, desc: &str, has_this: bool, is_init: bool, owner: &str) {

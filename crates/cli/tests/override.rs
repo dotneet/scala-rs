@@ -554,17 +554,13 @@ fn ov_repeated_against_repeated_still_overrides() {
 /// guards its ban with `clazz.isTrait && !clazz.isSubClass(AnyValClass)`.
 ///
 /// scalac 2.13.16 rejects this file with one error,
-/// `trait cannot redefine final method from class AnyRef`. scala-rs rejects it
-/// with one error too, by the ordinary rule, because `Object` stays in a
-/// universal trait's linearization; the wording is the only difference, and
-/// the count and the line are scalac's.
+/// `trait cannot redefine final method from class AnyRef`, and so does
+/// scala-rs: `Object`'s `notify` is read `final` from its class file, and a
+/// universal trait gets nsc's own wording for it.
 #[test]
 fn ov_universal_trait_may_not_redefine_object_finals() {
     rejected_once(
         "libanyval_univtrait_bad",
-        &[
-            "`override` modifier required to override concrete member:",
-            "(defined in class Object)",
-        ],
+        &["trait cannot redefine final method from class AnyRef"],
     );
 }

@@ -334,35 +334,6 @@ impl Typer {
     /// is, and stays open), the other branch does not mention it (one both
     /// sides carry is still the enclosing call's to fix), and it occurs
     /// covariantly (an invariant occurrence has no bound to read it at).
-    /// A branch of an `if` / `match` / `try` whose numeric type is narrower
-    /// than the weak lub the whole expression was given: widen it the way an
-    /// expected type would have (`1` in `if (c) 1 else 2.0` becomes `1.0`),
-    /// so every branch leaves the same JVM sort in the result slot.
-    pub(crate) fn widen_numeric_branch(&mut self, branch: &mut Tree, to: &Type) {
-        let from = branch.ty.widen_constant();
-        let to = to.widen_constant();
-        if from != to && weak_numeric_lub(&from, &to).as_ref() == Some(&to) {
-            self.adapt(branch, &to);
-        }
-    }
-
-    /// The join of two branch types of an `if` / `match` / `try` typed
-    /// against `pt`. nsc `ptOrLub`: a fully defined `pt` *is* the result and
-    /// the branches are left as they are (`println(if (c) 1 else 2.0)` prints
-    /// `1`); without one the branches are joined by `weakLub`, so numeric
-    /// value types meet by weak conformance -- `val y = if (c) 1 else 2.0` is
-    /// a `Double` and prints `1.0`. The plain lub of two primitives is
-    /// `AnyVal`, which boxed the value and silently changed both what it
-    /// prints and which overload it picks.
-    pub(crate) fn join_branches(&self, a: &Type, b: &Type, pt: &Type) -> Type {
-        if pt_allows_weak_lub(pt) {
-            if let Some(w) = weak_numeric_lub(a, b) {
-                return w;
-            }
-        }
-        self.lub_branches(a, b)
-    }
-
     pub(crate) fn lub_branches(&self, a: &Type, b: &Type) -> Type {
         if a == b
             || matches!(a, Type::Nothing)
@@ -454,6 +425,68 @@ impl Typer {
             }
         }
         plain
+    }
+
+    /// nsc `weakLub`'s numeric half (`numericLub`), for the branches of an
+    /// `if` or a `match` typed without an expected type: when every branch is
+    /// a numeric value type, the result is the one the others weakly conform
+    /// to, and the branches are widened to it (`typedIf`'s `needAdapt`).
+    ///
+    /// `(if (h > 0) cumulative(h - 1) else 0) + index`, with `cumulative`
+    /// returning `Long`, is `Long` in scalac; here it was the plain `lub`
+    /// `AnyVal`, whose `+` is `any2stringadd`'s -- "no matching overload for
+    /// (String)String with arguments (Int)" in every `scala.jdk` accumulator.
+    ///
+    /// `None` when an expected type is given (nsc's `isFullyDefined(pt)`: the
+    /// branches were already typed against it, and `val x: Any = if (c) 1L
+    /// else 0` keeps the `0` an `Int`), when a branch is not numeric, or when
+    /// all branches already agree.
+    pub(crate) fn numeric_branch_lub(&self, pt: &Type, branch_tys: &[Type]) -> Option<Type> {
+        if !(pt.is_no_type() || matches!(pt, Type::Wildcard)) {
+            return None;
+        }
+        let rank = |t: &Type| -> Option<u8> {
+            match t {
+                Type::Byte => Some(0),
+                Type::Short => Some(1),
+                Type::Char => Some(1),
+                Type::Int => Some(2),
+                Type::Long => Some(3),
+                Type::Float => Some(4),
+                Type::Double => Some(5),
+                _ => None,
+            }
+        };
+        // Weak conformance (SLS 3.5.3): `Byte <: Short <: Int <: Long <:
+        // Float <: Double` and `Char <: Int`; `Char` and `Short` (or `Byte`)
+        // meet only at `Int`.
+        let weak_sub = |a: &Type, b: &Type| -> bool {
+            a == b
+                || match (a, b) {
+                    (Type::Char, _) | (_, Type::Char) => {
+                        matches!(a, Type::Char) && rank(b).is_some_and(|r| r >= 2)
+                    }
+                    _ => rank(a).zip(rank(b)).is_some_and(|(x, y)| x <= y),
+                }
+        };
+        let widened: Vec<Type> = branch_tys
+            .iter()
+            .filter(|t| !matches!(t, Type::Nothing))
+            .map(|t| t.widen_constant())
+            .collect();
+        if widened.len() < 2 || widened.iter().any(|t| rank(t).is_none()) {
+            return None;
+        }
+        let lub = widened[1..].iter().fold(widened[0].clone(), |acc, t| {
+            if weak_sub(&acc, t) {
+                t.clone()
+            } else if weak_sub(t, &acc) {
+                acc
+            } else {
+                Type::Int
+            }
+        });
+        widened.iter().any(|t| *t != lub).then_some(lub)
     }
 
     /// The type an `if` or a `match` takes: [`pt_or_lub`], except that an
@@ -946,6 +979,40 @@ impl Typer {
                 }
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     return ty;
+                }
+                // A SAM expected type is a function type for this purpose
+                // (nsc `inferExprAlternative` weighs the alternatives against
+                // it): `val f: Fun[String, Unit] = println` keeps
+                // `println(x: Any)`, which eta-expands into the SAM, rather
+                // than applying `println()`. Only when some alternative has
+                // the SAM's arity and no value alternative (a field, or a
+                // nullary method's result) is already of the expected type:
+                // slick's case class `AndThenAction(as: IndexedSeq[…])` also
+                // inherits `as[A](a: => A)`, and `sam_sig` can read a library
+                // class whose members are only partly loaded (`IndexedSeq`) as
+                // a SAM -- the field is what `as` means there.
+                if matches!(pt, Type::Class { .. }) {
+                    if let Some(sam) = self.st.sam_sig(pt) {
+                        let arity = sam.param_tys.len();
+                        let value_fits = distinct.iter().any(|a| match a {
+                            Type::Method { paramss, ret }
+                                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+                            {
+                                self.st.is_sub_type(ret, pt)
+                            }
+                            Type::Method { .. } => false,
+                            _ => true,
+                        });
+                        if arity > 0
+                            && !value_fits
+                            && distinct.iter().any(|a| {
+                                matches!(a, Type::Method { paramss, .. }
+                                    if paramss.first().is_some_and(|c| c.len() == arity))
+                            })
+                        {
+                            return ty;
+                        }
+                    }
                 }
                 let nullary: Vec<&Type> = distinct
                     .iter()
@@ -2907,6 +2974,12 @@ impl Typer {
         if self.reject_unapplied_implicit_clause(tree) {
             return;
         }
+        // An unapplied method where no function type is expected (nsc
+        // `adaptMethodTypeToExpr`): an error in 2.13, eta-expanded under
+        // `-Xsource:3` and then adapted like any other function value.
+        if !self.expects_function_value(pt) && self.adapt_method_value(tree) && tree.ty.is_error() {
+            return;
+        }
         self.complete_java_type(&tree.ty, tree.span);
         // By-name wrap must run before `Nothing <: pt` (Nothing inhabits every
         // type, including `=> T`). Otherwise `tryBreakable { throw e }` would
@@ -3120,15 +3193,18 @@ impl Typer {
                 let ret = (**ret).clone();
                 let msym = tree.sym;
                 let (params, ret) = self.solve_eta_tparams(tree.sym, params, ret, pt);
-                if paramss.len() > 1 && matches!(pt, Type::Function { .. }) {
-                    // A curried method's value type is a nested function.  The
-                    // old flat expansion made `def f(a)(b)` look like
-                    // `(a, b) => r`, which rejects the legal `A => B => R`
-                    // assignment before codegen ever sees the call.
-                    eta_expand_curried(&mut self.st, &mut self.gensym, tree, &paramss, ret);
-                } else {
-                    eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
-                }
+                let curried = paramss.len() > 1 && matches!(pt, Type::Function { .. });
+                self.eta_with_stable_receiver(tree, |this, tree| {
+                    if curried {
+                        // A curried method's value type is a nested function.
+                        // The old flat expansion made `def f(a)(b)` look like
+                        // `(a, b) => r`, which rejects the legal `A => B => R`
+                        // assignment before codegen ever sees the call.
+                        eta_expand_curried(&mut this.st, &mut this.gensym, tree, &paramss, ret);
+                    } else {
+                        eta_expand(&mut this.st, &mut this.gensym, tree, params, ret);
+                    }
+                });
                 self.record_open_tparams(msym, &tree.ty);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
@@ -3166,8 +3242,14 @@ impl Typer {
         match conversion {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
-                let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let mut arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                 let from = arg.ty.clone();
+                // A by-name view parameter (`booleanBlock2RouteMatcher(block:
+                // => Boolean)`) takes the argument as its thunk; this call is
+                // built here, so the thunk `adapt` would insert is asked for.
+                if let Some(bn @ Type::ByName(_)) = self.conv_first_param(id) {
+                    self.adapt(&mut arg, &bn);
+                }
                 let fun = self.ref_implicit(id, span);
                 let applied = Tree {
                     id: arg.id,
@@ -3624,7 +3706,137 @@ impl Typer {
         self.adapt_singleton(&mut probe, pt)
     }
 
+    /// The stable path a call to a `this.type` method returns, when it has one.
+    ///
+    /// SLS 3.2.1 and 6.4: `this.type` in a member's signature is the singleton
+    /// type of the prefix the member is selected on, so `p.m(args)` has type
+    /// `p.type` whenever `p` is a stable path. Member selection here reads the
+    /// result through the receiver's *widened* type (`subst_as_seen_from` gets
+    /// `Buffer[A]`, not the path), which is right for every use but a
+    /// singleton expectation: `def append(x: A): this.type = addOne(x)`,
+    /// `this += x`, `super.addAll(xs)` and `def f(b: B): b.type =
+    /// b.add(1).add(2)` all failed with `found: Buffer[A] required:
+    /// Buffer.this.type`. scala/scala's own collections are written this way
+    /// throughout (`Growable`, `Buffer`, `Stack`, every `super.addAll` in a
+    /// builder).
+    ///
+    /// Only a call whose method is *declared* with a `this.type` result of its
+    /// receiver's class (or an ancestor of it) qualifies, and only once every
+    /// parameter list has been applied: `m(1)` of `def m(x: Int)(y: Int):
+    /// this.type` is still a method, and a `this.type` of an enclosing class
+    /// (`Outer.this.type` read from `Inner`) is not the receiver's.
+    fn this_type_call_receiver<'t>(&self, tree: &'t Tree) -> Option<SingletonRecv<'t>> {
+        if !matches!(
+            tree.kind,
+            TreeKind::Apply { .. } | TreeKind::TypeApply { .. }
+        ) && !matches!(tree.kind, TreeKind::Select { .. } | TreeKind::Ident { .. })
+        {
+            return None;
+        }
+        if matches!(
+            tree.ty,
+            Type::Method { .. } | Type::Overload(_) | Type::Error | Type::NoType
+        ) {
+            return None;
+        }
+        let mut fun = tree;
+        while let TreeKind::Apply { fun: f, .. } | TreeKind::TypeApply { fun: f, .. } = &fun.kind {
+            fun = f;
+        }
+        let m = fun.sym;
+        if m.is_none() || !matches!(self.st.get(m).kind, SymKind::Method) {
+            return None;
+        }
+        let mut ret = &self.st.get(m).ty;
+        while let Type::Method { ret: r, .. } = ret {
+            ret = r;
+        }
+        let Type::ThisType(declared) = *ret else {
+            return None;
+        };
+        let inherits = |cls: SymbolId| {
+            !cls.is_none() && (cls == declared || self.st.is_ancestor_of(declared, cls))
+        };
+        match &fun.kind {
+            TreeKind::Select { qual, .. } => match &qual.kind {
+                // `super.m` returns this class's `this`, not the parent's.
+                TreeKind::Super { qual: sq, .. } => {
+                    let here = self.super_owner(sq.as_deref());
+                    inherits(here).then_some(SingletonRecv::This(here))
+                }
+                _ => {
+                    let rc = self.st.class_sym_of(&qual.ty)?;
+                    inherits(rc).then_some(SingletonRecv::Tree(qual))
+                }
+            },
+            // An unqualified member is selected on the innermost `this` that
+            // has it; a member of an enclosing class is not inherited here.
+            TreeKind::Ident { .. } => {
+                let here = self.st.this_class;
+                let owner = self.st.get(m).owner;
+                let is_member = matches!(
+                    self.st.get(owner).kind,
+                    SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                );
+                (is_member && inherits(here)).then_some(SingletonRecv::This(here))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `tree` is, as a path, the singleton `pt` names -- `adapt_singleton`'s
+    /// test without its side effect, followed through `this.type` calls.
+    fn denotes_singleton(&self, tree: &Tree, pt: &Type) -> bool {
+        match self.this_type_call_receiver(tree) {
+            Some(SingletonRecv::Tree(q)) => return self.denotes_singleton(q, pt),
+            Some(SingletonRecv::This(here)) => {
+                return match pt {
+                    Type::ThisType(cls) => {
+                        here == *cls
+                            || self
+                                .base_type_instance(&self.st.self_type_of_class(here), *cls, 0)
+                                .is_some()
+                    }
+                    _ => false,
+                };
+            }
+            None => {}
+        }
+        // A receiver already typed as the singleton (a dependent result such
+        // as `def f(b: B): b.type`) answers for itself.
+        if matches!(tree.ty, Type::ThisType(_) | Type::SingleType { .. })
+            && self.st.is_sub_type(&tree.ty, pt)
+        {
+            return true;
+        }
+        match pt {
+            Type::ThisType(cls) => {
+                matches!(&tree.kind, TreeKind::This { .. })
+                    && (tree.sym == *cls
+                        || matches!(
+                            &tree.ty,
+                            Type::Class { sym, .. } | Type::ModuleRef(sym) if *sym == *cls
+                        )
+                        || self.this_derives_from(tree, *cls))
+            }
+            Type::SingleType { sym, .. } => {
+                matches!(&tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+                    && tree.sym == *sym
+            }
+            _ => false,
+        }
+    }
+
     fn adapt_singleton(&self, tree: &mut Tree, pt: &Type) -> bool {
+        if matches!(pt, Type::ThisType(_) | Type::SingleType { .. })
+            && self.this_type_call_receiver(tree).is_some()
+        {
+            let ok = self.denotes_singleton(tree, pt);
+            if ok {
+                tree.ty = pt.clone();
+            }
+            return ok;
+        }
         match pt {
             Type::ThisType(cls) => {
                 if !matches!(&tree.kind, TreeKind::This { .. }) {
@@ -3710,12 +3922,10 @@ impl Typer {
         let prefix = prefix.clone();
         let parts = parts.clone();
         let args = args.clone();
-        let sc = Tree {
+        let node = |kind: TreeKind| Tree {
             id: NodeId(0),
             span,
-            kind: TreeKind::Ident {
-                name: "StringContext".into(),
-            },
+            kind,
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
@@ -3723,6 +3933,30 @@ impl Typer {
             stable_pat: false,
             byname_thunk: false,
             byname_type_marker: false,
+        };
+        // `-Xsource-features:string-context-scope`: always
+        // `_root_.scala.StringContext`, never a `StringContext` the scope
+        // happens to hold (run/source3Xrun's `SC2`). Without it nsc writes the
+        // bare name, and a local `object StringContext` wins.
+        let sc = if self
+            .source_features
+            .contains(crate::SourceFeature::StringContextScope)
+        {
+            let root = node(TreeKind::Ident {
+                name: "_root_".into(),
+            });
+            let scala = node(TreeKind::Select {
+                qual: Box::new(root),
+                name: "scala".into(),
+            });
+            node(TreeKind::Select {
+                qual: Box::new(scala),
+                name: "StringContext".into(),
+            })
+        } else {
+            node(TreeKind::Ident {
+                name: "StringContext".into(),
+            })
         };
         let apply = Tree {
             id: NodeId(0),
@@ -3988,42 +4222,6 @@ impl Typer {
 /// literal, not merely constant-typed, so `val n = 3; val b: Byte = -n`
 /// (`n` is a stable reference, not a literal) is left alone and still
 /// reports the type mismatch scalac itself gives.
-/// Whether `pt` leaves the result of a branching expression to the branches
-/// (nsc `isFullyDefined(pt)` is false): no expectation at all, or one still
-/// waiting on inference.
-pub(crate) fn pt_allows_weak_lub(pt: &Type) -> bool {
-    pt.is_no_type() || matches!(pt, Type::Wildcard) || pt_is_undecided(pt)
-}
-
-/// nsc `numericLub`: the least numeric value type both `a` and `b` weakly
-/// conform to (SLS 3.5.3: `Byte <: Short <: Int <: Long <: Float <: Double`,
-/// `Char <: Int`), or `None` when either is not a numeric value type or the two
-/// are the same type. `Char` against `Byte` or `Short` meets at `Int`.
-pub(crate) fn weak_numeric_lub(a: &Type, b: &Type) -> Option<Type> {
-    let rank = |t: &Type| match t {
-        Type::Byte => Some(1),
-        Type::Short => Some(2),
-        Type::Char => Some(2),
-        Type::Int => Some(3),
-        Type::Long => Some(4),
-        Type::Float => Some(5),
-        Type::Double => Some(6),
-        _ => None,
-    };
-    let (a, b) = (a.widen_constant(), b.widen_constant());
-    if a == b {
-        return None;
-    }
-    let (ra, rb) = (rank(&a)?, rank(&b)?);
-    if matches!(
-        (&a, &b),
-        (Type::Char, Type::Byte | Type::Short) | (Type::Byte | Type::Short, Type::Char)
-    ) {
-        return Some(Type::Int);
-    }
-    Some(if ra >= rb { a } else { b })
-}
-
 fn negated_int_literal(tree: &Tree) -> Option<i32> {
     let TreeKind::Apply { fun, args } = &tree.kind else {
         return None;
@@ -4085,4 +4283,12 @@ fn bound_mentions_tparam(ty: &Type) -> bool {
         }
         _ => false,
     }
+}
+
+/// The receiver a `this.type` call returns (see `this_type_call_receiver`):
+/// a written qualifier, or the `this` of a class (an unqualified member or a
+/// `super` selection).
+enum SingletonRecv<'t> {
+    Tree(&'t Tree),
+    This(SymbolId),
 }

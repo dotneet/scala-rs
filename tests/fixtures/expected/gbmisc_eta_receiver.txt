@@ -1,0 +1,16 @@
+mk 1
+5
+List(11, 12)
+List(11, 12)
+List(a, a, a)
+List(b, b, b)
+2
+after l
+lazy
+101
+mk 2
+List(3, 4, 5) calls=2
+mk 3
+16 calls=3
+mk 4
+11 calls=4

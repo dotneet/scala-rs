@@ -1,0 +1,11 @@
+upd (a,b)
+3
+update (Reopen,reopen)
+1
+update (c,c)
+1
+inv (Close,close)
+2
+1
+x
+1,2y

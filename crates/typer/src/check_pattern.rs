@@ -29,18 +29,22 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = self.join_branches(&res, &c.body.ty, pt);
+            res = self.lub_branches(&res, &c.body.ty);
             branch_tys.push(c.body.ty.clone());
             self.st.pop_scope();
         }
         let span = tree.span;
-        let result = self.branch_result_ty(pt, &branch_tys, res);
-        if let TreeKind::Match { cases, .. } = &mut tree.kind {
-            for c in cases.iter_mut() {
-                self.widen_numeric_branch(&mut c.body, &result);
+        // `numericLub`, as for an `if` (see `numeric_branch_lub`).
+        if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+            if let TreeKind::Match { cases, .. } = &mut tree.kind {
+                for c in cases.iter_mut() {
+                    self.adapt(&mut c.body, &num);
+                }
             }
+            tree.ty = num;
+        } else {
+            tree.ty = self.branch_result_ty(pt, &branch_tys, res);
         }
-        tree.ty = result;
         if let TreeKind::Match { selector, cases } = &tree.kind {
             // The pattern-matching function a `for` generator desugars to is
             // guarded by the `withFilter` the parser puts in front of it, so
@@ -247,11 +251,7 @@ impl Typer {
                 }
                 // A backquoted name is stable however it is spelled; the
                 // parser has already marked it.
-                let is_varid = !stable_hint
-                    && name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
                 // SLS 8.1.5 wants a *stable* id here. `found[0]` can be a
                 // `def` of the same name, which nsc rejects rather than
                 // calling, so pick the value or module if the scope has one.
@@ -388,6 +388,16 @@ impl Typer {
                     } else {
                         receiver
                     }
+                } else if self.equality_pattern_binds_scrutinee(body) {
+                    // `case n @ Whatever =>` / `case n @ 1 =>` test with `==`,
+                    // and `==` says nothing about the scrutinee's class: an
+                    // `object` may override `equals`, and `1 == 1L`. nsc 2.13
+                    // (scala/bug#1503) binds `n` at the scrutinee's type.
+                    // Taking the object's own type made `def f(x: Any) = x
+                    // match { case n @ Whatever => n }` return `Whatever.type`,
+                    // and the `areturn` of the scrutinee failed verification
+                    // (`run/t1503`).
+                    sel_ty.clone()
                 } else {
                     body.ty.clone()
                 };
@@ -743,6 +753,7 @@ impl Typer {
                     );
                 }
                 self.type_pattern(expr, &ty);
+                self.type_singleton_type_ref(tpt, &ty);
                 if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
                     && !self.st.is_sub_type(sel_ty, &Type::AnyRef)
                 {
@@ -1155,6 +1166,23 @@ impl Typer {
         }
     }
 
+    /// Does `body` match by `==` against an `object` or a literal, so that a
+    /// binder over it learns nothing about the scrutinee's type? A stable
+    /// `val` of a class type still binds at that type (`case n @ V` with a
+    /// `String` `V` is a `String` in nsc too).
+    fn equality_pattern_binds_scrutinee(&self, body: &Tree) -> bool {
+        match &body.kind {
+            TreeKind::Literal { lit } => !matches!(lit, scala_rs_parser::Lit::Null),
+            TreeKind::Ident { .. } | TreeKind::Select { .. } if !body.sym.is_none() => {
+                matches!(
+                    self.st.get(body.sym).kind,
+                    SymKind::Module | SymKind::ModuleClass
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn find_class_named(&self, child: SymbolId, name: &str) -> Option<SymbolId> {
         let owner = self.st.get(child).owner;
         if !owner.is_none() {
@@ -1356,11 +1384,19 @@ impl Typer {
     }
 
     /// A member with no implementation: a body-less `def` (the namer sets
-    /// `ABSTRACT` on those) or a body-less `val` / `var`.
+    /// `ABSTRACT` on those), a pickled one (`Symbol::deferred_method`, the
+    /// pickle's `DEFERRED`), or a body-less `val` / `var`.
+    ///
+    /// The pickled half is what scalatra needs: `ScalatraBase` declares an
+    /// abstract `requestPath(implicit request)`, reached through
+    /// `JacksonJsonSupport` before the class-file `ScalatraFilter` that
+    /// implements it *and* its `requestPath(uri, idx)` overload. Read as
+    /// concrete, the declaration won `super.requestPath(uri, idx)` with the
+    /// wrong arity (gitbucket's `ControllerBase`).
     pub(crate) fn is_deferred_member(&self, m: SymbolId) -> bool {
         let s = self.st.get(m);
         match s.kind {
-            SymKind::Method => s.flags.contains(Flags::ABSTRACT),
+            SymKind::Method => s.flags.contains(Flags::ABSTRACT) || s.deferred_method,
             SymKind::Term => s.deferred_val,
             _ => false,
         }
@@ -2201,10 +2237,7 @@ impl Typer {
             TreeKind::Wildcard | TreeKind::Empty => true,
             TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
             TreeKind::Ident { name } => {
-                let is_varid = name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = scala_rs_parser::ast::is_variable_name(name);
                 is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
             }
             TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),

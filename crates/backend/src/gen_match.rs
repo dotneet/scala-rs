@@ -5,7 +5,7 @@
 use crate::code::Assembler;
 use crate::gen::*;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::SymKind;
+use scala_rs_typer::{SymKind, SymbolTable};
 
 pub(crate) fn gen_match(
     asm: &mut Assembler,
@@ -56,10 +56,7 @@ pub(crate) fn switch_pat_key(pat: &Tree) -> Option<SwitchPat> {
         TreeKind::Literal { lit: Lit::Char(c) } => Some(SwitchPat::Key(*c as i32)),
         TreeKind::Wildcard | TreeKind::Empty => Some(SwitchPat::Default),
         TreeKind::Ident { name } => {
-            let is_varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
+            let is_varid = scala_rs_parser::ast::is_variable_name(name);
             if is_varid {
                 Some(SwitchPat::Default)
             } else {
@@ -217,6 +214,20 @@ pub(crate) fn unapply_param_class(ctx: &EmitCtx, uid: SymbolId) -> Option<String
     None
 }
 
+/// The public `<name>$access$<index>` accessor nsc gives a case field that is
+/// not public (`case class Foo(private val x: Int)` has `x$access$0()`), or
+/// `None` for a public one. `index` is the field's position among the case
+/// fields (nsc's `caseFieldAccessors.indexOf`).
+pub(crate) fn case_field_access_name(
+    st: &SymbolTable,
+    field: SymbolId,
+    index: usize,
+) -> Option<String> {
+    let f = st.get(field);
+    (f.flags.contains(Flags::PRIVATE) || f.flags.contains(Flags::PROTECTED))
+        .then(|| format!("{}$access${index}", f.name))
+}
+
 /// A `case class` pattern that reads the constructor fields directly.
 ///
 /// Shared by the `Apply` pattern arm and by the synthetic `unapply` of a
@@ -293,7 +304,16 @@ pub(crate) fn gen_ctor_fields_pattern(
             // accessor is not always spelled like the field
             // (`$colon$colon.tl` is read through `next$access$1`), so
             // guessing the name produced `NoSuchMethodError`.
-            let acc = if !acc.is_empty() {
+            // A field that is not public is private on the JVM as well, and
+            // so is its plain accessor: outside the class only the
+            // `$access$` twin reaches it (`run/t5407`, `run/t8944`).
+            let hidden = (ctx.class_sym != class_id
+                && ctx.st.get(class_id).flags.contains(Flags::CASE))
+            .then(|| case_field_access_name(ctx.st, *fid, i))
+            .flatten();
+            let acc = if let Some(h) = hidden {
+                Some(h)
+            } else if !acc.is_empty() {
                 Some(acc)
             } else if !ctx.st.source_classes.contains(&class_id)
                 && has_nullary_accessor(ctx.st, class_id, &fname)
@@ -666,12 +686,57 @@ pub(crate) fn is_binding_ident(ctx: &EmitCtx, pat: &Tree, name: &str) -> bool {
     // resolved `val` and a fresh pattern variable are both `SymKind::Term`
     // and the test below would call every constant pattern a binding.
     !pat.stable_pat
-        && (name
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_lowercase() || c == '_')
+        && (scala_rs_parser::ast::is_variable_name(name)
             || pat.sym.is_none()
             || ctx.st.get(pat.sym).kind == SymKind::Term)
+}
+
+/// Compare the constant already on the stack (of type `pat_ty`) with the
+/// scrutinee in `tmp`, jumping to `fail` when they differ.
+///
+/// Usually the constant is converted to the scrutinee's representation (see
+/// [`emit_pattern_operand`]). A constant of a *wider* numeric type than a
+/// primitive scrutinee goes the other way: `1 match { case
+/// 0xFFFFFFFF00000001L => … }` compares the two as `Long`s, which is what
+/// nsc's `==` does, so the `Int` 1 does not match a `Long` whose low word
+/// happens to be 1. Handing the `long` to `if_icmpne` did not verify at all
+/// (`run/t1423`).
+fn emit_const_pattern_test(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    pat_ty: &Type,
+    tmp: u16,
+    sel_sort: JvmSort,
+    fail: crate::code::Label,
+) {
+    fn rank(t: &Type) -> Option<u8> {
+        match t {
+            Type::Int | Type::Char | Type::Short | Type::Byte => Some(0),
+            Type::Long => Some(1),
+            Type::Float => Some(2),
+            Type::Double => Some(3),
+            _ => None,
+        }
+    }
+    let pat = pat_ty.widen_constant();
+    let sel_ty = match sel_sort {
+        JvmSort::Int => Some(Type::Int),
+        JvmSort::Long => Some(Type::Long),
+        JvmSort::Float => Some(Type::Float),
+        JvmSort::Double => Some(Type::Double),
+        _ => None,
+    };
+    if let (Some(sel_ty), Some(pr)) = (sel_ty, rank(&pat)) {
+        if rank(&sel_ty).is_some_and(|sr| pr > sr) {
+            load(asm, tmp, sel_sort);
+            widen_primitive(asm, &sel_ty, &pat);
+            emit_pattern_eq_jump(asm, ctx, jvm_sort(&pat), fail);
+            return;
+        }
+    }
+    emit_pattern_operand(asm, pat_ty, sel_sort);
+    load(asm, tmp, sel_sort);
+    emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
 }
 
 /// Put a constant pattern's value on the stack in the *scrutinee's* JVM
@@ -941,9 +1006,7 @@ pub(crate) fn gen_pattern(
                 // The stable id goes on the stack first, the scrutinee second:
                 // see `emit_pattern_eq_jump`.
                 gen_ident(asm, frame, ctx, pat);
-                emit_pattern_operand(asm, &pat.ty, sel_sort);
-                load(asm, tmp, sel_sort);
-                emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+                emit_const_pattern_test(asm, ctx, &pat.ty, tmp, sel_sort, fail);
             }
         }
         TreeKind::Literal { lit } => {
@@ -963,24 +1026,25 @@ pub(crate) fn gen_pattern(
                 }
             } else {
                 gen_literal(asm, lit);
-                emit_pattern_operand(asm, &pat.ty, sel_sort);
-                load(asm, tmp, sel_sort);
-                emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+                // What `gen_literal` pushed is the literal's own type, which
+                // the typer does not always leave on the pattern (`case 4.5f`
+                // against an `Int` came out typed `Int`).
+                let lit_ty = match Type::lit_underlying(lit) {
+                    t @ (Type::Int | Type::Long | Type::Float | Type::Double) => t,
+                    _ => pat.ty.clone(),
+                };
+                emit_const_pattern_test(asm, ctx, &lit_ty, tmp, sel_sort, fail);
             }
         }
         TreeKind::Select { .. } => {
             gen_expr(asm, frame, ctx, pat);
-            emit_pattern_operand(asm, &pat.ty, sel_sort);
-            load(asm, tmp, sel_sort);
-            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+            emit_const_pattern_test(asm, ctx, &pat.ty, tmp, sel_sort, fail);
         }
         TreeKind::Apply { .. } if pat.stable_pat => {
             // A local lazy stable identifier becomes an accessor call during
             // lowering. Its arguments belong to that call, not an extractor.
             gen_expr(asm, frame, ctx, pat);
-            emit_pattern_operand(asm, &pat.ty, sel_sort);
-            load(asm, tmp, sel_sort);
-            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+            emit_const_pattern_test(asm, ctx, &pat.ty, tmp, sel_sort, fail);
         }
         TreeKind::Apply { args, .. } => {
             let class_id = if pat.sym.is_none() {
@@ -1016,9 +1080,46 @@ pub(crate) fn gen_pattern(
             };
             store(asm, slot, sort);
         }
-        TreeKind::Typed { expr, .. } => {
+        TreeKind::Typed { expr, tpt } => {
             if pat.sym == ctx.st.singleton_sym {
                 gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
+            // A singleton type pattern is a comparison, not a class test
+            // (nsc `TypeTestTreeMaker`): `_: p.type` is `p eq x` when `p` is
+            // an `AnyRef` and `p == x` otherwise, `_: 1` is `1 == x`. The
+            // comparison implies the class, so a binder is only narrowed.
+            if let Some(stable) = singleton_pattern_ref(tpt)
+                .filter(|s| sel_sort == JvmSort::Ref || is_jvm_primitive(&s.ty))
+            {
+                gen_expr(asm, frame, ctx, stable);
+                if sel_sort == JvmSort::Ref && ctx.st.is_sub_type(&stable.ty, &Type::AnyRef) {
+                    load(asm, tmp, sel_sort);
+                    asm.if_acmpne(fail);
+                } else {
+                    emit_const_pattern_test(asm, ctx, &stable.ty, tmp, sel_sort, fail);
+                }
+                bind_singleton_pattern(asm, frame, ctx, pat, expr, tmp, sel_sort, fail);
+                return;
+            }
+            let literal_type = match (&tpt.kind, peel_type_annot(&pat.ty)) {
+                (TreeKind::Literal { lit }, _) | (_, Type::Constant(lit)) => Some(lit),
+                _ => None,
+            };
+            if let Some(lit) = literal_type {
+                if matches!(lit, Lit::Null) {
+                    if sel_sort == JvmSort::Ref {
+                        load(asm, tmp, sel_sort);
+                        asm.ifnonnull(fail);
+                    } else {
+                        asm.goto(fail);
+                    }
+                } else {
+                    gen_literal(asm, lit);
+                    let lit_ty = Type::Constant(lit.clone());
+                    emit_const_pattern_test(asm, ctx, &lit_ty, tmp, sel_sort, fail);
+                }
+                bind_singleton_pattern(asm, frame, ctx, pat, expr, tmp, sel_sort, fail);
                 return;
             }
             // `case x: Meters` on an `Any` tests for the boxed value class and
@@ -1141,6 +1242,106 @@ pub(crate) fn gen_pattern(
         }
         _ => {}
     }
+}
+
+/// The term a singleton type tree (`p.type`, `this.type`) names, when the
+/// typer typed it for comparison (`Typer::type_singleton_type_ref`).
+pub(crate) fn singleton_pattern_ref(tpt: &Tree) -> Option<&Tree> {
+    match &tpt.kind {
+        TreeKind::AnnotatedTypeTree { tpt, .. } => singleton_pattern_ref(tpt),
+        TreeKind::SingletonTypeTree { ref_ } if !ref_.ty.is_no_type() && !ref_.ty.is_error() => {
+            Some(ref_)
+        }
+        _ => None,
+    }
+}
+
+/// `x.isInstanceOf[p.type]` / `x.isInstanceOf[1]`, which nsc's erasure
+/// (`SingletonInstanceCheck`) turns into `p eq x` -- `p.equals(x)` when the
+/// type's class is an `AnyVal` -- rather than a class test. The comparand is
+/// evaluated first, as there. Returns false, emitting nothing, for any other
+/// type argument.
+pub(crate) fn gen_singleton_instance_test(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    qual: &Tree,
+    targs: &[Tree],
+) -> bool {
+    let Some(targ) = targs.first() else {
+        return false;
+    };
+    let by_value = if let Some(stable) = singleton_pattern_ref(targ) {
+        gen_expr(asm, frame, ctx, stable);
+        if is_jvm_primitive(&stable.ty) {
+            emit_box(asm, &stable.ty.widen_constant());
+        }
+        // `pt.typeSymbol.isSubClass(AnyValClass)`: a path of type `Any` is
+        // compared by `eq` here, though a pattern would use `==`.
+        is_jvm_primitive(&stable.ty)
+            || is_unit_like(&stable.ty)
+            || ctx.st.is_sub_type(&stable.ty, &Type::AnyVal)
+    } else {
+        let lit = match (&targ.kind, peel_type_annot(&targ.ty)) {
+            (_, Type::Constant(lit)) | (TreeKind::Literal { lit }, _) => lit.clone(),
+            _ => return false,
+        };
+        gen_literal(asm, &lit);
+        let lit_ty = Type::Constant(lit.clone()).widen_constant();
+        if is_jvm_primitive(&lit_ty) {
+            emit_box(asm, &lit_ty);
+        }
+        // nsc compares with `==` exactly when the literal's class is an
+        // `AnyVal`; a `String` or `null` literal type is compared by `eq`.
+        is_jvm_primitive(&lit_ty) || is_unit_like(&lit_ty)
+    };
+    gen_expr(asm, frame, ctx, qual);
+    adapt_unit_qualifier(asm, ctx, qual);
+    if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
+        emit_box(asm, &qual.ty.widen_constant());
+    }
+    if by_value {
+        // `Any_equals`, the `equals` method -- not `==`: nsc answers false
+        // for `(1L: Any).isInstanceOf[1]`.
+        asm.invokevirtual("java/lang/Object", "equals", "(Ljava/lang/Object;)Z");
+    } else {
+        crate::gen_lambda::emit_bool_from_jump(asm, |asm, l| asm.if_acmpne(l));
+    }
+    true
+}
+
+/// After a singleton type pattern's comparison succeeded, bind `expr` (the
+/// `x` of `x: p.type`) to the scrutinee, narrowed to the pattern's type.
+#[allow(clippy::too_many_arguments)]
+fn bind_singleton_pattern(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    pat: &Tree,
+    expr: &Tree,
+    tmp: u16,
+    sel_sort: JvmSort,
+    fail: crate::code::Label,
+) {
+    // `_: 1` binds nothing; unboxing for it anyway threw on `(1L: Any)`, which
+    // `==` lets through.
+    if matches!(&expr.kind, TreeKind::Wildcard | TreeKind::Empty)
+        || matches!(&expr.kind, TreeKind::Ident { name } if name == "_")
+    {
+        return;
+    }
+    let want = jvm_sort(&pat.ty);
+    if want == sel_sort && sel_sort != JvmSort::Ref {
+        gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+        return;
+    }
+    load(asm, tmp, sel_sort);
+    if sel_sort == JvmSort::Ref {
+        emit_from_erased_object(asm, ctx.st, &pat.ty);
+    }
+    let narrowed = frame.alloc_tmp(want);
+    store(asm, narrowed, want);
+    gen_pattern(asm, frame, ctx, expr, narrowed, want, fail);
 }
 
 /// Bind the value on top of the stack to `pat`. `sort` is the sort that value

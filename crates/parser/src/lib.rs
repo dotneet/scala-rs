@@ -12,7 +12,7 @@ pub use specialization::{
     SpecializedTypes,
 };
 
-use scala_rs_lexer::tokenize;
+use scala_rs_lexer::tokenize_opts;
 use scala_rs_span::{Diagnostic, SourceFile};
 
 pub fn parse_file(source: &SourceFile, file_index: usize) -> ParseResult {
@@ -20,7 +20,7 @@ pub fn parse_file(source: &SourceFile, file_index: usize) -> ParseResult {
 }
 
 pub fn parse_file_opts(source: &SourceFile, file_index: usize, opts: ParseOptions) -> ParseResult {
-    let (tokens, lex_diags) = tokenize(source, file_index);
+    let (tokens, lex_diags) = tokenize_opts(source, file_index, opts.unicode_escapes_raw);
     let mut result = parse_source_opts(source, file_index, tokens, opts);
     let mut diags = lex_diags;
     diags.append(&mut result.diags);

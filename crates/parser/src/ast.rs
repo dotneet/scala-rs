@@ -597,6 +597,14 @@ impl Tree {
         matches!(self.kind, TreeKind::Empty)
     }
 
+    /// Asked of a `ValDef`'s right-hand side: is it the `_` of
+    /// `var x: T = _` (nsc `DEFAULTINIT`)? The parser keeps that `_` as the
+    /// rhs only for a typed `var` of a plain name, so the definition is
+    /// concrete (a field) but has no initializer to run.
+    pub fn is_default_init(&self) -> bool {
+        matches!(self.kind, TreeKind::Wildcard)
+    }
+
     pub fn name(&self) -> Option<&str> {
         match &self.kind {
             TreeKind::Ident { name } => Some(name),
@@ -925,6 +933,19 @@ pub fn op_precedence(op: &str) -> i32 {
         '*' | '/' | '%' => 9,
         _ => 10,
     }
+}
+
+/// nsc's `nme.isVariableName` first-character test, which decides whether an
+/// identifier pattern binds or compares: `_`, or a character that is both
+/// lower case (`Character.isLowerCase`, which counts `Other_Lowercase` such
+/// as `ª` and `ʰ`) and a *letter* (`Character.isLetter`). A lower-case letter
+/// *number* such as `ⅰ` is not a letter, so `case ⅰ_ⅲ =>` compares
+/// (run/identifierCase). Rust's `is_alphabetic` also admits the `Nl`
+/// numbers, hence the `is_numeric` exclusion.
+pub fn is_variable_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c == '_' || (c.is_lowercase() && c.is_alphabetic() && !c.is_numeric()))
 }
 
 pub fn is_assignment_op(op: &str) -> bool {

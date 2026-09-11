@@ -11,7 +11,18 @@ pub use token::{is_operator_name, keyword_kind, Token, TokenKind};
 use scala_rs_span::{Diagnostic, SourceFile, Span};
 
 pub fn tokenize(source: &SourceFile, file_index: usize) -> (Vec<Token>, Vec<Diagnostic>) {
+    tokenize_opts(source, file_index, false)
+}
+
+/// `unicode_escapes_raw` is `-Xsource-features:unicode-escapes-raw`: leave
+/// unicode escapes in triple-quoted strings and `raw` interpolations alone.
+pub fn tokenize_opts(
+    source: &SourceFile,
+    file_index: usize,
+    unicode_escapes_raw: bool,
+) -> (Vec<Token>, Vec<Diagnostic>) {
     let mut lx = Lexer::new(source, file_index);
+    lx.unicode_escapes_raw = unicode_escapes_raw;
     lx.tokenize_all();
     let tokens = drop_non_separating_newlines(lx.tokens);
     (tokens, lx.diags)
@@ -158,14 +169,28 @@ struct Lexer<'a> {
     /// Brace depth in normal mode; used for interpolation holes.
     brace_depth: i32,
     interp_stack: Vec<InterpFrame>,
+    /// `-Xsource-features:unicode-escapes-raw`.
+    unicode_escapes_raw: bool,
+}
+
+/// What an interpolator does with a backslash in its literal parts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InterpEscapes {
+    /// `s` and `f`: `StringContext.processEscapes`, for single- and
+    /// triple-quoted literals alike.
+    Standard,
+    /// `raw`: unicode escapes alone (`StringContext.processUnicode`, which
+    /// nsc's `FastStringInterpolator` applies, deprecated since 2.13.2).
+    Unicode,
+    /// Any other interpolator: the parts verbatim.
+    Verbatim,
 }
 
 struct InterpFrame {
     triple: bool,
     /// Brace depth at which the `${` hole started; -1 if currently in the string part.
     hole_brace: i32,
-    /// `raw"..."` does not interpret escape sequences (nsc `StringContext.raw`).
-    raw: bool,
+    escapes: InterpEscapes,
 }
 
 impl<'a> Lexer<'a> {
@@ -179,6 +204,7 @@ impl<'a> Lexer<'a> {
             diags: Vec::new(),
             brace_depth: 0,
             interp_stack: Vec::new(),
+            unicode_escapes_raw: false,
         }
     }
 
@@ -730,10 +756,14 @@ impl<'a> Lexer<'a> {
             self.bump(); // "
         }
         if let Some(prefix) = interp_prefix {
-            // Only `s` and `f` process escapes; every other interpolator —
-            // `raw` and any user-defined one — gets the parts verbatim, which
-            // is what `StringContext.parts` holds in scalac.
-            let raw = !matches!(prefix.as_str(), "s" | "f");
+            // Only `s` and `f` process escapes; `raw` processes unicode
+            // escapes alone, and every other interpolator gets the parts
+            // verbatim, which is what `StringContext.parts` holds in scalac.
+            let escapes = match prefix.as_str() {
+                "s" | "f" => InterpEscapes::Standard,
+                "raw" if !self.unicode_escapes_raw => InterpEscapes::Unicode,
+                _ => InterpEscapes::Verbatim,
+            };
             self.emit(
                 TokenKind::InterpStart { prefix, triple },
                 lo,
@@ -742,13 +772,20 @@ impl<'a> Lexer<'a> {
             self.interp_stack.push(InterpFrame {
                 triple,
                 hole_brace: -1,
-                raw,
+                escapes,
             });
             self.lex_interp_string();
             return;
         }
         if triple {
             if let Some(s) = self.read_triple_string() {
+                // nsc `replaceUnicodeEscapesInTriple` (deprecated since 2.13.2,
+                // off under `-Xsource-features:unicode-escapes-raw`).
+                let s = if self.unicode_escapes_raw {
+                    s
+                } else {
+                    self.process_unicode(s, lo)
+                };
                 self.emit(TokenKind::StringLit(s), lo, self.pos as u32);
             } else {
                 self.error(lo, self.pos as u32, "unterminated triple-quoted string");
@@ -826,29 +863,28 @@ impl<'a> Lexer<'a> {
                     buf.push('"');
                     self.bump();
                 }
-                self.emit(TokenKind::InterpEnd(buf), lo, self.pos as u32);
+                let part = self.finish_interp_part(buf, lo);
+                self.emit(TokenKind::InterpEnd(part), lo, self.pos as u32);
                 self.interp_stack.pop();
                 return;
             }
             if !triple && self.peek() == Some('"') {
                 self.bump();
-                self.emit(TokenKind::InterpEnd(buf), lo, self.pos as u32);
+                let part = self.finish_interp_part(buf, lo);
+                self.emit(TokenKind::InterpEnd(part), lo, self.pos as u32);
                 self.interp_stack.pop();
                 return;
             }
             if self.peek() == Some('$') {
-                if self.starts_with("$$") {
+                // `$$` is a dollar and `$"` a quote (nsc `getStringPart`).
+                if self.starts_with("$$") || self.starts_with("$\"") {
                     self.bump();
-                    self.bump();
-                    buf.push('$');
+                    buf.push(self.bump().unwrap());
                     continue;
                 }
                 if self.starts_with("${") {
-                    self.emit(
-                        TokenKind::StringPart(std::mem::take(&mut buf)),
-                        lo,
-                        self.pos as u32,
-                    );
+                    let part = self.finish_interp_part(std::mem::take(&mut buf), lo);
+                    self.emit(TokenKind::StringPart(part), lo, self.pos as u32);
                     self.bump(); // $
                     let brace_lo = self.pos as u32;
                     self.bump(); // {
@@ -869,11 +905,8 @@ impl<'a> Lexer<'a> {
                     // and not `Chars.isIdentifier{Start,Part}`, so `$l$r` is
                     // two holes. slick writes `b"\($l${op}$r\)"`.
                     if is_interp_id_start(c) {
-                        self.emit(
-                            TokenKind::StringPart(std::mem::take(&mut buf)),
-                            lo,
-                            self.pos as u32,
-                        );
+                        let part = self.finish_interp_part(std::mem::take(&mut buf), lo);
+                        self.emit(TokenKind::StringPart(part), lo, self.pos as u32);
                         self.bump(); // $
                         let id_lo = self.pos as u32;
                         self.bump();
@@ -889,18 +922,167 @@ impl<'a> Lexer<'a> {
                 buf.push(self.bump().unwrap());
                 continue;
             }
-            let raw = self.interp_stack.last().map(|f| f.raw).unwrap_or(false);
-            if !triple && !raw && self.peek() == Some('\\') {
-                let elo = self.pos as u32;
-                self.bump();
-                match self.read_escape(elo) {
-                    Some(ch) => buf.push(ch),
-                    None => return,
+            let escapes = self
+                .interp_stack
+                .last()
+                .map(|f| f.escapes)
+                .unwrap_or(InterpEscapes::Verbatim);
+            if self.peek() == Some('\\') {
+                // A single-quoted `s` / `f` part is unescaped as it is read.
+                // A triple-quoted one is read raw -- a backslash does not keep
+                // `"""` from closing it -- and unescaped once complete
+                // (`finish_interp_part`), which is the order nsc's scanner and
+                // `processEscapes` run in.
+                if escapes == InterpEscapes::Standard && !triple {
+                    let elo = self.pos as u32;
+                    self.bump();
+                    match self.read_escape(elo) {
+                        Some(ch) => buf.push(ch),
+                        None => return,
+                    }
+                    continue;
                 }
-                continue;
+                // nsc `getStringPart`: in a single-quoted literal a backslash
+                // and a following `"` or `\` are copied as a pair, so `\"`
+                // does not close the literal.
+                if !triple {
+                    buf.push(self.bump().unwrap());
+                    if matches!(self.peek(), Some('"') | Some('\\')) {
+                        buf.push(self.bump().unwrap());
+                    }
+                    continue;
+                }
             }
             buf.push(self.bump().unwrap());
         }
+    }
+
+    /// A finished literal part of an interpolation, as the interpolator
+    /// receives it: `raw` sees its unicode escapes replaced, and a
+    /// triple-quoted `s` / `f` part is unescaped (`s"""a\tb"""` holds a tab).
+    fn finish_interp_part(&mut self, buf: String, lo: u32) -> String {
+        let Some(frame) = self.interp_stack.last() else {
+            return buf;
+        };
+        match (frame.escapes, frame.triple) {
+            (InterpEscapes::Unicode, _) => self.process_unicode(buf, lo),
+            (InterpEscapes::Standard, true) => self.process_escapes(buf, lo),
+            _ => buf,
+        }
+    }
+
+    /// `StringContext.processEscapes` over a raw part: `\b \t \n \f \r \" \'
+    /// \\` and `\uXXXX`; any other backslash is an error, as nsc's
+    /// interpolator macro reports it at compile time.
+    fn process_escapes(&mut self, s: String, lo: u32) -> String {
+        if !s.contains('\\') {
+            return s;
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '\\' {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            let Some(&c) = chars.get(i + 1) else {
+                self.error(lo, self.pos as u32, "invalid escape at end of string part");
+                return out;
+            };
+            let simple = match c {
+                'b' => Some('\u{0008}'),
+                't' => Some('\t'),
+                'n' => Some('\n'),
+                'f' => Some('\u{000C}'),
+                'r' => Some('\r'),
+                '"' => Some('"'),
+                '\'' => Some('\''),
+                '\\' => Some('\\'),
+                _ => None,
+            };
+            if let Some(ch) = simple {
+                out.push(ch);
+                i += 2;
+                continue;
+            }
+            if c == 'u' {
+                let mut j = i + 1;
+                while chars.get(j) == Some(&'u') {
+                    j += 1;
+                }
+                let hex: String = chars.iter().skip(j).take(4).collect();
+                let decoded = (hex.len() == 4 && hex.chars().all(|h| h.is_ascii_hexdigit()))
+                    .then(|| u32::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .and_then(char::from_u32);
+                if let Some(ch) = decoded {
+                    out.push(ch);
+                    i = j + 4;
+                    continue;
+                }
+                self.error(lo, self.pos as u32, "invalid unicode escape");
+                return out;
+            }
+            self.error(lo, self.pos as u32, format!("invalid escape \\{c}"));
+            return out;
+        }
+        out
+    }
+
+    /// `StringContext.processUnicode`: replace each `\uXXXX` (one or more
+    /// `u`s) whose backslash is not itself escaped -- an odd run of
+    /// backslashes -- and leave every other backslash alone. An escape that
+    /// is not four hex digits is an error, as it is in nsc.
+    fn process_unicode(&mut self, s: String, lo: u32) -> String {
+        if !s.contains("\\u") {
+            return s;
+        }
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != '\\' {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            let run = chars[i..].iter().take_while(|&&c| c == '\\').count();
+            // All but the last backslash of the run are plain characters;
+            // the last escapes a `u` only when the run is odd.
+            for _ in 0..run - 1 {
+                out.push('\\');
+            }
+            let last = i + run - 1;
+            if run % 2 == 1 && chars.get(last + 1) == Some(&'u') {
+                let mut j = last + 1;
+                while chars.get(j) == Some(&'u') {
+                    j += 1;
+                }
+                let hex: String = chars.iter().skip(j).take(4).collect();
+                match (hex.len() == 4)
+                    .then(|| u32::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .filter(|_| hex.chars().all(|c| c.is_ascii_hexdigit()))
+                    .and_then(char::from_u32)
+                {
+                    Some(c) => {
+                        out.push(c);
+                        i = j + 4;
+                    }
+                    None => {
+                        self.error(lo, self.pos as u32, "invalid unicode escape");
+                        out.push('\\');
+                        i = last + 1;
+                    }
+                }
+            } else {
+                out.push('\\');
+                i = last + 1;
+            }
+        }
+        out
     }
 
     fn read_escape(&mut self, lo: u32) -> Option<char> {

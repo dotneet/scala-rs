@@ -43,6 +43,35 @@ pub(crate) fn store(asm: &mut Assembler, slot: u16, sort: JvmSort) {
     }
 }
 
+/// nsc's `treeInfo.isQualifierSafeToElide` (`isExprSafeToInline`): a path of
+/// stable symbols, `this`, `super` or a literal. Anything else -- a block, a
+/// call -- has to be evaluated even when its value is not needed.
+pub(crate) fn qualifier_safe_to_elide(st: &SymbolTable, tree: &Tree) -> bool {
+    fn stable(st: &SymbolTable, id: SymbolId) -> bool {
+        if id.is_none() {
+            return false;
+        }
+        let s = st.get(id);
+        match s.kind {
+            SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+            SymKind::Term => !s.flags.contains(Flags::MUTABLE),
+            _ => false,
+        }
+    }
+    match &tree.kind {
+        TreeKind::Empty
+        | TreeKind::This { .. }
+        | TreeKind::Super { .. }
+        | TreeKind::Literal { .. } => true,
+        TreeKind::Ident { .. } => stable(st, tree.sym),
+        TreeKind::Select { qual, .. } => stable(st, tree.sym) && qualifier_safe_to_elide(st, qual),
+        TreeKind::TypeApply { fun, .. } => qualifier_safe_to_elide(st, fun),
+        TreeKind::Typed { expr, .. } => qualifier_safe_to_elide(st, expr),
+        TreeKind::Block { stats, expr } => stats.is_empty() && qualifier_safe_to_elide(st, expr),
+        _ => false,
+    }
+}
+
 pub(crate) fn pop_if_value(asm: &mut Assembler, ty: &Type) {
     pop_sort(asm, jvm_sort(ty));
 }
@@ -641,6 +670,17 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
             }
             if sort == JvmSort::Void {
                 gen_stat(asm, frame, ctx, rhs);
+                // A captured `var x: Unit` still lives in an `ObjectRef`, which
+                // a closure reads and writes: it has to exist, holding the
+                // `BoxedUnit`. Without it the capture read an unassigned slot
+                // (`VerifyError: Bad local variable type`, `run/t6863`).
+                if is_boxed_var(ctx, tree.sym) {
+                    emit_boxed_unit(asm);
+                    emit_runtime_ref_create(asm, &ty);
+                    let slot = frame.alloc(tree.sym, JvmSort::Ref);
+                    store(asm, slot, JvmSort::Ref);
+                    return;
+                }
                 frame.alloc(tree.sym, sort);
                 return;
             }
@@ -838,6 +878,15 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                 load_this(asm, ctx);
             }
         }
+        // `B.super[A1].f` written inside a class nested in `B` calls `f` on
+        // *`B`'s* instance: the receiver is `B.this`, reached through
+        // `$outer`, exactly as for the qualified `this`. Loading the nested
+        // class's own `this` handed a `B$C` to `A1.f$` (`IllegalAccessError:
+        // Receiver class B$C must be … a subtype of interface A1`,
+        // `run/t10290`, `run/t4300`).
+        TreeKind::Super {
+            qual: Some(name), ..
+        } => load_qualified_this(asm, ctx, name),
         TreeKind::Super { .. } => load_this(asm, ctx),
         TreeKind::Ident { .. } => gen_ident(asm, frame, ctx, tree),
         TreeKind::Select { qual, name } => gen_select(asm, frame, ctx, tree, qual, name),
@@ -870,6 +919,11 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                             return;
                         }
                         emit_as_instance_of(asm, ctx, &tree.ty);
+                        return;
+                    }
+                    if matches!(ic, Intrinsic::IsInstanceOf)
+                        && gen_singleton_instance_test(asm, frame, ctx, qual, args)
+                    {
                         return;
                     }
                     if matches!(ic, Intrinsic::IsInstanceOf) {
@@ -1156,8 +1210,14 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
     }
     if let Some((slot, sort)) = frame.get(id) {
         if is_boxed_var(ctx, id) {
+            let ty = ctx.st.get(id).ty.clone();
+            // A `Unit` value leaves nothing on the stack; its cell holds the
+            // `BoxedUnit` only so that the closures sharing it can.
+            if is_unit_like(&ty) {
+                return;
+            }
             load(asm, slot, JvmSort::Ref);
-            load_runtime_ref_elem(asm, ctx, &ctx.st.get(id).ty);
+            load_runtime_ref_elem(asm, ctx, &ty);
             return;
         }
         load(asm, slot, sort);
@@ -1804,6 +1864,13 @@ pub(crate) fn gen_select(
                     invoke_module_accessor(asm, ctx.st, outer, mcls);
                     return;
                 }
+                // nsc's `Flatten`: the lifted module is read directly, but a
+                // qualifier that is not safe to elide still runs first --
+                // `{ println("x"); Outer }.Inner` prints (run/t4859).
+                if !qualifier_safe_to_elide(ctx.st, qual) {
+                    gen_expr(asm, frame, ctx, qual);
+                    pop_if_value(asm, &qual.ty);
+                }
                 let jvm = class_internal(ctx.st, mcls);
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));
                 return;
@@ -1872,7 +1939,13 @@ pub(crate) fn gen_assign(
                 if let Some((slot, _)) = frame.get(id) {
                     load(asm, slot, JvmSort::Ref);
                     gen_expr(asm, frame, ctx, rhs);
-                    store_runtime_ref_elem(asm, &ctx.st.get(id).ty);
+                    let ty = ctx.st.get(id).ty.clone();
+                    // The cell of a `Unit` variable holds the `BoxedUnit`,
+                    // which a `Unit` right-hand side did not leave behind.
+                    if is_unit_like(&ty) {
+                        adapt_unit_arg(asm, ctx, rhs, &Type::Unit);
+                    }
+                    store_runtime_ref_elem(asm, &ty);
                     return;
                 }
             }
@@ -2157,6 +2230,22 @@ pub(crate) fn gen_new(
             // prefix that was written, not the current `this`.
             // `new_prefix_instance` already checked the prefix conforms.
             Some(pfx) => gen_expr(asm, frame, ctx, pfx),
+            // `class Child extends Parent(new Foo {})`: the anonymous class is
+            // created before `Child`'s super constructor has run, and its
+            // enclosing instance would be the `Child` under construction --
+            // `uninitializedThis`, which JVMS §4.10.1.9 lets nothing but a
+            // `putfield` take (`VerifyError`, `run/t6957`, `run/t6506`). nsc
+            // gives such a class no outer reference at all, and rejects
+            // ("implementation restriction: … requires premature access")
+            // one that would need it; so it can never be read, and the slot is
+            // filled with `null`.
+            None if ctx.presuper
+                && self_reaches_owner(ctx.st, ctx.class_sym, outer)
+                && !(ctx.presuper_outer.is_some()
+                    && outer_chain_reaches_owner(ctx.st, ctx.class_sym, outer)) =>
+            {
+                asm.aconst_null();
+            }
             None => load_outer_arg(asm, ctx, outer),
         }
     }
@@ -3133,16 +3222,32 @@ pub(crate) fn gen_apply(
     );
     // `this(...)` inside an auxiliary constructor hands the primary one the
     // enclosing instance it was itself given (slot 1), ahead of the arguments.
-    if !fun.sym.is_none()
-        && ctx.st.get(fun.sym).name == "<init>"
-        && outer_field_class(ctx.st, ctx.st.get(fun.sym).owner).is_some()
-    {
+    let self_ctor_call = !fun.sym.is_none() && ctx.st.get(fun.sym).name == "<init>";
+    if self_ctor_call && outer_field_class(ctx.st, ctx.st.get(fun.sym).owner).is_some() {
         asm.aload(1);
     }
+    // The arguments of `this(...)` run before any constructor of this class
+    // has, exactly like a primary constructor's super arguments: `this` is
+    // still `uninitializedThis`, so the enclosing instance comes from the
+    // `$outer` parameter and not from the field. `def this(s: String) =
+    // this(x, y, s)` in an inner class, reading the outer class's `x`,
+    // emitted `aload_0; getfield $outer` and did not verify
+    // (`run/constructors`).
+    let presuper_ctx;
+    let arg_ctx = if self_ctor_call && ctx.method_sym != SymbolId::NONE {
+        presuper_ctx = EmitCtx {
+            presuper: true,
+            presuper_outer: presuper_outer_of(ctx.st, ctx.class_sym),
+            ..ctx.clone()
+        };
+        &presuper_ctx
+    } else {
+        ctx
+    };
     gen_call_args(
         asm,
         frame,
-        ctx,
+        arg_ctx,
         args,
         &param_tys,
         value_owner.is_some() || (ctx.library_abi && !array_elem_op),
@@ -3163,6 +3268,15 @@ pub(crate) fn gen_apply(
             return;
         }
         if name == "update" && matches!(qual.ty, Type::Array(_)) {
+            // An `Array[Unit]` holds `BoxedUnit`s, and `xs(i) = ()` left
+            // nothing to store: the generic `update(Int, T)` parameter says
+            // nothing about `Unit`, so the argument pass did not supply the
+            // singleton (`run/t5680`: `VerifyError` at the `aastore`).
+            if let (Type::Array(elem), Some(v)) = (&qual.ty, args.get(1)) {
+                if is_unit_like(elem) {
+                    adapt_unit_arg(asm, ctx, v, &Type::Unit);
+                }
+            }
             emit_array_store(asm, &qual.ty);
             return;
         }
@@ -3224,6 +3338,16 @@ pub(crate) fn gen_apply(
             super_is_qualified(fun),
             selected_params.as_deref(),
         );
+        // `override def addAll(xs): this.type = super.addAll(xs)`: the parent
+        // returns its own erasure (`Growable`) and the tree is this class's
+        // `this.type`, erased to this class. scalac casts, as it does for any
+        // call whose declared erasure is wider than the tree's; `invoke_method`
+        // does the same for every other call. An `Object`-returning (generic)
+        // super call is left alone: its unboxing is decided elsewhere.
+        let desc = method_desc_from_sym(ctx.st, fun.sym);
+        if !desc_returns_object(&desc) {
+            maybe_unbox_erased_result(asm, ctx, &desc, Some(&tree.ty));
+        }
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {
@@ -4597,6 +4721,13 @@ pub(crate) fn gen_receiver(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 // call (`class Outer { def deco(s: String) = …; class Inner {
                 // def q(c: String) = deco(c) } }`).
                 load_owner_instance(asm, ctx, owner);
+            } else if let Some(m) = (!is_owner_compatible(ctx.st, ctx.class_sym, owner))
+                .then(|| static_module_supplying(ctx.st, ctx.class_sym, owner))
+                .flatten()
+            {
+                // An enclosing `object` (or package object) inherits it; see
+                // `static_module_supplying`.
+                load_module_instance(asm, ctx, m);
             } else {
                 load_this(asm, ctx);
                 maybe_checkcast_owner(asm, ctx, owner);

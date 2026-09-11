@@ -2,7 +2,7 @@
 //! `Object`, wrap by-name as `Function0`, and insert box/unbox trees so the
 //! backend does not have to guess at call sites.
 
-use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
 
 use crate::symbol::{Intrinsic, SymbolTable};
 
@@ -1065,10 +1065,22 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 }
                 erase_tree(a, st, None);
             }
+            // `null.asInstanceOf[Meters]` is nsc's zero of the *underlying*
+            // type, boxed on demand (`run/t5866` prints `Foo(0.0)`): erasure
+            // casts the `null` to the underlying type, where a primitive
+            // unboxes through `BoxesRunTime` to its zero. Casting to the box
+            // and reading the field instead threw a `NullPointerException`.
+            let null_qual = matches!(
+                &fun.kind,
+                TreeKind::Select { qual, .. }
+                    if matches!(qual.ty, Type::Null)
+                        || matches!(qual.kind, TreeKind::Literal { lit: Lit::Null })
+            );
             erase_tree(fun, st, None);
             // `x.asInstanceOf[Meters]` casts to the boxed class; the caller
             // unboxes from there if it wants the underlying value.
-            let vc_cast = (!fun.sym.is_none()
+            let vc_cast = (!null_qual
+                && !fun.sym.is_none()
                 && matches!(st.get(fun.sym).intrinsic, Intrinsic::AsInstanceOf))
             .then(|| value_class_of(&tree.ty, st))
             .flatten();
@@ -1097,7 +1109,11 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 Some(c) if tree.sym.is_none() || st.get(tree.sym).owner != c => Some(Type::Any),
                 _ => None,
             };
+            let prelude_box = prelude_value_class_box(&qual.ty, tree.sym, st);
             erase_tree(qual, st, recv_pt.as_ref());
+            if let Some(c) = prelude_box {
+                wrap_vc_box(qual, c);
+            }
             if !tree.sym.is_none() {
                 let owner = st.get(tree.sym).owner;
                 if st.is_value_class(owner)
@@ -1493,6 +1509,30 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         t => erase_ty(t, st),
     };
     tree.ty = orig_erased.clone();
+    // A result type parameter instantiated at `Nothing` -- nsc's own inference
+    // for `def s: String = deser("x")` with `def deser[T](o: Any): T`, where
+    // only the (covariant) result mentions `T`. The call does return: its
+    // erased result is `Object`, and nsc's erasure retypes the tree at that
+    // and casts it to what the position expects. Leaving the tree at
+    // `Nothing` made the backend treat it as a call that cannot return and
+    // append `checkcast Throwable; athrow` (`ClassCastException: String cannot
+    // be cast to Throwable`, `run/t8188`).
+    if matches!(orig_erased, Type::Nothing)
+        && is_ref_erased(&ret_erased)
+        && !matches!(ret_erased, Type::Nothing)
+    {
+        match expected {
+            Some(e) if is_primitive(e) && !matches!(e, Type::Unit) => {
+                tree.ty = ret_erased;
+                wrap_unbox(tree, e.clone());
+            }
+            Some(e) if is_ref_erased(e) && !matches!(e, Type::Nothing | Type::Null) => {
+                tree.ty = e.clone();
+            }
+            _ => tree.ty = ret_erased,
+        }
+        return;
+    }
     let array_prim_load = match &tree.kind {
         TreeKind::Apply { fun, .. } => match &fun.kind {
             TreeKind::Select { qual, name } if name == "apply" => match &qual.ty {
@@ -1780,6 +1820,35 @@ fn collect_source_value_classes(tree: &Tree, st: &SymbolTable, out: &mut Vec<Sym
 
 /// The user-defined value class a *pre-erasure* type denotes, if any. The nine
 /// primitive value classes are excluded: they have their own boxes.
+/// The prelude value class a receiver has to be boxed into before `member`
+/// can be called on it.
+///
+/// `value_class_of` leaves the prelude's value classes unboxed on purpose
+/// (see there), and for a member the class declares itself that is right:
+/// nsc calls `RichInt.max$extension(int, int)` with the underlying value. A
+/// member it only *inherits* from a universal trait is another matter --
+/// `false < true` is `Ordered.<` on `RichBoolean` -- and nsc really allocates
+/// the wrapper there (`new RichBoolean(b).$less(…)`). Without the box the
+/// primitive was handed to `checkcast scala/math/Ordered` and the method did
+/// not verify (`run/boolord`).
+fn prelude_value_class_box(ty: &Type, member: SymbolId, st: &SymbolTable) -> Option<SymbolId> {
+    let Type::Class { sym, .. } = ty else {
+        return None;
+    };
+    if member.is_none() || sym.0 >= st.prelude_end || !st.is_value_class(*sym) {
+        return None;
+    }
+    let m = st.get(member);
+    if m.kind != crate::symbol::SymKind::Method || m.owner == *sym || m.owner.is_none() {
+        return None;
+    }
+    let owner = st.get(m.owner);
+    (owner.kind == crate::symbol::SymKind::Class
+        && owner.flags.contains(Flags::TRAIT)
+        && !st.is_value_class(m.owner))
+    .then_some(*sym)
+}
+
 pub(crate) fn value_class_of(ty: &Type, st: &SymbolTable) -> Option<SymbolId> {
     let sym = match ty {
         Type::Class { sym, .. } => *sym,

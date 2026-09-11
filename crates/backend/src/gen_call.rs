@@ -52,6 +52,112 @@ pub(crate) fn gen_java_varargs_array(
     }
 }
 
+/// Push the `ClassTag` nsc's uncurry resolves for the element type of a
+/// sequence spliced into a Java varargs parameter (`sequenceToArray`).
+///
+/// The primitive tags are `ClassTag.Int` & co. -- their arrays are `[I` and
+/// friends. A bottom type is never allowed further than this: nsc asks for
+/// `ClassTag.Any` instead (scala/bug#4024), whose array is an `Object[]`.
+/// Every other type gets `ClassTag(classOf[erasure])`.
+pub(crate) fn emit_class_tag(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type) {
+    let ty = ty.widen_constant();
+    asm.getstatic(
+        "scala/reflect/ClassTag$",
+        "MODULE$",
+        "Lscala/reflect/ClassTag$;",
+    );
+    let prim = match ty {
+        Type::Int => Some("Int"),
+        Type::Long => Some("Long"),
+        Type::Double => Some("Double"),
+        Type::Float => Some("Float"),
+        Type::Char => Some("Char"),
+        Type::Byte => Some("Byte"),
+        Type::Short => Some("Short"),
+        Type::Boolean => Some("Boolean"),
+        Type::Unit => Some("Unit"),
+        _ => None,
+    };
+    if let Some(p) = prim {
+        asm.invokevirtual(
+            "scala/reflect/ClassTag$",
+            p,
+            &format!("()Lscala/reflect/ManifestFactory${p}Manifest;"),
+        );
+        return;
+    }
+    if matches!(ty, Type::Nothing | Type::Null) {
+        asm.invokevirtual(
+            "scala/reflect/ClassTag$",
+            "Any",
+            "()Lscala/reflect/ClassTag;",
+        );
+        return;
+    }
+    gen_java_class_of(asm, ctx, &ty);
+    asm.invokevirtual(
+        "scala/reflect/ClassTag$",
+        "apply",
+        "(Ljava/lang/Class;)Lscala/reflect/ClassTag;",
+    );
+}
+
+/// Turn the value spliced into a Java varargs parameter (`f(xs: _*)`) into
+/// the array that parameter really is -- nsc uncurry's `sequenceToArray` and
+/// its `toObjectArray` step.
+///
+/// A `Seq` becomes `xs.toArray(ClassTag[elem])`; an `Array` is passed as it
+/// is. Either one holding primitives meets an `Object[]` parameter (a generic
+/// `T...`, as in `Arrays.asList`) through `ScalaRunTime.toObjectArray`, which
+/// boxes every element. Passing the `Seq` itself was a `VerifyError` at the
+/// call (`List` is not assignable to `[Ljava/lang/Object;`), and an `[I` where
+/// `[Ljava/lang/Object;` is wanted was one too (`run/t1360`, `run/t4024`,
+/// `run/t3199b`).
+fn adapt_java_varargs_splice(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    spliced: &Type,
+    elem: &Type,
+    param_desc: Option<&str>,
+) {
+    let Some(param_desc) = param_desc.filter(|d| d.starts_with('[')) else {
+        return;
+    };
+    let elem_prim = is_jvm_primitive(elem) && !is_unit_like(elem);
+    // Only a reference-element parameter can take the boxed copy; a primitive
+    // one (`int...`) takes the primitive array itself.
+    let param_holds_refs = param_desc.starts_with("[L") || param_desc.starts_with("[[");
+    let prim_array_source = match spliced {
+        Type::Array(e) => is_jvm_primitive(e) && !is_unit_like(e),
+        _ => elem_prim,
+    };
+    if !matches!(spliced, Type::Array(_)) {
+        emit_class_tag(asm, ctx, elem);
+        asm.invokeinterface(
+            "scala/collection/IterableOnceOps",
+            "toArray",
+            "(Lscala/reflect/ClassTag;)Ljava/lang/Object;",
+        );
+    }
+    if prim_array_source && param_holds_refs {
+        asm.getstatic(
+            "scala/runtime/ScalaRunTime$",
+            "MODULE$",
+            "Lscala/runtime/ScalaRunTime$;",
+        );
+        asm.swap();
+        asm.invokevirtual(
+            "scala/runtime/ScalaRunTime$",
+            "toObjectArray",
+            "(Ljava/lang/Object;)[Ljava/lang/Object;",
+        );
+        return;
+    }
+    if !matches!(spliced, Type::Array(_)) {
+        asm.checkcast(param_desc);
+    }
+}
+
 pub(crate) fn gen_wrap_varargs(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -386,6 +492,19 @@ pub(crate) fn gen_call_args(
         if !java_varargs && ctx.library_abi && matches!(inner.ty, Type::Array(_)) {
             emit_array_copy_to_immutable_seq(asm);
         }
+        if java_varargs && ctx.library_abi {
+            let elem_ty = match &var_args[0].ty {
+                Type::Repeated(t) => t.as_ref().clone(),
+                _ => elem.clone(),
+            };
+            adapt_java_varargs_splice(
+                asm,
+                ctx,
+                &inner.ty,
+                &elem_ty,
+                declared.get(ri).map(String::as_str),
+            );
+        }
     } else if java_varargs {
         gen_java_varargs_array(asm, frame, ctx, var_args, elem);
     } else {
@@ -595,17 +714,15 @@ pub(crate) fn unit_stat_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
         TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => {
             unit_stat_leaves_ref(expr, st)
         }
+        // A function *value* applied (`mk(p)(x)`, where `mk` returns an
+        // `Int => Unit`) goes out as `FunctionN.apply`, and
+        // `gen_function_apply` already drops the `BoxedUnit` a `Unit` result
+        // comes back as. The symbol on the inner call is `mk`, whose result
+        // is not `Unit`, so asking `leaves_ref_sym` popped a second time --
+        // `VerifyError: Operand stack underflow` (`run/Course-2002-06`).
+        TreeKind::Apply { fun, .. } if matches!(fun.ty, Type::Function { .. }) => false,
         TreeKind::Apply { fun, .. } => {
             let f = peel_fun(fun);
-            // Applying a function *value* goes through `gen_function_apply`,
-            // whose `emit_unbox(Unit)` already dropped `FunctionN.apply`'s
-            // result. `def adder: Int => Unit` is such a value even though
-            // its symbol is a method whose declared result (a function) is
-            // not `Unit`; asking `leaves_ref_sym` about it popped twice
-            // (`VerifyError: Operand stack underflow` on `a.adder(1)`).
-            if matches!(f.ty, Type::Function { .. }) {
-                return false;
-            }
             leaves_ref_sym(f.sym, st, false)
         }
         // A **nilary** `def` has no argument list, so calling it builds a bare
@@ -944,46 +1061,35 @@ pub(crate) fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
     }
 }
 
-thread_local! {
-    /// Whether the unit being emitted links against scala-library, so that
-    /// `emit_unbox` may call `scala.runtime.BoxesRunTime`. Set for the whole
-    /// of one `emit_opts` call (`LibraryUnboxScope`); the thirty-odd
-    /// `emit_unbox` sites have no `EmitCtx` to ask.
-    static LIBRARY_UNBOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Holds [`LIBRARY_UNBOX`] for one unit's emission and restores it after.
-pub(crate) struct LibraryUnboxScope(bool);
-
-impl LibraryUnboxScope {
-    pub(crate) fn enter(library_abi: bool) -> Self {
-        LibraryUnboxScope(LIBRARY_UNBOX.with(|c| c.replace(library_abi)))
-    }
-}
-
-impl Drop for LibraryUnboxScope {
-    fn drop(&mut self) {
-        LIBRARY_UNBOX.with(|c| c.set(self.0));
-    }
-}
-
 pub(crate) fn emit_unbox(asm: &mut Assembler, ty: &Type) {
-    // nsc unboxes through `BoxesRunTime.unboxToInt` & co., which read `null`
-    // as the primitive's zero: an erased generic read of a `null` -- a
-    // `var v: T = _` at `T = Int`, `Some(null.asInstanceOf[Int]).get` -- is
-    // `0` there, where `checkcast Integer; intValue` threw
-    // NullPointerException. A value of the wrong box is a
-    // ClassCastException either way.
-    if LIBRARY_UNBOX.with(|c| c.get()) {
-        if let Some((name, desc)) = boxes_runtime_unbox(ty) {
-            asm.invokestatic("scala/runtime/BoxesRunTime", name, desc);
-            return;
-        }
-    }
     emit_unbox_inner(asm, &ty.widen_constant())
 }
 
 pub(crate) fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
+    // nsc unboxes through `BoxesRunTime.unboxToX`, which answers the zero of
+    // the type for `null` -- a `null.asInstanceOf[Int]`, or an erased `A`
+    // instantiated at `Int` that nobody assigned (`fold[Int, Int]` handing
+    // `null.asInstanceOf[A]` to a lambda). `Integer.intValue` on the same
+    // reference is a `NullPointerException` (`run/function-null-unbox`,
+    // `run/t7584b`, `run/t7899`, `run/t5866`). The private runtime has no
+    // `BoxesRunTime`, so it keeps the direct form.
+    if emitting_library_abi() {
+        let unbox = match ty {
+            Type::Int => Some(("unboxToInt", "(Ljava/lang/Object;)I")),
+            Type::Boolean => Some(("unboxToBoolean", "(Ljava/lang/Object;)Z")),
+            Type::Byte => Some(("unboxToByte", "(Ljava/lang/Object;)B")),
+            Type::Short => Some(("unboxToShort", "(Ljava/lang/Object;)S")),
+            Type::Long => Some(("unboxToLong", "(Ljava/lang/Object;)J")),
+            Type::Double => Some(("unboxToDouble", "(Ljava/lang/Object;)D")),
+            Type::Char => Some(("unboxToChar", "(Ljava/lang/Object;)C")),
+            Type::Float => Some(("unboxToFloat", "(Ljava/lang/Object;)F")),
+            _ => None,
+        };
+        if let Some((name, desc)) = unbox {
+            asm.invokestatic("scala/runtime/BoxesRunTime", name, desc);
+            return;
+        }
+    }
     match ty {
         Type::Int => {
             asm.checkcast("java/lang/Integer");
@@ -1030,22 +1136,6 @@ pub(crate) fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
     }
 }
 
-/// `scala.runtime.BoxesRunTime`'s null-tolerant unboxing method for a
-/// primitive: `unboxToInt(Object): int` and so on.
-pub(crate) fn boxes_runtime_unbox(ty: &Type) -> Option<(&'static str, &'static str)> {
-    Some(match ty.widen_constant() {
-        Type::Int => ("unboxToInt", "(Ljava/lang/Object;)I"),
-        Type::Long => ("unboxToLong", "(Ljava/lang/Object;)J"),
-        Type::Double => ("unboxToDouble", "(Ljava/lang/Object;)D"),
-        Type::Float => ("unboxToFloat", "(Ljava/lang/Object;)F"),
-        Type::Boolean => ("unboxToBoolean", "(Ljava/lang/Object;)Z"),
-        Type::Char => ("unboxToChar", "(Ljava/lang/Object;)C"),
-        Type::Byte => ("unboxToByte", "(Ljava/lang/Object;)B"),
-        Type::Short => ("unboxToShort", "(Ljava/lang/Object;)S"),
-        _ => return None,
-    })
-}
-
 /// Boxed wrapper class for a primitive (`Int` -> `java/lang/Integer`, ...),
 /// used by `asInstanceOf`/`isInstanceOf` against an `Any`-erased (`Object`)
 /// receiver that may hold a boxed primitive.
@@ -1071,15 +1161,6 @@ pub(crate) fn boxed_internal_name(ty: &Type) -> Option<&'static str> {
 /// emits `checkcast` against a type with real runtime class information.
 pub(crate) fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
     if boxed_internal_name(target).is_some() {
-        // nsc unboxes through `BoxesRunTime.unboxToInt` & co., which read
-        // `null` as the primitive's zero: `null.asInstanceOf[Int]` is `0`.
-        // `checkcast Integer; intValue` threw `NullPointerException`.
-        if ctx.library_abi {
-            if let Some((name, desc)) = boxes_runtime_unbox(target) {
-                asm.invokestatic("scala/runtime/BoxesRunTime", name, desc);
-                return;
-            }
-        }
         emit_unbox(asm, target);
         return;
     }

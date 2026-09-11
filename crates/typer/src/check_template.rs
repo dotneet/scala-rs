@@ -121,7 +121,15 @@ impl Typer {
                 clauses[0] = ps;
                 ret = r;
             }
-            crate::uncurry::eta_expand_curried(&mut self.st, &mut self.gensym, tree, &clauses, ret);
+            self.eta_with_stable_receiver(tree, |this, tree| {
+                crate::uncurry::eta_expand_curried(
+                    &mut this.st,
+                    &mut this.gensym,
+                    tree,
+                    &clauses,
+                    ret,
+                );
+            });
         }
     }
 
@@ -724,8 +732,10 @@ impl Typer {
         // companion is not, and `wants_product` tells them apart by the `CASE`
         // flag the namer copies from the `object`'s own modifiers.
         self.link_case_product(cls);
+        self.link_serializable_companion(m, cls);
         self.register_sealed_child(cls);
         self.enter_inherited_members(cls);
+        self.unlink_case_apply_by_inherited(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
         self.presig_import_prefixes(body);
         let saved_missed = self.import_prefix_missed;
@@ -1209,8 +1219,17 @@ impl Typer {
                 // The signature pass and the body pass both bind the alias;
                 // allocating twice would make `self` look like an overload.
                 let sid = self.st.get(class_id).self_alias.unwrap_or_else(|| {
-                    self.st
-                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "")
+                    let sid = self
+                        .st
+                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "");
+                    // Owned by the template (the `self_alias` checks read the
+                    // owner) but not one of its members: `(x: F).self` is
+                    // `value self is not a member of F` in nsc, and a member
+                    // lookup that walked into `Function1`'s `self =>` made
+                    // `s.self` on `WrappedString(private val self: String)`
+                    // an overload of the field and `Function1.this.type`.
+                    self.st.get_mut(class_id).members.retain(|&m| m != sid);
+                    sid
                 });
                 self.st.get_mut(class_id).self_alias = Some(sid);
                 self.st.get_mut(sid).ty = st;
@@ -1513,44 +1532,54 @@ impl Typer {
             };
             self.error(at, e.message);
         }
-        // A `var` already defines its setter `x_=`, so a hand-written
-        // `def x_=(v: T)` of the same type is a second definition of it
-        // (nsc: "method x_= is defined twice; the conflicting variable x").
-        // Only a `private[this]` var has no accessors to clash with.
-        for vd in body {
-            let TreeKind::ValDef { name, mods, .. } = &vd.kind else {
-                continue;
-            };
-            if !mods.flags.contains(Flags::MUTABLE) || mods.flags.contains(Flags::LOCAL) {
-                continue;
-            }
-            if vd.sym.is_none() {
-                continue;
-            }
-            let var_ty = self.st.get(vd.sym).ty.clone();
+        self.check_var_setter_twice(body);
+    }
+
+    /// A template `var x: T` has the setter `x_=(T): Unit`, so a `def x_=`
+    /// of the same parameter type beside it is that setter written twice
+    /// (nsc's namer: "method x_= is defined twice; the conflicting variable x
+    /// was defined at ..."; `neg/t591`). Only an exact match of the one
+    /// parameter's type is reported; a `def x_=` taking some other type is an
+    /// overload.
+    fn check_var_setter_twice(&mut self, body: &[Tree]) {
+        let vars: Vec<(String, Type)> = body
+            .iter()
+            .filter_map(|t| match &t.kind {
+                // A `private[this]` var has no accessors, so nothing to clash
+                // with: scalac accepts `private[this] var x; def x_=(v: T)`.
+                TreeKind::ValDef { mods, name, .. }
+                    if mods.flags.contains(Flags::MUTABLE)
+                        && !mods.flags.contains(Flags::LOCAL)
+                        && !t.sym.is_none()
+                        && !self.block_local_defs.contains(&(self.file_index, t.id)) =>
+                {
+                    let ty = self.st.get(t.sym).ty.clone();
+                    (!ty.is_no_type() && !ty.is_error()).then(|| (name.clone(), ty))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, ty) in vars {
             let setter = format!("{name}_=");
-            for d in body {
-                let TreeKind::DefDef { name: dn, .. } = &d.kind else {
+            for t in body {
+                let TreeKind::DefDef { name: dname, .. } = &t.kind else {
                     continue;
                 };
-                if *dn != setter || d.sym.is_none() {
+                if *dname != setter || t.sym.is_none() {
                     continue;
                 }
-                let clashes = match &self.st.get(d.sym).ty {
-                    Type::Method { paramss, .. } => {
-                        paramss.len() == 1
-                            && paramss[0].len() == 1
-                            && !var_ty.is_no_type()
-                            && self.st.is_sub_type(&paramss[0][0], &var_ty)
-                            && self.st.is_sub_type(&var_ty, &paramss[0][0])
-                    }
-                    _ => false,
-                };
-                if clashes {
+                let s = self.st.get(t.sym);
+                if s.flags.contains(Flags::SYNTHETIC) || s.flags.contains(Flags::ACCESSOR) {
+                    continue;
+                }
+                let same = matches!(&s.ty, Type::Method { paramss, .. }
+                    if paramss.len() == 1 && paramss[0].len() == 1 && paramss[0][0] == ty);
+                if same {
                     self.error(
-                        d.span,
+                        t.span,
                         format!(
-                            "method {setter} is defined twice; the conflicting variable {name} was defined earlier"
+                            "method {setter} is defined twice;\n  the conflicting variable \
+                             {name} was defined earlier in the same template"
                         ),
                     );
                 }
@@ -1712,6 +1741,45 @@ impl Typer {
         }
     }
 
+    /// A member trait's self type read from the class that mixes it in.
+    ///
+    /// `protected trait GenKeySet { this: Set[K] => }` is declared inside
+    /// `MapOps[K, …]`, so its `K` is `MapOps`'s. A class nested in a subclass
+    /// of `MapOps` -- `SortedMapOps[K, …]`'s `class KeySortedSet extends
+    /// SortedSet[K] with GenKeySet`, `HashMap[K, V]`'s `class HashKeySet` --
+    /// mixes it in through its *enclosing* `this`, where that `K` is the
+    /// subclass's own. Without reading it there, all four key-set classes in
+    /// scala/scala's `src/library` were "self-type … does not conform to
+    /// Set[K]": one `K` against another.
+    fn outer_self_type_at(&self, class_id: SymbolId, trait_id: SymbolId, ty: Type) -> Type {
+        let decl_owner = self.st.get(trait_id).owner;
+        if decl_owner.is_none()
+            || !matches!(
+                self.st.get(decl_owner).kind,
+                SymKind::Class | SymKind::ModuleClass
+            )
+        {
+            return ty;
+        }
+        let mut c = self.st.get(class_id).owner;
+        for _ in 0..32 {
+            if c.is_none() {
+                return ty;
+            }
+            let s = self.st.get(c);
+            if matches!(s.kind, SymKind::Class | SymKind::ModuleClass)
+                && (c == decl_owner || self.st.is_ancestor_of(decl_owner, c))
+            {
+                if c == decl_owner {
+                    return ty;
+                }
+                return self.st.subst_as_seen_from(&Type::ThisType(c), &ty);
+            }
+            c = s.owner;
+        }
+        ty
+    }
+
     fn check_self_conformance(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
@@ -1814,8 +1882,16 @@ impl Typer {
                 // cats' `Nested` self types came out as the doubly-applied
                 // `Apply[[α][F, G, α]F[G[α]][F, G, G[α]]]` and were rejected.
                 let st = self.st.subst_tparams(id, &args, &st);
-                let st = self.st.expand_type_members(class_id, &st);
-                if !self.st.is_sub_type(&this_ty, &st) {
+                // Read at the enclosing `this` (see `outer_self_type_at`) *or*
+                // as declared: a class type carries no prefix here, so a base
+                // class nested in the same outer (`LinkedHashMap`'s
+                // `LinkedKeySet extends KeySet`, `KeySet` declared in `MapOps`)
+                // still reaches `Set[K]` in `MapOps`'s own vocabulary.
+                let declared = self.st.expand_type_members(class_id, &st);
+                let seen = self.outer_self_type_at(class_id, id, st);
+                let st = self.st.expand_type_members(class_id, &seen);
+                if !self.st.is_sub_type(&this_ty, &st) && !self.st.is_sub_type(&this_ty, &declared)
+                {
                     self.error(
                         span,
                         format!(
@@ -2121,6 +2197,15 @@ impl Typer {
         }
         let s = self.st.get(lhs.sym);
         if !matches!(s.kind, SymKind::Method | SymKind::Term) || s.name.ends_with("_=") {
+            return None;
+        }
+        // A `private[this] var` has no setter: `x = v` stores the field even
+        // beside a hand-written `def x_=` (which it would otherwise call,
+        // recursing forever when the assignment is that method's own body).
+        if s.kind == SymKind::Term
+            && s.flags.contains(Flags::LOCAL)
+            && s.flags.contains(Flags::MUTABLE)
+        {
             return None;
         }
         let owner = s.owner;

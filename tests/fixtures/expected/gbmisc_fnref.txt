@@ -1,0 +1,24 @@
+1
+2
+4
+List(())
+1
+2
+1
+show 3
+ov1 5
+ov1 6
+List(8)
+List(sa)
+8
+1
+()
+g1
+101
+9
+1
+()
+sam
+sam2
+show fs
+List(yes, no)
