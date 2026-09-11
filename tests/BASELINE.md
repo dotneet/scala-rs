@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `712279e5` |
+| commit | `cd35fd83` |
 |---|---|
 | updated | 2026-09-11 |
 
-**Fifty-one composed gates have been accepted this session**, covering the earlier
+**Fifty-two composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
@@ -23,7 +23,8 @@ collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch, and the combined contextual,
 lexical, source-unit ownership and erased field-access batch, and the combined
 Scala declaration, array signature, value-class storage and implicit-view batch,
-and the contextual inference, by-name, local import and declaration-access batch.
+and the contextual inference, by-name, local import and declaration-access batch,
+and the nested function-erasure, generic local-conversion and documentation batch.
 Twenty-eight intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -82,6 +83,7 @@ coordinator measured the merged tree each time, not the branches.
 | `96c0abb3` | contextual inference, lexical scope, source-unit identity and erased field access | 105 -> **99** | 90 -> **83** |
 | `e608c7dc` | declaration clauses, Array signatures, value-class/Unit storage and implicit views | 99 -> **96** | 83 -> **83** |
 | `712279e5` | contextual inference, by-name values/signatures, copy and local imports | 96 -> **92** | 83 -> **34** |
+| `cd35fd83` | nested function application erasure, generic local conversions, README/docs cleanup | 92 | 34 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -322,13 +324,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1152** | 362 | 345 |
+| `pos` (1859) | **1154** | 360 | 345 |
 | `neg` (1405) | **718** | 318 | 369 |
-| `run` (2060) | **706** | 801 | 553 |
+| `run` (2060) | **707** | 800 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-712279e5.tsv`](baselines/corpus-712279e5.tsv): 5324 unique
+[`baselines/corpus-cd35fd83.tsv`](baselines/corpus-cd35fd83.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `cd35fd83` gate compared against `corpus-712279e5.tsv`: **losses=0,
+changes=3**: pos/eta, pos/t0438, run/Course-2002-02.
+
 The `712279e5` gate compared against `corpus-e608c7dc.tsv`: **losses=0,
 changes=11**: pos/looping-jsig, pos/t5727, run/phantomValueClass, run/reflection-allmirrors-tostring, run/reflection-magicsymbols-vanilla, run/sd242, run/t7120, run/t7584, run/t7859, run/t8733, run/valueclasses-pavlov.
 
@@ -470,7 +475,7 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **313 result rows, 2800 passed, 0 failed** at `712279e5` |
+| `cargo test --workspace --release --no-fail-fast` | **313 result rows, 2802 passed, 0 failed** at `cd35fd83` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
@@ -3938,6 +3943,44 @@ Exact summary block:
 ```text
 === summary
   HEAD=712279e5  logs=/tmp/scala-rs-gate-712279e5-codex
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-two: nested function erasure, generic local conversions and README cleanup
+
+The gate ran on `HEAD=0fb2db57` with 16 dirty files in
+`/tmp/scala-rs-gate-contextual-evidence-20260911-retry`. The handoff commit is
+`cd35fd83`; it contains exactly the source, tests and documentation that were
+present in the gated tree, with no post-gate source changes. The baseline update
+and raw corpus ledger are the only later changes.
+
+Gitbucket stayed at 92 errors in 43 files (354 inputs, including 3 Java
+sources); cats stayed at 34 errors in 23 files (339 inputs, 1 skipped); the
+library stayed at 383 errors in 107 files (538 inputs). Slick compiled with 0
+errors and 1504 classes. Its execution check passed 12/12 programs with 36/36
+byte-exact attempts, and the class subset verified all 1504 classes with zero
+lint problems. The workspace suite passed 2802 tests in 313 result rows.
+
+The corpus retained all 5324 identities with `losses=0` and three status gains:
+`pos/eta`, `pos/t0438` and `run/Course-2002-02`. Counts are pos 1154/360/345,
+neg 718/318/369 and run 707/800/553 for pass/fail/skip. The saved ledger is
+[`baselines/corpus-cd35fd83.tsv`](baselines/corpus-cd35fd83.tsv), SHA-256
+`473a8745df0d48bd99c97ed04c7ca03eaadfdf5d36944d6a6618d2fd23d9913e`.
+
+The implementation fixes nested function applications by using the returned
+function type during erasure, preserves the ordinary by-name path for nested
+calls, expands curried method values into nested functions, and improves
+structural inference for generic local conversions. New fixtures compare
+acceptance and runtime output with scalac 2.13.16. `README.md` is now a concise
+OSS-style entry point; detailed project notes remain under `docs/`, all in
+English.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=0fb2db57  logs=/tmp/scala-rs-gate-contextual-evidence-20260911-retry
 VERDICT=PASS
 DONE
 ```
