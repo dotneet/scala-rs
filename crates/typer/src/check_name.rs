@@ -193,7 +193,7 @@ impl Typer {
     /// nsc's `Symbol.toString` spells the owner of a definition in that
     /// message. The *simple* name: nsc prints "package p7", not the full
     /// path, which is why this is not [`Typer::owner_desc`].
-    fn defining_owner_desc(&self, owner: SymbolId) -> String {
+    pub(crate) fn defining_owner_desc(&self, owner: SymbolId) -> String {
         if owner.is_none() {
             return "an enclosing scope".to_string();
         }

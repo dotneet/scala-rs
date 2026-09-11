@@ -677,12 +677,14 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
         return false;
     }
     let bty = base_type_at(st, cls, base, child);
+    let java_base = st.get(base).flags.contains(Flags::JAVA);
     let bps = match &bty {
-        Type::Method { paramss, .. } => norm_paramss(paramss),
+        Type::Method { paramss, .. } => java_object_paramss(st, java_base, norm_paramss(paramss)),
         _ => Vec::new(),
     };
     let rigid = rigid_tparams(st, cls, child);
     let agrees = |cps: &[Vec<Type>]| {
+        let cps = java_object_paramss(st, java_base, cps.to_vec());
         cps.len() == bps.len()
             && cps.iter().zip(bps.iter()).all(|(c, b)| {
                 c.len() == b.len()
@@ -708,6 +710,33 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
     // union keeps this module on the side it has always been on: silence when
     // a comparison is not to be trusted.
     agrees(&paramss_of(st, child)) || agrees(&member_paramss_at(st, cls, child))
+}
+
+/// nsc's `ObjectTpeJava`: `java.lang.Object` in a Java signature is the same
+/// type as `Any` *and* as `AnyRef`, so a Scala override may write either --
+/// `Migration.migrate(String, String, Map<String, Object>)` is implemented by
+/// `migrate(…, context: java.util.Map[String, AnyRef])` and equally by
+/// `Map[String, Any]`. scala-rs reads that `Object` as `Any` (inside a
+/// generic argument) or `JavaObject`; comparing against a Java declaration,
+/// every spelling of the top type is folded to `Any` on both sides. A
+/// Scala-defined base keeps the ordinary rule, where `Map[String, AnyRef]`
+/// and `Map[String, Any]` are two different parameter types.
+fn java_object_paramss(st: &SymbolTable, java_base: bool, ps: Vec<Vec<Type>>) -> Vec<Vec<Type>> {
+    if !java_base {
+        return ps;
+    }
+    let fold = |t: &Type| {
+        crate::symbol::map_type(t, &mut |t| match t {
+            Type::AnyRef | Type::JavaObject => Type::Any,
+            Type::Class { sym, args }
+                if args.is_empty() && st.get(*sym).jvm_name == "java/lang/Object" =>
+            {
+                Type::Any
+            }
+            other => other.clone(),
+        })
+    };
+    ps.iter().map(|c| c.iter().map(fold).collect()).collect()
 }
 
 /// `child`'s parameter lists read at `cls`, for the second reading `matches`
