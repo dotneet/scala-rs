@@ -677,10 +677,7 @@ fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
             }
         }
         TreeKind::Ident { name } => {
-            let varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
+            let varid = scala_rs_parser::ast::is_variable_name(name);
             if varid && !pat.sym.is_none() {
                 out.insert(pat.sym);
             }

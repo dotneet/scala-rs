@@ -724,8 +724,10 @@ impl Typer {
         // companion is not, and `wants_product` tells them apart by the `CASE`
         // flag the namer copies from the `object`'s own modifiers.
         self.link_case_product(cls);
+        self.link_serializable_companion(m, cls);
         self.register_sealed_child(cls);
         self.enter_inherited_members(cls);
+        self.unlink_case_apply_by_inherited(cls);
         self.bind_self_type(cls, self_name, self_tpt.as_deref());
         self.presig_import_prefixes(body);
         let saved_missed = self.import_prefix_missed;

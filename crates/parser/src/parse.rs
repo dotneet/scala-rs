@@ -38,6 +38,9 @@ pub struct ParseOptions {
     /// lambdas. Off by default, because that plugin is not Scala and nsc
     /// without it rejects the same programs this rejects without the flag.
     pub kind_projector: bool,
+    /// `-Xsource-features:unicode-escapes-raw`: the lexer leaves unicode
+    /// escapes in triple-quoted strings and `raw` interpolations alone.
+    pub unicode_escapes_raw: bool,
 }
 
 pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) -> ParseResult {
@@ -5407,12 +5410,7 @@ fn desugar_for(
     fn is_irrefutable_at(pat: &Tree, deep: bool) -> bool {
         match &pat.kind {
             TreeKind::Ident { name } => {
-                !deep
-                    || (!pat.stable_pat
-                        && name
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_lowercase() || c == '_'))
+                !deep || (!pat.stable_pat && crate::ast::is_variable_name(name))
             }
             TreeKind::Wildcard => true,
             TreeKind::Bind { body, .. } => is_irrefutable_at(body, true),
@@ -6023,12 +6021,7 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
 fn pattern_bound_names(pat: &Tree, out: &mut Vec<String>) {
     match &pat.kind {
         TreeKind::Ident { name } => {
-            if name != "_"
-                && name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_lowercase() || c == '_')
-            {
+            if name != "_" && crate::ast::is_variable_name(name) {
                 out.push(name.clone());
             }
         }

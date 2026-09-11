@@ -101,11 +101,11 @@
 //!
 //! ## What is deliberately not here
 //!
-//! `checkEphemeral`'s `DefDef` arm also rejects secondary constructors, a
-//! redefined `equals`/`hashCode`, and an "additional parameter" (a second
-//! parameter accessor). Those three read `stat.symbol`'s nsc-specific flags
-//! (`isAuxiliaryConstructor`, `isSynthetic`, `isParamAccessor`), none of which
-//! this tree carries in the same sense, and none appears in
+//! `checkEphemeral`'s `DefDef` arm also rejects secondary constructors and an
+//! "additional parameter" (a second parameter accessor). Those two read
+//! `stat.symbol`'s nsc-specific flags (`isAuxiliaryConstructor`,
+//! `isParamAccessor`), neither of which this tree carries in the same sense,
+//! and neither appears in
 //! `neg/valueclasses.check` or `neg/valueclasses-impl-restrictions.check`. The
 //! same goes for the "qualified super reference" arm of the deep traversal.
 //! They are left out rather than guessed at: every one of them is a *new
@@ -253,11 +253,32 @@ pub fn ephemeral_violations(body: &[Tree], is_value_class: bool) -> Vec<Violatio
             | TreeKind::ClassDef { .. }
             | TreeKind::TypeDef { .. }
             | TreeKind::Empty => {}
-            // nsc runs three more checks here (secondary constructor,
-            // redefined equals/hashCode, additional parameter) that are
-            // deliberately not implemented — see the module header — and then
-            // descends into the right-hand side.
-            TreeKind::DefDef { rhs, .. } => {
+            // nsc runs two more checks here (secondary constructor,
+            // additional parameter) that are deliberately not implemented —
+            // see the module header — and then descends into the right-hand
+            // side. The redefined `equals`/`hashCode` check is by name, on a
+            // written `def`: codegen always gives a value class its own pair
+            // (nsc's `SyntheticMethods`), so a written one would be dropped.
+            TreeKind::DefDef {
+                rhs, name, mods, ..
+            } => {
+                if is_value_class && !mods.flags.contains(Flags::SYNTHETIC) {
+                    let redefined = match name.as_str() {
+                        "equals" => Some(
+                            "redefinition of equals method. See SIP-15, criterion 5. is not allowed in value class",
+                        ),
+                        "hashCode" => Some(
+                            "redefinition of hashCode method. See SIP-15, criterion 5. is not allowed in value class",
+                        ),
+                        _ => None,
+                    };
+                    if let Some(msg) = redefined {
+                        out.push(Violation {
+                            span: stat.span,
+                            msg,
+                        });
+                    }
+                }
                 if is_value_class {
                     ephemeral_deep(rhs, &mut out);
                 }

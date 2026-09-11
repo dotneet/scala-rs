@@ -1405,10 +1405,7 @@ fn switch_pat_key(pat: &Tree) -> Option<SwitchPat> {
         TreeKind::Literal { lit: Lit::Char(c) } => Some(SwitchPat::Key(*c as i32)),
         TreeKind::Wildcard | TreeKind::Empty => Some(SwitchPat::Default),
         TreeKind::Ident { name } => {
-            let is_varid = name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_lowercase() || c == '_');
+            let is_varid = scala_rs_parser::ast::is_variable_name(name);
             if is_varid {
                 Some(SwitchPat::Default)
             } else {

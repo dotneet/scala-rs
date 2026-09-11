@@ -43,6 +43,35 @@ pub(crate) fn store(asm: &mut Assembler, slot: u16, sort: JvmSort) {
     }
 }
 
+/// nsc's `treeInfo.isQualifierSafeToElide` (`isExprSafeToInline`): a path of
+/// stable symbols, `this`, `super` or a literal. Anything else -- a block, a
+/// call -- has to be evaluated even when its value is not needed.
+pub(crate) fn qualifier_safe_to_elide(st: &SymbolTable, tree: &Tree) -> bool {
+    fn stable(st: &SymbolTable, id: SymbolId) -> bool {
+        if id.is_none() {
+            return false;
+        }
+        let s = st.get(id);
+        match s.kind {
+            SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+            SymKind::Term => !s.flags.contains(Flags::MUTABLE),
+            _ => false,
+        }
+    }
+    match &tree.kind {
+        TreeKind::Empty
+        | TreeKind::This { .. }
+        | TreeKind::Super { .. }
+        | TreeKind::Literal { .. } => true,
+        TreeKind::Ident { .. } => stable(st, tree.sym),
+        TreeKind::Select { qual, .. } => stable(st, tree.sym) && qualifier_safe_to_elide(st, qual),
+        TreeKind::TypeApply { fun, .. } => qualifier_safe_to_elide(st, fun),
+        TreeKind::Typed { expr, .. } => qualifier_safe_to_elide(st, expr),
+        TreeKind::Block { stats, expr } => stats.is_empty() && qualifier_safe_to_elide(st, expr),
+        _ => false,
+    }
+}
+
 pub(crate) fn pop_if_value(asm: &mut Assembler, ty: &Type) {
     pop_sort(asm, jvm_sort(ty));
 }
@@ -870,6 +899,11 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                             return;
                         }
                         emit_as_instance_of(asm, ctx, &tree.ty);
+                        return;
+                    }
+                    if matches!(ic, Intrinsic::IsInstanceOf)
+                        && gen_singleton_instance_test(asm, frame, ctx, qual, args)
+                    {
                         return;
                     }
                     if matches!(ic, Intrinsic::IsInstanceOf) {
@@ -1788,6 +1822,13 @@ pub(crate) fn gen_select(
                     }
                     invoke_module_accessor(asm, ctx.st, outer, mcls);
                     return;
+                }
+                // nsc's `Flatten`: the lifted module is read directly, but a
+                // qualifier that is not safe to elide still runs first --
+                // `{ println("x"); Outer }.Inner` prints (run/t4859).
+                if !qualifier_safe_to_elide(ctx.st, qual) {
+                    gen_expr(asm, frame, ctx, qual);
+                    pop_if_value(asm, &qual.ty);
                 }
                 let jvm = class_internal(ctx.st, mcls);
                 asm.getstatic(&jvm, "MODULE$", &format!("L{jvm};"));

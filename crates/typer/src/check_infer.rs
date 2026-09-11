@@ -3656,12 +3656,10 @@ impl Typer {
         let prefix = prefix.clone();
         let parts = parts.clone();
         let args = args.clone();
-        let sc = Tree {
+        let node = |kind: TreeKind| Tree {
             id: NodeId(0),
             span,
-            kind: TreeKind::Ident {
-                name: "StringContext".into(),
-            },
+            kind,
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
@@ -3669,6 +3667,30 @@ impl Typer {
             stable_pat: false,
             byname_thunk: false,
             byname_type_marker: false,
+        };
+        // `-Xsource-features:string-context-scope`: always
+        // `_root_.scala.StringContext`, never a `StringContext` the scope
+        // happens to hold (run/source3Xrun's `SC2`). Without it nsc writes the
+        // bare name, and a local `object StringContext` wins.
+        let sc = if self
+            .source_features
+            .contains(crate::SourceFeature::StringContextScope)
+        {
+            let root = node(TreeKind::Ident {
+                name: "_root_".into(),
+            });
+            let scala = node(TreeKind::Select {
+                qual: Box::new(root),
+                name: "scala".into(),
+            });
+            node(TreeKind::Select {
+                qual: Box::new(scala),
+                name: "StringContext".into(),
+            })
+        } else {
+            node(TreeKind::Ident {
+                name: "StringContext".into(),
+            })
         };
         let apply = Tree {
             id: NodeId(0),

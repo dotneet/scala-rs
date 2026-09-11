@@ -1,0 +1,17 @@
+tab<09>tab
+tab<09>tab
+tab<09>tab
+a<09>1
+tab<09>tab
+tab<09>tab
+a\nb
+tab<09>tab
+no\ttab
+t<09>1 <09>
+\u0040
+\\u0040
+a<0d><0a>b
+q"x
+a"b
+a"
+x\y\\z

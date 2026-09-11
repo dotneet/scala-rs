@@ -767,6 +767,11 @@ impl Typer {
                         }
                     }
                 }
+            } else if let Some(id) = self.function_value_alternative(&alts, pt) {
+                if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                    tree.ty = t.clone();
+                }
+                tree.sym = id;
             } else if !matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                 // The set may still have exactly one alternative whose
                 // parameters are all implicit, which value position keeps for

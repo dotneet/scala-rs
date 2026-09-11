@@ -1,0 +1,12 @@
+(false,false,true,true,true)
+true
+(1,2,3)
+(5,6,3)
+(108,101,7)
+(a!,true)
+(Fn(3),Fn(4))
+(true,true,true,true)
+(Named!,true)
+(Ex: boom,true)
+(true,true)
+(1,2,0)

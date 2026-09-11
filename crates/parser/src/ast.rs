@@ -923,6 +923,19 @@ pub fn op_precedence(op: &str) -> i32 {
     }
 }
 
+/// nsc's `nme.isVariableName` first-character test, which decides whether an
+/// identifier pattern binds or compares: `_`, or a character that is both
+/// lower case (`Character.isLowerCase`, which counts `Other_Lowercase` such
+/// as `ª` and `ʰ`) and a *letter* (`Character.isLetter`). A lower-case letter
+/// *number* such as `ⅰ` is not a letter, so `case ⅰ_ⅲ =>` compares
+/// (run/identifierCase). Rust's `is_alphabetic` also admits the `Nl`
+/// numbers, hence the `is_numeric` exclusion.
+pub fn is_variable_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c == '_' || (c.is_lowercase() && c.is_alphabetic() && !c.is_numeric()))
+}
+
 pub fn is_assignment_op(op: &str) -> bool {
     op.ends_with('=')
         && op.len() > 1

@@ -1868,8 +1868,12 @@ impl Typer {
         allow_widen: bool,
         open: &[SymbolId],
     ) -> bool {
+        // Numeric widening is weak conformance, which nsc's applicability
+        // (`isWeaklyCompatible`) uses from the first try: `f(3)` against
+        // `f(x: AnyVal)` and `f(x: Double)` has both applicable, and the more
+        // specific `Double` wins (run/t12560). Holding widening back to the
+        // view round made the `AnyVal` one the only candidate.
         match self.arg_score(arg, param) {
-            Some(3) if !allow_widen && !self.spec_probe.get() => false, // numeric widen
             Some(_) => true,
             None if allow_widen => {
                 // Narrowing an `Int` literal (`take(3)` on a `Byte` parameter)

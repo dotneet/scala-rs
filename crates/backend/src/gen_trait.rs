@@ -1640,6 +1640,31 @@ impl<'a> Gen<'a> {
     /// synthesizes these from the constructor fields; a hand-written one wins.
     /// `hashCode` is nsc's MurmurHash3 under `--scala-library` and the
     /// 31-fold under `--no-scala-library`; see `emit_case_hash_code`.
+    /// Whether `class_id` inherits a concrete, written `name` (`equals`,
+    /// `hashCode` or `toString`) from something other than `Object` / `Any`.
+    pub(crate) fn inherits_object_method_override(&self, class_id: SymbolId, name: &str) -> bool {
+        let arity = if name == "equals" { 1 } else { 0 };
+        let tops = [
+            self.st.object_sym,
+            self.st.any_sym,
+            self.st.anyref_sym,
+            self.st.anyval_sym,
+        ];
+        self.st.lookup_member(class_id, name).into_iter().any(|m| {
+            let s = self.st.get(m);
+            let params = match &s.ty {
+                Type::Method { paramss, .. } => paramss.iter().flatten().count(),
+                _ => 0,
+            };
+            s.owner != class_id
+                && !tops.contains(&s.owner)
+                && s.kind == SymKind::Method
+                && !self.st.method_is_deferred(m)
+                && !s.flags.contains(Flags::SYNTHETIC)
+                && params == arity
+        })
+    }
+
     pub(crate) fn emit_case_object_methods(&self, b: &mut ClassBuilder, class_id: SymbolId) {
         if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
             return;
@@ -1647,7 +1672,18 @@ impl<'a> Gen<'a> {
         let fields = self.st.get(class_id).ctor_fields.clone();
         let class_jvm = b.this_name.clone();
         let simple = self.st.get(class_id).name.clone();
-        let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        let mut defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        // nsc's `SyntheticMethods.hasOverridingImplementation`: `equals`,
+        // `hashCode` and `toString` are synthesized only when the member the
+        // class would otherwise inherit is `Object`'s. A concrete one from a
+        // superclass or a binary trait wins -- `case class Bippy(a: String)
+        // extends Proxy` compares through `Proxy.equals` (run/proxy). A
+        // source trait's reaches `b.methods` as a mixin forwarder already.
+        for name in ["equals", "hashCode", "toString"] {
+            if self.inherits_object_method_override(class_id, name) {
+                defined.insert(name.to_string());
+            }
+        }
         if is_module_class(self.st, class_id) {
             // The module class is `Asc$`; the `case object` is called `Asc`.
             let name = simple.strip_suffix('$').unwrap_or(&simple).to_string();
@@ -2843,8 +2879,23 @@ impl<'a> Gen<'a> {
             let fname = module_field_name(self.st, mcls);
             let aname = module_accessor_name(self.st, mcls);
             let adesc = module_accessor_desc(self.st, mcls);
+            // `@transient object B` keeps its instance out of the enclosing
+            // object's serialized form, as nsc's `B$module` field does
+            // (run/transient-object).
+            let owner = self.st.get(mcls).owner;
+            let transient = self.st.get(mcls).flags.contains(Flags::TRANSIENT)
+                || self.st.get(owner).members.iter().any(|&m| {
+                    let s = self.st.get(m);
+                    s.kind == SymKind::Module
+                        && s.ty == Type::ModuleRef(mcls)
+                        && s.flags.contains(Flags::TRANSIENT)
+                });
+            let mut access = ACC_PRIVATE | ACC_VOLATILE;
+            if transient {
+                access |= ACC_TRANSIENT;
+            }
             b.fields.push(Field {
-                access: ACC_PRIVATE | ACC_VOLATILE,
+                access,
                 name: fname.clone(),
                 desc: mdesc.clone(),
             });

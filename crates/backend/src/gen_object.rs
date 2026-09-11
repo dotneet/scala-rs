@@ -62,6 +62,18 @@ impl<'a> Gen<'a> {
             Some(_) => self.add_serializable(&mut b),
             // `case object Q`: a `Product` in its own right.
             None if mods.flags.contains(Flags::CASE) => self.add_product_interfaces(&mut b),
+            // The companion of a `Serializable` class: the typer added the
+            // parent (`Typer::link_serializable_companion`, nsc's
+            // `typedModuleDef`), but the source's parent trees do not name it.
+            None if !cls.is_none()
+                && self.st.get(cls).parents.iter().any(|p| {
+                    self.st
+                        .class_sym_of(p)
+                        .is_some_and(|s| class_internal(self.st, s) == "java/io/Serializable")
+                }) =>
+            {
+                self.add_serializable(&mut b)
+            }
             None => {}
         }
         // A member `object` lives once per enclosing instance, so it carries
@@ -175,8 +187,12 @@ impl<'a> Gen<'a> {
         // case-class companion: synthetic apply
         let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
+            // The synthetic `apply` is owed exactly when the typer kept it: a
+            // written or inherited `apply` that matches its signature
+            // unlinked it (`crate::typer::case_apply_unlink`, nsc's rule),
+            // and one that does not is an overload beside it.
             if self.st.get(class_id).flags.contains(Flags::CASE)
-                && !impl_.body.iter().any(|t| t.name() == Some("apply"))
+                && !case_apply_sym(self.st, class_id).is_none()
             {
                 emit_case_apply(&mut b, self.st, class_id);
                 // nsc emits no forwarder for an `apply` that is not public.
@@ -337,6 +353,7 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
+        let delayed_stats = Gen::has_delayed_stats(body);
         let is_app = extends_app(st, class_id);
         let super_name = b.super_name.clone();
         // `object X extends Y(args)` / `case object X extends Y(args)`: the
@@ -478,7 +495,9 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
-                Gen::emit_delayed_init_call(asm, &class_name);
+                if delayed_stats {
+                    Gen::emit_delayed_init_call(asm, &class_name);
+                }
             } else {
                 for vd in &inits {
                     if let TreeKind::ValDef {
@@ -1378,6 +1397,13 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
     } else {
         base_ctor_d
     };
+    // A written `apply` of the same erasure already took the slot.
+    if b.methods
+        .iter()
+        .any(|m| m.name == "apply" && m.desc == desc)
+    {
+        return;
+    }
     let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
     b.add_code(acc, "apply", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
