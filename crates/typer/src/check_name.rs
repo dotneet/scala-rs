@@ -396,16 +396,25 @@ impl Typer {
     /// Shared by the two places that need it: rewriting a bare name back into
     /// `u.name` for the backend ([`Self::qualify_term_import`]), and reading
     /// an imported implicit at the prefix's type
-    /// (`Typer::implicit_candidate_ty`). A member the enclosing class already
-    /// has is reached through `this` and is not this import's.
+    /// (`Typer::implicit_candidate_ty`). A member an enclosing class already
+    /// has is reached through that class's `this` and is not this import's.
+    ///
+    /// "Has" is [`SymbolTable::enclosing_class_reaching`]'s: the class itself,
+    /// a parent, or its self type, for the current class *or any class
+    /// enclosing it*. The prefixes are kept for the whole run and keyed by the
+    /// member's owner, so the entry this would answer with can be another
+    /// file's import. gitbucket's services write `import
+    /// gitbucket.core.model.Profile.currentDate`, which files `trait Profile`
+    /// under the object path; every component `trait X { self: Profile => …
+    /// }` then read its own `profile` -- and every table class nested in it
+    /// its `dateColumnType` -- as `gitbucket.core.model.Profile.profile`, the
+    /// object's, where nsc has `X.this.profile`. One instance in gitbucket;
+    /// for any other the program silently used the wrong one.
     pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<Tree> {
         if owner.is_none() || self.term_import_prefixes.is_empty() {
             return None;
         }
-        if !self.st.this_class.is_none()
-            && (owner == self.st.this_class
-                || crate::pickle_supply::inherits_from(&self.st, self.st.this_class, owner))
-        {
+        if self.st.enclosing_class_reaching(owner).is_some() {
             return None;
         }
         self.term_import_prefixes
@@ -431,7 +440,7 @@ impl Typer {
     /// that view, and `+` fell to `any2stringadd`. Only a member of a class
     /// the reference sits inside can be re-spelled this way; a shadowed
     /// local has no other spelling and stays out of reach.
-    fn writable_import_prefix(&self, q: &Tree) -> Option<Tree> {
+    pub(crate) fn writable_import_prefix(&self, q: &Tree) -> Option<Tree> {
         if self.prefix_in_scope(q) {
             return Some(q.clone());
         }
@@ -458,19 +467,20 @@ impl Typer {
         if cls.is_none() || !self.st.get(cls).is_class_like() {
             return None;
         }
-        let mut c = self.st.this_class;
-        while !c.is_none() && c != cls {
-            c = self.st.get(c).owner;
-        }
-        if c.is_none() {
-            return None;
-        }
+        // The `this` that reaches `cls`: an enclosing class that is `cls`,
+        // inherits it, or has it in its self type. A component trait reads
+        // `import profile.api._` through `self: Profile =>`, and `profile` is
+        // `Profile`'s, which no class *encloses*; requiring an enclosing
+        // `cls` itself dropped the prefix, and the view `profile.api.wrap`
+        // was emitted as a bare `wrap` on a cast `this` (a
+        // `ClassCastException` from a program that typechecked).
+        let c = self.st.enclosing_class_reaching(cls)?;
         let this = Tree {
             span: root.span,
-            sym: cls,
-            ty: self.st.self_type_of_class(cls),
+            sym: c,
+            ty: self.st.self_type_of_class(c),
             ..Tree::dummy(TreeKind::This {
-                qual: (cls != self.st.this_class).then(|| self.st.get(cls).name.clone()),
+                qual: (c != self.st.this_class).then(|| self.st.get(c).name.clone()),
             })
         };
         let name = name.clone();

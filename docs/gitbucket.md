@@ -3482,4 +3482,13 @@ back instead of typing it again, and three typer repairs -- is
 silent miscompile in exactly gitbucket's table shape: a table class that
 extends `Table` through `import profile.api._` gets the component, not the
 profile, as its superclass's outer instance, and its constructor throws
-`ClassCastException` at run time.
+`ClassCastException` at run time. It needs prefix-carrying class types
+(`agent/prefixtypes`); the reduction is item 1 of §7.25's list.
+
+A second one is fixed: a service's `import
+gitbucket.core.model.Profile.currentDate` was taken, run-wide, as the receiver
+of every component's own `profile` (and of the `dateColumnType` its tables
+take from the self type), so they read the object's where nsc reads
+`XComponent.this`'s -- the same value in gitbucket, which has one instance.
+All 31 `mapTo` prefixes now arrive as `XComponent.this.profile.api`
+(`gbmac_selfimport.scala`, §7.25 "The receiver of a self-type member").

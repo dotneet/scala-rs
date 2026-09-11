@@ -2466,14 +2466,14 @@ fn owner_chain_path(st: &SymbolTable, first: String, mut cur: SymbolId) -> Optio
 /// A member selected from a *class* rather than from a value: `a.b.C.m`
 /// where `C` is a class or trait.
 ///
-/// The typer writes a member reached through an enclosing template's self
-/// type this way -- gitbucket's `trait AccountComponent { self: Profile =>
-/// import profile.api._ … }` gives every implicit the import supplies the
-/// qualifier `gitbucket.core.model.Profile.profile`. That is not a term path:
-/// typed again at the macro's call site, `Profile` names no value. What it
-/// stands for is `C.this.m` for the enclosing class `C` the member is reached
-/// through, which is what nsc's typed tree carries, so that is what is
-/// written. Anything this cannot place is left as it was.
+/// That is not a term path: typed again at the macro's call site, `C` names
+/// no value. What it stands for is `C.this.m` for the enclosing class the
+/// member is reached through, which is what nsc's typed tree carries, so that
+/// is what is written. Anything this cannot place is left as it was.
+/// (gitbucket's component prefixes used to arrive as
+/// `gitbucket.core.model.Profile.profile` -- another file's import taken as
+/// the receiver of a self-type member, fixed in `term_import_prefix_for`;
+/// they are `AccountComponent.this.profile` now.)
 fn class_path_member(cx: &WireCx, t: &Tree, qual: &Tree, name: &str, out: &mut String) -> bool {
     if qual.sym.is_none() || cx.st.get(qual.sym).kind != SymKind::Class || t.sym.is_none() {
         return false;

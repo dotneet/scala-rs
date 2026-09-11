@@ -3602,11 +3602,40 @@ with its near misses in `gbmac_typer_bad.scala`; the unmodified `9cac778e` binar
 
 #### Validation
 
-`crates/cli/tests/gbmac.rs`, thirteen tests, each fixture run under scala-rs and under real scalac:
+`crates/cli/tests/gbmac.rs`, each fixture run under scala-rs and under real scalac:
 `gbmac_mapto` on H2; `gbmac_mapto_bad` (`mapTo` to a class whose field types do not match, to one
 with a column too many, and to a non-case class -- rejected on the same three lines by both
 compilers); the mirror against nsc and its named refusals; `mapToImpl`'s opening on current-run
-classes; the reply shapes; the three typer repairs and their near misses.
+classes; the reply shapes; the three typer repairs and their near misses; `gbmac_selfimport` (below).
+
+#### The receiver of a self-type member (gitbucket's component shape)
+
+Every gitbucket table lives in `trait XComponent { self: Profile => import profile.api._ … }`, and
+`gitbucket.core.model` has an `object Profile` beside `trait Profile`. Three receivers were silently
+wrong there (`tests/fixtures/gbmac_selfimport.scala`; each also wrong on `4ac7c31b` and on the
+`batch/w1` merge `c39d6394`, scalac prints what `expected/gbmac_selfimport.txt` holds):
+
+* **Another file's import as the receiver** (`check_name.rs`, `term_import_prefix_for`). The
+  prefixes of value imports are kept for the whole run, keyed by the member's owner. A service's
+  `import gitbucket.core.model.Profile.currentDate` files `trait Profile` under the object path, and
+  from then on a component's own `profile` -- and `dateColumnType`, the implicit a table class nested
+  in the component takes from the self type -- was read as the object's. The test that a member is
+  `this`'s asked only whether the current class *inherits* its owner; a self type is not
+  inheritance, and a nested class inherits nothing of its component. It is now
+  `SymbolTable::enclosing_class_reaching` (the class, a parent, or the self type, of the current
+  class or any class enclosing it) -- the same walk `ident_prefix_class` and the macro wire's
+  `this_qualifier_of` use. In gitbucket every `mapTo` prefix was
+  `_root_.gitbucket.core.model.Profile.profile.api`; all 31 are `XComponent.this.profile.api` now,
+  as nsc has them. With an implicit in `trait Profile` the same entry, a symbolic path, reached
+  codegen as a receiver and the file was rejected ("unresolved ident").
+* **A view from an object of an instance** (`implicits.rs`, `instance_object_import_prefix`).
+  `import profile.obj._` where `obj` is an `object` inside `profile`'s class: the implicit was
+  emitted as a bare name and loaded as the `obj` of a cast `this`. It now takes the path the scope's
+  own binding was imported under.
+* **An import root shadowed where it is used** (`check_name.rs`, `writable_import_prefix`). `def
+  shadowed(profile: Int) = "s".shout` after `import profile.api._` still means `this`'s `profile`;
+  the rewrite into `C.this.profile` only looked for `profile`'s owner among the *enclosing* classes,
+  and a self type's member is not one of them.
 
 #### Found on the way and not fixed here
 
@@ -3616,7 +3645,16 @@ classes; the reply shapes; the three typer repairs and their near misses.
    Inner(k) }`: scala-rs passes `Comp.this` where `prof` belongs and the constructor throws
    `ClassCastException` at run time. gitbucket's every table (`extends Table[…]` through `import
    profile.api._`) has this shape; `gbmac_mapto.scala` writes `extends profile.Table[…]` to stay clear
-   of it.
+   of it. `import prof._; … extends Direct(k)` with the alias in `Api` itself, and `extends
+   prof.Inner(k)`, are right; what fails is an alias one member down -- `extends Inner(k)` or `new
+   Inner(k)` through `prof.api`, and `new prof.api.Inner(k)` written out. The outer is `Api.this` as
+   seen from `prof.api`, i.e. the prefix of `prof.api`'s *type* (`prof.Aliases`); `Type::Class`
+   carries no prefix, so `Aliases` declared as `Api.this.Aliases` and as `other.Aliases` look alike
+   (slick's `api` is pickled as `JdbcProfile.this.API`, and that `ThisType` is dropped on reading;
+   `SymbolTable::binary_alias_prefixes` records an alias's own prefix and is read by nothing). This
+   is the prefix-carrying class type redesign `agent/prefixtypes` owns. The backend falls back to
+   the nearest enclosing instance (`load_outer_arg`) instead of refusing; turning that fallback into
+   a diagnostic would make each gitbucket table a compile error rather than a run-time one.
 2. `x.mapTo[R]` through an implicit view is "not a member" until something else has loaded
    `ShapedValue`'s members (a class with `column[String]("A")` columns and no `O.PrimaryKey` shows it;
    gitbucket does not).
@@ -3631,6 +3669,8 @@ classes; the reply shapes; the three typer repairs and their near misses.
    it passes.
 7. `FixedSqlStreamingAction[…, Read] <: DBIOAction[R, NoStream, Nothing]` is rejected, so
    `db.run(query.result)` does not typecheck; `gbmac_mapto.scala` runs `query.result.map(x => x)`.
-8. In a component trait with `self: Profile =>`, `import profile.api._` resolves `profile` to the
-   member of gitbucket's `object Profile` (the companion) rather than to `this`'s -- the same value
-   in gitbucket, which has one instance, and a wrong binding in general.
+8. (Fixed; see "The receiver of a self-type member" above.) In a component trait with `self:
+   Profile =>`, `profile` was read as the member of gitbucket's `object Profile` rather than
+   `this`'s.
+9. `O PrimaryKey` without `scala.language.postfixOps` is a warning in scala-rs and an error in scalac
+   2.13.16 ("postfix operator PrimaryKey needs to be enabled"); gitbucket enables the feature.

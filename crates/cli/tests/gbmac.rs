@@ -16,7 +16,10 @@
 //! * `gbmac_shapes_*` -- the reply shapes the expansion is built of, without
 //!   slick;
 //! * `gbmac_typer*` -- three typer repairs the expansion depends on, shown
-//!   without the macro.
+//!   without the macro;
+//! * `gbmac_selfimport` -- gitbucket's component shape (`self: Profile =>
+//!   import profile.api._` beside an `object Profile`), whose receivers were
+//!   silently wrong.
 //!
 //! Fixture prefix: `gbmac_`.
 
@@ -225,6 +228,53 @@ fn slick_program(name: &str, main_class: &str, with_scalac: bool) {
     run_cp.push(&env.reflect);
     assert_eq!(run_main(&join(&run_cp), main_class), expected(name));
     let _ = fs::remove_dir_all(&out);
+}
+
+/// Compile `name` alone with scala-rs or with scalac, run `main_class` under
+/// `-Xverify:all`, and compare with the recorded output.
+fn plain_program(name: &str, main_class: &str, with_scalac: bool) {
+    let Some(env) = env(name) else { return };
+    let out = tmp_dir(name);
+    let o = if with_scalac {
+        scalac_compile(
+            &env.scalac,
+            &[fixture(name)],
+            &out,
+            &env.lib.display().to_string(),
+        )
+    } else {
+        scala_rs(
+            &[fixture(name)],
+            &out,
+            &env.reflect.display().to_string(),
+            &env.lib,
+        )
+    };
+    assert!(
+        o.status.success(),
+        "compile {name} failed:\n{}",
+        diagnostics(&o)
+    );
+    assert_eq!(
+        run_main(&join(&[out.as_path(), &env.lib]), main_class),
+        expected(name)
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// gitbucket's `trait X { self: Profile => import profile.api._ }` beside an
+/// `object Profile`: the self type's member, a class nested in the component,
+/// a view from an object of that member, and an import root shadowed where
+/// it is used. Each was a silent miscompile (the object's `profile`, or a
+/// cast `this` as the receiver).
+#[test]
+fn gbmac_selfimport_reads_this_profile() {
+    plain_program("gbmac_selfimport", "gbmacsi.Main", false);
+}
+
+#[test]
+fn scalac_agrees_gbmac_selfimport() {
+    plain_program("gbmac_selfimport", "gbmacsi.Main", true);
 }
 
 #[test]

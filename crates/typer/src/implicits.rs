@@ -3381,6 +3381,15 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         };
+        if let Some(prefix) = self.instance_object_import_prefix(id) {
+            return Tree {
+                kind: TreeKind::Select {
+                    qual: Box::new(prefix),
+                    name,
+                },
+                ..ident
+            };
+        }
         let Some(module) = self.wildcard_module_for(id) else {
             // `import b._` where `b` is a *value*: the conversion is an
             // instance member of `b`'s class, so the call needs `b` as its
@@ -3437,6 +3446,69 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         }
+    }
+
+    /// The import path an implicit declared in an `object` that belongs to an
+    /// *instance* was brought in through.
+    ///
+    /// `import profile.api._` where `api` is an `object` of `profile`'s class:
+    /// the object is `profile`'s own, reached only by calling `profile.api`.
+    /// Emitted as a bare name, the view was loaded as the `api` of a cast
+    /// `this` -- a `ClassCastException` from a program that typechecked, where
+    /// nsc's tree is `X.this.profile.api.wrap(…)`. A static object (one only
+    /// packages and objects enclose) is its own receiver and is left to the
+    /// callers below. The path is the one the scope's own binding of the name
+    /// was imported under, so it is this import's and no other file's.
+    fn instance_object_import_prefix(&self, id: SymbolId) -> Option<Tree> {
+        let owner = self.st.get(id).owner;
+        if owner.is_none() || self.st.get(owner).kind != SymKind::ModuleClass {
+            return None;
+        }
+        let mut up = self.st.get(owner).owner;
+        loop {
+            if up.is_none() || up == self.st.root {
+                return None;
+            }
+            match self.st.get(up).kind {
+                SymKind::Package => return None,
+                SymKind::Module | SymKind::ModuleClass => up = self.st.get(up).owner,
+                _ => break,
+            }
+        }
+        // Written inside the object (or a class it encloses): its `this`.
+        if self.st.enclosing_class_reaching(owner).is_some() {
+            return None;
+        }
+        let name = &self.st.get(id).name;
+        for scope in self.st.scopes.iter().rev() {
+            let origin = scope
+                .lookup_ranked(name)
+                .iter()
+                .find(|b| b.sym == id)
+                .map(|b| b.origin)
+                .or_else(|| {
+                    scope
+                        .wildcards()
+                        .iter()
+                        .find(|w| {
+                            w.offers(name)
+                                && (w.owner == owner
+                                    || crate::pickle_supply::inherits_from(
+                                        &self.st, w.owner, owner,
+                                    ))
+                        })
+                        .map(|w| w.origin)
+                });
+            let Some(origin) = origin else {
+                continue;
+            };
+            let prefix = self.object_import_prefixes.get(&origin)?;
+            if prefix.ty.is_no_type() || prefix.ty.is_error() {
+                return None;
+            }
+            return self.writable_import_prefix(prefix);
+        }
+        None
     }
 
     /// The object a wildcard import brought `id` in through, when `id` is
