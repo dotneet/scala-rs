@@ -237,6 +237,9 @@ impl Typer {
                 }
             }
         }
+        // A template's self alias (`trait Function1[-T1, +R] { self => … }`)
+        // is a name in that template's scope, not a member, and never reaches
+        // `found`: `bind_self_type` keeps it out of the template's `members`.
         // Module: members of module class
         if found.is_empty() {
             if let Type::ModuleRef(id) = &recv_ty {
@@ -661,6 +664,22 @@ impl Typer {
         } else {
             Vec::new()
         };
+        // A receiver typed by an abstract type (`clone(): C`, `empty: C`) is
+        // read through its bound, but `this.type` in the member stands for
+        // the receiver itself: `clone() -= key` is a `C`. And `super.m` is
+        // selected on this class's `this` (SLS 6.5), so a `this.type` in its
+        // result is this class's even where it is not the whole result:
+        // `override def lazyZip[B](that): LazyZip2[A, B, LazyList.this.type] =
+        // super.lazyZip(that)`.
+        let this_prefix = match (&qual.ty, super_this) {
+            (_, Some(here)) if ext_conv.is_none() => Some(Type::ThisType(here)),
+            (Type::TypeParam(_) | Type::TypeMember(_), None)
+                if ext_conv.is_none() && recv_ty != qual.ty =>
+            {
+                Some(qual.ty.clone())
+            }
+            _ => None,
+        };
         let subst = |ty: Type| -> Type {
             let ty = apply_path_members(ty, &path_members);
             // `import seq.integral._; increment < zero` is
@@ -672,7 +691,10 @@ impl Typer {
             } else {
                 self.at_import_prefix_of(ext_conv, &ty).unwrap_or(ty)
             };
-            let ty = self.st.subst_as_seen_from(&recv_ty, &ty);
+            let ty = match &this_prefix {
+                Some(p) => self.st.subst_as_seen_from_prefix(&recv_ty, p, &ty),
+                None => self.st.subst_as_seen_from(&recv_ty, &ty),
+            };
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                     return self.st.subst_tparams(owner, &subst_args, &ty);
@@ -698,6 +720,7 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let ty = expand(subst(self.st.get(s).ty.clone()));
+            let ty = self.opaque_projection_params(&qual.ty, ty);
             let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless(s, ty, pt);
             if let Type::Array(elem) = &qual.ty {
@@ -737,6 +760,10 @@ impl Typer {
             let alts: Vec<(SymbolId, Type)> = found
                 .iter()
                 .map(|s| (*s, expand(subst(self.st.get(*s).ty.clone()))))
+                .collect();
+            let alts: Vec<(SymbolId, Type)> = alts
+                .into_iter()
+                .map(|(s, t)| (s, self.opaque_projection_params(&qual.ty, t)))
                 .collect();
             self.overload_member_types.insert(found[0].0, alts.clone());
             let ov = Type::Overload(alts.clone().into_iter().map(|(_, t)| t).collect());
@@ -2701,12 +2728,141 @@ impl Typer {
         true
     }
 
+    /// A member selected through a type projection `A#B` whose prefix leaves
+    /// an abstract type member `T` of `B`'s enclosing class unsettled
+    /// ([`crate::symbol::PROJECTION_MARK`]): in the member's *parameter*
+    /// types `T` is nsc's existential `_1.T forSome { val _1: A }` -- the
+    /// `T` of one particular, unknown instance -- so each selection gets a
+    /// fresh abstract type, bounded like `T` and below `A#T`. Only `Nothing`
+    /// (or a type `T` itself bounds from below) conforms to it:
+    ///
+    /// ```scala
+    /// val a: Base#Inner = new IntBase.Inner
+    /// val b: Base#Inner = new StringBase.Inner
+    /// a.set(b.get())   // found: Base#T  required: _1.T where val _1: Base
+    /// ```
+    ///
+    /// Results keep `T` itself, which is the projection `A#T` scalac packs
+    /// the existential back into, so `val t: Base#T = a.get()` still holds.
+    pub(crate) fn opaque_projection_params(&mut self, recv: &Type, ty: Type) -> Type {
+        let Some((parent, settled)) = crate::symbol::SymbolTable::type_projection_view(recv) else {
+            return ty;
+        };
+        let Type::Method { paramss, ret } = ty else {
+            return ty;
+        };
+        let Some(cls) = self.st.class_sym_of(parent) else {
+            return Type::Method { paramss, ret };
+        };
+        let settled: Vec<String> = settled.into_iter().map(str::to_string).collect();
+        let mut targets: Vec<SymbolId> = Vec::new();
+        for owner in self.st.enclosing_classes(cls).into_iter().skip(1) {
+            for name in self.st.abstract_type_member_names(owner) {
+                if settled.contains(&name) {
+                    continue;
+                }
+                for m in self.st.lookup_member(owner, &name) {
+                    if self.st.is_deferred_type_member(m)
+                        && self.st.get(m).tparams.is_empty()
+                        && !targets.contains(&m)
+                    {
+                        targets.push(m);
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Type::Method { paramss, ret };
+        }
+        let mut fresh: Vec<(SymbolId, SymbolId)> = Vec::new();
+        let mut params_out = Vec::with_capacity(paramss.len());
+        for clause in paramss {
+            let mut out = Vec::with_capacity(clause.len());
+            for p in clause {
+                let mut wanted: Vec<SymbolId> = Vec::new();
+                crate::symbol::map_type(&p, &mut |t| {
+                    if let Type::TypeMember(id) = t {
+                        if targets.contains(id) && !wanted.contains(id) {
+                            wanted.push(*id);
+                        }
+                    }
+                    t.clone()
+                });
+                for id in wanted {
+                    if !fresh.iter().any(|(d, _)| *d == id) {
+                        let f = self.fresh_projection_member(id);
+                        fresh.push((id, f));
+                    }
+                }
+                out.push(crate::symbol::map_type(&p, &mut |t| match t {
+                    Type::TypeMember(id) => match fresh.iter().find(|(d, _)| d == id) {
+                        Some((_, f)) => Type::TypeMember(*f),
+                        None => t.clone(),
+                    },
+                    other => other.clone(),
+                }));
+            }
+            params_out.push(out);
+        }
+        Type::Method {
+            paramss: params_out,
+            ret,
+        }
+    }
+
+    /// `_1.T` for [`Self::opaque_projection_params`]: a new abstract type
+    /// member with `T`'s lower bound and `T` itself (the projection) as its
+    /// upper bound, owned by a synthetic value `_1` so it prints the way
+    /// scalac's message does.
+    fn fresh_projection_member(&mut self, decl: SymbolId) -> SymbolId {
+        let name = self.st.get(decl).name.clone();
+        let lo = self.st.get(decl).bound_lo.clone();
+        let holder = self
+            .st
+            .alloc("_1", SymbolId::NONE, SymKind::Term, Flags::SYNTHETIC, "");
+        let id = self
+            .st
+            .alloc(name, holder, SymKind::TypeMember, Flags::SYNTHETIC, "");
+        let s = self.st.get_mut(id);
+        s.ty = Type::TypeMember(id);
+        s.bound_lo = lo;
+        s.bound_hi = Some(Type::TypeMember(decl));
+        id
+    }
+
     fn is_assignable_lhs(&self, tree: &Tree) -> bool {
         if tree.sym.is_none() {
             return false;
         }
         let s = self.st.get(tree.sym);
-        s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE)
+        if s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE) {
+            return true;
+        }
+        // nsc `isVariableOrGetter`: a getter (`mayBeVarGetter` -- a
+        // parameterless, non-lazy `def` of a class) whose owner also has a
+        // `name_=`. `x += 1` then becomes `x = x + 1`, which the assignment
+        // turns into the setter call. OpenHashMap writes `size += 1` over
+        // `override def size = _size` / `private[this] def size_=(s: Int)`,
+        // and PriorityQueue `resarr.p_size0 += 1` over a `def p_size0` /
+        // `def p_size0_=` pair; both were "receiver is not assignable".
+        // `def x()` (empty parentheses) and a `val` are not getters, and
+        // scalac rejects `+=` on them even with a setter beside them.
+        if s.kind != SymKind::Method
+            || s.name.ends_with("_=")
+            || s.flags.contains(Flags::LAZY)
+            || matches!(&s.ty, Type::Method { paramss, .. } if !paramss.is_empty())
+            || !matches!(
+                self.st.get(s.owner).kind,
+                SymKind::Class | SymKind::ModuleClass | SymKind::Module
+            )
+        {
+            return false;
+        }
+        let setter = format!("{}_=", s.name);
+        self.st
+            .lookup_member(s.owner, &setter)
+            .into_iter()
+            .any(|m| self.st.get(m).kind == SymKind::Method)
     }
 
     /// nsc `convertToAssignment`'s `mkUpdate`: `t(i) op= x` is

@@ -1177,18 +1177,7 @@ pub(crate) fn invoke_method(
                         "apply",
                         "(Ljava/lang/Object;)Ljava/lang/Object;",
                     );
-                    if let Some(ty) = result_ty {
-                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            let cls = jvm_desc(ctx.st, ty);
-                            if let Some(inner) =
-                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-                            {
-                                if inner != "java/lang/Object" {
-                                    asm.checkcast(inner);
-                                }
-                            }
-                        }
-                    }
+                    cast_erased_ref_result(asm, ctx, result_ty);
                     return;
                 }
                 "get" => {
@@ -1218,18 +1207,7 @@ pub(crate) fn invoke_method(
                         "apply",
                         "(Ljava/lang/Object;)Ljava/lang/Object;",
                     );
-                    if let Some(ty) = result_ty {
-                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            let cls = jvm_desc(ctx.st, ty);
-                            if let Some(inner) =
-                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-                            {
-                                if inner != "java/lang/Object" {
-                                    asm.checkcast(inner);
-                                }
-                            }
-                        }
-                    }
+                    cast_erased_ref_result(asm, ctx, result_ty);
                     return;
                 }
                 "get" => {
@@ -1268,18 +1246,7 @@ pub(crate) fn invoke_method(
                         "apply",
                         "(Ljava/lang/Object;)Ljava/lang/Object;",
                     );
-                    if let Some(ty) = result_ty {
-                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            let cls = jvm_desc(ctx.st, ty);
-                            if let Some(inner) =
-                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-                            {
-                                if inner != "java/lang/Object" {
-                                    asm.checkcast(inner);
-                                }
-                            }
-                        }
-                    }
+                    cast_erased_ref_result(asm, ctx, result_ty);
                     return;
                 }
                 "get" => {
@@ -1532,18 +1499,7 @@ pub(crate) fn invoke_method(
                         "apply",
                         "(I)Ljava/lang/Object;",
                     );
-                    if let Some(ty) = result_ty {
-                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            let cls = jvm_desc(ctx.st, ty);
-                            if let Some(inner) =
-                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-                            {
-                                if inner != "java/lang/Object" {
-                                    asm.checkcast(inner);
-                                }
-                            }
-                        }
-                    }
+                    cast_erased_ref_result(asm, ctx, result_ty);
                     return;
                 }
                 ":+" => {
@@ -1683,18 +1639,7 @@ pub(crate) fn invoke_method(
                         "apply",
                         "(I)Ljava/lang/Object;",
                     );
-                    if let Some(ty) = result_ty {
-                        if !is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            let cls = jvm_desc(ctx.st, ty);
-                            if let Some(inner) =
-                                cls.strip_prefix('L').and_then(|s| s.strip_suffix(';'))
-                            {
-                                if inner != "java/lang/Object" {
-                                    asm.checkcast(inner);
-                                }
-                            }
-                        }
-                    }
+                    cast_erased_ref_result(asm, ctx, result_ty);
                     return;
                 }
                 _ => {}
@@ -2701,6 +2646,22 @@ pub(crate) fn erased_load_needs_narrowing(st: &SymbolTable, from_desc: &str, wan
     if from_desc == "Ljava/lang/Object;" {
         return true;
     }
+    // An array is erased from the element inwards: `Array[Array[T]]` is a
+    // `[Ljava/lang/Object;` field, and read at `T = String` it is a
+    // `[[Ljava/lang/String;`, whose element an `aastore` of a `String`
+    // needs to see (`run/t0677-new`, `VerifyError: Bad type on operand stack
+    // in aastore`). Same test as `maybe_unbox_erased_result`'s array arm.
+    if from_desc.starts_with('[') {
+        let Type::Array(elem) = want else {
+            return false;
+        };
+        let w = jvm_desc(st, want);
+        let depth = |d: &str| d.len() - d.trim_start_matches('[').len();
+        return w != from_desc
+            && is_concrete_array_elem(elem)
+            && depth(&w) >= depth(from_desc)
+            && from_desc.trim_start_matches('[') == "Ljava/lang/Object;";
+    }
     let Some(declared) = from_desc
         .strip_prefix('L')
         .and_then(|s| s.strip_suffix(';'))
@@ -2772,6 +2733,29 @@ pub(crate) fn checkcast_to(
 
 /// After a generic invoke that returns `Object`, unbox when the tree still has
 /// a primitive (e.g. `Iterator.next` / `Option.get` as `Int`).
+/// Narrow a *reference* result that a hand-written library call returned as
+/// `Object` (`MapOps.apply` and friends) to the type the typer gave the call.
+/// A primitive result is left alone: erasure has already wrapped the call in
+/// its `$unbox`. An array is cast by its descriptor -- `Map[Int,
+/// Array[Int]].apply` hands back an `Object`, and the `arraylength` or the
+/// `[I` local it reaches rejected it (`run/groupby`).
+pub(crate) fn cast_erased_ref_result(asm: &mut Assembler, ctx: &EmitCtx, result_ty: Option<&Type>) {
+    let Some(ty) = result_ty else {
+        return;
+    };
+    if is_jvm_primitive(ty) || is_unit_like(ty) {
+        return;
+    }
+    let cls = jvm_desc(ctx.st, ty);
+    if let Some(inner) = cls.strip_prefix('L').and_then(|s| s.strip_suffix(';')) {
+        if inner != "java/lang/Object" {
+            asm.checkcast(inner);
+        }
+    } else if matches!(ty, Type::Array(e) if is_concrete_array_elem(e)) {
+        asm.checkcast(&cls);
+    }
+}
+
 pub(crate) fn maybe_unbox_erased_result(
     asm: &mut Assembler,
     ctx: &EmitCtx,
@@ -3038,6 +3022,9 @@ pub(crate) fn is_concrete_array_elem(elem: &Type) -> bool {
             // `Array[Unit]` is `[Lscala/runtime/BoxedUnit;` — a concrete
             // element like any other, not the `V` that `Unit` is as a result.
             | Type::Unit
+            // `Array(f, f)` with `f: Null` is built from `ClassTag.Null`, a
+            // `[Lscala/runtime/Null$;` (`run/t7015`).
+            | Type::Null
     )
 }
 

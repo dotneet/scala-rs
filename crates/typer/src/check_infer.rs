@@ -427,6 +427,68 @@ impl Typer {
         plain
     }
 
+    /// nsc `weakLub`'s numeric half (`numericLub`), for the branches of an
+    /// `if` or a `match` typed without an expected type: when every branch is
+    /// a numeric value type, the result is the one the others weakly conform
+    /// to, and the branches are widened to it (`typedIf`'s `needAdapt`).
+    ///
+    /// `(if (h > 0) cumulative(h - 1) else 0) + index`, with `cumulative`
+    /// returning `Long`, is `Long` in scalac; here it was the plain `lub`
+    /// `AnyVal`, whose `+` is `any2stringadd`'s -- "no matching overload for
+    /// (String)String with arguments (Int)" in every `scala.jdk` accumulator.
+    ///
+    /// `None` when an expected type is given (nsc's `isFullyDefined(pt)`: the
+    /// branches were already typed against it, and `val x: Any = if (c) 1L
+    /// else 0` keeps the `0` an `Int`), when a branch is not numeric, or when
+    /// all branches already agree.
+    pub(crate) fn numeric_branch_lub(&self, pt: &Type, branch_tys: &[Type]) -> Option<Type> {
+        if !(pt.is_no_type() || matches!(pt, Type::Wildcard)) {
+            return None;
+        }
+        let rank = |t: &Type| -> Option<u8> {
+            match t {
+                Type::Byte => Some(0),
+                Type::Short => Some(1),
+                Type::Char => Some(1),
+                Type::Int => Some(2),
+                Type::Long => Some(3),
+                Type::Float => Some(4),
+                Type::Double => Some(5),
+                _ => None,
+            }
+        };
+        // Weak conformance (SLS 3.5.3): `Byte <: Short <: Int <: Long <:
+        // Float <: Double` and `Char <: Int`; `Char` and `Short` (or `Byte`)
+        // meet only at `Int`.
+        let weak_sub = |a: &Type, b: &Type| -> bool {
+            a == b
+                || match (a, b) {
+                    (Type::Char, _) | (_, Type::Char) => {
+                        matches!(a, Type::Char) && rank(b).is_some_and(|r| r >= 2)
+                    }
+                    _ => rank(a).zip(rank(b)).is_some_and(|(x, y)| x <= y),
+                }
+        };
+        let widened: Vec<Type> = branch_tys
+            .iter()
+            .filter(|t| !matches!(t, Type::Nothing))
+            .map(|t| t.widen_constant())
+            .collect();
+        if widened.len() < 2 || widened.iter().any(|t| rank(t).is_none()) {
+            return None;
+        }
+        let lub = widened[1..].iter().fold(widened[0].clone(), |acc, t| {
+            if weak_sub(&acc, t) {
+                t.clone()
+            } else if weak_sub(t, &acc) {
+                acc
+            } else {
+                Type::Int
+            }
+        });
+        widened.iter().any(|t| *t != lub).then_some(lub)
+    }
+
     /// The type an `if` or a `match` takes: [`pt_or_lub`], except that an
     /// expected type which is still a stand-in for an undetermined variable
     /// ([`pt_is_undecided`]) does not get to be the answer. Adopting `F[_]`
@@ -3570,7 +3632,137 @@ impl Typer {
         self.adapt_singleton(&mut probe, pt)
     }
 
+    /// The stable path a call to a `this.type` method returns, when it has one.
+    ///
+    /// SLS 3.2.1 and 6.4: `this.type` in a member's signature is the singleton
+    /// type of the prefix the member is selected on, so `p.m(args)` has type
+    /// `p.type` whenever `p` is a stable path. Member selection here reads the
+    /// result through the receiver's *widened* type (`subst_as_seen_from` gets
+    /// `Buffer[A]`, not the path), which is right for every use but a
+    /// singleton expectation: `def append(x: A): this.type = addOne(x)`,
+    /// `this += x`, `super.addAll(xs)` and `def f(b: B): b.type =
+    /// b.add(1).add(2)` all failed with `found: Buffer[A] required:
+    /// Buffer.this.type`. scala/scala's own collections are written this way
+    /// throughout (`Growable`, `Buffer`, `Stack`, every `super.addAll` in a
+    /// builder).
+    ///
+    /// Only a call whose method is *declared* with a `this.type` result of its
+    /// receiver's class (or an ancestor of it) qualifies, and only once every
+    /// parameter list has been applied: `m(1)` of `def m(x: Int)(y: Int):
+    /// this.type` is still a method, and a `this.type` of an enclosing class
+    /// (`Outer.this.type` read from `Inner`) is not the receiver's.
+    fn this_type_call_receiver<'t>(&self, tree: &'t Tree) -> Option<SingletonRecv<'t>> {
+        if !matches!(
+            tree.kind,
+            TreeKind::Apply { .. } | TreeKind::TypeApply { .. }
+        ) && !matches!(tree.kind, TreeKind::Select { .. } | TreeKind::Ident { .. })
+        {
+            return None;
+        }
+        if matches!(
+            tree.ty,
+            Type::Method { .. } | Type::Overload(_) | Type::Error | Type::NoType
+        ) {
+            return None;
+        }
+        let mut fun = tree;
+        while let TreeKind::Apply { fun: f, .. } | TreeKind::TypeApply { fun: f, .. } = &fun.kind {
+            fun = f;
+        }
+        let m = fun.sym;
+        if m.is_none() || !matches!(self.st.get(m).kind, SymKind::Method) {
+            return None;
+        }
+        let mut ret = &self.st.get(m).ty;
+        while let Type::Method { ret: r, .. } = ret {
+            ret = r;
+        }
+        let Type::ThisType(declared) = *ret else {
+            return None;
+        };
+        let inherits = |cls: SymbolId| {
+            !cls.is_none() && (cls == declared || self.st.is_ancestor_of(declared, cls))
+        };
+        match &fun.kind {
+            TreeKind::Select { qual, .. } => match &qual.kind {
+                // `super.m` returns this class's `this`, not the parent's.
+                TreeKind::Super { qual: sq, .. } => {
+                    let here = self.super_owner(sq.as_deref());
+                    inherits(here).then_some(SingletonRecv::This(here))
+                }
+                _ => {
+                    let rc = self.st.class_sym_of(&qual.ty)?;
+                    inherits(rc).then_some(SingletonRecv::Tree(qual))
+                }
+            },
+            // An unqualified member is selected on the innermost `this` that
+            // has it; a member of an enclosing class is not inherited here.
+            TreeKind::Ident { .. } => {
+                let here = self.st.this_class;
+                let owner = self.st.get(m).owner;
+                let is_member = matches!(
+                    self.st.get(owner).kind,
+                    SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                );
+                (is_member && inherits(here)).then_some(SingletonRecv::This(here))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `tree` is, as a path, the singleton `pt` names -- `adapt_singleton`'s
+    /// test without its side effect, followed through `this.type` calls.
+    fn denotes_singleton(&self, tree: &Tree, pt: &Type) -> bool {
+        match self.this_type_call_receiver(tree) {
+            Some(SingletonRecv::Tree(q)) => return self.denotes_singleton(q, pt),
+            Some(SingletonRecv::This(here)) => {
+                return match pt {
+                    Type::ThisType(cls) => {
+                        here == *cls
+                            || self
+                                .base_type_instance(&self.st.self_type_of_class(here), *cls, 0)
+                                .is_some()
+                    }
+                    _ => false,
+                };
+            }
+            None => {}
+        }
+        // A receiver already typed as the singleton (a dependent result such
+        // as `def f(b: B): b.type`) answers for itself.
+        if matches!(tree.ty, Type::ThisType(_) | Type::SingleType { .. })
+            && self.st.is_sub_type(&tree.ty, pt)
+        {
+            return true;
+        }
+        match pt {
+            Type::ThisType(cls) => {
+                matches!(&tree.kind, TreeKind::This { .. })
+                    && (tree.sym == *cls
+                        || matches!(
+                            &tree.ty,
+                            Type::Class { sym, .. } | Type::ModuleRef(sym) if *sym == *cls
+                        )
+                        || self.this_derives_from(tree, *cls))
+            }
+            Type::SingleType { sym, .. } => {
+                matches!(&tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+                    && tree.sym == *sym
+            }
+            _ => false,
+        }
+    }
+
     fn adapt_singleton(&self, tree: &mut Tree, pt: &Type) -> bool {
+        if matches!(pt, Type::ThisType(_) | Type::SingleType { .. })
+            && self.this_type_call_receiver(tree).is_some()
+        {
+            let ok = self.denotes_singleton(tree, pt);
+            if ok {
+                tree.ty = pt.clone();
+            }
+            return ok;
+        }
         match pt {
             Type::ThisType(cls) => {
                 if !matches!(&tree.kind, TreeKind::This { .. }) {
@@ -4017,4 +4209,12 @@ fn bound_mentions_tparam(ty: &Type) -> bool {
         }
         _ => false,
     }
+}
+
+/// The receiver a `this.type` call returns (see `this_type_call_receiver`):
+/// a written qualifier, or the `this` of a class (an unqualified member or a
+/// `super` selection).
+enum SingletonRecv<'t> {
+    Tree(&'t Tree),
+    This(SymbolId),
 }

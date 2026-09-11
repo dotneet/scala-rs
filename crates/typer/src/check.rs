@@ -405,6 +405,9 @@ pub struct Typer {
     /// This distinction controls inherited result inference, membership and
     /// `@tailrec` eligibility: local declarations cannot override members.
     pub(crate) block_local_defs: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
+    /// The prefix an inner class's constructor is being picked through
+    /// (`Typer::ctor_outer_prefix`), set only around the pick itself.
+    pub(crate) ctor_prefix: Option<Type>,
     /// Parent constructor calls whose omitted (implicit / defaulted) argument
     /// list has already been synthesized. `extends P` is walked by the header
     /// pass, the signature pass and the body pass; filling it more than once
@@ -908,6 +911,9 @@ pub fn typecheck_units_src(
     // early -- `type Integral[T] = scala.math.Integral[T]` came out
     // unresolvable, and the memo kept it that way for the rest of the run.
     t.link_collection_factories();
+    // A source `Predef`'s type aliases are named by signatures, so they have
+    // to be open before the pass below; its terms follow after it.
+    crate::predef_reimport::reimport_source_predef_types(&mut t.st);
     {
         // Member types first, across every unit: typing a body may call a
         // member declared further down the file, or in a file that comes
@@ -1013,6 +1019,7 @@ impl Typer {
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
             block_local_defs: std::collections::HashSet::new(),
+            ctor_prefix: None,
             parent_fill_done: std::collections::HashSet::new(),
             warmed_scopes: std::collections::HashSet::new(),
             completed_arg_classes: std::collections::HashSet::new(),

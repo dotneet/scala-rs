@@ -1520,8 +1520,17 @@ fn tparam_env(st: &SymbolTable, owner: SymbolId) -> std::collections::HashMap<St
     env
 }
 
-fn java_method_flags(m: &crate::javaclass::JavaMethod) -> Flags {
+fn java_method_flags(m: &crate::javaclass::JavaMethod, is_scala: bool) -> Flags {
     let mut flags = Flags::JAVA;
+    // nsc's `ClassfileParser` maps `ACC_FINAL` to `FINAL` for a Java class
+    // file, and `RefChecks` then closes the member: `class R { override def
+    // getClass(): Class[R] }` and `class R { def notify(): Unit = () }` are
+    // "cannot override final member" (`java.lang.Object`'s `getClass`,
+    // `notify`, `notifyAll` and `wait` are all `final`). A Scala class file's
+    // `ACC_FINAL` says nothing the pickle does not, and is not read.
+    if !is_scala && m.access & 0x0010 != 0 && m.name != "<init>" {
+        flags = flags.with(Flags::FINAL);
+    }
     if crate::javaclass::is_java_static(m.access) {
         flags = flags.with(Flags::STATIC);
     }
@@ -1743,7 +1752,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             // TypedType[String]". Nothing in the bytecode can contradict
             // either flag, so keeping them is not a guess.
             let had = st.get(id).flags;
-            let mut f = java_method_flags(m);
+            let mut f = java_method_flags(m, c.is_scala);
             for pickled in [Flags::IMPLICIT, Flags::ACCESSOR] {
                 if had.contains(pickled) {
                     f = f.with(pickled);
@@ -1796,8 +1805,18 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                 }
             }
         }
+        // An `Object[]` parameter keeps its element as `ObjectTpeJava`, which
+        // is `=:=` both `Any` and `AnyRef`: without it `Arrays.fill(Object[],
+        // Object)` took no `Array[AnyRef]` at all. A varargs `Object...` is a
+        // sequence of values and stays `Any*`, so `String.format("%d", 1)`
+        // still boxes its argument.
+        for p in params.iter_mut() {
+            if let Type::Array(elem) = p {
+                *p = Type::Array(Box::new(java_array_element((**elem).clone())));
+            }
+        }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
-        let flags = java_method_flags(m);
+        let flags = java_method_flags(m, c.is_scala);
         let id = add_method_types(st, owner, &m.name, names, params, ret);
         st.get_mut(id).flags = flags;
         mark_java_package_private(st, id, owner, m.access);
