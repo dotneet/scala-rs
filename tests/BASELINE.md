@@ -23,7 +23,7 @@ collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch, and the combined contextual,
 lexical, source-unit ownership and erased field-access batch, and the combined
 Scala declaration, array signature, value-class storage and implicit-view batch.
-Twenty-six intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-seven intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -3687,6 +3687,102 @@ Exact summary block:
   fail: slick_run: slick compile failed; see /private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slickrun/w-contextual-evidence-18b8e5d7/rs.log
   fail: slick_subset: verified=0 failed=0 classfile_lint: no class files subset_files=115 classes=0 (of 184 sources)
   fail: workspace tests: 313 rows, 2786 passed, 1 failed
+VERDICT=FAIL
+DONE
+```
+
+
+## Rejected contextual recovery candidate: e5df7b09
+
+Frozen candidate `e5df7b0959a7b4b8dee612fb09c8acb2ca514f0c`, tree `1989943eded3cd2a666aed68ddb68522d3d39302`,
+contains local main 5bab48cd. Its final `git merge main` was already up to date.
+Full gate `/tmp/scala-rs-gate-e5df7b09-codex` reached DONE with exit 1
+in 1478.7 seconds. Both the script and independent audit reject it.
+The candidate is NOT merged into main. Accepted compiler and baseline remain
+e608c7dc (gitbucket 96/45, cats 83/34, library 415/113, Slick 0/1504).
+This main commit contains only this record, the rejected raw ledger and the next
+batch inventory. The gated candidate stays at its exact frozen tree on
+codex/contextual-evidence; no compiler changes were made while the gate ran.
+No push was attempted: previous automatic approval review still requires explicit
+destination/payload authorization, which has not been provided.
+
+Candidate measurements (not an accepted baseline):
+
+- Gitbucket: 354 Scala/Twirl inputs plus three Java sources, zero skipped;
+  96/45 -> 93/43. Four diagnostics removed, one same-location replacement.
+- Cats: 339 sources, one skipped; 83/34 -> 87/27. Forty-nine diagnostics removed
+  but 53 new locations, all generated Tuple copy calls. The new source-case-copy
+  guard incorrectly requires an own SYNTHETIC declaration from prelude Tuples,
+  whose supported constructor rewrite is represented by CASE/ctor_fields.
+- Library: 538 sources; 415/113 -> 387/107. Twenty-eight diagnostics removed,
+  no added diagnostic or location.
+- Slick: all 184 sources compile, zero errors, 1504 classes. All 1504 classes
+  loaded under strong JVM verification, zero failures/incomplete loads. Subset
+  verifies 1504, lint_problems=0; all 12 clients agree across 36/36 executions.
+- Workspace: 2786 passed, 5 failed,
+  313 result rows. Failures are cats3::fixtures_c3_infer_bad_is_rejected,
+  preludefidelity::fixtures_pf_case and ::pf_case_bad_is_rejected, and
+  tupletailrec::fixtures_tt_tuple and ::tt_tuple_bad_is_rejected. The cats3 input
+  still rejects both bad statements but loses its precise Box[Unit] mismatch
+  diagnostic; the four others are the library-case-copy acceptance/diagnostic
+  regression. No existing test was removed or weakened.
+- Corpus: 5324 unique identities, losses=0, three run gains:
+  phantomValueClass, t7859 and valueclasses-pavlov. Counts are
+  pos 1150/1859, neg 718/1405, run 700/2060. The previous rejected candidate's
+  pos/t5727 gain is absent; that program still failed at the accepted baseline
+  and is therefore not counted as a baseline loss. Its fixed Base constructor
+  versus provisional type-argument conversion is in the next inventory.
+
+Rejected raw ledger [`baselines/corpus-e5df7b09.tsv`](baselines/corpus-e5df7b09.tsv),
+SHA-256 `a20b9a61b040b12476e141e2c893b9154cf4adf5aa0a9c9fcb2040ebee08b691`. Preserve its raw bytes; it is NOT the next GATE_LEDGER.
+Continue using tests/baselines/corpus-e608c7dc.tsv.
+Prerequisite/gate binary SHA-256 `c02a06ece6fe58c022c19a03c8402d8e265112f06d7566c3974f8ae98ac64584`.
+The independent audit checked full input counts, all 5324 unique corpus keys,
+new diagnostic locations, workspace counts, strong class loads, runtime output,
+unchanged commit/tree and exact prerequisite/gate binary identity.
+
+The combined candidate retains the prior seven mechanisms and adds deferred
+lambda result inference, invariant result applicability, provisional value-view
+boundaries, rigid implicit factory arguments, selected secondary constructor
+formals, source copy suppression and transactional curried-copy rewriting.
+Four additional ctxev groups cover 23 executable positive programs and fourteen
+negative fixtures; the prior four groups remain. Real scalac and byte-exact
+runtime comparisons cover all eight groups. Two ordinary/user curried-copy
+probes previously compiled and executed but printed () instead of 7; six new
+copy negatives were wrongly accepted before. Those repairs are preserved on the
+candidate branch, not claimed integrated into the accepted compiler.
+
+Prerequisites passed 714 CLI tests in 43 suites and 190 typer tests, then 2304
+corpus identities including all 1405 negatives and all 44 historical loss names,
+with zero losses. A coverage audit caught one plus-named test missed by a glob
+escape; it was run once and included in the complete union. Early Slick was
+0 errors/1504 classes, all strongly verified. Clippy remains at 57 existing
+warning occurrences, none added. Environment checks passed four pinned trees,
+121 jar archives, 33 released Java classes and 1498 reference class hashes.
+
+The first prerequisite pass stopped at a private-parent copy negative. Its
+repair expanded the affected copy rewrite paths, but tupletailrec and
+preludefidelity were not added to the prerequisite set; cats3 was also omitted.
+This was an existing-test selection failure. The next inventory maps copy
+fixtures back to test targets and requires refreshing the set after later
+repairs, plus early compile measures for the generated cats surface.
+
+During the frozen gate, bidirectional probes reduced the prelude-copy regression
+across Tuple1..22, Some, Left and Right. Additional existing defects were measured:
+local-val alias imports refuse valid methods; by-name Function0 literals either
+refuse valid code or accept a function where Int is required; Function1..3 literals
+compile and verify but throw IncompatibleClassChangeError at runtime, while named
+function values execute correctly. Include supported repairs with recovery of
+both regressions in the next batch; do not spend a gate on one repair alone.
+See [next combined inventory](../docs/batches/case-copy-byname-inventory.md).
+All proof binaries, logs and terminal results are under /tmp/scala-rs-contextual-recovery.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=e5df7b09  logs=/tmp/scala-rs-gate-e5df7b09-codex
+  fail: workspace tests: 313 rows, 2786 passed, 5 failed
 VERDICT=FAIL
 DONE
 ```
