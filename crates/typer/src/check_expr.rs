@@ -1008,6 +1008,11 @@ impl Typer {
                     if let Some((only, ty)) = self.alt_taking_targs(sym, targs.len()) {
                         sym = only;
                         base_ty = ty;
+                    } else if !matches!(fun_pt, Type::Method { .. }) {
+                        if let Some((only, ty)) = self.implicit_alt_beats_nullary(fun, &targs, pt) {
+                            sym = only;
+                            base_ty = ty;
+                        }
                     }
                     // `Module[T1, T2]` with no explicit `.apply` written still
                     // means the type args target the module's generic `apply`

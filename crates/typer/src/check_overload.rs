@@ -79,6 +79,112 @@ impl Typer {
         hits.next().is_none().then(|| (first.0, first.1.clone()))
     }
 
+    /// The alternative nsc's `inferExprAlternative` picks for `x.m[T1, …, Tn]`
+    /// in value position, when value position has already collapsed the set to
+    /// its nullary alternative but it also holds one whose only clause is
+    /// implicit (and that takes the same `n` type parameters).
+    ///
+    /// cats declares exactly that pair on `Alternative`: `MonoidK.compose[G[_]]:
+    /// MonoidK[λ[α => F[G[α]]]]` beside `Alternative.compose[G[_]:
+    /// Applicative]: Alternative[λ[α => F[G[α]]]]`. The nullary one is not
+    /// "the" value-position alternative: nsc's `isAsSpecific` looks straight
+    /// through an implicit clause, so the two are compared by their results
+    /// once the type arguments are in, and the owner that is a proper subclass
+    /// scores a point too (`isStrictlyMoreSpecific`). An alternative the
+    /// expected type rules out and the other does not loses first.
+    /// `Alternative[F].compose[G]` is therefore the `Alternative`, and at a
+    /// declared `MonoidK[…]` it still is -- scalac then reports the missing
+    /// `Applicative[G]` instead of quietly taking the `MonoidK`.
+    ///
+    /// `None` leaves the collapse as it was, including the tie nsc would
+    /// report as ambiguous.
+    pub(crate) fn implicit_alt_beats_nullary(
+        &self,
+        fun: &Tree,
+        targs: &[Type],
+        pt: &Type,
+    ) -> Option<(SymbolId, Type)> {
+        let sym = fun.sym;
+        if sym.is_none() || !self.is_nullary_method_sym(sym) {
+            return None;
+        }
+        // `overload_member_types` is keyed by symbol, not by selection: the set
+        // recorded when `Alternative[F].compose` collapsed to `MonoidK.compose`
+        // is still filed under that symbol when a plain `MonoidK[F].compose`
+        // selects it later. Only a receiver that really has the implicit
+        // alternative as a member may be steered to it.
+        let TreeKind::Select { qual, .. } = &fun.kind else {
+            return None;
+        };
+        let recv = self.st.class_sym_of(&self.st.widen_type_param(&qual.ty))?;
+        let alts = self.overload_member_types.get(&sym.0)?;
+        let nullary = alts.iter().find(|(s, _)| *s == sym)?.1.clone();
+        let implicit_only = |s: SymbolId| {
+            let decl = &self.st.get(s).paramss;
+            decl.len() == 1
+                && !decl[0].is_empty()
+                && decl[0]
+                    .iter()
+                    .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        };
+        let mut hits = alts.iter().filter(|(s, t)| {
+            *s != sym
+                && self.st.get(*s).tparams.len() == targs.len()
+                && matches!(t, Type::Method { .. })
+                && implicit_only(*s)
+        });
+        let (isym, ity) = hits.next()?;
+        if hits.next().is_some() || self.st.get(sym).tparams.len() != targs.len() {
+            return None;
+        }
+        let owner_i = self.st.get(*isym).owner;
+        if owner_i != recv && !self.st.is_ancestor_of(owner_i, recv) {
+            return None;
+        }
+        let result = |s: SymbolId, t: &Type| {
+            let t = self.st.subst_tparams(s, targs, t);
+            match t {
+                Type::Method { ret, .. } => *ret,
+                other => other,
+            }
+        };
+        let r_imp = result(*isym, ity);
+        let r_nul = result(sym, &nullary);
+        if r_imp.is_error() || r_nul.is_error() {
+            return None;
+        }
+        let value_pt = !matches!(
+            pt,
+            Type::NoType
+                | Type::Error
+                | Type::Wildcard
+                | Type::Method { .. }
+                | Type::Function { .. }
+        );
+        if value_pt {
+            let imp_fits = self.st.is_sub_type(&r_imp, pt);
+            let nul_fits = self.st.is_sub_type(&r_nul, pt);
+            if imp_fits != nul_fits {
+                return imp_fits.then(|| (*isym, ity.clone()));
+            }
+        }
+        let owner_n = self.st.get(sym).owner;
+        let mut score = 0i32;
+        if self.st.is_sub_type(&r_imp, &r_nul) {
+            score += 1;
+        }
+        if self.st.is_sub_type(&r_nul, &r_imp) {
+            score -= 1;
+        }
+        if owner_i != owner_n && self.st.is_ancestor_of(owner_n, owner_i) {
+            score += 1;
+        }
+        if owner_i != owner_n && self.st.is_ancestor_of(owner_i, owner_n) {
+            score -= 1;
+        }
+        (score > 0).then(|| (*isym, ity.clone()))
+    }
+
     /// `chosen`'s declared type, as seen from the receiver of `fun`, with its
     /// own type parameters still un-instantiated.
     ///
@@ -1162,11 +1268,10 @@ impl Typer {
                 sym: *cls,
                 args: Vec::new(),
             };
-            let alts: Vec<Type> = self
-                .st
-                .lookup_member(*cls, "apply")
-                .into_iter()
-                .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(a).ty))
+            let syms = self.st.lookup_member(*cls, "apply");
+            let alts: Vec<Type> = syms
+                .iter()
+                .map(|a| self.st.subst_as_seen_from(&recv, &self.st.get(*a).ty))
                 .collect();
             if alts.is_empty() {
                 return Type::NoType;
@@ -1175,7 +1280,26 @@ impl Typer {
             if !f.is_no_type() {
                 return f;
             }
-            return self.agreed_value_param(&alts, idx);
+            let v = self.agreed_value_param(&alts, idx);
+            if !v.is_no_type() {
+                return v;
+            }
+            // A generic case class's companion has one `apply`, and it is
+            // polymorphic: what the expected type settles about its type
+            // parameters is the argument's prototype, exactly as for any other
+            // polymorphic method (nsc's `protoTypeArgs` does not care how the
+            // callee was spelled). cats' `EitherK(run match { case Right(ga) =>
+            // Right(G.coflatMap(ga)(x => rightc(x))) … })` at a declared
+            // `EitherK[F, G, EitherK[F, G, A]]` has no other way to tell
+            // `rightc` its `F`, and `Kleisli((fe: Either[A, B]) => …)` no other
+            // way to give the literal's body its `F[Either[C, D]]`.
+            let mut poly = syms.iter().zip(&alts).filter(|(s, t)| {
+                !self.st.get(**s).tparams.is_empty() && matches!(t, Type::Method { .. })
+            });
+            if let (Some((s, t)), None) = (poly.next(), poly.next()) {
+                return self.proto_arg_type(t, *s, idx, pt, Some(&recv), use_lower_bounds);
+            }
+            return Type::NoType;
         }
         let Type::Method { paramss, ret } = fun_ty else {
             return Type::NoType;
@@ -1306,6 +1430,74 @@ impl Typer {
             Type::ByName(inner) => *inner,
             other => other,
         }
+    }
+
+    /// nsc's *lenient* `protoTypeArgs`: the formal with what the expected type
+    /// settles substituted in and every parameter it leaves open read as a
+    /// wildcard. [`Self::proto_arg_type`] declines such a formal outright, and
+    /// that is right for most arguments; this is for a nested *call*, whose
+    /// own inference has nothing else to go on. cats' `Arrow.second` writes
+    /// `compose(swap, compose(first[A, B, C](fa), swap))` at a declared
+    /// `F[(C, A), (C, B)]`: the outer `compose` settles its `A` from that and
+    /// hands the inner call `F[(C, A), ?]`, and only that `(C, A)` tells the
+    /// inner `swap[X, Y]` what `X` and `Y` are. Typed against nothing, the
+    /// inner call is ill-typed in nsc too.
+    ///
+    /// `NoType` unless the callee is one polymorphic method, the formal is not
+    /// a bare type parameter, and the expected type settles at least one of
+    /// the parameters the formal mentions.
+    pub(crate) fn lenient_proto_arg_type(
+        &self,
+        fun_ty: &Type,
+        sym: SymbolId,
+        idx: usize,
+        pt: &Type,
+    ) -> Type {
+        if sym.is_none() || pt.is_no_type() || pt.is_error() {
+            return Type::NoType;
+        }
+        let Type::Method { paramss, ret } = fun_ty else {
+            return Type::NoType;
+        };
+        let tps = self.st.get(sym).tparams.clone();
+        let Some(param) = paramss.first().and_then(|ps| param_at(ps, idx)) else {
+            return Type::NoType;
+        };
+        let param = match param {
+            Type::ByName(inner) => inner.as_ref(),
+            other => other,
+        };
+        if tps.is_empty() || matches!(param, Type::TypeParam(_)) || !mentions_tparam(param, &tps) {
+            return Type::NoType;
+        }
+        let solved: Vec<(SymbolId, Type)> = self
+            .add_expected_constraints_in(sym, ret, pt, Vec::new(), false)
+            .into_iter()
+            .filter(|(tp, t)| {
+                type_mentions_tparam(param, *tp)
+                    && !t.is_no_type()
+                    && !t.is_error()
+                    && !matches!(t, Type::Nothing | Type::Any | Type::Wildcard)
+                    && !type_has_wildcard(t)
+                    && !mentions_tparam(t, &tps)
+            })
+            .collect();
+        if solved.is_empty() {
+            return Type::NoType;
+        }
+        let ids: Vec<SymbolId> = solved.iter().map(|(id, _)| *id).collect();
+        let vals: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
+        let out = crate::symbol::subst_tparams_slice(&ids, &vals, param);
+        let rest: Vec<SymbolId> = tps
+            .iter()
+            .copied()
+            .filter(|tp| type_mentions_tparam(&out, *tp))
+            .collect();
+        // A type *constructor* left open is not a wildcard's kind.
+        if rest.iter().any(|tp| !self.st.get(*tp).tparams.is_empty()) {
+            return Type::NoType;
+        }
+        crate::symbol::subst_tparams_slice(&rest, &vec![Type::Wildcard; rest.len()], &out)
     }
 
     /// Explicit type arguments for a *Java* method, with `Any` read as the
@@ -2321,9 +2513,25 @@ impl Typer {
             }
         }
         if let Type::Method { paramss, ret } = arg {
-            let f = Type::Function {
-                params: paramss.iter().flatten().cloned().collect(),
-                ret: ret.clone(),
+            // A curried method eta-expands to a curried function:
+            // `def ite(b: Boolean)(x: A, y: A): A` is `Boolean => (A, A) => A`
+            // (cats' `Apply.ifA` passes it to `map(fcond)(ite)`), not the
+            // `(Boolean, A, A) => A` flattening every clause gave, which no
+            // one-parameter function parameter could take.
+            let f = paramss
+                .iter()
+                .rev()
+                .fold((**ret).clone(), |acc, clause| Type::Function {
+                    params: clause.clone(),
+                    ret: Box::new(acc),
+                });
+            let f = if paramss.is_empty() {
+                Type::Function {
+                    params: Vec::new(),
+                    ret: ret.clone(),
+                }
+            } else {
+                f
             };
             return self.arg_score(&f, param);
         }

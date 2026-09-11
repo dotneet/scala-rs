@@ -823,7 +823,40 @@ impl Typer {
                     self.diags.truncate(mark);
                 }
                 if is_annotated_lambda(a) {
-                    self.type_expr(a, &Type::NoType);
+                    // The parameters are written, but the body still deserves
+                    // what the expected type settles about the result (nsc's
+                    // `protoTypeArgs`): cats' `Kleisli((fe: Either[A, B]) => fe
+                    // match { case Left(a) => F.map(f(a))(Left.apply _) … })` at
+                    // a declared `Kleisli[F, Either[A, B], Either[C, D]]` types
+                    // each branch against `F[Either[C, D]]`; typed against
+                    // nothing, the branches met at `AnyRef`. Only the result
+                    // is taken, and only when it is fully settled.
+                    let proto = self.proto_arg_type(
+                        &fun_ty_for_pretype,
+                        fun.sym,
+                        ai,
+                        pt,
+                        recv_ty.as_ref(),
+                        false,
+                    );
+                    let body_pt = match &proto {
+                        Type::Function { params, ret }
+                            if params.len() == source_arity && !type_has_wildcard(ret) =>
+                        {
+                            proto.clone()
+                        }
+                        _ => Type::NoType,
+                    };
+                    let saved = a.clone();
+                    let mark = self.diags.len();
+                    self.type_expr(a, &body_pt);
+                    if !body_pt.is_no_type() && self.error_count_since(mark) > 0 {
+                        // A hint the literal does not fit is no hint: type it
+                        // as before and let the call report what is wrong.
+                        *a = saved;
+                        self.diags.truncate(mark);
+                        self.type_expr(a, &Type::NoType);
+                    }
                     arg_tys.push(a.argument_type());
                     continue;
                 }
@@ -927,6 +960,20 @@ impl Typer {
                 } else {
                     strict_proto
                 };
+                // A nested call with nothing stricter to go on gets the
+                // lenient prototype (`lenient_proto_arg_type`). Still a hint:
+                // the fallback below re-types it with none when it does not
+                // fit.
+                let mut lenient = false;
+                let pt_arg = if pt_arg.is_no_type()
+                    && matches!(a.kind, TreeKind::Apply { .. } | TreeKind::TypeApply { .. })
+                {
+                    let l = self.lenient_proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt);
+                    lenient = !l.is_no_type();
+                    l
+                } else {
+                    pt_arg
+                };
                 if pt_arg.is_no_type() {
                     self.type_expr(a, &Type::NoType);
                 } else {
@@ -948,7 +995,13 @@ impl Typer {
                     let mark = self.diags.len();
                     self.type_expr_arg_prototype(a, &pt_arg, provisional);
                     let with_errs = self.error_count_since(mark);
-                    if with_errs > 0
+                    // A lenient prototype's wildcards are "not decided", never
+                    // an answer: an argument that took one into its own type
+                    // (cats' `leftWiden(rightFunctor.widen(fac))` came back
+                    // `F[_, D]`) is typed again without the hint.
+                    let leaked = lenient && type_has_wildcard(&a.ty);
+                    if leaked
+                        || with_errs > 0
                         || a.ty.is_error()
                         || a.ty.is_no_type()
                         || !self.st.is_sub_type(&a.ty, &pt_arg)
@@ -1668,6 +1721,17 @@ impl Typer {
                                 ret = crate::symbol::subst_tparams_slice(&ids, &vals, &ret);
                                 recv_ty = recv_ty
                                     .map(|t| crate::symbol::subst_tparams_slice(&ids, &vals, &t));
+                                // The later clauses are read back off `fun.ty`
+                                // (`fill_defaults_and_implicits`), as for the
+                                // callee's own solutions above. cats'
+                                // `first(fa).dimap((_: (C, A)).swap)(_.swap)`
+                                // solves `first`'s `C` from `dimap`'s first
+                                // clause, and the second clause still expected a
+                                // `((B, C)) => S1` over the unsolved `C`: the
+                                // literal came back `found: ((B, C)) =>
+                                // Tuple2[C, B]  required: ((B, C)) => (C, B)`,
+                                // two different `C`s printed alike.
+                                fun.ty = crate::symbol::subst_tparams_slice(&ids, &vals, &fun.ty);
                                 self.undet_tvars.retain(|tp| !ids.contains(tp));
                             }
                         }

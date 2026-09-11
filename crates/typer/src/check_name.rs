@@ -2139,17 +2139,60 @@ impl Typer {
         if f.contains(Flags::PRIVATE) && f.contains(Flags::LOCAL) {
             return ty;
         }
-        let this_ty = Type::Class {
-            sym: self.st.this_class,
+        let this_ty = self.class_as_this_type(self.ident_prefix_class(owner));
+        self.st.subst_as_seen_from(&this_ty, &ty)
+    }
+
+    /// The enclosing class an unqualified reference to a member of `owner`
+    /// is made through -- nsc's `C.this` for the innermost enclosing `C` that
+    /// has the member, by inheritance or through its self type. Usually that
+    /// is `this_class` itself; it is an *outer* class when the name was found
+    /// in an enclosing template. cats' `trait Parallel[M[_]] extends
+    /// NonEmptyParallel[M]` writes `new ApplicativeError[F, E] { … parallel(…)
+    /// … }`, and `parallel: M ~> F` read through the anonymous class kept
+    /// `NonEmptyParallel`'s own `M` -- `no matching overload for (M[A])F[A]
+    /// with arguments (M[A])`, two `M`s printed alike.
+    ///
+    /// Falls back to `this_class` when no enclosing class has the member, so
+    /// every shape that was read through `this_class` before still is.
+    fn ident_prefix_class(&self, owner: SymbolId) -> SymbolId {
+        let this = self.st.this_class;
+        let reaches = |ty: &Type| -> bool {
+            let parts: Vec<&Type> = match ty {
+                Type::Refined { parents, .. } => parents.iter().collect(),
+                other => vec![other],
+            };
+            parts.into_iter().any(|p| {
+                self.st
+                    .class_sym_of(p)
+                    .is_some_and(|c| crate::pickle_supply::inherits_from(&self.st, c, owner))
+            })
+        };
+        for c in self.st.enclosing_classes(this) {
+            if !self.st.get(c).is_class_like() {
+                continue;
+            }
+            if c == owner || crate::pickle_supply::inherits_from(&self.st, c, owner) {
+                return c;
+            }
+            if self.st.get(c).self_type.as_ref().is_some_and(reaches) {
+                return c;
+            }
+        }
+        this
+    }
+
+    fn class_as_this_type(&self, cls: SymbolId) -> Type {
+        Type::Class {
+            sym: cls,
             args: self
                 .st
-                .get(self.st.this_class)
+                .get(cls)
                 .tparams
                 .iter()
                 .map(|t| Type::TypeParam(*t))
                 .collect(),
-        };
-        self.st.subst_as_seen_from(&this_ty, &ty)
+        }
     }
 
     fn bind_found(&mut self, tree: &mut Tree, mut found: Vec<SymbolId>, pt: &Type) {
@@ -2235,16 +2278,7 @@ impl Typer {
                     && !private_this
                     && owner_is_class
                 {
-                    let this_ty = Type::Class {
-                        sym: self.st.this_class,
-                        args: self
-                            .st
-                            .get(self.st.this_class)
-                            .tparams
-                            .iter()
-                            .map(|t| Type::TypeParam(*t))
-                            .collect(),
-                    };
+                    let this_ty = self.class_as_this_type(self.ident_prefix_class(owner));
                     ty = self.st.subst_as_seen_from(&this_ty, &ty);
                 }
             }

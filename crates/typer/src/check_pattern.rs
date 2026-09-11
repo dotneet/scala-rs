@@ -150,6 +150,22 @@ impl Typer {
                 return ts.clone();
             }
         }
+        // A function scrutinee is its `FunctionN` class: cats'
+        // `final case class StrictConstFunction1[A](a: A) extends Function1[Any,
+        // A]` is matched against a `run: A => F[B]`, and `case
+        // StrictConstFunction1(fb)` binds `fb: F[B]`. With no class symbol to
+        // walk to, the field kept the case class's own `A`.
+        let as_class;
+        let sel_ty = match sel_ty {
+            Type::Function { .. } => match self.st.function_class_form(sel_ty) {
+                Some(c) => {
+                    as_class = c;
+                    &as_class
+                }
+                None => sel_ty,
+            },
+            _ => sel_ty,
+        };
         let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
             return Vec::new();
         };
@@ -1062,6 +1078,20 @@ impl Typer {
         if tps.len() != args.len() {
             return pat_ty.clone();
         }
+        // A function scrutinee is its `FunctionN` class, as in
+        // `pattern_class_args`: cats' `case run: StrictConstFunction1[?]` on a
+        // `run: A => F[B]` is a `StrictConstFunction1[F[B]]`.
+        let as_class;
+        let sel_ty = match sel_ty {
+            Type::Function { .. } => match self.st.function_class_form(sel_ty) {
+                Some(c) => {
+                    as_class = c;
+                    &as_class
+                }
+                None => sel_ty,
+            },
+            _ => sel_ty,
+        };
         let Some(sel_sym) = self.st.class_sym_of(sel_ty) else {
             return pat_ty.clone();
         };
@@ -1436,6 +1466,15 @@ impl Typer {
                 continue;
             }
             let p = self.st.subst_tparams_cow(sym, args, p);
+            // A parent written as a function type (`extends Function1[Any, A]`
+            // is stored as `Any => A`) is its `FunctionN` class here.
+            let p = match p.as_ref() {
+                Type::Function { .. } => match self.st.function_class_form(&p) {
+                    Some(c) => std::borrow::Cow::Owned(c),
+                    None => p,
+                },
+                _ => p,
+            };
             if let Some(found) = self.base_type_instance(&p, target, depth + 1) {
                 return Some(found);
             }
