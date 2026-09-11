@@ -83,6 +83,7 @@ mod prelude_oshadow;
 mod prelude_ovl2;
 mod prelude_ovl3;
 mod prelude_paramnames;
+mod prelude_polymap;
 mod prelude_product;
 mod prelude_reflect;
 mod prelude_reflectruntime;

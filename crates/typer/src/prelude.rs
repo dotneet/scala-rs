@@ -600,6 +600,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // The `[B1 >: B]` of `Either.getOrElse` / `Try.getOrElse` (`add_either` /
     // `add_try` wrote them as `(=> Any): Any`).
     crate::prelude_dbio::install(st);
+    crate::prelude_polymap::install(st);
     crate::prelude_lang::install(st);
     crate::prelude_lazyref::install(st);
 
