@@ -2411,7 +2411,16 @@ impl Typer {
         if !self.library_abi {
             return;
         }
-        for jvm in ["scala/Product", "java/io/Serializable"] {
+        // `ProductN` too: `TupleN extends ProductN[T1, …]`, so an
+        // `Option[Product2[Int, String]]` extractor may return `Some((1, "a"))`
+        // (`run/unapply`, `pos/unapplySeq`).
+        let products: Vec<String> = (1..=crate::check::MAX_TUPLE_ARITY)
+            .map(|n| format!("scala/Product{n}"))
+            .collect();
+        for jvm in ["scala/Product", "java/io/Serializable"]
+            .into_iter()
+            .chain(products.iter().map(String::as_str))
+        {
             let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             let owner = crate::classpath::ensure_package(&mut self.st, pkg);
             self.load_binary_into(jvm, owner, Span::new(0, 0), false);

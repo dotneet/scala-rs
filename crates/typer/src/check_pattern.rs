@@ -630,8 +630,21 @@ impl Typer {
                     pat.ty = class_ty;
                     pat.sym = class_id;
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
-                    let extracted =
-                        self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, true);
+                    // An implicit clause after the scrutinee's: type the call
+                    // itself (see `type_unapply_call`).
+                    let (typed_ret, implicit_args) =
+                        match self.type_unapply_call(fun, u, sel_ty, pat.span) {
+                            Some((t, a)) => (Some(t), a),
+                            None => (None, Vec::new()),
+                        };
+                    let extracted = self.unapply_pattern_types(
+                        u,
+                        sel_ty,
+                        args.len(),
+                        pat.span,
+                        true,
+                        typed_ret,
+                    );
                     let failed = extracted.is_none();
                     let extracted = extracted.unwrap_or_else(|| vec![Type::Error; args.len()]);
                     if !failed && args.len() != extracted.len() && !extracted.is_empty() {
@@ -661,6 +674,22 @@ impl Typer {
                     // binds `c` at is narrowed separately in `TreeKind::Bind`
                     // below, which is the only place that needs it.
                     let fun = std::mem::replace(fun, Box::new(Tree::dummy(TreeKind::Empty)));
+                    // The implicit arguments ride along as `Apply(fun,
+                    // implicits)`; `gen_unapply_pattern` passes them after the
+                    // scrutinee.
+                    let fun = if implicit_args.is_empty() {
+                        fun
+                    } else {
+                        let (sym, ty, span) = (fun.sym, fun.ty.clone(), fun.span);
+                        let mut wrapped = Tree::dummy(TreeKind::Apply {
+                            fun,
+                            args: implicit_args,
+                        });
+                        wrapped.sym = sym;
+                        wrapped.ty = ty;
+                        wrapped.span = span;
+                        Box::new(wrapped)
+                    };
                     let args = std::mem::take(args);
                     pat.kind = TreeKind::UnApply { fun, args };
                     pat.sym = u;
@@ -743,7 +772,10 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
             TreeKind::UnApply { fun, args } => {
-                self.type_expr(fun, &Type::NoType);
+                // `Apply(fun, implicits)` was typed in full already.
+                if !matches!(fun.kind, TreeKind::Apply { .. }) {
+                    self.type_expr(fun, &Type::NoType);
+                }
                 let u = if pat.sym.is_none() {
                     self.find_unapply(fun, sel_ty).unwrap_or(SymbolId::NONE)
                 } else {
@@ -752,7 +784,7 @@ impl Typer {
                 let extracted = if u.is_none() {
                     vec![Type::Any; args.len()]
                 } else {
-                    self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, false)
+                    self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, false, None)
                         .unwrap_or_else(|| vec![Type::Error; args.len()])
                 };
                 for (i, a) in args.iter_mut().enumerate() {
@@ -2240,7 +2272,7 @@ impl Typer {
     /// performs the same implicit type test a `case x: T` pattern does, so
     /// `case c @ LiteralNode(_) if c.volatileHint` sees `c: LiteralNode`
     /// (which declares `volatileHint`), not the scrutinee's static `Node`.
-    fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
+    pub(crate) fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
         let param = match &self.st.get(unapply).ty {
             Type::Method { paramss, .. } => paramss.first().and_then(|p| p.first()).cloned(),
             Type::Function { params, .. } => params.first().cloned(),

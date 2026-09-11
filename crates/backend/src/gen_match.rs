@@ -382,6 +382,16 @@ fn gen_unapply_pattern(
     let TreeKind::UnApply { fun, args } = &pat.kind else {
         unreachable!("gen_unapply_pattern is only called for UnApply patterns");
     };
+    // `Apply(fun, implicits)`: an extractor whose `unapply` has an implicit
+    // clause (the typer's `type_unapply_call`); they are passed after the
+    // scrutinee.
+    let (fun, implicit_args): (&Tree, &[Tree]) = match &fun.kind {
+        TreeKind::Apply {
+            fun: inner,
+            args: implicits,
+        } => (inner.as_ref(), implicits.as_slice()),
+        _ => (fun.as_ref(), &[]),
+    };
     let uid = if pat.sym.is_none() { fun.sym } else { pat.sym };
     // A `case class`'s companion `unapply` is synthesized as a *symbol* with
     // no body; nothing emits the method, so calling it is a
@@ -511,6 +521,11 @@ fn gen_unapply_pattern(
     let fun_is_call = !fun.sym.is_none() && ctx.st.get(fun.sym).kind == SymKind::Method;
     if !owner.is_none() && (!is_module_class(ctx.st, owner) || fun_is_call) {
         gen_expr(asm, frame, ctx, fun);
+        // The extractor value's static type may be a trait over the class
+        // that declares `unapply`: `Date.unanchored` is an `UnanchoredRegex`
+        // (a trait extending `Regex`), an interface on the JVM, and
+        // `invokevirtual Regex.unapplySeq` on it does not verify.
+        crate::gen_desc::checkcast_method_receiver_sym(asm, ctx, uid, true);
     } else if !owner.is_none() {
         // The `unapply` being called belongs to `owner`, so the receiver is
         // `owner`'s singleton -- not whatever the *name* in the pattern is
@@ -566,6 +581,20 @@ fn gen_unapply_pattern(
         report_ctx_error(ctx, pat.span, "unresolved unapply");
         throw_runtime(asm, "unresolved unapply");
         return;
+    }
+    if !implicit_args.is_empty() {
+        let formals: Vec<Type> = match &ctx.st.get(uid).ty {
+            Type::Method { paramss, .. } => paramss.iter().skip(1).flatten().cloned().collect(),
+            _ => Vec::new(),
+        };
+        for (i, a) in implicit_args.iter().enumerate() {
+            gen_expr(asm, frame, ctx, a);
+            if let Some(p) = formals.get(i) {
+                if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(p) {
+                    emit_box(asm, &a.ty);
+                }
+            }
+        }
     }
     invoke_method(asm, ctx, uid, None);
     if ret_bool {

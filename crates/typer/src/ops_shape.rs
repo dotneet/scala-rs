@@ -51,7 +51,7 @@ impl Typer {
             return;
         }
         let jvm = self.st.get(r).jvm_name.clone();
-        let shape = if jvm.starts_with("scala/collection/") && self.st.get(r).tparams.len() == 1 {
+        let shape = if jvm.starts_with("scala/collection/") && !self.st.get(r).tparams.is_empty() {
             self.pickle
                 .iterable_ops_classes(&mut self.binary, &jvm)
                 .and_then(|(cc, c)| {
@@ -71,13 +71,16 @@ impl Typer {
     /// The class a member returning `slot` yields on a collection whose own
     /// class is `r`: what the pickle binds, or `r` itself when that is not
     /// known.
+    ///
+    /// A map's `CC[B]` members have `MapOps`' own two-parameter `CC` beside
+    /// `IterableOps`' (`m.map(f)` builds a `Map` when `f` returns pairs), so
+    /// only the `C` slot is read for a class with more than one parameter:
+    /// `MapView[K, V]`'s `C` is `View[(K, V)]`, and `mv.drop(1)` is a `View`.
     pub(crate) fn ops_target(&self, r: SymbolId, slot: OpsSlot) -> SymbolId {
-        match self.st.ops_shapes.get(&r).copied().flatten() {
-            Some(s) => match slot {
-                OpsSlot::Cc => s.cc,
-                OpsSlot::C => s.c,
-            },
-            None => r,
+        match (self.st.ops_shapes.get(&r).copied().flatten(), slot) {
+            (Some(s), OpsSlot::C) => s.c,
+            (Some(s), OpsSlot::Cc) if self.st.get(r).tparams.len() == 1 => s.cc,
+            _ => r,
         }
     }
 }

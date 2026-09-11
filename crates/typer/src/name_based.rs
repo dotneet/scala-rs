@@ -28,6 +28,11 @@ impl Typer {
     /// The types an `unapply` pattern's `n` sub-patterns are matched against,
     /// or `None` when the extractor cannot be used and that was reported
     /// (with `report`).
+    ///
+    /// `typed_ret` is the result type of the call `X.unapply(<selector>)`
+    /// when that was typed in full (an extractor with an implicit clause, see
+    /// [`Self::type_unapply_call`]); otherwise the result is read off the
+    /// declaration, its type parameters solved against the scrutinee.
     pub(crate) fn unapply_pattern_types(
         &mut self,
         unapply: SymbolId,
@@ -35,6 +40,7 @@ impl Typer {
         n: usize,
         span: Span,
         report: bool,
+        typed_ret: Option<Type>,
     ) -> Option<Vec<Type>> {
         // A case class's synthetic `unapply` is compiled as its constructor
         // pattern (`gen_ctor_fields_pattern`), one sub-pattern per field; nsc
@@ -43,11 +49,15 @@ impl Typer {
             let extracted = self.unapply_extracted_types(unapply);
             return Some(self.subst_unapply_tparams(unapply, sel_ty, extracted));
         }
-        let ret = self.st.get(unapply).ty.result().clone();
-        let ret = self
-            .subst_unapply_tparams(unapply, sel_ty, vec![ret.clone()])
-            .pop()
-            .unwrap_or(ret);
+        let ret = match typed_ret {
+            Some(t) => t,
+            None => {
+                let ret = self.st.get(unapply).ty.result().clone();
+                self.subst_unapply_tparams(unapply, sel_ty, vec![ret.clone()])
+                    .pop()
+                    .unwrap_or(ret)
+            }
+        };
         let ret = self.st.dealias(&ret);
         if matches!(ret, Type::Boolean) {
             return Some(Vec::new());
@@ -72,10 +82,18 @@ impl Typer {
         };
         if n == 1 {
             // nsc accepts one pattern for a whole tuple but deprecates it
-            // (`neg/t6675`). Only a tuple: a class with product selectors of
-            // its own is bound whole without a word.
+            // (`neg/t6675`). Only a tuple, and only one the extractor
+            // *declares*: `unapply[A](v: Either[A, A]): Option[A]` matched
+            // against pairs binds its `A` without a word (`pos/t6675`), and a
+            // class with product selectors of its own is bound whole too.
+            let declared = match self.st.dealias(self.st.get(unapply).ty.result()) {
+                Type::Class { sym, args } if self.is_option_like(sym) => args.first().cloned(),
+                _ => None,
+            };
             if report {
-                if let Some(k) = crate::check::tuple_arity(&self.st, &self.st.dealias(&get_ty))
+                if let Some(k) = declared
+                    .as_ref()
+                    .and_then(|d| crate::check::tuple_arity(&self.st, &self.st.dealias(d)))
                     .filter(|&k| k > 1)
                 {
                     let elems = match self.st.dealias(&get_ty) {
@@ -106,6 +124,74 @@ impl Typer {
             return Some(vec![get_ty]);
         }
         Some(self.product_selector_types(unapply, &get_ty, n))
+    }
+
+    /// An extractor whose `unapply` takes a clause after the scrutinee's
+    /// (necessarily implicit): `def unapply(s: String)(implicit p:
+    /// Option[String] = None)` (`run/t3353`), `def unapply[S, T](s: S)
+    /// (implicit w: FooHasType[S, T]): Option[T]` (`run/t6111`).
+    ///
+    /// nsc types the pattern's extractor as the call
+    /// `X.unapply(<unapply-selector>)` and lets ordinary application fill
+    /// the implicit clause -- which is also what solves a type parameter only
+    /// the implicit mentions (`T` above). The same call is typed here, with
+    /// the selector a transient local of the `unapply`'s parameter type.
+    /// Returns the call's result type and the implicit arguments it was
+    /// given; the backend passes those after the scrutinee. The call used to
+    /// be emitted with the scrutinee alone, which did not verify.
+    pub(crate) fn type_unapply_call(
+        &mut self,
+        fun: &scala_rs_parser::Tree,
+        unapply: SymbolId,
+        sel_ty: &Type,
+        span: Span,
+    ) -> Option<(Type, Vec<scala_rs_parser::Tree>)> {
+        use scala_rs_parser::{Tree, TreeKind};
+        let clauses = match &self.st.get(unapply).ty {
+            Type::Method { paramss, .. } => paramss.len(),
+            _ => 0,
+        };
+        if clauses < 2 {
+            return None;
+        }
+        let param = self.unapply_receiver_type(unapply, sel_ty)?;
+        let name = self.fresh("unapply$selector");
+        let sel = self
+            .st
+            .alloc(&name, self.st.owner, SymKind::Term, Flags::SYNTHETIC, "");
+        self.st.get_mut(sel).ty = param;
+        let mut ident = Tree::dummy(TreeKind::Ident { name: name.clone() });
+        ident.span = span;
+        let mut select = Tree::dummy(TreeKind::Select {
+            qual: Box::new(fun.clone()),
+            name: self.st.get(unapply).name.clone(),
+        });
+        select.span = span;
+        let mut call = Tree::dummy(TreeKind::Apply {
+            fun: Box::new(select),
+            args: vec![ident],
+        });
+        call.span = span;
+        self.st.push_scope();
+        self.st.enter_in_current(&name, sel);
+        self.type_expr(&mut call, &Type::NoType);
+        self.st.pop_scope();
+        if call.ty.is_error() || call.ty.is_no_type() {
+            return None;
+        }
+        // `fill_defaults_and_implicits` appends the implicit clause to the
+        // argument list it was handed (`Apply(X.unapply, [sel, implicits..])`);
+        // a nested `Apply(Apply(X.unapply, [sel]), implicits)` is taken too.
+        let implicits = match &call.kind {
+            TreeKind::Apply { fun: inner, args }
+                if matches!(inner.kind, TreeKind::Apply { .. }) =>
+            {
+                args.clone()
+            }
+            TreeKind::Apply { args, .. } if args.len() > 1 => args[1..].to_vec(),
+            _ => Vec::new(),
+        };
+        Some((call.ty.clone(), implicits))
     }
 
     /// `Option` / `Some` by name as well as by symbol: the prelude and the
