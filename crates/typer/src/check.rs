@@ -2884,6 +2884,11 @@ pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
         Type::Array(e) | Type::ByName(e) | Type::Repeated(e) => mentions_tparam(e, tps),
         Type::Annotated { tpe, .. } => mentions_tparam(tpe, tps),
         Type::Tuple(ts) => ts.iter().any(|t| mentions_tparam(t, tps)),
+        // A compound mentions what its components mention: without this,
+        // `def two[A]: Monad[Either[A, *]] with Traverse[Either[A, *]]` looked
+        // closed, and a reference to it in value position never solved `A`
+        // from the expected type.
+        Type::Refined { parents, .. } => parents.iter().any(|p| mentions_tparam(p, tps)),
         _ => false,
     }
 }

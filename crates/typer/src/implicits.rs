@@ -325,7 +325,26 @@ impl Typer {
             );
         for sc in self.st.scopes.iter().rev() {
             for (name, ids) in sc.entries() {
-                if !shadowed_names.insert(name.as_str()) {
+                // Types and terms are separate namespaces (SLS 2): a *type*
+                // named `F` hides no term `F`. cats' `new Parallel[IorT[F0, E,
+                // *]] { type F[x] = IorT[F0, E, x]; … }` sits inside a method
+                // whose `implicit F: Monad[F0]` is the `Applicative[F0]` the
+                // body's `IorT.pure(a)` needs, and the anonymous class's type
+                // member took it out of the search.
+                let binds_term = ids.iter().any(|b| {
+                    !matches!(
+                        self.st.get(b.sym).kind,
+                        crate::symbol::SymKind::Class
+                            | crate::symbol::SymKind::TypeParam
+                            | crate::symbol::SymKind::TypeMember
+                    )
+                });
+                let hidden = if binds_term {
+                    !shadowed_names.insert(name.as_str())
+                } else {
+                    shadowed_names.contains(name.as_str())
+                };
+                if hidden {
                     continue;
                 }
                 // Every binding of the name, whatever its SLS 2 precedence:

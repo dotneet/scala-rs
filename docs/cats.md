@@ -3130,3 +3130,135 @@ measure's own flags and classpath (130 other errors, none of them this one).
 So the receiver's shape depends on what else is in the run, and the next slice
 on this should start by recording where `Vector`'s parent list comes from in
 the full run rather than by minimising the expression.
+
+## The last 27 (agent/catsrest)
+
+Measured on `9cac778e` (+ `4ac7c31b`, which touches no typer code), with the
+same flags as `tests/cats_measure.sh`:
+
+| | before | after |
+|---|---:|---:|
+| cats (339, 1 skipped) | 27 / 17 files | **4 / 3** |
+| scala library (538) | 383 / 107 | **358 / 102** |
+| gitbucket (354) | 92 / 43 | 92 / 43 (same lines) |
+| slick (184) | `errors=0 classes=1504` | `errors=0 classes=1504` |
+
+Every root below was reduced to a standalone program and compared with
+scalac 2.13.16 in both directions; the reductions are
+`tests/fixtures/catsr_infer.scala` (runs, output identical to scalac's build)
+and `tests/fixtures/catsr_bad.scala` (rejected on exactly the lines scalac
+rejects), driven by `crates/cli/tests/catsr.rs`.
+
+### Twelve roots, each its own mechanism
+
+1. **A compound result against a base of one component** (`instances/
+   either.scala:244`, `EitherT.scala:1050`, 2). `mentions_tparam` did not look
+   inside `Type::Refined`, so `def std[A]: MonadError[Either[A, *], A] with
+   Traverse[…]` looked closed in value position and `A` was never read off
+   the expected `Monad[Either[E, *]]`; `collect_expected` then paired
+   components with the expected type only by *identical* class. It now falls
+   back to the first component that has the expected class as a base and says
+   something (`Q2[List[Int]] with Q[List[A]]` against `P[List[String]]`
+   reads `Q`). The three arms after it were unreachable and are gone.
+   The brief's "alpha-equivalence of type lambdas" was not involved.
+2. **The receiver's variable solved in the first clause reaches the second**
+   (`IndexedStateT.scala:444`, `IndexedReaderWriterStateT.scala:748`, 2).
+   *Not* a `Tuple2`/`(C, B)` identity problem: `first(fa).dimap(f)(_.swap)`
+   solves `first`'s `C` from `f`, but only `param_tys`, `ret` and the receiver
+   were substituted -- `fun.ty`, which `fill_defaults_and_implicits` reads the
+   later clauses from, kept the open `C`, and the message compared two
+   different `C`s printed alike.
+3. **A type path whose head is a still-inferred member `val`**
+   (`Nested.scala` 117/124/126/128, 4). A template types its aliases before
+   its other signatures, so `val FG = F0.compose(G0); type Representation =
+   FG.Representation` read `FG` as `<notype>`. `path_dependent_type` now runs
+   the head's pending completion first (a genuine cycle still reports).
+4. **An implicit-only alternative against the nullary one**
+   (`Nested.scala:162`, 1). `Alternative[F].compose[G]` collapsed in value
+   position to `MonoidK.compose[G]` because it is nullary. nsc compares the
+   results through the implicit clause plus the owner-subclass point; nine
+   scalac probes (`C4`..`C9`, `Sub`/`Base`, `Q`/`P`) fix the rule: the
+   implicit one wins only on a strictly positive score, and a tie keeps the
+   nullary one. `overload_member_types` is keyed by symbol, so the receiver
+   must really have the implicit alternative as a member.
+5. **A curried method as a function argument** (`Apply.scala:247`, 1). The
+   scoring eta-shape flattened every clause (`(Boolean, A, A) => A`); it is
+   curried now (`Boolean => (A, A) => A`).
+6. **A by-name function parameter given a `Function1` subclass**
+   (`ContT.scala` 51/58, 2). The function-view step of `unify_tparam_all`
+   did not look under `=>`.
+7. **A type member does not shadow an implicit term** (`IorT.scala`
+   609/614, 2). `type F[x]` in an anonymous class hid the enclosing
+   `implicit F: Monad[F0]` from the search; only term bindings shadow.
+8. **An outer member is read through the outer class** (`Parallel.scala`
+   106/109, 2). An unqualified member found in an enclosing template was
+   substituted as seen from the *innermost* class, which does not derive from
+   its owner, so `NonEmptyParallel`'s own `M` stayed in `parallel: M ~> F`.
+9. **Function-typed scrutinees and parents in patterns** (`Kleisli.scala`
+   74/79, 2). `case StrictConstFunction1(fb)` and `case run:
+   StrictConstFunction1[?]` on a `run: A => F[B]`: neither the constructor
+   pattern nor the typed pattern read a `Type::Function` scrutinee as its
+   `FunctionN` class, and `base_type_instance` could not walk a parent stored
+   as a function type.
+10. **The expected type reaches a case-class `apply` and an annotated
+    literal's body** (`Kleisli.scala:571`, 1). `proto_arg_type` answered
+    nothing for a companion `apply`, and an annotated literal was typed with
+    no expected type at all, so its branches met at `AnyRef`.
+11. **Method values, and `Either`'s prelude stubs** (`ArrowChoice.scala:58`,
+    `syntax/either.scala:332`, `EitherK.scala:60`, 3). A monomorphic method value (`identity[C]`) now unifies as its
+    eta-expansion; a polymorphic one (`Ior.both`) still goes through
+    `solve_eta_tparams` -- the first version of this took both and cost 104
+    cats errors, which is why the gate exists. `Either.map` in the prelude was
+    the stub `(B => Any)Either[A, B]` (right for an application, which
+    `either_map_result` rewrites, wrong for `eab.map` as a value); it is
+    `map[B1](f: B => B1): Either[A, B1]` now. `Left.apply` / `Right.apply`
+    likewise took `Any` and are `apply[A, B](value: A|B)`, which -- with root 10's prototype
+    for the `EitherK(…)` companion call -- is what lets `EitherK.scala:60`
+    hand `rightc` its `F`.
+12. **A polymorphic nullary argument solved through the expected type**
+    (`Arrow.scala:46`, 1). `compose(swap, compose(first(fa), swap))`: an
+    argument solution carrying the argument's own undetermined variables
+    (`A := (X, Y)`) could not be overridden by the invariant expected type,
+    because it does not *conform* until `X` and `Y` are solved; and the inner
+    call had no prototype at all, because the outer formal still mentions an
+    unsolved parameter. nsc's lenient `protoTypeArgs` (open parameters as
+    wildcards) is now given to a nested *call* only, and a wildcard that
+    leaks into the argument's own type (`leftWiden(rightFunctor.widen(fac))`
+    came back `F[_, D]`) sends it back to the untyped retry. A *bare*
+    undetermined solution is left to `solve_undet_result` as before.
+
+### What is left (4)
+
+* `FunctionK.scala:95` -- `FunctionKMacroMethods` lives in the file the
+  measure holds out (`CATS_EXCLUDE`). A measurement artefact.
+* `syntax/semigroupal.scala` 71/78 -- **an inner class of a generic class
+  loses its outer's type arguments.** `class B[T] { def m[A](a: A) = new
+  B1(a); class B1[A0](a0: A0) { def n(z: T) = … } }` and then `new
+  B[X].m(1).n(x)` is `found: X  required: T` (scalac accepts; five variants in
+  the slice's probes). `Type::Class` has no prefix, so `B[X]#B1[A]` is plain
+  `B1[A]` and `T` is never substituted. This is the same representation gap
+  `docs/language-support.md` records for `A#B`; it needs a prefix on class
+  types, not an inference rule.
+* `NonEmptySet.scala:418` -- `found: SortedSet[A]  required: Iterable[A]`;
+  does not reproduce standalone (`def f[A](s: SortedSet[A]): Iterable[A] =
+  s` compiles), the base-type-merge family recorded above.
+
+### Corpus
+
+`CORPUS_KINDS=neg CORPUS_SIZE=full` against `corpus-c0c10f08.tsv`: three
+tests went from pass to fail -- `abstract-class-2`, `t1010`,
+`compile-time-only-a`. All three passed only on `type … is not a member of
+<notype>`, the false error root 3 removes; scalac rejects them for reasons
+this compiler does not check (a path-dependent prefix mismatch in the first
+two, `@compileTimeOnly` in the third), so they are now accepted.
+
+### Found in passing, not fixed
+
+* `Option.map` (and the other hand-written collection `map`s in the prelude)
+  are the same monomorphic stub `Either.map` was: `that.flatMap(o.map)` on an
+  `Option` is `found: Option[B]  required: Option[C]` where scalac accepts.
+* `new Q2[List[Int]] with Q[List[A]] {}` for `Q2[X] extends P[X]`, `Q[X]
+  extends P[X]` is accepted; scalac reports that it "inherits different type
+  instances of trait P".
+* Without `-Xsource:3`, `ov(ite)` for an overloaded `ov` taking function
+  types is accepted; scalac reports "missing argument list for method ite".

@@ -2210,34 +2210,45 @@ impl Typer {
         self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty)
     }
 
-    /// The class whose `this` an unqualified reference to a member of
-    /// `owner` is selected on: the innermost enclosing class that has `owner`
-    /// as a base class (or is `owner`), which is not always the class the
-    /// reference is written in.
+    /// The enclosing class an unqualified reference to a member of `owner`
+    /// is made through -- nsc's `C.this` for the innermost enclosing `C` that
+    /// has the member, by inheritance or through its self type. Usually that
+    /// is `this_class` itself; it is an *outer* class when the name was found
+    /// in an enclosing template. cats' `trait Parallel[M[_]] extends
+    /// NonEmptyParallel[M]` writes `new ApplicativeError[F, E] { … parallel(…)
+    /// … }`, and `parallel: M ~> F` read through the anonymous class kept
+    /// `NonEmptyParallel`'s own `M` -- `no matching overload for (M[A])F[A]
+    /// with arguments (M[A])`, two `M`s printed alike.
     ///
-    /// `SetOps[A, CC, C]` declares `private class SubsetsItr` whose `next()`
-    /// calls the inherited `newSpecificBuilder` bare. That member is
-    /// `IterableOps`', and the reference means `SetOps.this.newSpecificBuilder`
-    /// -- `SubsetsItr` does not extend `IterableOps` at all. Reading it through
-    /// `SubsetsItr` left `IterableOps`' own `A` and `C` in place, so
-    /// `buf += elms(idx)` was "no matching overload ... with arguments (A)".
-    ///
-    /// Falls back to the current class when no enclosing class derives from
-    /// `owner` (a member reached some other way keeps what it did before).
+    /// Falls back to `this_class` when no enclosing class has the member, so
+    /// every shape that was read through `this_class` before still is.
     pub(crate) fn ident_prefix_class(&self, owner: SymbolId) -> SymbolId {
-        let mut c = self.st.this_class;
-        while !c.is_none() {
-            if matches!(
-                self.st.get(c).kind,
-                SymKind::Class | SymKind::ModuleClass | SymKind::Module
-            ) && (c == owner || self.st.is_ancestor_of(owner, c))
-            {
+        let this = self.st.this_class;
+        let reaches = |ty: &Type| -> bool {
+            let parts: Vec<&Type> = match ty {
+                Type::Refined { parents, .. } => parents.iter().collect(),
+                other => vec![other],
+            };
+            parts.into_iter().any(|p| {
+                self.st
+                    .class_sym_of(p)
+                    .is_some_and(|c| crate::pickle_supply::inherits_from(&self.st, c, owner))
+            })
+        };
+        for c in self.st.enclosing_classes(this) {
+            if !self.st.get(c).is_class_like() {
+                continue;
+            }
+            if c == owner || crate::pickle_supply::inherits_from(&self.st, c, owner) {
                 return c;
             }
-            c = self.st.get(c).owner;
+            if self.st.get(c).self_type.as_ref().is_some_and(reaches) {
+                return c;
+            }
         }
-        self.st.this_class
+        this
     }
+
 
     /// The prefix an inner class is instantiated through, for reading its
     /// constructor: `p.C(…)` / `new p.C(…)` is `p`'s type, and a bare `C(…)`

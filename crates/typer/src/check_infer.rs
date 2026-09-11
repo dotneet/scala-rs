@@ -1695,6 +1695,41 @@ impl Typer {
                 Type::Repeated(e) => e.as_ref(),
                 other => other,
             };
+            // A method value handed to a function parameter is the function
+            // its eta-expansion makes, one clause per arrow. cats'
+            // `lift(identity[C])` for `lift[A, B](f: A => B)` reads `A` and
+            // `B` off `C => C`; left as the method type `(C)C` it pinned
+            // nothing, both were opened to `Any`, and `(C) => C` then failed
+            // against `(Any) => Any`.
+            // Only a *monomorphic* method value: `Ior.both` still carries its
+            // own `[A, B]`, which the eta-expansion solves from the parameter
+            // (`solve_eta_tparams`); reading them here as fixed types solved
+            // the callee to `Ior[A, B]` in `both`'s own parameters.
+            let eta;
+            let a =
+                match a {
+                    Type::Method { paramss, ret }
+                        if !paramss.is_empty()
+                            && is_function_pt(match p {
+                                Type::ByName(inner) => inner,
+                                other => other,
+                            })
+                            && {
+                                let mut free = Vec::new();
+                                collect_tparams(a, &mut free);
+                                free.iter().all(|tp| self.tparam_in_scope(*tp))
+                            } =>
+                    {
+                        eta = paramss.iter().rev().fold((**ret).clone(), |acc, clause| {
+                            Type::Function {
+                                params: clause.clone(),
+                                ret: Box::new(acc),
+                            }
+                        });
+                        &eta
+                    }
+                    other => other,
+                };
             let a = &self.align_arg_to_param(p, a);
             let keep_singleton = self.st.get(tp).bound_hi.as_ref().is_some_and(|hi| {
                 self.st.is_sub_type(
@@ -1738,9 +1773,17 @@ impl Typer {
             // `B` out of. Only where the argument as written pinned nothing:
             // weighing the view first changed which alternative slick's `map`
             // calls resolved to.
-            if hit.is_none() && is_function_pt(p) && !matches!(a, Type::Function { .. }) {
+            // A by-name function parameter is the same function once forced:
+            // cats' `ContT.later[M, A, B](fn: => (B => M[A]) => M[A])` is
+            // handed an `AndThen[B => M[A], M[A]]`, and only its `Function1`
+            // base says what `B` is.
+            let p_fn = match p {
+                Type::ByName(inner) => inner.as_ref(),
+                other => other,
+            };
+            if hit.is_none() && is_function_pt(p_fn) && !matches!(a, Type::Function { .. }) {
                 if let Some(view) = self.function_view(a) {
-                    hit = unify_one(&self.st, tp, p, &view);
+                    hit = unify_one(&self.st, tp, p_fn, &view);
                 }
             }
             // A rigid type parameter argument is what its *upper bound* is,
@@ -1857,6 +1900,10 @@ impl Typer {
             return inst;
         }
         let mut inst = inst;
+        // What overriding an argument's solution through its undetermined
+        // variables said about those variables; applied to the other
+        // solutions below, since the same `X` may sit in more than one.
+        let mut undet_solved: Vec<(SymbolId, Type)> = Vec::new();
         for (tp, ty, strong) in found {
             match inst.iter_mut().find(|(id, _)| *id == tp) {
                 // The arguments already pinned it. Only an invariant position
@@ -1879,15 +1926,47 @@ impl Typer {
                     // still the best answer there is -- `Set()` for a declared
                     // `Set[TableOption[?]]` is a source existential and solves
                     // `A := TableOption[_]` through the `None` arm below.
-                    if strong
-                        && slot.1 != ty
-                        && !type_has_wildcard(&ty)
-                        && self.st.is_sub_type(&slot.1, &ty)
-                    {
-                        slot.1 = ty;
+                    // An argument's solution that still carries *its own*
+                    // undetermined variables conforms when some instantiation
+                    // of them does: cats' `compose(swap, compose(first(fa),
+                    // swap))`, with `def swap[X, Y]: F[(X, Y), (Y, X)]`, reads
+                    // `A := (X, Y)` off the inner `swap` and only the declared
+                    // result says `A` is `(C, A)` -- which is what then solves
+                    // `X` and `Y`.
+                    if strong && slot.1 != ty && !type_has_wildcard(&ty) {
+                        if self.st.is_sub_type(&slot.1, &ty) {
+                            slot.1 = ty;
+                        } else if !matches!(&slot.1, Type::TypeParam(v) if self.undet_tvars.contains(v))
+                            && self.undet_compatible(&slot.1, &ty)
+                        {
+                            // (A *bare* undetermined variable is left alone:
+                            // the result carries it out and
+                            // `solve_undet_result` settles it against the same
+                            // expected type.)
+                            for v in self.undet_tvars.iter().copied() {
+                                if !type_mentions_tparam(&slot.1, v)
+                                    || undet_solved.iter().any(|(id, _)| *id == v)
+                                {
+                                    continue;
+                                }
+                                if let Some(t) = unify_one(&self.st, v, &slot.1, &ty) {
+                                    if !type_mentions_tparam(&t, v) {
+                                        undet_solved.push((v, t));
+                                    }
+                                }
+                            }
+                            slot.1 = ty;
+                        }
                     }
                 }
                 None => inst.push((tp, ty)),
+            }
+        }
+        if !undet_solved.is_empty() {
+            let ids: Vec<SymbolId> = undet_solved.iter().map(|(id, _)| *id).collect();
+            let vals: Vec<Type> = undet_solved.iter().map(|(_, t)| t.clone()).collect();
+            for (_, t) in inst.iter_mut() {
+                *t = crate::symbol::subst_tparams_slice(&ids, &vals, t);
             }
         }
         inst
@@ -2158,10 +2237,56 @@ impl Typer {
                     }
                 }
             }
+            // A compound result against one class: nsc's `A with B <: P` holds
+            // when some component conforms, so the component whose own class is
+            // `P` speaks first, and failing that the first one `P` is a base
+            // class of. cats' `catsStdInstancesForEither[A]: MonadError[Either[A,
+            // *], A] with Traverse[…] with Align[…]` assigned to a declared
+            // `Monad[Either[E, *]]` names `Monad` in none of its components, so
+            // `A` was never read off the expected type and stayed open; the
+            // `Class` arm below lines `MonadError` up with `Monad` through its
+            // base type.
             (Type::Refined { parents: rps, .. }, _) => {
                 let head = self.st.class_sym_of(pt);
-                for rp in rps.iter().filter(|rp| self.st.class_sym_of(rp) == head) {
-                    self.collect_expected(tps, rp, pt, variance, depth + 1, allow_covariant, out);
+                let same: Vec<&Type> = rps
+                    .iter()
+                    .filter(|rp| self.st.class_sym_of(rp) == head)
+                    .collect();
+                if !same.is_empty() {
+                    for rp in same {
+                        self.collect_expected(
+                            tps,
+                            rp,
+                            pt,
+                            variance,
+                            depth + 1,
+                            allow_covariant,
+                            out,
+                        );
+                    }
+                } else if let (Some(h), Type::Class { .. }) = (head, pt) {
+                    // The first component that both reaches `P` and says
+                    // something: in `Q2[List[Int]] with Q[List[A]]` against
+                    // `P[List[String]]` it is `Q` that decides `A`.
+                    for rp in rps
+                        .iter()
+                        .filter(|rp| self.base_type_instance(rp, h, 0).is_some())
+                    {
+                        let mut here = Vec::new();
+                        self.collect_expected(
+                            tps,
+                            rp,
+                            pt,
+                            variance,
+                            depth + 1,
+                            allow_covariant,
+                            &mut here,
+                        );
+                        if !here.is_empty() {
+                            out.extend(here);
+                            break;
+                        }
+                    }
                 }
             }
             (_, Type::Refined { parents: pps, .. }) => {
@@ -2214,37 +2339,6 @@ impl Typer {
                             out,
                         );
                     }
-                }
-            }
-            // A *compound* result type. `private def instance[F[_] <: Product]
-            // (trav: …): Traverse[F] with Reducible[F]` names `F` nowhere but
-            // in its result, so cats' generated
-            // `catsUnorderedFoldableInstancesForTuple1: Traverse[Tuple1] with
-            // Reducible[Tuple1] = instance(…)` has only the expected type to
-            // read it off; without this the parameter stayed open, the lambda
-            // was typed against `_[Any]`, and every one of the twenty-two
-            // tuple instances reported `value _1 is not a member of _[Any]`
-            // followed by `found: Traverse[F] with Reducible[F]`.
-            //
-            // Components pair by position -- both sides come from the same
-            // declaration whenever this fires -- and a non-compound on either
-            // side is tried against every component, which is how `unify_one`
-            // already reads a parameter out of a compound argument.
-            (Type::Refined { parents: rps, .. }, Type::Refined { parents: pps, .. })
-                if rps.len() == pps.len() =>
-            {
-                for (x, y) in rps.iter().zip(pps) {
-                    self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
-                }
-            }
-            (Type::Refined { parents: rps, .. }, _) => {
-                for x in rps {
-                    self.collect_expected(tps, x, pt, variance, depth + 1, allow_covariant, out);
-                }
-            }
-            (_, Type::Refined { parents: pps, .. }) => {
-                for y in pps {
-                    self.collect_expected(tps, ret, y, variance, depth + 1, allow_covariant, out);
                 }
             }
             _ => {}

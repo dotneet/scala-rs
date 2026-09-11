@@ -1000,6 +1000,13 @@ impl Typer {
     }
 
     fn path_dependent_type(&mut self, span: Span, prefix: &Tree, name: &str) -> Type {
+        // The path's head may be a member whose type is still inferred from its
+        // right-hand side. A template types its type aliases before its other
+        // signatures, so cats' `new Representable[…] { val FG =
+        // F0.compose(G0); type Representation = FG.Representation }` read
+        // `FG` as `<notype>` (`type Representation is not a member of
+        // <notype>`). nsc's lazy completer types `FG` right there.
+        self.complete_path_head(prefix, span);
         if !self.is_stable_path(prefix) {
             self.error(
                 span,
@@ -1022,6 +1029,25 @@ impl Typer {
         };
         let t = self.project_from_prefix(span, &pty, name);
         self.at_term_path(prefix, &pty, t)
+    }
+
+    /// Complete the signature of the term a type path starts from, when it is
+    /// still pending (an unannotated `val` of the template being typed).
+    fn complete_path_head(&mut self, prefix: &Tree, span: Span) {
+        let mut head = prefix;
+        while let TreeKind::Select { qual, .. } = &head.kind {
+            head = qual;
+        }
+        let TreeKind::Ident { name } = &head.kind else {
+            return;
+        };
+        let pending = self.st.lookup_term(name).into_iter().find(|s| {
+            let sy = self.st.get(*s);
+            matches!(sy.kind, SymKind::Term | SymKind::Method) && sy.ty.is_no_type()
+        });
+        if let Some(s) = pending {
+            self.complete_lazy_sig(s, span);
+        }
     }
 
     /// The chain of term symbols a stable path names (`a.b.c` -> `[a, b, c]`),
