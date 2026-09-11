@@ -28,6 +28,18 @@ impl<'a> Gen<'a> {
             if let TreeKind::ClassDef { name, impl_, .. } = &tpt.kind {
                 if name.starts_with("$anon") {
                     self.emit_class(tpt, &HashSet::new());
+                    // `new WL(new {} #:: S) with T`: an anonymous class in the
+                    // super arguments of another one is emitted nowhere else
+                    // (`NoClassDefFoundError`, `run/t6506`).
+                    for p in &impl_.parents {
+                        self.emit_anon_classes(p);
+                    }
+                    // The classes and objects an anonymous class *declares*
+                    // (`new Y { class Z; def z = classOf[Z] }`): nothing else
+                    // walks its body for them (`NoClassDefFoundError:
+                    // X$$anon$1$Z`, `run/t8445`). Anonymous classes nested in
+                    // those are still found by the loop below.
+                    self.walk_stats(&impl_.body);
                     for s in &impl_.body {
                         self.emit_anon_classes(s);
                     }
@@ -575,7 +587,7 @@ impl<'a> Gen<'a> {
         let binary_lazies = self.binary_mixin_lazy_vals(class_id, &impl_.body);
         for v in &self.mixin_lazy_vals(class_id, &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PRIVATE,
+                access: Self::mixin_lazy_field_access(v),
                 name: v.name().unwrap_or("").to_string(),
                 desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
@@ -1161,6 +1173,7 @@ impl<'a> Gen<'a> {
             // `putfield` of a field declared in the current class on
             // `uninitializedThis` -- but never a `getfield`, which is why the
             // pre-super code below reads the argument instead of the field.
+            ctx_early.presuper = true;
             if has_outer {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);
                 if let Some(od) = &outer_desc_c {
@@ -1401,6 +1414,11 @@ impl<'a> Gen<'a> {
             return;
         }
         let mut frame = Frame::instance();
+        if acc & ACC_STATIC != 0 {
+            // No receiver: the first parameter is slot 0 (a `def` lifted out
+            // of a constructor's arguments, see `lambda_lift`).
+            frame.next_slot = 0;
+        }
         if ctor_outer.is_some() {
             frame.next_slot += 1; // slot 1 is $outer
         }

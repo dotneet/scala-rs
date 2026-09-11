@@ -392,6 +392,16 @@ impl Typer {
                     } else {
                         receiver
                     }
+                } else if self.equality_pattern_binds_scrutinee(body) {
+                    // `case n @ Whatever =>` / `case n @ 1 =>` test with `==`,
+                    // and `==` says nothing about the scrutinee's class: an
+                    // `object` may override `equals`, and `1 == 1L`. nsc 2.13
+                    // (scala/bug#1503) binds `n` at the scrutinee's type.
+                    // Taking the object's own type made `def f(x: Any) = x
+                    // match { case n @ Whatever => n }` return `Whatever.type`,
+                    // and the `areturn` of the scrutinee failed verification
+                    // (`run/t1503`).
+                    sel_ty.clone()
                 } else {
                     body.ty.clone()
                 };
@@ -1150,6 +1160,23 @@ impl Typer {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Does `body` match by `==` against an `object` or a literal, so that a
+    /// binder over it learns nothing about the scrutinee's type? A stable
+    /// `val` of a class type still binds at that type (`case n @ V` with a
+    /// `String` `V` is a `String` in nsc too).
+    fn equality_pattern_binds_scrutinee(&self, body: &Tree) -> bool {
+        match &body.kind {
+            TreeKind::Literal { lit } => !matches!(lit, scala_rs_parser::Lit::Null),
+            TreeKind::Ident { .. } | TreeKind::Select { .. } if !body.sym.is_none() => {
+                matches!(
+                    self.st.get(body.sym).kind,
+                    SymKind::Module | SymKind::ModuleClass
+                )
+            }
+            _ => false,
         }
     }
 
