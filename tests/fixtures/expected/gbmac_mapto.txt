@@ -1,0 +1,12 @@
+Vector(Account(alice,30,Some(a@example.com)), Account(bob,25,None))
+Vector(alice)
+Vector(Tag1(red))
+Vector(Label(7,bug))
+Vector((0,first,86400000,None), (2,second,86400000,Some(1)))
+first,second
+first,second
+Account(carol,41,Some(c@example.com))
+(dave,52,None)
+gbmacm.Account
+Fast Path of (String, Int, Option[String]).mapTo[gbmacm.Account]
+Fast Path of (Int, String, java.sql.Timestamp, Option[Int]).mapTo[gbmacm.Comment]

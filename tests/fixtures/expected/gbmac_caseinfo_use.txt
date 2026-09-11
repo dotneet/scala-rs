@@ -1,0 +1,3 @@
+Nothing v:Int
+Nothing id:Int,name:String,tags:List[String]
+Nothing when:java.util.Date,note:Option[String]

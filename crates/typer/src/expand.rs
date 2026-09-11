@@ -667,7 +667,7 @@ impl Typer {
                 .to_string());
         }
         let (argss, targs, prefix) = peel_application(tree);
-        let (request, placeholders) =
+        let (request, splices) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
         if let Some(why) = &self.macro_engine_error {
             // Starting it costs a `javac` and a JVM; a run whose first attempt
@@ -685,47 +685,29 @@ impl Typer {
             }
         }
         self.macro_rpc_span = tree.span;
-        self.macro_undescribed.clear();
         let reply = self.converse(&request)?;
         let items = reply.list()?;
         match items.first().and_then(|s| s.atom()) {
-            Some("ok") => self.tree_from_reply(at(items, 1)?, tree.span),
+            Some("ok") => {
+                let saved = std::mem::replace(
+                    &mut self.macro_splices,
+                    splices.into_iter().map(Some).collect(),
+                );
+                let built = self.tree_from_reply(at(items, 1)?, tree.span);
+                self.macro_splices = saved;
+                built
+            }
             Some("abort") => {
                 // `c.abort` is the implementation asking for a compile error
                 // at the call site. It is not a gap in this expander, so it is
-                // reported as itself -- *unless* a placeholder went over, in
-                // which case the implementation was answering a question about
-                // a class it was never shown, and its verdict says nothing
-                // about the program.
+                // reported as itself. Every class it can have asked about was
+                // answered for real (`crate::expand_mirror`) or refused with a
+                // reason, which ends the expansion as an `err` instead.
                 let msg = at(items, 1)?.text();
-                if let Some(why) = placeholder_verdict(&placeholders, &msg) {
-                    return Err(why);
-                }
-                if let Some(why) =
-                    crate::expand_rpc::undescribed_verdict(&self.macro_undescribed, &msg)
-                {
-                    return Err(why);
-                }
                 self.error(tree.span, msg);
                 Err("the macro implementation aborted the expansion".to_string())
             }
-            // An implementation that *threw* while a placeholder was in play
-            // most likely asked it for the info it does not have; the engine
-            // reports the exception, and the reason for it is said here.
-            Some("err") => {
-                let msg = at(items, 1)?.text();
-                if msg.starts_with("the macro implementation threw") {
-                    if let Some(why) = placeholder_verdict(&placeholders, &msg) {
-                        return Err(why);
-                    }
-                    if let Some(why) =
-                        crate::expand_rpc::undescribed_verdict(&self.macro_undescribed, &msg)
-                    {
-                        return Err(why);
-                    }
-                }
-                Err(msg)
-            }
+            Some("err") => Err(at(items, 1)?.text()),
             _ => Err(format!("the macro engine replied {reply:?}")),
         }
     }
@@ -766,6 +748,13 @@ impl Typer {
         request: &str,
         budget: &mut Option<Duration>,
     ) -> Result<Sexp, String> {
+        // `SCALA_RS_MACRO_TRACE=1` prints every line of the conversation on
+        // stderr: the one debugging aid that shows which side of the bridge
+        // produced a shape the other side refuses.
+        let trace = std::env::var_os("SCALA_RS_MACRO_TRACE").is_some();
+        if trace {
+            eprintln!("[macro ->] {request}");
+        }
         engine.send(request)?;
         // A wedged implementation is caught by the budget; a *chattering* one
         // -- an implementation whose questions never end although each is
@@ -774,6 +763,9 @@ impl Typer {
         let mut asked = 0u32;
         loop {
             let reply = engine.read_reply(budget)?;
+            if trace {
+                eprintln!("[macro <-] {reply}");
+            }
             let items = reply.list()?;
             if items.first().and_then(|s| s.atom()) == Some("log") {
                 asked += 1;
@@ -805,6 +797,9 @@ impl Typer {
                 ));
             }
             let answer = self.answer_query(items);
+            if trace {
+                eprintln!("[macro ->] {answer}");
+            }
             engine.send(&answer)?;
         }
     }
@@ -818,15 +813,13 @@ impl Typer {
         targs: &[Type],
         prefix: Option<&Tree>,
         application: &Tree,
-    ) -> Result<(String, Vec<String>), String> {
-        let mut placeholders = Vec::new();
-        let mut out = String::from("(expand ");
-        quote_into(&mut out, &binding.impl_class);
-        out.push(' ');
-        quote_into(&mut out, &binding.impl_method);
+    ) -> Result<(String, Vec<Tree>), String> {
         let sym = self
             .macro_symbol_of(application)
             .ok_or("macro application lost its symbol")?;
+        // The typed trees the implementation may hand back unchanged, each
+        // sent under its index (`splice_to_wire`).
+        let mut splices: Vec<Tree> = Vec::new();
         let paramss = match &self.st.get(sym).ty {
             Type::Method { paramss, .. } => paramss.clone(),
             _ => Vec::new(),
@@ -840,8 +833,39 @@ impl Typer {
         {
             return Err("macro argument clauses do not match its declaration".to_string());
         }
+        // Everything that needs the typer is worked out first: the type each
+        // argument's tree carries, the tags, and the type descriptors of the
+        // typed leaves the trees contain (`Typer::collect_wire_types`). The
+        // trees are then written with the symbol table borrowed alone.
+        let mut types = WireTypes::default();
+        let mut actuals: Vec<String> = Vec::new();
+        for clause in argss {
+            for arg in clause {
+                self.collect_wire_types(arg, &mut types);
+                actuals.push(self.tag_wire(macro_argument_type(arg))?);
+            }
+        }
+        let mut tags = Vec::new();
+        if binding.tag_params > 0 {
+            for t in self.tag_types(binding, targs, prefix)? {
+                tags.push(self.tag_descriptor(&t)?);
+            }
+        }
+        if let Some(p) = prefix {
+            self.collect_wire_types(p, &mut types);
+        }
+        self.collect_wire_types(application, &mut types);
+        let cx = WireCx {
+            st: &self.st,
+            types: &types,
+        };
+        let mut out = String::from("(expand ");
+        quote_into(&mut out, &binding.impl_class);
+        out.push(' ');
+        quote_into(&mut out, &binding.impl_method);
         out.push_str(" (argss");
         let mut slot = 0;
+        let mut actual = actuals.iter();
         for (clause_index, params) in paramss.iter().enumerate() {
             let clause = argss.get(clause_index).map(Vec::as_slice).unwrap_or(&[]);
             out.push_str(" (args");
@@ -861,14 +885,15 @@ impl Typer {
                 if repeated && index == fixed {
                     out.push_str(" (repeat");
                     for arg in &clause[index..] {
-                        let actual = self.tag_wire(macro_argument_type(arg), &mut placeholders)?;
-                        argument_to_wire(arg, as_expr, &actual, &mut out)?;
+                        let a = actual.next().ok_or("macro argument types are incomplete")?;
+                        argument_to_wire(&cx, arg, as_expr, a, splices.len(), &mut out)?;
+                        splices.push(arg.clone());
                     }
                     out.push(')');
                 } else {
-                    let actual =
-                        self.tag_wire(macro_argument_type(&clause[index]), &mut placeholders)?;
-                    argument_to_wire(&clause[index], as_expr, &actual, &mut out)?;
+                    let a = actual.next().ok_or("macro argument types are incomplete")?;
+                    argument_to_wire(&cx, &clause[index], as_expr, a, splices.len(), &mut out)?;
+                    splices.push(clause[index].clone());
                 }
             }
             out.push(')');
@@ -879,12 +904,9 @@ impl Typer {
             );
         }
         out.push_str(") (tags");
-        if binding.tag_params > 0 {
-            for t in self.tag_types(binding, targs, prefix)? {
-                out.push(' ');
-                let desc = self.tag_descriptor(&t, &mut placeholders)?;
-                out.push_str(&desc);
-            }
+        for desc in &tags {
+            out.push(' ');
+            out.push_str(desc);
         }
         out.push(')');
         // `c.prefix` -- the receiver the macro was called on. nsc hands the
@@ -910,13 +932,18 @@ impl Typer {
             }
             Some(p) => {
                 let mut built = String::new();
-                match typed_tree_to_wire(&self.st, p, &mut built) {
+                match typed_tree_to_wire(&cx, p, &mut built) {
                     Err(why) => {
                         out.push_str("(no ");
                         quote_into(&mut out, &why);
                         out.push(')');
                     }
-                    Ok(()) => out.push_str(&built),
+                    Ok(()) => {
+                        out.push_str(&format!("(orig {} ", splices.len()));
+                        out.push_str(&built);
+                        out.push(')');
+                        splices.push(p.clone());
+                    }
                 }
             }
         }
@@ -959,7 +986,7 @@ impl Typer {
         out.push(')');
         out.push_str(" (app ");
         let mut built = String::new();
-        match typed_tree_to_wire(&self.st, application, &mut built) {
+        match typed_tree_to_wire(&cx, application, &mut built) {
             Err(why) => {
                 out.push_str("(no ");
                 quote_into(&mut out, &why);
@@ -977,7 +1004,29 @@ impl Typer {
             quote_into(&mut out, setting);
         }
         out.push_str("))");
-        Ok((out, placeholders))
+        Ok((out, splices))
+    }
+
+    /// The type descriptor of every *typed leaf* in `t` that has no source
+    /// spelling the engine could rebuild: a `classOf[T]` the typer
+    /// materialised (the `$classOf` of a `ClassTag.apply`), and a type tree
+    /// the typer resolved itself (`materialize::RESOLVED_TYPE`). Recorded by
+    /// node address, so the serialiser can find each one again
+    /// ([`WireCx::types`]); a type that cannot be described is recorded as
+    /// the reason, which the serialiser raises only if it reaches the node.
+    pub(crate) fn collect_wire_types(&mut self, t: &Tree, types: &mut WireTypes) {
+        let leaf = match &t.kind {
+            TreeKind::Ident { name } => {
+                name == "$classOf" || name == crate::materialize::RESOLVED_TYPE
+            }
+            _ => false,
+        };
+        if leaf {
+            let wire = self.tag_wire(&t.ty);
+            types.insert(t as *const Tree, wire);
+            return;
+        }
+        crate::erasure::for_each_child(t, &mut |c| self.collect_wire_types(c, types));
     }
 
     /// The type each `WeakTypeTag` the implementation asks for stands for, at
@@ -1132,11 +1181,7 @@ impl Typer {
     /// placeholder a real question therefore gets an exception rather than a
     /// quiet wrong answer, and that becomes a diagnostic
     /// ([`Typer::macro_expansion`]).
-    fn tag_descriptor(
-        &mut self,
-        ty: &Type,
-        placeholders: &mut Vec<String>,
-    ) -> Result<String, String> {
+    fn tag_descriptor(&mut self, ty: &Type) -> Result<String, String> {
         // `f(42)` types its argument as the *constant* type `42`; the tag nsc
         // builds for the `Expr` that wraps it is `Int`. Only the outermost
         // type is widened -- `Tag[1]` is not `Tag[Int]`, so a constant that is
@@ -1145,7 +1190,7 @@ impl Typer {
             Type::Constant(lit) => Type::lit_underlying(lit),
             other => other.clone(),
         };
-        self.tag_wire(&widened, placeholders)
+        self.tag_wire(&widened)
     }
 
     /// One type as a tag descriptor, type arguments and all.
@@ -1162,18 +1207,29 @@ impl Typer {
     ///
     /// A type argument that is a class **this run is compiling** still travels
     /// as the empty placeholder of §5.1, at whatever depth it occurs.
-    fn tag_wire(&mut self, ty: &Type, placeholders: &mut Vec<String>) -> Result<String, String> {
+    fn tag_wire(&mut self, ty: &Type) -> Result<String, String> {
+        // An inner class behind a prefix (`prefix.rs`) travels as the class:
+        // the wire names classes, and gitbucket's `TableQuery[Repositories]`
+        // -- an inner class of the cake component -- has always gone as one.
+        let stripped;
+        let ty = if crate::prefix::view_prefix(ty).is_some() {
+            stripped = crate::prefix::strip_view(ty).clone();
+            &stripped
+        } else {
+            ty
+        };
         if let Some(sym) = plain_class_of(&self.st, ty) {
             if self.is_current_run_class(sym) {
+                // The class goes over as its identity. The engine builds its
+                // symbol under the class's real owner and asks for the info
+                // -- parents, declarations -- only if the implementation
+                // forces it (`crate::expand_mirror`), so a macro that merely
+                // splices the type (`TableQuery[Issues]`) costs nothing, and
+                // one that interrogates it (`mapTo[Account]`) is answered in
+                // nsc's shape.
                 let full = scala_full_name(&self.st, sym);
-                self.macro_local_tags.insert(full.clone(), ty.clone());
-                if !placeholders.contains(&full) {
-                    placeholders.push(full.clone());
-                }
-                let mut out = String::from("(syn ");
-                quote_into(&mut out, &full);
-                out.push(')');
-                return Ok(out);
+                self.macro_local_tags.insert(full, ty.clone());
+                return Ok(format!("(src {})", sym.0));
             }
         }
         // A constant type nested inside a type argument. nsc's tag for
@@ -1188,7 +1244,7 @@ impl Typer {
         if let Some((name, args)) = self.applied_tag_shape(ty)? {
             let mut written = Vec::new();
             for a in &args {
-                written.push(self.tag_wire(a, placeholders)?);
+                written.push(self.tag_wire(a)?);
             }
             let mut out = String::from("(ty ");
             quote_into(&mut out, &name);
@@ -1230,8 +1286,9 @@ impl Typer {
                 if self.is_current_run_class(*sym) {
                     return Err(format!(
                         "scala-rs cannot build a type tag for `{}`, a class this run \
-                         is compiling applied to type arguments; the placeholder the \
-                         engine is given carries a name and nothing else",
+                         is compiling applied to type arguments; the engine is given \
+                         such a class as its identity, and its type parameters would \
+                         have nothing to bind",
                         scala_full_name(&self.st, *sym)
                     ));
                 }
@@ -1329,6 +1386,9 @@ impl Typer {
             })),
             "Ident" => {
                 let name = decode_method_name(&name_from(at(kids, 0)?)?);
+                if self.macro_reply_pattern && name == "_" {
+                    return Ok(node(TreeKind::Wildcard));
+                }
                 // A *static* symbol is rebuilt from its full name: the
                 // expansion is typed in the call site's scope, where the
                 // implementation's own imports do not exist, so `Ident(Helper)`
@@ -1414,42 +1474,199 @@ impl Typer {
                 rhs: Box::new(self.tree_from_reply(at(kids, 1)?, span)?),
             })),
             "Typed" => {
-                let expr = self.tree_from_reply(at(kids, 0)?, span)?;
-                let tpt = self.tree_from_reply(at(kids, 1)?, span)?;
+                let mut expr = self.tree_from_reply(at(kids, 0)?, span)?;
+                // Our parser writes the `_` of a typed pattern `_: T` as the
+                // identifier `_`, and a bare `_` pattern as `Wildcard`; the
+                // typer's pattern checks are written against those shapes.
+                if self.macro_reply_pattern && matches!(expr.kind, TreeKind::Wildcard) {
+                    expr.kind = TreeKind::Ident { name: "_".into() };
+                }
+                // A pattern's type is a type, not a pattern: nsc's `Ident(_)`
+                // cannot occur there, and the flag must not reach it.
+                let saved = std::mem::replace(&mut self.macro_reply_pattern, false);
+                let tpt = self.tree_from_reply(at(kids, 1)?, span);
+                self.macro_reply_pattern = saved;
                 Ok(node(TreeKind::Typed {
                     expr: Box::new(expr),
-                    tpt: Box::new(tpt),
+                    tpt: Box::new(tpt?),
                 }))
             }
             "TypeTree" => {
-                let items = at(kids, 0)?.list()?;
-                let name = at(items, 1)?.text();
-                // A class this run is compiling went over as a placeholder
-                // carrying only its name (`tag_descriptor`). Coming back it is
-                // that same name, and the type it stands for is the one the
-                // typer already had -- resolving the name again would look for
-                // a path that need not exist at the call site, because a class
-                // nested in a trait has no such path at all.
-                if let Some(ty) = self.macro_local_tags.get(&name) {
-                    let mut t = node(TreeKind::Ident {
-                        name: crate::materialize::RESOLVED_TYPE.to_string(),
-                    });
-                    t.ty = ty.clone();
-                    return Ok(t);
-                }
-                if items.len() > 2 {
-                    return Err(format!(
-                        "the expansion mentions the type `{name}`, whose type \
-                         arguments scala-rs cannot rebuild yet"
-                    ));
-                }
-                if name.is_empty() {
-                    return Err("the expansion contains an empty `TypeTree`".to_string());
-                }
-                // A type path is the same tree shape as a term path here, and
-                // `tree_to_type` reads it.
-                Ok(path_tree(&name, span))
+                let mut t = self.type_tree_from_wire(at(kids, 0)?, span)?;
+                t.id = id;
+                Ok(t)
             }
+            // `Bind(name, body)`. A *term* name is a pattern binder, `x @ p`
+            // (nsc writes a plain variable pattern `x` as `Bind(x, Ident(_))`,
+            // which binds the same way). A *type* name is a type binder in a
+            // pattern's type: `_` is nsc's spelling of the wildcard in
+            // `case _: C[_, _]`, which our parser writes as a `TypeDef` named
+            // `_`, and any other name is a binder our parser writes as the
+            // bare identifier (`case _: List[t]`).
+            "Bind" => {
+                let name_sexp = at(kids, 0)?;
+                let name = name_from(name_sexp)?;
+                let is_type = name_sexp
+                    .list()
+                    .ok()
+                    .and_then(|n| n.get(1))
+                    .and_then(|k| k.atom())
+                    == Some("type");
+                if is_type {
+                    let body = at(kids, 1)?;
+                    let (lo, hi) = if is_node(body, "TypeBoundsTree") {
+                        self.bounds_from_reply(body, span)?
+                    } else if is_node(body, "EmptyTree") {
+                        (None, None)
+                    } else {
+                        return Err(format!(
+                            "the expansion binds the type `{name}` to a type tree, \
+                             which scala-rs cannot rebuild yet"
+                        ));
+                    };
+                    if name == "_" {
+                        return Ok(node(TreeKind::TypeDef {
+                            mods: Modifiers::default(),
+                            name,
+                            tparams: Vec::new(),
+                            rhs: Box::new(node(TreeKind::Empty)),
+                            lo,
+                            hi,
+                            views: Vec::new(),
+                            ctx_bounds: Vec::new(),
+                        }));
+                    }
+                    if lo.is_some() || hi.is_some() {
+                        return Err(format!(
+                            "the expansion binds the pattern type `{name}` with bounds, \
+                             which scala-rs cannot rebuild yet"
+                        ));
+                    }
+                    return Ok(node(TreeKind::Ident { name }));
+                }
+                if !self.macro_reply_pattern {
+                    return Err("the expansion contains a `Bind` outside a pattern, \
+                                which scala-rs cannot rebuild"
+                        .to_string());
+                }
+                let body = self.pattern_from_reply(at(kids, 1)?, span)?;
+                Ok(node(TreeKind::Bind {
+                    name: decode_method_name(&name),
+                    body: Box::new(body),
+                }))
+            }
+            // `Match(selector, cases)`. An *empty* selector is nsc's pattern
+            // matching anonymous function, `{ case p => e }`, which our parser
+            // spells as `x$pf => x$pf match { … }` (`parse_block_expr`); the
+            // typer recognises exactly that shape, so it is rebuilt here.
+            "Match" => {
+                let mut cases = Vec::new();
+                for c in at(kids, 1)?.list()?.iter().skip(1) {
+                    cases.push(self.case_from_reply(c, span)?);
+                }
+                if is_node(at(kids, 0)?, "EmptyTree") {
+                    let param = node(TreeKind::ValDef {
+                        mods: Modifiers::new(Flags::PARAM),
+                        name: "x$pf".into(),
+                        tpt: Box::new(self.macro_node(TreeKind::Empty, span)?),
+                        rhs: Box::new(self.macro_node(TreeKind::Empty, span)?),
+                    });
+                    let selector = self.macro_node(
+                        TreeKind::Ident {
+                            name: "x$pf".into(),
+                        },
+                        span,
+                    )?;
+                    let body = self.macro_node(
+                        TreeKind::Match {
+                            selector: Box::new(selector),
+                            cases,
+                        },
+                        span,
+                    )?;
+                    return self.macro_node(
+                        TreeKind::Function {
+                            vparams: vec![param],
+                            body: Box::new(body),
+                        },
+                        span,
+                    );
+                }
+                let selector = self.tree_from_reply(at(kids, 0)?, span)?;
+                Ok(node(TreeKind::Match {
+                    selector: Box::new(selector),
+                    cases,
+                }))
+            }
+            // `super.m` / `C.super[M].m`. The qualifier is a `This` whose name
+            // is empty for a plain `super`; the mix is a type name, empty when
+            // none was written.
+            "Super" => {
+                let this = at(kids, 0)?.list()?;
+                if at(this, 1)?.text() != "This" {
+                    return Err("the expansion contains a `Super` whose qualifier \
+                                is not a `This`"
+                        .to_string());
+                }
+                let qual = name_from(at(this, 3)?)?;
+                let mix = name_from(at(kids, 1)?)?;
+                Ok(node(TreeKind::Super {
+                    qual: (!qual.is_empty()).then_some(qual),
+                    mix: (!mix.is_empty()).then_some(mix),
+                }))
+            }
+            // `f(name = value)`. Our parser spells a named argument as an
+            // assignment in argument position, and the typer reads it that
+            // way (`Typer::named_arg_parts`).
+            "NamedArg" => Ok(node(TreeKind::Assign {
+                lhs: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+                rhs: Box::new(self.tree_from_reply(at(kids, 1)?, span)?),
+            })),
+            // `T forSome { type X; … }`, as nsc's typer writes a wildcard it
+            // had to skolemise (`tm.asInstanceOf[C[D, R, _$1] forSome { type
+            // _$1 }]` in slick's `mapToImpl`).
+            "ExistentialTypeTree" => {
+                let tpt = self.tree_from_reply(at(kids, 0)?, span)?;
+                let clauses = self.reply_trees(at(kids, 1)?, span)?;
+                Ok(node(TreeKind::ExistentialTypeTree {
+                    tpt: Box::new(tpt),
+                    clauses,
+                }))
+            }
+            // `type T >: L <: H` or `type T = R`: the right-hand side is a
+            // `TypeBoundsTree` for an abstract member and a type tree for an
+            // alias, and our tree keeps the bounds in their own fields.
+            "TypeDef" => {
+                let mods = mods_from_with(at(kids, 0)?, true)?;
+                let name = name_from(at(kids, 1)?)?;
+                let tparams = self.reply_trees(at(kids, 2)?, span)?;
+                let rhs = at(kids, 3)?;
+                let (rhs, lo, hi) = if is_node(rhs, "TypeBoundsTree") {
+                    let (lo, hi) = self.bounds_from_reply(rhs, span)?;
+                    (node(TreeKind::Empty), lo, hi)
+                } else {
+                    (self.tree_from_reply(rhs, span)?, None, None)
+                };
+                Ok(node(TreeKind::TypeDef {
+                    mods,
+                    name,
+                    tparams,
+                    rhs: Box::new(rhs),
+                    lo,
+                    hi,
+                    views: Vec::new(),
+                    ctx_bounds: Vec::new(),
+                }))
+            }
+            // `p | q` and the `_*` of a sequence pattern. Only in a pattern:
+            // neither has a meaning in an expression, and nsc rejects one
+            // there (`unexpected tree: Trees$Star`).
+            "Alternative" if self.macro_reply_pattern => Ok(node(TreeKind::Alternative {
+                trees: self.reply_trees(at(kids, 0)?, span)?,
+            })),
+            "Star" if self.macro_reply_pattern => Ok(node(TreeKind::Star {
+                elem: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+            })),
             // `Function(vparams, body)` and the `ValDef`s under it. slick's
             // `TableQueryMacroImpl.apply` builds exactly this -- a function
             // literal whose one parameter is spelled out with a `Modifiers`,
@@ -1487,8 +1704,32 @@ impl Typer {
                 let mut ctor_mods = Modifiers::default();
                 let mut vparamss = Vec::new();
                 let mut primary = false;
+                // A class parameter is two trees in nsc's: the constructor's
+                // `PARAM | PARAMACCESSOR` parameter and a `PARAMACCESSOR` field
+                // in the template body, `private[this]` for a plain parameter
+                // and public for a `val`. Our tree has only the parameter, with
+                // the `val`-ness on it (`Parser::parse_param`), so each field
+                // is folded into its parameter and left out of the body.
+                let mut accessor_fields: Vec<(String, Vec<String>)> = Vec::new();
+                for member in at(template, 5)?.list()?.iter().skip(1) {
+                    if is_node(member, "ValDef") {
+                        let fields = member.list()?;
+                        let names = flag_names(at(fields, 3)?)?;
+                        if names.iter().any(|n| n == "PARAMACCESSOR") {
+                            accessor_fields.push((name_from(at(fields, 4)?)?, names));
+                        }
+                    }
+                }
+                let mut folded = 0usize;
                 for member in at(template, 5)?.list()?.iter().skip(1) {
                     let fields = member.list()?;
+                    if is_node(member, "ValDef")
+                        && flag_names(at(fields, 3)?)?
+                            .iter()
+                            .any(|n| n == "PARAMACCESSOR")
+                    {
+                        continue;
+                    }
                     if !primary
                         && at(fields, 1)?.text() == "DefDef"
                         && name_from(at(fields, 4)?)? == "<init>"
@@ -1496,7 +1737,14 @@ impl Typer {
                         primary = true;
                         ctor_mods = mods_from(at(fields, 3)?)?;
                         for clause in at(fields, 6)?.list()?.iter().skip(1) {
-                            vparamss.push(self.reply_trees(clause, span)?);
+                            let mut params = Vec::new();
+                            for param in clause.list()?.iter().skip(1) {
+                                let (param, was_accessor) =
+                                    class_param_sexp(param, &accessor_fields)?;
+                                folded += usize::from(was_accessor);
+                                params.push(self.tree_from_reply(&param, span)?);
+                            }
+                            vparamss.push(params);
                         }
                         // The primary constructor's super call is represented
                         // by Template.parents in our AST. Preserve additional
@@ -1522,6 +1770,12 @@ impl Typer {
                     } else {
                         body.push(self.tree_from_reply(member, span)?);
                     }
+                }
+                if folded != accessor_fields.len() {
+                    return Err(format!(
+                        "the expansion's class `{name}` has a parameter field with no \
+                         constructor parameter, which scala-rs cannot rebuild"
+                    ));
                 }
                 Ok(node(TreeKind::ClassDef {
                     mods,
@@ -1612,11 +1866,180 @@ impl Typer {
                 }))
             }
             "EmptyTree" => Ok(node(TreeKind::Empty)),
+            // The receiver or an argument, handed back as it was given. The
+            // first time, it is the tree the typer already typed -- nsc does
+            // not type such a tree again -- and any later mention of the same
+            // tree is rebuilt from its shape, so no typed subtree is shared.
+            "Orig" => {
+                let k = at(kids, 0)?
+                    .text()
+                    .parse::<usize>()
+                    .map_err(|e| e.to_string())?;
+                match self.macro_splices.get_mut(k).and_then(Option::take) {
+                    Some(mut typed) => {
+                        typed.id = NodeId::PRETYPED_SPLICE;
+                        Ok(typed)
+                    }
+                    None => self.tree_from_reply(at(kids, 1)?, span),
+                }
+            }
             other => Err(format!(
                 "the expansion contains a `{other}`, which scala-rs cannot rebuild yet"
             )),
         }
     }
+
+    /// A node of the rebuilt expansion that has no counterpart in the reply
+    /// -- the parameter and selector of a pattern-matching anonymous
+    /// function -- with a fresh identity of its own, like every other node
+    /// `tree_from_reply` builds.
+    fn macro_node(&mut self, kind: TreeKind, span: Span) -> Result<Tree, String> {
+        let id = NodeId(self.macro_next_node);
+        self.macro_next_node = self
+            .macro_next_node
+            .checked_add(1)
+            .ok_or("macro node identity exhausted")?;
+        let mut t = path_tree("_", span);
+        t.id = id;
+        t.kind = kind;
+        Ok(t)
+    }
+
+    /// Rebuild a pattern: nsc's `Ident(_)` is the wildcard there.
+    fn pattern_from_reply(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
+        let saved = std::mem::replace(&mut self.macro_reply_pattern, true);
+        let pat = self.tree_from_reply(s, span);
+        self.macro_reply_pattern = saved;
+        pat
+    }
+
+    /// One `CaseDef(pat, guard, body)`.
+    fn case_from_reply(
+        &mut self,
+        s: &Sexp,
+        span: Span,
+    ) -> Result<scala_rs_parser::CaseDef, String> {
+        let items = s.list()?;
+        if items.first().and_then(|s| s.atom()) != Some("t") || at(items, 1)?.text() != "CaseDef" {
+            return Err(format!("the macro engine sent {s} where a case belongs"));
+        }
+        let kids = items.get(3..).unwrap_or(&[]);
+        let saved = std::mem::replace(&mut self.macro_reply_pattern, false);
+        let parts = (|| -> Result<_, String> {
+            let pat = self.pattern_from_reply(at(kids, 0)?, span)?;
+            let guard = self.tree_from_reply(at(kids, 1)?, span)?;
+            let body = self.tree_from_reply(at(kids, 2)?, span)?;
+            Ok((pat, guard, body))
+        })();
+        self.macro_reply_pattern = saved;
+        let (pat, guard, body) = parts?;
+        Ok(scala_rs_parser::CaseDef {
+            pat,
+            guard,
+            body,
+            span,
+        })
+    }
+
+    /// The bounds of a `TypeBoundsTree(lo, hi)`, each absent when it is the
+    /// `EmptyTree` nsc writes for "no bound".
+    #[allow(clippy::type_complexity)]
+    fn bounds_from_reply(
+        &mut self,
+        s: &Sexp,
+        span: Span,
+    ) -> Result<(Option<Box<Tree>>, Option<Box<Tree>>), String> {
+        let items = s.list()?;
+        let kids = items.get(3..).unwrap_or(&[]);
+        let mut bound = |s: &Sexp| -> Result<Option<Box<Tree>>, String> {
+            if is_node(s, "EmptyTree") {
+                Ok(None)
+            } else {
+                Ok(Some(Box::new(self.tree_from_reply(s, span)?)))
+            }
+        };
+        let lo = bound(at(kids, 0)?)?;
+        let hi = bound(at(kids, 1)?)?;
+        Ok((lo, hi))
+    }
+
+    /// The type a `TypeTree` carries, as a type tree the call site reads.
+    ///
+    /// `(ty "a.b.C" <arg>…)` is a class and its arguments. A class this run
+    /// is compiling went over as a placeholder or a description carrying its
+    /// full name (`tag_descriptor`), and coming back it is that same name:
+    /// the type it stands for is the one the typer already had, so it is
+    /// handed back resolved rather than looked up again -- a class nested in
+    /// a trait has no path the call site could name. Any other class is
+    /// written as the path its full name spells, applied to its arguments,
+    /// which is the tree a user writing `a.b.C[X, Y]` there would have
+    /// produced and is read by `tree_to_type` the same way.
+    ///
+    /// `(tyx "why")` is a type the engine refused to spell (a singleton, a
+    /// refinement, an existential, an abstract type, a class nested in a
+    /// class): a name for any of those would stand for a different type.
+    fn type_tree_from_wire(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
+        let items = s.list()?;
+        match items.first().and_then(|s| s.atom()) {
+            Some("ty") => {}
+            Some("tyx") => {
+                return Err(format!(
+                    "the expansion mentions the type `{}`, which scala-rs cannot \
+                     rebuild at the call site",
+                    at(items, 1)?.text()
+                ))
+            }
+            _ => return Err(format!("the macro engine sent the type {s}")),
+        }
+        let name = at(items, 1)?.text();
+        if name.is_empty() {
+            return Err("the expansion contains an empty `TypeTree`".to_string());
+        }
+        let mut head = if let Some(ty) = self.macro_local_tags.get(&name) {
+            let mut t = path_tree(crate::materialize::RESOLVED_TYPE, span);
+            t.ty = ty.clone();
+            t
+        } else {
+            // A type path is the same tree shape as a term path here, and
+            // `tree_to_type` reads it.
+            path_tree(&name, span)
+        };
+        head.id = NodeId(self.macro_next_node);
+        self.macro_next_node = self
+            .macro_next_node
+            .checked_add(1)
+            .ok_or("macro node identity exhausted")?;
+        let args = items.get(2..).unwrap_or(&[]);
+        if args.is_empty() {
+            return Ok(head);
+        }
+        if matches!(&head.kind, TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE)
+        {
+            return Err(format!(
+                "the expansion applies `{name}`, a class this run is compiling, to type \
+                 arguments, which scala-rs cannot rebuild yet"
+            ));
+        }
+        let mut built = Vec::new();
+        for a in args {
+            built.push(self.type_tree_from_wire(a, span)?);
+        }
+        self.macro_node(
+            TreeKind::AppliedTypeTree {
+                tpt: Box::new(head),
+                args: built,
+            },
+            span,
+        )
+    }
+}
+
+/// Whether a reply node is a tree of the given kind.
+fn is_node(s: &Sexp, kind: &str) -> bool {
+    s.list().is_ok_and(|items| {
+        items.first().and_then(|s| s.atom()) == Some("t")
+            && items.get(1).map(|k| k.text()).as_deref() == Some(kind)
+    })
 }
 
 /// Whether the engine sent back a `TypeTree` with no type in it -- nsc's
@@ -1651,6 +2074,66 @@ fn is_empty_type_tree(s: &Sexp) -> bool {
     kids.len() == 2 && at(kids, 1).map(|s| s.text()).as_deref() == Ok("")
 }
 
+/// The flag names of an `(mods (f "NAME" …) …)` node.
+fn flag_names(s: &Sexp) -> Result<Vec<String>, String> {
+    let items = s.list()?;
+    if items.first().and_then(|s| s.atom()) != Some("mods") {
+        return Err(format!("expected modifiers, got {s:?}"));
+    }
+    Ok(at(items, 1)?
+        .list()?
+        .iter()
+        .skip(1)
+        .map(|f| f.text())
+        .collect())
+}
+
+/// A primary constructor's parameter with its class-body field folded in: a
+/// `var` if the field is mutable, a `val` if it is not `private[this]`, a
+/// plain parameter otherwise; the field's access goes with it. Answers the
+/// rewritten parameter and whether it was a parameter accessor at all.
+fn class_param_sexp(
+    param: &Sexp,
+    accessor_fields: &[(String, Vec<String>)],
+) -> Result<(Sexp, bool), String> {
+    let fields = param.list()?;
+    if !is_node(param, "ValDef") {
+        return Ok((param.clone(), false));
+    }
+    let mods = at(fields, 3)?.list()?;
+    let mut names = flag_names(at(fields, 3)?)?;
+    if !names.iter().any(|n| n == "PARAMACCESSOR") {
+        return Ok((param.clone(), false));
+    }
+    let pname = name_from(at(fields, 4)?)?;
+    let Some((_, field)) = accessor_fields.iter().find(|(n, _)| *n == pname) else {
+        return Err(format!(
+            "the expansion's constructor parameter `{pname}` has no field, which \
+             scala-rs cannot rebuild"
+        ));
+    };
+    names.retain(|n| n != "PARAMACCESSOR");
+    let has = |f: &str| field.iter().any(|n| n == f);
+    if has("MUTABLE") {
+        names.push("MUTABLE".to_string());
+    } else if !has("LOCAL") {
+        names.push("ACCESSOR".to_string());
+    }
+    if has("PRIVATE") && !has("LOCAL") {
+        names.push("PRIVATE".to_string());
+    }
+    if has("PROTECTED") {
+        names.push("PROTECTED".to_string());
+    }
+    let mut flag_list = vec![Sexp::Atom("f".to_string())];
+    flag_list.extend(names.into_iter().map(Sexp::Str));
+    let mut new_mods = mods.clone();
+    new_mods[1] = Sexp::List(flag_list);
+    let mut new_fields = fields.clone();
+    new_fields[3] = Sexp::List(new_mods);
+    Ok((Sexp::List(new_fields), true))
+}
+
 /// The `Modifiers` of a `ValDef` the engine sent back.
 ///
 /// Every flag arrives by *name*, so scala-rs never has to know nsc's bit
@@ -1665,6 +2148,10 @@ fn is_empty_type_tree(s: &Sexp) -> bool {
 /// *different* definition -- a `var` as a `val`, a `lazy val` as a strict one
 /// -- and nothing downstream would notice.
 fn mods_from(s: &Sexp) -> Result<Modifiers, String> {
+    mods_from_with(s, false)
+}
+
+fn mods_from_with(s: &Sexp, deferred_ok: bool) -> Result<Modifiers, String> {
     let items = s.list()?;
     if items.first().and_then(|s| s.atom()) != Some("mods") {
         return Err(format!("expected modifiers, got {s:?}"));
@@ -1686,9 +2173,19 @@ fn mods_from(s: &Sexp) -> Result<Modifiers, String> {
             "DEFAULTPARAM" => Flags::DEFAULTPARAM,
             "PRESUPER" => Flags::PRESUPER,
             "SYNTHETIC" => Flags::SYNTHETIC,
+            // Never sent by the engine (`universe.Flag` does not publish it):
+            // written by `class_param_sexp` for a class parameter that is a
+            // `val`, which is how our parser marks one.
+            "ACCESSOR" => Flags::ACCESSOR,
             // The second name on a bit already read above, and the two that
             // only record how nsc produced the definition.
             "COVARIANT" | "TRAIT" | "ARTIFACT" | "STABLE" => Flags::EMPTY,
+            // A definition with no right-hand side, accepted only where the
+            // caller says our tree expresses it by *having* none: an abstract
+            // `type` (nsc's typer writes the flag on the existential `type
+            // _$1` it makes for a wildcard). Anywhere else -- a `val` in a
+            // block -- dropping it would rebuild a different definition.
+            "DEFERRED" if deferred_ok => Flags::EMPTY,
             other => {
                 return Err(format!(
                     "the expansion contains a definition marked `{other}`, \
@@ -1881,6 +2378,141 @@ fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>, Option<Tree>) {
 
 // ------------------------------------------------------------ our tree → wire
 
+/// A type descriptor for each typed leaf of the trees being sent, by node
+/// address ([`Typer::collect_wire_types`]).
+pub(crate) type WireTypes = std::collections::HashMap<*const Tree, Result<String, String>>;
+
+/// What the outbound serialiser reads besides the tree itself: the symbol
+/// table, to tell a static object from a local, and the descriptors of the
+/// typed leaves, which only the typer could work out.
+pub(crate) struct WireCx<'a> {
+    pub(crate) st: &'a SymbolTable,
+    pub(crate) types: &'a WireTypes,
+}
+
+impl WireCx<'_> {
+    fn leaf_type(&self, t: &Tree) -> Result<&str, String> {
+        match self.types.get(&(t as *const Tree)) {
+            Some(Ok(w)) => Ok(w),
+            Some(Err(why)) => Err(why.clone()),
+            None => Err("scala-rs cannot hand a type the typer resolved itself \
+                         to a macro implementation here"
+                .to_string()),
+        }
+    }
+}
+
+/// `_root_.a.b.M` for an `object` reachable from the root through packages
+/// and objects alone, or `None` for any other symbol.
+///
+/// A tree the typer built rather than the source -- an implicit argument, a
+/// `ClassTag` it materialised -- names such an object by a bare identifier
+/// that was resolved where the *implicit* was found, not where the macro was
+/// called: `Shape.tuple2Shape(…)` in slick's `c.prefix` and `ClassTag.apply(…)`
+/// for `mapTo`'s `ClassTag[R]` are both written that way, and neither name
+/// is in scope at a call site that imports nothing but the profile's API.
+/// nsc's typed tree carries the symbol (`lifted.this.Shape`); the path from
+/// the root is the one spelling of that symbol that means the same thing
+/// wherever the expansion is typed.
+fn static_module_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
+    if sym.is_none() || st.get(sym).kind != SymKind::Module {
+        return None;
+    }
+    owner_chain_path(st, st.get(sym).name.clone(), st.get(sym).owner)
+}
+
+/// `_root_.a.b.M.m` for a member `m` of a static `object` `M`, when no class
+/// enclosing the call site supplies it.
+///
+/// The same reason as [`static_module_path`], one level down: an implicit
+/// the typer found in a companion's implicit scope is written as the bare
+/// member once it is cached -- `repColumnShape(…)` for slick's
+/// `Shape.repColumnShape`, in every `mapTo` prefix after the first in a run --
+/// and the bare name means nothing where the expansion is typed. A member of
+/// an enclosing object is left to [`this_qualifier_of`] and to the call site's
+/// own scope, which is where the source found it.
+fn static_member_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
+    if sym.is_none() || !matches!(st.get(sym).kind, SymKind::Method | SymKind::Term) {
+        return None;
+    }
+    let owner = st.get(sym).owner;
+    if owner.is_none() || st.get(owner).kind != SymKind::ModuleClass {
+        return None;
+    }
+    if this_qualifier_of(st, sym).is_some() {
+        return None;
+    }
+    let module = st.get(owner).name.trim_end_matches('$').to_string();
+    let path = owner_chain_path(st, module, st.get(owner).owner)?;
+    Some(format!("{path}.{}", st.get(sym).name))
+}
+
+/// `first` preceded by the names of the packages and objects `cur` and its
+/// owners are, up to the root; `None` when a class or a local is on the way,
+/// or when no package is (the empty package has no path from the root).
+fn owner_chain_path(st: &SymbolTable, first: String, mut cur: SymbolId) -> Option<String> {
+    let mut parts = vec![first];
+    let mut saw_package = false;
+    for _ in 0..64 {
+        if cur.is_none() || cur == st.root {
+            parts.reverse();
+            return (saw_package && parts.iter().all(|p| !p.is_empty() && !p.starts_with('<')))
+                .then(|| parts.join("."));
+        }
+        let s = st.get(cur);
+        match s.kind {
+            SymKind::Package => {
+                saw_package = true;
+                parts.push(s.name.clone());
+            }
+            SymKind::ModuleClass => parts.push(s.name.trim_end_matches('$').to_string()),
+            _ => return None,
+        }
+        cur = s.owner;
+    }
+    None
+}
+
+/// A member selected from a *class* rather than from a value: `a.b.C.m`
+/// where `C` is a class or trait.
+///
+/// That is not a term path: typed again at the macro's call site, `C` names
+/// no value. What it stands for is `C.this.m` for the enclosing class the
+/// member is reached through, which is what nsc's typed tree carries, so that
+/// is what is written. Anything this cannot place is left as it was.
+/// (gitbucket's component prefixes used to arrive as
+/// `gitbucket.core.model.Profile.profile` -- another file's import taken as
+/// the receiver of a self-type member, fixed in `term_import_prefix_for`;
+/// they are `AccountComponent.this.profile` now.)
+fn class_path_member(cx: &WireCx, t: &Tree, qual: &Tree, name: &str, out: &mut String) -> bool {
+    if qual.sym.is_none() || cx.st.get(qual.sym).kind != SymKind::Class || t.sym.is_none() {
+        return false;
+    }
+    let Some(owner) = this_qualifier_of(cx.st, t.sym) else {
+        return false;
+    };
+    out.push_str("(t \"Select\" (s0) (t \"This\" (s0) (n type ");
+    quote_into(out, &owner);
+    out.push_str(")) (n term ");
+    quote_into(out, &encode_method_name(name));
+    out.push_str("))");
+    true
+}
+
+/// `_root_.a.b.c` as a chain of term selections.
+fn root_path_to_wire(path: &str, out: &mut String) {
+    let mut built = String::from("(t \"Ident\" (s0) (n term \"_root_\"))");
+    for seg in path.split('.') {
+        let mut next = String::from("(t \"Select\" (s0) ");
+        next.push_str(&built);
+        next.push_str(" (n term ");
+        quote_into(&mut next, &encode_method_name(seg));
+        next.push_str("))");
+        built = next;
+    }
+    out.push_str(&built);
+}
+
 /// The template a bare name belongs to, when nsc would have typed the name as
 /// `C.this.name`.
 ///
@@ -1889,17 +2521,26 @@ fn peel_application(tree: &Tree) -> (Vec<Vec<Tree>>, Vec<Type>, Option<Tree>) {
 /// method or a block owns -- stays an `Ident`. A member of a package object
 /// or of a package is not qualified with `this` either, so a package owner
 /// says no.
-fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<String> {
+pub(crate) fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<String> {
     if sym == SymbolId::NONE {
         return None;
     }
     let owner = st.get(sym).owner;
-    if owner == SymbolId::NONE {
+    if owner == SymbolId::NONE || !st.get(owner).is_class_like() {
         return None;
     }
-    let name = &st.get(owner).name;
-    match st.get(owner).kind {
-        SymKind::Class => Some(name.clone()),
+    // The `this` is the *enclosing* class the member is reached through --
+    // the owner itself, a subclass of it, or a class whose self type has it
+    // -- not the owner by name. gitbucket's component traits read
+    // `profile.api._` through `self: Profile =>`, so `c.prefix` of every
+    // `mapTo` there is `Tables.this.profile.api.anyToShapedValue(…)`, and a
+    // `Profile.this` would name a class the call site is not inside. A name
+    // no enclosing class supplies (an imported member) keeps its own spelling.
+    // The walk is the typer's own (`ident_prefix_class`).
+    let cur = st.enclosing_class_reaching(owner)?;
+    let name = &st.get(cur).name;
+    match st.get(cur).kind {
+        SymKind::Class | SymKind::Module => Some(name.clone()),
         // A module class is `Test$` here and in the JVM, but nsc's *symbol*
         // for it is named `Test` and that is what `Test.this` prints as.
         SymKind::ModuleClass => Some(name.strip_suffix('$').unwrap_or(name).to_string()),
@@ -1920,16 +2561,16 @@ fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<String> {
 /// that the implementation can splice them into its expansion, which is then
 /// type-checked again at the call site -- where an unqualified name still
 /// means what the source meant, and a `This` we did not resolve would not.
-fn typed_tree_to_wire(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let start = out.len();
-    typed_tree_to_wire_body(st, t, out)?;
+    typed_tree_to_wire_body(cx, t, out)?;
     mirror_tree_identity(t, start, out);
     Ok(())
 }
 
-fn typed_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Result<(), String> {
+fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
-        TreeKind::Ident { name } => match this_qualifier_of(st, t.sym) {
+        TreeKind::Ident { name } => match this_qualifier_of(cx.st, t.sym) {
             Some(owner) => {
                 out.push_str("(t \"Select\" (s0) (t \"This\" (s0) (n type ");
                 quote_into(out, &owner);
@@ -1938,11 +2579,14 @@ fn typed_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Resu
                 out.push_str("))");
                 Ok(())
             }
-            None => tree_to_wire(t, out),
+            None => tree_to_wire(cx, t, out),
         },
         TreeKind::Select { qual, name } => {
+            if class_path_member(cx, t, qual, name, out) {
+                return Ok(());
+            }
             out.push_str("(t \"Select\" (s0) ");
-            typed_tree_to_wire(st, qual, out)?;
+            typed_tree_to_wire(cx, qual, out)?;
             out.push_str(" (n term ");
             quote_into(out, &encode_method_name(name));
             out.push_str("))");
@@ -1951,19 +2595,19 @@ fn typed_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Resu
         TreeKind::Apply { fun, args } => {
             out.push_str("(t \"Apply\" (s0) ");
             if matches!(fun.kind, TreeKind::New { .. }) {
-                application_fun_to_wire(fun, out)?;
+                application_fun_to_wire(cx, fun, out)?;
             } else {
-                typed_tree_to_wire(st, fun, out)?;
+                typed_tree_to_wire(cx, fun, out)?;
             }
             out.push_str(" (l");
             for a in args {
                 out.push(' ');
-                tree_to_wire(a, out)?;
+                tree_to_wire(cx, a, out)?;
             }
             out.push_str("))");
             Ok(())
         }
-        _ => tree_to_wire(t, out),
+        _ => tree_to_wire(cx, t, out),
     }
 }
 
@@ -1975,14 +2619,14 @@ fn typed_tree_to_wire_body(st: &SymbolTable, t: &Tree, out: &mut String) -> Resu
 /// conversion, a desugared for-comprehension) would be typed a second time;
 /// refusing those by name is the honest answer until the bridge carries typed
 /// trees (`docs/macros.md` §4.3).
-pub(crate) fn tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
+pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let start = out.len();
-    tree_to_wire_body(t, out)?;
+    tree_to_wire_body(cx, t, out)?;
     mirror_tree_identity(t, start, out);
     Ok(())
 }
 
-pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String> {
+pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let unsupported = |what: &str| {
         Err(format!(
             "scala-rs cannot hand {what} to a macro implementation yet"
@@ -1995,7 +2639,31 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
             out.push(')');
             Ok(())
         }
+        // `classOf[T]` as the typer materialised it for a `ClassTag`: an
+        // identifier carrying `T` as its type, with no spelling of its own.
+        // nsc's tree is the constant `Literal(Constant(T))`; this bridge
+        // writes the call that denotes it, `_root_.scala.Predef.classOf[T]`,
+        // with `T` a `TypeTree` built from the descriptor -- so a class this
+        // run is compiling goes over the way every other type of it does.
+        TreeKind::Ident { name } if name == "$classOf" => {
+            let ty = cx.leaf_type(t)?;
+            out.push_str("(t \"TypeApply\" (s0) ");
+            root_path_to_wire("scala.Predef.classOf", out);
+            out.push_str(" (l (t \"TypeTree\" (s0) ");
+            out.push_str(ty);
+            out.push_str(")))");
+            Ok(())
+        }
+        TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE => {
+            type_tree_to_wire(cx, t, out)
+        }
         TreeKind::Ident { name } => {
+            if let Some(path) =
+                static_module_path(cx.st, t.sym).or_else(|| static_member_path(cx.st, t.sym))
+            {
+                root_path_to_wire(&path, out);
+                return Ok(());
+            }
             out.push_str("(t \"Ident\" (s0) (n term ");
             // Reflect names are NameTransformer-encoded (`+` is `$plus`), the
             // way nsc hands them to a macro.
@@ -2010,8 +2678,11 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
             Ok(())
         }
         TreeKind::Select { qual, name } => {
+            if class_path_member(cx, t, qual, name, out) {
+                return Ok(());
+            }
             out.push_str("(t \"Select\" (s0) ");
-            tree_to_wire(qual, out)?;
+            tree_to_wire(cx, qual, out)?;
             out.push_str(" (n term ");
             quote_into(out, &encode_method_name(name));
             out.push_str("))");
@@ -2019,11 +2690,11 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
         }
         TreeKind::Apply { fun, args } => {
             out.push_str("(t \"Apply\" (s0) ");
-            application_fun_to_wire(fun, out)?;
+            application_fun_to_wire(cx, fun, out)?;
             out.push_str(" (l");
             for a in args {
                 out.push(' ');
-                tree_to_wire(a, out)?;
+                tree_to_wire(cx, a, out)?;
             }
             out.push_str("))");
             Ok(())
@@ -2034,65 +2705,65 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
         }
         TreeKind::Block { stats, expr } => {
             out.push_str("(t \"Block\" (s0) ");
-            trees_to_wire(stats, out)?;
+            trees_to_wire(cx, stats, out)?;
             out.push(' ');
-            tree_to_wire(expr, out)?;
+            tree_to_wire(cx, expr, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::Function { vparams, body } => {
             out.push_str("(t \"Function\" (s0) ");
-            trees_to_wire(vparams, out)?;
+            trees_to_wire(cx, vparams, out)?;
             out.push(' ');
-            tree_to_wire(body, out)?;
+            tree_to_wire(cx, body, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::New { tpt } => {
             out.push_str("(t \"New\" (s0) ");
-            type_tree_to_wire(tpt, out)?;
+            type_tree_to_wire(cx, tpt, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::If { cond, thenp, elsep } => {
             out.push_str("(t \"If\" (s0) ");
-            tree_to_wire(cond, out)?;
+            tree_to_wire(cx, cond, out)?;
             out.push(' ');
-            tree_to_wire(thenp, out)?;
+            tree_to_wire(cx, thenp, out)?;
             out.push(' ');
-            tree_to_wire(elsep, out)?;
+            tree_to_wire(cx, elsep, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::Assign { lhs, rhs } => {
             out.push_str("(t \"Assign\" (s0) ");
-            tree_to_wire(lhs, out)?;
+            tree_to_wire(cx, lhs, out)?;
             out.push(' ');
-            tree_to_wire(rhs, out)?;
+            tree_to_wire(cx, rhs, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::Typed { expr, tpt } => {
             out.push_str("(t \"Typed\" (s0) ");
-            tree_to_wire(expr, out)?;
+            tree_to_wire(cx, expr, out)?;
             out.push(' ');
-            type_tree_to_wire(tpt, out)?;
+            type_tree_to_wire(cx, tpt, out)?;
             out.push(')');
             Ok(())
         }
         TreeKind::TypeApply { fun, args } => {
             out.push_str("(t \"TypeApply\" (s0) ");
-            tree_to_wire(fun, out)?;
+            tree_to_wire(cx, fun, out)?;
             out.push_str(" (l");
             for arg in args {
                 out.push(' ');
-                type_tree_to_wire(arg, out)?;
+                type_tree_to_wire(cx, arg, out)?;
             }
             out.push_str("))");
             Ok(())
         }
         TreeKind::AppliedTypeTree { .. } | TreeKind::AnnotatedTypeTree { .. } => {
-            type_tree_to_wire(t, out)
+            type_tree_to_wire(cx, t, out)
         }
         TreeKind::ValDef {
             mods,
@@ -2101,13 +2772,13 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
             rhs,
         } => {
             out.push_str("(t \"ValDef\" (s0) ");
-            mods_to_wire(mods, out)?;
+            mods_to_wire(cx, mods, out)?;
             out.push_str(" (n term ");
             quote_into(out, &encode_method_name(name));
             out.push_str(") ");
-            type_tree_to_wire(tpt, out)?;
+            type_tree_to_wire(cx, tpt, out)?;
             out.push(' ');
-            tree_to_wire(rhs, out)?;
+            tree_to_wire(cx, rhs, out)?;
             out.push(')');
             Ok(())
         }
@@ -2120,11 +2791,11 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
             impl_,
         } => {
             out.push_str("(t \"ClassDef\" (s0) ");
-            mods_to_wire(mods, out)?;
+            mods_to_wire(cx, mods, out)?;
             out.push_str(" (n type ");
             quote_into(out, name);
             out.push_str(") ");
-            trees_to_wire(tparams, out)?;
+            trees_to_wire(cx, tparams, out)?;
             out.push_str(" (t \"Template\" (s0) (l");
             for parent in &impl_.parents {
                 if matches!(parent.kind, TreeKind::Apply { .. }) {
@@ -2134,27 +2805,27 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
                     );
                 }
                 out.push(' ');
-                type_tree_to_wire(parent, out)?;
+                type_tree_to_wire(cx, parent, out)?;
             }
             out.push_str(") (t \"ValDef\" (s0) (mods (f) (rest \"0\") \"\" (l)) (n term ");
             quote_into(out, impl_.self_name.as_deref().unwrap_or("_"));
             out.push_str(") ");
             if let Some(tpt) = &impl_.self_tpt {
-                type_tree_to_wire(tpt, out)?;
+                type_tree_to_wire(cx, tpt, out)?;
             } else {
                 out.push_str("(t \"TypeTree\" (s0) (ty \"\"))");
             }
             out.push_str(" (t \"EmptyTree\" (s0))) (l (t \"DefDef\" (s0) ");
-            mods_to_wire(ctor_mods, out)?;
+            mods_to_wire(cx, ctor_mods, out)?;
             out.push_str(" (n term \"<init>\") (l) (l");
             for params in vparamss {
                 out.push(' ');
-                trees_to_wire(params, out)?;
+                trees_to_wire(cx, params, out)?;
             }
             out.push_str(") (t \"TypeTree\" (s0) (ty \"\")) (t \"Block\" (s0) (l (t \"Apply\" (s0) (t \"Select\" (s0) (t \"Super\" (s0) (t \"This\" (s0) (n type \"\")) (n type \"\")) (n term \"<init>\")) (l))) (t \"Literal\" (s0) (c \"Unit\" \"()\"))))");
             for stat in &impl_.body {
                 out.push(' ');
-                tree_to_wire(stat, out)?;
+                tree_to_wire(cx, stat, out)?;
             }
             out.push_str(")))");
             Ok(())
@@ -2168,20 +2839,20 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
             rhs,
         } => {
             out.push_str("(t \"DefDef\" (s0) ");
-            mods_to_wire(mods, out)?;
+            mods_to_wire(cx, mods, out)?;
             out.push_str(" (n term ");
             quote_into(out, &encode_method_name(name));
             out.push_str(") ");
-            trees_to_wire(tparams, out)?;
+            trees_to_wire(cx, tparams, out)?;
             out.push_str(" (l");
             for clause in vparamss {
                 out.push(' ');
-                trees_to_wire(clause, out)?;
+                trees_to_wire(cx, clause, out)?;
             }
             out.push_str(") ");
-            type_tree_to_wire(tpt, out)?;
+            type_tree_to_wire(cx, tpt, out)?;
             out.push(' ');
-            tree_to_wire(rhs, out)?;
+            tree_to_wire(cx, rhs, out)?;
             out.push(')');
             Ok(())
         }
@@ -2190,14 +2861,18 @@ pub(crate) fn tree_to_wire_body(t: &Tree, out: &mut String) -> Result<(), String
     }
 }
 
-pub(crate) fn application_fun_to_wire(fun: &Tree, out: &mut String) -> Result<(), String> {
+pub(crate) fn application_fun_to_wire(
+    cx: &WireCx,
+    fun: &Tree,
+    out: &mut String,
+) -> Result<(), String> {
     if matches!(fun.kind, TreeKind::New { .. }) {
         out.push_str("(t \"Select\" (s0) ");
-        tree_to_wire(fun, out)?;
+        tree_to_wire(cx, fun, out)?;
         out.push_str(" (n term \"<init>\"))");
         Ok(())
     } else {
-        tree_to_wire(fun, out)
+        tree_to_wire(cx, fun, out)
     }
 }
 
@@ -2210,13 +2885,22 @@ fn macro_argument_type(arg: &Tree) -> &Type {
     }
 }
 
-fn argument_to_wire(t: &Tree, as_expr: bool, actual: &str, out: &mut String) -> Result<(), String> {
+fn argument_to_wire(
+    cx: &WireCx,
+    t: &Tree,
+    as_expr: bool,
+    actual: &str,
+    splice: usize,
+    out: &mut String,
+) -> Result<(), String> {
     out.push_str(if as_expr {
         " (arg expr "
     } else {
         " (arg tree "
     });
-    tree_to_wire(t, out)?;
+    out.push_str(&format!("(orig {splice} "));
+    tree_to_wire(cx, t, out)?;
+    out.push(')');
     // nsc uses Expr[Nothing] for value arguments, not the argument's type.
     out.push_str(if as_expr {
         " (ty \"scala.Nothing\")"
@@ -2229,20 +2913,29 @@ fn argument_to_wire(t: &Tree, as_expr: bool, actual: &str, out: &mut String) -> 
     Ok(())
 }
 
-fn trees_to_wire(trees: &[Tree], out: &mut String) -> Result<(), String> {
+fn trees_to_wire(cx: &WireCx, trees: &[Tree], out: &mut String) -> Result<(), String> {
     out.push_str("(l");
     for tree in trees {
         out.push(' ');
-        tree_to_wire(tree, out)?;
+        tree_to_wire(cx, tree, out)?;
     }
     out.push(')');
     Ok(())
 }
 
-fn type_tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
+fn type_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
         TreeKind::Empty => {
             out.push_str("(t \"TypeTree\" (s0) (ty \"\"))");
+            Ok(())
+        }
+        // A type the typer resolved itself (nsc's `TypeTree(tp)`), written as
+        // one: a `TypeTree` the engine builds from the type's descriptor.
+        TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE => {
+            let ty = cx.leaf_type(t)?;
+            out.push_str("(t \"TypeTree\" (s0) ");
+            out.push_str(ty);
+            out.push(')');
             Ok(())
         }
         TreeKind::Ident { name } => {
@@ -2253,7 +2946,7 @@ fn type_tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
         }
         TreeKind::Select { qual, name } => {
             out.push_str("(t \"Select\" (s0) ");
-            tree_to_wire(qual, out)?;
+            tree_to_wire(cx, qual, out)?;
             out.push_str(" (n type ");
             quote_into(out, name);
             out.push_str("))");
@@ -2261,28 +2954,28 @@ fn type_tree_to_wire(t: &Tree, out: &mut String) -> Result<(), String> {
         }
         TreeKind::AppliedTypeTree { tpt, args } => {
             out.push_str("(t \"AppliedTypeTree\" (s0) ");
-            type_tree_to_wire(tpt, out)?;
+            type_tree_to_wire(cx, tpt, out)?;
             out.push_str(" (l");
             for arg in args {
                 out.push(' ');
-                type_tree_to_wire(arg, out)?;
+                type_tree_to_wire(cx, arg, out)?;
             }
             out.push_str("))");
             Ok(())
         }
         TreeKind::AnnotatedTypeTree { tpt, annot } => {
             out.push_str("(t \"Annotated\" (s0) ");
-            tree_to_wire(annot, out)?;
+            tree_to_wire(cx, annot, out)?;
             out.push(' ');
-            type_tree_to_wire(tpt, out)?;
+            type_tree_to_wire(cx, tpt, out)?;
             out.push(')');
             Ok(())
         }
-        _ => tree_to_wire(t, out),
+        _ => tree_to_wire(cx, t, out),
     }
 }
 
-fn mods_to_wire(mods: &Modifiers, out: &mut String) -> Result<(), String> {
+fn mods_to_wire(cx: &WireCx, mods: &Modifiers, out: &mut String) -> Result<(), String> {
     out.push_str("(mods (f");
     let mut known = Flags::EMPTY;
     for (flag, name) in [
@@ -2318,7 +3011,7 @@ fn mods_to_wire(mods: &Modifiers, out: &mut String) -> Result<(), String> {
     out.push_str(") (rest \"0\") ");
     quote_into(out, mods.private_within.as_deref().unwrap_or(""));
     out.push(' ');
-    trees_to_wire(&mods.annotations, out)?;
+    trees_to_wire(cx, &mods.annotations, out)?;
     out.push(')');
     Ok(())
 }
@@ -2346,34 +3039,6 @@ pub(crate) fn lit_to_wire(lit: &Lit, out: &mut String) -> Result<(), String> {
     quote_into(out, &text);
     out.push(')');
     Ok(())
-}
-
-/// Why an implementation's own verdict may not be repeated to the user.
-///
-/// A class this run is compiling goes over as a placeholder that carries its
-/// name and nothing else ([`Typer::tag_descriptor`]). An implementation that
-/// asks such a symbol what it *is* -- slick's `mapToImpl` opens with
-/// `if (!rSym.isClass || !rSym.asClass.isCaseClass) c.abort(...)` -- is
-/// answering about a symbol it was never shown, so neither its `abort` nor an
-/// exception out of it says anything about the program being compiled.
-/// Reporting the implementation's message verbatim would be a wrong error;
-/// this says what actually happened instead.
-fn placeholder_verdict(placeholders: &[String], msg: &str) -> Option<String> {
-    if placeholders.is_empty() {
-        return None;
-    }
-    let names = placeholders
-        .iter()
-        .map(|n| format!("`{n}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!(
-        "the type argument {names} is a class this run is compiling, so the \
-         implementation was handed a placeholder symbol carrying only its \
-         name; it looked the class up and answered \"{msg}\", which says \
-         nothing about this program. nsc has no such limit -- it expands in \
-         its own universe, where the class being compiled is a real symbol"
-    ))
 }
 
 /// The class symbol of a monomorphic class type, if that is what `ty` is.
@@ -2515,6 +3180,29 @@ impl Sexp {
         match self {
             Sexp::List(v) if v.len() == 2 && v[0].atom() == Some("err") => Some(v[1].text()),
             _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Sexp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Sexp::Atom(a) => f.write_str(a),
+            Sexp::Str(s) => {
+                let mut out = String::new();
+                quote_into(&mut out, s);
+                f.write_str(&out)
+            }
+            Sexp::List(items) => {
+                f.write_str("(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                f.write_str(")")
+            }
         }
     }
 }
