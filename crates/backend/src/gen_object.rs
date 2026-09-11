@@ -46,6 +46,7 @@ impl<'a> Gen<'a> {
         // `<name>()` accessor — not a static `MODULE$` singleton.
         let inner_outer = member_module_outer(self.st, cls);
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
+        b.strict_fp = is_strictfp(self.st, cls);
         b.access = if inner_outer.is_some() {
             ACC_PUBLIC | ACC_SUPER
         } else {

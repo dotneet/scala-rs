@@ -2,7 +2,7 @@
 
 use crate::classfile::{
     encode_method_name, ClassEmit, EmittedClass, Field, InnerClassEntry, Method, Pool, ACC_FINAL,
-    ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_SUPER, MAX_CODE_LENGTH,
+    ACC_PRIVATE, ACC_PROTECTED, ACC_PUBLIC, ACC_STATIC, ACC_STRICT, ACC_SUPER, MAX_CODE_LENGTH,
 };
 use crate::code::{Assembler, Label};
 use crate::companion_fwd::{self};
@@ -1040,6 +1040,34 @@ pub(crate) struct ClassBuilder {
     /// JVMS §4.7.2 `ConstantValue` on a `static final long` field
     /// (`@SerialVersionUID`).
     pub(crate) field_constants: HashMap<String, i64>,
+    /// The class is `@strictfp`, or inside something that is: every method
+    /// with code gets `ACC_STRICT` (nsc `Symbol.isStrictFP`, which asks the
+    /// owner chain).
+    pub(crate) strict_fp: bool,
+}
+
+/// nsc `Symbol.isStrictFP` minus `isDeferred` (only methods with code ask):
+/// `sym` or anything it is nested in carries `@strictfp`.
+pub(crate) fn is_strictfp(st: &SymbolTable, sym: SymbolId) -> bool {
+    let mut cur = sym;
+    let mut guard = 0;
+    while !cur.is_none() && guard < 64 {
+        let s = st.get(cur);
+        if matches!(s.kind, SymKind::Package) {
+            return false;
+        }
+        if s.annotations.iter().any(|a| {
+            matches!(
+                a.annotation_path().as_str(),
+                "strictfp" | "annotation.strictfp" | "scala.annotation.strictfp"
+            )
+        }) {
+            return true;
+        }
+        cur = s.owner;
+        guard += 1;
+    }
+    false
 }
 
 impl ClassBuilder {
@@ -1059,6 +1087,7 @@ impl ClassBuilder {
             signature: None,
             field_signatures: HashMap::default(),
             field_constants: HashMap::default(),
+            strict_fp: false,
         }
     }
 
@@ -1070,6 +1099,11 @@ impl ClassBuilder {
         max_locals: u16,
         gen: impl FnOnce(&mut Assembler),
     ) {
+        let access = if self.strict_fp {
+            access | ACC_STRICT
+        } else {
+            access
+        };
         let mut asm = Assembler::with_pool(std::mem::take(&mut self.pool), max_locals.max(1));
         asm.init_method(access, name, desc, &self.this_name);
         gen(&mut asm);

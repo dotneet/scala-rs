@@ -1503,6 +1503,7 @@ impl Typer {
             .filter(|t| matches!(t.kind, TreeKind::DefDef { .. }))
             .map(|t| t.sym)
             .collect();
+        self.check_setter_conflicts(class_id, body);
         for e in crate::double_def::check_double_defs(&self.st, class_id, &members) {
             let Some(at) = body
                 .iter()
@@ -2047,6 +2048,9 @@ impl Typer {
         };
         for a in &mods.annotations {
             let path = a.annotation_path();
+            if crate::strictfp::is_strictfp_annot(&path) {
+                self.check_strictfp_annotation(a);
+            }
             if is_tailrec_annot(&path) {
                 if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
                     self.error(

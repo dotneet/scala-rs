@@ -483,7 +483,13 @@ fn gen_unapply_pattern(
             }
         }
     }
-    if !owner.is_none() && !is_module_class(ctx.st, owner) {
+    // The extractor is what a parameterless *method* returns -- the accessor
+    // of an object nested in a class instance (`StringContext(..).s` in
+    // `case s"..."`), or a user interpolator's `def x = ...`. Its singleton
+    // has no static `MODULE$`, and the call has to run anyway (nsc evaluates
+    // it once per test; `run/sd167` counts the side effect).
+    let fun_is_call = !fun.sym.is_none() && ctx.st.get(fun.sym).kind == SymKind::Method;
+    if !owner.is_none() && (!is_module_class(ctx.st, owner) || fun_is_call) {
         gen_expr(asm, frame, ctx, fun);
     } else if !owner.is_none() {
         // The `unapply` being called belongs to `owner`, so the receiver is

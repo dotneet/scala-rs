@@ -47,6 +47,7 @@ impl Typer {
             if !for_desugaring {
                 self.check_match_exhaustive(span, &sel_ty, cases);
             }
+            self.warn_duplicate_alternatives(&sel_ty, cases);
             if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
                 self.warning(
                     selector.span,
@@ -403,6 +404,7 @@ impl Typer {
                 let saved_ctor_pat = std::mem::replace(&mut self.ctor_pattern_fun, ctor_pat);
                 self.type_expr(fun, &Type::NoType);
                 self.ctor_pattern_fun = saved_ctor_pat;
+                self.prefer_extractor_object(fun);
                 // `case (a, b) =>` is `scala.Tuple2(a, b)`: a synthesized name
                 // is resolved in package `scala`, never lexically. Note the
                 // ordinary path uses `lookup`, which stops at the first scope
