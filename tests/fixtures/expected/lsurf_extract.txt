@@ -1,0 +1,19 @@
+one xyz
+one miss
+two 3 n3
+whole 4n4
+t1 (t5)
+pp 1
+pp2 12
+tuple as product 7t
+casey1 null true
+casey2 8
+casey2 miss
+nn a
+nn miss
+unit 42!
+int:3
+plus 14
+List(11, 12)
+x/None
+unanchored 2024

@@ -194,6 +194,171 @@ impl Typer {
         Some((call.ty.clone(), implicits))
     }
 
+    /// `StringContext(parts: _*).s(args: _*)` written out as a call.
+    ///
+    /// `s` is a macro in 2.13 (`def s(args: Any*): String = macro ???`): the
+    /// jar's `scala.StringContext` has no `s(Seq)` method at all, only
+    /// `s()`, the object `case s"…"` patterns use. The prelude declares an
+    /// `s(Any*)` so interpolation literals type, and a call written out
+    /// against it compiled to `invokevirtual StringContext.s(Seq)` --
+    /// `NoSuchMethodError` at run time (`run/interpolationArgs`). nsc's
+    /// expansion for a receiver that is not a literal is
+    /// `sc.standardInterpolator(StringContext.processEscapes, args)`, which
+    /// also does the part/argument count check the test prints. That is what
+    /// the call is rewritten to here. (Interpolation *literals* are an
+    /// `InterpolatedString` tree of their own and never reach this.)
+    pub(crate) fn rewrite_explicit_s_interpolator(
+        &mut self,
+        tree: &mut scala_rs_parser::Tree,
+        pt: &Type,
+    ) -> bool {
+        use scala_rs_parser::{Tree, TreeKind};
+        let TreeKind::Apply { fun, args } = &tree.kind else {
+            return false;
+        };
+        let TreeKind::Select { qual, name } = &fun.kind else {
+            return false;
+        };
+        if name != "s" || fun.sym.is_none() || !self.library_abi {
+            return false;
+        }
+        let owner = self.st.get(fun.sym).owner;
+        if self.st.get(owner).jvm_name != "scala/StringContext"
+            || !self.st.get(fun.sym).pickled_origin.is_empty()
+        {
+            return false;
+        }
+        let span = tree.span;
+        let mk = |kind: TreeKind| {
+            let mut t = Tree::dummy(kind);
+            t.span = span;
+            t
+        };
+        let mut sc = mk(TreeKind::Ident {
+            name: "StringContext".into(),
+        });
+        sc.scala_ref = true;
+        let process = mk(TreeKind::Select {
+            qual: Box::new(sc),
+            name: "processEscapes".into(),
+        });
+        // `sc.s(xs: _*)` hands its sequence over as it is; anything else is
+        // collected into a `Seq`.
+        let seq_arg = match args.as_slice() {
+            [one]
+                if matches!(&one.kind, TreeKind::Typed { tpt, .. }
+                if matches!(tpt.kind, TreeKind::Star { .. } | TreeKind::Wildcard)
+                    || matches!(&tpt.kind, TreeKind::Ident { name } if name == "_*")) =>
+            {
+                match &one.kind {
+                    TreeKind::Typed { expr, .. } => (**expr).clone(),
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                let mut seq = mk(TreeKind::Ident { name: "Seq".into() });
+                seq.scala_ref = true;
+                mk(TreeKind::Apply {
+                    fun: Box::new(seq),
+                    args: args.clone(),
+                })
+            }
+        };
+        let call = mk(TreeKind::Apply {
+            fun: Box::new(mk(TreeKind::Select {
+                qual: qual.clone(),
+                name: "standardInterpolator".into(),
+            })),
+            args: vec![process, seq_arg],
+        });
+        *tree = call;
+        self.type_expr(tree, pt);
+        true
+    }
+
+    /// Report an extractor method that cannot take the scrutinee: SLS 8.1.8
+    /// wants exactly one parameter in its first clause (an implicit clause
+    /// may follow). `def unapply: Option[Int]`, `def unapply()` and
+    /// `def unapply(a: Int, b: Int)` were accepted and then called with the
+    /// scrutinee anyway -- a `VerifyError` (`neg/t5078`). Messages as
+    /// scalac 2.13.16 words them. Only a method this run defines: the
+    /// prelude's and the pickle's own extractors are not re-judged here.
+    pub(crate) fn reject_extractor_shape(
+        &mut self,
+        unapply: SymbolId,
+        fun: &scala_rs_parser::Tree,
+        span: Span,
+    ) -> bool {
+        let s = self.st.get(unapply);
+        if unapply.0 < self.st.prelude_end || !s.pickled_origin.is_empty() {
+            return false;
+        }
+        let owner = s.owner;
+        if self.st.get(owner).jvm_name.starts_with("scala/") {
+            return false;
+        }
+        let (paramss, ret) = match &s.ty {
+            Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
+            other => (Vec::new(), other.clone()),
+        };
+        let method = s.name.clone();
+        let reason = match paramss.first() {
+            None => format!("an {method} method must accept a single argument"),
+            Some(c) if c.is_empty() => format!("an {method} method must accept a single argument"),
+            Some(c) if c.len() > 1 => {
+                "as it has more than one (non-implicit) parameter".to_string()
+            }
+            Some(_) => return false,
+        };
+        // `def unapply(a: Int, b: Int): Option[Int]`, with the parameter
+        // names the symbol carries.
+        let names: Vec<Vec<String>> = self
+            .st
+            .get(unapply)
+            .paramss
+            .iter()
+            .map(|c| c.iter().map(|p| self.st.get(*p).name.clone()).collect())
+            .collect();
+        let clauses: String = paramss
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let ps: Vec<String> = c
+                    .iter()
+                    .enumerate()
+                    .map(|(j, t)| {
+                        let n = names
+                            .get(i)
+                            .and_then(|c| c.get(j))
+                            .cloned()
+                            .unwrap_or_else(|| format!("x${}", j + 1));
+                        format!("{n}: {}", self.st.display_type(t))
+                    })
+                    .collect();
+                format!("({})", ps.join(", "))
+            })
+            .collect();
+        let what = match self.st.get(owner).kind {
+            SymKind::Module | SymKind::ModuleClass => "object",
+            _ => "value",
+        };
+        let name = fun
+            .name()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.st.get(owner).name.trim_end_matches('$').to_string());
+        let sep = if reason.starts_with("as ") { " " } else { ": " };
+        self.error(
+            span,
+            format!(
+                "{what} {name} is not a case class, nor does it have a valid unapply/unapplySeq \
+                 member\nNote: def {method}{clauses}: {} exists in {what} {name}, but it cannot \
+                 be used as an extractor{sep}{reason}",
+                self.st.display_type(&ret)
+            ),
+        );
+        true
+    }
+
     /// `Option` / `Some` by name as well as by symbol: the prelude and the
     /// pickle may each supply one.
     fn is_option_like(&self, sym: SymbolId) -> bool {

@@ -515,6 +515,22 @@ impl Typer {
                 }
                 let unapply = self.find_unapply(fun, sel_ty);
                 let unapply_seq = self.find_unapply_seq(fun);
+                // SLS 8.1.8: an extractor method takes the scrutinee as its
+                // one (first-clause) argument. `def unapply: Option[Int]`,
+                // `def unapply()` and `def unapply(a: Int, b: Int)` were
+                // accepted and called with the scrutinee anyway, which did not
+                // verify (`neg/t5078`).
+                if let Some(u) = unapply.or(unapply_seq) {
+                    if self.reject_extractor_shape(u, fun, pat.span) {
+                        // Still bind the sub-patterns, so their names do not
+                        // come back as "not found" in the case body.
+                        for a in args.iter_mut() {
+                            self.type_pattern(a, &Type::Error);
+                        }
+                        pat.ty = Type::Error;
+                        return;
+                    }
+                }
                 // `def unapply(n: Nd) = Some((n.v, n.tag))` has no result type
                 // of its own; without completing it the pattern would see
                 // `<notype>` and count one sub-pattern instead of two.

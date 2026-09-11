@@ -715,10 +715,7 @@ fn gen_name_based_result(
     let sort = desc_ret_sort(&desc);
     let slot = frame.alloc_tmp(sort);
     store(asm, slot, sort);
-    let recv_ty = Type::Class {
-        sym: nb.result_class,
-        args: vec![],
-    };
+    let recv_ty = erased_receiver_ty(ctx, nb.result_class);
     let tmp = ExtractorTmp {
         sym: nb.result_tmp,
         slot,
@@ -761,10 +758,7 @@ fn bind_product_selectors(
     }
     let slot = frame.alloc_tmp(JvmSort::Ref);
     store(asm, slot, JvmSort::Ref);
-    let recv_ty = Type::Class {
-        sym: sels.class,
-        args: vec![],
-    };
+    let recv_ty = erased_receiver_ty(ctx, sels.class);
     let tmp = ExtractorTmp {
         sym: sels.tmp,
         slot,
@@ -776,6 +770,24 @@ fn bind_product_selectors(
         let (want, sort) = extracted_want(ctx, a, &raw);
         read_tmp_member(asm, frame, ctx, &tmp, sel, &want);
         bind_subpattern(asm, frame, ctx, a, sort, fail);
+    }
+}
+
+/// The static type the synthetic receiver of an extractor's `isEmpty` /
+/// `get` / `_N` read carries: the class, or -- for a value class, which the
+/// local holds unboxed -- the underlying type, which is what erasure gives
+/// every value-class-typed expression in source trees. Typed at the value
+/// class itself, the read took the local for a box and unboxed it again
+/// (`checkcast NonNullChar; invokevirtual get()` on a `char`).
+fn erased_receiver_ty(ctx: &EmitCtx, cls: SymbolId) -> Type {
+    if !cls.is_none() && ctx.st.is_value_class(cls) {
+        if let Some(under) = ctx.st.value_class_underlying(cls) {
+            return under;
+        }
+    }
+    Type::Class {
+        sym: cls,
+        args: vec![],
     }
 }
 

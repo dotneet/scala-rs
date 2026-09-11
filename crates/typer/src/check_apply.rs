@@ -210,6 +210,10 @@ impl Typer {
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
+        if self.rewrite_explicit_s_interpolator(tree, pt) {
+            self.undet_tvars = saved;
+            return;
+        }
         // The expected type is the last constraint on what the arguments left
         // undetermined, exactly as it is for the callee's own parameters:
         // `val l: List[Map[String, Int]] = f(Map.empty)` pins the `K` and `V`
