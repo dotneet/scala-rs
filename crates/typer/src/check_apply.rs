@@ -322,7 +322,7 @@ impl Typer {
             // read its parameter types from. Only for a monomorphic class,
             // only where the arity settles which constructor this is, and only
             // for a fully determined function-shaped parameter.
-            let ctor_protos: Vec<Type> = class_id
+            let mut ctor_protos: Vec<Type> = class_id
                 .filter(|_| tps.is_empty())
                 .map(|c| self.st.get(c).ctor_fields.clone())
                 .filter(|fs| fs.len() == args.len())
@@ -344,6 +344,52 @@ impl Typer {
                         .collect()
                 })
                 .unwrap_or_default();
+            // A class with a single constructor is not an overload, and nsc
+            // types each argument against that constructor's formal parameter
+            // (`Typers.doTypedApply`, after `preSelectOverloaded` has nothing
+            // to choose). The parameter is what instantiates a polymorphic
+            // argument: `new Node(Array.empty, Array.empty)` on
+            // `Node(content: Array[Any], hashes: Array[Int])` builds an
+            // `Object[]` and an `int[]`, and `Array(x)` for an `Array[Any]`
+            // parameter searches `ClassTag[Any]`, not `ClassTag[A]`. Typed
+            // with no expected type, both searched a tag for a variable
+            // nothing had solved (`scala/collection/immutable/HashSet.scala`,
+            // `HashMap.scala`). Only a parameter that is already a proper
+            // type here -- the class's own type parameters written or
+            // substituted away -- and still only a hint (see below).
+            if let (Some(c), None) = (class_id, curried_clauses.as_ref()) {
+                if let Some(ctor) = self.sole_own_ctor(c) {
+                    let first = match &self.st.get(ctor).ty {
+                        Type::Method { paramss, .. } => {
+                            paramss.first().cloned().unwrap_or_default()
+                        }
+                        _ => Vec::new(),
+                    };
+                    ctor_protos.resize(args.len(), Type::NoType);
+                    for (i, slot) in ctor_protos.iter_mut().enumerate() {
+                        if !slot.is_no_type() {
+                            continue;
+                        }
+                        let declared = match param_at(&first, i) {
+                            Some(Type::ByName(t)) => t.as_ref(),
+                            Some(t) => t,
+                            None => continue,
+                        };
+                        let t = if !explicit.is_empty() && explicit.len() == tps.len() {
+                            self.st.subst_tparams(c, &explicit, declared)
+                        } else {
+                            declared.clone()
+                        };
+                        if self.is_closed_ctor_proto(declared, &tps)
+                            && !mentions_tparam(&t, &tps)
+                            && !t.is_error()
+                            && !type_mentions_wildcard(&t)
+                        {
+                            *slot = t;
+                        }
+                    }
+                }
+            }
             for (ai, a) in args.iter_mut().enumerate() {
                 if a.byname_thunk {
                     arg_tys.push(a.argument_type());
@@ -1923,7 +1969,7 @@ impl Typer {
                             let inst: Vec<(SymbolId, Type)> = self
                                 .infer_method_tparams(sym, &sig_param_tys, &now)
                                 .into_iter()
-                                .filter(|(_, t)| {
+                                .filter(|(id, t)| {
                                     // A solution that is *this* call's own variable
                                     // is no solution -- `T := T` leaves the result
                                     // exactly as it was. The caller's type
@@ -1932,9 +1978,27 @@ impl Typer {
                                     // solves `mk`'s `T` to `const`'s, and
                                     // rejecting every `TypeParam` printed the
                                     // result as `GR[T] required GR[T]`.
+                                    //
+                                    // `Nothing` is held back for the expected
+                                    // type to improve on. With no expected
+                                    // type, nsc's `adjustTypeArgs` keeps a
+                                    // `Nothing` solution undetermined only
+                                    // where the variable is not covariant in
+                                    // the result -- `tryBreakable { throw e }`
+                                    // stays a `TryBlock[?T]` for `catchBreak`
+                                    // to decide -- and instantiates it
+                                    // otherwise: `onError { e => throw e }` on
+                                    // `onError[T](h: Throwable => T):
+                                    // PartialFunction[Throwable, T]` is a
+                                    // `PartialFunction[Throwable, Nothing]`.
+                                    // Leaving `T` in that result made the
+                                    // enclosing `try p catch onError { … }` an
+                                    // `AnyRef` (`sys/process/ProcessImpl.scala`).
+                                    let nothing_ok = pt.is_no_type()
+                                        && self.tparam_variance_in(&ret, *id, 1) == Some(1);
                                     !t.is_no_type()
                                         && !t.is_error()
-                                        && !matches!(t, Type::Nothing)
+                                        && (!matches!(t, Type::Nothing) || nothing_ok)
                                         && !mentions_tparam(t, &tps)
                                 })
                                 .collect();
@@ -3377,5 +3441,43 @@ impl Typer {
             return t;
         }
         self.st.lub(a, b)
+    }
+
+    /// Can a constructor parameter's *declared* type be handed to its
+    /// argument as the expected type without reading it through a prefix?
+    /// Only a type built from classes, arrays, tuples and functions whose
+    /// type parameters are the constructed class's own (`tps`, which the
+    /// caller substitutes or refuses). A type member, a singleton or an
+    /// enclosing class's parameter means something different at every
+    /// `new o.C(…)`, and nothing on this path does the as-seen-from.
+    pub(crate) fn is_closed_ctor_proto(&self, ty: &Type, tps: &[SymbolId]) -> bool {
+        match ty {
+            Type::Unit
+            | Type::Boolean
+            | Type::Byte
+            | Type::Short
+            | Type::Int
+            | Type::Long
+            | Type::Float
+            | Type::Double
+            | Type::Char
+            | Type::String
+            | Type::Any
+            | Type::AnyRef
+            | Type::JavaObject
+            | Type::AnyVal
+            | Type::Null
+            | Type::Nothing => true,
+            Type::TypeParam(id) => tps.contains(id),
+            Type::Array(t) => self.is_closed_ctor_proto(t, tps),
+            Type::Class { args, .. } | Type::Tuple(args) => {
+                args.iter().all(|a| self.is_closed_ctor_proto(a, tps))
+            }
+            Type::Function { params, ret } => {
+                params.iter().all(|p| self.is_closed_ctor_proto(p, tps))
+                    && self.is_closed_ctor_proto(ret, tps)
+            }
+            _ => false,
+        }
     }
 }

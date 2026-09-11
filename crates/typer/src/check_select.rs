@@ -2636,7 +2636,7 @@ impl Typer {
                     .rewrite_update_assignment_op(tree, table, indices, &name, rhs_args, pt);
             }
         }
-        if self.is_assignable_lhs(qual) {
+        if self.is_assignable_lhs(qual) || self.is_var_getter_lhs(qual) {
             let op = name[..name.len() - 1].to_string();
             let lhs = (**qual).clone();
             let rhs_args = args.clone();
@@ -2702,6 +2702,28 @@ impl Typer {
         }
         let s = self.st.get(tree.sym);
         s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE)
+    }
+
+    /// nsc `treeInfo.isVariableOrGetter`'s getter half (`mayBeVarGetter`
+    /// plus a `name_=` beside it): a *parameterless* `def` of a class whose
+    /// owner also has the setter. `size += 1` on `def size = _size` with a
+    /// `private def size_=(s: Int)` (`mutable/OpenHashMap.scala`) is
+    /// `size = size + 1`, which the `Assign` case turns into `size_=(…)`.
+    /// A `val` is stable and a `def size()` has a parameter list, and nsc
+    /// refuses both even when a `size_=` exists.
+    fn is_var_getter_lhs(&mut self, tree: &Tree) -> bool {
+        if tree.sym.is_none() {
+            return false;
+        }
+        let s = self.st.get(tree.sym);
+        if s.kind != SymKind::Method
+            || !s.paramss.is_empty()
+            || s.name.ends_with("_=")
+            || !self.st.get(s.owner).is_class_like()
+        {
+            return false;
+        }
+        self.setter_assign_lhs(tree) || self.ident_setter_assign_lhs(tree).is_some()
     }
 
     /// nsc `convertToAssignment`'s `mkUpdate`: `t(i) op= x` is

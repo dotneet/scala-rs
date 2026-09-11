@@ -981,7 +981,10 @@ impl<'a> Gen<'a> {
                     name, mods, rhs, ..
                 } = &stt.kind
                 {
-                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                    // `var x: T = _` stores nothing: the field keeps whatever
+                    // it holds, including a value written by a superclass
+                    // constructor through an overridden method.
+                    if rhs.is_empty() || rhs.is_default_init() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
                     asm.aload(0);
@@ -1176,7 +1179,10 @@ impl<'a> Gen<'a> {
                     name, mods, rhs, ..
                 } = &vd.kind
                 {
-                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                    // `var x: T = _` stores nothing: the field keeps whatever
+                    // it holds, including a value written by a superclass
+                    // constructor through an overridden method.
+                    if rhs.is_empty() || rhs.is_default_init() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
                     asm.aload(0);
@@ -1307,7 +1313,13 @@ impl<'a> Gen<'a> {
                         name, mods, rhs, ..
                     } = &vd.kind
                     {
-                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        // `var x: T = _` stores nothing: the field keeps whatever
+                        // it holds, including a value written by a superclass
+                        // constructor through an overridden method.
+                        if rhs.is_empty()
+                            || rhs.is_default_init()
+                            || mods.flags.contains(Flags::LAZY)
+                        {
                             continue;
                         }
                         asm.aload(0);

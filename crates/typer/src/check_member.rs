@@ -481,8 +481,14 @@ impl Typer {
             &tree.kind,
             TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::PRESUPER)
         );
-        let (rhs, declared) = match &mut tree.kind {
-            TreeKind::ValDef { rhs, .. } => (rhs, tree.ty.clone()),
+        let (rhs, declared, literal_tpt) = match &mut tree.kind {
+            TreeKind::ValDef { rhs, tpt, .. } => {
+                let literal = match &tpt.kind {
+                    TreeKind::Literal { lit } if !matches!(lit, Lit::Unit) => Some(tpt.span),
+                    _ => None,
+                };
+                (rhs, tree.ty.clone(), literal)
+            }
             _ => return,
         };
         if rhs.is_empty() {
@@ -492,37 +498,39 @@ impl Typer {
             }
             return;
         }
-        // `var x: T = _` is the zero of `T` (nsc's default initializer).
-        if matches!(rhs.kind, TreeKind::Wildcard) {
+        // `var x: T = _` (nsc's DEFAULTINIT, SLS 4.2): the field starts at
+        // the JVM default of its erased type and the constructor never
+        // stores to it -- so a value a superclass constructor wrote through
+        // an overridden method survives, and any `T` qualifies, a type
+        // parameter or a value class included. There is no expression to
+        // type: the `_` stays in the tree, typed as `T`, and the backend
+        // skips the initializer (`Tree::is_default_init`).
+        if rhs.is_default_init() {
             if declared.is_no_type() {
                 self.error(tree.span, "unbound placeholder parameter");
                 tree.ty = Type::Error;
                 return;
             }
-            let lit = match declared.widen_constant() {
-                Type::Int => Lit::Int(0),
-                Type::Long => Lit::Long(0),
-                Type::Double => Lit::Double(0.0),
-                Type::Float => Lit::Float(0.0),
-                Type::Short | Type::Byte | Type::Char => Lit::Int(0),
-                Type::Boolean => Lit::Boolean(false),
-                Type::Unit => Lit::Unit,
-                _ => Lit::Null,
-            };
-            let span = rhs.span;
-            **rhs = Tree {
-                id: rhs.id,
-                span,
-                kind: TreeKind::Literal { lit },
-                ty: declared.clone(),
-                sym: SymbolId::NONE,
-                postfix: false,
-                scala_ref: false,
-                stable_pat: false,
-                byname_thunk: false,
-                byname_type_marker: false,
-            };
-            self.type_expr(rhs, &declared);
+            // nsc `LocalVarUninitializedError`: a local variable has no
+            // default value.
+            if self.block_local_defs.contains(&(self.file_index, tree.id)) {
+                self.error(tree.span, "local variables must be initialized");
+                tree.ty = Type::Error;
+                return;
+            }
+            // SIP-23: a literal type has one value and no default. nsc asks
+            // the type *as written* -- `var x: One = _` through `type One =
+            // 1` is accepted -- so this reads the tree, not the dealiased
+            // type (`neg/sip23-uninitialized-2`).
+            if let Some(span) = literal_tpt {
+                self.error(
+                    span,
+                    "default initialization prohibited for literal-typed vars",
+                );
+                tree.ty = Type::Error;
+                return;
+            }
+            rhs.ty = declared.clone();
             tree.ty = declared;
             return;
         }
@@ -1560,7 +1568,7 @@ impl Typer {
     /// also reports the *inherited* `<init>`, which is not an overload of it;
     /// and a class with auxiliary constructors is resolved from the arguments
     /// that are written, never filled from an empty list.
-    fn sole_own_ctor(&self, class_id: SymbolId) -> Option<SymbolId> {
+    pub(crate) fn sole_own_ctor(&self, class_id: SymbolId) -> Option<SymbolId> {
         let alts: Vec<SymbolId> = self
             .st
             .lookup_member(class_id, "<init>")

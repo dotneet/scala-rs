@@ -4710,7 +4710,10 @@ impl SymbolTable {
             return self.is_sub_type(&Type::AnyRef, b);
         }
         if matches!(b, Type::JavaObject) {
-            return self.is_sub_type(a, &Type::AnyRef);
+            // nsc's `ObjectTpeJava`: an `Any` fits where Java says `Object`
+            // (`Any <:< ObjectTpeJava`), so `Array[Any]` meets an `Object[]`
+            // parameter the way `Array[AnyRef]` does.
+            return matches!(a, Type::Any) || self.is_sub_type(a, &Type::AnyRef);
         }
         if a == b {
             return true;

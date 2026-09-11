@@ -1796,6 +1796,17 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                 }
             }
         }
+        // An `Object[]` *parameter* is an array of nsc's `ObjectTpeJava` as
+        // much as an `Object[]` result is: `java.util.Arrays.fill(Object[],
+        // Object)` takes the `Array[AnyRef]` scalac hands it, and reading the
+        // element as a plain `Any` made that `no matching overload` (an
+        // invariant `Array[AnyRef]` is no `Array[Any]`). `Array[Any]` still
+        // fits too: `ObjectTpeJava` is `Any` as well (`is_sub_type`).
+        for p in params.iter_mut() {
+            if let Type::Array(elem) = p {
+                *p = Type::Array(Box::new(java_array_element((**elem).clone())));
+            }
+        }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
         let flags = java_method_flags(m);
         let id = add_method_types(st, owner, &m.name, names, params, ret);

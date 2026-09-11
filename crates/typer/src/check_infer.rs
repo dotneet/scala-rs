@@ -427,6 +427,68 @@ impl Typer {
         plain
     }
 
+    /// nsc's `ptOrLub` takes a *weak* lub (`weakLub`, SLS 3.5.3) when the
+    /// expected type leaves the result open: branches that are all numeric
+    /// value types meet at the widest of them, not at `AnyVal`. `if (c)
+    /// cumulative(i) else 0` is a `Long` -- read as `AnyVal`, the `+ index`
+    /// after it found only `any2stringadd` (`no matching overload for
+    /// (String)String with arguments (Int)` in `scala/jdk/*Accumulator.scala`).
+    /// Two numeric types neither of which weakly conforms to the other
+    /// (`Short`, `Char`) meet at `Int`, as in nsc's `numericLub`. A branch
+    /// that never returns (`Nothing`) does not take part.
+    ///
+    /// Only where nothing is expected: under a real expected type (`Any`
+    /// included) nsc adapts every branch to that type on its own, and
+    /// `val x: Any = if (c) 1L else 0` boxes an `Integer` on the `else` path.
+    /// `None` when the branches already agree -- the ordinary path types
+    /// that just as well.
+    pub(crate) fn weak_numeric_branch_lub(&self, pt: &Type, branch_tys: &[Type]) -> Option<Type> {
+        if !(pt.is_no_type() || matches!(pt, Type::Wildcard)) {
+            return None;
+        }
+        let tys: Vec<Type> = branch_tys
+            .iter()
+            .map(|t| t.widen_constant())
+            .filter(|t| !matches!(t, Type::Nothing))
+            .collect();
+        let numeric = |t: &Type| {
+            matches!(
+                t,
+                Type::Byte
+                    | Type::Short
+                    | Type::Char
+                    | Type::Int
+                    | Type::Long
+                    | Type::Float
+                    | Type::Double
+            )
+        };
+        let first = tys.first()?;
+        if !tys.iter().all(numeric) || tys.iter().all(|t| t == first) {
+            return None;
+        }
+        let lub = tys[1..].iter().fold(first.clone(), |acc, t| {
+            if acc == *t || numeric_widen(t, &acc).is_some() {
+                acc
+            } else if numeric_widen(&acc, t).is_some() {
+                t.clone()
+            } else {
+                Type::Int
+            }
+        });
+        Some(lub)
+    }
+
+    /// Widen one branch to the weak lub `weak_numeric_branch_lub` chose. The
+    /// JVM needs the conversion instruction in the branch itself: the join
+    /// after an `if` takes one operand type.
+    pub(crate) fn adapt_numeric_branch(&mut self, branch: &mut Tree, to: &Type) {
+        if matches!(branch.ty, Type::Nothing) || branch.ty.widen_constant() == *to {
+            return;
+        }
+        self.adapt(branch, to);
+    }
+
     /// The type an `if` or a `match` takes: [`pt_or_lub`], except that an
     /// expected type which is still a stand-in for an undetermined variable
     /// ([`pt_is_undecided`]) does not get to be the answer. Adopting `F[_]`

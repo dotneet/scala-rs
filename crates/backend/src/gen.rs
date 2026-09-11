@@ -242,13 +242,17 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
                     into.vals.insert(tree.sym, vals);
                 }
                 // `$init$` runs the `val` initializers *and* the trait
-                // body's bare statements, in source order (SLS 5.1).
+                // body's bare statements, in source order (SLS 5.1). A
+                // `var x: T = _` has a field (`vals` above) but nothing to
+                // run.
                 let init_stats: Vec<Tree> = impl_
                     .body
                     .iter()
                     .filter(|s| match &s.kind {
                         TreeKind::ValDef { rhs, mods, .. } => {
-                            !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                            !rhs.is_empty()
+                                && !rhs.is_default_init()
+                                && !mods.flags.contains(Flags::LAZY)
                         }
                         _ => is_template_stat(s),
                     })

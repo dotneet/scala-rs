@@ -908,6 +908,9 @@ pub fn typecheck_units_src(
     // early -- `type Integral[T] = scala.math.Integral[T]` came out
     // unresolvable, and the memo kept it that way for the rest of the run.
     t.link_collection_factories();
+    // A source `Predef`'s type aliases are named by signatures, so they have
+    // to be open before the pass below; its terms follow after it.
+    crate::predef_reimport::reimport_source_predef_types(&mut t.st);
     {
         // Member types first, across every unit: typing a body may call a
         // member declared further down the file, or in a file that comes
