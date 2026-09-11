@@ -202,10 +202,11 @@ fn fixtures_selfrec_primitive_casts_box_and_convert() {
     );
     let to_byte = body("toByte");
     assert!(to_byte.contains("i2b"), "toByte is not an i2b:\n{to_byte}");
-    // Reference -> primitive still unboxes.
+    // Reference -> primitive still unboxes. In jar mode this goes through
+    // `BoxesRunTime.unboxToInt`, exactly as nsc emits it (null unboxes to 0).
     let from_any = body("fromAny");
     assert!(
-        from_any.contains("intValue"),
+        from_any.contains("intValue") || from_any.contains("BoxesRunTime.unboxToInt"),
         "fromAny does not unbox:\n{from_any}"
     );
     let _ = fs::remove_dir_all(&out);
