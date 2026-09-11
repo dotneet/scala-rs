@@ -17,8 +17,6 @@ use scala_rs_parser::ast::*;
 pub(crate) enum CVal {
     Unit,
     Bool(bool),
-    Byte(i8),
-    Short(i16),
     Char(char),
     Int(i32),
     Long(i64),
@@ -49,8 +47,6 @@ impl CVal {
         match self {
             CVal::Unit => 1,
             CVal::Bool(_) => 2,
-            CVal::Byte(_) => 3,
-            CVal::Short(_) => 4,
             CVal::Char(_) => 5,
             CVal::Int(_) => 6,
             CVal::Long(_) => 7,
@@ -76,8 +72,6 @@ impl CVal {
                     1237
                 }
             }
-            CVal::Byte(n) => *n as i32,
-            CVal::Short(n) => *n as i32,
             CVal::Char(c) => *c as i32,
             CVal::Int(n) => *n,
             CVal::Long(n) => ((*n as u64) ^ ((*n as u64) >> 32)) as i32,
@@ -108,8 +102,6 @@ impl CVal {
         match self {
             CVal::Unit => "()".to_string(),
             CVal::Bool(b) => b.to_string(),
-            CVal::Byte(n) => n.to_string(),
-            CVal::Short(n) => n.to_string(),
             CVal::Int(n) => n.to_string(),
             CVal::Long(n) => format!("{n}L"),
             CVal::Float(bits) => format!("{}f", java_float(f32::from_bits(*bits) as f64, true)),
@@ -350,8 +342,6 @@ impl<'a> Types<'a> {
         match c {
             CVal::Unit => st.unit_sym,
             CVal::Bool(_) => st.boolean_sym,
-            CVal::Byte(_) => st.byte_sym,
-            CVal::Short(_) => st.short_sym,
             CVal::Char(_) => st.char_sym,
             CVal::Int(_) => st.int_sym,
             CVal::Long(_) => st.long_sym,

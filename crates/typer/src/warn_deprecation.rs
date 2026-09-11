@@ -59,15 +59,6 @@ impl<'a> Depr<'a> {
     }
 
     fn check_sym(&mut self, sym: SymbolId, point: u32) {
-        if std::env::var_os("SCALA_RS_DEPR_DEBUG").is_some() && !sym.is_none() {
-            let s = self.t.st.get(sym);
-            eprintln!(
-                "depr-check {} {:?} owner={}",
-                s.name,
-                s.kind,
-                if s.owner.is_none() { "-".to_string() } else { self.t.st.get(s.owner).jvm_name.clone() }
-            );
-        }
         if self.in_deprecated > 0 || sym.is_none() {
             return;
         }
@@ -199,18 +190,6 @@ impl<'a> Depr<'a> {
             Some(full) => self.t.pickle.class_sig_by_name(&mut self.t.binary, full, false),
             None => self.t.pickle.class_sig_of(&self.t.st, &mut self.t.binary, owner),
         };
-        if std::env::var_os("SCALA_RS_DEPR_DEBUG").is_some() {
-            eprintln!(
-                "depr-member {name} owner={} ours={our_params:?} sig={}",
-                self.t.st.get(owner).jvm_name,
-                sig.as_ref().map(|s| {
-                    s.members_named(&name)
-                        .map(|m| format!("{:?}/{:?}", sig_param_names(&m.ty), m.deprecated))
-                        .collect::<Vec<_>>()
-                        .join(";")
-                }).unwrap_or_else(|| "none".into())
-            );
-        }
         let sig = sig?;
         let cands: Vec<&scala_rs_pickle::sym::Member> = sig.members_named(&name).collect();
         if cands.is_empty() {

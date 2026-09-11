@@ -859,7 +859,6 @@ impl<'x> Approx<'x> {
                         let pv = PatVal {
                             key: PatKey::Sym(nil, None),
                             tp: NTy::Module(nil_cls),
-                            stable: true,
                             text: "Nil".into(),
                             switch_const: None,
                         };

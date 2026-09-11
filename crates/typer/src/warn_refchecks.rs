@@ -17,7 +17,8 @@
 
 use crate::check::Typer;
 use crate::symbol::{SymKind, SymbolTable};
-use crate::warn_util::{point_of, warning_at};
+use crate::warn_util::{each_child, point_of, warning_at};
+use std::collections::HashSet;
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Phase};
 
@@ -279,33 +280,12 @@ impl<'a> Refchecks<'a> {
                     self.tree(s, false);
                 }
             }
-            TreeKind::ClassDef { mods, impl_, vparamss, .. } => {
-                if mods.flags.contains(Flags::SYNTHETIC) {
-                    return;
-                }
-                let params: usize = vparamss
-                    .iter()
-                    .flatten()
-                    .map(|p| match &p.kind {
-                        TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::MUTABLE) => 3,
-                        TreeKind::ValDef { mods, .. }
-                            if mods.flags.contains(Flags::ACCESSOR)
-                                || mods.flags.contains(Flags::CASE) =>
-                        {
-                            2
-                        }
-                        _ => 1,
-                    })
-                    .sum();
-                if mods.flags.contains(Flags::TRAIT) {
-                    self.early_defs_in_trait(impl_);
-                }
-                self.template(impl_, params);
-            }
+            TreeKind::ClassDef { .. } => self.class_def(t, false),
             TreeKind::ModuleDef { mods, impl_, .. } => {
                 if mods.flags.contains(Flags::SYNTHETIC) {
                     return;
                 }
+                self.uninitialized_reads(impl_);
                 self.template(impl_, 0);
             }
             TreeKind::DefDef { mods, tpt, rhs, name, vparamss, .. } => {
@@ -319,6 +299,126 @@ impl<'a> Refchecks<'a> {
                 self.tree(rhs, unit);
                 self.meths.pop();
             }
+            _ => self.tree_rest(t, unit_pt),
+        }
+    }
+
+    /// A class definition, `anonymous` when it is the body of a `new`.
+    fn class_def(&mut self, t: &Tree, anonymous: bool) {
+        let TreeKind::ClassDef { mods, impl_, vparamss, .. } = &t.kind else {
+            return;
+        };
+        if mods.flags.contains(Flags::SYNTHETIC) && !anonymous {
+            return;
+        }
+        let params: usize = vparamss
+            .iter()
+            .flatten()
+            .map(|p| match &p.kind {
+                TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::MUTABLE) => 3,
+                TreeKind::ValDef { mods, .. }
+                    if mods.flags.contains(Flags::ACCESSOR) || mods.flags.contains(Flags::CASE) =>
+                {
+                    2
+                }
+                _ => 1,
+            })
+            .sum();
+        if mods.flags.contains(Flags::TRAIT) {
+            self.early_defs_in_trait(impl_);
+        } else {
+            // A trait's fields are initialized by its `$init$`, which nsc
+            // does not check.
+            self.uninitialized_reads(impl_);
+        }
+        self.template(impl_, params);
+    }
+
+    /// `Constructors.checkUninitializedReads`: a class body statement that
+    /// reads one of the class's own eager fields before its definition.
+    fn uninitialized_reads(&mut self, impl_: &Template) {
+        let mut pending: HashSet<SymbolId> = impl_
+            .body
+            .iter()
+            .filter(|s| matches!(s.kind, TreeKind::ValDef { .. }) && !s.sym.is_none())
+            .filter(|s| {
+                let f = self.sym_flags(s.sym);
+                !f.contains(Flags::LAZY) && !f.contains(Flags::SYNTHETIC)
+            })
+            .filter(|s| !matches!(&s.kind, TreeKind::ValDef { rhs, .. } if rhs.is_empty()))
+            .map(|s| s.sym)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        for s in &impl_.body {
+            match &s.kind {
+                TreeKind::ValDef { rhs, .. } => {
+                    pending.remove(&s.sym);
+                    if !self.sym_flags(s.sym).contains(Flags::LAZY) {
+                        self.uninit_check(rhs, &pending);
+                    }
+                }
+                _ if is_def_like(s) => {}
+                _ => self.uninit_check(s, &pending),
+            }
+        }
+    }
+
+    fn uninit_check(&mut self, t: &Tree, pending: &HashSet<SymbolId>) {
+        match &t.kind {
+            // Lifted out of the constructor: local definitions by lambdalift,
+            // function bodies (and by-name arguments) by uncurry.
+            TreeKind::DefDef { .. }
+            | TreeKind::ClassDef { .. }
+            | TreeKind::ModuleDef { .. }
+            | TreeKind::Function { .. } => return,
+            TreeKind::Apply { fun, args } => {
+                self.uninit_check(fun, pending);
+                let by_name: Vec<bool> = match &fun.ty {
+                    Type::Method { paramss, .. } => paramss
+                        .first()
+                        .map(|ps| ps.iter().map(|p| matches!(p, Type::ByName(_))).collect())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                for (i, a) in args.iter().enumerate() {
+                    if !by_name.get(i).copied().unwrap_or(false) {
+                        self.uninit_check(a, pending);
+                    }
+                }
+                return;
+            }
+            TreeKind::ValDef { .. } if self.sym_flags(t.sym).contains(Flags::LAZY) => return,
+            TreeKind::Ident { name } | TreeKind::Select { name, .. } if pending.contains(&t.sym) => {
+                let this_qual = match &t.kind {
+                    TreeKind::Select { qual, .. } => matches!(qual.kind, TreeKind::This { .. }),
+                    _ => true,
+                };
+                if this_qual {
+                    let kind = if self.sym_flags(t.sym).contains(Flags::MUTABLE) {
+                        "variable"
+                    } else {
+                        "value"
+                    };
+                    let d = warning_at(
+                        self.file,
+                        point_of(t, self.src),
+                        t.span.hi.0,
+                        format!("Reference to uninitialized {kind} {name}"),
+                        Phase::Constructors,
+                        self.fatal,
+                    );
+                    self.out.push(d);
+                }
+            }
+            _ => {}
+        }
+        each_child(t, &mut |c| self.uninit_check(c, pending));
+    }
+
+    fn tree_rest(&mut self, t: &Tree, unit_pt: bool) {
+        match &t.kind {
             TreeKind::ValDef { tpt, rhs, .. } => {
                 let unit = !matches!(tpt.kind, TreeKind::Empty) && matches!(tpt.ty, Type::Unit);
                 self.tree(rhs, unit);
@@ -559,6 +659,10 @@ impl<'a> Refchecks<'a> {
                 self.tree(rhs, false);
             }
             TreeKind::Throw { expr } => self.tree(expr, false),
+            // `new T { ... }`: the anonymous class is checked like any other.
+            TreeKind::New { tpt } if matches!(tpt.kind, TreeKind::ClassDef { .. }) => {
+                self.class_def(tpt, true)
+            }
             TreeKind::New { .. } => {}
             TreeKind::Typed { expr, .. } => self.tree(expr, false),
             TreeKind::InterpolatedString { args, .. } => {

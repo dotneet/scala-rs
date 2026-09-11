@@ -129,3 +129,61 @@ pub(crate) fn warning_at(
     };
     d.in_phase(phase).with_category(WarnCategory::Other)
 }
+
+/// Every child tree (expressions and definitions), in source order.
+pub(crate) fn each_child(t: &Tree, f: &mut dyn FnMut(&Tree)) {
+    match &t.kind {
+        TreeKind::PackageDef { stats, .. } => stats.iter().for_each(f),
+        TreeKind::ClassDef { impl_, .. } | TreeKind::ModuleDef { impl_, .. } => {
+            impl_.parents.iter().for_each(&mut *f);
+            impl_.body.iter().for_each(f)
+        }
+        TreeKind::ValDef { rhs, .. } => f(rhs),
+        TreeKind::DefDef { rhs, .. } => f(rhs),
+        TreeKind::LabelDef { rhs, .. } => f(rhs),
+        TreeKind::Block { stats, expr } => {
+            stats.iter().for_each(&mut *f);
+            f(expr)
+        }
+        TreeKind::If { cond, thenp, elsep } => {
+            f(cond);
+            f(thenp);
+            f(elsep)
+        }
+        TreeKind::Match { selector, cases } => {
+            f(selector);
+            for c in cases {
+                f(&c.guard);
+                f(&c.body);
+            }
+        }
+        TreeKind::Try { block, catches, finalizer } => {
+            f(block);
+            for c in catches {
+                f(&c.guard);
+                f(&c.body);
+            }
+            f(finalizer)
+        }
+        TreeKind::Function { body, .. } => f(body),
+        TreeKind::Assign { lhs, rhs } => {
+            f(lhs);
+            f(rhs)
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { body, cond } => {
+            f(cond);
+            f(body)
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => f(expr),
+        TreeKind::New { tpt } => f(tpt),
+        TreeKind::Typed { expr, .. } => f(expr),
+        TreeKind::TypeApply { fun, .. } => f(fun),
+        TreeKind::Apply { fun, args } => {
+            f(fun);
+            args.iter().for_each(f)
+        }
+        TreeKind::Select { qual, .. } => f(qual),
+        TreeKind::InterpolatedString { args, .. } => args.iter().for_each(f),
+        _ => {}
+    }
+}

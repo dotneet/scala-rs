@@ -188,7 +188,7 @@ impl<'t> Translator<'t> {
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>();
-                Ok(vec![Maker::new(TM::Alts { prev: b, alts, pos, switch })])
+                Ok(vec![Maker::new(TM::Alts { alts, pos, switch })])
             }
             _ => Err(bail!()),
         }
@@ -219,7 +219,6 @@ impl<'t> Translator<'t> {
                 Ok(PatVal {
                     key: PatKey::Lit(c.clone()),
                     tp,
-                    stable: false,
                     text: c.escaped(),
                     switch_const: switchable_const(&c),
                 })
@@ -287,7 +286,6 @@ impl<'t> Translator<'t> {
                 Ok(PatVal {
                     key,
                     tp,
-                    stable,
                     text: name.trim_end_matches('$').to_string(),
                     switch_const,
                 })
@@ -715,7 +713,7 @@ pub(crate) fn is_star_pattern(t: &Tree) -> bool {
 /// `SwitchablePattern`: a constant in `Int` range, a `String`, or `null`.
 pub(crate) fn switchable_const(c: &CVal) -> Option<CVal> {
     match c {
-        CVal::Int(_) | CVal::Char(_) | CVal::Byte(_) | CVal::Short(_) | CVal::Str(_) | CVal::Null => {
+        CVal::Int(_) | CVal::Char(_) | CVal::Str(_) | CVal::Null => {
             Some(c.clone())
         }
         _ => None,

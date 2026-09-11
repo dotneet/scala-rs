@@ -39,6 +39,7 @@ pub enum Phase {
     Specialize,
     ExplicitOuter,
     Erasure,
+    Constructors,
     /// Position-less diagnostics issued at the end of the run.
     Summary,
 }

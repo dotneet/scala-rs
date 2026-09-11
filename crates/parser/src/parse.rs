@@ -1248,6 +1248,15 @@ impl<'a> Parser<'a> {
                     lo_b = Some(Box::new(self.parse_type()));
                 }
                 TokenKind::ViewBound => {
+                    if !self.opts.source3 {
+                        // nsc `typeParamClauseOpt`, at the `<%`.
+                        let sp = self.span();
+                        self.deprecation(
+                            sp,
+                            "view bounds are deprecated; use an implicit parameter instead.\n  example: instead of `def f[A <% Int](a: A)` use `def f[A](a: A)(implicit ev: A => Int)`",
+                            "2.12.0",
+                        );
+                    }
                     self.bump();
                     views.push(self.parse_type());
                 }

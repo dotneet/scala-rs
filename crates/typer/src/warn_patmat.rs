@@ -24,12 +24,10 @@
 
 use crate::check::Typer;
 use crate::symbol::SymKind;
-use crate::warn_patmat_logic::*;
-use crate::warn_patmat_types::{sealed_children, CVal, NTy, Types};
+use crate::warn_patmat_types::{CVal, NTy, Types};
 use crate::warn_util::{point_of, warning_at};
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Phase};
-use std::collections::HashMap;
 
 pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
     let mut sym_ids: usize = 0;
@@ -306,8 +304,6 @@ pub(crate) struct PatVal {
     pub(crate) key: PatKey,
     /// `p.tpe.normalize`.
     pub(crate) tp: NTy,
-    /// `p.symbol.isStable`.
-    pub(crate) stable: bool,
     /// `p.toString` / `p.symbol.name`.
     pub(crate) text: String,
     /// The constant a switch would use (`SwitchablePattern`).
@@ -347,7 +343,6 @@ pub(crate) enum TM {
         next: B,
     },
     Alts {
-        prev: B,
         alts: Vec<Vec<Maker>>,
         pos: u32,
         /// The alternatives' switch constants, when every one is switchable.
@@ -552,8 +547,6 @@ fn collapse_guarded(cases: &[SwCase]) -> bool {
 fn switch_lit(c: &CVal) -> CVal {
     match c {
         CVal::Char(ch) => CVal::Int(*ch as i32),
-        CVal::Byte(n) => CVal::Int(*n as i32),
-        CVal::Short(n) => CVal::Int(*n as i32),
         other => other.clone(),
     }
 }

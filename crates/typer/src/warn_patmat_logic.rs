@@ -270,24 +270,6 @@ pub(crate) fn gather_symbols(p: &Prop, out: &mut Vec<SymId>) {
     }
 }
 
-/// Every variable of `p`, in traversal order (`gatherVariables`).
-pub(crate) fn gather_variables(p: &Prop, out: &mut Vec<VarId>) {
-    match p {
-        Prop::And(ops) | Prop::Or(ops) => {
-            for o in ops {
-                gather_variables(o, out);
-            }
-        }
-        Prop::Not(a) => gather_variables(a, out),
-        Prop::Eq(v, _) => {
-            if !out.contains(v) {
-                out.push(*v);
-            }
-        }
-        _ => {}
-    }
-}
-
 // ---------------------------------------------------------------------------
 // CNF and DPLL (`Solving.scala`)
 // ---------------------------------------------------------------------------
@@ -581,7 +563,7 @@ pub(crate) fn eq_free_prop_to_solvable(p: &Prop) -> Result<Solvable, BudgetExcee
         buff: Vec::new(),
         const_true: None,
     };
-    let mut cnf_for = |prop: &Prop, t: &mut TransformToCnf| -> Vec<Clause> {
+    let cnf_for = |prop: &Prop, t: &mut TransformToCnf| -> Vec<Clause> {
         match to_cnf(t.mapping, prop) {
             Some(cs) => cs,
             None => t.apply(prop),
