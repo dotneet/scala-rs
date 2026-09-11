@@ -920,6 +920,9 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 Some(erase_ty(&tree.ty, st))
             };
             erase_tree(rhs, st, pt.as_ref());
+            if let (Some(&cls), Some(pt)) = (st.value_class_terms.get(&tree.sym), pt) {
+                unbox_value_class_result(rhs, cls, &pt);
+            }
         }
         TreeKind::DefDef {
             tparams,
@@ -1454,9 +1457,29 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
         }
         for (i, a) in args.iter_mut().enumerate() {
-            let vc_elem = vc_arg_expected(st, &pre_params, &param_tys, i);
+            // Declaration identity distinguishes Object-backed value classes
+            // from a generic slot instantiated at a boxed value class.
+            let callee = if !apply_sym.is_none() && st.get(apply_sym).name == "<init>" {
+                apply_sym
+            } else {
+                fun.sym
+            };
+            let formal = if matches!(fun_pre_ty, Type::Function { .. }) {
+                None
+            } else {
+                st.get(callee).params.get(i).copied()
+            };
+            let declared_vc = formal.and_then(|id| st.value_class_terms.get(&id)).copied();
+            let vc_elem = if declared_vc.is_some() {
+                None
+            } else {
+                vc_arg_expected(st, &pre_params, &param_tys, i)
+            };
             let p = vc_elem.or_else(|| param_tys.get(i).cloned());
             erase_tree(a, st, p.as_ref());
+            if let (Some(cls), Some(pt)) = (declared_vc, p.as_ref()) {
+                unbox_value_class_result(a, cls, pt);
+            }
         }
     }
     let orig = tree.ty.clone();

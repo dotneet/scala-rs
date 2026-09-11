@@ -1276,19 +1276,31 @@ impl Typer {
                 // `def` with no result type has nothing to build yet: its type
                 // comes from its own body, so a forward reference to it is the
                 // cycle nsc reports.
+                // Complete each hoisted signature in its source-order import
+                // context. Restore imports before typing executable statements;
+                // only the completed local declarations are block-wide.
+                let before_imports = self.st.scopes.last().cloned().unwrap();
                 for s in stats.iter_mut() {
+                    if matches!(s.kind, TreeKind::Import { .. }) {
+                        self.type_stat(s);
+                    }
+                    if matches!(s.kind, TreeKind::TypeDef { .. }) {
+                        if s.sym.is_none() {
+                            self.namer(s);
+                        }
+                        self.type_member_sig(s);
+                        self.finish_type_aliases(std::slice::from_mut(s));
+                    }
                     if let TreeKind::DefDef { tpt, name, .. } = &s.kind {
                         if name != "<init>" && !tpt.is_empty() {
                             self.type_member_sig(s);
                         }
                     }
-                }
-                // A local `lazy val` is in scope for the whole block as well:
-                // `lazy val a: Int = b + 1; lazy val b: Int = 2` is legal (an
-                // eager `val` may not be forward-referenced). As above, only
-                // the signature is built here; the initialiser waits, and with
-                // it the point at which the `lazy val` is forced.
-                for s in stats.iter_mut() {
+                    // A local `lazy val` is in scope for the whole block as well:
+                    // `lazy val a: Int = b + 1; lazy val b: Int = 2` is legal (an
+                    // eager `val` may not be forward-referenced). As above, only
+                    // the signature is built here; the initialiser waits, and with
+                    // it the point at which the `lazy val` is forced.
                     if let TreeKind::ValDef { tpt, mods, .. } = &s.kind {
                         if mods.flags.contains(Flags::LAZY)
                             && !tpt.is_empty()
@@ -1296,6 +1308,15 @@ impl Typer {
                             && self.lazy_val_presig.insert((self.file_index, s.id))
                         {
                             self.type_val_sig(s);
+                        }
+                    }
+                }
+                let completed = self.st.scopes.last().cloned().unwrap();
+                *self.st.scopes.last_mut().unwrap() = before_imports;
+                for (name, entries) in completed.entries() {
+                    for entry in entries {
+                        if entry.rank == crate::symbol::BindRank::Definition {
+                            self.st.enter_in_current(name, entry.sym);
                         }
                     }
                 }

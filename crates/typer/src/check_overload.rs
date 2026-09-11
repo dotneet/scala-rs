@@ -1107,6 +1107,7 @@ impl Typer {
         sym: SymbolId,
         idx: usize,
         pt: &Type,
+        recv: Option<&Type>,
     ) -> Type {
         if sym.is_none() {
             return Type::NoType;
@@ -1221,25 +1222,29 @@ impl Typer {
                 return p.clone();
             }
         }
-        if pt.is_no_type() || pt.is_error() {
-            return Type::NoType;
-        }
         let Some(param) = param_at(params, idx) else {
             return Type::NoType;
         };
         if !mentions_tparam(param, &tps) {
             return Type::NoType;
         }
-        let solved: Vec<(SymbolId, Type)> = self
+        let mut solved: Vec<(SymbolId, Type)> = self
             .add_expected_constraints_in(sym, ret, pt, Vec::new(), true)
             .into_iter()
             .filter(|(_, t)| {
                 !t.is_no_type()
                     && !t.is_error()
                     && !matches!(t, Type::Nothing | Type::Any | Type::Wildcard)
-                    && !mentions_any_tparam(t)
+                    && !mentions_tparam(t, &tps)
             })
             .collect();
+        for &tp in &tps {
+            if !solved.iter().any(|(id, _)| *id == tp) {
+                if let Some(lo) = self.tparam_lower_bound(sym, tp, recv) {
+                    solved.push((tp, lo));
+                }
+            }
+        }
         if let Type::TypeParam(tp) = param {
             if !tps.contains(tp) {
                 return Type::NoType;

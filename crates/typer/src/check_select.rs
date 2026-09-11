@@ -533,6 +533,21 @@ impl Typer {
                 found = non_local;
             }
         }
+        // Term position prefers the companion module (and methods/vals) over
+        // the class of the same name, matching `type_ident`.
+        let terms: Vec<SymbolId> = found
+            .iter()
+            .copied()
+            .filter(|s| {
+                matches!(
+                    self.st.get(*s).kind,
+                    SymKind::Module | SymKind::Method | SymKind::Term
+                )
+            })
+            .collect();
+        if !terms.is_empty() {
+            found = terms;
+        }
         // The receiver's linearization is what orders two sibling overrides of
         // one member, so it is passed rather than looked up again.
         found = self.drop_overridden_at(
@@ -577,21 +592,6 @@ impl Typer {
             );
             tree.ty = Type::Error;
             return;
-        }
-        // Term position prefers the companion module (and methods/vals) over
-        // the class of the same name, matching `type_ident`.
-        let terms: Vec<SymbolId> = found
-            .iter()
-            .copied()
-            .filter(|s| {
-                matches!(
-                    self.st.get(*s).kind,
-                    SymKind::Module | SymKind::Method | SymKind::Term
-                )
-            })
-            .collect();
-        if !terms.is_empty() {
-            found = terms;
         }
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, tree.span);

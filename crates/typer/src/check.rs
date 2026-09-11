@@ -3134,6 +3134,11 @@ pub(crate) fn unify_one_precise(
             _ => None,
         },
         Type::Function { params, ret } => {
+            if let Type::Class { sym, args } = actual {
+                if let Some(function) = st.function_class_shape(*sym, args) {
+                    return unify_one_precise(st, tp, pattern, &function);
+                }
+            }
             if let Type::Function {
                 params: aps,
                 ret: ar,

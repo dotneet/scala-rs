@@ -30,6 +30,9 @@ makes no claim of conformance to the language specification. What exists today:
   application are covered by the [field scope batch](docs/batches/field-scope.md).
   Array signatures, declaration clauses, parent argument storage and implicit
   collection views are covered by the [declaration boundary batch](docs/batches/declaration-boundaries.md).
+  Parent and fallback prototypes, local import signatures, FunctionN inference
+  and value-class argument storage are covered by the
+  [contextual evidence batch](docs/batches/contextual-evidence.md).
 - Immutable Map lookup and update members require the declared key type,
   preserving implicit key conversions and independent value widening.
 - Function types preserve one Unit argument separately from an empty argument

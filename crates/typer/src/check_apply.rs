@@ -774,7 +774,8 @@ impl Typer {
                     ret: Box::new(Type::NoType),
                 });
             } else {
-                let pt_arg = self.proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt);
+                let pt_arg =
+                    self.proto_arg_type(&fun_ty_for_pretype, fun.sym, ai, pt, recv_ty.as_ref());
                 if pt_arg.is_no_type() {
                     self.type_expr(a, &Type::NoType);
                 } else {

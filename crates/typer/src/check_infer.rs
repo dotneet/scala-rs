@@ -2209,7 +2209,7 @@ impl Typer {
         }
     }
 
-    fn tparam_lower_bound(
+    pub(crate) fn tparam_lower_bound(
         &self,
         method: SymbolId,
         tp: SymbolId,

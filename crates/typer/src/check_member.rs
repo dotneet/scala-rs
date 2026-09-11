@@ -2074,7 +2074,50 @@ impl Typer {
                 return;
             }
         }
-        for a in args.iter_mut() {
+        // Explicit parent type arguments can settle a formal before the
+        // argument is typed, including polymorphic evidence expressions.
+        self.supply_binary_ctors(class_id);
+        let written_targs = match &class_ty {
+            Type::Class { args, .. } => args.clone(),
+            _ => Vec::new(),
+        };
+        let raw_tparams = self.st.get(class_id).tparams.clone();
+        let prototypes: Vec<Vec<Type>> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&id| self.st.get(id).owner == class_id)
+            .filter_map(|id| {
+                match self
+                    .st
+                    .subst_tparams(class_id, &written_targs, &self.st.get(id).ty)
+                {
+                    Type::Method { paramss, .. } => Some(paramss.into_iter().flatten().collect()),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (i, a) in args.iter_mut().enumerate() {
+            let prototype = prototypes
+                .first()
+                .and_then(|ps| param_at(ps, i))
+                .filter(|p| {
+                    !self.sigs_only
+                        && !mentions_tparam(p, &raw_tparams)
+                        && prototypes.iter().all(|ps| param_at(ps, i) == Some(*p))
+                })
+                .cloned()
+                .unwrap_or(Type::NoType);
+            let prototype = match prototype {
+                // An earlier parent signature pass may already have wrapped
+                // this argument in a Function0 thunk. Its type is checked by
+                // the selected by-name formal below, not as the raw value.
+                Type::ByName(_) if matches!(&a.kind, TreeKind::Function { vparams, .. } if vparams.is_empty()) => {
+                    Type::NoType
+                }
+                Type::ByName(t) | Type::Repeated(t) => *t,
+                t => t,
+            };
             // An argument this pass synthesized on an earlier walk of the same
             // parent (a filled implicit or default) is already bound to its
             // symbol. Re-typing it would resolve the name again, in a scope
@@ -2083,7 +2126,7 @@ impl Typer {
                 continue;
             }
             if let TreeKind::Function { vparams, .. } = &a.kind {
-                if !is_annotated_lambda(a) {
+                if !is_annotated_lambda(a) && prototype.is_no_type() {
                     // As for `new Base(f)`, an unannotated lambda needs the
                     // selected constructor's expected parameter type.
                     a.ty = Type::Function {
@@ -2093,7 +2136,10 @@ impl Typer {
                     continue;
                 }
             }
-            self.type_expr(a, &Type::NoType);
+            self.type_expr(a, &prototype);
+            if !prototype.is_no_type() {
+                self.adapt(a, &prototype);
+            }
         }
         tree.ty = class_ty.clone();
         if class_id.is_none() {
@@ -2262,22 +2308,40 @@ impl Typer {
         if tps.is_empty() || arg_tys.iter().any(|t| t.is_no_type() || t.is_error()) {
             return class_ty.clone();
         }
-        let OverloadPick::Found(_, param_tys, _) = self.pick_ctor_at(class_id, &[], arg_tys, None)
-        else {
-            return class_ty.clone();
-        };
-        let mut inferred = Vec::with_capacity(tps.len());
-        for tp in &tps {
-            match self.unify_tparam_all(*tp, &param_tys, arg_tys) {
-                Some(t) if !t.is_no_type() && !t.is_error() && !type_mentions_tparam(&t, *tp) => {
-                    inferred.push(t)
-                }
-                _ => return class_ty.clone(),
+        let mut solutions = Vec::new();
+        for ctor in self.st.lookup_member(class_id, "<init>") {
+            if self.st.get(ctor).owner != class_id {
+                continue;
+            }
+            let Type::Method { paramss, .. } = &self.st.get(ctor).ty else {
+                continue;
+            };
+            let param_tys: Vec<Type> = paramss.iter().flatten().cloned().collect();
+            let inferred: Option<Vec<Type>> = tps
+                .iter()
+                .map(|tp| {
+                    self.unify_tparam_all(*tp, &param_tys, arg_tys).filter(|t| {
+                        !t.is_no_type() && !t.is_error() && !type_mentions_tparam(t, *tp)
+                    })
+                })
+                .collect();
+            let Some(inferred) = inferred else {
+                continue;
+            };
+            if matches!(self.pick_ctor_at(class_id, &inferred, arg_tys, None),
+                OverloadPick::Found(picked, _, _) if picked == ctor)
+                && !solutions.contains(&inferred)
+            {
+                solutions.push(inferred);
             }
         }
-        Type::Class {
-            sym: class_id,
-            args: inferred,
+        if solutions.len() == 1 {
+            Type::Class {
+                sym: class_id,
+                args: solutions.pop().unwrap(),
+            }
+        } else {
+            class_ty.clone()
         }
     }
 
