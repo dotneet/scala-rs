@@ -101,8 +101,22 @@ impl Typer {
     }
 
     pub(crate) fn type_apply(&mut self, tree: &mut Tree, pt: &Type) {
+        let list_nil = self.any_cto && Self::is_list_nil_shape(tree);
+        let held = if list_nil {
+            std::mem::replace(&mut self.cto_deferred, Some(Vec::new()))
+        } else {
+            None
+        };
         let saved = std::mem::take(&mut self.undet_tvars);
         self.type_apply_in(tree, pt);
+        if list_nil {
+            let mine = std::mem::replace(&mut self.cto_deferred, held).unwrap_or_default();
+            if !self.is_list_module_apply(tree) {
+                for (span, msg) in mine {
+                    self.note_cto_held(span, msg);
+                }
+            }
+        }
         // The expected type is the last constraint on what the arguments left
         // undetermined, exactly as it is for the callee's own parameters:
         // `val l: List[Map[String, Int]] = f(Map.empty)` pins the `K` and `V`

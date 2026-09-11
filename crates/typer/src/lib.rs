@@ -13,6 +13,7 @@ mod check_select;
 mod check_template;
 mod check_types;
 mod classpath;
+mod compile_time_only;
 mod ctor_defaults;
 mod cyclic;
 mod default_recv;

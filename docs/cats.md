@@ -3252,6 +3252,38 @@ tests went from pass to fail -- `abstract-class-2`, `t1010`,
 this compiler does not check (a path-dependent prefix mismatch in the first
 two, `@compileTimeOnly` in the third), so they are now accepted.
 
+**`@compileTimeOnly` is implemented** (`crates/typer/src/compile_time_only.rs`),
+so `compile-time-only-a` is rejected again, now on exactly the 26 lines its
+`.check` lists. As in nsc's refchecks: a term reference to an annotated
+symbol, and a *written* type naming one (`val v: (C7, C7)`, `new C1`,
+`List.empty[C7]`, `x: @placebo`, `@placebo class Test`), is an error with the
+annotation's message, except inside a definition that is itself annotated;
+an annotated case class is reported at its definition (its companion's
+`apply` names it) and a call to that `apply` is a reference; `List[C7]()` is
+not, because nsc rewrites it to `Nil` first; an alias `type Al = K` is a
+reference to `K` only where the alias is written. The annotation reaches an
+implicit class's conversion and a `val` parameter's accessor, as its
+meta-annotations say. Two things had to be fixed on the way: the parser read
+`class O2` + newline + `@ann object O2` as a constructor annotation of the
+class (nsc's scanner ends the header there), and nothing else changes for a
+program without the annotation -- the check is off unless a source mentions
+it, and pickled members carry no annotations here, so the library's own
+placeholders are untouched. `tests/fixtures/catsr_cto_bad.scala` pins the
+line set against scalac in both directions.
+
+`abstract-class-2` and `t1010` need prefix-sensitive class types and were
+handed to a separate agent. What the representation does today: `p.S1` for a
+class `S1` is `path_dependent_type` -> `project_from_prefix` ->
+`projected_class_type`, which answers `Type::Class { sym: S1, args: [] }`
+(wrapped in the `AS_SEEN_FROM_MARK` refinement view only when the prefix
+settles abstract members); `at_term_path` / `SymbolTable::path_member` keep
+a path only for a *deferred type member* whose path starts at a local or a
+self alias (`stable_term_path` refuses a class-member head such as `private
+val in = new MailBox`, whose `in.Message` is therefore plain `Message`).
+`Type::Class` has no prefix field, so `P.this.p.S1` and `P2.this.S1`, and
+`MailBox#Message` and `in.Message`, are the same type to conformance and to
+override matching alike.
+
 ### Found in passing, not fixed
 
 * `Option.map` (and the other hand-written collection `map`s in the prelude)

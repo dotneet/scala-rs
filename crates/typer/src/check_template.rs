@@ -134,6 +134,14 @@ impl Typer {
     fn type_class_with_macro_owner(&mut self, tree: &mut Tree) {
         let id = tree.sym;
         self.suppress_inherited_case_copy(id);
+        // `@placebo class Test` references `placebo` (`crate::compile_time_only`).
+        if self.any_cto && !self.sigs_only {
+            if let TreeKind::ClassDef { mods, .. } = &tree.kind {
+                for a in mods.annotations.clone() {
+                    self.note_cto_type_name(&a, tree.span);
+                }
+            }
+        }
         if let TreeKind::ClassDef { mods, vparamss, .. } = &tree.kind {
             if mods.flags.contains(Flags::IMPLICIT) {
                 let owner_kind = if !id.is_none() {
@@ -681,6 +689,13 @@ impl Typer {
 
     fn type_module_with_macro_owner(&mut self, tree: &mut Tree) {
         let m = tree.sym;
+        if self.any_cto && !self.sigs_only {
+            if let TreeKind::ModuleDef { mods, .. } = &tree.kind {
+                for a in mods.annotations.clone() {
+                    self.note_cto_type_name(&a, tree.span);
+                }
+            }
+        }
         let cls = match self.st.get(m).ty {
             Type::ModuleRef(c) => c,
             _ => m,
@@ -2046,6 +2061,8 @@ impl Typer {
             _ => return,
         };
         for a in &mods.annotations {
+            // An annotation is a reference to its class (`@placebo def x`).
+            self.note_cto_type_name(a, tree.span);
             let path = a.annotation_path();
             if is_tailrec_annot(&path) {
                 if !matches!(&tree.kind, TreeKind::DefDef { .. }) {

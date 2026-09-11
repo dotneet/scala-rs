@@ -321,7 +321,9 @@ impl Typer {
             // A written type annotation is a name nsc has finished resolving:
             // `def f(x: Zork)` and `val x: Zork` are `not found: type Zork`,
             // not a silently accepted program. See `strict_type_names`.
+            let saved_cto = std::mem::replace(&mut self.cto_sig_owner, tree.sym);
             let ty = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
+            self.cto_sig_owner = saved_cto;
             self.check_proper_type(&ty, tree.span);
             ty
         };
@@ -931,7 +933,9 @@ impl Typer {
             // As in `type_val_sig`: a written result type is fully resolvable
             // by the time nsc looks at it, so an unresolved name is an error
             // and not a placeholder.
+            let saved_cto = std::mem::replace(&mut self.cto_sig_owner, tree.sym);
             let ret = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
+            self.cto_sig_owner = saved_cto;
             self.check_proper_type(&ret, span);
             ret
         };

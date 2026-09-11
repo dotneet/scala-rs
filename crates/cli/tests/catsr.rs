@@ -194,3 +194,25 @@ fn scalac_agrees_catsr_bad() {
     };
     assert_eq!(got, marked_lines("catsr_bad"));
 }
+
+#[test]
+fn catsr_cto_bad_is_rejected_on_the_marked_lines() {
+    let Some(got) = error_lines("catsr_cto_bad", None) else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    assert_eq!(got, marked_lines("catsr_cto_bad"));
+}
+
+#[test]
+fn scalac_agrees_catsr_cto_bad() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    let Some(got) = error_lines("catsr_cto_bad", Some(&sc)) else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    assert_eq!(got, marked_lines("catsr_cto_bad"));
+}

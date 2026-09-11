@@ -163,6 +163,25 @@ impl Typer {
                 self.expose_unqualified_type(name, tpt.span);
                 let name = name.clone();
                 let ty = self.resolve_type_name_completing(&name, &[], tpt.span);
+                // Only a *written* name: a tree the compiler built (the
+                // conversion an implicit class desugars to) arrives resolved.
+                if self.any_cto && tpt.sym.is_none() {
+                    // The name is the reference: an alias `type Al = K` is
+                    // not a reference to `K` (nsc checks the symbol the tree
+                    // names), and by now it has been expanded.
+                    let named = self.st.lookup_type(&name).first().copied();
+                    let sym = match (named, &ty) {
+                        (Some(n), _) if self.st.get(n).kind == SymKind::TypeMember => Some(n),
+                        (
+                            _,
+                            Type::Class { sym, .. } | Type::TypeMember(sym) | Type::ModuleRef(sym),
+                        ) => Some(*sym),
+                        (n, _) => n,
+                    };
+                    if let Some(sym) = sym {
+                        self.note_cto_ref(sym, tpt.span);
+                    }
+                }
                 self.reject_unresolved_type(ty, &name, tpt.span)
             }
             TreeKind::Select { name, qual } => {
@@ -176,6 +195,7 @@ impl Typer {
                     t
                 } else if let Some(id) = self.lookup_qualified_type(qual, name) {
                     self.complete_lazy_sig(id, tpt.span);
+                    self.note_cto_ref(id, tpt.span);
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
@@ -257,6 +277,7 @@ impl Typer {
             TreeKind::SingletonTypeTree { ref_ } => self.singleton_to_type(tpt.span, ref_),
             TreeKind::AnnotatedTypeTree { tpt: inner, annot } => {
                 let ty = self.tree_to_type(inner);
+                self.note_cto_type_name(annot, annot.span);
                 let path = annot.annotation_path();
                 let simple = path.rsplit('.').next().unwrap_or(path.as_str()).to_string();
                 Type::Annotated {
@@ -974,6 +995,7 @@ impl Typer {
                 SymKind::Class | SymKind::ModuleClass => self.projected_class_type(prefix, cls, m),
                 _ => continue,
             };
+            self.note_cto_ref(m, span);
             return self.st.expand_in_type(prefix, &ty);
         }
         // Nothing under that name yet. A class read from a jar has its members
