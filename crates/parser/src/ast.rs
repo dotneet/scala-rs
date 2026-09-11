@@ -32,6 +32,25 @@ impl NodeId {
     pub fn is_pretyped_default(self) -> bool {
         self.0 == u32::MAX - 1
     }
+
+    /// A tree the typer already typed, spliced back into a macro expansion
+    /// unchanged: the receiver or an argument of the macro application, which
+    /// the implementation returned as it was given. nsc hands a macro typed
+    /// trees and does not type them again, and neither does
+    /// `Typer::type_expr`; re-typing one at the call site from its source
+    /// shape can resolve differently from how the typer resolved it the first
+    /// time (an implicit found in a companion's implicit scope names nothing
+    /// in lexical scope).
+    pub const PRETYPED_SPLICE: NodeId = NodeId(u32::MAX - 2);
+
+    pub fn is_pretyped_splice(self) -> bool {
+        self.0 == u32::MAX - 2
+    }
+
+    /// Either kind of tree the typer must not type again.
+    pub fn is_pretyped(self) -> bool {
+        self.is_pretyped_default() || self.is_pretyped_splice()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

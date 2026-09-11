@@ -68,7 +68,10 @@ unrealistic, it is stated as such.
   - 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
   - 7.21 A type tag that carries type arguments, and the `Expr[Nothing]` nsc really passes (the `agent/gbmapto` slice)
   - 7.22 The type arguments written on the macro implementation reference (the `agent/mapto2` slice)
-  - 7.23 `reify { … }` over the typed body (the `agent/reify` slice)
+  - 7.23 Structural transport and source macro integration
+  - 7.24 Source symbol ownership in the integration candidate
+  - 7.25 `mapTo` against classes this run is compiling (the `agent/gbmacro` slice)
+  - 7.26 `reify { … }` over the typed body (the `agent/reify` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -3452,7 +3455,228 @@ This remains integration work. Polymorphic source-symbol info and source class
 shapes that cannot be fully described are explicitly refused; general macro
 bundles and whitebox inference remain outside this change.
 
-### 7.23 `reify { … }` over the typed body (the `agent/reify` slice)
+### 7.25 `mapTo` against classes this run is compiling (the `agent/gbmacro` slice)
+
+§7.22 left gitbucket's 31 `(a, b).mapTo[Row]` call sites at wall 3 -- the row class is compiled by
+the same run, so it reached the engine as a placeholder carrying only its name -- and named wall 4,
+rebuilding the tree `mapToImpl` returns. Both are done, and every `mapTo` in gitbucket now expands.
+
+| check | before (`9cac778e`) | after |
+| --- | --- | --- |
+| `cannot expand mapTo` lines in `tests/gitbucket_measure.sh` | 31 | **0** |
+| `tests/gitbucket_measure.sh` errors / files with errors | 92 / 43 | **61 / 15** |
+| the same, composed with `agent/gbmisc` (`ddf38db9`, 36 on its own) | -- | **5 / 3** |
+
+The 61 are exactly the baseline's other 61 errors, kind for kind: this slice removed the 31 and
+nothing else, and added nothing. (The `Shape` / `OptionLift` / `value _1 is not a member of A`
+cluster that looked like a `mapTo` cascade is an implicit-unification defect, fixed in `agent/gbmisc`.)
+
+A standalone program proves the whole path: `tests/fixtures/gbmac_mapto.scala` declares four case
+classes and their tables in the shape gitbucket writes them -- the tables in a component trait with a
+self type and an imported profile API, two `mapTo`s in one class -- and taking each of
+`mapToImpl`'s branches (companion with `tupled`; one field; explicit companion without `tupled`; a
+class implementing a trait's abstract `val`s, with a default, `Option` and timestamp fields). Built by
+scala-rs and by real scalac 2.13.16, both run against in-memory H2 under `-Xverify:all` and print the
+same rows, the same `toMapped` / `toBase` results and the same fast-path converter names
+(`Fast Path of (String, Int, Option[String]).mapTo[gbmacm.Account]`).
+
+#### 1. A class this run is compiling travels as its identity, and is described lazily, in nsc's shape
+
+A type tag for a current-run class is now `(src <id>)`: the class's scala-rs symbol id. The engine
+builds its symbol (`ScalaRsMacroEngine.sourceSymbol`) with a `LazyType` info that asks scala-rs
+`(q symbolInfo <id>)` only when the implementation forces it -- the reverse channel of §7.20, which
+is what §7.18 said this needed. `TableQuery[Issues]` never forces it and costs nothing;
+`mapTo[Account]` forces the class, its companion, and the case fields' types, and nothing else. A
+`val fontColor = { … }` in the row class is never inferred on the macro's behalf, which is nsc's own
+order of evaluation.
+
+The symbol is built under the class's **real owner**: a package is the runtime mirror's own
+package of that name (`mirror.staticPackage`), and the class and its companion are entered into its
+scope. nsc finds a companion by looking the name up in the owner's declarations
+(`Symbol.companionModule0`), so that is the only way `rSym.companion` can be right; the runtime
+package scope answers entered names before it falls back to class loading. An object's module and
+module class are made once, together (`(q modulePair …)`), and a class and its companion bring each
+other in (`(q companion …)`).
+
+What the class *is* is translated from scala-rs's model into nsc's (`crates/typer/src/expand_mirror.rs`):
+
+* a `val` is one symbol here and two in nsc -- a `private[this]` field whose name ends in a space and
+  a getter, plus a setter for a `var`; a constructor parameter that is not a `val` is the field alone,
+  without the space; a `lazy val`, a trait's `val` and an abstract `val` are accessors alone. Each
+  gets nsc's flags (`PARAMACCESSOR`, `CASEACCESSOR`, `STABLE`, `ACCESSOR`, access, `final`,
+  `implicit`), and each view's type is asked for separately (`(q viewInfo getter|setter|field …)`);
+* a constructor returns the class, with its parameters' names and `DEFAULTPARAM`s; a trait has a
+  `$init$` unless it is a pure interface (`<interface>`), and is `abstract`;
+* a case class lists nsc's synthetic members in nsc's order, with nsc's flags and parameter names --
+  including `productIterator`, `hashCode`, `toString` and `equals`, which scala-rs leaves to the
+  backend -- unless the class or a source ancestor declares one; a default getter's result is
+  `@uncheckedVariance`;
+* a case companion lists `<init>`, `apply` and `unapply` with the class's parameters, and the
+  synthetic companion's `toString` or the explicit one's `writeReplace`; a synthetic companion
+  extends `AbstractFunctionN` alone (so `tupled` is found exactly when nsc finds it), an explicit one
+  is `Serializable`.
+
+`tests/fixtures/gbmac_decls_use.scala` asks a macro (`gbmac_decls_impl.scala`) for all of that on
+eleven classes -- case classes with vars, defaults, body `val`s, `lazy val`s and `private[this]`
+fields, an explicit companion, a plain class, a trait with every kind of `val`, a pure trait,
+abstract members, a subclass -- and scala-rs prints the same 231 lines as real scalac, flag for flag.
+
+**What cannot be translated faithfully is refused**, naming the member (`gbmac_decls_bad.scala`,
+which real scalac compiles): a nested class or object, a type member, a case class with a second
+parameter list, a member with a qualified access boundary (`private[p]` / `protected[p]`: nsc keeps
+`p` as the symbol's `privateWithin`, which the wire has no field for, and neither PRIVATE nor public
+would be its answer), and a case class inheriting from a class-file ancestor, which might declare a
+member that stops nsc synthesising one. Two differences are known and not refused: a `final val x = 3` is
+`Int(3)` in nsc and `Int` here, and an `override def toString = …` written without parentheses is
+`(): String` in nsc and nullary here -- both are what scala-rs's typer models, not the mirror.
+
+This replaced the eager `(run …)` description of §7.20 (which refused every class with a field) and
+the placeholder of §5.1; `placeholder_verdict` and `undescribed_verdict` are gone with them. Three
+tests pinned the old refusals and now pin scalac's answers instead: `mg_inspect_bad.scala`'s `MgPlain
+must be a case class` is the program's error, exactly as real scalac reports it; `gbm_bad.scala`'s
+`caseInfo[LocalRow]` moved to `gbmac_caseinfo_use.scala`, which prints what scalac prints; and
+`mtc_bad.scala`'s `class Bag(val size: Int)` is described now, so that call site left the file.
+
+#### 2. Rebuilding what `mapToImpl` returns
+
+`Typer::tree_from_reply` (`crates/typer/src/expand.rs`) now rebuilds, into the shape our parser
+produces for the same source:
+
+* `TypeTree`s with type arguments, as the path their class names applied to the arguments; a class
+  this run is compiling is recognised by its full name and handed back resolved, wherever it is
+  nested. The engine writes a `TypeTree`'s type only when its class has a path
+  (`ScalaRsMacroEngine.serType`); anything else -- a singleton, a refinement, an abstract type --
+  is `(tyx …)` and refused by name rather than read as the underlying class;
+* `Match` with an empty selector -- nsc's `{ case … }` -- as `x$pf => x$pf match { … }`, with
+  `CaseDef`, `Bind`, extractor and typed patterns, wildcard type arguments (`Bind(TypeName("_"))`),
+  guards, alternatives and sequence wildcards (the last two only in a pattern, where they mean
+  something);
+* `Super`, `NamedArg`, `ExistentialTypeTree` and `TypeDef` / `TypeBoundsTree`, `DEFERRED` only
+  on a `TypeDef`;
+* a class with constructor parameters: nsc's `PARAMACCESSOR` field in the template body is folded
+  into its parameter as `val`, `var` or a plain parameter.
+
+`tests/fixtures/gbmac_shapes_impl.scala` returns each of these without slick, and both compilers'
+builds print the same (`gbmac_shapes_use.scala`).
+
+#### 3. The receiver and arguments go back typed
+
+`c.prefix` of a `mapTo` is `anyToShapedValue(…)(Shape.tuple4Shape(Shape.repColumnShape(…), …))` --
+the implicit view and its implicit arguments the typer inserted. It used to be rebuilt from its
+shape and typed again at the call site, and typing it again resolved differently from the first
+time in three separate ways: the typer writes an implicit found in a companion's implicit scope as a
+bare `repColumnShape` once it is cached; a member reached through a component's self type as
+`gitbucket.core.model.Profile.profile`; and `repColumnShape(dateColumnType)` typed as an explicit
+application fails where the implicit search accepted it (`BaseColumnType[Date]`, deferred below).
+
+nsc hands a macro typed trees and splices them back without typing them again, and now so does
+scala-rs. The receiver and each argument are sent as `(orig K <tree>)`; the engine remembers the
+object it built for each (`origTrees`), and a reply containing that very object writes
+`(t "Orig" (s0) K <tree>)`; scala-rs puts its own typed tree there, marked
+`NodeId::PRETYPED_SPLICE`, which `Typer::type_expr` only adapts. A second mention of the same tree is
+rebuilt from its shape, so no typed subtree is shared, and a tree the implementation changed is a
+different object and is rebuilt and typed as before. The shape still travels for the implementation
+to inspect, and for that and the fallback the outbound serialiser now writes a static object and a
+member of one from `_root_`, a `classOf` the typer materialised as `Predef.classOf[T]` with `T` a
+described type, and `C.this` for the enclosing class a member is reached through, its self type
+included (`this_qualifier_of`, `class_path_member`).
+
+#### 4. Three typer repairs the expansion needs
+
+Each is shown without the macro in `tests/fixtures/gbmac_typer.scala`, compared with real scalac,
+with its near misses in `gbmac_typer_bad.scala`; the unmodified `9cac778e` binary fails all three.
+
+* **An inherited alias to an abstract projection** (`crates/typer/src/check_types.rs`,
+  `type_member_here`): `type Reader = M#Reader` seen from `class L extends Conv[IntDomain, …]` was
+  returned unsubstituted, because an alias whose right-hand side is *another* type member was taken
+  for a deferred member standing for itself.
+* **A case class's `copy` from a jar** (`crates/pickle/src/sym.rs`, `Member::is_case_copy`): nsc
+  pickles `apply` and `unapply` `CASE | SYNTHETIC` but `copy` only `SYNTHETIC`, so it was dropped
+  with the synthetic plumbing and the class file's `copy(x$0, …)` stood in -- `super.getDumpInfo.copy
+  (name = …)`, in every `mapTo` expansion, was "unknown parameter name: name".
+* **A type member a jar class passes to a subclass** (`crates/typer/src/pickle_supply.rs`,
+  `complete_inherited_type_member`, and `check_name.rs`): slick's `ResultConverter` declares
+  `protected[this] type Reader = M#Reader`; no bytecode records an alias, and a bare `Reader` in a
+  subclass body was "not found". It is now looked up through the enclosing classes' binary ancestors
+  when nothing else binds the name, installed on the declaring class in its own vocabulary, and
+  substituted through the subclass by the repair above.
+
+#### Validation
+
+`crates/cli/tests/gbmac.rs`, each fixture run under scala-rs and under real scalac:
+`gbmac_mapto` on H2; `gbmac_mapto_bad` (`mapTo` to a class whose field types do not match, to one
+with a column too many, and to a non-case class -- rejected on the same three lines by both
+compilers); the mirror against nsc and its named refusals; `mapToImpl`'s opening on current-run
+classes; the reply shapes; the three typer repairs and their near misses; `gbmac_selfimport` (below).
+
+#### The receiver of a self-type member (gitbucket's component shape)
+
+Every gitbucket table lives in `trait XComponent { self: Profile => import profile.api._ … }`, and
+`gitbucket.core.model` has an `object Profile` beside `trait Profile`. Three receivers were silently
+wrong there (`tests/fixtures/gbmac_selfimport.scala`; each also wrong on `4ac7c31b` and on the
+`batch/w1` merge `c39d6394`, scalac prints what `expected/gbmac_selfimport.txt` holds):
+
+* **Another file's import as the receiver** (`check_name.rs`, `term_import_prefix_for`). The
+  prefixes of value imports are kept for the whole run, keyed by the member's owner. A service's
+  `import gitbucket.core.model.Profile.currentDate` files `trait Profile` under the object path, and
+  from then on a component's own `profile` -- and `dateColumnType`, the implicit a table class nested
+  in the component takes from the self type -- was read as the object's. The test that a member is
+  `this`'s asked only whether the current class *inherits* its owner; a self type is not
+  inheritance, and a nested class inherits nothing of its component. It is now
+  `SymbolTable::enclosing_class_reaching` (the class, a parent, or the self type, of the current
+  class or any class enclosing it) -- the same walk `ident_prefix_class` and the macro wire's
+  `this_qualifier_of` use. In gitbucket every `mapTo` prefix was
+  `_root_.gitbucket.core.model.Profile.profile.api`; all 31 are `XComponent.this.profile.api` now,
+  as nsc has them. With an implicit in `trait Profile` the same entry, a symbolic path, reached
+  codegen as a receiver and the file was rejected ("unresolved ident").
+* **A view from an object of an instance** (`implicits.rs`, `instance_object_import_prefix`).
+  `import profile.obj._` where `obj` is an `object` inside `profile`'s class: the implicit was
+  emitted as a bare name and loaded as the `obj` of a cast `this`. It now takes the path the scope's
+  own binding was imported under.
+* **An import root shadowed where it is used** (`check_name.rs`, `writable_import_prefix`). `def
+  shadowed(profile: Int) = "s".shout` after `import profile.api._` still means `this`'s `profile`;
+  the rewrite into `C.this.profile` only looked for `profile`'s owner among the *enclosing* classes,
+  and a self type's member is not one of them.
+
+#### Found on the way and not fixed here
+
+1. **A silent miscompile: the outer instance of a superclass named through an alias.**
+   `trait Api { self => class Inner(val n: Int); trait Aliases { type Inner = self.Inner }; val api:
+   Aliases = … }`, then `trait Comp { self: HasProf => import prof.api._; class Mine(k: Int) extends
+   Inner(k) }`: scala-rs passes `Comp.this` where `prof` belongs and the constructor throws
+   `ClassCastException` at run time. gitbucket's every table (`extends Table[…]` through `import
+   profile.api._`) has this shape; `gbmac_mapto.scala` writes `extends profile.Table[…]` to stay clear
+   of it. `import prof._; … extends Direct(k)` with the alias in `Api` itself, and `extends
+   prof.Inner(k)`, are right; what fails is an alias one member down -- `extends Inner(k)` or `new
+   Inner(k)` through `prof.api`, and `new prof.api.Inner(k)` written out. The outer is `Api.this` as
+   seen from `prof.api`, i.e. the prefix of `prof.api`'s *type* (`prof.Aliases`); `Type::Class`
+   carries no prefix, so `Aliases` declared as `Api.this.Aliases` and as `other.Aliases` look alike
+   (slick's `api` is pickled as `JdbcProfile.this.API`, and that `ThisType` is dropped on reading;
+   `SymbolTable::binary_alias_prefixes` records an alias's own prefix and is read by nothing). This
+   is the prefix-carrying class type redesign `agent/prefixtypes` owns. The backend falls back to
+   the nearest enclosing instance (`load_outer_arg`) instead of refusing; turning that fallback into
+   a diagnostic would make each gitbucket table a compile error rather than a run-time one.
+2. `x.mapTo[R]` through an implicit view is "not a member" until something else has loaded
+   `ShapedValue`'s members (a class with `column[String]("A")` columns and no `O.PrimaryKey` shows it;
+   gitbucket does not).
+3. An applied abstract type member from a jar does not conform through its bound:
+   `slick.lifted.Shape.repColumnShape(dateColumnType)` with `dateColumnType: BaseColumnType[Date]`
+   is "no matching overload" (scalac accepts), and the same shape written as source overflows the
+   stack. With §3 it no longer reaches `mapTo`; `MappedColumnType.base[…]`'s "no implicit …
+   BaseColumnType[Timestamp]" in gitbucket's `Profile.scala` may be the same root.
+4. `super.m` in a class that `extends java.lang.Object` explicitly is "`super` has no parent type".
+5. `_root_.X` for a class `X` in the empty package is accepted; nsc rejects it.
+6. A case class read from a class-file *directory* fails `R <: Product with Serializable`; from a jar
+   it passes.
+7. `FixedSqlStreamingAction[…, Read] <: DBIOAction[R, NoStream, Nothing]` is rejected, so
+   `db.run(query.result)` does not typecheck; `gbmac_mapto.scala` runs `query.result.map(x => x)`.
+8. (Fixed; see "The receiver of a self-type member" above.) In a component trait with `self:
+   Profile =>`, `profile` was read as the member of gitbucket's `object Profile` rather than
+   `this`'s.
+9. `O PrimaryKey` without `scala.language.postfixOps` is a warning in scala-rs and an error in scalac
+   2.13.16 ("postfix operator PrimaryKey needs to be enabled"); gitbucket enables the feature.
+
+### 7.26 `reify { … }` over the typed body (the `agent/reify` slice)
 
 `reify` now walks the **typed** body and rebuilds every reference from the
 symbol it resolved to -- nsc's own rule -- instead of classifying the parsed

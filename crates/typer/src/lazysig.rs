@@ -470,7 +470,14 @@ impl Typer {
                 Type::Method { ret, .. } => ret.is_no_type() || ret.is_error(),
                 ty => ty.is_no_type() || ty.is_error(),
             };
-            if unresolved || cyclic_now {
+            // A header-pass completion is provisional even when it resolves:
+            // constructors and member signatures are not typed yet, so the
+            // right-hand side was checked against half a symbol table and
+            // reported nothing (`val a = new X("s"); import a._` compiled;
+            // scala/scala `neg/t1038`). The type it found stays on the symbol
+            // for the rest of the header pass; the definition itself is typed
+            // again, for real, when a later pass reaches or needs it.
+            if unresolved || cyclic_now || self.header_pass {
                 self.diags.truncate(mark);
                 if cyclic_now {
                     self.lazy_cyclic.remove(&id);

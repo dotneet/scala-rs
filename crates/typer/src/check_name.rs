@@ -396,16 +396,25 @@ impl Typer {
     /// Shared by the two places that need it: rewriting a bare name back into
     /// `u.name` for the backend ([`Self::qualify_term_import`]), and reading
     /// an imported implicit at the prefix's type
-    /// (`Typer::implicit_candidate_ty`). A member the enclosing class already
-    /// has is reached through `this` and is not this import's.
+    /// (`Typer::implicit_candidate_ty`). A member an enclosing class already
+    /// has is reached through that class's `this` and is not this import's.
+    ///
+    /// "Has" is [`SymbolTable::enclosing_class_reaching`]'s: the class itself,
+    /// a parent, or its self type, for the current class *or any class
+    /// enclosing it*. The prefixes are kept for the whole run and keyed by the
+    /// member's owner, so the entry this would answer with can be another
+    /// file's import. gitbucket's services write `import
+    /// gitbucket.core.model.Profile.currentDate`, which files `trait Profile`
+    /// under the object path; every component `trait X { self: Profile => …
+    /// }` then read its own `profile` -- and every table class nested in it
+    /// its `dateColumnType` -- as `gitbucket.core.model.Profile.profile`, the
+    /// object's, where nsc has `X.this.profile`. One instance in gitbucket;
+    /// for any other the program silently used the wrong one.
     pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<Tree> {
         if owner.is_none() || self.term_import_prefixes.is_empty() {
             return None;
         }
-        if !self.st.this_class.is_none()
-            && (owner == self.st.this_class
-                || crate::pickle_supply::inherits_from(&self.st, self.st.this_class, owner))
-        {
+        if self.st.enclosing_class_reaching(owner).is_some() {
             return None;
         }
         self.term_import_prefixes
@@ -431,7 +440,7 @@ impl Typer {
     /// that view, and `+` fell to `any2stringadd`. Only a member of a class
     /// the reference sits inside can be re-spelled this way; a shadowed
     /// local has no other spelling and stays out of reach.
-    fn writable_import_prefix(&self, q: &Tree) -> Option<Tree> {
+    pub(crate) fn writable_import_prefix(&self, q: &Tree) -> Option<Tree> {
         if self.prefix_in_scope(q) {
             return Some(q.clone());
         }
@@ -458,19 +467,20 @@ impl Typer {
         if cls.is_none() || !self.st.get(cls).is_class_like() {
             return None;
         }
-        let mut c = self.st.this_class;
-        while !c.is_none() && c != cls {
-            c = self.st.get(c).owner;
-        }
-        if c.is_none() {
-            return None;
-        }
+        // The `this` that reaches `cls`: an enclosing class that is `cls`,
+        // inherits it, or has it in its self type. A component trait reads
+        // `import profile.api._` through `self: Profile =>`, and `profile` is
+        // `Profile`'s, which no class *encloses*; requiring an enclosing
+        // `cls` itself dropped the prefix, and the view `profile.api.wrap`
+        // was emitted as a bare `wrap` on a cast `this` (a
+        // `ClassCastException` from a program that typechecked).
+        let c = self.st.enclosing_class_reaching(cls)?;
         let this = Tree {
             span: root.span,
-            sym: cls,
-            ty: self.st.self_type_of_class(cls),
+            sym: c,
+            ty: self.st.self_type_of_class(c),
             ..Tree::dummy(TreeKind::This {
-                qual: (cls != self.st.this_class).then(|| self.st.get(cls).name.clone()),
+                qual: (c != self.st.this_class).then(|| self.st.get(c).name.clone()),
             })
         };
         let name = name.clone();
@@ -1548,6 +1558,15 @@ impl Typer {
                 }
             }
         }
+        // A type member an enclosing class inherits from a jar ancestor. The
+        // template scope holds what `enter_inherited_members` found in the
+        // symbol table, and a jar class's aliases are not there: an alias
+        // leaves no trace in the bytecode. Only asked when the name has no
+        // binding at all -- a default import (`scala._`, `Predef`) keeps
+        // answering as it always has.
+        if !default_type && self.library_abi && self.expose_inherited_binary_type(name) {
+            return;
+        }
         // Not from a jar: a source package member. `lookup_member` already
         // sees a package object's members through the package (see
         // `package_object_of`'s "a package object's members are the
@@ -1611,6 +1630,57 @@ impl Typer {
         }
     }
 
+    /// Bind `name` to a type member one of the enclosing classes inherits
+    /// from a class read from a jar, innermost class first
+    /// ([`crate::pickle_supply::PickleSupply::complete_inherited_type_member`]).
+    ///
+    /// The walk visits each enclosing class's ancestors breadth-first, the
+    /// order `enter_inherited_members` uses. A source ancestor's own members
+    /// are already in the template scope, so only a *binary* ancestor is
+    /// asked, and not its parents: its pickle lookup walks its whole
+    /// linearisation itself.
+    fn expose_inherited_binary_type(&mut self, name: &str) -> bool {
+        let mut enclosing = Vec::new();
+        let mut cur = self.st.this_class;
+        for _ in 0..64 {
+            if cur.is_none() {
+                break;
+            }
+            if self.st.get(cur).is_class_like() {
+                enclosing.push(cur);
+            }
+            cur = self.st.get(cur).owner;
+        }
+        for cls in enclosing {
+            let mut work: std::collections::VecDeque<Type> =
+                self.st.get(cls).parents.iter().rev().cloned().collect();
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(cls.0);
+            while let Some(p) = work.pop_front() {
+                let Some(pid) = self.st.class_sym_of(&p) else {
+                    continue;
+                };
+                if !seen.insert(pid.0) {
+                    continue;
+                }
+                if self.is_current_run_class(pid) {
+                    work.extend(self.st.get(pid).parents.iter().rev().cloned());
+                    continue;
+                }
+                if let Some(id) = self.pickle.complete_inherited_type_member(
+                    &mut self.st,
+                    &mut self.binary,
+                    pid,
+                    name,
+                ) {
+                    self.st.enter_in_current(name, id);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Is `outer` `inner` itself, or one of its enclosing packages?
     fn encloses_package(&self, outer: SymbolId, inner: SymbolId) -> bool {
         let mut cur = inner;
@@ -1637,7 +1707,22 @@ impl Typer {
     pub(crate) fn open_packages(&self, from: SymbolId) -> Vec<SymbolId> {
         let encl = self.enclosing_package(from);
         let mut out = vec![encl];
-        if let Some(opened) = self.open_pkgs.get(&self.file_index) {
+        // The clauses that open `encl` itself say which of its enclosing
+        // packages are open too: only the ones they are nested in.
+        let chains: Vec<&Vec<SymbolId>> = self
+            .open_pkg_chains
+            .get(&self.file_index)
+            .map(|cs| cs.iter().filter(|c| c.last() == Some(&encl)).collect())
+            .unwrap_or_default();
+        if !chains.is_empty() {
+            for chain in chains {
+                for &p in chain.iter().rev() {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        } else if let Some(opened) = self.open_pkgs.get(&self.file_index) {
             // Innermost first, and only the ones this definition is actually
             // inside: two sibling clauses in one file do not see each other.
             for &p in opened.iter().rev() {
@@ -2242,36 +2327,33 @@ impl Typer {
         if prefix == owner {
             return ty;
         }
-        self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty)
+        // Selected on `prefix.this`: that is the prefix an inner class in
+        // the member's type gets (`prefix.rs`), not the class type it is
+        // read through -- `def use: In = mk` inside `Sub` reads `mk`'s `In`
+        // as `Sub.this.In`.
+        self.st.subst_as_seen_from_at(
+            &self.class_this_ty(prefix),
+            Some(&Type::ThisType(prefix)),
+            &ty,
+        )
     }
 
-    /// The class whose `this` an unqualified reference to a member of
-    /// `owner` is selected on: the innermost enclosing class that has `owner`
-    /// as a base class (or is `owner`), which is not always the class the
-    /// reference is written in.
+    /// The enclosing class an unqualified reference to a member of `owner`
+    /// is made through -- nsc's `C.this` for the innermost enclosing `C` that
+    /// has the member, by inheritance or through its self type. Usually that
+    /// is `this_class` itself; it is an *outer* class when the name was found
+    /// in an enclosing template. cats' `trait Parallel[M[_]] extends
+    /// NonEmptyParallel[M]` writes `new ApplicativeError[F, E] { … parallel(…)
+    /// … }`, and `parallel: M ~> F` read through the anonymous class kept
+    /// `NonEmptyParallel`'s own `M` -- `no matching overload for (M[A])F[A]
+    /// with arguments (M[A])`, two `M`s printed alike.
     ///
-    /// `SetOps[A, CC, C]` declares `private class SubsetsItr` whose `next()`
-    /// calls the inherited `newSpecificBuilder` bare. That member is
-    /// `IterableOps`', and the reference means `SetOps.this.newSpecificBuilder`
-    /// -- `SubsetsItr` does not extend `IterableOps` at all. Reading it through
-    /// `SubsetsItr` left `IterableOps`' own `A` and `C` in place, so
-    /// `buf += elms(idx)` was "no matching overload ... with arguments (A)".
-    ///
-    /// Falls back to the current class when no enclosing class derives from
-    /// `owner` (a member reached some other way keeps what it did before).
+    /// Falls back to `this_class` when no enclosing class has the member, so
+    /// every shape that was read through `this_class` before still is.
     pub(crate) fn ident_prefix_class(&self, owner: SymbolId) -> SymbolId {
-        let mut c = self.st.this_class;
-        while !c.is_none() {
-            if matches!(
-                self.st.get(c).kind,
-                SymKind::Class | SymKind::ModuleClass | SymKind::Module
-            ) && (c == owner || self.st.is_ancestor_of(owner, c))
-            {
-                return c;
-            }
-            c = self.st.get(c).owner;
-        }
-        self.st.this_class
+        self.st
+            .enclosing_class_reaching(owner)
+            .unwrap_or(self.st.this_class)
     }
 
     /// The prefix an inner class is instantiated through, for reading its
@@ -2293,6 +2375,13 @@ impl Typer {
     pub(crate) fn ctor_outer_prefix(&self, class_id: SymbolId, tpt: &Tree) -> Option<Type> {
         if class_id.is_none() {
             return None;
+        }
+        // The head already carries the prefix (`prefix.rs`): `new o.In(…)`,
+        // or the `new Rec(…)` the `copy` rewrite builds for an `r: o.Rec`.
+        if let Some(pre) = crate::prefix::view_prefix(&tpt.ty) {
+            if !pre.is_no_type() {
+                return Some(pre.clone());
+            }
         }
         let owner = self.st.get(class_id).owner;
         if owner.is_none()
@@ -2432,7 +2521,11 @@ impl Typer {
                 {
                     let prefix = self.ident_prefix_class(owner);
                     if prefix != owner {
-                        ty = self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty);
+                        ty = self.st.subst_as_seen_from_at(
+                            &self.class_this_ty(prefix),
+                            Some(&Type::ThisType(prefix)),
+                            &ty,
+                        );
                     }
                 }
             }

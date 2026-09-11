@@ -1,0 +1,9 @@
+small
+string x
+other 
+list from one, rest 2 of 3
+map 1
+pair 7
+other 3.5
+t/t!:base,t/t!:base
+3

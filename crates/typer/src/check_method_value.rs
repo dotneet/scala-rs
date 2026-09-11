@@ -94,6 +94,10 @@ impl Typer {
     /// type expected. Returns whether it applied: in 2.13 mode `tree` is then
     /// an error, under `-Xsource:3` it is the eta-expansion.
     pub(crate) fn adapt_method_value(&mut self, tree: &mut Tree) -> bool {
+        if matches!(tree.ty, Type::Overload(_)) && self.adapt_overloaded_value(tree, &Type::NoType)
+        {
+            return true;
+        }
         let Some(meth) = self.unapplied_method_value(tree) else {
             return self.adapt_method_value_in_branches(tree);
         };

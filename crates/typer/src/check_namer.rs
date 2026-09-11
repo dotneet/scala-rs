@@ -26,6 +26,11 @@ impl Typer {
                 if !opened.contains(&pkg) {
                     opened.push(pkg);
                 }
+                let chain = self.pkg_nest.clone();
+                let chains = self.open_pkg_chains.entry(self.file_index).or_default();
+                if !chains.contains(&chain) {
+                    chains.push(chain);
+                }
                 self.st.push_scope();
                 // First pass: enter classes/modules so they can forward-ref.
                 for stt in stats.iter_mut() {
@@ -452,6 +457,15 @@ impl Typer {
                     }
                     let fid = self.st.alloc(name, id, SymKind::Term, flags, "");
                     self.st.get_mut(fid).private_within = mods.private_within.clone();
+                    // `class C6(@compileTimeOnly("C6.x") val x: Int)`: the
+                    // annotation reaches the accessor (`@meta.getter`); the
+                    // other parameter annotations stay where they were.
+                    self.st.get_mut(fid).annotations = mods
+                        .annotations
+                        .iter()
+                        .filter(|a| crate::compile_time_only::is_cto_path(&a.annotation_path()))
+                        .cloned()
+                        .collect();
                     self.st.enter_in_current(name, fid);
                     p.sym = fid;
                     fields.push(fid);
@@ -674,6 +688,22 @@ impl Typer {
         }
         if ctor.is_error() || args.iter().any(|a| a.is_error()) {
             return Type::Error;
+        }
+        // `o.In[Int]` / `In[Int]` inside `Outer`: the constructor carries a
+        // prefix (`prefix.rs`); the arguments go to the class under it.
+        if crate::prefix::view_prefix(&ctor).is_some() {
+            let Type::Refined { parents, decls } = ctor else {
+                unreachable!()
+            };
+            let core = parents.into_iter().next().unwrap_or(Type::Error);
+            let applied = self.apply_types(core, args, span);
+            return match applied {
+                Type::Class { .. } => Type::Refined {
+                    parents: vec![applied],
+                    decls,
+                },
+                other => other,
+            };
         }
         // An unresolved name applied to type arguments is a missing type, not a
         // kind error: nsc reports `not found: type X`.
