@@ -124,6 +124,41 @@ fn modifiers_are_known(st: &SymbolTable, m: SymbolId) -> bool {
     m.0 >= st.prelude_end && st.get(m).pickled_origin.is_empty()
 }
 
+/// A member of `Any` or `AnyVal` that nsc defines concretely, although the
+/// prelude declares it like every other hand-written member (so
+/// `modifiers_are_known` cannot vouch for it).
+///
+/// A value class's base classes stop at `Any` (`full_lin`), so these -- not
+/// `java.lang.Object`'s -- are what its `toString` or `getClass` redefines,
+/// and scalac 2.13.16 wants `override` on them:
+///
+/// ```scala
+/// class V(val x: Int) extends AnyVal { def getClass(): Class[_] = null }
+/// // `override` modifier required to override concrete member:
+/// // def getClass(): Class[_ <: AnyVal] (defined in class AnyVal)
+/// ```
+///
+/// `equals` and `hashCode` are left out: a value class may not redefine them
+/// at all (SIP-15 criterion 5, `crate::valueclass`), which is the error nsc
+/// reports.
+///
+/// Not when `cls` is itself `Any` or `AnyVal`: compiling the library's own
+/// `AnyVal.scala` declares the very member the prelude stands in for.
+fn universal_member_is_concrete(st: &SymbolTable, cls: SymbolId, base: SymbolId) -> bool {
+    let universal = |c: SymbolId| {
+        c == st.any_sym
+            || c == st.anyval_sym
+            || matches!(st.get(c).jvm_name.as_str(), "scala/Any" | "scala/AnyVal")
+    };
+    if universal(cls) {
+        return false;
+    }
+    let s = st.get(base);
+    s.kind == SymKind::Method
+        && ((s.owner == st.any_sym && s.name == "toString")
+            || (s.owner == st.anyval_sym && s.name == "getClass"))
+}
+
 /// nsc's `OverridingPairs.Cursor.exclude`: a **bare** constructor parameter is
 /// `private[this]` and is not a member at all, so it neither overrides nor
 /// implements anything. slick's `class JdbcFunction(name: String) extends
@@ -361,7 +396,9 @@ fn show_decl_of(st: &SymbolTable, m: SymbolId, ty: &Type) -> String {
 fn show_decl_of_at(st: &SymbolTable, m: SymbolId, ty: &Type, cls: SymbolId) -> String {
     let s = st.get(m);
     let mut out = String::new();
-    if s.flags.contains(Flags::FINAL) {
+    // The prelude stamps `FINAL` on every member it declares; only a member
+    // whose modifiers were read from a source or a class file is shown final.
+    if s.flags.contains(Flags::FINAL) && modifiers_are_known(st, m) {
         out.push_str("final ");
     }
     if s.abstract_override {
@@ -1502,7 +1539,7 @@ fn check_pair(
     //    one as deferred in an abstract class is not an override (scalac
     //    accepts `abstract class D extends B { def f: Int }`).
     if !base_deferred
-        && modifiers_are_known(st, base)
+        && (modifiers_are_known(st, base) || universal_member_is_concrete(st, cls, base))
         && !child_deferred
         && !st.get(child).flags.contains(Flags::OVERRIDE)
         && !st.get(child).abstract_override

@@ -44,6 +44,15 @@ impl Typer {
                     }
                 }
                 for s in stats.iter_mut() {
+                    // A top-level definition's annotations are resolved in
+                    // the package's scope; a member's are resolved by
+                    // `check_stored_annotations` in its template's.
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) {
+                        self.resolve_annotation_types(s);
+                    }
                     self.typer(s);
                 }
                 self.st.pop_scope();
@@ -531,6 +540,7 @@ impl Typer {
             self.check_abstract_override_grounded(id, tree_span, &headline);
             self.check_overrides(id, &body_snapshot, tree_span);
             self.check_double_defs(id, &body_snapshot);
+            self.check_default_overloads(id, tree_span);
             let missing_headline = if anon {
                 "object creation impossible.".to_string()
             } else {
@@ -801,6 +811,7 @@ impl Typer {
             self.check_abstract_override_grounded(cls, mod_span, &headline);
             self.check_overrides(cls, &body_snapshot, mod_span);
             self.check_double_defs(cls, &body_snapshot);
+            self.check_default_overloads(cls, mod_span);
             self.check_missing_implementations(cls, mod_span, &headline);
         }
         self.st.pop_scope();
@@ -2349,6 +2360,7 @@ impl Typer {
     }
 
     pub(crate) fn check_stored_annotations(&mut self, tree: &Tree) {
+        self.resolve_annotation_types(tree);
         let mods = match &tree.kind {
             TreeKind::DefDef { mods, .. }
             | TreeKind::ValDef { mods, .. }

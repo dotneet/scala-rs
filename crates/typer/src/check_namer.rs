@@ -26,6 +26,11 @@ impl Typer {
                 if !opened.contains(&pkg) {
                     opened.push(pkg);
                 }
+                let chain = self.pkg_nest.clone();
+                let chains = self.open_pkg_chains.entry(self.file_index).or_default();
+                if !chains.contains(&chain) {
+                    chains.push(chain);
+                }
                 self.st.push_scope();
                 // First pass: enter classes/modules so they can forward-ref.
                 for stt in stats.iter_mut() {
