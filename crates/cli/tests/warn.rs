@@ -137,6 +137,26 @@ fn deprecations_listed_expected_is_scalacs() {
     check_scalac("warn_depr", &["-deprecation"], "warn_depr_flag");
 }
 
+#[test]
+fn later_phase_warnings_match_scalac() {
+    check_ours("warn_later", &[], "warn_later");
+}
+
+#[test]
+fn later_phase_expected_is_scalacs() {
+    check_scalac("warn_later", &[], "warn_later");
+}
+
+#[test]
+fn later_phase_deprecations_listed_match_scalac() {
+    check_ours("warn_later", &["-deprecation"], "warn_later_flag");
+}
+
+#[test]
+fn later_phase_deprecations_listed_expected_is_scalacs() {
+    check_scalac("warn_later", &["-deprecation"], "warn_later_flag");
+}
+
 /// `-Werror` keeps the warnings as warnings and fails the run with one
 /// position-less error after the summaries, as nsc does.
 #[test]
@@ -174,7 +194,7 @@ fn warned_programs_still_run() {
     let Some(jar) = scala_library_jar() else {
         return;
     };
-    for name in ["warn_patmat", "warn_pure", "warn_depr"] {
+    for name in ["warn_patmat", "warn_pure", "warn_depr", "warn_later"] {
         let dir = tmp_dir(name);
         let o = Command::new(bin())
             .current_dir(fixtures_dir())
@@ -189,6 +209,7 @@ fn warned_programs_still_run() {
         let main = match name {
             "warn_patmat" => "WarnPatmat",
             "warn_pure" => "WarnPure",
+            "warn_later" => "WarnLater",
             _ => "WarnDepr",
         };
         let cp = format!("{}:{}", dir.display(), jar.display());

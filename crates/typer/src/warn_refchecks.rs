@@ -638,6 +638,144 @@ impl<'a> Refchecks<'a> {
         for s in &impl_.body {
             self.tree(s, false);
         }
+        for s in &impl_.body {
+            self.unused_specialized(s);
+        }
+    }
+
+    // --- SpecializeTypes.normalizeMember -----------------------------------
+
+    /// A member method's `@specialized` type parameters that no
+    /// specializable position of its signature mentions.
+    fn unused_specialized(&mut self, def: &Tree) {
+        let TreeKind::DefDef { mods, name, tparams, .. } = &def.kind else {
+            return;
+        };
+        // nsc skips default getters (`hasDefault`), which are synthetic here;
+        // a method that merely has default arguments is checked.
+        if mods.flags.contains(Flags::SYNTHETIC) || def.sym.is_none() {
+            return;
+        }
+        let stps: Vec<(SymbolId, &str)> = tparams
+            .iter()
+            .filter(|tp| !tp.sym.is_none() && self.st.get(tp.sym).specialized.is_some())
+            .filter_map(|tp| match &tp.kind {
+                TreeKind::TypeDef { name, .. } => Some((tp.sym, name.as_str())),
+                _ => None,
+            })
+            .collect();
+        if stps.is_empty() {
+            return;
+        }
+        // `specializedTypeVars(sym.info)`: the signature, then the type
+        // parameters' bounds.
+        let mut used = HashSet::new();
+        let info = self.st.get(def.sym).ty.clone();
+        self.specialized_type_vars(&info, &mut used);
+        for tp in tparams {
+            if tp.sym.is_none() {
+                continue;
+            }
+            let s = self.st.get(tp.sym);
+            let bounds: Vec<Type> = [&s.bound_lo, &s.bound_hi].into_iter().flatten().cloned().collect();
+            for b in &bounds {
+                self.specialized_type_vars(b, &mut used);
+            }
+        }
+        let unused: Vec<String> = stps
+            .iter()
+            .filter(|(sym, _)| !used.contains(sym))
+            .map(|(_, n)| format!("type {n}"))
+            .collect();
+        if unused.is_empty() {
+            return;
+        }
+        let verb = if unused.len() == 1 { "is" } else { "are" };
+        let at = def_name_point(def, name, self.src);
+        let d = warning_at(
+            self.file,
+            at,
+            at + name.len() as u32,
+            format!("{} {verb} unused or used in non-specializable positions.", unused.join(", ")),
+            Phase::Specialize,
+            self.fatal,
+        );
+        self.out.push(d);
+    }
+
+    /// nsc `specializedTypeVars` over the member's type after uncurry: a
+    /// by-name parameter is a `Function0`, a repeated one a `Seq`.
+    fn specialized_type_vars(&self, ty: &Type, out: &mut HashSet<SymbolId>) {
+        match ty {
+            Type::TypeParam(s) => {
+                if self.st.get(*s).specialized.is_some() {
+                    out.insert(*s);
+                }
+            }
+            Type::Array(e) | Type::ByName(e) => self.specialized_type_vars(e, out),
+            Type::Class { sym, args } => {
+                for (i, a) in args.iter().enumerate() {
+                    if self.class_tparam_specialized(*sym, i) {
+                        self.specialized_type_vars(a, out);
+                    }
+                }
+            }
+            // `Function0`-`Function2` and `Tuple1`/`Tuple2` specialize every
+            // type parameter.
+            Type::Function { params, ret } if params.len() <= 2 => {
+                for p in params {
+                    self.specialized_type_vars(p, out);
+                }
+                self.specialized_type_vars(ret, out);
+            }
+            Type::Tuple(ts) if ts.len() <= 2 => {
+                for t in ts {
+                    self.specialized_type_vars(t, out);
+                }
+            }
+            Type::Method { paramss, ret } => {
+                for p in paramss.iter().flatten() {
+                    self.specialized_type_vars(p, out);
+                }
+                self.specialized_type_vars(ret, out);
+            }
+            Type::Applied { ctor, .. } => self.specialized_type_vars(ctor, out),
+            Type::Annotated { tpe, .. } => self.specialized_type_vars(tpe, out),
+            Type::Refined { parents, .. } => {
+                for p in parents {
+                    self.specialized_type_vars(p, out);
+                }
+            }
+            Type::BoundedWildcard { lo, hi } => {
+                for b in [lo, hi].into_iter().flatten() {
+                    self.specialized_type_vars(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether type parameter `i` of class `cls` is `@specialized`: recorded
+    /// for source classes; for the library, the classes of `scala` that
+    /// specialize every type parameter.
+    fn class_tparam_specialized(&self, cls: SymbolId, i: usize) -> bool {
+        let c = self.st.get(cls);
+        if let Some(tp) = c.tparams.get(i) {
+            if self.st.get(*tp).specialized.is_some() {
+                return true;
+            }
+        }
+        let owner = if c.owner.is_none() { "" } else { self.st.get(c.owner).name.as_str() };
+        match owner {
+            "scala" => matches!(
+                c.name.as_str(),
+                "Function0" | "Function1" | "Function2" | "Tuple1" | "Tuple2" | "Product1" | "Product2"
+            ),
+            "runtime" => {
+                matches!(c.name.as_str(), "AbstractFunction0" | "AbstractFunction1" | "AbstractFunction2")
+            }
+            _ => false,
+        }
     }
 
     /// The children of a tree that does not pass an expected type on.
@@ -897,6 +1035,24 @@ impl ValueKind {
 
 /// `def f(...) { ... }` (no `=`, no result type): nsc's procedure syntax, a
 /// `Unit` method. (Our parser leaves the result type to inference.)
+/// nsc's position of a `def`: its name.
+fn def_name_point(def: &Tree, name: &str, src: &str) -> u32 {
+    let lo = def.span.lo.0 as usize;
+    let hi = (def.span.hi.0 as usize).min(src.len());
+    let text = src.get(lo..hi).unwrap_or("");
+    let mut from = 0;
+    while let Some(i) = text[from..].find("def") {
+        let after = from + i + 3;
+        let rest = &text[after..];
+        let trimmed = rest.trim_start();
+        if trimmed.len() < rest.len() && trimmed.starts_with(name) {
+            return (lo + after + (rest.len() - trimmed.len())) as u32;
+        }
+        from = after;
+    }
+    def.span.lo.0
+}
+
 pub(crate) fn is_procedure_syntax(def: &Tree, rhs: &Tree, src: &str) -> bool {
     let TreeKind::DefDef { tpt, name, .. } = &def.kind else {
         return false;
