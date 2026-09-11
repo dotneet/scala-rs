@@ -415,6 +415,45 @@ fn show_sig_at(st: &SymbolTable, m: SymbolId, ty: &Type, ret: &Type, cls: Symbol
 
 // ------------------------------------------------------------------ matching
 
+/// nsc reads `java.lang.Object` in a Java signature as `ObjectTpeJava`, a
+/// type that is the same as `Any` *and* as `AnyRef` (nsc `matchingParams`).
+/// This compiler reads a Java `Object` parameter as `Any`, so `override def
+/// contains(o: Object)` / `remove(elem: AnyRef)` over a
+/// `java.util.AbstractCollection` method (`JavaCollectionWrappers`, four
+/// times) compared `AnyRef` with `Any` and "overrode nothing", where scalac
+/// accepts `AnyRef`, `Object` and `Any` alike. When either member of the pair
+/// is a Java one, both sides are compared with every spelling of `Object`
+/// folded to `Any` -- inside type arguments too, which is what gitbucket's
+/// `migrate` over a Java `Map<String, Object>` needs. Between two Scala
+/// members nothing is folded: there `Any` and `AnyRef` really are two
+/// overloads.
+fn java_object_params(st: &SymbolTable, java: bool, paramss: Vec<Vec<Type>>) -> Vec<Vec<Type>> {
+    if !java {
+        return paramss;
+    }
+    let fold = |t: &Type| {
+        crate::symbol::map_type(t, &mut |n: &Type| match n {
+            Type::AnyRef | Type::JavaObject => Type::Any,
+            Type::Class { sym, args }
+                if args.is_empty() && (*sym == st.object_sym || *sym == st.anyref_sym) =>
+            {
+                Type::Any
+            }
+            other => other.clone(),
+        })
+    };
+    paramss
+        .into_iter()
+        .map(|ps| ps.iter().map(fold).collect())
+        .collect()
+}
+
+/// Whether a pair of members is compared with Java's `Object` folded
+/// ([`java_object_params`]).
+fn java_pair(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
+    st.get(base).flags.contains(Flags::JAVA) || st.get(child).flags.contains(Flags::JAVA)
+}
+
 /// `def f: T` and `def f(): T` match, so a single empty clause is dropped.
 fn norm_paramss(paramss: &[Vec<Type>]) -> Vec<Vec<Type>> {
     if paramss.len() == 1 && paramss[0].is_empty() {
@@ -681,32 +720,18 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
         Type::Method { paramss, .. } => norm_paramss(paramss),
         _ => Vec::new(),
     };
+    // nsc `matchingParams`: a Java method's `Object` is `ObjectTpeJava`.
+    let java = java_pair(st, child, base);
+    let bps = java_object_params(st, java, bps);
     let rigid = rigid_tparams(st, cls, child);
-    // nsc `matchingParams`: a Java method's `Object` parameter is read as
-    // `Any`, and it still matches a Scala `AnyRef` (`Object`) parameter in
-    // either direction -- `override def remove(elem: AnyRef)` over
-    // `java.util.AbstractSet.remove(Object)`, which scala/scala's own
-    // `JavaCollectionWrappers` writes four times.
-    let (child_java, base_java) = (
-        st.get(child).flags.contains(Flags::JAVA),
-        st.get(base).flags.contains(Flags::JAVA),
-    );
-    let is_any = |t: &Type| matches!(t, Type::Any | Type::JavaObject);
-    let is_object = |t: &Type| {
-        matches!(t, Type::AnyRef | Type::JavaObject)
-            || matches!(t, Type::Class { sym, args } if args.is_empty()
-                && (*sym == st.object_sym || *sym == st.anyref_sym))
-    };
-    let java_object = |ct: &Type, bt: &Type| {
-        (base_java && is_any(bt) && is_object(ct)) || (child_java && is_any(ct) && is_object(bt))
-    };
     let agrees = |cps: &[Vec<Type>]| {
+        let cps = &java_object_params(st, java, cps.to_vec())[..];
         cps.len() == bps.len()
             && cps.iter().zip(bps.iter()).all(|(c, b)| {
                 c.len() == b.len()
                     && c.iter()
                         .zip(b.iter())
-                        .all(|(ct, bt)| same_type(st, &rigid, ct, bt) || java_object(ct, bt))
+                        .all(|(ct, bt)| same_type(st, &rigid, ct, bt))
             })
     };
     // nsc `matchingSymbols` compares `self.memberType(sym1)` with
@@ -761,10 +786,13 @@ fn provably_overloaded(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: S
         Type::Method { paramss, .. } => norm_paramss(paramss),
         _ => return false,
     };
+    let java = java_pair(st, child, base);
+    let bps = java_object_params(st, java, bps);
     let rigid = rigid_tparams(st, cls, child);
     // Proven only when *both* readings of the child say so, mirroring the
     // union `matches` takes.
     let differs = |cps: &[Vec<Type>]| {
+        let cps = &java_object_params(st, java, cps.to_vec())[..];
         cps.len() == bps.len()
             && cps.iter().zip(bps.iter()).any(|(c, b)| {
                 c.len() == b.len()
@@ -789,10 +817,11 @@ fn strict_method_matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base:
     {
         return false;
     }
-    let cps = paramss_of(st, child);
+    let java = java_pair(st, child, base);
+    let cps = java_object_params(st, java, paramss_of(st, child));
     let bty = base_type_at(st, cls, base, child);
     let bps = match &bty {
-        Type::Method { paramss, .. } => norm_paramss(paramss),
+        Type::Method { paramss, .. } => java_object_params(st, java, norm_paramss(paramss)),
         _ => return false,
     };
     cps.len() == bps.len()

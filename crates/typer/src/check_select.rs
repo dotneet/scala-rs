@@ -238,14 +238,8 @@ impl Typer {
             }
         }
         // A template's self alias (`trait Function1[-T1, +R] { self => … }`)
-        // is a name in that template's scope, not a member: `o.self` on an
-        // `F1[Int, Int]` is "value self is not a member", and scala/scala's
-        // `WrappedString` -- whose own `private val self: String` sits beside
-        // `Function1`'s alias -- read `s.self` as an overload of the two.
-        found.retain(|&m| {
-            let owner = self.st.get(m).owner;
-            owner.is_none() || self.st.get(owner).self_alias != Some(m)
-        });
+        // is a name in that template's scope, not a member, and never reaches
+        // `found`: `bind_self_type` keeps it out of the template's `members`.
         // Module: members of module class
         if found.is_empty() {
             if let Type::ModuleRef(id) = &recv_ty {
@@ -726,6 +720,7 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let ty = expand(subst(self.st.get(s).ty.clone()));
+            let ty = self.opaque_projection_params(&qual.ty, ty);
             let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless(s, ty, pt);
             if let Type::Array(elem) = &qual.ty {
@@ -765,6 +760,10 @@ impl Typer {
             let alts: Vec<(SymbolId, Type)> = found
                 .iter()
                 .map(|s| (*s, expand(subst(self.st.get(*s).ty.clone()))))
+                .collect();
+            let alts: Vec<(SymbolId, Type)> = alts
+                .into_iter()
+                .map(|(s, t)| (s, self.opaque_projection_params(&qual.ty, t)))
                 .collect();
             self.overload_member_types.insert(found[0].0, alts.clone());
             let ov = Type::Overload(alts.clone().into_iter().map(|(_, t)| t).collect());
@@ -2722,6 +2721,108 @@ impl Typer {
         }
         tree.ty = Type::Error;
         true
+    }
+
+    /// A member selected through a type projection `A#B` whose prefix leaves
+    /// an abstract type member `T` of `B`'s enclosing class unsettled
+    /// ([`crate::symbol::PROJECTION_MARK`]): in the member's *parameter*
+    /// types `T` is nsc's existential `_1.T forSome { val _1: A }` -- the
+    /// `T` of one particular, unknown instance -- so each selection gets a
+    /// fresh abstract type, bounded like `T` and below `A#T`. Only `Nothing`
+    /// (or a type `T` itself bounds from below) conforms to it:
+    ///
+    /// ```scala
+    /// val a: Base#Inner = new IntBase.Inner
+    /// val b: Base#Inner = new StringBase.Inner
+    /// a.set(b.get())   // found: Base#T  required: _1.T where val _1: Base
+    /// ```
+    ///
+    /// Results keep `T` itself, which is the projection `A#T` scalac packs
+    /// the existential back into, so `val t: Base#T = a.get()` still holds.
+    pub(crate) fn opaque_projection_params(&mut self, recv: &Type, ty: Type) -> Type {
+        let Some((parent, settled)) = crate::symbol::SymbolTable::type_projection_view(recv) else {
+            return ty;
+        };
+        let Type::Method { paramss, ret } = ty else {
+            return ty;
+        };
+        let Some(cls) = self.st.class_sym_of(parent) else {
+            return Type::Method { paramss, ret };
+        };
+        let settled: Vec<String> = settled.into_iter().map(str::to_string).collect();
+        let mut targets: Vec<SymbolId> = Vec::new();
+        for owner in self.st.enclosing_classes(cls).into_iter().skip(1) {
+            for name in self.st.abstract_type_member_names(owner) {
+                if settled.contains(&name) {
+                    continue;
+                }
+                for m in self.st.lookup_member(owner, &name) {
+                    if self.st.is_deferred_type_member(m)
+                        && self.st.get(m).tparams.is_empty()
+                        && !targets.contains(&m)
+                    {
+                        targets.push(m);
+                    }
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Type::Method { paramss, ret };
+        }
+        let mut fresh: Vec<(SymbolId, SymbolId)> = Vec::new();
+        let mut params_out = Vec::with_capacity(paramss.len());
+        for clause in paramss {
+            let mut out = Vec::with_capacity(clause.len());
+            for p in clause {
+                let mut wanted: Vec<SymbolId> = Vec::new();
+                crate::symbol::map_type(&p, &mut |t| {
+                    if let Type::TypeMember(id) = t {
+                        if targets.contains(id) && !wanted.contains(id) {
+                            wanted.push(*id);
+                        }
+                    }
+                    t.clone()
+                });
+                for id in wanted {
+                    if !fresh.iter().any(|(d, _)| *d == id) {
+                        let f = self.fresh_projection_member(id);
+                        fresh.push((id, f));
+                    }
+                }
+                out.push(crate::symbol::map_type(&p, &mut |t| match t {
+                    Type::TypeMember(id) => match fresh.iter().find(|(d, _)| d == id) {
+                        Some((_, f)) => Type::TypeMember(*f),
+                        None => t.clone(),
+                    },
+                    other => other.clone(),
+                }));
+            }
+            params_out.push(out);
+        }
+        Type::Method {
+            paramss: params_out,
+            ret,
+        }
+    }
+
+    /// `_1.T` for [`Self::opaque_projection_params`]: a new abstract type
+    /// member with `T`'s lower bound and `T` itself (the projection) as its
+    /// upper bound, owned by a synthetic value `_1` so it prints the way
+    /// scalac's message does.
+    fn fresh_projection_member(&mut self, decl: SymbolId) -> SymbolId {
+        let name = self.st.get(decl).name.clone();
+        let lo = self.st.get(decl).bound_lo.clone();
+        let holder = self
+            .st
+            .alloc("_1", SymbolId::NONE, SymKind::Term, Flags::SYNTHETIC, "");
+        let id = self
+            .st
+            .alloc(name, holder, SymKind::TypeMember, Flags::SYNTHETIC, "");
+        let s = self.st.get_mut(id);
+        s.ty = Type::TypeMember(id);
+        s.bound_lo = lo;
+        s.bound_hi = Some(Type::TypeMember(decl));
+        id
     }
 
     fn is_assignable_lhs(&self, tree: &Tree) -> bool {

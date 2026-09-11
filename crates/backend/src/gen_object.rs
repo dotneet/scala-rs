@@ -485,7 +485,11 @@ impl<'a> Gen<'a> {
                         name, mods, rhs, ..
                     } = &vd.kind
                     {
-                        if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        // `var x: T = _`: no store (see `emit_ctor`).
+                        if rhs.is_empty()
+                            || rhs.is_default_init()
+                            || mods.flags.contains(Flags::LAZY)
+                        {
                             continue;
                         }
                         asm.aload(0);

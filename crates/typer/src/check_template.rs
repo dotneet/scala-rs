@@ -1209,8 +1209,17 @@ impl Typer {
                 // The signature pass and the body pass both bind the alias;
                 // allocating twice would make `self` look like an overload.
                 let sid = self.st.get(class_id).self_alias.unwrap_or_else(|| {
-                    self.st
-                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "")
+                    let sid = self
+                        .st
+                        .alloc(&name, class_id, SymKind::Term, Flags::SYNTHETIC, "");
+                    // Owned by the template (the `self_alias` checks read the
+                    // owner) but not one of its members: `(x: F).self` is
+                    // `value self is not a member of F` in nsc, and a member
+                    // lookup that walked into `Function1`'s `self =>` made
+                    // `s.self` on `WrappedString(private val self: String)`
+                    // an overload of the field and `Function1.this.type`.
+                    self.st.get_mut(class_id).members.retain(|&m| m != sid);
+                    sid
                 });
                 self.st.get_mut(class_id).self_alias = Some(sid);
                 self.st.get_mut(sid).ty = st;

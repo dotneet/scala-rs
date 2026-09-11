@@ -228,3 +228,38 @@ fn scalac_agrees_libapp_bad() {
     };
     check_rejects("libapp_bad", BAD_LINES, Some(&sc));
 }
+
+/// `libapp_proj` / `libapp_projbad`: members selected through a type
+/// projection `Base#Inner` take the enclosing class's unsettled abstract type
+/// as a fresh abstract type in parameter positions (`neg/sabin2`), while an
+/// object's inherited inner class `IntBase.Inner` reads what the object
+/// settles.
+const PROJBAD_LINES: &[u32] = &[15, 24, 25, 26, 27, 28, 29, 30, 31];
+
+#[test]
+fn libapp_proj_runs() {
+    check_runs("libapp_proj", None);
+}
+
+#[test]
+fn scalac_agrees_libapp_proj() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    check_runs("libapp_proj", Some(&sc));
+}
+
+#[test]
+fn libapp_projbad_is_rejected() {
+    check_rejects("libapp_projbad", PROJBAD_LINES, None);
+}
+
+#[test]
+fn scalac_agrees_libapp_projbad() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    check_rejects("libapp_projbad", PROJBAD_LINES, Some(&sc));
+}

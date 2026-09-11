@@ -7,6 +7,14 @@ use scala_rs_parser::{Flags, RefineDecl, SpecializedType, SpecializedTypes, Symb
 /// identifier, so it can never collide with a real member.
 pub const AS_SEEN_FROM_MARK: &str = "<asSeenFrom>";
 
+/// Second decl name of an as-seen-from view: the view is a *type*
+/// projection `A#B` (a `#` whose prefix is a type, not a stable value) and
+/// leaves an abstract type member of `B`'s enclosing class unsettled. Such a
+/// member means a different type for every instance, so a member selected
+/// through the projection takes it as nsc's existential `_1.T forSome { val
+/// _1: A }` in parameter positions (`Typer::opaque_projection_params`).
+pub const PROJECTION_MARK: &str = "<projection>";
+
 thread_local! {
     /// Type parameters whose upper bound `is_sub_type` is already expanding.
     /// An F-bound (`A <: Rep[A]`) would otherwise recurse forever.
@@ -5845,6 +5853,33 @@ impl SymbolTable {
     ///
     /// Used by `A#B` projection: these are the names whose meaning the
     /// projection prefix can settle.
+    /// For a type-projection view ([`PROJECTION_MARK`]): the projected class
+    /// and the names its prefix settled.
+    pub(crate) fn type_projection_view(ty: &Type) -> Option<(&Type, Vec<&str>)> {
+        let parent = Self::as_seen_from_view(ty)?;
+        let Type::Refined { decls, .. } = ty else {
+            return None;
+        };
+        if !decls
+            .iter()
+            .any(|d| matches!(d, RefineDecl::Type { name, .. } if name == PROJECTION_MARK))
+        {
+            return None;
+        }
+        let settled = decls
+            .iter()
+            .filter_map(|d| match d {
+                RefineDecl::Type { name, .. }
+                    if name != AS_SEEN_FROM_MARK && name != PROJECTION_MARK =>
+                {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        Some((parent, settled))
+    }
+
     pub(crate) fn abstract_type_member_names(&self, cls: SymbolId) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
