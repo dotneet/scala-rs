@@ -928,7 +928,13 @@ impl Typer {
                 let q = qual.clone();
                 let id = self.this_owner(q.as_deref());
                 if id.is_none() {
-                    self.error(tree.span, "`this` is not allowed here");
+                    // nsc `QualifyingClassError`, e.g. `this` in the early
+                    // section of a top-level class, which is typed outside it.
+                    let msg = match q.as_deref() {
+                        Some(name) => format!("{name} is not an enclosing class"),
+                        None => "this can be used only in a class, object, or template".into(),
+                    };
+                    self.error(tree.span, msg);
                     tree.ty = Type::Error;
                 } else {
                     tree.sym = id;

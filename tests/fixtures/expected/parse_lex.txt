@@ -1,0 +1,31 @@
+"quoted" and $ Alice
+hi"$"
+\"Hello\", Alice
+"Hello", Alice
+\TILT\
+\\TILT\\
+a	bA
+1$2
+dash(1,2)
+tag
+kv(9)
+tab(Z)
+back(Y)
+tq(W)
+bs(Q)
+nested(a|b:c|b|c)
+none
+James
+3
+(1,x)
+23
+(1,b)
+true
+1 List(2, 3)
+neg non-neg
+C(16)
+C(24)
+C(24)
+C(16)
+C(-4)
+43

@@ -5,6 +5,7 @@
 //! are tokenized as ordinary Scala.
 
 mod token;
+mod unicode_symbols;
 
 pub use token::{is_operator_name, keyword_kind, Token, TokenKind};
 
@@ -24,8 +25,56 @@ pub fn tokenize_opts(
     let mut lx = Lexer::new(source, file_index);
     lx.unicode_escapes_raw = unicode_escapes_raw;
     lx.tokenize_all();
-    let tokens = drop_non_separating_newlines(lx.tokens);
+    let tokens = drop_semi_before_else(lx.tokens);
+    let tokens = drop_trailing_commas(drop_non_separating_newlines(tokens));
     (tokens, lx.diags)
+}
+
+/// nsc `Scanners.postProcessToken`: `SEMI` followed by `ELSE` is `ELSE`, so
+/// `if (c) a; else b` (and a `;` ending the line before `else`) is one `if`.
+fn drop_semi_before_else(tokens: Vec<Token>) -> Vec<Token> {
+    let drop: Vec<bool> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            matches!(t.kind, TokenKind::Semi)
+                && tokens[i + 1..]
+                    .iter()
+                    .find(|n| !matches!(n.kind, TokenKind::Newline))
+                    .is_some_and(|n| matches!(n.kind, TokenKind::Else))
+        })
+        .collect();
+    tokens
+        .into_iter()
+        .zip(drop)
+        .filter_map(|(t, d)| (!d).then_some(t))
+        .collect()
+}
+
+/// SIP-27 (nsc `Scanners.skipTrailingComma`, called by `inGroupers` and
+/// `tokenSeparated`): a comma followed by a line break and then the `)` or `]`
+/// closing the innermost group is dropped, wherever the group is -- argument
+/// and parameter lists, tuples, type arguments and parameters, patterns, and
+/// the single parenthesized expression, where `(23,\n)` is `23`. On one line
+/// (`f(a, )`) it is kept and the parser rejects it.
+///
+/// A `}` is not handled here: in a block a comma is an error before nsc ever
+/// asks, so only the comma-separated lists in braces (import selectors) accept
+/// one, and the parser checks those itself with [`Token::nl_before`].
+fn drop_trailing_commas(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut it = tokens.into_iter().peekable();
+    while let Some(t) = it.next() {
+        if matches!(t.kind, TokenKind::Comma) {
+            if let Some(next) = it.peek() {
+                if next.nl_before && matches!(next.kind, TokenKind::RParen | TokenKind::RBracket) {
+                    continue;
+                }
+            }
+        }
+        out.push(t);
+    }
+    out
 }
 
 /// nsc `Scanners`: a line break separates statements only when the token before
@@ -94,8 +143,26 @@ fn drop_non_separating_newlines(tokens: Vec<Token>) -> Vec<Token> {
             let mut t = tokens[i].clone();
             t.blank_line = tokens[i..j].iter().any(|t| t.blank_line);
             out.push(t);
+            i = j;
+        } else if let Some(t) = tokens.get(j) {
+            // Dropped here too, so keep the fact on the token after it: a
+            // trailing comma in an import selector list needs it.
+            let mut t = t.clone();
+            t.nl_before = true;
+            match t.kind {
+                TokenKind::LParen => regions.push('('),
+                TokenKind::LBracket => regions.push('['),
+                TokenKind::LBrace => regions.push('{'),
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    regions.pop();
+                }
+                _ => {}
+            }
+            out.push(t);
+            i = j + 1;
+        } else {
+            i = j;
         }
-        i = j;
     }
     out
 }
@@ -378,9 +445,15 @@ impl<'a> Lexer<'a> {
                 }
             }
             '@' => {
-                let lo = self.pos as u32;
-                self.bump();
-                self.emit(TokenKind::At, lo, self.pos as u32);
+                // nsc scans `@` like any operator character and only the
+                // lone `@` is the `AT` token: `type @@[T, U]` names a type.
+                if self.peek_at(1).is_some_and(is_op_char) {
+                    self.lex_operator();
+                } else {
+                    let lo = self.pos as u32;
+                    self.bump();
+                    self.emit(TokenKind::At, lo, self.pos as u32);
+                }
             }
             '#' => {
                 // A lone `#` is the type projection operator; `##` (and any
@@ -549,6 +622,9 @@ impl<'a> Lexer<'a> {
             "<%" => TokenKind::ViewBound,
             "=" => TokenKind::Equals,
             ":" => TokenKind::Colon,
+            // Reached when a comment follows directly (`@/**/`).
+            "@" => TokenKind::At,
+            "#" => TokenKind::Hash,
             _ => TokenKind::Ident(text.to_string()),
         };
         self.emit(kind, lo, self.pos as u32);
@@ -844,14 +920,17 @@ impl<'a> Lexer<'a> {
         let triple = frame.triple;
         let lo = self.pos as u32;
         let mut buf = String::new();
+        // nsc `unclosedStringLit(seenEscapedQuote)`: say why when a `\"` is
+        // what kept the literal open.
+        let mut seen_escaped_quote = false;
         loop {
-            if self.pos >= self.bytes.len() {
-                self.error(lo, self.pos as u32, "unterminated interpolated string");
-                self.interp_stack.pop();
-                return;
-            }
-            if !triple && self.peek() == Some('\n') {
-                self.error(lo, self.pos as u32, "unterminated interpolated string");
+            if self.pos >= self.bytes.len() || (!triple && self.peek() == Some('\n')) {
+                let msg = if seen_escaped_quote {
+                    "unclosed string literal; note that `\\\"` no longer closes single-quoted interpolated string literals since 2.13.6, you can use a triple-quoted string instead"
+                } else {
+                    "unterminated interpolated string"
+                };
+                self.error(lo, self.pos as u32, msg);
                 self.interp_stack.pop();
                 return;
             }
@@ -876,11 +955,23 @@ impl<'a> Lexer<'a> {
                 return;
             }
             if self.peek() == Some('$') {
-                // `$$` is a dollar and `$"` a quote (nsc `getStringPart`).
+                // nsc `getStringPart`: `$$` is a `$` and (since 2.13.6) `$"`
+                // a `"`, in every interpolator and both quote styles.
                 if self.starts_with("$$") || self.starts_with("$\"") {
                     self.bump();
                     buf.push(self.bump().unwrap());
                     continue;
+                }
+                // `$_` is a wildcard hole, legal only in a pattern
+                // (`case s"$_-$x" =>`); the parser says so in an expression.
+                if self.starts_with("$_") {
+                    let part = self.finish_interp_part(std::mem::take(&mut buf), lo);
+                    self.emit(TokenKind::StringPart(part), lo, self.pos as u32);
+                    self.bump(); // $
+                    let us_lo = self.pos as u32;
+                    self.bump(); // _
+                    self.emit(TokenKind::Underscore, us_lo, self.pos as u32);
+                    return;
                 }
                 if self.starts_with("${") {
                     let part = self.finish_interp_part(std::mem::take(&mut buf), lo);
@@ -918,8 +1009,21 @@ impl<'a> Lexer<'a> {
                         return;
                     }
                 }
-                // stray $
+                // Anything else after `$` is nsc's syntax error; the `$` is
+                // then kept as a literal and the string goes on.
+                let dollar = self.pos as u32;
                 buf.push(self.bump().unwrap());
+                let what = match self.peek() {
+                    Some(c) if !(triple && self.starts_with("\"\"\"")) => format!("${c}"),
+                    _ => "$".to_string(),
+                };
+                self.error(
+                    dollar,
+                    dollar + 1,
+                    format!(
+                        "invalid string interpolation {what}, expected: $$, $\", $identifier or ${{expression}}"
+                    ),
+                );
                 continue;
             }
             let escapes = self
@@ -936,6 +1040,7 @@ impl<'a> Lexer<'a> {
                 if escapes == InterpEscapes::Standard && !triple {
                     let elo = self.pos as u32;
                     self.bump();
+                    seen_escaped_quote |= self.peek() == Some('"');
                     match self.read_escape(elo) {
                         Some(ch) => buf.push(ch),
                         None => return,
@@ -948,6 +1053,7 @@ impl<'a> Lexer<'a> {
                 if !triple {
                     buf.push(self.bump().unwrap());
                     if matches!(self.peek(), Some('"') | Some('\\')) {
+                        seen_escaped_quote |= self.peek() == Some('"');
                         buf.push(self.bump().unwrap());
                     }
                     continue;
@@ -988,7 +1094,13 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             let Some(&c) = chars.get(i + 1) else {
-                self.error(lo, self.pos as u32, "invalid escape at end of string part");
+                self.error(
+                    lo,
+                    self.pos as u32,
+                    format!(
+                        "invalid escape at terminal index {i} in \"{s}\". Use \\\\ for literal \\."
+                    ),
+                );
                 return out;
             };
             let simple = match c {
@@ -1025,7 +1137,13 @@ impl<'a> Lexer<'a> {
                 self.error(lo, self.pos as u32, "invalid unicode escape");
                 return out;
             }
-            self.error(lo, self.pos as u32, format!("invalid escape \\{c}"));
+            self.error(
+                lo,
+                self.pos as u32,
+                format!(
+                    "invalid escape '\\{c}' not one of [\\b, \\t, \\n, \\f, \\r, \\\\, \\\", \\', \\uxxxx] at index {i} in \"{s}\". Use \\\\ for literal \\."
+                ),
+            );
             return out;
         }
         out
@@ -1140,7 +1258,10 @@ pub fn is_id_start(c: char) -> bool {
     // identifier and not an error. Code that spells compiler-generated names
     // out in the source relies on it: cats' checked-in simulacrum output
     // writes `implicit ev$1: Defer[G]`.
-    c.is_ascii_alphabetic() || c == '_' || c == '$' || (!c.is_ascii() && c.is_alphabetic())
+    c.is_ascii_alphabetic()
+        || c == '_'
+        || c == '$'
+        || (!c.is_ascii() && c.is_alphabetic() && !is_unicode_symbol(c))
 }
 
 pub fn is_id_part(c: char) -> bool {
@@ -1181,12 +1302,27 @@ pub fn is_op_char(c: char) -> bool {
     ) || (!c.is_ascii() && is_unicode_op(c))
 }
 
+/// nsc `Chars.isSpecial`: a Unicode math (Sm) or other (So) symbol is an
+/// operator character (SLS 1.1) -- `↑`, `☀`, and supplementary ones like
+/// `🌀` too. The table is JDK 17's classification, which is what 2.13 on
+/// the pinned JDK uses.
 fn is_unicode_op(c: char) -> bool {
-    matches!(c, '⇒' | '←' | '→') || {
-        let u = c as u32;
-        // Sm, So — approximation of Scala's op chars
-        matches!(c, '∀'..='⋿') || (0x2200..=0x22FF).contains(&u)
-    }
+    is_unicode_symbol(c)
+}
+
+pub fn is_unicode_symbol(c: char) -> bool {
+    let u = c as u32;
+    unicode_symbols::SYMBOL_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if hi < u {
+                std::cmp::Ordering::Less
+            } else if lo > u {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -1357,5 +1493,121 @@ mod tests {
                 Semi
             ]
         );
+    }
+
+    /// SIP-27: only before a line break and the group's `)` / `]`.
+    #[test]
+    fn trailing_commas() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("f(a,\n)"),
+            vec![Ident("f".into()), LParen, Ident("a".into()), RParen]
+        );
+        assert_eq!(
+            kinds("C[A,\n]"),
+            vec![Ident("C".into()), LBracket, Ident("A".into()), RBracket]
+        );
+        assert_eq!(
+            kinds("f(a, )"),
+            vec![Ident("f".into()), LParen, Ident("a".into()), Comma, RParen]
+        );
+        // A brace group keeps it; the parser decides (import selectors).
+        assert_eq!(
+            kinds("{a,\n}"),
+            vec![LBrace, Ident("a".into()), Comma, RBrace]
+        );
+    }
+
+    /// nsc `postProcessToken`: `SEMI ELSE` is `ELSE`.
+    #[test]
+    fn semicolon_before_else() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("if (c) a; else b"),
+            vec![
+                If,
+                LParen,
+                Ident("c".into()),
+                RParen,
+                Ident("a".into()),
+                Else,
+                Ident("b".into())
+            ]
+        );
+        assert_eq!(kinds("a;\nelse"), vec![Ident("a".into()), Else]);
+        assert_eq!(
+            kinds("a; b"),
+            vec![Ident("a".into()), Semi, Ident("b".into())]
+        );
+    }
+
+    #[test]
+    fn interpolation_dollar_quote_and_wildcard_hole() {
+        use TokenKind::*;
+        assert_eq!(
+            kinds("s\"$\"x$$\""),
+            vec![
+                InterpStart {
+                    prefix: "s".into(),
+                    triple: false
+                },
+                InterpEnd("\"x$".into())
+            ]
+        );
+        assert_eq!(
+            kinds("s\"a$_b\""),
+            vec![
+                InterpStart {
+                    prefix: "s".into(),
+                    triple: false
+                },
+                StringPart("a".into()),
+                Underscore,
+                InterpEnd("b".into())
+            ]
+        );
+        // A raw part keeps `\"` and it does not end the literal.
+        assert_eq!(
+            kinds("raw\"\\\"a\""),
+            vec![
+                InterpStart {
+                    prefix: "raw".into(),
+                    triple: false
+                },
+                InterpEnd("\\\"a".into())
+            ]
+        );
+        // A triple-quoted `s` part is escape-processed after scanning.
+        assert_eq!(
+            kinds("s\"\"\"a\\tb\"\"\""),
+            vec![
+                InterpStart {
+                    prefix: "s".into(),
+                    triple: true
+                },
+                InterpEnd("a\tb".into())
+            ]
+        );
+    }
+
+    /// nsc `Chars.isSpecial`: Sm / So code points are operator characters,
+    /// supplementary ones included; `@` heads an operator unless alone.
+    #[test]
+    fn unicode_symbols_and_at_operators() {
+        use TokenKind::*;
+        assert_eq!(kinds("↑"), vec![Ident("↑".into())]);
+        assert_eq!(
+            kinds("a ☀= b"),
+            vec![Ident("a".into()), Ident("☀=".into()), Ident("b".into())]
+        );
+        assert_eq!(kinds("🌀d"), vec![Ident("🌀".into()), Ident("d".into())]);
+        assert_eq!(kinds("𐀀"), vec![Ident("𐀀".into())]);
+        assert_eq!(kinds("@@"), vec![Ident("@@".into())]);
+        assert_eq!(
+            kinds("x @ y"),
+            vec![Ident("x".into()), At, Ident("y".into())]
+        );
+        assert_eq!(kinds("@tailrec"), vec![At, Ident("tailrec".into())]);
+        assert!(!is_unicode_symbol('€'), "Sc is not an operator character");
     }
 }

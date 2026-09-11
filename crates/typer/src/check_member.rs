@@ -569,6 +569,13 @@ impl Typer {
         // A definition owns its inference boundary, including in a by-name
         // argument whose enclosing application is still being inferred.
         let saved_call_args = std::mem::take(&mut self.typing_call_args);
+        // An early definition is typed in the constructor context, outside
+        // the template (see `crate::presuper`).
+        let ctor_ctx = if presuper {
+            self.enter_presuper_scope(tree.sym)
+        } else {
+            None
+        };
         self.type_expr(rhs, &pt);
         // An inferred value has no expected type to trigger adapt's backstop.
         // A missing implicit is still an error, not a function to eta-expand.
@@ -577,14 +584,11 @@ impl Typer {
         if pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
             self.adapt_method_value(rhs);
         }
+        if let Some(saved) = ctor_ctx {
+            self.leave_presuper_scope(saved);
+        }
         self.typing_call_args = saved_call_args;
         self.warn_trivial_self_reference(tree.sym, rhs);
-        if presuper && tree_contains_this(rhs) {
-            self.error(
-                tree.span,
-                "this can be used only in a class, object, or template",
-            );
-        }
         let preserve_constant = final_value && matches!(rhs.ty, Type::Constant(_));
         if let Some(expected) = inherited.filter(|_| feature && !preserve_constant) {
             self.adapt(rhs, &expected);

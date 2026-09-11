@@ -1734,6 +1734,9 @@ impl Typer {
     /// Lexical access privileges survive even while constructor arguments
     /// cannot use the instance currently being initialized as their receiver.
     fn lexical_access_class(&self) -> SymbolId {
+        if !self.access_class_override.is_none() {
+            return self.access_class_override;
+        }
         let mut owner = self.st.owner;
         while !owner.is_none() {
             if self.st.get(owner).is_class_like() {

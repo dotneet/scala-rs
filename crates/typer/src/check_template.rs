@@ -1545,8 +1545,12 @@ impl Typer {
         let vars: Vec<(String, Type)> = body
             .iter()
             .filter_map(|t| match &t.kind {
+                // A `private[this] var` is a bare field with no setter, so
+                // nothing conflicts with it (scalac 2.13.16 accepts
+                // `private[this] var x: Int = 0; def x_=(v: Int) = ()`).
                 TreeKind::ValDef { mods, name, .. }
                     if mods.flags.contains(Flags::MUTABLE)
+                        && !mods.flags.contains(Flags::LOCAL)
                         && !t.sym.is_none()
                         && !self.block_local_defs.contains(&(self.file_index, t.id)) =>
                 {
@@ -2163,6 +2167,9 @@ impl Typer {
         };
         for a in &mods.annotations {
             let path = a.annotation_path();
+            if crate::strictfp::is_strictfp_annot(&path) {
+                self.check_strictfp_annotation(a);
+            }
             if is_tailrec_annot(&path) {
                 if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
                     self.error(

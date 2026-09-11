@@ -891,7 +891,7 @@ fn is_operator_part(c: char) -> bool {
             | '|'
             | '/'
             | '\\'
-    )
+    ) || (!c.is_ascii() && scala_rs_lexer::is_unicode_symbol(c))
 }
 
 /// nsc `nme.isOpAssignmentName`: an operator that ends in `=`, does not start
@@ -918,7 +918,8 @@ pub fn op_precedence(op: &str) -> i32 {
         return 0;
     }
     match op.chars().next().unwrap_or('\0') {
-        c if c.is_ascii_alphabetic() || c == '_' => 1,
+        // nsc `isScalaLetter`: any Unicode letter (`c 𐀀 d`), `$` and `_`.
+        c if c.is_alphabetic() || c == '_' || c == '$' => 1,
         '|' => 2,
         '^' => 3,
         '&' => 4,
