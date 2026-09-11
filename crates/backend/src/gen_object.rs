@@ -188,9 +188,13 @@ impl<'a> Gen<'a> {
         let mut suppressed: HashSet<String> = HashSet::new();
         if let Some(class_id) = self.find_class_named(name) {
             // The synthetic `apply` is owed exactly when the typer kept it: a
-            // written or inherited `apply` that matches its signature
-            // unlinked it (`crate::typer::case_apply_unlink`, nsc's rule),
-            // and one that does not is an overload beside it.
+            // written or inherited concrete `apply` with its signature
+            // unlinked it (`scala_rs_typer`'s `case_apply_unlink`, nsc's
+            // `caseApplyMeth` rule). An overload of another shape --
+            // `WebHookPushPayload.apply(git, …, newId, oldId)` beside the
+            // case class's own -- leaves it in place, and that body's
+            // `WebHookPushPayload(pusher = …)` calls it. `emit_case_apply`
+            // still refuses a descriptor the body already emitted.
             if self.st.get(class_id).flags.contains(Flags::CASE)
                 && !case_apply_sym(self.st, class_id).is_none()
             {
@@ -1387,6 +1391,13 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         args: vec![],
     };
     let desc = jvm_method_desc(st, &params, &ret);
+    // The companion's own `apply` of this very signature replaces it.
+    if b.methods
+        .iter()
+        .any(|m| m.name == "apply" && m.desc == desc)
+    {
+        return;
+    }
     // A case class nested in a class takes its enclosing instance first; the
     // companion is nested in the same class and holds the same one in its own
     // `$outer`. Reading it off the builder keeps the two in step: a companion
@@ -1402,13 +1413,6 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
     } else {
         base_ctor_d
     };
-    // A written `apply` of the same erasure already took the slot.
-    if b.methods
-        .iter()
-        .any(|m| m.name == "apply" && m.desc == desc)
-    {
-        return;
-    }
     let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
     b.add_code(acc, "apply", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);

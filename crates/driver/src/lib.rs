@@ -286,6 +286,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 },
                 language_features: opts.language_features.clone(),
                 source_features: opts.source_features,
+                scala3: opts.xsource3,
                 compiler_settings: compiler_settings(opts),
                 source_paths: sources
                     .iter()

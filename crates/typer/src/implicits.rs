@@ -1685,9 +1685,19 @@ impl Typer {
     /// would otherwise convert every type to itself.
     fn view_shape(&self, ty: &Type) -> Option<(Type, Type)> {
         match ty {
+            // A by-name parameter takes the value it delays: scalatra's
+            // `implicit def booleanBlock2RouteMatcher(block: => Boolean):
+            // RouteMatcher` views a `Boolean` (`get(!allowAnonymous) { … }`).
+            // Applying it wraps the argument in its thunk like any call.
             Type::Method { paramss, ret } => {
                 let ps = paramss.first()?;
-                (ps.len() == 1).then(|| (ps[0].clone(), (**ret).clone()))
+                (ps.len() == 1).then(|| {
+                    let p = match &ps[0] {
+                        Type::ByName(t) => (**t).clone(),
+                        t => t.clone(),
+                    };
+                    (p, (**ret).clone())
+                })
             }
             Type::Function { params, ret } if params.len() == 1 => {
                 Some((params[0].clone(), (**ret).clone()))
@@ -2462,6 +2472,40 @@ impl Typer {
     }
 
     /// Implicit conversion from `from` whose result type has member `name`.
+    /// Warm `want`'s implicit scope, and that of the implicit clauses of the
+    /// candidates its companions offer, `depth` levels further down.
+    ///
+    /// A witness can be a derivation rule whose own clause asks for a type
+    /// the program never names: `OptionLift.repOptionLift` needs a
+    /// `Shape[_ <: FlatShapeLevel, M, _, Rep[P]]`, and `Shape`'s companion is
+    /// read by nothing else in a file with no table in it. The first
+    /// `o.getOrElse(0)` on a `Rep[Option[Int]]` then had no `P` for its
+    /// extension class and was "not a member"; the same line below a
+    /// `TableQuery` compiled.
+    fn warm_witness_chain(&mut self, want: &Type, depth: usize) {
+        self.warm_implicit_scope(want);
+        self.warm_implicit_candidates(std::slice::from_ref(want));
+        if depth == 0 {
+            return;
+        }
+        let mut nested: Vec<Type> = Vec::new();
+        for c in self.companion_implicits(want) {
+            if !self.only_implicit_clauses(c) {
+                continue;
+            }
+            if let Type::Method { paramss, .. } = &*self.implicit_candidate_ty(c) {
+                for p in paramss.iter().flatten() {
+                    if !nested.contains(p) {
+                        nested.push(p.clone());
+                    }
+                }
+            }
+        }
+        for n in nested {
+            self.warm_witness_chain(&n, depth - 1);
+        }
+    }
+
     pub(crate) fn search_extension(
         &mut self,
         from: &Type,
@@ -2535,6 +2579,32 @@ impl Typer {
                         .into_iter()
                         .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
                         .collect();
+                }
+                // A result that still names the conversion's own type
+                // parameters is one only its implicit clause can finish:
+                // `anyOptionExtensionMethods[T, P](v: Rep[Option[T]])(implicit
+                // ol: OptionLift[P, Rep[Option[T]]])` learns `P` from
+                // `OptionLift`'s companion. Nothing has read that companion
+                // the first time a file writes `c.isEmpty` on a `Rep[Option[_]]`,
+                // so the witness search found no candidate at all and the
+                // member was reported missing -- once, on the first use; every
+                // later one worked. Warm the clauses' implicit scope and ask
+                // again.
+                let mut to = to;
+                if !members.is_empty() {
+                    let own = self.st.get(id).tparams.clone();
+                    if crate::check::mentions_tparam(&to, &own) {
+                        for want in self
+                            .conv_implicit_params(id, from, &Type::NoType)
+                            .into_iter()
+                            .flatten()
+                        {
+                            self.warm_witness_chain(&want, 1);
+                        }
+                        if let Some(again) = self.conversion_result(id, from) {
+                            to = again;
+                        }
+                    }
                 }
                 if let Some(m) = members.first() {
                     hits.push((id, *m, to));
@@ -3602,6 +3672,24 @@ impl<'a> Unify<'a> {
         }
         let a = strip_annot(a);
         let b = strip_annot(b);
+        // An unknown facing a bare `_` is not constrained by it (see the
+        // wildcard arm below), and `bind` refuses to record `_` as a
+        // solution -- which used to fail the whole unification.
+        // `repColumnShape[T]: Shape[Level, Rep[T], T, Rep[T]]` against
+        // `Shape[_ <: FlatShapeLevel, ?M, _, Rep[Int]]` (slick's
+        // `OptionLift.repOptionLift` asking which `M` packs to `Rep[Int]`)
+        // stopped at `T` against `_`, before `Rep[T]` against `Rep[Int]`
+        // could say `T = Int`; every `c.? isEmpty` then had no
+        // `AnyOptionExtensionMethods`.
+        if matches!(a, Type::Wildcard) || matches!(b, Type::Wildcard) {
+            let unbound = |t: &Type| {
+                self.unknown_of(t)
+                    .is_some_and(|id| !self.bound.contains_key(&id))
+            };
+            if unbound(a) || unbound(b) {
+                return true;
+            }
+        }
         if let Some(id) = self.unknown_of(a) {
             return match self.bound.get(&id).cloned() {
                 Some(prev) => self.unify_at(&prev, b, depth + 1),
@@ -3712,9 +3800,16 @@ impl<'a> Unify<'a> {
                 .iter()
                 .zip(t2.iter())
                 .all(|(x, y)| self.unify_at(x, y, depth + 1)),
-            (Type::Tuple(ts), Type::Class { args, .. })
-            | (Type::Class { args, .. }, Type::Tuple(ts))
-                if ts.len() == args.len() =>
+            // `(A, B)` and `Tuple2[A, B]` are two spellings of one type -- but
+            // only for the tuple class itself. Any class of the same arity used
+            // to pass: slick's `anyToShapedValue(v): ShapedValue[T, U]` unified
+            // with a wanted `(String, String)` by `T := String, U := String`,
+            // and `val t: (String, String) = "x"` compiled (to a
+            // `ShapedValue` where a `Tuple2` was promised).
+            (Type::Tuple(ts), Type::Class { sym, args })
+            | (Type::Class { sym, args }, Type::Tuple(ts))
+                if ts.len() == args.len()
+                    && self.typer.st.get(*sym).jvm_name == format!("scala/Tuple{}", ts.len()) =>
             {
                 let (l, r): (&Vec<Type>, &Vec<Type>) = match a {
                     Type::Tuple(_) => (ts, args),

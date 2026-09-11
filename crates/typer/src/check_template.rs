@@ -121,7 +121,15 @@ impl Typer {
                 clauses[0] = ps;
                 ret = r;
             }
-            crate::uncurry::eta_expand_curried(&mut self.st, &mut self.gensym, tree, &clauses, ret);
+            self.eta_with_stable_receiver(tree, |this, tree| {
+                crate::uncurry::eta_expand_curried(
+                    &mut this.st,
+                    &mut this.gensym,
+                    tree,
+                    &clauses,
+                    ret,
+                );
+            });
         }
     }
 

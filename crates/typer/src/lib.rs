@@ -6,6 +6,7 @@ mod check_args;
 mod check_expr;
 mod check_infer;
 mod check_member;
+mod check_method_value;
 mod check_name;
 mod check_namer;
 mod check_overload;

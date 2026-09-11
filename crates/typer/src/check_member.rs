@@ -572,8 +572,10 @@ impl Typer {
         self.type_expr(rhs, &pt);
         // An inferred value has no expected type to trigger adapt's backstop.
         // A missing implicit is still an error, not a function to eta-expand.
-        if pt.is_no_type() {
-            self.reject_unapplied_implicit_clause(rhs);
+        // Nor is a method with explicit parameters: nsc's "missing argument
+        // list", or its eta-expansion under `-Xsource:3`.
+        if pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
+            self.adapt_method_value(rhs);
         }
         self.typing_call_args = saved_call_args;
         self.warn_trivial_self_reference(tree.sym, rhs);
@@ -1428,8 +1430,8 @@ impl Typer {
             // above its use compiled fine, which is what gives the flag away.
             let saved_call_args = std::mem::take(&mut self.typing_call_args);
             self.type_expr(rhs, &ret_pt);
-            if ret_pt.is_no_type() {
-                self.reject_unapplied_implicit_clause(rhs);
+            if ret_pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
+                self.adapt_method_value(rhs);
             }
             self.typing_call_args = saved_call_args;
             self.warn_trivial_self_reference(tree.sym, rhs);
