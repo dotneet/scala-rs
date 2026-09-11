@@ -1,0 +1,21 @@
+11
+20
+42
+13
+14
+15
+List(101, 42)
+6 7
+5 8 9
+List(1, 2, 3)
+10
+9
+plus 6
+plus 7
+6
+null
+4
+s
+List(twice)
+3.0
+Comp(B)

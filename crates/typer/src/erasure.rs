@@ -851,6 +851,35 @@ fn is_primitive(ty: &Type) -> bool {
     }
 }
 
+/// The primitive type one of the eight numeric/boolean value classes stands
+/// for (`scala.Int` is `Type::Int`), `None` for any other class. `Unit` is
+/// left out: nothing is ever unboxed to it.
+fn primitive_class_type(st: &SymbolTable, cls: SymbolId) -> Option<Type> {
+    if cls.is_none() {
+        return None;
+    }
+    let t = if cls == st.int_sym {
+        Type::Int
+    } else if cls == st.long_sym {
+        Type::Long
+    } else if cls == st.double_sym {
+        Type::Double
+    } else if cls == st.float_sym {
+        Type::Float
+    } else if cls == st.char_sym {
+        Type::Char
+    } else if cls == st.boolean_sym {
+        Type::Boolean
+    } else if cls == st.byte_sym {
+        Type::Byte
+    } else if cls == st.short_sym {
+        Type::Short
+    } else {
+        return None;
+    };
+    Some(t)
+}
+
 fn is_ref_erased(ty: &Type) -> bool {
     matches!(
         ty,
@@ -1051,6 +1080,9 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 if matches!(st.dealias(&a.ty), Type::Class { sym, .. } if sym == st.singleton_sym) {
                     a.sym = st.singleton_sym;
                 }
+                if is_abstract_elem_array(&a.ty, st) {
+                    a.sym = st.array_sym;
+                }
                 // `classOf[Meters]` / `_: Meters` name the *boxed* class:
                 // `Meters.class`, not `Integer.TYPE`.
                 if let Some(c) = value_class_of(&a.ty, st) {
@@ -1110,6 +1142,20 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             erase_tree(qual, st, recv_pt.as_ref());
             if let Some(c) = prelude_box {
                 wrap_vc_box(qual, c);
+            }
+            // A member of a primitive class selected on a receiver whose
+            // *erased* type is a reference: `t + 1` on `t: T` where `T <: Int`
+            // -- a declared bound, or the bound a GADT case put on `T`
+            // (`check_pattern::refine_gadt_bounds`). `T` erases to `Object`
+            // while `+` is `Int`'s, so the receiver has to be unboxed first,
+            // as nsc's erasure does for any selection whose qualifier's
+            // erased type is not the member owner's. Without it the backend
+            // emitted `iadd` on an `Object` (`VerifyError: Bad type on operand
+            // stack`).
+            if !tree.sym.is_none() && is_ref_erased(&qual.ty) {
+                if let Some(prim) = primitive_class_type(st, st.get(tree.sym).owner) {
+                    wrap_unbox(qual, prim);
+                }
             }
             if !tree.sym.is_none() {
                 let owner = st.get(tree.sym).owner;
@@ -1736,6 +1782,8 @@ fn mark_value_class_patterns(pat: &mut Tree, st: &SymbolTable) {
     if let TreeKind::Typed { .. } = &pat.kind {
         if let Some(c) = value_class_of(&pat.ty, st) {
             pat.sym = c;
+        } else if is_abstract_elem_array(&pat.ty, st) {
+            pat.sym = st.array_sym;
         }
     }
     match &mut pat.kind {
@@ -1754,6 +1802,26 @@ fn mark_value_class_patterns(pat: &mut Tree, st: &SymbolTable) {
         }
         _ => {}
     }
+}
+
+/// `Array[_]`, `Array[T]` for an abstract `T`: erased to `Object`, because
+/// the element may be primitive. A type test against one cannot be an
+/// `instanceof` of any single array class (nsc emits `ScalaRunTime.isArray`),
+/// so `mark_value_class_patterns` and the `isInstanceOf` argument stamp
+/// `array_sym` on the node before erasure forgets it was an array at all.
+fn is_abstract_elem_array(ty: &Type, st: &SymbolTable) -> bool {
+    if let Type::Annotated { tpe, .. } = ty {
+        return is_abstract_elem_array(tpe, st);
+    }
+    let elem = match st.dealias(ty) {
+        Type::Array(e) => *e,
+        Type::Class { sym, mut args } if sym == st.array_sym && args.len() == 1 => args.remove(0),
+        _ => return false,
+    };
+    matches!(
+        elem,
+        Type::Wildcard | Type::BoundedWildcard { .. } | Type::TypeParam(_) | Type::TypeMember(_)
+    )
 }
 
 /// Record every value class this run compiles from source. Only those get the

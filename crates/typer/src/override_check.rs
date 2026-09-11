@@ -684,8 +684,99 @@ fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type)
         }
         // A structural type against a class: `PartialFunction[B, C]` against
         // `B => C`, `Array[_ <: T]` against `IterableOnce[T]`.
-        _ => heads_differ(st, a, b),
+        _ => {
+            heads_differ(st, a, b)
+                || matches!(
+                    (ground_class(st, a), ground_class(st, b)),
+                    (Some(x), Some(y)) if x != y && !boxes_of_each_other(&x, &y)
+                )
+        }
     }
+}
+
+/// The JVM class a parameter type denotes whatever the type parameters in
+/// play turn out to be, for the built-in variants `certainly_different`'s
+/// other arms do not reach (`Int`, `String`, `Any`, ...) and plain classes.
+///
+/// `class B extends A { def f(x: String) }` next to `A.f(x: Any)` is an
+/// overload: parameter types are invariant under overriding. Nothing here
+/// proved it -- `String` and `Any` fell through to `heads_differ`, which only
+/// knows structural types -- so the backend read the pair as an override,
+/// emitted a bridge `B.f(Object)` forwarding to `f(String)`, and every
+/// `(b: A).f(1)` threw `ClassCastException` (and a user's
+/// `def equals(o: C): Boolean` hijacked `Object.equals`). `Any`, `AnyRef`
+/// and a Java signature's `Object` are one class here: a Scala `f(x: Any)`
+/// does implement a Java `f(Object)`.
+fn ground_class(st: &SymbolTable, ty: &Type) -> Option<String> {
+    let name = match ty {
+        Type::Unit => "V",
+        Type::Boolean => "Z",
+        Type::Byte => "B",
+        Type::Short => "S",
+        Type::Int => "I",
+        Type::Long => "J",
+        Type::Float => "F",
+        Type::Double => "D",
+        Type::Char => "C",
+        Type::String => "java/lang/String",
+        Type::Any | Type::AnyRef | Type::JavaObject => "java/lang/Object",
+        Type::Constant(lit) => return ground_class(st, &Type::lit_underlying(lit)),
+        Type::Class { sym, .. } => {
+            // The built-in classes also exist as symbols; spell them the way
+            // their dedicated variants are spelled above.
+            let builtin = [
+                (st.unit_sym, Type::Unit),
+                (st.boolean_sym, Type::Boolean),
+                (st.byte_sym, Type::Byte),
+                (st.short_sym, Type::Short),
+                (st.int_sym, Type::Int),
+                (st.long_sym, Type::Long),
+                (st.float_sym, Type::Float),
+                (st.double_sym, Type::Double),
+                (st.char_sym, Type::Char),
+                (st.string_sym, Type::String),
+                (st.any_sym, Type::Any),
+                (st.anyref_sym, Type::AnyRef),
+                (st.object_sym, Type::AnyRef),
+            ];
+            if let Some((_, t)) = builtin.iter().find(|(s, _)| s == sym && !s.is_none()) {
+                return ground_class(st, t);
+            }
+            if *sym == st.anyval_sym
+                || *sym == st.singleton_sym
+                || (st.get(*sym).owner == st.scala_pkg
+                    && matches!(st.get(*sym).name.as_str(), "Nothing" | "Null"))
+            {
+                return None;
+            }
+            let jvm = &st.get(*sym).jvm_name;
+            if jvm.is_empty() {
+                return None;
+            }
+            return Some(jvm.clone());
+        }
+        _ => return None,
+    };
+    Some(name.to_string())
+}
+
+/// A primitive and its box, which the symbol table can spell either way for
+/// the same Scala type (`scala.Int` shares `java/lang/Integer`'s JVM name):
+/// nothing may be concluded from the two spellings differing.
+fn boxes_of_each_other(a: &str, b: &str) -> bool {
+    let boxed = |p: &str| match p {
+        "V" => Some("scala/runtime/BoxedUnit"),
+        "Z" => Some("java/lang/Boolean"),
+        "B" => Some("java/lang/Byte"),
+        "S" => Some("java/lang/Short"),
+        "I" => Some("java/lang/Integer"),
+        "J" => Some("java/lang/Long"),
+        "F" => Some("java/lang/Float"),
+        "D" => Some("java/lang/Double"),
+        "C" => Some("java/lang/Character"),
+        _ => None,
+    };
+    boxed(a) == Some(b) || boxed(b) == Some(a)
 }
 
 fn same_type(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type) -> bool {

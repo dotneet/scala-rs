@@ -569,6 +569,13 @@ impl Typer {
         // A definition owns its inference boundary, including in a by-name
         // argument whose enclosing application is still being inferred.
         let saved_call_args = std::mem::take(&mut self.typing_call_args);
+        // An early definition is typed in the constructor context, outside
+        // the template (see `crate::presuper`).
+        let ctor_ctx = if presuper {
+            self.enter_presuper_scope(tree.sym)
+        } else {
+            None
+        };
         self.type_expr(rhs, &pt);
         // An inferred value has no expected type to trigger adapt's backstop.
         // A missing implicit is still an error, not a function to eta-expand.
@@ -577,21 +584,39 @@ impl Typer {
         if pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
             self.adapt_method_value(rhs);
         }
+        if let Some(saved) = ctor_ctx {
+            self.leave_presuper_scope(saved);
+        }
         self.typing_call_args = saved_call_args;
-        self.warn_trivial_self_reference(tree.sym, rhs);
-        if presuper && tree_contains_this(rhs) {
+        // A strict *local* value may not mention itself in its own
+        // initializer (nsc refchecks: "forward reference extends over
+        // definition of value x"): the slot is read before it is written.
+        // `val fibs: LazyList[BigInt] = 0 #:: fibs.zip(...)` was accepted and
+        // read `null`. A field reads its default instead, and a `lazy val`
+        // is initialized on first use, so both stay legal.
+        if !tree.sym.is_none()
+            && self.block_local_defs.contains(&(self.file_index, tree.id))
+            && !self.st.get(tree.sym).flags.contains(Flags::LAZY)
+            && tree_mentions_sym(rhs, tree.sym)
+        {
+            let name = self.st.get(tree.sym).name.clone();
             self.error(
                 tree.span,
-                "this can be used only in a class, object, or template",
+                format!("forward reference extends over definition of value {name}"),
             );
         }
+        self.warn_trivial_self_reference(tree.sym, rhs);
         let preserve_constant = final_value && matches!(rhs.ty, Type::Constant(_));
         if let Some(expected) = inherited.filter(|_| feature && !preserve_constant) {
             self.adapt(rhs, &expected);
             tree.ty = expected;
             self.st.get_mut(tree.sym).ty = tree.ty.clone();
         } else if declared.is_no_type() {
-            tree.ty = rhs.ty.widen_constant();
+            // A variable the right-hand side left undetermined is closed here
+            // (nsc's mono-mode `instantiate`): `val b = List.newBuilder` is a
+            // `Builder[Nothing, List[Nothing]]`, not a `Builder[?A, …]` that a
+            // later line could still solve.
+            tree.ty = self.close_leaked_undet(&rhs.ty.widen_constant());
             if is_var {
                 tree.ty = self.widen_inferred_singleton(tree.ty.clone());
             }
@@ -1451,7 +1476,11 @@ impl Typer {
                 {
                     ret_pt.clone()
                 } else {
-                    self.widen_inferred_singleton(rhs.ty.widen_constant())
+                    // Close what the body left undetermined, as for a `val`
+                    // (`close_leaked_undet`): `def d = inv(fail())` is an
+                    // `Inv[Nothing]`.
+                    let closed = self.close_leaked_undet(&rhs.ty.widen_constant());
+                    self.widen_inferred_singleton(closed)
                 };
                 if let Type::Method { ret, .. } = &mut tree.ty {
                     **ret = inferred.clone();
@@ -2747,4 +2776,18 @@ impl Typer {
             }
         }
     }
+}
+
+/// Whether `tree` contains a reference (`Ident` or `Select`) to `sym`.
+fn tree_mentions_sym(tree: &Tree, sym: SymbolId) -> bool {
+    if matches!(tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) && tree.sym == sym {
+        return true;
+    }
+    let mut found = false;
+    crate::erasure::for_each_child(tree, &mut |c| {
+        if !found && tree_mentions_sym(c, sym) {
+            found = true;
+        }
+    });
+    found
 }

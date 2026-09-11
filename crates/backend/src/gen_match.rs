@@ -503,7 +503,13 @@ fn gen_unapply_pattern(
             }
         }
     }
-    if !owner.is_none() && !is_module_class(ctx.st, owner) {
+    // The extractor is what a parameterless *method* returns -- the accessor
+    // of an object nested in a class instance (`StringContext(..).s` in
+    // `case s"..."`), or a user interpolator's `def x = ...`. Its singleton
+    // has no static `MODULE$`, and the call has to run anyway (nsc evaluates
+    // it once per test; `run/sd167` counts the side effect).
+    let fun_is_call = !fun.sym.is_none() && ctx.st.get(fun.sym).kind == SymKind::Method;
+    if !owner.is_none() && (!is_module_class(ctx.st, owner) || fun_is_call) {
         gen_expr(asm, frame, ctx, fun);
     } else if !owner.is_none() {
         // The `unapply` being called belongs to `owner`, so the receiver is
@@ -1363,6 +1369,23 @@ pub(crate) fn gen_pattern(
             // `type_jvm_name` reports `Object` for an array, which tested
             // nothing and left `case a: Array[Int]` reading `arraylength` off
             // an `Object`; `instanceof` takes the array descriptor directly.
+            // `case a: Array[_]` (or `Array[T]` for an abstract `T`) may be an
+            // `int[]` as well as an `Object[]`: no single descriptor tests it,
+            // and nsc emits `ScalaRunTime.isArray(x, 1)`. Testing
+            // `instanceof [Ljava/lang/Object;` missed every primitive array,
+            // and the bound value is then left as the `Object` it is.
+            // Erasure stamps `array_sym` on such a pattern
+            // (`mark_value_class_patterns`): its type is `Object` by now.
+            if ctx.library_abi
+                && (pat.sym == ctx.st.array_sym
+                    || matches!(pat.ty.widen_constant(), Type::Array(ref e) if !is_concrete_array_elem(e)))
+            {
+                load(asm, tmp, JvmSort::Ref);
+                emit_is_array(asm);
+                asm.ifeq(fail);
+                gen_pattern(asm, frame, ctx, expr, tmp, sel_sort, fail);
+                return;
+            }
             let jvm = match pat.ty.widen_constant() {
                 Type::Array(_) => jvm_desc(ctx.st, &pat.ty),
                 _ => type_jvm_name(ctx.st, &pat.ty),

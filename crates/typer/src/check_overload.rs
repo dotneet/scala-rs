@@ -789,6 +789,44 @@ impl Typer {
                         winners = mono;
                     }
                 }
+                // nsc `isStrictlyMoreSpecific` weighs the owners too: an
+                // alternative earns a point for being as specific as the
+                // other and another for being defined in a proper subclass of
+                // the other's owner, and only a strictly greater total wins.
+                // The sole winner above is as specific as everything, but an
+                // alternative a *subclass* defines, that is not as specific
+                // back, ties it: `class Child extends Parent { override def
+                // who(x: Any) }` against `Parent.who(x: String)` makes
+                // `child.who("s")` ambiguous in scalac 2.13.16, and picking
+                // `who(String)` compiled a call nsc refuses.
+                //
+                // Only between members this run defines from source: a Java
+                // class's package-private members (`AbstractStringBuilder`'s
+                // `append(StringBuilder)`) and a library member reached both
+                // from its pickle and from source are alternatives nsc never
+                // weighs against each other, and this table cannot yet tell.
+                let from_source = |m: SymbolId| {
+                    m.0 >= self.st.prelude_end
+                        && self.st.get(m).pickled_origin.is_empty()
+                        && !self.st.get(m).flags.contains(Flags::JAVA)
+                };
+                if winners.len() == 1 && !with_views {
+                    let w = &winners[0];
+                    let tied = applicable.iter().any(|b| {
+                        b.0 != w.0
+                            && !b.0.is_none()
+                            && !w.0.is_none()
+                            && from_source(b.0)
+                            && from_source(w.0)
+                            && self.st.get(b.0).name == self.st.get(w.0).name
+                            && self.owner_is_proper_subclass(b.0, w.0)
+                            && !self.owner_is_proper_subclass(w.0, b.0)
+                            && !self.is_as_specific_method(b.0, w.0, &b.1, &w.1, with_views)
+                    });
+                    if tied {
+                        return OverloadPick::Ambiguous;
+                    }
+                }
                 match winners.len() {
                     1 => {
                         let (s, p, r) = winners.into_iter().next().unwrap();
@@ -1122,17 +1160,29 @@ impl Typer {
     /// nothing about it is still being solved, and a function literal nested in
     /// the argument has nowhere else to read its parameter types from.
     /// `NoType` means "as before".
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn proto_arg_type(
         &self,
         fun_ty: &Type,
         sym: SymbolId,
         idx: usize,
+        nargs: usize,
         pt: &Type,
         recv: Option<&Type>,
         use_lower_bounds: bool,
     ) -> Type {
         if sym.is_none() {
             return Type::NoType;
+        }
+        // nsc `preSelectOverloaded`: alternatives whose arity cannot take
+        // `nargs` arguments are dropped before the arguments are typed, so
+        // `Predef.println(if (c) 1 else 2.0)` types its argument against
+        // `println(x: Any)` -- `println()` never was a candidate -- and the
+        // `if` keeps `Any` rather than joining its branches to `Double`.
+        if let Type::Overload(alts) = fun_ty {
+            if let Some(p) = sole_arity_match_param(alts, idx, nargs) {
+                return p;
+            }
         }
         // An overloaded reference has no single parameter type -- except where
         // every alternative wants the *same* one, which is `Infer.pretypeArgs`
@@ -1304,9 +1354,34 @@ impl Typer {
         let ids: Vec<SymbolId> = solved.iter().map(|(id, _)| *id).collect();
         let vals: Vec<Type> = solved.iter().map(|(_, t)| t.clone()).collect();
         let out = crate::symbol::subst_tparams_slice(&ids, &vals, param);
-        if mentions_tparam(&out, &tps) || type_mentions_wildcard(&out) {
+        if type_mentions_wildcard(&out) {
             return Type::NoType;
         }
+        // nsc's *lenient* prototype (`protoTypeArgs` / `typedArgToPoly`): a
+        // variable the expected type did not settle is `WildcardType` in the
+        // argument's expected type, which constrains nothing there while the
+        // settled positions still reach the argument. The library's
+        // `override def map[B](f: A => B): CC[B] =
+        // strictOptimizedMap(iterableFactory.newBuilder, f)` is the shape:
+        // `strictOptimizedMap[B', C2](b: Builder[B', C2], f: A => B')` has
+        // `C2 := CC[B]` from the declared result, and `iterableFactory
+        // .newBuilder` typed at `Builder[_, CC[B]]` reads its own `A := B`
+        // out of the invariant `CC[A]` -- which is the only place `A` can be
+        // read from, `Builder` being contravariant in its element. Typed with
+        // no prototype instead it stayed `Builder[?A, CC[?A]]`, and the outer
+        // call reported `found: Builder[A, CC[A]] required: Builder[B, CC[A]]`
+        // (13 errors across `StrictOptimized{Iterable,Map,Seq,SortedMap}Ops`).
+        let out = if mentions_tparam(&out, &tps) {
+            let rest: Vec<SymbolId> = tps
+                .iter()
+                .copied()
+                .filter(|tp| type_mentions_tparam(&out, *tp))
+                .collect();
+            let wilds = vec![Type::Wildcard; rest.len()];
+            crate::symbol::subst_tparams_slice(&rest, &wilds, &out)
+        } else {
+            out
+        };
         // A by-name formal expects the *value*: `is_sub_type(F[Unit],
         // => F[Unit])` is false, and the caller would throw the prototype away
         // as one the argument did not fit. Wrapping in `Function0` is `adapt`'s
@@ -3004,4 +3079,40 @@ pub(crate) fn not_inherited_static(
     recv_cls: SymbolId,
 ) -> bool {
     !st.get(m).flags.contains(Flags::STATIC) || st.get(m).owner == recv_cls
+}
+
+/// The parameter type at `idx` of the only alternative in `alts` whose first
+/// parameter list can take `nargs` arguments, when that type is fully
+/// determined. An alternative with *more* parameters might be completed by
+/// defaults, which its type does not record, so it counts as a match.
+fn sole_arity_match_param(alts: &[Type], idx: usize, nargs: usize) -> Option<Type> {
+    let mut found: Option<&[Type]> = None;
+    for a in alts {
+        let Type::Method { paramss, .. } = a else {
+            return None;
+        };
+        let ps: &[Type] = paramss.first().map(|p| p.as_slice()).unwrap_or(&[]);
+        let repeated = ps.last().is_some_and(|p| matches!(p, Type::Repeated(_)));
+        let fits = ps.len() == nargs || (repeated && nargs + 1 >= ps.len()) || nargs < ps.len();
+        if fits {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(ps);
+        }
+    }
+    let p = param_at(found?, idx)?;
+    let p = match p {
+        Type::ByName(inner) => inner.as_ref(),
+        other => other,
+    };
+    if p.is_no_type()
+        || p.is_error()
+        || matches!(p, Type::Repeated(_))
+        || mentions_any_tparam(p)
+        || type_mentions_wildcard(p)
+    {
+        return None;
+    }
+    Some(p.clone())
 }
