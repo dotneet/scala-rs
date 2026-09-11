@@ -1358,6 +1358,7 @@ fn erase_ident(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
     }
 }
@@ -1876,6 +1877,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1890,6 +1892,7 @@ fn wrap_marker(tree: &mut Tree, name: &str, sym: SymbolId, param: Type, result: 
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     };
 }
 
@@ -1932,6 +1935,7 @@ fn wrap_box(tree: &mut Tree) {
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1946,6 +1950,7 @@ fn wrap_box(tree: &mut Tree) {
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     };
 }
 
@@ -1967,6 +1972,7 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     };
     *tree = Tree {
         id: inner.id,
@@ -1981,5 +1987,6 @@ fn wrap_unbox(tree: &mut Tree, to: Type) {
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     };
 }

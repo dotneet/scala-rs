@@ -74,7 +74,7 @@ project-diagnostic locations. Do not accept improved totals that hide new errors
 
 All new positive fixtures are compiled by real scalac 2.13.16 and scala-rs,
 executed with java -Xverify:all, and compared byte for byte with the expected
-stdout. ctxev adds eight test groups (16 total). Existing test expectations are
+stdout. ctxev adds nine test groups (17 total). Existing test expectations are
 not weakened. New negatives compare acceptance in both compilers.
 
 Immutable accepted-before binary: /tmp/scala-rs-declaration-boundaries/
@@ -144,3 +144,36 @@ library 383/107; no new diagnostic locations, no added cats diagnostics. Slick
 has zero errors and 1504 classes, all 1504 loaded with full JVM verification.
 Input health checks passed on four source trees, 121 jar archives, 33 cached
 Java classes and 1498 reference classes. Full gate is still required.
+
+The composed 287ec595 full gate finished with corpus5324/zero losses/11 gains,
+but failed two existing quasiquote diagnostic tests. It was rejected and its
+raw ledger recorded on main1cd50566 before further edits. Marker provenance
+was missing after changing the parser representation: standalone tq"=> Int"
+was silently accepted and emitted a bogus type-name tree; a written user type
+named `<ByName>`[A] was treated as the internal marker and refused.
+
+The repair adds explicit Tree.byname_type_marker provenance to the parser
+head and checks it in type interpretation and reification. The ordinary name
+resolves normally. ASCII and Unicode by-name arrows receive the same refusal
+in unsupported quasiquote positions; the accepted-before binary wrongly
+accepted the Unicode standalone form as Function0[Int]. Existing quasi tests
+remain unchanged. New runtime controls cover the written class, Unicode
+by-name function counters and quoted written type names. Kind-projector's
+function-arity consumer only accepts arity>=1, so its Function0 exclusion does
+not need a speculative change. Supported nested by-name quasiquote reification
+remains a separate limitation; scalac accepts it and both rs baselines refuse it.
+
+Prerequisite selection now includes all quasi/reify/typequote/kind-projector
+suites and source matches, plus all negatives, all historical losses and every
+gain from the rejected gate. No compiler changes were made while that gate ran.
+
+Marker-follow-up prerequisites passed on the final binary recorded in
+marker-prerequisites/binary.json:124 CLI tests in17 suites including quasi,
+all reify/typequote/kind-projector targets and the17 ctxev groups; parser67,
+backend58,typer190;2500 corpus identities including all1405 negatives and
+all44 historic losses,zero losses. All11 gains from287ec595 remain present.
+The9 new run passes were separately compiled in their numbered rounds by
+both real scalac and scala-rs, executed -Xverify:all and stdout byte-compared:9/9
+agree. Final four-project metrics remain92/43,34/23,383/107,0/1504 with no new
+diagnostic locations and all1504 strong loads. Clippy57 existing warnings,0new.
+The renewed full gate, not these prerequisite results, decides integration.

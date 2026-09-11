@@ -1469,6 +1469,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
     }
 
@@ -2691,6 +2692,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
     }
 
@@ -2919,6 +2921,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: true,
+                    byname_type_marker: false,
                 };
             }
             return;
@@ -3088,6 +3091,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 *tree = self.fill_conv_implicits(id, &from, applied, span);
                 return;
@@ -3521,6 +3525,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         if !matches!(&tree.kind, TreeKind::This { .. }) {
             return false;
@@ -3626,6 +3631,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let apply = Tree {
             id: NodeId(0),
@@ -3640,6 +3646,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let part_lits: Vec<Tree> = parts
             .into_iter()
@@ -3655,6 +3662,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             })
             .collect();
         let sc_apply = Tree {
@@ -3670,6 +3678,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let sel = Tree {
             id: NodeId(0),
@@ -3684,6 +3693,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         *tree = Tree {
             id: tree.id,
@@ -3698,6 +3708,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
     }
 
@@ -3747,6 +3758,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 *tree = Tree {
                     id: tree.id,
@@ -3761,6 +3773,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 self.type_expr_inner(tree, &Type::NoType);
             }
@@ -3860,6 +3873,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         self.type_select(
             fun,

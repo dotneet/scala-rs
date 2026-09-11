@@ -433,6 +433,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 **qual = self.fill_conv_implicits(conv, &from, applied, span);
                 found = if let Some(cls) = self.st.class_sym_of(&to) {
@@ -2370,6 +2371,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         **qual = self.fill_conv_implicits(conv, &from, applied, span);
         fun.sym = member;
@@ -2490,6 +2492,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let sel = Tree {
             id,
@@ -2504,6 +2507,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         tree.kind = TreeKind::Apply {
             fun: Box::new(sel),
@@ -2581,6 +2585,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             };
             let rhs = Tree {
                 id,
@@ -2595,6 +2600,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             };
             tree.kind = TreeKind::Assign {
                 lhs: Box::new(lhs),
@@ -2916,6 +2922,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         }
     }
 
@@ -3004,6 +3011,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 let inner = Tree {
                     id: lhs.id,
@@ -3018,6 +3026,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 tree.kind = TreeKind::Apply {
                     fun: Box::new(inner),
@@ -3052,6 +3061,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 let selected = Tree {
                     id: fun.id,
@@ -3066,6 +3076,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 let update = Tree {
                     id: fun.id,
@@ -3080,6 +3091,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 tree.kind = TreeKind::Apply {
                     fun: Box::new(update),
@@ -3548,6 +3560,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         self.type_expr(tree, pt);
         true

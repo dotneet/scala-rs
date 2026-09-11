@@ -983,6 +983,12 @@ impl<'a> Reifier<'a> {
 
     /// `applied_type` once the wildcards among `args`, if any, are bound.
     fn applied_type_head(&self, tpt: &Tree, args: &[Tree]) -> Result<Tree, String> {
+        // The parser accepts by-name type syntax for function domains, but
+        // standalone tq syntax refuses it. Do not reify the internal marker
+        // as a user type name; this also covers the Unicode arrow spelling.
+        if tpt.byname_type_marker {
+            return Err("a by-name type is not reified yet".to_string());
+        }
         if let TreeKind::Ident { name } = &tpt.kind {
             if name == "<tuple>" {
                 let mut ts = Vec::new();
@@ -1001,12 +1007,6 @@ impl<'a> Reifier<'a> {
             {
                 let written = self.text(tpt.span) == name.as_str();
                 if !written && rest.chars().all(|c| c.is_ascii_digit()) && !args.is_empty() {
-                    // `=> T` (a by-name type) also lands here; nsc's own
-                    // parser rejects it inside `tq"..."`, so it is refused
-                    // rather than turned into `() => T`.
-                    if self.text(tpt.span).starts_with("=>") {
-                        return Err("a by-name type is not reified yet".to_string());
-                    }
                     let (params, res) = args.split_at(args.len() - 1);
                     let mut ps = Vec::new();
                     for p in params {
@@ -1438,6 +1438,7 @@ impl<'a> Reifier<'a> {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         }
     }
 

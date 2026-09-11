@@ -1892,12 +1892,13 @@ impl<'a> Parser<'a> {
             let lo = self.span();
             self.bump();
             let rhs = self.parse_type();
-            let tpt = self.alloc(
+            let mut tpt = self.alloc(
                 lo,
                 TreeKind::Ident {
                     name: "<ByName>".into(),
                 },
             );
+            tpt.byname_type_marker = true;
             let fn0 = self.alloc(
                 lo.merge(rhs.span),
                 TreeKind::AppliedTypeTree {
@@ -5389,6 +5390,7 @@ fn desugar_for(
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         }
     }
     /// A generator pattern that always matches is a variable or `_`. nsc
@@ -6012,6 +6014,7 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
         scala_ref: false,
         stable_pat: false,
         byname_thunk: false,
+        byname_type_marker: false,
     }
 }
 

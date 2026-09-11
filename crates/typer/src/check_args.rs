@@ -1501,6 +1501,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             }
         } else if ctor_companion_getter {
             let module = companion_module.expect("companion getter has module");
@@ -1515,6 +1516,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             }
         } else if inserted_apply {
             let mut r = head.clone();
@@ -1560,6 +1562,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         self.type_expr(&mut gfun, &Type::NoType);
         // A parameter whose type is still a type parameter of the method
@@ -1610,6 +1613,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             };
             let pt = if i == last { &expected } else { &Type::NoType };
             self.type_expr(&mut next, pt);
@@ -1748,6 +1752,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
             }
         }
@@ -1774,6 +1779,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 self.type_expr(&mut t, &Type::NoType);
                 return t;
@@ -1846,6 +1852,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 }
             }
         }
@@ -2003,6 +2010,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             };
         }
         tree.ty = inst(&ret);
@@ -2221,6 +2229,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         })
     }
 
@@ -2309,6 +2318,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let recv = Tree {
             id: NodeId(0),
@@ -2322,6 +2332,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let fun = Tree {
             id: NodeId(0),
@@ -2336,6 +2347,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         Some(Tree {
             id: NodeId(0),
@@ -2353,6 +2365,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         })
     }
 
@@ -2438,6 +2451,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 });
             }
         };
@@ -2595,6 +2609,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -2611,6 +2626,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let mut lam = Tree {
             id: NodeId(0),
@@ -2628,6 +2644,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);
@@ -2747,6 +2764,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let param = Tree {
             id: NodeId(0),
@@ -2763,6 +2781,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let wrap_fun = Tree {
             id: NodeId(0),
@@ -2776,6 +2795,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let body = Tree {
             id: NodeId(0),
@@ -2790,6 +2810,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let mut lam = Tree {
             id: NodeId(0),
@@ -2807,6 +2828,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         self.type_expr(&mut lam, pt);
         self.adapt(&mut lam, pt);

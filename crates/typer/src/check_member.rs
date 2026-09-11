@@ -520,6 +520,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             };
             self.type_expr(rhs, &declared);
             tree.ty = declared;
@@ -1519,6 +1520,7 @@ impl Typer {
                         scala_ref: false,
                         stable_pat: false,
                         byname_thunk: false,
+                        byname_type_marker: false,
                     };
                     self.type_parent_ctor_app(tree);
                     return;
@@ -1677,6 +1679,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         let saved = std::mem::replace(&mut self.parent_ctor_scope, true);
         let _ = self.fill_defaults_and_implicits(span, args, &param_tys, &ctor_fun, &Type::NoType);
@@ -2595,6 +2598,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 let _ = self.fill_defaults_and_implicits(
                     tree.span,

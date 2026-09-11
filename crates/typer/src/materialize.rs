@@ -676,6 +676,7 @@ impl Materialiser<'_> {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         }
     }
 

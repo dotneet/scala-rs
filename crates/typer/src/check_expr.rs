@@ -1194,6 +1194,7 @@ impl Typer {
                             scala_ref: false,
                             stable_pat: false,
                             byname_thunk: false,
+                            byname_type_marker: false,
                         };
                     } else if sym != fun.sym {
                         fun.sym = sym;
@@ -1461,6 +1462,7 @@ impl Typer {
                         scala_ref: false,
                         stable_pat: false,
                         byname_thunk: false,
+                        byname_type_marker: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(update),
@@ -1493,6 +1495,7 @@ impl Typer {
                         scala_ref: false,
                         stable_pat: false,
                         byname_thunk: false,
+                        byname_type_marker: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -1517,6 +1520,7 @@ impl Typer {
                         scala_ref: false,
                         stable_pat: false,
                         byname_thunk: false,
+                        byname_type_marker: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -1546,6 +1550,7 @@ impl Typer {
                         scala_ref: false,
                         stable_pat: false,
                         byname_thunk: false,
+                        byname_type_marker: false,
                     };
                     tree.kind = TreeKind::Apply {
                         fun: Box::new(setter),
@@ -1897,6 +1902,7 @@ impl Typer {
                             scala_ref: false,
                             stable_pat: false,
                             byname_thunk: false,
+                            byname_type_marker: false,
                         };
                         self.type_apply(tree, pt);
                         return;

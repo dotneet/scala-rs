@@ -664,6 +664,7 @@ impl Typer {
                     scala_ref: false,
                     stable_pat: false,
                     byname_thunk: false,
+                    byname_type_marker: false,
                 };
                 // The picked constructor still speaks the class's own type
                 // parameters. `new TypedRep[Int]()` has to search for

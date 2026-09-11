@@ -226,6 +226,7 @@ impl Typer {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         };
         self.type_select(fun, &Type::NoType);
         !fun.ty.is_error() && !fun.ty.is_no_type()
@@ -2210,6 +2211,7 @@ impl Typer {
                 scala_ref: false,
                 stable_pat: false,
                 byname_thunk: false,
+                byname_type_marker: false,
             };
             let mut filled = self.fill_conv_implicits(id, &from, applied, span);
             filled.ty = solved.clone();

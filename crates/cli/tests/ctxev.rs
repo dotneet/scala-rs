@@ -250,3 +250,12 @@ fn byname_eta_modes_and_unit_discard() {
         ("byname_unit_overload_bad", false),
     ]);
 }
+
+#[test]
+fn byname_type_marker_identity() {
+    matrix(&[("byname_marker", true), ("byname_marker_bad", false)]);
+    let cp = format!("{JAR}:/tmp/scala-2.13.16/lib/scala-reflect.jar");
+    compare(&["byname_quote_bad"], None, &cp);
+    compare(&["byname_unicode_quote_bad"], None, &cp);
+    compare(&["byname_written_quote"], Some(b"`<ByName>`[Int]\n"), &cp);
+}

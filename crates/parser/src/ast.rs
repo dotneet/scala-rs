@@ -559,6 +559,8 @@ pub struct Tree {
     pub stable_pat: bool,
     /// A Function generated to delay a by-name argument, never a source literal.
     pub byname_thunk: bool,
+    /// Parser-created by-name type head, distinct from a written identifier.
+    pub byname_type_marker: bool,
 }
 
 impl Tree {
@@ -573,6 +575,7 @@ impl Tree {
             scala_ref: false,
             stable_pat: false,
             byname_thunk: false,
+            byname_type_marker: false,
         }
     }
 
