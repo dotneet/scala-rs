@@ -23,6 +23,7 @@ mod double_def;
 mod dup_alternatives;
 mod erasure;
 mod expand;
+mod expand_mirror;
 mod expand_private;
 mod expand_rpc;
 mod fasttrack_mirror;

@@ -518,6 +518,7 @@ impl PickleSupply {
             if !m.is_public_api()
                 && !(m.has(pflags::PRIVATE) && !m.has(pflags::BRIDGE) && !m.has(pflags::SYNTHETIC))
                 && !m.is_case_synthetic()
+                && !m.is_case_copy(sig.flags)
                 && !implicit_class_conversion_from(&internal, m)
             {
                 continue;
@@ -1627,7 +1628,18 @@ impl PickleSupply {
                 st.binary_alias_prefixes
                     .insert((alias_owner, name.to_string()), prefix.clone());
             }
-            return self.install_type_alias(st, bin, alias_owner, name, &hit.member.ty);
+            let this_prefix = match &hit.member.alias_prefix {
+                Some(SigType::This(c)) => Some(c.clone()),
+                _ => None,
+            };
+            return self.install_type_alias(
+                st,
+                bin,
+                alias_owner,
+                name,
+                &hit.member.ty,
+                this_prefix.as_deref(),
+            );
         }
         // A *nested class or trait* named as a **type**, as opposed to a type
         // alias or an abstract type member: `u.TypeTag[T]` (`TypeTags.TypeTag`),
@@ -1648,6 +1660,144 @@ impl PickleSupply {
             sym,
             args: Vec::new(),
         })
+    }
+
+    /// A type member that `class_sym`, a class read from a jar, passes on to a
+    /// subclass: what a bare `Reader` means inside a source class that
+    /// extends it.
+    ///
+    /// [`PickleSupply::complete_type_member`] answers a *selection* -- `p.T`,
+    /// `C#T`, a name an import offers -- and so only a public member. A
+    /// subclass body sees more than that: slick's `ResultConverter` declares
+    /// `protected[this] type Reader = M#Reader`, and every `mapTo` expansion
+    /// overrides `read(r: Reader)` in an anonymous subclass of
+    /// `SimpleFastPathResultConverter`. Nothing in the bytecode records an
+    /// alias, and the protected one was never installed, so the name was not
+    /// found at all.
+    ///
+    /// The member is installed as a symbol of the class that **declares** it,
+    /// in that class's own vocabulary (the pickle is re-read there rather than
+    /// through `class_sym`, whose lookup substitutes into `class_sym`'s type
+    /// parameters). Seen from the subclass, the typer then substitutes the
+    /// subclass's base-type arguments for the declaring class's parameters,
+    /// exactly as it does for a source ancestor's alias.
+    ///
+    /// A `private` member is not inherited (SLS 5.2) and is not offered; a
+    /// `protected` or `protected[this]` one is, and keeps `PROTECTED`.
+    pub fn complete_inherited_type_member(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        name: &str,
+    ) -> Option<SymbolId> {
+        if class_sym.is_none() || name.is_empty() || !st.get(class_sym).is_class_like() {
+            return None;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        if internal.is_empty()
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || internal.contains("$anon")
+        {
+            return None;
+        }
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let full = self.pickled_full_name(bin, &internal, is_module)?;
+        let inheritable = |m: &scala_rs_pickle::sym::Member| {
+            matches!(m.kind, MemberKind::TypeAlias | MemberKind::AbstractType)
+                && !m.has(pflags::PRIVATE)
+                && !m.has(pflags::SYNTHETIC)
+                && !m.has(pflags::BRIDGE)
+        };
+        let hit = {
+            let mut src = BinSource(bin);
+            let (hits, _) = self.sigs.lookup(&mut src, &full, is_module, name);
+            hits.into_iter().find(|h| inheritable(&h.member))?
+        };
+        let owner = if hit.owner == full && hit.owner_module == is_module {
+            class_sym
+        } else {
+            self.ensure_class(st, bin, &hit.owner, hit.owner_module)?
+        };
+        if let Some(id) = st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| st.get(m).kind == SymKind::TypeMember && st.get(m).name == name)
+        {
+            return Some(id);
+        }
+        // Re-read in the declaring class's own vocabulary.
+        let declared = {
+            let mut src = BinSource(bin);
+            let sig = self
+                .sigs
+                .class_sig(&mut src, &hit.owner, hit.owner_module)
+                .ok()?;
+            sig.members
+                .iter()
+                .find(|m| m.name == name && inheritable(m))?
+                .clone()
+        };
+        let id = if declared.kind == MemberKind::AbstractType {
+            match self.abstract_type_member(st, bin, &format!("{}.{name}", hit.owner), 0)? {
+                Type::TypeMember(id) => id,
+                _ => return None,
+            }
+        } else if matches!(declared.ty, SigType::Poly { .. }) {
+            let this_prefix = match &declared.alias_prefix {
+                Some(SigType::This(c)) => Some(c.clone()),
+                _ => None,
+            };
+            match self.install_type_alias(
+                st,
+                bin,
+                owner,
+                name,
+                &declared.ty,
+                this_prefix.as_deref(),
+            )? {
+                Type::TypeMember(id) => id,
+                _ => return None,
+            }
+        } else {
+            // A nullary alias. `install_type_alias` hands one back as its
+            // right-hand side with no symbol; a subclass needs the symbol, so
+            // that the declaring class's parameters in the right-hand side can
+            // be seen through the subclass's base type.
+            let mut scope: HashMap<String, Type> = HashMap::new();
+            for tp in &st.get(owner).tparams {
+                scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
+            }
+            let outer = self.self_ty.replace(Type::Class {
+                sym: owner,
+                args: Vec::new(),
+            });
+            let conv = self.conv_at(st, bin, &scope, &declared.ty, 0);
+            self.self_ty = outer;
+            let Some(target) = conv else {
+                trace(format_args!(
+                    "{}#{name}: inherited alias {:?} does not convert",
+                    hit.owner, declared.ty
+                ));
+                return None;
+            };
+            let id = st.alloc(name, owner, SymKind::TypeMember, Flags::EMPTY, "");
+            st.get_mut(id).ty = target;
+            st.get_mut(id).is_type_alias = true;
+            st.get_mut(owner).members.push(id);
+            id
+        };
+        if declared.has(pflags::PROTECTED) {
+            st.get_mut(id).flags = st.get(id).flags.with(Flags::PROTECTED);
+        }
+        trace(format_args!(
+            "{}#{name}: inherited type member installed for a subclass",
+            hit.owner
+        ));
+        Some(id)
     }
 
     /// The enclosing instance named by a member object or a result type's
@@ -1679,6 +1829,44 @@ impl PickleSupply {
         None
     }
 
+    /// `C.this.In` from a pickle: the `THIStpe` prefix of a `TypeRef` to a
+    /// nested class, which `SigType` has no room for (`sym.rs` records it
+    /// beside the member as `alias_prefix` / `result_prefix`). Attached as
+    /// the view prefix `ThisType(C)` (`prefix.rs`) when the type names a
+    /// class nested in a class: slick's `type Table[T] = JdbcProfile.this.Table[T]`
+    /// and `val api: JdbcProfile.this.API` are what gitbucket's every table
+    /// reaches its superclass and its enclosing instance through.
+    fn with_pickled_this_prefix(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        this_prefix: Option<&str>,
+        ty: Type,
+    ) -> Type {
+        let Some(owner_name) = this_prefix else {
+            return ty;
+        };
+        let inner = |st: &SymbolTable, t: &Type| matches!(t, Type::Class { sym, .. } if st.is_inner_class_of_class(*sym));
+        let core_is_inner = match &ty {
+            Type::Method { ret, .. } => inner(st, ret),
+            t => inner(st, t),
+        };
+        if !core_is_inner {
+            return ty;
+        }
+        let Some(c) = self.ensure_class(st, bin, owner_name, false) else {
+            return ty;
+        };
+        let pre = Type::ThisType(c);
+        match ty {
+            Type::Method { paramss, ret } => Type::Method {
+                paramss,
+                ret: Box::new(crate::prefix::with_prefix(*ret, pre)),
+            },
+            t => crate::prefix::with_prefix(t, pre),
+        }
+    }
+
     /// `type T[tps] = U` from a pickle, as the type it stands for.
     ///
     /// An alias is *transparent*: a nullary one is simply its right-hand side,
@@ -1696,6 +1884,7 @@ impl PickleSupply {
         owner: SymbolId,
         name: &str,
         ty: &SigType,
+        this_prefix: Option<&str>,
     ) -> Option<Type> {
         let owner_name = st
             .get(owner)
@@ -1729,7 +1918,7 @@ impl PickleSupply {
                     "{owner_name}#{name}: type alias right-hand side {rhs:?} does not convert"
                 ));
             }
-            return conv;
+            return conv.map(|t| self.with_pickled_this_prefix(st, bin, this_prefix, t));
         }
         // Owned but not yet a member: a right-hand side that will not convert
         // must leave the owner exactly as it was.
@@ -1759,6 +1948,7 @@ impl PickleSupply {
             ));
             return None;
         };
+        let target = self.with_pickled_this_prefix(st, bin, this_prefix, target);
         st.get_mut(id).ty = target;
         st.get_mut(id).is_type_alias = true;
         st.get_mut(owner).members.push(id);
@@ -1777,6 +1967,16 @@ impl PickleSupply {
         name: &str,
     ) -> Vec<SymbolId> {
         self.complete_named(st, bin, class_sym, name, false)
+    }
+
+    /// The pickled flags of the class (or module class) `full`, or `0` when
+    /// there is no pickle to read them from.
+    fn declared_class_flags(&mut self, bin: &mut BinaryIndex, full: &str, is_module: bool) -> u64 {
+        let mut src = BinSource(bin);
+        self.sigs
+            .class_sig(&mut src, full, is_module)
+            .map(|sig| sig.flags)
+            .unwrap_or(0)
     }
 
     /// `synthetic_ok` is set only when fetching a `$default$` getter, which is
@@ -2005,12 +2205,19 @@ impl PickleSupply {
             if m.kind != MemberKind::Def && m.kind != MemberKind::Val {
                 continue;
             }
+            // Only a synthetic `copy` needs its declaring class's flags; the
+            // lookup is skipped for every other member.
+            let case_copy = case_synthetic_ok
+                && m.name == "copy"
+                && m.has(pflags::SYNTHETIC)
+                && m.is_case_copy(self.declared_class_flags(bin, &hit.owner, hit.owner_module));
             if !m.is_public_api()
                 && !(m.has(pflags::PRIVATE)
                     && hit.owner == full
                     && !m.has(pflags::BRIDGE)
                     && !m.has(pflags::SYNTHETIC))
                 && !(case_synthetic_ok && m.is_case_synthetic())
+                && !case_copy
                 && !implicit_class_conversion_from(&hit.owner, m)
                 && !(synthetic_ok && is_default_getter(&m.name))
             {
@@ -2051,6 +2258,12 @@ impl PickleSupply {
                 st.get_mut(id).private_within = ctor_access_within(m);
                 if m.has(pflags::LOCAL) && m.has(pflags::PRIVATE) {
                     st.get_mut(id).flags = st.get(id).flags.with(Flags::LOCAL);
+                }
+                if let Some(SigType::This(c)) = &m.result_prefix {
+                    let c = c.clone();
+                    let ty = std::mem::replace(&mut st.get_mut(id).ty, Type::NoType);
+                    let ty = self.with_pickled_this_prefix(st, bin, Some(&c), ty);
+                    st.get_mut(id).ty = ty;
                 }
                 st.get_mut(id).parameterless_method = Some(shape.clauses.is_empty());
                 // A `val`'s accessor is stable; `ident_is_stable` /

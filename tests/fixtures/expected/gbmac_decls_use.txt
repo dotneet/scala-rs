@@ -1,0 +1,231 @@
+gbmac.use.Foo [case] case=true tpe=gbmac.use.Foo
+  parents=gbmac.use.Foo, java.io.Serializable, scala.Product, scala.Equals, java.lang.Object, scala.Any
+  primary=(id:Int, name:String)
+  def id [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: Int
+  val id<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: Int
+  def name [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: String
+  val name<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: String
+  def <init> [<method>] {ctor}(id:Int, name:String) :: gbmac.use.Foo
+  def copy [<method> <synthetic>] {}(id=:Int, name=:String) :: gbmac.use.Foo
+  def copy$default$1 [<method> <synthetic> <defaultparam/trait>] {} :: Int @scala.annotation.unchecked.uncheckedVariance
+  def copy$default$2 [<method> <synthetic> <defaultparam/trait>] {} :: String @scala.annotation.unchecked.uncheckedVariance
+  def productPrefix [<method> override <synthetic>] {} :: String
+  def productArity [<method> <synthetic>] {} :: Int
+  def productElement [<method> <synthetic>] {}(x$1:Int) :: Any
+  def productIterator [<method> override <synthetic>] {} :: Iterator[Any]
+  def canEqual [<method> <synthetic>] {}(x$1:Any) :: Boolean
+  def productElementName [<method> override <synthetic>] {}(x$1:Int) :: String
+  def hashCode [<method> override <synthetic>] {}() :: Int
+  def toString [<method> override <synthetic>] {}() :: String
+  def equals [<method> override <synthetic>] {}(x$1:Any) :: Boolean
+  caseAccessors=id,name
+  caseFields=id:Int,name:String
+  companion=gbmac.use.Foo [<module> <synthetic>] back=true
+  companion parents=gbmac.use.Foo, scala.runtime.AbstractFunction2, scala.Function2, java.lang.Object, scala.Any
+  def <init> [<method>] {ctor}() :: gbmac.use.Foo.type
+  def toString [<method> final override <synthetic>] {}() :: String
+  def apply [<method> case <synthetic>] {}(id:Int, name:String) :: gbmac.use.Foo
+  def unapply [<method> case <synthetic>] {}(x$0:gbmac.use.Foo) :: Option[(Int, String)]
+  tupled=true curried=true
+gbmac.use.Bar [case] case=true tpe=gbmac.use.Bar
+  parents=gbmac.use.Bar, java.io.Serializable, scala.Product, scala.Equals, java.lang.Object, scala.Any
+  primary=(id:Int, n=:Option[String])
+  def id [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: Int
+  val id<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: Int
+  def n [<method> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc} :: Option[String]
+  def n_$eq [<method> <accessor> <paramaccessor>] {setter,paramAcc}(x$1:Option[String]) :: Unit
+  val n<sp> [<mutable> <caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,isVar} :: Option[String]
+  def <init> [<method>] {ctor}(id:Int, n=:Option[String]) :: gbmac.use.Bar
+  def extra [<method> <stable> <accessor>] {getter,stable} :: Int
+  val extra<sp> [private[this]] {stable,isVal} :: Int
+  def lz [<method> <stable> <accessor> lazy] {getter,stable,lazy} :: String
+  def m [<method>] {}(x:Int) :: Int
+  val hidden [private[this]] {stable,isVal} :: Int
+  def h [<method>] {} :: Int
+  def copy [<method> <synthetic>] {}(id=:Int, n=:Option[String]) :: gbmac.use.Bar
+  def copy$default$1 [<method> <synthetic> <defaultparam/trait>] {} :: Int @scala.annotation.unchecked.uncheckedVariance
+  def copy$default$2 [<method> <synthetic> <defaultparam/trait>] {} :: Option[String] @scala.annotation.unchecked.uncheckedVariance
+  def productPrefix [<method> override <synthetic>] {} :: String
+  def productArity [<method> <synthetic>] {} :: Int
+  def productElement [<method> <synthetic>] {}(x$1:Int) :: Any
+  def productIterator [<method> override <synthetic>] {} :: Iterator[Any]
+  def canEqual [<method> <synthetic>] {}(x$1:Any) :: Boolean
+  def productElementName [<method> override <synthetic>] {}(x$1:Int) :: String
+  def hashCode [<method> override <synthetic>] {}() :: Int
+  def toString [<method> override <synthetic>] {}() :: String
+  def equals [<method> override <synthetic>] {}(x$1:Any) :: Boolean
+  caseAccessors=id,n
+  caseFields=id:Int
+  companion=gbmac.use.Bar [<module> <synthetic>] back=true
+  companion parents=gbmac.use.Bar, scala.runtime.AbstractFunction2, scala.Function2, java.lang.Object, scala.Any
+  def <init> [<method>] {ctor}() :: gbmac.use.Bar.type
+  def toString [<method> final override <synthetic>] {}() :: String
+  def apply [<method> case <synthetic>] {}(id:Int, n=:Option[String]) :: gbmac.use.Bar
+  def apply$default$2 [<method> <synthetic> <defaultparam/trait>] {} :: Option[String] @scala.annotation.unchecked.uncheckedVariance
+  def unapply [<method> case <synthetic>] {}(x$0:gbmac.use.Bar) :: Option[(Int, Option[String])]
+  def $lessinit$greater$default$2 [<method> <synthetic> <defaultparam/trait>] {} :: Option[String] @scala.annotation.unchecked.uncheckedVariance
+  tupled=true curried=true
+gbmac.use.One [case] case=true tpe=gbmac.use.One
+  parents=gbmac.use.One, java.io.Serializable, scala.Product, scala.Equals, java.lang.Object, scala.Any
+  primary=(v:Long)
+  def v [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: Long
+  val v<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: Long
+  def <init> [<method>] {ctor}(v:Long) :: gbmac.use.One
+  def copy [<method> <synthetic>] {}(v=:Long) :: gbmac.use.One
+  def copy$default$1 [<method> <synthetic> <defaultparam/trait>] {} :: Long @scala.annotation.unchecked.uncheckedVariance
+  def productPrefix [<method> override <synthetic>] {} :: String
+  def productArity [<method> <synthetic>] {} :: Int
+  def productElement [<method> <synthetic>] {}(x$1:Int) :: Any
+  def productIterator [<method> override <synthetic>] {} :: Iterator[Any]
+  def canEqual [<method> <synthetic>] {}(x$1:Any) :: Boolean
+  def productElementName [<method> override <synthetic>] {}(x$1:Int) :: String
+  def hashCode [<method> override <synthetic>] {}() :: Int
+  def toString [<method> override <synthetic>] {}() :: String
+  def equals [<method> override <synthetic>] {}(x$1:Any) :: Boolean
+  caseAccessors=v
+  caseFields=v:Long
+  companion=gbmac.use.One [<module> <synthetic>] back=true
+  companion parents=gbmac.use.One, scala.runtime.AbstractFunction1, scala.Function1, java.lang.Object, scala.Any
+  def <init> [<method>] {ctor}() :: gbmac.use.One.type
+  def toString [<method> final override <synthetic>] {}() :: String
+  def apply [<method> case <synthetic>] {}(v:Long) :: gbmac.use.One
+  def unapply [<method> case <synthetic>] {}(x$0:gbmac.use.One) :: Option[Long]
+  tupled=false curried=false
+gbmac.use.WithObj [case] case=true tpe=gbmac.use.WithObj
+  parents=gbmac.use.WithObj, java.io.Serializable, scala.Product, scala.Equals, java.lang.Object, scala.Any
+  primary=(a:Int, b:Int)
+  def a [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: Int
+  val a<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: Int
+  def b [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: Int
+  val b<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: Int
+  def <init> [<method>] {ctor}(a:Int, b:Int) :: gbmac.use.WithObj
+  def copy [<method> <synthetic>] {}(a=:Int, b=:Int) :: gbmac.use.WithObj
+  def copy$default$1 [<method> <synthetic> <defaultparam/trait>] {} :: Int @scala.annotation.unchecked.uncheckedVariance
+  def copy$default$2 [<method> <synthetic> <defaultparam/trait>] {} :: Int @scala.annotation.unchecked.uncheckedVariance
+  def productPrefix [<method> override <synthetic>] {} :: String
+  def productArity [<method> <synthetic>] {} :: Int
+  def productElement [<method> <synthetic>] {}(x$1:Int) :: Any
+  def productIterator [<method> override <synthetic>] {} :: Iterator[Any]
+  def canEqual [<method> <synthetic>] {}(x$1:Any) :: Boolean
+  def productElementName [<method> override <synthetic>] {}(x$1:Int) :: String
+  def hashCode [<method> override <synthetic>] {}() :: Int
+  def toString [<method> override <synthetic>] {}() :: String
+  def equals [<method> override <synthetic>] {}(x$1:Any) :: Boolean
+  caseAccessors=a,b
+  caseFields=a:Int,b:Int
+  companion=gbmac.use.WithObj [<module>] back=true
+  companion parents=gbmac.use.WithObj, java.io.Serializable, java.lang.Object, scala.Any
+  def <init> [<method>] {ctor}() :: gbmac.use.WithObj.type
+  def make [<method>] {} :: gbmac.use.WithObj
+  def apply [<method> case <synthetic>] {}(a:Int, b:Int) :: gbmac.use.WithObj
+  def unapply [<method> case <synthetic>] {}(x$0:gbmac.use.WithObj) :: Option[(Int, Int)]
+  def writeReplace [<method> <synthetic> private] {}() :: Object
+  tupled=false curried=false
+gbmac.use.Impl [case] case=true tpe=gbmac.use.Impl
+  parents=gbmac.use.Impl, java.io.Serializable, scala.Product, scala.Equals, gbmac.use.Named, java.lang.Object, scala.Any
+  primary=(name:String, when:java.util.Date)
+  def name [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: String
+  val name<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: String
+  def when [<method> <stable> <caseaccessor> <accessor> <paramaccessor>] {getter,paramAcc,caseAcc,stable} :: java.util.Date
+  val when<sp> [<caseaccessor> <paramaccessor> private[this]] {paramAcc,caseAcc,stable,isVal} :: java.util.Date
+  def <init> [<method>] {ctor}(name:String, when:java.util.Date) :: gbmac.use.Impl
+  def d [<method>] {} :: Int
+  def copy [<method> <synthetic>] {}(name=:String, when=:java.util.Date) :: gbmac.use.Impl
+  def copy$default$1 [<method> <synthetic> <defaultparam/trait>] {} :: String @scala.annotation.unchecked.uncheckedVariance
+  def copy$default$2 [<method> <synthetic> <defaultparam/trait>] {} :: java.util.Date @scala.annotation.unchecked.uncheckedVariance
+  def productPrefix [<method> override <synthetic>] {} :: String
+  def productArity [<method> <synthetic>] {} :: Int
+  def productElement [<method> <synthetic>] {}(x$1:Int) :: Any
+  def productIterator [<method> override <synthetic>] {} :: Iterator[Any]
+  def canEqual [<method> <synthetic>] {}(x$1:Any) :: Boolean
+  def productElementName [<method> override <synthetic>] {}(x$1:Int) :: String
+  def hashCode [<method> override <synthetic>] {}() :: Int
+  def toString [<method> override <synthetic>] {}() :: String
+  def equals [<method> override <synthetic>] {}(x$1:Any) :: Boolean
+  caseAccessors=name,when
+  caseFields=name:String,when:java.util.Date
+  companion=gbmac.use.Impl [<module> <synthetic>] back=true
+  companion parents=gbmac.use.Impl, scala.runtime.AbstractFunction2, scala.Function2, java.lang.Object, scala.Any
+  def <init> [<method>] {ctor}() :: gbmac.use.Impl.type
+  def toString [<method> final override <synthetic>] {}() :: String
+  def apply [<method> case <synthetic>] {}(name:String, when:java.util.Date) :: gbmac.use.Impl
+  def unapply [<method> case <synthetic>] {}(x$0:gbmac.use.Impl) :: Option[(String, java.util.Date)]
+  tupled=true curried=true
+gbmac.use.Plain [] case=false tpe=gbmac.use.Plain
+  parents=gbmac.use.Plain, java.lang.Object, scala.Any
+  primary=(a:Int, b:String)
+  def a [<method> <stable> <accessor> <paramaccessor>] {getter,paramAcc,stable} :: Int
+  val a<sp> [<paramaccessor> private[this]] {paramAcc,stable,isVal} :: Int
+  val b [<paramaccessor> private[this]] {paramAcc,stable,isVal} :: String
+  def <init> [<method>] {ctor}(a:Int, b:String) :: gbmac.use.Plain
+  def g [<method>] {} :: String
+  caseAccessors=
+  caseFields=
+  companion=<none>
+gbmac.use.Named [abstract <defaultparam/trait>] case=false tpe=gbmac.use.Named
+  parents=gbmac.use.Named, java.lang.Object, scala.Any
+  primary=()
+  def $init$ [<method>] {ctor}() :: Unit
+  def name [<method> <deferred> <stable> <accessor>] {getter,stable,isVal} :: String
+  def tag [<method> <stable> <accessor>] {getter,stable,isVal} :: String
+  def count [<method> <accessor>] {getter,isVar} :: Int
+  def count_$eq [<method> <accessor>] {setter,isVar}(x$1:Int) :: Unit
+  def lz [<method> <stable> <accessor> lazy] {getter,stable,isVal,lazy} :: Int
+  def d [<method> <deferred>] {} :: Int
+  def e [<method>] {} :: Int
+  def pv [<method> <stable> <accessor> protected] {getter,stable,isVal} :: Int
+  def priv [<method> <stable> <accessor> private] {getter,stable,isVal} :: Int
+  def usePriv [<method>] {} :: Int
+  caseAccessors=
+  caseFields=
+  companion=<none>
+gbmac.use.Pure [<interface> abstract <defaultparam/trait>] case=false tpe=gbmac.use.Pure
+  parents=gbmac.use.Pure, java.lang.Object, scala.Any
+  primary=
+  def a [<method> <deferred>] {} :: Int
+  def b [<method> <deferred>] {}(x:String) :: Int
+  caseAccessors=
+  caseFields=
+  companion=<none>
+gbmac.use.OnlyDefs [abstract <defaultparam/trait>] case=false tpe=gbmac.use.OnlyDefs
+  parents=gbmac.use.OnlyDefs, java.lang.Object, scala.Any
+  primary=()
+  def $init$ [<method>] {ctor}() :: Unit
+  def a [<method>] {} :: Int
+  caseAccessors=
+  caseFields=
+  companion=<none>
+gbmac.use.AbsC [abstract] case=false tpe=gbmac.use.AbsC
+  parents=gbmac.use.AbsC, java.lang.Object, scala.Any
+  primary=(x:Int)
+  def x [<method> <stable> <accessor> <paramaccessor>] {getter,paramAcc,stable} :: Int
+  val x<sp> [<paramaccessor> private[this]] {paramAcc,stable,isVal} :: Int
+  def <init> [<method>] {ctor}(x:Int) :: gbmac.use.AbsC
+  def y [<method> <deferred> <stable> <accessor>] {getter,stable} :: Int
+  def z [<method> <deferred> <accessor>] {getter} :: Int
+  def z_$eq [<method> <deferred> <accessor>] {setter}(x$1:Int) :: Unit
+  def w [<method> <deferred>] {} :: Int
+  def pz [<method> <accessor> private] {getter} :: Int
+  def pz_$eq [<method> <accessor> private] {setter}(x$1:Int) :: Unit
+  val pz<sp> [<mutable> private[this]] {isVar} :: Int
+  def ptv [<method> <stable> <accessor> protected[this]] {getter,stable} :: Int
+  val ptv<sp> [private[this]] {stable,isVal} :: Int
+  def iv [<method> implicit <stable> <accessor>] {getter,stable} :: Int
+  val iv<sp> [private[this]] {stable,isVal} :: Int
+  caseAccessors=
+  caseFields=
+  companion=<none>
+gbmac.use.Sub [] case=false tpe=gbmac.use.Sub
+  parents=gbmac.use.Sub, gbmac.use.AbsC, java.lang.Object, scala.Any
+  primary=(p:Int)
+  val p [<paramaccessor> private[this]] {paramAcc,stable,isVal} :: Int
+  def <init> [<method>] {ctor}(p:Int) :: gbmac.use.Sub
+  def y [<method> <stable> <accessor>] {getter,stable} :: Int
+  val y<sp> [private[this]] {stable,isVal} :: Int
+  def z [<method> <accessor>] {getter} :: Int
+  def z_$eq [<method> <accessor>] {setter}(x$1:Int) :: Unit
+  val z<sp> [<mutable> private[this]] {isVar} :: Int
+  def w [<method>] {} :: Int
+  caseAccessors=
+  caseFields=
+  companion=<none>

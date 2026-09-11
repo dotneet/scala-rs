@@ -267,11 +267,10 @@ fn gbm_applied_tags_match_real_scalac() {
 /// Main.type = Main.type[]
 /// ```
 ///
-/// The first is gitbucket's `mapTo` in miniature and the reason this slice
-/// does not close it: `LocalRow` is a case class **this run is compiling**, so
-/// it travels as the empty placeholder of `docs/macros.md` §5.1, and the
-/// implementation's verdict on a symbol carrying nothing but a name says
-/// nothing about the program -- so it is replaced rather than repeated.
+/// There used to be a fourth: gitbucket's `mapTo` in miniature, a case class
+/// this run is compiling as a *bare* type argument. It is answered now
+/// (`docs/macros.md` §7.25) and is compared with real scalac in
+/// `crates/cli/tests/gbmac.rs`.
 #[test]
 fn gbm_unbuildable_tags_are_named() {
     if !prerequisites("gbm_bad") {
@@ -289,9 +288,6 @@ fn gbm_unbuildable_tags_are_named() {
     let out = compile(&["gbm_bad"], &uses, &[&impls]);
     let text = diagnostics(&out);
     for want in [
-        // The placeholder: a type *argument* that is a class this run is
-        // compiling still carries a name and nothing else.
-        "the type argument `LocalRow` is a class this run is compiling",
         // A current-run class *applied* to type arguments: the placeholder has
         // nothing for them to bind to, so it is refused rather than sent as a
         // name the engine's mirror would fail to resolve.
@@ -307,7 +303,7 @@ fn gbm_unbuildable_tags_are_named() {
     assert!(!out.status.success() || text.contains("error:"), "{text}");
     assert_eq!(
         text.matches("macro expansion is not implemented").count(),
-        4,
+        3,
         "every call site must be refused:\n{text}"
     );
     let _ = fs::remove_dir_all(&impls);

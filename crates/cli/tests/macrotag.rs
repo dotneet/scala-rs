@@ -246,12 +246,14 @@ fn mg_local_class_expansion_matches_real_scalac() {
     let _ = fs::remove_dir_all(&lib);
 }
 
-/// An implementation that asks the placeholder what the class *is* gets an
-/// answer about a symbol it was never shown, so its verdict is refused and the
-/// call site says why. The same implementation's verdict on a class that
-/// really is on the macro classpath is reported as itself.
+/// An implementation that asks a class this run is compiling what it *is*
+/// gets the real answer (`docs/macros.md` §7.25), so its verdict -- `MgPlain
+/// must be a case class` -- is the program's error, exactly as real scalac
+/// 2.13.16 reports it. It used to be refused as a verdict on a placeholder
+/// symbol the implementation had never been shown. The control, a class on
+/// the macro classpath, is reported as itself as it always was.
 #[test]
-fn mg_placeholder_verdict_is_not_reported_as_the_programs_error() {
+fn mg_local_class_verdict_is_the_programs_own() {
     if !prerequisites("mg_inspect_bad") {
         return;
     }
@@ -265,13 +267,12 @@ fn mg_placeholder_verdict_is_not_reported_as_the_programs_error() {
     );
     let err = diagnostics(&out);
     assert!(
-        err.contains("the type argument `MgPlain` is a class this run is compiling")
-            && err.contains("placeholder symbol carrying only its name"),
-        "the placeholder's verdict was not refused: {err}"
+        err.contains("error: MgPlain must be a case class"),
+        "the implementation's verdict on a current-run class was not reported: {err}"
     );
     assert!(
-        !err.contains("error: MgPlain must be a case class"),
-        "the placeholder's verdict was reported as the program's error: {err}"
+        !err.contains("placeholder"),
+        "a current-run class still reached the engine as a placeholder: {err}"
     );
     // The control: a class the mirror really can find gets the real symbol, so
     // the implementation's `abort` is its own judgement and is reported.

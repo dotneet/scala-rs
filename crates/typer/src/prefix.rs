@@ -119,8 +119,11 @@ impl SymbolTable {
             return false;
         }
         let s = self.get(sym);
-        if s.kind != SymKind::Class || s.flags.contains(Flags::JAVA) {
+        if s.kind != SymKind::Class {
             return false;
+        }
+        if s.flags.contains(Flags::JAVA) {
+            return self.is_binary_nested_class(sym);
         }
         let owner = s.owner;
         if owner.is_none() || owner == sym {
@@ -128,6 +131,29 @@ impl SymbolTable {
         }
         let o = self.get(owner);
         o.kind == SymKind::Class && !o.flags.contains(Flags::JAVA)
+    }
+
+    /// A class read from a class file (`Flags::JAVA` marks every binary
+    /// symbol, Scala or Java) that is nested in a class -- `Numeric$NumericOps`,
+    /// `RelationalProfile$Table` -- and not `static`: the `InnerClasses`
+    /// attribute says which (`nested_static`, `classpath.rs`), and a class
+    /// nested in an object is static. Such a class takes an enclosing
+    /// instance exactly like one from source.
+    pub fn is_binary_nested_class(&self, sym: SymbolId) -> bool {
+        let s = self.get(sym);
+        if s.kind != SymKind::Class
+            || s.flags.contains(Flags::STATIC)
+            || s.flags.contains(Flags::MODULE)
+            || s.owner.is_none()
+            || s.owner == sym
+        {
+            return false;
+        }
+        let simple = s.jvm_name.rsplit('/').next().unwrap_or("");
+        if !simple.contains('$') || simple.ends_with('$') {
+            return false;
+        }
+        self.get(s.owner).kind == SymKind::Class
     }
 
     /// Does `ty` name a class `is_inner_class_of_class` says yes to, with no

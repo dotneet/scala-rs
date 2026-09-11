@@ -328,6 +328,13 @@ impl Typer {
                             }
                         } else {
                             let applied = self.apply_types(ctor.clone(), as_, span);
+                            // A parameterised alias of an inner class (`type
+                            // Table[T] = RelationalProfile.this.Table[T]`)
+                            // expands only now, so its `C.this` is read
+                            // through the import or the path here, the way
+                            // `import_prefixed` / `project_from_prefix_at`
+                            // read a nullary one (`prefix.rs`).
+                            let applied = self.applied_alias_prefixed(tpt, applied, span);
                             self.with_prefix_if_type_member(tpt, &ctor, applied)
                         }
                     }
@@ -793,10 +800,10 @@ impl Typer {
         let Type::Class { sym, .. } = crate::prefix::strip_view(ty).clone() else {
             return;
         };
-        if !self.st.is_inner_class_of_class(sym) {
+        let owner = self.st.get(sym).owner;
+        if owner.is_none() || !self.st.get(owner).is_class_like() {
             return;
         }
-        let owner = self.st.get(sym).owner;
         let reaches = |st: &SymbolTable, t: &Type| {
             st.class_sym_of(t)
                 .is_some_and(|c| c == owner || st.is_ancestor_of(owner, c))
@@ -880,7 +887,18 @@ impl Typer {
         if !self.st.mentions_inner_class(&ty) {
             return ty;
         }
-        let Some(sym) = self.st.lookup_type(name).first().copied() else {
+        // The binding that produced `ty`: the class itself, or an alias
+        // whose right-hand side names it. Several symbols may answer to the
+        // name (a class and a same-named alias of it, say).
+        let core = self.st.class_sym_of(crate::prefix::strip_view(&ty));
+        let Some(sym) = self.st.lookup_type(name).into_iter().find(|&s| {
+            let info = self.st.get(s);
+            match info.kind {
+                SymKind::Class => Some(s) == core,
+                SymKind::TypeMember => self.st.class_sym_of(&info.ty) == core,
+                _ => false,
+            }
+        }) else {
             return ty;
         };
         let owner = self.st.get(sym).owner;
@@ -897,8 +915,56 @@ impl Typer {
             self.diags.truncate(mark);
             return ty;
         }
+        self.warm_enclosing_parents(&q.ty);
         let qpre = self.singleton_prefix_of(&q);
         self.st.subst_as_seen_from_at(&q.ty, qpre.as_ref(), &ty)
+    }
+
+    /// `applied` is `tpt[args]` for a parameterised alias: read it through
+    /// the import (`Ident`) or the term path (`p.T[args]`) the alias was
+    /// named by. Anything else is handed back unchanged.
+    fn applied_alias_prefixed(&mut self, tpt: &Tree, applied: Type, span: Span) -> Type {
+        if !self.st.mentions_inner_class(&applied) {
+            return applied;
+        }
+        match &tpt.kind {
+            TreeKind::Ident { name } => {
+                let name = name.clone();
+                self.import_prefixed(&name, applied, span)
+            }
+            TreeKind::Select { qual, .. } if self.type_select_is_term_prefix(qual) => {
+                let Some(pty) = self.term_path_type(qual) else {
+                    return applied;
+                };
+                let Some(at) = self.singleton_prefix_of(qual) else {
+                    return applied;
+                };
+                self.warm_enclosing_parents(&pty);
+                self.st.rewrite_view_this(&pty, Some(&at), &applied)
+            }
+            _ => applied,
+        }
+    }
+
+    /// Attach the pickled parents of the class `ty` names and of every class
+    /// enclosing it, so that `rewrite_view_this` can tell which enclosing
+    /// class a `C.this` prefix belongs to (`is_ancestor_of` reads parents).
+    /// slick's `JdbcProfile#API` inherits `type Table[T] =
+    /// RelationalProfile.this.Table[T]`, and `RelationalProfile` is only
+    /// known to be an ancestor of `JdbcProfile` once its parents are in.
+    pub(crate) fn warm_enclosing_parents(&mut self, ty: &Type) {
+        if !self.library_abi {
+            return;
+        }
+        let Some(cls) = self.st.class_sym_of(crate::prefix::strip_view(ty)) else {
+            return;
+        };
+        for c in self.st.enclosing_classes(cls) {
+            if self.st.get(c).is_class_like() {
+                self.pickle
+                    .ensure_parents(&mut self.st, &mut self.binary, c);
+            }
+        }
     }
 
     /// `In` written bare inside a class that has it as a member (declared or
@@ -1233,6 +1299,7 @@ impl Typer {
         if t.is_error() || !self.st.mentions_inner_class(&t) {
             return t;
         }
+        self.warm_enclosing_parents(prefix);
         self.st.rewrite_view_this(prefix, Some(at), &t)
     }
 
@@ -4250,7 +4317,15 @@ impl Typer {
     /// `SimpleFeatureNode` declares.
     fn type_member_here(&self, id: SymbolId) -> Type {
         let base = self.st.type_member_as_seen(id);
-        if matches!(base, Type::TypeMember(_)) {
+        // A deferred member stands for itself and has nothing to substitute.
+        // An alias whose right-hand side is *another* member does: `type
+        // Reader = M#Reader` (slick's `ResultConverter`) is an abstract
+        // projection through the owner's type parameter `M`, and seen from a
+        // subclass that fixes `M` it reduces -- `subst_tparams` does exactly
+        // that through `subst_projections`. Returning it unsubstituted left
+        // `r: Reader` in `class L extends Conv[IntDomain, String]` as `M#Reader`
+        // while `next[Int].read` wanted the reduced `Int`.
+        if matches!(base, Type::TypeMember(m) if m == id) {
             return base;
         }
         let owner = self.st.get(id).owner;
