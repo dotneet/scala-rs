@@ -112,8 +112,10 @@ fixture focused on local-import signatures. That separate parser root is not
 claimed repaired by this batch. Import-dependent calls preceding the import
 statement itself also need further lazy-completion coverage.
 
-Integration status: work in progress. No full gate has yet run for this batch.
-No compiler change has been merged to main and no push has been attempted.
+Integration status: the first full gate287ec595 was rejected and recorded.
+The repaired composed tree712279e5 passed its full gate and independent audit
+and is accepted on local main. Detailed evidence is in tests/BASELINE.md.
+No push has been attempted; the earlier approval block remains unresolved.
 
 The first wider prerequisite pass completed 67 CLI suites: 957 passed, one
 ctorgaps failure. Private constructor descriptors belong to the dedicated

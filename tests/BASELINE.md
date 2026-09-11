@@ -11,18 +11,19 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `e608c7dc` |
+| commit | `712279e5` |
 |---|---|
 | updated | 2026-09-11 |
 
-**Fifty composed gates have been accepted this session**, covering the earlier
+**Fifty-one composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
 collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch, and the combined contextual,
 lexical, source-unit ownership and erased field-access batch, and the combined
-Scala declaration, array signature, value-class storage and implicit-view batch.
+Scala declaration, array signature, value-class storage and implicit-view batch,
+and the contextual inference, by-name, local import and declaration-access batch.
 Twenty-eight intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
@@ -80,6 +81,7 @@ coordinator measured the merged tree each time, not the branches.
 | `b969b0d1` | dependent results, SAM inference, implicit overrides and self types | 108 -> **105** | 103 -> **90** |
 | `96c0abb3` | contextual inference, lexical scope, source-unit identity and erased field access | 105 -> **99** | 90 -> **83** |
 | `e608c7dc` | declaration clauses, Array signatures, value-class/Unit storage and implicit views | 99 -> **96** | 83 -> **83** |
+| `712279e5` | contextual inference, by-name values/signatures, copy and local imports | 96 -> **92** | 83 -> **34** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -286,9 +288,9 @@ specialization remain explicitly red; this is not a completion claim.
 | check | errors | files with errors | classes |
 |---|---:|---:|---:|
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
-| `tests/cats_measure.sh` (339, 1 skipped) | **83** | **34** | — |
-| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **96** | **45** | — |
-| `tests/scalalib_measure.sh` (538) | **415** | **113** | — |
+| `tests/cats_measure.sh` (339, 1 skipped) | **34** | **23** | — |
+| `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **92** | **43** | — |
+| `tests/scalalib_measure.sh` (538) | **383** | **107** | — |
 
 Gate `913fb1c0` expanded gitbucket input coverage: that candidate on the previous
 353-source, Java-disabled input reported **115/54**. Its expanded **108/52** result
@@ -297,7 +299,7 @@ This difference is not reported as a compiler-only improvement.
 
 The file counts above are the scripts' reported metric (`grep -A 2` after
 error headers). Multiline diagnostics can escape that two-line window. The
-complete current diagnostic parser finds 34 cats, 48 gitbucket and 122 library
+complete current diagnostic parser finds 23 cats, 45 gitbucket and 116 library
 source paths with errors. Error totals agree exactly; measurement inputs have
 not changed in this gate.
 
@@ -320,13 +322,16 @@ Scala reflect, and Oracle `ojdbc8_g` 21.23.0.0 (the version pinned by Slick's
 
 | kind | pass | fail | skip |
 |---|---:|---:|---:|
-| `pos` (1859) | **1150** | 364 | 345 |
+| `pos` (1859) | **1152** | 362 | 345 |
 | `neg` (1405) | **718** | 318 | 369 |
-| `run` (2060) | **697** | 810 | 553 |
+| `run` (2060) | **706** | 801 | 553 |
 
 The complete per-test status reference is
-[`baselines/corpus-e608c7dc.tsv`](baselines/corpus-e608c7dc.tsv): 5324 unique
+[`baselines/corpus-712279e5.tsv`](baselines/corpus-712279e5.tsv): 5324 unique
 records from scala/scala revision `3f6bdaeafde17d790023cc3f299b81eaaf876ca3`.
+The `712279e5` gate compared against `corpus-e608c7dc.tsv`: **losses=0,
+changes=11**: pos/looping-jsig, pos/t5727, run/phantomValueClass, run/reflection-allmirrors-tostring, run/reflection-magicsymbols-vanilla, run/sd242, run/t7120, run/t7584, run/t7859, run/t8733, run/valueclasses-pavlov.
+
 The `e608c7dc` gate compared against `corpus-96c0abb3.tsv`: **losses=0,
 changes=8**: run/collections-toSelf, run/reflection-valueclasses-magic, run/t12222, run/t2255, run/t6260, run/t6337a, run/t9546, run/t9546b.
 
@@ -465,15 +470,15 @@ under `LC_ALL=C` with this UTF-8 baseline as if their runtime environments match
 
 | check | result |
 |---|---|
-| `cargo test --workspace --release --no-fail-fast` | **312 result rows, 2783 passed, 0 failed** at `e608c7dc` |
+| `cargo test --workspace --release --no-fail-fast` | **313 result rows, 2800 passed, 0 failed** at `712279e5` |
 | `tests/spec_classfiles.sh` | `tests=37 match=2 differ=26 no_compile=9`, `$sp` scalac=700 scala-rs=0, **LEDGER RED** |
 
 No compiler source, Cargo input, or test fixture changed after the full run.
 `cargo clippy --workspace --release` exits zero with **57** individual warning
 messages (excluding per-crate generated-warning summaries). Compared with the
 saved 57-warning log, there are no additions or removals. Evidence:
-`/tmp/scala-rs-declaration-boundaries/final-prerequisites/clippy-phase.log` and
-`/tmp/scala-rs-declaration-boundaries/final-prerequisites/clippy-compare.json`.
+`/tmp/scala-rs-copy-byname/marker-prerequisites/clippy.log` and
+`/tmp/scala-rs-copy-byname/marker-prerequisites/clippy-compare.json`.
 Compare the same command scope; `--all-targets` also includes test warnings.
 
 ## The six unloadable classes are fixed (2026-09-06)
@@ -3864,5 +3869,75 @@ Exact summary block:
   HEAD=287ec595  logs=/tmp/scala-rs-gate-287ec595-codex
   fail: workspace tests: 313 rows, 2797 passed, 2 failed
 VERDICT=FAIL
+DONE
+```
+
+
+## Gate fifty-one: contextual inference and by-name declaration boundaries
+
+Frozen candidate `712279e59958335d6ca5e31ac6606343e5beccf0`, tree `09a9d42b646a13d1150e22b4d0ebee817d1ecc3d`, contains local main
+1cd5056679c01087a1b9632782daa16eef8a9e5f. Final git merge main was already up to date. Gate
+`/tmp/scala-rs-gate-712279e5-codex` reached DONE in 1467.1 seconds,
+exit 0, VERDICT=PASS; independent audit PASS. The compiler is accepted on
+local main. The handover adds only BASELINE, the raw corpus ledger and the
+next inventory and integration-status documents; compiler sources, Cargo inputs and fixtures are
+identical to the gated tree. No push was attempted: previous automatic approval
+review still requires explicit destination/payload authorization.
+
+Gitbucket 96/45 -> 92/43 (354 Scala/Twirl plus 3 Java inputs, none skipped);
+cats 83/34 -> 34/23 (339 inputs, one skipped); library 415/113 -> 383/107
+(538 inputs). Slick remains zero errors, 1504 classes; subset/lint pass, all
+1504 independently loaded, 12 clients and 36/36 byte-exact runtime attempts.
+Diagnostic changes: {"cats": {"added": 0, "added_locations": 0, "removed": 49}, "gitbucket": {"added": 1, "added_locations": 0, "removed": 5}, "scalalib": {"added": 0, "added_locations": 0, "removed": 32}}.
+Workspace: 2800 passed, 0 failed, 313 result rows.
+Corpus: 5324 unique identities, exact baseline key set, losses=0;
+changes=11: pos/looping-jsig, pos/t5727, run/phantomValueClass, run/reflection-allmirrors-tostring, run/reflection-magicsymbols-vanilla, run/sd242, run/t7120, run/t7584, run/t7859, run/t8733, run/valueclasses-pavlov.
+Counts: {"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 362, "pass": 1152, "skip": 345}, "run": {"fail": 801, "pass": 706, "skip": 553}}.
+Ledger [`baselines/corpus-712279e5.tsv`](baselines/corpus-712279e5.tsv), SHA-256
+`900cd9d40d0869976d840037e4058370f5582331b3f8d5badf5f2ce000ee0591`. Prerequisite and gate binary SHA-256
+`2834b75d8a1d27b9bfc641025e1757b1bfb519e515f9158222676b50e1c9e1a3`.
+
+The composed batch additionally distinguishes by-name parser markers from
+written identifiers and retains the earlier unmerged contextual/parent/value-class
+repairs and adds source-function thunk provenance, callable by-name forcing,
+fixed formal prototypes, stable local alias signatures, prelude copy boundaries,
+imported private/protected declaration metadata, by-name function parameter
+types and ScalaSignature publishing, eta-mode and Unit-discard corrections.
+The 17 ctxev groups use real scalac acceptance/rejection and executable stdout
+comparisons; source/consumer combinations expose ABI failures invisible to
+single-compilation tests. Defect witnesses fail in the immutable accepted-before
+binary, with passing controls retained; private calls formerly threw IllegalAccessError, function values
+threw IncompatibleClassChangeError or were executed incorrectly.
+
+Initial prerequisite failures caught private constructor access and neg/t7899
+before any full gate. Both were corrected together with supported adjacent
+repairs. The first final candidate passed51 early and949 additional CLI tests.
+After the marker repair, final prerequisites passed124 CLI tests in17 suites,
+including quasi/reify/typequote/kind-projector, parser67/backend58/typer190;
+2500 corpus identities including all1405 negatives
+and all44 historical losses, losses=0. Clippy57 existing occurrences, zero new.
+Health: four pinned source trees,121 jars,33 Java cache classes and1498 reference
+class hashes. Evidence and corrected hypotheses: docs/batches/copy-byname-recovery.md
+and /tmp/scala-rs-copy-byname/. The first full gate failed two quasiquote tests; it was recorded and the
+marker identity/reification consumers were repaired before this accepted gate.
+All9 new run passes were independently compiled by both real scalac and the
+final candidate in numbered rounds, executed -Xverify:all and byte-compared:9/9
+agree. Evidence: /tmp/scala-rs-copy-byname/gain-runtime/results.json.
+
+The one gitbucket diagnostic replacement is IssuesService.scala:1116:
+its two Set[_ <: A] arguments now retain Set[A]. The same overload rejection
+remains at that location; no successful compile is attributed to that change.
+
+Remaining errors and deeper boundaries are inventoried in
+[contextual-next-inventory.md](../docs/batches/contextual-next-inventory.md).
+MODE=a and specialization remain red and were not rerun. These results do not
+claim complete Scala conformance or successful gitbucket/cats compilation.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=712279e5  logs=/tmp/scala-rs-gate-712279e5-codex
+VERDICT=PASS
 DONE
 ```
