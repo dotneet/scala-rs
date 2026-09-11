@@ -1509,7 +1509,16 @@ pub(crate) fn gen_any_eq(
     } else {
         asm.aconst_null();
     }
-    if ctx.library_abi {
+    // nsc (`genEqEqPrimitive`) takes `BoxesRunTime.equals` only when *both*
+    // operands may hold a boxed number, char or boolean; otherwise `l == r`
+    // is `if (l eq null) r eq null else l.equals(r)`. The difference is
+    // observable: `BoxesRunTime.equals` answers `true` for the same reference
+    // without calling `equals`, so a user `equals` that counts its calls, or
+    // that is not reflexive, saw `x == x` skip it.
+    let arg_ty = arg.map(|a| a.ty.clone()).unwrap_or(Type::Null);
+    let any_comparator =
+        !ctx.library_abi || (maybe_boxed(ctx.st, &recv_ty) && maybe_boxed(ctx.st, &arg_ty));
+    if ctx.library_abi && any_comparator {
         asm.invokestatic(
             "scala/runtime/BoxesRunTime",
             "equals",
@@ -1552,6 +1561,72 @@ pub(crate) fn gen_any_eq(
         asm.iconst(1);
         asm.ixor();
     }
+}
+
+/// nsc `isMaybeBoxed`: whether a value of static type `ty` may be a boxed
+/// primitive at run time, so that `==` has to go through `BoxesRunTime` to
+/// compare it cooperatively (`1 == 1L`). `Object` and the interfaces the
+/// boxes implement qualify, as do the boxes themselves and every subclass of
+/// `java.lang.Number` (`BigInt` included); a primitive operand is boxed before
+/// the comparison and qualifies through its box, except `Unit`, whose box is
+/// a `BoxedUnit`. A type with no class to inspect, and any class this run does
+/// not define, is answered `true`: the comparator's own conservative reading,
+/// and the precise question is only asked of source classes.
+pub(crate) fn maybe_boxed(st: &SymbolTable, ty: &Type) -> bool {
+    let ty = ty.widen_constant();
+    match &ty {
+        Type::Unit => return false,
+        Type::Null | Type::Nothing => return false,
+        Type::Boolean
+        | Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::Char => return true,
+        Type::Any | Type::AnyRef | Type::JavaObject | Type::AnyVal => return true,
+        Type::String | Type::Function { .. } | Type::Tuple(_) | Type::Array(_) => return false,
+        _ => {}
+    }
+    let Some(cls) = st.class_sym_of(&ty) else {
+        return true;
+    };
+    if [st.any_sym, st.anyref_sym, st.anyval_sym, st.object_sym].contains(&cls) {
+        return true;
+    }
+    if st.is_value_class(cls) {
+        return false;
+    }
+    const BOXLIKE: [&str; 6] = [
+        "java/lang/Object",
+        "java/io/Serializable",
+        "java/lang/Comparable",
+        "java/lang/Number",
+        "java/lang/Character",
+        "java/lang/Boolean",
+    ];
+    let own = &st.get(cls).jvm_name;
+    if BOXLIKE.contains(&own.as_str()) {
+        return true;
+    }
+    // A library class keeps the comparator. Its parents are not always all
+    // loaded here (`BigInt` reaches `Number` through the Java `ScalaNumber`,
+    // which its symbol does not list), and for a library class the only
+    // thing the comparator can change is the cooperative numeric answer --
+    // library `equals` are reflexive, so the reference shortcut is moot.
+    if !owner_defined_in_source(st, cls) {
+        return true;
+    }
+    // A class this run defines: only a subclass of `Number` inherits the
+    // property; implementing `Serializable` or `Comparable` does not make a
+    // class a box.
+    linearize(st, cls).iter().any(|&c| {
+        matches!(
+            st.get(c).jvm_name.as_str(),
+            "java/lang/Number" | "scala/math/ScalaNumber"
+        )
+    })
 }
 
 pub(crate) fn gen_synchronized(

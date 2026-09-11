@@ -767,6 +767,12 @@ impl Typer {
                 self.pattern_tpt = saved;
                 let ty = self.refine_pattern_type_binders(ty, sel_ty, &binders);
                 let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
+                if matches!(ty, Type::AnyVal) {
+                    self.error(
+                        tpt.span,
+                        "type AnyVal cannot be used in a type pattern or isInstanceOf test",
+                    );
+                }
                 if !self.typed_pattern_compatible(&ty, sel_ty) {
                     self.error(
                         tpt.span,

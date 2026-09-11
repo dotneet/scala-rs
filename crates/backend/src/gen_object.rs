@@ -440,6 +440,32 @@ impl<'a> Gen<'a> {
             if own_outer.is_some() {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);
             }
+            // Early definitions (`object O extends { val name = … } with T`)
+            // are stored before the super constructor and the trait
+            // initializers, as for a class (`emit_class_ctor`). The module
+            // path ran them with the rest of the body, after `T`'s `$init$`
+            // had already read the field as `null`.
+            for vd in &inits {
+                if !is_presuper_val(vd) {
+                    continue;
+                }
+                if let TreeKind::ValDef {
+                    name, mods, rhs, ..
+                } = &vd.kind
+                {
+                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                        continue;
+                    }
+                    asm.aload(0);
+                    gen_expr(asm, &mut frame, &ctx_early, rhs);
+                    let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
+                        st.get(vd.sym).ty.clone()
+                    } else {
+                        vd.ty.clone()
+                    };
+                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                }
+            }
             asm.aload(0);
             if let Some(o) = super_outer {
                 // Read the enclosing instance out of the argument when it is
@@ -506,6 +532,9 @@ impl<'a> Gen<'a> {
                 }
             } else {
                 for vd in &inits {
+                    if is_presuper_val(vd) {
+                        continue;
+                    }
                     if let TreeKind::ValDef {
                         name, mods, rhs, ..
                     } = &vd.kind

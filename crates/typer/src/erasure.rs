@@ -1080,6 +1080,9 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 if matches!(st.dealias(&a.ty), Type::Class { sym, .. } if sym == st.singleton_sym) {
                     a.sym = st.singleton_sym;
                 }
+                if is_abstract_elem_array(&a.ty, st) {
+                    a.sym = st.array_sym;
+                }
                 // `classOf[Meters]` / `_: Meters` name the *boxed* class:
                 // `Meters.class`, not `Integer.TYPE`.
                 if let Some(c) = value_class_of(&a.ty, st) {
@@ -1779,6 +1782,8 @@ fn mark_value_class_patterns(pat: &mut Tree, st: &SymbolTable) {
     if let TreeKind::Typed { .. } = &pat.kind {
         if let Some(c) = value_class_of(&pat.ty, st) {
             pat.sym = c;
+        } else if is_abstract_elem_array(&pat.ty, st) {
+            pat.sym = st.array_sym;
         }
     }
     match &mut pat.kind {
@@ -1797,6 +1802,26 @@ fn mark_value_class_patterns(pat: &mut Tree, st: &SymbolTable) {
         }
         _ => {}
     }
+}
+
+/// `Array[_]`, `Array[T]` for an abstract `T`: erased to `Object`, because
+/// the element may be primitive. A type test against one cannot be an
+/// `instanceof` of any single array class (nsc emits `ScalaRunTime.isArray`),
+/// so `mark_value_class_patterns` and the `isInstanceOf` argument stamp
+/// `array_sym` on the node before erasure forgets it was an array at all.
+fn is_abstract_elem_array(ty: &Type, st: &SymbolTable) -> bool {
+    if let Type::Annotated { tpe, .. } = ty {
+        return is_abstract_elem_array(tpe, st);
+    }
+    let elem = match st.dealias(ty) {
+        Type::Array(e) => *e,
+        Type::Class { sym, mut args } if sym == st.array_sym && args.len() == 1 => args.remove(0),
+        _ => return false,
+    };
+    matches!(
+        elem,
+        Type::Wildcard | Type::BoundedWildcard { .. } | Type::TypeParam(_) | Type::TypeMember(_)
+    )
 }
 
 /// Record every value class this run compiles from source. Only those get the

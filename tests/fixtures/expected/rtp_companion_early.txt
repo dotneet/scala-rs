@@ -1,0 +1,3 @@
+Money(124) Money(5) List(Money(1), Money(2))
+Tag(X) Pt(1,2) Pt(3,4)
+Hello, object | Hello, class | Hello, null

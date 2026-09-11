@@ -4495,6 +4495,27 @@ impl SymbolTable {
         if self.is_sub_type(&b, &a) {
             return a;
         }
+        // Two distinct value types meet at `AnyVal`, not `Any`: nsc's lub of
+        // `Int` and `Double` (or `Boolean`) is `AnyVal`, which is what
+        // `Map(1 -> 2, 3 -> 4.5)` is a map *to*. (The *weak* lub, `Double`,
+        // is the branch join's business -- `numeric_branch_lub` -- not this.)
+        let value_type = |t: &Type| {
+            matches!(
+                t,
+                Type::Unit
+                    | Type::Boolean
+                    | Type::Byte
+                    | Type::Short
+                    | Type::Char
+                    | Type::Int
+                    | Type::Long
+                    | Type::Float
+                    | Type::Double
+            )
+        };
+        if value_type(&a) && value_type(&b) {
+            return Type::AnyVal;
+        }
         if depth >= MAX_LUB_DEPTH {
             return if self.is_sub_type(&a, &Type::AnyRef) && self.is_sub_type(&b, &Type::AnyRef) {
                 Type::AnyRef
@@ -6344,6 +6365,28 @@ impl SymbolTable {
         let jvm = self.get(cls).jvm_name.clone();
         if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
             return None;
+        }
+        // nsc `samOf`: a SAM *class* must be instantiable by the literal's
+        // anonymous subclass with no arguments -- its constructor takes an
+        // empty parameter list. `abstract class H(x: Int) { def h(s: String):
+        // String }` is not a SAM type; converting to it built a subclass
+        // calling a `<init>()V` that does not exist.
+        let f = self.get(cls).flags;
+        if !f.contains(Flags::TRAIT) && !f.contains(Flags::INTERFACE) {
+            let ctors: Vec<SymbolId> = self
+                .get(cls)
+                .members
+                .iter()
+                .copied()
+                .filter(|m| self.get(*m).name == "<init>")
+                .collect();
+            let nullary = |c: &SymbolId| match &self.get(*c).ty {
+                Type::Method { paramss, .. } => paramss.iter().all(|l| l.is_empty()),
+                _ => self.get(*c).params.is_empty(),
+            };
+            if !ctors.is_empty() && !ctors.iter().any(nullary) {
+                return None;
+            }
         }
         let mut abstracts = self.abstract_sam_methods(cls);
         if !overridden.is_empty() {

@@ -588,6 +588,23 @@ impl Typer {
             self.leave_presuper_scope(saved);
         }
         self.typing_call_args = saved_call_args;
+        // A strict *local* value may not mention itself in its own
+        // initializer (nsc refchecks: "forward reference extends over
+        // definition of value x"): the slot is read before it is written.
+        // `val fibs: LazyList[BigInt] = 0 #:: fibs.zip(...)` was accepted and
+        // read `null`. A field reads its default instead, and a `lazy val`
+        // is initialized on first use, so both stay legal.
+        if !tree.sym.is_none()
+            && self.block_local_defs.contains(&(self.file_index, tree.id))
+            && !self.st.get(tree.sym).flags.contains(Flags::LAZY)
+            && tree_mentions_sym(rhs, tree.sym)
+        {
+            let name = self.st.get(tree.sym).name.clone();
+            self.error(
+                tree.span,
+                format!("forward reference extends over definition of value {name}"),
+            );
+        }
         self.warn_trivial_self_reference(tree.sym, rhs);
         let preserve_constant = final_value && matches!(rhs.ty, Type::Constant(_));
         if let Some(expected) = inherited.filter(|_| feature && !preserve_constant) {
@@ -2759,4 +2776,18 @@ impl Typer {
             }
         }
     }
+}
+
+/// Whether `tree` contains a reference (`Ident` or `Select`) to `sym`.
+fn tree_mentions_sym(tree: &Tree, sym: SymbolId) -> bool {
+    if matches!(tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) && tree.sym == sym {
+        return true;
+    }
+    let mut found = false;
+    crate::erasure::for_each_child(tree, &mut |c| {
+        if !found && tree_mentions_sym(c, sym) {
+            found = true;
+        }
+    });
+    found
 }

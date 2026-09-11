@@ -1772,6 +1772,7 @@ impl Typer {
         args: &[Type],
     ) -> Option<Type> {
         let mut acc: Option<Type> = None;
+        let mut all_direct = true;
         for (i, a) in args.iter().enumerate() {
             let Some(p) = param_at(params, i) else {
                 break;
@@ -1855,6 +1856,22 @@ impl Typer {
                     }
                 }
             }
+            // nsc registers a *numeric* bound (joined by weak lub) only where
+            // the variable is the parameter type itself: `List(1, 2.5)` is a
+            // `List[Double]`, but `f[K, V](xs: (K, V)*)` given `(1, 2)` and
+            // `(3, 4.5)` bounds `V` inside `Tuple2` and joins to `AnyVal`.
+            // Joining those to `Double` left `(1, 2)` inapplicable, and
+            // `Map(1 -> 2, 3 -> 4.5)` fell through to a receiver view.
+            let direct = matches!(
+                match p {
+                    Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                    other => other,
+                },
+                Type::TypeParam(id) if *id == tp
+            );
+            if hit.is_some() && !direct {
+                all_direct = false;
+            }
             if let Some(t) = hit {
                 acc = Some(match acc {
                     None => t,
@@ -1870,7 +1887,11 @@ impl Typer {
                     Some(prev) => {
                         let prev = self.minimize_undet(&prev);
                         let t = self.minimize_undet(&t);
-                        self.lub_ty(&prev, &t)
+                        if all_direct {
+                            self.lub_ty(&prev, &t)
+                        } else {
+                            self.st.lub(&prev, &t)
+                        }
                     }
                 });
             }
@@ -1916,7 +1937,7 @@ impl Typer {
     /// Substitute every undetermined variable in `t` by its lower bound
     /// (`Nothing` when it has none) -- nsc's minimisation of a type variable
     /// nothing constrains from above.
-    fn minimize_undet(&self, t: &Type) -> Type {
+    pub(crate) fn minimize_undet(&self, t: &Type) -> Type {
         if self.undet_tvars.is_empty() {
             return t.clone();
         }
@@ -2520,7 +2541,11 @@ impl Typer {
                 (Some(t), Some(lo)) => {
                     let t = self.minimize_undet(&t);
                     let lo = self.minimize_undet(&lo);
-                    out.push((tp, self.lub_ty(&t, &lo)))
+                    // The plain lub: a declared lower bound is not a numeric
+                    // bound, so `List(1, 2) :+ 2.5` (`:+[B >: A](elem: B)`) is
+                    // a `List[AnyVal]`, not a `List[Double]` holding an `Int`
+                    // -- and `padTo(3, 1.5)` stopped failing its own bound.
+                    out.push((tp, self.st.lub(&t, &lo)))
                 }
                 (Some(t), None) => out.push((tp, t)),
                 (None, Some(lo)) => out.push((tp, lo)),

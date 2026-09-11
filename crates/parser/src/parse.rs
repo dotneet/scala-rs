@@ -3128,7 +3128,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let g = self.parse_postfix_expr();
                 if let Some(last) = enums.last_mut() {
-                    last.guard = Some(g);
+                    last.guards.push(g);
                 } else {
                     self.error_here("guard without a generator");
                 }
@@ -3161,17 +3161,17 @@ impl<'a> Parser<'a> {
                 false
             };
             let rhs = self.parse_expr();
-            let mut guard = None;
+            let mut guards = Vec::new();
             self.skip_nl();
-            if matches!(self.kind(), TokenKind::If) {
+            while matches!(self.kind(), TokenKind::If) {
                 self.bump();
-                guard = Some(self.parse_postfix_expr());
+                guards.push(self.parse_postfix_expr());
             }
             enums.push(Enumerator {
                 pat,
                 rhs,
                 is_val,
-                guard,
+                guards,
             });
             self.accept_separator();
             if matches!(self.kind(), TokenKind::RParen | TokenKind::RBrace) {
@@ -3395,6 +3395,28 @@ impl<'a> Parser<'a> {
             {
                 let sp = self.span();
                 self.bump();
+                // nsc `prefixExpr`: `-` directly followed by a numeric literal
+                // is a *negative literal*, and the selections after it apply to
+                // that literal -- `-5.abs` is `(-5).abs`, which is `5`, not
+                // `-(5.abs)`. The same holds with a space (`- 5.abs`).
+                if name == "-" {
+                    let neg = match self.kind().clone() {
+                        TokenKind::IntLit(n) => n.checked_neg().map(Lit::Int),
+                        TokenKind::DoubleLit(d) => Some(Lit::Double(-d)),
+                        TokenKind::FloatLit(f) => Some(Lit::Float(-f)),
+                        // A `LongLit` of 2147483648 may be `-2147483648`
+                        // (an Int, lexed wide) or `-2147483648L`; the token
+                        // cannot say which, so that one stays a unary minus.
+                        TokenKind::LongLit(n) if n != 2147483648 => n.checked_neg().map(Lit::Long),
+                        _ => None,
+                    };
+                    if let Some(lit) = neg {
+                        let lit_sp = sp.merge(self.span());
+                        self.bump();
+                        let t = self.alloc(lit_sp, TreeKind::Literal { lit });
+                        return self.parse_simple_expr_rest(t, true);
+                    }
+                }
                 let arg = self.parse_prefix_expr();
                 let sel = self.alloc(
                     sp,
@@ -6217,18 +6239,13 @@ fn desugar_for(
         apply_collection(p, input, "withFilter", pred)
     }
 
-    fn filter_generator_rhs(
-        p: &mut Parser,
-        mut rhs: Tree,
-        pat: &Tree,
-        guard: Option<Tree>,
-    ) -> Tree {
+    fn filter_generator_rhs(p: &mut Parser, mut rhs: Tree, pat: &Tree, guards: &[Tree]) -> Tree {
         if !is_irrefutable(pat) {
             let pred = filter_lambda(p, pat, None);
             rhs = apply_collection(p, rhs, "withFilter", pred);
         }
-        if let Some(g) = guard {
-            rhs = with_filter(p, rhs, pat, g);
+        for g in guards {
+            rhs = with_filter(p, rhs, pat, g.clone());
         }
         rhs
     }
@@ -6260,7 +6277,7 @@ fn desugar_for(
             let mut group_size = 0;
             while next < enums.len() && enums[next].is_val && group_size < MAX_VALUE_DEFS_PER_GROUP
             {
-                let has_guard = enums[next].guard.is_some();
+                let has_guard = !enums[next].guards.is_empty();
                 next += 1;
                 group_size += 1;
                 if has_guard {
@@ -6306,14 +6323,14 @@ fn desugar_for(
                 tuple_args.extend(group_pats);
                 current_pat = tuple_tree(p, tuple_span, tuple_args);
             }
-            if let Some(g) = group.last().and_then(|e| e.guard.clone()) {
+            for g in group.last().map(|e| e.guards.clone()).unwrap_or_default() {
                 stream = with_filter(p, stream, &current_pat, g);
             }
             return build(p, enums, next, stream, current_pat, body, is_yield);
         }
 
         let e = &enums[index];
-        let rhs = filter_generator_rhs(p, e.rhs.clone(), &e.pat, e.guard.clone());
+        let rhs = filter_generator_rhs(p, e.rhs.clone(), &e.pat, &e.guards);
         let inner = build(p, enums, index + 1, rhs, e.pat.clone(), body, is_yield);
         let method = if is_yield { "flatMap" } else { "foreach" };
         let fun = lambda(p, current_pat, inner);
@@ -6328,7 +6345,7 @@ fn desugar_for(
         return body;
     }
     let first = &enums[0];
-    let rhs = filter_generator_rhs(p, first.rhs.clone(), &first.pat, first.guard.clone());
+    let rhs = filter_generator_rhs(p, first.rhs.clone(), &first.pat, &first.guards);
     build(p, &enums, 1, rhs, first.pat.clone(), body, is_yield)
 }
 
