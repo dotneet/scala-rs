@@ -68,6 +68,7 @@ unrealistic, it is stated as such.
   - 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
   - 7.21 A type tag that carries type arguments, and the `Expr[Nothing]` nsc really passes (the `agent/gbmapto` slice)
   - 7.22 The type arguments written on the macro implementation reference (the `agent/mapto2` slice)
+  - 7.23 `reify { … }` over the typed body (the `agent/reify` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -3450,3 +3451,18 @@ rejection across both API producers and both consumers.
 This remains integration work. Polymorphic source-symbol info and source class
 shapes that cannot be fully described are explicitly refused; general macro
 bundles and whitebox inference remain outside this change.
+
+### 7.23 `reify { … }` over the typed body (the `agent/reify` slice)
+
+`reify` now walks the **typed** body and rebuilds every reference from the
+symbol it resolved to -- nsc's own rule -- instead of classifying the parsed
+body name by name (§7.15, §7.17). Locals and parameters bound outside the
+body are *free terms* (`newFreeTerm` + `setInfo`), type parameters with no tag
+in scope are *free types*, definitions inside the body (classes, objects,
+defs, vals, closures, patterns) are reified by name, members of the enclosing
+`object` through `mkThis`, and the tag materialiser builds its types through
+the same type reifier (nested classes, singletons, aliases, `Predef.String`).
+The design, the measured walls and what remains, in order, are in
+[`docs/notes/reify-design.md`](notes/reify-design.md); the fixtures are
+`tests/fixtures/reify2_*.scala` (`crates/cli/tests/reify2.rs`), each run
+through real scalac 2.13.16 with identical output.
