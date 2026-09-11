@@ -27,6 +27,18 @@ trait Logged[A] extends Buffer[A] {
   }
 }
 
+// Library traits the symbol table's linearization leaves out or misorders:
+// `SeqOps$$super$concat` / `$$super$sizeCompare` are still owed, and resolve
+// to `IterableOps` (pos/t3568's shape, with and without an explicit
+// `StrictOptimizedSeqOps`).
+abstract class PlainSeq[E] extends collection.IndexedSeq[E] { def length = 1 }
+class OnePlain extends PlainSeq[String] { def apply(i: Int) = "p" }
+abstract class StrictSeq[E] extends collection.IndexedSeq[E]
+  with collection.StrictOptimizedSeqOps[E, collection.IndexedSeq, collection.IndexedSeq[E]] {
+  def length = 1
+}
+class OneStrict extends StrictSeq[String] { def apply(i: Int) = "s" }
+
 // A trait extending a class is an interface to the JVM: every place a
 // value of the trait's type meets the class needs a cast.
 trait Mute extends Throwable { override def fillInStackTrace(): Throwable = this }
@@ -72,5 +84,9 @@ object Main {
     loc = t
     println(loc.name + " " + (try t catch { case _: Throwable => new C0 }).name)
     try t.boom() catch { case e: Mute0 => println("caught " + e.getMessage) }
+    val op = new OnePlain
+    val os = new OneStrict
+    println(op.sizeCompare(3) + " " + op.concat(List("x")).toList)
+    println(os.sizeCompare(1) + " " + os.concat(List("y")).toList)
   }
 }

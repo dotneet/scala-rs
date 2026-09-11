@@ -1022,39 +1022,20 @@ impl<'a> Gen<'a> {
                     // The class file's own list: a trait read from a jar has
                     // none of these in the symbol table (see
                     // `binary_methods`).
-                    let any_members = &self.st.get(self.st.any_sym).members;
+                    let iface = class_internal(self.st, *parent);
                     for (aname, desc, enc) in self
                         .binary_trait_super_accessors_cf(*parent)
                         .unwrap_or_default()
                     {
-                        if b.methods.iter().any(|m| m.name == aname && m.desc == desc) {
-                            continue;
-                        }
-                        let name = decode_method_name(&enc);
-                        let object_method =
-                            matches!(name.as_str(), "equals" | "hashCode" | "toString");
-                        let target = if object_method {
-                            any_members
-                                .iter()
-                                .copied()
-                                .find(|&mid| self.st.get(mid).name == name)
-                                .unwrap_or(SymbolId::NONE)
-                        } else {
-                            SymbolId::NONE
-                        };
-                        let ret = desc
-                            .find(')')
-                            .map(|i| desc_value_type(self.st, &desc[i + 1..]))
-                            .unwrap_or(Type::Unit);
-                        owed.push(SuperAccessor {
-                            name,
-                            accessor: aname,
-                            descriptor: desc.clone(),
-                            target_descriptor: desc.clone(),
-                            target,
-                            params: desc_value_types(self.st, &desc),
-                            result: ret,
-                        });
+                        self.emit_cf_super_accessor(
+                            b,
+                            &lin,
+                            Some(idx),
+                            &iface,
+                            &aname,
+                            &desc,
+                            &enc,
+                        );
                     }
                 }
                 None => {
@@ -1174,6 +1155,207 @@ impl<'a> Gen<'a> {
                 });
             }
         }
+        self.emit_unlinearized_super_accessors(b, &lin);
+    }
+
+    /// The `p$T$$super$m` accessors of binary traits the class inherits but
+    /// the symbol table's linearization does not list.
+    ///
+    /// A library trait reaches the symbol table through its pickle, and its
+    /// parents only as far as the typer asked for them. `abstract class
+    /// BaseSeq2[E] extends IndexedSeq[E]` linearized without `SeqOps` and
+    /// `IterableOps` at all, so `SeqOps$$super$concat` was never implemented
+    /// and `concat` died with `AbstractMethodError`. The class files are
+    /// complete: every abstract `$$super$` method on an interface the class
+    /// implements is owed, unless a binary superclass already implements it.
+    pub(crate) fn emit_unlinearized_super_accessors(&self, b: &mut ClassBuilder, lin: &[SymbolId]) {
+        let Some(bp) = self.binary_parents.clone() else {
+            return;
+        };
+        let in_lin: HashSet<String> = lin.iter().map(|s| class_internal(self.st, *s)).collect();
+        let roots: Vec<String> = lin
+            .iter()
+            .skip(1)
+            .filter(|s| !owner_defined_in_source(self.st, **s))
+            .map(|s| class_internal(self.st, *s))
+            .collect();
+        let ancestors = bp.ancestors(&roots);
+        // Concrete methods the binary superclasses already carry.
+        let inherited: HashSet<(String, String)> = ancestors
+            .iter()
+            .filter(|(_, iface)| !iface)
+            .filter_map(|(n, _)| bp.methods_of(n))
+            .flat_map(|ms| {
+                ms.iter()
+                    .filter(|(_, _, a)| a & (ACC_STATIC | ACC_ABSTRACT) == 0)
+                    .map(|(n, d, _)| (n.clone(), d.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (iface, is_iface) in &ancestors {
+            if !is_iface || in_lin.contains(iface) {
+                continue;
+            }
+            let Some(ms) = bp.methods_of(iface) else {
+                continue;
+            };
+            let prefix = format!("{}$$super$", iface.replace('/', "$"));
+            for (aname, desc, acc) in ms.iter() {
+                if acc & ACC_STATIC != 0 || acc & ACC_ABSTRACT == 0 {
+                    continue;
+                }
+                let Some(enc) = aname.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if inherited.contains(&(aname.clone(), desc.clone())) {
+                    continue;
+                }
+                self.emit_cf_super_accessor(b, lin, None, iface, aname, desc, enc);
+            }
+        }
+    }
+
+    /// Emit one `$$super$` accessor a binary trait's class file declares
+    /// (`aname`, `desc`, for the encoded method `enc`), when this class does
+    /// not already have it and its target can be found.
+    ///
+    /// The target is the next implementation after the trait: first along
+    /// the symbol table's linearization (`idx` is the trait's position in
+    /// `lin`, when it is listed); failing that, the linearization's entries
+    /// the class files make super-types of the trait, in order; failing
+    /// that, the trait's own class-file ancestors, breadth first. The symbol
+    /// table's linearization of library traits can be both incomplete and
+    /// out of order (`IterableOps` ahead of `SeqOps` for a class mixing in
+    /// `StrictOptimizedSeqOps`, pos/t3568), and a walk that finds nothing must
+    /// not reject a valid program over it: an accessor without a target is
+    /// left out, exactly as it was before any of these were emitted.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn emit_cf_super_accessor(
+        &self,
+        b: &mut ClassBuilder,
+        lin: &[SymbolId],
+        idx: Option<usize>,
+        iface: &str,
+        aname: &str,
+        desc: &str,
+        enc: &str,
+    ) {
+        if b.methods.iter().any(|m| m.name == aname && m.desc == desc) {
+            return;
+        }
+        let name = decode_method_name(enc);
+        let params = desc_params(desc).to_string();
+        // (owner, owner is a trait, the owner's own descriptor)
+        let mut found: Option<(String, bool, String)> = None;
+        if let Some(i) = idx {
+            let object_target = if matches!(name.as_str(), "equals" | "hashCode" | "toString") {
+                self.st
+                    .get(self.st.any_sym)
+                    .members
+                    .iter()
+                    .copied()
+                    .find(|&mid| self.st.get(mid).name == name)
+                    .unwrap_or(SymbolId::NONE)
+            } else {
+                SymbolId::NONE
+            };
+            if let Some(t) = self.next_lin_impl(lin, i, &name, desc, object_target) {
+                let call = self
+                    .super_target_desc(
+                        Some(t),
+                        &name,
+                        desc_param_sorts(&params).len(),
+                        desc,
+                        object_target,
+                    )
+                    .map(|(d, _)| d)
+                    .unwrap_or_else(|| desc.to_string());
+                found = Some((class_internal(self.st, t.0), t.1, call));
+            }
+        }
+        if found.is_none() {
+            found = self.cf_super_target(lin, iface, enc, &params);
+        }
+        let Some((owner, is_trait, call)) = found else {
+            return;
+        };
+        let ret = desc[desc.find(')').map_or(0, |i| i + 1)..].to_string();
+        let mut locals = 1u16;
+        let mut loads = Vec::new();
+        for sort in desc_param_sorts(&params) {
+            loads.push((locals, sort));
+            locals += sort.slots();
+        }
+        let cast = narrowing_return_cast(&call, desc);
+        b.add_code(ACC_PUBLIC, aname, desc, locals.max(1), |asm| {
+            asm.aload(0);
+            for (slot, sort) in &loads {
+                load(asm, *slot, *sort);
+            }
+            if is_trait {
+                asm.invokestatic_interface(
+                    &owner,
+                    &format!("{enc}$"),
+                    &trait_static_desc(&owner, &call),
+                );
+            } else {
+                asm.invokespecial(&owner, enc, &call);
+            }
+            if let Some(c) = &cast {
+                asm.checkcast(c);
+            }
+            if !emit_forwarded_nothing(asm, &ret) {
+                ret_of_sort(asm, ret_str_sort(&ret));
+            }
+        });
+    }
+
+    /// The class-file fallback of [`Gen::emit_cf_super_accessor`]'s target
+    /// search, as `(owner, owner is a trait, owner's descriptor)`.
+    fn cf_super_target(
+        &self,
+        lin: &[SymbolId],
+        iface: &str,
+        enc: &str,
+        params: &str,
+    ) -> Option<(String, bool, String)> {
+        let bp = self.binary_parents.clone()?;
+        let implements = |owner: &str, is_iface: bool| -> Option<String> {
+            if is_iface {
+                bp.trait_impls(owner)?
+                    .iter()
+                    .find(|(n, d)| n == enc && desc_params(d) == params)
+                    .map(|(_, d)| d.clone())
+            } else {
+                bp.methods_of(owner)?
+                    .iter()
+                    .find(|(n, d, a)| {
+                        n == enc
+                            && desc_params(d) == params
+                            && a & (ACC_STATIC | ACC_ABSTRACT | ACC_PRIVATE) == 0
+                    })
+                    .map(|(_, d, _)| d.clone())
+            }
+        };
+        for &s in lin.iter().skip(1) {
+            let n = class_internal(self.st, s);
+            if n == iface || owner_defined_in_source(self.st, s) || !bp.is_subtype(iface, &n) {
+                continue;
+            }
+            let is_iface = is_interface_sym(self.st, s);
+            if let Some(d) = implements(&n, is_iface) {
+                return Some((n, is_iface, d));
+            }
+        }
+        for (n, is_iface) in bp.ancestors(&[iface.to_string()]) {
+            if n == iface {
+                continue;
+            }
+            if let Some(d) = implements(&n, is_iface) {
+                return Some((n, is_iface, d));
+            }
+        }
+        None
     }
 
     /// The `Q$$super$m` accessors this class owes the classes nested in it

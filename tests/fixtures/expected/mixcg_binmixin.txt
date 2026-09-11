@@ -9,3 +9,5 @@ t0 t0 t0 t0
 t0 t0 c0
 t0 t0
 caught x
+-1 List(p, x)
+0 List(s, y)

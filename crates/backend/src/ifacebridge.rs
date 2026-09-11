@@ -163,8 +163,12 @@ fn parse(bytes: &[u8]) -> Option<Info> {
 pub struct BinaryParents {
     idx: RefCell<BinaryIndex>,
     cache: RefCell<HashMap<String, Option<Rc<Info>>>>,
-    impls_cache: RefCell<HashMap<String, Option<Rc<Vec<(String, String)>>>>>,
+    impls_cache: RefCell<HashMap<String, Option<ImplList>>>,
 }
+
+/// `(name, instance descriptor)` of the members a trait implements; see
+/// [`BinaryParents::trait_impls`].
+pub type ImplList = Rc<Vec<(String, String)>>;
 
 impl std::fmt::Debug for BinaryParents {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -230,7 +234,7 @@ impl BinaryParents {
     /// `default` method that holds each concrete member's body. Cached: every
     /// class mixing a library trait in asks, and `IterableOps` alone has a
     /// few hundred members.
-    pub fn trait_impls(&self, name: &str) -> Option<Rc<Vec<(String, String)>>> {
+    pub fn trait_impls(&self, name: &str) -> Option<ImplList> {
         if let Some(hit) = self.impls_cache.borrow().get(name) {
             return hit.clone();
         }
@@ -265,6 +269,26 @@ impl BinaryParents {
             .borrow_mut()
             .insert(name.to_string(), computed.clone());
         computed
+    }
+
+    /// [`BinaryParents::is_sub`] for callers outside this pass: does the class
+    /// file hierarchy make `a` a sub-type of `b`?
+    pub fn is_subtype(&self, a: &str, b: &str) -> bool {
+        self.is_sub(a, b)
+    }
+
+    /// Every super-type of `roots` on the binary path, `roots` included, in
+    /// breadth-first order, each with whether it is an interface. The class
+    /// files' own hierarchy: unlike the symbol table's, it is complete for a
+    /// library trait whose parents the typer never asked the pickle for.
+    pub fn ancestors(&self, roots: &[String]) -> Vec<(String, bool)> {
+        self.closure(roots)
+            .into_iter()
+            .map(|n| {
+                let iface = self.info(&n).is_some_and(|i| i.is_interface);
+                (n, iface)
+            })
+            .collect()
     }
 
     /// Is `a` a sub-type of `b`? Everything is a sub-type of `java/lang/Object`.
