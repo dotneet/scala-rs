@@ -1097,9 +1097,7 @@ pub(crate) fn gen_pattern(
                     load(asm, tmp, sel_sort);
                     asm.if_acmpne(fail);
                 } else {
-                    emit_pattern_operand(asm, &stable.ty, sel_sort);
-                    load(asm, tmp, sel_sort);
-                    emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+                    emit_const_pattern_test(asm, ctx, &stable.ty, tmp, sel_sort, fail);
                 }
                 bind_singleton_pattern(asm, frame, ctx, pat, expr, tmp, sel_sort, fail);
                 return;
@@ -1118,9 +1116,8 @@ pub(crate) fn gen_pattern(
                     }
                 } else {
                     gen_literal(asm, lit);
-                    emit_pattern_operand(asm, &Type::Constant(lit.clone()), sel_sort);
-                    load(asm, tmp, sel_sort);
-                    emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+                    let lit_ty = Type::Constant(lit.clone());
+                    emit_const_pattern_test(asm, ctx, &lit_ty, tmp, sel_sort, fail);
                 }
                 bind_singleton_pattern(asm, frame, ctx, pat, expr, tmp, sel_sort, fail);
                 return;
