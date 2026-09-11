@@ -3220,6 +3220,35 @@ impl PickleSupply {
     /// exactly that case: what the wildcard offers is almost all inherited,
     /// and deciding what the value even is (`Check::is_reflect_universe`: does
     /// this extend `scala.reflect.api.Universe`?) reads the same parent list.
+    /// `IterableOps[A, CC, C]` as the pickle of the class `internal`
+    /// instantiates it along its linearization: the dotted names of the
+    /// classes `CC` and `C` stand for, when both are plain class references.
+    /// `NumericRange[T]` answers `IndexedSeq` twice, `IndexedSeqView[A]`
+    /// `View` twice, `Vector[A]` itself. See `crate::ops_shape`.
+    pub(crate) fn iterable_ops_classes(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+    ) -> Option<(String, String)> {
+        let full = self.pickled_full_name(bin, internal, false)?;
+        let mut errs = Vec::new();
+        let lin = {
+            let mut src = BinSource(bin);
+            self.sigs.linearization(&mut src, &full, false, &mut errs)
+        };
+        let step = lin
+            .iter()
+            .find(|s| !s.module && s.class_name == "scala.collection.IterableOps")?;
+        fn head(t: &SigType) -> Option<String> {
+            match t {
+                SigType::Annotated(t) => head(t),
+                SigType::Ref { sym, .. } if sym.contains('.') => Some(sym.clone()),
+                _ => None,
+            }
+        }
+        Some((head(step.subst.get("CC")?)?, head(step.subst.get("C")?)?))
+    }
+
     pub fn ensure_parents(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, cls: SymbolId) {
         if cls.is_none() || self.parented.contains(&cls.0) {
             return;

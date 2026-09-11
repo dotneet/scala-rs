@@ -520,6 +520,15 @@ fn gen_unapply_pattern(
         gen_receiver(asm, frame, ctx, fun);
     }
     load(asm, tmp, sel_sort);
+    if sel_sort == JvmSort::Void {
+        // A `Unit` scrutinee occupies no slot, and the extractor's parameter
+        // (`unapply(u: Unit)`, or `Any`) takes the box (`run/t9029`).
+        asm.getstatic(
+            "scala/runtime/BoxedUnit",
+            "UNIT",
+            "Lscala/runtime/BoxedUnit;",
+        );
+    }
     if is_seq && ctx.library_abi && shape == SeqPatShape::SeqOps {
         // The forwarder's parameter is `SeqOps`; the scrutinee's static type
         // may be anything the test above let through.
@@ -556,6 +565,12 @@ fn gen_unapply_pattern(
     if ret_bool {
         asm.ifeq(fail);
         return;
+    }
+    if !is_seq {
+        if let Some(nb) = ctx.st.name_based_unapply.get(&uid) {
+            gen_name_based_result(asm, frame, ctx, uid, nb, args, fail);
+            return;
+        }
     }
     if is_seq && ctx.library_abi {
         match shape {
@@ -602,30 +617,208 @@ fn gen_unapply_pattern(
         } else {
             asm.pop();
         }
+    } else if let Some(sels) = ctx.st.unapply_selectors.get(&(uid, args.len())) {
+        // `Option[Product2[Int, String]]` with two sub-patterns reads the
+        // product's own `_1` / `_2`; it is not a `Tuple2`.
+        bind_product_selectors(asm, frame, ctx, sels, args, fail);
     } else {
-        // The tuple goes in a local, not on the stack: a sub-pattern that
-        // tests jumps to `fail` from inside `bind_subpattern`, and the `dup`ed
-        // tuple left there made the two paths disagree about the stack
-        // (`VerifyError: Inconsistent stackmap frames`, for
-        // `case P(v) ~ _` on a user-defined infix extractor).
-        let tuple = format!("scala/Tuple{}", args.len());
-        asm.checkcast(&tuple);
-        let slot = frame.alloc_tmp(JvmSort::Ref);
-        store(asm, slot, JvmSort::Ref);
-        for (i, a) in args.iter().enumerate() {
-            let fname = format!("_{}", i + 1);
-            load(asm, slot, JvmSort::Ref);
-            if args.len() == 2 {
-                // `scala.Tuple2`'s two fields are public, and so are the
-                // private runtime's; every wider tuple keeps them private
-                // behind an accessor, which is what nsc calls.
-                asm.getfield(&tuple, &fname, "Ljava/lang/Object;");
-            } else {
-                asm.invokevirtual(&tuple, &fname, "()Ljava/lang/Object;");
-            }
-            let sort = coerce_subpattern(asm, ctx, a);
+        bind_tuple_fields(asm, frame, ctx, args, fail);
+    }
+}
+
+/// Match the `TupleN` on top of the stack field by field against `args`.
+fn bind_tuple_fields(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    args: &[Tree],
+    fail: crate::code::Label,
+) {
+    // The tuple goes in a local, not on the stack: a sub-pattern that
+    // tests jumps to `fail` from inside `bind_subpattern`, and the `dup`ed
+    // tuple left there made the two paths disagree about the stack
+    // (`VerifyError: Inconsistent stackmap frames`, for
+    // `case P(v) ~ _` on a user-defined infix extractor).
+    let tuple = format!("scala/Tuple{}", args.len());
+    asm.checkcast(&tuple);
+    let slot = frame.alloc_tmp(JvmSort::Ref);
+    store(asm, slot, JvmSort::Ref);
+    for (i, a) in args.iter().enumerate() {
+        let fname = format!("_{}", i + 1);
+        load(asm, slot, JvmSort::Ref);
+        if args.len() == 2 {
+            // `scala.Tuple2`'s two fields are public, and so are the
+            // private runtime's; every wider tuple keeps them private
+            // behind an accessor, which is what nsc calls.
+            asm.getfield(&tuple, &fname, "Ljava/lang/Object;");
+        } else {
+            asm.invokevirtual(&tuple, &fname, "()Ljava/lang/Object;");
+        }
+        let sort = coerce_subpattern(asm, ctx, a);
+        bind_subpattern(asm, frame, ctx, a, sort, fail);
+    }
+}
+
+/// A name-based extractor's result is on the stack (nsc's `isEmpty` / `get`
+/// protocol; see `scala_rs_typer`'s `name_based`): fail when `isEmpty`,
+/// otherwise match `get` against the sub-patterns -- all of it for one
+/// sub-pattern, its product selectors for several.
+///
+/// The calls are emitted as ordinary member selections on a synthetic local,
+/// so a value-class result goes through its `$extension` statics and an
+/// inherited or interface member through the usual dispatch.
+fn gen_name_based_result(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    uid: SymbolId,
+    nb: &scala_rs_typer::NameBasedUnapply,
+    args: &[Tree],
+    fail: crate::code::Label,
+) {
+    let desc = method_desc_boxed(ctx.st, uid, ctx.boxed_vars);
+    let sort = desc_ret_sort(&desc);
+    let slot = frame.alloc_tmp(sort);
+    store(asm, slot, sort);
+    let recv_ty = Type::Class {
+        sym: nb.result_class,
+        args: vec![],
+    };
+    let tmp = ExtractorTmp {
+        sym: nb.result_tmp,
+        slot,
+        sort,
+        ty: &recv_ty,
+    };
+    read_tmp_member(asm, frame, ctx, &tmp, nb.is_empty, &Type::Boolean);
+    asm.ifne(fail);
+    let raw = member_result_ty(ctx.st, nb.get);
+    match args {
+        [] => {}
+        [a] => {
+            let (want, sort) = extracted_want(ctx, a, &raw);
+            read_tmp_member(asm, frame, ctx, &tmp, nb.get, &want);
             bind_subpattern(asm, frame, ctx, a, sort, fail);
         }
+        _ => {
+            read_tmp_member(asm, frame, ctx, &tmp, nb.get, &raw);
+            match ctx.st.unapply_selectors.get(&(uid, args.len())) {
+                Some(sels) => bind_product_selectors(asm, frame, ctx, sels, args, fail),
+                None => bind_tuple_fields(asm, frame, ctx, args, fail),
+            }
+        }
+    }
+}
+
+/// Match an extractor's `get` value (on top of the stack, a reference) against
+/// `args` through the product selectors `_1` … `_N` its type declares.
+fn bind_product_selectors(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    sels: &scala_rs_typer::UnapplySelectors,
+    args: &[Tree],
+    fail: crate::code::Label,
+) {
+    let cls = class_internal(ctx.st, sels.class);
+    if cls != "java/lang/Object" {
+        asm.checkcast(&cls);
+    }
+    let slot = frame.alloc_tmp(JvmSort::Ref);
+    store(asm, slot, JvmSort::Ref);
+    let recv_ty = Type::Class {
+        sym: sels.class,
+        args: vec![],
+    };
+    let tmp = ExtractorTmp {
+        sym: sels.tmp,
+        slot,
+        sort: JvmSort::Ref,
+        ty: &recv_ty,
+    };
+    for (a, &sel) in args.iter().zip(&sels.selectors) {
+        let raw = member_result_ty(ctx.st, sel);
+        let (want, sort) = extracted_want(ctx, a, &raw);
+        read_tmp_member(asm, frame, ctx, &tmp, sel, &want);
+        bind_subpattern(asm, frame, ctx, a, sort, fail);
+    }
+}
+
+/// A local an extractor's intermediate value is parked in while members are
+/// read off it.
+struct ExtractorTmp<'a> {
+    /// The typer's synthetic symbol for it, mapped to `slot` for each read.
+    sym: SymbolId,
+    slot: u16,
+    sort: JvmSort,
+    ty: &'a Type,
+}
+
+/// Push `tmp.member`, converted to `want`, exactly as the selection
+/// `tmp.member` in source would be.
+fn read_tmp_member(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    tmp: &ExtractorTmp,
+    member: SymbolId,
+    want: &Type,
+) {
+    let mut qual = Tree::dummy(TreeKind::Ident {
+        name: ctx.st.get(tmp.sym).name.clone(),
+    });
+    qual.sym = tmp.sym;
+    qual.ty = tmp.ty.clone();
+    let name = ctx.st.get(member).name.clone();
+    let mut sel = Tree::dummy(TreeKind::Select {
+        qual: Box::new(qual),
+        name: name.clone(),
+    });
+    sel.sym = member;
+    sel.ty = want.clone();
+    let TreeKind::Select { qual, .. } = &sel.kind else {
+        unreachable!()
+    };
+    // A value class held unboxed *is* its one field: `NonNullChar(val get:
+    // Char)`'s `get` is the `char` in the local. (Erasure rewrites such reads
+    // in source trees; this one never went through it.)
+    let m = ctx.st.get(member);
+    if m.kind == SymKind::Term && ctx.st.is_value_class(m.owner) {
+        load(asm, tmp.slot, tmp.sort);
+        return;
+    }
+    // The same synthetic symbol serves every use of the extractor, nested
+    // ones included, so it names this use's slot only for the one read.
+    let saved = frame.locals.insert(tmp.sym, (tmp.slot, tmp.sort));
+    crate::gen_expr::gen_select(asm, frame, ctx, &sel, qual, &name);
+    match saved {
+        Some(prev) => {
+            frame.locals.insert(tmp.sym, prev);
+        }
+        None => {
+            frame.locals.remove(&tmp.sym);
+        }
+    }
+}
+
+/// The (erased) type a nullary member hands back.
+fn member_result_ty(st: &SymbolTable, member: SymbolId) -> Type {
+    let s = st.get(member);
+    match (&s.kind, &s.ty) {
+        (SymKind::Method, Type::Method { ret, .. }) => (**ret).clone(),
+        (_, t) => t.clone(),
+    }
+}
+
+/// What an extracted value of erased type `raw` is read as for sub-pattern
+/// `a`, and the sort it is then left in: as it stands when `a` tests it (see
+/// `reads_erased_value`), narrowed to `a`'s type when `a` binds it.
+fn extracted_want(ctx: &EmitCtx, a: &Tree, raw: &Type) -> (Type, JvmSort) {
+    if reads_erased_value(ctx, a) {
+        let sort = desc_ret_sort(&format!("(){}", jvm_desc(ctx.st, raw)));
+        (raw.clone(), sort)
+    } else {
+        (a.ty.clone(), jvm_sort(&a.ty))
     }
 }
 

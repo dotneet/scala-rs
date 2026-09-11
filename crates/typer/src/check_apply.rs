@@ -9,6 +9,7 @@
 //! `ArrayOps` yields -- which nsc gets from `CanBuildFrom`-era signatures.
 
 use crate::check::*;
+use crate::ops_shape::OpsSlot;
 use scala_rs_parser::ast::*;
 
 impl Typer {
@@ -2235,6 +2236,11 @@ impl Typer {
                     // member of T` and 13 `value map is not a member of O2` in
                     // gitbucket were that cascade.
                     let impl_missing = std::mem::take(&mut self.implicit_arg_missing);
+                    // The `BuildFrom` rebuilds below consult the receiver's
+                    // `IterableOps` shape (`crate::ops_shape`).
+                    if let Some(t) = recv_ty.clone().or_else(|| self.curried_receiver_ty(fun)) {
+                        self.prime_ops_shape(&t);
+                    }
                     if !self.implicit_undet_solved.is_empty() {
                         let sol = std::mem::take(&mut self.implicit_undet_solved);
                         let ids: Vec<SymbolId> = sol.iter().map(|(i, _)| *i).collect();
@@ -2308,7 +2314,8 @@ impl Typer {
                                     // `BuildFrom` puts the receiver's own two-
                                     // parameter class back.
                                     let pair_rebuild = declared.and_then(|d| {
-                                        let r = self.receiver_collection_root(recv_ty.as_ref())?;
+                                        let r =
+                                            self.receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)?;
                                         (self.st.get(r).tparams.len() == 2).then_some(()).and_then(
                                             |()| {
                                                 self.rebuild_widened(
@@ -2322,7 +2329,7 @@ impl Typer {
                                         )
                                     });
                                     let recv_cls = self
-                                        .receiver_collection_root(recv_ty.as_ref())
+                                        .receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)
                                         .filter(|&c| self.takes_one_type_parameter(c));
                                     let cls = match (recv_cls, declared) {
                                         // `IndexedSeq` does not redeclare `map`, so
@@ -2390,7 +2397,15 @@ impl Typer {
                         // as the `map` rule above, and gated the same way: a
                         // `scala.collection` class that really is a subclass of
                         // what the declaration named.
-                        if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
+                        let slot = if matches!(method_name.as_str(), "++" | "$plus$plus")
+                            && !sym.is_none()
+                            && !self.st.get(sym).tparams.is_empty()
+                        {
+                            OpsSlot::Cc
+                        } else {
+                            OpsSlot::C
+                        };
+                        if let Some(r) = self.receiver_ops_root(recv_ty.as_ref(), slot) {
                             // `SeqView` is the one collection whose `C` is not
                             // itself: `trait SeqView[+A] extends SeqOps[A, View,
                             // View[A]] with View[A]`, so `filter` & friends return
@@ -2469,8 +2484,9 @@ impl Typer {
                                 if self.is_array_ops_ty(recv_ty.as_ref()) {
                                     ret = Type::Array(Box::new(to.widen_constant()));
                                 } else if let Some(cls) = self
-                                    .receiver_collection_root(recv_ty.as_ref())
+                                    .receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)
                                     .filter(|&c| self.takes_one_type_parameter(c))
+                                    .filter(|&c| self.collect_rebuilds_to(c))
                                 {
                                     ret = Type::Class {
                                         sym: cls,
@@ -2514,7 +2530,9 @@ impl Typer {
                                     }
                                 }
                             }
-                        } else if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
+                        } else if let Some(r) =
+                            self.receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)
+                        {
                             // `zip[B](that): CC[(A, B)]`.
                             if let Some(t) = self.rebuild_from_receiver(r, &ret) {
                                 ret = t;
@@ -2557,7 +2575,7 @@ impl Typer {
                             // receiver's, whatever class the inherited declaration
                             // named. `IndexedSeq.flatMap` said `Seq[B]`, and a
                             // `Map`'s said `Iterable[(K2, V2)]`.
-                            if let Some(r) = self.receiver_collection_root(recv_ty.as_ref()) {
+                            if let Some(r) = self.receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc) {
                                 if let Some(t) = self.rebuild_widened(r, &ret) {
                                     ret = t;
                                 }
@@ -2711,7 +2729,7 @@ impl Typer {
                     // `Map[K, C]`: the receiver's own collection sits *inside* the
                     // declared result, so the `BuildFrom` rebuild has to reach in.
                     let nested_recv = recv_ty.clone().or_else(|| self.curried_receiver_ty(fun));
-                    if let Some(r) = self.receiver_collection_root(nested_recv.as_ref()) {
+                    if let Some(r) = self.receiver_ops_root(nested_recv.as_ref(), OpsSlot::C) {
                         if let Some(t) = self.rebuild_inside(r, &ret, &method_name) {
                             ret = t;
                         }
@@ -3218,7 +3236,8 @@ impl Typer {
             }
             _ => return,
         };
-        let Some(r) = self.receiver_collection_root(Some(recv_ty)) else {
+        let slot = if widens { OpsSlot::Cc } else { OpsSlot::C };
+        let Some(r) = self.receiver_ops_root(Some(recv_ty), slot) else {
             return;
         };
         // A *view* is the one collection whose `C` is not itself:
@@ -3272,6 +3291,33 @@ impl Typer {
             .map(|c| self.collection_root(c))
     }
 
+    /// The class the `BuildFrom` rebuild may put back for a member returning
+    /// `slot`: the receiver's `IterableOps` `CC` / `C` where its pickle says
+    /// (`crate::ops_shape`), the receiver's own class otherwise.
+    fn receiver_ops_root(&self, recv_ty: Option<&Type>, slot: OpsSlot) -> Option<SymbolId> {
+        self.receiver_collection_root(recv_ty)
+            .map(|r| self.ops_target(r, slot))
+    }
+
+    /// Whether `collect`'s `CC[B]` may be spelled with `cls`. A class outside
+    /// the library that is a collection binds `CC` through the parent it
+    /// extends (`class C[A] extends Iterable[A]` collects to an `Iterable`),
+    /// which the declared result already says; putting `cls` there instead
+    /// cast the `List` the call returns to `cls`. Non-collections
+    /// (`Option`, `Try`, …) keep the rebuild they always had.
+    fn collect_rebuilds_to(&self, cls: SymbolId) -> bool {
+        if self.st.get(cls).jvm_name.starts_with("scala/") {
+            return true;
+        }
+        let Some(io) = crate::classpath::find_by_jvm(&self.st, "scala/collection/IterableOnce")
+        else {
+            return true;
+        };
+        // Not `class_reaches`: it gives up at the `PartialFunction` parent
+        // every `Seq` has.
+        !crate::lin::linearize(&self.st, cls).contains(&io)
+    }
+
     /// `xs.partition(p)` is `(C, C)` and `xs.groupBy(f)` is `Map[K, C]`: the
     /// receiver's collection is *inside* the result, not the result itself.
     fn rebuild_inside(&self, recv_root: SymbolId, ret: &Type, method_name: &str) -> Option<Type> {
@@ -3322,7 +3368,7 @@ impl Typer {
         }
     }
 
-    fn collection_root(&self, id: SymbolId) -> SymbolId {
+    pub(crate) fn collection_root(&self, id: SymbolId) -> SymbolId {
         let n = self.st.get(id).name.as_str();
         if n == "Some" || n == "None$" || n == "None" {
             self.st.option_sym

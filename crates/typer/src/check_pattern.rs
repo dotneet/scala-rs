@@ -599,9 +599,11 @@ impl Typer {
                     pat.ty = class_ty;
                     pat.sym = class_id;
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
-                    let extracted = self.unapply_extracted_types(u);
-                    let extracted = self.subst_unapply_tparams(u, sel_ty, extracted);
-                    if args.len() != extracted.len() && !extracted.is_empty() {
+                    let extracted =
+                        self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, true);
+                    let failed = extracted.is_none();
+                    let extracted = extracted.unwrap_or_else(|| vec![Type::Error; args.len()]);
+                    if !failed && args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
                             format!(
@@ -719,7 +721,8 @@ impl Typer {
                 let extracted = if u.is_none() {
                     vec![Type::Any; args.len()]
                 } else {
-                    self.unapply_extracted_types(u)
+                    self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, false)
+                        .unwrap_or_else(|| vec![Type::Error; args.len()])
                 };
                 for (i, a) in args.iter_mut().enumerate() {
                     let ft = extracted.get(i).cloned().unwrap_or(Type::Any);
@@ -1946,7 +1949,12 @@ impl Typer {
     /// `Some.unapply[A](x: Option[A]): Option[A]` extracts `A`; the scrutinee
     /// says what `A` is. Without this the bound variable keeps the extractor's
     /// own type parameter and degrades to `Any`.
-    fn subst_unapply_tparams(&self, unapply: SymbolId, sel_ty: &Type, out: Vec<Type>) -> Vec<Type> {
+    pub(crate) fn subst_unapply_tparams(
+        &self,
+        unapply: SymbolId,
+        sel_ty: &Type,
+        out: Vec<Type>,
+    ) -> Vec<Type> {
         let tps = self.st.get(unapply).tparams.clone();
         if tps.is_empty() || sel_ty.is_no_type() {
             return out;
@@ -2094,18 +2102,28 @@ impl Typer {
         Some(crate::symbol::subst_tparams_slice(&ids, &tys, &param))
     }
 
-    fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
+    pub(crate) fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
         let ret = match &self.st.get(unapply).ty {
             Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
             t => t.clone(),
         };
+        self.unapply_extracted_types_at(unapply, ret)
+    }
+
+    /// [`Self::unapply_extracted_types`] for a result type that is not an
+    /// `Option` (no case-class fallback applies).
+    pub(crate) fn unapply_extracted_types_of(&self, ret: Type) -> Vec<Type> {
+        self.unapply_extracted_types_at(SymbolId::NONE, ret)
+    }
+
+    fn unapply_extracted_types_at(&self, unapply: SymbolId, ret: Type) -> Vec<Type> {
         if matches!(ret, Type::Boolean) {
             return vec![];
         }
         if let Type::Class { sym, args } = &ret {
             let name = self.st.get(*sym).name.as_str();
             if *sym == self.st.option_sym || name == "Option" || name == "Some" {
-                if args.is_empty() {
+                if args.is_empty() && !unapply.is_none() {
                     // A bare `Option` says nothing about what it yields: that
                     // is what an `unapply` read back from a *classfile* looks
                     // like when its signature was erased. For a case class's
@@ -2134,7 +2152,7 @@ impl Typer {
     /// `apply` of exactly the constructor's arity, which is what
     /// `synthesize_case_members` gives every case class and what a hand-written
     /// companion of a non-case class rarely matches.
-    fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
+    pub(crate) fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
         if module_cls.is_none() {
             return None;
         }

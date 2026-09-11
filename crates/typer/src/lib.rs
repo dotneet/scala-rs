@@ -35,7 +35,9 @@ mod localobj;
 mod macros;
 mod materialize;
 mod materialize_manifest;
+mod name_based;
 mod named_eval_order;
+mod ops_shape;
 mod overload_value;
 mod override_check;
 pub use override_check::{method_overloads, method_overrides, record_method_override_families};
@@ -148,8 +150,8 @@ pub use named_eval_order::restore_named_arg_order;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};
 pub use specialize::{rewrite_specialized_calls, specialize_method_defs};
 pub use symbol::{
-    bool_shortcircuit_rhs, Intrinsic, MacroBinding, MethodVariant, SamSig, SeqPayload, SymKind,
-    Symbol, SymbolTable, AS_SEEN_FROM_MARK,
+    bool_shortcircuit_rhs, Intrinsic, MacroBinding, MethodVariant, NameBasedUnapply, SamSig,
+    SeqPayload, SymKind, Symbol, SymbolTable, UnapplySelectors, AS_SEEN_FROM_MARK,
 };
 pub use uncurry::uncurry;
 pub use value_companion::add_value_class_companions;
