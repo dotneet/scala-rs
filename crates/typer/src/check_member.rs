@@ -2156,7 +2156,7 @@ impl Typer {
             fun.sym = class_id;
         }
         let hidden = self.hide_template_for_parent_args();
-        self.type_parent_ctor_args(node, tree, class_ty, class_id);
+        self.type_parent_ctor_args(node, tree, class_ty, class_id, parent_pre);
         if let Some((index, original)) = hidden {
             self.st.scopes[index] = original;
         }
@@ -2198,12 +2198,17 @@ impl Typer {
         Some((index, original))
     }
 
+    /// The argument half of `type_parent_ctor_app_in`, typed with the
+    /// template's own members out of scope. `parent_pre` is the prefix the
+    /// parent's head carries (`prefix.rs`), put back on the types this half
+    /// records for it.
     fn type_parent_ctor_args(
         &mut self,
         node: (NodeId, Span),
         tree: &mut Tree,
         class_ty: Type,
         class_id: SymbolId,
+        parent_pre: Option<Type>,
     ) {
         let (fun, args) = match &mut tree.kind {
             TreeKind::Apply { fun, args } => (fun, args),

@@ -1069,6 +1069,11 @@ pub struct SymbolTable {
     /// constructor fields private behind accessors; ours are emitted with the
     /// field public, so the two are read differently.
     pub source_classes: rustc_hash::FxHashSet<SymbolId>,
+    /// The receiver temporaries of `c.copy(…)` calls the typer rewrote to
+    /// `{ val tmp = c; new CC(…) }` for a case class that is a member of a
+    /// class or trait: the backend builds the copy on `tmp.$outer`, the
+    /// receiver's own enclosing instance, as nsc's synthetic `copy` does.
+    pub copy_receivers: rustc_hash::FxHashSet<SymbolId>,
     /// Scala classes seeded by the shallow classpath reader. Their complete
     /// signature must be adopted before type checking uses their members.
     pub pending_classpath_signatures: rustc_hash::FxHashSet<SymbolId>,
@@ -1343,6 +1348,7 @@ impl SymbolTable {
             erased_abstract_params: rustc_hash::FxHashMap::default(),
             source_value_classes: rustc_hash::FxHashSet::default(),
             source_classes: rustc_hash::FxHashSet::default(),
+            copy_receivers: rustc_hash::FxHashSet::default(),
             pending_classpath_signatures: rustc_hash::FxHashSet::default(),
             lazy_cells: Vec::new(),
             local_lazy_cells: rustc_hash::FxHashSet::default(),

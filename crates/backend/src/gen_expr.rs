@@ -972,7 +972,23 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
             for s in stats {
                 gen_stat(asm, frame, ctx, s);
             }
-            gen_expr(asm, frame, ctx, expr);
+            // `c.copy(…)` rewritten by the typer to `{ val tmp = c; new
+            // CC(…) }`, `CC` a member of a class: the copy is built on the
+            // receiver's own enclosing instance (`SymbolTable::copy_receivers`).
+            let mut copied = false;
+            if let [recv] = stats.as_slice() {
+                if ctx.st.copy_receivers.contains(&recv.sym) {
+                    if let TreeKind::Apply { fun, args } = &expr.kind {
+                        if let TreeKind::New { tpt } = &fun.kind {
+                            gen_new_with(asm, frame, ctx, tpt, args, expr.sym, Some(recv.sym));
+                            copied = true;
+                        }
+                    }
+                }
+            }
+            if !copied {
+                gen_expr(asm, frame, ctx, expr);
+            }
         }
         TreeKind::If { cond, thenp, elsep } => {
             gen_if(asm, frame, ctx, cond, thenp, elsep, &tree.ty);
@@ -2239,6 +2255,21 @@ pub(crate) fn gen_new(
     args: &[Tree],
     ctor_sym: SymbolId,
 ) {
+    gen_new_with(asm, frame, ctx, tpt, args, ctor_sym, None);
+}
+
+/// [`gen_new`], with the enclosing instance optionally taken from
+/// `outer_of`'s `$outer` -- a local holding an instance of the very class
+/// being created (the receiver of a rewritten `copy`).
+pub(crate) fn gen_new_with(
+    asm: &mut Assembler,
+    frame: &mut Frame,
+    ctx: &EmitCtx,
+    tpt: &Tree,
+    args: &[Tree],
+    ctor_sym: SymbolId,
+    outer_of: Option<SymbolId>,
+) {
     if let Some(elem) = array_elem_ty(&tpt.ty) {
         if let Some(len) = args.first() {
             gen_expr(asm, frame, ctx, len);
@@ -2295,7 +2326,15 @@ pub(crate) fn gen_new(
     }
     asm.new_obj(&internal);
     asm.dup();
-    if let Some(outer) = outer_field_class(ctx.st, class_id) {
+    let receiver_outer = outer_of.and_then(|tmp| {
+        let (slot, sort) = frame.get(tmp)?;
+        let od = outer_field_desc(ctx.st, class_id)?;
+        (ctx.st.class_sym_of(&ctx.st.get(tmp).ty) == Some(class_id)).then_some((slot, sort, od))
+    });
+    if let Some((slot, sort, od)) = receiver_outer {
+        load(asm, slot, sort);
+        asm.getfield(&internal, "$outer", &od);
+    } else if let Some(outer) = outer_field_class(ctx.st, class_id) {
         match new_prefix_instance(ctx, tpt, outer) {
             // `new i.Deep()` / `new c.Inner`: the enclosing instance is the
             // prefix that was written, not the current `this`.

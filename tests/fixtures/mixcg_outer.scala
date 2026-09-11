@@ -37,6 +37,26 @@ trait Kase {
 }
 class Box(val id: Int) { case class In(x: Int) }
 
+// A parent written as a path to an inner class names its enclosing
+// instance: `extends a.In` with no argument list, in an object and in a class.
+class Encl(val tag: String) { class In { def v = "in of " + tag } }
+object PathParent {
+  val a = new Encl("PathParent.a")
+  class C extends a.In
+}
+class PathHost {
+  val a = new Encl("host.a")
+  class D extends a.In
+}
+
+// `c.copy(…)` on an inner case class is built on `c`'s enclosing instance,
+// wherever the call is written; a generic one still re-infers its type
+// arguments.
+class Shop(val tag: String) {
+  case class Item(x: Int) { def show = tag + ":" + x }
+  case class Box2[+A](a: A, n: Int) { def show = tag + ":" + a + "/" + n }
+}
+
 // Parent constructor arguments do not see the template's own members.
 class P(val p: Int)
 trait HasA { def a: Int }
@@ -82,5 +102,16 @@ object Main {
 
     println(new Scope.E1().p + " " + new Scope.E2(1).p + " " + new Scope.E3(3).p + " " + Scope.E4.p)
     println(new Scope.E5().p + " " + new Scope.E5().a)
+
+    val ph = new PathHost
+    println(new PathParent.C().v + " / " + new ph.D().v)
+    val shop = new Shop("shop")
+    val item = shop.Item(1)
+    println(item.copy(x = 2).show + " " + item.copy().show + " " + (item.copy() == item))
+    val box = shop.Box2("s", 1)
+    val widened: shop.Box2[Any] = box.copy(a = 42)
+    println(box.copy(n = 5).show + " " + widened.show)
+    def viaProjection(i: Shop#Item) = i.copy(x = 9)
+    println(viaProjection(item).show)
   }
 }

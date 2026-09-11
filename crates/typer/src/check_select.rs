@@ -3750,6 +3750,24 @@ impl Typer {
         };
         tree.span = span;
         self.type_expr(tree, pt);
+        // A case class that is a member of a class or trait is built on an
+        // enclosing instance, and `c.copy(…)`'s is `c`'s own -- nsc's
+        // synthetic `copy` reads it as `this.$outer`. The rewritten `new
+        // CC(…)` has no term to take it from when the receiver's type carries
+        // no stable prefix, and the backend then handed over the *caller's*
+        // enclosing instance: `Main$ cannot be cast to Outer` for
+        // `o.CC(1).copy(x = 2)` written in `object Main`. Record the receiver
+        // temporary so the backend passes its `$outer` instead.
+        let owner = self.st.get(class_id).owner;
+        if !owner.is_none() && self.st.get(owner).kind == SymKind::Class {
+            if let TreeKind::Block { stats, .. } = &tree.kind {
+                if let Some(t) = stats.first() {
+                    if !t.sym.is_none() {
+                        self.st.copy_receivers.insert(t.sym);
+                    }
+                }
+            }
+        }
         true
     }
 

@@ -13,3 +13,7 @@ false true
 true
 5 6 5 5
 31 30
+in of PathParent.a / in of host.a
+shop:2 shop:1 true
+shop:s/5 shop:42/1
+shop:9
