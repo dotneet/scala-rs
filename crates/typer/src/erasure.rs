@@ -1578,6 +1578,14 @@ fn method_param_types(
     ctor_sym: SymbolId,
     nargs: usize,
 ) -> Vec<Type> {
+    // A nested application such as `g(1)("x")` carries the original symbol
+    // `g`, but its callee type is the function returned by the first call. The
+    // declaration's first parameter list is therefore unrelated to this
+    // application; use the instantiated function type captured before the
+    // callee is erased.
+    if let Type::Function { params, .. } = fun_pre_ty {
+        return params.clone();
+    }
     if !ctor_sym.is_none() && st.get(ctor_sym).name == "<init>" {
         // Parent applications have a type tree as their callee, rather than
         // New. They must use the selected constructor's storage types too.

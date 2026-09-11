@@ -11,7 +11,7 @@
 use crate::check::*;
 use crate::implicits::ImplicitSearch;
 use crate::symbol::SymKind;
-use crate::uncurry::eta_expand;
+use crate::uncurry::{eta_expand, eta_expand_curried};
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
@@ -3033,11 +3033,20 @@ impl Typer {
         }
         if let Type::Method { paramss, ret } = &tree.ty {
             if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
+                let paramss = paramss.clone();
                 let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
                 let ret = (**ret).clone();
                 let msym = tree.sym;
                 let (params, ret) = self.solve_eta_tparams(tree.sym, params, ret, pt);
-                eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
+                if paramss.len() > 1 && matches!(pt, Type::Function { .. }) {
+                    // A curried method's value type is a nested function.  The
+                    // old flat expansion made `def f(a)(b)` look like
+                    // `(a, b) => r`, which rejects the legal `A => B => R`
+                    // assignment before codegen ever sees the call.
+                    eta_expand_curried(&mut self.st, &mut self.gensym, tree, &paramss, ret);
+                } else {
+                    eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
+                }
                 self.record_open_tparams(msym, &tree.ty);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;

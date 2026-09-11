@@ -3174,6 +3174,19 @@ impl Typer {
 
     fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
         let param = &unwrap_byname(param);
+        // Match a polymorphic conversion against the receiver after solving
+        // its own parameters structurally. Erasing them to wildcards first
+        // loses the variance of nested function types such as
+        // `A => Option[B]`; the exact `Int => Option[String]` receiver then
+        // fails the wildcard subtype check even though nsc accepts the view.
+        let tps = &self.st.get(id).tparams;
+        if !tps.is_empty() {
+            let targs = self.conv_targs(id, from);
+            let instantiated = crate::symbol::subst_tparams_slice(tps, &targs, param);
+            if self.st.is_sub_type(from, &instantiated) {
+                return true;
+            }
+        }
         let erased = self.erase_method_tparams(id, param);
         if self.st.is_sub_type(from, &erased) || matches!(erased, Type::Any | Type::Wildcard) {
             return true;
@@ -3824,6 +3837,20 @@ fn fold_applied(ty: &Type) -> Type {
 fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
     match (param, from) {
         (Type::TypeParam(id), actual) if *id == tp => Some(actual.widen_constant()),
+        (
+            Type::Function {
+                params: pp,
+                ret: pr,
+            },
+            Type::Function {
+                params: fp,
+                ret: fr,
+            },
+        ) => pp
+            .iter()
+            .zip(fp.iter())
+            .find_map(|(p, f)| unify_conv_tparam(tp, p, f))
+            .or_else(|| unify_conv_tparam(tp, pr, fr)),
         (Type::Array(p), Type::Array(a)) => unify_conv_tparam(tp, p, a),
         (Type::Class { args: pa, .. }, Type::Class { args: fa, .. }) => pa
             .iter()

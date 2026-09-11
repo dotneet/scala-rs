@@ -1317,20 +1317,23 @@ kind-projector type lambda that is never beta-reduced (`[A0, β](A0, β)[A0,
 Any]` has no `.copy`).
 
 
-### 検証で見つかった inserted `apply` の型境界漏れ
+### Missing Type-Bound Checks for an Inserted `apply`
 
-既存スライスの検証時、推論した型引数を代入する前の境界検証が抜けていることを
-実行で確認した。`def upper: UpperApply` に続く `upper("wrong")` は、
-`UpperApply.apply[A <: Number]` に違反していても受理されていた。
-`OwnerApply[T].apply[A <: T]` と、不変な `Box[A]` を受け取る
-`LowerApply[T].apply[A >: T]` でも同じく誤受理した。3 呼出しを含むソースを
-scala-rs は 6 classfiles にコンパイルし、scalac 2.13.16 は拒否した。
+During validation of an existing slice, execution showed that bounds were not
+checked before inferred type arguments were substituted. After
+`def upper: UpperApply`, `upper("wrong")` was accepted even though it violates
+`UpperApply.apply[A <: Number]`. The same false acceptance occurred for
+`OwnerApply[T].apply[A <: T]` and `LowerApply[T].apply[A >: T]`, whose argument is
+an invariant `Box[A]`. scala-rs compiled the source containing all three calls
+to six class files, while scalac 2.13.16 rejected it.
 
-挿入した `apply` のレシーバ型を通常の推論と同じ
-`infer_method_tparams_in` に渡し、`check_tparam_bounds` で上限・下限を確認して
-から型を代入する。元の引数なしメソッドのレシーバでは境界の `T` が異なるため、
-新しい `Select` のレシーバを使う。`c3_bounds_bad.scala` はこの 3 呼出しの拒否、
-`c3_parallel.scala` は境界に収まる呼出しの出力を実 scalac と比較する。
+The inserted `apply` now passes its receiver type through the same
+`infer_method_tparams_in` path as an ordinary call, checks upper and lower
+bounds with `check_tparam_bounds`, and only then substitutes the inferred
+types. The newly built `Select` receiver is used because the original
+parameterless method receiver carries a different `T`. `c3_bounds_bad.scala`
+checks rejection of the three invalid calls, while `c3_parallel.scala`
+compares a bounded valid call with real scalac.
 
 ## Two leftover type parameters, and the diagnostic that hid them (`agent/catseta`)
 

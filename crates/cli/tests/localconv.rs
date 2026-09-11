@@ -226,6 +226,16 @@ fn fixtures_lc_conv_lib() {
     dual_run_fixture("lc_conv");
 }
 
+#[test]
+fn fixtures_lc_generic_function() {
+    check("lc_generic_function");
+}
+
+#[test]
+fn fixtures_lc_generic_function_lib() {
+    dual_run_fixture("lc_generic_function");
+}
+
 // --------------------------------------------------------------- 3. shadowing
 
 /// A local implicit shadows a same-named outer one -- ordinary unqualified

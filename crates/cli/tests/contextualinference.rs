@@ -114,6 +114,7 @@ fn inferred_override_scope() {
 fn implicit_method_values() {
     matrix(
         &[
+            ("curried_eta", true),
             ("implicit_eta", true),
             ("eta_generic", true),
             ("eta_missing_bad", false),

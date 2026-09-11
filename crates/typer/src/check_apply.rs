@@ -706,6 +706,52 @@ impl Typer {
         self.type_expr(fun, &dummy_method);
         self.callee_arity = saved_arity;
         self.typing_callee = false;
+
+        // A function-typed value is applied through FunctionN.apply. Its
+        // symbol still points at the declaration that produced the value (for
+        // example `g` in `g(1)`), but that declaration's parameter lists are
+        // unrelated to this call once the callee is itself an application:
+        // `g(1)("x")` must read the second parameter list from the function
+        // result, not re-read `g`'s first `Int` parameter. Going through the
+        // method overload path in that shape typed the second argument as
+        // `Int` and emitted a runtime checkcast from `String` to `Integer`.
+        if matches!(fun.kind, TreeKind::Apply { .. }) {
+            if let Type::Function { params, ret } = fun.ty.clone() {
+                // By-name parameters use the ordinary application path: it
+                // recognizes source thunks and preserves their result type.
+                // Treating a thunk literal as an ordinary function argument
+                // here wraps it once more (`=> Int` becomes `() => (() =>
+                // Int)`).
+                if !params.iter().any(|p| matches!(p, Type::ByName(_)))
+                    && args.len() != params.len()
+                {
+                    self.error(
+                        tree.span,
+                        format!(
+                            "wrong number of arguments (found {}, expected {})",
+                            args.len(),
+                            params.len()
+                        ),
+                    );
+                }
+                if params.iter().any(|p| matches!(p, Type::ByName(_))) {
+                    // Fall through to the normal method/function path.
+                } else {
+                    for (i, a) in args.iter_mut().enumerate() {
+                        let p = params.get(i).cloned().unwrap_or(Type::NoType);
+                        if a.ty.is_no_type() || matches!(a.kind, TreeKind::Function { .. }) {
+                            self.type_expr(a, &p);
+                        }
+                        if !p.is_no_type() {
+                            self.adapt(a, &p);
+                        }
+                    }
+                    tree.ty = (*ret).clone();
+                    tree.sym = SymbolId::NONE;
+                    return;
+                }
+            }
+        }
         self.rewrite_receiver_apply(fun);
         Self::auto_apply_nullary_function(fun, args.len());
         let placed = self.reorder_named_args(args, fun);

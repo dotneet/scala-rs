@@ -1,117 +1,145 @@
-# Codegen候補の親セッションによる回帰修正（未受け入れ）
+# Codegen Regression Repairs from Candidate 81454c19 (Not Accepted)
 
-起点は `81454c19`。内側クラスの ClassProjection WIP は含まない。
+The starting point was `81454c19`. The ClassProjection work in inner classes is
+not included.
 
-## 型検査の繰り返しによる速度劣化
+## Performance regression from repeated typing
 
-候補81454c19の全workspaceは2275 PASS / 0 FAIL（205 result rows、1118.45秒）。
-Slickは0 errors / 1490 classes、catsは355 errors / 83 filesだった。
-続くGitBucketコンパイラはCPU約98%で走り続けた。スタックを1秒採取し、
-10分51秒時点で親がそのコンパイラPIDだけにSIGTERMを送った。
-検証runnerはgitbucketのexit 2を記録してexit 1で停止した。
-**この候補のGitBucketは未完了。残りのscalalib、strict検証、Slick実行、
-特殊化ledger、コーパスもこの全体runでは未実施。再起動済みとは扱わない。**
+The candidate workspace run finished with 2275 PASS / 0 FAIL (205 result rows,
+1118.45 seconds). Slick reported 0 errors across 1490 classes, and Cats
+reported 355 errors across 83 files. The GitBucket compiler then continued at
+about 98% CPU. The parent sampled its stack for one second and sent SIGTERM to
+that compiler process at 10 minutes 51 seconds. The validation runner recorded
+GitBucket exit 2 and stopped with exit 1.
 
-`object Main { val x = missing.f(0).f(0)... }` で再現した。
-12段で0.79秒、16段と20段は各5秒でタイムアウト。
-`try_rewrite_dynamic_apply` が、既に型の付いたqualifierを再度typecheckしていた。
-通常のselection側でも暫定Errorを再試行するため、入れ子ごとに同じ木を重複して
-検査していた。DynamicかどうかのprobeではNoTypeのqualifierだけを型検査し、
-それ以外は完成済みの型を使うようにした。通常のselection側の暫定Error再試行は維持。
+**GitBucket was incomplete for this candidate. The same run did not perform the
+remaining Scala-library measure, strict verification, Slick execution,
+specialization ledger, or corpus. It must not be treated as a restarted run.**
 
-修正後: 20段0.10秒、40段0.17秒、80段0.46秒。
-実GitBucket計測は10.93秒で終了（906 errors / 112 files）。
-件数減少だけを成果とは扱わない。constructor ambiguity等の新しい診断差分は
-未監査であり、main基準912 / 111に対する受け入れ条件をまだ満たしていない。
+The issue reproduced with `object Main { val x = missing.f(0).f(0)... }`:
+12 nesting levels took 0.79 seconds, while 16 and 20 levels each timed out at
+five seconds. `try_rewrite_dynamic_apply` typechecked a qualifier that already
+had a type. The ordinary selection path also retried a provisional `Error`, so
+each nesting level checked the same tree again. The dynamic probe now types only
+a `NoType` qualifier and reuses a completed type otherwise; the ordinary
+provisional-`Error` retry remains.
 
-永続テスト `qualifier_retry::erroneous_application_chain_does_not_repeat_dynamic_receiver_typing`
-は80段の不正な式を20秒以内に拒否し、未定義名の診断が1件だけであることを要求。
-この余裕のある期限は正常時の速度を競うためではなく、旧実装の爆発的な再検査を
-有限時間で検出するため。既存のcross-unit正常/異常×ファイル順序×nsc/rs比較もPASS。
+After the repair, 20 levels took 0.10 seconds, 40 took 0.17 seconds, and 80
+took 0.46 seconds. A real GitBucket measure finished in 10.93 seconds with
+906 errors across 112 files. A lower diagnostic count is not sufficient: new
+differences such as constructor ambiguity were not audited, so the candidate
+did not meet the main baseline of 912 / 111.
 
-## Function subclassのtyped pattern
+The persistent test
+`qualifier_retry::erroneous_application_chain_does_not_repeat_dynamic_receiver_typing`
+requires the 80-level invalid expression to be rejected within 20 seconds and
+to report one undefined-name diagnostic. The generous limit detects the old
+explosive rechecking within a finite time; it is not a normal-case performance
+target. Existing cross-unit valid/invalid, file-order, and nsc/scala-rs
+comparisons also pass.
 
-`A => B` と `Function1[A,B]` が異なる表現のまま、抽象型引数を別の規則で消去
-していた。型パターン互換性の入口でFunction構文をFunctionNクラスに正規化し、
-双方の引数を同じ規則で扱うようにした。catsの新しい4件の誤診断が消えた。
+## Typed patterns for Function subclasses
 
-`function_subclass_pattern.scala` はConstant、Wrapped、Zeroとwildcardパターンを
-実行してnscと比較する。さらにFunction1/Function0のInt戻り値に対して
-String戻り値のfinal subclassを検査する不正な例は、両処理系で拒否される。
+`A => B` and `Function1[A, B]` had separate representations and erased
+abstract type arguments with different rules. The type-pattern compatibility
+entry point now normalizes function syntax to a `FunctionN` class and applies
+the same argument rules to both forms. Four false Cats diagnostics disappeared.
 
-## 確認済みと残件
+`function_subclass_pattern.scala` executes Constant, Wrapped, Zero, and
+wildcard patterns and compares them with nsc. An invalid final subclass with a
+String result is also checked against an expected Int result for Function1 and
+Function0; both compilers reject it.
 
-- Cargo: function_pattern 1、qualifier_retry 2、seqpat 20、e2eのdynamic 5、合計28 PASS。
-- fresh release build成功、git diff --check成功。
-- Slick: 184 files / 0 errors / 1490 classes（2.26秒）。
-- cats: 339 / skip1 / 351 errors / 81 files（2.29秒）。
-- GitBucket: 353 / skip1 / 906 errors / 112 files（10.93秒）。
-- Scala library: 538 / 1620 errors / 171 files（2.01秒）。
+## Verified results and remaining work
 
-catsにはmonadErrorのandThen ambiguityが新しく1件残る。
-Scala libraryにはTNode/CNode/LNode、MutableBufferWrapper、Listの型パターンで
-追加診断があり、FilePropのconstructor ambiguityが消えている。
-不足する型情報の下で不適合と断定していないか、実際のsymbol/継承関係を調べること。
-診断数を合わせるために型をAnyに広げたり、型パターン検査を一括で無効化しない。
+- Cargo: function_pattern 1, qualifier_retry 2, seqpat 20, dynamic e2e 5;
+  28 tests passed.
+- Fresh release build and `git diff --check` succeeded.
+- Slick: 184 files / 0 errors / 1490 classes (2.26 seconds).
+- Cats: 339 / skip1 / 351 errors / 81 files (2.29 seconds).
+- GitBucket: 353 / skip1 / 906 errors / 112 files (10.93 seconds).
+- Scala library: 538 / 1620 errors / 171 files (2.01 seconds).
 
-上記が解決してから新しい候補の全体ゲートへ進む。現時点ではマージ不可。
+One new Cats `monadError` `andThen` ambiguity remained. The Scala library had
+additional diagnostics in TNode/CNode/LNode, MutableBufferWrapper, and List
+type patterns, while FileProp constructor ambiguity disappeared. Investigate
+the actual symbols and inheritance relationships before deciding that missing
+type information makes a candidate inapplicable. Do not widen types to `Any`
+or disable type-pattern checks merely to match counts.
 
-証拠:
+The new full gate must wait until those questions are resolved. This candidate
+is not mergeable.
+
+Evidence:
+
 - `/tmp/scala-rs-codex/integration/candidate-81454c1/results.json`
-- 同 `gitbucket-sample.txt`、`gitbucket-parent-interruption.json`、`cats-parent-diff.txt`
+- The accompanying `gitbucket-sample.txt`, `gitbucket-parent-interruption.json`,
+  and `cats-parent-diff.txt`
 - `/tmp/scala-rs-codex/integration/error-retry-growth/results.json`
-- 同 `reused-qualifier/results.json`、`focused.log`、`dynamic-focused.log`
-- 同 `measures/results.json` と各 `*-baseline-diff.txt`。
+- The accompanying `reused-qualifier/results.json`, `focused.log`, and
+  `dynamic-focused.log`
+- The accompanying `measures/results.json` and each `*-baseline-diff.txt`
 
-## Applied List/Option/Some の強制解決を除去（親の継続修正）
+## Removing forced List/Option/Some resolution
 
-`check_types::tree_to_type(AppliedTypeTree)` が、名前の最後の要素が
-List/Option/Someなら修飾子やsource定義にかかわらずprelude symbolを返していた。
-コメントにも「source定義へ解決するとlibraryのエラー数が増えるので維持」と
-明記されていた。しかし `custom.List[Int]` までscalaのListになるため、これは
-互換性を保つ処理ではない。3種類も通常のconstructor名解決・型適用へ通した。
+`check_types::tree_to_type(AppliedTypeTree)` returned a prelude symbol whenever
+the final name was List, Option, or Some, regardless of its qualifier or source
+definition. A comment explicitly kept this behavior because resolving source
+definitions increased the library error count. That was not compatible,
+however: `custom.List[Int]` also became scala's List. All three names now use
+ordinary constructor lookup and type application.
 
-修正前のfixtureでは `custom.List` / `custom.Option` のconstructorが見つからず、
-`value` accessorも見つからなかった。修正後は、修飾付きの型注釈・import経由の
-constructor・明示的なscala標準Listを併用し、nscと同じ `7/option/9/3` を出力する。
-custom.List[Int]→custom.List[String]、custom.Option[Int]→custom.Option[String]
-の不正代入は両処理系で型不一致として拒否される。strict JVM実行も成功。
+The old fixture could not find the constructors or `value` accessors for
+`custom.List` and `custom.Option`. The repaired fixture combines qualified type
+annotations, imported constructors, and an explicit scala List and prints
+`7/option/9/3`, matching nsc. Invalid assignments from
+`custom.List[Int]` to `custom.List[String]` and from
+`custom.Option[Int]` to `custom.Option[String]` are rejected by both compilers.
+Strict JVM execution also succeeds.
 
-関連テスト24 PASS: applied_collection_names 1、aliaslookup 2、function_pattern 1、
-seqpat 20。import経由のconstructorを追加後もapplied_collection_namesを再実行しPASS。
-型パターン検査を無効化する変更や、Anyへ置き換える変更はない。
+The related 24 tests passed: applied_collection_names 1, aliaslookup 2,
+function_pattern 1, and seqpat 20. The applied_collection_names test was run
+again after adding the imported-constructor case. No type-pattern check was
+disabled and no type was replaced with `Any`.
 
-追加計測（fresh release build、既定のJDK17/UTF-8）:
+Additional measurements with a fresh release build, JDK 17, and UTF-8 were:
 
-- cats 351 errors / 81 files（1.85秒）
-- GitBucket 902 errors / 112 files（5.52秒）
-- Slick 0 errors / 1490 classes（1.76秒）
-- Scala library **1880 errors / 203 files**（1.55秒、直前1620 / 171）
+- Cats: 351 errors / 81 files (1.85 seconds)
+- GitBucket: 902 errors / 112 files (5.52 seconds)
+- Slick: 0 errors / 1490 classes (1.76 seconds)
+- Scala library: **1880 errors / 203 files** (1.55 seconds; previously 1620 / 171)
 
-増えた診断全部の妥当性は未監査。数値の悪化だけを理由に誤ったsymbolへの解決に
-戻してはならないが、増分をすべて正しいと断定してもならない。
-全workspaceと全コーパスを検証し、失った実際の互換動作を修正すること。
-全体受け入れ前の候補であり、main基準値は更新しない。
+The additional diagnostics were not all audited. Do not restore an incorrect
+symbol resolution solely because the count worsened, but do not assume every
+new diagnostic is valid either. The full workspace and corpus must be checked,
+and any real compatibility regressions repaired. This remained a candidate
+before full acceptance, so the main baseline was not updated.
 
-追加証拠: `/tmp/scala-rs-codex/integration/applied-collection-names/` の
-before.log、focused.log、import-focused.log、measures/の各ログとprevious-diff。
+Additional evidence is in `/tmp/scala-rs-codex/integration/applied-collection-names/`:
+`before.log`, `focused.log`, `import-focused.log`, the `measures/` logs, and the
+previous diff.
 
-### 切り分けられた別の不足
+### Separated missing information
 
-一時的な型関係トレースを採取し、全デバッグコードは除去済み。
-`error-retry-growth/pattern-trace.log` のPATREL行に以下を記録した。
+A temporary type-relation trace was collected and all debug code was removed.
+The `PATREL` lines in `error-retry-growth/pattern-trace.log` recorded:
 
-- TNode等のscrutineeが `Named { name: "MainNode", args: [] }` のまま。
-  同じコンテキストで `class_sym_of` は実際のMainNodeのsymbolを発見できる。
-- MutableBufferWrapperのscrutinee `java.util.List` がscala immutable Listの
-  prelude symbol #50になる。この引数はソースで `ju.List[A]` と書かれており、
-  今回除去したAppliedTypeTreeの処理が修飾子を無視する問題に該当する。
-  修正後、このMutableBufferWrapperの誤診断は消えている。
-  別途、classpath.rsのdescriptor readerにも完全JVM名よりsimple nameを
-  優先する処理を見つけた。ただし今回の診断の原因とは断定しない。
-  同名のJavaクラスを使うprovider/consumerで別に再現を取る必要がある。
-- source Listの型パターンもprelude #50（parents=[AnyRef]）を使っていた。
-  今回の名前解決変更の直接の動機はこの経路とcustom fixtureである。
+- TNode and related scrutinees remained
+  `Named { name: "MainNode", args: [] }`, even though `class_sym_of` found the
+  actual MainNode symbol in the same context.
+- The MutableBufferWrapper scrutinee `java.util.List` became the scala
+  immutable List prelude symbol #50. The source argument was written as
+  `ju.List[A]`, so this matched the removed AppliedTypeTree path that ignored
+  qualifiers. The false MutableBufferWrapper diagnostic disappeared after the
+  repair.
+- A separate issue was found in the classpath descriptor reader, which favored
+  a simple name over the full JVM name. This was not established as the cause
+  of the current diagnostic; reproduce it separately with same-named Java
+  classes in provider and consumer runs.
+- Source List type patterns also used prelude #50 with `parents=[AnyRef]`.
+  This path and the custom fixture directly motivated the name-resolution
+  change.
 
-トレース時の計測はJDK環境を明示していないため数値比較には使わず、上の
-環境を固定した追加計測を数値の証拠に使う。
+The trace was collected without an explicitly fixed JDK environment, so it is
+not measurement evidence. Use the fixed-environment measurements above for
+numeric comparisons.

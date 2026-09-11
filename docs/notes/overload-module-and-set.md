@@ -1,21 +1,29 @@
-# オーバーロードの曖昧性と集合の結合
+# Overload Ambiguity and Set Combination
 
-同名のメソッドと object がある場合は object の `apply` も候補になります。
-`def f(Int)` と `object f { def apply(Int) }` の同順位を、引数・戻り値型が同じという理由で一つにまとめません。
-object 側が選ばれた場合は、元の受信側を保持して `receiver.f.apply(...)` を生成します。
+When a method and an object have the same name, the object's `apply` is also a
+candidate. A `def f(Int)` and `object f { def apply(Int) }` at the same priority
+are not collapsed merely because their argument and result types match. When
+the object wins, code generation retains the original receiver and emits
+`receiver.f.apply(...)`.
 
-非ジェネリックな候補を無条件で優先すると、`f(1)` と `f[A <: 1](A)` の曖昧性を消してしまいます。
-候補の型と宣言元の継承関係で比較します。標準ライブラリの簡略宣言でも、
-`SetOps.++` と `IterableOps.++` が異なる trait の宣言であることを保持します。
+Unconditionally preferring a non-generic candidate would erase the ambiguity
+between `f(1)` and `f[A <: 1](A)`. Candidates are compared by their types and
+the inheritance relationship of their owners. Even in the compact standard
+library declarations, `SetOps.++` and `IterableOps.++` retain their distinct
+trait owners.
 
-`SetOps.++` は元の集合型を保ちます。型を広げる `IterableOps.++` は通常の Set を返すため、
-SortedSet の受信側から呼ばれても戻り値を SortedSet に狭めてはいけません。
-生成コードも選択済みのオーバーロードを保ち、両者を同じ JVM 呼び出しに置き換えません。
-SortedMap の値の型だけを広げる結合は、キーの型と既存の Ordering を保つため、SortedMap の結果を維持します。
+`SetOps.++` preserves the original set type. The widening `IterableOps.++`
+normally returns a plain `Set`, so a `SortedSet` receiver must not narrow that
+result back to `SortedSet`. Generated code also preserves the selected
+overload instead of replacing both candidates with one JVM call. A
+`SortedMap` combination that widens only the value type retains the key type,
+the existing `Ordering`, and the `SortedMap` result.
 
-`cargo test --release -p scala-rs-cli --test overload_module` で scalac 2.13.16 と比較します。
-テストは曖昧な呼び出しの拒否、特異性による選択、受信側の一度だけの評価、
-通常の集合結合と要素型を広げる結合について `java -Xverify:all` の終了と標準出力を検査します。
-既存コーパスの `neg/t11866` と同じ四つの呼び出し位置でも曖昧性を要求します。
+`cargo test --release -p scala-rs-cli --test overload_module` compares the
+behavior with scalac 2.13.16. The test checks rejection of ambiguous calls,
+selection by specificity, single evaluation of the receiver, and the exit
+status and stdout of `java -Xverify:all` for ordinary and element-widening set
+combinations. It also requires ambiguity at the four call sites covered by
+`neg/t11866` in the existing corpus.
 
-これは Scala 2.13 のオーバーロード全般の適合性を証明するものではありません。
+This does not establish full Scala 2.13 overload compatibility.
