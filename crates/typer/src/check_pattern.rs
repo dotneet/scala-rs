@@ -22,8 +22,23 @@ impl Typer {
         let sel_ty = sel.ty.clone();
         let mut res = Type::Nothing;
         let mut branch_tys = Vec::new();
+        // An expected type that is the enclosing method's *own* (rigid) type
+        // parameter: `def ev[T](e: E[T]): T = e match { … }`. `pt_or_lub`
+        // hands a bare parameter back to the branches, because elsewhere it
+        // is an undetermined stand-in; here it is a real type, and a body
+        // conforms to it only under its own case's GADT bounds (`Int <: T`
+        // inside `case I(i)`), which are gone by the time the branches are
+        // joined. nsc's `ptOrLub` takes a fully defined `pt` outright; so
+        // does this. A body that did not conform has already reported its
+        // own mismatch, and lubbing the branches instead only added a
+        // second error at the `match` that scalac does not give.
+        let rigid_pt = matches!(pt, Type::TypeParam(id) if self.tparam_in_scope(*id));
         for c in cases.iter_mut() {
             self.st.push_scope();
+            // GADT bounds the pattern puts on the enclosing method's type
+            // parameters last exactly as long as this case (nsc's
+            // `CaseDef.savedTypeBounds` / `restoreTypeBounds`).
+            let gadt_mark = self.st.gadt_bounds.len();
             self.type_pattern(&mut c.pat, &sel_ty);
             if !c.guard.is_empty() {
                 self.type_expr(&mut c.guard, &Type::Boolean);
@@ -31,11 +46,14 @@ impl Typer {
             self.type_expr(&mut c.body, pt);
             res = self.lub_branches(&res, &c.body.ty);
             branch_tys.push(c.body.ty.clone());
+            self.st.gadt_bounds.truncate(gadt_mark);
             self.st.pop_scope();
         }
         let span = tree.span;
-        // `numericLub`, as for an `if` (see `numeric_branch_lub`).
-        if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+        if rigid_pt && !cases.is_empty() {
+            tree.ty = pt.clone();
+        } else if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+            // `numericLub`, as for an `if` (see `numeric_branch_lub`).
             if let TreeKind::Match { cases, .. } = &mut tree.kind {
                 for c in cases.iter_mut() {
                     self.adapt(&mut c.body, &num);
@@ -57,6 +75,7 @@ impl Typer {
             if !for_desugaring {
                 self.check_match_exhaustive(span, &sel_ty, cases);
             }
+            self.warn_duplicate_alternatives(&sel_ty, cases);
             if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
                 self.warning(
                     selector.span,
@@ -267,11 +286,7 @@ impl Typer {
                 }
                 // A backquoted name is stable however it is spelled; the
                 // parser has already marked it.
-                let is_varid = !stable_hint
-                    && name
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
                 // SLS 8.1.5 wants a *stable* id here. `found[0]` can be a
                 // `def` of the same name, which nsc rejects rather than
                 // calling, so pick the value or module if the scope has one.
@@ -408,6 +423,16 @@ impl Typer {
                     } else {
                         receiver
                     }
+                } else if self.equality_pattern_binds_scrutinee(body) {
+                    // `case n @ Whatever =>` / `case n @ 1 =>` test with `==`,
+                    // and `==` says nothing about the scrutinee's class: an
+                    // `object` may override `equals`, and `1 == 1L`. nsc 2.13
+                    // (scala/bug#1503) binds `n` at the scrutinee's type.
+                    // Taking the object's own type made `def f(x: Any) = x
+                    // match { case n @ Whatever => n }` return `Whatever.type`,
+                    // and the `areturn` of the scrutinee failed verification
+                    // (`run/t1503`).
+                    sel_ty.clone()
                 } else {
                     body.ty.clone()
                 };
@@ -429,6 +454,7 @@ impl Typer {
                 let saved_ctor_pat = std::mem::replace(&mut self.ctor_pattern_fun, ctor_pat);
                 self.type_expr(fun, &Type::NoType);
                 self.ctor_pattern_fun = saved_ctor_pat;
+                self.prefer_extractor_object(fun);
                 // `case (a, b) =>` is `scala.Tuple2(a, b)`: a synthesized name
                 // is resolved in package `scala`, never lexically. Note the
                 // ordinary path uses `lookup`, which stops at the first scope
@@ -580,6 +606,17 @@ impl Typer {
                         sym: class_id,
                         args: cargs.clone(),
                     };
+                    // nsc's `inferConstructorInstance`: `case I(i)` on an
+                    // `E[T]` with `I extends E[Int]` bounds `T` at `Int` for
+                    // this case. A pattern class whose own parameters the
+                    // scrutinee could not fill types its fields at those
+                    // parameters, so they are the case's skolems.
+                    let skolems = if cargs.is_empty() {
+                        self.st.get(class_id).tparams.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    self.refine_gadt_bounds(&class_ty, sel_ty, &skolems);
                     for (i, a) in args.iter_mut().enumerate() {
                         let ft = if i + 1 >= fields.len() && repeated_elem.is_some() {
                             Type::Repeated(Box::new(repeated_elem.clone().unwrap()))
@@ -769,6 +806,12 @@ impl Typer {
                 self.pattern_tpt = saved;
                 let ty = self.refine_pattern_type_binders(ty, sel_ty, &binders);
                 let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
+                if matches!(ty, Type::AnyVal) {
+                    self.error(
+                        tpt.span,
+                        "type AnyVal cannot be used in a type pattern or isInstanceOf test",
+                    );
+                }
                 if !self.typed_pattern_compatible(&ty, sel_ty) {
                     self.error(
                         tpt.span,
@@ -778,8 +821,15 @@ impl Typer {
                             self.st.display_type(sel_ty)
                         ),
                     );
+                } else {
+                    // nsc's `inferTypedPattern`: `case a: Array[Int]` on an
+                    // `Array[T]` bounds `T` at `Int` for this case, so an
+                    // `ord: Ordering[T]` is an `Ordering[Int]` there
+                    // (`scala/util/Sorting.scala`'s `sort[T]`).
+                    self.refine_gadt_bounds(&ty, sel_ty, &binders);
                 }
                 self.type_pattern(expr, &ty);
+                self.type_singleton_type_ref(tpt, &ty);
                 if matches!(self.st.dealias(&ty), Type::Class { sym, .. } if sym == self.st.singleton_sym)
                     && !self.st.is_sub_type(sel_ty, &Type::AnyRef)
                 {
@@ -796,6 +846,130 @@ impl Typer {
             _ => {
                 pat.ty = sel_ty.clone();
             }
+        }
+    }
+
+    /// nsc's GADT refinement (`Infer.inferTypedPattern` /
+    /// `inferConstructorInstance`, both ending in `instantiateTypeVar`): when
+    /// a pattern's type does not conform to the scrutinee outright, and the
+    /// scrutinee mentions type parameters of the enclosing *method* (nsc's
+    /// `freeTypeParamsOfTerms`: abstract types owned by a term), the
+    /// pattern's base type at the scrutinee's class says what those
+    /// parameters are for the duration of the case. `def ev[T](e: E[T]): T =
+    /// e match { case I(i) => i }` with `case class I(i: Int) extends E[Int]`
+    /// bounds `T` at `Int..Int`, so `i` conforms to `T`; `(a: Array[T]) match
+    /// { case a: Array[Int] => ms[Int](a, ord) }` with `ord: Ordering[T]`
+    /// makes `Ordering[T]` an `Ordering[Int]`.
+    ///
+    /// The bound follows the parameter's variance in the scrutinee: an
+    /// invariant occurrence pins both bounds, a covariant one (`E[+T]`) only
+    /// the lower (`T >: Int`), a contravariant one only the upper -- the same
+    /// reading `isPopulated` gives a type variable there. A solution that is
+    /// not a concrete type (it names a type parameter, a wildcard, `Nothing`)
+    /// or that leaves the declared bounds is discarded, as nsc discards
+    /// cyclic or inconsistent bounds. Class type parameters are never refined
+    /// (their owner is not a term), and neither are the pattern's own
+    /// existential binders, which `refine_pattern_type_binders` solves the
+    /// other way round.
+    ///
+    /// `skolems` are the pattern's own rigid unknowns -- the binders of a
+    /// typed pattern, or the class parameters of a constructor pattern whose
+    /// arguments the scrutinee could not supply (`case P(a, b)` for `case
+    /// class P[A, B](a: E[A], b: E[B]) extends E[(A, B)]` types its fields at
+    /// `P`'s own `A` and `B`), which nsc skolemises for the case. A solution
+    /// may name those and nothing else that is a parameter.
+    ///
+    /// A refinement that contradicts the bounds already in force -- the
+    /// declared ones, or an enclosing case's (`case I(_) => f match { case
+    /// S(s) => … }` asks `T = String` where `T = Int` holds) -- is discarded,
+    /// as nsc discards inconsistent bounds; the body is then checked against
+    /// the bounds that stand, which is the mismatch scalac reports.
+    ///
+    /// The bounds live in `SymbolTable::gadt_bounds`, which `type_match`
+    /// truncates when the case ends.
+    fn refine_gadt_bounds(&mut self, pat_ty: &Type, sel_ty: &Type, skolems: &[SymbolId]) {
+        let sel = match sel_ty {
+            Type::Annotated { tpe, .. } => tpe.as_ref(),
+            other => other,
+        };
+        if pat_ty.is_no_type() || pat_ty.is_error() || sel.is_no_type() || sel.is_error() {
+            return;
+        }
+        let mut tps = Vec::new();
+        collect_tparams(sel, &mut tps);
+        tps.dedup();
+        tps.retain(|tp| {
+            let s = self.st.get(*tp);
+            s.kind == SymKind::TypeParam
+                && !s.is_pattern_skolem
+                && s.tparams.is_empty()
+                && !s.owner.is_none()
+                && self.st.get(s.owner).kind == SymKind::Method
+        });
+        if tps.is_empty() || self.st.is_sub_type(pat_ty, sel) {
+            return;
+        }
+        // `Array[Int]` against `Array[T]`: `Type::Array` has no class to take
+        // a base type at, and the pattern is already the instance to read.
+        let base = match (pat_ty, sel) {
+            (Type::Array(_), Type::Array(_)) => pat_ty.clone(),
+            _ => {
+                let Some(sel_cls) = self.st.class_sym_of(sel) else {
+                    return;
+                };
+                let Some(base) = self.base_type_instance(pat_ty, sel_cls, 0) else {
+                    return;
+                };
+                base
+            }
+        };
+        for tp in tps {
+            let Some(t) = unify_one(&self.st, tp, sel, &base) else {
+                continue;
+            };
+            if t.is_no_type()
+                || t.is_error()
+                || matches!(t, Type::Nothing | Type::Null)
+                || type_mentions_wildcard(&t)
+            {
+                continue;
+            }
+            let mut named = Vec::new();
+            collect_tparams(&t, &mut named);
+            if named.iter().any(|n| !skolems.contains(n)) {
+                continue;
+            }
+            let (lo, hi) = match self.tparam_variance_in(sel, tp, 1) {
+                Some(1) => (Some(t), None),
+                Some(-1) => (None, Some(t)),
+                _ => (Some(t.clone()), Some(t)),
+            };
+            // The bounds in force: an enclosing case's, else the declared ones.
+            let declared_hi = self
+                .st
+                .gadt_hi(tp)
+                .cloned()
+                .or_else(|| self.st.get(tp).bound_hi.clone());
+            let declared_lo = self
+                .st
+                .gadt_lo(tp)
+                .cloned()
+                .or_else(|| self.st.get(tp).bound_lo.clone());
+            let outside = |bound: &Option<Type>, new: &Option<Type>, upper: bool| match (bound, new)
+            {
+                (Some(b), Some(n)) if !mentions_any_tparam(b) => {
+                    if upper {
+                        !self.st.is_sub_type(n, b)
+                    } else {
+                        !self.st.is_sub_type(b, n)
+                    }
+                }
+                _ => false,
+            };
+            if outside(&declared_hi, &hi, true) || outside(&declared_lo, &lo, false) {
+                continue;
+            }
+            self.st.gadt_bounds.push((tp, lo, hi));
         }
     }
 
@@ -1206,6 +1380,23 @@ impl Typer {
         }
     }
 
+    /// Does `body` match by `==` against an `object` or a literal, so that a
+    /// binder over it learns nothing about the scrutinee's type? A stable
+    /// `val` of a class type still binds at that type (`case n @ V` with a
+    /// `String` `V` is a `String` in nsc too).
+    fn equality_pattern_binds_scrutinee(&self, body: &Tree) -> bool {
+        match &body.kind {
+            TreeKind::Literal { lit } => !matches!(lit, scala_rs_parser::Lit::Null),
+            TreeKind::Ident { .. } | TreeKind::Select { .. } if !body.sym.is_none() => {
+                matches!(
+                    self.st.get(body.sym).kind,
+                    SymKind::Module | SymKind::ModuleClass
+                )
+            }
+            _ => false,
+        }
+    }
+
     fn find_class_named(&self, child: SymbolId, name: &str) -> Option<SymbolId> {
         let owner = self.st.get(child).owner;
         if !owner.is_none() {
@@ -1407,11 +1598,19 @@ impl Typer {
     }
 
     /// A member with no implementation: a body-less `def` (the namer sets
-    /// `ABSTRACT` on those) or a body-less `val` / `var`.
+    /// `ABSTRACT` on those), a pickled one (`Symbol::deferred_method`, the
+    /// pickle's `DEFERRED`), or a body-less `val` / `var`.
+    ///
+    /// The pickled half is what scalatra needs: `ScalatraBase` declares an
+    /// abstract `requestPath(implicit request)`, reached through
+    /// `JacksonJsonSupport` before the class-file `ScalatraFilter` that
+    /// implements it *and* its `requestPath(uri, idx)` overload. Read as
+    /// concrete, the declaration won `super.requestPath(uri, idx)` with the
+    /// wrong arity (gitbucket's `ControllerBase`).
     pub(crate) fn is_deferred_member(&self, m: SymbolId) -> bool {
         let s = self.st.get(m);
         match s.kind {
-            SymKind::Method => s.flags.contains(Flags::ABSTRACT),
+            SymKind::Method => s.flags.contains(Flags::ABSTRACT) || s.deferred_method,
             SymKind::Term => s.deferred_val,
             _ => false,
         }
@@ -2283,10 +2482,7 @@ impl Typer {
             TreeKind::Wildcard | TreeKind::Empty => true,
             TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
             TreeKind::Ident { name } => {
-                let is_varid = name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_lowercase() || c == '_');
+                let is_varid = scala_rs_parser::ast::is_variable_name(name);
                 is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
             }
             TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),

@@ -96,6 +96,7 @@ impl Typer {
                 _ => unreachable!(),
             };
             self.type_ident(tree, name, pt);
+            self.spell_out_inferred_class_of(tree);
         } else if matches!(&tree.kind, TreeKind::Function { .. }) {
             let ty = {
                 let (vparams, body) = match &mut tree.kind {
@@ -927,7 +928,13 @@ impl Typer {
                 let q = qual.clone();
                 let id = self.this_owner(q.as_deref());
                 if id.is_none() {
-                    self.error(tree.span, "`this` is not allowed here");
+                    // nsc `QualifyingClassError`, e.g. `this` in the early
+                    // section of a top-level class, which is typed outside it.
+                    let msg = match q.as_deref() {
+                        Some(name) => format!("{name} is not an enclosing class"),
+                        None => "this can be used only in a class, object, or template".into(),
+                    };
+                    self.error(tree.span, msg);
                     tree.ty = Type::Error;
                 } else {
                     tree.sym = id;
@@ -1217,6 +1224,21 @@ impl Typer {
                             return;
                         }
                         crate::symbol::Intrinsic::IsInstanceOf => {
+                            // nsc: `AnyVal` has no runtime class to test for
+                            // (every primitive and value class conforms), so
+                            // the test is rejected rather than compiled into
+                            // an `instanceof Object` that is true for everything.
+                            if matches!(targs.first(), Some(Type::AnyVal)) {
+                                self.error(
+                                    tree.span,
+                                    "type AnyVal cannot be used in a type pattern or isInstanceOf test",
+                                );
+                            }
+                            // `x.isInstanceOf[p.type]` compares with `p`, so
+                            // codegen needs `p` as a typed term.
+                            if let (Some(a), Some(t)) = (args.first_mut(), targs.first()) {
+                                self.type_singleton_type_ref(a, t);
+                            }
                             tree.ty = Type::Boolean;
                             return;
                         }
@@ -1767,6 +1789,34 @@ impl Typer {
                 }
                 tree.ty = tpt.ty.clone();
                 tree.sym = tpt.sym;
+                // SLS 5.2 / nsc `checkInstantiable`: a plain `new C` of an
+                // abstract class or a trait is an error -- only an anonymous
+                // subclass (`new C { ... }`, typed above) may instantiate one.
+                // Accepted, it emitted `new C; invokespecial C.<init>`, an
+                // `InstantiationError` at run time.
+                // The prelude's hand-written stand-ins (scala-xml's
+                // `NamespaceBinding`, ...) carry flags the real class does not,
+                // so only a class read from a pickle or a class file, or
+                // defined in source, is trusted.
+                let stand_in = !tree.sym.is_none()
+                    && tree.sym.0 < self.st.prelude_end
+                    && self.st.get(tree.sym).pickled_origin.is_empty();
+                if !tree.sym.is_none() && !stand_in && self.st.get(tree.sym).kind == SymKind::Class
+                {
+                    let s = self.st.get(tree.sym);
+                    let is_trait =
+                        s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE);
+                    if is_trait || s.flags.contains(Flags::ABSTRACT) {
+                        let what = if is_trait { "trait" } else { "class" };
+                        let name = s.name.clone();
+                        self.error(
+                            tpt.span,
+                            format!("{what} {name} is abstract; cannot be instantiated"),
+                        );
+                        tree.ty = Type::Error;
+                        return;
+                    }
+                }
                 if tree.sym.is_none() {
                     if let Some(id) = self.st.class_sym_of(&tpt.ty) {
                         tree.sym = id;
@@ -2008,18 +2058,31 @@ impl Typer {
                     .collect();
                 let no_unit = !matches!(block.ty, Type::Unit)
                     && !handlers.iter().any(|t| matches!(t, Type::Unit));
-                tree.ty = if matches!(block.ty, Type::Nothing) {
-                    handlers
+                // `numericLub`, as for an `if` (see `numeric_branch_lub`):
+                // `val t = try 1 catch { case _: E => 2.0 }` is a `Double`, and
+                // the body is widened to it so that both leave the same JVM
+                // sort in the result slot (it printed `1` where scalac prints
+                // `1.0`).
+                let mut branch_tys = vec![block.ty.clone()];
+                branch_tys.extend(handlers.iter().cloned());
+                if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+                    self.adapt(block, &num);
+                    for c in catches.iter_mut() {
+                        self.adapt(&mut c.body, &num);
+                    }
+                    tree.ty = num;
+                } else if matches!(block.ty, Type::Nothing) {
+                    tree.ty = handlers
                         .into_iter()
                         .reduce(|a, b| self.lub_ty(&a, &b))
-                        .unwrap_or_else(|| block.ty.clone())
+                        .unwrap_or_else(|| block.ty.clone());
                 } else if no_unit && !handlers.iter().all(|t| self.st.is_sub_type(t, &block.ty)) {
-                    handlers
+                    tree.ty = handlers
                         .into_iter()
-                        .fold(block.ty.clone(), |a, b| self.lub_ty(&a, &b))
+                        .fold(block.ty.clone(), |a, b| self.lub_ty(&a, &b));
                 } else {
-                    block.ty.clone()
-                };
+                    tree.ty = block.ty.clone();
+                }
             }
             TreeKind::InterpolatedString {
                 prefix,

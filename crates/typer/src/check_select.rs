@@ -84,6 +84,13 @@ impl Typer {
             tree.ty = Type::Error;
             return;
         }
+        // A method with explicit parameters as a prefix (`add.tupled`): nsc
+        // types the qualifier as a value, so this is "missing argument list"
+        // in 2.13 and the eta-expansion under `-Xsource:3`.
+        if self.adapt_method_value(qual) && qual.ty.is_error() {
+            tree.ty = Type::Error;
+            return;
+        }
         // A parameterless polymorphic receiver has no Apply node to register
         // its open variables. Keep them available for the selected call's
         // arguments and expected result, just as for an applied receiver.
@@ -100,7 +107,11 @@ impl Typer {
         // nsc: `x.m` on `x: A` where `A <: T` resolves against `T`.
         // An alias member (`type Scope = Map[K, V]`) is dealiased first, or the
         // receiver's type arguments would be invisible to the substitution below.
-        let mut recv_ty = self.st.dealias(&self.st.widen_type_param(&qual.ty));
+        // A GADT-bounded parameter (`t: T` inside a case that pinned `T` at
+        // `Int`) is read at that bound first (`gadt_widen`).
+        let mut recv_ty = self
+            .st
+            .dealias(&self.st.widen_type_param(&self.st.gadt_widen(&qual.ty)));
         // A *fully applied* type lambda is the type its body says it is.
         // `dealias` deliberately keeps a higher-kinded alias folded -- its body
         // means nothing until the arguments arrive -- but here they have, and
@@ -825,6 +836,11 @@ impl Typer {
                         }
                     }
                 }
+            } else if let Some(id) = self.function_value_alternative(&alts, pt) {
+                if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                    tree.ty = t.clone();
+                }
+                tree.sym = id;
             } else if !matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                 // The set may still have exactly one alternative whose
                 // parameters are all implicit, which value position keeps for
@@ -1749,6 +1765,9 @@ impl Typer {
     /// Lexical access privileges survive even while constructor arguments
     /// cannot use the instance currently being initialized as their receiver.
     fn lexical_access_class(&self) -> SymbolId {
+        if !self.access_class_override.is_none() {
+            return self.access_class_override;
+        }
         let mut owner = self.st.owner;
         while !owner.is_none() {
             if self.st.get(owner).is_class_like() {
@@ -2413,8 +2432,12 @@ impl Typer {
             return false;
         };
         let span = qual.span;
-        let old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
+        let mut old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
         let from = old.ty.clone();
+        // The by-name receiver of a view, as in `type_select` above.
+        if let Some(bn @ Type::ByName(_)) = self.conv_first_param(conv) {
+            self.adapt(&mut old, &bn);
+        }
         let conv_fun = self.ref_implicit(conv, span);
         let applied = Tree {
             id: old.id,

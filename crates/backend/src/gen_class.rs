@@ -4,8 +4,8 @@
 //! forwarders, and the `$extension` methods of a value class.
 
 use crate::classfile::{
-    Field, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
-    ACC_SYNTHETIC, ACC_VARARGS,
+    Field, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_STRICT,
+    ACC_SUPER, ACC_SYNTHETIC, ACC_VARARGS,
 };
 use crate::gen::*;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
@@ -28,6 +28,18 @@ impl<'a> Gen<'a> {
             if let TreeKind::ClassDef { name, impl_, .. } = &tpt.kind {
                 if name.starts_with("$anon") {
                     self.emit_class(tpt, &HashSet::new());
+                    // `new WL(new {} #:: S) with T`: an anonymous class in the
+                    // super arguments of another one is emitted nowhere else
+                    // (`NoClassDefFoundError`, `run/t6506`).
+                    for p in &impl_.parents {
+                        self.emit_anon_classes(p);
+                    }
+                    // The classes and objects an anonymous class *declares*
+                    // (`new Y { class Z; def z = classOf[Z] }`): nothing else
+                    // walks its body for them (`NoClassDefFoundError:
+                    // X$$anon$1$Z`, `run/t8445`). Anonymous classes nested in
+                    // those are still found by the loop below.
+                    self.walk_stats(&impl_.body);
                     for s in &impl_.body {
                         self.emit_anon_classes(s);
                     }
@@ -348,6 +360,7 @@ impl<'a> Gen<'a> {
         let (super_name, interfaces) = split_parents(self.st, &impl_.parents);
 
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
+        b.strict_fp = is_strictfp(self.st, class_id);
         b.super_name = super_name;
         b.interfaces = interfaces;
         if !is_trait && mods.flags.contains(Flags::CASE) {
@@ -575,7 +588,7 @@ impl<'a> Gen<'a> {
         let binary_lazies = self.binary_mixin_lazy_vals(class_id, &impl_.body);
         for v in &self.mixin_lazy_vals(class_id, &impl_.body) {
             b.fields.push(Field {
-                access: ACC_PRIVATE,
+                access: Self::mixin_lazy_field_access(v),
                 name: v.name().unwrap_or("").to_string(),
                 desc: jvm_desc_val(self.st, &val_tree_ty(self.st, v)),
             });
@@ -633,6 +646,42 @@ impl<'a> Gen<'a> {
         format!("{}$delayedInit$body", class_name.replace('/', "$"))
     }
 
+    /// nsc's `delayedEndpoint$<fullName with $>$1` (`Constructors.
+    /// delayedEndpointDef`). The name has to be the class's own: every
+    /// `DelayedInit` class in a hierarchy has an endpoint, and a shared
+    /// `delayedEndpoint$body` made a subclass's override answer the parent's
+    /// `delayedInit` call as well, running the subclass body twice (run/t6481).
+    pub(crate) fn delayed_endpoint_name(
+        st: &scala_rs_typer::SymbolTable,
+        class_id: SymbolId,
+        class_name: &str,
+    ) -> String {
+        let mut full = class_name.replace('/', "$");
+        if !class_id.is_none() && st.get(class_id).kind == SymKind::ModuleClass {
+            if let Some(stripped) = full.strip_suffix('$') {
+                full = stripped.to_string();
+            }
+        }
+        format!("delayedEndpoint${full}$1")
+    }
+
+    /// nsc wraps a `DelayedInit` class's constructor statements only when
+    /// there are some (`isDelayedInitSubclass && remainingConstrStats.
+    /// nonEmpty`): an abstract `class Foo extends DelayedInit` with no body
+    /// calls no `delayedInit` of its own.
+    pub(crate) fn has_delayed_stats(body: &[Tree]) -> bool {
+        body.iter().any(|t| {
+            is_delayed_ctor_stat(t)
+                && !is_presuper_val(t)
+                && match &t.kind {
+                    TreeKind::ValDef { mods, rhs, .. } => {
+                        !rhs.is_empty() && !mods.flags.contains(Flags::LAZY)
+                    }
+                    _ => true,
+                }
+        })
+    }
+
     pub(crate) fn emit_delayed_init_support(
         &self,
         b: &mut ClassBuilder,
@@ -652,8 +701,12 @@ impl<'a> Gen<'a> {
                 self.emit_app_private_members(b, &class_name);
             }
         }
+        if !Self::has_delayed_stats(body) {
+            return;
+        }
         self.emit_delayed_endpoint(b, class_id, body);
-        self.emit_delayed_init_lambda(&class_name);
+        let endpoint = Self::delayed_endpoint_name(self.st, class_id, &class_name);
+        self.emit_delayed_init_lambda(&class_name, &endpoint);
     }
 
     pub(crate) fn emit_app_private_members(&self, b: &mut ClassBuilder, class_name: &str) {
@@ -960,7 +1013,8 @@ impl<'a> Gen<'a> {
             .filter(|t| is_delayed_ctor_stat(t) && !is_presuper_val(t))
             .cloned()
             .collect();
-        b.add_code(ACC_PUBLIC, "delayedEndpoint$body", "()V", 4, |asm| {
+        let endpoint = Self::delayed_endpoint_name(st, class_id, &class_name);
+        b.add_code(ACC_PUBLIC | ACC_FINAL, &endpoint, "()V", 4, |asm| {
             let mut frame = Frame::instance();
             let ctx = emit_ctx(
                 st,
@@ -1004,7 +1058,7 @@ impl<'a> Gen<'a> {
         });
     }
 
-    pub(crate) fn emit_delayed_init_lambda(&self, class_name: &str) {
+    pub(crate) fn emit_delayed_init_lambda(&self, class_name: &str, endpoint: &str) {
         let lam = Self::delayed_body_class(class_name);
         let mut b = ClassBuilder::new(lam.clone(), self.source_name);
         b.access = ACC_PUBLIC | ACC_SUPER | ACC_SYNTHETIC | ACC_FINAL;
@@ -1028,7 +1082,7 @@ impl<'a> Gen<'a> {
         b.add_code(ACC_PUBLIC, "apply", "()Ljava/lang/Object;", 1, |asm| {
             asm.aload(0);
             asm.getfield(&lam, "$outer", &format!("L{cn};"));
-            asm.invokevirtual(&cn, "delayedEndpoint$body", "()V");
+            asm.invokevirtual(&cn, endpoint, "()V");
             asm.aconst_null();
             asm.areturn();
         });
@@ -1135,6 +1189,7 @@ impl<'a> Gen<'a> {
         let library_abi = self.library_abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
+        let delayed_stats = Gen::has_delayed_stats(body);
         let is_app = extends_app(st, class_id);
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
@@ -1161,6 +1216,7 @@ impl<'a> Gen<'a> {
             // `putfield` of a field declared in the current class on
             // `uninitializedThis` -- but never a `getfield`, which is why the
             // pre-super code below reads the argument instead of the field.
+            ctx_early.presuper = true;
             if has_outer {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);
                 if let Some(od) = &outer_desc_c {
@@ -1169,8 +1225,31 @@ impl<'a> Gen<'a> {
                     asm.putfield(&class_name, "$outer", od);
                 }
             }
+            // nsc's constructors phase stores the parameter-accessor fields
+            // (and the lambda-lifted captures, which are parameters too)
+            // *before* the super constructor call, like `$outer` above. A
+            // superclass constructor that dispatches back to an override
+            // reading `class Sub(val name: String)`'s `name` sees the argument
+            // under scalac, and saw `null` here.
+            for (slot, sort, fname, fdesc) in &param_info {
+                if fname.is_empty() {
+                    continue;
+                }
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
+            for (slot, sort, fname, fdesc) in &cap_info {
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
             // nsc: early vals are stored to fields before the superclass ctor so
-            // parent / trait `$init$` bodies see the values.
+            // parent / trait `$init$` bodies see the values. `mkTemplate` makes
+            // each one a *local* of the constructor first and `Constructors`
+            // copies it into the field: a later early definition reads the
+            // local, since `getfield` on `uninitializedThis` does not verify.
+            let mut early_locals = Vec::new();
             for vd in &inits {
                 if !is_presuper_val(vd) {
                     continue;
@@ -1185,13 +1264,22 @@ impl<'a> Gen<'a> {
                     if rhs.is_empty() || rhs.is_default_init() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
-                    asm.aload(0);
-                    gen_expr(asm, &mut frame, &ctx_early, rhs);
                     let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
                         st.get(vd.sym).ty.clone()
                     } else {
                         vd.ty.clone()
                     };
+                    let sort = jvm_sort(&ty);
+                    if sort == JvmSort::Void {
+                        gen_stat(asm, &mut frame, &ctx_early, rhs);
+                    } else {
+                        gen_expr(asm, &mut frame, &ctx_early, rhs);
+                    }
+                    let slot = frame.alloc(vd.sym, sort);
+                    store(asm, slot, sort);
+                    early_locals.push(vd.sym);
+                    asm.aload(0);
+                    load(asm, slot, sort);
                     emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
@@ -1262,18 +1350,10 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
-            for (slot, sort, fname, fdesc) in &param_info {
-                if fname.is_empty() {
-                    continue;
-                }
-                asm.aload(0);
-                load(asm, *slot, *sort);
-                asm.putfield(&class_name, fname, fdesc);
-            }
-            for (slot, sort, fname, fdesc) in &cap_info {
-                asm.aload(0);
-                load(asm, *slot, *sort);
-                asm.putfield(&class_name, fname, fdesc);
+            // After the super call the early fields are readable; the body
+            // reads them as fields, as nsc's does.
+            for sym in early_locals {
+                frame.locals.remove(&sym);
             }
             // From here on the field is the parameter: unbind the local so the
             // body's reads and writes go through it (see `mutable_params`).
@@ -1303,7 +1383,9 @@ impl<'a> Gen<'a> {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
-                Gen::emit_delayed_init_call(asm, &class_name);
+                if delayed_stats {
+                    Gen::emit_delayed_init_call(asm, &class_name);
+                }
             } else {
                 for vd in &inits {
                     if is_presuper_val(vd) {
@@ -1401,6 +1483,11 @@ impl<'a> Gen<'a> {
             return;
         }
         let mut frame = Frame::instance();
+        if acc & ACC_STATIC != 0 {
+            // No receiver: the first parameter is slot 0 (a `def` lifted out
+            // of a constructor's arguments, see `lambda_lift`).
+            frame.next_slot = 0;
+        }
         if ctor_outer.is_some() {
             frame.next_slot += 1; // slot 1 is $outer
         }
@@ -1440,6 +1527,13 @@ impl<'a> Gen<'a> {
             CaptureSlots::new()
         };
         let mut tailrec_error = None;
+        // `@strictfp def m` on its own; a `@strictfp` template already set
+        // `b.strict_fp`.
+        let acc = if is_strictfp(self.st, def.sym) {
+            acc | ACC_STRICT
+        } else {
+            acc
+        };
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
             let mut ctx = emit_ctx(
@@ -1727,6 +1821,14 @@ impl<'a> Gen<'a> {
         let fty = self.st.get(f).ty.clone();
         let fdesc = jvm_desc(self.st, &fty);
         let cj = b.this_name.clone();
+        // nsc generates these two even over an implementation inherited from
+        // a universal trait ("overridden … to enforce value class semantics");
+        // a value class cannot write its own (`valueclass.rs` rejects it). So
+        // a mixin forwarder to `Foo.equals$` is replaced, not kept (run/t6534).
+        b.methods.retain(|m| {
+            !((m.name == "equals" && m.desc == "(Ljava/lang/Object;)Z")
+                || (m.name == "hashCode" && m.desc == "()I"))
+        });
         let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
         let wide = matches!(fty, Type::Long | Type::Double);
         let fslots = if wide { 2u16 } else { 1 };

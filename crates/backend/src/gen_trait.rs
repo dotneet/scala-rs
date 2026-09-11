@@ -338,6 +338,12 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// The JVM field flags of a mixed-in `lazy val`'s field: private, plus
+    /// what the trait declared (`@transient` above all, `run/t10075`).
+    pub(crate) fn mixin_lazy_field_access(v: &Tree) -> u16 {
+        ACC_PRIVATE | Self::mixin_field_extra_access(v)
+    }
+
     /// The extra JVM field flags a mixed-in `val`/`var` keeps from the trait
     /// that declared it. `@volatile` above all: dropping it turns a field the
     /// program declared as volatile into a plain one, which is a memory-model
@@ -578,24 +584,40 @@ impl<'a> Gen<'a> {
     /// `run/t3038c` in scala/scala is exactly that program -- 70 `lazy val`s,
     /// of which we printed the first 32 and then zeros.
     pub(crate) fn lazy_bitmap_fields(&self, lazies: &[Tree], binary: usize) -> Vec<Field> {
-        let n = binary
-            + lazies
-                .iter()
-                .filter(|stt| match &stt.kind {
-                    TreeKind::ValDef { mods, rhs, .. } => {
-                        mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
-                    }
-                    _ => false,
-                })
-                .count();
-        let words = n.div_ceil(32).max(1);
-        (0..words)
+        let lazy: Vec<&Tree> = lazies
+            .iter()
+            .filter(|stt| match &stt.kind {
+                TreeKind::ValDef { mods, rhs, .. } => {
+                    mods.flags.contains(Flags::LAZY) && !rhs.is_empty()
+                }
+                _ => false,
+            })
+            .collect();
+        let transient = lazy.iter().filter(|s| is_transient_val(s)).count();
+        let n = binary + lazy.len() - transient;
+        let words = if transient > 0 {
+            n.div_ceil(32)
+        } else {
+            n.div_ceil(32).max(1)
+        };
+        let mut out: Vec<Field> = (0..words)
             .map(|w| Field {
                 access: ACC_PRIVATE,
                 name: format!("bitmap${w}"),
                 desc: "I".into(),
             })
-            .collect()
+            .collect();
+        // A `@transient lazy val`'s bits live in a transient word of their
+        // own, as nsc's `bitmap$trans$N`: the field is not serialized, so the
+        // copy that is read back has to see "not yet initialised" and compute
+        // the value again. Sharing the plain bitmap, it saw "initialised" and
+        // returned the `null` the stream left there (`run/t10244`).
+        out.extend((0..transient.div_ceil(32)).map(|w| Field {
+            access: ACC_PRIVATE | ACC_TRANSIENT,
+            name: format!("bitmap$trans${w}"),
+            desc: "I".into(),
+        }));
+        out
     }
 
     pub(crate) fn emit_trait_val_accessors(
@@ -1394,6 +1416,22 @@ impl<'a> Gen<'a> {
             )) {
                 continue;
             }
+            // The class's own body overrides this trait member at another
+            // erased descriptor -- `class IntBox extends Box[Int] { override
+            // def put(t: Int) }` against `Box[T].put(t: T)`. The wide
+            // descriptor then owes an erasure *bridge* to the override
+            // (`emit_erasure_bridges`), not a forwarder to the trait's body:
+            // with the forwarder, `(b: Box[Int]).put(5)` silently ran the
+            // trait's implementation. The typer froze this relation before
+            // erasure, when `T = Int` was still visible.
+            if body.iter().any(|stt| {
+                matches!(stt.kind, TreeKind::DefDef { .. })
+                    && !stt.sym.is_none()
+                    && scala_rs_typer::method_overrides(self.st, stt.sym, def.sym)
+                    && stt.sym != def.sym
+            }) {
+                continue;
+            }
             // `SynchronousDatabaseAction.openStream(context: C)` with
             // `C <: BasicBackend#BasicActionContext` is *overridden* by
             // `StreamingInvokerAction.openStream(ctx: JdbcBackend#JdbcActionContext)`,
@@ -1644,6 +1682,31 @@ impl<'a> Gen<'a> {
     /// synthesizes these from the constructor fields; a hand-written one wins.
     /// `hashCode` is nsc's MurmurHash3 under `--scala-library` and the
     /// 31-fold under `--no-scala-library`; see `emit_case_hash_code`.
+    /// Whether `class_id` inherits a concrete, written `name` (`equals`,
+    /// `hashCode` or `toString`) from something other than `Object` / `Any`.
+    pub(crate) fn inherits_object_method_override(&self, class_id: SymbolId, name: &str) -> bool {
+        let arity = if name == "equals" { 1 } else { 0 };
+        let tops = [
+            self.st.object_sym,
+            self.st.any_sym,
+            self.st.anyref_sym,
+            self.st.anyval_sym,
+        ];
+        self.st.lookup_member(class_id, name).into_iter().any(|m| {
+            let s = self.st.get(m);
+            let params = match &s.ty {
+                Type::Method { paramss, .. } => paramss.iter().flatten().count(),
+                _ => 0,
+            };
+            s.owner != class_id
+                && !tops.contains(&s.owner)
+                && s.kind == SymKind::Method
+                && !self.st.method_is_deferred(m)
+                && !s.flags.contains(Flags::SYNTHETIC)
+                && params == arity
+        })
+    }
+
     pub(crate) fn emit_case_object_methods(&self, b: &mut ClassBuilder, class_id: SymbolId) {
         if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
             return;
@@ -1651,7 +1714,18 @@ impl<'a> Gen<'a> {
         let fields = self.st.get(class_id).ctor_fields.clone();
         let class_jvm = b.this_name.clone();
         let simple = self.st.get(class_id).name.clone();
-        let defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        let mut defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();
+        // nsc's `SyntheticMethods.hasOverridingImplementation`: `equals`,
+        // `hashCode` and `toString` are synthesized only when the member the
+        // class would otherwise inherit is `Object`'s. A concrete one from a
+        // superclass or a binary trait wins -- `case class Bippy(a: String)
+        // extends Proxy` compares through `Proxy.equals` (run/proxy). A
+        // source trait's reaches `b.methods` as a mixin forwarder already.
+        for name in ["equals", "hashCode", "toString"] {
+            if self.inherits_object_method_override(class_id, name) {
+                defined.insert(name.to_string());
+            }
+        }
         if is_module_class(self.st, class_id) {
             // The module class is `Asc$`; the `case object` is called `Asc`.
             let name = simple.strip_suffix('$').unwrap_or(&simple).to_string();
@@ -1713,6 +1787,27 @@ impl<'a> Gen<'a> {
             self.library_abi,
             false,
         );
+        // nsc's SyntheticMethods gives every non-public case field a public
+        // `<name>$access$<index>` twin, and the pattern matcher reads the
+        // field through it from outside the class (`case Foo(x, _)` on
+        // `case class Foo(private val x: Int, …)`). It is part of the ABI:
+        // a client compiled against nsc's class calls it by that name.
+        for (i, f) in fields.iter().enumerate() {
+            let Some(acc) = case_field_access_name(self.st, *f, i) else {
+                continue;
+            };
+            if defined.contains(&acc) {
+                continue;
+            }
+            let (name, ty, desc) = field_info[i].clone();
+            let cj = class_jvm.clone();
+            let ret_desc = format!("(){}", jvm_desc(self.st, &ty));
+            b.add_code(ACC_PUBLIC, &acc, &ret_desc, 1, move |asm| {
+                asm.aload(0);
+                emit_getfield(asm, &cj, &name, &desc);
+                emit_return(asm, &ty);
+            });
+        }
 
         if !defined.contains("toString") {
             let fi = field_info.clone();
@@ -1774,6 +1869,14 @@ impl<'a> Gen<'a> {
         if !defined.contains("equals") {
             let fi = field_info.clone();
             let cj = class_jvm.clone();
+            // nsc synthesizes `this.x == that.x` per field, and `==` on a
+            // field that may hold a boxed number is `BoxesRunTime.equals`:
+            // `Gen(1, Nil) == Gen(1L, Nil)` and `AnyF(1) == AnyF(1.0)` are
+            // `true`. `Objects.equals` compared the boxes' classes too.
+            let cooperative: Vec<bool> = fi
+                .iter()
+                .map(|(_, ty, _)| self.library_abi && maybe_boxed(self.st, ty))
+                .collect();
             b.add_code(ACC_PUBLIC, "equals", "(Ljava/lang/Object;)Z", 3, |asm| {
                 let yes = asm.fresh_label();
                 let no = asm.fresh_label();
@@ -1786,12 +1889,20 @@ impl<'a> Gen<'a> {
                 asm.aload(1);
                 asm.checkcast(&cj);
                 asm.astore(2);
-                for (name, ty, desc) in &fi {
+                for (fidx, (name, ty, desc)) in fi.iter().enumerate() {
                     asm.aload(0);
                     asm.getfield(&cj, name, desc);
                     asm.aload(2);
                     asm.getfield(&cj, name, desc);
                     match ty {
+                        _ if cooperative[fidx] && !is_jvm_primitive(ty) => {
+                            asm.invokestatic(
+                                "scala/runtime/BoxesRunTime",
+                                "equals",
+                                "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+                            );
+                            asm.ifeq(no);
+                        }
                         Type::Long => {
                             asm.lcmp();
                             asm.ifne(no);
@@ -2847,8 +2958,23 @@ impl<'a> Gen<'a> {
             let fname = module_field_name(self.st, mcls);
             let aname = module_accessor_name(self.st, mcls);
             let adesc = module_accessor_desc(self.st, mcls);
+            // `@transient object B` keeps its instance out of the enclosing
+            // object's serialized form, as nsc's `B$module` field does
+            // (run/transient-object).
+            let owner = self.st.get(mcls).owner;
+            let transient = self.st.get(mcls).flags.contains(Flags::TRANSIENT)
+                || self.st.get(owner).members.iter().any(|&m| {
+                    let s = self.st.get(m);
+                    s.kind == SymKind::Module
+                        && s.ty == Type::ModuleRef(mcls)
+                        && s.flags.contains(Flags::TRANSIENT)
+                });
+            let mut access = ACC_PRIVATE | ACC_VOLATILE;
+            if transient {
+                access |= ACC_TRANSIENT;
+            }
             b.fields.push(Field {
-                access: ACC_PRIVATE | ACC_VOLATILE,
+                access,
                 name: fname.clone(),
                 desc: mdesc.clone(),
             });
@@ -2996,7 +3122,7 @@ impl<'a> Gen<'a> {
         // traits carry their initialiser as a tree; one inherited from a trait
         // that arrived as a class file is a call to that trait's `d$` static,
         // which is where nsc put the initialiser. Both share the bitmap words.
-        let mut items: Vec<(String, Type, LazyInit)> = Vec::new();
+        let mut items: Vec<(String, Type, LazyInit, bool)> = Vec::new();
         for stt in lazies {
             let TreeKind::ValDef {
                 name, mods, rhs, ..
@@ -3012,7 +3138,12 @@ impl<'a> Gen<'a> {
             } else {
                 stt.ty.clone()
             };
-            items.push((name.clone(), ty, LazyInit::Rhs(rhs.clone())));
+            items.push((
+                name.clone(),
+                ty,
+                LazyInit::Rhs(rhs.clone()),
+                is_transient_val(stt),
+            ));
         }
         for v in binary {
             let iface = class_internal(self.st, v.owner);
@@ -3025,9 +3156,20 @@ impl<'a> Gen<'a> {
                     static_name: trait_static_name(&v.name),
                     iface,
                 },
+                false,
             ));
         }
-        for (bit, (name, ty, init)) in items.into_iter().enumerate() {
+        // Plain and transient `lazy val`s number their bits separately; see
+        // `lazy_bitmap_fields`.
+        let (mut plain_bits, mut trans_bits) = (0usize, 0usize);
+        for (name, ty, init, transient) in items.into_iter() {
+            let (bit, word_prefix) = if transient {
+                trans_bits += 1;
+                (trans_bits - 1, "bitmap$trans$")
+            } else {
+                plain_bits += 1;
+                (plain_bits - 1, "bitmap$")
+            };
             let name = &name;
             let desc = format!("(){}", jvm_desc(self.st, &ty));
             let class_name = b.this_name.clone();
@@ -3042,7 +3184,7 @@ impl<'a> Gen<'a> {
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
             let mask = 1i32 << (bit % 32);
-            let bitmap = format!("bitmap${}", bit / 32);
+            let bitmap = format!("{word_prefix}{}", bit / 32);
             let ret_ty = ty.clone();
             let caps = capture_slots(self.st, &self.boxed_vars, class_id);
             b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
@@ -3335,6 +3477,11 @@ impl<'a> Gen<'a> {
 /// (`MurmurHash3.productSeed`, read back as the `ldc` at the head of every
 /// case class `hashCode` scalac emits).
 const PRODUCT_SEED: i32 = -889275714;
+
+/// `@transient` on a `val` / `lazy val` definition.
+pub(crate) fn is_transient_val(v: &Tree) -> bool {
+    matches!(&v.kind, TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::TRANSIENT))
+}
 
 /// A *primitive value type* in nsc's sense (`definitions.isPrimitiveValueType`,
 /// i.e. a member of `ScalaValueClasses`). `Unit` counts; `Null`, `Nothing`, a

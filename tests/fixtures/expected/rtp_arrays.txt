@@ -1,0 +1,7 @@
+List(int array, some array, some array, other, other)
+List(T array, T array, no)
+true false false
+null false
+x true
+null
+y

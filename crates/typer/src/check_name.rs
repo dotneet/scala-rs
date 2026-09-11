@@ -193,7 +193,7 @@ impl Typer {
     /// nsc's `Symbol.toString` spells the owner of a definition in that
     /// message. The *simple* name: nsc prints "package p7", not the full
     /// path, which is why this is not [`Typer::owner_desc`].
-    fn defining_owner_desc(&self, owner: SymbolId) -> String {
+    pub(crate) fn defining_owner_desc(&self, owner: SymbolId) -> String {
         if owner.is_none() {
             return "an enclosing scope".to_string();
         }
@@ -2108,6 +2108,26 @@ impl Typer {
         self.bind_found(tree, found, pt);
     }
 
+    /// The module term compiled to `<jvm>$`, wherever the table installed it.
+    fn binary_companion_module(&self, jvm: &str) -> Option<SymbolId> {
+        if jvm.is_empty() || jvm.starts_with('[') {
+            return None;
+        }
+        let internal = format!("{jvm}$");
+        let mc = crate::classpath::find_by_jvm(&self.st, &internal)?;
+        if self.st.get(mc).kind == SymKind::Module {
+            return Some(mc);
+        }
+        let held_by = self.st.get(mc).owner;
+        if held_by.is_none() {
+            return None;
+        }
+        self.st.get(held_by).members.iter().copied().find(|&m| {
+            self.st.get(m).kind == SymKind::Module
+                && (self.st.module_class_of(m) == mc || self.st.get(m).jvm_name == internal)
+        })
+    }
+
     /// The companion object of a class that is in scope under this name, read
     /// from its class file if nothing has read it yet.
     ///
@@ -2144,15 +2164,30 @@ impl Typer {
         }
         let mut modules = Vec::new();
         for cls in classes {
+            let jvm = self.st.get(cls).jvm_name.clone();
             if self.st.companion_module(cls).is_none() {
-                let jvm = self.st.get(cls).jvm_name.clone();
                 if jvm.is_empty() || jvm.starts_with('[') {
                     continue;
                 }
                 let owner = self.st.get(cls).owner;
                 self.load_binary_into(&format!("{jvm}$"), owner, span, true);
             }
-            if let Some(m) = self.st.companion_module(cls) {
+            // The prelude declares some library classes under a package they
+            // are only aliased into (`scala.Iterator` is
+            // `scala.collection.Iterator`). When the companion's class file was
+            // first read on another route -- `IterableOnce.iterator`'s result
+            // type, while typing `x.iterator` earlier in the file -- it was
+            // installed under its real package, the load above answers "already
+            // loaded", and the class's own owner still has no module of that
+            // name. The term then bound the *class*, and `Iterator.empty` went
+            // out with no receiver at all (`VerifyError: Operand stack
+            // underflow`, `run/t3269`). The class file decides: the module
+            // compiled as `<jvm>$` is the companion.
+            let companion = self
+                .st
+                .companion_module(cls)
+                .or_else(|| self.binary_companion_module(&jvm));
+            if let Some(m) = companion {
                 if !modules.contains(&m) {
                     modules.push(m);
                 }
@@ -2491,6 +2526,15 @@ impl Typer {
         self.overload_member_types.insert(found[0].0, alts.clone());
         let ov = Type::Overload(alts.iter().map(|(_, t)| t.clone()).collect());
         tree.ty = self.maybe_auto_apply(ov, pt);
+        if matches!(tree.ty, Type::Overload(_)) {
+            if let Some(id) = self.function_value_alternative(&alts, pt) {
+                if let Some((_, t)) = alts.iter().find(|(s, _)| *s == id) {
+                    tree.ty = t.clone();
+                }
+                tree.sym = id;
+                return;
+            }
+        }
         // The same rule the receiver form goes through in `type_select`: one
         // alternative whose parameters are all implicit is what value position
         // keeps, and `maybe_auto_apply` cannot recognise it from the type

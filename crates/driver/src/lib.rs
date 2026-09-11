@@ -10,8 +10,9 @@ use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
     expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
     lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes,
-    restore_named_arg_order, typecheck_units_src, uncurry, ClasspathClass, ClasspathField,
-    ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam, TypecheckOptions,
+    restore_named_arg_order, restore_rassoc_order, typecheck_units_src, uncurry, ClasspathClass,
+    ClasspathField, ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam,
+    TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -214,6 +215,9 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                         source3: opts.xsource3,
                         no_specialization: opts.no_specialization,
                         kind_projector: opts.kind_projector,
+                        unicode_escapes_raw: opts
+                            .source_features
+                            .contains(SourceFeature::UnicodeEscapesRaw),
                     },
                 );
                 diags.extend(parsed.diags);
@@ -283,6 +287,7 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 },
                 language_features: opts.language_features.clone(),
                 source_features: opts.source_features,
+                scala3: opts.xsource3,
                 compiler_settings: compiler_settings(opts),
                 source_paths: sources
                     .iter()
@@ -317,6 +322,8 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
                 // binds them to locals in the written order, so the reordering
                 // the typer did to resolve the names is not observable.
                 restore_named_arg_order(u.file_index, &mut u.tree, &mut st);
+                // nsc evaluates the left operand of `a :: b` before `b`.
+                restore_rassoc_order(&mut u.tree, &mut st);
                 uncurry(&mut u.tree, &mut st);
                 // A method-local `lazy val` becomes a cell plus a nested
                 // accessor def; lambda-lift then hoists the accessor and

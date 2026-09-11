@@ -867,7 +867,11 @@ pub struct Enumerator {
     pub pat: Tree,
     pub rhs: Tree,
     pub is_val: bool, // `p = e` vs `p <- e`
-    pub guard: Option<Tree>,
+    /// Every `if` that follows this enumerator, in source order. Each one
+    /// becomes its own `withFilter` (nsc desugars `x <- e if a; if b` to
+    /// `e.withFilter(a).withFilter(b)`); keeping only the last one silently
+    /// dropped the earlier filters.
+    pub guards: Vec<Tree>,
 }
 
 /// nsc `Chars.isOperatorPart`.
@@ -891,7 +895,7 @@ fn is_operator_part(c: char) -> bool {
             | '|'
             | '/'
             | '\\'
-    )
+    ) || (!c.is_ascii() && scala_rs_lexer::is_unicode_symbol(c))
 }
 
 /// nsc `nme.isOpAssignmentName`: an operator that ends in `=`, does not start
@@ -918,7 +922,8 @@ pub fn op_precedence(op: &str) -> i32 {
         return 0;
     }
     match op.chars().next().unwrap_or('\0') {
-        c if c.is_ascii_alphabetic() || c == '_' => 1,
+        // nsc `isScalaLetter`: any Unicode letter (`c 𐀀 d`), `$` and `_`.
+        c if c.is_alphabetic() || c == '_' || c == '$' => 1,
         '|' => 2,
         '^' => 3,
         '&' => 4,
@@ -929,6 +934,19 @@ pub fn op_precedence(op: &str) -> i32 {
         '*' | '/' | '%' => 9,
         _ => 10,
     }
+}
+
+/// nsc's `nme.isVariableName` first-character test, which decides whether an
+/// identifier pattern binds or compares: `_`, or a character that is both
+/// lower case (`Character.isLowerCase`, which counts `Other_Lowercase` such
+/// as `ª` and `ʰ`) and a *letter* (`Character.isLetter`). A lower-case letter
+/// *number* such as `ⅰ` is not a letter, so `case ⅰ_ⅲ =>` compares
+/// (run/identifierCase). Rust's `is_alphabetic` also admits the `Nl`
+/// numbers, hence the `is_numeric` exclusion.
+pub fn is_variable_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c == '_' || (c.is_lowercase() && c.is_alphabetic() && !c.is_numeric()))
 }
 
 pub fn is_assignment_op(op: &str) -> bool {

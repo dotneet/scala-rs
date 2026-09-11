@@ -22,6 +22,9 @@ pub const ACC_TRANSIENT: u16 = 0x0080;
 /// a Java varargs array (`@scala.annotation.varargs`).
 pub const ACC_VARARGS: u16 = 0x0080;
 pub const ACC_SYNTHETIC: u16 = 0x1000;
+/// `strictfp` (`@scala.annotation.strictfp`); meaningful up to class file
+/// version 60, and this writer emits 52.
+pub const ACC_STRICT: u16 = 0x0800;
 
 pub struct EmittedClass {
     /// e.g. `"Main"`, `"Main$"`, `"scala/Option"`
@@ -144,6 +147,10 @@ pub struct Pool {
     /// `BootstrapMethods` (JVMS §4.7.23) entries, in attribute order:
     /// `(method handle index, static argument indices)`.
     bootstraps: Vec<(u16, Vec<u16>)>,
+    /// Method handles of the bodies of this class's *serializable* lambdas,
+    /// in first-use order: the argument list of the class's
+    /// `$deserializeLambda$` (see `ClassBuilder::finish_inner`).
+    pub serializable_lambdas: Vec<u16>,
 }
 
 impl Pool {

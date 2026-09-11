@@ -210,7 +210,9 @@ fn indy1_emits_no_closure_classfiles() {
 }
 
 /// The `BootstrapMethods` attribute (JVMS 4.7.23) is really written, and
-/// `javap` can decode it: one `metafactory` entry per lambda.
+/// `javap` can decode it: one `altMetafactory` entry per lambda. Against the
+/// real library a `FunctionN` literal is serializable, as nsc emits it
+/// (`FLAG_SERIALIZABLE`, read back by the class's `$deserializeLambda$`).
 #[test]
 fn indy1_writes_a_bootstrap_methods_attribute() {
     let Some(jar) = scala_library_jar() else {
@@ -235,8 +237,13 @@ fn indy1_writes_a_bootstrap_methods_attribute() {
         "expected a BootstrapMethods attribute, got {text}"
     );
     assert!(
-        text.contains("REF_invokeStatic java/lang/invoke/LambdaMetafactory.metafactory"),
+        text.contains("REF_invokeStatic java/lang/invoke/LambdaMetafactory.altMetafactory"),
         "expected a LambdaMetafactory bootstrap, got {text}"
+    );
+    assert!(
+        text.contains("$deserializeLambda$")
+            && text.contains("REF_invokeStatic scala/runtime/LambdaDeserialize.bootstrap"),
+        "expected a $deserializeLambda$ over LambdaDeserialize, got {text}"
     );
     assert!(
         text.contains("invokedynamic"),

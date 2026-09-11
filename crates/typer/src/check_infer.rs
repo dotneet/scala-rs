@@ -306,6 +306,17 @@ impl Typer {
             if t.is_no_type() || t.is_error() || !self.undet_solution_in_bounds(*tp, &t) {
                 continue;
             }
+            // A bare wildcard in the expected type is a variable *that* call
+            // has not decided (nsc's `WildcardType` in a lenient prototype),
+            // not an answer: `leftWiden(rightFunctor.widen(fac))` typed its
+            // argument at `F[_, D]`, and taking `X := _` for `widen`'s
+            // receiver parameter then failed `leftWiden`'s own bounds check
+            // with `inferred type arguments [_, D, B]` (cats
+            // `VarianceConversions`). The variable stays open for the
+            // enclosing call, which is what pins it.
+            if matches!(t, Type::Wildcard | Type::BoundedWildcard { .. }) {
+                continue;
+            }
             solved = crate::symbol::subst_tparams_slice(&[*tp], &[t], &solved);
         }
         if self.st.is_sub_type(&solved, pt) {
@@ -628,7 +639,7 @@ impl Typer {
         if open.is_empty() {
             return p.clone();
         }
-        let mut out = p.clone();
+        let mut out = self.relax_function_result(p, open);
         for tp in open {
             // A *type constructor* has no bound that is a type. `Any` is not
             // one of its inhabitants -- it is not even the same kind -- so
@@ -652,6 +663,55 @@ impl Typer {
             out = crate::symbol::subst_tparams_slice(&[*tp], &[hi], &out);
         }
         out
+    }
+
+    /// nsc's `typedFunction`: the result of a function-typed parameter that
+    /// still mentions an undetermined variable is `WildcardType` for the
+    /// literal's body -- the body is what decides the variable -- while the
+    /// parameter positions are still opened to their bounds by the caller.
+    /// Opening the result to `Any` instead made it a real expected type: `x
+    /// => if (x > 1) 1.0 else 0` had both branches boxed and `Option(3).map(…)`
+    /// was an `Option[Any]` where scalac's weak-conformance lub says
+    /// `Option[Double]`. A pickled signature spells the parameter as the
+    /// `Function1[A, B]` class; it is relaxed the same way.
+    ///
+    /// A result that is itself a function whose *parameters* mention the
+    /// variable is relaxed whole: opening those to a bound would reverse the
+    /// constraint through contravariance before the variable is inferred
+    /// (`Deferred(() => saved)` with `saved: A => B`).
+    fn relax_function_result(&self, p: &Type, open: &[SymbolId]) -> Type {
+        let shape = match p {
+            Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+            // A pickled signature may also carry the class by name
+            // (`Function1[Int, B]`), the spelling `type_function` reads too.
+            Type::Named { name, args }
+                if name.starts_with("Function") && name != "Function" && !args.is_empty() =>
+            {
+                Some(Type::Function {
+                    params: args[..args.len() - 1].to_vec(),
+                    ret: Box::new(args[args.len() - 1].clone()),
+                })
+            }
+            _ => None,
+        };
+        let Type::Function { params, ret } = shape.as_ref().unwrap_or(p) else {
+            return p.clone();
+        };
+        if !mentions_tparam(ret, open) {
+            return p.clone();
+        }
+        let result = if matches!(ret.as_ref(),
+            Type::Function { params, .. } if params.iter().any(|q| mentions_tparam(q, open)))
+        {
+            Type::Wildcard
+        } else {
+            let wilds = vec![Type::Wildcard; open.len()];
+            crate::symbol::subst_tparams_slice(open, &wilds, ret)
+        };
+        Type::Function {
+            params: params.clone(),
+            ret: Box::new(result),
+        }
     }
 
     /// Whether an expected *tuple* type constrains nothing, because every one
@@ -979,6 +1039,40 @@ impl Typer {
                 }
                 if matches!(pt, Type::Function { .. } | Type::Method { .. }) {
                     return ty;
+                }
+                // A SAM expected type is a function type for this purpose
+                // (nsc `inferExprAlternative` weighs the alternatives against
+                // it): `val f: Fun[String, Unit] = println` keeps
+                // `println(x: Any)`, which eta-expands into the SAM, rather
+                // than applying `println()`. Only when some alternative has
+                // the SAM's arity and no value alternative (a field, or a
+                // nullary method's result) is already of the expected type:
+                // slick's case class `AndThenAction(as: IndexedSeq[…])` also
+                // inherits `as[A](a: => A)`, and `sam_sig` can read a library
+                // class whose members are only partly loaded (`IndexedSeq`) as
+                // a SAM -- the field is what `as` means there.
+                if matches!(pt, Type::Class { .. }) {
+                    if let Some(sam) = self.st.sam_sig(pt) {
+                        let arity = sam.param_tys.len();
+                        let value_fits = distinct.iter().any(|a| match a {
+                            Type::Method { paramss, ret }
+                                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
+                            {
+                                self.st.is_sub_type(ret, pt)
+                            }
+                            Type::Method { .. } => false,
+                            _ => true,
+                        });
+                        if arity > 0
+                            && !value_fits
+                            && distinct.iter().any(|a| {
+                                matches!(a, Type::Method { paramss, .. }
+                                    if paramss.first().is_some_and(|c| c.len() == arity))
+                            })
+                        {
+                            return ty;
+                        }
+                    }
                 }
                 let nullary: Vec<&Type> = distinct
                     .iter()
@@ -1678,6 +1772,7 @@ impl Typer {
         args: &[Type],
     ) -> Option<Type> {
         let mut acc: Option<Type> = None;
+        let mut all_direct = true;
         for (i, a) in args.iter().enumerate() {
             let Some(p) = param_at(params, i) else {
                 break;
@@ -1804,6 +1899,22 @@ impl Typer {
                     }
                 }
             }
+            // nsc registers a *numeric* bound (joined by weak lub) only where
+            // the variable is the parameter type itself: `List(1, 2.5)` is a
+            // `List[Double]`, but `f[K, V](xs: (K, V)*)` given `(1, 2)` and
+            // `(3, 4.5)` bounds `V` inside `Tuple2` and joins to `AnyVal`.
+            // Joining those to `Double` left `(1, 2)` inapplicable, and
+            // `Map(1 -> 2, 3 -> 4.5)` fell through to a receiver view.
+            let direct = matches!(
+                match p {
+                    Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                    other => other,
+                },
+                Type::TypeParam(id) if *id == tp
+            );
+            if hit.is_some() && !direct {
+                all_direct = false;
+            }
             if let Some(t) = hit {
                 acc = Some(match acc {
                     None => t,
@@ -1819,7 +1930,11 @@ impl Typer {
                     Some(prev) => {
                         let prev = self.minimize_undet(&prev);
                         let t = self.minimize_undet(&t);
-                        self.lub_ty(&prev, &t)
+                        if all_direct {
+                            self.lub_ty(&prev, &t)
+                        } else {
+                            self.st.lub(&prev, &t)
+                        }
                     }
                 });
             }
@@ -1827,10 +1942,45 @@ impl Typer {
         acc
     }
 
+    /// nsc's `adjustTypeArgs`: whether a `Nothing` the arguments inferred for
+    /// `tp` is retracted -- kept undetermined -- rather than instantiated.
+    /// Only a *covariant* occurrence in the result (or none at all) makes
+    /// `Nothing` the answer; an invariant or contravariant one is a variable
+    /// something later may still pin: `tryBreakable { throw e }` is a
+    /// `TryBlock[?T]` for `catchBreak` to decide, `inv(fail())` on
+    /// `def inv[T](body: => T): Inv[T]` an `Inv[?T]` for `.or("a")`.
+    ///
+    /// An expected type that already says what the parameter is re-pins it
+    /// at once (nsc instantiates the retracted variable against `pt` in
+    /// `adapt` before anything else can see it): `val x: Inv[Nothing] =
+    /// inv(fail())` keeps its `Nothing`, while `val z: Inv[Int] =
+    /// inv(fail())` and `val g: String => String = fn(fail())` retract it so
+    /// that `add_expected_constraints` records the expected type's answer --
+    /// which it does for an invariant or contravariant occurrence, the only
+    /// ones that get here.
+    pub(crate) fn nothing_solution_retracted(&self, tp: SymbolId, ret: &Type, pt: &Type) -> bool {
+        if !matches!(self.tparam_variance_in(ret, tp, 1), Some(0) | Some(-1)) {
+            return false;
+        }
+        if pt.is_no_type() || pt.is_error() || matches!(pt, Type::Wildcard) {
+            return true;
+        }
+        !matches!(unify_one(&self.st, tp, ret, pt), Some(Type::Nothing))
+    }
+
+    /// nsc's mono-mode `instantiate` at a definition: whatever the right-hand
+    /// side left undetermined has nothing further to constrain it once the
+    /// definition's type is fixed, so it is minimised to its lower bound.
+    /// `val y = inv(fail())` is an `Inv[Nothing]`, and `y.or("a")` on a later
+    /// line is the mismatch scalac reports -- not a solution of `T`.
+    pub(crate) fn close_leaked_undet(&self, t: &Type) -> Type {
+        self.minimize_undet(t)
+    }
+
     /// Substitute every undetermined variable in `t` by its lower bound
     /// (`Nothing` when it has none) -- nsc's minimisation of a type variable
     /// nothing constrains from above.
-    fn minimize_undet(&self, t: &Type) -> Type {
+    pub(crate) fn minimize_undet(&self, t: &Type) -> Type {
         if self.undet_tvars.is_empty() {
             return t.clone();
         }
@@ -2507,7 +2657,11 @@ impl Typer {
                 (Some(t), Some(lo)) => {
                     let t = self.minimize_undet(&t);
                     let lo = self.minimize_undet(&lo);
-                    out.push((tp, self.lub_ty(&t, &lo)))
+                    // The plain lub: a declared lower bound is not a numeric
+                    // bound, so `List(1, 2) :+ 2.5` (`:+[B >: A](elem: B)`) is
+                    // a `List[AnyVal]`, not a `List[Double]` holding an `Int`
+                    // -- and `padTo(3, 1.5)` stopped failing its own bound.
+                    out.push((tp, self.st.lub(&t, &lo)))
                 }
                 (Some(t), None) => out.push((tp, t)),
                 (None, Some(lo)) => out.push((tp, lo)),
@@ -3031,6 +3185,12 @@ impl Typer {
         if self.reject_unapplied_implicit_clause(tree) {
             return;
         }
+        // An unapplied method where no function type is expected (nsc
+        // `adaptMethodTypeToExpr`): an error in 2.13, eta-expanded under
+        // `-Xsource:3` and then adapted like any other function value.
+        if !self.expects_function_value(pt) && self.adapt_method_value(tree) && tree.ty.is_error() {
+            return;
+        }
         self.complete_java_type(&tree.ty, tree.span);
         // By-name wrap must run before `Nothing <: pt` (Nothing inhabits every
         // type, including `=> T`). Otherwise `tryBreakable { throw e }` would
@@ -3244,15 +3404,18 @@ impl Typer {
                 let ret = (**ret).clone();
                 let msym = tree.sym;
                 let (params, ret) = self.solve_eta_tparams(tree.sym, params, ret, pt);
-                if paramss.len() > 1 && matches!(pt, Type::Function { .. }) {
-                    // A curried method's value type is a nested function.  The
-                    // old flat expansion made `def f(a)(b)` look like
-                    // `(a, b) => r`, which rejects the legal `A => B => R`
-                    // assignment before codegen ever sees the call.
-                    eta_expand_curried(&mut self.st, &mut self.gensym, tree, &paramss, ret);
-                } else {
-                    eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
-                }
+                let curried = paramss.len() > 1 && matches!(pt, Type::Function { .. });
+                self.eta_with_stable_receiver(tree, |this, tree| {
+                    if curried {
+                        // A curried method's value type is a nested function.
+                        // The old flat expansion made `def f(a)(b)` look like
+                        // `(a, b) => r`, which rejects the legal `A => B => R`
+                        // assignment before codegen ever sees the call.
+                        eta_expand_curried(&mut this.st, &mut this.gensym, tree, &paramss, ret);
+                    } else {
+                        eta_expand(&mut this.st, &mut this.gensym, tree, params, ret);
+                    }
+                });
                 self.record_open_tparams(msym, &tree.ty);
                 if self.st.is_sub_type(&tree.ty, pt) {
                     return;
@@ -3290,8 +3453,14 @@ impl Typer {
         match conversion {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
-                let arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
+                let mut arg = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                 let from = arg.ty.clone();
+                // A by-name view parameter (`booleanBlock2RouteMatcher(block:
+                // => Boolean)`) takes the argument as its thunk; this call is
+                // built here, so the thunk `adapt` would insert is asked for.
+                if let Some(bn @ Type::ByName(_)) = self.conv_first_param(id) {
+                    self.adapt(&mut arg, &bn);
+                }
                 let fun = self.ref_implicit(id, span);
                 let applied = Tree {
                     id: arg.id,
@@ -3964,12 +4133,10 @@ impl Typer {
         let prefix = prefix.clone();
         let parts = parts.clone();
         let args = args.clone();
-        let sc = Tree {
+        let node = |kind: TreeKind| Tree {
             id: NodeId(0),
             span,
-            kind: TreeKind::Ident {
-                name: "StringContext".into(),
-            },
+            kind,
             ty: Type::NoType,
             sym: SymbolId::NONE,
             postfix: false,
@@ -3977,6 +4144,30 @@ impl Typer {
             stable_pat: false,
             byname_thunk: false,
             byname_type_marker: false,
+        };
+        // `-Xsource-features:string-context-scope`: always
+        // `_root_.scala.StringContext`, never a `StringContext` the scope
+        // happens to hold (run/source3Xrun's `SC2`). Without it nsc writes the
+        // bare name, and a local `object StringContext` wins.
+        let sc = if self
+            .source_features
+            .contains(crate::SourceFeature::StringContextScope)
+        {
+            let root = node(TreeKind::Ident {
+                name: "_root_".into(),
+            });
+            let scala = node(TreeKind::Select {
+                qual: Box::new(root),
+                name: "scala".into(),
+            });
+            node(TreeKind::Select {
+                qual: Box::new(scala),
+                name: "StringContext".into(),
+            })
+        } else {
+            node(TreeKind::Ident {
+                name: "StringContext".into(),
+            })
         };
         let apply = Tree {
             id: NodeId(0),

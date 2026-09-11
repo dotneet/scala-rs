@@ -38,6 +38,9 @@ pub struct ParseOptions {
     /// lambdas. Off by default, because that plugin is not Scala and nsc
     /// without it rejects the same programs this rejects without the flag.
     pub kind_projector: bool,
+    /// `-Xsource-features:unicode-escapes-raw`: the lexer leaves unicode
+    /// escapes in triple-quoted strings and `raw` interpolations alone.
+    pub unicode_escapes_raw: bool,
 }
 
 pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) -> ParseResult {
@@ -59,20 +62,22 @@ pub fn parse_source_opts(
     }
 }
 
-/// Compiler annotations this subset does not implement. User-defined
-/// `StaticAnnotation` classes (`@Ann(foo)`) are accepted so we can pickle them.
+/// Compiler annotations this subset does not implement, by simple name; none
+/// at present. User-defined `StaticAnnotation` classes (`@Ann(foo)`) are
+/// accepted so we can pickle them. `@strictfp` sets `ACC_STRICT` in the
+/// backend (`is_strictfp`).
+///
+/// `@elidable(level)` is not listed either: it elides a call only when
+/// `level < -Xelide-below`, and nsc's default for that setting is
+/// `elidable.MINIMUM` (`Int.MinValue`), which no level is below. This subset
+/// has no `-Xelide-below`, so ignoring the annotation *is* nsc's behaviour at
+/// every setting we accept. Whoever adds `-Xelide-below` has to implement
+/// elision at the same time.
+const UNSUPPORTED_COMPILER_ANNOTATIONS: &[&str] = &[];
+
 fn annotation_compiler_unsupported(path: &str) -> bool {
     let simple = path.rsplit('.').next().unwrap_or(path);
-    match simple {
-        // `@elidable(level)` elides a call only when `level < -Xelide-below`,
-        // and nsc's default for that setting is `elidable.MINIMUM`
-        // (`Int.MinValue`), which no level is below. This subset has no
-        // `-Xelide-below`, so ignoring the annotation *is* nsc's behaviour at
-        // every setting we accept. Whoever adds `-Xelide-below` has to
-        // implement elision at the same time.
-        "strictfp" => true,
-        _ => false,
-    }
+    UNSUPPORTED_COMPILER_ANNOTATIONS.contains(&simple)
 }
 
 fn annotation_supported(path: &str) -> bool {
@@ -119,6 +124,10 @@ struct Parser<'a> {
     /// How many `-Ykind-projector` lambdas this file has produced, so each
     /// gets a name of its own. See `kindproj::lambda_name`.
     kp_lambdas: u32,
+    /// Parsing top-level or template-body statements, where nsc's
+    /// `templateStat` / `topStat` accept `-Xsource:3`'s soft modifiers
+    /// (`open class`, `infix def`); a block's statements do not.
+    template_stats: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -139,6 +148,7 @@ impl<'a> Parser<'a> {
             in_block: false,
             kp_counter: 0,
             kp_lambdas: 0,
+            template_stats: false,
         }
     }
 
@@ -517,6 +527,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_top_stats(&mut self) -> Vec<Tree> {
+        let saved_template = std::mem::replace(&mut self.template_stats, true);
         let saved = std::mem::take(&mut self.placeholder_params);
         let mut stats = Vec::new();
         loop {
@@ -572,13 +583,14 @@ impl<'a> Parser<'a> {
                 && !matches!(self.kind(), TokenKind::RBrace)
             {
                 // Adjacent template defs without separator — still ok if next is a keyword.
-                if !is_mod_or_def_start(self.kind()) {
+                if !is_mod_or_def_start(self.kind()) && !self.at_valid_soft_modifier() {
                     self.error_here("expected newline or `;` after statement");
                     self.bump();
                 }
             }
         }
         self.finish_no_escaping(saved);
+        self.template_stats = saved_template;
         stats
     }
 
@@ -740,6 +752,14 @@ impl<'a> Parser<'a> {
             self.skip_nl();
             if matches!(self.kind(), TokenKind::Comma) {
                 self.bump();
+                // SIP-27: `import p.{\n a,\n b,\n}`. On one line
+                // (`import p.{ a, }`) nsc wants another selector.
+                if matches!(self.kind(), TokenKind::RBrace) && !self.at_nl_before() {
+                    self.error_here("expected identifier");
+                }
+            } else {
+                self.expect("}", |k| matches!(k, TokenKind::RBrace));
+                break;
             }
         }
         sels
@@ -860,6 +880,9 @@ impl<'a> Parser<'a> {
                     // `case class` / `case object` — don't consume if it's a match case.
                     // At def-start, peek next.
                     flags = flags.with(Flags::CASE);
+                    self.bump();
+                }
+                TokenKind::Ident(_) if self.at_valid_soft_modifier() => {
                     self.bump();
                 }
                 TokenKind::At => {
@@ -1053,7 +1076,11 @@ impl<'a> Parser<'a> {
             mods.flags = mods.flags.with(Flags::TRAIT);
         }
         let (name, _) = self.expect_ident();
-        self.skip_nl();
+        // nsc `typeParamClauseOpt`: `newLineOptWhenFollowedBy(LBRACKET)`.
+        // Skipping any line break here made the annotation of the *next*
+        // definition (`class B` + newline + `@E(x) val b`) a constructor
+        // annotation of `B`.
+        self.newline_opt_when_followed_by(|k| matches!(k, TokenKind::LBracket));
         let tparams = self.parse_type_param_clause();
         // A constructor modifier (`class C private (x: Int)`) sits on the same
         // line as the class name, so the decision has to be taken *before* the
@@ -1248,12 +1275,10 @@ impl<'a> Parser<'a> {
             loop {
                 params.push(self.parse_param(implicit));
                 self.skip_nl();
+                // A SIP-27 trailing comma never gets here: the lexer drops it.
                 if matches!(self.kind(), TokenKind::Comma) {
                     self.bump();
                     self.skip_nl();
-                    if matches!(self.kind(), TokenKind::RParen) && self.at_nl_before() {
-                        break;
-                    }
                 } else {
                     break;
                 }
@@ -1410,7 +1435,11 @@ impl<'a> Parser<'a> {
 
     fn parse_with_parents(&mut self, parents: &mut Vec<Tree>) {
         loop {
-            self.skip_nl();
+            // Only a line break in front of `with` is skipped: the one that
+            // ends the statement (`val c = new { .. } with T` + newline +
+            // `println(c)`) must survive, or the next line reads as an infix
+            // operation on the `new`.
+            self.newline_opt_when_followed_by(|k| matches!(k, TokenKind::With));
             if matches!(self.kind(), TokenKind::With) {
                 self.bump();
                 self.skip_nl();
@@ -1483,7 +1512,7 @@ impl<'a> Parser<'a> {
             self.skip_nl();
             self.expect("=>", |k| matches!(k, TokenKind::Arrow));
         }
-        let body = self.parse_stats_until_rbrace();
+        let body = self.parse_stats_until_rbrace(true);
         self.expect("}", |k| matches!(k, TokenKind::RBrace));
         (self_name, self_tpt, body)
     }
@@ -1535,7 +1564,8 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn parse_stats_until_rbrace(&mut self) -> Vec<Tree> {
+    fn parse_stats_until_rbrace(&mut self, template: bool) -> Vec<Tree> {
+        let saved_template = std::mem::replace(&mut self.template_stats, template);
         let saved = std::mem::take(&mut self.placeholder_params);
         let mut stats = Vec::new();
         loop {
@@ -1544,16 +1574,81 @@ impl<'a> Parser<'a> {
                 break;
             }
             stats.extend(flatten_val_block(self.parse_block_stat()));
+            // nsc `acceptStatSepOpt`: two statements need a `;` or a line
+            // break between them. Letting the next one start anyway accepted
+            // `def i = `+` 42` as two statements where nsc reports
+            // "';' expected but integer literal found" (`neg/unary-unquoted`).
+            // (A statement parser that already stepped over the line break --
+            // `class A` looking for a template body -- leaves it behind it.)
+            let stepped_over = self.pos > 0
+                && matches!(
+                    self.tokens[self.pos - 1].kind,
+                    TokenKind::Newline | TokenKind::Semi
+                );
             if !self.accept_separator()
+                && !stepped_over
                 && !matches!(self.kind(), TokenKind::RBrace | TokenKind::Eof)
             {
-                if !is_def_start(self.kind()) && !matches!(self.kind(), TokenKind::Case) {
-                    // might be ok — next token starts next stat
-                }
+                self.error_here(format!(
+                    "expected newline or `;` after statement, found {}",
+                    token_name(self.kind())
+                ));
             }
         }
         self.finish_no_escaping(saved);
+        self.template_stats = saved_template;
         stats
+    }
+
+    /// nsc `isValidSoftModifier` (`-Xsource:3`): `open` or `infix`, not
+    /// backquoted, in front of (more modifiers and then) a `class` -- or, for
+    /// `infix`, a `def`, `trait` or `type`. Only where a template or top-level
+    /// statement may start; the modifier means nothing to 2.13 and is dropped.
+    fn at_valid_soft_modifier(&self) -> bool {
+        if !self.opts.source3 || !self.template_stats {
+            return false;
+        }
+        let soft = |p: &Self, i: usize| match p.tokens.get(i) {
+            Some(t) => {
+                matches!(&t.kind, TokenKind::Ident(s) if s == "open" || s == "infix")
+                    && !p.is_backquoted(t.span)
+            }
+            None => false,
+        };
+        if !soft(self, self.pos) {
+            return false;
+        }
+        let infix = matches!(self.kind(), TokenKind::Ident(s) if s == "infix");
+        let mut i = self.pos + 1;
+        while let Some(t) = self.tokens.get(i) {
+            let skip = matches!(
+                t.kind,
+                TokenKind::Newline
+                    | TokenKind::Abstract
+                    | TokenKind::Final
+                    | TokenKind::Sealed
+                    | TokenKind::Private
+                    | TokenKind::Protected
+                    | TokenKind::Override
+                    | TokenKind::Implicit
+                    | TokenKind::Lazy
+            ) || soft(self, i);
+            if !skip {
+                break;
+            }
+            i += 1;
+        }
+        match self.tokens.get(i).map(|t| &t.kind) {
+            Some(TokenKind::Class) => true,
+            Some(TokenKind::Case) => {
+                matches!(
+                    self.tokens.get(i + 1).map(|t| &t.kind),
+                    Some(TokenKind::Class)
+                )
+            }
+            Some(TokenKind::Def | TokenKind::Trait | TokenKind::TypeKw) => infix,
+            _ => false,
+        }
     }
 
     fn parse_block_stat(&mut self) -> Tree {
@@ -1564,14 +1659,14 @@ impl<'a> Parser<'a> {
         // Treating the `implicit` as a modifier instead rejected the block and
         // then read the rest of it as the closure's body.
         if matches!(self.kind(), TokenKind::Implicit)
-            && matches!(self.kind_at(1), TokenKind::Ident(_))
+            && matches!(self.kind_at(1), TokenKind::Ident(_) | TokenKind::Underscore)
         {
             self.in_block = true;
             let t = self.parse_expr();
             self.in_block = false;
             return t;
         }
-        if is_mod_or_def_start(self.kind()) {
+        if is_mod_or_def_start(self.kind()) || self.at_valid_soft_modifier() {
             return self.parse_tmpl_or_def();
         }
         // nsc: block statements are parsed as `expr(InBlock)`.
@@ -1777,9 +1872,18 @@ impl<'a> Parser<'a> {
             // auxiliary constructor
             self.bump();
             let vparamss = self.parse_param_clauses();
-            self.skip_nl();
-            self.expect("=", |k| matches!(k, TokenKind::Equals));
-            let rhs = self.parse_expr();
+            // nsc `funDefOrDcl`: `newLineOptWhenFollowedBy(LBRACE)`, then a
+            // `{` is the deprecated procedure-syntax `constrBlock`
+            // (`def this() { this(1) }`), accepted by 2.13 with a warning --
+            // also under `-Xsource:3`.
+            let rhs = if matches!(self.peek_non_nl(), TokenKind::LBrace) {
+                self.skip_nl();
+                self.parse_block_expr()
+            } else {
+                self.skip_nl();
+                self.expect("=", |k| matches!(k, TokenKind::Equals));
+                self.parse_expr()
+            };
             let tpt = self.empty(self.span());
             return self.alloc(
                 lo.merge(self.prev_span()),
@@ -2473,6 +2577,22 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            // nsc `simpleType` under `-Xsource:3`: `+` or `-` followed by `_`
+            // is the type named `+_` / `-_` (Scala 3's variant placeholders
+            // for type lambdas), whatever that name is bound to here.
+            TokenKind::Ident(ref s)
+                if self.opts.source3
+                    && (s == "+" || s == "-")
+                    && !self.is_backquoted(self.span())
+                    && (matches!(self.kind_at(1), TokenKind::Underscore)
+                        || matches!(self.kind_at(1), TokenKind::Ident(u) if u == "_")) =>
+            {
+                let lo = self.span();
+                let name = format!("{s}_");
+                self.bump();
+                self.bump();
+                self.alloc(lo.merge(self.prev_span()), TreeKind::Ident { name })
+            }
             TokenKind::Underscore => self.parse_wildcard_type(),
             // `?` is a wildcard alias for `_` in type position.
             TokenKind::Ident(ref s) if s == "?" && !self.is_backquoted(self.span()) => {
@@ -2626,10 +2746,41 @@ impl<'a> Parser<'a> {
                 )
             }
             TokenKind::Implicit => {
-                // implicit lambda: implicit x => e
+                // nsc `implicitClosure`: the parameter is a postfix
+                // expression (`x`, `_`, `(x: Int)`) with an optional
+                // `: typeOrInfixType(location)` -- in a block an infix type,
+                // so `{ implicit x: Int => body }` keeps its arrow -- and in
+                // a block the body is the rest of the block.
                 let lo = self.span();
                 self.bump();
-                let params = vec![self.parse_param(true)];
+                let p = self.parse_postfix_expr();
+                let p = if matches!(self.kind(), TokenKind::Colon) {
+                    self.bump();
+                    let tpt = if in_block {
+                        self.parse_infix_type()
+                    } else {
+                        self.parse_type()
+                    };
+                    self.alloc(
+                        p.span.merge(tpt.span),
+                        TreeKind::Typed {
+                            expr: Box::new(p),
+                            tpt: Box::new(tpt),
+                        },
+                    )
+                } else {
+                    p
+                };
+                let mut params = self.convert_to_params(p);
+                if params.len() != 1 || !matches!(params[0].kind, TreeKind::ValDef { .. }) {
+                    self.error_span(lo, "not a legal formal parameter");
+                    params.truncate(1);
+                }
+                for param in params.iter_mut() {
+                    if let TreeKind::ValDef { mods, .. } = &mut param.kind {
+                        mods.flags = mods.flags.with(Flags::IMPLICIT);
+                    }
+                }
                 self.expect("=>", |k| matches!(k, TokenKind::Arrow));
                 let body = self.parse_function_body(in_block);
                 self.alloc(
@@ -2977,7 +3128,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let g = self.parse_postfix_expr();
                 if let Some(last) = enums.last_mut() {
-                    last.guard = Some(g);
+                    last.guards.push(g);
                 } else {
                     self.error_here("guard without a generator");
                 }
@@ -3010,17 +3161,17 @@ impl<'a> Parser<'a> {
                 false
             };
             let rhs = self.parse_expr();
-            let mut guard = None;
+            let mut guards = Vec::new();
             self.skip_nl();
-            if matches!(self.kind(), TokenKind::If) {
+            while matches!(self.kind(), TokenKind::If) {
                 self.bump();
-                guard = Some(self.parse_postfix_expr());
+                guards.push(self.parse_postfix_expr());
             }
             enums.push(Enumerator {
                 pat,
                 rhs,
                 is_val,
-                guard,
+                guards,
             });
             self.accept_separator();
             if matches!(self.kind(), TokenKind::RParen | TokenKind::RBrace) {
@@ -3093,6 +3244,7 @@ impl<'a> Parser<'a> {
         // stats until next case or }
         let lo = self.span();
         let mut stats = Vec::new();
+        let saved_template = std::mem::replace(&mut self.template_stats, false);
         loop {
             self.skip_nl();
             if matches!(
@@ -3111,6 +3263,7 @@ impl<'a> Parser<'a> {
             stats.extend(flatten_val_block(self.parse_block_stat()));
             self.accept_separator();
         }
+        self.template_stats = saved_template;
         block_from_stats(self, lo, stats)
     }
 
@@ -3132,27 +3285,31 @@ impl<'a> Parser<'a> {
                 t = sel;
             }
         }
-        // Eta-expansion `foo _` (nsc: Typed(foo, Function([], EmptyTree))).
-        if matches!(self.kind(), TokenKind::Underscore) {
-            let sp = self.span();
-            self.bump();
-            let empty = self.empty(sp);
-            let fn_tpt = self.alloc(
-                sp,
-                TreeKind::Function {
-                    vparams: vec![],
-                    body: Box::new(empty),
-                },
-            );
-            t = self.alloc(
-                t.span.merge(sp),
-                TreeKind::Typed {
-                    expr: Box::new(t),
-                    tpt: Box::new(fn_tpt),
-                },
-            );
-        }
         t
+    }
+
+    /// Eta-expansion `foo _` (nsc `simpleExprRest`'s `USCORE` case:
+    /// `Typed(foo, Function([], EmptyTree))`). It ends a *simple* expression,
+    /// so `f[T] _ compose g` is `(f[T] _).compose(g)` and `a op b _` is
+    /// `a op (b _)`.
+    fn finish_method_value(&mut self, t: Tree) -> Tree {
+        let sp = self.span();
+        self.bump();
+        let empty = self.empty(sp);
+        let fn_tpt = self.alloc(
+            sp,
+            TreeKind::Function {
+                vparams: vec![],
+                body: Box::new(empty),
+            },
+        );
+        self.alloc(
+            t.span.merge(sp),
+            TreeKind::Typed {
+                expr: Box::new(t),
+                tpt: Box::new(fn_tpt),
+            },
+        )
     }
 
     fn parse_infix_expr(&mut self, min_prec: i32) -> Tree {
@@ -3229,9 +3386,37 @@ impl<'a> Parser<'a> {
     fn parse_prefix_expr(&mut self) -> Tree {
         self.skip_nl();
         if let Some(name) = self.ident_text() {
-            if matches!(name.as_str(), "+" | "-" | "!" | "~") {
+            // nsc `prefixExpr`: only a raw (not backquoted) `+ - ! ~` that an
+            // expression follows is a prefix operator; `` `+`(6) `` and
+            // `+[Int](6)` call a method named `+`.
+            if matches!(name.as_str(), "+" | "-" | "!" | "~")
+                && !self.is_backquoted(self.span())
+                && is_expr_intro(self.kind_at(1))
+            {
                 let sp = self.span();
                 self.bump();
+                // nsc `prefixExpr`: `-` directly followed by a numeric literal
+                // is a *negative literal*, and the selections after it apply to
+                // that literal -- `-5.abs` is `(-5).abs`, which is `5`, not
+                // `-(5.abs)`. The same holds with a space (`- 5.abs`).
+                if name == "-" {
+                    let neg = match self.kind().clone() {
+                        TokenKind::IntLit(n) => n.checked_neg().map(Lit::Int),
+                        TokenKind::DoubleLit(d) => Some(Lit::Double(-d)),
+                        TokenKind::FloatLit(f) => Some(Lit::Float(-f)),
+                        // A `LongLit` of 2147483648 may be `-2147483648`
+                        // (an Int, lexed wide) or `-2147483648L`; the token
+                        // cannot say which, so that one stays a unary minus.
+                        TokenKind::LongLit(n) if n != 2147483648 => n.checked_neg().map(Lit::Long),
+                        _ => None,
+                    };
+                    if let Some(lit) = neg {
+                        let lit_sp = sp.merge(self.span());
+                        self.bump();
+                        let t = self.alloc(lit_sp, TreeKind::Literal { lit });
+                        return self.parse_simple_expr_rest(t, true);
+                    }
+                }
                 let arg = self.parse_prefix_expr();
                 let sel = self.alloc(
                     sp,
@@ -3502,6 +3687,7 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
+                TokenKind::Underscore => return self.finish_method_value(t),
                 _ => break,
             }
         }
@@ -3571,14 +3757,12 @@ impl<'a> Parser<'a> {
                 let a = self.parse_expr();
                 args.push(self.finish_arg_star(a));
                 self.skip_nl();
+                // SIP-27's trailing comma (only before a line break) is
+                // dropped by the lexer; one written on the same line reaches
+                // `parse_expr` as `)` and is rejected there, as nsc does.
                 if matches!(self.kind(), TokenKind::Comma) {
                     self.bump();
                     self.skip_nl();
-                    // SIP-27: a trailing comma is allowed only when a line
-                    // break follows it.
-                    if matches!(self.kind(), TokenKind::RParen) && self.at_nl_before() {
-                        break;
-                    }
                 } else {
                     break;
                 }
@@ -3676,7 +3860,7 @@ impl<'a> Parser<'a> {
                 },
             );
         }
-        let stats = self.parse_stats_until_rbrace();
+        let stats = self.parse_stats_until_rbrace(false);
         self.expect("}", |k| matches!(k, TokenKind::RBrace));
         block_from_stats(self, lo.merge(self.prev_span()), stats)
     }
@@ -3690,9 +3874,31 @@ impl<'a> Parser<'a> {
             // name was dropped, so a nested class referring back to the outer
             // instance through it was "not found: value self" (slick's
             // `new BaseTag { base => … new RefTag(path) { … base.taggedAs … } }`).
-            let (self_name, self_tpt, body) = self.parse_template_body();
+            let (mut self_name, mut self_tpt, mut body) = self.parse_template_body();
+            let mut parents = vec![];
+            // nsc `template()`, which `new` shares with a class's `extends`
+            // clause: a leading `{ ... }` followed by `with` is an early
+            // initializer section, `new { val x = 1 } with T { ... }`.
+            if self_name.is_none()
+                && self_tpt.is_none()
+                && matches!(self.peek_non_nl(), TokenKind::With)
+            {
+                self.mark_early_defs(&mut body);
+                self.skip_nl();
+                self.bump(); // with
+                self.skip_nl();
+                parents.push(self.parse_parent());
+                self.parse_with_parents(&mut parents);
+                if matches!(self.peek_non_nl(), TokenKind::LBrace) {
+                    self.skip_nl();
+                    let (sn, st, rest) = self.parse_template_body();
+                    self_name = sn;
+                    self_tpt = st;
+                    body.extend(rest);
+                }
+            }
             let impl_ = Template {
-                parents: vec![],
+                parents,
                 self_name,
                 self_tpt,
                 body,
@@ -3834,6 +4040,13 @@ impl<'a> Parser<'a> {
                     self.error_here("unterminated interpolated string");
                     break;
                 }
+                // `$_` is a pattern hole only.
+                TokenKind::Underscore => {
+                    self.error_here("error in interpolated string: identifier or block expected");
+                    let sp = self.span();
+                    self.bump();
+                    args.push(self.alloc(sp, TreeKind::Literal { lit: Lit::Unit }));
+                }
                 _ => {
                     // ${ expr }
                     args.push(self.parse_expr());
@@ -3952,7 +4165,31 @@ impl<'a> Parser<'a> {
             }
             self.pos = saved;
         }
-        self.parse_pattern3()
+        let p = self.parse_pattern3();
+        // nsc `pattern2` looks at the pattern `pattern3` returned, parentheses
+        // stripped: `(xs) @ _*` binds `xs`, and `_ @ p` is just `p`.
+        if matches!(self.kind(), TokenKind::At) {
+            match &p.kind {
+                TreeKind::Ident { name } => {
+                    let name = name.clone();
+                    self.bump();
+                    let body = self.parse_pattern3();
+                    return self.alloc(
+                        p.span.merge(body.span),
+                        TreeKind::Bind {
+                            name,
+                            body: Box::new(body),
+                        },
+                    );
+                }
+                TreeKind::Wildcard => {
+                    self.bump();
+                    return self.parse_pattern3();
+                }
+                _ => {}
+            }
+        }
+        p
     }
 
     /// `Pattern3 ::= SimplePattern { id [nl] SimplePattern }`. nsc desugars an
@@ -3973,8 +4210,10 @@ impl<'a> Parser<'a> {
                 self.pos = saved;
                 break;
             };
-            // `|` is alternation and `*` closes a `_*` sequence pattern.
-            if op == "|" || op == "*" {
+            // `|` is alternation, and a `*` right before `)` closes a sequence
+            // pattern (`xs*`); any other `*` is an infix extractor
+            // (`case b * c`, nsc `pattern3`).
+            if op == "|" || self.at_trailing_pattern_star() {
                 self.pos = saved;
                 break;
             }
@@ -4201,6 +4440,7 @@ impl<'a> Parser<'a> {
             TokenKind::FloatLit(n) => self.lit_pat(Lit::Float(n)),
             TokenKind::CharLit(c) => self.lit_pat(Lit::Char(c)),
             TokenKind::StringLit(s) => self.lit_pat(Lit::String(s)),
+            TokenKind::InterpStart { prefix, .. } => self.parse_interpolated_pattern(prefix),
             other => {
                 self.error_here(format!("expected pattern, found {}", token_name(&other)));
                 let sp = self.span();
@@ -4208,6 +4448,117 @@ impl<'a> Parser<'a> {
                 self.alloc(sp, TreeKind::Wildcard)
             }
         }
+    }
+
+    /// nsc `interpolatedString(inPattern = true)`: `case id"p0$x p1${pat}p2"`
+    /// is the extractor pattern `StringContext("p0", " p1", "p2").id(x, pat)`,
+    /// so its `unapply` / `unapplySeq` is whatever `StringContext(...).id`
+    /// offers -- `StringContext.s`'s glob matcher, or a user extension
+    /// (`implicit class X(sc: StringContext) { def x = ... }`).
+    fn parse_interpolated_pattern(&mut self, prefix: String) -> Tree {
+        let lo = self.span();
+        self.bump(); // InterpStart
+        let mut parts = Vec::new();
+        let mut pats = Vec::new();
+        loop {
+            match self.kind().clone() {
+                TokenKind::StringPart(s) => {
+                    parts.push(s);
+                    self.bump();
+                    // `dropAnyBraces(pattern())`: `$x`, `$_` and `${pat}`.
+                    let pat = match self.kind().clone() {
+                        TokenKind::InterpId(name) => {
+                            let sp = self.span();
+                            self.bump();
+                            self.alloc(sp, TreeKind::Ident { name })
+                        }
+                        TokenKind::LBrace => {
+                            self.bump();
+                            self.skip_nl();
+                            let p = self.parse_pattern();
+                            self.skip_nl();
+                            self.expect("}", |k| matches!(k, TokenKind::RBrace));
+                            p
+                        }
+                        TokenKind::Underscore => {
+                            let sp = self.span();
+                            self.bump();
+                            self.alloc(sp, TreeKind::Wildcard)
+                        }
+                        other => {
+                            self.error_here(format!(
+                                "expected pattern, found {}",
+                                token_name(&other)
+                            ));
+                            let sp = self.span();
+                            self.alloc(sp, TreeKind::Wildcard)
+                        }
+                    };
+                    pats.push(pat);
+                }
+                TokenKind::InterpEnd(s) => {
+                    parts.push(s);
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    self.error_here("unterminated interpolated string");
+                    break;
+                }
+            }
+        }
+        let span = lo.merge(self.prev_span());
+        // The lexer already processed the escapes of an `s` / `f` part (see
+        // `Lexer::finish_interp_part`), but `StringContext.s.unapplySeq` processes
+        // them again at run time (nsc hands it the parts as written). Quoting
+        // the backslashes makes that second pass the identity.
+        let requote = matches!(prefix.as_str(), "s" | "f");
+        let lits: Vec<Tree> = parts
+            .into_iter()
+            .map(|p| {
+                let p = if requote { p.replace('\\', "\\\\") } else { p };
+                self.alloc(
+                    span,
+                    TreeKind::Literal {
+                        lit: Lit::String(p),
+                    },
+                )
+            })
+            .collect();
+        let sc = self.alloc(
+            span,
+            TreeKind::Ident {
+                name: "StringContext".into(),
+            },
+        );
+        let sc_apply = self.alloc(
+            span,
+            TreeKind::Select {
+                qual: Box::new(sc),
+                name: "apply".into(),
+            },
+        );
+        let sc_new = self.alloc(
+            span,
+            TreeKind::Apply {
+                fun: Box::new(sc_apply),
+                args: lits,
+            },
+        );
+        let fun = self.alloc(
+            span,
+            TreeKind::Select {
+                qual: Box::new(sc_new),
+                name: prefix,
+            },
+        );
+        self.alloc(
+            span,
+            TreeKind::Apply {
+                fun: Box::new(fun),
+                args: pats,
+            },
+        )
     }
 
     fn lit_pat(&mut self, lit: Lit) -> Tree {
@@ -5413,12 +5764,7 @@ fn desugar_for(
     fn is_irrefutable_at(pat: &Tree, deep: bool) -> bool {
         match &pat.kind {
             TreeKind::Ident { name } => {
-                !deep
-                    || (!pat.stable_pat
-                        && name
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_lowercase() || c == '_'))
+                !deep || (!pat.stable_pat && crate::ast::is_variable_name(name))
             }
             TreeKind::Wildcard => true,
             TreeKind::Bind { body, .. } => is_irrefutable_at(body, true),
@@ -5893,18 +6239,13 @@ fn desugar_for(
         apply_collection(p, input, "withFilter", pred)
     }
 
-    fn filter_generator_rhs(
-        p: &mut Parser,
-        mut rhs: Tree,
-        pat: &Tree,
-        guard: Option<Tree>,
-    ) -> Tree {
+    fn filter_generator_rhs(p: &mut Parser, mut rhs: Tree, pat: &Tree, guards: &[Tree]) -> Tree {
         if !is_irrefutable(pat) {
             let pred = filter_lambda(p, pat, None);
             rhs = apply_collection(p, rhs, "withFilter", pred);
         }
-        if let Some(g) = guard {
-            rhs = with_filter(p, rhs, pat, g);
+        for g in guards {
+            rhs = with_filter(p, rhs, pat, g.clone());
         }
         rhs
     }
@@ -5936,7 +6277,7 @@ fn desugar_for(
             let mut group_size = 0;
             while next < enums.len() && enums[next].is_val && group_size < MAX_VALUE_DEFS_PER_GROUP
             {
-                let has_guard = enums[next].guard.is_some();
+                let has_guard = !enums[next].guards.is_empty();
                 next += 1;
                 group_size += 1;
                 if has_guard {
@@ -5982,14 +6323,14 @@ fn desugar_for(
                 tuple_args.extend(group_pats);
                 current_pat = tuple_tree(p, tuple_span, tuple_args);
             }
-            if let Some(g) = group.last().and_then(|e| e.guard.clone()) {
+            for g in group.last().map(|e| e.guards.clone()).unwrap_or_default() {
                 stream = with_filter(p, stream, &current_pat, g);
             }
             return build(p, enums, next, stream, current_pat, body, is_yield);
         }
 
         let e = &enums[index];
-        let rhs = filter_generator_rhs(p, e.rhs.clone(), &e.pat, e.guard.clone());
+        let rhs = filter_generator_rhs(p, e.rhs.clone(), &e.pat, &e.guards);
         let inner = build(p, enums, index + 1, rhs, e.pat.clone(), body, is_yield);
         let method = if is_yield { "flatMap" } else { "foreach" };
         let fun = lambda(p, current_pat, inner);
@@ -6004,7 +6345,7 @@ fn desugar_for(
         return body;
     }
     let first = &enums[0];
-    let rhs = filter_generator_rhs(p, first.rhs.clone(), &first.pat, first.guard.clone());
+    let rhs = filter_generator_rhs(p, first.rhs.clone(), &first.pat, &first.guards);
     build(p, &enums, 1, rhs, first.pat.clone(), body, is_yield)
 }
 
@@ -6029,12 +6370,7 @@ fn dummy_ident_from(pat: &Tree) -> Tree {
 fn pattern_bound_names(pat: &Tree, out: &mut Vec<String>) {
     match &pat.kind {
         TreeKind::Ident { name } => {
-            if name != "_"
-                && name
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_lowercase() || c == '_')
-            {
+            if name != "_" && crate::ast::is_variable_name(name) {
                 out.push(name.clone());
             }
         }
