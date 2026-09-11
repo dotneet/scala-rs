@@ -2207,7 +2207,15 @@ impl Typer {
         if prefix == owner {
             return ty;
         }
-        self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty)
+        // Selected on `prefix.this`: that is the prefix an inner class in
+        // the member's type gets (`prefix.rs`), not the class type it is
+        // read through -- `def use: In = mk` inside `Sub` reads `mk`'s `In`
+        // as `Sub.this.In`.
+        self.st.subst_as_seen_from_at(
+            &self.class_this_ty(prefix),
+            Some(&Type::ThisType(prefix)),
+            &ty,
+        )
     }
 
     /// The enclosing class an unqualified reference to a member of `owner`
@@ -2249,7 +2257,6 @@ impl Typer {
         this
     }
 
-
     /// The prefix an inner class is instantiated through, for reading its
     /// constructor: `p.C(…)` / `new p.C(…)` is `p`'s type, and a bare `C(…)`
     /// is the enclosing class that has `C`'s owner as a base
@@ -2269,6 +2276,13 @@ impl Typer {
     pub(crate) fn ctor_outer_prefix(&self, class_id: SymbolId, tpt: &Tree) -> Option<Type> {
         if class_id.is_none() {
             return None;
+        }
+        // The head already carries the prefix (`prefix.rs`): `new o.In(…)`,
+        // or the `new Rec(…)` the `copy` rewrite builds for an `r: o.Rec`.
+        if let Some(pre) = crate::prefix::view_prefix(&tpt.ty) {
+            if !pre.is_no_type() {
+                return Some(pre.clone());
+            }
         }
         let owner = self.st.get(class_id).owner;
         if owner.is_none()
@@ -2408,7 +2422,11 @@ impl Typer {
                 {
                     let prefix = self.ident_prefix_class(owner);
                     if prefix != owner {
-                        ty = self.st.subst_as_seen_from(&self.class_this_ty(prefix), &ty);
+                        ty = self.st.subst_as_seen_from_at(
+                            &self.class_this_ty(prefix),
+                            Some(&Type::ThisType(prefix)),
+                            &ty,
+                        );
                     }
                 }
             }

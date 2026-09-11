@@ -1617,7 +1617,7 @@ impl Typer {
                     // un-applied `new C` carries the class's own parameters as
                     // placeholders, which satisfy their own bounds and so pass
                     // this silently.
-                    if let Type::Class { sym, args } = tpt.ty.clone() {
+                    if let Type::Class { sym, args } = crate::prefix::strip_view(&tpt.ty).clone() {
                         self.check_class_tparam_bounds(sym, &args, tpt.span);
                     }
                 } else if matches!(&tpt.kind, TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE)
@@ -1687,10 +1687,12 @@ impl Typer {
                         .find(|s| self.st.get(*s).kind == SymKind::Class)
                     {
                         tpt.sym = id;
-                        tpt.ty = Type::Class {
+                        // `new In` inside `Outer` is a `C.this.In`, the same
+                        // as the type `In` written there (`prefix.rs`).
+                        tpt.ty = self.this_prefixed(Type::Class {
                             sym: id,
                             args: vec![],
-                        };
+                        });
                     } else if let Some(alias) = self.new_alias_target(&found, tpt.span) {
                         // `new A(…)` where `type A = C`: nsc constructs the
                         // alias's right-hand side. The alias symbol has no

@@ -120,12 +120,24 @@ impl Typer {
     /// DumpInfo` with no position at all. nsc's `TypeTree(tp)`, the same
     /// marker `crate::materialize` uses.
     pub(crate) fn resolved_class_tpt(&self, class_id: SymbolId) -> Tree {
+        self.resolved_class_tpt_at(class_id, None)
+    }
+
+    /// `resolved_class_tpt` for an inner class seen through a prefix
+    /// (`prefix.rs`): `r.copy(…)` on an `r: o.Rec` rebuilds an `o.Rec`.
+    pub(crate) fn resolved_class_tpt_at(&self, class_id: SymbolId, prefix: Option<&Type>) -> Tree {
         let mut t = Tree::dummy(TreeKind::Ident {
             name: crate::materialize::RESOLVED_TYPE.to_string(),
         });
-        t.ty = Type::Class {
+        let core = Type::Class {
             sym: class_id,
             args: Vec::new(),
+        };
+        t.ty = match prefix {
+            Some(pre) if self.st.is_inner_class_of_class(class_id) => {
+                crate::prefix::with_prefix(core, pre.clone())
+            }
+            _ => core,
         };
         t.sym = class_id;
         t

@@ -2279,6 +2279,17 @@ pub(crate) fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
             sym,
             args: vec![Type::TypeParam(tp)],
         },
+        // `U: BCT` for an inner trait `BCT` of the enclosing class: the bound
+        // carries its prefix (`prefix.rs`), and the argument goes under it.
+        Type::Refined { parents, decls }
+            if crate::symbol::SymbolTable::as_seen_from_view_decls(&decls) =>
+        {
+            let parents = parents
+                .into_iter()
+                .map(|p| apply_context_bound(p, tp))
+                .collect();
+            Type::Refined { parents, decls }
+        }
         Type::Named { name, args } if args.is_empty() => Type::Named {
             name,
             args: vec![Type::TypeParam(tp)],

@@ -86,6 +86,14 @@ pub fn with_prefix(core: Type, pre: Type) -> Type {
     }
 }
 
+/// `with_prefix` when there is a prefix to put back.
+pub fn with_prefix_opt(core: Type, pre: Option<&Type>) -> Type {
+    match pre {
+        Some(p) => with_prefix(core, p.clone()),
+        None => core,
+    }
+}
+
 /// `ty` with its prefix (and the rest of its view) removed, as the parents
 /// of a class are stored: `base_type_args`, `linearize` and every other
 /// reader of `parents` matches `Type::Class` directly.
@@ -132,10 +140,19 @@ impl SymbolTable {
 
     /// The prefix form of a receiver: a class applied to its *own* type
     /// parameters is the class's `this` (that is what `class_this_ty` and
-    /// `self_type_of_class` build), and nsc writes it `C.this`.
+    /// `self_type_of_class` build), and nsc writes it `C.this`; a singleton
+    /// is itself. Any other class type is a *widened* receiver -- a value
+    /// this compiler did not keep the path of. nsc skolemizes it (`_1.In
+    /// forSome { val _1: C[X] }`); here it is the type itself, which reads
+    /// as the projection `C[X]#In`: its arguments still instantiate the
+    /// enclosing class (`new SB[F] |@| fa` in cats' semigroupal syntax), and
+    /// it is no particular instance, so it is not an `a.In` -- the same
+    /// answer nsc gives. A class with no parameters and no arguments is
+    /// read as its `this`: nothing distinguishes the two spellings, and
+    /// `expand_in_type` reaches here with the class's own type.
     pub fn canonical_prefix(&self, recv: &Type) -> Type {
         match recv {
-            Type::Class { sym, args } if !sym.is_none() && !args.is_empty() => {
+            Type::Class { sym, args } if !sym.is_none() => {
                 let tps = &self.get(*sym).tparams;
                 let own = tps.len() == args.len()
                     && tps
@@ -148,7 +165,12 @@ impl SymbolTable {
                     recv.clone()
                 }
             }
-            other => other.clone(),
+            Type::ThisType(_) | Type::SingleType { .. } | Type::ModuleRef(_) => recv.clone(),
+            // An inner class behind a prefix is itself a prefix for the
+            // classes nested in it: `o.mid.in` for `class Mid { def in = new
+            // In }` is an `o.mid.In`-like `Mid`-with-prefix-`o` instance.
+            Type::Refined { .. } if view_prefix(recv).is_some() => recv.clone(),
+            _ => Type::NoType,
         }
     }
 
@@ -163,6 +185,14 @@ impl SymbolTable {
     /// `ThisType(c)` for a self alias `self` of `c`; the singleton otherwise.
     fn norm_singleton(&self, pre: &Type) -> Type {
         match pre {
+            // An object is one value however it is spelled: `O.type`,
+            // `O.In`'s `ModuleRef`, or `this` inside `O`.
+            Type::SingleType { sym, .. }
+                if !sym.is_none()
+                    && matches!(self.get(*sym).kind, SymKind::Module | SymKind::ModuleClass) =>
+            {
+                Type::ThisType(self.module_class_of(*sym))
+            }
             Type::SingleType { sym, .. } if !sym.is_none() => {
                 let owner = self.get(*sym).owner;
                 if !owner.is_none() && self.get(owner).self_alias == Some(*sym) {
@@ -201,8 +231,22 @@ impl SymbolTable {
                     sym: s2,
                 },
             ) => {
+                // Dependent method types: `def foo(a: A)(v: a.V)` overridden
+                // by `def foo(a: A)(v: a.V)` names two different `a`s, which
+                // nsc matches positionally. Two method parameters of one name
+                // are read as the same one (`run/t6135`).
                 if s1 != s2 {
-                    return false;
+                    let (x, y) = (self.get(*s1), self.get(*s2));
+                    let both_params = x.flags.contains(Flags::PARAM)
+                        && y.flags.contains(Flags::PARAM)
+                        && x.name == y.name
+                        && !x.owner.is_none()
+                        && !y.owner.is_none()
+                        && self.get(x.owner).kind == SymKind::Method
+                        && self.get(y.owner).kind == SymKind::Method;
+                    if !both_params {
+                        return false;
+                    }
                 }
                 match (p1.as_ref(), p2.as_ref()) {
                     (Type::NoType, _) | (_, Type::NoType) => true,
@@ -241,7 +285,7 @@ impl SymbolTable {
     /// else is a projection over a type, which every prefix of a conforming
     /// type is in.
     pub fn prefix_conforms(&self, a: &Type, b: &Type) -> bool {
-        if a == b {
+        if a == b || a.is_no_type() || b.is_no_type() {
             return true;
         }
         if self.is_singleton_prefix(b) {
@@ -289,6 +333,125 @@ impl SymbolTable {
         })
     }
 
+    /// Does `ty` mention an inner class of a class, bare or behind a prefix?
+    /// The cheap test for whether a selection has any prefix work to do.
+    pub fn mentions_inner_class(&self, ty: &Type) -> bool {
+        crate::symbol::any_type(ty, &mut |t| {
+            self.is_bare_inner_class_type(t) || view_prefix(t).is_some()
+        })
+    }
+
+    /// nsc's as-seen-from for the `C.this` written in a view's prefix, for
+    /// a member read through `recv` (selected on the stable path
+    /// `inner_pre`, when there is one):
+    ///
+    /// * `C.this` for the receiver's own class or one of its ancestors is the
+    ///   receiver -- `o.mk` for `def mk: In` (`Outer.this.In`) is an `o.In`;
+    /// * `C.this` for a class *enclosing* the receiver's class is the
+    ///   receiver path's own prefix at that depth -- `p.O.f` for `object O {
+    ///   def f(x: S1) }` inside `P` takes a `p.S1` -- and, when the path does
+    ///   not reach that far, an unknown prefix (`NoType`), which conforms to
+    ///   anything: this compiler cannot tell which instance, so it does not
+    ///   guess one.
+    ///
+    /// Only prefixes (of views and of the paths inside them) are rewritten;
+    /// a `this.type` standing on its own keeps the treatment
+    /// `subst_receiver_this_type` gives it.
+    pub(crate) fn rewrite_view_this(
+        &self,
+        recv: &Type,
+        inner_pre: Option<&Type>,
+        ty: &Type,
+    ) -> Type {
+        let mut owners = Vec::new();
+        Self::this_type_owners(ty, &mut owners);
+        if owners.is_empty() {
+            return ty.clone();
+        }
+        let Some(rc) = self.class_sym_of(recv) else {
+            return ty.clone();
+        };
+        let pre_to = match inner_pre {
+            Some(p) => p.clone(),
+            None => self.canonical_prefix(recv),
+        };
+        let encl: Vec<SymbolId> = self
+            .enclosing_classes(rc)
+            .into_iter()
+            .skip(1)
+            .filter(|c| self.get(*c).is_class_like())
+            .collect();
+        // The enclosing instance `level` steps out of the receiver. It is
+        // the receiver *type*'s own prefix (`database: JdbcBackend.this.
+        // JdbcDatabaseDef[F]` has `JdbcBackend.this` around it, whatever
+        // path `database` was reached by), then that prefix's, and so on;
+        // for an object nested in a class, selected through a path, the
+        // path's prefix (`p.O` is level 1 `p`). Through the receiver's own
+        // `this`, an enclosing `E.this` is still `E.this` (`None`: leave
+        // it). Past what is known: unknown.
+        let outer_at = |level: usize| -> Option<Type> {
+            let mut cur: Option<Type> = Some(recv.clone());
+            for _ in 0..level {
+                cur = match cur {
+                    Some(ref t) => match view_prefix(t) {
+                        Some(p) => Some(p.clone()),
+                        None => match (t, inner_pre) {
+                            (Type::ThisType(_), _) => return None,
+                            (Type::Class { .. }, Some(Type::ThisType(_))) => return None,
+                            (_, Some(Type::SingleType { prefix, sym }))
+                                if self.is_singleton_prefix(prefix)
+                                    && Some(*sym) == self.class_sym_of(t)
+                                    && self.get(*sym).kind == SymKind::ModuleClass =>
+                            {
+                                Some((**prefix).clone())
+                            }
+                            (Type::SingleType { sym, .. }, _) if !sym.is_none() => {
+                                let under = self.singleton_underlying(*sym);
+                                match view_prefix(&under) {
+                                    Some(p) => Some(p.clone()),
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        },
+                    },
+                    None => None,
+                };
+            }
+            Some(cur.unwrap_or(Type::NoType))
+        };
+        let target = |c: SymbolId| -> Option<Type> {
+            if c == rc || self.is_ancestor_of(c, rc) {
+                return Some(pre_to.clone());
+            }
+            let level = encl
+                .iter()
+                .position(|e| *e == c || self.is_ancestor_of(c, *e))?;
+            outer_at(level + 1)
+        };
+        let mut hit = false;
+        let mut plan: Vec<(SymbolId, Type)> = Vec::new();
+        for c in owners {
+            if let Some(t) = target(c) {
+                hit = true;
+                plan.push((c, t));
+            }
+        }
+        if !hit {
+            return ty.clone();
+        }
+        let f = |pre: &Type| -> Type {
+            crate::symbol::map_type(pre, &mut |t| match t {
+                Type::ThisType(c) => match plan.iter().find(|(x, _)| x == c) {
+                    Some((_, to)) => to.clone(),
+                    None => t.clone(),
+                },
+                other => other.clone(),
+            })
+        };
+        map_view_prefixes(ty, &f)
+    }
+
     /// Give every bare inner class of a class in `owners` the prefix `pre`,
     /// throughout `ty`. This is the half of as-seen-from that `subst_tparams`
     /// cannot do: a member of `Outer` that mentions `In` means
@@ -300,6 +463,11 @@ impl SymbolTable {
         pre: &Type,
         ty: Type,
     ) -> Type {
+        // Nothing to say about the prefix: the class stays bare, which means
+        // the same thing and costs nothing downstream.
+        if pre.is_no_type() {
+            return ty;
+        }
         let wants = |st: &SymbolTable, sym: SymbolId| -> bool {
             st.is_inner_class_of_class(sym) && owners.contains(&st.get(sym).owner.0)
         };
@@ -309,32 +477,32 @@ impl SymbolTable {
         ) {
             return ty;
         }
-        attach_rec(self, &ty, &wants, pre)
+        let on_class = |c: Type| -> Type {
+            match &c {
+                Type::Class { sym, .. } if wants(self, *sym) => with_prefix(c, pre.clone()),
+                _ => c,
+            }
+        };
+        map_views(&ty, &on_class, &|p| p.clone())
     }
 }
 
-/// The recursion of [`SymbolTable::attach_inner_prefixes`]. A class already
-/// under a view keeps the prefix it has; the view's arguments are still
-/// visited.
-fn attach_rec(
-    st: &SymbolTable,
+/// The recursion of [`SymbolTable::attach_inner_prefixes`]: `on_class` sees
+/// every class type that is not already under a view, and `on_prefix` every
+/// view's prefix. A class already under a view keeps the prefix it has (its
+/// arguments are still visited); a prefix is written in the caller's
+/// vocabulary, not the member's, so `on_class` never runs inside one.
+fn map_views(
     ty: &Type,
-    wants: &dyn Fn(&SymbolTable, SymbolId) -> bool,
-    pre: &Type,
+    on_class: &dyn Fn(Type) -> Type,
+    on_prefix: &dyn Fn(&Type) -> Type,
 ) -> Type {
-    let go = |t: &Type| attach_rec(st, t, wants, pre);
+    let go = |t: &Type| map_views(t, on_class, on_prefix);
     match ty {
-        Type::Class { sym, args } => {
-            let core = Type::Class {
-                sym: *sym,
-                args: args.iter().map(go).collect(),
-            };
-            if wants(st, *sym) {
-                with_prefix(core, pre.clone())
-            } else {
-                core
-            }
-        }
+        Type::Class { sym, args } => on_class(Type::Class {
+            sym: *sym,
+            args: args.iter().map(go).collect(),
+        }),
         Type::Refined { parents, decls } if SymbolTable::as_seen_from_view(ty).is_some() => {
             let parents = parents
                 .iter()
@@ -349,9 +517,19 @@ fn attach_rec(
             let decls = decls
                 .iter()
                 .map(|d| match d {
-                    // The prefix itself is left alone: it is written in the
-                    // caller's vocabulary, not the member's.
-                    RefineDecl::Type { name, .. } if name == PREFIX_MARK => d.clone(),
+                    RefineDecl::Type {
+                        name,
+                        rhs: Some(pre),
+                        tparams,
+                        lo,
+                        hi,
+                    } if name == PREFIX_MARK => RefineDecl::Type {
+                        name: name.clone(),
+                        rhs: Some(on_prefix(pre)),
+                        tparams: *tparams,
+                        lo: lo.clone(),
+                        hi: hi.clone(),
+                    },
                     other => map_decl(other, &go),
                 })
                 .collect();
@@ -393,8 +571,17 @@ fn attach_rec(
             name: name.clone(),
             args: args.iter().map(go).collect(),
         },
+        Type::SingleType { prefix, sym } => Type::SingleType {
+            prefix: Box::new(go(prefix)),
+            sym: *sym,
+        },
         other => other.clone(),
     }
+}
+
+/// `f` applied to the prefix of every view in `ty`.
+fn map_view_prefixes(ty: &Type, f: &dyn Fn(&Type) -> Type) -> Type {
+    map_views(ty, &|c| c, f)
 }
 
 fn map_decl(d: &RefineDecl, go: &dyn Fn(&Type) -> Type) -> RefineDecl {

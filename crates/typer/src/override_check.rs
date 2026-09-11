@@ -678,6 +678,29 @@ fn certainly_different(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type)
             }
             definitely_different(st, a, b)
         }
+        // Two inner-class types with prefixes (`prefix.rs`): the same class
+        // behind two different stable prefixes is two types -- `def f(x:
+        // p.S1)` is not implemented by `def f(x: S1)` (`P2.this.S1`), which
+        // nsc reports as "their prefixes (i.e., enclosing instances) differ"
+        // (`neg/abstract-class-2`).
+        (Type::Refined { .. }, Type::Refined { .. })
+            if crate::prefix::view_prefix(a).is_some()
+                && crate::prefix::view_prefix(b).is_some() =>
+        {
+            let (ca, cb) = (crate::prefix::strip_view(a), crate::prefix::strip_view(b));
+            let same_class = matches!(
+                (ca, cb),
+                (Type::Class { sym: x, .. }, Type::Class { sym: y, .. }) if x == y
+            );
+            if !same_class {
+                return certainly_different(st, rigid, ca, cb);
+            }
+            let (pa, pb) = (
+                crate::prefix::view_prefix(a).unwrap(),
+                crate::prefix::view_prefix(b).unwrap(),
+            );
+            st.prefixes_certainly_differ(pa, pb) || certainly_different(st, rigid, ca, cb)
+        }
         // A bound type variable against an application of a constructor.
         (Type::TypeParam(p), other) | (other, Type::TypeParam(p)) => {
             rigid.contains(p) && is_constructor_app(other)

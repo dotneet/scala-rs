@@ -1163,6 +1163,16 @@ impl Typer {
     /// A type argument that is a class **this run is compiling** still travels
     /// as the empty placeholder of §5.1, at whatever depth it occurs.
     fn tag_wire(&mut self, ty: &Type, placeholders: &mut Vec<String>) -> Result<String, String> {
+        // An inner class behind a prefix (`prefix.rs`) travels as the class:
+        // the wire names classes, and gitbucket's `TableQuery[Repositories]`
+        // -- an inner class of the cake component -- has always gone as one.
+        let stripped;
+        let ty = if crate::prefix::view_prefix(ty).is_some() {
+            stripped = crate::prefix::strip_view(ty).clone();
+            &stripped
+        } else {
+            ty
+        };
         if let Some(sym) = plain_class_of(&self.st, ty) {
             if self.is_current_run_class(sym) {
                 let full = scala_full_name(&self.st, sym);

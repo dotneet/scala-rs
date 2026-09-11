@@ -594,6 +594,16 @@ impl Typer {
                         } else {
                             self.st.subst_tparams(class_id, &cargs, &ft)
                         };
+                        // A scrutinee that is an inner case class behind a
+                        // prefix (`prefix.rs`): a field written in the
+                        // enclosing class's vocabulary is read through the
+                        // prefix -- `case o.Rec(n, t)` on an `o.Rec` with
+                        // `o: Outer[String]` binds `t: String`.
+                        let ft = if crate::prefix::view_prefix(sel_ty).is_some() {
+                            self.st.subst_as_seen_from(sel_ty, &ft)
+                        } else {
+                            ft
+                        };
                         let ft = match ft {
                             Type::Repeated(elem) if pattern_has_star(a) => {
                                 self.seq_of(&elem).unwrap_or(Type::Class {
@@ -611,6 +621,19 @@ impl Typer {
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
                     let extracted = self.unapply_extracted_types(u);
                     let extracted = self.subst_unapply_tparams(u, sel_ty, extracted);
+                    // A scrutinee that is an inner class behind a prefix
+                    // (`prefix.rs`): what its companion's `unapply` extracts
+                    // is written in the enclosing class's vocabulary, and the
+                    // prefix instantiates it -- `case o.Rec(a, t)` on an
+                    // `o.Rec` with `o: Outer[String]` binds `t: String`.
+                    let extracted: Vec<Type> = if crate::prefix::view_prefix(sel_ty).is_some() {
+                        extracted
+                            .iter()
+                            .map(|t| self.st.subst_as_seen_from(sel_ty, t))
+                            .collect()
+                    } else {
+                        extracted
+                    };
                     if args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
@@ -1419,6 +1442,28 @@ impl Typer {
             }
             Type::Annotated { tpe, .. } => {
                 return self.base_type_instance(tpe, target, depth + 1);
+            }
+            // An inner class behind a prefix (`prefix.rs`): its parents are
+            // written in the enclosing class's vocabulary, and the prefix is
+            // what instantiates them -- `hm.KeySet` for `class KeySet extends
+            // MySet[K]` inside `MapOps[K]` is a `MySet[Int]`, not a `MySet[K]`.
+            Type::Refined { .. } if crate::symbol::SymbolTable::as_seen_from_view(ty).is_some() => {
+                let core = crate::prefix::strip_view(ty).clone();
+                let Some(pre) = crate::prefix::view_prefix(ty).cloned() else {
+                    return self.base_type_instance(&core, target, depth + 1);
+                };
+                let Type::Class { sym, args } = &core else {
+                    return self.base_type_instance(&core, target, depth + 1);
+                };
+                if *sym == target {
+                    return Some(core);
+                }
+                let parents = self.st.get(*sym).parents.clone();
+                return parents.iter().find_map(|p| {
+                    let p = self.st.subst_tparams(*sym, args, p);
+                    let p = self.st.subst_as_seen_from(&pre, &p);
+                    self.base_type_instance(&p, target, depth + 1)
+                });
             }
             _ => return None,
         };

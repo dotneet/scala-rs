@@ -1181,6 +1181,11 @@ pub struct SymbolTable {
     /// Keyed by the chain of term symbols that spells the path (`a.b.c` is
     /// `[a, b, c]`) together with the declaration being projected.
     pub(crate) path_members: rustc_hash::FxHashMap<(Vec<SymbolId>, SymbolId), SymbolId>,
+    /// The prefix a class's `i`th parent was written with, when it names an
+    /// inner class of a class (`prefix.rs`): `ThisType(C)` for a bare `In`
+    /// inside `C`, the path for `extends o.In`. `parents` itself holds the
+    /// bare class, which every reader of it expects.
+    pub(crate) parent_prefixes: rustc_hash::FxHashMap<(u32, usize), Type>,
     /// The declaration a path-dependent member stands for. Erasure and the
     /// pickle read this so that they see exactly the type they saw before the
     /// typer could tell two paths apart.
@@ -1346,6 +1351,7 @@ impl SymbolTable {
             method_variants: rustc_hash::FxHashMap::default(),
             qualify_tparams: std::cell::RefCell::new(Vec::new()),
             path_members: rustc_hash::FxHashMap::default(),
+            parent_prefixes: rustc_hash::FxHashMap::default(),
             path_member_decl: rustc_hash::FxHashMap::default(),
             path_member_path: rustc_hash::FxHashMap::default(),
             path_member_lambdas: rustc_hash::FxHashMap::default(),
@@ -3188,7 +3194,9 @@ impl SymbolTable {
         if n == 0 || self.kind_arity(b) != n {
             return None;
         }
-        let eta_ok = |t: &Type| self.hk_alias(t).is_some() || matches!(t, Type::Class { .. });
+        let eta_ok = |t: &Type| {
+            self.hk_alias(t).is_some() || matches!(crate::prefix::strip_view(t), Type::Class { .. })
+        };
         if !eta_ok(a) || !eta_ok(b) {
             return None;
         }
@@ -3353,6 +3361,11 @@ impl SymbolTable {
     /// Remaining kind arity: 0 is a proper type (`*`), 1 is `* -> *`, etc.
     pub fn kind_arity(&self, ty: &Type) -> usize {
         match ty {
+            // An inner class behind a prefix (`prefix.rs`) has the kind of
+            // the class: `Accumulator[List]` for `class List[T]` inside `HOSeq`.
+            Type::Refined { .. } if crate::prefix::view_prefix(ty).is_some() => {
+                self.kind_arity(crate::prefix::strip_view(ty))
+            }
             Type::TypeParam(id) | Type::TypeMember(id) => self.get(*id).tparams.len(),
             Type::Class { sym, args } => self.class_tparam_count(*sym).saturating_sub(args.len()),
             Type::Applied { ctor, args } => self.kind_arity(ctor).saturating_sub(args.len()),
@@ -3373,6 +3386,9 @@ impl SymbolTable {
     /// Kinds of the next type parameters of a type constructor (`F[_]` → `[0]`).
     pub fn tparam_arities(&self, ty: &Type) -> Vec<usize> {
         match ty {
+            Type::Refined { .. } if crate::prefix::view_prefix(ty).is_some() => {
+                self.tparam_arities(crate::prefix::strip_view(ty))
+            }
             // `Array`'s element parameter is a proper type and is not in the
             // symbol table (see `class_tparam_count`).
             Type::Class { sym, args } if *sym == self.array_sym => {
@@ -3403,7 +3419,7 @@ impl SymbolTable {
     }
 
     /// Classes `ty` names through `this.type`, in no particular order.
-    fn this_type_owners(ty: &Type, out: &mut Vec<SymbolId>) {
+    pub(crate) fn this_type_owners(ty: &Type, out: &mut Vec<SymbolId>) {
         match ty {
             Type::ThisType(c) => {
                 if !out.contains(c) {
@@ -3483,8 +3499,7 @@ impl SymbolTable {
         // `this.type` in a member's signature means the receiver it was
         // selected on: `def add(v: T): this.type` on a `B[String]` gives back a
         // `B[String]`, not a bare `B` whose argument has to be invented.
-        let ty = self.subst_receiver_this_type(recv, recv, ty);
-        self.subst_as_seen_from_walk(recv, &ty)
+        self.subst_as_seen_from_at(recv, None, ty)
     }
 
     /// `subst_as_seen_from` for a receiver whose *own* type is not the class
@@ -3507,7 +3522,9 @@ impl SymbolTable {
         if owners.is_empty() {
             return self.subst_as_seen_from(recv, ty);
         }
-        let mut out = self.subst_as_seen_from_walk(recv, ty);
+        let inner_pre = matches!(prefix, Type::ThisType(_)).then_some(prefix);
+        let ty = self.rewrite_view_this(recv, inner_pre, ty);
+        let mut out = self.subst_as_seen_from_walk_at(recv, inner_pre, &ty);
         for c in owners {
             out = subst_this_type(&out, c, prefix);
         }
@@ -3532,19 +3549,16 @@ impl SymbolTable {
         out
     }
 
-    /// The parent walk of `subst_as_seen_from`, without its `this.type` step.
-    fn subst_as_seen_from_walk(&self, recv: &Type, ty: &Type) -> Type {
-        self.subst_as_seen_from_walk_at(recv, None, ty)
-    }
-
     /// `subst_as_seen_from` with the prefix bare inner classes in `ty` are
     /// given: the stable path the member was selected on, when the caller
     /// has one (`o.mk` for `def mk: In` is an `o.In`, not an `Outer#In`).
     pub fn subst_as_seen_from_at(&self, recv: &Type, inner_pre: Option<&Type>, ty: &Type) -> Type {
-        let ty = self.subst_receiver_this_type(recv, recv, ty);
+        let ty = self.rewrite_view_this(recv, inner_pre, ty);
+        let ty = self.subst_receiver_this_type(recv, recv, &ty);
         self.subst_as_seen_from_walk_at(recv, inner_pre, &ty)
     }
 
+    /// The parent walk of `subst_as_seen_from`, without its `this.type` step.
     fn subst_as_seen_from_walk_at(&self, recv: &Type, inner_pre: Option<&Type>, ty: &Type) -> Type {
         fn walk(
             st: &SymbolTable,
@@ -3675,6 +3689,17 @@ impl SymbolTable {
                     for p in parents {
                         t = walk(st, p, t, seen, base);
                     }
+                    // An inner class seen through a prefix, reached as the
+                    // type of a path (`m.In` with `val m = o.mid`): the
+                    // prefix instantiates the enclosing class. Its own
+                    // `seen`, so the enclosing class is walked even when the
+                    // inner class also derives from it, and so the classes
+                    // it reaches are not the receiver's own (see
+                    // `attach_inner_prefixes`).
+                    if let Some(pre) = crate::prefix::view_prefix(recv) {
+                        let mut pseen = rustc_hash::FxHashSet::default();
+                        t = walk(st, pre, t, &mut pseen, base);
+                    }
                     t
                 }
                 // A member reached through an abstract type member (or a type
@@ -3704,8 +3729,24 @@ impl SymbolTable {
         // as much as in `In`'s own, and the prefix is what instantiates
         // `Outer`. Its own `seen` set, so a `T` of `Outer` that `In`'s own
         // base walk did not reach is still substituted.
-        let outer = crate::prefix::view_prefix(recv);
-        let core = if outer.is_some() {
+        let outer = crate::prefix::view_prefix(recv).or_else(|| {
+            // An object nested in a class, selected through a path (`o.Rec`
+            // for `case class Rec` inside `Outer`, whose companion's `apply`
+            // takes `Outer`'s `T`): the path's prefix is its enclosing
+            // instance.
+            match inner_pre {
+                Some(Type::SingleType { prefix, sym })
+                    if self.is_singleton_prefix(prefix)
+                        && Some(*sym) == self.class_sym_of(recv)
+                        && self.get(*sym).kind == SymKind::ModuleClass
+                        && self.get(self.get(*sym).owner).kind == SymKind::Class =>
+                {
+                    Some(prefix.as_ref())
+                }
+                _ => None,
+            }
+        });
+        let core = if crate::prefix::view_prefix(recv).is_some() {
             crate::prefix::strip_view(recv)
         } else {
             recv
@@ -4849,10 +4890,8 @@ impl SymbolTable {
         // prefix are compared prefix first (nsc's `isSubPre`) -- `a.In` is
         // not a `b.In`, and `Outer#In` is not an `a.In`, while `a.In` is an
         // `Outer#In`. See `prefix.rs`.
-        if let (Some(p1), Some(p2)) = (
-            crate::prefix::view_prefix(a),
-            crate::prefix::view_prefix(b),
-        ) {
+        if let (Some(p1), Some(p2)) = (crate::prefix::view_prefix(a), crate::prefix::view_prefix(b))
+        {
             let (ca, cb) = (crate::prefix::strip_view(a), crate::prefix::strip_view(b));
             if let (Type::Class { sym: s1, .. }, Type::Class { sym: s2, .. }) = (ca, cb) {
                 if s1 == s2 {
@@ -4872,6 +4911,32 @@ impl SymbolTable {
             };
         }
         if let Some(p) = Self::as_seen_from_view(b) {
+            // A bare class against an inner class behind a prefix: `new S1
+            // {}` inside `P` against `p.S1`. The parents decide, each with
+            // the prefix it was written with (`parent_prefixes`): `P.this.S1`
+            // is not a `p.S1`, while a parent written `extends o.In` is an
+            // `o.In`, and one this compiler has no prefix for conforms as
+            // before.
+            if crate::prefix::view_prefix(b).is_some() {
+                if let Type::Class { sym: s1, args: a1 } = a {
+                    if !s1.is_none() && self.class_sym_of(p) != Some(*s1) {
+                        return self.walk_parents(a, b, || {
+                            let child = self.get(*s1);
+                            child.parents.iter().enumerate().any(|(i, q)| {
+                                let q = self.subst_tparams_cow(*s1, a1, q);
+                                match self.parent_prefixes.get(&(s1.0, i)) {
+                                    Some(pre) => {
+                                        let qq =
+                                            crate::prefix::with_prefix((*q).clone(), pre.clone());
+                                        self.is_sub_type(&qq, b)
+                                    }
+                                    None => self.is_sub_type(&q, b),
+                                }
+                            })
+                        });
+                    }
+                }
+            }
             return self.is_sub_type(a, p);
         }
         // `Array[T]` has two spellings: `Type::Array` from source, and
@@ -5634,7 +5699,9 @@ impl SymbolTable {
     fn display_prefix(&self, pre: &Type) -> Option<String> {
         match pre {
             Type::ThisType(c) if !c.is_none() => Some(format!("{}.this", self.get(*c).name)),
-            Type::ModuleRef(m) if !m.is_none() => Some(self.get(*m).name.clone()),
+            Type::ModuleRef(m) if !m.is_none() => {
+                Some(self.get(*m).name.trim_end_matches('$').to_string())
+            }
             Type::SingleType { prefix, sym } if !sym.is_none() => {
                 let name = self.get(*sym).name.clone();
                 match prefix.as_ref() {
@@ -7110,7 +7177,9 @@ pub(crate) fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
                 .collect(),
             ret: Box::new(go(ret)),
         },
-        // See `this_type_owners`: the prefixes are where `C.this` is written.
+        // See `this_type_owners`. A view's *prefix* is left alone: it is
+        // `SymbolTable::rewrite_view_this`'s, which has already run and
+        // knows the difference between the receiver's `this` and its class.
         Type::SingleType { prefix, sym } => Type::SingleType {
             prefix: Box::new(go(prefix)),
             sym: *sym,
@@ -7126,7 +7195,7 @@ pub(crate) fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
                         tparams,
                         lo,
                         hi,
-                    } => RefineDecl::Type {
+                    } if name != crate::prefix::PREFIX_MARK => RefineDecl::Type {
                         name: name.clone(),
                         rhs: Some(go(t)),
                         tparams: *tparams,

@@ -298,7 +298,15 @@ impl Typer {
             // inferred result type became `CNode[Nothing, Nothing]`. Every
             // caller then failed; 13 of that file's 46 errors were the single
             // overload `GCAS(cn, cn.renewed(startgen, ct), ct)`.
-            let explicit: Vec<Type> = match &fun.ty {
+            // `new o.In[Int](…)`: the head's type carries a prefix
+            // (`prefix.rs`); the arguments are on the class under it, and the
+            // prefix goes back on the result below.
+            let head_view: Option<Vec<scala_rs_parser::RefineDecl>> =
+                match (&fun.ty, crate::prefix::view_prefix(&fun.ty)) {
+                    (Type::Refined { decls, .. }, Some(_)) => Some(decls.clone()),
+                    _ => None,
+                };
+            let explicit: Vec<Type> = match crate::prefix::strip_view(&fun.ty) {
                 Type::Class { args, .. }
                     if type_args_are_instantiated(args, &tps)
                         || (Self::new_wrote_type_args(fun)
@@ -693,6 +701,15 @@ impl Typer {
                 }
             } else {
                 tree.ty = fun.ty.clone();
+            }
+            if let Some(decls) = head_view {
+                if matches!(tree.ty, Type::Class { .. }) {
+                    tree.ty = Type::Refined {
+                        parents: vec![tree.ty.clone()],
+                        decls,
+                    };
+                    fun.ty = tree.ty.clone();
+                }
             }
             for (i, a) in args.iter_mut().enumerate() {
                 // A repeated parameter covers every argument from its position

@@ -2085,11 +2085,16 @@ impl Typer {
             _ => return,
         };
         self.qualify_parent_type_prefix(fun);
-        let class_ty = {
+        // The parent's prefix (`prefix.rs`) rides on the head tree's type;
+        // everything below reads the class, whose constructors and type
+        // arguments it is asking about.
+        let full_ty = {
             let head: &Tree = fun;
             self.with_strict_type_names(|s| s.tree_to_type(head))
         };
-        fun.ty = class_ty.clone();
+        let parent_pre = crate::prefix::view_prefix(&full_ty).cloned();
+        let class_ty = crate::prefix::parent_form(&full_ty);
+        fun.ty = crate::prefix::with_prefix_opt(class_ty.clone(), parent_pre.as_ref());
         let class_id = self.st.class_sym_of(&class_ty).unwrap_or(SymbolId::NONE);
         if !class_id.is_none() {
             fun.sym = class_id;
@@ -2125,7 +2130,7 @@ impl Typer {
         // Explicit parent type arguments can settle a formal before the
         // argument is typed, including polymorphic evidence expressions.
         self.supply_binary_ctors(class_id);
-        let written_targs = match &class_ty {
+        let written_targs = match crate::prefix::strip_view(&class_ty) {
             Type::Class { args, .. } => args.clone(),
             _ => Vec::new(),
         };
@@ -2194,7 +2199,7 @@ impl Typer {
                 self.adapt(a, &prototype);
             }
         }
-        tree.ty = class_ty.clone();
+        tree.ty = crate::prefix::with_prefix_opt(class_ty.clone(), parent_pre.as_ref());
         if class_id.is_none() {
             return;
         }
@@ -2206,8 +2211,8 @@ impl Typer {
         // print `Seqn[T]` while neither is the other. The inferred arguments
         // become the recorded parent too, so `Derived[X] <: Base[X]` holds.
         let class_ty = self.infer_parent_targs(class_id, &class_ty, &arg_tys);
-        fun.ty = class_ty.clone();
-        tree.ty = class_ty.clone();
+        fun.ty = crate::prefix::with_prefix_opt(class_ty.clone(), parent_pre.as_ref());
+        tree.ty = fun.ty.clone();
         let targs: Vec<Type> = match &class_ty {
             Type::Class { args, .. } => args.clone(),
             _ => Vec::new(),

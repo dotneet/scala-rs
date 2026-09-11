@@ -673,6 +673,22 @@ impl Typer {
         if ctor.is_error() || args.iter().any(|a| a.is_error()) {
             return Type::Error;
         }
+        // `o.In[Int]` / `In[Int]` inside `Outer`: the constructor carries a
+        // prefix (`prefix.rs`); the arguments go to the class under it.
+        if crate::prefix::view_prefix(&ctor).is_some() {
+            let Type::Refined { parents, decls } = ctor else {
+                unreachable!()
+            };
+            let core = parents.into_iter().next().unwrap_or(Type::Error);
+            let applied = self.apply_types(core, args, span);
+            return match applied {
+                Type::Class { .. } => Type::Refined {
+                    parents: vec![applied],
+                    decls,
+                },
+                other => other,
+            };
+        }
         // An unresolved name applied to type arguments is a missing type, not a
         // kind error: nsc reports `not found: type X`.
         if let Type::Named { name, args: pre } = &ctor {

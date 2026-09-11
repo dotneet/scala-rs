@@ -2246,6 +2246,28 @@ impl Typer {
             // `A` was never read off the expected type and stayed open; the
             // `Class` arm below lines `MonadError` up with `Monad` through its
             // base type.
+            // An inner class behind a prefix (`prefix.rs`): the class it is,
+            // or -- against another class -- its base type there, read through
+            // the prefix (`hm.KeySet` against `MySet[?K]` says `?K := Int`).
+            (Type::Refined { .. }, _) if crate::prefix::view_prefix(ret).is_some() => {
+                let core = crate::prefix::strip_view(ret).clone();
+                let head = self.st.class_sym_of(pt);
+                if head.is_some() && self.st.class_sym_of(&core) != head {
+                    if let Some(bt) = self.base_type_instance(ret, head.unwrap(), 0) {
+                        self.collect_expected(
+                            tps,
+                            &bt,
+                            pt,
+                            variance,
+                            depth + 1,
+                            allow_covariant,
+                            out,
+                        );
+                        return;
+                    }
+                }
+                self.collect_expected(tps, &core, pt, variance, depth + 1, allow_covariant, out);
+            }
             (Type::Refined { parents: rps, .. }, _) => {
                 let head = self.st.class_sym_of(pt);
                 let same: Vec<&Type> = rps

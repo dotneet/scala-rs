@@ -352,7 +352,15 @@ impl Typer {
         let saved_parent_ctx = self.parent_ctx.replace((id, saved_this));
         for p in parents.iter_mut() {
             self.type_parent(p);
-            pts.push(p.ty.clone());
+            // A parent is stored as the class it names: every reader of
+            // `parents` matches `Type::Class`. The prefix an inner-class
+            // parent was written with is kept beside it (`prefix.rs`).
+            if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
+                self.st
+                    .parent_prefixes
+                    .insert((id.0, pts.len()), pre.clone());
+            }
+            pts.push(crate::prefix::parent_form(&p.ty));
         }
         self.parent_ctx = saved_parent_ctx;
         if !pts.is_empty() {
@@ -711,7 +719,12 @@ impl Typer {
             // Parents are types: `object B extends B` extends the *trait* B,
             // not itself. Typing them as expressions picks the module.
             self.type_parent(p);
-            pts.push(p.ty.clone());
+            if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
+                self.st
+                    .parent_prefixes
+                    .insert((cls.0, pts.len()), pre.clone());
+            }
+            pts.push(crate::prefix::parent_form(&p.ty));
         }
         pts.retain(|t| !matches!(t, Type::ModuleRef(m) if *m == cls));
         self.parent_ctx = saved_parent_ctx;
@@ -1854,6 +1867,21 @@ impl Typer {
             }
         }
         for m in self.st.get(class_id).members.clone() {
+            // A `val` member whose type is a local class: nsc checks the
+            // refinement it infers for it (`neg/t5060`). Other vals are left
+            // as they were -- their declared types are checked where they
+            // are written.
+            if self.st.get(m).kind == SymKind::Term && !self.st.get(m).flags.contains(Flags::PARAM)
+            {
+                let ty = self.st.get(m).ty.clone();
+                let name = self.st.get(m).name.clone();
+                if let Type::Class { sym, .. } = &ty {
+                    if self.local_class_escapes(*sym, &vars) {
+                        self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
+                    }
+                }
+                continue;
+            }
             if self.st.get(m).kind != SymKind::Method {
                 continue;
             }
@@ -1874,6 +1902,27 @@ impl Typer {
                 self.check_variance_ty(&vars, &ret, 1, span, &format!("return type of {name}"));
             }
         }
+    }
+
+    /// Is `sym` a class local to a method or a block (nsc: its owner is a
+    /// term), whose members can mention one of `vars`? Such a class has no
+    /// name outside its block, so a member typed by it is typed by the
+    /// refinement of its members in nsc.
+    fn local_class_escapes(&self, sym: SymbolId, vars: &[(SymbolId, i8, String)]) -> bool {
+        let s = self.st.get(sym);
+        if s.kind != SymKind::Class || s.flags.contains(Flags::JAVA) || s.owner.is_none() {
+            return false;
+        }
+        if !matches!(self.st.get(s.owner).kind, SymKind::Method | SymKind::Term) {
+            return false;
+        }
+        // The class must sit inside the class whose parameters are checked:
+        // walk the owners up to a class and compare.
+        let mut o = s.owner;
+        while !o.is_none() && !self.st.get(o).is_class_like() {
+            o = self.st.get(o).owner;
+        }
+        !o.is_none() && vars.iter().any(|(tp, _, _)| self.st.get(*tp).owner == o)
     }
 
     /// Declared variances of `sym`'s own type parameters (`+` → 1, `-` → -1).
@@ -1948,6 +1997,37 @@ impl Typer {
                 for (i, a) in args.iter().enumerate() {
                     let vp = vs.get(i).copied().unwrap_or(0);
                     self.check_variance_ty(vars, a, pos * vp, span, where_);
+                }
+                // A *local* class escaping as a member's type: nsc infers the
+                // refinement `AnyRef{def contains(x: T): Unit}` for it and
+                // variance-checks that, so `class A[+T] { val foo0 = { class L
+                // { def contains(x: T) = () }; new L } }` is rejected
+                // (`neg/t5060`). The class's own type says nothing about `T`;
+                // its public members do.
+                if self.local_class_escapes(*sym, vars) {
+                    for m in self.st.get(*sym).members.clone() {
+                        let s = self.st.get(m);
+                        if s.flags.contains(Flags::PRIVATE)
+                            || s.flags.contains(Flags::SYNTHETIC)
+                            || s.name == "<init>"
+                            || !matches!(s.kind, SymKind::Method | SymKind::Term)
+                        {
+                            continue;
+                        }
+                        let mty = s.ty.clone();
+                        let refined =
+                            format!("AnyRef{{def {}{}}}", s.name, self.st.display_type(&mty));
+                        let where_ = format!("type {refined} of {where_}");
+                        match &mty {
+                            Type::Method { paramss, ret } => {
+                                for p in paramss.iter().flatten() {
+                                    self.check_variance_ty(vars, p, -pos, span, &where_);
+                                }
+                                self.check_variance_ty(vars, ret, pos, span, &where_);
+                            }
+                            other => self.check_variance_ty(vars, other, pos, span, &where_),
+                        }
+                    }
                 }
             }
             Type::Applied { ctor, args } => {
