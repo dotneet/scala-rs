@@ -5,11 +5,16 @@
 //!   (`NoStackTrace`, `SeqOps`'s `super.sizeCompare`, a stackable trait over
 //!   `ArrayBuffer`) and the cast a trait-typed value needs where the class the
 //!   trait extends is expected.
-//! * `mixcg_jaruse` -- the same for a user library packed into a jar.
+//! * `mixcg_jaruse` -- the same for a user library packed into a jar, plus a
+//!   binary trait layered with a trait of this run (both orders) and two
+//!   binary traits overriding one member with neither extending the other.
 //! * `mixcg_outer` -- `Q.super.m` from a class nested in `Q`, `new p.C {}`
 //!   holding `p` as the enclosing instance, inner case class equality, and
-//!   the members a parent constructor's arguments may see.
+//!   the members a parent constructor's arguments may see (early
+//!   definitions included).
 //! * `mixcg_parentargs_bad` -- the template's own members, rejected there.
+//! * `mixcg_tsuper_use` -- `T.super.m` from a class nested in trait `T`,
+//!   with `T` compiled by scala-rs and the class mixing it compiled by scalac.
 //!
 //! Every fixture is also compiled by scalac 2.13.16 and must print the same.
 //!

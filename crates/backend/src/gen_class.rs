@@ -4,8 +4,8 @@
 //! forwarders, and the `$extension` methods of a value class.
 
 use crate::classfile::{
-    Field, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_SUPER,
-    ACC_SYNTHETIC, ACC_VARARGS,
+    Field, ACC_ABSTRACT, ACC_FINAL, ACC_INTERFACE, ACC_PRIVATE, ACC_PUBLIC, ACC_STATIC, ACC_STRICT,
+    ACC_SUPER, ACC_SYNTHETIC, ACC_VARARGS,
 };
 use crate::gen::*;
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
@@ -360,6 +360,7 @@ impl<'a> Gen<'a> {
         let (super_name, interfaces) = split_parents(self.st, &impl_.parents);
 
         let mut b = ClassBuilder::new(this_name.clone(), self.source_name);
+        b.strict_fp = is_strictfp(self.st, class_id);
         b.super_name = super_name;
         b.interfaces = interfaces;
         if !is_trait && mods.flags.contains(Flags::CASE) {
@@ -1240,8 +1241,31 @@ impl<'a> Gen<'a> {
                     asm.putfield(&class_name, "$outer", od);
                 }
             }
+            // nsc's constructors phase stores the parameter-accessor fields
+            // (and the lambda-lifted captures, which are parameters too)
+            // *before* the super constructor call, like `$outer` above. A
+            // superclass constructor that dispatches back to an override
+            // reading `class Sub(val name: String)`'s `name` sees the argument
+            // under scalac, and saw `null` here.
+            for (slot, sort, fname, fdesc) in &param_info {
+                if fname.is_empty() {
+                    continue;
+                }
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
+            for (slot, sort, fname, fdesc) in &cap_info {
+                asm.aload(0);
+                load(asm, *slot, *sort);
+                asm.putfield(&class_name, fname, fdesc);
+            }
             // nsc: early vals are stored to fields before the superclass ctor so
-            // parent / trait `$init$` bodies see the values.
+            // parent / trait `$init$` bodies see the values. `mkTemplate` makes
+            // each one a *local* of the constructor first and `Constructors`
+            // copies it into the field: a later early definition reads the
+            // local, since `getfield` on `uninitializedThis` does not verify.
+            let mut early_locals = Vec::new();
             for vd in &inits {
                 if !is_presuper_val(vd) {
                     continue;
@@ -1256,13 +1280,22 @@ impl<'a> Gen<'a> {
                     if rhs.is_empty() || rhs.is_default_init() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
-                    asm.aload(0);
-                    gen_expr(asm, &mut frame, &ctx_early, rhs);
                     let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
                         st.get(vd.sym).ty.clone()
                     } else {
                         vd.ty.clone()
                     };
+                    let sort = jvm_sort(&ty);
+                    if sort == JvmSort::Void {
+                        gen_stat(asm, &mut frame, &ctx_early, rhs);
+                    } else {
+                        gen_expr(asm, &mut frame, &ctx_early, rhs);
+                    }
+                    let slot = frame.alloc(vd.sym, sort);
+                    store(asm, slot, sort);
+                    early_locals.push(vd.sym);
+                    asm.aload(0);
+                    load(asm, slot, sort);
                     emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
@@ -1336,18 +1369,10 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
-            for (slot, sort, fname, fdesc) in &param_info {
-                if fname.is_empty() {
-                    continue;
-                }
-                asm.aload(0);
-                load(asm, *slot, *sort);
-                asm.putfield(&class_name, fname, fdesc);
-            }
-            for (slot, sort, fname, fdesc) in &cap_info {
-                asm.aload(0);
-                load(asm, *slot, *sort);
-                asm.putfield(&class_name, fname, fdesc);
+            // After the super call the early fields are readable; the body
+            // reads them as fields, as nsc's does.
+            for sym in early_locals {
+                frame.locals.remove(&sym);
             }
             // From here on the field is the parameter: unbind the local so the
             // body's reads and writes go through it (see `mutable_params`).
@@ -1521,6 +1546,13 @@ impl<'a> Gen<'a> {
             CaptureSlots::new()
         };
         let mut tailrec_error = None;
+        // `@strictfp def m` on its own; a `@strictfp` template already set
+        // `b.strict_fp`.
+        let acc = if is_strictfp(self.st, def.sym) {
+            acc | ACC_STRICT
+        } else {
+            acc
+        };
         b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
             let mut ctx = emit_ctx(

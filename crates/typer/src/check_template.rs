@@ -1552,8 +1552,12 @@ impl Typer {
         let vars: Vec<(String, Type)> = body
             .iter()
             .filter_map(|t| match &t.kind {
+                // A `private[this] var` is a bare field with no setter, so
+                // nothing conflicts with it (scalac 2.13.16 accepts
+                // `private[this] var x: Int = 0; def x_=(v: Int) = ()`).
                 TreeKind::ValDef { mods, name, .. }
                     if mods.flags.contains(Flags::MUTABLE)
+                        && !mods.flags.contains(Flags::LOCAL)
                         && !t.sym.is_none()
                         && !self.block_local_defs.contains(&(self.file_index, t.id)) =>
                 {
@@ -1651,6 +1655,83 @@ impl Typer {
     fn check_mixin_parents(&mut self, class_id: SymbolId, span: Span) {
         if class_id.is_none() {
             return;
+        }
+        // nsc `validateParentClasses`: a `final` class has no subclasses, and
+        // a case class may not have a case class among its ancestors (the
+        // synthesized `equals` / `unapply` of the two would disagree). Both
+        // were accepted and compiled.
+        let own = self.st.get(class_id).flags;
+        // A case class's companion object carries the flag too, and `object
+        // End extends End()` beside `case class End()` is legal (`pos/jesper`):
+        // an object only counts as a `case object` when no case class of its
+        // name sits beside it.
+        let is_module =
+            self.st.get(class_id).kind == SymKind::ModuleClass || own.contains(Flags::MODULE);
+        let companion_of_case_class = is_module && {
+            let base = self.st.get(class_id).name.trim_end_matches('$').to_string();
+            let owner = self.st.get(class_id).owner;
+            self.st.get(owner).members.iter().any(|&m| {
+                let s = self.st.get(m);
+                s.kind == SymKind::Class && s.name == base && s.flags.contains(Flags::CASE)
+            })
+        };
+        let own_is_case = own.contains(Flags::CASE) && !companion_of_case_class;
+        for p in self.st.get(class_id).parents.clone().iter() {
+            let Some(ps) = self.st.class_sym_of(p) else {
+                continue;
+            };
+            if ps == class_id
+                || self.st.get(ps).kind != SymKind::Class
+                || [
+                    self.st.any_sym,
+                    self.st.anyref_sym,
+                    self.st.anyval_sym,
+                    self.st.object_sym,
+                ]
+                .contains(&ps)
+                || self.st.get(ps).jvm_name == "java/lang/Object"
+            {
+                continue;
+            }
+            let f = self.st.get(ps).flags;
+            let name = self.st.get(ps).name.clone();
+            // The prelude's hand-written stand-ins carry `FINAL` where the real
+            // class has none (`Exception`, `AnyRef`), so only a class read from
+            // a pickle or a class file, or defined in source, is trusted.
+            let stand_in = ps.0 < self.st.prelude_end && self.st.get(ps).pickled_origin.is_empty();
+            if f.contains(Flags::FINAL) && !f.contains(Flags::TRAIT) && !stand_in {
+                self.error(span, format!("illegal inheritance from final class {name}"));
+            }
+        }
+        // Any case class among the ancestors, not only a direct parent
+        // (`case class Dingus(y: Int) extends Innocent` with `class Innocent
+        // extends A(1)`, `neg/caseinherit`).
+        if own_is_case {
+            let case_ancestor = crate::lin::linearize(&self.st, class_id)
+                .into_iter()
+                .skip(1)
+                .find(|&c| {
+                    let s = self.st.get(c);
+                    c != class_id
+                        && s.kind == SymKind::Class
+                        && s.flags.contains(Flags::CASE)
+                        && !s.flags.contains(Flags::TRAIT)
+                });
+            if let Some(anc) = case_ancestor {
+                let what = if is_module {
+                    "case object"
+                } else {
+                    "case class"
+                };
+                let child = self.st.get(class_id).name.trim_end_matches('$').to_string();
+                let name = self.st.get(anc).name.clone();
+                self.error(
+                    span,
+                    format!(
+                        "{what} {child} has case ancestor {name}, but case-to-case inheritance is prohibited. To overcome this limitation, use extractors to pattern match on non-leaf nodes."
+                    ),
+                );
+            }
         }
         for p in self.st.get(class_id).parents.clone().iter().skip(1) {
             let Some(ps) = self.st.class_sym_of(p) else {
@@ -1870,7 +1951,33 @@ impl Typer {
                 self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
             }
         }
+        let ctor_fields = self.st.get(class_id).ctor_fields.clone();
         for m in self.st.get(class_id).members.clone() {
+            // A `val` / `var` declared in the body: its getter is a covariant
+            // position and a `var`'s setter a contravariant one (nsc reports
+            // the setter as `value a_=`). Only the constructor fields were
+            // checked, so `class Cell[+A](init: A) { var a: A = init }` -- a
+            // cell anyone could write a supertype into -- was accepted.
+            // `private[this]` members are exempt, as in nsc.
+            if self.st.get(m).kind == SymKind::Term
+                && !ctor_fields.contains(&m)
+                && self.st.get(m).owner == class_id
+            {
+                let flags = self.st.get(m).flags;
+                if flags.contains(Flags::SYNTHETIC)
+                    || flags.contains(Flags::PARAM)
+                    || flags.contains(Flags::LOCAL)
+                {
+                    continue;
+                }
+                let ty = self.st.get(m).ty.clone();
+                let name = self.st.get(m).name.clone();
+                if flags.contains(Flags::MUTABLE) {
+                    self.check_variance_ty(&vars, &ty, -1, span, &format!("value {name}_="));
+                }
+                self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
+                continue;
+            }
             if self.st.get(m).kind != SymKind::Method {
                 continue;
             }
@@ -2100,6 +2207,15 @@ impl Typer {
         if !matches!(s.kind, SymKind::Method | SymKind::Term) || s.name.ends_with("_=") {
             return None;
         }
+        // A `private[this] var` has no setter: `x = v` stores the field even
+        // beside a hand-written `def x_=` (which it would otherwise call,
+        // recursing forever when the assignment is that method's own body).
+        if s.kind == SymKind::Term
+            && s.flags.contains(Flags::LOCAL)
+            && s.flags.contains(Flags::MUTABLE)
+        {
+            return None;
+        }
         let owner = s.owner;
         let setter = format!("{name}_=");
         self.st
@@ -2170,6 +2286,9 @@ impl Typer {
         };
         for a in &mods.annotations {
             let path = a.annotation_path();
+            if crate::strictfp::is_strictfp_annot(&path) {
+                self.check_strictfp_annotation(a);
+            }
             if is_tailrec_annot(&path) {
                 if !matches!(&tree.kind, TreeKind::DefDef { .. }) {
                     self.error(

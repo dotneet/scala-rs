@@ -22,6 +22,9 @@ pub const ACC_TRANSIENT: u16 = 0x0080;
 /// a Java varargs array (`@scala.annotation.varargs`).
 pub const ACC_VARARGS: u16 = 0x0080;
 pub const ACC_SYNTHETIC: u16 = 0x1000;
+/// `strictfp` (`@scala.annotation.strictfp`); meaningful up to class file
+/// version 60, and this writer emits 52.
+pub const ACC_STRICT: u16 = 0x0800;
 
 pub struct EmittedClass {
     /// e.g. `"Main"`, `"Main$"`, `"scala/Option"`

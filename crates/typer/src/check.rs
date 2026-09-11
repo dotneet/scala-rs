@@ -690,6 +690,13 @@ pub struct Typer {
     /// Number of scopes the prelude occupies; they stay in place while a
     /// signature is completed in the scope of its own definition.
     pub(crate) lazy_base_scopes: usize,
+    /// While a constructor default is typed: the class whose access rights
+    /// it has -- the companion that holds its `<init>$default$N` getter, as in
+    /// nsc. Its lexical owner is the class's *enclosing* scope (the class's
+    /// members are out of reach), which would otherwise leave it no rights at
+    /// all: `class A private (b: A.B = A.b)` names two private members of
+    /// `object A` (`pos/t5217`).
+    pub(crate) access_class_override: SymbolId,
     /// Default-argument expressions waiting to be typed. While signatures are
     /// being built the units that come later have not been walked yet, so a
     /// default that names one of their members would see `<notype>`; nsc types
@@ -1099,6 +1106,7 @@ impl Typer {
             lazy_done: HashMap::new(),
             lazy_body_done: HashSet::new(),
             lazy_base_scopes,
+            access_class_override: SymbolId::NONE,
             defer_default_rhs: false,
             pending_ctor_defaults: Vec::new(),
             default_scopes: HashMap::new(),

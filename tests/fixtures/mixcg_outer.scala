@@ -46,6 +46,9 @@ object Scope {
   class E2(x: Int) extends P(x + a) { def a = 100 }
   class E3[T: Ordering](x: T) extends P(implicitly[Ordering[T]].compare(x, x) + a)
   object E4 extends P(a) { val a = 2 }
+  // An early definition is a constructor local ahead of the super call: the
+  // parent's arguments do see it.
+  class E5 extends { val a = 30 } with P(a + 1) with HasA
 }
 
 object Main {
@@ -78,5 +81,6 @@ object Main {
     println(h1.In(1).hashCode == h2.In(1).hashCode)
 
     println(new Scope.E1().p + " " + new Scope.E2(1).p + " " + new Scope.E3(3).p + " " + Scope.E4.p)
+    println(new Scope.E5().p + " " + new Scope.E5().a)
   }
 }
