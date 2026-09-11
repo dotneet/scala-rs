@@ -1805,6 +1805,16 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                 }
             }
         }
+        // An `Object[]` parameter keeps its element as `ObjectTpeJava`, which
+        // is `=:=` both `Any` and `AnyRef`: without it `Arrays.fill(Object[],
+        // Object)` took no `Array[AnyRef]` at all. A varargs `Object...` is a
+        // sequence of values and stays `Any*`, so `String.format("%d", 1)`
+        // still boxes its argument.
+        for p in params.iter_mut() {
+            if let Type::Array(elem) = p {
+                *p = Type::Array(Box::new(java_array_element((**elem).clone())));
+            }
+        }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
         let flags = java_method_flags(m, c.is_scala);
         let id = add_method_types(st, owner, &m.name, names, params, ret);

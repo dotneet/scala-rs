@@ -528,6 +528,12 @@ impl Typer {
                 tree.ty = Type::Error;
                 return;
             }
+            // nsc: a default initializer is for fields only.
+            if self.block_local_defs.contains(&(self.file_index, tree.id)) {
+                self.error(tree.span, "local variables must be initialized");
+                tree.ty = declared;
+                return;
+            }
             let lit = match declared.widen_constant() {
                 Type::Int => Lit::Int(0),
                 Type::Long => Lit::Long(0),
@@ -539,6 +545,12 @@ impl Typer {
                 _ => Lit::Null,
             };
             let span = rhs.span;
+            // The zero of a type parameter or an abstract type is still the
+            // JVM's `null` (`var hd: A = _` all over `Iterator`), but `null`
+            // is no `A` to the typer -- nsc rejects `var hd: A = null` -- so
+            // a stand-in `null` there is not type-checked, only stamped.
+            let unchecked_null =
+                matches!(lit, Lit::Null) && !self.st.is_sub_type(&Type::Null, &declared);
             **rhs = Tree {
                 id: rhs.id,
                 span,
@@ -551,7 +563,9 @@ impl Typer {
                 byname_thunk: false,
                 byname_type_marker: false,
             };
-            self.type_expr(rhs, &declared);
+            if !unchecked_null {
+                self.type_expr(rhs, &declared);
+            }
             tree.ty = declared;
             return;
         }
@@ -2120,16 +2134,23 @@ impl Typer {
             _ => Vec::new(),
         };
         let raw_tparams = self.st.get(class_id).tparams.clone();
+        // `extends NumericOps(lhs)` inside `Integral[T]`: the parent is an
+        // inner class of a base trait, read through the enclosing `this`.
+        let outer_prefix = self.ctor_outer_prefix(class_id, fun);
         let prototypes: Vec<Vec<Type>> = self
             .st
             .lookup_member(class_id, "<init>")
             .into_iter()
             .filter(|&id| self.st.get(id).owner == class_id)
             .filter_map(|id| {
-                match self
+                let ty = self
                     .st
-                    .subst_tparams(class_id, &written_targs, &self.st.get(id).ty)
-                {
+                    .subst_tparams(class_id, &written_targs, &self.st.get(id).ty);
+                let ty = match &outer_prefix {
+                    Some(p) => self.st.subst_as_seen_from(p, &ty),
+                    None => ty,
+                };
+                match ty {
                     Type::Method { paramss, .. } => Some(paramss.into_iter().flatten().collect()),
                     _ => None,
                 }
@@ -2202,7 +2223,10 @@ impl Typer {
         // checked through the normal default-argument path.
         self.ensure_external_ctor_defaults(class_id, tree.span);
         self.supply_binary_ctors(class_id);
-        match self.pick_ctor_at(class_id, &targs, &arg_tys, None) {
+        let saved_prefix = std::mem::replace(&mut self.ctor_prefix, outer_prefix);
+        let picked = self.pick_ctor_at(class_id, &targs, &arg_tys, None);
+        self.ctor_prefix = saved_prefix;
+        match picked {
             OverloadPick::Found(sym, param_tys, _) => {
                 // `class Sub[T](y: T) extends Base[T](y)`: the constructor's
                 // parameters are stated in `Base`'s own `T`, and
@@ -2475,6 +2499,12 @@ impl Typer {
                 ty
             } else {
                 self.st.subst_tparams(class_id, targs, &ty)
+            };
+            // An inner class's parameters, read through the prefix it is
+            // instantiated on (`Typer::ctor_outer_prefix`).
+            let ty = match &self.ctor_prefix {
+                Some(p) => self.st.subst_as_seen_from(p, &ty),
+                None => ty,
             };
             match ty {
                 Type::Method { paramss, ret } if paramss.len() > 1 => Type::Method {

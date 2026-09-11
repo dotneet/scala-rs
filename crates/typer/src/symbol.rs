@@ -5271,6 +5271,16 @@ impl SymbolTable {
             // the other (`Array[Byte]` is an `Array[_ <: AnyVal]`), same rule
             // as for an invariant class parameter above.
             (Type::Array(x), Type::Array(y)) => {
+                // A Java `Object[]` element is nsc's `ObjectTpeJava`, which is
+                // the same type as both `Any` and `AnyRef`: scalac passes an
+                // `Array[Any]` and an `Array[AnyRef]` to
+                // `Arrays.fill(Object[], Object)`, and still rejects an
+                // `Array[String]` (the second half below).
+                let java_object_twin =
+                    |j: &Type, o: &Type| matches!(j, Type::JavaObject) && matches!(o, Type::Any | Type::AnyRef | Type::JavaObject);
+                if java_object_twin(x, y) || java_object_twin(y, x) {
+                    return true;
+                }
                 if is_wildcard_arg(x) || is_wildcard_arg(y) {
                     self.is_sub_type(x, y)
                 } else {
