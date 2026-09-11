@@ -1,0 +1,6 @@
+true
+gr
+(3,2,1)
+(1,false)
+(true,4)
+(true,98)

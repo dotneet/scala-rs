@@ -3180,6 +3180,16 @@ pub(crate) fn gen_apply(
             super_is_qualified(fun),
             selected_params.as_deref(),
         );
+        // `override def addAll(xs): this.type = super.addAll(xs)`: the parent
+        // returns its own erasure (`Growable`) and the tree is this class's
+        // `this.type`, erased to this class. scalac casts, as it does for any
+        // call whose declared erasure is wider than the tree's; `invoke_method`
+        // does the same for every other call. An `Object`-returning (generic)
+        // super call is left alone: its unboxing is decided elsewhere.
+        let desc = method_desc_from_sym(ctx.st, fun.sym);
+        if !desc_returns_object(&desc) {
+            maybe_unbox_erased_result(asm, ctx, &desc, Some(&tree.ty));
+        }
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {

@@ -319,22 +319,57 @@ impl Typer {
             // function literal *inside* an argument -- slick's
             // `StatementParameters(…, if (…) … else { s => …; … }, …)`, whose
             // case-class `apply` lands on this path -- has nowhere else to
-            // read its parameter types from. Only for a monomorphic class,
-            // only where the arity settles which constructor this is, and only
-            // for a fully determined function-shaped parameter.
+            // read its parameter types from. Only for a monomorphic class (or
+            // one whose type arguments were written), only where the arity
+            // settles which constructor this is, and only for a fully
+            // determined parameter.
+            //
+            // A class with a *single* constructor has nothing to pick, so
+            // every such parameter is the argument's expected type, as it is
+            // for nsc (`doTypedApply` types the arguments of a monomorphic
+            // method against its formals). An invariant one decides the
+            // argument's own inference: `new BitmapIndexedMapNode[K, V1](…,
+            // Array(k, v), …)` passes an `Array[Any]` in scalac, and typed
+            // with no expected type `Array(k, v)` was an `Array[AnyRef]`.
+            // With several constructors a parameter is a hint for a function
+            // literal only: `new C(1)` beside `C(Long)` and `C(Int)` must
+            // still pick on the argument's own type.
+            let outer_prefix = class_id.and_then(|c| self.ctor_outer_prefix(c, fun));
+            let single_ctor = class_id.is_some_and(|c| {
+                self.st
+                    .lookup_member(c, "<init>")
+                    .into_iter()
+                    .filter(|&id| {
+                        self.st.get(id).owner == c
+                            && self.st.get(id).kind == crate::symbol::SymKind::Method
+                    })
+                    .count()
+                    == 1
+            });
             let mut ctor_protos: Vec<Type> = class_id
-                .filter(|_| tps.is_empty())
-                .map(|c| self.st.get(c).ctor_fields.clone())
-                .filter(|fs| fs.len() == args.len())
-                .map(|fs| {
+                .filter(|_| tps.is_empty() || explicit.len() == tps.len())
+                .map(|c| (c, self.st.get(c).ctor_fields.clone()))
+                .filter(|(_, fs)| fs.len() == args.len())
+                .map(|(c, fs)| {
                     fs.iter()
                         .map(|f| {
                             let t = self.st.get(*f).ty.clone();
+                            let t = if tps.is_empty() {
+                                t
+                            } else {
+                                self.st.subst_tparams(c, &explicit, &t)
+                            };
+                            let t = match &outer_prefix {
+                                Some(p) => self.st.subst_as_seen_from(p, &t),
+                                None => t,
+                            };
                             if !t.is_no_type()
                                 && !t.is_error()
                                 && !type_mentions_wildcard(&t)
                                 && !mentions_any_tparam(&t)
-                                && self.is_function_shaped(&t)
+                                && (self.is_function_shaped(&t)
+                                    || (single_ctor
+                                        && !matches!(t, Type::ByName(_) | Type::Repeated(_))))
                             {
                                 t
                             } else {
@@ -344,19 +379,18 @@ impl Typer {
                         .collect()
                 })
                 .unwrap_or_default();
-            // A class with a single constructor is not an overload, and nsc
-            // types each argument against that constructor's formal parameter
-            // (`Typers.doTypedApply`, after `preSelectOverloaded` has nothing
-            // to choose). The parameter is what instantiates a polymorphic
-            // argument: `new Node(Array.empty, Array.empty)` on
-            // `Node(content: Array[Any], hashes: Array[Int])` builds an
-            // `Object[]` and an `int[]`, and `Array(x)` for an `Array[Any]`
-            // parameter searches `ClassTag[Any]`, not `ClassTag[A]`. Typed
-            // with no expected type, both searched a tag for a variable
-            // nothing had solved (`scala/collection/immutable/HashSet.scala`,
-            // `HashMap.scala`). Only a parameter that is already a proper
-            // type here -- the class's own type parameters written or
-            // substituted away -- and still only a hint (see below).
+            // The same single-constructor rule where the fields above say
+            // nothing: a *polymorphic* class whose type arguments are being
+            // inferred still has parameters that do not mention them, and
+            // those are fully determined -- `new Node(Array.empty,
+            // Array.empty, 0)` on `Node[A](content: Array[Any], hashes:
+            // Array[Int], n: Int)` builds an `Object[]` and an `int[]` in
+            // scalac (`EmptyMapNode` in `HashMap.scala`), and typed with no
+            // expected type both searched a `ClassTag` for a variable nothing
+            // had solved. The constructor's own signature is read, so a class
+            // with no `ctor_fields` (one read from a class file) is covered
+            // too. Only a closed type (`is_closed_ctor_proto`), and only the
+            // slots still empty.
             if let (Some(c), None) = (class_id, curried_clauses.as_ref()) {
                 if let Some(ctor) = self.sole_own_ctor(c) {
                     let first = match &self.st.get(ctor).ty {
@@ -449,7 +483,13 @@ impl Typer {
                         .get(c)
                         .ctor_fields
                         .iter()
-                        .map(|f| self.st.get(*f).ty.clone())
+                        .map(|f| {
+                            let t = self.st.get(*f).ty.clone();
+                            match &outer_prefix {
+                                Some(p) => self.st.subst_as_seen_from(p, &t),
+                                None => t,
+                            }
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -468,6 +508,7 @@ impl Typer {
                 // its `targs` all along (`pick_ctor_at`); the `new` path did
                 // not.
                 self.supply_binary_ctors(c);
+                let saved_prefix = std::mem::replace(&mut self.ctor_prefix, outer_prefix.clone());
                 let mut picked =
                     self.pick_ctor_at_clause(c, &explicit, &arg_tys, None, curried_first_len);
                 // An argument whose class is still a `-cp` stub is a subtype of
@@ -483,6 +524,7 @@ impl Typer {
                     picked =
                         self.pick_ctor_at_clause(c, &explicit, &arg_tys, None, curried_first_len);
                 }
+                self.ctor_prefix = saved_prefix;
                 match picked {
                     OverloadPick::Found(sym, ps, _) => {
                         params_at_targs = !explicit.is_empty();
@@ -1431,19 +1473,7 @@ impl Typer {
                                 // `it.grouped(2).map { case Seq(i, t) => … }` typed
                                 // its lambda against `Int` and emitted a
                                 // `checkcast` that is a `VerifyError` at run time.
-                                let settled = fp.len() == 1 && {
-                                    let mut open = Vec::new();
-                                    collect_tparams(&fp[0], &mut open);
-                                    open.is_empty()
-                                        && !fp[0].is_no_type()
-                                        && !matches!(
-                                            fp[0],
-                                            Type::Named { .. }
-                                                | Type::Any
-                                                | Type::AnyRef
-                                                | Type::TypeMember(_)
-                                        )
-                                };
+                                //
                                 // A *rigid* type parameter is settled too. Read
                                 // through the receiver, `class Vd[+E, +A] { def
                                 // map[B](f: A => B) }` states its parameter as
@@ -1456,11 +1486,33 @@ impl Typer {
                                 // still written in the *declaring* class's own
                                 // parameter, which is not in scope at the call
                                 // site.
-                                let settled = settled
-                                    || matches!(&fp[..], [Type::TypeParam(tp)]
-                                        if self.tparam_in_scope(*tp)
-                                            && !self.undet_tvars.contains(tp)
-                                            && !self.st.get(sym).tparams.contains(tp));
+                                //
+                                // That holds inside a larger type as well:
+                                // `Node[K, V]`'s own
+                                // `foreach[U](f: ((K, V)) => U)`, called as
+                                // `_next.foreach(f)` in mutable `HashMap`, states
+                                // `(K, V)` with both parameters in scope, and the
+                                // guess (`Node` is in `scala/collection/` but no
+                                // collection, so its first argument `K`) made it
+                                // "found: ((K, V)) => U  required: (K) => Any".
+                                let rigid = |tp: &SymbolId| {
+                                    self.tparam_in_scope(*tp)
+                                        && !self.undet_tvars.contains(tp)
+                                        && !self.st.get(sym).tparams.contains(tp)
+                                };
+                                let settled = fp.len() == 1 && {
+                                    let mut open = Vec::new();
+                                    collect_tparams(&fp[0], &mut open);
+                                    open.iter().all(rigid)
+                                        && !fp[0].is_no_type()
+                                        && !matches!(
+                                            fp[0],
+                                            Type::Named { .. }
+                                                | Type::Any
+                                                | Type::AnyRef
+                                                | Type::TypeMember(_)
+                                        )
+                                };
                                 let fparams = if fp.len() == 1
                                     && !settled
                                     && self.st.kind_arity(&elem) == 0

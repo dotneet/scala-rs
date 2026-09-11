@@ -237,6 +237,9 @@ impl Typer {
                 }
             }
         }
+        // A template's self alias (`trait Function1[-T1, +R] { self => … }`)
+        // is a name in that template's scope, not a member, and never reaches
+        // `found`: `bind_self_type` keeps it out of the template's `members`.
         // Module: members of module class
         if found.is_empty() {
             if let Type::ModuleRef(id) = &recv_ty {
@@ -661,6 +664,22 @@ impl Typer {
         } else {
             Vec::new()
         };
+        // A receiver typed by an abstract type (`clone(): C`, `empty: C`) is
+        // read through its bound, but `this.type` in the member stands for
+        // the receiver itself: `clone() -= key` is a `C`. And `super.m` is
+        // selected on this class's `this` (SLS 6.5), so a `this.type` in its
+        // result is this class's even where it is not the whole result:
+        // `override def lazyZip[B](that): LazyZip2[A, B, LazyList.this.type] =
+        // super.lazyZip(that)`.
+        let this_prefix = match (&qual.ty, super_this) {
+            (_, Some(here)) if ext_conv.is_none() => Some(Type::ThisType(here)),
+            (Type::TypeParam(_) | Type::TypeMember(_), None)
+                if ext_conv.is_none() && recv_ty != qual.ty =>
+            {
+                Some(qual.ty.clone())
+            }
+            _ => None,
+        };
         let subst = |ty: Type| -> Type {
             let ty = apply_path_members(ty, &path_members);
             // `import seq.integral._; increment < zero` is
@@ -672,7 +691,10 @@ impl Typer {
             } else {
                 self.at_import_prefix_of(ext_conv, &ty).unwrap_or(ty)
             };
-            let ty = self.st.subst_as_seen_from(&recv_ty, &ty);
+            let ty = match &this_prefix {
+                Some(p) => self.st.subst_as_seen_from_prefix(&recv_ty, p, &ty),
+                None => self.st.subst_as_seen_from(&recv_ty, &ty),
+            };
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                     return self.st.subst_tparams(owner, &subst_args, &ty);
@@ -2636,7 +2658,7 @@ impl Typer {
                     .rewrite_update_assignment_op(tree, table, indices, &name, rhs_args, pt);
             }
         }
-        if self.is_assignable_lhs(qual) || self.is_var_getter_lhs(qual) {
+        if self.is_assignable_lhs(qual) {
             let op = name[..name.len() - 1].to_string();
             let lhs = (**qual).clone();
             let rhs_args = args.clone();
@@ -2701,29 +2723,34 @@ impl Typer {
             return false;
         }
         let s = self.st.get(tree.sym);
-        s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE)
-    }
-
-    /// nsc `treeInfo.isVariableOrGetter`'s getter half (`mayBeVarGetter`
-    /// plus a `name_=` beside it): a *parameterless* `def` of a class whose
-    /// owner also has the setter. `size += 1` on `def size = _size` with a
-    /// `private def size_=(s: Int)` (`mutable/OpenHashMap.scala`) is
-    /// `size = size + 1`, which the `Assign` case turns into `size_=(…)`.
-    /// A `val` is stable and a `def size()` has a parameter list, and nsc
-    /// refuses both even when a `size_=` exists.
-    fn is_var_getter_lhs(&mut self, tree: &Tree) -> bool {
-        if tree.sym.is_none() {
-            return false;
+        if s.kind == SymKind::Term && s.flags.contains(Flags::MUTABLE) {
+            return true;
         }
-        let s = self.st.get(tree.sym);
+        // nsc `isVariableOrGetter`: a getter (`mayBeVarGetter` -- a
+        // parameterless, non-lazy `def` of a class) whose owner also has a
+        // `name_=`. `x += 1` then becomes `x = x + 1`, which the assignment
+        // turns into the setter call. OpenHashMap writes `size += 1` over
+        // `override def size = _size` / `private[this] def size_=(s: Int)`,
+        // and PriorityQueue `resarr.p_size0 += 1` over a `def p_size0` /
+        // `def p_size0_=` pair; both were "receiver is not assignable".
+        // `def x()` (empty parentheses) and a `val` are not getters, and
+        // scalac rejects `+=` on them even with a setter beside them.
         if s.kind != SymKind::Method
-            || !s.paramss.is_empty()
             || s.name.ends_with("_=")
-            || !self.st.get(s.owner).is_class_like()
+            || s.flags.contains(Flags::LAZY)
+            || matches!(&s.ty, Type::Method { paramss, .. } if !paramss.is_empty())
+            || !matches!(
+                self.st.get(s.owner).kind,
+                SymKind::Class | SymKind::ModuleClass | SymKind::Module
+            )
         {
             return false;
         }
-        self.setter_assign_lhs(tree) || self.ident_setter_assign_lhs(tree).is_some()
+        let setter = format!("{}_=", s.name);
+        self.st
+            .lookup_member(s.owner, &setter)
+            .into_iter()
+            .any(|m| self.st.get(m).kind == SymKind::Method)
     }
 
     /// nsc `convertToAssignment`'s `mkUpdate`: `t(i) op= x` is

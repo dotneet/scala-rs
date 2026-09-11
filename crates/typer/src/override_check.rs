@@ -415,22 +415,30 @@ fn show_sig_at(st: &SymbolTable, m: SymbolId, ty: &Type, ret: &Type, cls: Symbol
 
 // ------------------------------------------------------------------ matching
 
-/// `def f: T` and `def f(): T` match, so a single empty clause is dropped.
 /// nsc reads `java.lang.Object` in a Java signature as `ObjectTpeJava`, a
-/// type that is the same as `Any` *and* as `AnyRef`. This compiler reads a
-/// Java `Object` parameter as `Any`, so `override def contains(o: Object)` on
-/// a `java.util.AbstractCollection` subclass (`JavaCollectionWrappers`)
-/// compared `AnyRef` with `Any` and "overrode nothing", where scalac accepts
-/// `AnyRef`, `Object` and `Any` alike. Against a Java member both sides are
-/// compared with every `Object` spelling folded to `Any`; a Scala member is
-/// left alone, where `Any` and `AnyRef` really are two overloads.
-fn java_object_params(java: bool, paramss: Vec<Vec<Type>>) -> Vec<Vec<Type>> {
+/// type that is the same as `Any` *and* as `AnyRef` (nsc `matchingParams`).
+/// This compiler reads a Java `Object` parameter as `Any`, so `override def
+/// contains(o: Object)` / `remove(elem: AnyRef)` over a
+/// `java.util.AbstractCollection` method (`JavaCollectionWrappers`, four
+/// times) compared `AnyRef` with `Any` and "overrode nothing", where scalac
+/// accepts `AnyRef`, `Object` and `Any` alike. When either member of the pair
+/// is a Java one, both sides are compared with every spelling of `Object`
+/// folded to `Any` -- inside type arguments too, which is what gitbucket's
+/// `migrate` over a Java `Map<String, Object>` needs. Between two Scala
+/// members nothing is folded: there `Any` and `AnyRef` really are two
+/// overloads.
+fn java_object_params(st: &SymbolTable, java: bool, paramss: Vec<Vec<Type>>) -> Vec<Vec<Type>> {
     if !java {
         return paramss;
     }
     let fold = |t: &Type| {
         crate::symbol::map_type(t, &mut |n: &Type| match n {
             Type::AnyRef | Type::JavaObject => Type::Any,
+            Type::Class { sym, args }
+                if args.is_empty() && (*sym == st.object_sym || *sym == st.anyref_sym) =>
+            {
+                Type::Any
+            }
             other => other.clone(),
         })
     };
@@ -440,6 +448,13 @@ fn java_object_params(java: bool, paramss: Vec<Vec<Type>>) -> Vec<Vec<Type>> {
         .collect()
 }
 
+/// Whether a pair of members is compared with Java's `Object` folded
+/// ([`java_object_params`]).
+fn java_pair(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
+    st.get(base).flags.contains(Flags::JAVA) || st.get(child).flags.contains(Flags::JAVA)
+}
+
+/// `def f: T` and `def f(): T` match, so a single empty clause is dropped.
 fn norm_paramss(paramss: &[Vec<Type>]) -> Vec<Vec<Type>> {
     if paramss.len() == 1 && paramss[0].is_empty() {
         return Vec::new();
@@ -705,11 +720,12 @@ fn matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: SymbolId) -> 
         Type::Method { paramss, .. } => norm_paramss(paramss),
         _ => Vec::new(),
     };
-    let java = st.get(base).flags.contains(Flags::JAVA);
-    let bps = java_object_params(java, bps);
+    // nsc `matchingParams`: a Java method's `Object` is `ObjectTpeJava`.
+    let java = java_pair(st, child, base);
+    let bps = java_object_params(st, java, bps);
     let rigid = rigid_tparams(st, cls, child);
     let agrees = |cps: &[Vec<Type>]| {
-        let cps = &java_object_params(java, cps.to_vec())[..];
+        let cps = &java_object_params(st, java, cps.to_vec())[..];
         cps.len() == bps.len()
             && cps.iter().zip(bps.iter()).all(|(c, b)| {
                 c.len() == b.len()
@@ -770,13 +786,13 @@ fn provably_overloaded(st: &SymbolTable, cls: SymbolId, child: SymbolId, base: S
         Type::Method { paramss, .. } => norm_paramss(paramss),
         _ => return false,
     };
-    let java = st.get(base).flags.contains(Flags::JAVA);
-    let bps = java_object_params(java, bps);
+    let java = java_pair(st, child, base);
+    let bps = java_object_params(st, java, bps);
     let rigid = rigid_tparams(st, cls, child);
     // Proven only when *both* readings of the child say so, mirroring the
     // union `matches` takes.
     let differs = |cps: &[Vec<Type>]| {
-        let cps = &java_object_params(java, cps.to_vec())[..];
+        let cps = &java_object_params(st, java, cps.to_vec())[..];
         cps.len() == bps.len()
             && cps.iter().zip(bps.iter()).any(|(c, b)| {
                 c.len() == b.len()
@@ -801,11 +817,11 @@ fn strict_method_matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base:
     {
         return false;
     }
-    let java = st.get(base).flags.contains(Flags::JAVA);
-    let cps = java_object_params(java, paramss_of(st, child));
+    let java = java_pair(st, child, base);
+    let cps = java_object_params(st, java, paramss_of(st, child));
     let bty = base_type_at(st, cls, base, child);
     let bps = match &bty {
-        Type::Method { paramss, .. } => java_object_params(java, norm_paramss(paramss)),
+        Type::Method { paramss, .. } => java_object_params(st, java, norm_paramss(paramss)),
         _ => return false,
     };
     cps.len() == bps.len()
@@ -832,7 +848,10 @@ fn strict_method_matches(st: &SymbolTable, cls: SymbolId, child: SymbolId, base:
 fn full_lin(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
     let mut out = linearize(st, cls);
     let universal = if is_any_rooted(st, cls) {
-        vec![st.any_sym]
+        // `AnyVal` is a base class of every value class, and it declares
+        // `getClass(): Class[_ <: AnyVal]`. A value class names it as the
+        // `Type::AnyVal` variant, which the linearization does not enter.
+        vec![st.anyval_sym, st.any_sym]
     } else {
         vec![st.object_sym, st.anyref_sym, st.any_sym]
     };
@@ -842,6 +861,32 @@ fn full_lin(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
         }
     }
     out
+}
+
+/// A trait that extends `Any` rather than `AnyRef` (SLS 5.3: a universal
+/// trait), directly or through another universal trait.
+fn is_universal_trait(st: &SymbolTable, cls: SymbolId) -> bool {
+    fn walk(st: &SymbolTable, cls: SymbolId, depth: usize) -> bool {
+        if depth > 32 || !is_interface(st, cls) {
+            return false;
+        }
+        let parents = &st.get(cls).parents;
+        let names_any = |p: &Type| match p {
+            Type::Any => true,
+            Type::Class { sym, .. } => *sym == st.any_sym,
+            _ => false,
+        };
+        if parents.iter().any(names_any) {
+            return true;
+        }
+        match parents.first().and_then(|p| st.class_sym_of(p)) {
+            Some(first) if first != st.anyref_sym && first != st.object_sym => {
+                walk(st, first, depth + 1)
+            }
+            _ => false,
+        }
+    }
+    walk(st, cls, 0)
 }
 
 /// A template whose base classes stop at `Any`: `Any` itself, `AnyVal`, and
@@ -948,6 +993,45 @@ fn overridden(st: &SymbolTable, cls: SymbolId, child: SymbolId) -> Vec<SymbolId>
         }
     }
     out
+}
+
+/// Whether `child` overrides a member `cls` only has through its own declared
+/// self type.
+///
+/// nsc's "overrides nothing" test (RefChecks, check 4) searches
+/// `clazz.thisType.baseClasses`, and a template's `this` is typed by its self
+/// type: `protected trait GenKeySet { this: Set[K] => override def size: Int =
+/// MapOps.this.size }` (scala/scala's `collection.Map`) overrides `Set`'s
+/// `size`. Only the "overrides nothing" test looks there -- the overriding
+/// pairs themselves are formed from real base classes, as in nsc -- and
+/// only the class's *own* self type counts, not one a parent declares.
+fn overrides_through_self_type(st: &SymbolTable, cls: SymbolId, child: SymbolId) -> bool {
+    let Some(self_ty) = st.get(cls).self_type.clone() else {
+        return false;
+    };
+    let name = st.get(child).name.clone();
+    for sc in st.self_type_classes(&self_ty) {
+        for base in full_lin(st, sc) {
+            if base == cls {
+                continue;
+            }
+            for &m in &st.get(base).members {
+                if st.get(m).owner != base || st.get(m).name != name {
+                    continue;
+                }
+                if !is_overridable_kind(st, m)
+                    || !is_member_of(st, base, m)
+                    || is_private_to_owner(st, m)
+                {
+                    continue;
+                }
+                if matches(st, cls, child, m) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Record source method identities that were proven before erasure.  The
@@ -1134,6 +1218,7 @@ pub fn check_overrides(
             if st.get(child).flags.contains(Flags::OVERRIDE)
                 && !product_edge_missing(st, cls)
                 && !approximated
+                && !overrides_through_self_type(st, cls, child)
             {
                 let word = if st.get(child).kind == SymKind::Method {
                     "method"
@@ -1253,6 +1338,16 @@ fn check_pair(
 
     // 5. `final` members are closed.
     if st.get(base).flags.contains(Flags::FINAL) && modifiers_are_known(st, base) {
+        // nsc: `Object` is not a base class of a universal trait, so its
+        // final methods are not "overridden" there -- but the JVM would still
+        // see a default method replacing one, and RefChecks bans that under
+        // its own wording.
+        let base_owner = st.get(base).owner;
+        if (base_owner == st.object_sym || base_owner == st.anyref_sym)
+            && is_universal_trait(st, cls)
+        {
+            return Some("trait cannot redefine final method from class AnyRef".to_string());
+        }
         return Some(format!("cannot override final member:\n{decl}"));
     }
 
@@ -1344,6 +1439,9 @@ fn check_pair(
     if inferred_result(child) && st.get(child).kind == SymKind::Method {
         return None;
     }
+    if let Some(ok) = existential_result_conforms(st, &crt, &brt) {
+        return if ok { None } else { Some(mismatch()) };
+    }
     if !robust(&brt) || !robust(&crt) {
         return None;
     }
@@ -1351,6 +1449,79 @@ fn check_pair(
         return None;
     }
     Some(mismatch())
+}
+
+/// `crt <: brt` for a base result that is an existential over its class's
+/// parameters -- every argument a wildcard, as in `Any.getClass(): Class[_]`
+/// and `AnyVal.getClass(): Class[_ <: AnyVal]`. `robust` refuses any type
+/// with a wildcard in it, which would let every override of these through;
+/// but with the wildcards at the top the question needs no approximation:
+///
+/// * the same class: each argument has to lie within its wildcard's bounds
+///   (`Class[Int]` within `_ <: AnyVal`, not `Class[String]`);
+/// * a class that cannot reach the base's at all (`String` against
+///   `Class[_]`): no argument makes it conform.
+///
+/// `None` is "not this shape", and the caller's usual rules apply.
+fn existential_result_conforms(st: &SymbolTable, crt: &Type, brt: &Type) -> Option<bool> {
+    let Type::Class {
+        sym: b,
+        args: bargs,
+    } = brt
+    else {
+        return None;
+    };
+    if bargs.is_empty() {
+        return None;
+    }
+    for w in bargs {
+        match w {
+            Type::Wildcard => {}
+            Type::BoundedWildcard { lo, hi } => {
+                if lo.as_deref().is_some_and(|l| !robust(l))
+                    || hi.as_deref().is_some_and(|h| !robust(h))
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if !robust(crt) {
+        return None;
+    }
+    let c = match crt {
+        Type::Class { sym, .. } => *sym,
+        Type::String
+        | Type::Int
+        | Type::Long
+        | Type::Short
+        | Type::Byte
+        | Type::Char
+        | Type::Float
+        | Type::Double
+        | Type::Boolean
+        | Type::Unit => st.class_sym_of(crt)?,
+        _ => return None,
+    };
+    if c != *b {
+        let (jc, jb) = (&st.get(c).jvm_name, &st.get(*b).jvm_name);
+        let unrelated = !jc.is_empty() && !jb.is_empty() && jc != jb;
+        return (unrelated && st.class_reaches(c, *b) == Some(false)).then_some(false);
+    }
+    let Type::Class { args: cargs, .. } = crt else {
+        return None;
+    };
+    if cargs.len() != bargs.len() {
+        return None;
+    }
+    Some(cargs.iter().zip(bargs).all(|(a, w)| match w {
+        Type::BoundedWildcard { lo, hi } => {
+            lo.as_deref().is_none_or(|l| st.is_sub_type(l, a))
+                && hi.as_deref().is_none_or(|h| st.is_sub_type(a, h))
+        }
+        _ => true,
+    }))
 }
 
 /// The override's type parameters must accept at least what the base's do:

@@ -1,0 +1,22 @@
+List(null, null, null)
+List((), (), ())
+List(x, (), ())
+List(7, 7)
+[7, 7]
+List((1,a), (1,a))
+List((2,b))
+6
+2
+List(0, 10, 7, 17)
+List(1.5, 99.0, 7.0)
+java.lang.Long java.lang.Integer
+java.lang.Integer 3
+6
+true
+null
+x
+List(1, a)
+List(x, y)
+List(a, 1) x
+1
+int

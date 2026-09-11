@@ -34,13 +34,14 @@ impl Typer {
             self.st.pop_scope();
         }
         let span = tree.span;
-        if let Some(w) = self.weak_numeric_branch_lub(pt, &branch_tys) {
+        // `numericLub`, as for an `if` (see `numeric_branch_lub`).
+        if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
             if let TreeKind::Match { cases, .. } = &mut tree.kind {
                 for c in cases.iter_mut() {
-                    self.adapt_numeric_branch(&mut c.body, &w);
+                    self.adapt(&mut c.body, &num);
                 }
             }
-            tree.ty = w;
+            tree.ty = num;
         } else {
             tree.ty = self.branch_result_ty(pt, &branch_tys, res);
         }

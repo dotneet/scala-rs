@@ -1437,10 +1437,10 @@ impl Typer {
                 // `Option[X]` as a common ancestor (sgap fixture; slick's
                 // `PositionedResult.nextXOption()` methods rely on exactly this).
                 let branch_tys = [thenp.ty.clone(), elsep.ty.clone()];
-                if let Some(w) = self.weak_numeric_branch_lub(pt, &branch_tys) {
-                    self.adapt_numeric_branch(thenp, &w);
-                    self.adapt_numeric_branch(elsep, &w);
-                    tree.ty = w;
+                if let Some(num) = self.numeric_branch_lub(pt, &branch_tys) {
+                    self.adapt(thenp, &num);
+                    self.adapt(elsep, &num);
+                    tree.ty = num;
                 } else {
                     let joined = self.lub_branches(&thenp.ty, &elsep.ty);
                     tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
