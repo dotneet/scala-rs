@@ -129,11 +129,11 @@ Compiler flags (`agent/xflags`):
   `import scala.async.Async.async` is reported as `value async is not a member
   of object scala.async.Async`, where scalac reports the library's own
   `-Xasync` message.
-- **`-Xsource-features`: nine ignored features and one partial feature.**
-  `case-apply-copy-access` is implemented; `infer-override` is partial (below).
-  The remaining features
+- **`-Xsource-features`: eight ignored features and one partial feature.**
+  `case-apply-copy-access` and `unicode-escapes-raw` are implemented;
+  `infer-override` is partial (below). The remaining features
   (`case-companion-function`, `case-copy-by-name`,
-  `any2stringadd`, `unicode-escapes-raw`, `string-context-scope`,
+  `any2stringadd`, `string-context-scope`,
   `leading-infix`, `package-prefix-implicits`, `implicit-resolution`,
   `double-definitions`) are parsed and validated, and warn when named one by
   one, but change nothing. Naming a group (`_`, `v2.13.14`) does not warn,

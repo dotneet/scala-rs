@@ -112,6 +112,10 @@ mod uncurry;
 mod value_companion;
 mod valueclass;
 mod views;
+// Warnings nsc issues by default (agent/warn).
+mod warn_refchecks;
+mod warn_util;
+mod scala_coll;
 // The prelude.rs split (agent/preludesplit): topic modules pulled out of the
 // 7400-line prelude.rs, following the existing prelude_<topic>.rs convention.
 // Appended here rather than interleaved alphabetically above to avoid

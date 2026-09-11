@@ -533,7 +533,7 @@ pub struct Typer {
     /// with the `implicit val classTag` it is about to inherit from it.
     pub(crate) parent_ctor_scope: bool,
     pub(crate) class_bound_evidence_types: HashMap<SymbolId, Vec<Type>>,
-    fatal_warnings: bool,
+    pub(crate) fatal_warnings: bool,
     pub(crate) library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     pub(crate) return_meth: Option<SymbolId>,
@@ -983,6 +983,11 @@ pub fn typecheck_units_src(
     // parent or self type is raised twice. Member signatures are built once
     // (see `sig_done`), so their diagnostics survive here.
     dedup_diags(&mut t.diags);
+    // nsc's later phases only run when the typer reported no errors; so do
+    // the warnings they issue.
+    if !t.diags.iter().any(|d| d.level == scala_rs_span::Level::Error) {
+        crate::warn_refchecks::run(&mut t, units);
+    }
     (t.st, t.diags)
 }
 
@@ -1123,11 +1128,22 @@ impl Typer {
     }
 
     pub(crate) fn warning(&mut self, span: Span, msg: impl Into<String>) {
+        self.warning_in(scala_rs_span::Phase::Typer, span, msg);
+    }
+
+    /// A warning nsc issues in `phase` (which decides where it is reported;
+    /// see `scala_rs_span::finish_diagnostics`).
+    pub(crate) fn warning_in(
+        &mut self,
+        phase: scala_rs_span::Phase,
+        span: Span,
+        msg: impl Into<String>,
+    ) {
         if self.fatal_warnings {
             self.error(span, msg);
         } else {
             self.diags
-                .push(Diagnostic::warning(self.file_index, span, msg));
+                .push(Diagnostic::warning(self.file_index, span, msg).in_phase(phase));
         }
     }
 
