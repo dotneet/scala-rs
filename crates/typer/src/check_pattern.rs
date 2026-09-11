@@ -85,7 +85,7 @@ impl Typer {
     /// callee that resolved to something other than a class or its companion
     /// -- an `unapply` reached through a value, say -- where the extractor
     /// arms are the ones that apply.
-    fn qualified_pattern_class(&self, fun: &Tree) -> Option<SymbolId> {
+    fn qualified_pattern_class(&mut self, fun: &Tree) -> Option<SymbolId> {
         if !matches!(fun.kind, TreeKind::Select { .. }) || fun.sym.is_none() {
             return None;
         }
@@ -93,6 +93,22 @@ impl Typer {
             SymKind::Class => Some(self.follow_class_alias(fun.sym)),
             SymKind::Module | SymKind::ModuleClass => {
                 let mcls = self.st.module_class_of(fun.sym);
+                // Nested case-class companions are recorded in a module
+                // owner's member list, while a classfile reader may expose
+                // that list through the enclosing object. The JVM name still
+                // identifies the matching class exactly (`Ior$Right$` /
+                // `Ior$Right`), so prefer it before the lexical fallback.
+                if let Some(class_jvm) = self.st.get(mcls).jvm_name.strip_suffix('$') {
+                    if let Some(c) = crate::classpath::find_by_jvm(&self.st, class_jvm)
+                        .filter(|id| self.st.get(*id).kind == SymKind::Class)
+                    {
+                        if self.library_abi {
+                            self.pickle
+                                .ensure_parents(&mut self.st, &mut self.binary, c);
+                        }
+                        return Some(self.follow_class_alias(c));
+                    }
+                }
                 let base = self.st.get(mcls).name.trim_end_matches('$').to_string();
                 let owner = self.st.get(mcls).owner;
                 self.st
@@ -141,40 +157,23 @@ impl Typer {
             sym: class_id,
             args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
         };
-        let mut cands = vec![self_ty];
-        let mut work: Vec<Type> = self
-            .st
-            .get(class_id)
-            .parents
+        // Use the same base-type walk as ordinary conformance and overload
+        // inference. The former hand-written parent traversal keyed on the
+        // first symbol it saw, so a pickled case class whose parent carries a
+        // different symbol instance could not line its field up with the
+        // scrutinee. `Ior.Right[B]` then bound its `B` to the outer `Ior`'s
+        // left argument instead of to the right argument.
+        let Some(base) = self.base_type_instance(&self_ty, sel_sym, 0) else {
+            return Vec::new();
+        };
+        let args: Vec<Type> = tps
             .iter()
-            .map(|p| self.st.subst_tparams(class_id, &[], p))
+            .map(|tp| unify_one(&self.st, *tp, &base, sel_ty).unwrap_or(Type::Any))
             .collect();
-        let mut seen = std::collections::HashSet::new();
-        while let Some(p) = work.pop() {
-            let Some(psym) = self.st.class_sym_of(&p) else {
-                continue;
-            };
-            if !seen.insert(psym.0) {
-                continue;
-            }
-            for q in self.st.get(psym).parents.clone() {
-                work.push(self.st.subst_as_seen_from(&p, &q));
-            }
-            cands.push(p);
-        }
-        for c in cands {
-            if self.st.class_sym_of(&c) != Some(sel_sym) {
-                continue;
-            }
-            let args: Vec<Type> = tps
-                .iter()
-                .map(|tp| unify_one(&self.st, *tp, &c, sel_ty).unwrap_or(Type::Any))
-                .collect();
-            if args.iter().any(|a| !matches!(a, Type::Any)) {
-                return args;
-            }
-        }
-        Vec::new()
+        args.iter()
+            .any(|a| !matches!(a, Type::Any))
+            .then_some(args)
+            .unwrap_or_default()
     }
 
     fn type_pattern(&mut self, pat: &mut Tree, sel_ty: &Type) {

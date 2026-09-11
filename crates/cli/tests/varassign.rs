@@ -406,6 +406,46 @@ fn varassign_inherited_val_is_reported() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A selected source field can have a hand-written setter, and a variable
+/// imported from an object must use that module's setter. Both cases resolve
+/// the left-hand side as a `Term`, so the setter rewrite must not be limited
+/// to accessor methods from class files.
+#[test]
+fn varassign_selected_terms_use_setters() {
+    let (Some(jar), Some(sc), true) = (scala_library_jar(), scalac(), java_available()) else {
+        eprintln!("skip varassign_selected_terms_use_setters: jar, scalac or java absent");
+        return;
+    };
+    let dir = tmp_dir("selected");
+    let mine = dir.join("mine");
+    let theirs = dir.join("theirs");
+    fs::create_dir_all(&mine).unwrap();
+    fs::create_dir_all(&theirs).unwrap();
+    ok(
+        compile_rs(&fixture("varassign_setter"), &mine, &jar),
+        "selected setter fixture",
+    );
+    ok(
+        compile_scalac(&sc, &fixture("varassign_setter"), &theirs, &jar),
+        "selected setter fixture under scalac",
+    );
+    let expected = expected_stdout("varassign_setter");
+    assert_eq!(run_java(&mine, &jar, None), expected);
+    assert_eq!(run_java(&theirs, &jar, None), expected);
+    if javap_available() {
+        let mine_box = javap(&mine, "Main$");
+        assert!(
+            mine_box.contains("SetterBox.value_$eq"),
+            "field-like assignment should invoke the hand-written setter:\n{mine_box}"
+        );
+        assert!(
+            mine_box.contains("ImportedState$.value_$eq"),
+            "wildcard-imported variable should invoke the module setter:\n{mine_box}"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // Negatives. Each is paired with the same file under real scalac, so the
 // sentence being asserted is nsc's and not ours.

@@ -361,6 +361,30 @@ trait C3Db[F[_]] {
 }
 "#;
 
+/// `NonEmptyList`'s `nonEmptyPartition` reduced to the two inference edges
+/// that used to fail: `Ior.right` has a result-only type parameter, and an
+/// `Ior.Right` pattern is a nested case class whose base is `Ior[Nothing, B]`.
+const CATS_NEL: &str = r#"
+import cats.data.{NonEmptyList, Ior}
+
+object C3NonEmptyList {
+  def partition[A, B, C](fa: NonEmptyList[A])(f: A => Either[B, C]): Ior[NonEmptyList[B], NonEmptyList[C]] = {
+    val reversed = fa.reverse
+    val lastIor = f(reversed.head) match {
+      case Right(c) => Ior.right(NonEmptyList.one(c))
+      case Left(b) => Ior.left(NonEmptyList.one(b))
+    }
+    reversed.tail.foldLeft(lastIor)((ior, a) =>
+      (f(a), ior) match {
+        case (Right(c), Ior.Left(_)) => ior.putRight(NonEmptyList.one(c))
+        case (Right(c), _) => ior.map(c :: _)
+        case (Left(b), Ior.Right(r)) => Ior.bothNel(b, r)
+        case (Left(b), _) => ior.leftMap(b :: _)
+      })
+  }
+}
+"#;
+
 fn compile_cats_user(tag: &str, source: &str) -> Option<String> {
     let jar = scala_library_jar()?;
     let cats = cats_effect_jars()?;
@@ -414,8 +438,22 @@ fn cats_syntax_conversion_completes_its_own_witness() {
 }
 
 #[test]
+fn cats_non_empty_list_partition_inference_compiles() {
+    let Some(msgs) = compile_cats_user("cats-nel", CATS_NEL) else {
+        eprintln!("skip: cats jars or scala-library jar not present");
+        return;
+    };
+    assert!(msgs.is_empty(), "compile failed:\n{msgs}");
+}
+
+#[test]
 fn scalac_agrees_cats_syntax_conversion_completes_its_own_witness() {
     scalac_accepts("scalac-catsdb", CATS_DB);
+}
+
+#[test]
+fn scalac_agrees_cats_non_empty_list_partition_inference() {
+    scalac_accepts("scalac-cats-nel", CATS_NEL);
 }
 
 /// The same eleven lines through real scalac, so the test above cannot be

@@ -1926,13 +1926,22 @@ impl Typer {
         }
     }
 
-    /// `x.f = v` where `f` resolved to a getter and the receiver has an
-    /// `f_=`: the assignment is that call, not a field store.
+    /// `x.f = v` where `f` resolved to a getter or field and the receiver has
+    /// an `f_=`: the assignment is that call, not a field store.
+    ///
+    /// Source fields and imported object variables can be represented by a
+    /// `Term`, while accessors read from a class file are represented by a
+    /// `Method`. Both forms still use the setter when one exists. Restricting
+    /// this to methods made `val v` beside a hand-written `def v_=` report a
+    /// reassignment error, and made wildcard-imported object vars write their
+    /// backing field directly instead of calling the ABI setter.
     pub(crate) fn setter_assign_lhs(&mut self, lhs: &Tree) -> bool {
         let TreeKind::Select { qual, name } = &lhs.kind else {
             return false;
         };
-        if lhs.sym.is_none() || self.st.get(lhs.sym).kind != SymKind::Method {
+        if lhs.sym.is_none()
+            || !matches!(self.st.get(lhs.sym).kind, SymKind::Method | SymKind::Term)
+        {
             return false;
         }
         let Some(cls) = self.st.class_sym_of(&qual.ty) else {
@@ -1955,7 +1964,8 @@ impl Typer {
     /// compiler emitted (`putfield B.bv`) linked against a scalac-built `B`
     /// and threw `IllegalAccessError` at the first call. Only the qualified
     /// form `this.bv = 5` was ever rewritten, because only that one is a
-    /// `Select`.
+    /// `Select`. A bare source term can need the same rewrite when it is an
+    /// object member brought into scope by a wildcard import.
     pub(crate) fn ident_setter_assign_lhs(&mut self, lhs: &Tree) -> Option<String> {
         let TreeKind::Ident { name } = &lhs.kind else {
             return None;
@@ -1964,7 +1974,7 @@ impl Typer {
             return None;
         }
         let s = self.st.get(lhs.sym);
-        if s.kind != SymKind::Method || s.name.ends_with("_=") {
+        if !matches!(s.kind, SymKind::Method | SymKind::Term) || s.name.ends_with("_=") {
             return None;
         }
         let owner = s.owner;

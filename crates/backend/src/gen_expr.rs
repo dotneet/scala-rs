@@ -1880,6 +1880,22 @@ pub(crate) fn gen_assign(
                     asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
+                // A top-level or nested object stores a `var` behind its
+                // `value_$eq` method. Bare names supplied by `import O._`
+                // still resolve to the module-class term, so writing its
+                // field directly would bypass the Scala ABI.
+                if s.kind == SymKind::Term
+                    && s.flags.contains(Flags::MUTABLE)
+                    && is_module_class(ctx.st, s.owner)
+                {
+                    load_module_instance(asm, ctx, s.owner);
+                    gen_expr(asm, frame, ctx, rhs);
+                    let owner = class_internal(ctx.st, s.owner);
+                    let vd = jvm_desc_val(ctx.st, &s.ty);
+                    fill_boxed_unit_slot(asm, &vd);
+                    asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
+                    return;
+                }
                 // Inherited `var` of a separately compiled superclass: its
                 // field is private there, so go through the setter.
                 if s.via_accessor {
@@ -1923,6 +1939,22 @@ pub(crate) fn gen_assign(
                 fill_boxed_unit_slot(asm, &vd);
                 asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
+            }
+            // The selected form of an object member has already emitted its
+            // singleton receiver above. Use the ordinary setter for a mutable
+            // module term instead of the backing field.
+            if !lhs.sym.is_none() {
+                let s = ctx.st.get(lhs.sym);
+                if s.kind == SymKind::Term
+                    && s.flags.contains(Flags::MUTABLE)
+                    && is_module_class(ctx.st, s.owner)
+                {
+                    let owner = class_internal(ctx.st, s.owner);
+                    let vd = jvm_desc_val(ctx.st, &s.ty);
+                    fill_boxed_unit_slot(asm, &vd);
+                    asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
+                    return;
+                }
             }
             // A `var` of a separately compiled class: scalac made the field
             // private, so the write is `v_$eq(x)` exactly as the read is

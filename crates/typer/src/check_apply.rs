@@ -3175,10 +3175,18 @@ impl Typer {
             }
             Type::Class { sym, .. } if self.st.get(*sym).name == "Range" => Some(Type::Int),
             Type::Class { sym, .. } if self.st.get(*sym).name == "BitSet" => Some(Type::Int),
-            Type::Class { sym, args } if !args.is_empty() => Some(
-                self.iterable_once_elem(*sym, args)
-                    .unwrap_or_else(|| args[0].clone()),
-            ),
+            Type::Class { sym, args } if !args.is_empty() => self
+                .iterable_once_elem(*sym, args)
+                // The fallback is only for collection classes whose
+                // `IterableOnce` parent has not been loaded yet. Applying it
+                // to every generic receiver made `Ior[A, B].map` read the
+                // left parameter as the mapped value and rejected a perfectly
+                // valid `B => C` function.
+                .or_else(|| {
+                    let jvm = self.st.get(*sym).jvm_name.as_str();
+                    (jvm.starts_with("scala/collection/") || jvm.starts_with("scala/ArrayOps"))
+                        .then(|| args[0].clone())
+                }),
             // cats' syntax layer hands back `Ops[F, A] { type TypeClassType =
             // FlatMap[F] }`; the arguments live on the parent.
             Type::Refined { parents, .. } => parents.iter().find_map(|p| self.elem_type(p)),

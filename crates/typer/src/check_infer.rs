@@ -739,10 +739,12 @@ impl Typer {
         pt: &Type,
         nargs: usize,
     ) -> Type {
-        // Only where the call is what the expected type is checked against.
-        // With none, this is a receiver a further application may still solve
-        // (nsc keeps those in `Context.undetparams`).
-        if method.is_none() || pt.is_no_type() || pt.is_error() {
+        // An application typed as a callee still receives the dummy Method
+        // expectation from `check_apply`, so it remains open for a following
+        // application. A value application has no such expectation; nsc
+        // closes result-only parameters there even when no expected type was
+        // written (`val x = Ior.right(1)` is `Ior[Nothing, Int]`).
+        if method.is_none() || pt.is_error() {
             return ret;
         }
         let tps = self.st.get(method).tparams.clone();
