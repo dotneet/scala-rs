@@ -5,7 +5,7 @@
 use crate::code::Assembler;
 use crate::gen::*;
 use scala_rs_parser::{Flags, Lit, SymbolId, Tree, TreeKind, Type};
-use scala_rs_typer::SymKind;
+use scala_rs_typer::{SymKind, SymbolTable};
 
 pub(crate) fn gen_match(
     asm: &mut Assembler,
@@ -217,6 +217,20 @@ pub(crate) fn unapply_param_class(ctx: &EmitCtx, uid: SymbolId) -> Option<String
     None
 }
 
+/// The public `<name>$access$<index>` accessor nsc gives a case field that is
+/// not public (`case class Foo(private val x: Int)` has `x$access$0()`), or
+/// `None` for a public one. `index` is the field's position among the case
+/// fields (nsc's `caseFieldAccessors.indexOf`).
+pub(crate) fn case_field_access_name(
+    st: &SymbolTable,
+    field: SymbolId,
+    index: usize,
+) -> Option<String> {
+    let f = st.get(field);
+    (f.flags.contains(Flags::PRIVATE) || f.flags.contains(Flags::PROTECTED))
+        .then(|| format!("{}$access${index}", f.name))
+}
+
 /// A `case class` pattern that reads the constructor fields directly.
 ///
 /// Shared by the `Apply` pattern arm and by the synthetic `unapply` of a
@@ -293,7 +307,16 @@ pub(crate) fn gen_ctor_fields_pattern(
             // accessor is not always spelled like the field
             // (`$colon$colon.tl` is read through `next$access$1`), so
             // guessing the name produced `NoSuchMethodError`.
-            let acc = if !acc.is_empty() {
+            // A field that is not public is private on the JVM as well, and
+            // so is its plain accessor: outside the class only the
+            // `$access$` twin reaches it (`run/t5407`, `run/t8944`).
+            let hidden = (ctx.class_sym != class_id
+                && ctx.st.get(class_id).flags.contains(Flags::CASE))
+            .then(|| case_field_access_name(ctx.st, *fid, i))
+            .flatten();
+            let acc = if let Some(h) = hidden {
+                Some(h)
+            } else if !acc.is_empty() {
                 Some(acc)
             } else if !ctx.st.source_classes.contains(&class_id)
                 && has_nullary_accessor(ctx.st, class_id, &fname)
@@ -674,6 +697,54 @@ pub(crate) fn is_binding_ident(ctx: &EmitCtx, pat: &Tree, name: &str) -> bool {
             || ctx.st.get(pat.sym).kind == SymKind::Term)
 }
 
+/// Compare the constant already on the stack (of type `pat_ty`) with the
+/// scrutinee in `tmp`, jumping to `fail` when they differ.
+///
+/// Usually the constant is converted to the scrutinee's representation (see
+/// [`emit_pattern_operand`]). A constant of a *wider* numeric type than a
+/// primitive scrutinee goes the other way: `1 match { case
+/// 0xFFFFFFFF00000001L => … }` compares the two as `Long`s, which is what
+/// nsc's `==` does, so the `Int` 1 does not match a `Long` whose low word
+/// happens to be 1. Handing the `long` to `if_icmpne` did not verify at all
+/// (`run/t1423`).
+fn emit_const_pattern_test(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    pat_ty: &Type,
+    tmp: u16,
+    sel_sort: JvmSort,
+    fail: crate::code::Label,
+) {
+    fn rank(t: &Type) -> Option<u8> {
+        match t {
+            Type::Int | Type::Char | Type::Short | Type::Byte => Some(0),
+            Type::Long => Some(1),
+            Type::Float => Some(2),
+            Type::Double => Some(3),
+            _ => None,
+        }
+    }
+    let pat = pat_ty.widen_constant();
+    let sel_ty = match sel_sort {
+        JvmSort::Int => Some(Type::Int),
+        JvmSort::Long => Some(Type::Long),
+        JvmSort::Float => Some(Type::Float),
+        JvmSort::Double => Some(Type::Double),
+        _ => None,
+    };
+    if let (Some(sel_ty), Some(pr)) = (sel_ty, rank(&pat)) {
+        if rank(&sel_ty).is_some_and(|sr| pr > sr) {
+            load(asm, tmp, sel_sort);
+            widen_primitive(asm, &sel_ty, &pat);
+            emit_pattern_eq_jump(asm, ctx, jvm_sort(&pat), fail);
+            return;
+        }
+    }
+    emit_pattern_operand(asm, pat_ty, sel_sort);
+    load(asm, tmp, sel_sort);
+    emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+}
+
 /// Put a constant pattern's value on the stack in the *scrutinee's* JVM
 /// representation: boxed when the scrutinee is a reference (`case 1 =>` on an
 /// `Any`), widened when the scrutinee is a wider primitive (`case 1 =>` on a
@@ -941,9 +1012,7 @@ pub(crate) fn gen_pattern(
                 // The stable id goes on the stack first, the scrutinee second:
                 // see `emit_pattern_eq_jump`.
                 gen_ident(asm, frame, ctx, pat);
-                emit_pattern_operand(asm, &pat.ty, sel_sort);
-                load(asm, tmp, sel_sort);
-                emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+                emit_const_pattern_test(asm, ctx, &pat.ty, tmp, sel_sort, fail);
             }
         }
         TreeKind::Literal { lit } => {
@@ -963,24 +1032,25 @@ pub(crate) fn gen_pattern(
                 }
             } else {
                 gen_literal(asm, lit);
-                emit_pattern_operand(asm, &pat.ty, sel_sort);
-                load(asm, tmp, sel_sort);
-                emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+                // What `gen_literal` pushed is the literal's own type, which
+                // the typer does not always leave on the pattern (`case 4.5f`
+                // against an `Int` came out typed `Int`).
+                let lit_ty = match Type::lit_underlying(lit) {
+                    t @ (Type::Int | Type::Long | Type::Float | Type::Double) => t,
+                    _ => pat.ty.clone(),
+                };
+                emit_const_pattern_test(asm, ctx, &lit_ty, tmp, sel_sort, fail);
             }
         }
         TreeKind::Select { .. } => {
             gen_expr(asm, frame, ctx, pat);
-            emit_pattern_operand(asm, &pat.ty, sel_sort);
-            load(asm, tmp, sel_sort);
-            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+            emit_const_pattern_test(asm, ctx, &pat.ty, tmp, sel_sort, fail);
         }
         TreeKind::Apply { .. } if pat.stable_pat => {
             // A local lazy stable identifier becomes an accessor call during
             // lowering. Its arguments belong to that call, not an extractor.
             gen_expr(asm, frame, ctx, pat);
-            emit_pattern_operand(asm, &pat.ty, sel_sort);
-            load(asm, tmp, sel_sort);
-            emit_pattern_eq_jump(asm, ctx, sel_sort, fail);
+            emit_const_pattern_test(asm, ctx, &pat.ty, tmp, sel_sort, fail);
         }
         TreeKind::Apply { args, .. } => {
             let class_id = if pat.sym.is_none() {
