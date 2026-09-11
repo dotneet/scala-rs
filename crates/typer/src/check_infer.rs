@@ -738,13 +738,21 @@ impl Typer {
         ret: Type,
         pt: &Type,
         nargs: usize,
+        user_nargs: usize,
     ) -> Type {
         // An application typed as a callee still receives the dummy Method
         // expectation from `check_apply`, so it remains open for a following
-        // application. A value application has no such expectation; nsc
-        // closes result-only parameters there even when no expected type was
-        // written (`val x = Ior.right(1)` is `Ior[Nothing, Int]`).
-        if method.is_none() || pt.is_error() {
+        // application. Calls containing only compiler-filled defaults are in
+        // the same position: `newBuilder()` has one synthetic default tree,
+        // but a following `.add` must still choose its element type. A value
+        // application with a user argument has no such context; nsc closes
+        // result-only parameters there (`Ior.right(1)` is `Ior[Nothing, Int]`).
+        if method.is_none()
+            || pt.is_error()
+            || self.typing_callee
+            || self.qualifier_depth > 0
+            || user_nargs == 0
+        {
             return ret;
         }
         let tps = self.st.get(method).tparams.clone();

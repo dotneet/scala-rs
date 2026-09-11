@@ -2465,6 +2465,61 @@ impl Typer {
         );
     }
 
+    /// Rewrite `d.name[T]` before the ordinary `TypeApply` path types `name`
+    /// as a selection. That path has no member to carry the written type
+    /// arguments, so typing it first would turn the call into
+    /// `selectDynamic("name")` and silently infer `T` from its bound.
+    pub(crate) fn try_rewrite_dynamic_type_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let (mut qual, name, targs) = match &mut tree.kind {
+            TreeKind::TypeApply { fun, args } => match &mut fun.kind {
+                TreeKind::Select { qual, name } => ((**qual).clone(), name.clone(), args.clone()),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if qual.ty.is_no_type() {
+            self.type_qualifier(&mut qual, &Type::NoType);
+        }
+        if !self.is_dynamic_receiver(&qual.ty) || self.receiver_has_term(&qual.ty, &name) {
+            return false;
+        }
+        if !self.language_dynamics {
+            self.dynamics_feature_error(tree.span, "selectDynamic");
+            tree.ty = Type::Error;
+            return true;
+        }
+        let span = tree.span;
+        let name_lit = Tree::new(
+            NodeId(0),
+            span,
+            TreeKind::Literal {
+                lit: Lit::String(name),
+            },
+        );
+        let sel = Tree::new(
+            tree.id,
+            span,
+            TreeKind::Select {
+                qual: Box::new(qual),
+                name: "selectDynamic".into(),
+            },
+        );
+        let typed_sel = Tree::new(
+            tree.id,
+            span,
+            TreeKind::TypeApply {
+                fun: Box::new(sel),
+                args: targs,
+            },
+        );
+        tree.kind = TreeKind::Apply {
+            fun: Box::new(typed_sel),
+            args: vec![name_lit],
+        };
+        self.type_apply(tree, pt);
+        true
+    }
+
     fn rewrite_select_dynamic(&mut self, tree: &mut Tree, pt: &Type) {
         if !self.language_dynamics {
             self.dynamics_feature_error(tree.span, "selectDynamic");

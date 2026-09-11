@@ -1705,8 +1705,33 @@ impl Typer {
                             }
                             self.adapt(a, &p_check);
                         }
-                        if let TreeKind::Function { body, .. } = &a.kind {
-                            let body_ty = body.ty.widen_constant();
+                        if let TreeKind::Function { body, .. } = &mut a.kind {
+                            let mut body_ty = body.ty.widen_constant();
+                            // A relaxed result such as `Eval[_]` gives a
+                            // generic constructor the wildcard as its own
+                            // type argument, so the lambda carries
+                            // `Eval[_]` back into the enclosing call. Retry
+                            // only that body without the provisional
+                            // expectation; if it yields a concrete type,
+                            // that is the result the method type parameter
+                            // must be inferred from. Failed retries keep the
+                            // original typed tree and diagnostics.
+                            if type_has_wildcard(&body_ty) {
+                                let saved_body = body.clone();
+                                let mark = self.diags.len();
+                                self.type_expr(body, &Type::NoType);
+                                let candidate = body.ty.widen_constant();
+                                if self.error_count_since(mark) == 0
+                                    && !candidate.is_no_type()
+                                    && !candidate.is_error()
+                                    && !type_has_wildcard(&candidate)
+                                {
+                                    body_ty = candidate;
+                                } else {
+                                    *body = saved_body;
+                                    self.diags.truncate(mark);
+                                }
+                            }
                             if let Type::Function { params, ret } = &a.ty {
                                 // A wildcard here is one the relaxation above put
                                 // in, standing for "the body decides"; leaving it
@@ -1921,6 +1946,15 @@ impl Typer {
                             }
                         }
                     }
+                    // Capture the arguments written by the caller before
+                    // default getters or implicit search append synthetic
+                    // trees. Result-only type parameters of a call such as
+                    // `newBuilder()` must stay open even though its default
+                    // capacity occupies one slot after filling.
+                    let user_nargs = args
+                        .iter()
+                        .filter(|a| !a.id.is_filled_arg() && !a.id.is_pretyped_default())
+                        .count();
                     let leftover =
                         self.fill_defaults_and_implicits(tree.span, args, &param_tys, fun, pt);
                     // nsc's `applyImplicitArgs`: `if (args contains EmptyTree)
@@ -2421,7 +2455,8 @@ impl Typer {
                     let params: Vec<SymbolId> =
                         self.st.get(sym).paramss.iter().flatten().copied().collect();
                     let ret = self.subst_dependent_paths(&params, args, ret);
-                    let ret = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
+                    let ret =
+                        self.instantiate_leftover_tparams(sym, ret, pt, args.len(), user_nargs);
                     // nsc's `applyImplicitArgs` ends `if (args contains
                     // EmptyTree) setError(tree)`. The witness that was not
                     // found is often the only thing that could have said what
@@ -3184,8 +3219,13 @@ impl Typer {
                 // valid `B => C` function.
                 .or_else(|| {
                     let jvm = self.st.get(*sym).jvm_name.as_str();
-                    (jvm.starts_with("scala/collection/") || jvm.starts_with("scala/ArrayOps"))
-                        .then(|| args[0].clone())
+                    (jvm.starts_with("scala/collection/")
+                        || jvm.starts_with("scala/ArrayOps")
+                        || matches!(
+                            self.st.get(*sym).name.as_str(),
+                            "Traversable" | "Iterable" | "Seq" | "IndexedSeq" | "LinearSeq"
+                        ))
+                    .then(|| args[0].clone())
                 }),
             // cats' syntax layer hands back `Ops[F, A] { type TypeClassType =
             // FlatMap[F] }`; the arguments live on the parent.

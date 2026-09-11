@@ -18,7 +18,9 @@ use std::collections::HashMap;
 impl Typer {
     pub(crate) fn type_qualifier(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::replace(&mut self.typing_qualifier, true);
+        self.qualifier_depth += 1;
         self.type_expr(tree, pt);
+        self.qualifier_depth -= 1;
         self.typing_qualifier = saved;
     }
 
@@ -895,6 +897,11 @@ impl Typer {
         }
         if matches!(&tree.kind, TreeKind::Assign { .. })
             && self.try_rewrite_dynamic_update(tree, pt)
+        {
+            return;
+        }
+        if matches!(&tree.kind, TreeKind::TypeApply { .. })
+            && self.try_rewrite_dynamic_type_apply(tree, pt)
         {
             return;
         }
