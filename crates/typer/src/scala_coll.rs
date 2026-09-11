@@ -64,7 +64,9 @@ fn champ_level<T: Clone>(items: &[(T, u32)], shift: u32, out: &mut Vec<T>) {
 /// `scala.util.hashing.MurmurHash3.mix`.
 pub(crate) fn murmur_mix(hash: i32, data: i32) -> i32 {
     let h = murmur_mix_last(hash, data);
-    h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe6546b64u32 as i32)
+    h.rotate_left(13)
+        .wrapping_mul(5)
+        .wrapping_add(0xe6546b64u32 as i32)
 }
 
 /// `MurmurHash3.mixLast`.
@@ -162,10 +164,13 @@ impl<T: Clone + PartialEq + ScalaHash> ScalaSet<T> {
     }
 
     fn rehash(v: Vec<T>) -> Vec<T> {
-        let items: Vec<(T, i32)> = v.into_iter().map(|x| {
-            let h = x.scala_hash();
-            (x, h)
-        }).collect();
+        let items: Vec<(T, i32)> = v
+            .into_iter()
+            .map(|x| {
+                let h = x.scala_hash();
+                (x, h)
+            })
+            .collect();
         champ_order(&items)
     }
 

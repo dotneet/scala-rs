@@ -98,11 +98,17 @@ impl<'t> Translator<'t> {
 
     /// `translateCase`: pattern, guard and body, the substitution
     /// propagated (`SubstOnly` makers dropped).
-    pub(crate) fn translate_case(&mut self, scrut: B, c: &CaseDef) -> Result<Vec<Maker>, Unsupported> {
+    pub(crate) fn translate_case(
+        &mut self,
+        scrut: B,
+        c: &CaseDef,
+    ) -> Result<Vec<Maker>, Unsupported> {
         let mut makers = self.translate(scrut, &c.pat)?;
         if !c.guard.is_empty() {
             let constant = match &c.guard.kind {
-                TreeKind::Literal { lit: Lit::Boolean(b) } => Some(*b),
+                TreeKind::Literal {
+                    lit: Lit::Boolean(b),
+                } => Some(*b),
                 _ => None,
             };
             makers.push(Maker::new(TM::Guard { constant }));
@@ -167,7 +173,11 @@ impl<'t> Translator<'t> {
                 let pv = self.pat_val(pat)?;
                 let next_tp = self.tys.widen(&self.binders[b].tp);
                 let next = self.binder(next_tp);
-                Ok(vec![Maker::new(TM::EqTest { prev: b, pat: pv, next })])
+                Ok(vec![Maker::new(TM::EqTest {
+                    prev: b,
+                    pat: pv,
+                    next,
+                })])
             }
             TreeKind::Alternative { trees } => {
                 let mut alts = Vec::new();
@@ -182,9 +192,10 @@ impl<'t> Translator<'t> {
                 let switch = alts
                     .iter()
                     .map(|a| match a.as_slice() {
-                        [Maker { tm: TM::EqTest { pat, .. }, .. }] => {
-                            pat.switch_const.clone().map(|c| (c, pat.text.clone()))
-                        }
+                        [Maker {
+                            tm: TM::EqTest { pat, .. },
+                            ..
+                        }] => pat.switch_const.clone().map(|c| (c, pat.text.clone())),
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>();
@@ -244,22 +255,24 @@ impl<'t> Translator<'t> {
                         let library = crate::warn_patmat_types::library_constant(st, pat.sym);
                         let tp = if let Some(c) = library {
                             NTy::Const(c)
-                        } else { match constant {
-                            Some(l) => match CVal::from_lit(&l) {
-                                Some(CVal::Null) => NTy::Null,
-                                Some(c) => NTy::Const(c),
-                                None => return Err(bail!()),
-                            },
-                            None if stable => NTy::Single(pat.sym),
-                            None => {
-                                *self.fresh += 1;
-                                let w = self.ty(&vt);
-                                if w.is_unknown() {
-                                    return Err(bail!());
+                        } else {
+                            match constant {
+                                Some(l) => match CVal::from_lit(&l) {
+                                    Some(CVal::Null) => NTy::Null,
+                                    Some(c) => NTy::Const(c),
+                                    None => return Err(bail!()),
+                                },
+                                None if stable => NTy::Single(pat.sym),
+                                None => {
+                                    *self.fresh += 1;
+                                    let w = self.ty(&vt);
+                                    if w.is_unknown() {
+                                        return Err(bail!());
+                                    }
+                                    NTy::Fresh(*self.fresh, Box::new(w))
                                 }
-                                NTy::Fresh(*self.fresh, Box::new(w))
                             }
-                        } };
+                        };
                         (tp, stable)
                     }
                     _ => return Err(bail!()),
@@ -376,7 +389,10 @@ impl<'t> Translator<'t> {
             let Type::Method { paramss, ret } = &us.ty else {
                 return Err(bail!());
             };
-            let param = paramss.first().and_then(|c| c.first()).ok_or_else(|| bail!())?;
+            let param = paramss
+                .first()
+                .and_then(|c| c.first())
+                .ok_or_else(|| bail!())?;
             let (param, ret) = if us.tparams.is_empty() {
                 (param.clone(), (**ret).clone())
             } else {
@@ -402,7 +418,10 @@ impl<'t> Translator<'t> {
                     }
                     return Err(bail!());
                 };
-                (st.subst_tparams(u, &args, param), st.subst_tparams(u, &args, ret))
+                (
+                    st.subst_tparams(u, &args, param),
+                    st.subst_tparams(u, &args, ret),
+                )
             };
             let mut ret = ret;
             param_type = {
@@ -428,10 +447,15 @@ impl<'t> Translator<'t> {
                     match (&sel, companion) {
                         (NTy::Class(c, args), Some(comp)) if *c == comp => {
                             // The wrapper's element type is the scrutinee's.
-                            if let (Type::Class { sym, args: rargs }, Some(first)) = (&ret, args.first()) {
+                            if let (Type::Class { sym, args: rargs }, Some(first)) =
+                                (&ret, args.first())
+                            {
                                 if rargs.len() == 1 && !first.is_unknown() {
                                     if let Type::Class { args: sargs, .. } = &pat.ty {
-                                        ret = Type::Class { sym: *sym, args: vec![sargs[0].clone()] };
+                                        ret = Type::Class {
+                                            sym: *sym,
+                                            args: vec![sargs[0].clone()],
+                                        };
                                     }
                                 }
                             }
@@ -454,12 +478,15 @@ impl<'t> Translator<'t> {
             let ret = &ret;
             let ret_ty = self.ty(ret);
             let boolean = matches!(*ret, Type::Boolean);
-            let is_wrapper =
-                |c: SymbolId| st.get(c).name == "UnapplySeqWrapper" && st.get(c).jvm_name.starts_with("scala/");
+            let is_wrapper = |c: SymbolId| {
+                st.get(c).name == "UnapplySeqWrapper" && st.get(c).jvm_name.starts_with("scala/")
+            };
             let (get_ty, irrefutable) = match &ret_ty {
                 NTy::Class(c, a) if *c == st.option_sym && a.len() == 1 => (a[0].clone(), false),
                 NTy::Class(c, a) if *c == st.some_sym && a.len() == 1 => (a[0].clone(), true),
-                NTy::Class(c, a) if a.len() == 1 && is_wrapper(*c) && is_seq_ex => (ret_ty.clone(), false),
+                NTy::Class(c, a) if a.len() == 1 && is_wrapper(*c) && is_seq_ex => {
+                    (ret_ty.clone(), false)
+                }
                 _ if boolean && !is_seq_ex => (NTy::Unknown, false),
                 _ => return Err(bail!()),
             };
@@ -486,12 +513,11 @@ impl<'t> Translator<'t> {
                 // `UnapplySeqWrapper[E]` a collection factory returns). The
                 // prelude writes a factory's `unapplySeq` with the element
                 // type itself (`Option[A]`).
-                let factory = st
-                    .get(us.owner)
-                    .jvm_name
-                    .starts_with("scala/collection/");
+                let factory = st.get(us.owner).jvm_name.starts_with("scala/collection/");
                 let elem = match &last {
-                    NTy::Class(c, a) if a.len() == 1 && !(factory && !is_seq_like(st, *c)) => a[0].clone(),
+                    NTy::Class(c, a) if a.len() == 1 && !(factory && !is_seq_like(st, *c)) => {
+                        a[0].clone()
+                    }
                     other if factory && !other.is_unknown() => other.clone(),
                     _ => return Err(bail!()),
                 };
@@ -572,7 +598,9 @@ impl<'t> Translator<'t> {
         for (i, a) in args.iter().enumerate() {
             let tp = sub_types.get(i).cloned().unwrap_or(NTy::Unknown);
             let (bind, p): (B, &Tree) = match &a.kind {
-                TreeKind::Bind { body, .. } if !a.sym.is_none() => (self.sym_binder(a.sym, tp), &**body),
+                TreeKind::Bind { body, .. } if !a.sym.is_none() => {
+                    (self.sym_binder(a.sym, tp), &**body)
+                }
                 TreeKind::Ident { .. } if Self::is_var_pattern(a) && !a.sym.is_none() => {
                     (self.sym_binder(a.sym, tp), a)
                 }
@@ -614,7 +642,10 @@ impl<'t> Translator<'t> {
             let seq_tree = if !is_ctor && product_arity == 0 {
                 PTree::Ref(result_binder)
             } else {
-                PTree::Sel(Box::new(PTree::Ref(result_binder)), tuple_sel(product_arity + 1))
+                PTree::Sel(
+                    Box::new(PTree::Ref(result_binder)),
+                    tuple_sel(product_arity + 1),
+                )
             };
             let mut r = elems_to_n(product_arity);
             for i in 0..element_arity {
@@ -624,7 +655,10 @@ impl<'t> Translator<'t> {
                 if element_arity == 0 {
                     r.push(seq_tree.clone());
                 } else {
-                    r.push(PTree::Sel(Box::new(seq_tree.clone()), Field::Drop(element_arity)));
+                    r.push(PTree::Sel(
+                        Box::new(seq_tree.clone()),
+                        Field::Drop(element_arity),
+                    ));
                 }
             }
             r
@@ -669,7 +703,10 @@ fn is_seq_like(st: &crate::symbol::SymbolTable, c: SymbolId) -> bool {
     let seq = crate::classpath::find_by_jvm(st, "scala/collection/Seq");
     c == st.list_sym
         || seq.is_some_and(|q| q == c || crate::pickle_supply::inherits_from(st, c, q))
-        || matches!(s.name.as_str(), "Seq" | "IndexedSeq" | "LinearSeq" | "List" | "Vector")
+        || matches!(
+            s.name.as_str(),
+            "Seq" | "IndexedSeq" | "LinearSeq" | "List" | "Vector"
+        )
 }
 
 /// Bind `tps` by matching the declared type `p` against the actual `s`.
@@ -713,9 +750,7 @@ pub(crate) fn is_star_pattern(t: &Tree) -> bool {
 /// `SwitchablePattern`: a constant in `Int` range, a `String`, or `null`.
 pub(crate) fn switchable_const(c: &CVal) -> Option<CVal> {
     match c {
-        CVal::Int(_) | CVal::Char(_) | CVal::Str(_) | CVal::Null => {
-            Some(c.clone())
-        }
+        CVal::Int(_) | CVal::Char(_) | CVal::Str(_) | CVal::Null => Some(c.clone()),
         _ => None,
     }
 }

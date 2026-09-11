@@ -85,7 +85,10 @@ impl<'a> Depr<'a> {
                 TreeKind::Assign { lhs, rhs } => (lhs.name().unwrap_or("").to_string(), &**rhs),
                 _ => ((if i == 0 { "message" } else { "since" }).to_string(), arg),
             };
-            if let TreeKind::Literal { lit: Lit::String(s) } = &value.kind {
+            if let TreeKind::Literal {
+                lit: Lit::String(s),
+            } = &value.kind
+            {
                 if slot == "message" {
                     message = s.clone();
                 } else if slot == "since" {
@@ -108,18 +111,22 @@ impl<'a> Depr<'a> {
 
     fn compute(&mut self, sym: SymbolId) -> Option<(String, String)> {
         let s = self.t.st.get(sym);
-        if matches!(s.kind, SymKind::Package | SymKind::TypeParam | SymKind::NoSymbol) {
+        if matches!(
+            s.kind,
+            SymKind::Package | SymKind::TypeParam | SymKind::NoSymbol
+        ) {
             return None;
         }
         if s.flags.contains(Flags::PARAM) {
             return None;
         }
-        let (message, since, desc) = if let Some((m, v)) = self.source_deprecated(&s.annotations.clone()) {
-            (m, v, self.describe_source(sym))
-        } else {
-            let (m, v) = self.library_deprecation(sym)?;
-            (m, v, self.describe_library(sym))
-        };
+        let (message, since, desc) =
+            if let Some((m, v)) = self.source_deprecated(&s.annotations.clone()) {
+                (m, v, self.describe_source(sym))
+            } else {
+                let (m, v) = self.library_deprecation(sym)?;
+                (m, v, self.describe_library(sym))
+            };
         let since_txt = if since.is_empty() {
             String::new()
         } else {
@@ -139,16 +146,27 @@ impl<'a> Depr<'a> {
         if !self.t.library_abi {
             return None;
         }
-        let class_like = matches!(s.kind, SymKind::Class | SymKind::ModuleClass | SymKind::Module | SymKind::TypeMember);
+        let class_like = matches!(
+            s.kind,
+            SymKind::Class | SymKind::ModuleClass | SymKind::Module | SymKind::TypeMember
+        );
         if class_like {
             let cls = if s.kind == SymKind::Module {
                 self.t.st.module_class_of(sym)
             } else {
                 sym
             };
-            if self.t.st.get(cls).jvm_name.starts_with("scala/") && self.t.st.get(cls).kind != SymKind::TypeMember {
-                let sig = self.t.pickle.class_sig_of(&self.t.st, &mut self.t.binary, cls)?;
-                return sig.deprecated.as_ref().map(|d| (d.message.clone(), d.since.clone()));
+            if self.t.st.get(cls).jvm_name.starts_with("scala/")
+                && self.t.st.get(cls).kind != SymKind::TypeMember
+            {
+                let sig = self
+                    .t
+                    .pickle
+                    .class_sig_of(&self.t.st, &mut self.t.binary, cls)?;
+                return sig
+                    .deprecated
+                    .as_ref()
+                    .map(|d| (d.message.clone(), d.since.clone()));
             }
             if s.kind == SymKind::TypeMember || s.kind == SymKind::Module {
                 return self.member_deprecation(sym);
@@ -187,8 +205,14 @@ impl<'a> Depr<'a> {
         let name = s.name.clone();
         let our_params = param_names(&self.t.st, &s.ty);
         let sig = match primitive {
-            Some(full) => self.t.pickle.class_sig_by_name(&mut self.t.binary, full, false),
-            None => self.t.pickle.class_sig_of(&self.t.st, &mut self.t.binary, owner),
+            Some(full) => self
+                .t
+                .pickle
+                .class_sig_by_name(&mut self.t.binary, full, false),
+            None => self
+                .t
+                .pickle
+                .class_sig_of(&self.t.st, &mut self.t.binary, owner),
         };
         let sig = sig?;
         let cands: Vec<&scala_rs_pickle::sym::Member> = sig.members_named(&name).collect();
@@ -221,7 +245,12 @@ impl<'a> Depr<'a> {
     fn describe_source(&self, sym: SymbolId) -> String {
         let st = &self.t.st;
         let s = st.get(sym);
-        format!("{} {}{}", kind_string(st, sym), s.name.trim_end_matches('$'), self.location(s.owner))
+        format!(
+            "{} {}{}",
+            kind_string(st, sym),
+            s.name.trim_end_matches('$'),
+            self.location(s.owner)
+        )
     }
 
     fn describe_library(&self, sym: SymbolId) -> String {
@@ -239,7 +268,10 @@ impl<'a> Depr<'a> {
             SymKind::Package => format!(" in package {name}"),
             SymKind::ModuleClass | SymKind::Module if name == "package" => {
                 // A package object prints as its package.
-                let pkg = o.jvm_name.trim_end_matches("/package$").trim_end_matches("/package");
+                let pkg = o
+                    .jvm_name
+                    .trim_end_matches("/package$")
+                    .trim_end_matches("/package");
                 let last = pkg.rsplit('/').next().unwrap_or(pkg);
                 format!(" in package {last}")
             }
@@ -256,12 +288,21 @@ impl<'a> Depr<'a> {
         mods.annotations.iter().any(|a| {
             let p = a.annotation_path();
             p == "deprecated" || p == "scala.deprecated"
-        }) || (!sym.is_none() && self.source_deprecated(&self.t.st.get(sym).annotations).is_some())
+        }) || (!sym.is_none()
+            && self
+                .source_deprecated(&self.t.st.get(sym).annotations)
+                .is_some())
     }
 
     fn visit(&mut self, tree: &Tree) {
         match &tree.kind {
-            TreeKind::ClassDef { mods, impl_, vparamss, tparams, .. } => {
+            TreeKind::ClassDef {
+                mods,
+                impl_,
+                vparamss,
+                tparams,
+                ..
+            } => {
                 if mods.flags.contains(Flags::SYNTHETIC) {
                     return;
                 }
@@ -294,7 +335,14 @@ impl<'a> Depr<'a> {
                 }
                 self.in_deprecated -= usize::from(dep);
             }
-            TreeKind::DefDef { mods, tparams, vparamss, tpt, rhs, .. } => {
+            TreeKind::DefDef {
+                mods,
+                tparams,
+                vparamss,
+                tpt,
+                rhs,
+                ..
+            } => {
                 if mods.flags.contains(Flags::SYNTHETIC) {
                     return;
                 }
@@ -342,7 +390,11 @@ impl<'a> Depr<'a> {
                 // deprecated operation it folds, before refchecks.
                 if let TreeKind::Select { qual, .. } = &fun.kind {
                     let lit = |t: &Tree| matches!(t.kind, TreeKind::Literal { .. });
-                    if lit(qual) && !args.is_empty() && args.iter().all(lit) && self.in_deprecated == 0 {
+                    if lit(qual)
+                        && !args.is_empty()
+                        && args.iter().all(lit)
+                        && self.in_deprecated == 0
+                    {
                         if let Some((msg, since)) = self.deprecation_of(fun.sym) {
                             let p = point_of(fun, self.src);
                             self.push(p, msg, since, Phase::Typer);
@@ -390,7 +442,11 @@ impl<'a> Depr<'a> {
                     self.visit(&c.body);
                 }
             }
-            TreeKind::Try { block, catches, finalizer } => {
+            TreeKind::Try {
+                block,
+                catches,
+                finalizer,
+            } => {
                 self.visit(block);
                 for c in catches {
                     self.visit_pattern(&c.pat);
@@ -457,7 +513,9 @@ impl<'a> Depr<'a> {
                     self.visit_type(a);
                 }
             }
-            TreeKind::CompoundTypeTree { parents, .. } => parents.iter().for_each(|p| self.visit_type(p)),
+            TreeKind::CompoundTypeTree { parents, .. } => {
+                parents.iter().for_each(|p| self.visit_type(p))
+            }
             TreeKind::AnnotatedTypeTree { tpt, .. } => self.visit_type(tpt),
             TreeKind::ExistentialTypeTree { tpt, .. } => self.visit_type(tpt),
             _ => {}
@@ -472,9 +530,9 @@ impl<'a> Depr<'a> {
         }
         // Our typer appends an implicit clause's arguments to the explicit
         // ones, so the `xs: _*` is not necessarily last.
-        let Some((index, last)) = args.iter().enumerate().find(|(_, a)| {
-            matches!(&a.kind, TreeKind::Typed { tpt, .. } if is_repeated_marker(tpt))
-        }) else {
+        let Some((index, last)) = args.iter().enumerate().find(
+            |(_, a)| matches!(&a.kind, TreeKind::Typed { tpt, .. } if is_repeated_marker(tpt)),
+        ) else {
             return;
         };
         let TreeKind::Typed { expr, .. } = &last.kind else {
@@ -482,7 +540,9 @@ impl<'a> Depr<'a> {
         };
         let array = match &expr.ty {
             Type::Array(_) => true,
-            Type::Class { sym, .. } => self.t.st.is_array_class(*sym) || *sym == self.t.st.array_sym,
+            Type::Class { sym, .. } => {
+                self.t.st.is_array_class(*sym) || *sym == self.t.st.array_sym
+            }
             _ => false,
         };
         if !array {
@@ -503,13 +563,20 @@ impl<'a> Depr<'a> {
             Type::Method { paramss, .. } => {
                 let direct = paramss.get(clause).and_then(|c| c.get(index));
                 let flat = paramss.iter().skip(clause).flatten().nth(index);
-                direct.or(flat).is_some_and(|p| matches!(p, Type::Repeated(_)))
+                direct
+                    .or(flat)
+                    .is_some_and(|p| matches!(p, Type::Repeated(_)))
             }
             _ => false,
         };
         if repeated {
             let p = point_of(expr, self.src);
-            self.push(p, VARARGS_ARRAY.to_string(), "2.13.0".into(), Phase::Uncurry);
+            self.push(
+                p,
+                VARARGS_ARRAY.to_string(),
+                "2.13.0".into(),
+                Phase::Uncurry,
+            );
         }
     }
 }
@@ -542,11 +609,17 @@ fn kind_string(st: &crate::symbol::SymbolTable, sym: SymbolId) -> &'static str {
     let s = st.get(sym);
     match s.kind {
         SymKind::Module | SymKind::ModuleClass => "object",
-        SymKind::Class if s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE) => "trait",
+        SymKind::Class if s.flags.contains(Flags::TRAIT) || s.flags.contains(Flags::INTERFACE) => {
+            "trait"
+        }
         SymKind::Class => "class",
         SymKind::TypeMember => "type",
         SymKind::Package => "package",
-        SymKind::Method if s.flags.contains(Flags::ACCESSOR) && !s.flags.contains(Flags::MUTABLE) => "value",
+        SymKind::Method
+            if s.flags.contains(Flags::ACCESSOR) && !s.flags.contains(Flags::MUTABLE) =>
+        {
+            "value"
+        }
         SymKind::Method => "method",
         SymKind::Term if s.flags.contains(Flags::LAZY) => "lazy value",
         SymKind::Term if s.flags.contains(Flags::MUTABLE) => "variable",

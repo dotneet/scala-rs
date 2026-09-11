@@ -82,7 +82,12 @@ pub(crate) struct Approx<'x> {
 }
 
 impl<'x> Approx<'x> {
-    pub(crate) fn new(t: &'x mut Typer, binders: &'x [Binder], root: B, sym_ids: &'x mut usize) -> Self {
+    pub(crate) fn new(
+        t: &'x mut Typer,
+        binders: &'x [Binder],
+        root: B,
+        sym_ids: &'x mut usize,
+    ) -> Self {
         let mut a = Approx {
             t,
             binders,
@@ -159,10 +164,22 @@ impl<'x> Approx<'x> {
     /// `TreeMakerToProp.updateSubstitution`
     fn update_substitution(&mut self, m: &Maker) {
         let subst = m.sub_patterns_as_substitution();
-        if let TM::Extractor { ext, has_extra: false, next, prev, .. } = &m.tm {
+        if let TM::Extractor {
+            ext,
+            has_extra: false,
+            next,
+            prev,
+            ..
+        } = &m.tm
+        {
             let arg = self.accum.apply(&self.normalize.apply(&PTree::Ref(*prev)));
             let key = (ext.unapply, arg);
-            match self.extract_binders.iter().find(|(k, _)| *k == key).map(|(_, b)| *b) {
+            match self
+                .extract_binders
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, b)| *b)
+            {
                 Some(reuse) => {
                     let to = self.binder_tree(reuse);
                     self.normalize = self.normalize.then(&Subst::one(*next, to));
@@ -354,7 +371,11 @@ impl<'x> Approx<'x> {
     }
 
     /// `enumerateSubtypes`
-    fn enumerate_subtypes(&mut self, tp: &NTy, grouped: bool) -> Result<Vec<Vec<NTy>>, Unsupported> {
+    fn enumerate_subtypes(
+        &mut self,
+        tp: &NTy,
+        grouped: bool,
+    ) -> Result<Vec<Vec<NTy>>, Unsupported> {
         let st_unit = self.t.st.unit_sym;
         let st_bool = self.t.st.boolean_sym;
         let Some(sym) = self.tys().type_symbol(tp) else {
@@ -364,7 +385,10 @@ impl<'x> Approx<'x> {
             return Ok(vec![vec![NTy::Class(st_unit, vec![])]]);
         }
         if sym == st_bool {
-            return Ok(vec![vec![NTy::Const(CVal::Bool(true)), NTy::Const(CVal::Bool(false))]]);
+            return Ok(vec![vec![
+                NTy::Const(CVal::Bool(true)),
+                NTy::Const(CVal::Bool(false)),
+            ]]);
         }
         let s = self.t.st.get(sym);
         if s.kind == SymKind::ModuleClass {
@@ -443,7 +467,11 @@ impl<'x> Approx<'x> {
         out
     }
 
-    fn sealed_descendants(&mut self, c: SymbolId, out: &mut Vec<SymbolId>) -> Result<(), Unsupported> {
+    fn sealed_descendants(
+        &mut self,
+        c: SymbolId,
+        out: &mut Vec<SymbolId>,
+    ) -> Result<(), Unsupported> {
         if !out.contains(&c) {
             out.push(c);
         } else {
@@ -458,10 +486,16 @@ impl<'x> Approx<'x> {
         Ok(())
     }
 
-    fn enumerate_sealed(&mut self, tp: &NTy, sym: SymbolId, grouped: bool) -> Result<Vec<Vec<NTy>>, Unsupported> {
+    fn enumerate_sealed(
+        &mut self,
+        tp: &NTy,
+        sym: SymbolId,
+        grouped: bool,
+    ) -> Result<Vec<Vec<NTy>>, Unsupported> {
         let groups: Vec<Vec<SymbolId>> = if grouped {
             let mut acc: Vec<Vec<SymbolId>> = Vec::new();
-            let mut wl: std::collections::VecDeque<SymbolId> = std::collections::VecDeque::from([sym]);
+            let mut wl: std::collections::VecDeque<SymbolId> =
+                std::collections::VecDeque::from([sym]);
             let mut guard = 0;
             while let Some(hd) = wl.pop_front() {
                 guard += 1;
@@ -580,7 +614,11 @@ impl<'x> Approx<'x> {
         }
         let checkable = self.vars[v].checkable.clone();
         let c = self.type_const(&checkable);
-        let s = self.vars[v].sym_for.iter().find(|(k, _)| *k == c).map(|(_, s)| *s);
+        let s = self.vars[v]
+            .sym_for
+            .iter()
+            .find(|(k, _)| *k == c)
+            .map(|(_, s)| *s);
         self.vars[v].sym_static = Some(s);
         s
     }
@@ -596,18 +634,25 @@ impl<'x> Approx<'x> {
             return Ok(false);
         }
         let ltp = if l.is_value { &l.wide } else { &l.tp };
-        self.tys().instance_of_implies(ltp, &u.tp).ok_or_else(|| bail!())
+        self.tys()
+            .instance_of_implies(ltp, &u.tp)
+            .ok_or_else(|| bail!())
     }
 
     /// `excludes(a, b)`
     fn excludes(&self, domain: &Option<Vec<ConstId>>, a: ConstId, b: ConstId) -> bool {
-        let both = domain.as_ref().is_some_and(|d| d.contains(&a) && d.contains(&b));
+        let both = domain
+            .as_ref()
+            .is_some_and(|d| d.contains(&a) && d.contains(&b));
         let either_null = self.consts[a].is_null || self.consts[b].is_null;
         let both_values = self.consts[a].is_value && self.consts[b].is_value;
         both && (either_null || both_values) && a != b
     }
 
-    fn implications(&mut self, v: VarId) -> Result<Vec<(SymId, Vec<SymId>, Vec<SymId>)>, Unsupported> {
+    fn implications(
+        &mut self,
+        v: VarId,
+    ) -> Result<Vec<(SymId, Vec<SymId>, Vec<SymId>)>, Unsupported> {
         if let Some(i) = &self.vars[v].implications {
             return Ok(i.clone());
         }
@@ -623,11 +668,15 @@ impl<'x> Approx<'x> {
                 .copied()
                 .filter(|b| {
                     let bc = self.syms[*b].konst;
-                    !(bc == sc || excluded_pairs.iter().any(|(x, y)| (*x == bc && *y == sc) || (*x == sc && *y == bc)))
+                    !(bc == sc
+                        || excluded_pairs
+                            .iter()
+                            .any(|(x, y)| (*x == bc && *y == sc) || (*x == sc && *y == bc)))
                 })
                 .collect();
-            let (excluded, not_excluded): (Vec<SymId>, Vec<SymId>) =
-                todo.into_iter().partition(|b| self.excludes(&domain, sc, self.syms[*b].konst));
+            let (excluded, not_excluded): (Vec<SymId>, Vec<SymId>) = todo
+                .into_iter()
+                .partition(|b| self.excludes(&domain, sc, self.syms[*b].konst));
             let mut implied = Vec::new();
             for b in not_excluded {
                 if self.implies(sc, self.syms[b].konst)? {
@@ -677,7 +726,11 @@ impl<'x> Approx<'x> {
     }
 
     /// `removeVarEq`
-    fn remove_var_eq(&mut self, props: &[Prop], model_null: bool) -> Result<(Prop, Vec<Prop>), Unsupported> {
+    fn remove_var_eq(
+        &mut self,
+        props: &[Prop],
+        model_null: bool,
+    ) -> Result<(Prop, Vec<Prop>), Unsupported> {
         let mut vars: Vec<VarId> = Vec::new();
         for p in props {
             self.gather_equalities(p, model_null, &mut vars);
@@ -708,7 +761,10 @@ impl<'x> Approx<'x> {
             let groups = self.grouped_domains(v)?;
             for (sym, implied, excluded) in imps {
                 for i in implied {
-                    axioms.push(or_create([Prop::Not(Box::new(Prop::Sym(sym))), Prop::Sym(i)]));
+                    axioms.push(or_create([
+                        Prop::Not(Box::new(Prop::Sym(sym))),
+                        Prop::Sym(i),
+                    ]));
                 }
                 for e in excluded {
                     let exclusive = groups.iter().any(|d| d.contains(&sym) && d.contains(&e));
@@ -766,7 +822,11 @@ impl<'x> Approx<'x> {
         if let Some(p) = self.eq_props.get(&key) {
             return p.clone();
         }
-        let pat = self.pat_trees.entry(pat.key.clone()).or_insert_with(|| pat.clone()).clone();
+        let pat = self
+            .pat_trees
+            .entry(pat.key.clone())
+            .or_insert_with(|| pat.clone())
+            .clone();
         let v = self.var(&path);
         let c = self.value_const(&pat);
         let p = Prop::Eq(v, c);
@@ -802,9 +862,12 @@ impl<'x> Approx<'x> {
             self.update_substitution(m);
         }
         Ok(match &m.tm {
-            TM::TypeTest { tested, expected, extractor_arg, .. } => {
-                self.render_type_test(*tested, expected, *extractor_arg)?
-            }
+            TM::TypeTest {
+                tested,
+                expected,
+                extractor_arg,
+                ..
+            } => self.render_type_test(*tested, expected, *extractor_arg)?,
             TM::EqTest { prev, pat, .. } => {
                 let p = self.binder_tree(*prev);
                 self.eq_prop(p, pat)
@@ -820,7 +883,11 @@ impl<'x> Approx<'x> {
                 }
                 big_or(ors)
             }
-            TM::Product { prev, has_extra: false, .. } => {
+            TM::Product {
+                prev,
+                has_extra: false,
+                ..
+            } => {
                 let p = self.binder_tree(*prev);
                 self.nonnull_prop(p)
             }
@@ -829,15 +896,24 @@ impl<'x> Approx<'x> {
                 let p = self.binder_tree(*prev);
                 self.nonnull_prop(p)
             }
-            TM::Guard { constant: Some(true) } => Prop::True,
-            TM::Guard { constant: Some(false) } => Prop::False,
+            TM::Guard {
+                constant: Some(true),
+            } => Prop::True,
+            TM::Guard {
+                constant: Some(false),
+            } => Prop::False,
             _ => self.handle_unknown(m, unknown),
         })
     }
 
     fn handle_unknown(&mut self, m: &Maker, unknown: Unknown) -> Prop {
         // `irrefutableExtractor`
-        if let TM::Extractor { ext, has_extra: false, .. } = &m.tm {
+        if let TM::Extractor {
+            ext,
+            has_extra: false,
+            ..
+        } = &m.tm
+        {
             if ext.irrefutable {
                 return Prop::True;
             }
@@ -852,10 +928,20 @@ impl<'x> Approx<'x> {
             }
             Unknown::Exhaust => {
                 // `rewriteListPattern`: `List()` as `Nil`.
-                if let TM::Extractor { ext, checked_length: Some(0), prev, .. } = &m.tm {
+                if let TM::Extractor {
+                    ext,
+                    checked_length: Some(0),
+                    prev,
+                    ..
+                } = &m.tm
+                {
                     if ext.seq_wrapper {
                         let nil = self.t.st.nil_sym;
-                        let nil_cls = if nil.is_none() { nil } else { self.t.st.module_class_of(nil) };
+                        let nil_cls = if nil.is_none() {
+                            nil
+                        } else {
+                            self.t.st.module_class_of(nil)
+                        };
                         let pv = PatVal {
                             key: PatKey::Sym(nil, None),
                             tp: NTy::Module(nil_cls),
@@ -879,7 +965,12 @@ impl<'x> Approx<'x> {
     }
 
     /// `TypeTestTreeMaker.renderCondition(condStrategy)`
-    fn render_type_test(&mut self, tested: B, expected: &NTy, extractor_arg: bool) -> Result<Prop, Unsupported> {
+    fn render_type_test(
+        &mut self,
+        tested: B,
+        expected: &NTy,
+        extractor_arg: bool,
+    ) -> Result<Prop, Unsupported> {
         let tys = self.tys();
         let tested_wide = tys.widen(&self.binders[tested].tp);
         if tested_wide.is_unknown() || expected.is_unknown() {
@@ -906,7 +997,11 @@ impl<'x> Approx<'x> {
         })
     }
 
-    fn approximate(&mut self, cases: &[Vec<Maker>], unknown: Unknown) -> Result<Vec<Vec<(Prop, bool)>>, Unsupported> {
+    fn approximate(
+        &mut self,
+        cases: &[Vec<Maker>],
+        unknown: Unknown,
+    ) -> Result<Vec<Vec<(Prop, bool)>>, Unsupported> {
         let mut out = Vec::new();
         for c in cases {
             let mut tests = Vec::new();
@@ -921,13 +1016,22 @@ impl<'x> Approx<'x> {
     }
 
     fn case_without_body(tests: &[(Prop, bool)]) -> Prop {
-        big_and(tests.iter().take_while(|(_, body)| !body).map(|(p, _)| p.clone()).collect())
+        big_and(
+            tests
+                .iter()
+                .take_while(|(_, body)| !body)
+                .map(|(p, _)| p.clone())
+                .collect(),
+        )
     }
 
     // --- unreachability ---------------------------------------------------------
 
     /// `unreachableCase`: the index of the first case that cannot match.
-    pub(crate) fn unreachable_case(&mut self, cases: &[Vec<Maker>]) -> Result<Option<usize>, Unsupported> {
+    pub(crate) fn unreachable_case(
+        &mut self,
+        cases: &[Vec<Maker>],
+    ) -> Result<Option<usize>, Unsupported> {
         let ok: Vec<Prop> = self
             .approximate(cases, Unknown::Reach(true))?
             .iter()
@@ -972,7 +1076,10 @@ fn uncheckable(a: &mut Approx, tp: &NTy) -> Result<bool, Unsupported> {
     if let NTy::Class(c, args) = tp {
         let st = &a.t.st;
         let name = &st.get(*c).name;
-        if name.strip_prefix("Tuple").and_then(|n| n.parse::<usize>().ok()) == Some(args.len())
+        if name
+            .strip_prefix("Tuple")
+            .and_then(|n| n.parse::<usize>().ok())
+            == Some(args.len())
             && st.get(*c).jvm_name.starts_with("scala/Tuple")
         {
             for x in args.clone() {
@@ -1034,7 +1141,11 @@ impl CEx {
             }
             CEx::List(_) => format!(
                 "List({})",
-                self.elems().iter().map(|e| e.show()).collect::<Vec<_>>().join(", ")
+                self.elems()
+                    .iter()
+                    .map(|e| e.show())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             CEx::Tuple(args) => format!(
                 "({})",
@@ -1059,10 +1170,12 @@ impl CEx {
         match (self, other) {
             (CEx::List(_), CEx::List(_)) => {
                 let (a, b) = (self.elems(), other.elems());
-                self == other || (a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.covered_by(y)))
+                self == other
+                    || (a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.covered_by(y)))
             }
             (CEx::Tuple(a), CEx::Tuple(b)) => {
-                self == other || (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.covered_by(y)))
+                self == other
+                    || (a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.covered_by(y)))
             }
             _ => self == other || *other == CEx::Wildcard,
         }
@@ -1074,7 +1187,10 @@ type VarAssignment = Vec<(VarId, (Vec<ConstId>, Vec<ConstId>))>;
 impl<'x> Approx<'x> {
     /// `exhaustive`: the counter-examples, `Ok(None)` when the analysis
     /// backs off or the scrutinee is uncheckable.
-    pub(crate) fn exhaustive(&mut self, cases: &[Vec<Maker>]) -> Result<(Vec<String>, bool), Unsupported> {
+    pub(crate) fn exhaustive(
+        &mut self,
+        cases: &[Vec<Maker>],
+    ) -> Result<(Vec<String>, bool), Unsupported> {
         let root_tp = self.binders[self.root].tp.clone();
         if uncheckable(self, &root_tp)? {
             return Ok((Vec::new(), false));
@@ -1252,7 +1368,11 @@ impl<'x> Approx<'x> {
     }
 
     /// `modelToCounterExample`
-    fn model_to_counter_example(&mut self, scrut: VarId, va: &VarAssignment) -> Result<Option<CEx>, Unsupported> {
+    fn model_to_counter_example(
+        &mut self,
+        scrut: VarId,
+        va: &VarAssignment,
+    ) -> Result<Option<CEx>, Unsupported> {
         let mut nodes: Vec<VaNode> = Vec::new();
         let mut uniques: HashMap<VarId, usize> = HashMap::new();
         let mut keys: Vec<VarId> = va.iter().map(|(v, _)| *v).collect();
@@ -1266,11 +1386,21 @@ impl<'x> Approx<'x> {
         self.to_counter_example(root, false, &nodes)
     }
 
-    fn va_unique(&self, v: VarId, va: &VarAssignment, nodes: &mut Vec<VaNode>, uniques: &mut HashMap<VarId, usize>) -> usize {
+    fn va_unique(
+        &self,
+        v: VarId,
+        va: &VarAssignment,
+        nodes: &mut Vec<VaNode>,
+        uniques: &mut HashMap<VarId, usize>,
+    ) -> usize {
         if let Some(n) = uniques.get(&v) {
             return *n;
         }
-        let (eq, neq) = va.iter().find(|(k, _)| *k == v).map(|(_, e)| e.clone()).unwrap_or_default();
+        let (eq, neq) = va
+            .iter()
+            .find(|(k, _)| *k == v)
+            .map(|(_, e)| e.clone())
+            .unwrap_or_default();
         nodes.push(VaNode {
             var: v,
             equal_to: eq,
@@ -1282,7 +1412,14 @@ impl<'x> Approx<'x> {
         n
     }
 
-    fn va_apply(&self, v: VarId, scrut: VarId, va: &VarAssignment, nodes: &mut Vec<VaNode>, uniques: &mut HashMap<VarId, usize>) -> usize {
+    fn va_apply(
+        &self,
+        v: VarId,
+        scrut: VarId,
+        va: &VarAssignment,
+        nodes: &mut Vec<VaNode>,
+        uniques: &mut HashMap<VarId, usize>,
+    ) -> usize {
         let path = self.chop(&self.vars[v].path);
         let new_ctor = self.va_unique(v, va, nodes, uniques);
         if path.len() <= 1 {
@@ -1295,7 +1432,9 @@ impl<'x> Approx<'x> {
         let pre_var = if pre.len() == 1 && scrut_path.len() == 1 && pre[0] == scrut_path[0] {
             Some(scrut)
         } else {
-            va.iter().map(|(k, _)| *k).find(|k| self.chop(&self.vars[*k].path) == pre)
+            va.iter()
+                .map(|(k, _)| *k)
+                .find(|k| self.chop(&self.vars[*k].path) == pre)
         };
         if let Some(pv) = pre_var {
             let outer = self.va_apply(pv, scrut, va, nodes, uniques);
@@ -1358,7 +1497,9 @@ impl<'x> Approx<'x> {
                 if !s.flags.contains(Flags::TRAIT)
                     && !s.flags.contains(Flags::INTERFACE)
                     && self.pickled_cache.get(&sym).is_none_or(|p| {
-                        p & (scala_rs_pickle::read::pflags::TRAIT | scala_rs_pickle::read::pflags::INTERFACE) == 0
+                        p & (scala_rs_pickle::read::pflags::TRAIT
+                            | scala_rs_pickle::read::pflags::INTERFACE)
+                            == 0
                     }) =>
             {
                 if sym == self.t.st.any_sym || sym == self.t.st.anyval_sym {
@@ -1372,10 +1513,17 @@ impl<'x> Approx<'x> {
         }
     }
 
-    fn to_counter_example(&self, idx: usize, brief: bool, nodes: &[VaNode]) -> Result<Option<CEx>, Unsupported> {
+    fn to_counter_example(
+        &self,
+        idx: usize,
+        brief: bool,
+        nodes: &[VaNode],
+    ) -> Result<Option<CEx>, Unsupported> {
         let n = &nodes[idx];
         let cls = self.node_class(n);
-        let case_accs: Vec<SymbolId> = cls.map(|c| self.t.st.get(c).ctor_fields.clone()).unwrap_or_default();
+        let case_accs: Vec<SymbolId> = cls
+            .map(|c| self.t.st.get(c).ctor_fields.clone())
+            .unwrap_or_default();
         // `allFieldAssignmentsLegal`
         if !self.all_fields_legal(idx, nodes) {
             return Ok(Some(CEx::No));
@@ -1403,10 +1551,12 @@ impl<'x> Approx<'x> {
                     for acc in case_accs.iter().take(arg_len) {
                         let f = ChopSym::Field(Field::Acc(*acc));
                         match n.fields.iter().find(|(k, _)| *k == f) {
-                            Some((_, child)) => match self.to_counter_example(*child, brevity, nodes)? {
-                                Some(e) => out.push(e),
-                                None => return Ok(None),
-                            },
+                            Some((_, child)) => {
+                                match self.to_counter_example(*child, brevity, nodes)? {
+                                    Some(e) => out.push(e),
+                                    None => return Ok(None),
+                                }
+                            }
                             None => out.push(CEx::Wildcard),
                         }
                     }
@@ -1414,7 +1564,11 @@ impl<'x> Approx<'x> {
                 };
                 let s = st.get(c);
                 let is_cons = c == st.cons_sym;
-                let is_tuple = s.name.strip_prefix("Tuple").and_then(|x| x.parse::<usize>().ok()).is_some()
+                let is_tuple = s
+                    .name
+                    .strip_prefix("Tuple")
+                    .and_then(|x| x.parse::<usize>().ok())
+                    .is_some()
                     && s.jvm_name.starts_with("scala/Tuple");
                 if is_cons {
                     return Ok(args(brief)?.map(|a| {
@@ -1466,15 +1620,19 @@ impl<'x> Approx<'x> {
             };
             return Ok(Some(CEx::Negative(
                 eq_to,
-                non_trivial.iter().map(|c| self.consts[*c].text.clone()).collect(),
+                non_trivial
+                    .iter()
+                    .map(|c| self.consts[*c].text.clone())
+                    .collect(),
             )));
         }
         // `inSameDomain` (strict mode reports a wildcard either way).
         let domain_syms = self.vars[n.var].domain_syms.clone().flatten();
         let in_same_domain = unique_eq.iter().all(|c| {
-            domain_syms
-                .as_ref()
-                .is_some_and(|d| d.iter().any(|s| self.consts[self.syms[*s].konst].tp == self.consts[*c].tp))
+            domain_syms.as_ref().is_some_and(|d| {
+                d.iter()
+                    .any(|s| self.consts[self.syms[*s].konst].tp == self.consts[*c].tp)
+            })
         });
         if in_same_domain {
             return Ok(Some(CEx::Wildcard));
@@ -1489,7 +1647,8 @@ impl<'x> Approx<'x> {
             .map(|c| self.t.st.get(c).ctor_fields.clone())
             .unwrap_or_default();
         n.fields.iter().all(|(f, child)| {
-            matches!(f, ChopSym::Field(Field::Acc(a)) if accs.contains(a)) && self.all_fields_legal(*child, nodes)
+            matches!(f, ChopSym::Field(Field::Acc(a)) if accs.contains(a))
+                && self.all_fields_legal(*child, nodes)
         })
     }
 }

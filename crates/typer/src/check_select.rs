@@ -26,7 +26,12 @@ impl Typer {
                 _ => String::new(),
             };
             // nsc reports it at the operator.
-            let at = tree.span.hi.0.saturating_sub(name.len() as u32).max(tree.span.lo.0);
+            let at = tree
+                .span
+                .hi
+                .0
+                .saturating_sub(name.len() as u32)
+                .max(tree.span.lo.0);
             self.feature_warning(
                 Span::new(at, tree.span.hi.0),
                 "postfixOps",
@@ -199,7 +204,12 @@ impl Typer {
                     }
                     _ => "method",
                 };
-                let at = tree.span.hi.0.saturating_sub(name.len() as u32).max(tree.span.lo.0);
+                let at = tree
+                    .span
+                    .hi
+                    .0
+                    .saturating_sub(name.len() as u32)
+                    .max(tree.span.lo.0);
                 self.feature_warning(
                     Span::new(at, tree.span.hi.0),
                     "reflectiveCalls",

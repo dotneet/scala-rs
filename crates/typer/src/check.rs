@@ -1028,7 +1028,11 @@ pub fn typecheck_units_src(
     dedup_diags(&mut t.diags);
     // nsc's later phases only run when the typer reported no errors; so do
     // the warnings they issue.
-    if !t.diags.iter().any(|d| d.level == scala_rs_span::Level::Error) {
+    if !t
+        .diags
+        .iter()
+        .any(|d| d.level == scala_rs_span::Level::Error)
+    {
         crate::warn_refchecks::run(&mut t, units);
         crate::warn_deprecation::run(&mut t, units);
         crate::warn_features::run(&mut t, units);
@@ -1120,7 +1124,10 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
-            language_reflective_calls: language_flag_enabled(&opts.language_features, "reflectiveCalls"),
+            language_reflective_calls: language_flag_enabled(
+                &opts.language_features,
+                "reflectiveCalls",
+            ),
             reported_features: HashSet::new(),
             source_features: opts.source_features,
             scala3: opts.scala3,
@@ -1197,7 +1204,9 @@ impl Typer {
         } else {
             String::new()
         };
-        let msg = format!("{desc} should be enabled\nby making the implicit value {fq} visible.{explain}");
+        let msg = format!(
+            "{desc} should be enabled\nby making the implicit value {fq} visible.{explain}"
+        );
         if self.fatal_warnings {
             self.error(span, msg);
         } else {

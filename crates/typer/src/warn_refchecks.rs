@@ -18,9 +18,9 @@
 use crate::check::Typer;
 use crate::symbol::{SymKind, SymbolTable};
 use crate::warn_util::{each_child, point_of, warning_at};
-use std::collections::HashSet;
 use scala_rs_parser::ast::*;
 use scala_rs_span::{Diagnostic, Phase};
+use std::collections::HashSet;
 
 pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
     let mut out = Vec::new();
@@ -78,7 +78,8 @@ fn is_unit_literal(t: &Tree) -> bool {
 fn has_explicit_unit(t: &Tree) -> bool {
     match &t.kind {
         TreeKind::Typed { tpt, .. } => {
-            matches!(tpt.ty, Type::Unit) || matches!(&tpt.kind, TreeKind::Ident { name } if name == "Unit")
+            matches!(tpt.ty, Type::Unit)
+                || matches!(&tpt.kind, TreeKind::Ident { name } if name == "Unit")
         }
         TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => has_explicit_unit(fun),
         _ => false,
@@ -142,7 +143,10 @@ impl<'a> Refchecks<'a> {
             SymKind::Term => {
                 !s.flags.contains(Flags::PARAM) && !s.owner.is_none() && {
                     let o = self.st.get(s.owner);
-                    matches!(o.kind, SymKind::Class | SymKind::ModuleClass | SymKind::Module)
+                    matches!(
+                        o.kind,
+                        SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                    )
                 }
             }
             _ => false,
@@ -185,12 +189,17 @@ impl<'a> Refchecks<'a> {
             return true;
         }
         match &t.kind {
-            TreeKind::Empty | TreeKind::This { .. } | TreeKind::Super { .. } | TreeKind::Literal { .. } => true,
+            TreeKind::Empty
+            | TreeKind::This { .. }
+            | TreeKind::Super { .. }
+            | TreeKind::Literal { .. } => true,
             TreeKind::Ident { .. } => self.is_stable(t.sym),
             TreeKind::Select { qual, .. } => {
                 if let TreeKind::Literal { lit } = &qual.kind {
                     // `-5`, `5.toString`: any member of an AnyVal constant.
-                    if !matches!(lit, Lit::String(_) | Lit::Null | Lit::Symbol(_)) && !t.sym.is_none() {
+                    if !matches!(lit, Lit::String(_) | Lit::Null | Lit::Symbol(_))
+                        && !t.sym.is_none()
+                    {
                         return true;
                     }
                 }
@@ -288,7 +297,14 @@ impl<'a> Refchecks<'a> {
                 self.uninitialized_reads(impl_);
                 self.template(impl_, 0);
             }
-            TreeKind::DefDef { mods, tpt, rhs, name, vparamss, .. } => {
+            TreeKind::DefDef {
+                mods,
+                tpt,
+                rhs,
+                name,
+                vparamss,
+                ..
+            } => {
                 if mods.flags.contains(Flags::SYNTHETIC) {
                     return;
                 }
@@ -305,7 +321,13 @@ impl<'a> Refchecks<'a> {
 
     /// A class definition, `anonymous` when it is the body of a `new`.
     fn class_def(&mut self, t: &Tree, anonymous: bool) {
-        let TreeKind::ClassDef { mods, impl_, vparamss, .. } = &t.kind else {
+        let TreeKind::ClassDef {
+            mods,
+            impl_,
+            vparamss,
+            ..
+        } = &t.kind
+        else {
             return;
         };
         if mods.flags.contains(Flags::SYNTHETIC) && !anonymous {
@@ -390,7 +412,9 @@ impl<'a> Refchecks<'a> {
                 return;
             }
             TreeKind::ValDef { .. } if self.sym_flags(t.sym).contains(Flags::LAZY) => return,
-            TreeKind::Ident { name } | TreeKind::Select { name, .. } if pending.contains(&t.sym) => {
+            TreeKind::Ident { name } | TreeKind::Select { name, .. }
+                if pending.contains(&t.sym) =>
+            {
                 let this_qual = match &t.kind {
                     TreeKind::Select { qual, .. } => matches!(qual.kind, TreeKind::This { .. }),
                     _ => true,
@@ -444,7 +468,11 @@ impl<'a> Refchecks<'a> {
                     self.tree(&c.body, unit_pt);
                 }
             }
-            TreeKind::Try { block, catches, finalizer } => {
+            TreeKind::Try {
+                block,
+                catches,
+                finalizer,
+            } => {
                 if catches.is_empty() && finalizer.is_empty() {
                     // `Typers.issueTryWarnings`, a typer warning at `try`.
                     let d = warning_at(
@@ -473,7 +501,9 @@ impl<'a> Refchecks<'a> {
                             }
                             _ => None,
                         };
-                        if let Some(n) = name.filter(|n| n == "_" || scala_rs_parser::ast::is_variable_name(n)) {
+                        if let Some(n) =
+                            name.filter(|n| n == "_" || scala_rs_parser::ast::is_variable_name(n))
+                        {
                             let d = warning_at(
                                 self.file,
                                 c.pat.span.lo.0,
@@ -499,8 +529,7 @@ impl<'a> Refchecks<'a> {
                 for p in vparams {
                     self.tree(p, false);
                 }
-                let ret_unit =
-                    !self.in_args && matches!(fn_result(&t.ty), Some(Type::Unit));
+                let ret_unit = !self.in_args && matches!(fn_result(&t.ty), Some(Type::Unit));
                 let saved = std::mem::replace(&mut self.in_args, false);
                 self.tree(body, ret_unit);
                 self.in_args = saved;
@@ -595,7 +624,9 @@ impl<'a> Refchecks<'a> {
                     .and_then(|i| {
                         let rest = &text[i..];
                         let skip = rest.len() - rest.trim_start().len();
-                        rest.trim_start().starts_with(name.as_str()).then_some(lo + i + skip)
+                        rest.trim_start()
+                            .starts_with(name.as_str())
+                            .then_some(lo + i + skip)
                     })
                     .unwrap_or(lo) as u32;
                 let d = warning_at(
@@ -648,7 +679,13 @@ impl<'a> Refchecks<'a> {
     /// A member method's `@specialized` type parameters that no
     /// specializable position of its signature mentions.
     fn unused_specialized(&mut self, def: &Tree) {
-        let TreeKind::DefDef { mods, name, tparams, .. } = &def.kind else {
+        let TreeKind::DefDef {
+            mods,
+            name,
+            tparams,
+            ..
+        } = &def.kind
+        else {
             return;
         };
         // nsc skips default getters (`hasDefault`), which are synthetic here;
@@ -677,7 +714,11 @@ impl<'a> Refchecks<'a> {
                 continue;
             }
             let s = self.st.get(tp.sym);
-            let bounds: Vec<Type> = [&s.bound_lo, &s.bound_hi].into_iter().flatten().cloned().collect();
+            let bounds: Vec<Type> = [&s.bound_lo, &s.bound_hi]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
             for b in &bounds {
                 self.specialized_type_vars(b, &mut used);
             }
@@ -696,7 +737,10 @@ impl<'a> Refchecks<'a> {
             self.file,
             at,
             at + name.len() as u32,
-            format!("{} {verb} unused or used in non-specializable positions.", unused.join(", ")),
+            format!(
+                "{} {verb} unused or used in non-specializable positions.",
+                unused.join(", ")
+            ),
             Phase::Specialize,
             self.fatal,
         );
@@ -765,14 +809,27 @@ impl<'a> Refchecks<'a> {
                 return true;
             }
         }
-        let owner = if c.owner.is_none() { "" } else { self.st.get(c.owner).name.as_str() };
+        let owner = if c.owner.is_none() {
+            ""
+        } else {
+            self.st.get(c.owner).name.as_str()
+        };
         match owner {
             "scala" => matches!(
                 c.name.as_str(),
-                "Function0" | "Function1" | "Function2" | "Tuple1" | "Tuple2" | "Product1" | "Product2"
+                "Function0"
+                    | "Function1"
+                    | "Function2"
+                    | "Tuple1"
+                    | "Tuple2"
+                    | "Product1"
+                    | "Product2"
             ),
             "runtime" => {
-                matches!(c.name.as_str(), "AbstractFunction0" | "AbstractFunction1" | "AbstractFunction2")
+                matches!(
+                    c.name.as_str(),
+                    "AbstractFunction0" | "AbstractFunction1" | "AbstractFunction2"
+                )
             }
             _ => false,
         }
@@ -840,7 +897,8 @@ impl<'a> Refchecks<'a> {
             return;
         }
         let other = strip_box(&args[0]);
-        let (Some(recv), Some(act)) = (simple_value_kind(&qual.ty), simple_value_kind(&other.ty)) else {
+        let (Some(recv), Some(act)) = (simple_value_kind(&qual.ty), simple_value_kind(&other.ty))
+        else {
             return;
         };
         let eq = name == "==";
@@ -950,8 +1008,24 @@ fn fn_result(ty: &Type) -> Option<&Type> {
 fn is_foldable_binop(name: &str) -> bool {
     matches!(
         name,
-        "+" | "-" | "*" | "/" | "%" | "<<" | ">>" | ">>>" | "&" | "|" | "^" | "==" | "!=" | "<"
-            | ">" | "<=" | ">=" | "&&" | "||"
+        "+" | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "<<"
+            | ">>"
+            | ">>>"
+            | "&"
+            | "|"
+            | "^"
+            | "=="
+            | "!="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "&&"
+            | "||"
     )
 }
 

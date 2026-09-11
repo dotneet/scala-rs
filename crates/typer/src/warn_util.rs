@@ -157,7 +157,11 @@ pub(crate) fn each_child(t: &Tree, f: &mut dyn FnMut(&Tree)) {
                 f(&c.body);
             }
         }
-        TreeKind::Try { block, catches, finalizer } => {
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
             f(block);
             for c in catches {
                 f(&c.guard);

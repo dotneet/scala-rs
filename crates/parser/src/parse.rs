@@ -1513,7 +1513,8 @@ impl<'a> Parser<'a> {
                             .tokens
                             .iter()
                             .find(|t| {
-                                t.span.lo.0 >= lo && matches!(&t.kind, TokenKind::Ident(n) if *n == name)
+                                t.span.lo.0 >= lo
+                                    && matches!(&t.kind, TokenKind::Ident(n) if *n == name)
                             })
                             .map(|t| t.span)
                             .unwrap_or(s.span);
@@ -2543,7 +2544,9 @@ impl<'a> Parser<'a> {
             TokenKind::SymbolLit(s) => {
                 self.deprecation(
                     sp,
-                    format!("symbol literal is deprecated; use Symbol(\"{s}\") instead [quickfixable]"),
+                    format!(
+                        "symbol literal is deprecated; use Symbol(\"{s}\") instead [quickfixable]"
+                    ),
                     "2.13.0",
                 );
                 Lit::Symbol(s)
@@ -3641,7 +3644,9 @@ impl<'a> Parser<'a> {
                 let sp = self.span();
                 self.deprecation(
                     sp,
-                    format!("symbol literal is deprecated; use Symbol(\"{s}\") instead [quickfixable]"),
+                    format!(
+                        "symbol literal is deprecated; use Symbol(\"{s}\") instead [quickfixable]"
+                    ),
                     "2.13.0",
                 );
                 self.bump();

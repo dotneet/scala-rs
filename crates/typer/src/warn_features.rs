@@ -40,7 +40,9 @@ pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
         } else {
             String::new()
         };
-        let msg = format!("{desc} should be enabled\nby making the implicit value {fq} visible.{explain}");
+        let msg = format!(
+            "{desc} should be enabled\nby making the implicit value {fq} visible.{explain}"
+        );
         let span = scala_rs_span::Span::new(point, point + 1);
         let d = if t.fatal_warnings {
             Diagnostic::error(file, span, msg)
@@ -62,7 +64,9 @@ impl<'a> Finder<'a> {
     /// A value or parameterless method whose type was inferred as an
     /// anonymous class.
     fn anon_class_of(&self, qual: &Tree) -> Option<SymbolId> {
-        if !matches!(qual.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) || qual.sym.is_none() {
+        if !matches!(qual.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+            || qual.sym.is_none()
+        {
             return None;
         }
         let s = self.t.st.get(qual.sym);
@@ -104,7 +108,8 @@ impl<'a> Finder<'a> {
                         } else {
                             "method"
                         };
-                        let desc = format!("reflective access of structural type member {kind} {name}");
+                        let desc =
+                            format!("reflective access of structural type member {kind} {name}");
                         self.out.push((self.file, point_of(t, self.src), desc));
                     }
                 }

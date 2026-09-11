@@ -132,7 +132,11 @@ fn java_float(v: f64, float: bool) -> String {
         return "NaN".into();
     }
     if v.is_infinite() {
-        return if v > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if v > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     let s = if float {
         format!("{}", v as f32)
@@ -229,7 +233,10 @@ impl<'a> Types<'a> {
                 match s.kind {
                     SymKind::Class => {
                         if st.is_array_class(*sym) {
-                            return NTy::Class(st.array_sym, args.iter().map(|a| self.of(a)).collect());
+                            return NTy::Class(
+                                st.array_sym,
+                                args.iter().map(|a| self.of(a)).collect(),
+                            );
                         }
                         NTy::Class(*sym, args.iter().map(|a| self.of(a)).collect())
                     }
@@ -256,7 +263,8 @@ impl<'a> Types<'a> {
                 }
             }
             Type::Function { params, ret } => {
-                match crate::classpath::find_by_jvm(st, &format!("scala/Function{}", params.len())) {
+                match crate::classpath::find_by_jvm(st, &format!("scala/Function{}", params.len()))
+                {
                     Some(c) => {
                         let mut args: Vec<NTy> = params.iter().map(|p| self.of(p)).collect();
                         args.push(self.of(ret));
@@ -298,7 +306,10 @@ impl<'a> Types<'a> {
                 for a in args {
                     targs.push(self.to_type(a)?);
                 }
-                Type::Class { sym: *s, args: targs }
+                Type::Class {
+                    sym: *s,
+                    args: targs,
+                }
             }
             NTy::Wild => Type::Wildcard,
             NTy::Any => Type::Any,
@@ -364,7 +375,9 @@ impl<'a> Types<'a> {
     /// The (result) type of a value symbol.
     pub(crate) fn value_type(&self, s: SymbolId) -> Type {
         match &self.st.get(s).ty {
-            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => (**ret).clone(),
+            Type::Method { paramss, ret } if paramss.iter().all(|c| c.is_empty()) => {
+                (**ret).clone()
+            }
             t => t.clone(),
         }
     }
@@ -412,13 +425,19 @@ impl<'a> Types<'a> {
             (_, NTy::AnyVal) => Some(!self.is_reference(a) && !matches!(a, NTy::Any)),
             (NTy::Any | NTy::AnyRef | NTy::AnyVal, _) => Some(false),
             (NTy::Const(c), _) => {
-                if matches!(b, NTy::Const(_) | NTy::Single(_) | NTy::Module(_) | NTy::Fresh(..)) {
+                if matches!(
+                    b,
+                    NTy::Const(_) | NTy::Single(_) | NTy::Module(_) | NTy::Fresh(..)
+                ) {
                     return Some(false);
                 }
                 self.sub(&NTy::Class(self.const_class(c), vec![]), b)
             }
             (NTy::Single(_), _) => {
-                if matches!(b, NTy::Single(_) | NTy::Const(_) | NTy::Module(_) | NTy::Fresh(..)) {
+                if matches!(
+                    b,
+                    NTy::Single(_) | NTy::Const(_) | NTy::Module(_) | NTy::Fresh(..)
+                ) {
                     return Some(false);
                 }
                 let w = self.widen(a);
@@ -428,7 +447,10 @@ impl<'a> Types<'a> {
                 self.sub(&w, b)
             }
             (NTy::Fresh(_, bound), _) => {
-                if matches!(b, NTy::Single(_) | NTy::Const(_) | NTy::Module(_) | NTy::Fresh(..)) {
+                if matches!(
+                    b,
+                    NTy::Single(_) | NTy::Const(_) | NTy::Module(_) | NTy::Fresh(..)
+                ) {
                     return Some(false);
                 }
                 self.sub(bound, b)
@@ -517,7 +539,10 @@ impl<'a> Types<'a> {
                 // A type parameter of the subclass stands in for "anything".
                 return None;
             }
-            let flags = tparams.get(i).map(|p| self.st.get(*p).flags).unwrap_or_default();
+            let flags = tparams
+                .get(i)
+                .map(|p| self.st.get(*p).flags)
+                .unwrap_or_default();
             let ok = if flags.contains(Flags::COVARIANT) {
                 self.sub(sa, ta)?
             } else if flags.contains(Flags::CONTRAVARIANT) {
@@ -535,11 +560,12 @@ impl<'a> Types<'a> {
     /// nsc `instanceOfTpImplies`.
     pub(crate) fn instance_of_implies(&self, tp: &NTy, implied: &NTy) -> Option<bool> {
         let value = self.is_primitive_value_type(tp);
-        let normalized = if (value && *implied == NTy::AnyVal) || (!value && *implied == NTy::AnyRef) {
-            NTy::Any
-        } else {
-            implied.clone()
-        };
+        let normalized =
+            if (value && *implied == NTy::AnyVal) || (!value && *implied == NTy::AnyRef) {
+                NTy::Any
+            } else {
+                implied.clone()
+            };
         self.sub(tp, &normalized)
     }
 
@@ -549,19 +575,33 @@ impl<'a> Types<'a> {
         let st = self.st;
         match t {
             NTy::Class(s, args) => {
-                let tuple_arity = st.get(*s).name.strip_prefix("Tuple").and_then(|n| n.parse::<usize>().ok());
-                if tuple_arity.is_some_and(|n| n == args.len() && n > 1) && is_scala_owned(st, *s)
+                let tuple_arity = st
+                    .get(*s)
+                    .name
+                    .strip_prefix("Tuple")
+                    .and_then(|n| n.parse::<usize>().ok());
+                if tuple_arity.is_some_and(|n| n == args.len() && n > 1)
+                    && is_scala_owned(st, *s)
                     && args.iter().all(|a| *a != NTy::Wild)
                 {
                     return format!(
                         "({})",
-                        args.iter().map(|a| self.show(a)).collect::<Vec<_>>().join(", ")
+                        args.iter()
+                            .map(|a| self.show(a))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
                 }
                 let mut s = self.class_name(*s);
                 if !args.is_empty() {
                     s.push('[');
-                    s.push_str(&args.iter().map(|a| self.show(a)).collect::<Vec<_>>().join(","));
+                    s.push_str(
+                        &args
+                            .iter()
+                            .map(|a| self.show(a))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
                     s.push(']');
                 }
                 s
@@ -595,7 +635,8 @@ impl<'a> Types<'a> {
         let simple = jvm.rsplit('/').next().unwrap_or("");
         let omit = matches!(pkg, "" | "scala" | "java/lang");
         let owner = sym.owner;
-        if !owner.is_none() && matches!(st.get(owner).kind, SymKind::ModuleClass | SymKind::Module) {
+        if !owner.is_none() && matches!(st.get(owner).kind, SymKind::ModuleClass | SymKind::Module)
+        {
             let o = st.get(owner);
             if o.name != "Predef" && o.name != "package" && simple.contains('$') {
                 return format!("{}.{name}", self.class_name(owner));
@@ -654,7 +695,9 @@ pub(crate) fn pickled_flags(t: &mut Typer, cls: SymbolId) -> Option<u64> {
     if !t.library_abi || cls.is_none() || !t.st.get(cls).jvm_name.starts_with("scala/") {
         return None;
     }
-    t.pickle.class_sig_of(&t.st, &mut t.binary, cls).map(|s| s.flags)
+    t.pickle
+        .class_sig_of(&t.st, &mut t.binary, cls)
+        .map(|s| s.flags)
 }
 
 /// The sealed children of a class: the source's own record, or the pickle's
@@ -668,13 +711,19 @@ pub(crate) fn sealed_children(t: &mut Typer, cls: SymbolId) -> Option<Vec<Symbol
     if !t.library_abi || !s.jvm_name.starts_with("scala/") {
         // A source sealed class with no subclass at all, or one this run
         // cannot read the pickle of.
-        return if s.jvm_name.starts_with("scala/") { None } else { Some(Vec::new()) };
+        return if s.jvm_name.starts_with("scala/") {
+            None
+        } else {
+            Some(Vec::new())
+        };
     }
     let sig = t.pickle.class_sig_of(&t.st, &mut t.binary, cls)?;
     let mut out = Vec::new();
     for (full, module) in &sig.children {
         let internal = full.replace('.', "/");
-        let id = t.pickle.ensure_class(&mut t.st, &mut t.binary, full, *module)?;
+        let id = t
+            .pickle
+            .ensure_class(&mut t.st, &mut t.binary, full, *module)?;
         let id = if *module {
             let s = t.st.get(id);
             if s.kind == SymKind::Module {

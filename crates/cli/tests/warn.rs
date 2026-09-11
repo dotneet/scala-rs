@@ -60,7 +60,10 @@ fn compile(compiler: &Path, scala_rs: bool, name: &str, flags: &[&str]) -> (bool
             .arg("--scala-library")
             .arg(jar);
     }
-    cmd.arg("-d").arg(&dir).args(flags).arg(format!("{name}.scala"));
+    cmd.arg("-d")
+        .arg(&dir)
+        .args(flags)
+        .arg(format!("{name}.scala"));
     let o = cmd.output().expect("run compiler");
     let _ = fs::remove_dir_all(&dir);
     (
@@ -84,7 +87,11 @@ fn check_ours(name: &str, flags: &[&str], expected_file: &str) {
     }
     let (ok, out) = compile(&bin(), true, name, flags);
     assert!(ok, "{name} should compile with warnings only:\n{out}");
-    assert_eq!(out, expected(expected_file), "scala-rs output for {name} {flags:?}");
+    assert_eq!(
+        out,
+        expected(expected_file),
+        "scala-rs output for {name} {flags:?}"
+    );
 }
 
 fn check_scalac(name: &str, flags: &[&str], expected_file: &str) {
@@ -94,7 +101,11 @@ fn check_scalac(name: &str, flags: &[&str], expected_file: &str) {
     };
     let (ok, out) = compile(&sc, false, name, flags);
     assert!(ok, "scalac rejected {name}:\n{out}");
-    assert_eq!(out, expected(expected_file), "scalac output for {name} {flags:?}");
+    assert_eq!(
+        out,
+        expected(expected_file),
+        "scalac output for {name} {flags:?}"
+    );
 }
 
 #[test]
@@ -173,7 +184,8 @@ fn werror_fails_after_the_warnings() {
         .trim_end_matches('\n')
         .rsplit_once('\n')
         .expect("a warning count line");
-    let want = format!("{body}\nerror: No warnings can be incurred under -Werror.\n{count}\n1 error\n");
+    let want =
+        format!("{body}\nerror: No warnings can be incurred under -Werror.\n{count}\n1 error\n");
     assert_eq!(out, want);
 }
 
@@ -217,7 +229,11 @@ fn warned_programs_still_run() {
             .args(["-Xverify:all", "-cp", &cp, main])
             .output()
             .unwrap();
-        assert!(r.status.success(), "{name}: {}", String::from_utf8_lossy(&r.stderr));
+        assert!(
+            r.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

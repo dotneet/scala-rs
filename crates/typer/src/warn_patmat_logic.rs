@@ -59,7 +59,12 @@ impl Hash for Prop {
                 b.hash(state);
             }
             Prop::And(ops) | Prop::Or(ops) => {
-                (if matches!(self, Prop::And(_)) { 1u8 } else { 2u8 }).hash(state);
+                (if matches!(self, Prop::And(_)) {
+                    1u8
+                } else {
+                    2u8
+                })
+                .hash(state);
                 // Order-independent, like a set's hash.
                 let mut acc: u64 = 0;
                 for o in ops {
@@ -677,7 +682,10 @@ fn find_tseitin_model(clauses: &[Clause]) -> Option<Vec<Lit>> {
             .next()
             .and_then(|c| c.head())
             .expect("a non-empty clause");
-        let effective = clauses.iter().position(|c| c.is_none()).unwrap_or(clauses.len());
+        let effective = clauses
+            .iter()
+            .position(|c| c.is_none())
+            .unwrap_or(clauses.len());
         let mut pos_clauses: Vec<Option<Clause>> = clauses[..effective].to_vec();
         let mut neg_clauses: Vec<Option<Clause>> = clauses[..effective].to_vec();
         pos_clauses.push(Some(clause1(split)));

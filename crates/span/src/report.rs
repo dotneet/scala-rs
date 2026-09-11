@@ -313,7 +313,11 @@ mod tests {
     #[test]
     fn scalac_rendering_keeps_tabs_in_the_caret_line() {
         let sf = SourceFile::new("a.scala", "object A {\n\t1  \n}\n");
-        let d = warn(0, 12, "a pure expression does nothing in statement position");
+        let d = warn(
+            0,
+            12,
+            "a pure expression does nothing in statement position",
+        );
         let s = render_scalac(&[d], &[sf]);
         assert_eq!(
             s,
@@ -337,7 +341,10 @@ mod tests {
             msgs,
             ["2 deprecations (since 2.13.0); re-run with -deprecation for details"]
         );
-        let out = finish_diagnostics(vec![d(1, "2.13.0"), d(3, "2.11.0")], &WarnSettings::default());
+        let out = finish_diagnostics(
+            vec![d(1, "2.13.0"), d(3, "2.11.0")],
+            &WarnSettings::default(),
+        );
         let msgs: Vec<_> = out.iter().map(|d| d.message.as_str()).collect();
         assert_eq!(
             msgs,

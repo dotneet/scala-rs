@@ -55,7 +55,10 @@ pub(crate) fn run(t: &mut Typer, units: &mut [(&mut Tree, usize)]) {
 
 /// One enclosing definition, for `matchingSymbolInScope`.
 enum Owner {
-    Method { name: String, params: Vec<(String, SymbolId)> },
+    Method {
+        name: String,
+        params: Vec<(String, SymbolId)>,
+    },
     Class(SymbolId),
 }
 
@@ -80,7 +83,14 @@ struct Patmat<'a> {
 impl<'a> Patmat<'a> {
     fn warn(&mut self, point: u32, msg: impl Into<String>) {
         let fatal = self.t.fatal_warnings;
-        self.out.push(warning_at(self.file, point, point + 1, msg, Phase::Patmat, fatal));
+        self.out.push(warning_at(
+            self.file,
+            point,
+            point + 1,
+            msg,
+            Phase::Patmat,
+            fatal,
+        ));
     }
 
     fn point(&self, t: &Tree) -> u32 {
@@ -97,7 +107,11 @@ impl<'a> Patmat<'a> {
                 }
                 self.translate_match(tree, selector, cases);
             }
-            TreeKind::Try { block, catches, finalizer } => {
+            TreeKind::Try {
+                block,
+                catches,
+                finalizer,
+            } => {
                 self.visit(block);
                 for c in catches {
                     self.visit(&c.guard);
@@ -108,7 +122,15 @@ impl<'a> Patmat<'a> {
                 }
                 self.visit(finalizer);
             }
-            TreeKind::DefDef { mods, name, vparamss, tparams, rhs, tpt, .. } => {
+            TreeKind::DefDef {
+                mods,
+                name,
+                vparamss,
+                tparams,
+                rhs,
+                tpt,
+                ..
+            } => {
                 if mods.flags.contains(Flags::SYNTHETIC) {
                     return;
                 }
@@ -118,7 +140,10 @@ impl<'a> Patmat<'a> {
                         params.push((n, p.sym));
                     }
                 }
-                self.owners.push(Owner::Method { name: name.clone(), params });
+                self.owners.push(Owner::Method {
+                    name: name.clone(),
+                    params,
+                });
                 self.visit(tpt);
                 for p in vparamss.iter().flatten() {
                     self.visit(p);
@@ -126,7 +151,12 @@ impl<'a> Patmat<'a> {
                 self.visit(rhs);
                 self.owners.pop();
             }
-            TreeKind::ClassDef { mods, impl_, vparamss, .. } => {
+            TreeKind::ClassDef {
+                mods,
+                impl_,
+                vparamss,
+                ..
+            } => {
                 if mods.flags.contains(Flags::SYNTHETIC) {
                     return;
                 }
@@ -262,7 +292,10 @@ pub(crate) struct Subst {
 
 impl Subst {
     pub(crate) fn one(from: B, to: PTree) -> Subst {
-        Subst { from: vec![from], to: vec![to] }
+        Subst {
+            from: vec![from],
+            to: vec![to],
+        }
     }
     fn is_empty(&self) -> bool {
         self.from.is_empty()
@@ -411,7 +444,10 @@ impl Maker {
     pub(crate) fn sub_patterns_as_substitution(&self) -> Subst {
         match &self.tm {
             TM::Product { subs, refs, .. } | TM::Extractor { subs, refs, .. } => {
-                let s = Subst { from: subs.clone(), to: refs.clone() };
+                let s = Subst {
+                    from: subs.clone(),
+                    to: refs.clone(),
+                };
                 s.then(&self.substitution())
             }
             _ => self.substitution(),
@@ -431,7 +467,10 @@ pub(crate) fn propagate(makers: Vec<Maker>, initial: Subst) -> Vec<Maker> {
         let cur = accum.then(&m.local());
         if let TM::Alts { alts, .. } = &mut m.tm {
             let taken = std::mem::take(alts);
-            *alts = taken.into_iter().map(|a| propagate(a, cur.clone())).collect();
+            *alts = taken
+                .into_iter()
+                .map(|a| propagate(a, cur.clone()))
+                .collect();
         }
         m.sub = Some(cur.clone());
         accum = cur;
@@ -469,8 +508,12 @@ impl SwCase {
 
 fn pattern_implies(x: &SwPat, y: &SwPat) -> bool {
     match (x, y) {
-        (SwPat::Alt(ps), _) => ps.iter().any(|p| pattern_implies(&SwPat::Lit(p.clone()), y)),
-        (_, SwPat::Alt(qs)) => qs.iter().any(|q| pattern_implies(x, &SwPat::Lit(q.clone()))),
+        (SwPat::Alt(ps), _) => ps
+            .iter()
+            .any(|p| pattern_implies(&SwPat::Lit(p.clone()), y)),
+        (_, SwPat::Alt(qs)) => qs
+            .iter()
+            .any(|q| pattern_implies(x, &SwPat::Lit(q.clone()))),
         (SwPat::Lit(a), SwPat::Lit(b)) => a == b,
         (SwPat::Default, _) => true,
         _ => false,
@@ -480,7 +523,8 @@ fn pattern_implies(x: &SwPat, y: &SwPat) -> bool {
 fn pattern_equals(x: &SwPat, y: &SwPat) -> bool {
     match (x, y) {
         (SwPat::Alt(xs), SwPat::Alt(ys)) => {
-            xs.iter().all(|a| ys.iter().any(|b| a == b)) && ys.iter().all(|b| xs.iter().any(|a| a == b))
+            xs.iter().all(|a| ys.iter().any(|b| a == b))
+                && ys.iter().all(|b| xs.iter().any(|a| a == b))
         }
         (SwPat::Alt(ps), _) => ps.iter().all(|p| pattern_equals(&SwPat::Lit(p.clone()), y)),
         (_, SwPat::Alt(qs)) => qs.iter().all(|q| pattern_equals(x, &SwPat::Lit(q.clone()))),
@@ -500,7 +544,9 @@ fn switch_unreachable(cases: &[SwCase]) -> Option<usize> {
             return Some(i + 1);
         }
         if !head.guarded() || head.guard == Some(Some(true)) {
-            if let Some(j) = (i + 1..cases.len()).find(|j| pattern_implies(&head.pat, &cases[*j].pat)) {
+            if let Some(j) =
+                (i + 1..cases.len()).find(|j| pattern_implies(&head.pat, &cases[*j].pat))
+            {
                 return Some(j);
             }
             i += 1;
@@ -524,7 +570,10 @@ fn collapse_guarded(cases: &[SwCase]) -> bool {
         let (implies_curr, others): (Vec<SwCase>, Vec<SwCase>) = if curr_default {
             (remaining[1..].to_vec(), Vec::new())
         } else {
-            remaining[1..].iter().cloned().partition(|c| pattern_implies(&curr.pat, &c.pat))
+            remaining[1..]
+                .iter()
+                .cloned()
+                .partition(|c| pattern_implies(&curr.pat, &c.pat))
         };
         let unguarded_ok = (!curr.guarded() && implies_curr.is_empty()) || {
             match implies_curr.iter().position(|c| !c.guarded()) {
@@ -532,7 +581,11 @@ fn collapse_guarded(cases: &[SwCase]) -> bool {
                 Some(k) => k + 1 == implies_curr.len(),
             }
         };
-        if unguarded_ok && implies_curr.iter().all(|c| pattern_equals(&curr.pat, &c.pat)) {
+        if unguarded_ok
+            && implies_curr
+                .iter()
+                .all(|c| pattern_equals(&curr.pat, &c.pat))
+        {
             collapsed += 1;
             remaining = others;
         } else {
@@ -554,7 +607,9 @@ fn switch_lit(c: &CVal) -> CVal {
 fn is_annotated_with(t: &Tree, what: &str) -> bool {
     fn ty_has(ty: &Type, what: &str) -> bool {
         match ty {
-            Type::Annotated { annot, tpe } => annot.rsplit('.').next() == Some(what) || ty_has(tpe, what),
+            Type::Annotated { annot, tpe } => {
+                annot.rsplit('.').next() == Some(what) || ty_has(tpe, what)
+            }
             _ => false,
         }
     }
@@ -676,7 +731,14 @@ impl<'a> Patmat<'a> {
             return;
         }
         let point = self.selector_point(selector);
-        self.analyze_cases(&binders, root, &makers, point, suppress_exhaustive, suppress_unreachable);
+        self.analyze_cases(
+            &binders,
+            root,
+            &makers,
+            point,
+            suppress_exhaustive,
+            suppress_unreachable,
+        );
     }
 
     /// `analyzeCases`
@@ -691,18 +753,24 @@ impl<'a> Patmat<'a> {
     ) {
         if !suppress_unreachable {
             let r = {
-                let mut a = crate::warn_patmat_analysis::Approx::new(self.t, binders, root, self.sym_ids);
+                let mut a =
+                    crate::warn_patmat_analysis::Approx::new(self.t, binders, root, self.sym_ids);
                 a.unreachable_case(makers)
             };
             if let Ok(Some(i)) = r {
-                if let Some(Maker { tm: TM::Body { pos }, .. }) = makers[i].last() {
+                if let Some(Maker {
+                    tm: TM::Body { pos },
+                    ..
+                }) = makers[i].last()
+                {
                     self.warn(*pos, "unreachable code");
                 }
             }
         }
         if !suppress_exhaustive {
             let r = {
-                let mut a = crate::warn_patmat_analysis::Approx::new(self.t, binders, root, self.sym_ids);
+                let mut a =
+                    crate::warn_patmat_analysis::Approx::new(self.t, binders, root, self.sym_ids);
                 a.exhaustive(makers)
             };
             if let Ok((examples, depth_reached)) = r {
@@ -721,7 +789,10 @@ impl<'a> Patmat<'a> {
                     let ce = match examples.as_slice() {
                         [one] if one == "_" => String::new(),
                         [one] => format!("\nIt would fail on the following input: {one}"),
-                        many => format!("\nIt would fail on the following inputs: {}", many.join(", ")),
+                        many => format!(
+                            "\nIt would fail on the following inputs: {}",
+                            many.join(", ")
+                        ),
                     };
                     self.warn(point, format!("match may not be exhaustive.{ce}"));
                 }
@@ -738,17 +809,32 @@ impl<'a> Patmat<'a> {
         let mut cases: Vec<SwCase> = Vec::new();
         for c in makers {
             let (head, rest): (Option<&TM>, &[Maker]) = match c.as_slice() {
-                [Maker { tm: TM::Body { .. }, .. }] | [Maker { tm: TM::Guard { .. }, .. }, Maker { tm: TM::Body { .. }, .. }] => {
-                    (None, c.as_slice())
-                }
+                [Maker {
+                    tm: TM::Body { .. },
+                    ..
+                }]
+                | [Maker {
+                    tm: TM::Guard { .. },
+                    ..
+                }, Maker {
+                    tm: TM::Body { .. },
+                    ..
+                }] => (None, c.as_slice()),
                 [first, rest @ ..] => (Some(&first.tm), rest),
                 [] => return false,
             };
             let (guard, body_pos) = match rest {
-                [Maker { tm: TM::Body { pos }, .. }] => (None, *pos),
-                [Maker { tm: TM::Guard { constant }, .. }, Maker { tm: TM::Body { pos }, .. }] => {
-                    (Some(*constant), *pos)
-                }
+                [Maker {
+                    tm: TM::Body { pos },
+                    ..
+                }] => (None, *pos),
+                [Maker {
+                    tm: TM::Guard { constant },
+                    ..
+                }, Maker {
+                    tm: TM::Body { pos },
+                    ..
+                }] => (Some(*constant), *pos),
                 _ => return false,
             };
             let pat = match head {
@@ -757,7 +843,11 @@ impl<'a> Patmat<'a> {
                     Some(k) => SwPat::Lit(switch_lit(k)),
                     None => return false,
                 },
-                Some(TM::Alts { switch: Some(alts), pos, .. }) => {
+                Some(TM::Alts {
+                    switch: Some(alts),
+                    pos,
+                    ..
+                }) => {
                     let lits: Vec<CVal> = alts.iter().map(|(k, _)| switch_lit(k)).collect();
                     // scala/bug#7290: report the first duplicate of each constant.
                     let mut distinct: Vec<CVal> = Vec::new();
@@ -767,8 +857,10 @@ impl<'a> Patmat<'a> {
                         }
                     }
                     if distinct.len() < lits.len() {
-                        let groups: Vec<(CVal, i32)> =
-                            distinct.iter().map(|k| (k.clone(), k.scala_hash())).collect();
+                        let groups: Vec<(CVal, i32)> = distinct
+                            .iter()
+                            .map(|k| (k.clone(), k.scala_hash()))
+                            .collect();
                         let ordered = crate::scala_coll::champ_order(&groups);
                         let dups: Vec<String> = ordered
                             .iter()
@@ -776,13 +868,23 @@ impl<'a> Patmat<'a> {
                             .map(|k| k.escaped())
                             .collect();
                         let pos = *pos;
-                        self.warn(pos, format!("Pattern contains duplicate alternatives: {}", dups.join(", ")));
+                        self.warn(
+                            pos,
+                            format!(
+                                "Pattern contains duplicate alternatives: {}",
+                                dups.join(", ")
+                            ),
+                        );
                     }
                     SwPat::Alt(distinct)
                 }
                 _ => return false,
             };
-            cases.push(SwCase { pat, guard, body_pos });
+            cases.push(SwCase {
+                pat,
+                guard,
+                body_pos,
+            });
         }
         if let Some(i) = switch_unreachable(&cases) {
             let pos = cases[i].body_pos;
@@ -816,7 +918,10 @@ impl<'a> Patmat<'a> {
                 vpat = Some(format!("variable pattern{name} on line {line}"));
                 let add = self.addendum(&c.pat);
                 let p = c.pat.span.lo.0;
-                self.warn(p, format!("patterns after a variable pattern cannot match (SLS 8.1.1){add}"));
+                self.warn(
+                    p,
+                    format!("patterns after a variable pattern cannot match (SLS 8.1.1){add}"),
+                );
             }
         }
     }
@@ -839,10 +944,9 @@ impl<'a> Patmat<'a> {
                     }
                 }
                 Owner::Class(c) if !c.is_none() => {
-                    let hit = st
-                        .members_including_inherited(*c)
-                        .into_iter()
-                        .find(|m| st.get(*m).name == name && st.get(*m).kind != SymKind::TypeMember);
+                    let hit = st.members_including_inherited(*c).into_iter().find(|m| {
+                        st.get(*m).name == name && st.get(*m).kind != SymKind::TypeMember
+                    });
                     if let Some(m) = hit {
                         let s = st.get(m);
                         let kind = match s.kind {
@@ -873,7 +977,8 @@ impl<'a> Patmat<'a> {
 
     /// `translateTry`: catch clauses are checked for unreachable cases only.
     fn translate_try(&mut self, catches: &[CaseDef]) {
-        let Some(throwable) = crate::classpath::find_by_jvm(&self.t.st, "java/lang/Throwable") else {
+        let Some(throwable) = crate::classpath::find_by_jvm(&self.t.st, "java/lang/Throwable")
+        else {
             return;
         };
         let tys = Types { st: &self.t.st };
@@ -902,7 +1007,9 @@ impl<'a> Patmat<'a> {
                         break;
                     }
                 },
-                TreeKind::Typed { expr, .. } if crate::warn_patmat_translate::Translator::is_var_pattern(expr) => {
+                TreeKind::Typed { expr, .. }
+                    if crate::warn_patmat_translate::Translator::is_var_pattern(expr) =>
+                {
                     Some(tys.of(&c.pat.ty))
                 }
                 _ if crate::warn_patmat_translate::Translator::is_wildcard(&c.pat)
@@ -946,7 +1053,9 @@ impl<'a> Patmat<'a> {
                     self.warn(p, "unreachable code");
                     return;
                 }
-                if let Some(j) = (i + 1..simple.len()).find(|j| implies(&simple[i].0, &simple[*j].0)) {
+                if let Some(j) =
+                    (i + 1..simple.len()).find(|j| implies(&simple[i].0, &simple[*j].0))
+                {
                     let p = simple[j].1;
                     self.warn(p, "unreachable code");
                     return;
