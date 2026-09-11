@@ -23,7 +23,7 @@ collection result, evidence factory and Java member batch, and the dependent
 result, SAM, implicit override and self-type batch, and the combined contextual,
 lexical, source-unit ownership and erased field-access batch, and the combined
 Scala declaration, array signature, value-class storage and implicit-view batch.
-Twenty-seven intermediate candidates were rejected, three despite a PASS script verdict. From
+Twenty-eight intermediate candidates were rejected, three despite a PASS script verdict. From
 this gate on, run them with **`tests/verify_merge.sh`**: one command, one log
 directory, one `VERDICT=` line, one `DONE` sentinel, and every skipped step
 named in the summary. This one reports `VERDICT=PASS`. The
@@ -3783,6 +3783,86 @@ Exact summary block:
 === summary
   HEAD=e5df7b09  logs=/tmp/scala-rs-gate-e5df7b09-codex
   fail: workspace tests: 313 rows, 2786 passed, 5 failed
+VERDICT=FAIL
+DONE
+```
+
+
+## Rejected by-name and copy recovery candidate: 287ec595
+
+Frozen candidate `287ec59500b841a8d4fc7c7be03e7741cb3eafa6`, tree `3b4abddab2c976cc89e3a16404a1a26308b7bdb0`,
+contains local main 788e56955585f8a9683f8c1e15d7879b83c8994a. Final git merge main was already up to date.
+Gate `/tmp/scala-rs-gate-287ec595-codex` reached DONE, exit 1,
+in 1437.9 seconds. Script and independent audit reject the candidate.
+No compiler change is merged into main. Accepted baseline remains e608c7dc
+(gitbucket96/45, cats83/34, library415/113, Slick0/1504). This main commit adds
+only the rejected gate record, raw corpus ledger and next inventory document.
+No push was attempted: previous automatic approval review still requires
+explicit destination/payload authorization, which has not arrived.
+
+Candidate measurements, not an accepted baseline:
+
+- Gitbucket:354 Scala/Twirl plus3 Java inputs, none skipped;96/45 ->92/43.
+- Cats:339 inputs, one skipped;83/34 ->34/23.
+- Library:538 inputs;415/113 ->383/107.
+- No new diagnostic locations; cats removes49 diagnostics with none added,
+  library removes32 with none added; gitbucket removes5 and replaces1 at an
+  existing location.
+- Slick:184 inputs,0 errors,1504 classes; all1504 independently strongly loaded,
+  no failures/incomplete loads; subset verifies1504, lint_problems=0;12 clients
+  and36/36 byte-exact runtime attempts.
+- Workspace:2797 passed,2 failed,313 result rows.
+- Corpus:5324 unique identities, exact accepted-baseline key set,
+  losses=0, changes=11: pos/looping-jsig, pos/t5727, run/phantomValueClass, run/reflection-allmirrors-tostring, run/reflection-magicsymbols-vanilla, run/sd242, run/t7120, run/t7584, run/t7859, run/t8733, run/valueclasses-pavlov.
+  Counts:{"neg": {"fail": 318, "pass": 718, "skip": 369}, "pos": {"fail": 362, "pass": 1152, "skip": 345}, "run": {"fail": 801, "pass": 706, "skip": 553}}.
+
+The two failures are quasi::qq_ctx_bad_names_every_form_it_cannot_build and
+quasi::qr_forms_bad_names_every_form_it_cannot_build. The parser now preserves
+by-name function domains as <ByName>, but reify still recognizes the older
+Function marker when rejecting standalone by-name types. The quasi suite was
+omitted when prerequisite scope expanded to parser/reification. This is a
+selection failure; the tests remain unchanged. A grouped real-scalac probe
+confirmed actual false acceptance: standalone tq"=> Int" is rejected by nsc
+and accepted-before, but candidate compiles and executes a bogus
+$lessByName$greater[Int] tree. A written user class named `<ByName>`[A] prints7
+under nsc and accepted-before but candidate refuses it. Nested by-name
+function quasiquote syntax is a separate existing unsupported boundary.
+
+The candidate combines the previous unmerged contextual/parent/value-class
+repairs with source-function thunk provenance, callable by-name forcing,
+fixed formal prototypes, local stable alias signatures, prelude copy guards,
+imported private/protected declarations, by-name function types and publishing,
+eta parameter modes and Unit discarding.16 ctxev groups pass real-scalac
+accept/reject and executable byte comparisons, including producer/consumer
+exchanges. No stubs, subagents or aggregate before remeasurement were used.
+
+Earlier prerequisite failures caught private-constructor access and neg/t7899
+before any full gate. Both were repaired together with adjacent boundaries.
+Final prerequisites:51 early CLI tests,949 additional CLI tests, parser67,
+backend58,typer190;2492 corpus identities, all1405 negatives and44 historical
+loss names,losses=0. Clippy57 existing warnings,0 new. Input health:four pinned
+source trees,121 jars,33 released Java cache classes,1498 reference hashes.
+The full gate used the same immutable binary as those final prerequisites.
+Binary SHA-256 `d3ee2ab22003c6dbdba5e6bdf05896400e61ac1d604d2c404c5dca25090a3756`.
+Rejected ledger [`baselines/corpus-287ec595.tsv`](baselines/corpus-287ec595.tsv),
+SHA-256 `900cd9d40d0869976d840037e4058370f5582331b3f8d5badf5f2ce000ee0591`. Preserve raw bytes; this is not the next GATE_LEDGER.
+Continue using tests/baselines/corpus-e608c7dc.tsv.
+Independent audit problems: ["gate verdict is not PASS", "gate process failed", "workspace incomplete or failed"].
+
+Evidence:/tmp/scala-rs-copy-byname/, especially checked-prerequisites,
+early-measures5, marker-probe and the frozen full gate.
+Next grouped boundaries and the corrected diagnoses are in
+[byname-marker-inventory.md](../docs/batches/byname-marker-inventory.md).
+The gated tree remains untouched; repair marker identity and reification
+consumers together after recording this result. MODE=a and specialization
+remain red. No successful gitbucket/cats compilation is claimed.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=287ec595  logs=/tmp/scala-rs-gate-287ec595-codex
+  fail: workspace tests: 313 rows, 2797 passed, 2 failed
 VERDICT=FAIL
 DONE
 ```
