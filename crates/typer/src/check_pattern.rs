@@ -515,11 +515,18 @@ impl Typer {
                 }
                 let unapply = self.find_unapply(fun, sel_ty);
                 let unapply_seq = self.find_unapply_seq(fun);
+                // `def unapply(n: Nd) = Some((n.v, n.tag))` has no result type
+                // of its own; without completing it the pattern would see
+                // `<notype>` and count one sub-pattern instead of two.
+                for u in unapply.iter().chain(unapply_seq.iter()) {
+                    self.complete_lazy_sig(*u, pat.span);
+                }
                 // SLS 8.1.8: an extractor method takes the scrutinee as its
                 // one (first-clause) argument. `def unapply: Option[Int]`,
                 // `def unapply()` and `def unapply(a: Int, b: Int)` were
                 // accepted and called with the scrutinee anyway, which did not
-                // verify (`neg/t5078`).
+                // verify (`neg/t5078`). Judged only once the signature is
+                // complete: a lazily typed `unapply` has no clauses yet.
                 if let Some(u) = unapply.or(unapply_seq) {
                     if self.reject_extractor_shape(u, fun, pat.span) {
                         // Still bind the sub-patterns, so their names do not
@@ -530,12 +537,6 @@ impl Typer {
                         pat.ty = Type::Error;
                         return;
                     }
-                }
-                // `def unapply(n: Nd) = Some((n.v, n.tag))` has no result type
-                // of its own; without completing it the pattern would see
-                // `<notype>` and count one sub-pattern instead of two.
-                for u in unapply.iter().chain(unapply_seq.iter()) {
-                    self.complete_lazy_sig(*u, pat.span);
                 }
                 // Without the jar there is no `Array$` / `Vector$` companion
                 // at all, so a sequence pattern on one finds no `unapplySeq`

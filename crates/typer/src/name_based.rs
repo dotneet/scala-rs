@@ -290,7 +290,15 @@ impl Typer {
         span: Span,
     ) -> bool {
         let s = self.st.get(unapply);
-        if unapply.0 < self.st.prelude_end || !s.pickled_origin.is_empty() {
+        // A case class's synthetic `unapply` is matched as the constructor
+        // pattern, whatever its symbol's signature says at this point (a
+        // local case class's is typed lazily: cats' `case class Deferred`
+        // inside a method body).
+        if unapply.0 < self.st.prelude_end
+            || !s.pickled_origin.is_empty()
+            || s.flags.contains(Flags::CASE)
+            || s.flags.contains(Flags::SYNTHETIC)
+        {
             return false;
         }
         let owner = s.owner;
