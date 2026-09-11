@@ -3205,19 +3205,30 @@ impl Typer {
                 // `IterableOnce` parent has not been loaded yet. Applying it
                 // to every generic receiver made `Ior[A, B].map` read the
                 // left parameter as the mapped value and rejected a perfectly
-                // valid `B => C` function. Prefer it for the standard
-                // collection hierarchy as well: walking a deeply nested
-                // `List` through every `IterableOnce` parent is needlessly
-                // expensive during repeated `asInstanceOf` chains.
+                // valid `B => C` function.
+                //
+                // Classes known to iterate their first type parameter skip
+                // the parent walk: walking a deeply nested `List` through
+                // every `IterableOnce` parent is needlessly expensive during
+                // repeated `asInstanceOf` chains. The rest of the collection
+                // package must take the walk first -- `Iterator.sliding`
+                // returns `GroupedIterator[B]`, which iterates `Seq[B]`, and
+                // reading its argument as the element rejected
+                // `it.sliding(2).map(f)` for a valid `f: Seq[A] => B`.
+                let name = self.st.get(*sym).name.as_str();
                 let jvm = self.st.get(*sym).jvm_name.as_str();
-                let standard = (jvm.starts_with("scala/collection/")
-                    || jvm.starts_with("scala/ArrayOps")
+                if is_first_arg_elem_collection(jvm)
                     || matches!(
-                        self.st.get(*sym).name.as_str(),
+                        name,
                         "Traversable" | "Iterable" | "Seq" | "IndexedSeq" | "LinearSeq"
-                    ))
-                .then(|| args[0].clone());
-                standard.or_else(|| self.iterable_once_elem(*sym, args))
+                    )
+                {
+                    return Some(args[0].clone());
+                }
+                self.iterable_once_elem(*sym, args).or_else(|| {
+                    (jvm.starts_with("scala/collection/") || jvm.starts_with("scala/ArrayOps"))
+                        .then(|| args[0].clone())
+                })
             }
             // cats' syntax layer hands back `Ops[F, A] { type TypeClassType =
             // FlatMap[F] }`; the arguments live on the parent.

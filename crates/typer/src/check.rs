@@ -1171,6 +1171,51 @@ pub(crate) fn is_tuple2_elem_map(name: &str) -> bool {
     )
 }
 
+/// Standard collection classes whose `IterableOnce` element is exactly their
+/// first type parameter, so `elem_type` may answer without walking parents.
+/// Anything else in `scala/collection/` (`GroupedIterator[B]` iterates
+/// `Seq[B]`, maps iterate pairs) must be derived from the base type.
+pub(crate) fn is_first_arg_elem_collection(jvm: &str) -> bool {
+    let Some(rest) = jvm.strip_prefix("scala/collection/") else {
+        return false;
+    };
+    matches!(
+        rest,
+        "IterableOnce"
+            | "Iterator"
+            | "Iterable"
+            | "Seq"
+            | "IndexedSeq"
+            | "LinearSeq"
+            | "Set"
+            | "ArrayOps"
+            | "immutable/Iterable"
+            | "immutable/Seq"
+            | "immutable/IndexedSeq"
+            | "immutable/LinearSeq"
+            | "immutable/List"
+            | "immutable/$colon$colon"
+            | "immutable/Vector"
+            | "immutable/LazyList"
+            | "immutable/Stream"
+            | "immutable/Queue"
+            | "immutable/Set"
+            | "immutable/ArraySeq"
+            | "mutable/Iterable"
+            | "mutable/Seq"
+            | "mutable/IndexedSeq"
+            | "mutable/Buffer"
+            | "mutable/ArrayBuffer"
+            | "mutable/ListBuffer"
+            | "mutable/ArraySeq"
+            | "mutable/Set"
+            | "mutable/HashSet"
+            | "mutable/Queue"
+            | "mutable/Stack"
+            | "mutable/ArrayDeque"
+    )
+}
+
 pub(crate) fn is_tailrec_annot(path: &str) -> bool {
     matches!(
         path,
