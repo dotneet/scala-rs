@@ -958,6 +958,13 @@ impl Typer {
         };
         match ty {
             Type::TypeParam(id) if *id == tp => Some(variance),
+            // An inner class behind a prefix (`prefix.rs`) is the class
+            // under the view: `tryBreakable[T](op: => T): TryBlock[T]` -- an
+            // inner trait of `Breaks` -- still has `T` invariant in its
+            // result, which is what keeps a `Nothing` solution retracted.
+            Type::Refined { .. } if crate::symbol::SymbolTable::as_seen_from_view(ty).is_some() => {
+                self.tparam_variance_in(crate::prefix::strip_view(ty), tp, variance)
+            }
             Type::Class { sym, args } => {
                 let tparams = self.st.get(*sym).tparams.clone();
                 let mut out = None;

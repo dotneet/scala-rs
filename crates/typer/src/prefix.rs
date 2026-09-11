@@ -38,9 +38,7 @@ pub fn view_prefix(ty: &Type) -> Option<&Type> {
     let Type::Refined { decls, .. } = ty else {
         return None;
     };
-    if SymbolTable::as_seen_from_view(ty).is_none() {
-        return None;
-    }
+    SymbolTable::as_seen_from_view(ty)?;
     decls.iter().find_map(|d| match d {
         RefineDecl::Type { name, rhs, .. } if name == PREFIX_MARK => rhs.as_ref(),
         _ => None,
@@ -407,10 +405,7 @@ impl SymbolTable {
                             }
                             (Type::SingleType { sym, .. }, _) if !sym.is_none() => {
                                 let under = self.singleton_underlying(*sym);
-                                match view_prefix(&under) {
-                                    Some(p) => Some(p.clone()),
-                                    None => None,
-                                }
+                                view_prefix(&under).cloned()
                             }
                             _ => None,
                         },
