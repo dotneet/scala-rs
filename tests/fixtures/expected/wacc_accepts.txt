@@ -1,0 +1,17 @@
+Top
+1 2
+40 0
+CC(3)
+2 7
+5 6
+value method
+D.int C.any
+5 8
+2 7
+pair 1 2, small, list 7
+10
+F(1) 8 3 9
+35
+2 3
+$ 4 5 "a\tb
+3m

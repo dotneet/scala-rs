@@ -1707,7 +1707,22 @@ impl Typer {
     pub(crate) fn open_packages(&self, from: SymbolId) -> Vec<SymbolId> {
         let encl = self.enclosing_package(from);
         let mut out = vec![encl];
-        if let Some(opened) = self.open_pkgs.get(&self.file_index) {
+        // The clauses that open `encl` itself say which of its enclosing
+        // packages are open too: only the ones they are nested in.
+        let chains: Vec<&Vec<SymbolId>> = self
+            .open_pkg_chains
+            .get(&self.file_index)
+            .map(|cs| cs.iter().filter(|c| c.last() == Some(&encl)).collect())
+            .unwrap_or_default();
+        if !chains.is_empty() {
+            for chain in chains {
+                for &p in chain.iter().rev() {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+        } else if let Some(opened) = self.open_pkgs.get(&self.file_index) {
             // Innermost first, and only the ones this definition is actually
             // inside: two sibling clauses in one file do not see each other.
             for &p in opened.iter().rev() {

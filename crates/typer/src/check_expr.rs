@@ -1985,6 +1985,15 @@ impl Typer {
                         self.type_apply(tree, pt);
                         return;
                     }
+                    if let Some(msg) = self
+                        .st
+                        .class_sym_of(&tree.ty)
+                        .and_then(|cls| self.unapplied_new_error(cls))
+                    {
+                        self.error(tree.span, msg);
+                        tree.ty = Type::Error;
+                        return;
+                    }
                     self.check_instantiated_self_type(&tree.ty, tree.span);
                 }
             }
