@@ -4428,10 +4428,44 @@ impl<'a> Unify<'a> {
         match (a, b) {
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
                 if s1 == s2 && a1.len() == a2.len() {
-                    return a1
-                        .iter()
-                        .zip(a2.iter())
-                        .all(|(x, y)| self.unify_at(x, y, depth + 1));
+                    let variances = self.typer.st.get(*s1).tparams.clone();
+                    return a1.iter().zip(a2.iter()).enumerate().all(|(i, (x, y))| {
+                        // A position that mentions **no unknown on either side**
+                        // has nothing to solve, so the question there is
+                        // conformance -- in the direction that position's
+                        // variance demands, which is how nsc's constraint solver
+                        // reads it. `IterableFactory.toBuildFrom[A, CC](f:
+                        // IterableFactory[CC]): BuildFrom[Any, A, CC[A]]` fitted
+                        // to a wanted `BuildFrom[IterableOnce[Future[T]], T, To]`
+                        // stopped at `Any` against `IterableOnce[Future[T]]` --
+                        // `BuildFrom`'s `From` is *contravariant*, so the
+                        // candidate's wider type is exactly right -- and
+                        // `Future.fold`/`Future.reduce`'s
+                        // `sequence(futures)(ArrayBuffer, executor)` was
+                        // `no matching overload` (`concurrent/Future.scala:813,832`).
+                        // Tried only after structural unification declines, so
+                        // no position that could still bind an unknown is
+                        // decided this way.
+                        if self.unify_at(x, y, depth + 1) {
+                            return true;
+                        }
+                        if mentions_unknown(x, &self.unknowns)
+                            || mentions_unknown(y, &self.unknowns)
+                        {
+                            return false;
+                        }
+                        let f = variances
+                            .get(i)
+                            .map(|&tp| self.typer.st.get(tp).flags)
+                            .unwrap_or(Flags::EMPTY);
+                        if f.contains(Flags::COVARIANT) {
+                            self.typer.st.is_sub_type(x, y)
+                        } else if f.contains(Flags::CONTRAVARIANT) {
+                            self.typer.st.is_sub_type(y, x)
+                        } else {
+                            false
+                        }
+                    });
                 }
                 if s1 == s2 {
                     return a1.is_empty() || a2.is_empty();

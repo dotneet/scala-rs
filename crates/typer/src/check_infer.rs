@@ -3415,6 +3415,21 @@ impl Typer {
         if matches!(tree.ty, Type::Repeated(_)) {
             return;
         }
+        // A type parameter that nothing in the *call* determined, carried out
+        // through a **selection** on that call's result: `Promise.failed(e).future`
+        // for a `def failed[T](e: Throwable): Promise[T]` is a `Future[?T]`, and
+        // only the expected type says what `?T` is. `type_apply` leaks such a
+        // variable to the enclosing context and asks this question for an
+        // application; a selection on one had nowhere to ask it, so
+        // `final def failed[T](exception: Throwable): Future[T] =
+        // Promise.failed(exception).future` was `found Future[T (defined in
+        // method failed)] required Future[T (defined in method failed)]` -- two
+        // different `T`s of the same name (`concurrent/Future.scala:651`).
+        // `solve_undet_result` is a no-op unless a variable is still open and
+        // its solution actually conforms.
+        if matches!(tree.kind, TreeKind::Select { .. }) && !self.undet_tvars.is_empty() {
+            self.solve_undet_result(tree, pt);
+        }
         if self.reject_unapplied_implicit_clause(tree) {
             return;
         }
@@ -4151,7 +4166,17 @@ impl Typer {
         if params.len() != sam.param_tys.len() {
             return false;
         }
-        if !ret.is_no_type() && !self.st.is_sub_type(ret, &sam.ret_ty) {
+        // A `Unit` SAM result **discards** the literal's value (SLS 6.26.1, and
+        // nsc types the body at the abstract method's result type): a
+        // `(T, Throwable) => Boolean` is a `BiConsumer[T, Throwable]`, whose
+        // `accept` returns `void`. Without this,
+        // `whenCompleteAsync((t, e) => { if (e == null) cf.complete(t) else … })`
+        // was `found (T, Throwable) => AnyVal required BiConsumer[_ >: T,
+        // _ >: Throwable]` (`concurrent/impl/FutureConvertersImpl.scala:57`).
+        if !ret.is_no_type()
+            && !self.st.is_sub_type(ret, &sam.ret_ty)
+            && !matches!(sam.ret_ty, Type::Unit)
+        {
             return false;
         }
         for (have, want) in params.iter().zip(sam.param_tys.iter()) {
