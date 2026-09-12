@@ -329,12 +329,26 @@ if [[ ! -f /tmp/scala-2.13.16/lib/scala-reflect.jar ]]; then
   cp $CCACHE/org/scala-lang/scala-reflect/2.13.16/scala-reflect-2.13.16.jar /tmp/scala-2.13.16/lib/scala-reflect.jar
   cp $CCACHE/org/scala-lang/scala-compiler/2.13.16/scala-compiler-2.13.16.jar /tmp/scala-2.13.16/lib/scala-compiler.jar
 fi
-if [[ ! -d $CORPUS/test/files ]]; then
+# `test/files` present is not the same as the checkout being usable. On
+# 2026-09-13 `/tmp/scala-rs-corpus/scala/.git` held four empty directories and
+# nothing else -- a `/tmp` sweep had taken `HEAD`, `config` and the refs and left
+# the worktree. The guard below saw `test/files`, skipped the clone, and the
+# revision check then died with `fatal: not a git repository`: the whole corpus
+# step of the merge gate exited 128 after one second and read as a compiler
+# failure. Ask git whether the repository answers at all, and treat "it does not"
+# the same as "the material is missing", which is what this script already
+# promises to repair by itself.
+corpus_revision() { git -C $CORPUS rev-parse HEAD 2>/dev/null }
+if [[ ! -d $CORPUS/test/files ]] || [[ -z $(corpus_revision) ]]; then
   mkdir -p ${CORPUS:h}; rm -rf $CORPUS
   git clone --depth 1 --branch v2.13.16 --filter=blob:none --no-tags \
       https://github.com/scala/scala.git $CORPUS >/dev/null 2>&1
 fi
-have=$(git -C $CORPUS rev-parse HEAD)
+have=$(corpus_revision)
+if [[ -z $have ]]; then
+  echo "corpus checkout at $CORPUS is not a usable git repository, and re-cloning it failed" >&2
+  exit 2
+fi
 if [[ $have != $SCALA_REV ]]; then
   echo "corpus revision mismatch: got $have, expected $SCALA_REV (v2.13.16)" >&2
   exit 2
