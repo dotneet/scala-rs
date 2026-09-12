@@ -1299,7 +1299,9 @@ impl Typer {
                         continue;
                     }
                     if s.sym.is_none() {
+                        self.block_local_naming = true;
                         self.namer(s);
+                        self.block_local_naming = false;
                     }
                     if !s.sym.is_none() {
                         self.st.get_mut(s.sym).local_scope = Some(block_scope);
@@ -1955,10 +1957,9 @@ impl Typer {
                         );
                         return;
                     }
-                    let fillable = self
-                        .st
-                        .class_sym_of(&tree.ty)
-                        .is_some_and(|cls| self.parent_ctor_is_fillable(cls));
+                    let fillable = self.st.class_sym_of(&tree.ty).is_some_and(|cls| {
+                        self.parent_ctor_is_fillable(cls) || self.bare_new_needs_application(cls)
+                    });
                     if fillable {
                         let head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                         *tree = Tree {

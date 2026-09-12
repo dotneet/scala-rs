@@ -1,0 +1,15 @@
+List(1, 1, 2, 2)
+List(a, aa, b, bb)
+Vector(1)
+List(2)
+List(6)
+List(1, 10, 2, 20)
+List(5, 6)
+hello
+6
+9
+List(3, 3)
+List(3, 3)
+15
+x-y
+p+q

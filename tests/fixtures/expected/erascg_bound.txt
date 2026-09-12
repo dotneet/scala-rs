@@ -1,0 +1,33 @@
+public int C$D.foo(java.lang.String)
+public java.lang.String C$D$E.baz(java.lang.String)
+public java.lang.String C.bar(java.lang.String)
+3 q x
+public int CHK$D.foo(java.lang.String)
+11
+(3,3) List(3, 3) 3
+9 P(3)
+public P(int)
+public int P.get() / public int P.twice(int)
+5 3
+2 30
+public abstract int T.f(int) / public int TI.f(int)
+e=42 43
+42
+public abstract long U.e()
+5
+public abstract int X.f(int) / public int Y.f(int)
+4
+3 false zz 3.0
+5 List(4, 4) 8 7
+6
+public int Main$.id(int)
+public long Main$.idl(long)
+public boolean Main$.ids(boolean)
+public java.lang.String Main$.str(char)
+public double Main$.dbl(double)
+public int Main$.arr(java.lang.Object)
+public scala.collection.immutable.List Main$.mk(int)
+public int Main$.first(scala.collection.immutable.Seq)
+public int Main$.max2(int,int)
+public int Main$.viaGen(int)
+3 List(1, 2)
