@@ -74,8 +74,33 @@ mkdir -p "$GATE_DIR"
 if [[ -n ${GATE_LEDGER:-} ]]; then
   LEDGER=$GATE_LEDGER
 else
-  LEDGER=$(grep -oE 'tests/baselines/corpus-[0-9a-f]{8}\.tsv|baselines/corpus-[0-9a-f]{8}\.tsv' tests/BASELINE.md 2>/dev/null \
-             | sed 's|^baselines/|tests/baselines/|' | head -1)
+  # The ledger of the commit `tests/BASELINE.md` names in its header table --
+  # that is the accepted baseline. Picking the first ledger *mentioned* in the
+  # file chose a ledger one or more gates old (the header is followed by the
+  # history of every gate), so the gate compared against stale data and its
+  # "losses" were noise.
+  CUR=$(grep -m1 -oE '^\| commit \| `[0-9a-f]{8}`' tests/BASELINE.md 2>/dev/null | grep -oE '[0-9a-f]{8}')
+  if [[ -n $CUR && -s tests/baselines/corpus-$CUR.tsv ]]; then
+    LEDGER=tests/baselines/corpus-$CUR.tsv
+  else
+    LEDGER=$(grep -oE 'tests/baselines/corpus-[0-9a-f]{8}\.tsv|baselines/corpus-[0-9a-f]{8}\.tsv' tests/BASELINE.md 2>/dev/null \
+               | sed 's|^baselines/|tests/baselines/|' | head -1)
+  fi
+fi
+# The corpus checkout the runner defaults to has been found gutted (a `.git`
+# with no HEAD or refs), and `scala_corpus.sh` then dies on `git rev-parse`
+# leaving no tsv at all -- which the gate reported as "no ledger to compare
+# against", pointing at the wrong thing. Check it here and fall back to the
+# known-good checkout, saying so.
+if [[ -z ${CORPUS_DIR:-} ]]; then
+  for c in /tmp/scala-rs-corpus/scala /private/tmp/scala-rs-corpus-20260910-codex; do
+    if git -C $c rev-parse HEAD >/dev/null 2>&1; then export CORPUS_DIR=$c; break; fi
+  done
+  if [[ -z ${CORPUS_DIR:-} ]]; then
+    print "gate: no usable corpus checkout (tried /tmp/scala-rs-corpus/scala and /private/tmp/scala-rs-corpus-20260910-codex)"
+  elif [[ $CORPUS_DIR != /tmp/scala-rs-corpus/scala ]]; then
+    print "gate: default corpus checkout unusable, using CORPUS_DIR=$CORPUS_DIR"
+  fi
 fi
 SKIP=${GATE_SKIP:-}
 skipped() { [[ " $SKIP " == *" $1 "* ]] }
