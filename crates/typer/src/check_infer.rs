@@ -4470,7 +4470,31 @@ impl Typer {
         // selection is left alone -- `scala.Some(1)` already has its own
         // `apply` path, and rewriting it here would change what codegen
         // emits for every qualified companion call.
+        // A receiver typed by an abstract type reaches its `apply` through the
+        // type's upper bound, as nsc's `adaptToArguments` does:
+        //
+        // ```scala
+        // class IntIndexedSeqStepper[CC <: collection.IndexedSeqOps[Int, AnyConstr, _]](underlying: CC) {
+        //   def nextStep(): Int = { … ; underlying(i0) }   // underlying.apply(i0)
+        // ```
+        //
+        // `underlying.apply(j)` always worked; only the indexing sugar stopped
+        // here, with `value apply is not a member of CC`
+        // (`scala/collection/convert/impl/IndexedSeqStepper.scala`). Gated on
+        // the bound actually declaring `apply`, so a parameter with no such
+        // member keeps the diagnostic it has rather than gaining a second one.
+        let abstract_with_apply = matches!(
+            strip_annotations(&fun.ty),
+            Type::TypeParam(_) | Type::TypeMember(_)
+        ) && {
+            let ty = strip_annotations(&fun.ty).clone();
+            self.ensure_apply_supplied(&ty, fun.span);
+            self.st
+                .class_sym_of(&ty)
+                .is_some_and(|c| !self.st.lookup_member(c, "apply").is_empty())
+        };
         if matches!(&fun.kind, TreeKind::Select { .. })
+            && !abstract_with_apply
             && !matches!(
                 strip_annotations(&fun.ty),
                 Type::Class { .. } | Type::Array(_) | Type::ThisType(_) | Type::SingleType { .. }
@@ -4484,14 +4508,15 @@ impl Typer {
         // `val (b, m: Map[…] @unchecked) = …` then calls `m(f)`, and without
         // looking through `@unchecked` that reported
         // `value apply is not a member of Map[…] @unchecked`.
-        let insert = matches!(
-            strip_annotations(&fun.ty),
-            Type::Array(_)
-                | Type::Class { .. }
-                | Type::ModuleRef(_)
-                | Type::ThisType(_)
-                | Type::SingleType { .. }
-        );
+        let insert = abstract_with_apply
+            || matches!(
+                strip_annotations(&fun.ty),
+                Type::Array(_)
+                    | Type::Class { .. }
+                    | Type::ModuleRef(_)
+                    | Type::ThisType(_)
+                    | Type::SingleType { .. }
+            );
         if !insert {
             return;
         }

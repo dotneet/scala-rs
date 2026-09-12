@@ -3907,6 +3907,12 @@ impl SymbolTable {
                 Type::Class { sym, args } if !sym.is_none() => self.base_type_args(sym, &args),
                 _ => BaseTypeArgs::default(),
             },
+            // A compound (`C <: LinearSeq[A] with LinearSeqOps[A, CC, C]`) is
+            // a base-type sequence of its own, merged across the parents
+            // rather than taken from whichever one the walk reaches first.
+            Type::Refined { parents, .. } if parents.len() > 1 => {
+                self.base_type_args_compound(parents)
+            }
             _ => BaseTypeArgs::default(),
         };
         let mut seen = rustc_hash::FxHashSet::default();
@@ -4070,6 +4076,65 @@ impl SymbolTable {
                 slot.args = self.meet_base_args(SymbolId(k), &vs, &mut anc);
             }
         }
+        BaseTypeArgs { slots }
+    }
+
+    /// [`Self::base_type_args`] for a **compound** type's parent list.
+    ///
+    /// nsc builds a `RefinedType`'s base-type sequence with
+    /// `GlbBaseTypeSeq`, which merges the parents' sequences exactly as
+    /// `compoundBaseTypeSeq` merges one class's parent clauses. Without it a
+    /// compound *bound* was read through whichever parent came first:
+    ///
+    /// ```scala
+    /// trait LinearSeqOps[+A, +CC[X] <: LinearSeq[X],
+    ///                    +C <: LinearSeq[A] with LinearSeqOps[A, CC, C]]
+    ///   extends SeqOps[A, CC, C] { def tail: C; … }
+    /// var these = coll      // C
+    /// these = these.tail    // C, through `LinearSeqOps[A, CC, C]`
+    /// ```
+    ///
+    /// `LinearSeq[A]` is written first and reaches `LinearSeqOps` as
+    /// `LinearSeqOps[A, LinearSeq, LinearSeq[A]]`, so `tail` came back a
+    /// `LinearSeq[A]` and the assignment was "type mismatch; found:
+    /// LinearSeq[A] required: C" (`scala/collection/LinearSeq.scala`,
+    /// `Seq.scala`). The merge takes the glb at a covariant parameter, and
+    /// `C <: LinearSeq[A]`, so `C` is what the member is read at — the same
+    /// answer nsc gives, reached the same way and independent of the order
+    /// the parents are written in.
+    pub(crate) fn base_type_args_compound(&self, parents: &[Type]) -> BaseTypeArgs {
+        let mut variants: rustc_hash::FxHashMap<u32, Vec<Vec<Type>>> =
+            rustc_hash::FxHashMap::default();
+        for p in parents {
+            let as_class = self.function_class_form(p);
+            let Type::Class { sym, args } = as_class.as_ref().unwrap_or(p) else {
+                continue;
+            };
+            if sym.is_none() {
+                continue;
+            }
+            for (k, slot) in self.base_type_args(*sym, args).slots {
+                let vs = variants.entry(k).or_default();
+                if !vs.contains(&slot.args) {
+                    vs.push(slot.args);
+                }
+            }
+        }
+        let mut anc: AncMemo = Vec::new();
+        let slots = variants
+            .into_iter()
+            .map(|(k, vs)| {
+                let args = self.meet_base_args(SymbolId(k), &vs, &mut anc);
+                (
+                    k,
+                    BaseSlot {
+                        args,
+                        settled: true,
+                        more: Vec::new(),
+                    },
+                )
+            })
+            .collect();
         BaseTypeArgs { slots }
     }
 
@@ -4272,6 +4337,39 @@ impl SymbolTable {
         }
     }
 
+    /// The declared upper bound of an abstract type (a type parameter or a
+    /// deferred type member), and `None` for everything else -- including an
+    /// unbounded parameter, which nothing can order.
+    fn abstract_bound(&self, t: &Type) -> Option<Type> {
+        match t {
+            Type::TypeParam(id) | Type::TypeMember(id) => self.get(*id).bound_hi.clone(),
+            _ => None,
+        }
+    }
+
+    /// Whether an upper bound has `cls` above it: the class itself, one of its
+    /// descendants, any parent of a compound, or -- through another abstract
+    /// type -- that type's own bound. Depth-limited, because a bound may name
+    /// the parameter it bounds.
+    fn bound_reaches(&self, bound: &Type, cls: SymbolId, anc: &mut AncMemo, depth: u32) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        match bound {
+            Type::Refined { parents, .. } => parents
+                .iter()
+                .any(|p| self.bound_reaches(p, cls, anc, depth + 1)),
+            Type::TypeParam(id) | Type::TypeMember(id) => match self.get(*id).bound_hi.clone() {
+                Some(hi) => self.bound_reaches(&hi, cls, anc, depth + 1),
+                None => false,
+            },
+            other => match self.base_arg_class(other) {
+                Some(s) => s == cls || self.class_derives_from(s, cls, anc),
+                None => false,
+            },
+        }
+    }
+
     /// Whether `a` is the one of the pair a glb (`most_derived`) or a lub
     /// keeps, judged by class ancestry alone: the arrivals at one base-type
     /// position come from one hierarchy, so a full `is_sub_type` would answer
@@ -4290,6 +4388,29 @@ impl SymbolTable {
         match (b, most_derived) {
             (Type::Nothing, true) | (Type::Any, false) => return false,
             _ => {}
+        }
+        // An *abstract* arrival -- a type parameter or a deferred member --
+        // carries no parents of its own, so the class ancestry below cannot
+        // place it at all and the merge used to keep whichever came first.
+        // Its upper bound places it: `C <: LinearSeq[A] with LinearSeqOps[A,
+        // CC, C]` says `C` is below `LinearSeq[A]`, so the glb of the two is
+        // `C` -- which is what makes `LinearSeqOps.tail`, read through that
+        // compound bound, a `C` and not a `LinearSeq[A]`.
+        match (self.abstract_bound(a), self.abstract_bound(b)) {
+            (Some(_), Some(_)) => return false,
+            (Some(ba), None) => {
+                let Some(sb) = self.base_arg_class(b) else {
+                    return false;
+                };
+                return most_derived && self.bound_reaches(&ba, sb, anc, 0);
+            }
+            (None, Some(bb)) => {
+                let Some(sa) = self.base_arg_class(a) else {
+                    return false;
+                };
+                return !most_derived && self.bound_reaches(&bb, sa, anc, 0);
+            }
+            (None, None) => {}
         }
         let (Some(sa), Some(sb)) = (self.base_arg_class(a), self.base_arg_class(b)) else {
             return false;

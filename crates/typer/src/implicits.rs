@@ -3310,12 +3310,58 @@ impl Typer {
         crate::symbol::subst_tparams_slice(&tps, &wilds, ty)
     }
 
+    /// A candidate that is a one-argument function *by inheritance*, read as
+    /// the `A => B` it conforms to.
+    ///
+    /// nsc searches a view with the expected type `Function1[from, ?]`, so
+    /// **any** implicit whose type conforms to it is a view -- not only a `def`
+    /// and not only a value whose type is written as a function. `<:<` is the
+    /// case the library relies on: `sealed abstract class <:<[-From, +To]
+    /// extends (From => To)`, so
+    ///
+    /// ```scala
+    /// def invert[El1, It1[a] <: Iterable[a]](implicit w1: T1 <:< It1[El1]) = {
+    ///   val it1 = x._1.iterator   // T1 seen through w1
+    /// ```
+    ///
+    /// resolves `iterator` through `w1` (`scala/runtime/Tuple2Zipped.scala`,
+    /// `Tuple3Zipped.scala`). Only `Type::Function` parents count: the
+    /// `PartialFunction` / `Map` stand-ins [`Typer::function_view`] also
+    /// recognises are how the prelude spells those classes, and letting an
+    /// implicit `Map[K, V]` act as a view for every `K` receiver is a much
+    /// wider rule than the one the library needs.
+    fn conv_inherited_function1(&self, cand_ty: &Type) -> Option<Type> {
+        let Type::Class { sym, args } = cand_ty else {
+            return None;
+        };
+        if self.st.function_class_shape(*sym, args).is_some() {
+            // Already a `Function1` applied as a class: the callers' own
+            // `Type::Function` arm (after `function_class_shape`) handles it.
+            return None;
+        }
+        self.st
+            .base_type_seq(cand_ty)
+            .into_iter()
+            .find_map(|base| match &base {
+                Type::Function { params, .. } if params.len() == 1 => Some(base),
+                Type::Class { sym, args } => self
+                    .st
+                    .function_class_shape(*sym, args)
+                    .filter(|f| matches!(f, Type::Function { params, .. } if params.len() == 1)),
+                _ => None,
+            })
+    }
+
     fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
         let _prefixes = self.import_prefix_scope();
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
         let cand_ty = self.implicit_candidate_ty(id);
+        let cand_ty = match self.conv_inherited_function1(&cand_ty) {
+            Some(f) => std::borrow::Cow::Owned(f),
+            None => cand_ty,
+        };
         match &*cand_ty {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().filter(|ps| ps.len() == 1)?;
@@ -3361,6 +3407,10 @@ impl Typer {
             return Vec::new();
         }
         let cand_ty = self.implicit_candidate_ty(id);
+        let cand_ty = match self.conv_inherited_function1(&cand_ty) {
+            Some(f) => std::borrow::Cow::Owned(f),
+            None => cand_ty,
+        };
         let param: Option<&Type> = match &*cand_ty {
             Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()),
             Type::Function { params, .. } => params.first(),
