@@ -11,9 +11,9 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `c0c10f08` |
+| commit | `8ece0269` |
 |---|---|
-| updated | 2026-09-11 |
+| updated | 2026-09-12 |
 
 **Fifty-three composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
@@ -85,6 +85,7 @@ coordinator measured the merged tree each time, not the branches.
 | `712279e5` | contextual inference, by-name values/signatures, copy and local imports | 96 -> **92** | 83 -> **34** |
 | `cd35fd83` | nested function application erasure, generic local conversions, README/docs cleanup | 92 | 34 |
 | `c0c10f08` | collection extension precedence, ReusableBuilder parent recovery, SortedSet operators, Seq trait hierarchy, JDK 21 name data | 92 | 34 -> **31** |
+| `8ece0269` | twenty slices: element types, JDK 17 data, this.type/override, application/argument conformance, declarations, runtime crashes, gitbucket non-macro roots, output mismatches, hard inference, parser gaps, runtime probes, Slick `mapTo`, prefix-carrying types, `@compileTimeOnly`, wrong acceptances, erasure/ABI, warnings, reify/TypeTag, mixin/outer codegen, extractors and library surface, kind/variance | 92 -> **4** | 31 -> **2** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4023,6 +4024,121 @@ Exact summary block:
 ```text
 === summary
   HEAD=c0c10f08  logs=/private/tmp/scala-rs-gate-c0c10f08-20260911
+VERDICT=PASS
+DONE
+```
+## Rejected gate: `27df6bb3` (handoff commit of 2026-09-11)
+
+Run in `/private/tmp/scala-rs-gate-27df6bb3-20260911` with Temurin 17 and
+`CORPUS_DIR=/private/tmp/scala-rs-corpus-20260910-codex`. `VERDICT=FAIL`.
+
+* Five workspace failures. Two (`btargs_bad_is_rejected_where_scalac_rejects`,
+  `btargs_groupedelem_runs`) were a real regression from 27df6bb3: `elem_type`
+  read the first type argument of every `scala/collection/` class as its
+  element before the `IterableOnce` walk, so `it.sliding(n).map(f)` with
+  `f: Seq[A] => B` was rejected (`GroupedIterator[B]` iterates `Seq[B]`). Cats
+  measured 49 (baseline 31: +22 in `FoldableNFunctions.scala`), the library
+  389 (+6 in Iterable/IntMap/LongMap). Fixed in 9cac778e (only classes known to
+  iterate their first parameter skip the walk).
+* Three (`names_match_released_scala_for_bmp_and_escape_sequences`,
+  `numt_library_abi_matches_scalac`, `numt_private_runtime_matches_scalac`)
+  were environment: c0c10f08 had regenerated `java_identifier_parts.rs` and
+  `numt.txt` under JDK 24.0.1 (Homebrew's `openjdk@21` symlink), but this
+  machine's pinned runtime is Temurin 17. Restored the JDK 17 data in 4ac7c31b.
+* Corpus: `losses=0`, two gains (`run/t11397`, `run/t11756`).
+
+## Rejected gate: `908c5354` (first composed batch)
+
+`/private/tmp/scala-rs-gate-908c5354-20260912`. `VERDICT=FAIL` on one
+workspace test only: `fixtures_selfrec_primitive_casts_box_and_convert`
+asserted `intValue()` for `a.asInstanceOf[Int]`, while agent/rtverify had
+switched jar-mode unboxing to `BoxesRunTime.unboxToInt` — byte-for-byte what
+scalac emits. The assertion now accepts either form (c4412b81). Everything else
+passed: slick 0/1504, 12/12 execution, 1504 verified; cats 25, gitbucket 88,
+library 165; corpus pos 1169 / neg 718 / run 762 with `losses=0` and 66 gains.
+
+## Rejected gate: `c3afea7f` (nine slices composed)
+
+`/private/tmp/scala-rs-gate-c3afea7f-20260912`. `VERDICT=FAIL` on a single
+corpus loss, `run/t4658`: agent/hardinfer typed lambda bodies against a
+wildcard instead of `Any` when the result is undetermined, and the branches
+`NumericRange.inclusive(...)` / `NumericRange(...)` then lubbed to `AnyRef`
+(`value sum is not a member of AnyRef`). Bisected with each slice's binary:
+only trees containing ee816264 fail. Everything else passed: the workspace
+suite 2947/2947 in 323 result rows; slick 0/1504, 12/12 execution, 1504
+verified; cats 23, gitbucket 36, library 143; corpus pos 1195 / neg 728 /
+run 804 with 145 gains.
+
+## Gate fifty-four: twenty slices, accepted (`8ece0269`)
+
+Run in `/private/tmp/scala-rs-gate-8ece0269-20260912` on Temurin 17 with
+`CORPUS_DIR=/private/tmp/scala-rs-corpus-20260910-codex`. `VERDICT=PASS`.
+
+| measure | `c0c10f08` | `8ece0269` |
+|---|---:|---:|
+| gitbucket | 92 / 43 | **4 / 3** |
+| cats | 31 / 21 | **2 / 2** |
+| scala library | 383 / 107 | **126 / 49** |
+| slick | 0 errors / 1504 classes | 0 errors / 1504 classes |
+| corpus pos | 1158 | **1234** |
+| corpus neg | 718 | **814** |
+| corpus run | 707 | **1001** |
+| workspace suite | 2802 tests / 313 rows | **3077 tests / 333 rows** |
+
+Slick's execution check passed 12/12 programs with 36/36 byte-exact attempts,
+and the class subset verified all 1504 classes with zero lint problems. The
+corpus kept every one of the 5324 identities with `losses=0` and **497**
+status changes, all gains. The saved ledger is
+[`baselines/corpus-8ece0269.tsv`](baselines/corpus-8ece0269.tsv), SHA-256
+`f0292ba13b453bbb189716799d42c085acb2c446e980e82473459a7070585513`.
+
+The differential runtime probe harness added by `agent/rtprobe`
+(`tests/rt_probe.sh`, 128 programs compiled and run against scalac's output)
+went from **71 ok / 13 miscompiles / 14 runtime errors / 12 wrong acceptances**
+at the branch point to **114 ok / 3 miscompiles / 0 runtime errors / 0 wrong
+acceptances**.
+
+What the twenty slices closed, by area:
+
+* **Types and inference** — prefix-carrying inner-class types (`p.C` vs `q.C`,
+  outer type arguments, projections; `crates/typer/src/prefix.rs`), GADT
+  refinement in typed and constructor patterns, nested polymorphic arguments
+  solved with the outer call, weak numeric lub inside lambdas, invariant-position
+  `Nothing`, `this.type` results, kind-bounds variance and type-lambda variance
+  validation, abstract type constructors compared at their declared variance.
+* **Declarations and members** — `var x: T = _` (typing and codegen), Java
+  `Object`/`AnyRef`/`Any` identity in parameters, overrides and type arguments,
+  single-constructor argument expected types, getter `op=`, self aliases are not
+  members, Predef type members on the signature path, name-based extractors,
+  collection result shapes read from `IterableOps`, prelude `Option`/`Try`/
+  `Either` map types, `StringContext.s` as a method, `@compileTimeOnly`.
+* **Erasure, ABI and codegen** — a type parameter erases to its bound's erasure
+  (descriptors now match scalac, verified by separate compilation in four
+  combinations), interface-to-class casts, null unboxing through
+  `BoxesRunTime`, serializable lambdas with `$deserializeLambda$`, transient
+  lazy bitmaps, non-public case fields through `x$access$N`, mixin forwarders
+  and `$$super$` accessors read from class files, outer and super accessors for
+  nested classes, inner case class `equals`/`copy`, parent-constructor argument
+  scope, default getters dispatched virtually on the receiver.
+* **Front end** — procedure-syntax auxiliary constructors, early definitions in
+  `new` and in objects, trailing commas, interpolation lexing and `s"..."`
+  patterns, Unicode symbol operators, `@strictfp`, signed literal boundaries.
+* **Macros and reflection** — Slick's `mapTo` for case classes compiled in the
+  same run (a real lazy mirror of current-run symbols, `expand_mirror.rs`), a
+  complete reifier for `reify`/`TypeTag`/`WeakTypeTag` (`reify_tree.rs`), which
+  alone turned 77 corpus tests green.
+* **Diagnostics** — scalac's default warnings (match exhaustivity and
+  unreachability, uninitialized reads, specialization, deprecation and feature
+  summaries, pure expressions, fruitless type tests) and a long list of programs
+  we used to accept: modifier combinations, double definitions, annotation
+  types, overloaded value references, `new C` without required arguments,
+  package-clause visibility, `flatMap` whose function is not an `IterableOnce`.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=8ece0269  logs=/private/tmp/scala-rs-gate-8ece0269-20260912
 VERDICT=PASS
 DONE
 ```

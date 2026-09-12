@@ -6038,10 +6038,21 @@ fn parent_args(t: &Type) -> Vec<Type> {
 
 /// Whether `cls` already has `target` somewhere above it.
 pub(crate) fn inherits_from(st: &SymbolTable, cls: SymbolId, target: SymbolId) -> bool {
+    inherits_matching(st, cls, |c| c == target)
+}
+
+/// Whether `cls` or a reachable parent matches a predicate. Keep the same
+/// order and traversal bound as `inherits_from`, including checking a node
+/// before the visited/budget guard.
+pub(crate) fn inherits_matching(
+    st: &SymbolTable,
+    cls: SymbolId,
+    mut matches: impl FnMut(SymbolId) -> bool,
+) -> bool {
     let mut seen: Vec<u32> = Vec::new();
     let mut work = vec![cls];
     while let Some(c) = work.pop() {
-        if c == target {
+        if matches(c) {
             return true;
         }
         if seen.contains(&c.0) || seen.len() > 256 {

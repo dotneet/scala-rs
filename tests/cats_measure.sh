@@ -74,12 +74,18 @@ if [[ $MODULES == *core* ]]; then
   DIRS+=($SP/cats/core/src/main/scala $SP/cats/core/src/main/scala-2 \
          $SP/cats/core/src/main/scala-2.13+ $CGEN)
 fi
-# A parse error stops the run before typing, so one unparseable file hides the
-# other 339. `core/src/main/scala-2/cats/arrow/FunctionKMacros.scala` matches
-# trees with quasiquote *patterns* (`case q"..."`), and interpolated-string
-# patterns are not implemented at all -- so it is held out by default and
-# counted separately. Set CATS_EXCLUDE='' to measure with it in.
-EXCLUDE=${CATS_EXCLUDE-FunctionKMacros.scala}
+# CATS_EXCLUDE holds files out of the measurement; nothing is held out now.
+#
+# It used to default to `FunctionKMacros.scala`, cats' one macro
+# implementation: it matches trees with quasiquote *patterns*
+# (`case q"($param) => $trans[..$typeArgs]($arg)"`), interpolated-string
+# patterns in that position were not implemented at all, and a parse error
+# stops the run before typing -- so that one file hid the diagnostics of the
+# other 339. Quasiquote patterns are implemented
+# (`crates/typer/src/quasi_pattern.rs`), the file compiles, and all 340 are
+# measured. Keeping the holdout would now *create* an error, because
+# `FunctionK.scala` extends the `FunctionKMacroMethods` that file declares.
+EXCLUDE=${CATS_EXCLUDE-}
 ALL=($(find $DIRS -name '*.scala' | sort))
 if [[ -n $EXCLUDE ]]; then
   FILES=(${ALL:#*$EXCLUDE})

@@ -83,6 +83,34 @@ const EDGES: &[(&str, &str, Args)] = &[
         "scala/collection/Iterable",
         Args::Same,
     ),
+    // The `immutable` spine's own `Iterable`. In 2.13 each of the three
+    // unsorted immutable traits names it as its *first* parent --
+    // `trait Seq[+A] extends Iterable[A] with collection.Seq[A]`,
+    // `trait Set[A] extends Iterable[A] with collection.Set[A]`,
+    // `trait Map[K, +V] extends Iterable[(K, V)] with collection.Map[K, V]` --
+    // and only the `collection.*` half was wired here. The consequence was
+    // that nothing in the immutable library conformed to
+    // `scala.collection.immutable.Iterable` at all: `import
+    // scala.collection.immutable._` makes `Iterable` mean this trait, so
+    // cats' `override def toIterable[A](fa: NonEmptySet[A]): Iterable[A] =
+    // fa.toSortedSet` was `found: SortedSet[A]  required: Iterable[A]`, and
+    // so were `List`, `Vector`, `Map`, `Range`, `BitSet` and the rest (14
+    // shapes in `tests/fixtures/czero_immiter.scala`).
+    (
+        "scala/collection/immutable/Seq",
+        "scala/collection/immutable/Iterable",
+        Args::Same,
+    ),
+    (
+        "scala/collection/immutable/Set",
+        "scala/collection/immutable/Iterable",
+        Args::Same,
+    ),
+    (
+        "scala/collection/immutable/Map",
+        "scala/collection/immutable/Iterable",
+        Args::Pairs,
+    ),
     (
         "scala/collection/immutable/Seq",
         "scala/collection/Seq",
@@ -249,6 +277,14 @@ const EDGES: &[(&str, &str, Args)] = &[
 const LINKS: &[(&str, &str)] = &[
     ("scala/collection/IterableOnce", "+"),
     ("scala/collection/Iterable", "+"),
+    // `scala.collection.immutable.Iterable` was never built here, so the three
+    // edges below that name it as a parent were dropped as "parent not found"
+    // and nothing in the immutable library conformed to it. It is resolved
+    // from the classpath by JVM name when a source names it, and
+    // `find_by_jvm` reuses whatever symbol already carries that name, so
+    // declaring it here does not create a second one -- its members are still
+    // supplied from the pickle on demand.
+    ("scala/collection/immutable/Iterable", "+"),
     ("scala/collection/Seq", "+"),
     // `ArrayBuffer` was an `IndexedSeq` nowhere, so
     // `def and(ns: scala.collection.IndexedSeq[Node])` rejected the buffer

@@ -91,11 +91,15 @@ check_measure() {  # name, summary line, expected `files=` count
   fi
 }
 check_measure slick     "$SLICK" 184
-check_measure cats      "$CATS"  339
+check_measure cats      "$CATS"  340
 check_measure gitbucket "$GB"    354
 [[ $GB == *"java_sources=3"* ]] || FAIL+=("gitbucket Java inputs missing: $GB")
 check_measure library   "$LIB"   538
 [[ $SLICK == *"errors=0 files_with_errors=0 classes=1504"* ]] || FAIL+=("slick measure: $SLICK")
+# cats compiles clean since `agent/catszero` (quasiquote patterns made the
+# last held-out file compile, so there is no holdout any more). Zero is now
+# an invariant: a regression here is a gate failure, not a number to report.
+[[ $CATS == *"errors=0 files_with_errors=0"* ]] || FAIL+=("cats measure: $CATS")
 
 # --- execution --------------------------------------------------------------
 step "slick execution"

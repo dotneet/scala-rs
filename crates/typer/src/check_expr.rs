@@ -15,6 +15,72 @@ use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+mod universe_tests {
+    use super::*;
+
+    fn class(t: &mut Typer, jvm: &str, parents: &[SymbolId]) -> SymbolId {
+        let id =
+            t.st.alloc(jvm, t.st.root, SymKind::Class, Flags::EMPTY, jvm);
+        t.st.get_mut(id).parents = parents
+            .iter()
+            .map(|&sym| Type::Class { sym, args: vec![] })
+            .collect();
+        id
+    }
+
+    #[test]
+    fn universe_identity_follows_ancestors_including_duplicate_binary_names() {
+        let mut t = Typer::new(0, &TypecheckOptions::default());
+        let first = class(&mut t, "scala/reflect/api/Universe", &[]);
+        let second = class(&mut t, "scala/reflect/api/Universe", &[]);
+        let java = class(&mut t, "scala/reflect/api/JavaUniverse", &[]);
+        let unrelated = class(&mut t, "user/Universe", &[]);
+        let parent = class(&mut t, "user/Parent", &[second]);
+        let child = class(&mut t, "user/Child", &[parent, unrelated]);
+        for id in [first, second, java, parent, child] {
+            assert!(t.is_reflect_universe(id));
+        }
+        assert!(!t.is_reflect_universe(unrelated));
+        assert!(!t.is_reflect_universe(SymbolId::NONE));
+    }
+
+    #[test]
+    fn universe_identity_observes_late_parents_and_binary_name_changes() {
+        let mut t = Typer::new(0, &TypecheckOptions::default());
+        let parent = class(&mut t, "user/Pending", &[]);
+        let child = class(&mut t, "user/Child", &[]);
+        assert!(!t.is_reflect_universe(child));
+        t.st.get_mut(child).parents = vec![Type::Class {
+            sym: parent,
+            args: vec![],
+        }];
+        assert!(!t.is_reflect_universe(child));
+        t.st.set_jvm_name(parent, "scala/reflect/api/Universe");
+        assert!(t.is_reflect_universe(child));
+        t.st.get_mut(child).parents.clear();
+        assert!(!t.is_reflect_universe(child));
+    }
+
+    #[test]
+    fn universe_identity_terminates_on_cycles_and_finds_an_exit() {
+        let mut t = Typer::new(0, &TypecheckOptions::default());
+        let a = class(&mut t, "user/A", &[]);
+        let b = class(&mut t, "user/B", &[a]);
+        t.st.get_mut(a).parents = vec![Type::Class {
+            sym: b,
+            args: vec![],
+        }];
+        assert!(!t.is_reflect_universe(a));
+        let universe = class(&mut t, "scala/reflect/api/Universe", &[]);
+        t.st.get_mut(b).parents.push(Type::Class {
+            sym: universe,
+            args: vec![],
+        });
+        assert!(t.is_reflect_universe(a));
+    }
+}
+
 impl Typer {
     pub(crate) fn type_qualifier(&mut self, tree: &mut Tree, pt: &Type) {
         let saved = std::mem::replace(&mut self.typing_qualifier, true);
@@ -1146,14 +1212,10 @@ impl Typer {
             let jvm = &self.st.get(s).jvm_name;
             jvm == "scala/reflect/api/Universe" || jvm == "scala/reflect/api/JavaUniverse"
         };
-        if named(id) {
-            return true;
-        }
-        self.st
-            .symbols
-            .iter()
-            .filter(|s| named(s.id))
-            .any(|s| crate::pickle_supply::inherits_from(&self.st, id, s.id))
+        // Search the receiver's ancestors, not the entire symbol table for
+        // possible targets. This also covers duplicate symbols with the same
+        // JVM name and sees parents attached by lazy completion immediately.
+        crate::pickle_supply::inherits_matching(&self.st, id, named)
     }
 
     /// Report a quasiquote that could not be typed, saying which of the two

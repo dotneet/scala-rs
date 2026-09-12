@@ -3604,6 +3604,18 @@ impl SymbolTable {
         None
     }
 
+    /// Parent/name lookups may see truncated bounds or aliases under an
+    /// ambient expansion guard. Such answers must not share a memo with a
+    /// lookup made outside that expansion, even while `self` is immutable.
+    pub(crate) fn has_ambient_type_context(&self) -> bool {
+        EXPANDING_BOUNDS.with(|s| !s.borrow().is_empty())
+            || EXPANDING_ALIASES.with(|s| !s.borrow().is_empty())
+            || CHASING.with(|s| !s.borrow().is_empty())
+            || WRITTEN_TYPE.with(|s| s.get())
+            || SUBTYPE_WALK.with(|s| s.borrow().depth != 0)
+            || !self.qualify_tparams.borrow().is_empty()
+    }
+
     pub(crate) fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
         let mut work = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();
@@ -4000,8 +4012,8 @@ impl SymbolTable {
             for p in &self.get(c).parents {
                 // A parent written as a function type is `scala.FunctionN`,
                 // which is how `linearize` reads it too.
-                let p = self.function_class_form(p).unwrap_or_else(|| p.clone());
-                let p = self.subst_tparams_cow(c, &cargs, &p);
+                let as_class = self.function_class_form(p);
+                let p = self.subst_tparams_cow(c, &cargs, as_class.as_ref().unwrap_or(p));
                 if let Type::Class {
                     sym: ps,
                     args: pargs,
