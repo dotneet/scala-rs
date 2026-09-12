@@ -5819,6 +5819,25 @@ impl SymbolTable {
                 }
             }
             (Type::Applied { ctor, args }, other) => {
+                // A compound on the right is *every* one of its components, and
+                // each component is a question this arm can answer on its own.
+                // `CC[K, V]` for a `CC[X, Y] <: Map[X, Y] with MapOps[X, Y, CC,
+                // _]` is both a `CC[K, V]` and a `Map[K, V]`, so it conforms to
+                // `CC[K, V] with Map[K, V]`. Reading the abstract constructor's
+                // bound first asked the other question -- does the bound
+                // *alone* conform to the whole compound -- and `Map[K, V]` is
+                // no `CC[K, V]`: `BuildFrom`'s three `buildFrom*Ops` instances
+                // were `found $anon$219 required BuildFrom[CC[K0, V0] with
+                // Map[K0, V0], (K, V), CC[K, V] with Map[K, V]]`
+                // (`collection/BuildFrom.scala:48,55,98`). A view
+                // (`as_seen_from_view`) never reaches here -- its own arms
+                // above return.
+                if let Type::Refined { parents, decls } = other {
+                    if parents.len() > 1 || !decls.is_empty() {
+                        return parents.iter().all(|p| self.is_sub_type(a, p))
+                            && self.conforms_to_refinement(a, decls);
+                    }
+                }
                 let folded = apply_type_ctor((**ctor).clone(), args.clone());
                 if let Type::Applied { ctor, .. } = &folded {
                     // `type BaseColumnType[T] = JdbcType[T] & BaseTypedType[T]`

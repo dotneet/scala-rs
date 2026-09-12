@@ -702,6 +702,16 @@ impl Typer {
                     } else {
                         extracted
                     };
+                    // A *value* used as an extractor: `case pf(b)` for a
+                    // `pf: PF[A, B]`. `unapply` is declared in its class's own
+                    // type parameters and the receiver's type arguments are
+                    // what instantiate them; read bare, `PF.unapply(a: A):
+                    // Option[B]` bound `b` at `PF`'s own `B`, so
+                    // `Some(seq.map { case pf(b) => b })` was
+                    // `found Seq[B (defined in trait PF)] required Seq[B
+                    // (defined in method unapplySeq)]`
+                    // (`PartialFunction.scala:253`).
+                    let extracted = self.unapply_seen_from_recv(u, fun, extracted);
                     if !failed && args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
@@ -765,10 +775,18 @@ impl Typer {
                         }
                         _ => {
                             let own = self.unapply_seq_elem_type(u);
-                            self.subst_unapply_tparams(u, sel_ty, vec![own.clone()])
+                            let solved = self
+                                .subst_unapply_tparams(u, sel_ty, vec![own.clone()])
                                 .into_iter()
                                 .next()
-                                .unwrap_or(own)
+                                .unwrap_or(own);
+                            // The same receiver substitution the `unapply`
+                            // branch makes, for an `unapplySeq` declared on a
+                            // class rather than on a companion object.
+                            self.unapply_seen_from_recv(u, fun, vec![solved])
+                                .into_iter()
+                                .next()
+                                .unwrap_or(Type::Any)
                         }
                     };
                     self.check_seq_pattern_backing(u, pat.span);
@@ -1734,6 +1752,34 @@ impl Typer {
 
     /// The instance of `target` among `ty`'s base classes: `Some[Int]` seen as
     /// `Option` is `Option[Int]`. `None` when `target` is not a base class.
+    /// Read what an extractor extracts **as seen from the receiver it was
+    /// selected on**.
+    ///
+    /// Only for an extractor that is a value of a *generic class*: its
+    /// `unapply`/`unapplySeq` is written in that class's own type parameters,
+    /// and nothing else instantiates them (`subst_unapply_tparams` unifies the
+    /// extractor's *parameter* with the scrutinee, which says nothing about a
+    /// parameter that appears only in the result). A companion object's
+    /// extractor has no such parameters and is returned unchanged, as is one
+    /// whose receiver this pattern has no value type for.
+    fn unapply_seen_from_recv(&self, u: SymbolId, fun: &Tree, tys: Vec<Type>) -> Vec<Type> {
+        let owner = self.st.get(u).owner;
+        if owner.is_none() || self.st.get(owner).tparams.is_empty() {
+            return tys;
+        }
+        let recv = &fun.ty;
+        if matches!(
+            recv,
+            Type::Method { .. } | Type::Overload(_) | Type::NoType | Type::Error
+        ) || self.st.class_sym_of(recv).is_none()
+        {
+            return tys;
+        }
+        tys.iter()
+            .map(|t| self.st.subst_as_seen_from(recv, t))
+            .collect()
+    }
+
     pub(crate) fn base_type_instance(
         &self,
         ty: &Type,

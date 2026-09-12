@@ -751,7 +751,21 @@ impl Typer {
                     .into_iter()
                     .filter(|&m| not_inherited_static(&self.st, m, *id));
                 for m in apply {
-                    if let Type::Method { paramss, ret } = &self.st.get(m).ty {
+                    // As seen from the module, for the same reason as the
+                    // `Class` arm above: `object Queue extends
+                    // StrictOptimizedSeqFactory[Queue]` inherits
+                    // `IterableFactory.apply[A](elems: A*): CC[A]`, and read raw
+                    // the `CC` stayed the parent's own parameter -- every
+                    // `mutable.Queue(x)`, `immutable.Seq(b)`,
+                    // `ArrayBuffer()`, `Vector()`, `Set()` was
+                    // `found CC[K] required Queue[K]`
+                    // (`immutable/HashMap.scala:1777`, `util/Either.scala:419`,
+                    // `concurrent/Future.scala:813,832`). Only the `Module(...)`
+                    // sugar was affected: `Queue.apply(x)` written out, a
+                    // written type argument, and any other inherited factory
+                    // member all go through `type_select`, which substitutes.
+                    let mty = self.st.subst_as_seen_from(fun_ty_full, &self.st.get(m).ty);
+                    if let Type::Method { paramss, ret } = &mty {
                         cands.push((
                             m,
                             paramss.first().cloned().unwrap_or_default(),
