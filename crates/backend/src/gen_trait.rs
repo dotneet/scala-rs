@@ -2715,16 +2715,31 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// `(encoded name, descriptor)` of every `name$default$n` getter `owner`
-    /// declares, computed exactly as `emit_default_getters` does.
-    pub(crate) fn default_getter_sigs(&self, owner: SymbolId) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        for mid in self.st.get(owner).members.clone() {
+    pub(crate) fn emit_default_getters(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+        self.emit_default_getters_in(b, class_id, true);
+    }
+
+    /// A trait's `name$default$n` getters on the interface itself, as nsc
+    /// 2.13 emits them: a `default` method with the body, and beside it the
+    /// `public static name$($this, …)` that a `super.m()` into the trait and
+    /// a scalac-built class's mixin forwarder both call.
+    ///
+    /// The interface used to declare the getter abstract and leave the body
+    /// to each implementing class, so `class F extends T { def sup =
+    /// super.k() }` died with `NoSuchMethodError: T.k$default$1$(T)`. The
+    /// classes still get their own copy (`emit_default_getters`), which is
+    /// the same body.
+    pub(crate) fn emit_trait_default_getters(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        iface: &str,
+    ) {
+        self.emit_default_getters_in(b, class_id, false);
+        for mid in self.st.get(class_id).members.clone() {
             let s = self.st.get(mid);
-            if s.kind != SymKind::Method || !s.name.contains("$default$") {
-                continue;
-            }
-            if s.default_rhs.is_none() {
+            if s.kind != SymKind::Method || !s.name.contains("$default$") || s.default_rhs.is_none()
+            {
                 continue;
             }
             let pts: Vec<Type> = if !s.params.is_empty() {
@@ -2742,15 +2757,42 @@ impl<'a> Gen<'a> {
                 Type::Method { ret, .. } => (**ret).clone(),
                 _ => Type::Any,
             };
-            out.push((
-                encode_method_name(&s.name),
-                jvm_method_desc(self.st, &pts, &ret),
-            ));
+            let name = s.name.clone();
+            let inst_desc = jvm_method_desc(self.st, &pts, &ret);
+            let static_desc = trait_static_desc(iface, &inst_desc);
+            let mut locals = 1u16;
+            let mut loads = Vec::new();
+            for sort in desc_param_sorts(desc_params(&inst_desc)) {
+                loads.push((locals, sort));
+                locals += sort.slots();
+            }
+            let iface_c = iface.to_string();
+            b.add_code(
+                ACC_PUBLIC | ACC_STATIC | ACC_SYNTHETIC,
+                &trait_static_name(&name),
+                &static_desc,
+                locals.max(1),
+                move |asm| {
+                    asm.aload(0);
+                    for (slot, sort) in &loads {
+                        load(asm, *slot, *sort);
+                    }
+                    asm.invokespecial_interface(&iface_c, &name, &inst_desc);
+                    emit_return(asm, &ret);
+                },
+            );
         }
-        out
     }
 
-    pub(crate) fn emit_default_getters(&self, b: &mut ClassBuilder, class_id: SymbolId) {
+    /// `with_interfaces`: also the getters of the traits in `class_id`'s
+    /// linearization, which a *class* owes a body for. An interface emits
+    /// only its own.
+    fn emit_default_getters_in(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        with_interfaces: bool,
+    ) {
         if class_id.is_none() {
             return;
         }
@@ -2763,9 +2805,11 @@ impl<'a> Gen<'a> {
         // omitted `keepType` argument became
         // `NoSuchMethodError: Node.mapChildren$default$2`.
         let mut ids: Vec<SymbolId> = self.st.get(class_id).members.clone();
-        for p in linearize(self.st, class_id).into_iter().skip(1) {
-            if is_interface_sym(self.st, p) {
-                ids.extend(self.st.get(p).members.clone());
+        if with_interfaces {
+            for p in linearize(self.st, class_id).into_iter().skip(1) {
+                if is_interface_sym(self.st, p) {
+                    ids.extend(self.st.get(p).members.clone());
+                }
             }
         }
         for mid in ids {

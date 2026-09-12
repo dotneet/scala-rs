@@ -1108,9 +1108,17 @@ impl Typer {
             }
             let n = i + 1;
             let gname = format!("{name}$default${n}");
+            // Only a getter this owner *declares* makes a second one
+            // redundant. An inherited one is exactly what an override that
+            // writes its own default must replace: nsc emits `B.g$default$1`
+            // overriding `A.g$default$1`, and the call site invokes the getter
+            // virtually on the receiver. Looking through the parents here left
+            // `class B extends A { override def g(a: Int = 2) }` without a
+            // getter, so `new B().g()` ran with `A`'s default.
             if self
                 .st
-                .lookup_member(owner, &gname)
+                .get(owner)
+                .members
                 .iter()
                 .any(|&id| self.st.get(id).name == gname)
             {
