@@ -314,7 +314,29 @@ impl SymbolTable {
             return true;
         }
         if self.is_singleton_prefix(b) {
-            return self.is_singleton_prefix(a) && self.same_singleton_prefix(a, b);
+            if !self.is_singleton_prefix(a) {
+                return false;
+            }
+            if self.same_singleton_prefix(a, b) {
+                return true;
+            }
+            // `p.X` against `P.this.X` where `p` is a `P`: a member declared
+            // bare in `P` and read through `p` means `p.X` in nsc, and this
+            // compiler does not rewrite every `P.this` on every road a
+            // member type travels (an alias expanded after the selection,
+            // say). A value of the class is accepted as that class's `this`;
+            // two *different values* (`a.In` against `b.In`) and a value
+            // against a path the required type names (`P2.this.S1` against
+            // `p.S1`, neg/abstract-class-2) stay apart.
+            if let Type::ThisType(c) = self.norm_singleton(b) {
+                if !c.is_none() && matches!(a, Type::SingleType { .. } | Type::ModuleRef(_)) {
+                    let wa = self.widen_prefix(a);
+                    return !wa.is_no_type()
+                        && !wa.is_error()
+                        && self.is_sub_type(&wa, &self.self_type_of_class(c));
+                }
+            }
+            return false;
         }
         let wa = self.widen_prefix(a);
         // A prefix that names no class (a type parameter left as a

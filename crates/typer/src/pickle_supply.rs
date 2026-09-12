@@ -2259,7 +2259,10 @@ impl PickleSupply {
                 if m.has(pflags::LOCAL) && m.has(pflags::PRIVATE) {
                     st.get_mut(id).flags = st.get(id).flags.with(Flags::LOCAL);
                 }
-                if let Some(SigType::This(c)) = &m.result_prefix {
+                // A constructor's "result" is the class itself; its hidden
+                // outer slot is the backend's (`hidden_outer_desc`), not a
+                // prefix to record.
+                if let (Some(SigType::This(c)), false) = (&m.result_prefix, name == "<init>") {
                     let c = c.clone();
                     let ty = std::mem::replace(&mut st.get_mut(id).ty, Type::NoType);
                     let ty = self.with_pickled_this_prefix(st, bin, Some(&c), ty);

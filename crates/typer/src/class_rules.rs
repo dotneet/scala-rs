@@ -51,6 +51,12 @@ impl Typer {
             || cls.0 < self.st.prelude_end
             || !s.pickled_origin.is_empty()
             || s.binary_outer_desc.is_some()
+            // A class read from a class file is not one this run compiles:
+            // its constructor as the classfile reader installed it still has
+            // the hidden outer slot of a nested class (`x$0: C` for
+            // `class C { class D }` compiled by scalac), which
+            // `supply_binary_ctors` drops only when the constructor is used.
+            || self.st.binary_read.contains(&cls.0)
             || s.name.starts_with("$anon")
         {
             return None;

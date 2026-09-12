@@ -2224,7 +2224,22 @@ pub(crate) fn gen_new(
     }
     asm.new_obj(&internal);
     asm.dup();
-    if let Some(outer) = outer_field_class(ctx.st, class_id) {
+    // A separately compiled inner class (`new c.D` for scalac's `class C {
+    // class D }`) has no `enclosing_instance` here -- the class file reader
+    // marks every binary class `JAVA` -- but its constructor descriptor
+    // begins with the hidden outer slot (`binary_outer_desc`, read off the
+    // class file's `$outer` field), and the parent-constructor path already
+    // resolves that class. Without it the slot was left unfilled: a
+    // `VerifyError` (`uninitialized … is not assignable to pfxlib/C`).
+    let outer_cls = outer_field_class(ctx.st, class_id).or_else(|| {
+        ctx.st
+            .get(class_id)
+            .binary_outer_desc
+            .as_deref()
+            .and_then(|d| d.strip_prefix('L')?.strip_suffix(';'))
+            .and_then(|jvm| ctx.st.find_class_by_jvm(jvm))
+    });
+    if let Some(outer) = outer_cls {
         match new_prefix_instance(ctx, tpt, outer) {
             // `new i.Deep()` / `new c.Inner`: the enclosing instance is the
             // prefix that was written, not the current `this`.

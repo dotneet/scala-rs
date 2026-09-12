@@ -53,29 +53,54 @@ fn scalac() -> Option<PathBuf> {
 }
 
 fn compile(src: &Path, out: &Path, jar: &Path, scalac_path: Option<&Path>) -> Output {
+    compile_with(src, out, jar, scalac_path, None)
+}
+
+/// `compile`, with an extra class directory on the classpath (a library
+/// compiled separately).
+fn compile_with(
+    src: &Path,
+    out: &Path,
+    jar: &Path,
+    scalac_path: Option<&Path>,
+    cp: Option<&Path>,
+) -> Output {
     match scalac_path {
-        Some(sc) => Command::new(sc)
-            .args([
-                "-classpath",
-                jar.to_str().unwrap(),
-                "-d",
-                out.to_str().unwrap(),
-            ])
-            .arg(src)
-            .output()
-            .expect("run scalac"),
-        None => Command::new(bin())
-            .arg("compile")
-            .arg(src)
-            .args(["-d", out.to_str().unwrap()])
-            .args(["--scala-library", jar.to_str().unwrap()])
-            .output()
-            .expect("run scala-rs compile"),
+        Some(sc) => {
+            let mut classpath = jar.to_str().unwrap().to_string();
+            if let Some(cp) = cp {
+                classpath = format!("{classpath}:{}", cp.display());
+            }
+            Command::new(sc)
+                .args(["-classpath", &classpath, "-d", out.to_str().unwrap()])
+                .arg(src)
+                .output()
+                .expect("run scalac")
+        }
+        None => {
+            let mut c = Command::new(bin());
+            c.arg("compile")
+                .arg(src)
+                .args(["-d", out.to_str().unwrap()])
+                .args(["--scala-library", jar.to_str().unwrap()]);
+            if let Some(cp) = cp {
+                c.args(["-cp", cp.to_str().unwrap()]);
+            }
+            c.output().expect("run scala-rs compile")
+        }
     }
 }
 
 fn run_java(out: &Path, jar: &Path) -> String {
-    let cp = format!("{}:{}", out.display(), jar.display());
+    run_java_with(out, jar, None)
+}
+
+fn run_java_with(out: &Path, jar: &Path, cp: Option<&Path>) -> String {
+    let mut cp_s = format!("{}:{}", out.display(), jar.display());
+    if let Some(cp) = cp {
+        cp_s = format!("{cp_s}:{}", cp.display());
+    }
+    let cp = cp_s;
     let o = Command::new("java")
         .args(["-Xverify:all", "-cp", &cp, "Main"])
         .output()
@@ -163,6 +188,62 @@ fn check_rejects(name: &str, lines: &[u32], scalac_path: Option<&Path>) {
         "error lines differ:\n{text}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// An inner class of a *separately compiled* class (`tests/fixtures/pfx_binlib/`):
+/// the library built by scalac and by scala-rs, the client by both, every
+/// combination running `new c.D`, a method result read through `c`, and a
+/// subclass of `c.D`, and printing what scalac's build prints. The hidden
+/// outer slot of the binary constructor is the backend's to fill, not an
+/// argument the typer counts.
+#[test]
+fn pfx_binlib_inner_class_through_a_value_prefix() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    let lib_src = fixtures_dir().join("pfx_binlib/PfxLib.scala");
+    let client = fixtures_dir().join("pfx_binlib_use.scala");
+    let expected = fs::read_to_string(fixtures_dir().join("expected/pfx_binlib_use.txt")).unwrap();
+    for lib_by_scalac in [true, false] {
+        let lib = tmp_dir("binlib");
+        let o = compile_with(
+            &lib_src,
+            &lib,
+            &jar,
+            lib_by_scalac.then_some(sc.as_path()),
+            None,
+        );
+        assert!(
+            o.status.success(),
+            "library failed:\n{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        for client_by_scalac in [false, true] {
+            let out = tmp_dir("binlib-use");
+            let o = compile_with(
+                &client,
+                &out,
+                &jar,
+                client_by_scalac.then_some(sc.as_path()),
+                Some(&lib),
+            );
+            assert!(
+                o.status.success(),
+                "client failed (lib by scalac: {lib_by_scalac}, client by scalac: {client_by_scalac}):\n{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            );
+            assert_eq!(run_java_with(&out, &jar, Some(&lib)), expected);
+            let _ = fs::remove_dir_all(&out);
+        }
+        let _ = fs::remove_dir_all(&lib);
+    }
 }
 
 const BAD_LINES: &[u32] = &[8, 10, 17, 30, 32, 33, 34, 35, 37, 38];

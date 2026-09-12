@@ -666,6 +666,13 @@ impl Typer {
     /// term of the path is kept: `x.p.In` and `p.In` are two types.
     pub(crate) fn singleton_prefix_of(&self, path: &Tree) -> Option<Type> {
         match &path.kind {
+            // `super.Builder` in type position: the parent's member, but the
+            // instance is this one -- nsc's `Mid.super.type` is `Mid.this`.
+            // Read as the parent's *projection* it was a different prefix
+            // from the `Main.this.Builder` a member declared bare expects.
+            TreeKind::Super { .. } => {
+                (!self.st.this_class.is_none()).then_some(Type::ThisType(self.st.this_class))
+            }
             TreeKind::This { qual } => {
                 let id = match qual {
                     Some(name) => self
