@@ -2034,6 +2034,21 @@ impl Typer {
             let flags = self.st.get(f).flags;
             let ty = self.st.get(f).ty.clone();
             let name = self.st.get(f).name.clone();
+            // nsc's `VarianceValidator`: "No variance check for
+            // object-private/protected methods/values" -- `sym.isLocalToThis`,
+            // which is `private[this]` or `protected[this]`. Such a member can
+            // only be reached through `this`, whose type parameters are the
+            // class's own, so no supertype of the class can see it at the
+            // wrong variance. `final class LazyList[+A] private(private[this]
+            // var lazyState: () => LazyList.State[A])` is the case
+            // (`scala/collection/immutable/LazyList.scala`), and
+            // `scala/collection/immutable/TreeSeqMap.scala`'s and
+            // `scala/concurrent/impl/Promise.scala`'s object-private
+            // constructors. A `case` class clears the flag (the parameters are
+            // public), so this does not loosen those.
+            if flags.contains(Flags::LOCAL) {
+                continue;
+            }
             if flags.contains(Flags::MUTABLE) {
                 self.check_variance_ty(&vars, &ty, -1, span, &format!("value {name}"));
                 self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
@@ -2083,6 +2098,15 @@ impl Typer {
             // Box[+A](a: A)` is legal even though its `copy(a: A)` puts `A`
             // in a contravariant position.
             if self.st.get(m).flags.contains(Flags::SYNTHETIC) {
+                continue;
+            }
+            // Object-private / object-protected, as for the fields above:
+            // `private[this] def iterateUntilEmpty(f: Iterable[A] =>
+            // Iterable[A])` in `IterableOps[+A, …]`, `private[this] def
+            // linearSearch[B >: A](c: View[A], …)` in `SeqOps`, and
+            // `private[this] implicit def ccClassTag[X]: ClassTag[CC[X]]` in
+            // `ClassTagIterableFactory[+CC[_]]`.
+            if self.st.get(m).flags.contains(Flags::LOCAL) {
                 continue;
             }
             let name = self.st.get(m).name.clone();

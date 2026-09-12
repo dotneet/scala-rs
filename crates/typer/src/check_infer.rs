@@ -3543,6 +3543,28 @@ impl Typer {
                 conversion = self.search_conversion(&tree.ty, pt);
             }
         }
+        // nsc refuses to *close* a gap to one of the top types with a view,
+        // however applicable the view is: "the result type of an implicit
+        // conversion must be more specific than AnyVal". `def use(x: AnyVal)`
+        // applied to a `"s"` is that error in scalac 2.13.16, and
+        // `def use(x: AnyRef)` applied to a `3` is its `AnyRef` twin -- a
+        // blanket conversion of anything to any top type is what the rule
+        // keeps out. Reported only once a view was actually found, so a
+        // position that needs no conversion is untouched and an ambiguity
+        // among several views still reports the ambiguity, as nsc does.
+        if matches!(conversion, ImplicitSearch::Found(_))
+            && matches!(pt, Type::Any | Type::AnyVal | Type::AnyRef)
+        {
+            self.error(
+                tree.span,
+                format!(
+                    "the result type of an implicit conversion must be more specific than {}",
+                    self.st.display_type(pt)
+                ),
+            );
+            tree.ty = Type::Error;
+            return;
+        }
         match conversion {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;
@@ -4470,7 +4492,34 @@ impl Typer {
         // selection is left alone -- `scala.Some(1)` already has its own
         // `apply` path, and rewriting it here would change what codegen
         // emits for every qualified companion call.
+        // A receiver typed by an abstract type reaches its `apply` through the
+        // type's upper bound, as nsc's `adaptToArguments` does:
+        //
+        // ```scala
+        // class IntIndexedSeqStepper[CC <: collection.IndexedSeqOps[Int, AnyConstr, _]](underlying: CC) {
+        //   def nextStep(): Int = { … ; underlying(i0) }   // underlying.apply(i0)
+        // ```
+        //
+        // `underlying.apply(j)` always worked; only the indexing sugar stopped
+        // here, with `value apply is not a member of CC`
+        // (`scala/collection/convert/impl/IndexedSeqStepper.scala`). Gated on
+        // the bound actually declaring `apply`, so a parameter with no such
+        // member keeps the diagnostic it has rather than gaining a second one.
+        // Only a type *parameter*: a deferred type member reaches a second,
+        // unrelated gap -- `trait H { type C <: collection.IndexedSeq[Int];
+        // def xs: C; def at(j: Int) = xs(j) }` resolves the inserted `apply`
+        // to the type member itself ("no matching overload for H.C with
+        // arguments (Int)"), so including it would only trade one rejection
+        // for a more confusing one.
+        let abstract_with_apply = matches!(strip_annotations(&fun.ty), Type::TypeParam(_)) && {
+            let ty = strip_annotations(&fun.ty).clone();
+            self.ensure_apply_supplied(&ty, fun.span);
+            self.st
+                .class_sym_of(&ty)
+                .is_some_and(|c| !self.st.lookup_member(c, "apply").is_empty())
+        };
         if matches!(&fun.kind, TreeKind::Select { .. })
+            && !abstract_with_apply
             && !matches!(
                 strip_annotations(&fun.ty),
                 Type::Class { .. } | Type::Array(_) | Type::ThisType(_) | Type::SingleType { .. }
@@ -4484,14 +4533,15 @@ impl Typer {
         // `val (b, m: Map[…] @unchecked) = …` then calls `m(f)`, and without
         // looking through `@unchecked` that reported
         // `value apply is not a member of Map[…] @unchecked`.
-        let insert = matches!(
-            strip_annotations(&fun.ty),
-            Type::Array(_)
-                | Type::Class { .. }
-                | Type::ModuleRef(_)
-                | Type::ThisType(_)
-                | Type::SingleType { .. }
-        );
+        let insert = abstract_with_apply
+            || matches!(
+                strip_annotations(&fun.ty),
+                Type::Array(_)
+                    | Type::Class { .. }
+                    | Type::ModuleRef(_)
+                    | Type::ThisType(_)
+                    | Type::SingleType { .. }
+            );
         if !insert {
             return;
         }

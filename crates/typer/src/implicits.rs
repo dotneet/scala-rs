@@ -1888,6 +1888,12 @@ impl Typer {
         // `ArrayBuffer.type` has to see `IterableFactory[ArrayBuffer]`, or `CC`
         // falls through to `AnyRef`.
         let targs = self.conv_targs(id, &self.align_to_param_class(&param, from));
+        // A conversion whose own parameter would have to break its declared
+        // bound is not applicable: `wrapRefArray[T <: AnyRef]` is no candidate
+        // for an `Array[Char]` (`scala/io/Source.scala`'s `fromIterable(Array(c))`).
+        if !self.conv_targs_within_bounds(id, &param, &targs) {
+            return false;
+        }
         let param_s = crate::symbol::subst_tparams_slice(&tps, &targs, &param);
         let ret_s = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
         if self.weak_conforms(from, &param_s)
@@ -2526,17 +2532,46 @@ impl Typer {
     }
 
     fn is_as_specific_type(&self, a: SymbolId, b: SymbolId) -> bool {
+        // nsc's `isAsSpecific(ftpe1, ftpe2)` for a method *with* parameters is
+        // `isApplicableSafe(Nil, ftpe2, ftpe1.paramTypes, WildcardType)`: `b`
+        // must be applicable to `a`'s parameter type, with `a`'s own type
+        // parameters left abstract, and the *result* type plays no part (it is
+        // `isAsSpecificValueType`, for value-shaped implicits, that compares
+        // results). Relating the two parameter types with `is_sub_type` left
+        // `Array[T]` and `Array[T <: AnyRef]` unordered either way, so
+        // `wrapRefArray` and `genericWrapArray` came out ambiguous for every
+        // `Array[String]` used as a `Seq` (`scala/Array.scala`,
+        // `scala/collection/concurrent/TrieMap.scala`, and the same pair with
+        // `wrapCharArray` in `scala/io/Source.scala`). Keeping the result
+        // comparison *as well* would go the other way and break a tie nsc
+        // leaves ambiguous: `foo1[A](a: A): Foo[A]` beside `foo2(a: Any):
+        // Foo[String]` (`neg/sensitive2`), where both views accept the other's
+        // parameter and only the results are ordered.
+        // Only for a genuine *view*. nsc normalizes an implicit first clause
+        // away first (`case mt: MethodType if mt.isImplicit =>
+        // isAsSpecific(mt.resultType, ftpe2)`), so `implicit def a(implicit i:
+        // Int): Array[Byte]` beside `implicit def b[T](implicit i: Int):
+        // Array[T]` is ordered by its *result*; reading the implicit `i: Int`
+        // as the parameter to compare made the two equal and `fn[Array[Byte]]`
+        // "ambiguous implicit: b, a" (`pos/t1272`).
+        let view = |id: SymbolId| {
+            (!self.first_clause_is_implicit(id))
+                .then(|| self.conversion_arg_ty(id))
+                .flatten()
+        };
+        if let (Some(aa), Some(_)) = (view(a), view(b)) {
+            return self.conv_accepts_opaque(b, &unwrap_byname(&aa));
+        }
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
         if !self.st.is_sub_type(&ra, &rb) {
             return false;
         }
-        match (self.conversion_arg_ty(a), self.conversion_arg_ty(b)) {
-            (Some(aa), Some(ab)) => self.st.is_sub_type(&aa, &ab),
-            (Some(_), None) => false,
-            (None, Some(_)) => true,
-            (None, None) => true,
-        }
+        // A view does not beat a value-shaped implicit on type alone.
+        !matches!(
+            (self.conversion_arg_ty(a), self.conversion_arg_ty(b)),
+            (Some(_), None)
+        )
     }
 
     /// Direct owner must be class-like (nsc `owner.isSubClass`). A method-local
@@ -3289,16 +3324,75 @@ impl Typer {
     /// type parameters on *both* sides, which makes those two equal.
     fn conv_param_strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
         let as_specific = |x: SymbolId, y: SymbolId| -> bool {
-            match (self.conversion_arg_ty(x), self.conversion_arg_ty(y)) {
-                (Some(px), Some(py)) => {
-                    let px = unwrap_byname(&px);
-                    let py = self.erase_method_tparams(y, &unwrap_byname(&py));
-                    self.st.is_sub_type(&px, &py)
-                }
-                _ => false,
+            match self.conversion_arg_ty(x) {
+                Some(px) => self.conv_accepts_opaque(y, &unwrap_byname(&px)),
+                None => false,
             }
         };
         a != b && as_specific(a, b) && !as_specific(b, a)
+    }
+
+    /// Whether the view `y` is applicable to an argument of type `px`, whose
+    /// own type parameters are **abstract**: nsc's
+    /// `isApplicableSafe(Nil, ftpe2, ftpe1.paramTypes, WildcardType)`.
+    ///
+    /// The bounds are part of applicability, and that is what separates two
+    /// views an erasure to wildcards leaves equal:
+    ///
+    /// ```scala
+    /// implicit def genericWrapArray[T](xs: Array[T]): ArraySeq[T]
+    /// implicit def wrapRefArray[T <: AnyRef](xs: Array[T]): ArraySeq.ofRef[T]
+    /// ```
+    ///
+    /// `genericWrapArray` accepts an `Array[T']` for `wrapRefArray`'s abstract
+    /// `T'`; `wrapRefArray` does *not* accept an `Array[T]` for
+    /// `genericWrapArray`'s unbounded `T`, because nothing says `T <: AnyRef`.
+    /// So `wrapRefArray` is strictly the more specific, which is the one nsc
+    /// picks for an `Array[String]`. Both directions held before and the pair
+    /// was reported as "ambiguous implicit: wrapRefArray, genericWrapArray"
+    /// (`scala/Array.scala`, `scala/collection/concurrent/TrieMap.scala`).
+    fn conv_accepts_opaque(&self, y: SymbolId, px: &Type) -> bool {
+        let Some(py) = self.conversion_arg_ty(y) else {
+            return false;
+        };
+        let py = unwrap_byname(&py);
+        let tps = self.st.get(y).tparams.clone();
+        if tps.is_empty() {
+            return self.st.is_sub_type(px, &py);
+        }
+        let targs = self.conv_targs(y, px);
+        for (i, tp) in tps.iter().enumerate() {
+            if !crate::check::mentions_tparam(&py, &[*tp]) {
+                continue;
+            }
+            let (Some(arg), Some(hi)) = (targs.get(i), self.st.get(*tp).bound_hi.clone()) else {
+                continue;
+            };
+            let hi = crate::symbol::subst_tparams_slice(&tps, &targs, &hi);
+            if !self.arg_provably_within(arg, &hi) {
+                return false;
+            }
+        }
+        let inst = crate::symbol::subst_tparams_slice(&tps, &targs, &py);
+        self.st.is_sub_type(px, &inst)
+    }
+
+    /// `arg <: hi`, judged so that an **abstract** `arg` is only as good as its
+    /// own declared bound.
+    ///
+    /// `is_sub_type` lets a bare type parameter stand for any reference type
+    /// (`def c[T](t: T): AnyRef = t` is accepted, where scalac reports a
+    /// mismatch), and the specificity comparison above cannot use an answer
+    /// that is true of every parameter. Judged here rather than by tightening
+    /// conformance, which every part of the compiler leans on.
+    fn arg_provably_within(&self, arg: &Type, hi: &Type) -> bool {
+        match arg {
+            Type::TypeParam(id) | Type::TypeMember(id) => match self.st.get(*id).bound_hi.clone() {
+                Some(b) => self.st.is_sub_type(&b, hi),
+                None => matches!(hi, Type::Any),
+            },
+            _ => self.st.is_sub_type(arg, hi),
+        }
     }
 
     fn erase_method_tparams(&self, id: SymbolId, ty: &Type) -> Type {
@@ -3310,12 +3404,58 @@ impl Typer {
         crate::symbol::subst_tparams_slice(&tps, &wilds, ty)
     }
 
+    /// A candidate that is a one-argument function *by inheritance*, read as
+    /// the `A => B` it conforms to.
+    ///
+    /// nsc searches a view with the expected type `Function1[from, ?]`, so
+    /// **any** implicit whose type conforms to it is a view -- not only a `def`
+    /// and not only a value whose type is written as a function. `<:<` is the
+    /// case the library relies on: `sealed abstract class <:<[-From, +To]
+    /// extends (From => To)`, so
+    ///
+    /// ```scala
+    /// def invert[El1, It1[a] <: Iterable[a]](implicit w1: T1 <:< It1[El1]) = {
+    ///   val it1 = x._1.iterator   // T1 seen through w1
+    /// ```
+    ///
+    /// resolves `iterator` through `w1` (`scala/runtime/Tuple2Zipped.scala`,
+    /// `Tuple3Zipped.scala`). Only `Type::Function` parents count: the
+    /// `PartialFunction` / `Map` stand-ins [`Typer::function_view`] also
+    /// recognises are how the prelude spells those classes, and letting an
+    /// implicit `Map[K, V]` act as a view for every `K` receiver is a much
+    /// wider rule than the one the library needs.
+    fn conv_inherited_function1(&self, cand_ty: &Type) -> Option<Type> {
+        let Type::Class { sym, args } = cand_ty else {
+            return None;
+        };
+        if self.st.function_class_shape(*sym, args).is_some() {
+            // Already a `Function1` applied as a class: the callers' own
+            // `Type::Function` arm (after `function_class_shape`) handles it.
+            return None;
+        }
+        self.st
+            .base_type_seq(cand_ty)
+            .into_iter()
+            .find_map(|base| match &base {
+                Type::Function { params, .. } if params.len() == 1 => Some(base),
+                Type::Class { sym, args } => self
+                    .st
+                    .function_class_shape(*sym, args)
+                    .filter(|f| matches!(f, Type::Function { params, .. } if params.len() == 1)),
+                _ => None,
+            })
+    }
+
     fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
         let _prefixes = self.import_prefix_scope();
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
         let cand_ty = self.implicit_candidate_ty(id);
+        let cand_ty = match self.conv_inherited_function1(&cand_ty) {
+            Some(f) => std::borrow::Cow::Owned(f),
+            None => cand_ty,
+        };
         match &*cand_ty {
             Type::Method { paramss, ret } => {
                 let ps = paramss.first().filter(|ps| ps.len() == 1)?;
@@ -3361,6 +3501,10 @@ impl Typer {
             return Vec::new();
         }
         let cand_ty = self.implicit_candidate_ty(id);
+        let cand_ty = match self.conv_inherited_function1(&cand_ty) {
+            Some(f) => std::borrow::Cow::Owned(f),
+            None => cand_ty,
+        };
         let param: Option<&Type> = match &*cand_ty {
             Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()),
             Type::Function { params, .. } => params.first(),
@@ -3527,6 +3671,9 @@ impl Typer {
         let tps = &self.st.get(id).tparams;
         if !tps.is_empty() {
             let targs = self.conv_targs(id, from);
+            if !self.conv_targs_within_bounds(id, param, &targs) {
+                return false;
+            }
             let instantiated = crate::symbol::subst_tparams_slice(tps, &targs, param);
             if self.st.is_sub_type(from, &instantiated) {
                 return true;
@@ -3557,6 +3704,58 @@ impl Typer {
         // [`Self::conv_implicits_resolve`], [`Self::search_extension`] with
         // [`Self::drop_witnessless_conversions`], which may load first.
         fits_ctor
+    }
+
+    /// Whether the type arguments the receiver pins on a conversion's own
+    /// parameters respect their declared **upper bounds**.
+    ///
+    /// `Predef.wrapRefArray[T <: AnyRef](xs: Array[T])` is not a candidate for
+    /// an `Array[Char]`: `T` would have to be `Char`. Without the check it
+    /// stood beside `wrapCharArray` and `genericWrapArray` and every
+    /// `Array(c): Seq[Char]` in `scala/io/Source.scala` was "ambiguous
+    /// implicit: wrapRefArray, wrapCharArray, genericWrapArray". nsc's
+    /// `isApplicable` checks the bounds as part of deciding applicability, and
+    /// an inapplicable alternative never reaches the ambiguity report.
+    ///
+    /// Only a parameter the declared argument type actually mentions is
+    /// judged: that is the one [`Self::conv_targs`] solved from the receiver
+    /// structurally. A parameter the receiver says nothing about falls back to
+    /// `Nothing` (or stays itself) there, and holding that against the bound
+    /// would reject conversions nsc accepts. Lower bounds are left alone for
+    /// the same reason -- a `B >: A` is routinely solved as exactly `A` here,
+    /// and nsc widens it instead.
+    fn conv_targs_within_bounds(&self, id: SymbolId, param: &Type, targs: &[Type]) -> bool {
+        let tps = self.st.get(id).tparams.clone();
+        for (i, tp) in tps.iter().enumerate() {
+            let Some(arg) = targs.get(i) else {
+                continue;
+            };
+            if matches!(arg, Type::TypeParam(x) if x == tp) {
+                continue;
+            }
+            if !crate::check::mentions_tparam(param, &[*tp]) {
+                continue;
+            }
+            // A *higher-kinded* parameter's bound is written in terms of its
+            // own parameters (`B[U] <: Buffer[U]`, `CC[+B] <: Iterable[B]`),
+            // and what the receiver pins is a type *constructor*: relating the
+            // two is a kind-level question `is_sub_type` does not answer, and
+            // asking it dropped the conversions `pos/tcpoly_infer_ticket1864`,
+            // `pos/tcpoly_infer_implicit_tuple_wrapper`, `pos/t5953` and
+            // `pos/t11174` rely on. `kind_bounds.rs` is where such a bound is
+            // checked.
+            if !self.st.get(*tp).tparams.is_empty() {
+                continue;
+            }
+            let Some(hi) = self.st.get(*tp).bound_hi.clone() else {
+                continue;
+            };
+            let hi = crate::symbol::subst_tparams_slice(&tps, targs, &hi);
+            if !self.st.is_sub_type(arg, &hi) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The single value parameter of a conversion, as declared.

@@ -722,8 +722,33 @@ impl Typer {
         // `[B >: A]` / `[A <: Named]`: remember the bounds on the type parameter
         // symbol so inference can widen to the lower bound and check the upper one.
         for (tp_id, lo, hi) in bound_work {
+            // A **higher-kinded** parameter writes its bounds in terms of its
+            // own parameters (`def invert[El1, It1[a] <: Iterable[a]]`), and
+            // `enter_tparams` entered those in the *enclosing* scope, where a
+            // second parameter spelling its own the same way -- `It2[a] <:
+            // Iterable[a]` right beside it -- is a second binding under the
+            // same name. Resolved here without the parameter's own scope,
+            // `Iterable[a]` bound `a` to whichever came first, so `It2`'s bound
+            // was `Iterable[It1#a]`: `widen_type_param` had nothing of `It2`'s
+            // to substitute and `x._2.iterator` came back an `Iterator[a]`
+            // (`scala/runtime/Tuple2Zipped.scala`, `Tuple3Zipped.scala`).
+            // `check_namer::resolve_tparam_bounds` already pushes that scope;
+            // this pass ran after it and overwrote the good answer.
+            let inner = self.st.get(tp_id).tparams.clone();
+            if !inner.is_empty() {
+                self.st.push_scope();
+                for iid in &inner {
+                    let name = self.st.get(*iid).name.clone();
+                    if name != "_" {
+                        self.st.enter_in_current(&name, *iid);
+                    }
+                }
+            }
             let lo_ty = lo.map(|t| self.tree_to_type(&t));
             let hi_ty = hi.map(|t| self.tree_to_type(&t));
+            if !inner.is_empty() {
+                self.st.pop_scope();
+            }
             if let Some(t) = lo_ty {
                 if !t.is_error() {
                     self.st.get_mut(tp_id).bound_lo = Some(t);

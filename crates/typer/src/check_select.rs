@@ -481,6 +481,23 @@ impl Typer {
                     byname_type_marker: false,
                 };
                 **qual = self.fill_conv_implicits(conv, &from, applied, span);
+                // A view whose result applies a higher-kinded *type parameter*
+                // (`implicit w1: T1 <:< It1[El1]` with `It1[a] <: Iterable[a]`)
+                // offers the members of that parameter's upper bound, at the
+                // arguments the application supplies -- `Iterable[El1]`, so
+                // `iterator` is an `Iterator[El1]`. `class_sym_of` already
+                // follows the bound to find the class, but substitution needs
+                // the bound *instance*: read at `It1[El1]`, `Iterable`'s own
+                // `A` had nothing to match and `x._1.iterator` came back an
+                // `Iterator[A]` (`scala/runtime/Tuple2Zipped.scala`'s
+                // `invert`). Only an application is widened; a view result
+                // that is a bare type parameter keeps the parameter, as nsc's
+                // `memberType` does.
+                let to = if matches!(to, Type::Applied { .. }) {
+                    self.st.widen_type_param(&to)
+                } else {
+                    to
+                };
                 found = if let Some(cls) = self.st.class_sym_of(&to) {
                     self.st.lookup_member(cls, &name)
                 } else {
@@ -734,10 +751,25 @@ impl Typer {
         // result is this class's even where it is not the whole result:
         // `override def lazyZip[B](that): LazyZip2[A, B, LazyList.this.type] =
         // super.lazyZip(that)`.
+        // An *applied* abstract type is the same case: `c.add(x)` on a
+        // `c: CC[A]` with `CC[x] <: Buf[x]` is a `CC[A]`, not the `Buf[A]` the
+        // bound says -- which is what `clone().asInstanceOf[CC[K, V1]]
+        // .addOne((key, value))` needs (`scala/collection/mutable/SortedMap.scala`,
+        // `scala/collection/mutable/Map.scala`).
+        let applied_abstract = matches!(
+            &qual.ty,
+            Type::Applied { ctor, .. }
+                if matches!(**ctor, Type::TypeParam(_) | Type::TypeMember(_))
+        );
         let this_prefix = match (&qual.ty, super_this) {
             (_, Some(here)) if ext_conv.is_none() => Some(Type::ThisType(here)),
             (Type::TypeParam(_) | Type::TypeMember(_), None)
                 if ext_conv.is_none() && recv_ty != qual.ty =>
+            {
+                Some(qual.ty.clone())
+            }
+            (Type::Applied { .. }, None)
+                if applied_abstract && ext_conv.is_none() && recv_ty != qual.ty =>
             {
                 Some(qual.ty.clone())
             }
