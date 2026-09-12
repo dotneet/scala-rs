@@ -166,6 +166,13 @@ Compiler flags (`agent/xflags`):
   tests (`run/patmat-behavior`); warnings about trees a macro expands to
   (`run/t7047`). `Reference to uninitialized` does not look inside patterns
   (a stable-identifier pattern naming a later field).
+- **`enableRequired` language features.** `scala.language.postfixOps` and
+  `scala.language.dynamics` carry `@languageFeature(..., enableRequired =
+  true)`, so nsc reports using them without the import as an *error*
+  (`postfix operator bang needs to be enabled`, seen on
+  `tests/fixtures/postfix_ops_bad.scala`). We report the same text as a
+  feature warning, counted in the `-feature` summary, so such a file compiles
+  here and is rejected by scalac.
 - **The value class *implementation restrictions*.** The eight rules
   `neg/valueclasses.check` records — a `trait` may not extend `AnyVal`, a value
   class may not be nested or local, must have exactly one `val` parameter that

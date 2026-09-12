@@ -494,6 +494,13 @@ fn compile_fails_lib(name: &str, needle: &str) {
 }
 
 fn compile_warns(name: &str, needle: &str) {
+    compile_warns_flags(name, &[], needle)
+}
+
+/// Like [`compile_warns`], with extra compiler flags. A feature warning only
+/// names its feature under `-feature`; by default nsc just counts it in the
+/// `N feature warnings; re-run with -feature for details` summary.
+fn compile_warns_flags(name: &str, flags: &[&str], needle: &str) {
     let src = fixtures_dir().join(format!("{name}.scala"));
     let out = tmp_dir(name);
     let output = Command::new(bin())
@@ -504,6 +511,7 @@ fn compile_warns(name: &str, needle: &str) {
             out.to_str().unwrap(),
             "--no-scala-library",
         ])
+        .args(flags)
         .output()
         .expect("run scala-rs compile");
     assert!(
@@ -716,12 +724,12 @@ fn fixtures_dynamic_bad_is_error() {
 
 #[test]
 fn fixtures_postfix_ops_warns_without_import() {
-    compile_warns("postfix_ops_bad", "postfixOps");
+    compile_warns_flags("postfix_ops_bad", &["-feature"], "postfixOps");
 }
 
 #[test]
 fn fixtures_implicit_conv_warns_without_import() {
-    compile_warns("implicit_conv_bad", "implicitConversions");
+    compile_warns_flags("implicit_conv_bad", &["-feature"], "implicitConversions");
 }
 
 #[test]
