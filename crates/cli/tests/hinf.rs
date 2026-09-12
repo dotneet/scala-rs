@@ -268,3 +268,19 @@ fn scalac_agrees_hinf_nothing() {
 fn hinf_nothing_bad_rejected() {
     check_rejects("hinf_nothing_bad", &[11, 13, 15, 17, 18]);
 }
+
+// run/t4658: sibling library classes joined under no expected type need
+// their lazily attached parents (`ensure_join_parents`).
+#[test]
+fn hinf_join_runs() {
+    check_runs("hinf_join", None);
+}
+
+#[test]
+fn scalac_agrees_hinf_join() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    check_runs("hinf_join", Some(&sc));
+}

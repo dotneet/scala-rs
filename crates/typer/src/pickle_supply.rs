@@ -3365,6 +3365,70 @@ impl PickleSupply {
     /// exactly that case: what the wildcard offers is almost all inherited,
     /// and deciding what the value even is (`Check::is_reflect_universe`: does
     /// this extend `scala.reflect.api.Universe`?) reads the same parent list.
+    /// `IterableOps[A, CC, C]` as the pickle of the class `internal`
+    /// instantiates it along its linearization: the dotted names of the
+    /// classes `CC` and `C` stand for, when both are plain class references.
+    /// `NumericRange[T]` answers `IndexedSeq` twice, `IndexedSeqView[A]`
+    /// `View` twice, `Vector[A]` itself. See `crate::ops_shape`.
+    pub(crate) fn iterable_ops_classes(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+    ) -> Option<(String, String)> {
+        let full = self.pickled_full_name(bin, internal, false)?;
+        let mut errs = Vec::new();
+        let lin = {
+            let mut src = BinSource(bin);
+            self.sigs.linearization(&mut src, &full, false, &mut errs)
+        };
+        let step = lin
+            .iter()
+            .find(|s| !s.module && s.class_name == "scala.collection.IterableOps")?;
+        fn head(t: &SigType) -> Option<String> {
+            match t {
+                SigType::Annotated(t) => head(t),
+                SigType::Ref { sym, .. } if sym.contains('.') => Some(sym.clone()),
+                _ => None,
+            }
+        }
+        Some((head(step.subst.get("CC")?)?, head(step.subst.get("C")?)?))
+    }
+
+    /// The value-parameter counts (all clauses together) of every `name` the
+    /// pickled linearization of the class `internal` declares -- enough to
+    /// tell `SortedSetOps.map(f)(implicit ord)` from `IterableOps.map(f)`
+    /// when the class files cannot (the `Ops` trait declares it, and the
+    /// receiver's own interface file does not).
+    ///
+    /// Each count comes with the dotted name of the class declaring it, most
+    /// derived first.
+    pub(crate) fn pickled_arities(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        name: &str,
+    ) -> Vec<(usize, String)> {
+        let Some(full) = self.pickled_full_name(bin, internal, false) else {
+            return Vec::new();
+        };
+        let enc = scala_rs_pickle::names::encode_method_name(name);
+        let (hits, _errs) = {
+            let mut src = BinSource(bin);
+            self.sigs.lookup(&mut src, &full, false, &enc)
+        };
+        fn count(t: &SigType) -> usize {
+            match t {
+                SigType::Poly { result, .. } => count(result),
+                SigType::Method { params, result, .. } => params.len() + count(result),
+                _ => 0,
+            }
+        }
+        hits.iter()
+            .filter(|h| h.member.kind == MemberKind::Def && !h.owner_module)
+            .map(|h| (count(&h.member.ty), h.owner.clone()))
+            .collect()
+    }
+
     pub fn ensure_parents(&mut self, st: &mut SymbolTable, bin: &mut BinaryIndex, cls: SymbolId) {
         if cls.is_none() || self.parented.contains(&cls.0) {
             return;
@@ -4150,6 +4214,49 @@ impl PickleSupply {
         st.get(class_sym).jvm_name.starts_with("scala/")
             || self.adopted.contains(&class_sym.0)
             || self.implicits_supplied.contains(&class_sym.0)
+    }
+
+    /// The pickled signature of a library (or adopted) class or module class,
+    /// found under its dotted name the way `complete_named` finds it (the
+    /// `$` spelling first, then the nested one). `None` for a class this run
+    /// does not read pickles for.
+    pub(crate) fn class_sig_of(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        if cls.is_none() || !self.pickle_readable(st, cls) {
+            return None;
+        }
+        let sym = st.get(cls);
+        if !sym.is_class_like() {
+            return None;
+        }
+        let is_module = sym.kind == SymKind::ModuleClass;
+        let plain = sym.jvm_name.trim_end_matches('$').replace('/', ".");
+        let mut src = BinSource(bin);
+        if let Ok(sig) = self.sigs.class_sig(&mut src, &plain, is_module) {
+            return Some(sig);
+        }
+        let dotted = scala_rs_pickle::names::nested_to_dotted(&plain);
+        if dotted != plain {
+            if let Ok(sig) = self.sigs.class_sig(&mut src, &dotted, is_module) {
+                return Some(sig);
+            }
+        }
+        None
+    }
+
+    /// The pickled signature of the library class `full_name` (dotted).
+    pub(crate) fn class_sig_by_name(
+        &mut self,
+        bin: &mut BinaryIndex,
+        full_name: &str,
+        module: bool,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        let mut src = BinSource(bin);
+        self.sigs.class_sig(&mut src, full_name, module).ok()
     }
 
     fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {

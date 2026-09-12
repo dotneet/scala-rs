@@ -1,0 +1,37 @@
+warn_pure.scala:26: warning: enclosing method early has result type Unit: return value of type Int(7) discarded
+    val f = () => return 7
+                  ^
+warn_pure.scala:10: warning: a pure expression does nothing in statement position
+  def unitBody(): Unit = 1
+                         ^
+warn_pure.scala:14: warning: discarded pure expression does nothing
+    2
+    ^
+warn_pure.scala:17: warning: a pure expression does nothing in statement position
+  def tryUnit: Unit = try { 10 } catch { case _: Throwable => () }
+                            ^
+warn_pure.scala:20: warning: comparing values of types Unit and Unit using `==` will always yield true
+    println(u == ())
+              ^
+warn_pure.scala:21: warning: comparing values of types Int and String using `==` will always yield false
+    println(i == "x")
+              ^
+warn_pure.scala:22: warning: comparing values of types Boolean and Int using `!=` will always yield true
+    println(b != 3)
+              ^
+warn_pure.scala:26: warning: a pure expression does nothing in statement position
+    val f = () => return 7
+                         ^
+warn_pure.scala:31: warning: a pure expression does nothing in statement position; multiline expressions might require enclosing parentheses
+    1 + 1
+      ^
+warn_pure.scala:32: warning: a pure expression does nothing in statement position; multiline expressions might require enclosing parentheses
+    count
+    ^
+warn_pure.scala:33: warning: a pure expression does nothing in statement position; multiline expressions might require enclosing parentheses
+    h.held
+      ^
+warn_pure.scala:34: warning: a pure expression does nothing in statement position; multiline expressions might require enclosing parentheses
+    -5
+    ^
+12 warnings

@@ -15,7 +15,7 @@ use scala_rs_driver::{
     compile_paths, find_scala_library, find_scala_xml, run_main_with_cp, CompileOptions,
     CompileResult, SourceFeatures,
 };
-use scala_rs_span::render_all;
+use scala_rs_span::{render_all, render_scalac};
 
 fn main() -> ExitCode {
     // Deeply nested types and long method chains recurse; the default 8 MB
@@ -75,7 +75,7 @@ fn print_help() {
 scala-rs — a Scala 2.13 subset compiler (not Scala 3)
 
 USAGE:
-    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync] [-no-specialization] [-Ykind-projector]
+    scala-rs compile <files...> [-d <dir>] [-cp <path>] [--scala-library <jar>] [--no-scala-library] [--parse] [--typer] [-Xfatal-warnings] [-deprecation] [-feature] [-nowarn] [--diagnostics=scalac] [-language:<feat>] [-Xsource:3] [-Xsource-features:<features>] [-Xasync] [-no-specialization] [-Ykind-projector]
     scala-rs run <file> [--scala-library <jar>] [--no-scala-library] [--] [java-args...]
     scala-rs --help
 
@@ -99,7 +99,17 @@ OPTIONS:
                Force the private runtime even if a jar is auto-found.
     --parse             Parse only and dump the AST (do not typecheck or emit)
     --typer             Dump the typed tree after namer/typer
-    -Xfatal-warnings    Treat warnings as errors (non-exhaustive match, …)
+    -Xfatal-warnings, -Werror
+                        Fail the compilation if there are any warnings (they
+                        are still reported as warnings, as nsc does)
+    -deprecation        Report each deprecation instead of a summary line
+    -feature            Report each feature warning instead of a summary line
+    -nowarn             Report no warnings
+    -unchecked          Accepted; unchecked warnings are on by default
+    --diagnostics=scalac
+                        Print diagnostics as scalac's console reporter does
+                        (`file:line: warning: msg`, source line, caret, and the
+                        `N warnings` / `N errors` counts) and nothing else
     -language:<feat>    Enable a language feature (`postfixOps`, `implicitConversions`, `dynamics`)
     -Xsource:<version>  Source level: `2.13` (default), `3`, or `3-cross`.
                         `3`/`3-cross` accept the Scala 3 spellings this subset
@@ -163,12 +173,16 @@ fn cmd_compile(args: &[String]) -> ExitCode {
     }
 
     let result = compile_paths(&parsed.files, &parsed.opts);
-    print_diags(&result);
+    if parsed.scalac_diagnostics {
+        eprint!("{}", render_scalac(&result.diags, &result.sources));
+    } else {
+        print_diags(&result);
+    }
     if !result.ok() {
         return ExitCode::from(1);
     }
 
-    if !parsed.opts.parse_only {
+    if !parsed.opts.parse_only && !parsed.scalac_diagnostics {
         let n = result.emitted.len();
         println!(
             "wrote {n} class file{} to {}",
@@ -186,6 +200,9 @@ struct CompileArgs {
     warnings: Vec<String>,
     /// `-Xsource-features:help` was asked for; print the list and stop.
     features_help: bool,
+    /// `--diagnostics=scalac`: print diagnostics exactly as scalac's
+    /// `ConsoleReporter` does, and nothing else.
+    scalac_diagnostics: bool,
 }
 
 fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
@@ -193,6 +210,10 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
     let mut parse_only = false;
     let mut typer_dump = false;
     let mut fatal_warnings = false;
+    let mut deprecation = false;
+    let mut feature = false;
+    let mut nowarn = false;
+    let mut scalac_diagnostics = false;
     let mut scala_library = None;
     let mut no_scala_library = false;
     let mut class_path = Vec::new();
@@ -213,6 +234,10 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
         if a == "--" {
             files.extend(args[i + 1..].iter().map(PathBuf::from));
             break;
+        } else if a == "-deprecation" {
+            // Before the `-d<dir>` spelling below, which would read this as
+            // the directory `eprecation`.
+            deprecation = true;
         } else if a == "-d" {
             i += 1;
             let dir = args
@@ -228,8 +253,19 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             parse_only = true;
         } else if a == "--typer" {
             typer_dump = true;
-        } else if a == "-Xfatal-warnings" {
+        } else if a == "-Xfatal-warnings" || a == "-Werror" {
             fatal_warnings = true;
+        } else if a == "-feature" {
+            feature = true;
+        } else if a == "-nowarn" {
+            nowarn = true;
+        } else if a == "-unchecked" {
+            // nsc 2.13 reports unchecked warnings by default; the flag only
+            // restates that.
+        } else if a == "--diagnostics=scalac" {
+            scalac_diagnostics = true;
+        } else if a == "--diagnostics=rust" {
+            scalac_diagnostics = false;
         } else if a == "--no-scala-library" {
             no_scala_library = true;
         } else if a == "--scala-library" || a.starts_with("--scala-library=") {
@@ -325,6 +361,9 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
             parse_only,
             typer_dump,
             fatal_warnings,
+            deprecation,
+            feature,
+            nowarn,
             scala_library: resolved,
             class_path: class_path,
             language_features,
@@ -336,6 +375,7 @@ fn parse_compile_args(args: &[String]) -> Result<CompileArgs, String> {
         },
         warnings,
         features_help,
+        scalac_diagnostics,
     })
 }
 
@@ -446,6 +486,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         parse_only: false,
         typer_dump: false,
         fatal_warnings: false,
+        deprecation: false,
+        feature: false,
+        nowarn: false,
         scala_library: scala_library.clone(),
         class_path: Vec::new(),
         language_features: Vec::new(),

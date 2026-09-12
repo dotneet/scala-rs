@@ -565,7 +565,7 @@ pub struct Typer {
     /// with the `implicit val classTag` it is about to inherit from it.
     pub(crate) parent_ctor_scope: bool,
     pub(crate) class_bound_evidence_types: HashMap<SymbolId, Vec<Type>>,
-    fatal_warnings: bool,
+    pub(crate) fatal_warnings: bool,
     pub(crate) library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     pub(crate) return_meth: Option<SymbolId>,
@@ -575,6 +575,11 @@ pub struct Typer {
     pub(crate) language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     pub(crate) language_implicit_conversions: bool,
+    /// `import scala.language.reflectiveCalls` / `-language:reflectiveCalls`.
+    pub(crate) language_reflective_calls: bool,
+    /// Features a warning has already explained (nsc `reportedFeature`):
+    /// the "This can be achieved by ..." paragraph comes once per run.
+    pub(crate) reported_features: HashSet<String>,
     /// `-Xsource-features:<features>` (already gated on `-Xsource:3`).
     pub(crate) source_features: crate::source_features::SourceFeatures,
     /// `-Xsource:3` (see `TypecheckOptions::scala3`).
@@ -625,6 +630,12 @@ pub struct Typer {
     /// Saved and restored around each application, since typing an argument
     /// runs another application inside this one.
     pub(crate) undet_tvars: Vec<SymbolId>,
+    /// Classes whose parent chain `ensure_join_parents` has already walked.
+    /// `ensure_parents` only remembers the classes it *parented*; one with no
+    /// pickle to read (a Java or prelude class) repeats its jar lookup on
+    /// every call, and the join of every `if` / `match` branch asked for up
+    /// to 64 ancestors each -- gitbucket went from 13 s to over 10 min.
+    pub(crate) join_parents_done: rustc_hash::FxHashSet<u32>,
     /// Non-zero while an argument is being typed against an expected type this
     /// compiler *relaxed*: an undetermined variable in it was replaced by
     /// `Type::Wildcard` to say "the argument decides this" (`check_apply`'s
@@ -671,6 +682,16 @@ pub struct Typer {
     /// the prefix the backend loaded `this`, which is a `ClassCastException`
     /// at run time. This is what `import c.universe._` needs.
     pub(crate) term_import_prefixes: Vec<(SymbolId, Tree)>,
+    /// How many `reify { … }` bodies are being typed on a probe right now.
+    /// Above zero, a `reify` met while typing is nested in another and is
+    /// typed but not expanded (`Check::try_expand_reify`).
+    pub(crate) reify_depth: u32,
+    /// The nested `reify` applications the current probe met, by node, with
+    /// the expression naming their universe. Taken by the outer expansion.
+    pub(crate) nested_reifies: HashMap<NodeId, Tree>,
+    /// Where locals, parameters, type parameters and local classes were
+    /// defined: the origin nsc writes on a free symbol (`crate::reify::tree`).
+    pub(crate) def_spans: HashMap<SymbolId, Span>,
     /// Receiver paths keyed by the written import clause, so an inner
     /// wildcard cannot replace the receiver of an outer binding.
     pub(crate) object_import_prefixes: HashMap<u64, Tree>,
@@ -910,7 +931,10 @@ pub fn typecheck_units_src(
     // `@compileTimeOnly` is checked only when some source can carry it (only
     // source definitions keep annotations). A caller with no source text
     // checks unconditionally.
-    t.any_cto = t.sources.is_empty() || t.sources.iter().any(|s| s.contains("compileTimeOnly"));
+    t.any_cto = t.sources.is_empty()
+        || t.sources
+            .iter()
+            .any(|s| s.contains("compileTimeOnly") || s.contains("splice") || s.contains("reify"));
     {
         // Class headers before member types, across every unit: a class can
         // inherit from one whose own superclass chain is declared in a file
@@ -1038,6 +1062,18 @@ pub fn typecheck_units_src(
     // parent or self type is raised twice. Member signatures are built once
     // (see `sig_done`), so their diagnostics survive here.
     dedup_diags(&mut t.diags);
+    // nsc's later phases only run when the typer reported no errors; so do
+    // the warnings they issue.
+    if !t
+        .diags
+        .iter()
+        .any(|d| d.level == scala_rs_span::Level::Error)
+    {
+        crate::warn_refchecks::run(&mut t, units);
+        crate::warn_deprecation::run(&mut t, units);
+        crate::warn_features::run(&mut t, units);
+        crate::warn_patmat::run(&mut t, units);
+    }
     (t.st, t.diags)
 }
 
@@ -1127,6 +1163,11 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
+            language_reflective_calls: language_flag_enabled(
+                &opts.language_features,
+                "reflectiveCalls",
+            ),
+            reported_features: HashSet::new(),
             source_features: opts.source_features,
             scala3: opts.scala3,
             compiler_settings: opts.compiler_settings.clone(),
@@ -1135,12 +1176,16 @@ impl Typer {
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),
+            join_parents_done: rustc_hash::FxHashSet::default(),
             relaxed_pt_depth: 0,
             spec_probe: std::cell::Cell::new(false),
             tupling: false,
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
+            reify_depth: 0,
+            nested_reifies: HashMap::new(),
+            def_spans: HashMap::new(),
             object_import_prefixes: HashMap::new(),
             parent_import_prefixes: HashMap::new(),
             parent_import_names: HashMap::new(),
@@ -1187,11 +1232,47 @@ impl Typer {
     }
 
     pub(crate) fn warning(&mut self, span: Span, msg: impl Into<String>) {
+        self.warning_in(scala_rs_span::Phase::Typer, span, msg);
+    }
+
+    /// nsc `Reporting.featureWarning` for a feature that `should` be enabled
+    /// (`cat=feature`, summarized unless `-feature`). The explanation is
+    /// given the first time a feature is reported in the run.
+    pub(crate) fn feature_warning(&mut self, span: Span, feature: &str, desc: &str) {
+        let fq = format!("scala.language.{feature}");
+        let explain = if self.reported_features.insert(feature.to_string()) {
+            format!(
+                "\nThis can be achieved by adding the import clause 'import {fq}'\nor by setting the compiler option -language:{feature}.\nSee the Scaladoc for value {fq} for a discussion\nwhy the feature should be explicitly enabled."
+            )
+        } else {
+            String::new()
+        };
+        let msg = format!(
+            "{desc} should be enabled\nby making the implicit value {fq} visible.{explain}"
+        );
+        if self.fatal_warnings {
+            self.error(span, msg);
+        } else {
+            self.diags.push(
+                Diagnostic::warning(self.file_index, span, msg)
+                    .with_category(scala_rs_span::WarnCategory::Feature),
+            );
+        }
+    }
+
+    /// A warning nsc issues in `phase` (which decides where it is reported;
+    /// see `scala_rs_span::finish_diagnostics`).
+    pub(crate) fn warning_in(
+        &mut self,
+        phase: scala_rs_span::Phase,
+        span: Span,
+        msg: impl Into<String>,
+    ) {
         if self.fatal_warnings {
             self.error(span, msg);
         } else {
             self.diags
-                .push(Diagnostic::warning(self.file_index, span, msg));
+                .push(Diagnostic::warning(self.file_index, span, msg).in_phase(phase));
         }
     }
 
@@ -3749,17 +3830,6 @@ pub(crate) fn is_annotated_lambda(tree: &Tree) -> bool {
         }
         _ => false,
     }
-}
-
-/// The written name an application ultimately calls, past any type
-/// application: the node a `reify` body's classification has to be keyed on,
-/// since that is the one `crate::reify` asks about.
-pub(crate) fn reify_callee(fun: &Tree) -> &Tree {
-    let mut head = fun;
-    while let TreeKind::TypeApply { fun, .. } = &head.kind {
-        head = fun;
-    }
-    head
 }
 
 /// Drop diagnostics repeated verbatim at the same position, keeping the first.

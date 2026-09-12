@@ -5,7 +5,9 @@ use std::process::Command;
 
 use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
-use scala_rs_span::{render_all, Diagnostic, Level, SourceFile, Span};
+use scala_rs_span::{
+    finish_diagnostics, render_all, Diagnostic, Level, SourceFile, Span, WarnSettings,
+};
 use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
     expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
@@ -27,8 +29,16 @@ pub struct CompileOptions {
     pub parse_only: bool,
     /// `--typer`: dump the typed tree after typechecking.
     pub typer_dump: bool,
-    /// `-Xfatal-warnings`: promote warnings (e.g. non-exhaustive match) to errors.
+    /// `-Xfatal-warnings` / `-Werror`: as in nsc, the warnings are reported as
+    /// warnings and the run fails with `No warnings can be incurred under
+    /// -Werror.` (see `scala_rs_span::finish_diagnostics`).
     pub fatal_warnings: bool,
+    /// `-deprecation`: report each deprecation instead of the summary line.
+    pub deprecation: bool,
+    /// `-feature`: report each feature warning instead of the summary line.
+    pub feature: bool,
+    /// `-nowarn`: report no warnings at all.
+    pub nowarn: bool,
     /// When set, bytecode targets scala-library 2.13 on this jar (do not emit
     /// private Option/List/FunctionN stand-ins). The path is also added to the
     /// `java -cp` of [`run_main`] callers that pass it through.
@@ -67,6 +77,9 @@ impl Default for CompileOptions {
             parse_only: false,
             typer_dump: false,
             fatal_warnings: false,
+            deprecation: false,
+            feature: false,
+            nowarn: false,
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
@@ -199,6 +212,21 @@ fn failed_result(diags: Vec<Diagnostic>, sources: Vec<SourceFile>) -> CompileRes
 /// other compilation units). Class files are written to `opts.out_dir` on
 /// success unless `parse_only` is set.
 pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult {
+    let mut result = compile_paths_unreported(files, opts);
+    // nsc's reporting layer: phase order, summaries, `-Werror`.
+    result.diags = finish_diagnostics(
+        std::mem::take(&mut result.diags),
+        &WarnSettings {
+            deprecation: opts.deprecation,
+            feature: opts.feature,
+            nowarn: opts.nowarn,
+            fatal_warnings: opts.fatal_warnings,
+        },
+    );
+    result
+}
+
+fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> CompileResult {
     let mut diags = Vec::new();
     let mut sources = Vec::new();
     let mut units = Vec::new();
@@ -275,7 +303,10 @@ pub fn compile_paths(files: &[PathBuf], opts: &CompileOptions) -> CompileResult 
         let (mut st, tdiags) = typecheck_units_src(
             &mut refs,
             &TypecheckOptions {
-                fatal_warnings: opts.fatal_warnings,
+                // `-Werror` is applied by the reporting layer after the run
+                // (`finish_diagnostics`), as nsc does: the typer's own
+                // promotion of each warning to an error is for API callers.
+                fatal_warnings: false,
                 library_abi: opts.scala_library.is_some(),
                 classpath: load_cp(&opts.class_path),
                 binary_path: {
@@ -1088,6 +1119,9 @@ object Main {
             parse_only: false,
             typer_dump: false,
             fatal_warnings: false,
+            deprecation: false,
+            feature: false,
+            nowarn: false,
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
@@ -1136,6 +1170,9 @@ object Main {
             parse_only: true,
             typer_dump: false,
             fatal_warnings: false,
+            deprecation: false,
+            feature: false,
+            nowarn: false,
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
@@ -1161,6 +1198,9 @@ object Main {
             parse_only: false,
             typer_dump: false,
             fatal_warnings: false,
+            deprecation: false,
+            feature: false,
+            nowarn: false,
             scala_library: None,
             class_path: Vec::new(),
             language_features: Vec::new(),
@@ -1205,6 +1245,9 @@ object Main {
             xasync: false,
             no_specialization: false,
             kind_projector: false,
+            deprecation: false,
+            feature: false,
+            nowarn: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());

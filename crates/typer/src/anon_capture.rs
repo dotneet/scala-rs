@@ -115,8 +115,21 @@ fn consider(id: SymbolId, bound: &HashSet<SymbolId>, out: &mut Vec<SymbolId>, st
     if s.kind != SymKind::Term || s.owner.is_none() {
         return;
     }
-    // Only method-owned terms are locals; class members are reached via `this`.
-    if st.get(s.owner).kind != SymKind::Method {
+    // Method-owned terms are locals; class members are reached via `this`.
+    // A local of a block written directly in a template (`object T extends
+    // App { { val x = 2; class L { def get = x } } }`) is owned by the class
+    // yet is no member of it -- it lives in the constructor's frame -- and a
+    // class defined in that block captures it the same way (the rule
+    // `lambda_lift::consider_capture` already applies to nested defs).
+    // Without it `L.get` read `x` off `this`: `NoSuchFieldError: x`.
+    let owner = st.get(s.owner);
+    // A self alias (`trait Named { self => ... }`) is owned by the class and
+    // is no member either, but it is `this`, not a local.
+    let template_local = owner.is_class_like()
+        && !s.flags.contains(scala_rs_parser::Flags::PARAM)
+        && owner.self_alias != Some(id)
+        && !owner.members.contains(&id);
+    if owner.kind != SymKind::Method && !template_local {
         return;
     }
     out.push(id);

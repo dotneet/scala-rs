@@ -48,6 +48,23 @@ object Main {
   def +[T](x: T): String = "plus " + x
 
   def main(args: Array[String]): Unit = {
+    // nsc `prefixExpr`: `-` in front of a numeric literal belongs to the
+    // literal, so the selections after it apply to the negative number.
+    println(-3.0.abs)
+    println(-3.abs)
+    println(- 3.0.abs)
+    println(-1.toString)
+    println(-0x10.abs)
+    println(-1.5e10.toLong)
+    // `MinValue` exists only as a negated literal.
+    println(-2147483648)
+    println((-2147483648).abs)
+    println(-9223372036854775808L)
+    println(0x80000000)
+    println(-0x80000000)
+    val five = 5
+    println(-five.abs)
+    println(-3.0 max 2.0)
     println(foo { implicit x => x + 1 })
     println(foo { implicit x: Int => implicitly[Int] * 2 })
     println(foo { implicit _ => 42 })

@@ -2,11 +2,13 @@
 //! found in the scala/scala `pos` / `run` corpus, and the nearby programs
 //! scalac rejects that a naive relaxation would start accepting.
 //!
-//! * early definitions in `new` (`new { val x = 1 } with T { .. }`), typed in
-//!   the constructor context, and procedure-syntax auxiliary constructors;
+//! * early definitions in `new` (`new { val x = 1 } with T { .. }`) and read
+//!   by a parent constructor argument, typed in the constructor context, and
+//!   procedure-syntax auxiliary constructors;
 //! * interpolation: `$"`, raw `\"`, escapes of triple-quoted `s` parts, `$_`,
 //!   and interpolated patterns (`case s"$a-$b" =>`);
 //! * SIP-27 trailing commas, `; else`, Unicode symbol operators, `@@`;
+//! * `-3.0.abs` is `(-3.0).abs`, and `MinValue` as a negated literal;
 //! * implicit function literals in blocks, `*` as an infix pattern,
 //!   `(xs) @ _*`, `f _ compose g`, `+` as a method name, `var x: A = _`,
 //!   `@strictfp`;
@@ -305,6 +307,33 @@ const REJECTED: &[(&str, &[&str], &str, &str)] = &[
         &[],
         "object O {\n  private class B\n  private val b = 1\n}\nobject U { val x = O.b }\n",
         "cannot be accessed",
+    ),
+    // nsc `intVal`: an integer literal's magnitude may reach the type's
+    // limit plus one only as the operand of a unary `-`.
+    (
+        "int_too_large",
+        &[],
+        "object T { val x = 2147483648 }\n",
+        "integer number too large",
+    ),
+    (
+        "long_too_large",
+        &[],
+        "object T { val x = 9223372036854775808L }\n",
+        "integer number too large",
+    ),
+    (
+        "int_below_min",
+        &[],
+        "object T { val x = -2147483649 }\n",
+        "integer number too large",
+    ),
+    // An unsuffixed integer literal is an `Int`, whatever is expected.
+    (
+        "long_without_suffix",
+        &[],
+        "object T { val x: Long = 10000000000 }\n",
+        "integer number too large",
     ),
     // `@strictfp` is `scala.annotation.strictfp`, which has to be imported.
     (

@@ -1107,6 +1107,11 @@ pub struct SymbolTable {
     /// one) arrives from a classfile instead, where a by-name parameter is
     /// indistinguishable from a `Function0`. This is the line between the two.
     pub prelude_end: u32,
+    /// Symbols allocated before this index came from the prelude or from the
+    /// eager `-cp` classfile scan; from here on they are this run's own
+    /// sources (and the pickle members supplied on demand, which carry a
+    /// `pickled_origin`). `install_classpath` sets it.
+    pub source_start: u32,
     /// Prelude symbols a source definition of the same fully qualified name
     /// has replaced; see [`SymbolTable::shadow_supplied_by_source`].
     ///
@@ -1139,6 +1144,22 @@ pub struct SymbolTable {
     /// absent from the map are walked as `List`, which is what `List`'s own
     /// `unapplySeq` and every built-in factory want.
     pub seq_extractor_payload: rustc_hash::FxHashMap<SymbolId, SeqPayload>,
+    /// Name-based extractors (nsc's `isEmpty` / `get` protocol, SLS 8.1.8):
+    /// an `unapply` whose result is not an `Option` is matched by calling
+    /// `isEmpty` and then `get` on whatever it returns. Recorded by the typer
+    /// while the result type still has its arguments; see
+    /// [`NameBasedUnapply`].
+    pub name_based_unapply: rustc_hash::FxHashMap<SymbolId, NameBasedUnapply>,
+    /// Product selectors (`_1` … `_N`) an extractor's `get` value is read
+    /// through when a pattern gives it N > 1 sub-patterns and the value is
+    /// not a `TupleN` (a `TupleN` keeps the backend's tuple path). Keyed by
+    /// `(unapply, N)`: the selectors belong to the type `get` yields, which is
+    /// fixed for a given extractor and arity.
+    pub unapply_selectors: rustc_hash::FxHashMap<(SymbolId, usize), UnapplySelectors>,
+    /// `IterableOps[A, CC, C]`'s `CC` and `C` classes for a library
+    /// collection class, read off its pickle (`crate::ops_shape`); `None`
+    /// once looked up and not answerable.
+    pub ops_shapes: rustc_hash::FxHashMap<SymbolId, Option<OpsShape>>,
     /// `jvm_name` -> class-like symbols carrying it, for `classpath::find_by_jvm`,
     /// which used to scan every symbol on every call. See `JvmIndex`.
     pub(crate) jvm_index: std::cell::RefCell<JvmIndex>,
@@ -1241,6 +1262,39 @@ pub(crate) struct JvmIndex {
     /// How many entries of `symbols` have been folded into `map`.
     upto: usize,
     map: HashMap<String, Vec<SymbolId>>,
+}
+
+/// How a pattern reads a name-based extractor's result.
+#[derive(Clone, Debug)]
+pub struct NameBasedUnapply {
+    /// The nullary `isEmpty` member of the result type.
+    pub is_empty: SymbolId,
+    /// The nullary `get` member of the result type.
+    pub get: SymbolId,
+    /// A synthetic local that holds the result while `isEmpty` and `get` are
+    /// called on it (the backend gives it a slot per use).
+    pub result_tmp: SymbolId,
+    /// The result type's class, which the calls are made on.
+    pub result_class: SymbolId,
+}
+
+/// The classes a collection's `IterableOps[A, CC, C]` binds `CC` and `C` to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpsShape {
+    pub cc: SymbolId,
+    pub c: SymbolId,
+}
+
+/// The product selectors a multi-pattern extractor reads its `get` value
+/// through; see [`SymbolTable::unapply_selectors`].
+#[derive(Clone, Debug)]
+pub struct UnapplySelectors {
+    /// `_1` … `_N`, in order.
+    pub selectors: Vec<SymbolId>,
+    /// A synthetic local holding the `get` value while they are read.
+    pub tmp: SymbolId,
+    /// The class of the `get` value, which the selectors are read on.
+    pub class: SymbolId,
 }
 
 /// The container a `unapplySeq` hands back inside its `Option`.
@@ -1350,10 +1404,14 @@ impl SymbolTable {
             local_lazy_nlr: rustc_hash::FxHashSet::default(),
             named_arg_order: rustc_hash::FxHashMap::default(),
             prelude_end: 0,
+            source_start: 0,
             prelude_shadowed: rustc_hash::FxHashSet::default(),
             prelude_scope: 0,
             predef_superseded: false,
             seq_extractor_payload: rustc_hash::FxHashMap::default(),
+            name_based_unapply: rustc_hash::FxHashMap::default(),
+            unapply_selectors: rustc_hash::FxHashMap::default(),
+            ops_shapes: rustc_hash::FxHashMap::default(),
             jvm_index: std::cell::RefCell::new(JvmIndex::default()),
             erasure_settled: false,
             flattened_upto: 0,

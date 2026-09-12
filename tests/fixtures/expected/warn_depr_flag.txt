@@ -1,0 +1,23 @@
+warn_depr.scala:8: warning: procedure syntax is deprecated: instead, add `: Unit =` to explicitly declare `proc`'s return type [quickfixable]
+  def proc() { println("proc") }
+             ^
+warn_depr.scala:16: warning: symbol literal is deprecated; use Symbol("sym") instead [quickfixable]
+    println('sym.name)
+            ^
+warn_depr.scala:19: warning: method << in class Int is deprecated (since 2.12.7): shifting a value by a `Long` argument is deprecated (except when the value is a `Long`).
+Call `toInt` on the argument to maintain the current behavior and avoid the deprecation warning.
+    println(1 << 2L)
+              ^
+warn_depr.scala:13: warning: value Stream in package scala is deprecated (since 2.13.0): Use LazyList instead of Stream
+    val s = Stream(1, 2)
+            ^
+warn_depr.scala:15: warning: method one in object WarnDepr is deprecated (since 1.0): use two
+    println(one)
+            ^
+warn_depr.scala:20: warning: method round in class RichInt is deprecated (since 2.11.0): this is an integer type; there is no reason to round it.  Perhaps you meant to call this on a floating-point value?
+    println(3.round)
+              ^
+warn_depr.scala:18: warning: Passing an explicit array value to a Scala varargs method is deprecated (since 2.13.0) and will result in a defensive copy; Use the more efficient non-copying ArraySeq.unsafeWrapArray or an explicit toIndexedSeq call
+    println(total(a: _*))
+                  ^
+7 warnings

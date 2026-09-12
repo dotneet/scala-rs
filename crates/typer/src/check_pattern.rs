@@ -4,8 +4,8 @@
 //! Types the scrutinee and each pattern against it: constructor patterns and
 //! the type arguments they take from the scrutinee, `unapply` and
 //! `unapplySeq` extractors including their sequence and named-argument forms,
-//! bindings, and `super` selections used from a case body. Ends with the
-//! exhaustiveness check over a sealed hierarchy.
+//! bindings, and `super` selections used from a case body. Exhaustivity and
+//! reachability are checked after typing, by `warn_patmat`.
 
 use crate::check::*;
 use crate::symbol::SymKind;
@@ -44,7 +44,9 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = self.lub_branches(&res, &c.body.ty);
+            // Library classes complete their parents lazily; a join that
+            // fell to `AnyRef` asks for them (`join_branches`).
+            res = self.join_branches(&res, &c.body.ty);
             branch_tys.push(c.body.ty.clone());
             self.st.gadt_bounds.truncate(gadt_mark);
             self.st.pop_scope();
@@ -63,26 +65,10 @@ impl Typer {
         } else {
             tree.ty = self.branch_result_ty(pt, &branch_tys, res);
         }
-        if let TreeKind::Match { selector, cases } = &tree.kind {
-            // The pattern-matching function a `for` generator desugars to is
-            // guarded by the `withFilter` the parser puts in front of it, so
-            // nsc marks it synthetic and never reports it as inexhaustive.
-            // Its scrutinee is the parser's own `x$forN` / `x$forfN`, a name
-            // no source writes.
-            let for_desugaring = selector
-                .name()
-                .is_some_and(|n| n.starts_with("x$for") && n.len() > 5);
-            if !for_desugaring {
-                self.check_match_exhaustive(span, &sel_ty, cases);
-            }
-            self.warn_duplicate_alternatives(&sel_ty, cases);
-            if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
-                self.warning(
-                    selector.span,
-                    "could not emit switch for @switch annotated match",
-                );
-            }
-        }
+        // Exhaustivity, reachability and switch emission are reported by the
+        // patmat pass after typing (`crate::warn_patmat`), as nsc's `patmat`
+        // phase does.
+        let _ = span;
     }
 
     pub(crate) fn type_case(&mut self, c: &mut CaseDef, pt: &Type) {
@@ -537,6 +523,23 @@ impl Typer {
                 for u in unapply.iter().chain(unapply_seq.iter()) {
                     self.complete_lazy_sig(*u, pat.span);
                 }
+                // SLS 8.1.8: an extractor method takes the scrutinee as its
+                // one (first-clause) argument. `def unapply: Option[Int]`,
+                // `def unapply()` and `def unapply(a: Int, b: Int)` were
+                // accepted and called with the scrutinee anyway, which did not
+                // verify (`neg/t5078`). Judged only once the signature is
+                // complete: a lazily typed `unapply` has no clauses yet.
+                if let Some(u) = unapply.or(unapply_seq) {
+                    if self.reject_extractor_shape(u, fun, pat.span) {
+                        // Still bind the sub-patterns, so their names do not
+                        // come back as "not found" in the case body.
+                        for a in args.iter_mut() {
+                            self.type_pattern(a, &Type::Error);
+                        }
+                        pat.ty = Type::Error;
+                        return;
+                    }
+                }
                 // Without the jar there is no `Array$` / `Vector$` companion
                 // at all, so a sequence pattern on one finds no `unapplySeq`
                 // and every sub-pattern would silently come out `Any`. Say
@@ -656,8 +659,23 @@ impl Typer {
                     pat.ty = class_ty;
                     pat.sym = class_id;
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
-                    let extracted = self.unapply_extracted_types(u);
-                    let extracted = self.subst_unapply_tparams(u, sel_ty, extracted);
+                    // An implicit clause after the scrutinee's: type the call
+                    // itself (see `type_unapply_call`).
+                    let (typed_ret, implicit_args) =
+                        match self.type_unapply_call(fun, u, sel_ty, pat.span) {
+                            Some((t, a)) => (Some(t), a),
+                            None => (None, Vec::new()),
+                        };
+                    let extracted = self.unapply_pattern_types(
+                        u,
+                        sel_ty,
+                        args.len(),
+                        pat.span,
+                        true,
+                        typed_ret,
+                    );
+                    let failed = extracted.is_none();
+                    let extracted = extracted.unwrap_or_else(|| vec![Type::Error; args.len()]);
                     // A scrutinee that is an inner class behind a prefix
                     // (`prefix.rs`): what its companion's `unapply` extracts
                     // is written in the enclosing class's vocabulary, and the
@@ -671,7 +689,7 @@ impl Typer {
                     } else {
                         extracted
                     };
-                    if args.len() != extracted.len() && !extracted.is_empty() {
+                    if !failed && args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
                             format!(
@@ -698,6 +716,22 @@ impl Typer {
                     // binds `c` at is narrowed separately in `TreeKind::Bind`
                     // below, which is the only place that needs it.
                     let fun = std::mem::replace(fun, Box::new(Tree::dummy(TreeKind::Empty)));
+                    // The implicit arguments ride along as `Apply(fun,
+                    // implicits)`; `gen_unapply_pattern` passes them after the
+                    // scrutinee.
+                    let fun = if implicit_args.is_empty() {
+                        fun
+                    } else {
+                        let (sym, ty, span) = (fun.sym, fun.ty.clone(), fun.span);
+                        let mut wrapped = Tree::dummy(TreeKind::Apply {
+                            fun,
+                            args: implicit_args,
+                        });
+                        wrapped.sym = sym;
+                        wrapped.ty = ty;
+                        wrapped.span = span;
+                        Box::new(wrapped)
+                    };
                     let args = std::mem::take(args);
                     pat.kind = TreeKind::UnApply { fun, args };
                     pat.sym = u;
@@ -780,7 +814,10 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
             TreeKind::UnApply { fun, args } => {
-                self.type_expr(fun, &Type::NoType);
+                // `Apply(fun, implicits)` was typed in full already.
+                if !matches!(fun.kind, TreeKind::Apply { .. }) {
+                    self.type_expr(fun, &Type::NoType);
+                }
                 let u = if pat.sym.is_none() {
                     self.find_unapply(fun, sel_ty).unwrap_or(SymbolId::NONE)
                 } else {
@@ -789,7 +826,8 @@ impl Typer {
                 let extracted = if u.is_none() {
                     vec![Type::Any; args.len()]
                 } else {
-                    self.unapply_extracted_types(u)
+                    self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, false, None)
+                        .unwrap_or_else(|| vec![Type::Error; args.len()])
                 };
                 for (i, a) in args.iter_mut().enumerate() {
                     let ft = extracted.get(i).cloned().unwrap_or(Type::Any);
@@ -2197,7 +2235,12 @@ impl Typer {
     /// `Some.unapply[A](x: Option[A]): Option[A]` extracts `A`; the scrutinee
     /// says what `A` is. Without this the bound variable keeps the extractor's
     /// own type parameter and degrades to `Any`.
-    fn subst_unapply_tparams(&self, unapply: SymbolId, sel_ty: &Type, out: Vec<Type>) -> Vec<Type> {
+    pub(crate) fn subst_unapply_tparams(
+        &self,
+        unapply: SymbolId,
+        sel_ty: &Type,
+        out: Vec<Type>,
+    ) -> Vec<Type> {
         let tps = self.st.get(unapply).tparams.clone();
         if tps.is_empty() || sel_ty.is_no_type() {
             return out;
@@ -2316,7 +2359,7 @@ impl Typer {
     /// performs the same implicit type test a `case x: T` pattern does, so
     /// `case c @ LiteralNode(_) if c.volatileHint` sees `c: LiteralNode`
     /// (which declares `volatileHint`), not the scrutinee's static `Node`.
-    fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
+    pub(crate) fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
         let param = match &self.st.get(unapply).ty {
             Type::Method { paramss, .. } => paramss.first().and_then(|p| p.first()).cloned(),
             Type::Function { params, .. } => params.first().cloned(),
@@ -2345,18 +2388,28 @@ impl Typer {
         Some(crate::symbol::subst_tparams_slice(&ids, &tys, &param))
     }
 
-    fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
+    pub(crate) fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
         let ret = match &self.st.get(unapply).ty {
             Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
             t => t.clone(),
         };
+        self.unapply_extracted_types_at(unapply, ret)
+    }
+
+    /// [`Self::unapply_extracted_types`] for a result type that is not an
+    /// `Option` (no case-class fallback applies).
+    pub(crate) fn unapply_extracted_types_of(&self, ret: Type) -> Vec<Type> {
+        self.unapply_extracted_types_at(SymbolId::NONE, ret)
+    }
+
+    fn unapply_extracted_types_at(&self, unapply: SymbolId, ret: Type) -> Vec<Type> {
         if matches!(ret, Type::Boolean) {
             return vec![];
         }
         if let Type::Class { sym, args } = &ret {
             let name = self.st.get(*sym).name.as_str();
             if *sym == self.st.option_sym || name == "Option" || name == "Some" {
-                if args.is_empty() {
+                if args.is_empty() && !unapply.is_none() {
                     // A bare `Option` says nothing about what it yields: that
                     // is what an `unapply` read back from a *classfile* looks
                     // like when its signature was erased. For a case class's
@@ -2385,7 +2438,7 @@ impl Typer {
     /// `apply` of exactly the constructor's arity, which is what
     /// `synthesize_case_members` gives every case class and what a hand-written
     /// companion of a non-case class rarely matches.
-    fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
+    pub(crate) fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
         if module_cls.is_none() {
             return None;
         }
@@ -2437,102 +2490,6 @@ impl Typer {
                 }
             }
             other => vec![other],
-        }
-    }
-
-    fn check_match_exhaustive(&mut self, span: Span, sel_ty: &Type, cases: &[CaseDef]) {
-        let Some(cls) = self.st.class_sym_of(sel_ty) else {
-            return;
-        };
-        if !self.st.is_sealed(cls) {
-            return;
-        }
-        if cases
-            .iter()
-            .any(|c| c.guard.is_empty() && self.pattern_is_catchall(&c.pat))
-        {
-            return;
-        }
-        let leaves = self.st.sealed_leaves(cls);
-        if leaves.is_empty() {
-            return;
-        }
-        let mut missing = Vec::new();
-        for leaf in &leaves {
-            if !cases
-                .iter()
-                .any(|c| c.guard.is_empty() && self.pattern_covers(&c.pat, *leaf))
-            {
-                missing.push(self.st.get(*leaf).name.trim_end_matches('$').to_string());
-            }
-        }
-        if !missing.is_empty() {
-            self.warning(
-                span,
-                format!(
-                    "match may not be exhaustive. It would fail on the following input: {}",
-                    missing.join(", ")
-                ),
-            );
-        }
-    }
-
-    fn pattern_is_catchall(&self, pat: &Tree) -> bool {
-        match &pat.kind {
-            TreeKind::Wildcard | TreeKind::Empty => true,
-            TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
-            TreeKind::Ident { name } => {
-                let is_varid = scala_rs_parser::ast::is_variable_name(name);
-                is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
-            }
-            TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),
-            _ => false,
-        }
-    }
-
-    fn pattern_covers(&self, pat: &Tree, leaf: SymbolId) -> bool {
-        if self.pattern_is_catchall(pat) {
-            return true;
-        }
-        match &pat.kind {
-            TreeKind::Typed { .. } => {
-                if let Some(ps) = self.st.class_sym_of(&pat.ty) {
-                    ps == leaf || self.st.is_sub_type(&self.st.type_of_class(leaf), &pat.ty)
-                } else {
-                    false
-                }
-            }
-            TreeKind::Ident { .. } => {
-                if pat.sym.is_none() {
-                    return false;
-                }
-                let s = self.st.get(pat.sym);
-                match s.kind {
-                    SymKind::Module | SymKind::ModuleClass => {
-                        self.st.module_class_of(pat.sym) == leaf
-                    }
-                    SymKind::Class => pat.sym == leaf,
-                    _ => false,
-                }
-            }
-            TreeKind::Apply { .. } | TreeKind::UnApply { .. } => {
-                if pat.sym.is_none() {
-                    return false;
-                }
-                let s = self.st.get(pat.sym);
-                if s.kind == SymKind::Class {
-                    pat.sym == leaf
-                } else if s.name == "unapply" {
-                    let owner = s.owner;
-                    let name = self.st.get(owner).name.trim_end_matches('$').to_string();
-                    self.st.get(leaf).name.trim_end_matches('$') == name
-                } else {
-                    false
-                }
-            }
-            TreeKind::Bind { body, .. } => self.pattern_covers(body, leaf),
-            TreeKind::Alternative { trees } => trees.iter().any(|t| self.pattern_covers(t, leaf)),
-            _ => false,
         }
     }
 }

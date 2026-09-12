@@ -1,0 +1,8 @@
+false
+0
+false
+a
+a1b2c
+x	y
+a1b2c
+wrong number of arguments (1) for interpolated string with 3 parts

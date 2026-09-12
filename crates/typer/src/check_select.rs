@@ -25,11 +25,17 @@ impl Typer {
                 TreeKind::Select { name, .. } => name.clone(),
                 _ => String::new(),
             };
-            self.warning(
-                tree.span,
-                format!(
-                    "postfix operator {name} should be enabled by making the implicit value scala.language.postfixOps visible"
-                ),
+            // nsc reports it at the operator.
+            let at = tree
+                .span
+                .hi
+                .0
+                .saturating_sub(name.len() as u32)
+                .max(tree.span.lo.0);
+            self.feature_warning(
+                Span::new(at, tree.span.hi.0),
+                "postfixOps",
+                &format!("postfix operator {name}"),
             );
         }
         let (qual, name) = match &mut tree.kind {
@@ -185,6 +191,31 @@ impl Typer {
             _ => None,
         };
         if let Some(mty) = refined_term {
+            if !self.language_reflective_calls {
+                // nsc `checkFeature(ReflectiveCallsFeature)`: a member only
+                // the refinement declares is called reflectively.
+                let kind = match &recv_ty {
+                    Type::Refined { decls, .. }
+                        if decls.iter().any(|d| {
+                            matches!(d, scala_rs_parser::RefineDecl::Val { name: n, .. } if n == &name)
+                        }) =>
+                    {
+                        "value"
+                    }
+                    _ => "method",
+                };
+                let at = tree
+                    .span
+                    .hi
+                    .0
+                    .saturating_sub(name.len() as u32)
+                    .max(tree.span.lo.0);
+                self.feature_warning(
+                    Span::new(at, tree.span.hi.0),
+                    "reflectiveCalls",
+                    &format!("reflective access of structural type member {kind} {name}"),
+                );
+            }
             let mty = self.st.expand_in_type(&recv_ty, &mty);
             tree.ty = self.maybe_auto_apply(mty, pt);
             return;
@@ -866,6 +897,7 @@ impl Typer {
         }
         // A parameterless collection member returns the receiver's own class,
         // and only the application path put that back.
+        self.prime_ops_shape(&recv_ty);
         self.rebuild_parameterless_collection(tree.sym, &name, &recv_ty, &mut tree.ty);
         // A function value's `apply` is the function itself. The prelude's
         // `FunctionN.apply` is declared over erased parameters, so selecting it
@@ -2538,11 +2570,10 @@ impl Typer {
         if self.language_implicit_conversions {
             return;
         }
-        self.warning(
+        self.feature_warning(
             span,
-            format!(
-                "implicit conversion method {name} should be enabled by making the implicit value scala.language.implicitConversions visible"
-            ),
+            "implicitConversions",
+            &format!("implicit conversion method {name}"),
         );
     }
 
