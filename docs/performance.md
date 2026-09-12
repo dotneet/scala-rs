@@ -719,3 +719,14 @@ tree prints a recursive call under itself, so adding up every occurrence of
 frame — 92% and 26% of a thread that only spent 11% and 5% in them. Count a
 symbol once per root-to-leaf path (skip it when it is already on the path from
 the root), or read the *entry points* into it from outside instead.
+
+## gitbucket's measure is now macro-bound (2026-09-12)
+
+`tests/gitbucket_measure.sh` took 13 s before Slick's `mapTo` could expand and
+**142 s** after (`agent/gbmacro`): every one of the 31 call sites now starts the
+JVM macro engine, describes the case class being compiled as a lazy mirror and
+runs Slick's real `mapToImpl`. The other three measures are unchanged (cats
+7.6 s for 340 files, the library 3.3 s, slick 4.7 s), so this is macro
+expansion, not a general slowdown. Worth attacking when macro-heavy builds
+matter: the engine is started per run, the mirror is rebuilt per call site, and
+nothing caches an expansion whose inputs repeat.
