@@ -2095,9 +2095,55 @@ impl Typer {
     fn narrow_by_partial_function_shape(
         &self,
         applicable: Vec<(SymbolId, Vec<Type>, Type)>,
+        args: &[Type],
         shapes: &[ArgShape],
     ) -> Vec<(SymbolId, Vec<Type>, Type)> {
-        if !shapes.contains(&ArgShape::Function) {
+        // A *value* of function type is the other half of the same rule, and it
+        // needs no shape at all: `FunctionN` is not a `PartialFunction` and
+        // there is no conversion either way, so an alternative that asks for a
+        // `PartialFunction` at that position is simply not applicable.
+        //
+        // [`Self::arg_score`] nevertheless scores it, because the same call is
+        // how a function *literal* already typed as `Int => Int` reaches a
+        // `PartialFunction` formal. Where the argument is not a literal the
+        // score is wrong, and specificity then prefers the `PartialFunction`
+        // alternative: `pf1 andThen k` for a `k: B => C` selected
+        // `PartialFunction.andThen[C](k: PartialFunction[B, C])` and reported
+        // `found: (B) => C  required: PartialFunction[B, Any]` on the argument
+        // it had just chosen against (PartialFunction.scala:277 in the library,
+        // and any user class that overloads a method the same way).
+        let value_fn: Vec<bool> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                matches!(shapes.get(i), Some(ArgShape::Value))
+                    && matches!(strip_annotations(a), Type::Function { .. })
+            })
+            .collect();
+        let applicable = if value_fn.contains(&true) {
+            let kept: Vec<(SymbolId, Vec<Type>, Type)> = applicable
+                .iter()
+                .filter(|(_, ps, _)| {
+                    value_fn.iter().enumerate().all(|(i, is_fn)| {
+                        !*is_fn
+                            || match param_at(ps, i) {
+                                Some(p) => partial_function_type(&self.st, strip_param_wrappers(p))
+                                    .is_none(),
+                                None => true,
+                            }
+                    })
+                })
+                .cloned()
+                .collect();
+            if kept.is_empty() {
+                applicable
+            } else {
+                kept
+            }
+        } else {
+            applicable
+        };
+        if applicable.len() < 2 || !shapes.contains(&ArgShape::Function) {
             return applicable;
         }
         let kept: Vec<(SymbolId, Vec<Type>, Type)> = applicable
@@ -2150,7 +2196,7 @@ impl Typer {
         if applicable.len() < 2 {
             return applicable;
         }
-        let applicable = self.narrow_by_partial_function_shape(applicable, shapes);
+        let applicable = self.narrow_by_partial_function_shape(applicable, args, shapes);
         if applicable.len() < 2 {
             return applicable;
         }
@@ -2177,9 +2223,35 @@ impl Typer {
             .filter(|(_, ps, _)| {
                 shapes.iter().enumerate().all(|(i, shape)| {
                     let Some(n) = shape else { return true };
-                    match param_at(ps, i).and_then(|p| self.shape_arity(p)) {
+                    let Some(p) = param_at(ps, i) else {
+                        return true;
+                    };
+                    match self.shape_arity(p) {
                         Some(m) => m == *n,
-                        None => true,
+                        // Not function-shaped. nsc's `preSelectOverloaded`
+                        // compares the literal's shape type
+                        // (`FunctionN[Any, …, Nothing]`) with the formal, so a
+                        // formal every function conforms to -- `Any`, `AnyRef`,
+                        // a bare type parameter -- is still a candidate, a SAM
+                        // of the right arity is one too, and an ordinary class
+                        // that is neither is not. Keeping *everything* made
+                        // `processFully(log err _)` on
+                        // `processFully(buffer: java.lang.Appendable)` /
+                        // `processFully(processLine: String => Unit)` an
+                        // `ambiguous overload` -- `Appendable` declares three
+                        // abstract `append`s, so it is no SAM
+                        // (`sys/process/BasicIO.scala:160,161`).
+                        None => {
+                            let p = strip_param_wrappers(p);
+                            if self.st.sam_sig(p).is_some_and(|s| s.param_tys.len() == *n) {
+                                return true;
+                            }
+                            let shape_ty = Type::Function {
+                                params: vec![Type::Any; *n],
+                                ret: Box::new(Type::Nothing),
+                            };
+                            self.st.is_sub_type(&shape_ty, p)
+                        }
                     }
                 })
             })

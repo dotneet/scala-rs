@@ -587,11 +587,21 @@ impl Typer {
         self.link_case_companion(class_id, paramss_ty);
         let ctor_param_tys = paramss_ty.first().cloned().unwrap_or_default();
         let name = self.st.get(class_id).name.clone();
-        let companion = self
-            .st
-            .lookup(&name)
-            .into_iter()
-            .find(|&s| self.st.get(s).kind == SymKind::Module);
+        // The companion is the module of the same name *in the same owner*, not
+        // whatever that name resolves to in the current scope: a binding of the
+        // same name nearer the use site hides it, and then the `apply` /
+        // `unapply` allocated by `synthesize_case_members` are never given a
+        // signature at all. `package scala` has `val :: =
+        // scala.collection.immutable.::` beside the `case class ::` in
+        // `immutable`, and `scala.collection.immutable.::.unapply` stayed
+        // `NoType`: every `case hd :: rest` in the library was "extractor ::
+        // expects 1 argument(s), found 2" (`concurrent/duration/Duration.scala:79`).
+        let companion = self.st.companion_module(class_id).or_else(|| {
+            self.st
+                .lookup(&name)
+                .into_iter()
+                .find(|&s| self.st.get(s).kind == SymKind::Module)
+        });
         if let Some(m) = companion {
             let cls = match self.st.get(m).ty {
                 Type::ModuleRef(c) => c,

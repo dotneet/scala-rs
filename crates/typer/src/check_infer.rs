@@ -1784,14 +1784,22 @@ impl Typer {
         if ptys.len() != first.len() || ptys.iter().any(|t| matches!(t, Type::TypeParam(_))) {
             return Vec::new();
         }
-        if tps
-            .iter()
-            .all(|tp| ptys.iter().any(|t| type_mentions_tparam(t, *tp)))
-        {
-            tps
-        } else {
-            Vec::new()
-        }
+        // The parameters the implicit clause can speak about. A parameter it
+        // does not mention (`V` in `newBuilder[K: Ordering, V]`) is not solved
+        // here -- the expected type or a later `TypeApply` settles it -- but it
+        // is no reason to stop searching for the ones it does mention.
+        //
+        // Requiring *all* of them instead left `SortedMap.newBuilder` inside
+        // `SortedMap.WithDefault[K, V]` searching for an `Ordering[K]` at the
+        // callee's own rigid `K`, which the enclosing class's `implicit def
+        // ordering: Ordering[K]` cannot be (`immutable/SortedMap.scala:175`,
+        // `mutable/SortedMap.scala:101`). The caller filters this list again
+        // against the clause as actually instantiated, and
+        // [`Self::undet_solution`] declines the whole call when the witness
+        // leaves one of them open -- so nothing is committed on a guess.
+        tps.into_iter()
+            .filter(|tp| ptys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .collect()
     }
 
     /// Whether a selection's qualifier names a *type* (or package / module)
@@ -1834,6 +1842,18 @@ impl Typer {
         args: &[Type],
     ) -> Option<Type> {
         let mut acc: Option<Type> = None;
+        // What only *contravariant* occurrences said. nsc records those as an
+        // upper bound on the variable, not as a lower one, so they lose to any
+        // other position that pinned it: `pf.applyOrElse(s.charAt(i),
+        // fallback)` on `applyOrElse[A1 <: A, B1 >: B](x: A1, default: A1 => B1)`
+        // with a `fallback: Any => Any` has `A1` from `x` (`Char`) and from
+        // `default`'s *parameter* (`Any`); joining both gave `A1 = Any`, which
+        // is not the `A1 <: Char` the method declares, and the call was
+        // `inferred type arguments [Any,Any] do not conform`
+        // (`collection/StringOps.scala:282,302`). Kept as the answer when
+        // nothing else contributed at all, which is how
+        // `def sink[T](f: T => Unit)` is solved.
+        let mut acc_contra: Option<Type> = None;
         let mut all_direct = true;
         for (i, a) in args.iter().enumerate() {
             let Some(p) = param_at(params, i) else {
@@ -1977,8 +1997,18 @@ impl Typer {
             if hit.is_some() && !direct {
                 all_direct = false;
             }
+            let contra = !direct
+                && self.tparam_variance_in(
+                    match p {
+                        Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                        other => other,
+                    },
+                    tp,
+                    1,
+                ) == Some(-1);
             if let Some(t) = hit {
-                acc = Some(match acc {
+                let slot = if contra { &mut acc_contra } else { &mut acc };
+                *slot = Some(match slot.take() {
                     None => t,
                     // Two arguments contributing to the same parameter: nsc
                     // *minimises* each one's own undetermined variables before
@@ -2001,7 +2031,7 @@ impl Typer {
                 });
             }
         }
-        acc
+        acc.or(acc_contra)
     }
 
     /// nsc's `adjustTypeArgs`: whether a `Nothing` the arguments inferred for
@@ -2211,7 +2241,7 @@ impl Typer {
             }
             (Type::TypeParam(id), _) if tps.contains(id) => {
                 if variance != 1 || allow_covariant {
-                    if let Some(t) = self.expected_solution(tps, pt) {
+                    if let Some(t) = self.expected_solution(tps, pt, variance == 0) {
                         out.push((*id, t, variance == 0));
                     }
                 }
@@ -2581,8 +2611,20 @@ impl Typer {
 
     /// The type an expected-type position forces a parameter to, or `None`
     /// when it says nothing usable.
-    fn expected_solution(&self, tps: &[SymbolId], pt: &Type) -> Option<Type> {
+    fn expected_solution(&self, tps: &[SymbolId], pt: &Type, invariant: bool) -> Option<Type> {
         let pt = pt.widen_constant();
+        // `Nothing` and `Null` in an expected type are "nothing to go on"
+        // wherever the parameter could still be widened -- a covariant or
+        // contravariant occurrence leaves room, and minimisation is the better
+        // answer there. In an **invariant** position the expected type is the
+        // only possible answer, and refusing these two left the parameter
+        // uninstantiated: `val t: RB.Tree[E, Null] = RB.Tree.empty` on
+        // `Tree.empty[A, B]: Tree[A, B]` (`Tree[A, B]` invariant in both) was
+        // reported as `found: Tree[E, Nothing] required: Tree[E, Null]`
+        // (`mutable/TreeSet.scala:206,213,216`).
+        if invariant && matches!(pt, Type::Null | Type::Nothing) {
+            return Some(pt.clone());
+        }
         match pt {
             Type::NoType
             | Type::Error
@@ -2730,7 +2772,92 @@ impl Typer {
                 (None, None) => {}
             }
         }
+        self.widen_by_dependent_lower_bounds(method, recv, &mut out);
         out
+    }
+
+    /// `[B, B1 >: B]`: a lower bound that names another type parameter of the
+    /// *same* method is still a bound, once that other parameter is solved.
+    ///
+    /// [`Self::tparam_lower_bound`] has to drop such a bound -- it is consulted
+    /// while the call is still being solved, and `B` is not a type yet -- so it
+    /// is applied here, after the first pass, with the solutions substituted in.
+    /// nsc does the same thing in one step: `solvedTypes` collects
+    /// `B1 >: Null` from the argument and `B1 >: B` from the declaration and
+    /// answers the lub of both.
+    ///
+    /// `RB.update(tree, elem, null, overwrite = false)` on
+    /// `update[A: Ordering, B, B1 >: B](tree: Tree[A, B], k: A, v: B1, …):
+    /// Tree[A, B1]` with a `tree: Tree[A, Any]` is the library's case
+    /// (`immutable/TreeSet.scala:163,180`): the argument `null` alone says
+    /// `B1 = Null`, which does not satisfy `B1 >: B = Any`, and the call was
+    /// reported as `inferred type arguments [A,Any,Null] do not conform`.
+    fn widen_by_dependent_lower_bounds(
+        &self,
+        method: SymbolId,
+        recv: Option<&Type>,
+        out: &mut Vec<(SymbolId, Type)>,
+    ) {
+        let method_tps = self.st.get(method).tparams.clone();
+        if method_tps.len() < 2 {
+            return;
+        }
+        let owner = self.st.get(method).owner;
+        let owner_args = self.owner_args_as_seen_from(owner, recv);
+        let owner_tps = self.st.get(owner).tparams.clone();
+        let solved: Vec<(SymbolId, Type)> = out.clone();
+        for tp in method_tps.iter().copied() {
+            let Some(lo) = self.st.get(tp).bound_lo.clone() else {
+                continue;
+            };
+            // Only the dependent ones: the rest went through
+            // `tparam_lower_bound` already.
+            if !mentions_tparam(&lo, &method_tps) || type_mentions_tparam(&lo, tp) {
+                continue;
+            }
+            // First-order parameters only. A *constructor* bounded below by
+            // another constructor (`def x[N[X] >: M[X], M[_], G](n: N[G], m:
+            // M[G])`, corpus `pos/t2782`) is solved by nsc's higher-kinded
+            // path, where the bound is checked at the parameters the two share
+            // rather than joined as a type; `lub`bing the two constructors made
+            // `x(Some(3), Seq(2))` inapplicable.
+            if !self.st.get(tp).tparams.is_empty() {
+                continue;
+            }
+            let lo = if owner_args.is_empty() {
+                lo
+            } else {
+                self.st.subst_tparams(owner, &owner_args, &lo)
+            };
+            let ids: Vec<SymbolId> = solved
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| *id != tp)
+                .collect();
+            let vals: Vec<Type> = solved
+                .iter()
+                .filter(|(id, _)| *id != tp)
+                .map(|(_, t)| t.clone())
+                .collect();
+            let lo = crate::symbol::subst_tparams_slice(&ids, &vals, &lo);
+            let lo = self.minimize_undet(&lo);
+            if lo.is_no_type()
+                || lo.is_error()
+                || matches!(lo, Type::Nothing)
+                || mentions_tparam(&lo, &owner_tps)
+                || mentions_tparam(&lo, &method_tps)
+            {
+                continue;
+            }
+            match out.iter_mut().find(|(id, _)| *id == tp) {
+                Some(slot) => {
+                    if !self.st.is_sub_type(&lo, &slot.1) {
+                        slot.1 = self.st.lub(&slot.1, &lo);
+                    }
+                }
+                None => out.push((tp, lo)),
+            }
+        }
     }
 
     /// The argument type read as the parameter's own class, when it is a

@@ -2490,23 +2490,38 @@ impl Typer {
                                     // rejecting every `TypeParam` printed the
                                     // result as `GR[T] required GR[T]`.
                                     //
-                                    // `Nothing` is held back for the expected
-                                    // type to improve on. With no expected
-                                    // type, nsc's `adjustTypeArgs` keeps a
-                                    // `Nothing` solution undetermined only
-                                    // where the variable is not covariant in
-                                    // the result -- `tryBreakable { throw e }`
-                                    // stays a `TryBlock[?T]` for `catchBreak`
-                                    // to decide -- and instantiates it
-                                    // otherwise: `onError { e => throw e }` on
+                                    // nsc's `adjustTypeArgs` keeps a `Nothing`
+                                    // solution undetermined only where the
+                                    // variable is not covariant in the result
+                                    // -- `tryBreakable { throw e }` stays a
+                                    // `TryBlock[?T]` for `catchBreak` to decide
+                                    // -- and instantiates it otherwise:
+                                    // `onError { e => throw e }` on
                                     // `onError[T](h: Throwable => T):
                                     // PartialFunction[Throwable, T]` is a
                                     // `PartialFunction[Throwable, Nothing]`.
                                     // Leaving `T` in that result made the
                                     // enclosing `try p catch onError { … }` an
                                     // `AnyRef` (`sys/process/ProcessImpl.scala`).
-                                    let nothing_ok = pt.is_no_type()
-                                        && self.tparam_variance_in(&ret, *id, 1) == Some(1);
+                                    //
+                                    // The expected type does *not* get to
+                                    // improve on a covariant `Nothing`: that is
+                                    // the same asymmetry `add_expected_constraints`
+                                    // documents (`def cov[T]: List[T]` checked
+                                    // against `List[Any]` is a `List[Nothing]`
+                                    // for nsc, not a `List[Any]`), so it cannot
+                                    // be the reason to hold the solution back
+                                    // either. Holding it back left `T`
+                                    // uninstantiated with nothing able to pin
+                                    // it, and the call was reported against
+                                    // itself: `mkThrowableCatcher(_ => false,
+                                    // throw _)` for a declared
+                                    // `Catcher[Nothing]` was `found:
+                                    // PartialFunction[Throwable, T] required:
+                                    // PartialFunction[Throwable, Nothing]`
+                                    // (`util/control/Exception.scala:274-276`).
+                                    let nothing_ok =
+                                        self.tparam_variance_in(&ret, *id, 1) == Some(1);
                                     !t.is_no_type()
                                         && !t.is_error()
                                         && (!matches!(t, Type::Nothing) || nothing_ok)
@@ -2552,7 +2567,16 @@ impl Typer {
                     };
                     // `::` is `[B >: A](elem: B): List[B]` (see prelude_lowbound);
                     // its result comes from ordinary lower-bounded inference.
-                    if method_name == "->" {
+                    //
+                    // `->` is read off the receiver only for the *prelude's*
+                    // `ArrowAssoc`, whose declaration is deliberately imprecise
+                    // (`self: Any`, `->(Any): Tuple2[Any, Any]`; see
+                    // `prelude.rs`). A `->` declared in source has a signature
+                    // of its own, and overwriting its result with the receiver
+                    // type made `Predef.ArrowAssoc[A].→` -- which calls its own
+                    // sibling `->` -- a `Tuple2[Any, B]` where `(A, B)` was
+                    // declared (`Predef.scala:352`).
+                    if method_name == "->" && self.is_prelude_arrow_assoc(sym) {
                         if let Some(a0) = args.first() {
                             if let Some(t2) =
                                 self.st.lookup("Tuple2").into_iter().find(|id| {
@@ -3810,6 +3834,34 @@ impl Typer {
             },
             _ => Type::Tuple(out),
         })
+    }
+
+    /// Is this `->` the prelude's deliberately imprecise `ArrowAssoc.->`?
+    ///
+    /// The prelude declares it monomorphically (`self: Any`, `->(Any):
+    /// Tuple2[Any, Any]`, no type parameters) and `check_apply` reads the pair's
+    /// component types off the receiver and the argument instead. Anything with
+    /// a signature of its own -- including the library's own
+    /// `ArrowAssoc[A] { def ->[B](y: B): (A, B) }`, which has the same
+    /// `jvm_name` -- is typed from that signature.
+    fn is_prelude_arrow_assoc(&self, sym: SymbolId) -> bool {
+        if sym.is_none() {
+            // Unresolved: the declaration cannot be consulted, so keep the
+            // receiver-derived answer rather than leaving the pair untyped.
+            return true;
+        }
+        let s = self.st.get(sym);
+        if !s.tparams.is_empty() {
+            return false;
+        }
+        let ret = match &s.ty {
+            Type::Method { ret, .. } => ret.as_ref(),
+            other => other,
+        };
+        matches!(ret, Type::Class { sym, args }
+            if self.st.get(*sym).name == "Tuple2"
+                && args.len() == 2
+                && args.iter().all(|a| matches!(a, Type::Any)))
     }
 
     /// The collection a *curried* call was made on. `xs.groupMap(k)(f)` types

@@ -2656,6 +2656,35 @@ impl Typer {
             .copied()
             .find(|&s| self.st.get(s).kind == SymKind::TypeMember)?;
         self.complete_lazy_sig(alias, span);
+        // A *parameterized* alias cannot be dealiased on its own -- it needs
+        // arguments, and `new B(x)` writes none: they are inferred from the
+        // constructor's arguments, exactly as in `new Box(x)`. When the alias
+        // simply renames a class (its right-hand side applies that class to its
+        // own parameters, in order) the answer is that class with its arguments
+        // still open.
+        //
+        // `package scala` declares `type ::[+A] = scala.collection.immutable.::[A]`,
+        // and `new ::(this.get, Nil)` was `class type required but
+        // package.this.:: found` (`Option.scala:575`).
+        let tps = self.st.get(alias).tparams.clone();
+        if !tps.is_empty() {
+            let rhs = self.st.dealias(&self.st.get(alias).ty.clone());
+            let Type::Class { sym, args } = &rhs else {
+                return None;
+            };
+            let renames = args.len() == tps.len()
+                && args
+                    .iter()
+                    .zip(&tps)
+                    .all(|(a, tp)| matches!(a, Type::TypeParam(id) if id == tp));
+            if !renames || !self.st.get(*sym).is_class_like() {
+                return None;
+            }
+            return Some(Type::Class {
+                sym: *sym,
+                args: vec![],
+            });
+        }
         let target = self.st.dealias(&Type::TypeMember(alias));
         if matches!(target, Type::TypeMember(_)) {
             return None;

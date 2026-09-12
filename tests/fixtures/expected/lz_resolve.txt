@@ -1,0 +1,5 @@
+a
+Box(7)
+(k,1)
+(s,1)
+NarrowBox
