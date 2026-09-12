@@ -1,5 +1,196 @@
 ## Speed
 
+### 2026-09-12: recognize reflection universes through their ancestors
+
+On the pinned Slick 184-source full compile, against commit
+`1fc8f69247db3979e96884ed1f0bb344931b9277`:
+
+| | wall | user CPU | system CPU | class files |
+| --- | --- | --- | --- | --- |
+| before | 10.09 s | 9.71 s | 0.31 s | 1504 |
+| after | 3.55 s | 3.30 s | 0.23 s | 1504 |
+
+Medians of four runs per binary, reversing order on alternate pairs, each
+writing to a fresh directory. This is **65% less wall time (2.84x faster)**
+and **66% less user CPU** for this workload. Every run produced byte-identical
+class files and identical stdout/stderr after normalizing the output directory.
+The environment was macOS arm64, Rust 1.98.1 release defaults, Temurin
+21.0.12.1, Scala library/reflect 2.13.16, and the dependencies and Slick revision
+listed in `tests/bench.sh`. These numbers are a same-machine before/after
+comparison, not a comparison with the historical tables below.
+
+`sample` over the first five seconds of the baseline found
+`Typer::is_reflect_universe` in about half the compiler thread's samples.
+It scanned every symbol for the two Universe JVM names, then walked the
+receiver's ancestors separately for each matching symbol. This predicate is
+also called on ordinary imported receivers, so unrelated symbols made even
+negative answers expensive.
+
+The predicate now walks the receiver's ancestors once and checks their JVM
+names directly. `pickle_supply::inherits_matching` shares the original
+`inherits_from` traversal, including parent resolution, traversal order,
+cycle handling, and the 256-node guard (including its original boundary
+behavior). No answers are cached: lazy parent completion and JVM-name changes
+remain visible. All matching ancestors count, including duplicate JVM names;
+looking up only the first symbol in the existing JVM-name index would not
+preserve that property.
+
+The three `universe_tests` cover direct and inherited universes, duplicate
+binary names, unrelated names, late parent/name changes, and cycles. The
+comparison runner checks successful compilation, nonempty output, diagnostics,
+and SHA-256 hashes of every class file on every timed run:
+
+```sh
+python3 tests/bench_compare.py /path/to/before /path/to/after \
+  --sources-file /path/to/files.txt \
+  --scala-library /path/to/scala-library-2.13.16.jar \
+  --classpath "$(cat /path/to/deps.cp)" \
+  --compiler-arg=-Xsource:3 --reps 4
+```
+
+The source manifest contains one path per line. Use `tests/bench.sh`'s fixed
+file list, including the seven expanded FreeMarker templates. The runner does
+not download dependencies or build either binary. It prints per-run timings
+and medians as JSON lines, and fails on differing output or a failed compile
+instead of reporting that as a speedup.
+
+Validation:
+
+```sh
+cargo test --release --offline --workspace --lib --no-fail-fast
+cargo test --release --offline -p scala-rs-cli \
+  --test quasi --test reify --test reify2 --test rf_reify \
+  --test linearization --test implicitmemo --no-fail-fast
+```
+
+All **350 library tests** passed with JDK 17, and all **58 integration tests**
+passed with JDK 21 and Scala 2.13.16 available, including JVM execution and
+scalac comparisons. The library suite initially passed 349/350 on JDK 21:
+`names_match_released_scala_for_bmp_and_escape_sequences` compares the checked-in
+JDK 17 / Unicode 13 name table with the running JVM, so JDK 21's newer Unicode
+classification disagrees at U+0870. Re-running with its reference JDK 17
+passed; no name-encoding code was changed.
+
+### Follow-up: three isolated experiments
+
+Each candidate below was built separately on top of the Universe change,
+using the same Slick workload and output-checking runner. User CPU medians
+are from four runs per binary; compare each candidate only with its own
+paired baseline, since machine load varies between experiments.
+
+| candidate | baseline user CPU | candidate user CPU | reduction | decision |
+| --- | --- | --- | --- | --- |
+| borrow ordinary parent types in `parents_of` and `base_type_args` | 3.358 s | 3.311 s | 1.4% | keep |
+| cache complete root linearizations during backend emission | 3.392 s | 3.365 s | 0.8% | discard |
+| reuse the resolved implicit candidate signature during conversion inference | 3.359 s | 3.327 s | 0.9% | keep |
+
+The parent-type change removes two unconditional deep copies. Structural
+function parents still use `function_class_form`; all other parents are
+borrowed through the same class lookup and substitution as before.
+
+The backend experiment reused a class's complete linearization across 17
+mixin/initializer call sites in one `Gen`. Its lifetime was restricted to an
+immutable symbol-table borrow, so no invalidation was needed. Its small
+end-to-end saving did not justify the new cache state and call-site changes;
+the backend remains unchanged. This does not rule out a larger benefit from
+reusing linearizations in the typer, where safely delimiting mutations would
+require a separate design.
+
+For implicit conversions, `conv_targs` already resolves the candidate's type
+at its import/owner prefix. `solve_conv_targs_from_implicits` now borrows that
+snapshot instead of resolving it again; the intervening base-type lookup and
+structural unification perform no implicit searches. Non-polymorphic
+conversions return an empty type-argument list immediately, while callers
+continue to check their implicit clauses. Candidate selection, applicability,
+search bounds, and witness resolution are unchanged, and no new cache is
+introduced.
+
+With the two retained changes together, eight alternating pairs against the
+Universe-only binary measured **3.630 s → 3.542 s wall (−2.4%)**, and
+**3.370 s → 3.276 s user CPU (−2.8%)**, at the medians. System CPU was
+0.234 s → 0.232 s. Every run passed the class-byte and diagnostic comparison
+(1504 classes). This is the incremental saving over the previous optimization;
+the different absolute timings between sections are why each comparison uses
+back-to-back runs of both binaries.
+
+The retained combination passed all **350 library tests** and **73 targeted
+integration tests**, using JDK 17 and Scala 2.13.16. The integration selection
+covers base-type meets, function parents, inherited members, implicit
+conversion inference (including dependent and bounded arguments), required
+witnesses, local/by-name conversions, and JVM execution in both runtime modes:
+
+```sh
+cargo test --release --offline --workspace --lib --no-fail-fast
+cargo test --release --offline -p scala-rs-cli \
+  --test conversion_inference --test convimpl --test implicitmemo \
+  --test implicit_misc --test localconv --test btmeet --test bparent \
+  --test linearization --test traitextends --test ifacebridge --test javanest \
+  --test function_pattern --test byname_followup --no-fail-fast
+```
+
+### Reuse import-prefix resolution within one immutable search
+
+Eight alternating pairs against the preceding combined version, on the same
+Slick 184-source workload, measured:
+
+| | wall | user CPU | system CPU |
+| --- | --- | --- | --- |
+| previous combined version | 3.574 s | 3.306 s | 0.242 s |
+| scoped import-prefix lookup | 3.057 s | 2.800 s | 0.230 s |
+
+These medians are an additional **14.5% wall-time reduction** and **15.3%
+user-CPU reduction**. Every run produced the same 1504 class files, identical
+byte for byte, with identical diagnostics. This uses `bench_compare.py` with
+`--reps 8`, fresh output directories, JDK 21 and the same dependencies as the
+earlier timing runs. No test suite or build ran alongside this comparison.
+
+The next profile of the combined binary pointed at
+`implicit_candidate_ty` → `at_import_prefix_of`. A substantial part of that
+work precedes substitution: `term_import_prefix_for` asks whether the current
+or enclosing class already inherits the member's owner, then scans remembered
+imports in reverse order, walking their ancestors and checking whether their
+qualifiers are still writable. The list spans compilation units. Several
+candidates with the same owner, and repeated reads of one candidate during
+inference, were paying for the same positive or negative lookup repeatedly.
+
+`ImportPrefixMemo` caches that lookup by owner only for the lifetime of an
+immutable implicit search or conversion-result calculation. Nested operations
+share the map; the last guard clears it. The guard holds `&Typer`, so callers
+must drop it before changing scopes, imports, enclosing classes or parents.
+This also means `search_extension` cannot carry it across Java/pickle loading.
+It is separate from `ImplicitMemo`'s companion-prefix and route bookkeeping,
+and does not extend the lifetime of those search results.
+
+An immutable symbol table is not sufficient by itself: class lookup can see
+an already-open type expansion and truncate an alias or bound. Prefix lookups
+under any ambient bound/alias/chase, written-type, subtype-walk or qualified
+type-parameter context bypass the cache entirely. Standalone lookups still
+execute the original lookup order and return owned qualifier trees, so neither
+the chosen import nor ownership of the returned tree changes.
+
+Three new tests exercise late parent completion, disappearance/shadowing of
+an import root between searches, and both cache-hit and cache-miss behavior
+under an ambient bound chase.
+
+All **353 library tests** and **126 integration tests** passed with JDK 17
+and Scala 2.13.16. The integration selection includes imports, lexical
+contexts, path-dependent types, implicit conversions, quasiquotes and reify,
+including reference-scalac comparisons and JVM execution:
+
+```sh
+cargo test --release --offline --workspace --lib --no-fail-fast
+cargo test --release --offline -p scala-rs-cli \
+  --test imports --test quasi --test reify --test reify2 --test rf_reify \
+  --test lexicalcontext --test contextualinference --test nameamb --test pfx \
+  --test pathdep --test implicitmemo --test implicit_misc \
+  --test conversion_inference --test convimpl --test localconv \
+  --test bparent --test btmeet --test byname_followup --no-fail-fast
+```
+
+### Historical measurements
+
+The following tables and pass descriptions record earlier compiler versions.
+
 What is measured is slick's 184 files (the file list `tests/bench.sh` pins),
 with `-Xsource:3`, and scala-library 2.13.16 + slick's 12 dependency jars +
 scala-reflect on the classpath: a **full compile** (type checking → erasure →

@@ -225,11 +225,14 @@ fn memo_key(pt: &Type, undet: &[SymbolId]) -> u64 {
 /// Decrements the memo's re-entrancy count, and clears it when the outermost
 /// search returns. A guard rather than a plain decrement because the callers
 /// have several early returns.
-struct MemoLive<'a>(&'a Typer);
+struct MemoLive<'a> {
+    typer: &'a Typer,
+    _prefixes: crate::check_name::ImportPrefixLive<'a>,
+}
 
 impl Drop for MemoLive<'_> {
     fn drop(&mut self) {
-        let mut m = self.0.implicit_memo.borrow_mut();
+        let mut m = self.typer.implicit_memo.borrow_mut();
         m.depth -= 1;
         if m.depth == 0 {
             m.entries.clear();
@@ -2104,7 +2107,10 @@ impl Typer {
     /// is what says so.
     fn memo_scope(&self) -> MemoLive<'_> {
         self.implicit_memo.borrow_mut().depth += 1;
-        MemoLive(self)
+        MemoLive {
+            typer: self,
+            _prefixes: self.import_prefix_scope(),
+        }
     }
 
     /// The candidates the open-implicit stack could make
@@ -3252,6 +3258,7 @@ impl Typer {
     }
 
     fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
+        let _prefixes = self.import_prefix_scope();
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
         }
@@ -3295,6 +3302,11 @@ impl Typer {
     /// The conversion's own type arguments, solved from the receiver type.
     fn conv_targs(&self, id: SymbolId, from: &Type) -> Vec<Type> {
         let tps = &self.st.get(id).tparams;
+        if tps.is_empty() {
+            // No type arguments to infer. Callers still check the view's
+            // implicit clauses before applying it.
+            return Vec::new();
+        }
         let cand_ty = self.implicit_candidate_ty(id);
         let param: Option<&Type> = match &*cand_ty {
             Type::Method { paramss, .. } => paramss.first().and_then(|c| c.first()),
@@ -3321,7 +3333,7 @@ impl Typer {
             .iter()
             .map(|tp| unify_conv_tparam(*tp, param, from))
             .collect();
-        self.solve_conv_targs_from_implicits(id, tps, &mut solved);
+        self.solve_conv_targs_from_implicits(&cand_ty, tps, &mut solved);
         let ret = match &*cand_ty {
             Type::Method { ret, .. } | Type::Function { ret, .. } => Some(ret.as_ref()),
             _ => None,
@@ -3357,12 +3369,13 @@ impl Typer {
     /// parameter absent from the result can be fixed by an explicit witness.
     fn solve_conv_targs_from_implicits(
         &self,
-        id: SymbolId,
+        cand_ty: &Type,
         tps: &[SymbolId],
         solved: &mut [Option<Type>],
     ) {
-        let cand_ty = self.implicit_candidate_ty(id);
-        let Type::Method { paramss, .. } = &*cand_ty else {
+        // The caller already resolved the candidate at its import/owner
+        // prefix, and no implicit search has run since that snapshot.
+        let Type::Method { paramss, .. } = cand_ty else {
             return;
         };
         if paramss.len() < 2 {

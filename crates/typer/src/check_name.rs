@@ -13,7 +13,122 @@ use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 use std::collections::{HashMap, HashSet};
 
+/// Import lookup depends on scopes, the enclosing class and current parents.
+/// Cache only while an immutable borrow of the typer keeps all three fixed.
+#[derive(Default)]
+pub(crate) struct ImportPrefixMemo {
+    depth: usize,
+    entries: rustc_hash::FxHashMap<SymbolId, Option<Tree>>,
+}
+
+pub(crate) struct ImportPrefixLive<'a>(&'a Typer);
+
+impl Drop for ImportPrefixLive<'_> {
+    fn drop(&mut self) {
+        let mut memo = self.0.import_prefix_memo.borrow_mut();
+        memo.depth -= 1;
+        if memo.depth == 0 {
+            memo.entries.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod import_prefix_tests {
+    use super::*;
+
+    fn class(t: &mut Typer, name: &str) -> SymbolId {
+        t.st.alloc(name, t.st.root, SymKind::Class, Flags::EMPTY, name)
+    }
+
+    fn prefix() -> Tree {
+        Tree::dummy(TreeKind::Ident {
+            name: "prefix".into(),
+        })
+    }
+
+    #[test]
+    fn lookup_sees_parent_completion_after_a_search() {
+        let mut t = Typer::new(0, &TypecheckOptions::default());
+        let owner = class(&mut t, "Owner");
+        let child = class(&mut t, "Child");
+        t.term_import_prefixes.push((child, prefix()));
+        {
+            let _live = t.import_prefix_scope();
+            assert!(t.term_import_prefix_for(owner).is_none());
+            assert!(t.term_import_prefix_for(owner).is_none());
+        }
+        t.st.get_mut(child).parents.push(Type::Class {
+            sym: owner,
+            args: vec![],
+        });
+        {
+            let _live = t.import_prefix_scope();
+            assert!(t.term_import_prefix_for(owner).is_some());
+        }
+        t.term_import_prefixes.clear();
+        let _live = t.import_prefix_scope();
+        assert!(t.term_import_prefix_for(owner).is_none());
+    }
+
+    #[test]
+    fn lookup_sees_shadowing_after_a_search() {
+        let mut t = Typer::new(0, &TypecheckOptions::default());
+        let owner = class(&mut t, "Owner");
+        let root =
+            t.st.alloc("prefix", t.st.root, SymKind::Term, Flags::EMPTY, "");
+        let mut q = prefix();
+        q.sym = root;
+        t.term_import_prefixes.push((owner, q));
+        {
+            let _live = t.import_prefix_scope();
+            // The import's root is not bound here.
+            assert!(t.term_import_prefix_for(owner).is_none());
+        }
+        t.st.enter_in_current("prefix", root);
+        {
+            let _live = t.import_prefix_scope();
+            assert!(t.term_import_prefix_for(owner).is_some());
+        }
+        t.st.push_scope();
+        let shadow =
+            t.st.alloc("prefix", t.st.root, SymKind::Term, Flags::EMPTY, "");
+        t.st.enter_in_current("prefix", shadow);
+        let _live = t.import_prefix_scope();
+        assert!(t.term_import_prefix_for(owner).is_none());
+    }
+
+    #[test]
+    fn lookup_does_not_reuse_answers_under_an_ambient_bound_chase() {
+        let mut t = Typer::new(0, &TypecheckOptions::default());
+        let owner = class(&mut t, "Owner");
+        let child = class(&mut t, "Child");
+        let tp = t.st.alloc("T", child, SymKind::TypeParam, Flags::EMPTY, "");
+        t.st.get_mut(tp).bound_hi = Some(Type::Class {
+            sym: owner,
+            args: vec![],
+        });
+        t.st.get_mut(child).parents.push(Type::TypeParam(tp));
+        t.term_import_prefixes.push((child, prefix()));
+        let _live = t.import_prefix_scope();
+        {
+            let _chase = crate::symbol::enter_chase(crate::symbol::Chase::ClassOf, tp).unwrap();
+            assert!(t.term_import_prefix_for(owner).is_none());
+        }
+        assert!(t.term_import_prefix_for(owner).is_some());
+        {
+            let _chase = crate::symbol::enter_chase(crate::symbol::Chase::ClassOf, tp).unwrap();
+            assert!(t.term_import_prefix_for(owner).is_none());
+        }
+    }
+}
+
 impl Typer {
+    pub(crate) fn import_prefix_scope(&self) -> ImportPrefixLive<'_> {
+        self.import_prefix_memo.borrow_mut().depth += 1;
+        ImportPrefixLive(self)
+    }
+
     pub(crate) fn type_stat(&mut self, tree: &mut Tree) {
         match &tree.kind {
             TreeKind::ValDef { .. } => {
@@ -414,6 +529,30 @@ impl Typer {
     /// object's, where nsc has `X.this.profile`. One instance in gitbucket;
     /// for any other the program silently used the wrong one.
     pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<Tree> {
+        if owner.is_none() || self.term_import_prefixes.is_empty() {
+            return None;
+        }
+        if self.st.has_ambient_type_context() {
+            return self.term_import_prefix_uncached(owner);
+        }
+        let active = {
+            let memo = self.import_prefix_memo.borrow();
+            if let Some(hit) = memo.entries.get(&owner) {
+                return hit.clone();
+            }
+            memo.depth != 0
+        };
+        let result = self.term_import_prefix_uncached(owner);
+        if active {
+            self.import_prefix_memo
+                .borrow_mut()
+                .entries
+                .insert(owner, result.clone());
+        }
+        result
+    }
+
+    fn term_import_prefix_uncached(&self, owner: SymbolId) -> Option<Tree> {
         if owner.is_none() || self.term_import_prefixes.is_empty() {
             return None;
         }

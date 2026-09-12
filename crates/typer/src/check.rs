@@ -689,6 +689,7 @@ pub struct Typer {
     /// the prefix the backend loaded `this`, which is a `ClassCastException`
     /// at run time. This is what `import c.universe._` needs.
     pub(crate) term_import_prefixes: Vec<(SymbolId, Tree)>,
+    pub(crate) import_prefix_memo: std::cell::RefCell<crate::check_name::ImportPrefixMemo>,
     /// How many `reify { … }` bodies are being typed on a probe right now.
     /// Above zero, a `reify` met while typing is nested in another and is
     /// typed but not expanded (`Check::try_expand_reify`).
@@ -1191,6 +1192,7 @@ impl Typer {
             parent_arg_scope: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
+            import_prefix_memo: Default::default(),
             reify_depth: 0,
             nested_reifies: HashMap::new(),
             def_spans: HashMap::new(),
