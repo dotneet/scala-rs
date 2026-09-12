@@ -22,8 +22,13 @@ It is a *structural* check, not a verifier: it says nothing about types, stack
 depth, or whether a branch target carries a stack map frame.
 
     tests/classfile_lint.py <dir-of-class-files>...
+
+`LINT_JOBS=n` (default 1) runs n chunks side by side. The chunks are still
+consumed in order, so the problems printed and the exit status do not depend
+on it -- only the wall time does.
 """
 
+import concurrent.futures
 import os
 import re
 import subprocess
@@ -129,6 +134,13 @@ def check(text, problems):
     flush()
 
 
+def lint_chunk(paths):
+    """One `javap` process and the parse of its output: the unit of work."""
+    problems = []
+    check(javap(paths), problems)
+    return problems
+
+
 def main(argv):
     if len(argv) < 2:
         print(__doc__.strip().splitlines()[-1], file=sys.stderr)
@@ -141,8 +153,19 @@ def main(argv):
         return 2
     problems = []
     # `javap` takes many files at once; chunk so the argument list stays sane.
-    for i in range(0, len(paths), 200):
-        check(javap(paths[i:i + 200]), problems)
+    chunks = [paths[i:i + 200] for i in range(0, len(paths), 200)]
+    # Each chunk is an independent `javap` process plus the parse of its output,
+    # and both are the whole cost of this script, so LINT_JOBS>1 runs them side
+    # by side. `map` keeps the chunks in order, so the reported problems -- and
+    # therefore this script's output and exit status -- are the same either way.
+    jobs = max(1, int(os.environ.get("LINT_JOBS", "1")))
+    if jobs > 1 and len(chunks) > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
+            for found in pool.map(lint_chunk, chunks):
+                problems.extend(found)
+    else:
+        for c in chunks:
+            problems.extend(lint_chunk(c))
     for p in problems:
         print("BAD " + p)
     print(f"lint_classes={len(paths)} lint_problems={len(problems)}")

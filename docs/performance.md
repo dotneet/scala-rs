@@ -900,3 +900,111 @@ still, which is a property of *big* compilations.
 with caches and start with the shape of the data: `Type` is deep-cloned and
 structurally compared everywhere, and interning it (or at least `Rc`-ing the
 argument vectors) is the next real step.
+**142 s** after (`agent/gbmacro`): every one of the 31 call sites now starts the
+JVM macro engine, describes the case class being compiled as a lazy mirror and
+runs Slick's real `mapToImpl`. The other three measures are unchanged (cats
+7.6 s for 340 files, the library 3.3 s, slick 4.7 s), so this is macro
+expansion, not a general slowdown. Worth attacking when macro-heavy builds
+matter: the engine is started per run, the mirror is rebuilt per call site, and
+nothing caches an expansion whose inputs repeat.
+
+## The merge gate's wall time (2026-09-13)
+
+The gate (`tests/verify_merge.sh`) was serial from end to end. Derived from log
+mtimes on the last accepted run, and then measured directly once the gate
+learned to time itself:
+
+| step | serial (batch/w3 tip) | concurrent, final |
+| --- | --- | --- |
+| build | 9 s | 0.1 s (already built) |
+| slick measure | 7-16 s | 16.0 s |
+| cats measure | 8-15 s | 14.9 s |
+| gitbucket measure | 3:01 - 5:34 | 5:34 |
+| library measure | 5-7 s | 6.2 s |
+| `slick_run.sh` | ~2:00 | 1:59 |
+| `slick_subset.sh` | ~0:40 | 0:31 |
+| workspace tests | 31:00 - 37:45 | 19:05 |
+| full corpus | 4:16 - 9:17 | 18:53 |
+| fmt | instant | 2.5 s |
+| **total** | **29 min idle / 52 min under load** | **27:19 under load** |
+
+The ranges are real: every number on this machine moves by a factor of two or
+more with how many slices are running, and the two columns were not taken under
+the same load — the serial column is the accepted 631b238d gate (load average
+~28 on 16 cores), the concurrent one was measured with three other slices
+active (~52). So the concurrent column is a ceiling, not a best case: it did
+the same work at twice the load in half the time. It is the per-step table, not
+the total, that says where the time goes — and the steps that are still serial
+show the load difference plainly (the gitbucket measure alone reads 2:41, 3:20
+and 5:34 across three runs of the same tree).
+
+### What the time actually was
+
+**`slick_subset.sh`, the workspace suite and the full corpus share no state.**
+Each already had a private work area (`$SP/subset-$$`, `$CORPUS_WORK=$SP/work-$$`,
+its own log under `$GATE_DIR`), so they now run as three concurrent jobs. Two
+things had to be separated first:
+
+* **the compiler binary.** `cargo test --workspace` can relink
+  `target/release/scala-rs`, because workspace feature unification is not the
+  same as `-p scala-rs-cli`'s, and a corpus worker that execs it mid-relink
+  fails for a reason that has nothing to do with the tree. The heavy steps get
+  an immutable copy as `$SCALA_RS`, and the corpus runs with
+  `SCALA_RS_PREBUILT=1` so it never wants the cargo target lock.
+* **the corpus per-test timeout.** A compile over `CORPUS_TIMEOUT` is recorded
+  as `skip`, and `compare_corpus.py` counts a pass that became a skip as a
+  **loss**. Sharing the machine makes every compile slower, so the gate raises
+  its own limits to 120 s / 60 s. This is not cosmetic: at the default 40 s, a
+  corpus sharing the machine with 24 test threads would have invented losses.
+  It cannot hide a regression either -- a higher limit only turns a `skip` into
+  a `pass` or a `fail`, never a `pass` into a `skip` -- and the gate now prints
+  how many rows were skipped on a timeout (0 in both measured runs), so a run
+  that was racing for the machine is visible rather than inferred.
+
+**`RUST_TEST_THREADS` was never the problem.** `.cargo/config.toml` pins it to
+6 so a slice's `cargo test` leaves the machine usable. Raising it for the gate
+bought nothing measurable: the per-binary times libtest reports sum to 1862 s
+at 6 and 1850 s at 12, and in both cases that sum *was* the step's wall time.
+The reason is that **`cargo test` runs one test binary at a time** and this
+workspace has 329 of them, most holding a handful of tests -- so the fan-out
+inside a binary has nothing to work with while the machine idles between
+binaries.
+
+`tests/workspace_tests.sh` therefore builds once with `--no-run` and runs the
+binaries themselves in parallel (`WT_JOBS` x `WT_THREADS`, 6 x 4 by default),
+longest-first by test count from `--list` so the 460-test binary is not
+scheduled last and left as the tail. Measured standalone against the same tree
+`cargo test` had just spent 37:45 on: **16:09**, with identical results (336
+rows, 3106 passed, 0 failed, 7 rows from doc tests). The sum of per-binary
+times divided by the six lanes matches the wall time, i.e. the lanes were busy
+from start to finish, and the slowest single binary (230 s) is nowhere near the
+critical path -- so more lanes only help on a machine with spare capacity.
+
+`classfile_lint.py` takes `LINT_JOBS` (the gate passes 6): its `javap` chunks
+are independent, and 1498 slick classes went from 16.0 s to 5.5 s with
+byte-identical output.
+
+### What is still serial, and why
+
+* **the four compile measures.** Seconds each, and a measure that competes with
+  another measure -- or with itself -- is not a measurement of anything. The
+  one expensive member, gitbucket at 3-5.5 minutes, is macro expansion (see the
+  section above), not scheduling.
+* **`slick_run.sh`.** It is a differential *execution* test: it runs each client
+  program three times per side and compares stdout byte for byte. Timing and
+  machine load are part of what it measures, and its own header records how a
+  shared work directory once turned a harness collision into something that
+  read exactly like a compiler bug.
+
+### Two checks the gate did not have
+
+* **per-step wall times**, as a table in the summary. They had to be derived
+  from log mtimes, which is how the first column of the table above was
+  obtained.
+* **a step that died without failing a check.** Every heavy step was consumed
+  through a `| tail` pipeline, which discards the exit status, so a script that
+  exited non-zero while still printing a satisfying summary line read as a
+  pass. Each step's status is recorded and named if nothing else failed. The
+  same hole existed inside the workspace step: summing libtest's `test result:`
+  lines cannot notice a binary that printed none because it died on a signal,
+  so the runner counts the binaries it launched and reports `missing=`.

@@ -13,6 +13,13 @@ BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
 RUN=$SP/subset-$$
 GEN=$RUN/generated
 rm -rf $RUN; mkdir -p $RUN
+# Phase timing, so the cost of this script is attributable without deriving it
+# from log mtimes. It goes to stderr: callers parse the last lines of stdout
+# (`tests/verify_merge.sh` takes `tail -3`), and that contract must not move.
+zmodload -i zsh/datetime
+PHASE_T0=$EPOCHREALTIME
+phase() { printf 'phase %-10s %6.1fs\n' "$1" $(( EPOCHREALTIME - PHASE_T0 )) >&2
+          PHASE_T0=$EPOCHREALTIME }
 python3 "$ROOT/tests/expand_fm.py" $SRC/scala $GEN >/dev/null
 REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
 CP="$(cat $SP/deps.cp):$REFLECT"
@@ -58,6 +65,7 @@ for round in 1 2 3 4 5 6 7 8; do
   grep -vxF -f $RUN/bad.txt $RUN/files.txt > $RUN/files2.txt
   mv $RUN/files2.txt $RUN/files.txt
 done
+phase compile
 NFILES=$(wc -l < $RUN/files.txt | tr -d ' ')
 NCLASSES=$(find $RUN/out -name '*.class' | wc -l | tr -d ' ')
 # Load every class with verification on. Class.forName(initialize=false)
@@ -83,9 +91,12 @@ public class V {
 JAVA
 (cd $RUN && javac V.java >/dev/null 2>&1)
 java -Xverify:all -cp "$RUN:$RUN/out:$LIB:$CP" V $RUN/out $LIB 2>&1 | tail -5
+phase load
 # The loader above stops after the constant pool, so no method body is looked
 # at. This reads the bodies back with `javap -c` and reports the offsets that
 # cannot be right -- a branch out of its own method, a method over 64 KB.
-python3 "$ROOT/tests/classfile_lint.py" $RUN/out | tail -20
+# `LINT_JOBS` fans the `javap` chunks out over processes; see classfile_lint.py.
+LINT_JOBS=${SUBSET_JOBS:-${LINT_JOBS:-1}} python3 "$ROOT/tests/classfile_lint.py" $RUN/out | tail -20
+phase lint
 echo "subset_files=$NFILES classes=$NCLASSES (of 184 sources)"
 rm -rf $RUN
