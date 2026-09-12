@@ -418,7 +418,7 @@ print(" ".join(c["kind"]+"/"+c["test"] for c in d["changes"] if c.get("loss")))'
         kind=${spec%%/*}; name=${spec#*/}
         rlog=$GATE_DIR/retry-$kind-$name.tsv
         CORPUS_KINDS=$kind CORPUS_SIZE=full CORPUS_JOBS=1 \
-          CORPUS_FILTER="^${name}$" CORPUS_LOG=$rlog CORPUS_NO_REPORT=1 \
+          CORPUS_FILTER="$name" CORPUS_LOG=$rlog CORPUS_NO_REPORT=1 \
           SCALA_RS=$GATE_BIN SCALA_RS_PREBUILT=1 tests/scala_corpus.sh \
           > $GATE_DIR/retry-$kind-$name.log 2>&1
         st=$(awk -F'\t' -v n="$name" '$2==n {print $3}' $rlog 2>/dev/null | head -1)
