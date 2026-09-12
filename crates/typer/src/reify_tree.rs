@@ -1471,6 +1471,12 @@ impl<'a> Reifier<'a> {
     /// abstract type is spliced (`mkTypeTree(...)`) -- nsc's `reifyBoundType`.
     fn type_tree_of_type(&self, ty: &Type) -> Result<Tree, String> {
         let st = self.st();
+        // An inner class carrying its prefix as an as-seen-from view
+        // (`crate::prefix`): the tree names the class; the prefix matters
+        // for the type value only.
+        if crate::prefix::view_prefix(ty).is_some() {
+            return self.type_tree_of_type(crate::prefix::strip_view(ty));
+        }
         match ty {
             Type::Constant(l) => self.type_tree_of_type(&Type::lit_underlying(l)),
             Type::String => Ok(self.call(
@@ -1726,6 +1732,25 @@ impl<'a> Reifier<'a> {
     /// `TypeCreator` need (nsc's `reifyType`).
     pub(crate) fn type_value(&self, ty: &Type) -> Result<Tree, String> {
         let st = self.st();
+        // `Foo.this.R`, `p.R`: an inner class whose prefix the typer kept as
+        // a view (`crate::prefix`) is `TypeRef(<prefix>, R, args)`.
+        if let Some(pre) = crate::prefix::view_prefix(ty) {
+            let core = crate::prefix::strip_view(ty);
+            if let Type::Class { sym, args } = core {
+                if let Ok(prefix) = self.prefix_value(pre) {
+                    let class = self.class_symbol(*sym)?;
+                    let mut vs = Vec::new();
+                    for a in args {
+                        vs.push(self.type_value(a)?);
+                    }
+                    return Ok(self.call(
+                        self.support_member("TypeRef"),
+                        vec![prefix, class, self.list(vs)],
+                    ));
+                }
+            }
+            return self.type_value(core);
+        }
         match ty {
             Type::Constant(l) => self.type_value(&Type::lit_underlying(l)),
             Type::AnyRef | Type::JavaObject => Ok(self.type_constructor(self.call(
@@ -1935,6 +1960,7 @@ impl<'a> Reifier<'a> {
                 let module = self.module_symbol(cls)?;
                 self.select(self.select(module, "asModule"), "moduleClass")
             }
+            SymKind::Class if self.is_static_class(cls) => self.class_symbol(cls)?,
             _ => {
                 return Err(format!(
                     "`{}.this.type`, the type of a class instance, is not reified yet",
@@ -1943,6 +1969,19 @@ impl<'a> Reifier<'a> {
             }
         };
         Ok(self.call(self.support_member("ThisType"), vec![module_class]))
+    }
+
+    /// The value of a prefix a view carries: `ThisType(C)` for `C.this`,
+    /// an `object`'s singleton for a stable module path.
+    fn prefix_value(&self, pre: &Type) -> Result<Tree, String> {
+        match pre {
+            Type::ThisType(cls) => self.this_type_value(*cls),
+            Type::ModuleRef(_) | Type::SingleType { .. } => self.type_value(pre),
+            other => Err(format!(
+                "a prefix of type `{}` is not reified yet",
+                self.st().display_type(other)
+            )),
+        }
     }
 
     /// `<class>.asType.toTypeConstructor`.
