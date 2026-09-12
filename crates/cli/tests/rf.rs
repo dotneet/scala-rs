@@ -128,3 +128,138 @@ fn scalac_agrees_rf_booleanflag() {
     };
     check_runs("rf_booleanflag", Some(&sc));
 }
+
+/// Compile one fixture with scala-rs (or real scalac), `extra` on the class
+/// path. Used for the two-stage macro fixtures, where the implementation has to
+/// be a *separate run* from the call sites: that is the only arrangement in
+/// which a macro expands at all.
+fn compile_stage(
+    name: &str,
+    out: &Path,
+    extra: &[&Path],
+    scalac_path: Option<&Path>,
+) -> std::process::Output {
+    let jar = scala_library_jar().expect("scala-library");
+    let (reflect, compiler) = reflect_jars().expect("reflect jars");
+    let mut cp = format!("{}:{}", reflect.display(), compiler.display());
+    for e in extra {
+        cp.push(':');
+        cp.push_str(&e.display().to_string());
+    }
+    let src = fixtures_dir().join(format!("{name}.scala"));
+    match scalac_path {
+        Some(sc) => Command::new(sc)
+            .args(["-cp", &cp, "-d", out.to_str().unwrap()])
+            .arg(&src)
+            .output()
+            .expect("run scalac"),
+        None => Command::new(bin())
+            .arg("compile")
+            .arg(&src)
+            .args(["-d", out.to_str().unwrap()])
+            .args(["-cp", &cp])
+            .args(["--scala-library", jar.to_str().unwrap()])
+            .output()
+            .expect("run scala-rs compile"),
+    }
+}
+
+fn runtime_classpath(dirs: &[&Path]) -> String {
+    let jar = scala_library_jar().unwrap();
+    let (reflect, compiler) = reflect_jars().unwrap();
+    let mut cp = String::new();
+    for d in dirs {
+        cp.push_str(&d.display().to_string());
+        cp.push(':');
+    }
+    format!(
+        "{cp}{}:{}:{}",
+        reflect.display(),
+        compiler.display(),
+        jar.display()
+    )
+}
+
+/// `rf_wbimpl.scala` then `rf_wbuse.scala`: four whitebox macros whose
+/// expansions are typed more precisely than their declared `Any`, and one
+/// blackbox macro with the same expansion that is not.
+fn whitebox_two_stage(scalac_path: Option<&Path>) {
+    if scala_library_jar().is_none() {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    }
+    if reflect_jars().is_none() {
+        eprintln!("skip: scala-reflect / scala-compiler jars not present");
+        return;
+    }
+    let impls = tmp_dir("wbimpl");
+    let uses = tmp_dir("wbuse");
+    let out = compile_stage("rf_wbimpl", &impls, &[], scalac_path);
+    assert!(
+        out.status.success(),
+        "compile rf_wbimpl failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = compile_stage("rf_wbuse", &uses, &[&impls], scalac_path);
+    assert!(
+        out.status.success(),
+        "compile rf_wbuse failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cp = runtime_classpath(&[&uses, &impls]);
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java");
+    assert!(
+        run.status.success(),
+        "java Main failed:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let expected =
+        fs::read_to_string(fixtures_dir().join("expected").join("rf_wbuse.txt")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+
+    // The other direction: the blackbox declaration beside them keeps `Any`, so
+    // narrowing it at the call site must stay an error. A whitebox rule that
+    // applied to every macro would accept this.
+    let bad = tmp_dir("wbbad");
+    let out = compile_stage("rf_wbbad", &bad, &[&impls], scalac_path);
+    assert!(
+        !out.status.success(),
+        "rf_wbbad.scala was accepted; a blackbox expansion's type must not reach \
+         the call site:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        said.contains("type mismatch"),
+        "rf_wbbad.scala was rejected for the wrong reason: {said}"
+    );
+
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+    let _ = fs::remove_dir_all(&bad);
+}
+
+#[test]
+fn rf_whitebox_expansions_replace_the_declared_type() {
+    whitebox_two_stage(None);
+}
+
+#[test]
+fn scalac_agrees_rf_whitebox() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    whitebox_two_stage(Some(&sc));
+}

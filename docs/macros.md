@@ -722,9 +722,9 @@ But that damages the meaning of the "scala-rs compiles slick" benchmark, so if w
 
 ## 6.3 About whitebox
 
-Slick's two macros are blackbox. Quasiquotes and reify do not require a whitebox expander either
-(they are fast track). So **whitebox is not needed at all for now**. We implement only blackbox, and
-when we find a whitebox macro def we diagnose and fail.
+*History, superseded by §7.30 below.* Slick's two macros are blackbox. Quasiquotes and reify do not
+require a whitebox expander either (they are fast track). So whitebox was not needed for slick, and
+for a long time a whitebox macro def was diagnosed and failed at the binding.
 
 ## 6.4 Risk list
 
@@ -3804,3 +3804,48 @@ binds; `crates/cli/tests/czero.rs` compiles it with scala-rs *and* with real
 scalac 2.13.16 and requires both runs' stdout to be byte-identical to the
 recorded expectation, under `java -Xverify:all`. The matches and the
 non-matches are both in there, which is what makes it evidence.
+
+## 7.30 Whitebox macros (the `agent/runfail` slice)
+
+A whitebox macro's expansion type **replaces** the declared result type; a blackbox macro's does not.
+That is the whole semantic difference, and it is what nsc's `macroExpandApply` expresses by wrapping
+the expansion in `WhiteboxExpansion`: the expansion is typed against the *call site's* expected type
+rather than against the declaration's, and the type it comes out with stands. A blackbox expansion is
+typed against the declared result type and then ascribed with it (`Typed(expanded, TypeTree(innerPt))`),
+so the call site never sees anything more precise than the declaration.
+
+scala-rs now does the same, and a whitebox macro def is bound exactly like a blackbox one:
+
+* `crates/typer/src/macros.rs` no longer refuses `!blackbox` at the binding, and
+  `crates/typer/src/pickle_supply.rs` carries the pickle's `is_blackbox` into the
+  `MacroBinding` instead of requiring it. The deprecated pre-2.11 spelling
+  `scala.reflect.macros.Context` classifies as whitebox, which is what the library's own
+  `@deprecated type Context = whitebox.Context` makes it.
+* `Typer::expand_macro_application` (`crates/typer/src/expand.rs`) branches on `binding.blackbox`
+  for both halves of the rule: which expected type the expansion is re-typed against, and whether
+  the declared type is put back afterwards.
+* The engine's `Context` proxy (`crates/typer/java/ScalaRsMacroEngine.java`) declares
+  `scala.reflect.macros.whitebox.Context`, which *extends* the blackbox one, so one proxy serves
+  both kinds. Declaring only the blackbox interface made every whitebox implementation an
+  `IllegalArgumentException: argument type mismatch` out of `Method.invoke` -- not a diagnostic.
+  The three members whitebox adds (`ImplicitCandidate`, `openMacros`, `enclosingMacros`) are
+  answered the way the handler answers any member it does not implement: a named gap.
+
+**A check the refusal had been hiding.** `neg/macro-bundle-ambiguous` was rejected only because its
+bundle takes a whitebox `Context`. nsc's real reason is that `macro Macros.impl`, where
+`class Macros(val c: Context)` declares an `impl` *and* `object Macros` declares one, "makes sense
+both as a macro bundle method reference and a vanilla object method reference". Only candidates whose
+**shape** fits the macro def count, which is exactly the line nsc's own three tests draw: with
+`def foo: Unit`, `pos/macro-bundle-disambiguate-nonbundle` has only the object's fitting,
+`pos/macro-bundle-disambiguate-bundle` only the bundle's, and `neg/macro-bundle-ambiguous` both.
+`Typer::macro_bundle_companion` and `Typer::macro_clause_count` implement that; macro bundles
+themselves are still not expanded.
+
+**What it was worth.** On the corpus subset the `whitebox macros are not implemented` diagnostic
+named (40 tests, 14 `pos` and 26 `run`), measured with `CORPUS_KINDS="run pos" CORPUS_SIZE=full`:
+6 `pos` and 4 `run` tests newly pass. The rest now fail one layer deeper, at shapes that have
+nothing to do with boxity -- structural types out of an anonymous class in the expansion
+(`value x is not a member of Any`: `t8048b`, `macro-whitebox-structural`, `t6992`,
+`macro-vampire-false-warning`), whitebox `unapply` macros (`pattern arity`), `c.typecheck` with
+implicits or macros disabled, and a `TypeTag` for `_`. Those are the next walls, and they are
+recorded here so nobody looks for them under "whitebox" again.

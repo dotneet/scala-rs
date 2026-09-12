@@ -158,9 +158,18 @@ fn unresolved_macro_impl_is_error() {
     compile_fails("macro_impl_missing_bad", "macro implementation not found");
 }
 
+/// A whitebox macro def is bound like a blackbox one, so the *shape* check is
+/// what rejects an implementation that does not correspond to the definition.
+/// The blanket whitebox refusal that used to stand here short-cut every later
+/// check; real scalac 2.13.16 rejects this file as
+/// "macro implementation has incompatible shape ... parameter lists have
+/// different length".
 #[test]
-fn whitebox_macro_is_rejected() {
-    compile_fails("macro_whitebox_bad", "whitebox macros are not implemented");
+fn whitebox_macro_def_shape_is_checked() {
+    compile_fails(
+        "macro_whitebox_bad",
+        "macro implementation parameter shape does not match the macro definition",
+    );
 }
 
 /// Read the UTF8 constant pool entries of a class file.

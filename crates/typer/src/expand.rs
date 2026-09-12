@@ -648,7 +648,21 @@ impl Typer {
                 // declared result type* and keeps it, whatever more precise
                 // type the expansion itself has (nsc ascribes the expansion
                 // with `Typed(expanded, TypeTree(innerPt))`).
-                self.type_expr(tree, &declared);
+                //
+                // A **whitebox** macro is the opposite: nsc's
+                // `macroExpandApply` wraps the result in `WhiteboxExpansion`,
+                // types it with the *call site's* expected type rather than the
+                // declaration's, and lets the expansion's own -- possibly more
+                // precise -- type stand. `def foo: Any = macro impl` whose
+                // expansion is `if (true) Some(2) else None` is what the
+                // difference is for: typed against the declared `Any` the tree
+                // is an `Any`, and `val x: Option[Int] = Macros.foo` does not
+                // typecheck.
+                if binding.blackbox {
+                    self.type_expr(tree, &declared);
+                } else {
+                    self.type_expr(tree, &Type::NoType);
+                }
                 self.macro_depth -= 1;
                 if let Some(t) = retype_started {
                     let elapsed = t.elapsed();
@@ -656,7 +670,7 @@ impl Typer {
                         slot.retype += elapsed;
                     }
                 }
-                if !tree.ty.is_error() {
+                if !tree.ty.is_error() && binding.blackbox {
                     tree.ty = declared;
                 }
             }

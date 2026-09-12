@@ -2449,14 +2449,14 @@ impl PickleSupply {
     /// A macro that cannot be expanded is therefore an error, never a
     /// silently accepted call.
     ///
-    /// Two shapes are declined outright, matching what the source-level path
-    /// (`crates/typer/src/macros.rs`) refuses:
+    /// `is_blackbox` is carried into the binding rather than required:
+    /// `Typer::expand_macro_application` types a whitebox expansion with no
+    /// expected type and keeps the type it came out with, which is what nsc's
+    /// `macroExpandApply` does for a `WhiteboxExpansion`.
     ///
-    /// * a **whitebox** macro, whose expansion may refine the declared result
-    ///   type -- accepting the declaration would mean typing the call site
-    ///   against a type nsc does not use;
-    /// * a **macro bundle** (`class B(val c: Context)`), which the expander
-    ///   cannot instantiate.
+    /// One shape is declined outright, matching what the source-level path
+    /// (`crates/typer/src/macros.rs`) refuses: a **macro bundle**
+    /// (`class B(val c: Context)`), which the expander cannot instantiate.
     #[allow(clippy::too_many_arguments)]
     fn install_pickled_macro(
         &mut self,
@@ -2469,12 +2469,6 @@ impl PickleSupply {
         mi: &PickledMacroImpl,
         class_scope: &HashMap<String, Type>,
     ) -> Option<SymbolId> {
-        if !mi.is_blackbox {
-            trace(format_args!(
-                "{internal}#{name}: whitebox macros are not implemented"
-            ));
-            return None;
-        }
         if mi.is_bundle {
             trace(format_args!(
                 "{internal}#{name}: macro bundles are not implemented"
@@ -2595,7 +2589,7 @@ impl PickleSupply {
             pickle: None,
             impl_class: mi.class_name.clone(),
             impl_method: mi.method_name.clone(),
-            blackbox: true,
+            blackbox: mi.is_blackbox,
             tag_params,
             expr_args,
             tag_targs,

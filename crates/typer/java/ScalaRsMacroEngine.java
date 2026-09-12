@@ -240,9 +240,16 @@ public final class ScalaRsMacroEngine {
             }
         }
 
+        // `scala.reflect.macros.whitebox.Context` *extends* the blackbox one,
+        // so a single proxy serves both kinds of implementation. Declaring only
+        // the blackbox interface made every whitebox implementation an
+        // `IllegalArgumentException: argument type mismatch` from
+        // `Method.invoke`, which is not a diagnostic. The handler answers the
+        // three members whitebox adds the same way it answers any other it does
+        // not implement: by raising a named gap.
         Object ctx = Proxy.newProxyInstance(
             ScalaRsMacroEngine.class.getClassLoader(),
-            new Class<?>[]{loadClass("scala.reflect.macros.blackbox.Context")},
+            new Class<?>[]{loadClass("scala.reflect.macros.whitebox.Context")},
             handler);
 
         // 2.11 onwards an implementation may take a raw `c.Tree` instead of a

@@ -16,6 +16,10 @@ use crate::symbol::{MacroBinding, MacroPickle, MacroTarg, SymKind};
 /// Fully-qualified names of the two macro `Context` types.
 const BLACKBOX_CONTEXT: &str = "scala.reflect.macros.blackbox.Context";
 const WHITEBOX_CONTEXT: &str = "scala.reflect.macros.whitebox.Context";
+/// The pre-2.11 name, which the library still declares as
+/// `@deprecated type Context = whitebox.Context` in the `scala.reflect.macros`
+/// package object. An implementation written against it is whitebox.
+const LEGACY_CONTEXT: &str = "scala.reflect.macros.Context";
 
 /// The implementation `def f(…): T = macro ???` names: `scala.Predef.???`.
 ///
@@ -43,7 +47,10 @@ pub(crate) const PLACEHOLDER_IMPL: (&str, &str) = ("scala.Predef$", "???");
 fn context_kind_of_name(name: &str) -> Option<bool> {
     if name == BLACKBOX_CONTEXT || name.ends_with("blackbox.Context") {
         Some(true)
-    } else if name == WHITEBOX_CONTEXT || name.ends_with("whitebox.Context") {
+    } else if name == WHITEBOX_CONTEXT
+        || name.ends_with("whitebox.Context")
+        || name == LEGACY_CONTEXT
+    {
         Some(false)
     } else {
         None
@@ -225,9 +232,42 @@ impl Typer {
             return None;
         }
 
-        // The implementation must be resolvable by name alone at expansion time:
-        // nsc's runtime picks `getMethods.filter(_.getName == methodName).head`.
+        // nsc `Resolvers.resolveMacroImpl`: `macro Macros.impl` where `class
+        // Macros(val c: Context)` declares an `impl` of its own "makes sense
+        // both as a macro bundle method reference and a vanilla object method
+        // reference", and nsc refuses to choose rather than preferring either.
+        // This used to be out of reach behind the blanket whitebox refusal
+        // (`neg/macro-bundle-ambiguous`, whose bundle takes a whitebox
+        // `Context`), which rejected the program for the wrong reason.
         let name = self.st.get(sym).name.clone();
+        if let Some(bundle) = self.macro_bundle_companion(owner) {
+            // Only a candidate whose *shape* fits the macro def counts. nsc's
+            // own three tests draw exactly this line: with `def foo: Unit` the
+            // object's `impl(c: Context)` fits and the bundle's
+            // `impl(x: c.Tree)` does not (`pos/macro-bundle-disambiguate-
+            // nonbundle`); the bundle's `impl` fits and the object's
+            // `impl(c)(x: c.Tree)` does not (`pos/macro-bundle-disambiguate-
+            // bundle`); and both fit only in `neg/macro-bundle-ambiguous`. A
+            // vanilla implementation spends one clause on the `Context` a
+            // bundle carries in its constructor, so the two counts it is
+            // compared against differ by one.
+            let def_clauses = self.macro_clause_count(def_sym);
+            let vanilla_fits = self.macro_clause_count(sym) == def_clauses + 1;
+            let bundle_fits = self
+                .st
+                .lookup_member(bundle, &name)
+                .into_iter()
+                .filter(|&m| self.st.get(m).kind == SymKind::Method)
+                .any(|m| self.macro_clause_count(m) == def_clauses);
+            if vanilla_fits && bundle_fits {
+                self.error(
+                    span,
+                    "macro implementation reference is ambiguous: makes sense both as\n\
+                     a macro bundle method reference and a vanilla object method reference",
+                );
+                return None;
+            }
+        }
         let overloads = self
             .st
             .lookup_member(owner, &name)
@@ -287,14 +327,6 @@ impl Typer {
                 return None;
             }
         };
-        if !blackbox {
-            // The design deliberately implements blackbox first; see docs/macros.md.
-            self.error(
-                span,
-                format!("whitebox macros are not implemented (macro implementation {path})"),
-            );
-            return None;
-        }
 
         let tag_params = self.macro_impl_tag_params(sym);
         let pickle = self.macro_pickle_binding(sym, def_sym, &ref_targs, span)?;
@@ -629,6 +661,64 @@ impl Typer {
         // classifies as neither context, and is still refused.
         names.extend(self.macro_context_from_descriptor(impl_sym));
         names.iter().find_map(|n| context_kind_of_name(n))
+    }
+
+    /// Parameter clauses of a macro def or of a macro implementation, not
+    /// counting an implicit one: the trailing `(implicit T: WeakTypeTag[T])` an
+    /// implementation may add is not part of the correspondence.
+    fn macro_clause_count(&self, sym: SymbolId) -> usize {
+        if sym.is_none() {
+            return 0;
+        }
+        self.st
+            .get(sym)
+            .paramss
+            .iter()
+            .filter(|c| {
+                !c.iter().any(|p| {
+                    self.st
+                        .get(*p)
+                        .flags
+                        .contains(scala_rs_parser::Flags::IMPLICIT)
+                })
+            })
+            .count()
+    }
+
+    /// The *macro bundle* class a module class is the companion of, if it is
+    /// one.
+    ///
+    /// nsc `isMacroBundleType`: a class whose primary constructor takes a single
+    /// `val c: Context`. Its methods are macro implementations too, reached
+    /// through the same `Owner.method` reference as an object's, which is what
+    /// makes such a reference ambiguous.
+    fn macro_bundle_companion(&self, module_cls: SymbolId) -> Option<SymbolId> {
+        let owner = self.st.get(module_cls).owner;
+        if owner.is_none() {
+            return None;
+        }
+        let module = self.st.get(owner).members.iter().copied().find(|&m| {
+            self.st.get(m).kind == SymKind::Module && self.st.module_class_of(m) == module_cls
+        })?;
+        let name = self.st.get(module).name.clone();
+        let cls = self
+            .st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&c| self.st.get(c).kind == SymKind::Class && self.st.get(c).name == name)?;
+        let fields = self.st.get(cls).ctor_fields.clone();
+        let [only] = fields.as_slice() else {
+            return None;
+        };
+        let ty = self.st.get(*only).ty.clone();
+        let mut names = Vec::new();
+        Self::context_type_names(&self.st, &ty, &mut names);
+        names
+            .iter()
+            .any(|n| context_kind_of_name(n).is_some())
+            .then_some(cls)
     }
 
     /// Every dotted class name a macro implementation's first parameter type
