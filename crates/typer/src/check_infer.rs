@@ -2815,6 +2815,15 @@ impl Typer {
             if !mentions_tparam(&lo, &method_tps) || type_mentions_tparam(&lo, tp) {
                 continue;
             }
+            // First-order parameters only. A *constructor* bounded below by
+            // another constructor (`def x[N[X] >: M[X], M[_], G](n: N[G], m:
+            // M[G])`, corpus `pos/t2782`) is solved by nsc's higher-kinded
+            // path, where the bound is checked at the parameters the two share
+            // rather than joined as a type; `lub`bing the two constructors made
+            // `x(Some(3), Seq(2))` inapplicable.
+            if !self.st.get(tp).tparams.is_empty() {
+                continue;
+            }
             let lo = if owner_args.is_empty() {
                 lo
             } else {
