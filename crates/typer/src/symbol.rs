@@ -5307,11 +5307,52 @@ impl SymbolTable {
             (Type::Applied { ctor: c1, args: a1 }, Type::Applied { ctor: c2, args: a2 })
                 if a1.len() == a2.len() =>
             {
+                // An abstract type constructor *parameter* (`F[_, _]`) is
+                // applied at exactly the variance its own parameters declare:
+                // `F[_]` is invariant, so `F[(Int, Int)]` is not an
+                // `F[AnyRef]` -- scalac reports the mismatch with a note about
+                // `F` being invariant. Reading every argument covariantly let
+                // cats' `compose(swap, compose(first(fa), swap))` at a wrong
+                // declared result through once the call's `B` had been lubbed
+                // to `AnyRef`. Other constructor shapes (a partially applied
+                // class, a type lambda, a type member) keep the covariant
+                // reading they had.
+                let variances: Option<Vec<Flags>> = match c1.as_ref() {
+                    // A wildcard constructor on the right is an expectation
+                    // some enclosing call has not decided (`_[Option[_]]`).
+                    _ if matches!(c2.as_ref(), Type::Wildcard) => None,
+                    Type::TypeParam(id) if self.get(*id).tparams.len() == a1.len() => Some(
+                        self.get(*id)
+                            .tparams
+                            .iter()
+                            .map(|tp| self.get(*tp).flags)
+                            .collect(),
+                    ),
+                    _ => None,
+                };
                 self.is_sub_type(c1, c2)
-                    && a1
-                        .iter()
-                        .zip(a2.iter())
-                        .all(|(x, y)| self.is_sub_type(x, y))
+                    && a1.iter().zip(a2.iter()).enumerate().all(|(i, (x, y))| {
+                        let Some(flags) = variances.as_ref().map(|v| v[i]) else {
+                            return self.is_sub_type(x, y);
+                        };
+                        if flags.contains(Flags::CONTRAVARIANT) {
+                            if is_wildcard_arg(y) {
+                                self.is_sub_type(x, y)
+                            } else {
+                                self.is_sub_type(y, x)
+                            }
+                        } else if flags.contains(Flags::COVARIANT)
+                            || is_wildcard_arg(y)
+                            || is_wildcard_arg(x)
+                        {
+                            // A wildcard on either side is an argument some
+                            // enclosing call has not decided yet: containment,
+                            // as before.
+                            self.is_sub_type(x, y)
+                        } else {
+                            self.is_sub_type(x, y) && self.is_sub_type(y, x)
+                        }
+                    })
             }
             // `_[_]`: an undetermined type constructor applied to arguments,
             // the shape `check_apply` relaxes `G[B]` to while the argument

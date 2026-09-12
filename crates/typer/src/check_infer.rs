@@ -3681,13 +3681,22 @@ impl Typer {
             let mut sig = params.clone();
             sig.push(ret.clone());
             let mut want = pt_params.clone();
-            want.push(pt_ret);
+            want.push(pt_ret.clone());
             for (id, t) in self.infer_method_tparams(sym, &sig, &want) {
                 if !inst.iter().any(|(i, _)| *i == id) {
                     inst.push((id, t));
                 }
             }
         }
+        // nsc solves the parameters and the result together. The expected
+        // parameter only bounds a variable from below (`B <: A`); an
+        // *invariant* position in the expected result fixes it, and wins
+        // whenever the parameter's solution conforms to it. cats'
+        // `Ior.to[F[_], BB >: B]` is `fold(_ => F.empty, F.pure, …)` at
+        // `F[BB]`: `F.pure[A]` against `B => F[BB]` is `A := BB`, not the
+        // `A := B` the parameter alone says, which gives a `B => F[B]` that
+        // an invariant `F` does not accept.
+        let mut inst = self.add_expected_constraints(sym, &ret, &pt_ret, inst);
         // An instantiation the parameter's own bounds refuse is not an
         // instantiation. Leaving the variable open is what the caller expects:
         // `record_open_tparams` hands it outward and the mismatch is reported

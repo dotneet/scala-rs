@@ -3284,6 +3284,46 @@ val in = new MailBox`, whose `in.Message` is therefore plain `Message`).
 `MailBox#Message` and `in.Message`, are the same type to conformance and to
 override matching alike.
 
+### Composed with batch/w1: an abstract constructor applied invariantly
+
+Merged onto `24cf81c1` (batch/w1 + prefix-carrying types), `catsr_bad`'s
+`ArrowBad.bad1` -- `compose(swap, compose(first(fa), swap))` at a wrong
+declared result, which scalac rejects -- compiled. Neither of root 12's two
+mechanisms was involved (switching both off changed nothing). The outer
+`compose` reads `B := (C, B)` from one argument and `B := (B, C)` from the
+other, lubs them to `AnyRef`, and the `Applied`/`Applied` arm of
+`is_sub_type` then accepted `F[(C, B), (B, C)]` for `F[AnyRef, (B, C)]`: that
+arm, unchanged since higher-kinded types were first implemented, compared
+every argument covariantly. `def up[F[_, _]](x: F[(Int, Int), Int]): F[AnyRef,
+Int] = x` was accepted the same way.
+
+When the constructor is an abstract type *parameter* whose own parameters
+are known, each argument is now compared at the variance they declare
+(`F[_]` invariant, `F[+_]` covariant, `F[-_]` contravariant); a wildcard on
+either side is still containment, and every other constructor shape (a
+partially applied class, a type lambda, a type member) keeps the covariant
+reading. `catsr_bad`'s `InvariantCtor` pins both directions against scalac.
+
+The companion fix is in `solve_eta_tparams`: nsc solves an eta-expansion's
+parameters and result together, so the expected result's invariant positions
+now go through `add_expected_constraints`. `F.pure[A]` against `B => F[BB]` is
+`A := BB` (cats `Ior.to:485`, `OptionT.getOrElseF:302`), not the `A := B` the
+parameter alone gives -- a `B => F[B]` an invariant `F` refuses. Without it the
+corrected arm rejected those two valid cats files.
+
+**Two neg tests lose a wrong-reason pass.** `neg/t7872b` and `neg/t7872c`
+write `def up[F[+_]](fa: F[String]): F[Object] = fa` and `def down[F[-_]](fa:
+F[Object]): F[String] = fa`. Under the covariant arm those *definitions* did
+not typecheck (`F[Object] <: F[String]` asked `Object <: String`), which is the
+error the corpus counted; read at the declared variance they are correct, and
+both files now compile. What scalac rejects them for is not implemented:
+`t7872c` needs nsc's `checkKindBounds` variance half -- an inferred `F := List`
+does not match a `F[-_]` parameter ("type A is covariant, but type _ is
+declared contravariant") -- and `t7872b` needs variance validation of a type
+lambda's own body (`[-a]List[a]` uses `a` covariantly). Both are separate
+checks, and the second is not about kind conformance at all; neither is a
+reason to keep reading an abstract constructor covariantly.
+
 ### Found in passing, not fixed
 
 * `Option.map` (and the other hand-written collection `map`s in the prelude)
