@@ -169,8 +169,9 @@ the accepted fixtures `rb_free`, `rf_more`, `rd_defs_typed`, `ex_notag`.
    (`x$1` with `@unchecked`); a local class prints `pendingSuperCall` and
    `ScalaDot(AnyRef)` (the `SyntacticClassDef` shape) where nsc prints the
    explicit super call.
-8. **Outside `reify`**, the same corpus tests still stop at: whitebox macros
-   (22 tests; `crates/typer/src/macros.rs` refuses them at the binding), the
+8. **Outside `reify`**, the same corpus tests still stop at: ~~whitebox macros
+   (22 tests; `crates/typer/src/macros.rs` refuses them at the binding)~~ --
+   implemented by `agent/runfail`, `docs/macros.md` §7.30 -- the
    `Apply` / `Literal` / `NullaryMethodType` extractors inside macro
    implementations that also need `c.reifyTree` / `c.unreifyTree` /
    `c.typecheck` (`macro-reify-chained*`, `macro-sip19*`), `Manifest`s, and
