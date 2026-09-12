@@ -311,6 +311,61 @@ pub(crate) fn adapt_type_member_arg(
     asm.checkcast(cls);
 }
 
+/// A call whose *declared* JVM result names a class the expression's own type
+/// is a strict subtype of.
+///
+/// `buf += a` on a `ListBuffer[A]` has type `ListBuffer[A]` -- `Growable.addOne`
+/// returns `this.type` -- but the method it resolves to is declared
+/// `(Object)Lscala/collection/mutable/Growable;`, so the descriptor promises
+/// only the interface. nsc's erasure (`adaptToType`) casts the result; `javap`
+/// on scalac 2.13.16 shows `invokevirtual ListBuffer.$plus$eq; checkcast
+/// ListBuffer`. Without that cast, `if (p(a)) buf += a else buf` left a
+/// `Growable` at a join whose stack map says `ListBuffer`, and the class did
+/// not verify: "Inconsistent stackmap frames at branch target" -- cats'
+/// `Foldable.filter_`/`toList`/`dropWhile_`, reached by the first
+/// `cats.implicits` use.
+///
+/// Deliberately narrow. Only a declared result that names a *real* class is
+/// adapted, and only in the direction the typer already proved: the value is a
+/// `want`, and the descriptor merely under-promises. An `Object`-erased
+/// generic result is a different question, answered where the value is used.
+pub(crate) fn adapt_call_result(asm: &mut Assembler, st: &SymbolTable, ty: &Type) {
+    if matches!(ty, Type::Null | Type::Nothing) {
+        return;
+    }
+    let Some(top) = asm.top_object().map(str::to_string) else {
+        return;
+    };
+    if top == "java/lang/Object" || top.starts_with('[') {
+        return;
+    }
+    let desc = jvm_desc(st, ty);
+    let Some(want) = desc
+        .strip_prefix('L')
+        .and_then(|d| d.strip_suffix(';'))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if want == top || want == "java/lang/Object" {
+        return;
+    }
+    if verifier_accepts_receiver(st, &top, &want) {
+        return;
+    }
+    // When the declared class *is* in the symbol table, only narrow in the
+    // direction the typer proved -- the value is a `want` and the descriptor
+    // under-promises. When it is not (`scala/collection/mutable/Growable` is
+    // never loaded as a symbol: it reaches the backend only as a descriptor
+    // string), nothing can prove the verifier accepts the value where a `want`
+    // is wanted, so the cast stands. A redundant `checkcast` is a no-op; a
+    // missing one is a `VerifyError`.
+    if st.find_class_by_jvm(&top).is_some() && !jvm_assignable(st, &want, &top) {
+        return;
+    }
+    asm.checkcast(&want);
+}
+
 /// A value entering a slot of class `desc` -- a local, a field, a method's
 /// result -- whose tracked erasure is an *interface* that the class is a
 /// Scala-level parent of. `trait UnanchoredRegex extends Regex` conforms to

@@ -1,0 +1,11 @@
+true
+123
+45
+hello
+1.5
+2.5
+z
+zed
+3.0
+x
+List(1, x)

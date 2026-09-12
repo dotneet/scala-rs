@@ -14,10 +14,10 @@
 #   nohup tests/verify_merge.sh > $MY/gate.log 2>&1 &
 #   until grep -q '^DONE' $MY/gate.log; do sleep 60; done; grep -E '^(VERDICT|  )' $MY/gate.log
 #
-# The three heavy steps (slick_subset, the workspace suite and the full corpus)
-# run CONCURRENTLY -- see "the parallel block" below -- and the summary now
-# carries a per-step wall-time table, so nobody has to derive the cost of a
-# step from log mtimes again.
+# The five heavy steps (slick_subset, the cats and gitbucket execution
+# harnesses, the workspace suite and the full corpus) run CONCURRENTLY -- see
+# "the parallel block" below -- and the summary carries a per-step wall-time
+# table, so nobody has to derive the cost of a step from log mtimes again.
 #
 # Env:
 #   GATE_DIR      where every log goes (default: a fresh per-invocation dir)
@@ -25,7 +25,7 @@
 #   GATE_SKIP     space-separated steps to skip, e.g. "corpus" -- each skip is
 #                 printed in the summary, because a skipped check must never
 #                 read as a passing one.
-#   GATE_SERIAL=1 run the three heavy steps one after another instead of
+#   GATE_SERIAL=1 run the heavy steps one after another instead of
 #                 concurrently. Same checks, same numbers, ~2.5x the wall
 #                 time; keep it as the way to reproduce a confusing result
 #                 without the concurrency in the picture.
@@ -45,6 +45,12 @@
 #   GATE_CORPUS_JOBS    CORPUS_JOBS for the gate's corpus run (default 10;
 #                 an explicit CORPUS_JOBS in the environment wins).
 #   GATE_SUBSET_JOBS    javap fan-out inside tests/slick_subset.sh (default 6).
+#   GATE_SKIP="cats_run gb_run"
+#                 skips the two differential *execution* harnesses for cats and
+#                 gitbucket (tests/cats_run.sh, tests/gitbucket_run.sh). They are
+#                 the only checks that run a single instruction of either
+#                 project; the compile measures above say nothing about whether
+#                 what they emit works. Both are well under a minute.
 #   GATE_CORPUS_TIMEOUT / GATE_CORPUS_RUN_TIMEOUT
 #                 the corpus per-compile / per-`java Test` limits for the
 #                 gate's run (defaults 120 / 60 against the harness defaults
@@ -137,7 +143,7 @@ mkdir -p "$TDIR"
 # never reached) is left out. A fixed list rather than one appended to as the
 # gate runs, because the four measures are timed inside a command substitution
 # and a subshell cannot append to its parent's array.
-STEP_ORDER=(build m_slick m_cats m_gitbucket m_library slick_run subset tests corpus fmt)
+STEP_ORDER=(build m_slick m_cats m_gitbucket m_library slick_run subset cats_run gb_run tests corpus fmt)
 
 timed() {  # name, command...
   local name=$1; shift
@@ -271,23 +277,45 @@ run_corpus() {
   SCALA_RS=$GATE_BIN SCALA_RS_PREBUILT=1 \
     tests/scala_corpus.sh > "$GATE_DIR/corpus.log" 2>&1
 }
+# The two differential *execution* harnesses for cats and gitbucket. They belong
+# in this block for the same reason `slick_subset` does: each one recompiles its
+# project with `$GATE_BIN` into its own private, locked work area, reads nothing
+# the others write, and takes well under a minute (cats ~32 s, gitbucket ~45 s
+# with the shared scalac reference build in place -- both are timed in the table
+# below, so a regression in their own cost is visible).
+#
+# Unlike `slick_run`, neither measures timing or load, so neither needs the
+# machine to itself: they compare stdout byte for byte and they compile the
+# clients with real scalac.
+run_cats_run() {
+  SCALA_RS=$GATE_BIN CATSRUN_JOBS=2 tests/cats_run.sh > "$GATE_DIR/cats_run.log" 2>&1
+}
+run_gb_run() {
+  SCALA_RS=$GATE_BIN GBRUN_JOBS=2 tests/gitbucket_run.sh > "$GATE_DIR/gb_run.log" 2>&1
+}
 
-do_subset=1; do_tests=1; do_corpus=1
+do_subset=1; do_tests=1; do_corpus=1; do_cats_run=1; do_gb_run=1
 skipped subset && { do_subset=0; NOTE+=("slick_subset SKIPPED"); }
 skipped tests  && { do_tests=0;  NOTE+=("workspace tests SKIPPED"); }
 skipped corpus && { do_corpus=0; NOTE+=("corpus SKIPPED"); }
+skipped cats_run && { do_cats_run=0; NOTE+=("cats_run SKIPPED"); }
+skipped gb_run && { do_gb_run=0; NOTE+=("gitbucket_run SKIPPED"); }
 
 if [[ $SERIAL == 1 ]]; then
   step "heavy steps (serial, GATE_SERIAL=1)"
-  (( do_subset )) && timed subset run_subset
-  (( do_tests ))  && timed tests  run_tests
-  (( do_corpus )) && timed corpus run_corpus
+  (( do_subset ))   && timed subset   run_subset
+  (( do_cats_run )) && timed cats_run run_cats_run
+  (( do_gb_run ))   && timed gb_run   run_gb_run
+  (( do_tests ))    && timed tests    run_tests
+  (( do_corpus ))   && timed corpus   run_corpus
 else
-  step "heavy steps (concurrent): slick_subset + workspace tests + corpus"
-  print "  launched; the three logs are subset.log, tests.log, corpus.log in $GATE_DIR"
-  (( do_subset )) && spawn subset run_subset
-  (( do_tests ))  && spawn tests  run_tests
-  (( do_corpus )) && spawn corpus run_corpus
+  step "heavy steps (concurrent): slick_subset + cats_run + gitbucket_run + workspace tests + corpus"
+  print "  launched; the logs are subset.log, cats_run.log, gb_run.log, tests.log, corpus.log in $GATE_DIR"
+  (( do_subset ))   && spawn subset   run_subset
+  (( do_cats_run )) && spawn cats_run run_cats_run
+  (( do_gb_run ))   && spawn gb_run   run_gb_run
+  (( do_tests ))    && spawn tests    run_tests
+  (( do_corpus ))   && spawn corpus   run_corpus
   wait
 fi
 
@@ -303,6 +331,32 @@ if (( do_subset )); then
   [[ $SUB == *"verified=1504 failed=0"* && $SUB == *"lint_problems=0"* ]] || FAIL+=("slick_subset: $SUB")
   harness_ok subset $NF
 fi
+
+# --- cats / gitbucket execution --------------------------------------------
+# `new=0` is the check, not `fail=0`: each harness keeps a ledger of the programs
+# that do not pass yet with the root that stops each one, prints every entry, and
+# counts a failure that is *not* on the ledger -- or a ledger entry that now
+# passes -- as `new`. So a fix that lands elsewhere and unblocks one of them
+# fails this step until the ledger is pruned, and a new break fails it at once.
+for h in cats_run gb_run; do
+  (( ${(P)${:-do_$h}} )) || continue
+  case $h in
+    cats_run) what="cats execution (tests/cats_run.sh)"; log=$GATE_DIR/cats_run.log;;
+    gb_run)   what="gitbucket execution (tests/gitbucket_run.sh)"; log=$GATE_DIR/gb_run.log;;
+  esac
+  step "$what"
+  NF=${#FAIL[@]}
+  grep '^   known-fail ' "$log" | sed 's/^ */  /'
+  H=$(grep -m1 '^progs=' "$log")
+  print "  ${H:-(no summary line)}"
+  if [[ -z $H ]]; then
+    FAIL+=("$h printed no summary line; see $log")
+  else
+    [[ $H == *" new=0 "* ]] || FAIL+=("$h: $H")
+    [[ $H == *"lint_problems=0"* ]] || FAIL+=("$h classfile lint: $H")
+  fi
+  harness_ok $h $NF
+done
 
 # --- workspace suite --------------------------------------------------------
 if (( do_tests )); then

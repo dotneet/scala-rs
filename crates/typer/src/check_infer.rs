@@ -4103,7 +4103,18 @@ impl Typer {
         if overridden.is_empty() {
             return None;
         }
-        self.st.sam_sig_over(pt, &overridden)
+        let sam = self.st.sam_sig_over(pt, &overridden)?;
+        // Remember the proof. Erasure and the backend ask `sam_sig` again with
+        // no pickle in reach, and a `None` there would emit a plain
+        // `scala.FunctionN` for a tree this call just adapted to the SAM type.
+        // See `SymbolTable::sam_known_overrides`.
+        let known = self.st.sam_known_overrides.entry(cls.0).or_default();
+        for n in overridden {
+            if !known.contains(&n) {
+                known.push(n);
+            }
+        }
+        Some(sam)
     }
 
     fn adapt_to_sam(&mut self, tree: &mut Tree, pt: &Type) -> bool {

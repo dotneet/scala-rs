@@ -1,0 +1,7 @@
+List(2, 4)
+List(a, b)
+List(3, 1)
+(TreeSet(1, 2),None)
+(TreeSet(1, 2, 3),Some(3))
+true
+false

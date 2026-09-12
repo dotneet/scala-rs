@@ -299,6 +299,9 @@ struct Pickler<'a> {
     current_owner: u32,
     exist_n: u32,
     collection_immutable: Option<u32>,
+    /// Pickled `TypeRef` of each anonymous structural alias (a type lambda),
+    /// keyed by its symbol. See `pickle_structural_alias`.
+    structural_aliases: std::collections::HashMap<u32, u32>,
 }
 
 impl<'a> Pickler<'a> {
@@ -319,6 +322,7 @@ impl<'a> Pickler<'a> {
             this_tpes: std::collections::HashMap::new(),
             class_tparams: std::collections::HashMap::new(),
             class_pkg: std::collections::HashMap::new(),
+            structural_aliases: std::collections::HashMap::new(),
             current_owner: 0,
             exist_n: 0,
             collection_immutable: None,
@@ -946,6 +950,19 @@ impl<'a> Pickler<'a> {
                     .collect();
                 let sc = self.scala_module();
                 self.type_ref_in_refs(sc, &format!("Tuple{}", ts.len()), &arg_refs)
+            }
+            // `scala.FunctionN[…]`, the same shape as `TupleN` above. It has to
+            // be here and not fall through to `pickle_type`: that arm sends a
+            // function type *containing* a wildcard back here, so the fallback
+            // would not terminate.
+            Type::Function { params, ret } => {
+                let mut arg_refs: Vec<u32> = params
+                    .iter()
+                    .map(|a| self.pickle_type_pack(a, quantified))
+                    .collect();
+                arg_refs.push(self.pickle_type_pack(ret, quantified));
+                let sc = self.scala_module();
+                self.type_ref_in_refs(sc, &format!("Function{}", params.len()), &arg_refs)
             }
             Type::Annotated { tpe, annot } => {
                 let inner = self.pickle_type_pack(tpe, quantified);
@@ -1824,6 +1841,22 @@ impl<'a> Pickler<'a> {
                             args: all,
                         })
                     }
+                    // A *partially applied* type lambda. `Either[String, *]`
+                    // is stored as `Applied(TypeMember(Λ$), [String])` with
+                    // `Λ$[String-slot, β$0$]` -- the typer adds the captured
+                    // parameters as leading ones so a later substitution can
+                    // reach them (`check_types::refinement_type_member`).
+                    // Falling through to `pickle_type(ctor)` dropped the
+                    // arguments, and the lambda scalac read had one parameter
+                    // too many: "Λ$134$5 has 2 type parameters, but type F has
+                    // 1" on every cats instance for a partially applied type.
+                    Type::TypeMember(id)
+                        if self.st.get(*id).owner.is_none()
+                            && self.st.get(*id).is_type_alias
+                            && !args.is_empty() =>
+                    {
+                        self.pickle_structural_alias_at(*id, args)
+                    }
                     _ => self.pickle_type(ctor),
                 }
             }
@@ -1838,6 +1871,12 @@ impl<'a> Pickler<'a> {
                 // other by both dropping it.
                 if let Some(d) = self.st.projected_decl(*id) {
                     return self.pickle_projected_member(*id, d);
+                }
+                // An *anonymous* alias is a type lambda, and a parentless
+                // `ALIASsym` is not a type any reader can use. nsc writes the
+                // refinement it projects from. See `pickle_structural_alias`.
+                if self.st.get(*id).owner.is_none() && self.st.get(*id).is_type_alias {
+                    return self.pickle_structural_alias(*id);
                 }
                 let owner = self.st.get(*id).owner.0;
                 let pref = self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix);
@@ -1888,11 +1927,21 @@ impl<'a> Pickler<'a> {
                 let mut all: Vec<Type> = params.clone();
                 all.push((**ret).clone());
                 if all.iter().any(type_has_wildcard) {
-                    // A wildcard here would need an `EXISTENTIALtpe` wrapped
-                    // around the function type, which this writer does not put
-                    // there yet. The bare constructor is the honest fallback:
-                    // a reader takes no arguments rather than wrong ones.
-                    return self.type_ref_named(&name);
+                    // An `EXISTENTIALtpe` around the function type, exactly as
+                    // `Type::Tuple` below already writes one. The bare
+                    // constructor used to be written instead, and a reader then
+                    // saw a *raw* `Function1`: cats'
+                    // `FunctionK.lift[F[_], G[_]](f: (F[α] => G[α]) forSome {
+                    // type α })` came back as `(f: Function1)`, so scalac could
+                    // not eta-expand a polymorphic method into it --
+                    // "polymorphic expression cannot be instantiated to
+                    // expected type; found: [A](l: List[A]): Option[A];
+                    // required: Function1" -- and `FunctionK.lift`, the one
+                    // macro cats has, was unusable from any compilation that
+                    // read our classfiles.
+                    let mut quantified = Vec::new();
+                    let inner = self.pickle_type_pack(ty, &mut quantified);
+                    return self.pickle_existential_tpe(inner, &quantified);
                 }
                 let sc = self.scala_module();
                 self.type_ref_in_args(sc, &name, &all)
@@ -2566,11 +2615,22 @@ impl<'a> Pickler<'a> {
                 .enumerate()
                 .map(|(i, p)| {
                     let ps = self.st.get(*p);
-                    // A repeated parameter is a `Seq` on its symbol (that is
-                    // its type in the body) but pickles as `<repeated>`.
+                    // The method *type* is the signature; the parameter symbol
+                    // is only where the name comes from. They differ for a
+                    // repeated parameter (a `Seq` on the symbol, because that
+                    // is its type in the body, `<repeated>` in the signature),
+                    // and they differ for a case class's synthetic `apply`:
+                    // `finish_case_apply` gives the method fresh type
+                    // parameters and substitutes them into its `Type::Method`,
+                    // but reuses the *constructor's* parameter symbols, whose
+                    // types still name the class's parameters. Pickling those
+                    // wrote `apply[A](a: A): Good[A]` with the `A` of `class
+                    // Good[A]`, so real scalac could not instantiate it:
+                    // `Good(2)` was `type mismatch; found: Int(2), required:
+                    // A`, for every case class we emit.
                     let ty = match sig.get(i) {
-                        Some(t @ Type::Repeated(_)) => t.clone(),
-                        _ => ps.ty.clone(),
+                        Some(t) => t.clone(),
+                        None => ps.ty.clone(),
                     };
                     let name = if meth_name == "<init>" {
                         self.st
@@ -2832,7 +2892,119 @@ impl<'a> Pickler<'a> {
         (self.st.get(owner).self_alias == Some(head)).then_some(owner)
     }
 
+    /// A type lambda, written the way nsc writes one.
+    ///
+    /// `Either[String, *]` (kind-projector) and `[a] =>> Either[String, a]` are
+    /// parsed into `{ type Λ$[β$0$] = Either[String, β$0$] }#Λ$` and kept in the
+    /// symbol table as an *anonymous* alias -- a `TypeMember` whose owner is
+    /// `NONE` (`SymbolTable::is_structural_alias`). Pickled through the ordinary
+    /// path that came out as `TypeRef(NoPrefix, ALIASsym Λ$)` with no owner at
+    /// all, and real scalac reading it saw an opaque type constructor `in
+    /// <none>`: `type mismatch; found: Fun[Λ$0$0] (in <none>), required:
+    /// Fun[[β$0$]Val2[String,β$0$]]`. Every implicit instance in cats whose
+    /// subject is a partially applied type was therefore invisible to scalac --
+    /// `Functor[Either[String, *]]`, `Applicative[Validated[E, *]]`,
+    /// `Monad[OptionT[F, *]]`, `Functor[Nested[F, G, *]]` -- even though the
+    /// classfiles run perfectly. Six of this harness's eight clients failed to
+    /// compile against our cats for this one reason.
+    ///
+    /// What nsc writes instead (`scalac -Xplugin:kind-projector`, pickle read
+    /// back) is the projection itself: a `<refinement>` class whose scope holds
+    /// the `ALIASsym`, and a `TypeRef` whose prefix is the `RefinedType`. The
+    /// refinement is owned by whatever is being pickled around it -- usually the
+    /// method whose result type this is -- so the lambda's body can still name
+    /// that method's type parameters.
+    fn pickle_structural_alias(&mut self, id: SymbolId) -> u32 {
+        self.pickle_structural_alias_at(id, &[])
+    }
+
+    /// [`Self::pickle_structural_alias`] with the leading captured parameters
+    /// already supplied -- the `Applied(TypeMember(Λ$), args)` shape the typer
+    /// uses for a partially applied lambda.
+    fn pickle_structural_alias_at(&mut self, id: SymbolId, applied: &[Type]) -> u32 {
+        if applied.is_empty() {
+            if let Some(&r) = self.structural_aliases.get(&id.0) {
+                return r;
+            }
+        }
+        let name_ref = self.type_name("<refinement>");
+        let cls = self.add(CLASSSYM, vec![]);
+        let owner = self.current_owner;
+        let alias = self.pickle_lambda_alias(id, cls, applied);
+        let parent = self.type_ref_named("AnyRef");
+        let mut info_body = Vec::new();
+        write_nat_to(&mut info_body, cls);
+        write_nat_to(&mut info_body, parent);
+        let info = self.add(CLASSINFOTPE, info_body);
+        // SYNTHETIC (not remapped), as `pickle_refined` writes it.
+        let flags = 1u64 << 21;
+        let body = self.symbol_info(name_ref, owner, flags, info);
+        self.entries[cls as usize] = (CLASSSYM, body);
+        let mut rb = Vec::new();
+        write_nat_to(&mut rb, cls);
+        write_nat_to(&mut rb, parent);
+        let refined = self.add(REFINEDTPE, rb);
+        let mut tb = Vec::new();
+        write_nat_to(&mut tb, refined);
+        write_nat_to(&mut tb, alias);
+        let r = self.add(TYPEREFTPE, tb);
+        if applied.is_empty() {
+            self.structural_aliases.insert(id.0, r);
+        }
+        r
+    }
+
+    /// The `ALIASsym` of a type lambda, owned by the `<refinement>` that
+    /// projects it, with `applied` substituted for its leading captured
+    /// parameters so what is written is a *closed* lambda of the arity the
+    /// reader expects.
+    ///
+    /// Written out here rather than delegated to [`Self::pickle_type_member`],
+    /// which reads the parameters and the body straight off the symbol: the
+    /// symbol is the partial application's, the same symbol is shared by every
+    /// use of that written type, and the pickler has no mutable symbol table to
+    /// specialise it in.
+    fn pickle_lambda_alias(&mut self, id: SymbolId, owner_ref: u32, applied: &[Type]) -> u32 {
+        let s = self.st.get(id);
+        let name = s.name.clone();
+        let all: Vec<SymbolId> = s.tparams.clone();
+        let raw_body = s.ty.clone();
+        let flags_our = s.flags;
+        let n = applied.len().min(all.len());
+        let body = self.st.subst_type_params(&all[..n], applied, &raw_body);
+        let own: Vec<SymbolId> = all[n..].to_vec();
+        let name_ref = self.symbol_type_name(&name);
+        let idx = self.add(ALIASSYM, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = idx;
+        let tparam_refs: Vec<u32> = own.iter().map(|&t| self.pickle_typesym(t)).collect();
+        let info = self.pickle_type(&body);
+        let info = if tparam_refs.is_empty() {
+            info
+        } else {
+            let mut b = Vec::new();
+            write_nat_to(&mut b, info);
+            for r in &tparam_refs {
+                write_nat_to(&mut b, *r);
+            }
+            self.add(POLYTPE, b)
+        };
+        self.current_owner = saved;
+        let flags = pickled_from_our(flags_our, SymKind::TypeMember, 0);
+        let body_e = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[idx as usize] = (ALIASSYM, body_e);
+        idx
+    }
+
     fn pickle_type_member(&mut self, id: SymbolId) -> u32 {
+        self.pickle_type_member_owned(id, None)
+    }
+
+    /// `owner_ref` overrides the owner the symbol table records, for the one
+    /// case where the pickle owns the symbol differently: a type lambda's alias
+    /// is anonymous here and a member of a `<refinement>` class there
+    /// (`pickle_structural_alias`).
+    fn pickle_type_member_owned(&mut self, id: SymbolId, owner_ref: Option<u32>) -> u32 {
         if let Some(i) = self.sym_index.get(&id.0) {
             return *i;
         }
@@ -2850,7 +3022,8 @@ impl<'a> Pickler<'a> {
         let name_ref = self.symbol_type_name(&name);
         let idx = self.add(tag, vec![]);
         self.sym_index.insert(id.0, idx);
-        let owner_ref = self.sym_index.get(&owner_id).copied().unwrap_or(self.none);
+        let owner_ref = owner_ref
+            .unwrap_or_else(|| self.sym_index.get(&owner_id).copied().unwrap_or(self.none));
         // `type Rep[T] = lifted.Rep[T]` is a *polymorphic* alias: nsc's info
         // for it is `PolyType(List(T), lifted.Rep[T])`. Writing only the
         // right-hand side dropped the parameters, and every reader (scalac

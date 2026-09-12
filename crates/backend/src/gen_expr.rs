@@ -830,6 +830,12 @@ pub(crate) fn gen_expr(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
         return;
     }
     gen_expr_inner(asm, frame, ctx, tree);
+    // A call whose declared result is weaker than the expression's own type
+    // (`buf += a` is a `ListBuffer`, `Growable.addOne`'s descriptor says
+    // `Growable`) owes the cast nsc's erasure emits. See `adapt_call_result`.
+    if matches!(tree.kind, TreeKind::Apply { .. }) {
+        crate::gen_call::adapt_call_result(asm, ctx.st, &tree.ty);
+    }
     // Null$ is an ABI marker, not a JVM subtype of every reference class.
     // Preserve evaluation and checked casts, then expose the JVM's null
     // verification type so a Scala Null can flow to String, arrays or any
@@ -1360,6 +1366,13 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
                     } else {
                         desc
                     };
+                    // `this` is not always the owner's class on the stack: in a
+                    // *lifted lambda body* the captured receiver arrives as an
+                    // `Object` parameter, and the `getfield` on it was rejected
+                    // ("Type 'java/lang/Object' is not assignable to
+                    // 'cats/arrow/FunctionKMacros$Lifter'" -- which made real
+                    // scalac crash while *running* our `FunctionK.lift` macro).
+                    crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
                     emit_getfield(asm, &owner, &sym.name, &desc);
                 } else {
                     let acc = sym.jvm_name.clone();
@@ -1728,6 +1741,7 @@ pub(crate) fn gen_select(
                         } else {
                             desc
                         };
+                        crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
                         emit_getfield(asm, &owner, &s.name, &desc);
                     } else {
                         let acc = s.jvm_name.clone();
@@ -1927,6 +1941,7 @@ pub(crate) fn gen_select(
         gen_expr(asm, frame, ctx, qual);
         let owner = class_internal(ctx.st, cid);
         let desc = jvm_desc_val(ctx.st, &tree.ty);
+        crate::gen_desc::checkcast_field_receiver(asm, ctx, &owner);
         emit_getfield(asm, &owner, name, &desc);
         return;
     }

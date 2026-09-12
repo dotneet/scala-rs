@@ -992,6 +992,25 @@ pub struct SymbolTable {
     /// is not static (`prefix.rs`, `is_binary_nested_class`). A stub knows
     /// nothing yet.
     pub binary_read: rustc_hash::FxHashSet<u32>,
+    /// Deferred names a library class was *proven* to override, keyed by the
+    /// class symbol.
+    ///
+    /// `PickleSupply` installs members on demand, so a library trait's symbol
+    /// carries only what something asked for, and an override nobody asked for
+    /// reads as absent. `check_infer::sam_sig_here` repairs that for the one
+    /// question it matters to -- how many abstract methods a SAM candidate has
+    /// -- by reading the pickle (`PickleSupply::concrete_method_names`) rather
+    /// than installing the members, because completion is additive global
+    /// state. But the *answer* has to outlive that one call: erasure
+    /// (`erasure.rs`) and the backend (`gen_lambda.rs`) ask
+    /// [`Self::sam_sig`] again, with no pickle to reach for, and a `None`
+    /// there emits a plain `scala.Function2` for a tree the typer had already
+    /// adapted to the SAM type -- `cats.kernel.Order.toOrdering` returned a
+    /// `Function2` from a method typed `Ordering[A]`, and its unboxed `Int`
+    /// result made the whole class fail to verify. So the proof is recorded
+    /// here, where every later `sam_sig` sees it. Only SAM counting reads it;
+    /// nothing installs a member on the strength of it.
+    pub sam_known_overrides: rustc_hash::FxHashMap<u32, Vec<String>>,
     pub symbols: Vec<Symbol>,
     pub scopes: Vec<Scope>,
     pub root: SymbolId,
@@ -1388,6 +1407,7 @@ impl SymbolTable {
             parent_outer_modules: HashMap::default(),
             binary_alias_prefixes: HashMap::default(),
             binary_read: rustc_hash::FxHashSet::default(),
+            sam_known_overrides: rustc_hash::FxHashMap::default(),
             mutation_gen: std::cell::Cell::new(0),
             lin_cache: std::cell::RefCell::new(LinCache::default()),
             bta_cache: std::cell::RefCell::new(BtaCache::default()),
@@ -2773,6 +2793,17 @@ impl SymbolTable {
             Type::Method { paramss, .. } => paramss.iter().any(|c| !c.is_empty()),
             _ => false,
         }
+    }
+
+    /// Substitute `args` for the type parameters `tps`, and nothing else: no
+    /// projection reduction, no beta-reduction of the result. The backend's
+    /// pickler needs exactly this when it closes a type lambda over the
+    /// parameters the typer left partially applied (`pickle::pickle_lambda_alias`).
+    pub fn subst_type_params(&self, tps: &[SymbolId], args: &[Type], ty: &Type) -> Type {
+        if tps.is_empty() || args.is_empty() {
+            return ty.clone();
+        }
+        subst_map(ty, tps, args)
     }
 
     /// Substitute class type arguments into a member type (`List[Int].head` → `Int`).
@@ -7066,10 +7097,13 @@ impl SymbolTable {
             }
         }
         let mut abstracts = self.abstract_sam_methods(cls);
-        if !overridden.is_empty() {
+        let known = self.sam_known_overrides.get(&cls.0);
+        if !overridden.is_empty() || known.is_some() {
             abstracts.retain(|m| {
                 let s = self.get(*m);
-                s.owner == cls || !overridden.iter().any(|n| *n == s.name)
+                s.owner == cls
+                    || !(overridden.contains(&s.name)
+                        || known.is_some_and(|ns| ns.contains(&s.name)))
             });
         }
         if abstracts.len() != 1 {
