@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `f16daac1` |
+| commit | `b6e4c00f` |
 |---|---|
 | updated | 2026-09-13 |
 
@@ -88,6 +88,7 @@ coordinator measured the merged tree each time, not the branches.
 | `8ece0269` | twenty slices: element types, JDK 17 data, this.type/override, application/argument conformance, declarations, runtime crashes, gitbucket non-macro roots, output mismatches, hard inference, parser gaps, runtime probes, Slick `mapTo`, prefix-carrying types, `@compileTimeOnly`, wrong acceptances, erasure/ABI, warnings, reify/TypeTag, mixin/outer codegen, extractors and library surface, kind/variance | 92 -> **4** | 31 -> **2** |
 | `631b238d` | cats and gitbucket to **zero errors**: quasiquote patterns (so `FunctionKMacros.scala` compiles and there is no holdout), `immutable.Iterable` parents, macro tags of applied constructors, alias rebinding through an enclosing `this`, concrete trait members a class file calls abstract, views in a conversion's own implicit clause, a companion's statics are not inherited, super accessors for default getters, varargs anonymous classes, signature-path parent arguments | 4 -> **0** | 2 -> **0** |
 | `f16daac1` | library clusters (views, compound bounds, `private[this]` variance, array wrappers, `Function1[_, _]`, `= macro ???`, `AnyRef.clone`), a 9x faster typer (linearization and base-type caches), and a parallel gate | 0 | 0 |
+| `b6e4c00f` | whitebox macros, the nested-companion implicit scope, the library's last inference roots (66 -> 41), and the cats/gitbucket **run** harnesses with the eleven miscompilations they found | 0 | 0 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4261,6 +4262,78 @@ Exact summary block:
 ```text
 === summary
   HEAD=f16daac1  logs=/private/tmp/scala-rs-gate-f16daac1  wall=14:38
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-seven: running what we compile (`b6e4c00f`)
+
+Two runs on identical compiler code: the full gate at `0451e990`
+(`/private/tmp/scala-rs-gate-0451e990`, wall 15:17) covered every step and was
+green except a defect in the gate's own loss-retry, which passed
+`CORPUS_FILTER="^name$"` — a filter that matches nothing, so the retry reported
+`no-row` and could never clear a loss. With that fixed (`b6e4c00f`) the corpus
+path was re-run (`/private/tmp/scala-rs-gate-b6e4c00f-corpus`, wall 4:21) and is
+`losses=0`, `run/t5857` included.
+
+| measure | `f16daac1` | `b6e4c00f` |
+|---|---:|---:|
+| scala library | 66 / 30 | **41 / 20** |
+| cats | 0 errors, 2976 classes | 0 errors, **2977** classes |
+| gitbucket | 0 errors, 1317 classes | 0 errors, 1317 classes |
+| slick | 0 errors / 1504 classes | unchanged, 12/12, 1504 verified |
+| corpus pos / neg / run | 1239 / 815 / 1002 | **1245** / 815 / **1010** |
+| workspace suite | 3145 | **3168** |
+| `tests/cats_run.sh` | — | `progs=8 ok=4 diff=0 fail=4 classes=2977 known_fail=4 new=0` |
+| `tests/gitbucket_run.sh` | — | `progs=6 ok=5 diff=0 fail=1 classes=1317 known_fail=1 new=0` |
+
+Saved ledger: [`baselines/corpus-b6e4c00f.tsv`](baselines/corpus-b6e4c00f.tsv),
+SHA-256 `b039d72b00e69ffaf2481476cfc3aaf0b0d6d349f63526ec31e9a91c4d6ca6ed`.
+
+**We now run what we compile.** `tests/cats_run.sh` and
+`tests/gitbucket_run.sh` follow `tests/slick_run.sh`: compile the target with
+scala-rs and with scalac, compile each client program **both ways** (against our
+class files and against scalac's), run both under `java -Xverify:all` and
+compare stdout byte for byte — which separates a codegen defect from a pickle
+defect. gitbucket's clients drive its own compiled code against an in-memory H2
+database: five tables' DDL, rows round-tripped through `mapTo` / `.shaped.<>`,
+a join, `sortBy`, `groupBy`, the Date/Timestamp `MappedColumnType`, and a
+self-typed `import profile.api._` component. Both harnesses are in the gate's
+concurrent block and judge on `new=0` against a ledger of known failures, so a
+listed failure that starts passing is also a gate failure.
+
+The eleven miscompilations they found, none of which any compile measure could
+see: a context bound not merged into an explicit implicit clause (cats'
+`ParallelInstances` died with `Operand stack underflow`); an `if`/`match` whose
+arms are different primitives not boxed when there is no expected type (every
+gitbucket client died in `ConfigUtil.convertType`); `SetOps.apply` resolved to
+`Function1.apply`; a SAM judgement lost when it comes from a pickle; missing
+casts on a call whose declared JVM return type is weaker than the expression's,
+and on a `getfield` receiver; `private[p]` emitted as `ACC_PRIVATE`
+(`IllegalAccessError`); tuple bindings read from an erased field always cast to
+`Tuple2`; type lambdas pickled as a parentless `ALIASsym` with partially applied
+arguments dropped (all of `Functor[Either[E, *]]`-shaped instances invisible);
+a case class's synthetic `apply` pickled from the constructor's parameter
+symbols; and a value class's extension method pickled with its type parameters
+in the wrong order, which **crashed scalac** when it read our class files.
+
+Also in this gate: whitebox macros (the expansion's type replaces the declared
+one) with nsc's bundle-ambiguity rule, the nested library companion's implicit
+scope and its receiver (`showRaw(t, printIds = true)` and eleven more corpus
+tests), and ten inference/resolution roots in the library.
+
+Exact summary blocks:
+
+```text
+=== summary
+  HEAD=0451e990  logs=/private/tmp/scala-rs-gate-0451e990  wall=15:17
+  fail: corpus losses=1 vs tests/baselines/corpus-f16daac1.tsv: run/t5857(no-row)
+VERDICT=FAIL
+DONE
+
+=== summary
+  HEAD=b6e4c00f  logs=/private/tmp/scala-rs-gate-b6e4c00f-corpus  wall=4:21
+  note: slick_subset SKIPPED / workspace tests SKIPPED / cats_run SKIPPED / gitbucket_run SKIPPED
 VERDICT=PASS
 DONE
 ```
