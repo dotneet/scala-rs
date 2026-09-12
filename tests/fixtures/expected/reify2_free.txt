@@ -1,0 +1,17 @@
+31
+10
+42
+12
+3
+4
+<ab:ab!>sym1
+2
+40
+4
+1
+3
+Function(List(ValDef(Modifiers(PARAM), TermName("i"), Ident(scala.Int), EmptyTree)), Apply(Select(Ident(TermName("i")), TermName("$plus")), List(Apply(Select(Ident(Reify2Helper), TermName("twice")), List(Select(Ident(Reify2Helper), TermName("four")))))))
+Apply(Select(Apply(Select(Apply(Select(Apply(Select(Apply(Select(Apply(Select(Ident(TermName("x")), TermName("$plus")), List(Ident(TermName("y")))), TermName("$plus")), List(Ident(TermName("g")))), TermName("$plus")), List(Ident(TermName("lz")))), TermName("$plus")), List(Select(This(TypeName("Main")), TermName("member")))), TermName("$plus")), List(Select(Select(This(TypeName("Main")), TermName("Inner")), TermName("q")))), TermName("$plus")), List(Select(Apply(Select(New(Select(This(TypeName("Main")), TypeName("Box"))), termNames.CONSTRUCTOR), List(Literal(Constant(1)))), TermName("n"))))
+Match(Typed(Apply(Select(Ident(scala.Some), TermName("apply")), List(Literal(Constant(1)))), AppliedTypeTree(Ident(scala.Option), List(Ident(scala.Int)))), List(CaseDef(Apply(Ident(scala.Some), List(Bind(TermName("n"), Typed(Ident(termNames.WILDCARD), Ident(scala.Int))))), Apply(Select(Ident(TermName("n")), TermName("$greater")), List(Literal(Constant(0)))), Ident(TermName("n"))), CaseDef(Ident(termNames.WILDCARD), EmptyTree, Literal(Constant(0)))))
+Block(List(ValDef(Modifiers(), TermName("s"), TypeTree(), Literal(Constant("ab")))), Apply(Select(Apply(Select(Apply(Select(Apply(Select(Ident(scala.StringContext), TermName("apply")), List(Literal(Constant("<")), Literal(Constant(":")), Literal(Constant(">")))), TermName("s")), List(Ident(TermName("s")), Apply(Select(Ident(TermName("s")), TermName("$plus")), List(Literal(Constant("!")))))), TermName("$plus")), List(Select(Apply(Select(Ident(scala.Symbol), TermName("apply")), List(Literal(Constant("sym")))), TermName("name")))), TermName("$plus")), List(Select(Block(List(), Apply(Select(Select(Ident(scala.package), TermName("Nil")), TermName("$colon$colon")), List(Literal(Constant(1))))), TermName("head")))))
+Block(List(ValDef(Modifiers(), TermName("xs"), AppliedTypeTree(Select(Ident(scala.package), TypeName("List")), List(Ident(scala.Int))), Apply(Select(Select(Ident(scala.package), TermName("List")), TermName("apply")), List(Literal(Constant(1)), Literal(Constant(2)), Literal(Constant(3))))), DefDef(Modifiers(), TermName("id"), List(TypeDef(Modifiers(PARAM), TypeName("U"), List(), TypeBoundsTree(TypeTree(), TypeTree()))), List(List(ValDef(Modifiers(PARAM), TermName("x"), Ident(TypeName("U")), EmptyTree))), Ident(TypeName("U")), Ident(TermName("x")))), Apply(Ident(TermName("id")), List(Select(Ident(TermName("xs")), TermName("size")))))

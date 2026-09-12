@@ -28,13 +28,5 @@ object Main {
     // `Liftable[Symbol]`, so under `..$` it refuses -- and so do we.
     val syms = List(definitions.ListModule, definitions.ListModule)
     println(showRaw(q"g(..$syms)"))
-    // `reify { … }` is expanded now (`docs/macros.md` §7.14), but only over
-    // static `object` references and `.splice`d expressions: a local is a
-    // *free term* in nsc's reifier and scala-rs does not build those, so it
-    // is named here rather than reified as the bare name it was written with.
-    // Unqualified and qualified, since the two reach the expander by
-    // different doors.
-    println(reify(f).toString)
-    println(scala.reflect.runtime.universe.reify(xs).toString)
   }
 }

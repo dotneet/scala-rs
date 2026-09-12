@@ -1,8 +1,11 @@
-// The forms `reify` refuses, each by name. `docs/macros.md` §7.14.
+// The forms `reify` once refused, reified now (`docs/notes/reify-design.md`):
+// a parameter and a local of the macro implementation as *free terms*, a
+// type ascription by symbol, a pattern `val` in its desugared form, a type
+// argument with no tag in scope as a *free type*.
 //
-// nsc reifies a local or a parameter as a *free term* carried inside the
-// expansion; scala-rs does not build those. Reifying the bare name instead
-// would compile and run, and would mean whatever stood at the call site --
+// nsc reifies a local or a parameter as a free term carried inside the
+// expansion. Reifying the bare name instead would compile and run, and would
+// mean whatever stood at the call site --
 // the precise bug reification exists to prevent -- so every such body is an
 // error here.
 import scala.reflect.macros.blackbox.Context

@@ -672,6 +672,16 @@ pub struct Typer {
     /// the prefix the backend loaded `this`, which is a `ClassCastException`
     /// at run time. This is what `import c.universe._` needs.
     pub(crate) term_import_prefixes: Vec<(SymbolId, Tree)>,
+    /// How many `reify { … }` bodies are being typed on a probe right now.
+    /// Above zero, a `reify` met while typing is nested in another and is
+    /// typed but not expanded (`Check::try_expand_reify`).
+    pub(crate) reify_depth: u32,
+    /// The nested `reify` applications the current probe met, by node, with
+    /// the expression naming their universe. Taken by the outer expansion.
+    pub(crate) nested_reifies: HashMap<NodeId, Tree>,
+    /// Where locals, parameters, type parameters and local classes were
+    /// defined: the origin nsc writes on a free symbol (`crate::reify::tree`).
+    pub(crate) def_spans: HashMap<SymbolId, Span>,
     /// Receiver paths keyed by the written import clause, so an inner
     /// wildcard cannot replace the receiver of an outer binding.
     pub(crate) object_import_prefixes: HashMap<u64, Tree>,
@@ -911,7 +921,10 @@ pub fn typecheck_units_src(
     // `@compileTimeOnly` is checked only when some source can carry it (only
     // source definitions keep annotations). A caller with no source text
     // checks unconditionally.
-    t.any_cto = t.sources.is_empty() || t.sources.iter().any(|s| s.contains("compileTimeOnly"));
+    t.any_cto = t.sources.is_empty()
+        || t.sources
+            .iter()
+            .any(|s| s.contains("compileTimeOnly") || s.contains("splice") || s.contains("reify"));
     {
         // Class headers before member types, across every unit: a class can
         // inherit from one whose own superclass chain is declared in a file
@@ -1158,6 +1171,9 @@ impl Typer {
             parent_ctx: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
+            reify_depth: 0,
+            nested_reifies: HashMap::new(),
+            def_spans: HashMap::new(),
             object_import_prefixes: HashMap::new(),
             parent_import_prefixes: HashMap::new(),
             parent_import_names: HashMap::new(),
@@ -3802,17 +3818,6 @@ pub(crate) fn is_annotated_lambda(tree: &Tree) -> bool {
         }
         _ => false,
     }
-}
-
-/// The written name an application ultimately calls, past any type
-/// application: the node a `reify` body's classification has to be keyed on,
-/// since that is the one `crate::reify` asks about.
-pub(crate) fn reify_callee(fun: &Tree) -> &Tree {
-    let mut head = fun;
-    while let TreeKind::TypeApply { fun, .. } = &head.kind {
-        head = fun;
-    }
-    head
 }
 
 /// Drop diagnostics repeated verbatim at the same position, keeping the first.

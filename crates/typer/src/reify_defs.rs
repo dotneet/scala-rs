@@ -133,21 +133,50 @@ impl Reifier<'_> {
     /// definition built without it does not silently capture whatever
     /// stands at the name from the call site's own scope instead.
     pub(super) fn definition(&self, t: &Tree) -> Result<Tree, String> {
-        if self.in_reify_mode()
-            && matches!(
-                t.kind,
-                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } | TreeKind::TypeDef { .. }
-            )
-        {
-            return Err(format!("{} is not reified yet", super::describe(&t.kind)));
-        }
         match &t.kind {
             TreeKind::ValDef { .. } => self.value_def(t),
             TreeKind::DefDef { .. } => self.method_def(t),
             TreeKind::ClassDef { .. } => self.class_def(t),
             TreeKind::ModuleDef { mods, name, impl_ } => self.object_def(t.span, mods, name, impl_),
+            TreeKind::TypeDef { .. } if self.in_reify_mode() => self.type_alias_def(t),
             _ => self.term(t),
         }
+    }
+
+    /// A local `type T = U` inside a `reify` body:
+    /// `u.TypeDef(mods, u.TypeName("T"), tparams, <U>)`. nsc's typed tree
+    /// keeps the alias as written.
+    fn type_alias_def(&self, t: &Tree) -> Result<Tree, String> {
+        let TreeKind::TypeDef {
+            mods,
+            name,
+            tparams,
+            rhs,
+            lo,
+            hi,
+            ..
+        } = &t.kind
+        else {
+            unreachable!("called for a TypeDef");
+        };
+        let flags = self.def_flags(mods, Flags::EMPTY, "type definition")?;
+        let tps = self.type_params(tparams)?;
+        let rhs = if rhs.is_empty() {
+            let bound = |b: &Option<Box<Tree>>| match b {
+                Some(t) => self.typ(t),
+                None => Ok(self.universe_member("EmptyTree")),
+            };
+            self.call(
+                self.universe_member("TypeBoundsTree"),
+                vec![bound(lo)?, bound(hi)?],
+            )
+        } else {
+            self.typ(rhs)?
+        };
+        Ok(self.call(
+            self.universe_member("TypeDef"),
+            vec![self.mods(flags), self.type_name(name), tps, rhs],
+        ))
     }
 
     /// `new C { ... }` -- the parser turns the anonymous class into a
@@ -193,7 +222,10 @@ impl Reifier<'_> {
         }
         // `val (a, b) = e` is three definitions after parsing, and nsc keeps
         // it as one `SyntacticPatDef`; the trees are not the same.
-        if name.starts_with("x$pat") {
+        // In a `reify` body the desugared form is reified as it is: nsc's
+        // own tree for `val (a, b) = e` is a `match` bound to a synthetic
+        // `val` too, and the toolbox reads both the same way.
+        if name.starts_with("x$pat") && !self.in_reify_mode() {
             return Err("a pattern definition (`val (a, b) = ...`) is not reified yet".to_string());
         }
         let mut flags = self.def_flags(mods, VAL_MODS, "`val` definition")?;
@@ -329,7 +361,9 @@ impl Reifier<'_> {
         else {
             unreachable!("called for a ClassDef");
         };
-        if name == "$anon" {
+        // The parser names an anonymous class `$anon`; the typer, `$anon$1`.
+        let anon = name.starts_with("$anon");
+        if anon && !self.in_reify_mode() {
             return Err("an anonymous class is not reified yet".to_string());
         }
         let is_trait = mods.flags.contains(Flags::TRAIT);
@@ -339,7 +373,13 @@ impl Reifier<'_> {
             "class definition"
         };
         let is_case = mods.flags.contains(Flags::CASE);
-        let flags = self.def_flags(mods, CLASS_MODS, what)?;
+        // nsc's typer gives the class it makes for `new C { ... }` the one
+        // modifier `FINAL`, whatever the parser marked it with.
+        let flags = if anon {
+            nsc::FINAL
+        } else {
+            self.def_flags(mods, CLASS_MODS, what)?
+        };
         let tps = self.type_params(tparams)?;
         let (parents, self_ty, body) = self.template(t.span, impl_, is_case)?;
         if is_trait {
@@ -360,11 +400,16 @@ impl Reifier<'_> {
             ));
         }
         let ctor = self.def_flags(ctor_mods, CTOR_MODS, "constructor")?;
+        let class_name = if anon {
+            self.type_name("$anon")
+        } else {
+            self.type_name_or_hole(name)?
+        };
         Ok(self.call(
             self.support_member("SyntacticClassDef"),
             vec![
                 self.mods(flags),
-                self.type_name_or_hole(name)?,
+                class_name,
                 tps,
                 self.mods(ctor),
                 self.param_clauses(vparamss, Some(is_case))?,
@@ -711,8 +756,15 @@ impl Reifier<'_> {
         if mods.flags.contains(Flags::CONTRAVARIANT) {
             flags |= nsc::CONTRAVARIANT;
         }
+        // A quasiquote leaves an absent bound `EmptyTree`, as nsc's parser
+        // does; in a `reify` body the typer has been over the definition and
+        // its absent bounds are `TypeTree()`s.
         let bound = |b: &Option<Box<Tree>>| match b {
             Some(t) => self.typ(t),
+            None if self.in_reify_mode() => Ok(self.call(
+                self.select(self.support_member("SyntacticEmptyTypeTree"), "apply"),
+                vec![],
+            )),
             None => Ok(self.universe_member("EmptyTree")),
         };
         let bounds = self.call(

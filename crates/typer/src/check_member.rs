@@ -338,6 +338,7 @@ impl Typer {
                 .st
                 .alloc(name.clone(), self.st.owner, SymKind::Term, flags, "");
             tree.sym = id;
+            self.def_spans.insert(id, tree.span);
             self.st.enter_in_current(&name, id);
         }
         if local && !tree.sym.is_none() {
