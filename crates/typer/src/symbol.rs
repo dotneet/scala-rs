@@ -1107,6 +1107,11 @@ pub struct SymbolTable {
     /// one) arrives from a classfile instead, where a by-name parameter is
     /// indistinguishable from a `Function0`. This is the line between the two.
     pub prelude_end: u32,
+    /// Symbols allocated before this index came from the prelude or from the
+    /// eager `-cp` classfile scan; from here on they are this run's own
+    /// sources (and the pickle members supplied on demand, which carry a
+    /// `pickled_origin`). `install_classpath` sets it.
+    pub source_start: u32,
     /// Prelude symbols a source definition of the same fully qualified name
     /// has replaced; see [`SymbolTable::shadow_supplied_by_source`].
     ///
@@ -1399,6 +1404,7 @@ impl SymbolTable {
             local_lazy_nlr: rustc_hash::FxHashSet::default(),
             named_arg_order: rustc_hash::FxHashMap::default(),
             prelude_end: 0,
+            source_start: 0,
             prelude_shadowed: rustc_hash::FxHashSet::default(),
             prelude_scope: 0,
             predef_superseded: false,

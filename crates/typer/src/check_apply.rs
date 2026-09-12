@@ -671,7 +671,7 @@ impl Typer {
                         // `new C()` against constructors that all need
                         // arguments: nsc's wording, as for an unapplied `new C`.
                         let no_args = if arg_tys.is_empty() {
-                            self.unapplied_new_error(c)
+                            self.unapplied_new_error(c, &explicit)
                         } else {
                             None
                         };
@@ -2007,9 +2007,42 @@ impl Typer {
                                 if let (Some(proto), TreeKind::Function { body, .. }) =
                                     (flatmap_array_proto.as_ref(), &mut a.kind)
                                 {
-                                    if matches!(body.ty.widen_constant(), Type::Array(_)) {
+                                    let bt = body.ty.widen_constant();
+                                    // A `String` reaches `IterableOnce` the
+                                    // same way an `Array` does, through a view
+                                    // (`augmentString`): `Seq("ab").flatMap(x
+                                    // => x)` compiled and then died with
+                                    // `ClassCastException: String cannot be
+                                    // cast to IterableOnce`, because the body
+                                    // was handed over unconverted.
+                                    if matches!(bt, Type::Array(_) | Type::String) {
                                         self.adapt(body, proto);
                                         array_body_ret = Some(body.ty.clone());
+                                    } else if matches!(
+                                        bt,
+                                        Type::Int
+                                            | Type::Long
+                                            | Type::Short
+                                            | Type::Byte
+                                            | Type::Char
+                                            | Type::Boolean
+                                            | Type::Float
+                                            | Type::Double
+                                            | Type::Unit
+                                    ) {
+                                        // The body was typed against `Wildcard`,
+                                        // so nothing had checked it yet, and
+                                        // `Seq(1).flatMap(x => x)` compiled --
+                                        // scalac says `found: Int  required:
+                                        // scala.collection.IterableOnce[?]`.
+                                        // `adapt` reports it in those words.
+                                        //
+                                        // Only a primitive: it is no
+                                        // `IterableOnce` and no view makes it
+                                        // one, while a `Stream` or `LazyList`
+                                        // body conforms in nsc and not always
+                                        // in this table (see above).
+                                        self.adapt(body, proto);
                                     }
                                 }
                             }
