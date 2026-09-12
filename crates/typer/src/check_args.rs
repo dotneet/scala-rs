@@ -2488,6 +2488,31 @@ impl Typer {
         // types -- and is asked first; the three-shape builder below is the
         // fallback, and the one that names what neither can build.
         let reified = self.reify_type_standalone(&universe, &arg, span, tag);
+        // nsc: a `TypeTag` cannot be built for an abstract type without a
+        // `TypeTag` in scope -- a `WeakTypeTag` will not do -- and the
+        // wording is nsc's.
+        if reified.is_none() && tag == crate::materialize::Tag::Strong {
+            let mut ids = Vec::new();
+            crate::reify::collect_abstract(&arg, &mut ids);
+            if !ids.is_empty() {
+                self.error(
+                    span,
+                    format!("No TypeTag available for {}", self.st.display_type(&arg)),
+                );
+                return Some(Tree {
+                    id: NodeId(0),
+                    span,
+                    kind: TreeKind::Empty,
+                    ty: Type::Error,
+                    sym: SymbolId::NONE,
+                    postfix: false,
+                    scala_ref: false,
+                    stable_pat: false,
+                    byname_thunk: false,
+                    byname_type_marker: false,
+                });
+            }
+        }
         let mut tag_bindings = Vec::new();
         let (body, tag, tag_name) = match reified {
             Some((tree, universe_local, mirror_local, concrete, bindings)) => {

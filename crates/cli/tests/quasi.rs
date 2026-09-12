@@ -1593,7 +1593,7 @@ fn tt_tags_bad_names_every_tag_it_cannot_build() {
         // refuses it ("No TypeTag available"); a `WeakTypeTag` for the same
         // is built with a free type, as are nested classes, aliases and
         // singletons -- `tests/fixtures/reify2_tags.scala` runs those.
-        "cannot build a TypeTag for `T`, an abstract type with no tag in scope",
+        "No TypeTag available for T",
         "a structural type",
         "docs/macros.md",
     ] {

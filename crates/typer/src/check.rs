@@ -906,7 +906,10 @@ pub fn typecheck_units_src(
     // `@compileTimeOnly` is checked only when some source can carry it (only
     // source definitions keep annotations). A caller with no source text
     // checks unconditionally.
-    t.any_cto = t.sources.is_empty() || t.sources.iter().any(|s| s.contains("compileTimeOnly"));
+    t.any_cto = t.sources.is_empty()
+        || t.sources
+            .iter()
+            .any(|s| s.contains("compileTimeOnly") || s.contains("splice") || s.contains("reify"));
     {
         // Class headers before member types, across every unit: a class can
         // inherit from one whose own superclass chain is declared in a file

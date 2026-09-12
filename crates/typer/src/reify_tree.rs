@@ -774,6 +774,20 @@ impl<'a> Reifier<'a> {
                     let is_expr = matches!(&qual.ty, Type::Class { sym, .. }
                         if *sym == self.env().expr_class);
                     if is_expr {
+                        // nsc's `Metalevels`: a splice whose expression is
+                        // itself computed by a splice, or from something the
+                        // body defines, cannot be resolved at reification.
+                        if self.crosses_stages(qual) {
+                            return Err(
+                                "the splice cannot be resolved statically, which means there \
+                                 is a cross-stage evaluation involved.\ncross-stage evaluations \
+                                 need to be invoked explicitly, so we're showing you this \
+                                 error.\nif you're sure this is not an oversight, add \
+                                 scala-compiler.jar to the classpath,\nimport \
+                                 `scala.tools.reflect.Eval` and call `<your expr>.eval` instead"
+                                    .to_string(),
+                            );
+                        }
                         if let Some(written) = self.env().splices.get(&t.id) {
                             let ctx = self.reify.as_ref().expect("reify mode");
                             return Ok(self.splice_tree(ctx, written));
@@ -811,6 +825,34 @@ impl<'a> Reifier<'a> {
                     vec![q, self.term_name(&member)],
                 ))
             }
+        }
+    }
+
+    /// Whether the expression of a splice mentions another splice, or a
+    /// value the body itself binds: either makes its value one that exists
+    /// only when the reified tree runs, not when it is built.
+    fn crosses_stages(&self, t: &Tree) -> bool {
+        match &t.kind {
+            TreeKind::Select { qual, name } => {
+                (name == "splice"
+                    && matches!(&qual.ty, Type::Class { sym, .. } if *sym == self.env().expr_class))
+                    || self.crosses_stages(qual)
+            }
+            TreeKind::Ident { name } => self.is_local(t.sym) || self.local_bound(name),
+            TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+                self.crosses_stages(fun) || args.iter().any(|a| self.crosses_stages(a))
+            }
+            TreeKind::Block { stats, expr } => {
+                stats.iter().any(|s| self.crosses_stages(s)) || self.crosses_stages(expr)
+            }
+            TreeKind::ValDef { rhs, .. } => self.crosses_stages(rhs),
+            TreeKind::Typed { expr, .. } => self.crosses_stages(expr),
+            TreeKind::If { cond, thenp, elsep } => {
+                self.crosses_stages(cond)
+                    || self.crosses_stages(thenp)
+                    || self.crosses_stages(elsep)
+            }
+            _ => false,
         }
     }
 

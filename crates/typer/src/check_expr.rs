@@ -548,7 +548,9 @@ impl Typer {
                 universe_local: universe_local.clone(),
             },
         );
-        if tag == crate::materialize::Tag::Strong && r.needs_free_types(arg) {
+        // A `TypeTag` needs a `TypeTag` for every abstract type it mentions:
+        // a free type or a `WeakTypeTag` in scope is not enough.
+        if tag == crate::materialize::Tag::Strong && !r.is_concrete(arg) {
             return None;
         }
         let concrete = r.is_concrete(arg);
