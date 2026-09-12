@@ -2477,23 +2477,38 @@ impl Typer {
                                     // rejecting every `TypeParam` printed the
                                     // result as `GR[T] required GR[T]`.
                                     //
-                                    // `Nothing` is held back for the expected
-                                    // type to improve on. With no expected
-                                    // type, nsc's `adjustTypeArgs` keeps a
-                                    // `Nothing` solution undetermined only
-                                    // where the variable is not covariant in
-                                    // the result -- `tryBreakable { throw e }`
-                                    // stays a `TryBlock[?T]` for `catchBreak`
-                                    // to decide -- and instantiates it
-                                    // otherwise: `onError { e => throw e }` on
+                                    // nsc's `adjustTypeArgs` keeps a `Nothing`
+                                    // solution undetermined only where the
+                                    // variable is not covariant in the result
+                                    // -- `tryBreakable { throw e }` stays a
+                                    // `TryBlock[?T]` for `catchBreak` to decide
+                                    // -- and instantiates it otherwise:
+                                    // `onError { e => throw e }` on
                                     // `onError[T](h: Throwable => T):
                                     // PartialFunction[Throwable, T]` is a
                                     // `PartialFunction[Throwable, Nothing]`.
                                     // Leaving `T` in that result made the
                                     // enclosing `try p catch onError { … }` an
                                     // `AnyRef` (`sys/process/ProcessImpl.scala`).
-                                    let nothing_ok = pt.is_no_type()
-                                        && self.tparam_variance_in(&ret, *id, 1) == Some(1);
+                                    //
+                                    // The expected type does *not* get to
+                                    // improve on a covariant `Nothing`: that is
+                                    // the same asymmetry `add_expected_constraints`
+                                    // documents (`def cov[T]: List[T]` checked
+                                    // against `List[Any]` is a `List[Nothing]`
+                                    // for nsc, not a `List[Any]`), so it cannot
+                                    // be the reason to hold the solution back
+                                    // either. Holding it back left `T`
+                                    // uninstantiated with nothing able to pin
+                                    // it, and the call was reported against
+                                    // itself: `mkThrowableCatcher(_ => false,
+                                    // throw _)` for a declared
+                                    // `Catcher[Nothing]` was `found:
+                                    // PartialFunction[Throwable, T] required:
+                                    // PartialFunction[Throwable, Nothing]`
+                                    // (`util/control/Exception.scala:274-276`).
+                                    let nothing_ok =
+                                        self.tparam_variance_in(&ret, *id, 1) == Some(1);
                                     !t.is_no_type()
                                         && !t.is_error()
                                         && (!matches!(t, Type::Nothing) || nothing_ok)
