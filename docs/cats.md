@@ -3382,3 +3382,87 @@ class before reading it.
   instances of trait P".
 * Without `-Xsource:3`, `ov(ite)` for an overloaded `ov` taking function
   types is accepted; scalac reports "missing argument list for method ite".
+
+## cats compiles with zero errors (the `agent/catszero` slice)
+
+`CATS_EXCLUDE='' tests/cats_measure.sh` reports
+
+```
+files=340 skipped=0 errors=0 files_with_errors=0 classes=2976 compiler_exit=0
+```
+
+All 340 sources, the macro implementation included, and 2976 class files —
+codegen runs for the first time on cats, because it only runs when nothing is
+in error.
+
+| measure | before this slice | after |
+|---|---|---|
+| cats, 339 files (`FunctionKMacros.scala` held out) | 2 errors / 2 files | — (the holdout is gone) |
+| cats, all 340 files | 8 errors / 2 files | **0 / 0**, 2976 classes |
+| scala library | 126 / 49 | 126 / 49 |
+| gitbucket | 4 / 3 | 4 / 3 |
+| slick | 0 errors, 1504 classes | 0 errors, 1504 classes |
+
+`tests/cats_measure.sh` no longer holds any file out: `CATS_EXCLUDE` now
+defaults to empty. Keeping the old default would *create* an error, since
+`FunctionK.scala` extends the `FunctionKMacroMethods` that the held-out file
+declares.
+
+Three roots, each with a reduced reproduction real scalac 2.13.16 agrees with.
+`crates/cli/tests/czero.rs` pins all three, and `tests/fixtures/czero_fk.scala`
+is cats' macro file itself, self-contained.
+
+### 1. `scala.collection.immutable.Iterable` was a supertype of nothing
+
+```scala
+import scala.collection.immutable._
+object A { def f[A](s: SortedSet[A]): Iterable[A] = s }   // found: SortedSet[A]  required: Iterable[A]
+```
+
+`import scala.collection.immutable._` makes the bare name `Iterable` mean
+`immutable.Iterable`, and in 2.13 each of the three unsorted immutable traits
+names it as its **first** parent (`trait Seq[+A] extends Iterable[A] with
+collection.Seq[A]`, `trait Set[A] extends Iterable[A] with collection.Set[A]`,
+`trait Map[K, +V] extends Iterable[(K, V)] with collection.Map[K, V]`).
+`prelude_hier.rs` wired only the `collection.*` half of each, so *nothing* in
+the immutable library conformed to `immutable.Iterable` — `List`, `Vector`,
+`Set`, `SortedSet`, `TreeSet`, `Map`, `SortedMap`, `Queue`, `LazyList`,
+`Range`, `BitSet`, `HashSet`, `HashMap`, `immutable.Seq` and
+`immutable.IndexedSeq` all failed, sixteen shapes in
+`tests/fixtures/czero_immiter.scala`.
+
+The trait itself was also missing from the prelude: it is resolved from the
+classpath by JVM name when a source first mentions it, so the three edges were
+being dropped as "parent not found" without a word. It is declared in `LINKS`
+now; `find_by_jvm` reuses whatever symbol already carries the name, so there is
+still exactly one of it and its members still come from the pickle on demand.
+
+cats' one occurrence is `NonEmptySet.scala:418`,
+`override def toIterable[A](fa: NonEmptySet[A]): Iterable[A] = fa.toSortedSet`.
+
+### 2. A macro implementation may ask for a tag over an *applied* constructor
+
+```scala
+def liftA[F[_], G[_]](c: blackbox.Context)(f: c.Expr[Int])
+  (implicit evF: c.WeakTypeTag[F[Any]], evG: c.WeakTypeTag[G[Any]]): c.Expr[K[F, G]] = ???
+def a[F[_], G[_]](f: Int): K[F, G] = macro M.liftA[F, G]   // "parameter shape does not match"
+```
+
+nsc reads which type parameter a tag is *for* off `targ.typeSymbol`
+(`Helpers.transformTypeTagEvidenceParams`), which looks through an
+application: `c.WeakTypeTag[F[Any]]` is a tag for `F`, and that is the index
+its fingerprint carries. `crates/typer/src/macros.rs` read only the bare
+`Type::TypeParam` form, so the whole trailing clause looked like ordinary
+implicit values, the value/tag split came out wrong, and the macro
+*definition* was refused. cats' `FunctionKMacroMethods.lift` is written exactly
+that way.
+
+### 3. Quasiquotes in pattern position
+
+```scala
+case q"($param) => $trans[..$typeArgs]($arg)" if param.symbol == arg.symbol => …
+```
+
+is how `FunctionKMacros.scala` recognises the function it lifts to a
+`FunctionK`, and interpolated-string patterns in that position were the reason
+the file was held out of the measurement at all. See `docs/macros.md` §7.27.

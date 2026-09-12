@@ -208,6 +208,19 @@ impl Typer {
     }
 
     fn type_pattern(&mut self, pat: &mut Tree, sel_ty: &Type) {
+        // `case q"..." =>`: a quasiquote in pattern position is taken apart by
+        // `crate::quasi_pattern` before anything looks for an `unapply`. The
+        // `StringContext(parts).q(holes)` the parser built for it has none --
+        // `q` is a member of `Quasiquotes.Quasiquote`, and the interpolator is
+        // a compiler-internal macro, expanded with `nme.unapply` here and
+        // `nme.apply` in an expression. What comes back is an ordinary
+        // pattern, so it falls straight through to the rest of this method.
+        if self.library_abi && crate::quasi_pattern::split(pat).is_some() {
+            self.deconstruct_quasiquote_pattern(pat);
+            if pat.ty.is_error() {
+                return;
+            }
+        }
         // Read before the borrow below: the parser sets it on a backquoted
         // name, which is a stable identifier pattern however it is spelled.
         let stable_hint = pat.stable_pat;

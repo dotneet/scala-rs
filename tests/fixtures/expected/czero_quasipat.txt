@@ -1,0 +1,270 @@
+--- Literal(Constant(0))
+  lit:      zero
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(0) len=1
+  targs:    no targs
+  whole:    whole=0 kids=0
+  fixedArg: no fixedArg
+--- Literal(Constant(1))
+  lit:      one
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(1) len=1
+  targs:    no targs
+  whole:    whole=1 kids=0
+  fixedArg: no fixedArg
+--- Literal(Constant(2))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(2) len=1
+  targs:    no targs
+  whole:    whole=2 kids=0
+  fixedArg: no fixedArg
+--- Function(List(ValDef(Modifiers(PARAM), TermName("x"), Ident(TypeName("Int")), EmptyTree)), Apply(Ident(TermName("g")), List(Ident(TermName("x")))))
+  lit:      other
+  fn:       fn param=val x: Int = _ trans=g typeArgs=List() arg=x
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(((x: Int) => g(x))) len=1
+  targs:    no targs
+  whole:    whole=((x: Int) => g(x)) kids=2
+  fixedArg: no fixedArg
+--- Function(List(ValDef(Modifiers(PARAM), TermName("x"), Ident(TypeName("Int")), EmptyTree)), Apply(TypeApply(Ident(TermName("g")), List(Ident(TypeName("Int")))), List(Ident(TermName("x")))))
+  lit:      other
+  fn:       fn param=val x: Int = _ trans=g typeArgs=List(Int) arg=x
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(((x: Int) => g[Int](x))) len=1
+  targs:    no targs
+  whole:    whole=((x: Int) => g[Int](x)) kids=2
+  fixedArg: no fixedArg
+--- Apply(Ident(TermName("foo")), List(Literal(Constant(3))))
+  lit:      other
+  fn:       no fn
+  app:      app f=foo a=3
+  named:    foo(3)
+  spread:   spread f=foo as=List(3) len=1
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(foo(3)) len=1
+  targs:    no targs
+  whole:    whole=foo(3) kids=2
+  fixedArg: no fixedArg
+--- Apply(Select(Ident(TermName("a")), TermName("b")), List(Literal(Constant(4))))
+  lit:      other
+  fn:       no fn
+  app:      app f=a.b a=4
+  named:    a.b(4)
+  spread:   spread f=a.b as=List(4) len=1
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(a.b(4)) len=1
+  targs:    no targs
+  whole:    whole=a.b(4) kids=2
+  fixedArg: no fixedArg
+--- Apply(Ident(TermName("h")), List(Literal(Constant(1)), Literal(Constant(2)), Literal(Constant(3))))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   spread f=h as=List(1, 2, 3) len=3
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(h(1, 2, 3)) len=1
+  targs:    no targs
+  whole:    whole=h(1, 2, 3) kids=4
+  fixedArg: no fixedArg
+--- Apply(Ident(TermName("h")), List())
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   spread f=h as=List() len=0
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(h()) len=1
+  targs:    no targs
+  whole:    whole=h() kids=1
+  fixedArg: no fixedArg
+--- Ident(TermName("k"))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(k) len=1
+  targs:    no targs
+  whole:    whole=k kids=0
+  fixedArg: no fixedArg
+--- Apply(Select(Ident(TermName("x")), TermName("$plus")), List(Ident(TermName("y"))))
+  lit:      other
+  fn:       no fn
+  app:      app f=x.$plus a=y
+  named:    no named
+  spread:   spread f=x.$plus as=List(y) len=1
+  ops:      plus(x,y)
+  block:    no block
+  stats:    stats=List(x.$plus(y)) len=1
+  targs:    no targs
+  whole:    whole=x.$plus(y) kids=2
+  fixedArg: no fixedArg
+--- Apply(Select(Ident(TermName("x")), TermName("$plus")), List(Ident(TermName("y"))))
+  lit:      other
+  fn:       no fn
+  app:      app f=x.$plus a=y
+  named:    no named
+  spread:   spread f=x.$plus as=List(y) len=1
+  ops:      plus(x,y)
+  block:    no block
+  stats:    stats=List(x.$plus(y)) len=1
+  targs:    no targs
+  whole:    whole=x.$plus(y) kids=2
+  fixedArg: no fixedArg
+--- Apply(Select(Ident(TermName("x")), TermName("foo")), List(Ident(TermName("y"))))
+  lit:      other
+  fn:       no fn
+  app:      app f=x.foo a=y
+  named:    no named
+  spread:   spread f=x.foo as=List(y) len=1
+  ops:      foo(x,y)
+  block:    no block
+  stats:    stats=List(x.foo(y)) len=1
+  targs:    no targs
+  whole:    whole=x.foo(y) kids=2
+  fixedArg: no fixedArg
+--- Select(Ident(TermName("x")), TermName("foo"))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      sel(x)
+  block:    no block
+  stats:    stats=List(x.foo) len=1
+  targs:    no targs
+  whole:    whole=x.foo kids=1
+  fixedArg: no fixedArg
+--- Block(List(ValDef(Modifiers(), TermName("a"), TypeTree(), Literal(Constant(1)))), Ident(TermName("a")))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    block2(val a = 1,a)
+  stats:    stats=List(val a = 1, a) len=2
+  targs:    no targs
+  whole:    whole={
+  val a = 1;
+  a
+} kids=2
+  fixedArg: no fixedArg
+--- Block(List(Ident(TermName("p"))), Ident(TermName("r")))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   no spread
+  ops:      no ops
+  block:    block2(p,r)
+  stats:    stats=List(p, r) len=2
+  targs:    no targs
+  whole:    whole={
+  p;
+  r
+} kids=2
+  fixedArg: no fixedArg
+--- Apply(TypeApply(Ident(TermName("f")), List(Ident(TypeName("Int")))), List(Literal(Constant(3))))
+  lit:      other
+  fn:       no fn
+  app:      app f=f[Int] a=3
+  named:    no named
+  spread:   spread f=f[Int] as=List(3) len=1
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(f[Int](3)) len=1
+  targs:    int(f,3)
+  whole:    whole=f[Int](3) kids=2
+  fixedArg: no fixedArg
+--- Apply(TypeApply(Ident(TermName("f")), List(Ident(TypeName("A")))), List(Literal(Constant(3))))
+  lit:      other
+  fn:       no fn
+  app:      app f=f[A] a=3
+  named:    no named
+  spread:   spread f=f[A] as=List(3) len=1
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(f[A](3)) len=1
+  targs:    aa(f,3)
+  whole:    whole=f[A](3) kids=2
+  fixedArg: no fixedArg
+--- Apply(TypeApply(Ident(TermName("f")), List(Ident(TypeName("Long")))), List(Literal(Constant(3))))
+  lit:      other
+  fn:       no fn
+  app:      app f=f[Long] a=3
+  named:    no named
+  spread:   spread f=f[Long] as=List(3) len=1
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(f[Long](3)) len=1
+  targs:    no targs
+  whole:    whole=f[Long](3) kids=2
+  fixedArg: no fixedArg
+--- Apply(Ident(TermName("f")), List(Literal(Constant(3))))
+  lit:      other
+  fn:       no fn
+  app:      app f=f a=3
+  named:    no named
+  spread:   spread f=f as=List(3) len=1
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(f(3)) len=1
+  targs:    no targs
+  whole:    whole=f(3) kids=2
+  fixedArg: no fixedArg
+--- Apply(Ident(TermName("g")), List(Literal(Constant(1)), Literal(Constant(7))))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   spread f=g as=List(1, 7) len=2
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(g(1, 7)) len=1
+  targs:    no targs
+  whole:    whole=g(1, 7) kids=3
+  fixedArg: one_then(g,7)
+--- Apply(Ident(TermName("g")), List(Literal(Constant(2)), Literal(Constant(7))))
+  lit:      other
+  fn:       no fn
+  app:      no app
+  named:    no named
+  spread:   spread f=g as=List(2, 7) len=2
+  ops:      no ops
+  block:    no block
+  stats:    stats=List(g(2, 7)) len=1
+  targs:    no targs
+  whole:    whole=g(2, 7) kids=3
+  fixedArg: no fixedArg

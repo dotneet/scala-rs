@@ -115,6 +115,7 @@ mod prelude_universal;
 mod prelude_variance;
 mod prelude_viewc;
 mod presuper;
+mod quasi_pattern;
 mod quasiquote;
 mod reify;
 mod reify_expand;
