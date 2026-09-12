@@ -4315,14 +4315,14 @@ expected output is produced again by real scalac 2.13.16 in the same suite.
 against both compilers, because a compile is not evidence for a root whose
 failure mode was silent.
 
-## `agent/libzero`: 66 → 43 errors (2026-09-13)
+## `agent/libzero`: 66 → 41 errors (2026-09-13)
 
 Measured with `tests/scalalib_measure.sh` (the `--no-scala-library` arrangement,
 538 files). `classes=0` throughout: the library still has errors, so nothing
 reaches codegen yet and the headline number to aim at is
 `files=538 errors=0 files_with_errors=0`.
 
-Nine roots, each reduced to a standalone program and compared with real scalac
+Ten roots, each reduced to a standalone program and compared with real scalac
 2.13.16 in **both** directions (`crates/cli/tests/lz.rs`, fixtures `lz_infer`,
 `lz_infer_bad`, `lz_resolve`, `lz_resolve_bad`):
 
@@ -4337,6 +4337,7 @@ Nine roots, each reduced to a standalone program and compared with real scalac
 | a case class's companion is the module in the same owner, not what the name resolves to at the use site | `concurrent/duration/Duration.scala:79,80` | 2 |
 | `new B(x)` for a parameterized alias constructs the class it renames | `Option.scala:575` | 1 |
 | `->` off the receiver only for the prelude's `ArrowAssoc`; `super.m` and an inserted conversion read at the right type | `Predef.scala:352`, `immutable/BitSet.scala:83`, `mutable/BitSet.scala:188` | 3 |
+| an *overloaded* abstract method is no SAM, so an untyped literal is not a candidate for such a formal | `sys/process/BasicIO.scala:160,161` | 2 |
 
 cats (0 errors / 2976 classes), gitbucket (0 / 1317) and slick (0 / 1504) are
 unchanged by all of it.

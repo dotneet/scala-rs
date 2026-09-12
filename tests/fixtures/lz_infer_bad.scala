@@ -23,4 +23,9 @@ object InferBad {
     def ordering: Ord[K] = o
     def bad4: String = needs
   }
+
+  // An untyped function literal does not become a `java.lang.Appendable` just
+  // because that is the only formal on offer.
+  def onlyAppendable(a: java.lang.Appendable): Int = 1
+  def bad5: Int = onlyAppendable(x => ())
 }

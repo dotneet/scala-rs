@@ -1,6 +1,6 @@
 //! Taking scala/scala's own `src/library` towards zero errors (`agent/libzero`).
 //!
-//! Nine independent roots, each reduced to a standalone program and compared
+//! Ten independent roots, each reduced to a standalone program and compared
 //! with real scalac 2.13.16 in both directions.
 //!
 //! Inference (`lz_infer`):
@@ -30,15 +30,22 @@
 //!    mentions instead of demanding that it mention every one, so an `implicit
 //!    def` member of the enclosing class can answer it
 //!    (`immutable/SortedMap.scala:175`, `mutable/SortedMap.scala:101`).
+//! 7. `sam_sig` counts abstract methods by *name*, so that an override does not
+//!    count twice as the declaration it replaces -- which also collapsed a
+//!    genuinely **overloaded** abstract method to one. `java.lang.Appendable`
+//!    declares three abstract `append`s and is no SAM, so an untyped function
+//!    literal is not a candidate for an `Appendable` formal and
+//!    `processFully(log err _)` is not ambiguous
+//!    (`sys/process/BasicIO.scala:160,161`).
 //!
 //! Resolution (`lz_resolve`):
 //!
-//! 7. `new B(x)` for a parameterized alias `type B[+A] = p.Box[A]` constructs
+//! 8. `new B(x)` for a parameterized alias `type B[+A] = p.Box[A]` constructs
 //!    `p.Box` with its arguments left to inference (`Option.scala:575`).
-//! 8. `->` is read off the receiver only for the prelude's deliberately
+//! 9. `->` is read off the receiver only for the prelude's deliberately
 //!    imprecise `ArrowAssoc`; a `->` with a signature of its own is typed from
 //!    it (`Predef.scala:352`).
-//! 9. A receiver widened to its bound so its members could be found is still
+//! 10. A receiver widened to its bound so its members could be found is still
 //!    what an inserted conversion is applied to (`collection/package.scala:78`),
 //!    and `super.m` reached through a parent that only *inherits* `m` is read at
 //!    this class's own arguments for the class that declares it
@@ -187,7 +194,7 @@ fn check_rejects(name: &str, needles: &[&str], scalac_path: Option<&Path>) {
 }
 
 // ---------------------------------------------------------------------------
-// Roots 1-6: inference.
+// Roots 1-7: inference.
 
 #[test]
 fn inference_roots_run() {
@@ -216,6 +223,8 @@ fn inference_roots_still_reject() {
             "[Int] do not conform to method narrow's type parameter bounds",
             // A non-`implicit` override of an `implicit def` is not an implicit.
             "could not find implicit value of type Ord[K]",
+            // An untyped literal is not an `Appendable` either.
+            "no matching overload for (Appendable)Int",
         ],
         None,
     );
@@ -231,7 +240,7 @@ fn scalac_agrees_inference_roots_reject() {
 }
 
 // ---------------------------------------------------------------------------
-// Roots 7-9: name and member resolution.
+// Roots 8-10: name and member resolution.
 
 #[test]
 fn resolution_roots_run() {

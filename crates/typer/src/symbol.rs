@@ -7044,7 +7044,34 @@ impl SymbolTable {
             return None;
         }
         let method = abstracts[0];
-        // nsc `definitions.samOf`: `!sam.isOverloaded && sam.typeParams.isEmpty`.
+        // nsc `definitions.samOf`: `!sam.isOverloaded`. `abstract_sam_methods`
+        // keys by *name*, so that an override does not count twice as the
+        // declaration it replaces -- which also collapses a genuinely
+        // **overloaded** abstract method to one. `java.lang.Appendable`
+        // declares three abstract `append`s and is no SAM; read as one, an
+        // untyped function literal stayed a candidate for an `Appendable`
+        // formal and `processFully(log err _)` was an `ambiguous overload`
+        // against `processFully(processLine: String => Unit)`
+        // (`sys/process/BasicIO.scala:160,161`).
+        {
+            let name = self.get(method).name.clone();
+            let owner = self.get(method).owner;
+            let same_name = self
+                .get(owner)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    self.get(m).kind == SymKind::Method
+                        && self.get(m).name == name
+                        && self.method_is_deferred(m)
+                })
+                .count();
+            if same_name > 1 {
+                return None;
+            }
+        }
+        // nsc `definitions.samOf`: `sam.typeParams.isEmpty`.
         // A polymorphic abstract method has no function type to convert from,
         // and real scalac 2.13.16 says so -- `trait Poly { def f[A](a: A): A }`
         // with `val p: Poly = x => x` is two errors, `missing parameter type`

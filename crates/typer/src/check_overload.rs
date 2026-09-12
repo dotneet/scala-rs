@@ -2223,9 +2223,35 @@ impl Typer {
             .filter(|(_, ps, _)| {
                 shapes.iter().enumerate().all(|(i, shape)| {
                     let Some(n) = shape else { return true };
-                    match param_at(ps, i).and_then(|p| self.shape_arity(p)) {
+                    let Some(p) = param_at(ps, i) else {
+                        return true;
+                    };
+                    match self.shape_arity(p) {
                         Some(m) => m == *n,
-                        None => true,
+                        // Not function-shaped. nsc's `preSelectOverloaded`
+                        // compares the literal's shape type
+                        // (`FunctionN[Any, …, Nothing]`) with the formal, so a
+                        // formal every function conforms to -- `Any`, `AnyRef`,
+                        // a bare type parameter -- is still a candidate, a SAM
+                        // of the right arity is one too, and an ordinary class
+                        // that is neither is not. Keeping *everything* made
+                        // `processFully(log err _)` on
+                        // `processFully(buffer: java.lang.Appendable)` /
+                        // `processFully(processLine: String => Unit)` an
+                        // `ambiguous overload` -- `Appendable` declares three
+                        // abstract `append`s, so it is no SAM
+                        // (`sys/process/BasicIO.scala:160,161`).
+                        None => {
+                            let p = strip_param_wrappers(p);
+                            if self.st.sam_sig(p).is_some_and(|s| s.param_tys.len() == *n) {
+                                return true;
+                            }
+                            let shape_ty = Type::Function {
+                                params: vec![Type::Any; *n],
+                                ret: Box::new(Type::Nothing),
+                            };
+                            self.st.is_sub_type(&shape_ty, p)
+                        }
                     }
                 })
             })

@@ -40,6 +40,14 @@ object Infer {
     implicit def ordering: Ord[K] = o
     def describe: String = needs
   }
+
+  // 7. An untyped function literal is not a candidate for a formal that is
+  //    neither a function type nor a SAM: `java.lang.Appendable` declares three
+  //    abstract `append`s, so only the `String => Unit` alternative applies.
+  class Log { def err(s: String): String = "err:" + s }
+  def processFully(buffer: java.lang.Appendable): String => String = s => s
+  def processFully(processLine: String => String): String => String = processLine
+  def viaLog(log: Log): String => String = processFully(log err _)
 }
 
 object Main {
@@ -51,5 +59,6 @@ object Main {
     println(Infer.fallbackChar('c', x => x))
     Infer.useSink()
     println(new Infer.WithDefault[Int, String](new Infer.Ord[Int] { def name = "int-ord" }).describe)
+    println(Infer.viaLog(new Infer.Log)("x"))
   }
 }
