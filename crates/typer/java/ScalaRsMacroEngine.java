@@ -106,6 +106,19 @@ public final class ScalaRsMacroEngine {
      * `asyncImpl` aborts unless it contains `-Xasync`.
      */
     static List<String> compilerSettings = new ArrayList<>();
+    /**
+     * Nanoseconds spent inside `Method.invoke` -- the macro implementation's own
+     * run -- and, of that, the part spent blocked on an answer from scala-rs.
+     * Read and reset by the `(timing)` request, which scala-rs sends after each
+     * expansion when `SCALA_RS_MACRO_TIMING` is set. The difference is what the
+     * JVM actually computed, which is the only number scala-rs cannot measure
+     * from its own side of the pipe.
+     */
+    static long invokeNanos = 0;
+    static long waitNanos = 0;
+    /** Nanoseconds inside {@link #handle}: the whole exchange, of which
+     * `invokeNanos` is the implementation's own run. */
+    static long handleNanos = 0;
 
     public static void main(String[] args) throws Exception {
         out = new PrintStream(System.out, true, "UTF-8");
@@ -132,11 +145,13 @@ public final class ScalaRsMacroEngine {
                 continue;
             }
             String reply;
+            long handleStarted = System.nanoTime();
             try {
                 reply = handle(line);
             } catch (Throwable t) {
                 reply = err(describe(t));
             }
+            handleNanos += System.nanoTime() - handleStarted;
             out.println(reply);
         }
     }
@@ -152,6 +167,13 @@ public final class ScalaRsMacroEngine {
         if ("quit".equals(head)) {
             System.exit(0);
         }
+        if ("timing".equals(head)) {
+            String reply = "(timing " + invokeNanos + " " + waitNanos + " " + handleNanos + ")";
+            invokeNanos = 0;
+            waitNanos = 0;
+            handleNanos = 0;
+            return reply;
+        }
         if (!"expand".equals(head)) {
             return err("unknown request " + head);
         }
@@ -166,7 +188,7 @@ public final class ScalaRsMacroEngine {
 
         Class<?> implCls;
         try {
-            implCls = Class.forName(className, true, macroCl);
+            implCls = loadClass(className);
         } catch (ClassNotFoundException e) {
             return err("macro implementation class " + className
                 + " is not on the macro classpath (nsc requires the implementation to have "
@@ -202,16 +224,16 @@ public final class ScalaRsMacroEngine {
             handler.appTree = buildTree(app);
             Sexp position = req.field("position");
             if (position.items.size() == 4) {
-                Class<?> virtual = Class.forName("scala.reflect.io.VirtualFile", true, macroCl);
+                Class<?> virtual = loadClass("scala.reflect.io.VirtualFile");
                 String path = position.items.get(2).text();
                 Object file = virtual.getConstructor(String.class, String.class)
                     .newInstance(new java.io.File(path).getName(), path);
-                Class<?> abstractFile = Class.forName("scala.reflect.io.AbstractFile", true, macroCl);
-                Class<?> sourceClass = Class.forName("scala.reflect.internal.util.SourceFile", true, macroCl);
-                Object source = Class.forName("scala.reflect.internal.util.BatchSourceFile", true, macroCl)
+                Class<?> abstractFile = loadClass("scala.reflect.io.AbstractFile");
+                Class<?> sourceClass = loadClass("scala.reflect.internal.util.SourceFile");
+                Object source = loadClass("scala.reflect.internal.util.BatchSourceFile")
                     .getConstructor(abstractFile, char[].class)
                     .newInstance(file, position.items.get(1).text().toCharArray());
-                Object pos = Class.forName("scala.reflect.internal.util.OffsetPosition", true, macroCl)
+                Object pos = loadClass("scala.reflect.internal.util.OffsetPosition")
                     .getConstructor(sourceClass, int.class)
                     .newInstance(source, Integer.parseInt(position.items.get(3).text()));
                 call(handler.appTree, "setPos", 1, pos);
@@ -220,7 +242,7 @@ public final class ScalaRsMacroEngine {
 
         Object ctx = Proxy.newProxyInstance(
             ScalaRsMacroEngine.class.getClassLoader(),
-            new Class<?>[]{Class.forName("scala.reflect.macros.blackbox.Context", true, macroCl)},
+            new Class<?>[]{loadClass("scala.reflect.macros.blackbox.Context")},
             handler);
 
         // 2.11 onwards an implementation may take a raw `c.Tree` instead of a
@@ -254,9 +276,11 @@ public final class ScalaRsMacroEngine {
         pendingGap = null;
         pendingTypecheckFailure = null;
         Object result;
+        long invokeStarted = System.nanoTime();
         try {
             result = impl.invoke(receiver, argv.toArray());
         } catch (InvocationTargetException e) {
+            invokeNanos += System.nanoTime() - invokeStarted;
             Throwable cause = e.getCause();
             if (pendingGap != null) {
                 return err(pendingGap);
@@ -270,6 +294,7 @@ public final class ScalaRsMacroEngine {
             }
             return err("the macro implementation threw " + describe(cause));
         }
+        invokeNanos += System.nanoTime() - invokeStarted;
         // A gap the implementation caught and carried on from. Its answer is
         // built on something scala-rs never told it, so the reason is
         // reported instead of the tree.
@@ -284,7 +309,7 @@ public final class ScalaRsMacroEngine {
                 + "next was decided on something it was not told");
         }
         Object tree = result;
-        Class<?> exprCls = Class.forName("scala.reflect.api.Exprs$Expr", true, macroCl);
+        Class<?> exprCls = loadClass("scala.reflect.api.Exprs$Expr");
         if (exprCls.isInstance(result)) {
             tree = find(result.getClass(), "tree", 0).invoke(result);
         }
@@ -334,7 +359,9 @@ public final class ScalaRsMacroEngine {
      */
     static Sexp query(String q) throws Exception {
         out.println(q);
+        long waitStarted = System.nanoTime();
         String line = in.readLine();
+        waitNanos += System.nanoTime() - waitStarted;
         if (line == null) {
             throw new Gap("scala-rs closed the pipe while the macro was asking it a question");
         }
@@ -405,7 +432,7 @@ public final class ScalaRsMacroEngine {
 
     /** `scala.reflect.macros.TypecheckException(NoPosition, msg)`. */
     static Throwable newTypecheckException(String msg) throws Exception {
-        Class<?> cls = Class.forName("scala.reflect.macros.TypecheckException", true, macroCl);
+        Class<?> cls = loadClass("scala.reflect.macros.TypecheckException");
         Object pos = call(universe, "NoPosition", 0);
         return (Throwable) ctor(cls, 2).newInstance(pos, msg);
     }
@@ -626,7 +653,7 @@ public final class ScalaRsMacroEngine {
             // `@uncheckedVariance` nsc puts on a default getter's result.
             Object under = typeFor(s.items.get(2));
             Object annTpe = call(call(call(mirror, "staticClass", 1, name), "asType", 0), "toType", 0);
-            Object noJavaArgs = call(Class.forName("scala.collection.immutable.ListMap$", true, macroCl)
+            Object noJavaArgs = call(loadClass("scala.collection.immutable.ListMap$")
                 .getField("MODULE$").get(null), "empty", 0);
             Object ann = call(companion("Annotation"), "apply", 3, annTpe,
                 list(new ArrayList<>()), noJavaArgs);
@@ -648,7 +675,7 @@ public final class ScalaRsMacroEngine {
     /** `WeakTypeTag` for a type already built in the runtime universe. */
     static Object tagOf(Object tpe) throws Exception {
         Class<?> creatorCls =
-            Class.forName("scala.reflect.internal.StdCreators$FixedMirrorTypeCreator", true, macroCl);
+            loadClass("scala.reflect.internal.StdCreators$FixedMirrorTypeCreator");
         Object creator = ctor(creatorCls, 3).newInstance(universe, mirror, tpe);
         return call(companion("WeakTypeTag"), "apply", 2, mirror, creator);
     }
@@ -720,7 +747,7 @@ public final class ScalaRsMacroEngine {
     /** `universe.Expr(mirror, FixedMirrorTreeCreator(mirror, tree))(tag)`. */
     static Object mkExpr(Object tree, Object tag) throws Exception {
         Class<?> creatorCls =
-            Class.forName("scala.reflect.internal.StdCreators$FixedMirrorTreeCreator", true, macroCl);
+            loadClass("scala.reflect.internal.StdCreators$FixedMirrorTreeCreator");
         Object creator = ctor(creatorCls, 3).newInstance(universe, mirror, tree);
         return call(companion("Expr"), "apply", 3, mirror, creator, tag);
     }
@@ -1335,7 +1362,7 @@ public final class ScalaRsMacroEngine {
             // actual reflection ChangeOwnerTraverser still performs the tree
             // traversal and also moves a module's class, as nsc does.
             call(universe, "saveOriginalOwner", 1, symbol);
-            java.lang.reflect.Field owner = Class.forName("scala.reflect.internal.Symbols$Symbol", true, macroCl)
+            java.lang.reflect.Field owner = loadClass("scala.reflect.internal.Symbols$Symbol")
                 .getDeclaredField("_rawowner");
             owner.setAccessible(true);
             owner.set(symbol, next);
@@ -1343,7 +1370,7 @@ public final class ScalaRsMacroEngine {
     }
 
     static long internalFlag(String name) throws Exception {
-        Object flags = Class.forName("scala.reflect.internal.Flags$", true, macroCl).getField("MODULE$").get(null);
+        Object flags = loadClass("scala.reflect.internal.Flags$").getField("MODULE$").get(null);
         return ((Number) call(flags, name, 0)).longValue();
     }
 
@@ -1538,7 +1565,7 @@ public final class ScalaRsMacroEngine {
             int arity = m.getParameterCount();
             if (n.equals("internal") && arity == 0) {
                 if (internalProxy == null) {
-                    Class<?> api = Class.forName("scala.reflect.macros.Internals$ContextInternalApi", true, macroCl);
+                    Class<?> api = loadClass("scala.reflect.macros.Internals$ContextInternalApi");
                     internalProxy = Proxy.newProxyInstance(macroCl, new Class<?>[]{api}, (p, method, args) -> {
                         if (method.getName().equals("enclosingOwner") && method.getParameterCount() == 0) {
                             Sexp answer = query("(q enclosingOwner)");
@@ -1644,7 +1671,7 @@ public final class ScalaRsMacroEngine {
                     (Boolean) a[5]);
             }
             if (n.equals("TypecheckException") && arity == 0) {
-                return Class.forName("scala.reflect.macros.TypecheckException$", true, macroCl)
+                return loadClass("scala.reflect.macros.TypecheckException$")
                     .getField("MODULE$").get(null);
             }
             // Diagnostics and source inspection use the same call-site point.
@@ -1719,15 +1746,15 @@ public final class ScalaRsMacroEngine {
     }
 
     static Object boxedUnit() throws Exception {
-        return Class.forName("scala.runtime.BoxedUnit", true, macroCl)
+        return loadClass("scala.runtime.BoxedUnit")
             .getField("UNIT").get(null);
     }
 
     /** `List(xs)` in the immutable Scala list, built from `Nil` and `::`. */
     static Object list(List<Object> xs) throws Exception {
-        Object acc = Class.forName("scala.collection.immutable.Nil$", true, macroCl)
+        Object acc = loadClass("scala.collection.immutable.Nil$")
             .getField("MODULE$").get(null);
-        Class<?> cons = Class.forName("scala.collection.immutable.$colon$colon", true, macroCl);
+        Class<?> cons = loadClass("scala.collection.immutable.$colon$colon");
         Constructor<?> c = ctor(cons, 2);
         for (int i = xs.size() - 1; i >= 0; i--) {
             acc = c.newInstance(xs.get(i), acc);
@@ -1737,10 +1764,29 @@ public final class ScalaRsMacroEngine {
 
     static boolean isA(Object o, String cls) {
         try {
-            return Class.forName(cls, true, macroCl).isInstance(o);
+            return loadClass(cls).isInstance(o);
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * `Class.forName(name, true, macroCl)`, remembered.
+     *
+     * The tree serialiser asks `isA(node, "scala.reflect.api.Trees$Select")`
+     * and friends for every node of every tree, and each of those went through
+     * the class loader's own lookup. Classes do not change identity inside one
+     * engine process, so the answer is kept.
+     */
+    static final java.util.Map<String, Class<?>> classCache = new java.util.HashMap<>();
+
+    static Class<?> loadClass(String name) throws ClassNotFoundException {
+        Class<?> known = classCache.get(name);
+        if (known == null) {
+            known = Class.forName(name, true, macroCl);
+            classCache.put(name, known);
+        }
+        return known;
     }
 
     /**
@@ -1753,16 +1799,13 @@ public final class ScalaRsMacroEngine {
      * whose parameter types actually accept these arguments.
      */
     static Object call(Object recv, String name, int arity, Object... args) throws Exception {
+        Method[] candidates = overloads(recv.getClass(), name, arity);
         Method fallback = null;
-        for (Method m : recv.getClass().getMethods()) {
-            if (!m.getName().equals(name) || m.getParameterCount() != arity) {
-                continue;
-            }
+        for (Method m : candidates) {
             if (fallback == null) {
                 fallback = m;
             }
             if (accepts(m.getParameterTypes(), args)) {
-                m.setAccessible(true);
                 return m.invoke(recv, args);
             }
         }
@@ -1770,8 +1813,48 @@ public final class ScalaRsMacroEngine {
             throw new IllegalStateException(
                 "no " + name + "/" + arity + " on " + recv.getClass().getName());
         }
-        fallback.setAccessible(true);
         return fallback.invoke(recv, args);
+    }
+
+    /**
+     * The methods of `c` named `name` with `arity` parameters, in
+     * `getMethods()` order, remembered.
+     *
+     * `Class.getMethods()` builds and copies a fresh array every call, and a
+     * scala-reflect universe class has thousands of public methods; every node
+     * of every tree built or serialised here went through that scan. It was
+     * 8.2 s of a 27 s gitbucket build -- more than the macro implementations'
+     * own run by two orders of magnitude. The cache preserves the order the
+     * scan saw, so the overload this picks is the one it picked before.
+     */
+    static final java.util.Map<String, Method[]> overloadCache = new java.util.HashMap<>();
+    static final java.util.Map<Class<?>, Method[]> methodsCache = new java.util.HashMap<>();
+
+    static Method[] methodsOf(Class<?> c) {
+        Method[] known = methodsCache.get(c);
+        if (known == null) {
+            known = c.getMethods();
+            methodsCache.put(c, known);
+        }
+        return known;
+    }
+
+    static Method[] overloads(Class<?> c, String name, int arity) {
+        String key = c.getName() + '#' + name + '/' + arity;
+        Method[] known = overloadCache.get(key);
+        if (known != null) {
+            return known;
+        }
+        List<Method> found = new ArrayList<>();
+        for (Method m : methodsOf(c)) {
+            if (m.getName().equals(name) && m.getParameterCount() == arity) {
+                m.setAccessible(true);
+                found.add(m);
+            }
+        }
+        Method[] out = found.toArray(new Method[0]);
+        overloadCache.put(key, out);
+        return out;
     }
 
     static boolean accepts(Class<?>[] want, Object[] args) {
@@ -1789,13 +1872,11 @@ public final class ScalaRsMacroEngine {
     }
 
     static Method find(Class<?> c, String name, int arity) {
-        for (Method m : c.getMethods()) {
-            if (m.getName().equals(name) && m.getParameterCount() == arity) {
-                m.setAccessible(true);
-                return m;
-            }
+        Method[] found = overloads(c, name, arity);
+        if (found.length == 0) {
+            throw new IllegalStateException("no " + name + "/" + arity + " on " + c.getName());
         }
-        throw new IllegalStateException("no " + name + "/" + arity + " on " + c.getName());
+        return found[0];
     }
 
     static Constructor<?> ctor(Class<?> c, int arity) {

@@ -1257,6 +1257,72 @@ pub struct SymbolTable {
     pub(crate) abs_projections: rustc_hash::FxHashMap<(SymbolId, SymbolId), SymbolId>,
     /// `(prefix symbol, declaration)` for each symbol in `abs_projections`.
     pub(crate) abs_projection_of: rustc_hash::FxHashMap<SymbolId, (SymbolId, SymbolId)>,
+    /// How many times a symbol has been handed out for mutation
+    /// ([`SymbolTable::get_mut`] and the few places that index `symbols`
+    /// directly). Read-only caches over the symbol graph key themselves on it,
+    /// so any change at all -- whether or not it could have mattered -- throws
+    /// them away rather than risking a stale answer. See [`LinCache`].
+    pub(crate) mutation_gen: std::cell::Cell<u64>,
+    /// [`crate::lin::linearize`]'s answers for the current `mutation_gen`.
+    pub(crate) lin_cache: std::cell::RefCell<LinCache>,
+    /// [`SymbolTable::base_type_args`]'s answers for the current
+    /// `mutation_gen`.
+    pub(crate) bta_cache: std::cell::RefCell<BtaCache>,
+    /// The answer for a receiver that names no class, handed out by reference
+    /// so the hot path never allocates for it.
+    pub(crate) empty_base_type_args: std::rc::Rc<BaseTypeArgs>,
+}
+
+/// Memo for [`SymbolTable::base_type_args`], with the same validity rule as
+/// [`LinCache`]: an entry lives until any symbol is handed out for mutation.
+///
+/// The walk is asked for the same applied class over and over -- 44 million
+/// calls in a gitbucket build, and after the linearization cache the largest
+/// remaining entry in that profile. The key is the pair the walk is a function
+/// of: the class and the arguments it is applied at. Buckets are per class and
+/// scanned, because a class is asked about at a handful of instantiations and a
+/// `Vec<Type>` cannot be hashed (`Type` holds an `f64`).
+#[derive(Default)]
+pub(crate) struct BtaCache {
+    /// The generation `map` was filled at.
+    gen: u64,
+    map: rustc_hash::FxHashMap<u32, Vec<BtaEntry>>,
+    /// Total entries, so the cache can be dropped rather than grow without
+    /// bound over a long run.
+    len: usize,
+}
+
+/// One answered instantiation: the arguments the class was applied at, and the
+/// base-class map that came out.
+type BtaEntry = (Vec<Type>, std::rc::Rc<BaseTypeArgs>);
+
+/// Past this many instantiations of one class the bucket stops growing: the
+/// scan is linear, and a class asked about at hundreds of instantiations is
+/// one the cache cannot help anyway.
+const BTA_BUCKET_MAX: usize = 16;
+/// Past this many entries in total the cache is emptied.
+const BTA_CACHE_MAX: usize = 100_000;
+
+/// Memo for [`crate::lin::linearize`], shared by every call made while the
+/// symbol graph stands still.
+///
+/// `linearize` is a pure function of the `extends` graph and is called about
+/// 45 million times in a gitbucket build (812 million `Lin::lin` node visits,
+/// 14 s of CPU: the single largest entry in the profile), almost always on a
+/// class whose ancestry has not changed since the last time it was asked.
+/// `Lin`'s own memo only ever lived for one call, so a diamond was re-expanded
+/// once per caller.
+///
+/// Correctness rests on one rule: an entry is only valid while
+/// [`SymbolTable::mutation_gen`] is the one it was filled at. A namer or a
+/// pickle completion that rewrites a parent list bumps that counter (through
+/// `get_mut`), and the whole cache is dropped. Entries a truncated walk
+/// produced are never published, exactly as `Lin`'s own memo never keeps them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LinCache {
+    /// The generation `map` was filled at.
+    gen: u64,
+    map: rustc_hash::FxHashMap<u32, std::rc::Rc<Vec<SymbolId>>>,
 }
 
 /// Reverse index from `jvm_name` to the class-like symbols that have it.
@@ -1322,6 +1388,10 @@ impl SymbolTable {
             parent_outer_modules: HashMap::default(),
             binary_alias_prefixes: HashMap::default(),
             binary_read: rustc_hash::FxHashSet::default(),
+            mutation_gen: std::cell::Cell::new(0),
+            lin_cache: std::cell::RefCell::new(LinCache::default()),
+            bta_cache: std::cell::RefCell::new(BtaCache::default()),
+            empty_base_type_args: std::rc::Rc::new(BaseTypeArgs::default()),
             symbols: vec![Symbol {
                 id: SymbolId(0),
                 name: "<none>".into(),
@@ -1520,7 +1590,88 @@ impl SymbolTable {
     }
 
     pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
+        self.note_mutation();
         &mut self.symbols[id.0 as usize]
+    }
+
+    /// Say that a symbol is about to change, so every read-only cache over the
+    /// symbol graph stops trusting what it holds. `get_mut` calls this; the
+    /// handful of places that reach into `symbols` directly call it too.
+    #[inline]
+    pub(crate) fn note_mutation(&self) {
+        self.mutation_gen
+            .set(self.mutation_gen.get().wrapping_add(1));
+    }
+
+    /// `cls`'s linearization from [`LinCache`], if it was computed since the
+    /// last change to any symbol.
+    #[inline]
+    pub(crate) fn cached_linearization(&self, cls: SymbolId) -> Option<std::rc::Rc<Vec<SymbolId>>> {
+        let gen = self.mutation_gen.get();
+        let cache = self.lin_cache.borrow();
+        if cache.gen != gen {
+            return None;
+        }
+        cache.map.get(&cls.0).cloned()
+    }
+
+    /// Publish the path-independent results of one linearization walk.
+    pub(crate) fn publish_linearizations(
+        &self,
+        entries: rustc_hash::FxHashMap<u32, Vec<SymbolId>>,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+        let gen = self.mutation_gen.get();
+        let mut cache = self.lin_cache.borrow_mut();
+        if cache.gen != gen {
+            cache.gen = gen;
+            cache.map.clear();
+        }
+        for (k, v) in entries {
+            cache.map.entry(k).or_insert_with(|| std::rc::Rc::new(v));
+        }
+    }
+
+    /// [`Self::base_type_args`]'s answer for this exact pair, if it was
+    /// computed since the last change to any symbol.
+    fn cached_base_type_args(
+        &self,
+        sym: SymbolId,
+        args: &[Type],
+    ) -> Option<std::rc::Rc<BaseTypeArgs>> {
+        let gen = self.mutation_gen.get();
+        let cache = self.bta_cache.borrow();
+        if cache.gen != gen {
+            return None;
+        }
+        cache
+            .map
+            .get(&sym.0)?
+            .iter()
+            .find(|(a, _)| a.as_slice() == args)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn cache_base_type_args(&self, sym: SymbolId, args: &[Type], out: &std::rc::Rc<BaseTypeArgs>) {
+        let gen = self.mutation_gen.get();
+        let mut cache = self.bta_cache.borrow_mut();
+        if cache.gen != gen {
+            cache.gen = gen;
+            cache.map.clear();
+            cache.len = 0;
+        }
+        if cache.len >= BTA_CACHE_MAX {
+            cache.map.clear();
+            cache.len = 0;
+        }
+        let bucket = cache.map.entry(sym.0).or_default();
+        if bucket.len() >= BTA_BUCKET_MAX || bucket.iter().any(|(a, _)| a.as_slice() == args) {
+            return;
+        }
+        bucket.push((args.to_vec(), out.clone()));
+        cache.len += 1;
     }
 
     /// Copy whatever `@specialized` / `@unspecialized` a definition's
@@ -2776,6 +2927,7 @@ impl SymbolTable {
         // A deferred member stands for itself: `p.T` is abstract exactly when
         // `T` is, and a concrete `T` never reaches here (the alias expands and
         // carries the prefix along in its right-hand side).
+        self.note_mutation();
         self.symbols[id.0 as usize].ty = Type::TypeMember(id);
         self.symbols[id.0 as usize].tparams = tparams;
         self.symbols[id.0 as usize].bound_lo = lo.map(|t| self.expand_in_type(prefix, &t));
@@ -2814,6 +2966,7 @@ impl SymbolTable {
         // Deferred, and it stands for itself: an abstract projection is
         // exactly as opaque as the declaration it projects until the prefix
         // is instantiated.
+        self.note_mutation();
         self.symbols[id.0 as usize].ty = Type::TypeMember(id);
         self.symbols[id.0 as usize].tparams = tparams;
         self.symbols[id.0 as usize].bound_lo = lo;
@@ -3143,6 +3296,7 @@ impl SymbolTable {
                 info.bound_hi.clone(),
             );
             let clone = self.alloc(&name, SymbolId::NONE, SymKind::TypeMember, flags, "");
+            self.note_mutation();
             self.symbols[clone.0 as usize].tparams = tparams;
             self.symbols[clone.0 as usize].is_type_alias = true;
             // Insert before recursing: a body that reaches this alias again
@@ -3156,6 +3310,7 @@ impl SymbolTable {
             let lo = lo.map(|t| self.subst_path_member_in(&t, from, to, stack));
             let hi = hi.map(|t| self.subst_path_member_in(&t, from, to, stack));
             stack.pop();
+            self.note_mutation();
             self.symbols[clone.0 as usize].ty = new_body;
             self.symbols[clone.0 as usize].bound_lo = lo;
             self.symbols[clone.0 as usize].bound_hi = hi;
@@ -3905,15 +4060,15 @@ impl SymbolTable {
             }
             Type::SingleType { sym, .. } => match self.singleton_underlying(*sym) {
                 Type::Class { sym, args } if !sym.is_none() => self.base_type_args(sym, &args),
-                _ => BaseTypeArgs::default(),
+                _ => self.empty_base_type_args.clone(),
             },
             // A compound (`C <: LinearSeq[A] with LinearSeqOps[A, CC, C]`) is
             // a base-type sequence of its own, merged across the parents
             // rather than taken from whichever one the walk reaches first.
             Type::Refined { parents, .. } if parents.len() > 1 => {
-                self.base_type_args_compound(parents)
+                std::rc::Rc::new(self.base_type_args_compound(parents))
             }
-            _ => BaseTypeArgs::default(),
+            _ => self.empty_base_type_args.clone(),
         };
         let mut seen = rustc_hash::FxHashSet::default();
         let t = walk(self, core, ty.clone(), &mut seen, &base);
@@ -3973,7 +4128,29 @@ impl SymbolTable {
     /// already been substituted and recorded, and its entry can be settled on
     /// the spot. Every entry is expressed in `args`' vocabulary, so a caller
     /// substitutes with it directly and needs no second pass.
-    pub(crate) fn base_type_args(&self, sym: SymbolId, args: &[Type]) -> BaseTypeArgs {
+    pub(crate) fn base_type_args(&self, sym: SymbolId, args: &[Type]) -> std::rc::Rc<BaseTypeArgs> {
+        if let Some(hit) = self.cached_base_type_args(sym, args) {
+            return hit;
+        }
+        // The walk reads the parent clauses of every class in `sym`'s
+        // linearization, so it is only a function of the symbol graph where
+        // that linearization is (`crate::lin::linearize_settled`): a class with
+        // an unresolved parent is read differently once the name binds, and
+        // nothing mutates a symbol when it does.
+        let (lin, settled) = crate::lin::linearize_settled(self, sym);
+        let out = std::rc::Rc::new(self.base_type_args_uncached(sym, args, &lin));
+        if settled {
+            self.cache_base_type_args(sym, args, &out);
+        }
+        out
+    }
+
+    fn base_type_args_uncached(
+        &self,
+        sym: SymbolId,
+        args: &[Type],
+        lin: &[SymbolId],
+    ) -> BaseTypeArgs {
         // One entry per base class, holding the instantiation settled on and,
         // only for a class two parent clauses disagree about, the further
         // instantiations still to merge (nsc's `minTypes`). One map and one
@@ -3994,7 +4171,7 @@ impl SymbolTable {
                 more: Vec::new(),
             },
         );
-        for c in crate::lin::linearize(self, sym) {
+        for &c in lin {
             // Lifted out rather than cloned: the arguments go back into the
             // slot after the parent clauses have been substituted with them,
             // and a `Vec<Type>` clone per class of every linearization was one
@@ -4113,10 +4290,10 @@ impl SymbolTable {
             if sym.is_none() {
                 continue;
             }
-            for (k, slot) in self.base_type_args(*sym, args).slots {
-                let vs = variants.entry(k).or_default();
+            for (k, slot) in self.base_type_args(*sym, args).slots.iter() {
+                let vs = variants.entry(*k).or_default();
                 if !vs.contains(&slot.args) {
-                    vs.push(slot.args);
+                    vs.push(slot.args.clone());
                 }
             }
         }
@@ -4523,6 +4700,7 @@ impl SymbolTable {
     /// `find_by_jvm` would then never find the symbol under its new one.
     pub fn set_jvm_name(&mut self, id: SymbolId, jvm: impl Into<String>) {
         let jvm = jvm.into();
+        self.note_mutation();
         let sym = &mut self.symbols[id.0 as usize];
         if sym.jvm_name == jvm {
             return;

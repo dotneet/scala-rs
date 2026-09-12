@@ -49,16 +49,92 @@
 //!
 //! For a well-formed (acyclic) hierarchy the result is unchanged: no
 //! truncation can happen, and memoising a pure function is not observable.
+//!
+//! ## Why the memo outlives the call
+//!
+//! `Lin`'s memo used to be built and thrown away once per [`linearize`], and
+//! `linearize` runs about 45 million times in a gitbucket build -- 812 million
+//! `Lin::lin` node visits, the largest single entry in that profile. The memo
+//! is therefore also kept on the symbol table ([`SymbolTable`]'s `lin_cache`),
+//! keyed by its mutation generation: every answer stays usable until *any*
+//! symbol is handed out for mutation, at which point the whole cache is
+//! dropped rather than reasoned about.
+//!
+//! Two kinds of answer are never published. A truncated subtree, for the reason
+//! above; and a class whose parent clause does not *name* its class outright
+//! ([`parent_names_its_class`]), because resolving such a clause reads the
+//! scopes, the projection tables or the thread-local chase guard, none of which
+//! is the symbol graph -- so it can answer differently with no symbol having
+//! changed. Both are tracked per node, so a clean subtree under a tainted one
+//! is still kept.
 
 use crate::symbol::SymbolTable;
 use rustc_hash::{FxHashMap, FxHashSet};
-use scala_rs_parser::{Flags, SymbolId};
+use scala_rs_parser::{Flags, SymbolId, Type};
 
 fn skip_parent(st: &SymbolTable, p: SymbolId) -> bool {
     matches!(
         st.get(p).name.as_str(),
         "Any" | "AnyRef" | "AnyVal" | "Object"
     )
+}
+
+/// Whether a parent clause names its class *outright*, so that
+/// [`parents_of`]'s answer for it is a function of the symbol graph alone.
+///
+/// This is what makes a linearization safe to remember past the call that
+/// computed it (`SymbolTable::lin_cache`). Everything else -- an unresolved
+/// `Type::Named`, a type parameter, an applied alias, a projection -- is
+/// resolved by [`SymbolTable::class_sym_of`] through the *scopes*, through
+/// `abs_projections` / `path_members`, or through the thread-local chase guard,
+/// and all three change while the typer walks the program without any symbol
+/// being mutated. A class with such a parent is linearized as before and its
+/// answer is simply not kept.
+///
+/// A function type is resolved through the JVM-name index
+/// (`SymbolTable::function_class_form`), which is part of the symbol graph, so
+/// it counts as named outright. So does an inner class behind a prefix, which
+/// is a `Refined` around the class it names (`crate::prefix`), and an applied
+/// type whose constructor names its class -- gitbucket's every table is
+/// `extends profile.Table[…]`, so excluding those would have left the cache
+/// doing nothing where it matters most.
+fn parent_names_its_class(p: &Type) -> bool {
+    match p {
+        // Resolved outright, or to a field of the table that never changes.
+        Type::Class { .. }
+        | Type::ModuleRef(_)
+        | Type::ThisType(_)
+        | Type::Function { .. }
+        | Type::Array(_)
+        | Type::Any
+        | Type::AnyRef
+        | Type::AnyVal
+        | Type::JavaObject
+        | Type::Null
+        | Type::Nothing
+        | Type::Unit
+        | Type::Boolean
+        | Type::Byte
+        | Type::Short
+        | Type::Int
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::Char
+        | Type::String => true,
+        Type::Annotated { tpe, .. } => parent_names_its_class(tpe),
+        // `class_sym_of` recurses into the constructor.
+        Type::Applied { ctor, .. } => parent_names_its_class(ctor),
+        // `class_sym_of` takes the first parent that answers; requiring all of
+        // them to be resolvable is the conservative form of that.
+        Type::Refined { parents, .. } => parents.iter().all(parent_names_its_class),
+        // `Named` and `Tuple` are looked up by name through the scopes;
+        // `TypeParam`, `TypeMember` and `SingleType` chase bounds under the
+        // thread-local `enter_chase` guard, so their answer depends on which
+        // chase is already in progress. Neither is a function of the symbol
+        // graph alone.
+        _ => false,
+    }
 }
 
 fn parents_of(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
@@ -121,12 +197,25 @@ struct Lin<'a> {
     /// Bumped whenever the walk truncates at a class already on `path`. A
     /// subtree is only memoisable while this stands still across it.
     truncations: u32,
+    /// Bumped whenever a class's parent clause does not name its class outright
+    /// ([`parent_names_its_class`]). A subtree is only *rememberable past this
+    /// call* while this stands still across it, for the reason given there.
+    unresolved: u32,
 }
 
 impl Lin<'_> {
     fn lin(&mut self, cls: SymbolId) -> Vec<SymbolId> {
         if let Some(v) = self.memo.get(&cls.0) {
             return v.clone();
+        }
+        // An answer an earlier walk published. It is path-independent by
+        // construction (see the module comment), so it is just as good here --
+        // including for a class that is on this walk's own `path`, where it is
+        // the true linearization rather than the truncation the cycle rule
+        // would produce.
+        if let Some(v) = self.st.cached_linearization(cls) {
+            self.memo.insert(cls.0, (*v).clone());
+            return (*v).clone();
         }
         if self.path.contains(&cls) {
             // A cyclic `extends` graph, or a half-resolved parent list that
@@ -136,7 +225,16 @@ impl Lin<'_> {
             self.truncations += 1;
             return vec![cls];
         }
-        let before = self.truncations;
+        let before = (self.truncations, self.unresolved);
+        if self
+            .st
+            .get(cls)
+            .parents
+            .iter()
+            .any(|p| !parent_names_its_class(p))
+        {
+            self.unresolved += 1;
+        }
         let parents = parents_of(self.st, cls);
         self.path.push(cls);
         let lins: Vec<Vec<SymbolId>> = parents.iter().map(|&p| self.lin(p)).collect();
@@ -154,11 +252,40 @@ impl Lin<'_> {
         // `cls` heads its own linearization; a cyclic `extends` graph that
         // reaches it again must not list it twice.
         out.extend(acc.into_iter().filter(|&b| b != cls));
-        if self.truncations == before {
+        // Both counters have to stand still across the subtree: one answer
+        // that truncated at a cycle, or one parent clause resolved through
+        // something other than the symbol graph, taints everything built on it.
+        if (self.truncations, self.unresolved) == before {
             self.memo.insert(cls.0, out.clone());
         }
         out
     }
+}
+
+/// `cls`'s linearization, and whether it may be remembered past this call:
+/// it may when nothing in the walk truncated at a cycle and every parent clause
+/// it read named its class outright ([`parent_names_its_class`]).
+///
+/// Callers that cache something of their own derived from the same walk --
+/// [`SymbolTable::base_type_args`] -- have to honour the same verdict.
+pub fn linearize_settled(st: &SymbolTable, cls: SymbolId) -> (Vec<SymbolId>, bool) {
+    if let Some(v) = st.cached_linearization(cls) {
+        return ((*v).clone(), true);
+    }
+    let mut walk = Lin {
+        st,
+        memo: FxHashMap::default(),
+        path: Vec::new(),
+        truncations: 0,
+        unresolved: 0,
+    };
+    let out = walk.lin(cls);
+    // `memo` holds exactly the nodes whose whole subtree stood still, which is
+    // also exactly what may be published; `cls` is among them when its own
+    // answer is settled.
+    let settled = walk.memo.contains_key(&cls.0);
+    st.publish_linearizations(walk.memo);
+    (out, settled)
 }
 
 /// `cls` itself first, then its ancestors most-derived first (SLS 5.1.2).
@@ -167,13 +294,7 @@ impl Lin<'_> {
 /// Total on every symbol graph: a cyclic `extends` chain truncates instead of
 /// diverging.
 pub fn linearize(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
-    Lin {
-        st,
-        memo: FxHashMap::default(),
-        path: Vec::new(),
-        truncations: 0,
-    }
-    .lin(cls)
+    linearize_settled(st, cls).0
 }
 
 /// True for a `trait` (source) or a class-file / pickle `interface`.
@@ -268,4 +389,77 @@ pub fn inheritance_cycle(st: &SymbolTable, cls: SymbolId) -> Option<InheritanceC
         closing: *canonical.last()?,
         involving: *canonical.first()?,
     })
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::symbol::SymKind;
+
+    fn class(st: &mut SymbolTable, name: &str) -> SymbolId {
+        st.alloc(name, st.root, SymKind::Class, Flags::EMPTY, name)
+    }
+
+    /// The cache must follow a parent list that changes. It is keyed by the
+    /// symbol table's mutation generation, which `get_mut` bumps, so the second
+    /// answer is recomputed rather than served.
+    #[test]
+    fn a_changed_parent_list_is_not_served_from_the_cache() {
+        let mut st = SymbolTable::new();
+        let base = class(&mut st, "Base");
+        let mid = class(&mut st, "Mid");
+        let leaf = class(&mut st, "Leaf");
+        st.get_mut(leaf).parents.push(Type::Class {
+            sym: mid,
+            args: vec![],
+        });
+        assert_eq!(linearize(&st, leaf), vec![leaf, mid]);
+        // Cached now; adding a parent to `Mid` must still be seen.
+        st.get_mut(mid).parents.push(Type::Class {
+            sym: base,
+            args: vec![],
+        });
+        assert_eq!(linearize(&st, leaf), vec![leaf, mid, base]);
+    }
+
+    /// A class whose parent is still an unresolved name is linearized as before
+    /// but never remembered: the name is resolved through the scopes, and
+    /// entering it there mutates no symbol.
+    #[test]
+    fn an_unresolved_parent_is_not_remembered() {
+        let mut st = SymbolTable::new();
+        let base = class(&mut st, "Base");
+        let leaf = class(&mut st, "Leaf");
+        st.get_mut(leaf).parents.push(Type::Named {
+            name: "Base".into(),
+            args: vec![],
+        });
+        // Nothing binds `Base` as a type yet, so the parent resolves to nothing.
+        assert_eq!(linearize(&st, leaf), vec![leaf]);
+        assert!(!linearize_settled(&st, leaf).1);
+        assert!(st.cached_linearization(leaf).is_none());
+        // Entering the name in scope is not a symbol mutation, and the answer
+        // has to change anyway.
+        st.enter_in_current("Base", base);
+        assert_eq!(linearize(&st, leaf), vec![leaf, base]);
+    }
+
+    /// A cyclic `extends` graph still truncates, and still publishes nothing.
+    #[test]
+    fn a_cycle_is_not_remembered() {
+        let mut st = SymbolTable::new();
+        let x = class(&mut st, "X");
+        let y = class(&mut st, "Y");
+        st.get_mut(x).parents.push(Type::Class {
+            sym: y,
+            args: vec![],
+        });
+        st.get_mut(y).parents.push(Type::Class {
+            sym: x,
+            args: vec![],
+        });
+        assert_eq!(linearize(&st, x), vec![x, y]);
+        assert!(!linearize_settled(&st, x).1);
+        assert!(st.cached_linearization(x).is_none());
+    }
 }

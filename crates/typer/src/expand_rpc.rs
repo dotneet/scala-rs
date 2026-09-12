@@ -41,6 +41,26 @@ use crate::check::Typer;
 use crate::expand::{at, lit_to_wire, quote_into, scala_full_name, Sexp, WireCx};
 use crate::symbol::{SymKind, SymbolTable};
 
+/// The question's kind as a fixed name, for the timing table
+/// (`SCALA_RS_MACRO_TIMING=1`). A kind this module does not answer is still
+/// counted, under `<other>`, so the table adds up.
+pub(crate) fn query_kind(items: &[Sexp]) -> &'static str {
+    let Ok(kind) = at(items, 1) else {
+        return "<malformed>";
+    };
+    match kind.text().as_str() {
+        "typecheck" => "typecheck",
+        "enclosingOwner" => "enclosingOwner",
+        "functionSymbol" => "functionSymbol",
+        "symbol" => "symbol",
+        "symbolInfo" => "symbolInfo",
+        "companion" => "companion",
+        "modulePair" => "modulePair",
+        "viewInfo" => "viewInfo",
+        _ => "<other>",
+    }
+}
+
 impl Typer {
     pub(crate) fn macro_current_owner(&self) -> SymbolId {
         if self.macro_lexical_owner.is_none() {

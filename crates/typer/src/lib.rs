@@ -28,6 +28,7 @@ mod expand;
 mod expand_mirror;
 mod expand_private;
 mod expand_rpc;
+mod expand_timing;
 mod fasttrack_mirror;
 mod implicits;
 pub mod javaclass;
