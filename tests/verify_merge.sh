@@ -94,6 +94,9 @@ check_measure slick     "$SLICK" 184
 check_measure cats      "$CATS"  340
 check_measure gitbucket "$GB"    354
 [[ $GB == *"java_sources=3"* ]] || FAIL+=("gitbucket Java inputs missing: $GB")
+# gitbucket compiles clean since `agent/gbzero` and `agent/gbzero2`, and it
+# now reaches codegen (1317 classes). Zero is an invariant here too.
+[[ $GB == *"errors=0 files_with_errors=0"* ]] || FAIL+=("gitbucket measure: $GB")
 check_measure library   "$LIB"   538
 [[ $SLICK == *"errors=0 files_with_errors=0 classes=1504"* ]] || FAIL+=("slick measure: $SLICK")
 # cats compiles clean since `agent/catszero` (quasiquote patterns made the
