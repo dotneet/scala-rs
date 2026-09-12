@@ -3642,6 +3642,26 @@ impl Typer {
             return vec![Type::AnyRef; tps.len()];
         };
         let param = &unwrap_byname(param);
+        // A conversion whose *parameter* is itself a compound type:
+        // `implicit class StepperHasParStream[A](stepper: Stepper[A] with
+        // EfficientSplit)`. Only one component can mention the conversion's own
+        // type parameters, and that is the one the receiver has to be solved
+        // against -- `EfficientSplit` says nothing about `A`. Left as written,
+        // the compound was zipped against the compound receiver and `A` stayed
+        // open: `a.stepper.asJavaParStream` for an `a: Array[Byte]` was
+        // `could not find implicit value of type StreamShape[A, IntStream, St]`
+        // (`collection/convert/StreamExtensions.scala:192,199,206,213`).
+        let compound_param: Option<Type> = match param {
+            Type::Refined { parents, .. } => parents
+                .iter()
+                .find(|p| {
+                    matches!(p, Type::Class { args, .. } if !args.is_empty())
+                        && crate::check::mentions_tparam(p, tps)
+                })
+                .cloned(),
+            _ => None,
+        };
+        let param: &Type = compound_param.as_ref().unwrap_or(param);
         // nsc solves the conversion's parameters against the receiver's *base
         // type* at the parameter's class, not against the receiver as written.
         // `implicit def mapAsScalaMapConverter[K, V](m: java.util.Map[K, V])`

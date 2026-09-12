@@ -2958,18 +2958,25 @@ impl Typer {
                         && self.st.get(id).owner == class_id
                         && Some(id) != skip
                 })
-                .filter(|&id| match &self.st.get(id).ty {
-                    Type::Method { paramss, .. } => paramss
-                        .first()
-                        .is_some_and(|ps| ps.len() == args.len() && !ps.iter().any(is_open_formal)),
-                    _ => false,
+                .filter(|&id| {
+                    // The clauses of a curried delegation are folded into one
+                    // argument list before this runs
+                    // (`flatten_curried_ctor_delegation`), so the candidate's
+                    // are flattened too: `def this()(implicit ord: Ordering[K])
+                    // = this(RB.Tree.empty)(ord)` is two arguments against
+                    // `(tree: RB.Tree[K, V])(implicit ordering: Ordering[K])`
+                    // (`mutable/TreeMap.scala:48`, `mutable/TreeSet.scala:48`).
+                    // A delegation that writes fewer clauses than the callee
+                    // has -- leaving an implicit one to be filled in -- matches
+                    // no candidate's arity and keeps the old behaviour.
+                    let flat = flat_param_types(&self.st.get(id).ty);
+                    matches!(&self.st.get(id).ty, Type::Method { .. })
+                        && flat.len() == args.len()
+                        && !flat.iter().any(is_open_formal)
                 })
                 .collect();
             match fits[..] {
-                [only] => match &self.st.get(only).ty {
-                    Type::Method { paramss, .. } => paramss.first().cloned().unwrap_or_default(),
-                    _ => Vec::new(),
-                },
+                [only] => flat_param_types(&self.st.get(only).ty),
                 _ => Vec::new(),
             }
         };

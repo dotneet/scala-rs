@@ -689,8 +689,14 @@ fn map_decl(d: &RefineDecl, go: &dyn Fn(&Type) -> Type) -> RefineDecl {
             lo: lo.as_ref().map(go),
             hi: hi.as_ref().map(go),
         },
-        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+        RefineDecl::Def {
+            name,
+            tparams,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
             name: name.clone(),
+            tparams: tparams.clone(),
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(go).collect())

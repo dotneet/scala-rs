@@ -216,6 +216,28 @@ impl Typer {
                     &format!("reflective access of structural type member {kind} {name}"),
                 );
             }
+            // A declaration with type parameters of its own
+            // (`{ def f[S](x: S): S }`) has no symbol to hang them on, so
+            // `refine_member_type`'s `Type::Method` still mentions them as
+            // rigid parameters and nothing at the call site can instantiate
+            // them. Building such a type is implemented (`StreamExtensions`
+            // uses three of them as the right-hand side of a `<:<` evidence
+            // parameter, and `conforms_to_refinement` alpha-renames them);
+            // *calling* the member is not, and says so rather than reporting a
+            // mismatch against a type parameter the user cannot see.
+            if matches!(&recv_ty, Type::Refined { decls, .. } if decls.iter().any(|d| {
+                matches!(d, scala_rs_parser::RefineDecl::Def { name: n, tparams, .. }
+                    if n == &name && !tparams.is_empty())
+            })) {
+                self.error(
+                    tree.span,
+                    format!(
+                        "unimplemented: calling {name}, a structural type member with type parameters of its own"
+                    ),
+                );
+                tree.ty = Type::Error;
+                return;
+            }
             let mty = self.st.expand_in_type(&recv_ty, &mty);
             tree.ty = self.maybe_auto_apply(mty, pt);
             return;

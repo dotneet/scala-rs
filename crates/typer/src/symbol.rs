@@ -6227,8 +6227,20 @@ impl SymbolTable {
                 }
                 s
             }
-            RefineDecl::Def { name, paramss, ret } => {
+            RefineDecl::Def {
+                name,
+                tparams,
+                paramss,
+                ret,
+            } => {
                 let mut s = format!("def {name}");
+                if !tparams.is_empty() {
+                    let ps: Vec<String> = tparams
+                        .iter()
+                        .map(|&t| self.display_type(&Type::TypeParam(t)))
+                        .collect();
+                    s.push_str(&format!("[{}]", ps.join(", ")));
+                }
                 for ps in paramss {
                     let ps: Vec<String> = ps.iter().map(|p| self.display_type(p)).collect();
                     s.push_str(&format!("({})", ps.join(", ")));
@@ -6877,6 +6889,7 @@ impl SymbolTable {
                     name: n,
                     paramss,
                     ret,
+                    ..
                 } if n == name => {
                     return Some(Type::Method {
                         paramss: paramss.clone(),
@@ -6958,6 +6971,16 @@ impl SymbolTable {
                         }
                     }
                 }
+                RefineDecl::Def {
+                    name,
+                    tparams,
+                    paramss,
+                    ret,
+                } if !tparams.is_empty() => {
+                    if !self.polymorphic_decl_is_met(a, name, tparams, paramss, ret) {
+                        return false;
+                    }
+                }
                 RefineDecl::Def { name, ret, .. } => {
                     let Some(have) = self.lookup_term_member_on(a, name) else {
                         return false;
@@ -6977,6 +7000,65 @@ impl SymbolTable {
             }
         }
         true
+    }
+
+    /// Does `a` have a member that implements a **polymorphic** structural
+    /// declaration?
+    ///
+    /// nsc's `specializesSym` compares the member's whole *signature* with the
+    /// declaration's, after alpha-renaming the declaration's type parameters to
+    /// the member's own. The monomorphic arm above compares only result types,
+    /// which is wrong in both directions once the declaration has parameters of
+    /// its own: `def stepper[S <: Stepper[_]](implicit shape: StepperShape[A,
+    /// S]): S with EfficientSplit` would be "implemented" by any `stepper`
+    /// whatever its parameters, and its result `S` is a *rigid* parameter of the
+    /// declaration, which nothing a candidate can offer conforms to -- so the
+    /// same check would also reject the real member.
+    ///
+    /// The member has to be found as a **symbol**, not as a type:
+    /// `lookup_term_member_on` answers with a `Type::Method`, which has nowhere
+    /// to keep the member's own type parameters, and without them there is
+    /// nothing to rename to.
+    fn polymorphic_decl_is_met(
+        &self,
+        a: &Type,
+        name: &str,
+        decl_tps: &[SymbolId],
+        paramss: &[Vec<Type>],
+        ret: &Type,
+    ) -> bool {
+        let Some(cls) = self.class_sym_of(a) else {
+            return false;
+        };
+        self.lookup_member(cls, name).into_iter().any(|m| {
+            let sym = self.get(m);
+            if sym.kind != SymKind::Method || sym.tparams.len() != decl_tps.len() {
+                return false;
+            }
+            let args: Vec<Type> = sym.tparams.iter().map(|&t| Type::TypeParam(t)).collect();
+            let mty = self.subst_as_seen_from(a, &sym.ty.clone());
+            let Type::Method {
+                paramss: have_ps,
+                ret: have_ret,
+            } = &mty
+            else {
+                return false;
+            };
+            if have_ps.len() != paramss.len() {
+                return false;
+            }
+            let same = have_ps.iter().zip(paramss).all(|(h, d)| {
+                h.len() == d.len()
+                    && h.iter().zip(d).all(|(x, y)| {
+                        let y = subst_tparams_slice(decl_tps, &args, y);
+                        self.types_same_enough(x, &y)
+                    })
+            });
+            same && {
+                let want = subst_tparams_slice(decl_tps, &args, ret);
+                self.is_sub_type(have_ret, &want)
+            }
+        })
     }
 
     fn types_same_enough(&self, a: &Type, b: &Type) -> bool {
@@ -7395,8 +7477,14 @@ fn expand_refine_decl(st: &SymbolTable, from: SymbolId, d: &RefineDecl) -> Refin
             lo: lo.as_ref().map(|t| st.expand_type_members(from, t)),
             hi: hi.as_ref().map(|t| st.expand_type_members(from, t)),
         },
-        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+        RefineDecl::Def {
+            name,
+            tparams,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
             name: name.clone(),
+            tparams: tparams.clone(),
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| st.expand_type_members(from, p)).collect())
@@ -7429,8 +7517,14 @@ fn subst_refine_decl(
             lo: lo.as_ref().map(|t| subst_map(t, tps, args)),
             hi: hi.as_ref().map(|t| subst_map(t, tps, args)),
         },
-        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+        RefineDecl::Def {
+            name,
+            tparams,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
             name: name.clone(),
+            tparams: tparams.clone(),
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| subst_map(p, tps, args)).collect())
@@ -7450,8 +7544,14 @@ fn expand_hk_refine_decl(st: &SymbolTable, d: &RefineDecl) -> RefineDecl {
         // (possibly partially applied to what it captured); reducing it here
         // would throw its parameters away.
         RefineDecl::Type { .. } => d.clone(),
-        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+        RefineDecl::Def {
+            name,
+            tparams,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
             name: name.clone(),
+            tparams: tparams.clone(),
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| st.expand_hk_aliases(p)).collect())
@@ -7724,8 +7824,14 @@ fn map_refine_decl(d: &RefineDecl, f: &mut impl FnMut(&Type) -> Type) -> RefineD
             lo: lo.as_ref().map(|t| map_type(t, f)),
             hi: hi.as_ref().map(|t| map_type(t, f)),
         },
-        RefineDecl::Def { name, paramss, ret } => RefineDecl::Def {
+        RefineDecl::Def {
+            name,
+            tparams,
+            paramss,
+            ret,
+        } => RefineDecl::Def {
             name: name.clone(),
+            tparams: tparams.clone(),
             paramss: paramss
                 .iter()
                 .map(|ps| ps.iter().map(|p| map_type(p, f)).collect())

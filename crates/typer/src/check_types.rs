@@ -2503,11 +2503,23 @@ impl Typer {
                         ok = false;
                         continue;
                     }
-                    if !tparams.is_empty() {
-                        self.error(r.span, "unimplemented type: type parameters in refinement");
-                        ok = false;
-                        continue;
-                    }
+                    // A *polymorphic* declaration (`def stepper[S <:
+                    // Stepper[_]](implicit shape: StepperShape[A, S]): S with
+                    // EfficientSplit`, which is how `StreamExtensions` spells
+                    // the three refinements it uses as the right-hand side of a
+                    // `<:<` evidence parameter). Its parameters are entered as
+                    // real symbols for the duration of the signature, so the
+                    // parameter and result types mention them, and they are
+                    // carried on the declaration for
+                    // `conforms_to_refinement` to alpha-rename.
+                    let tparams = tparams.clone();
+                    let tp_ids = if tparams.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.st.push_scope();
+                        let mut ts = tparams;
+                        self.enter_tparams(&mut ts, SymbolId::NONE)
+                    };
                     let mut paramss = Vec::new();
                     for clause in vparamss {
                         let mut ct = Vec::new();
@@ -2523,8 +2535,12 @@ impl Typer {
                         paramss.push(ct);
                     }
                     let ret = self.tree_to_type(tpt);
+                    if !tp_ids.is_empty() {
+                        self.st.pop_scope();
+                    }
                     decls.push(scala_rs_parser::RefineDecl::Def {
                         name: name.clone(),
+                        tparams: tp_ids,
                         paramss,
                         ret,
                     });
@@ -2550,6 +2566,7 @@ impl Typer {
                         });
                         decls.push(scala_rs_parser::RefineDecl::Def {
                             name: format!("{name}_="),
+                            tparams: Vec::new(),
                             paramss: vec![vec![ty]],
                             ret: Type::Unit,
                         });

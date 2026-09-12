@@ -5225,6 +5225,10 @@ impl PickleSupply {
                 }
                 Some(scala_rs_parser::RefineDecl::Def {
                     name,
+                    // A pickled structural declaration's own type parameters
+                    // are not read back yet; the pickle's `PolyType` wrapper is
+                    // unwrapped above without them.
+                    tparams: Vec::new(),
                     paramss,
                     ret: self.conv_at(st, bin, scope, ty, d)?,
                 })

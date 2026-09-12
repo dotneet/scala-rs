@@ -1003,9 +1003,15 @@ impl<'a> Pickler<'a> {
         self.current_owner = idx;
         for d in decls {
             match d {
-                RefineDecl::Def { name, paramss, ret } => {
-                    self.pickle_refined_def(idx, name, paramss, ret)
-                }
+                // A polymorphic structural declaration is pickled without its
+                // own type parameters: `pickle_refined_def` writes a
+                // `METHODtpe`, and a `POLYtpe` around it would need the
+                // parameter symbols written into this synthetic refinement
+                // class first. The types that mention them still round-trip as
+                // the parameters' own entries.
+                RefineDecl::Def {
+                    name, paramss, ret, ..
+                } => self.pickle_refined_def(idx, name, paramss, ret),
                 RefineDecl::Val { name, ty } => {
                     self.pickle_refined_def(idx, name, &[], ty);
                 }

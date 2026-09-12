@@ -485,6 +485,15 @@ pub enum RefineDecl {
     },
     Def {
         name: String,
+        /// The declaration's **own** type parameters (`def stepper[S <:
+        /// Stepper[_]](implicit shape: StepperShape[A, S]): S with
+        /// EfficientSplit`, as `StreamExtensions` writes it). Empty for a
+        /// monomorphic declaration, which is every other one.
+        ///
+        /// They are real symbols, so `paramss` and `ret` mention them as
+        /// `Type::TypeParam`; `SymbolTable::conforms_to_refinement`
+        /// alpha-renames them to a candidate member's own before comparing.
+        tparams: Vec<SymbolId>,
         paramss: Vec<Vec<Type>>,
         ret: Type,
     },
@@ -526,8 +535,18 @@ impl fmt::Display for RefineDecl {
                 }
                 Ok(())
             }
-            RefineDecl::Def { name, paramss, ret } => {
+            RefineDecl::Def {
+                name,
+                tparams,
+                paramss,
+                ret,
+            } => {
                 write!(f, "def {name}")?;
+                if !tparams.is_empty() {
+                    // Symbol ids alone; the table is not to hand here. The
+                    // rendering that matters is `SymbolTable::display_refine_decl`.
+                    write!(f, "[{}]", vec!["_"; tparams.len()].join(", "))?;
+                }
                 for ps in paramss {
                     write!(f, "(")?;
                     for (i, p) in ps.iter().enumerate() {

@@ -3023,6 +3023,9 @@ impl Typer {
         if class_ctor_matches_typeparam_args(arg, param) {
             return Some(2);
         }
+        if self.ctor_base_type_matches(arg, param) {
+            return Some(2);
+        }
         if numeric_widen(arg, param).is_some() {
             return Some(3);
         }
@@ -3050,6 +3053,62 @@ impl Typer {
             }
         }
         None
+    }
+
+    /// Overload scoring for a parameter whose class the argument reaches only
+    /// through a **base** type, while the alternative's own type parameters are
+    /// still open.
+    ///
+    /// `new SeqView.Sorted(this, ord)` passes a `SeqView[A]` to
+    /// `underlying: SomeSeqOps[A']` -- `type SomeSeqOps[+A] = SeqOps[A,
+    /// AnyConstr, _]` -- and `class_ctor_matches_typeparam_args` compares
+    /// `SeqView` with `SeqOps` directly, so the two-parameter auxiliary
+    /// constructor scored nothing, the three-parameter primary was scored
+    /// against two arguments, and the call reported `no matching overload for
+    /// constructor Sorted` followed by `found Ordering[B] required Int`
+    /// (`collection/SeqView.scala:37`).
+    ///
+    /// The base type is taken first, then compared the way
+    /// `class_ctor_matches_typeparam_args` compares: a position that is a type
+    /// parameter, an abstract/alias type member or a wildcard on *either* side
+    /// cannot separate two alternatives, and `is_sub_type` decides the rest --
+    /// which is what reads `SeqOps`'s own covariance and `type AnyConstr[X] =
+    /// Any` (every constructor inhabits it). Scoring only: the pick still
+    /// substitutes and `adapt` still has to prove the argument fits.
+    fn ctor_base_type_matches(&self, arg: &Type, param: &Type) -> bool {
+        let param = self.st.dealias(param);
+        if !mentions_any_tparam(&param) {
+            return false;
+        }
+        let Some(ps) = self.st.class_sym_of(&param) else {
+            return false;
+        };
+        if self.st.class_sym_of(arg) == Some(ps) {
+            return false;
+        }
+        let Some(bt) = self.base_type_instance(arg, ps, 0) else {
+            return false;
+        };
+        let (Type::Class { args: aa, .. }, Type::Class { args: pa, .. }) = (&bt, &param) else {
+            return false;
+        };
+        let opaque = |t: &Type| {
+            matches!(
+                t,
+                Type::TypeParam(_)
+                    | Type::TypeMember(_)
+                    | Type::Wildcard
+                    | Type::BoundedWildcard { .. }
+            )
+        };
+        aa.len() == pa.len()
+            && aa.iter().zip(pa).all(|(a, p)| {
+                opaque(a)
+                    || opaque(p)
+                    || a == p
+                    || self.st.is_sub_type(a, p)
+                    || class_ctor_matches_typeparam_args(a, p)
+            })
     }
 
     /// Parameter types for an expanded placeholder section `f(_, x)`, read off

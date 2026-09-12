@@ -1780,6 +1780,20 @@ impl Typer {
                     self.base_type_instance(&p, target, depth + 1)
                 });
             }
+            // A plain compound type (`A with B`). nsc's `baseType` of a
+            // `RefinedType` asks its parents, left to right, and a compound has
+            // no base type of its own. `IntStepper with EfficientSplit` is a
+            // `Stepper[Int]` through its first parent, which is what solves `A`
+            // for `implicit class StepperHasSeqStream[A](s: Stepper[A])`:
+            // `conv_targs` reads the receiver's base type at the conversion's
+            // parameter class, got `None` here, and left `A` open -- the eight
+            // `could not find implicit value of type StreamShape[A, IntStream,
+            // St]` of `collection/convert/StreamExtensions.scala:190-213`.
+            Type::Refined { parents, .. } => {
+                return parents
+                    .iter()
+                    .find_map(|p| self.base_type_instance(p, target, depth + 1));
+            }
             _ => return None,
         };
         if sym == target {
