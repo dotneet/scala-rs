@@ -979,6 +979,9 @@ pub fn typecheck_units_src(
     // Default arguments are bodies, not signatures: typing them during the
     // pass above would let one name only the members of the units that come
     // before its own on the command line.
+    // Every source method has its parameters now; an override inherits the
+    // defaults of the method it overrides before any call is typed.
+    t.inherit_overridden_defaults();
     t.defer_default_rhs = false;
     t.type_pending_defaults();
     for (tree, file_index) in units.iter_mut() {

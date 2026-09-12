@@ -152,6 +152,79 @@ impl Typer {
         }
     }
 
+    /// nsc's namer: a parameter of a method that overrides or implements one
+    /// whose parameter declares a default inherits that default -- the
+    /// parameter is `DEFAULTPARAM` though it writes none, and a call that
+    /// omits it invokes the inherited `name$default$n` getter on the receiver.
+    ///
+    /// ```scala
+    /// class A { def g(a: Int = 1): Int = a }
+    /// class C extends A { override def g(a: Int): Int = a + 100 }
+    /// new C().g()   // 101: A.g$default$1 called on the C
+    /// ```
+    ///
+    /// scala-rs saw a parameter without a default and reported "no matching
+    /// overload ... with arguments ()". No getter is synthesized for such a
+    /// parameter: the inherited one is the one nsc calls, and a class
+    /// further down that writes its own default overrides it.
+    ///
+    /// Run once the signature pass has given every source method its
+    /// parameter symbols and types, before any body (any call) is typed.
+    pub(crate) fn inherit_overridden_defaults(&mut self) {
+        let end = self.st.symbols.len();
+        for idx in self.st.prelude_end as usize..end {
+            let m = SymbolId(idx as u32);
+            let s = self.st.get(m);
+            if s.kind != SymKind::Method
+                || s.name == "<init>"
+                || s.name.contains("$default$")
+                || !s.pickled_origin.is_empty()
+                || s.owner.is_none()
+                || !self.st.get(s.owner).is_class_like()
+            {
+                continue;
+            }
+            let params: Vec<SymbolId> = s.paramss.iter().flatten().copied().collect();
+            if params.is_empty()
+                || params
+                    .iter()
+                    .all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM))
+            {
+                continue;
+            }
+            let (owner, name) = (s.owner, s.name.clone());
+            let bases: Vec<SymbolId> = self
+                .st
+                .lookup_member(owner, &name)
+                .into_iter()
+                .filter(|&b| {
+                    b != m
+                        && self.st.get(b).owner != owner
+                        && self.st.get(b).kind == SymKind::Method
+                })
+                .collect();
+            for b in bases {
+                let bs = self.st.get(b);
+                let bparams: Vec<SymbolId> = if bs.paramss.is_empty() {
+                    bs.params.clone()
+                } else {
+                    bs.paramss.iter().flatten().copied().collect()
+                };
+                if bparams.len() != params.len() || !self.same_signature(m, b) {
+                    continue;
+                }
+                for (p, bp) in params.iter().zip(&bparams) {
+                    if self.st.get(*bp).flags.contains(Flags::DEFAULTPARAM)
+                        && !self.st.get(*p).flags.contains(Flags::DEFAULTPARAM)
+                    {
+                        let f = self.st.get(*p).flags.with(Flags::DEFAULTPARAM);
+                        self.st.get_mut(*p).flags = f;
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether `m` is a method whose parameters declare a default.
     fn declares_default(&self, m: SymbolId) -> bool {
         let s = self.st.get(m);
