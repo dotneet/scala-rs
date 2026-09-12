@@ -32,6 +32,7 @@ mod fasttrack_mirror;
 mod implicits;
 pub mod javaclass;
 mod javasign;
+mod kind_bounds;
 mod lambda_lift;
 mod lazy_local;
 mod lazysig;

@@ -11,6 +11,7 @@
 
 use crate::symbol::SymbolTable;
 use scala_rs_parser::ast::Flags;
+use scala_rs_parser::SymbolId;
 
 /// `(jvm name, one character per type parameter)`, `+`/`-`/`=`.
 const VARIANCES: &[(&str, &str)] = &[
@@ -47,33 +48,59 @@ const VARIANCES: &[(&str, &str)] = &[
 
 pub fn install(st: &mut SymbolTable) {
     for i in 0..st.symbols.len() {
-        let jvm = st.symbols[i].jvm_name.clone();
-        let tps = st.symbols[i].tparams.clone();
-        if tps.is_empty() {
-            continue;
-        }
-        let spec = if let Some(n) = tuple_arity(&jvm) {
-            "+".repeat(n)
-        } else {
-            match VARIANCES.iter().find(|(j, _)| *j == jvm) {
-                Some((_, v)) => (*v).to_string(),
-                None => continue,
-            }
-        };
-        for (tp, c) in tps.iter().zip(spec.chars()) {
-            let f = match c {
-                '+' => Flags::COVARIANT,
-                '-' => Flags::CONTRAVARIANT,
-                _ => continue,
-            };
-            let cur = st.get(*tp).flags;
-            st.get_mut(*tp).flags = cur.with(f);
-        }
+        apply_declared(st, SymbolId(i as u32));
     }
+}
+
+/// Give `id`'s type parameters the variance 2.13 declares for the class of
+/// that JVM name, if it is one the table knows. Also for a class built after
+/// [`install`] ran (`prelude_fntuple` makes `Function5` … `Function22`).
+pub(crate) fn apply_declared(st: &mut SymbolTable, id: SymbolId) {
+    let tps = st.get(id).tparams.clone();
+    if tps.is_empty() {
+        return;
+    }
+    let Some(spec) = spec_for(&st.get(id).jvm_name) else {
+        return;
+    };
+    for (tp, c) in tps.iter().zip(spec.chars()) {
+        let f = match c {
+            '+' => Flags::COVARIANT,
+            '-' => Flags::CONTRAVARIANT,
+            _ => continue,
+        };
+        let cur = st.get(*tp).flags;
+        st.get_mut(*tp).flags = cur.with(f);
+    }
+}
+
+/// One character per type parameter, `+`/`-`/`=`.
+fn spec_for(jvm: &str) -> Option<String> {
+    if let Some(n) = tuple_arity(jvm) {
+        return Some("+".repeat(n));
+    }
+    // `FunctionN[-T1, …, -Tn, +R]`. The kind check reads these when a
+    // function type is passed as a constructor (`fn[Function1]` for
+    // `F[-_, +_]`), where an invariant `T1` would refuse a valid program.
+    if let Some(n) = function_arity(jvm) {
+        let mut s = "-".repeat(n);
+        s.push('+');
+        return Some(s);
+    }
+    VARIANCES
+        .iter()
+        .find(|(j, _)| *j == jvm)
+        .map(|(_, v)| (*v).to_string())
 }
 
 /// `scala/TupleN` for `N` in 1..=22; every parameter is covariant.
 fn tuple_arity(jvm: &str) -> Option<usize> {
     let n: usize = jvm.strip_prefix("scala/Tuple")?.parse().ok()?;
     (1..=22).contains(&n).then_some(n)
+}
+
+/// `scala/FunctionN` for `N` in 0..=22.
+fn function_arity(jvm: &str) -> Option<usize> {
+    let n: usize = jvm.strip_prefix("scala/Function")?.parse().ok()?;
+    (0..=22).contains(&n).then_some(n)
 }

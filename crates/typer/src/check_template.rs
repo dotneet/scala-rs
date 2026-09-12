@@ -874,7 +874,9 @@ impl Typer {
                 if rhs.is_empty() {
                     Type::TypeMember(type_member_id)
                 } else {
+                    self.alias_rhs_depth += 1;
                     let rhs_ty = self.tree_to_type(rhs);
+                    self.alias_rhs_depth -= 1;
                     self.check_proper_type(&rhs_ty, span);
                     self.check_alias_against_bounds(
                         span,
@@ -906,7 +908,7 @@ impl Typer {
                 self.st.push_scope();
                 let tp_ids = self.enter_tparams(tparams, type_member_id);
                 if !type_member_id.is_none() {
-                    self.st.get_mut(type_member_id).tparams = tp_ids;
+                    self.st.get_mut(type_member_id).tparams = tp_ids.clone();
                 }
                 let lo_ty = lo.as_ref().map(|t| self.tree_to_type(t));
                 let hi_ty = hi.as_ref().map(|t| self.tree_to_type(t));
@@ -923,7 +925,9 @@ impl Typer {
                 let ty = if rhs.is_empty() {
                     Type::TypeMember(type_member_id)
                 } else {
+                    self.alias_rhs_depth += 1;
                     let rhs_ty = self.tree_to_type(rhs);
+                    self.alias_rhs_depth -= 1;
                     self.check_proper_type(&rhs_ty, span);
                     if let Some(h) = &hi_ty {
                         if !rhs_ty.is_error() && !self.st.is_sub_type(&rhs_ty, h) {
@@ -939,6 +943,27 @@ impl Typer {
                     }
                     rhs_ty
                 };
+                // `type l[-a] = Cov[a]`: the member's own parameters must
+                // occur at their declared variance (`neg/t7872`). nsc exempts
+                // a definition local to a block, whose owner is a term.
+                if !type_member_id.is_none()
+                    && self
+                        .st
+                        .get(self.st.get(type_member_id).owner)
+                        .is_class_like()
+                {
+                    let body = (!rhs.is_empty()).then_some(&ty);
+                    let lo_b = self.st.get(type_member_id).bound_lo.clone();
+                    let desc = format!("type {name}");
+                    self.check_hk_member_own_variance(
+                        &tp_ids,
+                        body,
+                        lo_b.as_ref(),
+                        hi_ty.as_ref(),
+                        span,
+                        &desc,
+                    );
+                }
                 self.st.pop_scope();
                 ty
             } else {
@@ -958,7 +983,10 @@ impl Typer {
         let ty = if rhs_empty {
             Type::TypeMember(type_member_id)
         } else if let TreeKind::TypeDef { rhs, .. } = &tree.kind {
-            self.tree_to_type(rhs)
+            self.alias_rhs_depth += 1;
+            let t = self.tree_to_type(rhs);
+            self.alias_rhs_depth -= 1;
+            t
         } else {
             return;
         };
@@ -2017,6 +2045,14 @@ impl Typer {
                 self.check_variance_ty(&vars, &ty, 1, span, &format!("value {name}"));
                 continue;
             }
+            // A type member: an alias's right-hand side is an invariant
+            // position for the class's parameters, an abstract member's upper
+            // bound a covariant and its lower bound a contravariant one
+            // (`class G[+T] { type V = List[T] }` is rejected by nsc).
+            if self.st.get(m).kind == SymKind::TypeMember && self.st.get(m).owner == class_id {
+                self.check_type_member_class_variance(&vars, m, span);
+                continue;
+            }
             if self.st.get(m).kind != SymKind::Method {
                 continue;
             }
@@ -2089,9 +2125,30 @@ impl Typer {
         span: Span,
         where_: &str,
     ) {
+        self.check_variance_ty_in(vars, ty, pos, span, where_, None);
+    }
+
+    /// [`Self::check_variance_ty`] with the type a diagnostic names spelled by
+    /// the caller. nsc prints the *definition's* type (`base.info`) -- the
+    /// whole `[-a]List[a]` of a type lambda, not the `a` that was found in the
+    /// wrong place -- and `shown` is that spelling; `None` prints the
+    /// occurrence itself, as the member checks always have.
+    pub(crate) fn check_variance_ty_in(
+        &mut self,
+        vars: &[(SymbolId, i8, String)],
+        ty: &Type,
+        pos: i8,
+        span: Span,
+        where_: &str,
+        shown: Option<&str>,
+    ) {
         match ty {
             Type::TypeParam(id) => {
                 if let Some((_, vp, name)) = vars.iter().find(|(t, _, _)| t == id) {
+                    let shown_s = match shown {
+                        Some(s) => s.to_string(),
+                        None => self.st.display_type(ty),
+                    };
                     if *vp != 0 && pos != 0 && (*vp < 0 && pos > 0 || *vp > 0 && pos < 0) {
                         let which = if *vp > 0 {
                             "covariant"
@@ -2106,8 +2163,7 @@ impl Typer {
                         self.error(
                             span,
                             format!(
-                                "{which} type {name} occurs in {place} position in type {} of {where_}",
-                                self.st.display_type(ty)
+                                "{which} type {name} occurs in {place} position in type {shown_s} of {where_}"
                             ),
                         );
                     }
@@ -2120,18 +2176,20 @@ impl Typer {
                         self.error(
                             span,
                             format!(
-                                "{which} type {name} occurs in invariant position in type {} of {where_}",
-                                self.st.display_type(ty)
+                                "{which} type {name} occurs in invariant position in type {shown_s} of {where_}"
                             ),
                         );
                     }
                 }
             }
             Type::Class { sym, args } => {
+                // A `-cp` class has its declared variances only once its
+                // pickle is adopted (`kind_bounds.rs`).
+                self.complete_pending_class(*sym, span);
                 let vs = self.tparam_variances(*sym);
                 for (i, a) in args.iter().enumerate() {
                     let vp = vs.get(i).copied().unwrap_or(0);
-                    self.check_variance_ty(vars, a, pos * vp, span, where_);
+                    self.check_variance_ty_in(vars, a, pos * vp, span, where_, shown);
                 }
                 // A *local* class escaping as a member's type: nsc infers the
                 // refinement `AnyRef{def contains(x: T): Unit}` for it and
@@ -2156,17 +2214,19 @@ impl Typer {
                         match &mty {
                             Type::Method { paramss, ret } => {
                                 for p in paramss.iter().flatten() {
-                                    self.check_variance_ty(vars, p, -pos, span, &where_);
+                                    self.check_variance_ty_in(vars, p, -pos, span, &where_, shown);
                                 }
-                                self.check_variance_ty(vars, ret, pos, span, &where_);
+                                self.check_variance_ty_in(vars, ret, pos, span, &where_, shown);
                             }
-                            other => self.check_variance_ty(vars, other, pos, span, &where_),
+                            other => {
+                                self.check_variance_ty_in(vars, other, pos, span, &where_, shown)
+                            }
                         }
                     }
                 }
             }
             Type::Applied { ctor, args } => {
-                self.check_variance_ty(vars, ctor, pos, span, where_);
+                self.check_variance_ty_in(vars, ctor, pos, span, where_, shown);
                 // nsc reads the variances off `sym.typeParams` of whatever the
                 // application heads on, not off classes alone. An abstract type
                 // member (`type M[+X] <: ...`) and a higher-kinded type
@@ -2177,6 +2237,7 @@ impl Typer {
                 let vs = match ctor.as_ref() {
                     Type::TypeMember(id) | Type::TypeParam(id) => self.tparam_variances(*id),
                     Type::Class { sym, args: pre } => {
+                        self.complete_pending_class(*sym, span);
                         let mut vs = self.tparam_variances(*sym);
                         vs.drain(0..pre.len().min(vs.len()));
                         vs
@@ -2185,53 +2246,53 @@ impl Typer {
                 };
                 for (i, a) in args.iter().enumerate() {
                     let vp = vs.get(i).copied().unwrap_or(0);
-                    self.check_variance_ty(vars, a, pos * vp, span, where_);
+                    self.check_variance_ty_in(vars, a, pos * vp, span, where_, shown);
                 }
             }
             Type::Function { params, ret } => {
                 for p in params {
-                    self.check_variance_ty(vars, p, -pos, span, where_);
+                    self.check_variance_ty_in(vars, p, -pos, span, where_, shown);
                 }
-                self.check_variance_ty(vars, ret, pos, span, where_);
+                self.check_variance_ty_in(vars, ret, pos, span, where_, shown);
             }
             Type::Method { paramss, ret } => {
                 for p in paramss.iter().flatten() {
-                    self.check_variance_ty(vars, p, -pos, span, where_);
+                    self.check_variance_ty_in(vars, p, -pos, span, where_, shown);
                 }
-                self.check_variance_ty(vars, ret, pos, span, where_);
+                self.check_variance_ty_in(vars, ret, pos, span, where_, shown);
             }
             // `Array` is invariant; `=> T` and `T*` keep the position.
             Type::Array(t) => {
-                self.check_variance_ty(vars, t, 0, span, where_);
+                self.check_variance_ty_in(vars, t, 0, span, where_, shown);
             }
             Type::ByName(t) | Type::Repeated(t) => {
-                self.check_variance_ty(vars, t, pos, span, where_);
+                self.check_variance_ty_in(vars, t, pos, span, where_, shown);
             }
             Type::Tuple(ts) => {
                 for t in ts {
-                    self.check_variance_ty(vars, t, pos, span, where_);
+                    self.check_variance_ty_in(vars, t, pos, span, where_, shown);
                 }
             }
             Type::Named { args, .. } => {
                 for a in args {
-                    self.check_variance_ty(vars, a, 0, span, where_);
+                    self.check_variance_ty_in(vars, a, 0, span, where_, shown);
                 }
             }
             Type::Refined { parents, decls } => {
                 for p in parents {
-                    self.check_variance_ty(vars, p, pos, span, where_);
+                    self.check_variance_ty_in(vars, p, pos, span, where_, shown);
                 }
                 for d in decls {
                     match d {
                         scala_rs_parser::RefineDecl::Type { rhs: Some(t), .. }
                         | scala_rs_parser::RefineDecl::Val { ty: t, .. } => {
-                            self.check_variance_ty(vars, t, pos, span, where_);
+                            self.check_variance_ty_in(vars, t, pos, span, where_, shown);
                         }
                         scala_rs_parser::RefineDecl::Def { paramss, ret, .. } => {
                             for p in paramss.iter().flatten() {
-                                self.check_variance_ty(vars, p, -pos, span, where_);
+                                self.check_variance_ty_in(vars, p, -pos, span, where_, shown);
                             }
-                            self.check_variance_ty(vars, ret, pos, span, where_);
+                            self.check_variance_ty_in(vars, ret, pos, span, where_, shown);
                         }
                         _ => {}
                     }
@@ -2240,7 +2301,7 @@ impl Typer {
             Type::Annotated { tpe, annot } => {
                 // nsc skips only `@uncheckedVariance`, not `@unchecked`.
                 if annot.rsplit('.').next().unwrap_or(annot.as_str()) != "uncheckedVariance" {
-                    self.check_variance_ty(vars, tpe, pos, span, where_);
+                    self.check_variance_ty_in(vars, tpe, pos, span, where_, shown);
                 }
             }
             _ => {}

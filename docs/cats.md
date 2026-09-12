@@ -3324,6 +3324,54 @@ lambda's own body (`[-a]List[a]` uses `a` covariantly). Both are separate
 checks, and the second is not about kind conformance at all; neither is a
 reason to keep reading an abstract constructor covariantly.
 
+**Both checks exist now** (`agent/kindvar`, `crates/typer/src/kind_bounds.rs`).
+nsc's `checkKindBoundsHK` is run from the three bounds checks -- written and
+inferred method type arguments, and the arguments of a written class type --
+comparing a type argument's parameters with the higher-kinded parameter's
+level by level: the same number, matching variance (an invariant expectation
+accepts anything; the comparison direction alternates with every level, so
+`M[_[_]]` refuses `CFunctor[F[+_]]` and `M[_[+_]]` accepts `Functor[F[_]]`),
+and no stricter bounds. `Any` and `Nothing` are kind-overloaded, a wildcard
+argument is skipped, and a bound that still mentions a type parameter after
+instantiation is not judged. The message is nsc's, prefix and explanation
+lines included, and `t7872c` is rejected on it. The variance of a type
+lambda's own parameters is validated wherever the refinement is written
+(`of value <local l>`), and of a named higher-kinded alias or abstract member
+(`of type l`; a member's own parameter in its lower bound keeps its position,
+the class's parameters flip there and are invariant in an alias's right-hand
+side). `t7872` and `t7872b` are rejected on exactly scalac's lines.
+
+Two things the probes turned up on the way. `FunctionN`'s hand-built class
+symbols had no variance at all (`prelude_variance.rs` lists the prelude's
+classes and had `TupleN` but not `FunctionN`), which the kind check would have
+turned into a false refusal of `fn[Function1]` for `F[-_, +_]`; they are
+`[-T1, …, -Tn, +R]` now. And slick's `HCons` writes `type Self = HCons[H @uv,
+T @uv]` with `uncheckedVariance` renamed by its import; `Type::Annotated`
+stored the written name, so the variance check did not recognise it and the
+class-parameter half of the new member check rejected the file. The written
+name is resolved at construction and stored as the annotation's own.
+
+The full corpus found two more, both false refusals. `pos/t2994a` writes
+`curry[m#a, s]` for `trait curry[n[_[_], _], s[_]]`, where `m#a`'s parameters
+are bounded (`z <: NAT`) and `curry`'s are not, and scalac accepts it. Not
+because class type applications escape the bounds half of the check: a plain
+`type f = curry[C]` for `class C[z <: NAT]` *is* rejected by scalac
+("type z's bounds <: NAT are stricter than type _'s declared bounds"), as is
+the same `C` as a method's type argument. Thirteen probes drew the line where
+nsc's trees draw it, not where the language does: an application that is an
+argument of an abstract higher-kinded member's application (t2994a's
+`n#a[curry[m#a, s]#f, z]`), or written in a method body with top-level
+classes, is never visited by refchecks' bounds walk, while a local alias over
+local classes is. Copying that would be copying an accident, so a class type
+application's arguments are compared for arity and variance only; method
+type arguments keep the full comparison. `pos/t8708` is a
+separate-compilation test: `class X[+A]` from an earlier round arrives from
+`-cp` with a shallow signature whose parameters are all invariant until its
+pickle is adopted (`ensure_java_loaded`), and the variance checks read the
+variances directly -- the pre-existing member check (`def m: X[B]` in a class
+covariant in `B`) had the same false positive. The checks complete such a
+class before reading it.
+
 ### Found in passing, not fixed
 
 * `Option.map` (and the other hand-written collection `map`s in the prelude)

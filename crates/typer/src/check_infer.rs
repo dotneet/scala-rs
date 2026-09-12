@@ -2887,6 +2887,12 @@ impl Typer {
         let recv_args: Vec<Type> = self.owner_args_as_seen_from(owner, recv);
         let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
         let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
+        // nsc's `checkBounds` kind-checks first, and a kind error stands in
+        // for the bounds error (`kind_bounds.rs`).
+        let prefix = if inferred { "inferred " } else { "" };
+        if self.check_kind_bounds(&ids, &vals, prefix, "", true, span) {
+            return;
+        }
         let mut bad = false;
         for (tp, actual) in inst {
             if actual.is_error() || actual.is_no_type() {
@@ -2966,6 +2972,15 @@ impl Typer {
             return;
         }
         if targs.iter().any(|t| t.is_error() || t.is_no_type()) {
+            return;
+        }
+        // `new Foo[Set]` for `class Foo[F[+_]]`: the kinds first, as nsc's
+        // `checkBounds` does, and a kind error replaces the bounds error.
+        // Arity and variance only: scalac accepts `curry[C]` for `class C[z
+        // <: NAT]` and `trait curry[n[_]]` (`pos/t2994a`), though it rejects
+        // the same `C` as a method's type argument.
+        let location = self.tparam_location_string(tps[0]);
+        if self.check_kind_bounds(&tps, targs, "", &location, false, span) {
             return;
         }
         let mut bad = false;
