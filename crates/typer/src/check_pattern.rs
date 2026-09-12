@@ -1651,6 +1651,68 @@ impl Typer {
         deferred
     }
 
+    /// The type `super.m`'s declaration is instantiated at.
+    ///
+    /// `super_select_member` hands back the *parent clause* the member was
+    /// reached through, which may only inherit it. A declaration read at such a
+    /// parent is instantiated at that parent's own arguments for the class that
+    /// declares it, and those need not be this class's:
+    /// `immutable.BitSet` mixes in both
+    /// `StrictOptimizedSortedSetOps[Int, immutable.SortedSet, BitSet]` and
+    /// `collection.BitSetOps[BitSet]`, and the latter extends
+    /// `SortedSetOps[Int, collection.SortedSet, C]`, so `super.zip(that)` came
+    /// back a `collection.SortedSet[(Int, B)]` where the override declares
+    /// `immutable.SortedSet[(Int, B)]` (`immutable/BitSet.scala:83`,
+    /// `mutable/BitSet.scala:188`). Reading it at the *declaring* class instead
+    /// goes through `base_type_seq`, which carries this class's own arguments
+    /// for it.
+    ///
+    /// Only the *prefix* is taken from the declaring class; the member set
+    /// `super_select_member` found stays as it is. A `super.m` whose
+    /// alternatives are declared in different classes (gitbucket's
+    /// `super.get(path) { … }`, whose one-clause and `ValueType` overloads sit
+    /// in different scalatra traits) keeps the whole set the parent clause saw.
+    pub(crate) fn super_decl_prefix_type(
+        &self,
+        this_id: SymbolId,
+        parent: SymbolId,
+        name: &str,
+    ) -> Type {
+        let fallback = || self.super_prefix_type(this_id, parent);
+        let declares = |c: SymbolId| {
+            self.st.get(c).members.iter().any(|&m| {
+                self.st.get(m).name == name
+                    && self.st.get(m).owner == c
+                    && !self.is_deferred_member(m)
+            })
+        };
+        // The parent clause really is the declaring class: nothing to correct.
+        if parent.is_none() || declares(parent) {
+            return fallback();
+        }
+        // Stay on the path `super_select_member` took -- only the class *that
+        // parent inherits the member from* is wanted, never some unrelated
+        // mixin that happens to declare the name.
+        let up = crate::lin::linearize(&self.st, parent);
+        let decl = crate::lin::linearize(&self.st, this_id)
+            .into_iter()
+            .find(|&c| c != this_id && c != parent && up.contains(&c) && declares(c));
+        let Some(decl) = decl else {
+            return fallback();
+        };
+        // `base_type_instance`, not a walk of `base_type_seq`: a class two of
+        // this one's parent clauses disagree about is the *meet* of their
+        // instantiations, not whichever a breadth-first walk meets first.
+        // `TreeMap` reaches `immutable.MapOps` as `MapOps[K, V, Map, Map[K, V]]`
+        // through `AbstractMap` and as `MapOps[K, V, Map, TreeMap[K, V]]`
+        // through `SortedMapFactoryDefaults`, and `super.removedAll(keys)` must
+        // be the second (`immutable/TreeMap.scala:164`).
+        let self_ty = self.st.self_type_of_class(this_id);
+        self.base_type_instance(&self_ty, decl, 0)
+            .filter(|t| matches!(t, Type::Class { args, .. } if !args.is_empty()))
+            .unwrap_or_else(fallback)
+    }
+
     /// A member with no implementation: a body-less `def` (the namer sets
     /// `ABSTRACT` on those), a pickled one (`Symbol::deferred_method`, the
     /// pickle's `DEFERRED`), or a body-less `val` / `var`.

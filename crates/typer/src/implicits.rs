@@ -2841,6 +2841,27 @@ impl Typer {
         name: &str,
         span: Span,
     ) -> Option<(SymbolId, SymbolId, Type)> {
+        self.search_extension_in(from, None, name, span)
+    }
+
+    /// [`Self::search_extension`] where the receiver had to be *widened* before
+    /// its members could be looked up.
+    ///
+    /// `narrow` is the receiver as written. The candidates still come from the
+    /// widened type -- an abstract receiver's extension lives in the companion
+    /// of its bound -- but the conversion's own type arguments are read off the
+    /// narrow type when that yields the same result class, because that is what
+    /// the conversion is applied to. `def p[C <: AnyRef](c: C): (C, Int) =
+    /// c -> 1` is `ArrowAssoc[C]`, not `ArrowAssoc[AnyRef]`
+    /// (`collection/package.scala:78`, `Some(t.init -> t.last)` where
+    /// `C <: SeqOps[A, CC, C]`).
+    pub(crate) fn search_extension_in(
+        &mut self,
+        from: &Type,
+        narrow: Option<&Type>,
+        name: &str,
+        span: Span,
+    ) -> Option<(SymbolId, SymbolId, Type)> {
         // A conversion is applicable only if its own implicit clauses have
         // witnesses ([`Self::drop_witnessless_conversions`], below). The
         // witness for `FlatMap[Box]` lives on `Box`'s companion, which is a
@@ -2882,6 +2903,14 @@ impl Typer {
                 };
                 let Some(cls) = self.st.class_sym_of(&to) else {
                     continue;
+                };
+                // The conversion is applied to the receiver as written; the
+                // widened type only said where to look for candidates. Accepted
+                // only when it names the same class, so a narrow type the
+                // conversion cannot read keeps the widened answer.
+                let to = match narrow.map(|n| self.conversion_result(id, n)) {
+                    Some(Some(t2)) if self.st.class_sym_of(&t2) == Some(cls) => t2,
+                    _ => to,
                 };
                 // Load the conversion *result* (e.g. ListHasAsScala) so `asScala`
                 // is visible. Do not complete the *argument* type: that would

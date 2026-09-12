@@ -4314,3 +4314,49 @@ expected output is produced again by real scalac 2.13.16 in the same suite.
 `unqname_shadowed_parent_is_the_local_trait` asserts the parent with `javap`
 against both compilers, because a compile is not evidence for a root whose
 failure mode was silent.
+
+## `agent/libzero`: 66 → 43 errors (2026-09-13)
+
+Measured with `tests/scalalib_measure.sh` (the `--no-scala-library` arrangement,
+538 files). `classes=0` throughout: the library still has errors, so nothing
+reaches codegen yet and the headline number to aim at is
+`files=538 errors=0 files_with_errors=0`.
+
+Nine roots, each reduced to a standalone program and compared with real scalac
+2.13.16 in **both** directions (`crates/cli/tests/lz.rs`, fixtures `lz_infer`,
+`lz_infer_bad`, `lz_resolve`, `lz_resolve_bad`):
+
+| root | library sites | errors |
+|---|---|---|
+| a value of function type is not applicable to a `PartialFunction` formal | `PartialFunction.scala:277` | 4 |
+| a covariant `Nothing` solution is instantiated even under an expected type | `util/control/Exception.scala:274-276,365` | 4 |
+| `[B, B1 >: B]`: a lower bound naming another parameter of the same method | `immutable/TreeSet.scala:163,180` | 2 |
+| `Null` / `Nothing` in an *invariant* position of the expected type | `mutable/TreeSet.scala:206,213,216` | 3 |
+| a contravariant occurrence bounds from above, so it loses to one that pinned | `collection/StringOps.scala:282,302` | 2 |
+| the implicit search takes the parameters its clause mentions, not all of them | `immutable/SortedMap.scala:175`, `mutable/SortedMap.scala:101` | 2 |
+| a case class's companion is the module in the same owner, not what the name resolves to at the use site | `concurrent/duration/Duration.scala:79,80` | 2 |
+| `new B(x)` for a parameterized alias constructs the class it renames | `Option.scala:575` | 1 |
+| `->` off the receiver only for the prelude's `ArrowAssoc`; `super.m` and an inserted conversion read at the right type | `Predef.scala:352`, `immutable/BitSet.scala:83`, `mutable/BitSet.scala:188` | 3 |
+
+cats (0 errors / 2976 classes), gitbucket (0 / 1317) and slick (0 / 1504) are
+unchanged by all of it.
+
+### Found here, not fixed here: `PartialFunction.applyOrElse` in the prelude
+
+`prelude_immutcoll2::add_partial_function` declares `applyOrElse(x: A, default:
+A => B): B` with no type parameters of its own, where nsc has
+`applyOrElse[A1 <: A, B1 >: B](x: A1, default: A1 => B1): B1`. So in
+`--scala-library` (jar) mode
+
+```scala
+def collect(pf: PartialFunction[Char, Char], s: String): Any = {
+  val fallback: Any => Any = (x: Any) => x
+  pf.applyOrElse(s.charAt(0), fallback)     // scalac: Any
+}
+```
+
+is `no matching overload for (Char, (Char) => Char)Char with arguments (Char,
+(Any) => Any)`. It is not a library-measure error -- the library compiles its
+own `PartialFunction` from source, where the declaration is the real one -- and
+the prelude's `PartialFunction` surface belongs to `agent/libsurf`, so it is
+recorded rather than changed.

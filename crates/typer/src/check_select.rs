@@ -167,7 +167,7 @@ impl Typer {
             if let Some((parent, members)) =
                 self.super_select_member(this_id, mix.as_deref(), &name)
             {
-                recv_ty = self.super_prefix_type(this_id, parent);
+                recv_ty = self.super_decl_prefix_type(this_id, parent, &name);
                 super_found = Some(members);
                 super_this = Some(this_id);
             }
@@ -483,7 +483,16 @@ impl Typer {
         // was imported from, which only that prefix can fill in.
         let mut ext_conv = SymbolId::NONE;
         if found.is_empty() {
-            if let Some((conv, member, to)) = self.search_extension(&recv_ty, &name, tree.span) {
+            // An abstract receiver was widened to its bound so its members
+            // could be found; a conversion inserted here still applies to the
+            // parameter itself (`search_extension_in`).
+            let narrow = match &qual.ty {
+                t @ Type::TypeParam(_) if *t != recv_ty => Some(t.clone()),
+                _ => None,
+            };
+            if let Some((conv, member, to)) =
+                self.search_extension_in(&recv_ty, narrow.as_ref(), &name, tree.span)
+            {
                 ext_conv = conv;
                 let span = qual.span;
                 let mut old = std::mem::replace(qual.as_mut(), Tree::dummy(TreeKind::Empty));
