@@ -4483,10 +4483,13 @@ impl Typer {
         // (`scala/collection/convert/impl/IndexedSeqStepper.scala`). Gated on
         // the bound actually declaring `apply`, so a parameter with no such
         // member keeps the diagnostic it has rather than gaining a second one.
-        let abstract_with_apply = matches!(
-            strip_annotations(&fun.ty),
-            Type::TypeParam(_) | Type::TypeMember(_)
-        ) && {
+        // Only a type *parameter*: a deferred type member reaches a second,
+        // unrelated gap -- `trait H { type C <: collection.IndexedSeq[Int];
+        // def xs: C; def at(j: Int) = xs(j) }` resolves the inserted `apply`
+        // to the type member itself ("no matching overload for H.C with
+        // arguments (Int)"), so including it would only trade one rejection
+        // for a more confusing one.
+        let abstract_with_apply = matches!(strip_annotations(&fun.ty), Type::TypeParam(_)) && {
             let ty = strip_annotations(&fun.ty).clone();
             self.ensure_apply_supplied(&ty, fun.span);
             self.st

@@ -751,10 +751,25 @@ impl Typer {
         // result is this class's even where it is not the whole result:
         // `override def lazyZip[B](that): LazyZip2[A, B, LazyList.this.type] =
         // super.lazyZip(that)`.
+        // An *applied* abstract type is the same case: `c.add(x)` on a
+        // `c: CC[A]` with `CC[x] <: Buf[x]` is a `CC[A]`, not the `Buf[A]` the
+        // bound says -- which is what `clone().asInstanceOf[CC[K, V1]]
+        // .addOne((key, value))` needs (`scala/collection/mutable/SortedMap.scala`,
+        // `scala/collection/mutable/Map.scala`).
+        let applied_abstract = matches!(
+            &qual.ty,
+            Type::Applied { ctor, .. }
+                if matches!(**ctor, Type::TypeParam(_) | Type::TypeMember(_))
+        );
         let this_prefix = match (&qual.ty, super_this) {
             (_, Some(here)) if ext_conv.is_none() => Some(Type::ThisType(here)),
             (Type::TypeParam(_) | Type::TypeMember(_), None)
                 if ext_conv.is_none() && recv_ty != qual.ty =>
+            {
+                Some(qual.ty.clone())
+            }
+            (Type::Applied { .. }, None)
+                if applied_abstract && ext_conv.is_none() && recv_ty != qual.ty =>
             {
                 Some(qual.ty.clone())
             }
