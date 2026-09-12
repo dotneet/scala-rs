@@ -5976,7 +5976,11 @@ impl SymbolTable {
                     // its time in, and cloning the parent list and the type
                     // parameters at every node of the DAG dominated its cost.
                     let child = self.get(*s1);
-                    child.parents.iter().any(|p| {
+                    // Whether any parent in this run was written with a prefix
+                    // at all. One `is_empty` keeps the lookup below off the hot
+                    // path for a program with no inner-class parent.
+                    let prefixed = !self.parent_prefixes.is_empty();
+                    child.parents.iter().enumerate().any(|(i, p)| {
                         // `self.`, not the free function: a parent carrying an
                         // abstract projection over `s1`'s own parameters is only
                         // the base type the question is about once the projection
@@ -5984,6 +5988,28 @@ impl SymbolTable {
                         // The method costs one `is_empty` when no program in this
                         // run has a projection at all.
                         let p = self.subst_tparams_cow(*s1, a1, p);
+                        // A parent that is an inner class is written in its
+                        // *enclosing* class's vocabulary, and only the prefix it
+                        // was written with instantiates that. `final class
+                        // HashKeySet extends ImmutableKeySet` inside
+                        // `HashMap[K, V]` inherits `class ImmutableKeySet
+                        // extends AbstractSet[K]` from `immutable.MapOps[K, V,
+                        // CC, C]`; walked bare, the `K` stayed `MapOps`'s own
+                        // and `HashKeySet` was not a `Set[K]` --
+                        // `illegal inheritance: self-type HashKeySet does not
+                        // conform to Set[K]` plus both `keySet` bodies
+                        // (`immutable/HashMap.scala:60,63,65`). The view sends
+                        // the recursion through `prefixed_parents_conform`,
+                        // which reads those parents as seen from the prefix.
+                        if prefixed {
+                            if let Some(pre) = self.parent_prefixes.get(&(s1.0, i)) {
+                                let q =
+                                    crate::prefix::with_prefix((*p).clone(), pre.clone());
+                                if self.is_sub_type(&q, b) {
+                                    return true;
+                                }
+                            }
+                        }
                         self.is_sub_type(&p, b)
                     })
                 })

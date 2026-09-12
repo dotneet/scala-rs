@@ -3480,6 +3480,15 @@ impl Typer {
     /// picks for an `Array[String]`. Both directions held before and the pair
     /// was reported as "ambiguous implicit: wrapRefArray, genericWrapArray"
     /// (`scala/Array.scala`, `scala/collection/concurrent/TrieMap.scala`).
+    ///
+    /// Applicability is **weak** conformance, as everywhere else an argument is
+    /// matched against a parameter: `def f(x: Long)` accepts `f(1)`. Asking
+    /// `is_sub_type` made `int2bigDecimal`, `long2bigDecimal` and
+    /// `double2bigDecimal` mutually unrelated -- neither `Int <: Long` nor
+    /// `Long <: Int` -- so `def sign: BigDecimal = signum` for a `signum: Int`
+    /// was `ambiguous implicit` (`math/BigDecimal.scala:555`) where nsc picks
+    /// the `Int` one, the only parameter all three accept and that accepts
+    /// neither of the others.
     fn conv_accepts_opaque(&self, y: SymbolId, px: &Type) -> bool {
         let Some(py) = self.conversion_arg_ty(y) else {
             return false;
@@ -3487,7 +3496,7 @@ impl Typer {
         let py = unwrap_byname(&py);
         let tps = self.st.get(y).tparams.clone();
         if tps.is_empty() {
-            return self.st.is_sub_type(px, &py);
+            return self.weak_conforms(px, &py);
         }
         let targs = self.conv_targs(y, px);
         for (i, tp) in tps.iter().enumerate() {
@@ -3503,7 +3512,7 @@ impl Typer {
             }
         }
         let inst = crate::symbol::subst_tparams_slice(&tps, &targs, &py);
-        self.st.is_sub_type(px, &inst)
+        self.weak_conforms(px, &inst)
     }
 
     /// `arg <: hi`, judged so that an **abstract** `arg` is only as good as its
