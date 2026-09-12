@@ -1,0 +1,24 @@
+true
+false
+true
+false
+true
+true
+true
+false
+true
+true
+true
+List(true, true, false)
+List(1)
+1 -1 97 3
+<V3> 8
+F4
+F5
+List(F1, F2)
+5
+8
+5 7 0
+42
+any:()
+43

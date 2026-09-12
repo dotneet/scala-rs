@@ -201,6 +201,17 @@ pub struct Member {
     /// `private[p]` whose `p` is unknown, and treating *that* as a plain
     /// `private` refuses every call scalac accepts.
     pub has_private_within: bool,
+    /// The symbol's `@deprecated` annotation, if it carries one.
+    pub deprecated: Option<Deprecation>,
+}
+
+/// A `@deprecated(message, since)` annotation read from a pickle. An
+/// argument that is not a string literal (a default argument) reads as `""`,
+/// which is both parameters' default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Deprecation {
+    pub message: String,
+    pub since: String,
 }
 
 impl Member {
@@ -319,6 +330,11 @@ pub struct ClassSig {
     /// types. Never silently dropped, so a caller can report a real gap
     /// instead of quietly serving a wrong signature.
     pub unresolved: Vec<String>,
+    /// The class's own `@deprecated` annotation, if it carries one.
+    pub deprecated: Option<Deprecation>,
+    /// A sealed class's direct subclasses (the pickle's `CHILDREN` entry):
+    /// dotted full name, and whether the child is an `object`.
+    pub children: Vec<(String, bool)>,
 }
 
 impl ClassSig {
@@ -361,6 +377,17 @@ pub fn class_sigs(p: &Pickle) -> Vec<ClassSig> {
             owners.entry(info.owner).or_default().push(i as Idx);
         }
     }
+    let mut annots: HashMap<Idx, Vec<&crate::read::AnnotInfo>> = HashMap::new();
+    let mut children: HashMap<Idx, Vec<Idx>> = HashMap::new();
+    for e in &p.entries {
+        match e {
+            Entry::SymAnnot { sym, annot } => annots.entry(*sym).or_default().push(annot),
+            Entry::Children { sym, children: cs } => {
+                children.entry(*sym).or_default().extend(cs.iter().copied())
+            }
+            _ => {}
+        }
+    }
     let mut out = Vec::new();
     for (i, e) in p.entries.iter().enumerate() {
         let Entry::ClassSym { info, .. } = e else {
@@ -373,10 +400,27 @@ pub fn class_sigs(p: &Pickle) -> Vec<ClassSig> {
         let mut b = Builder {
             p,
             owners: &owners,
+            annots: &annots,
             unresolved: Vec::new(),
         };
         let (tparams, parents) = b.class_info(info.info);
         let members = b.members_of(i as Idx);
+        let deprecated = b.deprecation(i as Idx);
+        let kids = children
+            .get(&(i as Idx))
+            .map(|cs| {
+                cs.iter()
+                    .filter_map(|c| {
+                        let module = match p.entry(*c)? {
+                            Entry::ClassSym { info, .. } => info.has(pflags::MODULE),
+                            Entry::ModuleSym { .. } | Entry::ExtModClassRef { .. } => true,
+                            _ => false,
+                        };
+                        Some((p.sym_full_name(*c)?, module))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         out.push(ClassSig {
             full_name: p.sym_full_name(i as Idx).unwrap_or_default(),
             is_module: info.has(pflags::MODULE),
@@ -385,6 +429,8 @@ pub fn class_sigs(p: &Pickle) -> Vec<ClassSig> {
             parents,
             members,
             unresolved: b.unresolved,
+            deprecated,
+            children: kids,
         });
     }
     out
@@ -393,10 +439,50 @@ pub fn class_sigs(p: &Pickle) -> Vec<ClassSig> {
 struct Builder<'a> {
     p: &'a Pickle,
     owners: &'a HashMap<Idx, Vec<Idx>>,
+    annots: &'a HashMap<Idx, Vec<&'a crate::read::AnnotInfo>>,
     unresolved: Vec<String>,
 }
 
 impl Builder<'_> {
+    /// The `@scala.deprecated` annotation on the symbol at `id`.
+    fn deprecation(&self, id: Idx) -> Option<Deprecation> {
+        let annots = self.annots.get(&id)?;
+        let annot = annots.iter().find(|a| {
+            let tsym = match self.p.entry(a.tpe) {
+                Some(Entry::TypeRefTpe { sym, .. }) => *sym,
+                _ => a.tpe,
+            };
+            self.p.sym_full_name(tsym).as_deref() == Some("scala.deprecated")
+        })?;
+        // A literal argument is pickled as the constant itself, anything else
+        // (a default getter call) as a tree. The library's `@deprecated`s come
+        // out as named pairs (`message = ..., since = ...`).
+        let text = |a: Idx| -> String {
+            let c = match self.p.entry(a) {
+                Some(Entry::Literal(c)) => Some(c.clone()),
+                _ => self.constant_at(a),
+            };
+            match c {
+                Some(Constant::Str(n)) => self.p.name(n).unwrap_or("").to_string(),
+                _ => String::new(),
+            }
+        };
+        let named = |key: &str| -> Option<String> {
+            annot
+                .assocs
+                .iter()
+                .find(|(k, _)| self.p.name(*k) == Some(key))
+                .map(|(_, v)| text(*v))
+        };
+        let message = named("message")
+            .or_else(|| annot.args.first().map(|a| text(*a)))
+            .unwrap_or_default();
+        let since = named("since")
+            .or_else(|| annot.args.get(1).map(|a| text(*a)))
+            .unwrap_or_default();
+        Some(Deprecation { message, since })
+    }
+
     fn class_info(&mut self, info: Idx) -> (Vec<TParam>, Vec<SigType>) {
         match self.p.entry(info) {
             Some(Entry::PolyTpe { result, tparams }) => {
@@ -493,6 +579,7 @@ impl Builder<'_> {
             macro_impl,
             private_within,
             has_private_within: info.private_within.is_some(),
+            deprecated: self.deprecation(id),
         })
     }
 

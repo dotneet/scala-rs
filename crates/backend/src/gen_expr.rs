@@ -452,7 +452,7 @@ pub(crate) fn emit_body_return(
         pop_if_value(asm, &rhs.ty);
         asm.vreturn();
     } else {
-        cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, ret));
+        cast_interface_value_to_class(asm, ctx.st, &jvm_desc(ctx.st, ret));
         emit_return(asm, ret);
     }
 }
@@ -692,13 +692,16 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
                 store(asm, slot, JvmSort::Ref);
                 return;
             }
+            // `val r: Regex = anUnanchoredRegex`: the local is declared at the
+            // class, so the interface value has to be cast on the way in.
+            cast_interface_value_to_class(asm, ctx.st, &jvm_desc_val(ctx.st, &ty));
             let slot = frame.alloc(tree.sym, sort);
             // Declared *before* the store: a `var` reassigned in a loop body
             // merges at the loop head, and the merge has to see the declared
             // class on both paths or it degrades to `java/lang/Object`.
             declare_local_ty(asm, ctx.st, slot, &ty);
             if sort == JvmSort::Ref {
-                cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ty));
+                cast_interface_value_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ty));
             }
             store(asm, slot, sort);
         }
@@ -1022,7 +1025,7 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                     if is_unit_like(&ctx.ret_ty) {
                         pop_if_value(asm, &expr.ty);
                     } else {
-                        cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ctx.ret_ty));
+                        cast_interface_value_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ctx.ret_ty));
                     }
                 }
                 match frame.finally_exits.last().copied() {
@@ -1051,7 +1054,7 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
             // `athrow` wants a `Throwable`, a class: a trait extending one
             // is an interface to the verifier (`trait Boom extends
             // RuntimeException { def boom() = throw this }`).
-            cast_trait_to_class(asm, ctx.st, "Ljava/lang/Throwable;");
+            cast_interface_value_to_class(asm, ctx.st, "Ljava/lang/Throwable;");
             asm.athrow();
             push_default(asm, &tree.ty);
         }
@@ -1961,7 +1964,7 @@ pub(crate) fn gen_assign(
                 jvm_desc_val(ctx.st, &s.ty)
             };
             fill_boxed_unit_slot(asm, &desc);
-            cast_trait_to_class(asm, ctx.st, &desc);
+            cast_interface_value_to_class(asm, ctx.st, &desc);
             if is_static {
                 asm.putstatic(&owner, &s.name, &desc);
             } else {
@@ -1990,7 +1993,11 @@ pub(crate) fn gen_assign(
             if let Some((slot, sort)) = frame.get(id) {
                 gen_expr(asm, frame, ctx, rhs);
                 if sort == JvmSort::Ref {
-                    cast_trait_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ctx.st.get(id).ty));
+                    cast_interface_value_to_class(
+                        asm,
+                        ctx.st,
+                        &jvm_desc(ctx.st, &ctx.st.get(id).ty),
+                    );
                 }
                 store(asm, slot, sort);
                 return;
@@ -2006,7 +2013,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
-                    cast_trait_to_class(asm, ctx.st, &vd);
+                    cast_interface_value_to_class(asm, ctx.st, &vd);
                     asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -2023,7 +2030,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
-                    cast_trait_to_class(asm, ctx.st, &vd);
+                    cast_interface_value_to_class(asm, ctx.st, &vd);
                     asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -2035,7 +2042,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
-                    cast_trait_to_class(asm, ctx.st, &vd);
+                    cast_interface_value_to_class(asm, ctx.st, &vd);
                     asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -2070,7 +2077,7 @@ pub(crate) fn gen_assign(
                 let owner = class_internal(ctx.st, s.owner);
                 let vd = jvm_desc_val(ctx.st, &s.ty);
                 fill_boxed_unit_slot(asm, &vd);
-                cast_trait_to_class(asm, ctx.st, &vd);
+                cast_interface_value_to_class(asm, ctx.st, &vd);
                 asm.invokeinterface(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
@@ -2086,7 +2093,7 @@ pub(crate) fn gen_assign(
                     let owner = class_internal(ctx.st, s.owner);
                     let vd = jvm_desc_val(ctx.st, &s.ty);
                     fill_boxed_unit_slot(asm, &vd);
-                    cast_trait_to_class(asm, ctx.st, &vd);
+                    cast_interface_value_to_class(asm, ctx.st, &vd);
                     asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                     return;
                 }
@@ -2099,7 +2106,7 @@ pub(crate) fn gen_assign(
                 let owner = class_internal(ctx.st, s.owner);
                 let vd = jvm_desc_val(ctx.st, &s.ty);
                 fill_boxed_unit_slot(asm, &vd);
-                cast_trait_to_class(asm, ctx.st, &vd);
+                cast_interface_value_to_class(asm, ctx.st, &vd);
                 asm.invokevirtual(&owner, &var_setter_name(&s.name), &format!("({vd})V"));
                 return;
             }
@@ -2138,8 +2145,9 @@ pub(crate) fn gen_if(
     gen_expr(asm, frame, ctx, cond);
     let else_l = asm.fresh_label();
     let end_l = asm.fresh_label();
-    if let Some(n) = join_class_of(ctx.st, result_ty) {
-        asm.set_join_class(end_l, &n);
+    let join = join_class_of(ctx.st, result_ty);
+    if let Some(n) = &join {
+        asm.set_join_class(end_l, n);
     }
     // `if (c) e` with no `else` and a non-`Unit` recorded type. nsc gives such
     // an expression the type `Unit`, so the branch's value is dropped and `()`
@@ -2154,7 +2162,7 @@ pub(crate) fn gen_if(
     } else {
         gen_expr(asm, frame, ctx, thenp);
         pad_unit_branch(asm, thenp, result_ty);
-        cast_branch_to_join(asm, ctx.st, result_ty);
+        cast_branch_to_join(asm, ctx.st, join.as_deref());
     }
     asm.goto(end_l);
     asm.mark(else_l);
@@ -2163,7 +2171,7 @@ pub(crate) fn gen_if(
     } else {
         gen_expr(asm, frame, ctx, elsep);
         pad_unit_branch(asm, elsep, result_ty);
-        cast_branch_to_join(asm, ctx.st, result_ty);
+        cast_branch_to_join(asm, ctx.st, join.as_deref());
     }
     asm.mark(end_l);
 }
@@ -2554,6 +2562,17 @@ pub(crate) fn gen_apply(
             gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
             return;
         }
+    }
+    // `(F: Int => F)(4)`: an ascription in call position is a *value* too,
+    // and the typer leaves a function-typed one unexpanded (any other type
+    // gets an explicit `apply` selection). `peel_fun` would strip the
+    // ascription and leave the bare `object F`, whose symbol then went out as
+    // a static call of a method named `F` on the empty package's class:
+    // `NoClassDefFoundError: scala/runtime/package` from a program scalac
+    // runs.
+    if matches!(fun.kind, TreeKind::Typed { .. }) && matches!(fun.ty, Type::Function { .. }) {
+        gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+        return;
     }
 
     let fun0 = peel_fun(fun);

@@ -18,7 +18,7 @@
 //!   two runs, and are compared with the same two files built by real scalac.
 //!   That is what says the tree does not merely print right but *runs*.
 //!
-//! `rf_bad.scala` is the confession: five bodies real scalac compiles and
+//! `rf_more.scala` holds five bodies that were once refused and are reified now;
 //! scala-rs refuses by name.
 
 use std::fs;
@@ -278,57 +278,46 @@ fn rf_macros_match_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The five bodies still refused, each named. Real scalac compiles all of
-/// them; scala-rs says which construct it cannot build rather than reifying
-/// the bare name, which would compile, run, and mean whatever stood at the
-/// expansion site.
+/// The five bodies `rf_bad.scala` once refused -- a member of the enclosing
+/// `object`, a pattern `val`, a package-object function, a class definition,
+/// a local of the enclosing method -- reified now that `reify` walks the
+/// typed body by symbol (`docs/notes/reify-design.md`).
 #[test]
-fn rf_gaps_are_named() {
-    if !prerequisites("rf_bad") {
+fn rf_more_reifies_and_runs() {
+    if !prerequisites("rf_more") {
         return;
     }
-    let out_dir = tmp_dir("rf_bad");
-    let out = compile("rf_bad", &out_dir, &[]);
-    assert!(!out.status.success(), "rf_bad.scala should not compile");
-    let text = diagnostics(&out);
-    for want in [
-        // a member of the enclosing `object` (nsc's `mkThis` form)
-        "`member` is a local, a parameter, or a name that does not stand for a static \
-         `object` or a member of one",
-        // a pattern `val` bound inside a reified block (an ordinary `val` is
-        // reified now; see the `agent/reifydefs` slice)
-        "a pattern definition (`val (a, b) = ...`) is not reified yet",
-        // `scala.math`'s package-object functions
-        "`math` is a local, a parameter, or a name that does not stand for a static \
-         `object` or a member of one",
-        // a class definition inside a reified block
-        "a class definition is not reified yet",
-        // a local of the enclosing method -- nsc's free terms
-        "`here` is a local, a parameter, or a name that does not stand for a static \
-         `object` or a member of one",
-    ] {
-        assert!(text.contains(want), "missing {want:?} in:\n{text}");
-    }
+    let out_dir = tmp_dir("rf_more");
+    let out = compile("rf_more", &out_dir, &[]);
     assert!(
-        text.contains("cannot expand reify { ... }"),
-        "the report should name reify:\n{text}"
+        out.status.success(),
+        "compile rf_more failed: {}",
+        diagnostics(&out)
+    );
+    assert_eq!(
+        run_main(&classpath(&[&out_dir]), "rf_more"),
+        expected_stdout("rf_more"),
+        "stdout mismatch for rf_more"
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// Real scalac accepts `rf_bad.scala`. Without this the fixture could drift
-/// into a file that is simply wrong, and the refusals above would stop being a
-/// confession and start looking like correct rejections.
+/// The same file through real scalac 2.13.16.
 #[test]
-fn rf_gaps_are_accepted_by_real_scalac() {
-    if !prerequisites("rf_bad scalac") {
+fn rf_more_matches_real_scalac() {
+    if !prerequisites("rf_more scalac diff") {
         return;
     }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip rf_bad scalac: scalac not obtainable");
+        eprintln!("skip rf_more scalac diff: scalac not obtainable");
         return;
     };
-    let out_dir = tmp_dir("rf_bad-scalac");
-    scalac_compile(&scalac, "rf_bad", &out_dir, &[]);
+    let out_dir = tmp_dir("rf_more-scalac");
+    scalac_compile(&scalac, "rf_more", &out_dir, &[]);
+    assert_eq!(
+        run_main(&classpath(&[&out_dir]), "rf_more (real scalac build)"),
+        expected_stdout("rf_more"),
+        "recorded expectation for rf_more does not match real scalac"
+    );
     let _ = fs::remove_dir_all(&out_dir);
 }

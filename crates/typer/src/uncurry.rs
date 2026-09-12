@@ -247,6 +247,30 @@ pub(crate) fn is_eta_marker(tpt: &Tree) -> bool {
     )
 }
 
+/// The function-type parameter an eta-expansion gives a method parameter.
+/// nsc's `etaExpand` turns a repeated `T*` into `Seq[T]`: `f[T] _` for `def
+/// f[T](xs: T*): T` is `Seq[T] => T`, a function of *one* sequence. Left as
+/// `T*`, applying it read the argument as a single repeated element, so `g(s)`
+/// solved `T` to `s`'s own type and cast the result to it
+/// (`ClassCastException`, run/eta-expand-star), and `h(1, 2)` was accepted.
+/// Only the function type changes: the lambda's own parameter keeps the
+/// repeated type, which is what passes the sequence straight through to the
+/// method. A run with no `immutable.Seq` (the private runtime) keeps `T*`.
+fn eta_fn_param(st: &SymbolTable, pty: &Type) -> Type {
+    match pty {
+        Type::Repeated(elem) => {
+            match crate::classpath::find_by_jvm(st, "scala/collection/immutable/Seq") {
+                Some(seq) => Type::Class {
+                    sym: seq,
+                    args: vec![(**elem).clone()],
+                },
+                None => pty.clone(),
+            }
+        }
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn eta_expand(
     st: &mut SymbolTable,
     gensym: &mut u32,
@@ -295,6 +319,7 @@ pub(crate) fn eta_expand(
         byname_thunk: false,
         byname_type_marker: false,
     };
+    let fn_params = params.iter().map(|p| eta_fn_param(st, p)).collect();
     *tree = Tree {
         id: apply.id,
         span,
@@ -303,7 +328,7 @@ pub(crate) fn eta_expand(
             body: Box::new(apply),
         },
         ty: Type::Function {
-            params,
+            params: fn_params,
             ret: Box::new(ret),
         },
         sym: SymbolId::NONE,
@@ -565,7 +590,7 @@ pub(crate) fn eta_expand_curried(
             body: Box::new(body),
         },
         ty: Type::Function {
-            params: first.clone(),
+            params: first.iter().map(|p| eta_fn_param(st, p)).collect(),
             ret: Box::new(body_ty),
         },
         sym: SymbolId::NONE,

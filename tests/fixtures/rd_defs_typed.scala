@@ -1,18 +1,10 @@
-// Two shapes of `val` / `def` reification still refused after the
-// `agent/reifydefs` slice. **Real scalac 2.13.16 compiles this file** -- it
-// is a confession of what is not implemented, not a program that ought to be
-// rejected.
-//
-// A `val` / `def` bound *inside* a reify body is now reified structurally,
-// by name (`docs/macros.md` §7.17); what remains unsolved is *its declared
-// type*, when that type is not a single monomorphic class. Measured with
-// `-Ymacro-debug-lite`, nsc rebuilds a written value type the same
-// structural way it rebuilds the rest of the body (`AppliedTypeTree`,
-// `Select`, ...), resolving only the leaf that names a class or a module by
-// symbol; scala-rs has no such structural type reifier yet (`Reifier::typ`'s
-// ordinary, non-reify branch is what a quasiquote uses for exactly this),
-// so only the single-leaf case is built and anything with its own structure
-// is refused rather than guessed at.
+// A `val` with a declared constructor type (`List[Int]`) and a local `def`
+// with a type parameter of its own, inside `reify`. Both were refused by the
+// `agent/reifydefs` slice, whose reifier had no structural type reifier;
+// `reify` now walks the typed body and rebuilds a written type from what it
+// resolved to, and a type parameter the body itself declares by name
+// (`docs/notes/reify-design.md`). Real scalac 2.13.16 compiles this file, and
+// so does scala-rs (`crates/cli/tests/reifydefs.rs`).
 import scala.reflect.runtime.universe._
 
 object Main {

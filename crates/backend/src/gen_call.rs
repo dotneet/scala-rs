@@ -297,64 +297,62 @@ pub(crate) fn adapt_type_member_arg(
         // assignable to an interface type, so an interface parameter never
         // owes one, and casting there would be noise on every call.
         //
-        // `verifier_accepts_receiver` rather than `jvm_assignable`: the
-        // symbol table's hierarchy is Scala's, where a trait may extend a
-        // class, and the JVM's is not -- `def f(x: T): Unit = take(x)` with
-        // `trait T extends C` and `take(c: C)` needs the cast nsc emits.
-        if verifier_accepts_receiver(ctx.st, top, cls) {
+        // And Scala-level conformance is not enough when the value's erasure
+        // is an interface: `trait UnanchoredRegex extends Regex` is a
+        // `Regex`, but the verifier cannot see an interface's class parent,
+        // so `takeRegex(Date.unanchored)` did not verify ("'UnanchoredRegex'
+        // is not assignable to 'Regex'"). nsc's `adaptToType` casts there.
+        // `verifier_accepts_receiver` is the same question the receiver of a
+        // call already asks.
+        if is_interface_jvm(ctx.st, cls) || verifier_accepts_receiver(ctx.st, top, cls) {
             return;
         }
     }
     asm.checkcast(cls);
 }
 
-/// Cast the reference on top of the stack to the class `want_desc` names when
-/// the assembler tracks it as an *interface* the Scala hierarchy puts below
-/// that class: a trait that extends a class.
+/// A value entering a slot of class `desc` -- a local, a field, a method's
+/// result -- whose tracked erasure is an *interface* that the class is a
+/// Scala-level parent of. `trait UnanchoredRegex extends Regex` conforms to
+/// `Regex`, but the verifier cannot see an interface's class parent, so
+/// `def f: Regex = Date.unanchored` failed with "Bad return type", and `val r:
+/// Regex = u; r.regex` stored the interface value into a local the assembler
+/// then believed was a `Regex`. nsc's erasure (`adaptToType`) casts wherever
+/// the erased type is not a subtype of the erased expected type; this is that
+/// cast for the one pair the JVM and Scala disagree on. Everything else is
+/// left to the paths that already handle it: an unknown class, a value that
+/// is not a reference, or one the verifier accepts as it stands.
 ///
-/// The JVM has no such hop. The trait compiles to an interface whose
-/// superclass is `Object`, so a value of the trait's type is not assignable
-/// to the class wherever one is declared -- a method's result, a field -- and
-/// nsc's `BCodeBodyBuilder.adapt` casts it there (its `BType.conformsTo`
-/// lets an interface conform only to `Object` and its super-interfaces).
-/// `trait T extends Throwable { override def fillInStackTrace(): Throwable =
-/// this }` -- `NoStackTrace`'s own shape -- failed to verify with "Type 'T'
-/// is not assignable to 'java/lang/Throwable' (from method signature)".
-///
-/// Only that hop: a value the assembler does not track, one of a class type,
-/// or a target that is itself an interface (JVMS 4.10.1.2 accepts any
-/// reference there) is left as it is.
-pub(crate) fn cast_trait_to_class(asm: &mut Assembler, st: &SymbolTable, want_desc: &str) {
-    let Some(want) = want_desc
-        .strip_prefix('L')
-        .and_then(|d| d.strip_suffix(';'))
-    else {
+/// The same question as a call receiver's (`verifier_accepts_receiver`) and
+/// an argument's (`adapt_type_member_arg`).
+pub(crate) fn cast_interface_value_to_class(asm: &mut Assembler, st: &SymbolTable, desc: &str) {
+    let Some(cls) = desc.strip_prefix('L').and_then(|d| d.strip_suffix(';')) else {
         return;
     };
-    if want == "java/lang/Object" || is_interface_jvm(st, want) {
+    if cls == "java/lang/Object" {
         return;
     }
-    let Some(top) = asm.top_object() else {
-        return;
+    let needs = match asm.top_object() {
+        Some(top) => {
+            top != cls && jvm_assignable(st, top, cls) && !verifier_accepts_receiver(st, top, cls)
+        }
+        None => false,
     };
-    if top == want || st.find_class_by_jvm(top).is_none() || !is_interface_jvm(st, top) {
-        return;
-    }
-    if jvm_assignable(st, top, want) {
-        let want = want.to_string();
-        asm.checkcast(&want);
+    if needs {
+        asm.checkcast(cls);
     }
 }
 
-/// [`cast_trait_to_class`] at the end of one branch of an `if`, a `match` or
-/// a `try` whose result is `result_ty`: the frame at the join declares that
-/// type's class ([`join_class_of`]), and a trait-typed branch value has to
-/// reach it as that class.
-pub(crate) fn cast_branch_to_join(asm: &mut Assembler, st: &SymbolTable, result_ty: &Type) {
-    if let Some(n) = join_class_of(st, result_ty) {
-        if !n.starts_with('[') {
-            cast_trait_to_class(asm, st, &format!("L{n};"));
-        }
+/// The value one branch of an `if` / `match` leaves for the join, whose stack
+/// map declares `join` (`join_class_of` of the expression's type). `val r:
+/// Regex = if (c) Date else Date.unanchored` joined a `Regex` with an
+/// `UnanchoredRegex` -- an interface the verifier does not see as a `Regex`
+/// -- and the frame at the join refused it ("Instruction type does not match
+/// stack map"). Each branch is cast on its way in, by the same rule as every
+/// other class-typed slot (`cast_interface_value_to_class`).
+pub(crate) fn cast_branch_to_join(asm: &mut Assembler, st: &SymbolTable, join: Option<&str>) {
+    if let Some(n) = join.filter(|n| !n.starts_with('[')) {
+        cast_interface_value_to_class(asm, st, &format!("L{n};"));
     }
 }
 
@@ -626,9 +624,6 @@ pub(crate) fn emit_getfield(asm: &mut Assembler, owner: &str, name: &str, desc: 
 /// Store into a field whose Scala type may be `Unit`, when the value comes
 /// from an *expression* rather than from a slot: a `Unit` expression leaves
 /// nothing behind, so the singleton is materialised here.
-///
-/// `st` is for [`cast_trait_to_class`]: a trait-typed value stored into a
-/// field of a class type the trait extends needs nsc's cast.
 pub(crate) fn emit_putfield_from_expr(
     asm: &mut Assembler,
     st: &SymbolTable,
@@ -637,7 +632,9 @@ pub(crate) fn emit_putfield_from_expr(
     desc: &str,
 ) {
     fill_boxed_unit_slot(asm, desc);
-    cast_trait_to_class(asm, st, desc);
+    // `val fr: Regex = anUnanchoredRegex` in a template: the field is the
+    // class, the value an interface (`cast_interface_value_to_class`).
+    cast_interface_value_to_class(asm, st, desc);
     asm.putfield(owner, name, desc);
 }
 

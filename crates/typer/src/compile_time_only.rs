@@ -60,6 +60,21 @@ impl Typer {
             return None;
         }
         let s = self.st.get(sym);
+        // The library's own placeholders carry the annotation in their
+        // pickle, which this compiler does not read: `Expr.splice` and
+        // `Expr.value` exist only to be eliminated by `reify`, and nsc's
+        // messages for a reference that survives are these.
+        if self.st.jvm_internal(s.owner) == "scala/reflect/api/Exprs$Expr" {
+            match s.name.as_str() {
+                "splice" => return Some("splice must be enclosed within a reify {} block".into()),
+                "value" => {
+                    return Some(
+                        "cannot use value except for signatures of macro implementations".into(),
+                    )
+                }
+                _ => {}
+            }
+        }
         let a = s
             .annotations
             .iter()
@@ -97,7 +112,7 @@ impl Typer {
     /// A written type tree resolved to `sym`: report it unless the
     /// definition being typed is (inside) an annotated one.
     pub(crate) fn note_cto_ref(&mut self, sym: SymbolId, span: Span) {
-        if !self.any_cto || self.header_pass || sym.is_none() {
+        if !self.any_cto || self.header_pass || self.resolving_annot || sym.is_none() {
             return;
         }
         let Some(msg) = self.cto_message(sym) else {

@@ -41,6 +41,13 @@ use crate::uncurry::is_eta_marker;
 #[path = "reify_defs.rs"]
 mod defs;
 
+/// `reify { … }` over the typed body: symbol-based references, free terms and
+/// types, and the type reifier. A child module for the same reason.
+#[path = "reify_tree.rs"]
+mod tree;
+
+pub(crate) use tree::{collect_abstract, ReifyEnv};
+
 /// How a hole's argument becomes a reflect `Tree`.
 ///
 /// nsc infers an implicit `Liftable[T]` for a hole whose argument is not a
@@ -143,84 +150,11 @@ struct Fresh {
     pat_depth: usize,
 }
 
-/// How one identifier of a `reify { … }` body is rebuilt inside the
-/// `TreeCreator`, which is the whole of reify's **hygiene**.
-///
-/// A quasiquote reifies a name as the name that was written
-/// (`SyntacticTermIdent(TermName("f"), false)`), and the tree it builds means
-/// whatever `f` means where the tree is finally typed. `reify` must not do
-/// that: the expression was written in the macro implementation's scope and
-/// has to keep meaning what it meant there, wherever the expansion lands. So
-/// nsc reifies each reference by its *symbol*, and this is the subset
-/// scala-rs builds -- see `docs/macros.md` §7.14 and `tests/fixtures/
-/// rd_impl.scala`, which is this same shape written out by hand.
-///
-/// Everything else -- a local, a parameter, `this` -- is **refused by name**.
-/// nsc turns those into free terms carried in the expansion; building the
-/// bare name instead would silently capture whatever stands there at the call
-/// site, which is exactly the bug reification exists to prevent.
-#[derive(Clone)]
-pub(crate) enum ReifyRef {
-    /// A static `object`: `rs.mkIdent($m.staticModule("<full name>"))`.
-    StaticModule(String),
-    /// A term member of a static `object`, named without its owner:
-    /// `println`, or a name an `import RfHelper._` brought into scope.
-    ///
-    /// nsc reifies it as the selection its typer had already made explicit
-    /// (`-Xprint:typer` on `reify { println("a") }` gives exactly this):
-    ///
-    /// ```text
-    /// $u.Select($u.internal.reificationSupport.mkIdent(
-    ///              $m.staticModule("scala.Predef")),
-    ///           $u.TermName("println"))
-    /// ```
-    ///
-    /// The owner is resolved through the mirror and the member is named on
-    /// it, so this is still "by symbol": the expansion cannot pick up a
-    /// different `println` from whatever is in scope where it lands.
-    StaticMember { owner: String, name: String },
-    /// `x.splice`: the argument's own tree, rebased into the mirror the
-    /// creator was handed -- `x.in[$u.type]($m).tree`. Carries the `x`.
-    Splice(Box<Tree>),
-    /// A type argument, rebuilt inside the creator and wrapped in
-    /// `rs.mkTypeTree(...)` -- which is `TypeTree().setType(...)`, the tree
-    /// nsc's reifier puts in a type position.
-    ///
-    /// The type itself is built the way a `TypeTag` is
-    /// (`crate::materialize::TagBody`): a monomorphic class is one
-    /// `staticClass` call, a type constructor at arguments is `appliedType`
-    /// over those, and an abstract type is only knowable through a tag in
-    /// scope -- which is the case slick's `TableQueryMacroImpl` needs, where
-    /// `reify { TableQuery.apply[E](cons.splice) }` reaches `E` through the
-    /// implicit `c.WeakTypeTag[E]`.
-    Type(Box<crate::materialize::TagBody>),
-    /// A `val` / parameter / `def` result type that names a monomorphic
-    /// class reachable through `staticClass` alone -- `Int`, `Boolean`, a
-    /// plain user class -- built as `rs.mkIdent($m.staticClass("<full
-    /// name>"))`, the same `Ident`-carrying-a-symbol shape a static `object`
-    /// reference gets, and *not* wrapped in `mkTypeTree`. Measured with
-    /// `-Ymacro-debug-lite` on `reify { def f(y: Int): Int = y + 1; f(1) }`:
-    /// a written *type* (as opposed to a type *argument* at a call site,
-    /// which really is `mkTypeTree` -- see `ReifyRef::Type`) is rebuilt
-    /// structurally, the same way a quasiquote builds one, and only the leaf
-    /// naming a class or a module is resolved by symbol.
-    StaticClass(String),
-    /// A type argument whose type scala-rs cannot rebuild, carrying the
-    /// reason the tag builder gave. Kept as a classification of its own so
-    /// the report says *which* type and why, rather than "a type in a reify
-    /// body is not reified yet".
-    TypeGap(String),
-}
-
-/// What a `reify { … }` body needs beyond a quasiquote's.
-pub(crate) struct ReifyCtx {
-    /// The classification of each identifier of the body, by node.
-    ///
-    /// Built by `Check::reify_refs`, which types a *clone* of each candidate
-    /// to find out what it means -- the same speculative shape
-    /// `Check::hole_lifts` uses. Nodes the walk did not classify are the ones
-    /// refused above.
-    pub(crate) refs: std::collections::HashMap<NodeId, ReifyRef>,
+/// What a `reify { … }` body needs beyond a quasiquote's; see
+/// `crate::reify::tree` (`reify_tree.rs`) for the environment and the rules.
+pub(crate) struct ReifyCtx<'a> {
+    /// The typed body's world: symbols, what the body defines, tags in scope.
+    pub(crate) env: ReifyEnv<'a>,
     /// The local the creator binds the mirror to, cast to
     /// `Mirror[$u.type]` (`docs/macros.md` §7.14, item 3).
     pub(crate) mirror_local: String,
@@ -259,7 +193,9 @@ pub(crate) struct Reifier<'a> {
     fresh: RefCell<Fresh>,
     /// Set when this is a `reify { … }` body rather than a quasiquote; see
     /// `ReifyCtx`.
-    reify: Option<ReifyCtx>,
+    reify: Option<ReifyCtx<'a>>,
+    /// The free symbols a `reify { … }` body binds; see `tree::Symtab`.
+    symtab: RefCell<tree::Symtab>,
     /// Names bound, at the current point of the walk, by a `val` / `def` /
     /// parameter that the `reify { … }` body itself introduces -- see
     /// `Reifier::local_bound`. Always empty outside reify mode: a quasiquote
@@ -285,12 +221,13 @@ impl<'a> Reifier<'a> {
             src,
             fresh: RefCell::new(Fresh::default()),
             reify: None,
+            symtab: RefCell::new(tree::Symtab::default()),
             locals: RefCell::new(Vec::new()),
         }
     }
 
     /// Turn this into the reifier for a `reify { … }` body.
-    pub(crate) fn in_reify(mut self, ctx: ReifyCtx) -> Self {
+    pub(crate) fn in_reify(mut self, ctx: ReifyCtx<'a>) -> Self {
         self.reify = Some(ctx);
         self
     }
@@ -309,7 +246,9 @@ impl<'a> Reifier<'a> {
     /// occurrences) is the *same* name.
     pub(crate) fn reify(&self, kind: QuasiKind, body: &Tree) -> Result<Tree, String> {
         let built = self.reify_body(kind, body)?;
-        let defs = std::mem::take(&mut self.fresh.borrow_mut().defs);
+        // A `reify` body's free symbols come first, then the fresh names.
+        let mut defs = self.take_symtab();
+        defs.append(&mut self.fresh.borrow_mut().defs);
         if defs.is_empty() {
             return Ok(built);
         }
@@ -494,129 +433,6 @@ impl<'a> Reifier<'a> {
         }
     }
 
-    /// The reify-only reading of one term: `Ok(None)` when the ordinary walk
-    /// below should take it.
-    ///
-    /// Two things happen here and nowhere else. A node the classification
-    /// resolved is built from its *symbol* rather than from the name that was
-    /// written, and every remaining form is checked against the subset reify
-    /// builds -- so an unclassified `Ident` is a local, and is refused by
-    /// name rather than reified as the bare name it happens to carry.
-    fn reify_term(&self, t: &Tree) -> Result<Option<Tree>, String> {
-        let Some(ctx) = &self.reify else {
-            return Ok(None);
-        };
-        if let Some(r) = ctx.refs.get(&t.id) {
-            return Ok(Some(match r {
-                ReifyRef::StaticModule(name) => self.static_module_ref(ctx, name),
-                ReifyRef::StaticMember { owner, name } => self.call(
-                    self.support_member("SyntacticSelectTerm"),
-                    vec![self.static_module_ref(ctx, owner), self.term_name(name)],
-                ),
-                ReifyRef::Splice(e) => self.splice_tree(ctx, e),
-                ReifyRef::Type(body) => self.call(
-                    self.support_member("mkTypeTree"),
-                    vec![self.rebuild_type(ctx, body)],
-                ),
-                ReifyRef::TypeGap(why) => {
-                    return Err(format!("a type argument cannot be rebuilt: {why}"))
-                }
-                // `classify_type_annot` only ever keys this by a *type*
-                // node's id (`Reifier::typ` is where it is read); a term
-                // node is never classified this way.
-                ReifyRef::StaticClass(_) => {
-                    return Err(format!("{} is not reified yet", describe(&t.kind)))
-                }
-            }));
-        }
-        match &t.kind {
-            // The forms whose *parts* are what carry meaning: each is walked
-            // on and its own leaves are classified or refused.
-            TreeKind::Literal { .. }
-            | TreeKind::Select { .. }
-            | TreeKind::Apply { .. }
-            | TreeKind::TypeApply { .. }
-            | TreeKind::Block { .. }
-            | TreeKind::If { .. } => Ok(None),
-            // Bound by a `val` / `def` / parameter this reify body itself
-            // introduces: reified structurally, by name, the same as a
-            // quasiquote would -- `Ok(None)` falls through to `term`'s own
-            // `Ident` handling below. Anything else unclassified really is
-            // free with respect to this body (bound outside it), which is
-            // the shape nsc carries as a free term and this module cannot
-            // build yet.
-            TreeKind::Ident { name } if self.local_bound(name) => Ok(None),
-            TreeKind::Ident { name } => Err(format!(
-                "`{name}` is a local, a parameter, or a name that does not stand for \
-                 a static `object` or a member of one"
-            )),
-            other => Err(format!("{} is not reified yet", describe(other))),
-        }
-    }
-
-    /// `rs.mkIdent($m.staticModule("<full name>"))` -- a static `object`
-    /// resolved through the mirror the creator was handed.
-    fn static_module_ref(&self, ctx: &ReifyCtx, full_name: &str) -> Tree {
-        self.call(
-            self.support_member("mkIdent"),
-            vec![self.call(
-                self.select(self.local(&ctx.mirror_local), "staticModule"),
-                vec![self.lit(Lit::String(full_name.to_string()))],
-            )],
-        )
-    }
-
-    /// `rs.mkIdent($m.staticClass("<full name>"))` -- the same shape, for a
-    /// monomorphic class named in a `val` / parameter / `def` result type;
-    /// see `ReifyRef::StaticClass`.
-    fn static_class_ref(&self, ctx: &ReifyCtx, full_name: &str) -> Tree {
-        self.call(
-            self.support_member("mkIdent"),
-            vec![self.call(
-                self.select(self.local(&ctx.mirror_local), "staticClass"),
-                vec![self.lit(Lit::String(full_name.to_string()))],
-            )],
-        )
-    }
-
-    /// One type, rebuilt inside the creator; see `ReifyRef::Type`.
-    ///
-    /// The same three shapes `crate::materialize` builds, written against the
-    /// creator's *cast* mirror rather than its parameter: `$m` is
-    /// `Mirror[$u.type]`, so `$m.staticClass(n)` is a `$u.ClassSymbol` and the
-    /// result is a `$u.Type` -- which is what `mkTypeTree` and the tree being
-    /// built around it want. The materialiser's own creator can select on the
-    /// parameter directly because its result is erased to `Types$TypeApi` and
-    /// nothing further is built on it.
-    fn rebuild_type(&self, ctx: &ReifyCtx, body: &crate::materialize::TagBody) -> Tree {
-        use crate::materialize::TagBody;
-        let static_class = |name: &str| {
-            self.call(
-                self.select(self.local(&ctx.mirror_local), "staticClass"),
-                vec![self.lit(Lit::String(name.to_string()))],
-            )
-        };
-        match body {
-            TagBody::StaticClass(name) => self.select(
-                self.select(static_class(name), "asType"),
-                "toTypeConstructor",
-            ),
-            TagBody::Applied { class_name, args } => {
-                let list = self.call(
-                    self.node(TreeKind::Ident {
-                        name: "List".to_string(),
-                    }),
-                    args.iter().map(|a| self.rebuild_type(ctx, a)).collect(),
-                );
-                self.call(
-                    self.universe_member("appliedType"),
-                    vec![static_class(class_name), list],
-                )
-            }
-            TagBody::FromTag(tag) => self.select(self.rebased(ctx, tag), "tpe"),
-        }
-    }
-
     /// `<e>.in[$u.type]($m)` -- an `Expr` or a tag moved into the mirror the
     /// creator was handed.
     ///
@@ -786,47 +602,10 @@ impl<'a> Reifier<'a> {
     /// Lower one type of the body: the whole of `tq"..."`, and the right-hand
     /// side of an ascription or a type application inside `q"..."`.
     fn typ(&self, t: &Tree) -> Result<Tree, String> {
-        // A *written* type in a reified body has to be rebuilt from its
-        // symbol too, and that is a second reifier (nsc's `reifyType`)
-        // scala-rs does not have. Refused rather than reified as the written
-        // name, which would mean whatever the call site's scope makes of it.
-        //
-        // An *omitted* type (`val x = 1`, and every `def`/parameter that
-        // reaches here with an empty `tpt`) is not a reference at all, so it
-        // needs no classification -- `Check::classify_type_annot` never adds
-        // an entry for one, and the match below falls through to the same
-        // `SyntacticEmptyTypeTree()` a quasiquote builds.
-        if let Some(ctx) = &self.reify {
-            match ctx.refs.get(&t.id) {
-                Some(ReifyRef::Type(body)) => {
-                    return Ok(self.call(
-                        self.support_member("mkTypeTree"),
-                        vec![self.rebuild_type(ctx, body)],
-                    ))
-                }
-                Some(ReifyRef::StaticClass(name)) => return Ok(self.static_class_ref(ctx, name)),
-                Some(ReifyRef::TypeGap(why)) => {
-                    return Err(format!("a type argument cannot be rebuilt: {why}"))
-                }
-                // A type position is never classified as one of the term-only
-                // shapes; kept as an arm rather than folded into `_` so a new
-                // `ReifyRef` variant has to be considered here too.
-                Some(ReifyRef::StaticModule(_))
-                | Some(ReifyRef::StaticMember { .. })
-                | Some(ReifyRef::Splice(_)) => {
-                    return Err(format!(
-                        "{} in a `reify` body is not reified yet",
-                        describe_type(&t.kind)
-                    ))
-                }
-                None if !matches!(t.kind, TreeKind::Empty) => {
-                    return Err(format!(
-                        "{} in a `reify` body is not reified yet",
-                        describe_type(&t.kind)
-                    ))
-                }
-                None => {}
-            }
+        // A *written* type in a reified body is rebuilt from what it resolved
+        // to (`tree::reify_typ`), never from the name it was written with.
+        if self.in_reify_mode() {
+            return self.reify_typ(t);
         }
         match &t.kind {
             // Written with the `apply` spelled out: `SyntacticEmptyTypeTree`
@@ -1051,6 +830,9 @@ impl<'a> Reifier<'a> {
     }
 
     fn pat_inner(&self, t: &Tree) -> Result<Tree, String> {
+        if let Some(t) = self.reify_pat(t)? {
+            return Ok(t);
+        }
         match &t.kind {
             TreeKind::Literal { lit } => Ok(self.constant(lit.clone())),
             TreeKind::Wildcard => Ok(self.term_ident("_")),
@@ -1147,13 +929,22 @@ impl<'a> Reifier<'a> {
 
     fn case_def(&self, c: &CaseDef) -> Result<Tree, String> {
         let p = self.pat(&c.pat)?;
-        let guard = if matches!(&c.guard.kind, TreeKind::Empty) {
-            self.universe_member("EmptyTree")
-        } else {
-            self.term(&c.guard)?
-        };
-        let body = self.term(&c.body)?;
-        Ok(self.call(self.universe_member("CaseDef"), vec![p, guard, body]))
+        // What the pattern binds is in scope for the guard and the body,
+        // which matters in reify mode, where an unbound name is a reference
+        // to be resolved by symbol.
+        let mut binders = Vec::new();
+        if self.in_reify_mode() {
+            self.pattern_binders(&c.pat, &mut binders);
+        }
+        self.with_locals(binders, || {
+            let guard = if matches!(&c.guard.kind, TreeKind::Empty) {
+                self.universe_member("EmptyTree")
+            } else {
+                self.term(&c.guard)?
+            };
+            let body = self.term(&c.body)?;
+            Ok(self.call(self.universe_member("CaseDef"), vec![p, guard, body]))
+        })
     }
 
     // -- shared pieces -----------------------------------------------------

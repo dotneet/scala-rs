@@ -1,4 +1,5 @@
-//! The tree `reify { … }` expands into (`docs/macros.md` §7.14).
+//! The tree `reify { … }` expands into (`docs/macros.md` §7.14,
+//! `docs/notes/reify-design.md`).
 //!
 //! `reify` is a compiler-internal macro like the quasiquotes: `scala.reflect
 //! .api.Universe` declares it, scala-reflect.jar holds no implementation, and
@@ -11,24 +12,29 @@
 //!         $m$untyped: scala.reflect.api.Mirror[U]): <Trees.TreeApi> = {
 //!       val $u = $m$untyped.universe
 //!       val $m = $m$untyped.asInstanceOf[scala.reflect.api.Mirror[$u.type]]
-//!       <the body, lowered by crate::reify::Reifier>
+//!       <the body, lowered by crate::reify::Reifier -- free symbols first>
 //!     }
 //!   }
 //!   <universe>.Expr.apply[T](
 //!     <universe>.rootMirror.asInstanceOf[<api.Mirror>], new $treecreator1()) }
 //! ```
 //!
-//! `tests/fixtures/rd_impl.scala` is this same shape written out by hand and
-//! run against real scalac, which is what says the pieces fit: the nested
-//! `object Expr` and its hand-written `apply` (`PickleSupply::
-//! install_expr_apply`), the `Mirror` cast the pickle's dropped bound makes
-//! necessary, and the `WeakTypeTag[T]` the implicit clause draws from
-//! `crate::materialize`.
+//! The `WeakTypeTag[T]` that `Expr.apply` demands is left to the implicit
+//! materialiser (`crate::materialize`) -- unless `T` mentions a free type,
+//! which only a `TypeCreator` sharing the body's symbol table can build. That
+//! creator is then written out here, as nsc always writes it:
 //!
-//! **The body is where hygiene lives**, and it is `crate::reify`'s job: a
-//! static `object` is rebuilt through `$m.staticModule`, a `.splice` through
-//! `Expr.in`, and anything else -- a local, a parameter, `this` -- is refused
-//! by name rather than reified as the bare name it was written with.
+//! ```text
+//!   <universe>.Expr.apply[T](<mirror>, new $treecreator1())(
+//!     <universe>.WeakTypeTag.apply[T](<mirror>, {
+//!       final class $typecreator1 extends scala.reflect.api.TypeCreator {
+//!         def apply[U <: ...]($m$untyped: Mirror[U]): <Types.TypeApi> = {
+//!           val $u = ...; val $m = ...; <free types>; <the type> } }
+//!       new $typecreator1() }))
+//! ```
+//!
+//! `tests/fixtures/rd_impl.scala` is the first shape written out by hand and
+//! run against real scalac, which is what says the pieces fit.
 
 use scala_rs_parser::{Flags, Modifiers, NodeId, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_span::Span;
@@ -47,31 +53,77 @@ pub(crate) struct ReifyExpander<'a> {
     pub(crate) arg: Type,
     /// `scala.reflect.api.Mirror`, for the cast on the mirror argument.
     pub(crate) mirror_ty: Type,
-    /// `scala.reflect.api.Trees.TreeApi`, the creator's erased result.
+    /// `scala.reflect.api.Trees.TreeApi`, the tree creator's erased result.
     pub(crate) tree_api: Type,
+    /// `scala.reflect.api.Types.TypeApi`, the type creator's erased result.
+    pub(crate) type_api: Type,
     /// The local the creator binds `$m$untyped.universe` to.
     pub(crate) universe_local: String,
     /// The local the creator binds the cast mirror to.
     pub(crate) mirror_local: String,
-    /// Whether the body mentions that mirror. A literal-only body does not,
-    /// and binding a `val` nothing reads would put a `Mirror[$u.type]` cast
-    /// into every `reify { 42 }` for nothing.
-    pub(crate) needs_mirror: bool,
+    /// The type creator's body, when the tag has to be built here: the
+    /// type value of `arg`, with its free types bound in front.
+    pub(crate) tag: Option<Tree>,
+    /// Name of the synthetic `TypeCreator` subclass, if one is written.
+    pub(crate) tag_creator_name: String,
+    /// The tags in scope the body splices, each bound to a local ahead of
+    /// the creator (`val $tag1 = evidence$1`): a creator is a local class,
+    /// and a class parameter's field is private to the class that declares
+    /// it, so the creator reads the local instead of the field.
+    pub(crate) tag_bindings: Vec<(String, Tree)>,
     pub(crate) span: Span,
 }
 
 impl ReifyExpander<'_> {
     pub(crate) fn build(&self) -> Tree {
-        let creator = self.creator_class();
-        let call = self.node(TreeKind::Apply {
+        let creator = self.creator_class(
+            &self.creator_name,
+            "TreeCreator",
+            self.tree_api.clone(),
+            &self.body,
+        );
+        let mut call = self.node(TreeKind::Apply {
             fun: Box::new(self.node(TreeKind::TypeApply {
                 fun: Box::new(self.select(self.select(self.universe.clone(), "Expr"), "apply")),
                 args: vec![self.resolved_type(self.arg.clone())],
             })),
-            args: vec![self.mirror(), self.new_creator()],
+            args: vec![self.mirror(), self.new_creator(&self.creator_name)],
         });
+        if let Some(tag_body) = &self.tag {
+            let tag_creator = self.creator_class(
+                &self.tag_creator_name,
+                "TypeCreator",
+                self.type_api.clone(),
+                tag_body,
+            );
+            let tag = self.node(TreeKind::Apply {
+                fun: Box::new(self.node(TreeKind::TypeApply {
+                    fun: Box::new(
+                        self.select(self.select(self.universe.clone(), "WeakTypeTag"), "apply"),
+                    ),
+                    args: vec![self.resolved_type(self.arg.clone())],
+                })),
+                args: vec![
+                    self.mirror(),
+                    self.node(TreeKind::Block {
+                        stats: vec![tag_creator],
+                        expr: Box::new(self.new_creator(&self.tag_creator_name)),
+                    }),
+                ],
+            });
+            call = self.node(TreeKind::Apply {
+                fun: Box::new(call),
+                args: vec![tag],
+            });
+        }
+        let mut stats: Vec<Tree> = self
+            .tag_bindings
+            .iter()
+            .map(|(name, tree)| self.val_def(name, tree.clone()))
+            .collect();
+        stats.push(creator);
         self.node(TreeKind::Block {
-            stats: vec![creator],
+            stats,
             expr: Box::new(call),
         })
     }
@@ -90,18 +142,21 @@ impl ReifyExpander<'_> {
         })
     }
 
-    fn new_creator(&self) -> Tree {
+    fn new_creator(&self, name: &str) -> Tree {
         self.node(TreeKind::Apply {
             fun: Box::new(self.node(TreeKind::New {
                 tpt: Box::new(self.node(TreeKind::Ident {
-                    name: self.creator_name.clone(),
+                    name: name.to_string(),
                 })),
             })),
             args: vec![],
         })
     }
 
-    fn creator_class(&self) -> Tree {
+    /// `final class <name> extends scala.reflect.api.<parent> { def apply[U
+    /// <: Universe with Singleton]($m$untyped: Mirror[U]): <result> = { val
+    /// $u = ...; val $m = ...; <body> } }`.
+    fn creator_class(&self, name: &str, parent: &str, result: Type, body: &Tree) -> Tree {
         let param = self.node(TreeKind::ValDef {
             mods: Modifiers {
                 flags: Flags::PARAM,
@@ -143,20 +198,20 @@ impl ReifyExpander<'_> {
             // `TreeCreator.apply` is *abstract* -- a descriptor ending in
             // `Object` overrides nothing and the first call would be an
             // `AbstractMethodError`.
-            tpt: Box::new(self.resolved_type(self.tree_api.clone())),
-            rhs: Box::new(self.creator_body()),
+            tpt: Box::new(self.resolved_type(result)),
+            rhs: Box::new(self.creator_body(body)),
         });
         self.node(TreeKind::ClassDef {
             mods: Modifiers {
                 flags: Flags::FINAL,
                 ..Modifiers::default()
             },
-            name: self.creator_name.clone(),
+            name: name.to_string(),
             tparams: vec![],
             ctor_mods: Modifiers::default(),
             vparamss: vec![],
             impl_: Template {
-                parents: vec![self.api_type("TreeCreator")],
+                parents: vec![self.api_type(parent)],
                 self_name: None,
                 self_tpt: None,
                 body: vec![apply],
@@ -173,13 +228,16 @@ impl ReifyExpander<'_> {
     ///
     /// The universe is bound to a `val` rather than selected afresh at every
     /// use because `$u.type` has to name *one* singleton: `$m`'s cast, and the
-    /// `x.in[$u.type]($m)` of every splice, are written against it.
-    fn creator_body(&self) -> Tree {
+    /// `x.in[$u.type]($m)` of every splice, are written against it. The
+    /// mirror is bound only when the body mentions it: a literal-only body
+    /// does not, and a `Mirror[$u.type]` cast nothing reads would sit in
+    /// every `reify { 42 }` for nothing.
+    fn creator_body(&self, body: &Tree) -> Tree {
         let mut stats = vec![self.val_def(
             &self.universe_local,
             self.select(self.untyped_mirror(), "universe"),
         )];
-        if self.needs_mirror {
+        if mentions(body, &self.mirror_local) {
             let cast = self.node(TreeKind::TypeApply {
                 fun: Box::new(self.select(self.untyped_mirror(), "asInstanceOf")),
                 args: vec![self.node(TreeKind::AppliedTypeTree {
@@ -195,7 +253,7 @@ impl ReifyExpander<'_> {
         }
         self.node(TreeKind::Block {
             stats,
-            expr: Box::new(self.body.clone()),
+            expr: Box::new(body.clone()),
         })
     }
 
@@ -265,6 +323,40 @@ impl ReifyExpander<'_> {
             name: "scala".to_string(),
         });
         self.select(scala, name)
+    }
+}
+
+/// Whether `t` mentions the identifier `name` anywhere.
+fn mentions(t: &Tree, name: &str) -> bool {
+    match &t.kind {
+        TreeKind::Ident { name: n } => n == name,
+        TreeKind::Select { qual, .. } => mentions(qual, name),
+        TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+            mentions(fun, name) || args.iter().any(|a| mentions(a, name))
+        }
+        TreeKind::Block { stats, expr } => {
+            stats.iter().any(|s| mentions(s, name)) || mentions(expr, name)
+        }
+        TreeKind::ValDef { tpt, rhs, .. } => mentions(tpt, name) || mentions(rhs, name),
+        TreeKind::Function { vparams, body } => {
+            vparams.iter().any(|p| mentions(p, name)) || mentions(body, name)
+        }
+        TreeKind::Typed { expr, tpt } => mentions(expr, name) || mentions(tpt, name),
+        TreeKind::New { tpt } => mentions(tpt, name),
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            mentions(tpt, name) || args.iter().any(|a| mentions(a, name))
+        }
+        TreeKind::SingletonTypeTree { ref_ } => mentions(ref_, name),
+        TreeKind::If { cond, thenp, elsep } => {
+            mentions(cond, name) || mentions(thenp, name) || mentions(elsep, name)
+        }
+        TreeKind::Match { selector, cases } => {
+            mentions(selector, name)
+                || cases.iter().any(|c| {
+                    mentions(&c.pat, name) || mentions(&c.guard, name) || mentions(&c.body, name)
+                })
+        }
+        _ => false,
     }
 }
 

@@ -20,7 +20,12 @@
 #          carries our diagnostics and the ones the `.check` expects, and
 #          tests/scala_corpus_report.sh scores the wording on top of it. Both
 #          numbers are reported; neither replaces the other.
-#   run/   pass when it compiles, `java Test` runs, and stdout matches `.check`
+#   run/   pass when it compiles, `java Test` runs, and the compiler's
+#          warnings followed by the program's output match `.check` -- partest
+#          writes both into the one log it compares, so a `.check` that opens
+#          with `x.scala:3: warning: ...` needs that warning from us, and a
+#          warning scalac does not give fails the test. scala-rs prints them
+#          with `--diagnostics=scalac` for this.
 #
 # scala-rs is a subset implementation, so most of the corpus is expected to
 # fail. The number is the product.
@@ -101,7 +106,11 @@ if [[ $1 == --one ]]; then
         undef $msg; undef $f; undef $l;
       }
       if (/^(error|warning)(?:\[[^\]]*\])?:\s*(.*)$/) {
-        flush(); $lvl = $1; $msg = $2; next;
+        flush(); $lvl = $1; $msg = $2;
+        # nsc closes a -Werror run with this position-less error; the
+        # `.check` side keeps only positioned records, so ours does too.
+        undef $msg if $msg eq "No warnings can be incurred under -Werror.";
+        next;
       }
       if (defined $msg && !defined $l && m{^\s*-->\s*(\S+)}) {
         my $p = $1;
@@ -168,9 +177,13 @@ if [[ $1 == --one ]]; then
         -Xsource:3|-Xsource:3.0|-Xsource:3.4) opts+=(-Xsource:3) ;;
         -Xsource:3-cross) opts+=(-Xsource:3-cross) ;;
         -Xfatal-warnings|-Xasync) opts+=($o) ;;
+        -Werror) opts+=(-Xfatal-warnings) ;;
         -language:*|-Xsource-features:*) opts+=($o) ;;
+        # They decide which warnings are printed, which a `run` test's
+        # `.check` records.
+        -deprecation|-feature|-nowarn|-unchecked) opts+=($o) ;;
         # Accepted by scalac, no effect on whether we accept the program.
-        -deprecation|-unchecked|-feature|-nowarn|-usejavacp|-explaintypes) ;;
+        -usejavacp|-explaintypes) ;;
         # Anything else changes what scalac accepts or how it reports, so the
         # test is not ours to judge.
         *) emit skip "unsupported-flag $o"; exit 0 ;;
@@ -184,6 +197,9 @@ if [[ $1 == --one ]]; then
     rounds=(${(onu)${(M)${srcs:t:r}%_[0-9]}##*_})
   fi
   errors=0; crashed=; timedout=; symptom=
+  # A `run` test compares the compiler's warnings too, in scalac's own shape.
+  diag_fmt=()
+  [[ $kind == run ]] && diag_fmt=(--diagnostics=scalac)
   cp_extra=
   for r in $rounds; do
     if (( ${#rounds} > 1 )); then
@@ -196,20 +212,23 @@ if [[ $1 == --one ]]; then
     set +e
     perl -e 'alarm shift @ARGV; exec @ARGV' $TMO \
       $BIN compile $group -d $WORK/out -cp "$WORK/out$cp_extra:$EXTRA_CP" \
-      --scala-library $LIB $opts > $log 2>&1
+      --scala-library $LIB $opts $diag_fmt > $log 2>&1
     rc=$?
     set -e
     cp_extra=":$WORK/out"
     if (( rc == 142 )); then timedout=1; break; fi
     if grep -q 'panicked at\|stack overflow\|fatal runtime' $log; then crashed=1; break; fi
     if (( rc != 0 && rc != 1 )); then crashed=1; break; fi
-    n=$(grep -c '^error' $log || true)
+    # scalac's shape puts `file:line: ` in front of `error:`; the symptom
+    # drops it so both shapes bucket alike.
+    n=$(grep -c -E '^([^ ]+:[0-9]+: )?error' $log || true)
     errors=$(( errors + n ))
     if (( n > 0 )); then
       # Keep the first diagnostic verbatim (minus tabs, which are the field
       # separator). Bucketing happens at report time, so the log stays usable
       # for anything we did not think to bucket by.
-      symptom=$(grep -m1 '^error' $log | LC_ALL=C tr '\t' ' ' | cut -c1-140)
+      symptom=$(grep -m1 -E '^([^ ]+:[0-9]+: )?error' $log | sed -E 's/^[^ ]+:[0-9]+: error/error/' \
+        | LC_ALL=C tr '\t' ' ' | cut -c1-140)
       break
     fi
   done
@@ -262,10 +281,18 @@ if [[ $1 == --one ]]; then
       if (( rc != 0 )); then
         emit fail "runtime $(head -c 70 $WORK/stderr.txt | head -1)"; exit 0
       fi
+      # What the compiler printed, as partest's log holds it: file names
+      # relative to the test directory (partest strips the path), and no
+      # closing `N warnings` count (partest's reporter does not print one).
+      perl -ne 'next if /^\d+ (warning|error)s?$/;
+                s{^\S*/([^/\s]+\.(?:scala|java)):(\d+): }{$1:$2: };
+                print' $WORK/round*.log(N) > $WORK/compile.txt
       if [[ -f $check ]]; then
         # partest merges stdout and stderr into one log before comparing, so
-        # accept either stdout alone or the two concatenated.
-        cat $WORK/stdout.txt $WORK/stderr.txt > $WORK/both.txt
+        # accept either stdout alone or the two concatenated -- each after the
+        # compiler's own output.
+        cat $WORK/compile.txt $WORK/stdout.txt > $WORK/out.txt
+        cat $WORK/compile.txt $WORK/stdout.txt $WORK/stderr.txt > $WORK/both.txt
         # partest compares the two as *line sequences*, so whether the last
         # line ends with a newline is not part of the answer. Sixteen `.check`
         # files in the tree have no final newline (`run/t429.check` is
@@ -274,13 +301,13 @@ if [[ $1 == --one ]]; then
         # final newline on both sides and keep everything else byte-exact: a
         # *blank* trailing line still counts, as it does in partest.
         norm() { perl -0777 -pe 's/\n?\z/\n/' "$1" }
-        if diff -q <(norm $check) <(norm $WORK/stdout.txt) >/dev/null 2>&1 \
+        if diff -q <(norm $check) <(norm $WORK/out.txt) >/dev/null 2>&1 \
            || diff -q <(norm $check) <(norm $WORK/both.txt) >/dev/null 2>&1; then
           emit pass -
         else
           emit fail output-mismatch
         fi
-      elif [[ ! -s $WORK/stdout.txt ]]; then
+      elif [[ ! -s $WORK/stdout.txt && ! -s $WORK/compile.txt ]]; then
         emit pass -
       else
         emit fail unexpected-output

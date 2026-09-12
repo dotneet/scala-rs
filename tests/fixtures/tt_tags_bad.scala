@@ -13,35 +13,11 @@
 // cannot be built, and a type whose shape has no `staticClass` at all.
 
 import scala.reflect.runtime.universe._
-
-class Foo
-
-object Nest {
-  class Inner
-}
-
 object Main {
-  // A type constructor whose *argument* cannot be built. The composition
-  // recurses, so the reason names the argument rather than the constructor.
-  val a = typeOf[List[Nest.Inner]]
-
-  // A tuple whose *element* cannot be built. The tuple itself is composed
-  // now -- `scala.Tuple2` at its arguments, `tt_tags.scala` runs it against
-  // real scalac -- so what is left is the element that has no body.
-  val b = weakTypeOf[(Int, Nest.Inner)]
-
-  // A class nested in an object: `staticClass` walks packages only; nsc
-  // reaches this one with `selectType` on the module class.
-  val c = typeOf[Nest.Inner]
-
-  // `AnyRef` is an alias for `java.lang.Object`, not a class.
-  val d = typeOf[AnyRef]
-
-  // An abstract type with no tag in scope. nsc's `WeakTypeTag` reifies it as
-  // a *free* type; there is no `TypeTag` for it at all.
+  // A `TypeTag` for a type parameter with no tag in scope: nsc refuses it too
+  // ("No TypeTag available for T"). A `WeakTypeTag` for the same is built,
+  // with a free type -- `reify2_tags.scala`.
   def f[T]: Type = typeOf[T]
-  def g[T]: Type = weakTypeOf[T]
-
-  // A singleton type.
-  val e = typeOf[Main.type]
+  // A refinement needs nsc's `newNestedSymbol` scope reification.
+  val s = typeOf[{ def foo: Int }]
 }

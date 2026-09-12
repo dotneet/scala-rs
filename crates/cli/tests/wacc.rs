@@ -11,6 +11,11 @@
 //!   `getClass`, a dotted package clause's scope, a header-pass completion
 //!   whose errors were dropped, and interpolation / escape scanning.
 //!
+//! * Default arguments dispatched on the receiver (`wacc_defaults`,
+//!   `wacc_sep`): an override's own `name$default$n` getter, a default an
+//!   override inherits, a trait's getter with its static for `super`, and
+//!   every pairing of scalac and scala-rs across a separate compilation.
+//!
 //! Every `_bad` fixture is written so that scalac reports all of its errors
 //! in one phase; the agreement tests check that scalac rejects it with the
 //! same number of errors and the same messages.
@@ -200,6 +205,88 @@ const REFCHECKS: &[&str] = &[
     "in class B, multiple overloaded alternatives of method f define default arguments.\nThe members with defaults are defined in trait T and class A.",
     "`override` modifier required to override concrete member:",
 ];
+
+/// Compile `wacc_sep/Lib.scala` with `lib_scalac` (else scala-rs), then
+/// `wacc_sep/Use.scala` against it with `use_scalac` (else scala-rs), and run.
+fn check_sep(lib_scalac: Option<&Path>, use_scalac: Option<&Path>) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let dir = tmp_dir("sep");
+    let (lib_out, use_out) = (dir.join("lib"), dir.join("use"));
+    fs::create_dir_all(&lib_out).unwrap();
+    fs::create_dir_all(&use_out).unwrap();
+    let lib = fixtures_dir().join("wacc_sep/Lib.scala");
+    let (ok, log) = compile(&[lib], &lib_out, &jar, lib_scalac);
+    assert!(ok, "Lib.scala failed:\n{log}");
+    let src = fixtures_dir().join("wacc_sep/Use.scala");
+    let o = match use_scalac {
+        Some(sc) => Command::new(sc)
+            .arg("-classpath")
+            .arg(format!("{}:{}", jar.display(), lib_out.display()))
+            .args(["-d", use_out.to_str().unwrap()])
+            .arg(&src)
+            .output()
+            .expect("run scalac"),
+        None => Command::new(bin())
+            .arg("compile")
+            .arg(&src)
+            .args(["-d", use_out.to_str().unwrap()])
+            .args(["-cp", lib_out.to_str().unwrap()])
+            .args(["--scala-library", jar.to_str().unwrap()])
+            .output()
+            .expect("run scala-rs compile"),
+    };
+    assert!(
+        o.status.success(),
+        "Use.scala failed:\n{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let cp = format!("{}:{}", use_out.display(), lib_out.display());
+    let r = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!("{cp}:{}", jar.display()),
+            "Main",
+        ])
+        .output()
+        .expect("run java");
+    assert!(
+        r.status.success(),
+        "java Main failed:\n{}{}",
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let expected =
+        fs::read_to_string(fixtures_dir().join("expected").join("wacc_sep.txt")).unwrap();
+    assert_eq!(String::from_utf8_lossy(&r.stdout), expected);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn wacc_defaults_dispatch_on_the_receiver() {
+    check_runs("wacc_defaults", None);
+}
+
+#[test]
+fn scalac_agrees_wacc_defaults() {
+    if let Some(sc) = scalac() {
+        check_runs("wacc_defaults", Some(&sc));
+    }
+}
+
+#[test]
+fn wacc_defaults_separate_compilation() {
+    check_sep(None, None);
+    if let Some(sc) = scalac() {
+        check_sep(Some(&sc), None);
+        check_sep(None, Some(&sc));
+        check_sep(Some(&sc), Some(&sc));
+    }
+}
 
 #[test]
 fn wacc_accepts_runs() {

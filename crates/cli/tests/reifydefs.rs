@@ -292,49 +292,37 @@ fn rd_defs_val_matches_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// The two shapes still refused, each named. Real scalac compiles both; both
-/// are about the *declared type* of a `val`/`def`, not about the definition
-/// or a reference to it -- see `rd_defs_bad.scala`'s own comments.
+/// The two shapes `rd_defs_bad.scala` once refused -- a `val` whose declared
+/// type is a constructor at arguments, and a local `def` with a type
+/// parameter of its own -- are reified now (`docs/notes/reify-design.md`):
+/// the type structurally by symbol, the type parameter by name. Real scalac
+/// compiles the file; so does scala-rs.
 #[test]
-fn rd_defs_gaps_are_named() {
-    if !prerequisites("rd_defs_bad") {
+fn rd_defs_typed_compiles() {
+    if !prerequisites("rd_defs_typed") {
         return;
     }
-    let out_dir = tmp_dir("rd_defs_bad");
-    let out = compile("rd_defs_bad", &out_dir, &[]);
+    let out_dir = tmp_dir("rd_defs_typed");
+    let out = compile("rd_defs_typed", &out_dir, &[]);
     assert!(
-        !out.status.success(),
-        "rd_defs_bad.scala should not compile"
-    );
-    let text = diagnostics(&out);
-    for want in [
-        // `List[Int]`: a type constructor applied to arguments.
-        "a type argument cannot be rebuilt: `List`, a type constructor applied to type arguments",
-        // a locally declared `def`'s own type parameter used in value position
-        "a type argument cannot be rebuilt: `U`",
-    ] {
-        assert!(text.contains(want), "missing {want:?} in:\n{text}");
-    }
-    assert!(
-        text.contains("cannot expand reify { ... }"),
-        "the report should name reify:\n{text}"
+        out.status.success(),
+        "compile rd_defs_typed failed: {}",
+        diagnostics(&out)
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
 
-/// Real scalac accepts `rd_defs_bad.scala`. Without this the fixture could
-/// drift into a program that is simply wrong, and the refusals above would
-/// stop being a confession and start looking like correct rejections.
+/// Real scalac accepts `rd_defs_typed.scala` too.
 #[test]
-fn rd_defs_gaps_are_accepted_by_real_scalac() {
-    if !prerequisites("rd_defs_bad scalac") {
+fn rd_defs_typed_is_accepted_by_real_scalac() {
+    if !prerequisites("rd_defs_typed scalac") {
         return;
     }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip rd_defs_bad scalac: scalac not obtainable");
+        eprintln!("skip rd_defs_typed scalac: scalac not obtainable");
         return;
     };
-    let out_dir = tmp_dir("rd_defs_bad-scalac");
-    scalac_compile(&scalac, "rd_defs_bad", &out_dir, &[]);
+    let out_dir = tmp_dir("rd_defs_typed-scalac");
+    scalac_compile(&scalac, "rd_defs_typed", &out_dir, &[]);
     let _ = fs::remove_dir_all(&out_dir);
 }

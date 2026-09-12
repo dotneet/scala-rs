@@ -23,7 +23,6 @@ mod cyclic;
 mod default_recv;
 mod double_def;
 mod double_names;
-mod dup_alternatives;
 mod erasure;
 mod expand;
 mod expand_mirror;
@@ -125,6 +124,17 @@ mod uncurry;
 mod value_companion;
 mod valueclass;
 mod views;
+// Warnings nsc issues by default (agent/warn).
+mod scala_coll;
+mod warn_deprecation;
+mod warn_features;
+mod warn_patmat;
+mod warn_patmat_analysis;
+mod warn_patmat_logic;
+mod warn_patmat_translate;
+mod warn_patmat_types;
+mod warn_refchecks;
+mod warn_util;
 // The prelude.rs split (agent/preludesplit): topic modules pulled out of the
 // 7400-line prelude.rs, following the existing prelude_<topic>.rs convention.
 // Appended here rather than interleaved alphabetically above to avoid

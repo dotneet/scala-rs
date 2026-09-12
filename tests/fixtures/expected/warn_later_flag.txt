@@ -1,0 +1,26 @@
+warn_later.scala:35: warning: view bounds are deprecated; use an implicit parameter instead.
+  example: instead of `def f[A <% Int](a: A)` use `def f[A](a: A)(implicit ev: A => Int)`
+  def view[A <% Int](a: A): Int = a
+             ^
+warn_later.scala:28: warning: type A is unused or used in non-specializable positions.
+  def inList[@specialized(Int) A](xs: List[A]): Int = xs.length // warn
+      ^
+warn_later.scala:29: warning: type A, type B are unused or used in non-specializable positions.
+  def none[@specialized(Int) A, @specialized(Int) B](x: Int): Int = x // warn
+      ^
+warn_later.scala:31: warning: type A is unused or used in non-specializable positions.
+  def triple[@specialized(Int) A](p: (A, Int, Int)): Int = 0 // warn
+      ^
+warn_later.scala:5: warning: Reference to uninitialized value late
+  val early = late // warn
+              ^
+warn_later.scala:7: warning: Reference to uninitialized variable w
+  var v = w + 1 // warn
+          ^
+warn_later.scala:13: warning: Reference to uninitialized value q
+  println(q) // warn
+          ^
+warn_later.scala:22: warning: Reference to uninitialized value b
+  val a = b // warn
+          ^
+8 warnings

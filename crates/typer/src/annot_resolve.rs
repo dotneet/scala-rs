@@ -59,9 +59,11 @@ impl Typer {
             }
             _ => {}
         }
+        let saved = std::mem::replace(&mut self.resolving_annot, true);
         for a in &annots {
             self.resolve_one_annotation(a);
         }
+        self.resolving_annot = saved;
     }
 
     fn resolve_one_annotation(&mut self, a: &Tree) {

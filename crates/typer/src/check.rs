@@ -331,6 +331,11 @@ pub struct Typer {
     /// Per-binary-name index for *local* classes/objects (`Main$Same$1`,
     /// `Main$Same$2`), keyed by the un-indexed binary name.
     pub(crate) local_class_n: std::collections::HashMap<String, u32>,
+    /// Set while a block statement's `class` / `object` is entered: it is a
+    /// local declaration even where no term owner shows it (a `val`
+    /// initializer's block is owned by the enclosing class). Taken by the
+    /// first `jvm_for_current`, so members of the local class are not local.
+    pub(crate) block_local_naming: bool,
     /// Enclosing package clauses; a nested one is relative to the last.
     pub(crate) pkg_nest: Vec<SymbolId>,
     /// Packages a file's `package` clauses actually *open*, by file index.
@@ -377,6 +382,11 @@ pub struct Typer {
     pub(crate) sigs_only: bool,
     /// Some source mentions `@compileTimeOnly`; see `crate::compile_time_only`.
     pub(crate) any_cto: bool,
+    /// `crate::annot_resolve` is resolving an annotation's own name. It
+    /// reaches `tree_to_type` with the annotation's span, and
+    /// `@compileTimeOnly` is reported at the annotated *definition*
+    /// (`note_cto_type_name`), so the type hook stays quiet there.
+    pub(crate) resolving_annot: bool,
     /// The definition whose written result type is being resolved; its own
     /// `@compileTimeOnly` covers it (the owner has been restored by then).
     pub(crate) cto_sig_owner: SymbolId,
@@ -551,7 +561,7 @@ pub struct Typer {
     /// with the `implicit val classTag` it is about to inherit from it.
     pub(crate) parent_ctor_scope: bool,
     pub(crate) class_bound_evidence_types: HashMap<SymbolId, Vec<Type>>,
-    fatal_warnings: bool,
+    pub(crate) fatal_warnings: bool,
     pub(crate) library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     pub(crate) return_meth: Option<SymbolId>,
@@ -561,6 +571,11 @@ pub struct Typer {
     pub(crate) language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     pub(crate) language_implicit_conversions: bool,
+    /// `import scala.language.reflectiveCalls` / `-language:reflectiveCalls`.
+    pub(crate) language_reflective_calls: bool,
+    /// Features a warning has already explained (nsc `reportedFeature`):
+    /// the "This can be achieved by ..." paragraph comes once per run.
+    pub(crate) reported_features: HashSet<String>,
     /// `-Xsource-features:<features>` (already gated on `-Xsource:3`).
     pub(crate) source_features: crate::source_features::SourceFeatures,
     /// `-Xsource:3` (see `TypecheckOptions::scala3`).
@@ -664,6 +679,16 @@ pub struct Typer {
     /// the prefix the backend loaded `this`, which is a `ClassCastException`
     /// at run time. This is what `import c.universe._` needs.
     pub(crate) term_import_prefixes: Vec<(SymbolId, Tree)>,
+    /// How many `reify { … }` bodies are being typed on a probe right now.
+    /// Above zero, a `reify` met while typing is nested in another and is
+    /// typed but not expanded (`Check::try_expand_reify`).
+    pub(crate) reify_depth: u32,
+    /// The nested `reify` applications the current probe met, by node, with
+    /// the expression naming their universe. Taken by the outer expansion.
+    pub(crate) nested_reifies: HashMap<NodeId, Tree>,
+    /// Where locals, parameters, type parameters and local classes were
+    /// defined: the origin nsc writes on a free symbol (`crate::reify::tree`).
+    pub(crate) def_spans: HashMap<SymbolId, Span>,
     /// Receiver paths keyed by the written import clause, so an inner
     /// wildcard cannot replace the receiver of an outer binding.
     pub(crate) object_import_prefixes: HashMap<u64, Tree>,
@@ -903,7 +928,10 @@ pub fn typecheck_units_src(
     // `@compileTimeOnly` is checked only when some source can carry it (only
     // source definitions keep annotations). A caller with no source text
     // checks unconditionally.
-    t.any_cto = t.sources.is_empty() || t.sources.iter().any(|s| s.contains("compileTimeOnly"));
+    t.any_cto = t.sources.is_empty()
+        || t.sources
+            .iter()
+            .any(|s| s.contains("compileTimeOnly") || s.contains("splice") || s.contains("reify"));
     {
         // Class headers before member types, across every unit: a class can
         // inherit from one whose own superclass chain is declared in a file
@@ -1003,6 +1031,9 @@ pub fn typecheck_units_src(
     // Default arguments are bodies, not signatures: typing them during the
     // pass above would let one name only the members of the units that come
     // before its own on the command line.
+    // Every source method has its parameters now; an override inherits the
+    // defaults of the method it overrides before any call is typed.
+    t.inherit_overridden_defaults();
     t.defer_default_rhs = false;
     t.type_pending_defaults();
     for (tree, file_index) in units.iter_mut() {
@@ -1028,6 +1059,18 @@ pub fn typecheck_units_src(
     // parent or self type is raised twice. Member signatures are built once
     // (see `sig_done`), so their diagnostics survive here.
     dedup_diags(&mut t.diags);
+    // nsc's later phases only run when the typer reported no errors; so do
+    // the warnings they issue.
+    if !t
+        .diags
+        .iter()
+        .any(|d| d.level == scala_rs_span::Level::Error)
+    {
+        crate::warn_refchecks::run(&mut t, units);
+        crate::warn_deprecation::run(&mut t, units);
+        crate::warn_features::run(&mut t, units);
+        crate::warn_patmat::run(&mut t, units);
+    }
     (t.st, t.diags)
 }
 
@@ -1059,6 +1102,7 @@ impl Typer {
             slot_source: Vec::new(),
             last_named_order: None,
             local_class_n: std::collections::HashMap::new(),
+            block_local_naming: false,
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
             open_pkg_chains: HashMap::new(),
@@ -1067,6 +1111,7 @@ impl Typer {
             import_text: HashMap::new(),
             sigs_only: false,
             any_cto: false,
+            resolving_annot: false,
             cto_sig_owner: SymbolId::NONE,
             cto_deferred: None,
             header_pass: false,
@@ -1114,6 +1159,11 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
+            language_reflective_calls: language_flag_enabled(
+                &opts.language_features,
+                "reflectiveCalls",
+            ),
+            reported_features: HashSet::new(),
             source_features: opts.source_features,
             scala3: opts.scala3,
             compiler_settings: opts.compiler_settings.clone(),
@@ -1129,6 +1179,9 @@ impl Typer {
             parent_arg_scope: None,
             pickle: crate::pickle_supply::PickleSupply::new(),
             term_import_prefixes: Vec::new(),
+            reify_depth: 0,
+            nested_reifies: HashMap::new(),
+            def_spans: HashMap::new(),
             object_import_prefixes: HashMap::new(),
             parent_import_prefixes: HashMap::new(),
             parent_import_names: HashMap::new(),
@@ -1175,11 +1228,47 @@ impl Typer {
     }
 
     pub(crate) fn warning(&mut self, span: Span, msg: impl Into<String>) {
+        self.warning_in(scala_rs_span::Phase::Typer, span, msg);
+    }
+
+    /// nsc `Reporting.featureWarning` for a feature that `should` be enabled
+    /// (`cat=feature`, summarized unless `-feature`). The explanation is
+    /// given the first time a feature is reported in the run.
+    pub(crate) fn feature_warning(&mut self, span: Span, feature: &str, desc: &str) {
+        let fq = format!("scala.language.{feature}");
+        let explain = if self.reported_features.insert(feature.to_string()) {
+            format!(
+                "\nThis can be achieved by adding the import clause 'import {fq}'\nor by setting the compiler option -language:{feature}.\nSee the Scaladoc for value {fq} for a discussion\nwhy the feature should be explicitly enabled."
+            )
+        } else {
+            String::new()
+        };
+        let msg = format!(
+            "{desc} should be enabled\nby making the implicit value {fq} visible.{explain}"
+        );
+        if self.fatal_warnings {
+            self.error(span, msg);
+        } else {
+            self.diags.push(
+                Diagnostic::warning(self.file_index, span, msg)
+                    .with_category(scala_rs_span::WarnCategory::Feature),
+            );
+        }
+    }
+
+    /// A warning nsc issues in `phase` (which decides where it is reported;
+    /// see `scala_rs_span::finish_diagnostics`).
+    pub(crate) fn warning_in(
+        &mut self,
+        phase: scala_rs_span::Phase,
+        span: Span,
+        msg: impl Into<String>,
+    ) {
         if self.fatal_warnings {
             self.error(span, msg);
         } else {
             self.diags
-                .push(Diagnostic::warning(self.file_index, span, msg));
+                .push(Diagnostic::warning(self.file_index, span, msg).in_phase(phase));
         }
     }
 
@@ -1879,6 +1968,19 @@ pub(crate) fn tree_contains_this(tree: &Tree) -> bool {
 /// are type parameters. Not used for implicit search (`is_sub_type`).
 pub(crate) fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
     match (arg, param) {
+        // `Array[T]` is the same shape as any other class application, only
+        // spelled with its own type node. Without it `new BO(Array(3))` on
+        // `class BO[T: Ordering](a: Array[T])` matched no constructor while
+        // `T` was still open, fell back to the fields, and went out with no
+        // constructor symbol at all -- the evidence clause was never filled
+        // and codegen called `BO.<init>(Object)` (`NoSuchMethodError`,
+        // run/t5284); with an explicit implicit clause it was a spurious
+        // "no matching overload".
+        (Type::Array(a), Type::Array(p)) => {
+            matches!(p.as_ref(), Type::TypeParam(_))
+                || a == p
+                || class_ctor_matches_typeparam_args(a, p)
+        }
         (Type::Class { sym: sa, args: aa }, Type::Class { sym: sp, args: pa })
             if sa == sp && aa.len() == pa.len() =>
         {
@@ -3724,17 +3826,6 @@ pub(crate) fn is_annotated_lambda(tree: &Tree) -> bool {
         }
         _ => false,
     }
-}
-
-/// The written name an application ultimately calls, past any type
-/// application: the node a `reify` body's classification has to be keyed on,
-/// since that is the one `crate::reify` asks about.
-pub(crate) fn reify_callee(fun: &Tree) -> &Tree {
-    let mut head = fun;
-    while let TreeKind::TypeApply { fun, .. } = &head.kind {
-        head = fun;
-    }
-    head
 }
 
 /// Drop diagnostics repeated verbatim at the same position, keeping the first.

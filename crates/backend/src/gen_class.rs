@@ -479,11 +479,10 @@ impl<'a> Gen<'a> {
             }
             // `def m(a: A, b: B = …)` in a trait: the `m$default$2` getter is
             // a synthesized *symbol*, not a tree, so the loop above never saw
-            // it. Declare it here; `emit_default_getters` puts the body on
-            // every implementing class.
-            for (n, d) in self.default_getter_sigs(class_id) {
-                b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT | ACC_SYNTHETIC, &n, &d);
-            }
+            // it. The interface carries it as a `default` method with its
+            // `m$default$2$` static (nsc's trait ABI); every implementing
+            // class also gets a copy from `emit_default_getters`.
+            self.emit_trait_default_getters(&mut b, class_id, &this_name);
             // `T.super.m` written in a class nested in this trait: the
             // accessor is the trait's, declared here and implemented by every
             // class mixing it in (`emit_super_accessors`).
@@ -1364,7 +1363,7 @@ impl<'a> Gen<'a> {
                     if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) && !is_jvm_primitive(pty) {
                         emit_box(asm, &a.ty);
                     } else if !is_jvm_primitive(pty) {
-                        cast_trait_to_class(asm, st, &jvm_desc(st, pty));
+                        cast_interface_value_to_class(asm, st, &jvm_desc(st, pty));
                     }
                 }
             }

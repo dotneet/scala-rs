@@ -1,5 +1,9 @@
 //! Source locations and compiler diagnostics.
 
+mod report;
+
+pub use report::{finish_diagnostics, render_scalac, Phase, WarnCategory, WarnSettings};
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -168,6 +172,12 @@ pub struct Diagnostic {
     pub span: Span,
     pub file_index: usize,
     pub notes: Vec<String>,
+    /// The nsc phase that would have issued this diagnostic; see [`Phase`].
+    pub phase: Phase,
+    /// nsc's `WarningCategory`, as far as reporting depends on it: the
+    /// deprecation and feature categories are summarized rather than printed
+    /// unless `-deprecation` / `-feature` is given.
+    pub category: WarnCategory,
 }
 
 impl Diagnostic {
@@ -178,6 +188,8 @@ impl Diagnostic {
             span,
             file_index,
             notes: Vec::new(),
+            phase: Phase::Typer,
+            category: WarnCategory::Other,
         }
     }
 
@@ -188,11 +200,37 @@ impl Diagnostic {
             span,
             file_index,
             notes: Vec::new(),
+            phase: Phase::Typer,
+            category: WarnCategory::Other,
+        }
+    }
+
+    /// A diagnostic without a source position (nsc's `NoPosition`), such as
+    /// the deprecation summary.
+    pub fn unpositioned(level: Level, message: impl Into<String>) -> Self {
+        Diagnostic {
+            level,
+            message: message.into(),
+            span: Span::DUMMY,
+            file_index: usize::MAX,
+            notes: Vec::new(),
+            phase: Phase::Summary,
+            category: WarnCategory::Other,
         }
     }
 
     pub fn note(mut self, note: impl Into<String>) -> Self {
         self.notes.push(note.into());
+        self
+    }
+
+    pub fn in_phase(mut self, phase: Phase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    pub fn with_category(mut self, category: WarnCategory) -> Self {
+        self.category = category;
         self
     }
 

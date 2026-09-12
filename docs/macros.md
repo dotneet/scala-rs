@@ -71,6 +71,7 @@ unrealistic, it is stated as such.
   - 7.23 Structural transport and source macro integration
   - 7.24 Source symbol ownership in the integration candidate
   - 7.25 `mapTo` against classes this run is compiling (the `agent/gbmacro` slice)
+  - 7.26 `reify { … }` over the typed body (the `agent/reify` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -3674,3 +3675,18 @@ wrong there (`tests/fixtures/gbmac_selfimport.scala`; each also wrong on `4ac7c3
    `this`'s.
 9. `O PrimaryKey` without `scala.language.postfixOps` is a warning in scala-rs and an error in scalac
    2.13.16 ("postfix operator PrimaryKey needs to be enabled"); gitbucket enables the feature.
+
+### 7.26 `reify { … }` over the typed body (the `agent/reify` slice)
+
+`reify` now walks the **typed** body and rebuilds every reference from the
+symbol it resolved to -- nsc's own rule -- instead of classifying the parsed
+body name by name (§7.15, §7.17). Locals and parameters bound outside the
+body are *free terms* (`newFreeTerm` + `setInfo`), type parameters with no tag
+in scope are *free types*, definitions inside the body (classes, objects,
+defs, vals, closures, patterns) are reified by name, members of the enclosing
+`object` through `mkThis`, and the tag materialiser builds its types through
+the same type reifier (nested classes, singletons, aliases, `Predef.String`).
+The design, the measured walls and what remains, in order, are in
+[`docs/notes/reify-design.md`](notes/reify-design.md); the fixtures are
+`tests/fixtures/reify2_*.scala` (`crates/cli/tests/reify2.rs`), each run
+through real scalac 2.13.16 with identical output.

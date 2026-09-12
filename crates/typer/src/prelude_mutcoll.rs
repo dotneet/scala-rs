@@ -144,9 +144,19 @@ fn add_constructors(st: &mut SymbolTable, ordering: Option<SymbolId>) {
         return;
     };
     // `javap`: `public scala.collection.mutable.TreeSet(scala.math.Ordering<A>);`
-    for name in ["TreeMap", "TreeSet", "PriorityQueue"] {
-        let jvm = format!("scala/collection/mutable/{name}");
-        let Some(cls) = crate::classpath::find_by_jvm(st, &jvm) else {
+    // The immutable pair is the same shape -- `def this()(implicit ordering:
+    // Ordering[K])` beside a private tree constructor, `javap`: `public
+    // scala.collection.immutable.TreeMap(scala.math.Ordering<K>)` and no
+    // `()V` -- and `new TreeMap[K, V]` compiled to `<init>()V`:
+    // `NoSuchMethodError` at run time (run/map_test, run/t2075).
+    for jvm in [
+        "scala/collection/mutable/TreeMap",
+        "scala/collection/mutable/TreeSet",
+        "scala/collection/mutable/PriorityQueue",
+        "scala/collection/immutable/TreeMap",
+        "scala/collection/immutable/TreeSet",
+    ] {
+        let Some(cls) = crate::classpath::find_by_jvm(st, jvm) else {
             continue;
         };
         if declares_ctor(st, cls) {

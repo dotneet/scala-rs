@@ -206,6 +206,20 @@ impl<'a> Sig<'a> {
                     Type::Class { .. } | Type::ThisType(_) | Type::String | Type::Array(_) => {
                         jvm_desc_val(self.st, &t)
                     }
+                    // A primitive bound is what the *descriptor* erases the
+                    // parameter to (`def id[A <: Int](a: A): A` is `(I)I`,
+                    // see `erasure::bound_erasure`), while the formal still
+                    // reads `<A:Ljava/lang/Object;>` -- the signature nsc
+                    // writes, `(TA;)TA;`, is checked against the descriptor
+                    // through this table and has to erase back to `(I)I`.
+                    Type::Int
+                    | Type::Long
+                    | Type::Double
+                    | Type::Float
+                    | Type::Boolean
+                    | Type::Byte
+                    | Type::Short
+                    | Type::Char => jvm_desc_val(self.st, &t),
                     _ => "Ljava/lang/Object;".to_string(),
                 }
             }

@@ -1309,6 +1309,13 @@ impl ClassBuilder {
         if g.sig == f.desc {
             return;
         }
+        // nsc's `getGenericSignatureHelper` suppresses the signature of a
+        // symbol whose type erases to a primitive (SI-7416): the `int` field
+        // of `class P[A <: Int](val a: A)` carries none, while its accessor
+        // `a()I` keeps `()TA;`.
+        if !f.desc.starts_with(['L', '[']) {
+            return;
+        }
         if crate::sig::erase_signature(&g.sig, &g.tvars).as_deref() != Some(f.desc.as_str()) {
             return;
         }
