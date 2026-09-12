@@ -4033,3 +4033,117 @@ class files" worked the whole time this was broken, and only "we compile
 against scalac's" did not. `crates/cli/tests/nullcross.rs` runs both
 directions and asserts the call shapes, so the day the field is narrowed to
 match nsc the asymmetry stops being a claim in a document.
+
+### Existential function types, `macro ???`, a compound's `apply`, and `AnyRef.clone` (`agent/libconc`)
+
+Five roots from the concurrency / conversion / interop corner of the standard
+library. Each is reduced to a standalone program in
+`crates/cli/tests/lconc.rs`, checked against scalac 2.13.16 in both directions.
+
+**`_ => _` as a parameter type.** `Function1[_, _]` is an existential: every
+function conforms to it, whatever its argument and result types are.
+`Type::Function`'s conformance compared parameters by flipping
+(contravariance), and flipping *against a wildcard* asked `_ <: Try[T]` and
+said no, so all eleven calls of `scala/concurrent/impl/Promise.scala`'s
+
+```scala
+final class Transformation[-F, T] private[this] (…) {
+  final def this(xform: Int, f: _ => _, ec: ExecutionContext) = …
+}
+```
+
+were `type mismatch; found: (Try[T]) => Try[S]  required: (_) => _`. An
+*unbounded* wildcard parameter on the right now contains the actual parameter
+type, the reading the `Type::Class` arm already gives a contravariant
+`SetParameter[_]`. A *bounded* one keeps the flip: `Function1[Any, Unit]` is a
+`Function1[_ <: AnyRef, Unit]` -- witness `AnyRef`, which `Any` accepts
+contravariantly -- and containment would ask `Any <: _ <: AnyRef` and refuse
+`tests/fixtures/existential_bounds.scala`.
+
+**`def f(…): T = macro ???`.** nsc treats the `Predef.???` reference as a
+placeholder rather than an implementation. `Validators.scala` runs only the
+confidence check on it and skips the correspondence check outright:
+
+```scala
+confidenceCheck()
+if (macroImpl != Predef_???) checkMacroDefMacroImplCorrespondence()
+```
+
+Every check the reference would fail -- a leading `Context` parameter, a
+matching parameter list -- is in that second half, so the *definition* stands
+and only a call site is refused (`macro implementation is missing`). The
+library declares its compiler-intrinsic macros this way
+(`StringContext.s/f/raw`, `scala.reflect.materializeClassTag`) and nsc fills
+them in from `FastTrack`, keyed on the macro def symbol. scala-rs now records
+the binding nsc pickles for one (`scala.Predef$.???`, empty signature, so the
+`MACRO` flag still reaches the class file), refuses it in
+`fasttrack_mirror::fasttrack_expansion` before the JVM bridge is started, and
+reports nsc's own wording at the call site.
+
+**Inference through a bounded existential on both sides.**
+`unify_one_precise` unwrapped a wildcard *pattern* down to its bound and
+matched that against the whole actual type; when the actual is a wildcard too
+there is nothing there to match. The four `invokeAll` / `invokeAny` forwarders
+in `ExecutionContextImpl.scala` re-declare Java's `<T> invokeAll(Collection<?
+extends Callable<T>>)` and forward to the same method on another
+`ExecutorService`, so the argument is a `Collection[_ <: Callable[U]]` and `T
+:= U` is readable only by lining the two *bounds* up. Both sides are now
+unwrapped, `hi` against `hi` and `lo` against `lo`.
+
+**A function parent.** `class_sym_of` answers `None` for a `Type::Function` by
+design -- conformance and erasure want it structural -- so the places that need
+the `FunctionN` *class* ask `function_class_form` for it. Two did not:
+
+* a compound's parents during member lookup, so `val b: ForkJoinPool
+  .ManagedBlocker with (() => T)` in `ExecutionContextImpl.scala` had no
+  `apply` and `b()` was "value apply is not a member of ManagedBlocker with ()
+  => T" (the application path also needed `Typer::type_has_apply` to read a
+  compound, and `retry_select_apply` to spell `b()` as `b.apply()` so
+  `type_select` does the parent walk);
+* `enter_inherited_members`, which puts an inherited name in the template
+  scope, so `trait PartialFunction[-A, +B] extends (A => B)` saw nothing of
+  `Function1` from *inside its own body* and `applyOrElse`'s unqualified
+  `apply(x)` was "not found: value apply". `lookup_member` had the rule
+  already, which is why `pf.apply(x)` through a receiver worked the whole time.
+
+Normalising the parent *type* instead -- in `type_parent`, so that
+`Symbol::parents` holds `Function2[…]` rather than the structural form -- fixes
+the same error and is the wrong place: erasure then reads the declared
+`apply(none: Unit, pp: String): Unit` of `object VcSinkUnit extends
+VcSink[Unit]` as an override of `Function2.apply(T1, T2)R` and gives it the
+descriptor `(BoxedUnit, String)Object`, where nsc emits `(BoxedUnit,
+String)void` plus the `(Object, Object)Object` bridge that materialises
+`BoxedUnit.UNIT`. The program still runs, but a separately compiled scalac
+caller links against the method nsc declares. `crates/cli/tests/vcself.rs`
+catches it.
+
+**`protected def clone(): AnyRef`** is declared on `scala.AnyRef` in nsc
+(`src/library-aux/scala/AnyRef.scala`) and was simply absent here, while
+`scala.Cloneable` is `java.lang.Cloneable`, a marker interface with no members.
+So `collection/mutable/Cloneable.scala`'s `override def clone(): C =
+super.clone().asInstanceOf[C]` had nothing to reach. It is `PROTECTED`, because
+`(new Object).clone()` is an error in scalac. Granting that access then needed
+one more fix: `protected_ok_in` asked `is_sub_type(cur_ty, type_of_class(owner))`,
+and `type_of_class(AnyRef)` is `Type::Class { sym: anyref_sym }`, a spelling the
+"everything reference-shaped is an `AnyRef`" arms do not match (no class lists
+`AnyRef` among its parents, so the ordinary parent walk finds nothing either).
+A member inherited from `AnyRef` itself was therefore refused in *every*
+subclass; the owner is now spelled `Type::AnyRef` when it is that class.
+
+Declaring a universal member that is *not* accessible everywhere needed one
+more rule, which the corpus found: the member walk reaches `AnyRef.clone` for
+any receiver, and it did so *before* the receiver's own pickle had been asked
+(a jar class's members are read one name at a time) and before any view. Two
+real selections are decided by what comes after -- `mutable.Cloneable` declares
+a public `override def clone(): C`, so `ArrayBuffer(1, 2, 3).clone()` must find
+that one (`run/mutable-treeset`, `run/t6114`), and `pos/t10206`'s `implicit
+class Enrich(foo: Foo) { def clone(x: Int, y: Int) }` is a view nsc applies
+here. A candidate set consisting *only* of inaccessible `Any`/`AnyRef` members
+is therefore cleared, which lets both paths run; when neither answers, the
+`AnyRef` fallback already at the end of `type_select` puts the declaration back
+and the access check reports nsc's own "cannot be accessed".
+
+Still open in that file: `super.clone()` from a **trait** needs the abstract
+super accessor nsc emits in the interface
+(`scala$collection$mutable$Cloneable$$super$clone()`, implemented by a mixin
+forwarder in each concrete class), which is codegen and not this slice's.

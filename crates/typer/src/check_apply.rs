@@ -3292,14 +3292,20 @@ impl Typer {
                     }
                     // nsc: `c(1)` looks up `apply`, never `update`. Assignment
                     // `c(i) = v` is the only path that rewrites to `update`.
-                    let has_apply = match strip_annotations(&fun_ty) {
-                        Type::Method { .. } | Type::Overload(_) | Type::Function { .. } => true,
-                        Type::Array(_) => true,
-                        Type::Class { sym, .. } | Type::ModuleRef(sym) => {
-                            !self.st.lookup_member(*sym, "apply").is_empty()
-                        }
-                        _ => false,
-                    };
+                    let has_apply = self.type_has_apply(&fun_ty);
+                    // A *compound* callee: `val b: ManagedBlocker with (() =>
+                    // T)` applied as `b()`. nsc reads `fun.tpe.member(apply)`,
+                    // which for a compound is whichever parent declares it;
+                    // the paths above only know how to apply a receiver whose
+                    // own type is the function or the class. Spelling the
+                    // selection out sends it through `type_select`, which does
+                    // walk the parents, and `b.apply()` already worked.
+                    if has_apply
+                        && matches!(strip_annotations(&fun_ty), Type::Refined { .. })
+                        && self.retry_select_apply(tree, pt)
+                    {
+                        return;
+                    }
                     // `"abcdef"(1)`: the callee has no `apply` of its own, but an
                     // implicit conversion of it does (`augmentString` ->
                     // `StringOps.apply`). nsc types `c(1)` as `c.apply(1)`, so
@@ -4163,6 +4169,85 @@ impl Typer {
             Type::Function { params, ret } => {
                 params.iter().all(|p| self.is_closed_ctor_proto(p, tps))
                     && self.is_closed_ctor_proto(ret, tps)
+            }
+            _ => false,
+        }
+    }
+
+    /// Re-type `c(args)` as `c.apply(args)`, keeping the diagnostics and the
+    /// tree as they were when that does not typecheck either.
+    ///
+    /// Unlike [`Typer::retry_apply_extension`] this asks for no implicit
+    /// conversion: the receiver is expected to have the `apply` already, and
+    /// the point is only to reach it through `type_select`, which walks a
+    /// compound's parents.
+    pub(crate) fn retry_select_apply(&mut self, tree: &mut Tree, pt: &Type) -> bool {
+        let TreeKind::Apply { fun, .. } = &tree.kind else {
+            return false;
+        };
+        // Already `x.apply(…)`: the Select path has had its turn.
+        if matches!(&fun.kind, TreeKind::Select { name, .. } if name == "apply") {
+            return false;
+        }
+        let span = fun.span;
+        let saved = tree.clone();
+        let mark = self.diags.len();
+        let TreeKind::Apply { fun, .. } = &mut tree.kind else {
+            return false;
+        };
+        let old = std::mem::replace(fun.as_mut(), Tree::dummy(TreeKind::Empty));
+        **fun = Tree {
+            id: old.id,
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(old),
+                name: "apply".to_string(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+            postfix: false,
+            scala_ref: false,
+            stable_pat: false,
+            byname_thunk: false,
+            byname_type_marker: false,
+        };
+        self.type_expr(tree, pt);
+        if tree.ty.is_error() || self.diags.len() != mark {
+            self.diags.truncate(mark);
+            *tree = saved;
+            return false;
+        }
+        true
+    }
+
+    /// Whether `c(…)` can be read as `c.apply(…)` for a receiver of this type.
+    ///
+    /// nsc: `c(1)` looks up `apply`, never `update`; assignment `c(i) = v` is
+    /// the only path that rewrites to `update`.
+    ///
+    /// A *compound* receiver is the case this was extracted for. `val b:
+    /// ForkJoinPool.ManagedBlocker with (() => T)` in
+    /// `ExecutionContextImpl.scala` is applied as `b()`, and neither parent on
+    /// its own is the answer: the `apply` comes from the function half, which
+    /// this representation keeps structural (`class_sym_of` answers `None` for
+    /// a `Type::Function`, by design -- see `SymbolTable::function_class_form`).
+    /// Reading only the whole compound left `b()` reported as "value apply is
+    /// not a member of ManagedBlocker with () => T".
+    pub(crate) fn type_has_apply(&self, ty: &Type) -> bool {
+        match strip_annotations(ty) {
+            Type::Method { .. } | Type::Overload(_) | Type::Function { .. } => true,
+            Type::Array(_) => true,
+            Type::Class { sym, .. } | Type::ModuleRef(sym) => {
+                !self.st.lookup_member(*sym, "apply").is_empty()
+            }
+            Type::Refined { parents, decls } => {
+                decls.iter().any(|d| {
+                    matches!(
+                        d,
+                        RefineDecl::Def { name, .. } | RefineDecl::Val { name, .. }
+                        if name == "apply"
+                    )
+                }) || parents.iter().any(|p| self.type_has_apply(p))
             }
             _ => false,
         }

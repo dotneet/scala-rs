@@ -57,6 +57,16 @@ impl Typer {
         if (binding.impl_class.as_str(), binding.impl_method.as_str()) == CURRENT_MIRROR {
             return Some(self.expand_current_mirror(span));
         }
+        // A `macro ???` placeholder this compiler has no fast-track entry for.
+        // There is no implementation to invoke -- `scala.Predef.???` takes no
+        // arguments and throws -- so the bridge is not started for it: the
+        // refusal is the answer, and `report_macro_calls` turns it into nsc's
+        // own "macro implementation is missing" at the call site.
+        if (binding.impl_class.as_str(), binding.impl_method.as_str())
+            == crate::macros::PLACEHOLDER_IMPL
+        {
+            return Some(Err("macro implementation is missing".to_string()));
+        }
         None
     }
 
