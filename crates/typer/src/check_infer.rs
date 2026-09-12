@@ -3543,6 +3543,28 @@ impl Typer {
                 conversion = self.search_conversion(&tree.ty, pt);
             }
         }
+        // nsc refuses to *close* a gap to one of the top types with a view,
+        // however applicable the view is: "the result type of an implicit
+        // conversion must be more specific than AnyVal". `def use(x: AnyVal)`
+        // applied to a `"s"` is that error in scalac 2.13.16, and
+        // `def use(x: AnyRef)` applied to a `3` is its `AnyRef` twin -- a
+        // blanket conversion of anything to any top type is what the rule
+        // keeps out. Reported only once a view was actually found, so a
+        // position that needs no conversion is untouched and an ambiguity
+        // among several views still reports the ambiguity, as nsc does.
+        if matches!(conversion, ImplicitSearch::Found(_))
+            && matches!(pt, Type::Any | Type::AnyVal | Type::AnyRef)
+        {
+            self.error(
+                tree.span,
+                format!(
+                    "the result type of an implicit conversion must be more specific than {}",
+                    self.st.display_type(pt)
+                ),
+            );
+            tree.ty = Type::Error;
+            return;
+        }
         match conversion {
             ImplicitSearch::Found(id) => {
                 let span = tree.span;

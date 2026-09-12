@@ -2532,25 +2532,46 @@ impl Typer {
     }
 
     fn is_as_specific_type(&self, a: SymbolId, b: SymbolId) -> bool {
+        // nsc's `isAsSpecific(ftpe1, ftpe2)` for a method *with* parameters is
+        // `isApplicableSafe(Nil, ftpe2, ftpe1.paramTypes, WildcardType)`: `b`
+        // must be applicable to `a`'s parameter type, with `a`'s own type
+        // parameters left abstract, and the *result* type plays no part (it is
+        // `isAsSpecificValueType`, for value-shaped implicits, that compares
+        // results). Relating the two parameter types with `is_sub_type` left
+        // `Array[T]` and `Array[T <: AnyRef]` unordered either way, so
+        // `wrapRefArray` and `genericWrapArray` came out ambiguous for every
+        // `Array[String]` used as a `Seq` (`scala/Array.scala`,
+        // `scala/collection/concurrent/TrieMap.scala`, and the same pair with
+        // `wrapCharArray` in `scala/io/Source.scala`). Keeping the result
+        // comparison *as well* would go the other way and break a tie nsc
+        // leaves ambiguous: `foo1[A](a: A): Foo[A]` beside `foo2(a: Any):
+        // Foo[String]` (`neg/sensitive2`), where both views accept the other's
+        // parameter and only the results are ordered.
+        // Only for a genuine *view*. nsc normalizes an implicit first clause
+        // away first (`case mt: MethodType if mt.isImplicit =>
+        // isAsSpecific(mt.resultType, ftpe2)`), so `implicit def a(implicit i:
+        // Int): Array[Byte]` beside `implicit def b[T](implicit i: Int):
+        // Array[T]` is ordered by its *result*; reading the implicit `i: Int`
+        // as the parameter to compare made the two equal and `fn[Array[Byte]]`
+        // "ambiguous implicit: b, a" (`pos/t1272`).
+        let view = |id: SymbolId| {
+            (!self.first_clause_is_implicit(id))
+                .then(|| self.conversion_arg_ty(id))
+                .flatten()
+        };
+        if let (Some(aa), Some(_)) = (view(a), view(b)) {
+            return self.conv_accepts_opaque(b, &unwrap_byname(&aa));
+        }
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
         if !self.st.is_sub_type(&ra, &rb) {
             return false;
         }
-        match (self.conversion_arg_ty(a), self.conversion_arg_ty(b)) {
-            // nsc's `isAsSpecific(ftpe1, ftpe2)`: `b` must be *applicable* to
-            // `a`'s parameter type with `a`'s own type parameters abstract.
-            // Comparing the two parameter types with `is_sub_type` instead left
-            // `Array[T]` and `Array[T <: AnyRef]` unordered in both directions,
-            // so `wrapRefArray` and `genericWrapArray` came out ambiguous for
-            // every `Array[String]` used as a `Seq` (`scala/Array.scala`,
-            // `scala/collection/concurrent/TrieMap.scala`, and the same pair
-            // with `wrapCharArray` in `scala/io/Source.scala`).
-            (Some(aa), Some(_)) => self.conv_accepts_opaque(b, &unwrap_byname(&aa)),
-            (Some(_), None) => false,
-            (None, Some(_)) => true,
-            (None, None) => true,
-        }
+        // A view does not beat a value-shaped implicit on type alone.
+        !matches!(
+            (self.conversion_arg_ty(a), self.conversion_arg_ty(b)),
+            (Some(_), None)
+        )
     }
 
     /// Direct owner must be class-like (nsc `owner.isSubClass`). A method-local
@@ -3713,6 +3734,17 @@ impl Typer {
                 continue;
             }
             if !crate::check::mentions_tparam(param, &[*tp]) {
+                continue;
+            }
+            // A *higher-kinded* parameter's bound is written in terms of its
+            // own parameters (`B[U] <: Buffer[U]`, `CC[+B] <: Iterable[B]`),
+            // and what the receiver pins is a type *constructor*: relating the
+            // two is a kind-level question `is_sub_type` does not answer, and
+            // asking it dropped the conversions `pos/tcpoly_infer_ticket1864`,
+            // `pos/tcpoly_infer_implicit_tuple_wrapper`, `pos/t5953` and
+            // `pos/t11174` rely on. `kind_bounds.rs` is where such a bound is
+            // checked.
+            if !self.st.get(*tp).tparams.is_empty() {
                 continue;
             }
             let Some(hi) = self.st.get(*tp).bound_hi.clone() else {
