@@ -1758,7 +1758,8 @@ impl Typer {
                 .map(|p| self.parent_may_reach(p, target))
                 .collect();
             if reaching.iter().filter(|r| **r).count() > 1 {
-                if let Some(targs) = self.st.base_type_args(sym, args).get(&target.0) {
+                let bta = self.st.base_type_args(sym, args);
+                if let Some(targs) = bta.get(&target.0) {
                     return Some(Type::Class {
                         sym: target,
                         args: targs.clone(),

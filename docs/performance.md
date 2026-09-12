@@ -720,13 +720,183 @@ frame — 92% and 26% of a thread that only spent 11% and 5% in them. Count a
 symbol once per root-to-leaf path (skip it when it is already on the path from
 the root), or read the *entry points* into it from outside instead.
 
-## gitbucket's measure is now macro-bound (2026-09-12)
+## gitbucket's measure was *not* macro-bound (2026-09-12, `agent/macroperf`)
 
 `tests/gitbucket_measure.sh` took 13 s before Slick's `mapTo` could expand and
-**142 s** after (`agent/gbmacro`): every one of the 31 call sites now starts the
-JVM macro engine, describes the case class being compiled as a lazy mirror and
-runs Slick's real `mapToImpl`. The other three measures are unchanged (cats
-7.6 s for 340 files, the library 3.3 s, slick 4.7 s), so this is macro
-expansion, not a general slowdown. Worth attacking when macro-heavy builds
-matter: the engine is started per run, the mirror is rebuilt per call site, and
-nothing caches an expansion whose inputs repeat.
+**154 s** after (`agent/gbmacro`; 142 s when that slice measured it). The
+obvious reading -- 31 new macro expansions, so about 4 s each inside the engine
+-- was wrong, and believing it would have optimised the wrong process. It is
+**20 s** now, and the macro bridge was a tenth of what was removed.
+
+### What the measurement actually said
+
+Two instruments, and they agreed.
+
+**`sample` on the compiler, for the whole run.** The main thread does nothing
+(it joins the worker), and reading the call graph of the *worker* thread -- each
+symbol counted once per root-to-leaf path, per the warning above -- gave, out of
+135 s:
+
+| inclusive                                               | seconds |
+| ------------------------------------------------------- | ------- |
+| `Typer::expand_macro_application` (the whole macro path) | **2.7** |
+| `Typer::search_extension` → implicit search              | 110     |
+| `Typer::at_import_prefix_of`                             | 77.7    |
+| `Typer::most_specific`                                   | 45      |
+
+Waiting for the engine was 1.3 s of the window; what looked like "blocked on the
+JVM" in a first reading was the *stderr collector* thread, which sits in `read`
+for the whole run by design. A blocked thread is sampled exactly like a working
+one -- the same trap as the writer pool above.
+
+**Counters, for one run.** `linearize` was called **44,539,771** times (812
+million `Lin::lin` node visits) and `base_type_args` **44,390,698** times,
+against 405,801 mutations of the symbol table in the whole compile. Both are
+pure functions of the symbol graph, and both were recomputed from scratch every
+time: `Lin`'s memo was built and thrown away once per call.
+
+### The four changes, each measured on its own
+
+All four are caches or memoisations of deterministic lookups. None changes what
+the compiler accepts or emits: `tests/bench_compare.py` compiles slick and cats
+with both binaries, alternating, and reports `identical_output: true` (slick
+1504 class files, cats 2976, byte for byte, with identical diagnostics), and
+gitbucket's error set is the same line for line.
+
+**Report instructions, not seconds, for the headline.** This machine carries
+several agents; the same pair of binaries on gitbucket gave 154 s/20 s on a
+quiet moment and 366 s/43 s under load an hour later, while *instructions
+retired* varied by 0.06% between runs. Driving the compiler directly (not
+through `tests/gitbucket_measure.sh`, whose `/usr/bin/time -l` would count only
+the shell):
+
+| gitbucket, 354 sources | instructions retired | wall, quiet machine |
+| ---------------------- | -------------------- | ------------------- |
+| base (`batch/w3`)      | 2,566,780,000,000    | 154 s |
+| after                  | **286,490,000,000**  | **20 s** |
+
+which is **9.0x fewer instructions**, with the same one error reported at the
+same place.
+
+The per-step figures below are wall-clock readings taken as each change landed,
+so they are good for the *ordering* and not for three digits:
+
+| after                                                     | gitbucket | what it removed |
+| --------------------------------------------------------- | --------- | --------------- |
+| base (`batch/w3`)                                          | 154 s     | -- |
+| linearization cache (`crates/typer/src/lin.rs`)            | 120 s     | 812 M `lin` node visits → 400 K; 99.9% hit rate |
+| `base_type_args` cache (`symbol.rs`)                       | 69 s      | 44.4 M walks → 44 K; 99.9% hit rate |
+| `implicit_candidate_ty` memo (`implicits.rs`)              | 34 s      | `most_specific`'s O(n²) re-substitution of candidate types |
+| engine-side reflection memo + one reused pipe placeholder  | **20 s**  | macro expansion 8.5 s → 0.4 s |
+
+1. **Linearization was recomputed per caller.** `Lin`'s memo lived for one
+   `linearize` call, so a diamond was re-expanded once per caller. It is now
+   also kept on the symbol table (`SymbolTable::lin_cache`), keyed by a
+   **mutation generation** that `SymbolTable::get_mut` bumps: an entry is valid
+   until *any* symbol is handed out for mutation, at which point the whole cache
+   is dropped rather than reasoned about. 405 K mutations against 44.5 M
+   queries, and the hit rate is 99.9%, so the conservative rule costs nothing.
+   A truncated subtree is still never published, exactly as `Lin`'s own memo
+   never kept one. Nor is a class whose parent clause does not *name* its class
+   outright (`lin::parent_names_its_class`): a `Type::Named`, a type parameter,
+   a projection or a tuple is resolved by `class_sym_of` through the **scopes**,
+   through `abs_projections` / `path_members`, or under the thread-local chase
+   guard, and all three move as the typer walks the program with no symbol being
+   mutated at all. An applied type, an annotated one and an inner class behind a
+   prefix (a `Refined` around the class it names) do count as naming it, which
+   matters: gitbucket's every table is `extends profile.Table[…]`, and excluding
+   those would have left the cache idle exactly where it pays.
+2. **`base_type_args` likewise** (`SymbolTable::bta_cache`), keyed by the pair
+   it is a function of: the class and the arguments it is applied at. Buckets
+   are per class and scanned with `==`, because `Type` cannot be hashed (it
+   holds an `f64`); a class asked about at more than 16 instantiations stops
+   being cached, and the whole cache is dropped past 100,000 entries. The answer
+   is handed out as an `Rc`, so the hot path neither rebuilds nor clones it.
+   The walk reads the parent clauses of every class in the linearization, so it
+   honours the same verdict: where the linearization may not be kept, neither
+   may this.
+3. **`most_specific` re-derived every candidate's type once per pair.** nsc's
+   `improvesCache` equivalent (`ImplicitMemo::improves`) already caches the
+   *verdict* for a candidate pair; the types those verdicts are computed from
+   were not cached, so for n candidates the `subst_as_seen_from` behind
+   `implicit_candidate_ty` ran O(n²) times. It is memoised for the life of one
+   search now (`ImplicitMemo::candidate_tys`) -- the same validity window
+   `improves` already relies on, which is why this is not a new assumption. The
+   one branch that reads `companion_prefixes`, a map the search itself writes,
+   is deliberately left uncached -- and not only when an entry is already
+   there: the search fills that map as it meets wanted types, so a candidate
+   whose answer that branch *could* decide is never kept, or the first question
+   would answer for the second.
+4. **The macro bridge.** With the above in, `SCALA_RS_MACRO_TIMING=1` (below)
+   said the engine was 8.5 s of a 27 s build, of which the macro
+   implementations' own run was **0.064 s**. Two causes, both outside the
+   implementations:
+   * `ScalaRsMacroEngine.call` did `recv.getClass().getMethods()` on every
+     reflective call. That builds and copies a fresh array each time, and a
+     scala-reflect universe class has thousands of public methods -- and every
+     node of every tree built or serialised goes through it. `getMethods`,
+     the (class, name, arity) overload list and `Class.forName` are all
+     remembered now, in `getMethods` order, so the overload picked is the one
+     that was picked before.
+   * `MacroEngine::read_reply` called `dead_pipe()` -- which **spawns a `true`
+     process** -- on every single read, to hold `stdout`'s place while the
+     reader thread has it. A gitbucket build reads 600 lines off that pipe:
+     1.2 s of the 1.5 s the conversation cost was `posix_spawn`. The
+     placeholder is made once per engine and swapped back after each read.
+
+### `SCALA_RS_MACRO_TIMING=1`
+
+`crates/typer/src/expand_timing.rs` reports, per expansion and as a total:
+request serialisation, wall time on the pipe, the engine's own compute (its
+whole exchange minus the time it was blocked on us), the implementation's run
+inside `Method.invoke`, what answering its questions cost us, tree rebuild,
+and re-typing the expansion at the call site -- plus the number of round trips
+and a breakdown of the questions by kind. The engine reports its own two
+numbers through a `(timing)` request, which is the only way to tell "the JVM was
+computing" from "the JVM was waiting for us". The instrumentation is off unless
+the variable is set (it costs one extra round trip per expansion).
+
+gitbucket, after all four changes (68 expansions: 37 `TableQuery`, 29 `mapTo`,
+2 `sql`):
+
+| stage                                             | seconds |
+| ------------------------------------------------- | ------- |
+| engine start-up (`javac` cached, JVM to `(ready)`) | 0.51 |
+| request serialisation                             | 0.003 |
+| wall on the pipe                                  | 0.274 |
+| &nbsp;&nbsp;of which the engine computed           | 0.241 |
+| &nbsp;&nbsp;of which the implementations ran       | 0.090 |
+| answering the engine's 572 questions              | 0.003 |
+| rebuilding the returned trees                     | 0.002 |
+| re-typing the expansions at their call sites      | 0.114 |
+| **total**                                         | **0.91** |
+
+The questions, by kind: `viewInfo` 197, `symbol` 138, `companion` 137,
+`symbolInfo` 65, `modulePair` 35 -- 0.003 s all together. So the two things the
+coordinator expected to matter do not: the engine-side symbol cache already
+exists (`ScalaRsMacroEngine.sourceSymbols`, never cleared between expansions),
+and **an expansion cache on the Rust side would save at most 0.27 s**, since
+that is all the pipe now costs for the whole build. Likewise the JVM warm-up
+ideas: start-up is 0.5 s, and `-XX:TieredStopAtLevel=1` would make the
+serialiser's own reflection *slower*, not faster. None of them were done, and
+the numbers are the reason.
+
+### Where these caches do *not* help
+
+The corpus is the other end of the scale and it barely moves: `CORPUS_SIZE=sample`
+(250 per kind, 577 tests) alternating the two binaries gave 44 s / 50 s before
+and 42 s / 48 s after, with the same 417 pass and 160 fail. Each of those tests
+is a handful of lines, so there is no symbol graph to amortise a cache over and
+the time is process start-up and reading the library jar. A cache keyed on "the
+symbol table has not changed" pays in proportion to how long the table stands
+still, which is a property of *big* compilations.
+
+### What is left on gitbucket (2026-09-12)
+
+16.5 s of worker time with no dominator: the largest self-time entry is
+`subst_as_seen_from_walk_at` at 1.2 s, then `class_reaches` 0.7 s,
+`mentions_abs_projection` 0.6 s, `Type::clone` 0.7 s, `Type::eq` 0.5 s,
+`subst_tparams_cow` 0.5 s. The distribution is flat, which is where to stop
+with caches and start with the shape of the data: `Type` is deep-cloned and
+structurally compared everywhere, and interning it (or at least `Rc`-ing the
+argument vectors) is the next real step.

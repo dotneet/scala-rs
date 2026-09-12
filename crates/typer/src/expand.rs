@@ -87,6 +87,12 @@ pub(crate) struct MacroEngine {
     /// Set when an expansion timed out and the child was killed: the pipe is
     /// no longer in sync with the requests, so nothing more may be asked.
     poisoned: bool,
+    /// The closed pipe that holds `stdout`'s place while the reader thread has
+    /// it ([`dead_pipe`]), kept so it is made once per engine rather than once
+    /// per read. Making it spawns a process, and a gitbucket build reads 600
+    /// lines off this pipe: 1.2 s of the 1.5 s that conversation cost was
+    /// `posix_spawn` for a `true` that was thrown away again.
+    spare_stdout: Option<BufReader<ChildStdout>>,
 }
 
 impl Drop for MacroEngine {
@@ -174,7 +180,11 @@ impl MacroEngine {
         // `read_line` cannot be interrupted, so it runs where it can be
         // abandoned. The reader owns the handle for the duration and gives it
         // back with the line; on a timeout it is dropped along with the child.
-        let mut stdout = std::mem::replace(&mut self.stdout, BufReader::new(dead_pipe()));
+        let placeholder = self
+            .spare_stdout
+            .take()
+            .unwrap_or_else(|| BufReader::new(dead_pipe()));
+        let mut stdout = std::mem::replace(&mut self.stdout, placeholder);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut line = String::new();
@@ -186,7 +196,9 @@ impl MacroEngine {
         *budget = Some(limit.saturating_sub(started.elapsed()));
         match outcome {
             Ok((stdout, r)) => {
-                self.stdout = stdout;
+                // The placeholder goes back into the spare slot for the next
+                // read; only a timeout loses it, along with the child.
+                self.spare_stdout = Some(std::mem::replace(&mut self.stdout, stdout));
                 match r {
                     Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
                     Ok((_, line)) => Sexp::parse(line.trim_end()),
@@ -277,6 +289,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         stderr_done,
         stderr_thread: Some(stderr_thread),
         poisoned: false,
+        spare_stdout: None,
     };
     if hello.trim_end() != "(ready)" {
         let why = match Sexp::parse(hello.trim_end()) {
@@ -629,6 +642,7 @@ impl Typer {
                 let declared = tree.ty.clone();
                 built.span = tree.span;
                 *tree = built;
+                let retype_started = self.macro_timing.enabled.then(Instant::now);
                 self.macro_depth += 1;
                 // A blackbox macro's expansion is typechecked *against the
                 // declared result type* and keeps it, whatever more precise
@@ -636,6 +650,12 @@ impl Typer {
                 // with `Typed(expanded, TypeTree(innerPt))`).
                 self.type_expr(tree, &declared);
                 self.macro_depth -= 1;
+                if let Some(t) = retype_started {
+                    let elapsed = t.elapsed();
+                    if let Some(slot) = self.macro_timing.expansions.last_mut() {
+                        slot.retype += elapsed;
+                    }
+                }
                 if !tree.ty.is_error() {
                     tree.ty = declared;
                 }
@@ -667,8 +687,13 @@ impl Typer {
                 .to_string());
         }
         let (argss, targs, prefix) = peel_application(tree);
+        let timing_start = self.macro_timing.enabled.then(Instant::now);
         let (request, splices) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
+        if let Some(t) = timing_start {
+            let slot = self.macro_timing_slot(binding);
+            slot.request += t.elapsed();
+        }
         if let Some(why) = &self.macro_engine_error {
             // Starting it costs a `javac` and a JVM; a run whose first attempt
             // failed must not pay that again at every call site.
@@ -676,7 +701,12 @@ impl Typer {
         }
         if self.macro_engine.is_none() {
             let cp = self.macro_classpath.clone();
-            match start_engine(&cp) {
+            let started = Instant::now();
+            let engine = start_engine(&cp);
+            if self.macro_timing.enabled {
+                self.macro_timing.engine_start += started.elapsed();
+            }
+            match engine {
                 Ok(e) => self.macro_engine = Some(e),
                 Err(why) => {
                     self.macro_engine_error = Some(why.clone());
@@ -685,7 +715,22 @@ impl Typer {
             }
         }
         self.macro_rpc_span = tree.span;
-        let reply = self.converse(&request)?;
+        let rpc_started = self.macro_timing.enabled.then(Instant::now);
+        let reply = self.converse(&request);
+        if let Some(t) = rpc_started {
+            let elapsed = t.elapsed();
+            let engine = self.engine_timing();
+            let slot = self
+                .macro_timing
+                .expansions
+                .last_mut()
+                .expect("slot made above");
+            slot.rpc += elapsed;
+            slot.engine_invoke += engine.0;
+            slot.engine_wait += engine.1;
+            slot.engine_handle += engine.2;
+        }
+        let reply = reply?;
         let items = reply.list()?;
         match items.first().and_then(|s| s.atom()) {
             Some("ok") => {
@@ -693,7 +738,14 @@ impl Typer {
                     &mut self.macro_splices,
                     splices.into_iter().map(Some).collect(),
                 );
+                let rebuild_started = self.macro_timing.enabled.then(Instant::now);
                 let built = self.tree_from_reply(at(items, 1)?, tree.span);
+                if let Some(t) = rebuild_started {
+                    let elapsed = t.elapsed();
+                    if let Some(slot) = self.macro_timing.expansions.last_mut() {
+                        slot.rebuild += elapsed;
+                    }
+                }
                 self.macro_splices = saved;
                 built
             }
@@ -709,6 +761,52 @@ impl Typer {
             }
             Some("err") => Err(at(items, 1)?.text()),
             _ => Err(format!("the macro engine replied {reply:?}")),
+        }
+    }
+
+    /// Open a row for the expansion about to run, so every stage can add to
+    /// the same one (`SCALA_RS_MACRO_TIMING=1`).
+    fn macro_timing_slot(
+        &mut self,
+        binding: &MacroBinding,
+    ) -> &mut crate::expand_timing::ExpansionTiming {
+        self.macro_timing
+            .expansions
+            .push(crate::expand_timing::ExpansionTiming {
+                name: format!("{}.{}", binding.impl_class, binding.impl_method),
+                ..Default::default()
+            });
+        self.macro_timing
+            .expansions
+            .last_mut()
+            .expect("just pushed")
+    }
+
+    /// Ask the engine for the two numbers only it can see, and reset them:
+    /// time inside `Method.invoke` (the implementation's own run) and the part
+    /// of it spent blocked on an answer from here. The difference is what the
+    /// JVM actually computed for this expansion.
+    fn engine_timing(&mut self) -> (Duration, Duration, Duration) {
+        let Some(mut engine) = self.macro_engine.take() else {
+            return (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        };
+        let answer = engine
+            .send("(timing)")
+            .and_then(|()| engine.read_reply(&mut None));
+        self.macro_engine = Some(engine);
+        let nanos =
+            |s: &Sexp| -> Duration { Duration::from_nanos(s.text().parse::<u64>().unwrap_or(0)) };
+        match answer {
+            Ok(reply) => match reply.list() {
+                Ok(items) => match (at(items, 1), at(items, 2), at(items, 3)) {
+                    (Ok(invoke), Ok(wait), Ok(handle)) => {
+                        (nanos(invoke), nanos(wait), nanos(handle))
+                    }
+                    _ => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
+                },
+                Err(_) => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
+            },
+            Err(_) => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
         }
     }
 
@@ -796,7 +894,22 @@ impl Typer {
                      looping"
                 ));
             }
+            let answer_started = self.macro_timing.enabled.then(Instant::now);
             let answer = self.answer_query(items);
+            if let Some(t) = answer_started {
+                let elapsed = t.elapsed();
+                let kind = crate::expand_rpc::query_kind(items);
+                if let Some(slot) = self.macro_timing.expansions.last_mut() {
+                    slot.round_trips += 1;
+                    match slot.answers.iter_mut().find(|(k, _, _)| *k == kind) {
+                        Some(entry) => {
+                            entry.1 += 1;
+                            entry.2 += elapsed;
+                        }
+                        None => slot.answers.push((kind, 1, elapsed)),
+                    }
+                }
+            }
             if trace {
                 eprintln!("[macro ->] {answer}");
             }

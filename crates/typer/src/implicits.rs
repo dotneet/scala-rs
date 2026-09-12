@@ -128,6 +128,53 @@ pub(crate) struct ImplicitMemo {
     /// implicit def fromOther(b: Bridge): Inner }` found for an `o1.Inner`
     /// gives an `o1.Inner` (pos/t4947).
     companion_prefixes: rustc_hash::FxHashMap<u32, Vec<Type>>,
+    /// [`Typer::implicit_candidate_ty`] by candidate, for the candidates whose
+    /// answer does not depend on `companion_prefixes` (which this search
+    /// itself writes). `None` means "the declared type, unsubstituted".
+    ///
+    /// [`Typer::most_specific`] compares every pair of candidates and each
+    /// comparison reads both candidates' types, so the same substitution was
+    /// performed O(n^2) times for n candidates -- 72 s of a 154 s gitbucket
+    /// build, the largest entry in that profile once the linearization and
+    /// base-type caches were in. The validity window is the one `improves`
+    /// already relies on: that cache holds the *verdict* derived from these
+    /// very types, so if they could change inside one search it would already
+    /// be wrong.
+    candidate_tys: rustc_hash::FxHashMap<u32, Option<std::rc::Rc<Type>>>,
+}
+
+/// A candidate's type as an implicit search reads it.
+///
+/// Borrowed from the symbol table when nothing had to be substituted -- the
+/// common case, and deep-cloning every candidate's declared type was once the
+/// largest single source of `Type::clone` in a slick build. Shared when a
+/// substitution did happen, so the memo can hand the same answer to every
+/// later caller in the search without cloning it again.
+pub(crate) enum CandidateTy<'a> {
+    Declared(&'a Type),
+    Seen(std::rc::Rc<Type>),
+}
+
+impl std::ops::Deref for CandidateTy<'_> {
+    type Target = Type;
+
+    fn deref(&self) -> &Type {
+        match self {
+            CandidateTy::Declared(t) => t,
+            CandidateTy::Seen(t) => t,
+        }
+    }
+}
+
+impl CandidateTy<'_> {
+    pub(crate) fn into_owned(self) -> Type {
+        match self {
+            CandidateTy::Declared(t) => t.clone(),
+            CandidateTy::Seen(t) => {
+                std::rc::Rc::try_unwrap(t).unwrap_or_else(|shared| (*shared).clone())
+            }
+        }
+    }
 }
 
 struct MemoEntry {
@@ -242,6 +289,7 @@ impl Drop for MemoLive<'_> {
             m.cut = false;
             m.routes.clear();
             m.companion_prefixes.clear();
+            m.candidate_tys.clear();
         }
     }
 }
@@ -932,7 +980,42 @@ impl Typer {
     /// `TT[P1]` of `Mid` inside `trait Mid[P1] extends Base[P1]`. Without this
     /// the candidate carries `Base`'s `P1`, which never matches the wanted
     /// `TT[P1]` of `Mid`.
-    pub(crate) fn implicit_candidate_ty(&self, id: SymbolId) -> std::borrow::Cow<'_, Type> {
+    pub(crate) fn implicit_candidate_ty(&self, id: SymbolId) -> CandidateTy<'_> {
+        {
+            let memo = self.implicit_memo.borrow();
+            if memo.depth > 0 {
+                if let Some(hit) = memo.candidate_tys.get(&id.0) {
+                    return match hit {
+                        Some(seen) => CandidateTy::Seen(seen.clone()),
+                        None => CandidateTy::Declared(&self.st.get(id).ty),
+                    };
+                }
+            }
+        }
+        let (seen, memoisable) = self.implicit_candidate_ty_computed(id);
+        if memoisable {
+            let seen = seen.map(std::rc::Rc::new);
+            let mut memo = self.implicit_memo.borrow_mut();
+            if memo.depth > 0 {
+                memo.candidate_tys.insert(id.0, seen.clone());
+            }
+            return match seen {
+                Some(seen) => CandidateTy::Seen(seen),
+                None => CandidateTy::Declared(&self.st.get(id).ty),
+            };
+        }
+        match seen {
+            Some(seen) => CandidateTy::Seen(std::rc::Rc::new(seen)),
+            None => CandidateTy::Declared(&self.st.get(id).ty),
+        }
+    }
+
+    /// [`Self::implicit_candidate_ty`] without the memo: the substituted type,
+    /// or `None` for "read the declaration as it stands", and whether the
+    /// answer may be kept for the rest of the search. The
+    /// `companion_prefixes` branch may not: this search writes that map as it
+    /// goes, so its answer can change between two calls.
+    fn implicit_candidate_ty_computed(&self, id: SymbolId) -> (Option<Type>, bool) {
         // Borrowed in the common case. This runs once per candidate per
         // implicit search, and deep-cloning the declared type of every
         // candidate was the single largest source of `Type::clone` in a slick
@@ -954,7 +1037,7 @@ impl Typer {
             .copied()
             .unwrap_or(id);
         if let Some(seen) = self.at_import_prefix_of(origin, ty) {
-            return std::borrow::Cow::Owned(seen);
+            return (Some(seen), true);
         }
         // A member of the companion of an inner class, reached through the
         // prefix the wanted type carries (`companion_prefixes`): `object
@@ -965,9 +1048,15 @@ impl Typer {
         // conversions come from both `r.E`'s and `s.E`'s companion,
         // pos/t5340), the member keeps no prefix: the class is read bare,
         // which conforms to either.
+        // `companion_prefixes` is filled in as the search meets wanted types,
+        // so a candidate whose answer this branch *could* decide must not be
+        // remembered even when the entry is not there yet: the very next
+        // question may add it.
+        let mut companion_sensitive = false;
         if !owner.is_none() && self.st.get(owner).kind == SymKind::ModuleClass {
             let k = self.st.get(owner).owner;
             if !k.is_none() && self.st.get(k).kind == SymKind::Class {
+                companion_sensitive = true;
                 let pres = self
                     .implicit_memo
                     .try_borrow()
@@ -984,13 +1073,12 @@ impl Typer {
                         {
                             recv = self.st.type_of_class(k);
                         }
-                        return std::borrow::Cow::Owned(self.st.subst_as_seen_from_at(
-                            &recv,
-                            Some(&pres[0]),
-                            ty,
-                        ));
+                        return (
+                            Some(self.st.subst_as_seen_from_at(&recv, Some(&pres[0]), ty)),
+                            false,
+                        );
                     }
-                    return std::borrow::Cow::Owned(crate::prefix::bare_this_views(ty, k));
+                    return (Some(crate::prefix::bare_this_views(ty, k)), false);
                 }
             }
         }
@@ -1000,7 +1088,7 @@ impl Typer {
             || !self.st.get(owner).is_class_like()
             || self.st.get(owner).tparams.is_empty()
         {
-            return std::borrow::Cow::Borrowed(ty);
+            return (None, !companion_sensitive);
         }
         let this_ty = Type::Class {
             sym: this,
@@ -1012,7 +1100,10 @@ impl Typer {
                 .map(|t| Type::TypeParam(*t))
                 .collect(),
         };
-        std::borrow::Cow::Owned(self.st.subst_as_seen_from(&this_ty, ty))
+        (
+            Some(self.st.subst_as_seen_from(&this_ty, ty)),
+            !companion_sensitive,
+        )
     }
 
     /// Whether `id` can inhabit `pt`, and with which type arguments.

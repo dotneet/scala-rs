@@ -541,6 +541,8 @@ pub struct Typer {
     /// application currently being expanded, so a tree the engine hands over
     /// gets positions inside the file that asked for the expansion.
     pub(crate) macro_rpc_span: Span,
+    /// Where macro expansion's time went (`SCALA_RS_MACRO_TIMING=1`).
+    pub(crate) macro_timing: crate::expand_timing::MacroTiming,
     /// Types handed to the engine as *placeholder* symbols, by the full name
     /// the placeholder carries. A class this run is compiling has no class
     /// file for the engine's mirror to find, so it travels as its name alone
@@ -1082,6 +1084,7 @@ pub fn typecheck_units_src(
         crate::warn_features::run(&mut t, units);
         crate::warn_patmat::run(&mut t, units);
     }
+    t.macro_timing.report();
     (t.st, t.diags)
 }
 
@@ -1155,6 +1158,7 @@ impl Typer {
             macro_rpc_forcing: Vec::new(),
             macro_query_depth: 0,
             macro_rpc_span: Span::DUMMY,
+            macro_timing: crate::expand_timing::MacroTiming::new(),
             macro_local_tags: HashMap::new(),
             macro_lexical_owner: SymbolId::NONE,
             macro_mirror_owners: HashMap::new(),
