@@ -561,6 +561,18 @@ impl Typer {
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         let mut module_apply_candidates = Vec::new();
+        // An inner class behind a prefix (`prefix.rs`) is applied as the
+        // class -- `Literal(c)` on `val Literal: Trees.this.LiteralExtractor`
+        // -- while its `apply` is still read through the view, which is what
+        // instantiates the enclosing class's parameters.
+        let fun_ty_full = fun_ty;
+        let stripped;
+        let fun_ty = if crate::prefix::view_prefix(fun_ty).is_some() {
+            stripped = crate::prefix::strip_view(fun_ty).clone();
+            &stripped
+        } else {
+            fun_ty
+        };
         // Value alternatives of function type (`val f: String => Int` beside
         // `def f(s: String)`): nsc's `followApply` makes them compete through
         // their `apply`. Only used to detect a tie below.
@@ -723,7 +735,7 @@ impl Typer {
                     // extends (Int => String)` gets `Function1.apply`, and
                     // reading it raw made `m(3)` report
                     // `found: 3  required: T1`.
-                    let mty = self.st.subst_as_seen_from(fun_ty, &self.st.get(m).ty);
+                    let mty = self.st.subst_as_seen_from(fun_ty_full, &self.st.get(m).ty);
                     if let Type::Method { paramss, ret } = &mty {
                         cands.push((
                             m,
@@ -1769,7 +1781,7 @@ impl Typer {
         if is_function_pt(p) {
             return true;
         }
-        match p {
+        match crate::prefix::strip_view(p) {
             Type::Class { sym, args } => {
                 self.st.function_class_shape(*sym, args).is_some() || self.st.sam_sig(p).is_some()
             }
@@ -2038,7 +2050,7 @@ impl Typer {
     /// `None` means "no opinion" -- the parameter is not function-shaped, so a
     /// literal's arity says nothing about it.
     fn shape_arity(&self, param: &Type) -> Option<usize> {
-        match param {
+        match crate::prefix::strip_view(param) {
             Type::ByName(inner) | Type::Repeated(inner) => self.shape_arity(inner),
             Type::Function { params, .. } => Some(params.len()),
             Type::Class { sym, args } => {
@@ -2726,7 +2738,7 @@ impl Typer {
         // function-against-function rule below has to see it: a literal whose
         // parameters are not inferred yet would otherwise be inapplicable to
         // every such method.
-        if let Type::Class { sym, args } = param {
+        if let Type::Class { sym, args } = crate::prefix::strip_view(param) {
             if let Some(f) = self.st.function_class_shape(*sym, args) {
                 return self.arg_score(arg, &f);
             }

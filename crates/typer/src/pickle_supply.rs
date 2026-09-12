@@ -1628,7 +1628,18 @@ impl PickleSupply {
                 st.binary_alias_prefixes
                     .insert((alias_owner, name.to_string()), prefix.clone());
             }
-            return self.install_type_alias(st, bin, alias_owner, name, &hit.member.ty);
+            let this_prefix = match &hit.member.alias_prefix {
+                Some(SigType::This(c)) => Some(c.clone()),
+                _ => None,
+            };
+            return self.install_type_alias(
+                st,
+                bin,
+                alias_owner,
+                name,
+                &hit.member.ty,
+                this_prefix.as_deref(),
+            );
         }
         // A *nested class or trait* named as a **type**, as opposed to a type
         // alias or an abstract type member: `u.TypeTag[T]` (`TypeTags.TypeTag`),
@@ -1736,7 +1747,18 @@ impl PickleSupply {
                 _ => return None,
             }
         } else if matches!(declared.ty, SigType::Poly { .. }) {
-            match self.install_type_alias(st, bin, owner, name, &declared.ty)? {
+            let this_prefix = match &declared.alias_prefix {
+                Some(SigType::This(c)) => Some(c.clone()),
+                _ => None,
+            };
+            match self.install_type_alias(
+                st,
+                bin,
+                owner,
+                name,
+                &declared.ty,
+                this_prefix.as_deref(),
+            )? {
                 Type::TypeMember(id) => id,
                 _ => return None,
             }
@@ -1807,6 +1829,44 @@ impl PickleSupply {
         None
     }
 
+    /// `C.this.In` from a pickle: the `THIStpe` prefix of a `TypeRef` to a
+    /// nested class, which `SigType` has no room for (`sym.rs` records it
+    /// beside the member as `alias_prefix` / `result_prefix`). Attached as
+    /// the view prefix `ThisType(C)` (`prefix.rs`) when the type names a
+    /// class nested in a class: slick's `type Table[T] = JdbcProfile.this.Table[T]`
+    /// and `val api: JdbcProfile.this.API` are what gitbucket's every table
+    /// reaches its superclass and its enclosing instance through.
+    fn with_pickled_this_prefix(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        this_prefix: Option<&str>,
+        ty: Type,
+    ) -> Type {
+        let Some(owner_name) = this_prefix else {
+            return ty;
+        };
+        let inner = |st: &SymbolTable, t: &Type| matches!(t, Type::Class { sym, .. } if st.is_inner_class_of_class(*sym));
+        let core_is_inner = match &ty {
+            Type::Method { ret, .. } => inner(st, ret),
+            t => inner(st, t),
+        };
+        if !core_is_inner {
+            return ty;
+        }
+        let Some(c) = self.ensure_class(st, bin, owner_name, false) else {
+            return ty;
+        };
+        let pre = Type::ThisType(c);
+        match ty {
+            Type::Method { paramss, ret } => Type::Method {
+                paramss,
+                ret: Box::new(crate::prefix::with_prefix(*ret, pre)),
+            },
+            t => crate::prefix::with_prefix(t, pre),
+        }
+    }
+
     /// `type T[tps] = U` from a pickle, as the type it stands for.
     ///
     /// An alias is *transparent*: a nullary one is simply its right-hand side,
@@ -1824,6 +1884,7 @@ impl PickleSupply {
         owner: SymbolId,
         name: &str,
         ty: &SigType,
+        this_prefix: Option<&str>,
     ) -> Option<Type> {
         let owner_name = st
             .get(owner)
@@ -1857,7 +1918,7 @@ impl PickleSupply {
                     "{owner_name}#{name}: type alias right-hand side {rhs:?} does not convert"
                 ));
             }
-            return conv;
+            return conv.map(|t| self.with_pickled_this_prefix(st, bin, this_prefix, t));
         }
         // Owned but not yet a member: a right-hand side that will not convert
         // must leave the owner exactly as it was.
@@ -1887,6 +1948,7 @@ impl PickleSupply {
             ));
             return None;
         };
+        let target = self.with_pickled_this_prefix(st, bin, this_prefix, target);
         st.get_mut(id).ty = target;
         st.get_mut(id).is_type_alias = true;
         st.get_mut(owner).members.push(id);
@@ -2196,6 +2258,15 @@ impl PickleSupply {
                 st.get_mut(id).private_within = ctor_access_within(m);
                 if m.has(pflags::LOCAL) && m.has(pflags::PRIVATE) {
                     st.get_mut(id).flags = st.get(id).flags.with(Flags::LOCAL);
+                }
+                // A constructor's "result" is the class itself; its hidden
+                // outer slot is the backend's (`hidden_outer_desc`), not a
+                // prefix to record.
+                if let (Some(SigType::This(c)), false) = (&m.result_prefix, name == "<init>") {
+                    let c = c.clone();
+                    let ty = std::mem::replace(&mut st.get_mut(id).ty, Type::NoType);
+                    let ty = self.with_pickled_this_prefix(st, bin, Some(&c), ty);
+                    st.get_mut(id).ty = ty;
                 }
                 st.get_mut(id).parameterless_method = Some(shape.clauses.is_empty());
                 // A `val`'s accessor is stable; `ident_is_stable` /

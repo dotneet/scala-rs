@@ -1445,6 +1445,7 @@ fn stub_class_in(
 }
 
 fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclass::JavaClass) {
+    st.binary_read.insert(id.0);
     let mut flags = st.get(id).flags.with(java_class_flags(c));
     if st.get(id).kind == SymKind::ModuleClass {
         flags = flags.with(Flags::MODULE).with(Flags::FINAL);

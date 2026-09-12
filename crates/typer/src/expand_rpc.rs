@@ -468,6 +468,9 @@ impl Typer {
     /// approximate one would have the implementation reasoning about a type
     /// that is not the one it asked about.
     pub(crate) fn type_to_wire(&mut self, ty: &Type) -> Result<String, String> {
+        // An inner class behind a prefix (`prefix.rs`) is the class it views;
+        // the engine is handed the class, as for the bare type.
+        let ty = crate::prefix::strip_view(ty);
         let structural = match ty {
             Type::Function { params, ret } if params.len() <= 22 => {
                 let mut args = params.clone();

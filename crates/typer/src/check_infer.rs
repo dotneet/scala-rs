@@ -2736,6 +2736,8 @@ impl Typer {
     /// The argument type read as the parameter's own class, when it is a
     /// strict subclass of it. Everything else is handed back unchanged.
     pub(crate) fn align_to_param_class(&self, param: &Type, arg: &Type) -> Type {
+        // An inner class behind a prefix (`prefix.rs`) lines up by its class.
+        let param = crate::prefix::strip_view(param);
         let Type::Class { sym: ps, args: pas } = param else {
             return arg.clone();
         };
@@ -2797,7 +2799,10 @@ impl Typer {
         // matching nominal shapes; the original argument still undergoes
         // conformance checking, including invariant container arguments.
         let aligned = self.align_to_param_class(param, arg);
-        match (param, &aligned) {
+        match (
+            crate::prefix::strip_view(param),
+            crate::prefix::strip_view(&aligned),
+        ) {
             (
                 Type::Class { sym: ps, args: pas },
                 Type::Class {

@@ -3196,6 +3196,13 @@ pub(crate) fn type_is_erroneous(ty: &Type) -> bool {
 pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
     match ty {
         Type::TypeParam(id) => *id == tp,
+        // An inner class behind a prefix (`prefix.rs`) is not a compound
+        // type the program wrote: it mentions what the class under it
+        // mentions. `implicit def conv[T](x: From): x.To[T]` leaves `T` open
+        // in its result, which is what lets `from.foo(23)` solve it.
+        Type::Refined { .. } if crate::symbol::SymbolTable::as_seen_from_view(ty).is_some() => {
+            type_mentions_tparam(crate::prefix::strip_view(ty), tp)
+        }
         Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
             args.iter().any(|t| type_mentions_tparam(t, tp))
         }

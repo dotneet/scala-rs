@@ -183,7 +183,8 @@ impl Typer {
                     }
                 }
                 let ty = self.reject_unresolved_type(ty, &name, tpt.span);
-                self.this_prefixed(ty)
+                let ty = self.this_prefixed(ty);
+                self.import_prefixed(&name, ty, tpt.span)
             }
             TreeKind::Select { name, qual } => {
                 if let TreeKind::Ident { name: q } = &qual.kind {
@@ -327,6 +328,13 @@ impl Typer {
                             }
                         } else {
                             let applied = self.apply_types(ctor.clone(), as_, span);
+                            // A parameterised alias of an inner class (`type
+                            // Table[T] = RelationalProfile.this.Table[T]`)
+                            // expands only now, so its `C.this` is read
+                            // through the import or the path here, the way
+                            // `import_prefixed` / `project_from_prefix_at`
+                            // read a nullary one (`prefix.rs`).
+                            let applied = self.applied_alias_prefixed(tpt, applied, span);
                             self.with_prefix_if_type_member(tpt, &ctor, applied)
                         }
                     }
@@ -658,6 +666,13 @@ impl Typer {
     /// term of the path is kept: `x.p.In` and `p.In` are two types.
     pub(crate) fn singleton_prefix_of(&self, path: &Tree) -> Option<Type> {
         match &path.kind {
+            // `super.Builder` in type position: the parent's member, but the
+            // instance is this one -- nsc's `Mid.super.type` is `Mid.this`.
+            // Read as the parent's *projection* it was a different prefix
+            // from the `Main.this.Builder` a member declared bare expects.
+            TreeKind::Super { .. } => {
+                (!self.st.this_class.is_none()).then_some(Type::ThisType(self.st.this_class))
+            }
             TreeKind::This { qual } => {
                 let id = match qual {
                     Some(name) => self
@@ -753,6 +768,209 @@ impl Typer {
         Type::SingleType {
             prefix: Box::new(prefix),
             sym,
+        }
+    }
+
+    /// The enclosing instance an inner class's constructor call needs, written
+    /// into the head of the `new` / parent clause as a qualifier the backend
+    /// evaluates (`gen_expr::new_prefix_instance`).
+    ///
+    /// `import prof.api._; class Mine(k: Int) extends Inner(k)` -- gitbucket's
+    /// every table -- names `Inner` through an alias `type Inner = self.Inner`
+    /// of `prof.api`'s trait, and the instance `Inner` belongs to is `prof`:
+    /// the prefix the alias expanded to (`prefix.rs`), not the import's
+    /// `prof.api` and not `Comp.this`, which is what the backend's fallback
+    /// loaded (a `ClassCastException` at run time). The head keeps its type;
+    /// only its qualifier is (re)written, from the prefix's path. A `this`
+    /// prefix is left to the outer-instance chain, which already handles it.
+    pub(crate) fn qualify_inner_ctor_head(&mut self, head: &mut Tree) {
+        let ty = head.ty.clone();
+        self.qualify_inner_ctor_head_in(head, &ty);
+    }
+
+    fn qualify_inner_ctor_head_in(&mut self, head: &mut Tree, ty: &Type) {
+        match &mut head.kind {
+            TreeKind::AppliedTypeTree { tpt, .. }
+            | TreeKind::TypeApply { fun: tpt, .. }
+            | TreeKind::AnnotatedTypeTree { tpt, .. } => {
+                return self.qualify_inner_ctor_head_in(tpt, ty);
+            }
+            TreeKind::Ident { .. } | TreeKind::Select { .. } => {}
+            _ => return,
+        }
+        let Some(pre) = crate::prefix::view_prefix(ty).cloned() else {
+            return;
+        };
+        if !matches!(pre, Type::SingleType { .. } | Type::ModuleRef(_)) {
+            return;
+        }
+        let Type::Class { sym, .. } = crate::prefix::strip_view(ty).clone() else {
+            return;
+        };
+        let owner = self.st.get(sym).owner;
+        if owner.is_none() || !self.st.get(owner).is_class_like() {
+            return;
+        }
+        let reaches = |st: &SymbolTable, t: &Type| {
+            st.class_sym_of(t)
+                .is_some_and(|c| c == owner || st.is_ancestor_of(owner, c))
+        };
+        // Already written through the enclosing instance (`new prof.Inner`).
+        if let TreeKind::Select { qual, .. } = &head.kind {
+            if reaches(&self.st, &qual.ty) {
+                return;
+            }
+        }
+        let Some(mut q) = self.path_tree_of(&pre, head.span) else {
+            return;
+        };
+        let mark = self.diags.len();
+        self.type_expr(&mut q, &Type::NoType);
+        if self.error_count_since(mark) > 0
+            || q.ty.is_no_type()
+            || q.ty.is_error()
+            || !reaches(&self.st, &q.ty)
+        {
+            self.diags.truncate(mark);
+            return;
+        }
+        let name = match &head.kind {
+            TreeKind::Ident { name } | TreeKind::Select { name, .. } => name.clone(),
+            _ => return,
+        };
+        // The alias's name may differ from the class's (`type Table = ...`);
+        // the qualifier's *class* has the class itself under its own name.
+        let name = if self.st.get(sym).name == name {
+            name
+        } else {
+            self.st.get(sym).name.clone()
+        };
+        head.kind = TreeKind::Select {
+            qual: Box::new(q),
+            name,
+        };
+    }
+
+    /// A tree that evaluates to the value of the singleton `pre`, for
+    /// `qualify_inner_ctor_head`; typed by the caller. `None` when `pre` is
+    /// not a path this compiler can spell here.
+    fn path_tree_of(&self, pre: &Type, span: Span) -> Option<Tree> {
+        let mut t = match pre {
+            Type::ThisType(c) if !c.is_none() => {
+                let qual = if *c == self.st.this_class {
+                    None
+                } else {
+                    Some(self.st.get(*c).name.clone())
+                };
+                Tree::dummy(TreeKind::This { qual })
+            }
+            Type::ModuleRef(m) if !m.is_none() => Tree::dummy(TreeKind::Ident {
+                name: self.st.get(*m).name.trim_end_matches('$').to_string(),
+            }),
+            Type::SingleType { prefix, sym } if !sym.is_none() => {
+                let name = self.st.get(*sym).name.clone();
+                match prefix.as_ref() {
+                    // A local, or a member reached bare: the name resolves.
+                    Type::NoType | Type::ThisType(_) => Tree::dummy(TreeKind::Ident { name }),
+                    p => Tree::dummy(TreeKind::Select {
+                        qual: Box::new(self.path_tree_of(p, span)?),
+                        name,
+                    }),
+                }
+            }
+            _ => return None,
+        };
+        t.span = span;
+        Some(t)
+    }
+
+    /// A type named through `import p._` for a value `p`: what it names is
+    /// read through `p` (`prefix.rs`). `import prof.api._` brings in `type
+    /// Inner = self.Inner` of `prof.api`'s trait, and that alias means
+    /// `prof.Inner` here -- the instance `prof`, not `Api.this` -- which is
+    /// what an inner class's constructor needs to know. Left alone when the
+    /// name is not an import's or the enclosing class has it itself.
+    pub(crate) fn import_prefixed(&mut self, name: &str, ty: Type, span: Span) -> Type {
+        if !self.st.mentions_inner_class(&ty) {
+            return ty;
+        }
+        // The binding that produced `ty`: the class itself, or an alias
+        // whose right-hand side names it. Several symbols may answer to the
+        // name (a class and a same-named alias of it, say).
+        let core = self.st.class_sym_of(crate::prefix::strip_view(&ty));
+        let Some(sym) = self.st.lookup_type(name).into_iter().find(|&s| {
+            let info = self.st.get(s);
+            match info.kind {
+                SymKind::Class => Some(s) == core,
+                SymKind::TypeMember => self.st.class_sym_of(&info.ty) == core,
+                _ => false,
+            }
+        }) else {
+            return ty;
+        };
+        let owner = self.st.get(sym).owner;
+        if owner.is_none() || !self.st.get(owner).is_class_like() {
+            return ty;
+        }
+        let Some(mut q) = self.term_import_prefix_for(owner) else {
+            return ty;
+        };
+        let mark = self.diags.len();
+        q.span = span;
+        self.type_expr(&mut q, &Type::NoType);
+        if self.error_count_since(mark) > 0 || q.ty.is_no_type() || q.ty.is_error() {
+            self.diags.truncate(mark);
+            return ty;
+        }
+        self.warm_enclosing_parents(&q.ty);
+        let qpre = self.singleton_prefix_of(&q);
+        self.st.subst_as_seen_from_at(&q.ty, qpre.as_ref(), &ty)
+    }
+
+    /// `applied` is `tpt[args]` for a parameterised alias: read it through
+    /// the import (`Ident`) or the term path (`p.T[args]`) the alias was
+    /// named by. Anything else is handed back unchanged.
+    fn applied_alias_prefixed(&mut self, tpt: &Tree, applied: Type, span: Span) -> Type {
+        if !self.st.mentions_inner_class(&applied) {
+            return applied;
+        }
+        match &tpt.kind {
+            TreeKind::Ident { name } => {
+                let name = name.clone();
+                self.import_prefixed(&name, applied, span)
+            }
+            TreeKind::Select { qual, .. } if self.type_select_is_term_prefix(qual) => {
+                let Some(pty) = self.term_path_type(qual) else {
+                    return applied;
+                };
+                let Some(at) = self.singleton_prefix_of(qual) else {
+                    return applied;
+                };
+                self.warm_enclosing_parents(&pty);
+                self.st.rewrite_view_this(&pty, Some(&at), &applied)
+            }
+            _ => applied,
+        }
+    }
+
+    /// Attach the pickled parents of the class `ty` names and of every class
+    /// enclosing it, so that `rewrite_view_this` can tell which enclosing
+    /// class a `C.this` prefix belongs to (`is_ancestor_of` reads parents).
+    /// slick's `JdbcProfile#API` inherits `type Table[T] =
+    /// RelationalProfile.this.Table[T]`, and `RelationalProfile` is only
+    /// known to be an ancestor of `JdbcProfile` once its parents are in.
+    pub(crate) fn warm_enclosing_parents(&mut self, ty: &Type) {
+        if !self.library_abi {
+            return;
+        }
+        let Some(cls) = self.st.class_sym_of(crate::prefix::strip_view(ty)) else {
+            return;
+        };
+        for c in self.st.enclosing_classes(cls) {
+            if self.st.get(c).is_class_like() {
+                self.pickle
+                    .ensure_parents(&mut self.st, &mut self.binary, c);
+            }
         }
     }
 
@@ -1088,6 +1306,7 @@ impl Typer {
         if t.is_error() || !self.st.mentions_inner_class(&t) {
             return t;
         }
+        self.warm_enclosing_parents(prefix);
         self.st.rewrite_view_this(prefix, Some(at), &t)
     }
 
@@ -1312,8 +1531,17 @@ impl Typer {
             Some(sp) => self.project_from_prefix_at(span, &pty, name, sp),
             None => self.project_from_prefix(span, &pty, name),
         };
+        let direct = |st: &SymbolTable, sym: SymbolId| {
+            st.class_sym_of(&pty).is_some_and(|c| {
+                st.lookup_member(c, name)
+                    .into_iter()
+                    .any(|m| m == sym && st.get(m).kind == SymKind::Class)
+            })
+        };
         let t = match (crate::prefix::strip_view(&t), spre) {
-            (Type::Class { sym, .. }, Some(pre)) if self.st.is_inner_class_of_class(*sym) => {
+            (Type::Class { sym, .. }, Some(pre))
+                if self.st.is_inner_class_of_class(*sym) && direct(&self.st, *sym) =>
+            {
                 crate::prefix::with_prefix(t, pre)
             }
             _ => t,
@@ -1545,6 +1773,11 @@ impl Typer {
                         Type::SingleType { .. } | Type::ThisType(_) | Type::ModuleRef(_)
                     ) {
                         return arg.ty.clone();
+                    }
+                    if let TreeKind::This { .. } = &arg.kind {
+                        if let Some(c) = self.st.class_sym_of(&arg.ty) {
+                            return Type::ThisType(c);
+                        }
                     }
                     if self.is_stable_path(arg) {
                         if let Some(sym) = self.term_path_sym(arg) {
@@ -1975,14 +2208,21 @@ impl Typer {
                     }
                 }
                 let cls = self.path_member_owner(&qt)?;
+                // Read through the path: `prof.api` for `val api: Aliases`
+                // declared in `Api` is a `prof.Aliases`, whose own prefix is
+                // what `prof.api.Inner` then resolves against (`prefix.rs`).
+                let qpre = self.singleton_prefix_of(qual);
                 self.st.lookup_member(cls, name).into_iter().find_map(|s| {
                     let sy = self.st.get(s);
                     match sy.kind {
                         SymKind::Term | SymKind::Method => {
-                            Some(self.maybe_auto_apply(
-                                self.st.expand_in_type(&qt, &sy.ty),
-                                &Type::NoType,
-                            ))
+                            let t = self.st.expand_in_type(&qt, &sy.ty);
+                            let t = if self.st.mentions_inner_class(&t) {
+                                self.st.subst_as_seen_from_at(&qt, qpre.as_ref(), &t)
+                            } else {
+                                t
+                            };
+                            Some(self.maybe_auto_apply(t, &Type::NoType))
                         }
                         SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
                         _ => None,

@@ -62,8 +62,15 @@ the macro engine's tag wire.
 
 Only classes `SymbolTable::is_inner_class_of_class` says yes to get a prefix:
 a `SymKind::Class` (class or trait) whose owner is a class or trait, neither
-flagged `JAVA`. Members of objects have one enclosing instance, local classes
-none, Java nested classes are static.
+flagged `JAVA` -- or a class read from a class file that
+`is_binary_nested_class` recognises: `SymbolTable::binary_read` (set by
+`apply_java_class_meta`), not `STATIC`, a `$` in its JVM simple name, owner a
+class. Members of objects have one enclosing instance, local classes none,
+Java nested classes are static. A pickled signature's `THIStpe` prefix on an
+alias or a method result (`alias_prefix` / `result_prefix`, `SigType::This`)
+becomes a `ThisType` view (`with_pickled_this_prefix`), so `c.mk` on a
+separately compiled `class C { class D; def mk: D }` is a `c.D`
+(`tests/fixtures/pfx_binlib`).
 
 ## Where prefixes are attached
 
@@ -103,11 +110,32 @@ none, Java nested classes are static.
 ## Conformance (`is_sub_type`)
 
 * Two views of the same class: `prefix_conforms(p1, p2) && core1 <: core2`.
-  `prefix_conforms` is nsc's `isSubPre`: a singleton on the right admits only
-  the same singleton (`same_singleton_prefix`, deliberately lenient where this
-  compiler cannot tell: two `this` prefixes related by inheritance are the
-  same, a path's own prefix rewritten to a class type is ignored); anything
-  else is a projection, and `widen(p1) <: p2` decides.
+  `prefix_conforms` is nsc's `isSubPre`: `NoType` on either side conforms; a
+  singleton on the right admits only the same singleton
+  (`same_singleton_prefix`); anything else is a projection, and `widen(p1) <:
+  p2` decides. `same_singleton_prefix` is deliberately lenient where this
+  compiler cannot tell, and only there:
+  * `norm_singleton` first: an object is one value however spelled (`O.type`,
+    `ModuleRef`, `this` inside `O`), a self alias is its class's `this`, and a
+    path whose *last step's declared type, read as seen from the path*
+    (`path_step_type`), is a singleton denotes that value (`r.ring` with
+    `ring: C` on `r: Poly[BigInt.type]` is `BigInt`, pos/t5777);
+  * two `this` prefixes of classes related by inheritance are the same (the
+    override checker reads both members through the subclass);
+  * two paths are the same when they name one symbol, two method parameters
+    of one name (dependent method types matched positionally, run/t6135), or
+    two members of one name in classes related by inheritance (a member and
+    its override: `new Dep { val a = new A; val b = a.mkB }` against `Dep`'s
+    `val b: a.B`, pos/t5313 -- nsc's `equalSymsAndPrefixes`), under prefixes
+    that are themselves the same;
+  * a value's path on the *left* against its class's `this` on the right
+    (`p.X` against `P.this.X` with `p: P`): a member declared bare in `P` and
+    read through `p` means `p.X` in nsc, and this compiler does not rewrite
+    every `P.this` on every road a type travels (an alias expanded after the
+    selection, an implicit view's result, a dependent method's result). The
+    other direction stays rejected -- scalac: `found P.this.S1, required
+    P.this.p.S1` -- as do two different values (`a.In` against `b.In`) and a
+    base-class value against a subclass's `this` (neg/abstract-class-2).
 * A view on the left against another class: the class first, then its parents
   read through the prefix (`prefixed_parents_conform`) -- `hm.KeySet <: MySet[Int]`.
 * A bare class on the left against a view on the right of a different class:
@@ -128,6 +156,25 @@ StrTypes`'s implicits.
 `display_type` prints a singleton prefix the way nsc does (`a.In`,
 `Outer.this.In`, `O.In`); a projection prints bare.
 
+Everything that asks "which class is this, and what shape" reads through the
+view (`prefix::strip_view`): `sam_sig` (a function literal against an inner
+SAM trait, pos/t11558), overload scoring and `shape_arity`, `is_function_shaped`,
+`align_to_param_class` / `align_arg_to_param` (a `Some[t1.View]` lined up with
+`Some[t1.Two[A, A]]`, run/t9114), `view_shape`, `base_type_instance`, the
+pattern binder kinds (pos/t4070), the divergence check's `complexity` /
+`head_sym` (a shrinking derivation through an inner witness class was read as
+one node and cut off, pos/t8146b), `type_mentions_tparam`, `tag_wire` and
+`type_to_wire` (a `c.typecheck` answer, pos/t9392).
+
+Implicit scope: `collect_type_parts` adds a view's prefix's parts (SLS 7.2)
+and records, per search (`ImplicitMemo::companion_prefixes`), the prefix each
+inner class's companion was reached through; `implicit_candidate_ty` then
+reads such a companion member as seen from that prefix, so `object Inner {
+implicit def fromOther(b: Bridge): Inner }` found for an `o1.Inner` gives an
+`o1.Inner` (pos/t4947), and `at_import_prefix_of` does the same for `import
+o1.Inner.fromOther`. Reached through two paths in one search (`b: s.E` with
+`b: r.E`, pos/t5340) the member is read bare, which conforms to either.
+
 ## What landed (this branch)
 
 * neg/abstract-class-2, neg/t1010, neg/sabin2 rejected for nsc's reason;
@@ -145,36 +192,49 @@ StrTypes`'s implicits.
   4/3 -> 2/2 (`syntax/semigroupal.scala` 71/78 were the `B[X]#B1[A]` case),
   gitbucket 88/43 -> 88/43 with three fewer error sites (the `Migration`
   override errors) and no new one, slick 0 errors / 1504 classes.
+* The outer-instance miscompile handed over by agent/gbmacro (`import
+  prof.api._; class Mine(k) extends Inner(k)` passed the wrong `$outer`,
+  `ClassCastException`): `import_prefixed` / `applied_alias_prefixed` /
+  `qualify_inner_ctor_head` give a `new` or parent head reached through an
+  import, an alias or a path its prefix, `new_prefix_instance` evaluates it,
+  and the gitbucket-shaped `gbtable` reduction prints the same DDL as scalac
+  under `-Xverify:all`.
+* Separately compiled inner classes through a value prefix (`new c.D`, `c.mk`,
+  `class Sub extends c.D(4)` against a scalac-built library:
+  `tests/fixtures/pfx_binlib`, `pfx_binlib_use.scala`), with `gen_new` taking
+  the outer from the class file's `InnerClasses` attribute
+  (`binary_outer_desc`).
+* The 15 pos/run corpus tests the first prefix commit lost (t5313, t5340,
+  looping-jsig, t5958, t4947, t11174b, t8138, t11558, t12520,
+  t2421_delitedsl, t4070, t5777, t8146b, t9392, run/t9114) pass again, each
+  by one of the view-reading rules above.
 
 ## Probe battery
 
-`/private/tmp/scala-rs-pfx/probes/p01..p53` (run with `run.sh`; scalac and
-scala-rs verdicts compared, run output compared under `-Xverify:all`). 46 of
-the 53 agree with scalac. The seven that do not, each reduced:
+`/private/tmp/scala-rs-pfx/probes/p01..p74` (run with `run.sh` / `battery.sh`;
+scalac and scala-rs verdicts compared, run output compared under
+`-Xverify:all`). 67 of the 72 agree with scalac (p58's "difference" is the
+stack trace of the same exception). The ones that do not, each reduced:
 
 | probe | shape | status |
 |---|---|---|
 | p09 | `IntIsIntegral.mkNumericOps(6) / 2` (inner class read from the jar) | open, step 1 below |
 | p35 / p48 | `o.Rec(3, "z")` -- companion `apply` of an inner case class through a path, *without* `.apply` | open, step 2 |
 | p39 / p49 | `class C extends a.In` -- `VerifyError` in `C.<init>` | pre-existing codegen gap (same on 904b32c5) |
-| p53 | `r.copy(a = 2)` on an `r: o.Rec` from outside `Outer` -- `ClassCastException` | pre-existing: the `copy` rewrite passes `this` as `$outer` (same on 904b32c5) |
 | p40 (original form) | `new Abstract[F](..)` accepted | pre-existing: no "class is abstract; cannot be instantiated" check |
+| `new c.api.D` (left out of pfx_binlib_use.scala) | a pickled alias `type D = In` of a separately compiled class, through a value | open: `type D is not a member of Aliases` -- the pickle lookup of an alias member through a value prefix |
 
 ## Remaining steps
 
-1. **Inner classes read from a jar.** `is_inner_class_of_class` refuses a
-   `JAVA`-flagged symbol, and every classpath stub carries `JAVA` whether the
-   class file is Java or Scala (`classpath.rs`, `stub_class_in`;
-   `apply_java_class_meta` ORs the flags). A Scala class file's `InnerClasses`
-   attribute says whether a nested class is static (`nested_static`), which is
-   the exact answer: record "read from a Scala class file, non-static nested"
-   on the symbol (a `SymbolTable` set, or a flag bit) in `apply_java_class_meta`,
-   let `is_inner_class_of_class` accept it, and make `check_select` load the
-   class file of a bare inner-class result type before `subst_as_seen_from`
-   (the stub is only completed when a member is looked up on it, which is one
-   selection too late for `mkNumericOps(6) / 2`). The pickle reader
-   (`crates/pickle/src/sym.rs`, `TypeRefTpe`) drops `THIStpe` prefixes; keeping
-   `pre#T` for a `this` prefix would let `sig_ref` resolve to the view directly.
+1. **Inner classes read from a jar.** `binary_read` + `is_binary_nested_class`
+   now recognise a non-static nested class of a Scala class file, and the
+   pickle's `THIStpe` prefixes on aliases and method results are kept. Still
+   open: `check_select` reads a bare inner-class result type before the stub
+   is completed (the class file is only read when a member is looked up on
+   it, one selection too late for `IntIsIntegral.mkNumericOps(6) / 2`, p09),
+   and an *alias* member of a separately compiled class through a value
+   (`new c.api.D`, `type D is not a member of Aliases`) is not found by the
+   pickle lookup.
 2. **`o.Rec(...)` sugar.** `resolve_overload_inner` (check_overload.rs) sees
    `fun_ty = ModuleRef(Rec$)` and reads `apply` raw. `type_apply` should hand it
    `SingleType { o, Rec$ }` when the callee is a stable `Select` on an object
