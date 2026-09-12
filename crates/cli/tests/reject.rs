@@ -231,7 +231,9 @@ fn fixtures_rej_bad_is_error() {
             // when the arguments do not match.
             "illegal inheritance: self-type Miss[A] does not conform to Q[A]",
             // ... and when the cake's alias resolves to a different class.
-            "illegal inheritance: self-type Fake[F] does not conform to Real[F]",
+            // The required type is an inner class of the cake, printed with
+            // its prefix as scalac prints it (`Cake.this.Real[F]`).
+            "illegal inheritance: self-type Fake[F] does not conform to Cake.this.Real[F]",
         ],
     );
 }
