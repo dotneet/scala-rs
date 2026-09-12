@@ -3304,6 +3304,26 @@ either side is still containment, and every other constructor shape (a
 partially applied class, a type lambda, a type member) keeps the covariant
 reading. `catsr_bad`'s `InvariantCtor` pins both directions against scalac.
 
+The companion fix is in `solve_eta_tparams`: nsc solves an eta-expansion's
+parameters and result together, so the expected result's invariant positions
+now go through `add_expected_constraints`. `F.pure[A]` against `B => F[BB]` is
+`A := BB` (cats `Ior.to:485`, `OptionT.getOrElseF:302`), not the `A := B` the
+parameter alone gives -- a `B => F[B]` an invariant `F` refuses. Without it the
+corrected arm rejected those two valid cats files.
+
+**Two neg tests lose a wrong-reason pass.** `neg/t7872b` and `neg/t7872c`
+write `def up[F[+_]](fa: F[String]): F[Object] = fa` and `def down[F[-_]](fa:
+F[Object]): F[String] = fa`. Under the covariant arm those *definitions* did
+not typecheck (`F[Object] <: F[String]` asked `Object <: String`), which is the
+error the corpus counted; read at the declared variance they are correct, and
+both files now compile. What scalac rejects them for is not implemented:
+`t7872c` needs nsc's `checkKindBounds` variance half -- an inferred `F := List`
+does not match a `F[-_]` parameter ("type A is covariant, but type _ is
+declared contravariant") -- and `t7872b` needs variance validation of a type
+lambda's own body (`[-a]List[a]` uses `a` covariantly). Both are separate
+checks, and the second is not about kind conformance at all; neither is a
+reason to keep reading an abstract constructor covariantly.
+
 ### Found in passing, not fixed
 
 * `Option.map` (and the other hand-written collection `map`s in the prelude)
