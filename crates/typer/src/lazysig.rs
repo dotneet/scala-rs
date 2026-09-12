@@ -97,6 +97,18 @@ pub(crate) struct PendingSig {
     /// unit only by coincidence. `PendingDefault` (`type_pending_defaults`)
     /// already carries this for the same reason.
     pub file_index: usize,
+    /// A definition local to a **block**, with the height the scope stack had
+    /// when its block was opened.
+    ///
+    /// Such a definition is completed in the *live* stack truncated to that
+    /// height, not in a snapshot: the block's own scope grows as its statements
+    /// are typed (an eager `val` is entered where it stands), and a snapshot
+    /// taken while the names were being hoisted has none of them -- `def done =
+    /// pos >= line.length` completed from a `def cur` above it reported `not
+    /// found: value pos` for the `var pos` that precedes them both. Truncating
+    /// drops the scopes the *referencing* definition opened (its own type and
+    /// value parameters), which nsc's completer cannot see either.
+    pub block_depth: Option<usize>,
 }
 
 /// `val x = rhs` / `def f = rhs`: no type annotation, but a body to infer from.
@@ -135,6 +147,7 @@ impl Typer {
                 scopes: None,
                 sig_done: false,
                 file_index: self.file_index,
+                block_depth: None,
             },
         );
     }
@@ -164,6 +177,7 @@ impl Typer {
                 scopes: Some(scopes),
                 sig_done: true,
                 file_index: self.file_index,
+                block_depth: None,
             },
         );
     }
@@ -212,6 +226,36 @@ impl Typer {
     /// signature itself is not rebuilt, so none of what `sig_rerun_safe`
     /// declines to redo (a second evidence clause, re-typed view bounds)
     /// happens.
+    /// A **block**-local definition with no written type: keep it pending so a
+    /// statement above it can complete it.
+    ///
+    /// [`Self::register_namer_sig`] declines anything whose owner is not
+    /// class-like, which is every local definition, and the block hoist in
+    /// `check_expr` only built the signatures it could write down. So a
+    /// reference from an earlier statement to a result-type-less local `def`
+    /// was simply `not found`, where nsc's namer has entered the name and the
+    /// completer infers the type on demand. The signature has not been built
+    /// (`sig_done: false`), and the scope is the one the hoist is standing in,
+    /// which is the block's own scope with this unit's imports in source order.
+    pub(crate) fn register_block_sig(&mut self, tree: &Tree) {
+        if tree.sym.is_none() || !needs_lazy_sig(tree) {
+            return;
+        }
+        let scopes = Rc::new(self.st.scopes[self.lazy_base_scopes..].to_vec());
+        self.pending_sigs.insert(
+            tree.sym,
+            PendingSig {
+                tree: tree.clone(),
+                owner: self.st.owner,
+                this_class: self.st.this_class,
+                scopes: Some(scopes),
+                sig_done: false,
+                file_index: self.file_index,
+                block_depth: Some(self.st.scopes.len()),
+            },
+        );
+    }
+
     pub(crate) fn refresh_pending_scope(&mut self, tree: &Tree) {
         if !(self.sigs_only || self.header_pass) || tree.sym.is_none() {
             return;
@@ -363,6 +407,7 @@ impl Typer {
                     scopes: p.scopes.clone(),
                     sig_done: p.sig_done,
                     file_index: p.file_index,
+                    block_depth: p.block_depth,
                 },
                 self.st.get(id).ty.clone(),
                 self.lazy_cyclic.contains(&id),
@@ -373,7 +418,13 @@ impl Typer {
         let saved_this = self.st.this_class;
         let saved_ret = self.return_meth;
         let saved_file = self.file_index;
-        let saved_scopes = self.swap_in_pending_scopes(&p);
+        // A block-local definition keeps the live stack, cut back to its
+        // block's own height (see `PendingSig::block_depth`); everything else
+        // is typed in the snapshot taken where it was written.
+        let (saved_scopes, block_tail) = match p.block_depth {
+            Some(d) if d <= self.st.scopes.len() => (Vec::new(), Some(self.st.scopes.split_off(d))),
+            _ => (self.swap_in_pending_scopes(&p), None),
+        };
         self.st.owner = p.owner;
         self.st.this_class = p.this_class;
         self.return_meth = None;
@@ -419,7 +470,15 @@ impl Typer {
             }
         }
 
-        self.swap_back_scopes(saved_scopes);
+        match block_tail {
+            Some(tail) => {
+                self.st
+                    .scopes
+                    .truncate(p.block_depth.unwrap_or(self.st.scopes.len()));
+                self.st.scopes.extend(tail);
+            }
+            None => self.swap_back_scopes(saved_scopes),
+        }
         self.st.owner = saved_owner;
         self.st.this_class = saved_this;
         self.return_meth = saved_ret;

@@ -142,6 +142,15 @@ impl Typer {
                 self.type_val_body(tree);
             }
             TreeKind::DefDef { .. } => {
+                // A block-local `def` with no result type may already have been
+                // completed in full by a forward reference from an earlier
+                // statement (`register_block_sig`): `take_lazy_done` splices
+                // that typed tree back in, and typing its body a second time
+                // would synthesize a second set of evidence parameters and
+                // report everything it reports twice.
+                if self.take_lazy_done(tree) {
+                    return;
+                }
                 // `type_member_sig`, not `type_def_sig`: the block above may
                 // already have built this signature, and doing it twice would
                 // synthesize a second set of evidence parameters.

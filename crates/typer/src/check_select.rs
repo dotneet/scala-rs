@@ -1763,13 +1763,49 @@ impl Typer {
         // reconstructing the prefix here, a parameter mentioning a type
         // parameter matches anything -- an overload that differs only inside a
         // type parameter is not one nsc can distinguish either.
-        sub_ps.iter().zip(&base_ps).all(|(a, b)| {
-            a == b
-                || a.is_no_type()
-                || b.is_no_type()
-                || sig_has_abstract_type(a)
-                || sig_has_abstract_type(b)
-        })
+        sub_ps
+            .iter()
+            .zip(&base_ps)
+            .all(|(a, b)| self.same_sig_param(a, b))
+    }
+
+    /// One parameter position of [`Check::same_signature`].
+    ///
+    /// The leniency above is about type *arguments* a prefix would have
+    /// substituted, and it was reading much further than that: both sides name
+    /// a class, the two classes are different, and the pair was still called
+    /// one member because one of them happened to mention a type parameter
+    /// somewhere inside. `mutable.StringBuilder` declares
+    /// `++=(s: String)` and inherits `Growable.++=(xs: IterableOnce[A])`;
+    /// `IterableOnce[A]` mentions `A`, so the owner rule in
+    /// `drop_overridden_at` dropped the inherited alternative and `b ++= it`
+    /// for an `it: IterableOnce[Char]` was `no matching overload for
+    /// (String)StringBuilder` (`collection/Factory.scala:53`). No substitution
+    /// turns `IterableOnce[A]` into `String`, so no prefix is needed to know
+    /// these are two parameters: when both sides *name* a class and the two
+    /// classes are **unrelated**, no prefix can bring them together.
+    ///
+    /// Related classes stay lenient, and that restriction is measured rather
+    /// than cautious. cats writes `def compose[G[_]: Functor]: Functor[…]` in
+    /// `Functor` and `def compose[G[_]: Traverse]: Traverse[…]` in `Traverse`,
+    /// which nsc treats as two genuine alternatives and separates by the
+    /// expected type -- something this compiler does not yet do for an
+    /// overloaded value with no argument list, so reducing the pair is what
+    /// keeps `Traverse[F].compose[G]` working (`cats/data/Nested.scala`, 11
+    /// errors when the pair survives). A side whose head is an abstract type is
+    /// lenient too; that is the case [`Check::same_member_at`] exists to
+    /// re-check with a receiver to hand.
+    fn same_sig_param(&self, a: &Type, b: &Type) -> bool {
+        if a == b || a.is_no_type() || b.is_no_type() {
+            return true;
+        }
+        if !sig_has_abstract_type(a) && !sig_has_abstract_type(b) {
+            return false;
+        }
+        let (Some(x), Some(y)) = (sig_head_class(&self.st, a), sig_head_class(&self.st, b)) else {
+            return true;
+        };
+        x == y || self.owner_is_below(x, y) || self.owner_is_below(y, x)
     }
 
     /// nsc `Symbol#kindString`, in the "sanitized" spelling error messages
@@ -4126,4 +4162,34 @@ fn apply_path_members(ty: Type, map: &[(SymbolId, SymbolId)]) -> Type {
         ty = crate::symbol::subst_type_member(&ty, *decl, &Type::TypeMember(*sk));
     }
     ty
+}
+
+/// The class a parameter type *names*, for [`Check::same_sig_param`] -- and
+/// nothing more.
+///
+/// Deliberately not `SymbolTable::class_sym_of`, which answers the different
+/// question "where do this type's members live": that one resolves an
+/// unbounded type parameter to `Any` and an applied abstract constructor
+/// (`Ev[A]`, the evidence parameter of
+/// `EvidenceIterableFactory.newBuilder[A : Ev]`) to `Any` through it. `Any` is
+/// "no information" here, not a class, and reading it as one made
+/// `PriorityQueue.newBuilder`'s own `Ordering[A]` a *different* parameter from
+/// the `Ev[A]` it implements, so the pair stopped reducing and every
+/// `PriorityQueue.newBuilder` came out as an unreduced overload.
+fn sig_head_class(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId> {
+    match ty {
+        Type::Class { sym, .. } => Some(*sym),
+        Type::Annotated { tpe, .. } => sig_head_class(st, tpe),
+        Type::Int
+        | Type::Byte
+        | Type::Short
+        | Type::Long
+        | Type::Float
+        | Type::Double
+        | Type::Char
+        | Type::Boolean
+        | Type::Unit
+        | Type::String => st.class_sym_of(ty),
+        _ => None,
+    }
 }

@@ -2933,8 +2933,52 @@ impl Typer {
             outer = self.st.get(outer).owner;
         }
         let saved_this = std::mem::replace(&mut self.st.this_class, outer);
-        for a in args.iter_mut() {
-            self.type_expr(a, &Type::NoType);
+        // When the delegation can only mean *one* constructor, that
+        // constructor's formals are the arguments' expected types -- the same
+        // rule `check_apply`'s `single_ctor` applies to `new C(…)`, and nsc's
+        // `doTypedApply` for a method with nothing to pick. Typed against
+        // nothing, `TrieMap`'s `def this() = this(Hashing.default,
+        // Equiv.universal)` read `Hashing.default` as a `Default[T]` with `T`
+        // still its own parameter, and no alternative accepted it
+        // (`no matching overload for constructor TrieMap with arguments
+        // (Default[T], Equiv[T])`). The class's own type parameters are in
+        // scope here under their own names, so the formals need no
+        // substitution. Nothing is handed out unless the arity alone settles
+        // which constructor this is: with several candidates the pick is still
+        // driven by the arguments' own types, and a shorter argument list that
+        // relies on defaults (`def this() = this(null)` in front of eight) does
+        // not match any candidate's arity and keeps the old behaviour.
+        let self_call_protos: Vec<Type> = {
+            let fits: Vec<SymbolId> = self
+                .st
+                .lookup_member(class_id, "<init>")
+                .into_iter()
+                .filter(|&id| {
+                    self.st.get(id).kind == crate::symbol::SymKind::Method
+                        && self.st.get(id).owner == class_id
+                        && Some(id) != skip
+                })
+                .filter(|&id| match &self.st.get(id).ty {
+                    Type::Method { paramss, .. } => paramss
+                        .first()
+                        .is_some_and(|ps| ps.len() == args.len() && !ps.iter().any(is_open_formal)),
+                    _ => false,
+                })
+                .collect();
+            match fits[..] {
+                [only] => match &self.st.get(only).ty {
+                    Type::Method { paramss, .. } => paramss.first().cloned().unwrap_or_default(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            }
+        };
+        for (ai, a) in args.iter_mut().enumerate() {
+            let pt = match self_call_protos.get(ai) {
+                Some(t) if !t.is_no_type() && !t.is_error() => t.clone(),
+                _ => Type::NoType,
+            };
+            self.type_expr(a, &pt);
         }
         let arg_tys: Vec<Type> = args.iter().map(Tree::argument_type).collect();
         match self.pick_ctor(class_id, &arg_tys, skip) {
@@ -3067,6 +3111,18 @@ fn type_parent_path_prefix(t: &mut Typer, head: &mut Tree) {
         | TreeKind::AnnotatedTypeTree { tpt, .. } => type_parent_path_prefix(t, tpt),
         _ => {}
     }
+}
+
+/// A formal that must not be handed out as an argument's expected type: the
+/// by-name and repeated forms are not the type of the expression written at
+/// that position (nsc's `formalTypes` strips the one and expands the other),
+/// and an erroneous or wildcard-carrying formal says nothing the argument's own
+/// inference can use.
+fn is_open_formal(t: &Type) -> bool {
+    t.is_no_type()
+        || t.is_error()
+        || matches!(t, Type::ByName(_) | Type::Repeated(_))
+        || type_mentions_wildcard(t)
 }
 
 /// Whether `tree` contains a reference (`Ident` or `Select`) to `sym`.

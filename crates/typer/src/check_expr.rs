@@ -1770,9 +1770,20 @@ impl Typer {
                 // called before it is written -- and two of them may call each
                 // other. Only the signature is built here (which is what a
                 // reference needs); the body still waits its turn below. A
-                // `def` with no result type has nothing to build yet: its type
-                // comes from its own body, so a forward reference to it is the
-                // cycle nsc reports.
+                // `def` with no result type gets its *name* and a lazy
+                // completer instead (`register_block_sig`): nsc's namer enters
+                // every member of a block before any of them is typed, and the
+                // completer runs when the type is first needed, so
+                //
+                // ```scala
+                // def cur: Int = if (done) EOF else line.charAt(pos)
+                // def done   = pos >= line.length
+                // ```
+                //
+                // types `done`'s body from inside `cur` and infers `Boolean`
+                // (`sys/process/Parser.scala:38`, which was `not found: value
+                // done`). A reference that is *genuinely* circular still
+                // reports the cycle, from `complete_lazy_sig`'s own lock.
                 // Complete each hoisted signature in its source-order import
                 // context. Restore imports before typing executable statements;
                 // only the completed local declarations are block-wide.
@@ -1803,6 +1814,29 @@ impl Typer {
                                 self.sig_done.remove(&(self.file_index, s.id));
                                 self.diags.truncate(mark);
                             }
+                        }
+                    }
+                    // The result-type-less half of the same rule: the name and
+                    // a lazy completer, with no signature work at all. The
+                    // symbol is allocated exactly as `type_def_sig` would
+                    // allocate it (same kind, same empty flag word, same
+                    // scope), so reaching the statement in source order still
+                    // builds the signature in the ordinary way.
+                    let hoist_lazy = matches!(&s.kind, TreeKind::DefDef { tpt, name, rhs, .. }
+                        if name != "<init>" && tpt.is_empty() && !rhs.is_empty())
+                        && s.sym.is_none();
+                    if hoist_lazy {
+                        if let Some(name) = s.name().map(str::to_string) {
+                            let id = self.st.alloc(
+                                name.clone(),
+                                self.st.owner,
+                                crate::symbol::SymKind::Method,
+                                Flags::EMPTY,
+                                "",
+                            );
+                            s.sym = id;
+                            self.st.enter_in_current(&name, id);
+                            self.register_block_sig(s);
                         }
                     }
                     // A local `lazy val` is in scope for the whole block as well:

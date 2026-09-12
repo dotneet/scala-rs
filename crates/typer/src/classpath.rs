@@ -1857,7 +1857,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             let ret = java_result_obj(jtype_to_type(st, &ms.ret, &env));
             (params, ret, tp_ids)
         } else {
-            let (p, r) = parse_method_desc_java(st, &m.desc);
+            let (p, r) = parse_method_desc_java(st, &m.desc, c.is_scala);
             (p, java_result_obj(r), Vec::new())
         };
         let mut params = params;
@@ -1918,7 +1918,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             .as_deref()
             .and_then(crate::javasign::parse_field_sig)
             .map(|jt| jtype_to_type(st, &jt, &env))
-            .unwrap_or_else(|| parse_field_ty_java(st, &f.desc).0);
+            .unwrap_or_else(|| parse_field_ty_java(st, &f.desc, c.is_scala).0);
         let java_object_field = !c.is_scala && ty == Type::Any;
         let ty = if !c.is_scala { java_result_obj(ty) } else { ty };
         let mut flags = Flags::JAVA;
@@ -2048,7 +2048,11 @@ fn java_array_element(t: Type) -> Type {
     }
 }
 
-fn parse_method_desc_java(st: &mut SymbolTable, desc: &str) -> (Vec<Type>, Type) {
+fn parse_method_desc_java(
+    st: &mut SymbolTable,
+    desc: &str,
+    scala_erased: bool,
+) -> (Vec<Type>, Type) {
     let rest = desc.strip_prefix('(').unwrap_or(desc);
     let (params_s, ret_s) = match rest.find(')') {
         Some(i) => (&rest[..i], &rest[i + 1..]),
@@ -2057,24 +2061,35 @@ fn parse_method_desc_java(st: &mut SymbolTable, desc: &str) -> (Vec<Type>, Type)
     let mut params = Vec::new();
     let mut s = params_s;
     while !s.is_empty() {
-        let (t, n) = parse_field_ty_java(st, s);
+        let (t, n) = parse_field_ty_java(st, s, scala_erased);
         params.push(t);
         s = &s[n..];
         if n == 0 {
             break;
         }
     }
-    let (ret, _) = parse_field_ty_java(st, ret_s);
+    let (ret, _) = parse_field_ty_java(st, ret_s, scala_erased);
     (params, ret)
 }
 
 /// One JVM field descriptor as a type. Used by `pickle_supply` to give a
 /// `-cp` value class the constructor field its underlying representation is.
 pub(crate) fn field_ty_from_desc(st: &mut SymbolTable, desc: &str) -> Type {
-    parse_field_ty_java(st, desc).0
+    parse_field_ty_java(st, desc, true).0
 }
 
-fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
+/// One JVM descriptor as a type.
+///
+/// `scala_erased` says whether the class file this descriptor came from was
+/// produced by *scalac*. Only then does `Lscala/runtime/BoxedUnit;` mean `Unit`
+/// -- that mapping undoes scalac's own erasure of `Unit` in a value position.
+/// `BoxedUnit` is itself a **Java** class, and its
+/// `public static final BoxedUnit UNIT` field came back typed `Unit`, so
+/// `def box(x: Unit): scala.runtime.BoxedUnit = scala.runtime.BoxedUnit.UNIT`
+/// was `found: Unit required: BoxedUnit` (`scala/Unit.scala:41`). javac cannot
+/// erase a type it has no notion of, so a Java descriptor means exactly what it
+/// says.
+fn parse_field_ty_java(st: &mut SymbolTable, s: &str, scala_erased: bool) -> (Type, usize) {
     if s.is_empty() {
         return (Type::Any, 0);
     }
@@ -2089,7 +2104,7 @@ fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
         b'B' => (Type::Byte, 1),
         b'S' => (Type::Short, 1),
         b'[' => {
-            let (inner, n) = parse_field_ty_java(st, &s[1..]);
+            let (inner, n) = parse_field_ty_java(st, &s[1..], scala_erased);
             (Type::Array(Box::new(inner)), n + 1)
         }
         b'L' => {
@@ -2100,7 +2115,7 @@ fn parse_field_ty_java(st: &mut SymbolTable, s: &str) -> (Type, usize) {
                 Type::String
             } else if inner == "java/lang/Object" {
                 Type::Any
-            } else if inner == "scala/runtime/BoxedUnit" {
+            } else if inner == "scala/runtime/BoxedUnit" && scala_erased {
                 Type::Unit
             } else if inner == "scala/runtime/Nothing$" {
                 Type::Nothing

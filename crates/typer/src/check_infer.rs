@@ -2331,6 +2331,30 @@ impl Typer {
                 }
                 self.collect_expected(tps, rr, pr, variance, depth + 1, allow_covariant, out);
             }
+            // A result that is a *class* and an expected type that is a
+            // function. `Predef.$conforms[A]: A => A = <:<.refl` calls
+            // `def refl[A]: A =:= A`, and `=:=` reaches `Function1` only
+            // through `<:<`; the expected type stays structural
+            // (`class_sym_of` deliberately leaves `Type::Function` alone), so
+            // no arm below matched the pair and `A` was minimised to `Nothing`
+            // (`found =:=[Nothing,Nothing] required (A) => A`). Reading the
+            // expected type back as `scala.FunctionN` hands the pair to the
+            // `Class`/`Class` arm, whose `base_type_instance` walk lines the
+            // two up -- and brings `Function1`'s contravariant first parameter
+            // with it, which the structural arm above also applies.
+            (Type::Class { .. } | Type::Refined { .. }, Type::Function { .. }) => {
+                if let Some(form) = self.st.function_class_form(pt) {
+                    self.collect_expected(
+                        tps,
+                        ret,
+                        &form,
+                        variance,
+                        depth + 1,
+                        allow_covariant,
+                        out,
+                    );
+                }
+            }
             (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
                 for (x, y) in a.iter().zip(b) {
                     self.collect_expected(tps, x, y, variance, depth + 1, allow_covariant, out);
