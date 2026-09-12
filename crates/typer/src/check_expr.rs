@@ -1442,7 +1442,9 @@ impl Typer {
                     self.adapt(elsep, &num);
                     tree.ty = num;
                 } else {
-                    let joined = self.lub_branches(&thenp.ty, &elsep.ty);
+                    // Library classes complete their parents lazily; a join
+                    // that fell to `AnyRef` asks for them (`join_branches`).
+                    let joined = self.join_branches(&thenp.ty, &elsep.ty);
                     tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
                 }
             }

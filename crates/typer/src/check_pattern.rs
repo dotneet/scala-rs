@@ -44,7 +44,9 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = self.lub_branches(&res, &c.body.ty);
+            // Library classes complete their parents lazily; a join that
+            // fell to `AnyRef` asks for them (`join_branches`).
+            res = self.join_branches(&res, &c.body.ty);
             branch_tys.push(c.body.ty.clone());
             self.st.gadt_bounds.truncate(gadt_mark);
             self.st.pop_scope();

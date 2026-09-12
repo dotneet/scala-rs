@@ -109,6 +109,28 @@ with an inferred type close leftovers to their lower bound
 Evidence: `hinf_nothing` runs identically; `hinf_nothing_bad` rejected at
 the same five lines by both.
 
+## 3a. Joining sibling library classes under no expected type (run/t4658)
+
+Fixing root 3 exposed a latent dependency: a class read from the library
+jar gets its parents from the pickle *lazily* (`pickle_supply::
+ensure_parents`), and `SymbolTable::lub` walks whatever parent list is
+attached. Typing a lambda body against `Any` used to force those parents as
+a side effect of `adapt`; with the body typed under no expected type,
+`if (r.inclusive) NumericRange.inclusive(…) else NumericRange(…)` joined
+`NumericRange.Inclusive[Int]` and `NumericRange.Exclusive[Int]` to
+`AnyRef` (`value sum is not a member of AnyRef`). `join_branches`
+(`check_infer.rs`) retries `lub_branches` after `ensure_join_parents` --
+the branch classes' own parents, one level, once per class -- and only when
+the first join already fell to `AnyRef`/`Any`. The narrowness matters:
+attaching whole ancestor chains for every `if`/`match` branch made
+gitbucket's implicit searches and linearisations walk hierarchies it never
+completed before. Fixture `hinf_join` (the t4658 shapes for `Range`,
+`NumericRange[Int|Long|BigInt]`, a `match`, and `Some`/`None`).
+
+A separate, pre-existing weakness surfaced on the way: `lub(List[Int],
+Vector[Int])` is `IterableOnce[Int]` where nsc gives a `Seq[Int]`-based
+refinement (`.length` is not a member). Not touched here.
+
 ## Deferred (reproduced, not fixed here)
 
 * `IterableFactory[CC].newBuilder` read from the jar is "not a member":
