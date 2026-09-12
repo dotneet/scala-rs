@@ -17,6 +17,27 @@ use crate::symbol::{MacroBinding, MacroPickle, MacroTarg, SymKind};
 const BLACKBOX_CONTEXT: &str = "scala.reflect.macros.blackbox.Context";
 const WHITEBOX_CONTEXT: &str = "scala.reflect.macros.whitebox.Context";
 
+/// The implementation `def f(…): T = macro ???` names: `scala.Predef.???`.
+///
+/// nsc treats this reference as a *placeholder*, not as an implementation.
+/// `scala/reflect/macros/compiler/Validators.scala` runs only the "confidence
+/// check" on it (is it a public, non-overloaded method of a static object?) and
+/// skips `checkMacroDefMacroImplCorrespondence` outright:
+///
+/// ```text
+/// confidenceCheck()
+/// if (macroImpl != Predef_???) checkMacroDefMacroImplCorrespondence()
+/// ```
+///
+/// Every check the reference would fail -- a leading `Context` parameter, a
+/// parameter list matching the definition's -- lives in that second half, so
+/// `macro ???` is accepted at the *definition* site and rejected only when
+/// someone calls it ("macro implementation is missing"). The library declares
+/// its compiler-intrinsic macros this way (`StringContext.s/f/raw`,
+/// `scala.reflect.materializeClassTag`); nsc fills them in from its own
+/// `FastTrack` table, keyed on the macro *def* symbol.
+pub(crate) const PLACEHOLDER_IMPL: (&str, &str) = ("scala.Predef$", "???");
+
 /// `Some(true)` for the blackbox `Context`, `Some(false)` for the whitebox
 /// one, `None` for any other class.
 fn context_kind_of_name(name: &str) -> Option<bool> {
@@ -221,6 +242,38 @@ impl Typer {
             return None;
         }
 
+        let impl_class = {
+            let jvm = self.st.get(owner).jvm_name.clone();
+            if jvm.is_empty() {
+                self.st.get(owner).name.clone()
+            } else {
+                jvm.replace('/', ".")
+            }
+        };
+
+        // `macro ???`. Everything below this point is the correspondence check
+        // nsc skips for the placeholder (see [`PLACEHOLDER_IMPL`]), so the
+        // binding is built here and the definition stands. It carries the
+        // reference nsc pickles -- `scala.Predef$.???` with an empty signature,
+        // `???` taking no parameter list -- so the `MACRO` flag still reaches
+        // the class file and a separately compiled caller still sees a macro
+        // rather than a method with no bytecode. `blackbox` is arbitrary: a
+        // call site is refused before boxity can matter.
+        if (impl_class.as_str(), name.as_str()) == PLACEHOLDER_IMPL {
+            return Some(MacroBinding {
+                pickle: Some(MacroPickle {
+                    signature: Vec::new(),
+                    targs: Vec::new(),
+                }),
+                impl_class,
+                impl_method: name,
+                blackbox: true,
+                tag_params: 0,
+                expr_args: Vec::new(),
+                tag_targs: Vec::new(),
+            });
+        }
+
         let blackbox = match self.macro_context_kind(sym) {
             Some(b) => b,
             None => {
@@ -243,14 +296,6 @@ impl Typer {
             return None;
         }
 
-        let impl_class = {
-            let jvm = self.st.get(owner).jvm_name.clone();
-            if jvm.is_empty() {
-                self.st.get(owner).name.clone()
-            } else {
-                jvm.replace('/', ".")
-            }
-        };
         let tag_params = self.macro_impl_tag_params(sym);
         let pickle = self.macro_pickle_binding(sym, def_sym, &ref_targs, span)?;
         Some(MacroBinding {
@@ -642,6 +687,16 @@ impl Typer {
         if let Some(sym) = self.macro_symbol_of(tree) {
             let name = self.st.get(sym).name.clone();
             let binding = self.st.get(sym).macro_impl.clone().expect("macro symbol");
+            // `def f(…): T = macro ???` has no implementation to run at all:
+            // nsc accepts the definition and reports this at the call site
+            // (`MacroImplementationNotFoundError`). The library's own
+            // `StringContext.s` is one of these; nsc supplies it from
+            // `FastTrack`, scala-rs from its interpolation path in the typer,
+            // and a *user* macro declared this way is simply uncallable.
+            if (binding.impl_class.as_str(), binding.impl_method.as_str()) == PLACEHOLDER_IMPL {
+                self.error(tree.span, "macro implementation is missing");
+                return;
+            }
             let why = self
                 .macro_failures
                 .get(&self.macro_failure_key(tree.span))

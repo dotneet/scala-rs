@@ -3321,8 +3321,32 @@ pub(crate) fn unify_one_precise(
                 Some(actual.clone())
             }
         }
-        Type::BoundedWildcard { hi: Some(h), .. } | Type::BoundedWildcard { lo: Some(h), .. } => {
-            unify_one_precise(st, tp, h, actual)
+        Type::BoundedWildcard { lo, hi } => {
+            // Both sides existential, which is how a Java wildcard signature
+            // re-implemented in Scala arrives: `invokeAll[T](callables:
+            // Collection[_ <: Callable[T]])` forwards to the same method on
+            // another `ExecutorService`, so the argument is a `Collection[_ <:
+            // Callable[U]]` and `T := U` is readable only by lining the two
+            // *bounds* up. Matching the pattern's bound against the whole
+            // wildcard (what this arm used to do) found nothing there, and the
+            // four `invokeAll`/`invokeAny` forwarders in
+            // `ExecutionContextImpl.scala` came out `no matching overload`
+            // against alternatives they match exactly.
+            if let Type::BoundedWildcard { lo: alo, hi: ahi } = actual {
+                for (p, a) in [(hi, ahi), (lo, alo)] {
+                    if let (Some(p), Some(a)) = (p.as_deref(), a.as_deref()) {
+                        if let Some(t) = unify_one_precise(st, tp, p, a) {
+                            return Some(t);
+                        }
+                    }
+                }
+                return None;
+            }
+            // A concrete actual under an existential pattern: the bound is the
+            // only place the parameter can be.
+            hi.as_deref()
+                .or(lo.as_deref())
+                .and_then(|h| unify_one_precise(st, tp, h, actual))
         }
         Type::Wildcard => None,
         Type::Class { args: pas, .. } => {

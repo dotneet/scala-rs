@@ -5845,10 +5845,30 @@ impl SymbolTable {
                     ret: r2,
                 },
             ) if p1.len() == p2.len() => {
-                p2.iter()
-                    .zip(p1.iter())
-                    .all(|(exp, act)| self.is_sub_type(exp, act))
-                    && self.is_sub_type(r1, r2)
+                p2.iter().zip(p1.iter()).all(|(exp, act)| {
+                    // An *unbounded* wildcard parameter on the right stands
+                    // for some type with nothing said about it, so it contains
+                    // the actual one however the parameter's (contravariant)
+                    // variance would flip -- the reading the `Type::Class` arm
+                    // above gives `SetParameter[_]` for a contravariant
+                    // `SetParameter[-T]`. `Function1[_, _]` is reached
+                    // structurally rather than as a `Type::Class`, so it needs
+                    // the rule here too: `Promise.scala`'s `def this(xform:
+                    // Int, f: _ => _, ec: ExecutionContext)` takes every
+                    // `Try[T] => Try[S]`, and flipping against the wildcard
+                    // rejected all eleven calls.
+                    //
+                    // A *bounded* one keeps the flip. `Function1[Any, Unit]` is
+                    // a `Function1[_ <: AnyRef, Unit]` -- witness `AnyRef`,
+                    // which `Any` accepts contravariantly -- and containment
+                    // would ask `Any <: _ <: AnyRef` and say no
+                    // (`tests/fixtures/existential_bounds.scala`).
+                    if matches!(exp, Type::Wildcard) {
+                        true
+                    } else {
+                        self.is_sub_type(exp, act)
+                    }
+                }) && self.is_sub_type(r1, r2)
             }
             (Type::Function { .. }, Type::Class { sym, args }) => {
                 match self.function_class_shape(*sym, args) {

@@ -1354,6 +1354,15 @@ impl Typer {
         let mut seen = std::collections::HashSet::new();
         seen.insert(cls.0);
         while let Some(p) = work.pop_front() {
+            // `trait PartialFunction[-A, +B] extends (A => B)` really does
+            // inherit `Function1.apply`, and `applyOrElse`'s body calls it
+            // unqualified. A function parent names no class until the
+            // structural form is read back as one (`class_sym_of` answers
+            // `None` for a `Type::Function` by design); `lookup_member` already
+            // does this, so a selection through a receiver found `apply` and a
+            // bare name did not.
+            let as_class = self.st.function_class_form(&p);
+            let p = as_class.unwrap_or(p);
             let Some(pid) = self.st.class_sym_of(&p) else {
                 continue;
             };

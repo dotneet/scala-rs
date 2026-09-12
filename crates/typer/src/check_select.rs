@@ -224,6 +224,14 @@ impl Typer {
         let mut found = super_found.take().unwrap_or_default();
         if let Type::Refined { parents, .. } = &recv_ty {
             for p in parents {
+                // A function parent is kept structural by `class_sym_of`
+                // (which answers `None` for it), so the class it denotes has
+                // to be asked for by name: `val b: ManagedBlocker with (() =>
+                // T)` in `ExecutionContextImpl.scala` gets its `apply` from
+                // `scala.Function0`, and without this `b()` reported "value
+                // apply is not a member of ManagedBlocker with () => T".
+                let as_class = self.st.function_class_form(p);
+                let p = as_class.as_ref().unwrap_or(p);
                 if let Some(o) = self.st.class_sym_of(p) {
                     found.extend(self.st.lookup_member(o, &name));
                 }
@@ -394,6 +402,30 @@ impl Typer {
         }
         if found.is_empty() && name == "toString" {
             found = self.st.lookup_member(self.st.any_sym, "toString");
+        }
+        // An *inaccessible* universal member is no answer at all. `AnyRef`
+        // declares `protected def clone()`, which every class inherits, so the
+        // walk above finds it for any receiver -- before the receiver's own
+        // pickle has been asked (a jar class's members are read one name at a
+        // time) and before any view. Two real selections are decided by what
+        // comes after: `scala.collection.mutable.Cloneable` declares a public
+        // `override def clone(): C`, and `pos/t10206`'s `implicit class
+        // Enrich(foo: Foo) { def clone(x: Int, y: Int) }` is a view that nsc
+        // applies here. Clearing the set lets both paths run. When neither
+        // answers, the `AnyRef` fallback further down puts the declaration back
+        // and the access check reports nsc's own "cannot be accessed".
+        if !found.is_empty()
+            && !matches!(
+                self.st.class_sym_of(&recv_ty),
+                Some(c) if c == self.st.any_sym || c == self.st.anyref_sym
+            )
+            && found.iter().all(|&s| {
+                let o = self.st.get(s).owner;
+                (o == self.st.any_sym || o == self.st.anyref_sym)
+                    && !self.accessible(s, Some(qual.as_ref()))
+            })
+        {
+            found.clear();
         }
         // The library's own pickle, *before* the view search: a member the
         // receiver really has always beats an implicit conversion (SLS 6.26.1
@@ -2247,7 +2279,21 @@ impl Typer {
 
     fn protected_ok_in(&self, current: SymbolId, owner: SymbolId, prefix: Option<&Tree>) -> bool {
         let cur_ty = self.st.type_of_class(current);
-        let own_ty = self.st.type_of_class(owner);
+        // `AnyRef` spelled as its own class symbol is not the spelling
+        // conformance answers for: the arms that say "everything
+        // reference-shaped is an `AnyRef`" match the `Type::AnyRef`
+        // constructor, while `type_of_class` hands back `Type::Class { sym:
+        // anyref_sym }`, for which the ordinary class-to-class parent walk
+        // finds nothing (no class lists `AnyRef` among its parents). So a
+        // member inherited from `AnyRef` itself -- `protected def clone()`,
+        // reached by `super.clone()` in `collection/mutable/Cloneable.scala` --
+        // was refused in every subclass. Using the constructor spelling here
+        // sends the question to the rule that already answers it.
+        let own_ty = if owner == self.st.anyref_sym {
+            Type::AnyRef
+        } else {
+            self.st.type_of_class(owner)
+        };
         if current != owner && !self.st.is_sub_type(&cur_ty, &own_ty) {
             return false;
         }

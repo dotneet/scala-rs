@@ -1,6 +1,6 @@
 use crate::prelude::{method, type_param};
 use crate::symbol::{Intrinsic, SymbolTable};
-use scala_rs_parser::Type;
+use scala_rs_parser::{Flags, Type};
 
 pub(crate) fn add_any_members(st: &mut SymbolTable) {
     let any = st.any_sym;
@@ -113,6 +113,25 @@ pub(crate) fn add_any_members(st: &mut SymbolTable) {
     ] {
         method(st, anyref, name, params, Type::Unit, Intrinsic::None);
     }
+    // `protected def clone(): AnyRef`, as nsc declares it on `scala.AnyRef`
+    // (`src/library-aux/scala/AnyRef.scala`). `scala.Cloneable` is
+    // `java.lang.Cloneable`, a marker interface with no members of its own, so
+    // `trait Cloneable[+C <: AnyRef] extends scala.Cloneable { override def
+    // clone(): C = super.clone().asInstanceOf[C] }` in
+    // `collection/mutable/Cloneable.scala` reaches this declaration and nothing
+    // else -- it reported "value clone is not a member of Cloneable".
+    //
+    // `PROTECTED`, not public: `(new Object).clone()` is an error in scalac
+    // ("method clone in class Object cannot be accessed"), and declaring it
+    // public here would start accepting that. An empty parameter list, not a
+    // parameterless method, because `clone()` is how it is written.
+    let cl = method(st, anyref, "clone", vec![], Type::AnyRef, Intrinsic::None);
+    st.get_mut(cl).ty = Type::Method {
+        paramss: vec![vec![]],
+        ret: Box::new(Type::AnyRef),
+    };
+    st.get_mut(cl).flags.set(Flags::PROTECTED, true);
+    st.get_mut(cl).flags.set(Flags::FINAL, false);
 }
 pub(crate) fn add_int_members(st: &mut SymbolTable) {
     let c = st.int_sym;
