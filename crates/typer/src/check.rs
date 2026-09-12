@@ -561,7 +561,7 @@ pub struct Typer {
     /// with the `implicit val classTag` it is about to inherit from it.
     pub(crate) parent_ctor_scope: bool,
     pub(crate) class_bound_evidence_types: HashMap<SymbolId, Vec<Type>>,
-    fatal_warnings: bool,
+    pub(crate) fatal_warnings: bool,
     pub(crate) library_abi: bool,
     /// Nearest enclosing named method; `None` in class/object constructors.
     pub(crate) return_meth: Option<SymbolId>,
@@ -571,6 +571,11 @@ pub struct Typer {
     pub(crate) language_postfix_ops: bool,
     /// `import scala.language.implicitConversions` / `-language:implicitConversions`.
     pub(crate) language_implicit_conversions: bool,
+    /// `import scala.language.reflectiveCalls` / `-language:reflectiveCalls`.
+    pub(crate) language_reflective_calls: bool,
+    /// Features a warning has already explained (nsc `reportedFeature`):
+    /// the "This can be achieved by ..." paragraph comes once per run.
+    pub(crate) reported_features: HashSet<String>,
     /// `-Xsource-features:<features>` (already gated on `-Xsource:3`).
     pub(crate) source_features: crate::source_features::SourceFeatures,
     /// `-Xsource:3` (see `TypecheckOptions::scala3`).
@@ -1034,6 +1039,18 @@ pub fn typecheck_units_src(
     // parent or self type is raised twice. Member signatures are built once
     // (see `sig_done`), so their diagnostics survive here.
     dedup_diags(&mut t.diags);
+    // nsc's later phases only run when the typer reported no errors; so do
+    // the warnings they issue.
+    if !t
+        .diags
+        .iter()
+        .any(|d| d.level == scala_rs_span::Level::Error)
+    {
+        crate::warn_refchecks::run(&mut t, units);
+        crate::warn_deprecation::run(&mut t, units);
+        crate::warn_features::run(&mut t, units);
+        crate::warn_patmat::run(&mut t, units);
+    }
     (t.st, t.diags)
 }
 
@@ -1122,6 +1139,11 @@ impl Typer {
                 &opts.language_features,
                 "implicitConversions",
             ),
+            language_reflective_calls: language_flag_enabled(
+                &opts.language_features,
+                "reflectiveCalls",
+            ),
+            reported_features: HashSet::new(),
             source_features: opts.source_features,
             scala3: opts.scala3,
             compiler_settings: opts.compiler_settings.clone(),
@@ -1182,11 +1204,47 @@ impl Typer {
     }
 
     pub(crate) fn warning(&mut self, span: Span, msg: impl Into<String>) {
+        self.warning_in(scala_rs_span::Phase::Typer, span, msg);
+    }
+
+    /// nsc `Reporting.featureWarning` for a feature that `should` be enabled
+    /// (`cat=feature`, summarized unless `-feature`). The explanation is
+    /// given the first time a feature is reported in the run.
+    pub(crate) fn feature_warning(&mut self, span: Span, feature: &str, desc: &str) {
+        let fq = format!("scala.language.{feature}");
+        let explain = if self.reported_features.insert(feature.to_string()) {
+            format!(
+                "\nThis can be achieved by adding the import clause 'import {fq}'\nor by setting the compiler option -language:{feature}.\nSee the Scaladoc for value {fq} for a discussion\nwhy the feature should be explicitly enabled."
+            )
+        } else {
+            String::new()
+        };
+        let msg = format!(
+            "{desc} should be enabled\nby making the implicit value {fq} visible.{explain}"
+        );
+        if self.fatal_warnings {
+            self.error(span, msg);
+        } else {
+            self.diags.push(
+                Diagnostic::warning(self.file_index, span, msg)
+                    .with_category(scala_rs_span::WarnCategory::Feature),
+            );
+        }
+    }
+
+    /// A warning nsc issues in `phase` (which decides where it is reported;
+    /// see `scala_rs_span::finish_diagnostics`).
+    pub(crate) fn warning_in(
+        &mut self,
+        phase: scala_rs_span::Phase,
+        span: Span,
+        msg: impl Into<String>,
+    ) {
         if self.fatal_warnings {
             self.error(span, msg);
         } else {
             self.diags
-                .push(Diagnostic::warning(self.file_index, span, msg));
+                .push(Diagnostic::warning(self.file_index, span, msg).in_phase(phase));
         }
     }
 

@@ -1,0 +1,38 @@
+warn_patmat.scala:11: warning: match may not be exhaustive.
+It would fail on the following input: Rect(_, _)
+  def area(s: Shape): Int = s match {
+                            ^
+warn_patmat.scala:16: warning: match may not be exhaustive.
+It would fail on the following input: Some(_)
+  def opt(o: Option[Int]): Int = o match {
+                                 ^
+warn_patmat.scala:21: warning: match may not be exhaustive.
+It would fail on the following input: List(_, _)
+  def list(l: List[Int]): Int = l match {
+                                ^
+warn_patmat.scala:26: warning: match may not be exhaustive.
+It would fail on the following inputs: (false, true), (true, false)
+  def pair(p: (Boolean, Boolean)): Int = p match {
+                                         ^
+warn_patmat.scala:33: warning: unreachable code
+    case 1 => "uno"
+              ^
+warn_patmat.scala:39: warning: unreachable code
+    case _: String => 2
+                      ^
+warn_patmat.scala:45: warning: patterns after a variable pattern cannot match (SLS 8.1.1)
+    case other => 2
+         ^
+warn_patmat.scala:46: warning: unreachable code due to variable pattern 'other' on line 45
+    case "b" => 3
+                ^
+warn_patmat.scala:46: warning: unreachable code
+    case "b" => 3
+                ^
+warn_patmat.scala:50: warning: Pattern contains duplicate alternatives: 0
+    case 0 | 0 => 0
+         ^
+warn_patmat.scala:51: warning: Pattern contains duplicate alternatives: 2, 3
+    case 2 | 2 | 3 | 3 => 1
+         ^
+11 warnings

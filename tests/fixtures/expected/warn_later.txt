@@ -1,0 +1,23 @@
+warn_later.scala:28: warning: type A is unused or used in non-specializable positions.
+  def inList[@specialized(Int) A](xs: List[A]): Int = xs.length // warn
+      ^
+warn_later.scala:29: warning: type A, type B are unused or used in non-specializable positions.
+  def none[@specialized(Int) A, @specialized(Int) B](x: Int): Int = x // warn
+      ^
+warn_later.scala:31: warning: type A is unused or used in non-specializable positions.
+  def triple[@specialized(Int) A](p: (A, Int, Int)): Int = 0 // warn
+      ^
+warn_later.scala:5: warning: Reference to uninitialized value late
+  val early = late // warn
+              ^
+warn_later.scala:7: warning: Reference to uninitialized variable w
+  var v = w + 1 // warn
+          ^
+warn_later.scala:13: warning: Reference to uninitialized value q
+  println(q) // warn
+          ^
+warn_later.scala:22: warning: Reference to uninitialized value b
+  val a = b // warn
+          ^
+warning: 1 deprecation (since 2.12.0); re-run with -deprecation for details
+8 warnings

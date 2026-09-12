@@ -4152,6 +4152,49 @@ impl PickleSupply {
             || self.implicits_supplied.contains(&class_sym.0)
     }
 
+    /// The pickled signature of a library (or adopted) class or module class,
+    /// found under its dotted name the way `complete_named` finds it (the
+    /// `$` spelling first, then the nested one). `None` for a class this run
+    /// does not read pickles for.
+    pub(crate) fn class_sig_of(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        if cls.is_none() || !self.pickle_readable(st, cls) {
+            return None;
+        }
+        let sym = st.get(cls);
+        if !sym.is_class_like() {
+            return None;
+        }
+        let is_module = sym.kind == SymKind::ModuleClass;
+        let plain = sym.jvm_name.trim_end_matches('$').replace('/', ".");
+        let mut src = BinSource(bin);
+        if let Ok(sig) = self.sigs.class_sig(&mut src, &plain, is_module) {
+            return Some(sig);
+        }
+        let dotted = scala_rs_pickle::names::nested_to_dotted(&plain);
+        if dotted != plain {
+            if let Ok(sig) = self.sigs.class_sig(&mut src, &dotted, is_module) {
+                return Some(sig);
+            }
+        }
+        None
+    }
+
+    /// The pickled signature of the library class `full_name` (dotted).
+    pub(crate) fn class_sig_by_name(
+        &mut self,
+        bin: &mut BinaryIndex,
+        full_name: &str,
+        module: bool,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        let mut src = BinSource(bin);
+        self.sigs.class_sig(&mut src, full_name, module).ok()
+    }
+
     fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {
         let mut src = BinSource(bin);
         let r = self.sigs.class_sig(&mut src, full_name, module);
