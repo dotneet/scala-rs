@@ -1394,6 +1394,29 @@ impl Typer {
                 if s.flags.contains(Flags::PRIVATE) && s.private_within.is_none() {
                     continue;
                 }
+                // Neither is a `static` member. scalac mirrors every
+                // accessible companion-object member onto the class's own
+                // class file as a static forwarder, and
+                // `classpath::fill_java_members` installs it like any other
+                // member -- so `object Rep`'s `Some` / `forNodeUntyped` /
+                // `forNode` were in unqualified scope inside every subclass
+                // of `slick.lifted.Rep`, which every slick table is through
+                // `AbstractTable`. nsc's rule is that static Java members
+                // belong to companion objects in Scala and are *not*
+                // inherited; `check_overload::not_inherited_static` already
+                // applies it to a selection (`r.forNodeUntyped` is "not a
+                // member", `docs/gitbucket.md` root 26) and this is the same
+                // rule for the name reached without a qualifier. Selecting
+                // one on the companion itself (`Rep.forNodeUntyped`), on the
+                // exact class that declares it, and importing it
+                // (`import java.lang.Integer._`) all still work.
+                //
+                // Without it gitbucket's `Repository.scala:77` read the
+                // `Some(…)` of `.shaped.<>(…, r => Some(…))` as slick's
+                // `Rep.Some` instead of `scala.Some`.
+                if !crate::check_overload::not_inherited_static(&self.st, m, cls) {
+                    continue;
+                }
                 self.st.enter_in_current(&n, m);
             }
             work.extend(self.st.get(pid).parents.iter().rev().cloned());

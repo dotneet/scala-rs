@@ -479,13 +479,36 @@ impl Typer {
                     .count()
                     == 1
             });
+            // A repeated parameter's *field* symbol carries the type it has
+            // inside the body -- `Seq[T]` -- which is the expected type of no
+            // single argument: nsc's `formalTypes` expands `T*` into one `T`
+            // per argument. Handing `Seq[T]` out typed `new A(new P { … })`'s
+            // anonymous class against `Seq[P]`, which fails, so the rollback
+            // below restored the saved tree and typed it a **second** time --
+            // and a template typed twice comes out without its members
+            // ("not found: value a" in its own method, then "object creation
+            // impossible"). Leave those slots empty for the `sole_own_ctor`
+            // pass below, whose `param_at` yields the element type.
+            let ctor_repeated_from: Option<usize> = class_id
+                .and_then(|c| self.sole_own_ctor(c))
+                .and_then(|ctor| {
+                    let flat: Vec<Type> = match &self.st.get(ctor).ty {
+                        Type::Method { paramss, .. } => paramss.iter().flatten().cloned().collect(),
+                        _ => return None,
+                    };
+                    flat.iter().position(|p| matches!(p, Type::Repeated(_)))
+                });
             let mut ctor_protos: Vec<Type> = class_id
                 .filter(|_| tps.is_empty() || explicit.len() == tps.len())
                 .map(|c| (c, self.st.get(c).ctor_fields.clone()))
                 .filter(|(_, fs)| fs.len() == args.len())
                 .map(|(c, fs)| {
                     fs.iter()
-                        .map(|f| {
+                        .enumerate()
+                        .map(|(fi, f)| {
+                            if ctor_repeated_from.is_some_and(|r| fi >= r) {
+                                return Type::NoType;
+                            }
                             let t = self.st.get(*f).ty.clone();
                             let t = if tps.is_empty() {
                                 t
