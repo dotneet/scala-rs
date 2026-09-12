@@ -1,0 +1,12 @@
+3
+x
+true
+true
+xyz
+seq
+par
+seq
+fut
+a1bc/5
+int int long
+true

@@ -30,6 +30,17 @@ use scala_rs_span::{Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+/// One open block, for the forward-reference rule (`Typer::fwd_blocks`).
+pub(crate) struct FwdBlock {
+    /// Every definition the block declares, with the index of its statement.
+    pub defs: Vec<(SymbolId, usize)>,
+    /// The statement being typed.
+    pub cur: usize,
+    /// The name of the eager `val`/`var` that statement defines, if it is one.
+    /// Only such a statement can make a forward reference illegal.
+    pub val_name: Option<String>,
+}
+
 pub(crate) struct PendingTypeBounds {
     pub class: SymbolId,
     pub args: Vec<Type>,
@@ -447,6 +458,19 @@ pub struct Typer {
     /// This distinction controls inherited result inference, membership and
     /// `@tailrec` eligibility: local declarations cannot override members.
     pub(crate) block_local_defs: std::collections::HashSet<(usize, scala_rs_parser::NodeId)>,
+    /// One entry per open block, for SLS 4.1's forward-reference rule: "a
+    /// reference to a local definition that comes *later* in the block must not
+    /// extend over the definition of a value".
+    ///
+    /// A local `def` is in scope for the whole block (that is what the hoist in
+    /// `check_expr`'s `Block` arm is for), so `{ val s = g; def g = 2; s }` --
+    /// which scalac refuses with "forward reference to method g ... extends
+    /// over definition of value s" -- would otherwise simply compile: the `val`
+    /// is *evaluated* where it stands, and `g` cannot be called before `s`'s
+    /// initialiser has run. A reference from a plain statement, from another
+    /// `def`'s body or from a `lazy val` is legal and stays so (checked against
+    /// scalac 2.13.16 in both directions).
+    pub(crate) fwd_blocks: Vec<FwdBlock>,
     /// The prefix an inner class's constructor is being picked through
     /// (`Typer::ctor_outer_prefix`), set only around the pick itself.
     pub(crate) ctor_prefix: Option<Type>,
@@ -1138,6 +1162,7 @@ impl Typer {
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
             block_local_defs: std::collections::HashSet::new(),
+            fwd_blocks: Vec::new(),
             ctor_prefix: None,
             parent_fill_done: std::collections::HashSet::new(),
             warmed_scopes: std::collections::HashSet::new(),

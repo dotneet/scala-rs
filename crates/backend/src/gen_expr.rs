@@ -1706,7 +1706,19 @@ pub(crate) fn gen_select(
                         jvm_desc_val(ctx.st, &s.ty)
                     };
                     asm.getstatic(&owner, &s.name, &desc);
-                    if desc == BOXED_UNIT_DESC {
+                    // A `Unit`-typed field really is a `BoxedUnit` on the JVM,
+                    // and a `Unit`-typed *expression* leaves nothing on the
+                    // stack -- so the reference has to be dropped. The question
+                    // is the selection's own type, not the descriptor:
+                    // `scala.runtime.BoxedUnit.UNIT` is a field of type
+                    // `BoxedUnit` whose descriptor is the same string, and
+                    // popping on the descriptor alone emitted
+                    // `getstatic UNIT; pop; areturn` for
+                    // `def box(x: Unit): BoxedUnit = BoxedUnit.UNIT`
+                    // (`VerifyError: Operand stack underflow`). It only became
+                    // reachable once the classfile reader stopped reading that
+                    // field's type as `Unit` (`classpath::parse_field_ty_java`).
+                    if is_unit_like(&tree.ty) {
                         asm.pop();
                     }
                     maybe_cast_erased_load(asm, ctx, &s.ty, &tree.ty);

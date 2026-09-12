@@ -3020,13 +3020,24 @@ impl Typer {
                     byname_thunk: false,
                     byname_type_marker: false,
                 };
-                let _ = self.fill_defaults_and_implicits(
-                    tree.span,
-                    args,
-                    &param_tys,
-                    &ctor_fun,
-                    &Type::NoType,
-                );
+                // Nothing to fill when the delegation already wrote every
+                // clause. `flatten_curried_ctor_delegation` folded them into one
+                // argument list, but `param_tys` is the *first* clause, so
+                // `def this()(implicit ord: Ordering[K]) = this(RB.Tree.empty)(ord)`
+                // looked like one argument too many for one clause and the
+                // implicit clause was filled in a second time -- the emitted
+                // `<init>` pushed `(tree, ord, ord)` for a two-parameter
+                // descriptor (`VerifyError: Bad type on operand stack`).
+                let total = flat_param_types(&self.st.get(sym).ty).len();
+                if args.len() < total {
+                    let _ = self.fill_defaults_and_implicits(
+                        tree.span,
+                        args,
+                        &param_tys,
+                        &ctor_fun,
+                        &Type::NoType,
+                    );
+                }
                 for (i, a) in args.iter_mut().enumerate() {
                     if let Some(p) = param_tys.get(i) {
                         if !p.is_no_type() {

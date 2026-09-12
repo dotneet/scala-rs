@@ -189,6 +189,47 @@ impl Typer {
         }
     }
 
+    /// SLS 4.1: a reference to a definition that comes **later** in the same
+    /// block must not extend over the definition of a value.
+    ///
+    /// A local `def` is in scope for the whole block, so `{ val s = g; def g =
+    /// 2; s }` resolves -- and then calls `g` before `s`'s initialiser has run.
+    /// scalac 2.13.16 refuses it ("forward reference to method g defined on
+    /// line N extends over definition of value s") and accepts the three
+    /// neighbours: the same reference from a plain statement, from another
+    /// `def`'s body, and from a `lazy val`'s initialiser. So the rule asks for
+    /// an eager `val`/`var` definition (`FwdBlock::val_name`) and for the target
+    /// to be declared by a *later* statement of that same block.
+    fn check_forward_reference(&mut self, found: &[SymbolId], span: Span) {
+        // Innermost block outward: the reference may sit in a block (or a
+        // lambda, or a nested definition) *inside* the value's right-hand side,
+        // which is where scalac reports `val r = { println(f); 1 }` above a
+        // `def f = 2`.
+        let Some((val_name, sym)) = self.fwd_blocks.iter().rev().find_map(|fb| {
+            let val_name = fb.val_name.as_ref()?;
+            let cur = fb.cur;
+            let (sym, _) = fb
+                .defs
+                .iter()
+                .find(|(s, i)| *i > cur && found.contains(s))?;
+            Some((val_name.clone(), *sym))
+        }) else {
+            return;
+        };
+        let kind = if self.st.get(sym).kind == SymKind::Method {
+            "method"
+        } else {
+            "value"
+        };
+        let name = self.st.get(sym).name.clone();
+        self.error(
+            span,
+            format!(
+                "forward reference to {kind} {name} extends over definition of value {val_name}"
+            ),
+        );
+    }
+
     pub(crate) fn type_import(&mut self, tree: &mut Tree) {
         let expr = match &mut tree.kind {
             TreeKind::Import { expr, .. } => expr,
@@ -2619,6 +2660,7 @@ impl Typer {
         // `empty` written inside `TreeSet` is `TreeSet`'s `empty`.
         found = self.drop_overridden_at(self.st.this_class, found);
         let ref_span = tree.span;
+        self.check_forward_reference(&found, ref_span);
         for s in found.iter().copied() {
             self.complete_lazy_sig(s, ref_span);
         }

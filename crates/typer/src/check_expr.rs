@@ -1863,9 +1863,44 @@ impl Typer {
                         }
                     }
                 }
+                // SLS 4.1: a reference to a definition that comes later in
+                // this block must not extend over the definition of a value.
+                // Recorded here, once the hoist has given every definition its
+                // symbol, and read by `bind_found`.
+                self.fwd_blocks.push(crate::check::FwdBlock {
+                    defs: stats
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| {
+                            !s.sym.is_none()
+                                && matches!(
+                                    s.kind,
+                                    TreeKind::DefDef { .. }
+                                        | TreeKind::ValDef { .. }
+                                        | TreeKind::ClassDef { .. }
+                                        | TreeKind::ModuleDef { .. }
+                                        | TreeKind::TypeDef { .. }
+                                )
+                        })
+                        .map(|(i, s)| (s.sym, i))
+                        .collect(),
+                    cur: 0,
+                    val_name: None,
+                });
                 for index in 0..stats.len() {
                     let (through, rest) = stats.split_at_mut(index + 1);
                     let s = &mut through[index];
+                    if let Some(fb) = self.fwd_blocks.last_mut() {
+                        fb.cur = index;
+                        fb.val_name = match &s.kind {
+                            TreeKind::ValDef {
+                                name, mods, rhs, ..
+                            } if !mods.flags.contains(Flags::LAZY) && !rhs.is_empty() => {
+                                Some(name.clone())
+                            }
+                            _ => None,
+                        };
+                    }
                     // A repeated body pass rebuilds the block scope, but
                     // signature completion does not allocate the local again.
                     // Re-enter its existing symbol at its declaration point.
@@ -1891,7 +1926,12 @@ impl Typer {
                         }
                     }
                 }
+                if let Some(fb) = self.fwd_blocks.last_mut() {
+                    fb.cur = stats.len();
+                    fb.val_name = None;
+                }
                 self.type_expr(expr, pt);
+                self.fwd_blocks.pop();
                 tree.ty = expr.ty.clone();
                 self.st.pop_scope();
             }
