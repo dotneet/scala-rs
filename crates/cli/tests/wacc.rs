@@ -289,6 +289,53 @@ fn wacc_defaults_separate_compilation() {
 }
 
 #[test]
+fn wacc_new_with_written_type_arguments_rejected() {
+    let want = [
+        "not enough arguments for constructor Gen: (a: Int): Gen[Int].\nUnspecified value parameter a.",
+        "not enough arguments for constructor Pair: (a: Int, b: String): Pair[Int, String].\nUnspecified value parameters a, b.",
+    ];
+    check_rejects(&["wacc_newtargs_bad.scala"], &want, 2, None);
+    if let Some(sc) = scalac() {
+        // scalac spells the type arguments `Pair[Int,String]`.
+        let want = [
+            "not enough arguments for constructor Gen: (a: Int): Gen[Int].",
+            "not enough arguments for constructor Pair: (a: Int, b: String):",
+        ];
+        check_rejects(&["wacc_newtargs_bad.scala"], &want, 2, Some(&sc));
+    }
+}
+
+#[test]
+fn wacc_flatmap_body_must_be_iterable_once() {
+    let want = [
+        "type mismatch; found: Int  required: IterableOnce[_]",
+        "type mismatch; found: Int  required: Option[_]",
+    ];
+    check_rejects(&["wacc_flatmap_bad.scala"], &want, 4, None);
+    if let Some(sc) = scalac() {
+        // scalac reports `x + 1` twice, so five errors for the same four
+        // definitions.
+        let want = [
+            "required: scala.collection.IterableOnce[?]",
+            "required: Option[?]",
+        ];
+        check_rejects(&["wacc_flatmap_bad.scala"], &want, 5, Some(&sc));
+    }
+}
+
+#[test]
+fn wacc_collections_runs() {
+    check_runs("wacc_collections", None);
+}
+
+#[test]
+fn scalac_agrees_wacc_collections() {
+    if let Some(sc) = scalac() {
+        check_runs("wacc_collections", Some(&sc));
+    }
+}
+
+#[test]
 fn wacc_accepts_runs() {
     check_runs("wacc_accepts", None);
 }

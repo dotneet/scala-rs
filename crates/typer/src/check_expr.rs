@@ -1957,6 +1957,17 @@ impl Typer {
                         );
                         return;
                     }
+                    // Whether the one clause is *implicit* is recorded in the
+                    // pickle and not in the class file, whose reader leaves it
+                    // an ordinary parameter. Without the pickled constructor
+                    // `new UnrolledBuffer[Int]` -- one implicit `ClassTag`
+                    // clause -- was neither filled nor reported, and codegen
+                    // emitted an `<init>()` the class does not have
+                    // (`NoSuchMethodError`). The applied path supplies them the
+                    // same way before picking a constructor.
+                    if let Some(cls) = self.st.class_sym_of(&tree.ty) {
+                        self.supply_binary_ctors(cls);
+                    }
                     let fillable = self.st.class_sym_of(&tree.ty).is_some_and(|cls| {
                         self.parent_ctor_is_fillable(cls) || self.bare_new_needs_application(cls)
                     });
@@ -1980,10 +1991,14 @@ impl Typer {
                         self.type_apply(tree, pt);
                         return;
                     }
+                    let written_targs = match &tree.ty {
+                        Type::Class { args, .. } => args.clone(),
+                        _ => Vec::new(),
+                    };
                     if let Some(msg) = self
                         .st
                         .class_sym_of(&tree.ty)
-                        .and_then(|cls| self.unapplied_new_error(cls))
+                        .and_then(|cls| self.unapplied_new_error(cls, &written_targs))
                     {
                         self.error(tree.span, msg);
                         tree.ty = Type::Error;

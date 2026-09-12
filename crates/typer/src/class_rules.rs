@@ -41,7 +41,7 @@ impl Typer {
     /// compiles are judged: their constructors are all known. A constructor
     /// taking a single parameter `()` could be adapted to (a type parameter,
     /// `Any`, `AnyVal`, `Unit`) is left alone, as nsc inserts the `()`.
-    pub(crate) fn unapplied_new_error(&self, cls: SymbolId) -> Option<String> {
+    pub(crate) fn unapplied_new_error(&self, cls: SymbolId, targs: &[Type]) -> Option<String> {
         let s = self.st.get(cls);
         if s.kind != SymKind::Class
             || s.flags.contains(Flags::TRAIT)
@@ -52,6 +52,7 @@ impl Typer {
             || !s.pickled_origin.is_empty()
             || s.binary_outer_desc.is_some()
             || s.name.starts_with("$anon")
+            || cls.0 < self.st.source_start
         {
             return None;
         }
@@ -67,6 +68,26 @@ impl Typer {
         let mut shown = Vec::new();
         for &c in &ctors {
             let cs = self.st.get(c);
+            // A constructor supplied from a pickle or read from a class file
+            // states no implicit clause as such, so "every parameter is
+            // omissible" cannot be read off it: `new UnrolledBuffer[Int]`,
+            // whose only clause is an implicit `ClassTag`, looked like a call
+            // missing its argument. The classfile reader names such parameters
+            // `x$0`, `x$1`, … -- having the declaration's own names is exactly
+            // the condition this rule (and nsc's "Unspecified value parameter
+            // a") needs.
+            if !cs.pickled_origin.is_empty() {
+                return None;
+            }
+            let synthetic_names = cs.paramss.iter().flatten().any(|p| {
+                let n = &self.st.get(*p).name;
+                n.strip_prefix("x$").is_some_and(|rest| {
+                    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                })
+            });
+            if synthetic_names {
+                return None;
+            }
             let Type::Method { paramss, .. } = &cs.ty else {
                 return None;
             };
@@ -78,6 +99,10 @@ impl Typer {
             if ids.len() != first.len() {
                 return None;
             }
+            // `new Gen[Int]` states the argument: the parameter is `Int`, not
+            // the declaration's `T`, so the `()`-insertion below must not read
+            // it as an open type parameter.
+            let first = self.at_written_targs(cls, targs, &first);
             let omissible = ids.iter().all(|p| {
                 let f = self.st.get(*p).flags;
                 f.contains(Flags::DEFAULTPARAM) || f.contains(Flags::IMPLICIT)
@@ -94,7 +119,11 @@ impl Typer {
         }
         let class_ty = Type::Class {
             sym: cls,
-            args: s.tparams.iter().map(|t| Type::TypeParam(*t)).collect(),
+            args: if targs.len() == s.tparams.len() && !targs.is_empty() {
+                targs.to_vec()
+            } else {
+                s.tparams.iter().map(|t| Type::TypeParam(*t)).collect()
+            },
         };
         let sig = |c: SymbolId| -> String {
             let cs = self.st.get(c);
@@ -103,6 +132,7 @@ impl Typer {
             };
             let mut out = String::new();
             for (i, clause) in paramss.iter().enumerate() {
+                let clause = &self.at_written_targs(cls, targs, clause);
                 let ids = cs.paramss.get(i).cloned().unwrap_or_default();
                 let implicit = ids
                     .first()
@@ -150,6 +180,18 @@ impl Typer {
                 alts.join(" <and>\n")
             ))
         }
+    }
+
+    /// `tys` with the class's type parameters replaced by the type arguments
+    /// the `new` wrote, when it wrote a full list.
+    fn at_written_targs(&self, cls: SymbolId, targs: &[Type], tys: &[Type]) -> Vec<Type> {
+        let tps = self.st.get(cls).tparams.clone();
+        if targs.len() != tps.len() || targs.is_empty() {
+            return tys.to_vec();
+        }
+        tys.iter()
+            .map(|t| crate::symbol::subst_tparams_slice(&tps, targs, t))
+            .collect()
     }
 
     /// nsc's namer: a parameter of a method that overrides or implements one
