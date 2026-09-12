@@ -44,7 +44,9 @@ impl Typer {
                 self.type_expr(&mut c.guard, &Type::Boolean);
             }
             self.type_expr(&mut c.body, pt);
-            res = self.lub_branches(&res, &c.body.ty);
+            // Library classes complete their parents lazily; a join that
+            // fell to `AnyRef` asks for them (`join_branches`).
+            res = self.join_branches(&res, &c.body.ty);
             branch_tys.push(c.body.ty.clone());
             self.st.gadt_bounds.truncate(gadt_mark);
             self.st.pop_scope();
@@ -521,6 +523,23 @@ impl Typer {
                 for u in unapply.iter().chain(unapply_seq.iter()) {
                     self.complete_lazy_sig(*u, pat.span);
                 }
+                // SLS 8.1.8: an extractor method takes the scrutinee as its
+                // one (first-clause) argument. `def unapply: Option[Int]`,
+                // `def unapply()` and `def unapply(a: Int, b: Int)` were
+                // accepted and called with the scrutinee anyway, which did not
+                // verify (`neg/t5078`). Judged only once the signature is
+                // complete: a lazily typed `unapply` has no clauses yet.
+                if let Some(u) = unapply.or(unapply_seq) {
+                    if self.reject_extractor_shape(u, fun, pat.span) {
+                        // Still bind the sub-patterns, so their names do not
+                        // come back as "not found" in the case body.
+                        for a in args.iter_mut() {
+                            self.type_pattern(a, &Type::Error);
+                        }
+                        pat.ty = Type::Error;
+                        return;
+                    }
+                }
                 // Without the jar there is no `Array$` / `Vector$` companion
                 // at all, so a sequence pattern on one finds no `unapplySeq`
                 // and every sub-pattern would silently come out `Any`. Say
@@ -640,8 +659,23 @@ impl Typer {
                     pat.ty = class_ty;
                     pat.sym = class_id;
                 } else if let Some(u) = unapply.filter(|_| !has_star) {
-                    let extracted = self.unapply_extracted_types(u);
-                    let extracted = self.subst_unapply_tparams(u, sel_ty, extracted);
+                    // An implicit clause after the scrutinee's: type the call
+                    // itself (see `type_unapply_call`).
+                    let (typed_ret, implicit_args) =
+                        match self.type_unapply_call(fun, u, sel_ty, pat.span) {
+                            Some((t, a)) => (Some(t), a),
+                            None => (None, Vec::new()),
+                        };
+                    let extracted = self.unapply_pattern_types(
+                        u,
+                        sel_ty,
+                        args.len(),
+                        pat.span,
+                        true,
+                        typed_ret,
+                    );
+                    let failed = extracted.is_none();
+                    let extracted = extracted.unwrap_or_else(|| vec![Type::Error; args.len()]);
                     // A scrutinee that is an inner class behind a prefix
                     // (`prefix.rs`): what its companion's `unapply` extracts
                     // is written in the enclosing class's vocabulary, and the
@@ -655,7 +689,7 @@ impl Typer {
                     } else {
                         extracted
                     };
-                    if args.len() != extracted.len() && !extracted.is_empty() {
+                    if !failed && args.len() != extracted.len() && !extracted.is_empty() {
                         self.error(
                             pat.span,
                             format!(
@@ -682,6 +716,22 @@ impl Typer {
                     // binds `c` at is narrowed separately in `TreeKind::Bind`
                     // below, which is the only place that needs it.
                     let fun = std::mem::replace(fun, Box::new(Tree::dummy(TreeKind::Empty)));
+                    // The implicit arguments ride along as `Apply(fun,
+                    // implicits)`; `gen_unapply_pattern` passes them after the
+                    // scrutinee.
+                    let fun = if implicit_args.is_empty() {
+                        fun
+                    } else {
+                        let (sym, ty, span) = (fun.sym, fun.ty.clone(), fun.span);
+                        let mut wrapped = Tree::dummy(TreeKind::Apply {
+                            fun,
+                            args: implicit_args,
+                        });
+                        wrapped.sym = sym;
+                        wrapped.ty = ty;
+                        wrapped.span = span;
+                        Box::new(wrapped)
+                    };
                     let args = std::mem::take(args);
                     pat.kind = TreeKind::UnApply { fun, args };
                     pat.sym = u;
@@ -764,7 +814,10 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
             TreeKind::UnApply { fun, args } => {
-                self.type_expr(fun, &Type::NoType);
+                // `Apply(fun, implicits)` was typed in full already.
+                if !matches!(fun.kind, TreeKind::Apply { .. }) {
+                    self.type_expr(fun, &Type::NoType);
+                }
                 let u = if pat.sym.is_none() {
                     self.find_unapply(fun, sel_ty).unwrap_or(SymbolId::NONE)
                 } else {
@@ -773,7 +826,8 @@ impl Typer {
                 let extracted = if u.is_none() {
                     vec![Type::Any; args.len()]
                 } else {
-                    self.unapply_extracted_types(u)
+                    self.unapply_pattern_types(u, sel_ty, args.len(), pat.span, false, None)
+                        .unwrap_or_else(|| vec![Type::Error; args.len()])
                 };
                 for (i, a) in args.iter_mut().enumerate() {
                     let ft = extracted.get(i).cloned().unwrap_or(Type::Any);
@@ -2181,7 +2235,12 @@ impl Typer {
     /// `Some.unapply[A](x: Option[A]): Option[A]` extracts `A`; the scrutinee
     /// says what `A` is. Without this the bound variable keeps the extractor's
     /// own type parameter and degrades to `Any`.
-    fn subst_unapply_tparams(&self, unapply: SymbolId, sel_ty: &Type, out: Vec<Type>) -> Vec<Type> {
+    pub(crate) fn subst_unapply_tparams(
+        &self,
+        unapply: SymbolId,
+        sel_ty: &Type,
+        out: Vec<Type>,
+    ) -> Vec<Type> {
         let tps = self.st.get(unapply).tparams.clone();
         if tps.is_empty() || sel_ty.is_no_type() {
             return out;
@@ -2300,7 +2359,7 @@ impl Typer {
     /// performs the same implicit type test a `case x: T` pattern does, so
     /// `case c @ LiteralNode(_) if c.volatileHint` sees `c: LiteralNode`
     /// (which declares `volatileHint`), not the scrutinee's static `Node`.
-    fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
+    pub(crate) fn unapply_receiver_type(&self, unapply: SymbolId, sel_ty: &Type) -> Option<Type> {
         let param = match &self.st.get(unapply).ty {
             Type::Method { paramss, .. } => paramss.first().and_then(|p| p.first()).cloned(),
             Type::Function { params, .. } => params.first().cloned(),
@@ -2329,18 +2388,28 @@ impl Typer {
         Some(crate::symbol::subst_tparams_slice(&ids, &tys, &param))
     }
 
-    fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
+    pub(crate) fn unapply_extracted_types(&self, unapply: SymbolId) -> Vec<Type> {
         let ret = match &self.st.get(unapply).ty {
             Type::Method { ret, .. } | Type::Function { ret, .. } => (**ret).clone(),
             t => t.clone(),
         };
+        self.unapply_extracted_types_at(unapply, ret)
+    }
+
+    /// [`Self::unapply_extracted_types`] for a result type that is not an
+    /// `Option` (no case-class fallback applies).
+    pub(crate) fn unapply_extracted_types_of(&self, ret: Type) -> Vec<Type> {
+        self.unapply_extracted_types_at(SymbolId::NONE, ret)
+    }
+
+    fn unapply_extracted_types_at(&self, unapply: SymbolId, ret: Type) -> Vec<Type> {
         if matches!(ret, Type::Boolean) {
             return vec![];
         }
         if let Type::Class { sym, args } = &ret {
             let name = self.st.get(*sym).name.as_str();
             if *sym == self.st.option_sym || name == "Option" || name == "Some" {
-                if args.is_empty() {
+                if args.is_empty() && !unapply.is_none() {
                     // A bare `Option` says nothing about what it yields: that
                     // is what an `unapply` read back from a *classfile* looks
                     // like when its signature was erased. For a case class's
@@ -2369,7 +2438,7 @@ impl Typer {
     /// `apply` of exactly the constructor's arity, which is what
     /// `synthesize_case_members` gives every case class and what a hand-written
     /// companion of a non-case class rarely matches.
-    fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
+    pub(crate) fn case_ctor_field_types(&self, module_cls: SymbolId) -> Option<Vec<Type>> {
         if module_cls.is_none() {
             return None;
         }

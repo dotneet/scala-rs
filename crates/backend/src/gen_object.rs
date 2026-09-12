@@ -446,6 +446,12 @@ impl<'a> Gen<'a> {
             // initializers, as for a class (`emit_class_ctor`). The module
             // path ran them with the rest of the body, after `T`'s `$init$`
             // had already read the field as `null`.
+            // Each one goes into a *local* first and from there into the
+            // field, as `emit_class_ctor` does: a later early definition, or a
+            // parent constructor argument, reads the local, because `getfield`
+            // on `uninitializedThis` does not verify
+            // (`object O extends { val baz = "ob" } with Foo(baz + "!")`).
+            let mut early_locals = Vec::new();
             for vd in &inits {
                 if !is_presuper_val(vd) {
                     continue;
@@ -454,16 +460,25 @@ impl<'a> Gen<'a> {
                     name, mods, rhs, ..
                 } = &vd.kind
                 {
-                    if rhs.is_empty() || mods.flags.contains(Flags::LAZY) {
+                    if rhs.is_empty() || rhs.is_default_init() || mods.flags.contains(Flags::LAZY) {
                         continue;
                     }
-                    asm.aload(0);
-                    gen_expr(asm, &mut frame, &ctx_early, rhs);
                     let ty = if vd.ty.is_no_type() && !vd.sym.is_none() {
                         st.get(vd.sym).ty.clone()
                     } else {
                         vd.ty.clone()
                     };
+                    let sort = jvm_sort(&ty);
+                    if sort == JvmSort::Void {
+                        gen_stat(asm, &mut frame, &ctx_early, rhs);
+                    } else {
+                        gen_expr(asm, &mut frame, &ctx_early, rhs);
+                    }
+                    let slot = frame.alloc(vd.sym, sort);
+                    store(asm, slot, sort);
+                    early_locals.push(vd.sym);
+                    asm.aload(0);
+                    load(asm, slot, sort);
                     emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
@@ -515,6 +530,11 @@ impl<'a> Gen<'a> {
                 }
             }
             asm.invokespecial(&super_owner, "<init>", &super_desc);
+            // The fields are readable from here on; the body reads them as
+            // fields, as nsc's does.
+            for sym in early_locals {
+                frame.locals.remove(&sym);
+            }
             if own_outer.is_none() {
                 asm.aload(0);
                 asm.putstatic(&class_name, "MODULE$", &format!("L{class_name};"));

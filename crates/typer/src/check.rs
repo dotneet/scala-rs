@@ -626,6 +626,12 @@ pub struct Typer {
     /// Saved and restored around each application, since typing an argument
     /// runs another application inside this one.
     pub(crate) undet_tvars: Vec<SymbolId>,
+    /// Classes whose parent chain `ensure_join_parents` has already walked.
+    /// `ensure_parents` only remembers the classes it *parented*; one with no
+    /// pickle to read (a Java or prelude class) repeats its jar lookup on
+    /// every call, and the join of every `if` / `match` branch asked for up
+    /// to 64 ancestors each -- gitbucket went from 13 s to over 10 min.
+    pub(crate) join_parents_done: rustc_hash::FxHashSet<u32>,
     /// Non-zero while an argument is being typed against an expected type this
     /// compiler *relaxed*: an undetermined variable in it was replaced by
     /// `Type::Wildcard` to say "the argument decides this" (`check_apply`'s
@@ -1172,6 +1178,7 @@ impl Typer {
             overload_groups: HashMap::new(),
             overload_member_types: HashMap::new(),
             undet_tvars: Vec::new(),
+            join_parents_done: rustc_hash::FxHashSet::default(),
             relaxed_pt_depth: 0,
             spec_probe: std::cell::Cell::new(false),
             tupling: false,

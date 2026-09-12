@@ -345,6 +345,61 @@ impl Typer {
     /// is, and stays open), the other branch does not mention it (one both
     /// sides carry is still the enclosing call's to fix), and it occurs
     /// covariantly (an invariant occurrence has no bound to read it at).
+    /// Complete the parents of the classes a branch type names, so that the
+    /// join can see them. A class read from the library jar gets its parents
+    /// from the pickle lazily (`ensure_parents`), and `SymbolTable::lub`
+    /// walks whatever parent list is there: with nothing attached yet,
+    /// `NumericRange.Inclusive[Int]` and `NumericRange.Exclusive[Int]` joined
+    /// to `AnyRef` instead of `NumericRange[Int]` (`run/t4658`). Typing the
+    /// branches against an `Any` expected type used to force the parents as a
+    /// side effect of `adapt`; a body typed with no expected type (nsc's
+    /// `WildcardType`) has no such accident, so the join asks for them.
+    ///
+    /// Deliberately narrow: only the branch classes themselves (one level),
+    /// and only called once a join has already fallen to `AnyRef` / `Any`.
+    /// Every parent attached here is a hierarchy every later implicit search
+    /// and linearisation walks; attaching whole ancestor chains for every
+    /// `if` / `match` made gitbucket's compile thirty times slower.
+    pub(crate) fn ensure_join_parents(&mut self, ty: &Type) {
+        if !self.library_abi {
+            return;
+        }
+        fn named_class(t: &Type) -> Option<SymbolId> {
+            match t {
+                Type::Class { sym, .. } => Some(*sym),
+                Type::Annotated { tpe, .. } => named_class(tpe),
+                _ => None,
+            }
+        }
+        let classes: Vec<SymbolId> = match ty {
+            Type::Refined { parents, .. } => parents.iter().filter_map(named_class).collect(),
+            other => named_class(other).into_iter().collect(),
+        };
+        for cls in classes {
+            // Once per class per compilation (`join_parents_done`):
+            // `ensure_parents` repeats its jar lookup for a class it has no
+            // pickle for, and the parents attached the first time stay.
+            if cls.is_none() || !self.join_parents_done.insert(cls.0) {
+                continue;
+            }
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, cls);
+        }
+    }
+
+    /// `lub_branches`, retried with the branch classes' parents completed
+    /// when the first answer is the top of the reference hierarchy -- the
+    /// answer an unattached parent list gives (see `ensure_join_parents`).
+    pub(crate) fn join_branches(&mut self, a: &Type, b: &Type) -> Type {
+        let joined = self.lub_branches(a, b);
+        if !matches!(joined, Type::AnyRef | Type::Any) {
+            return joined;
+        }
+        self.ensure_join_parents(a);
+        self.ensure_join_parents(b);
+        self.lub_branches(a, b)
+    }
+
     pub(crate) fn lub_branches(&self, a: &Type, b: &Type) -> Type {
         if a == b
             || matches!(a, Type::Nothing)

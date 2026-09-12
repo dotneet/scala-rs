@@ -37,6 +37,32 @@ pub(crate) fn link_tuple_products(st: &mut SymbolTable) {
         let Some(cls) = crate::classpath::find_by_jvm(st, &jvm) else {
             continue;
         };
+        // `ProductN[T1, …, TN]` first, as nsc lists it. Only when the class
+        // file came with the right number of type parameters: a stub with
+        // none would make every tuple a raw `ProductN`.
+        let tps = st.get(cls).tparams.clone();
+        if let Some(pn) = crate::classpath::find_by_jvm(st, &format!("scala/Product{n}"))
+            .filter(|&pn| st.get(pn).tparams.len() == n && tps.len() == n)
+        {
+            let has = st
+                .get(cls)
+                .parents
+                .iter()
+                .any(|p| matches!(p, Type::Class { sym, .. } if *sym == pn));
+            if !has {
+                let parent = Type::Class {
+                    sym: pn,
+                    args: tps.iter().map(|t| Type::TypeParam(*t)).collect(),
+                };
+                let at = st
+                    .get(cls)
+                    .parents
+                    .iter()
+                    .position(|p| matches!(p, Type::AnyRef))
+                    .map_or(0, |i| i + 1);
+                st.get_mut(cls).parents.insert(at, parent);
+            }
+        }
         for p in &extra {
             if !st.get(cls).parents.contains(p) {
                 st.get_mut(cls).parents.push(p.clone());
