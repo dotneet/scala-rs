@@ -496,7 +496,7 @@ impl Typer {
                 if let Some(bn @ Type::ByName(_)) = self.conv_first_param(conv) {
                     self.adapt(&mut old, &bn);
                 }
-                let fun = self.ref_implicit(conv, span);
+                let fun = self.ref_implicit_with_receiver(conv, span);
                 let applied = Tree {
                     id: old.id,
                     span,
@@ -2560,7 +2560,7 @@ impl Typer {
         if let Some(bn @ Type::ByName(_)) = self.conv_first_param(conv) {
             self.adapt(&mut old, &bn);
         }
-        let conv_fun = self.ref_implicit(conv, span);
+        let conv_fun = self.ref_implicit_with_receiver(conv, span);
         let applied = Tree {
             id: old.id,
             span,

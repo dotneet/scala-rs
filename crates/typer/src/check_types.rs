@@ -3223,16 +3223,23 @@ impl Typer {
         {
             return;
         }
-        // A *nested* `scala.*` object is not this pass's business. Its class
-        // file has no `ScalaSignature` of its own (a trait's nested object is
-        // pickled inside the enclosing trait), and `materialize::ensure_tag_module`
-        // hand-builds `TypeTags#TypeTag$` -- taking the presence of a symbol
-        // under that JVM name as the record that it already did. Entering the
-        // bare class file first made it stand down, and `typeOf[T]`'s
+        // `materialize::ensure_tag_module` hand-builds `TypeTags#TypeTag$` and
+        // `TypeTags#WeakTypeTag$` -- `apply(mirror, creator)` is a signature no
+        // class file carries -- and takes the presence of a symbol under that
+        // JVM name as part of the record that it did. Entering the bare class
+        // file first made it stand down, and `typeOf[T]`'s
         // `TypeTag.apply(mirror, creator)` had no `apply` to resolve to
-        // (slick's `ShapedValue` / `TableQuery` macros).
-        let simple = internal.rsplit('/').next().unwrap_or("");
-        if internal.starts_with("scala/") && simple.contains('$') {
+        // (slick's `ShapedValue` / `TableQuery` macros). Those two are the
+        // whole exception. Until 2026-09-13 this returned for *every* nested
+        // `scala.*` class, which left `scala.reflect.api.Printers.BooleanFlag`
+        // -- a nested case class whose companion carries the only
+        // `Boolean => BooleanFlag` conversion there is -- with an empty
+        // implicit scope, so `showRaw(tree, printIds = true)` could not be
+        // typed at all (12 `run` tests of the corpus).
+        if matches!(
+            internal.as_str(),
+            crate::materialize::TYPE_TAG | crate::materialize::WEAK_TYPE_TAG
+        ) {
             return;
         }
         let module = format!("{internal}$");
@@ -3266,6 +3273,19 @@ impl Typer {
             let o = self.st.get(class_id).owner;
             if !o.is_none() && self.st.get(o).is_class_like() {
                 o
+            } else if let Some(encl) = internal
+                .rsplit_once('$')
+                .and_then(|(p, _)| crate::classpath::find_by_jvm(&self.st, p))
+                .filter(|&e| self.st.get(e).is_class_like())
+            {
+                // The class itself reached the symbol table flattened, from a
+                // JVM descriptor, so its own `owner` is the *package*. The
+                // companion of an inner class still belongs to the class that
+                // encloses it: installed in the package it would look like a
+                // static object, and the call to one of its members was emitted
+                // as `Printers$BooleanFlag$.MODULE$`, a field an inner object
+                // does not have.
+                encl
             } else {
                 let pkg = internal.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
                 crate::classpath::ensure_package(&mut self.st, pkg)
@@ -3647,6 +3667,36 @@ impl Typer {
         }
     }
 
+    /// The classes of every parameter of every alternative of an overloaded
+    /// reference. Used to warm their implicit scopes before a second
+    /// applicability pass: a view that makes an argument fit is normally
+    /// declared by the companion of the *parameter* type.
+    pub(crate) fn overload_param_classes(&self, fun_ty: &Type) -> Vec<SymbolId> {
+        let alts: &[Type] = match fun_ty {
+            Type::Overload(alts) => alts,
+            other => std::slice::from_ref(other),
+        };
+        let mut out = Vec::new();
+        for alt in alts {
+            if let Type::Method { paramss, .. } = alt {
+                for clause in paramss {
+                    for p in clause {
+                        if let Some(c) = self.st.class_sym_of(p) {
+                            if !out.contains(&c) {
+                                out.push(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn warm_one_scope_pub(&mut self, c: SymbolId) -> bool {
+        self.warm_one_scope(c)
+    }
+
     fn warm_one_scope(&mut self, c: SymbolId) -> bool {
         if c.is_none() || !self.warmed_scopes.insert(c.0) {
             return false;
@@ -3723,10 +3773,7 @@ impl Typer {
         let mcls = match self.st.get(class_id).kind {
             SymKind::Module => self.st.module_class_of(class_id),
             SymKind::ModuleClass => class_id,
-            _ => match self.st.companion_module(class_id) {
-                Some(m) => self.st.module_class_of(m),
-                None => return,
-            },
+            _ => self.st.companion_module_class_for_implicits(class_id),
         };
         if mcls.is_none() {
             return;

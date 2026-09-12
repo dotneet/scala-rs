@@ -1,0 +1,8 @@
+BooleanFlag(Some(true))
+BooleanFlag(None)
+TypeRef(ThisType(scala), scala.Int, List())
+TypeRef(ThisType(scala#<id>), scala.Int#<id>, List())
+TypeRef(ThisType(scala#PKC), scala.Int#CLS, List())
+TypeRef(ThisType(scala#<id>#PKC), scala.Int#<id>#CLS, List())
+TypeRef(ThisType(scala#PKC), scala.Int#CLS, List())
+scala.Int#CLS

@@ -1462,6 +1462,19 @@ impl Typer {
             for t in &tys {
                 fresh |= self.warm_own_scope_once(t);
             }
+            // The conversion that makes an argument applicable usually lives
+            // on the companion of the *parameter* type, not of the argument's:
+            // `showRaw(tree, printIds = true)` needs
+            // `Printers.BooleanFlag.booleanToBooleanFlag`, which is in the
+            // implicit scope of `BooleanFlag` and nowhere near `Boolean`.
+            // Warming only the arguments left that call resolvable exactly
+            // when some earlier line in the file had happened to warm
+            // `BooleanFlag` -- `showRaw(tree)` on the line above was enough,
+            // so the same call compiled or did not depending on its neighbours
+            // (corpus `showraw_*`, `t6732`, `reflection-companion*`).
+            for c in self.overload_param_classes(&fun_ty) {
+                fresh |= self.warm_one_scope_pub(c);
+            }
             if fresh {
                 chosen = self.resolve_overload_targs(
                     &fun_ty,

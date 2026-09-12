@@ -2723,6 +2723,38 @@ impl SymbolTable {
             .find(|&m| self.get(m).kind == SymKind::Module && self.get(m).name == name)
     }
 
+    /// The companion module *class* of `class_id`, for SLS 7.2's implicit
+    /// scope, including the case where the two symbols do not share a name.
+    ///
+    /// A nested library class can reach the symbol table twice, by two routes
+    /// that do not agree on either name or owner: flattened, from a JVM
+    /// descriptor (`Printers$BooleanFlag`, owned by the package
+    /// `scala.reflect.api`), and nested, from the enclosing class's pickle
+    /// (`BooleanFlag$`, owned by the trait `Printers`). `companion_module`
+    /// asks for the same name under the same owner and so joins neither to the
+    /// other, and `scala.reflect.api.Printers.BooleanFlag` -- whose companion
+    /// carries the only `Boolean => BooleanFlag` conversion there is -- had an
+    /// empty implicit scope as a result.
+    ///
+    /// The JVM name is what joins them: the companion of `X` is `X$`. Only the
+    /// implicit-scope callers use this; `companion_module`'s own answer is a
+    /// *module* symbol, which a pickled module class is not.
+    pub fn companion_module_class_for_implicits(&self, class_id: SymbolId) -> SymbolId {
+        if let Some(m) = self.companion_module(class_id) {
+            return self.module_class_of(m);
+        }
+        let jvm = &self.get(class_id).jvm_name;
+        if jvm.is_empty() || jvm.ends_with('$') {
+            return SymbolId::NONE;
+        }
+        let module = format!("{jvm}$");
+        match self.find_class_by_jvm(&module) {
+            Some(m) if self.get(m).kind == SymKind::ModuleClass => m,
+            Some(m) if self.get(m).kind == SymKind::Module => self.module_class_of(m),
+            _ => SymbolId::NONE,
+        }
+    }
+
     pub fn module_class_of(&self, id: SymbolId) -> SymbolId {
         match self.get(id).ty {
             Type::ModuleRef(c) => c,

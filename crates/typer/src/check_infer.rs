@@ -3576,7 +3576,7 @@ impl Typer {
                 if let Some(bn @ Type::ByName(_)) = self.conv_first_param(id) {
                     self.adapt(&mut arg, &bn);
                 }
-                let fun = self.ref_implicit(id, span);
+                let fun = self.ref_implicit_with_receiver(id, span);
                 let applied = Tree {
                     id: arg.id,
                     span,
@@ -4403,7 +4403,7 @@ impl Typer {
         };
         match self.search_implicit(&ct_ty) {
             ImplicitSearch::Found(id) => {
-                let mut recv = self.ref_implicit(id, span);
+                let mut recv = self.ref_implicit_with_receiver(id, span);
                 self.adapt(&mut recv, &ct_ty);
                 let sel = Tree {
                     id: NodeId(0),

@@ -1884,6 +1884,100 @@ impl Typer {
     /// The tree for a resolved implicit. A derivation rule
     /// (`implicit def listShow[A](implicit s: Show[A]): Show[List[A]]`) is
     /// applied to its own implicits, which are resolved the same way.
+    /// Whether an `object` needs an instance to reach it: it is nested in a
+    /// *class*, not in a package or another object, so its class file has no
+    /// `MODULE$` field and it exists once per instance of that class.
+    ///
+    /// The symbol's own owner cannot answer this for a library class: a nested
+    /// class reached through a JVM descriptor is flattened into its package, so
+    /// `scala.reflect.api.Printers.BooleanFlag`'s companion looks package-owned
+    /// whatever the source said. The JVM name does answer it -- `A$B$` is
+    /// nested in `A$` when `A$` is itself a module and in the class `A`
+    /// otherwise.
+    fn object_needs_instance_receiver(&self, mcls: SymbolId) -> bool {
+        let outer = self.st.get(mcls).owner;
+        if !outer.is_none() && self.st.get(outer).kind == SymKind::Class {
+            return true;
+        }
+        let jvm = self.st.get(mcls).jvm_name.clone();
+        let Some((enclosing, _)) = jvm.trim_end_matches('$').rsplit_once('$') else {
+            return false;
+        };
+        if enclosing.is_empty() {
+            return false;
+        }
+        // `A$B$` inside `A$`: a static object, its own receiver.
+        if crate::classpath::find_by_jvm(&self.st, &format!("{enclosing}$")).is_some() {
+            return false;
+        }
+        match crate::classpath::find_by_jvm(&self.st, enclosing) {
+            Some(e) => self.st.get(e).kind == SymKind::Class,
+            // Not in the symbol table at all: the class file says the name is
+            // nested, and only a class can enclose a name no module accounts
+            // for.
+            None => true,
+        }
+    }
+
+    /// [`Typer::ref_implicit`] plus the receiver an implicit declared by an
+    /// `object` *nested in a class* needs.
+    ///
+    /// `scala.reflect.api.Printers.BooleanFlag`'s companion declares the only
+    /// `Boolean => BooleanFlag` conversion there is, and that companion is an
+    /// inner object of the trait `Printers`: it exists once per universe and is
+    /// reached by calling `universe.BooleanFlag()`. `ref_implicit` has no
+    /// receiver to offer for it -- the routes it knows are a static object, a
+    /// wildcard-imported object, and an `import <value>._` prefix for the
+    /// *declaring* class -- so the call was emitted bare and codegen read
+    /// `Printers$BooleanFlag$.MODULE$`, a field that does not exist
+    /// (`NoSuchFieldError: MODULE$` at run time, from a program that
+    /// typechecked).
+    ///
+    /// The receiver is built by typing the object's own name exactly as the
+    /// source would (`BooleanFlag` under `import scala.reflect.runtime
+    /// .universe._` types to `scala.reflect.runtime.universe.BooleanFlag`), and
+    /// the reference is left bare when that does not resolve to this very
+    /// object -- so an implicit whose object cannot be named here keeps
+    /// whatever diagnostic it had rather than gaining a wrong receiver.
+    pub(crate) fn ref_implicit_with_receiver(&mut self, id: SymbolId, span: Span) -> Tree {
+        let mut tree = self.ref_implicit(id, span);
+        if !matches!(tree.kind, TreeKind::Ident { .. }) {
+            return tree;
+        }
+        let owner = self.st.get(id).owner;
+        if owner.is_none() || self.st.get(owner).kind != SymKind::ModuleClass {
+            return tree;
+        }
+        if !self.object_needs_instance_receiver(owner) {
+            return tree;
+        }
+        // Written inside the object, or a class it encloses: its own `this`.
+        if self.st.enclosing_class_reaching(owner).is_some() {
+            return tree;
+        }
+        let mname = self.st.get(owner).name.trim_end_matches('$').to_string();
+        if mname.is_empty() {
+            return tree;
+        }
+        let mut qual = Tree::dummy(TreeKind::Ident { name: mname });
+        qual.span = span;
+        let mark = self.diags.len();
+        self.type_expr(&mut qual, &Type::NoType);
+        self.diags.truncate(mark);
+        if self.st.class_sym_of(&qual.ty) != Some(owner) {
+            return tree;
+        }
+        let name = match &tree.kind {
+            TreeKind::Ident { name } => name.clone(),
+            _ => return tree,
+        };
+        tree.kind = TreeKind::Select {
+            qual: Box::new(qual),
+            name,
+        };
+        tree
+    }
+
     pub(crate) fn implicit_tree(
         &mut self,
         id: SymbolId,
@@ -1919,7 +2013,7 @@ impl Typer {
     fn implicit_tree_in(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
         let (paramss, ret) = match self.implicit_candidate_ty(id).into_owned() {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
-            _ => return self.ref_implicit(id, span),
+            _ => return self.ref_implicit_with_receiver(id, span),
         };
         let tps = self.st.get(id).tparams.clone();
         // The solved type arguments of a polymorphic implicit
@@ -1930,7 +2024,7 @@ impl Typer {
             .map(|f| f.targs)
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
-        let mut reference = self.ref_implicit(id, span);
+        let mut reference = self.ref_implicit_with_receiver(id, span);
         if self.st.get(id).macro_impl.is_some() && !targs.is_empty() {
             let args = targs
                 .iter()

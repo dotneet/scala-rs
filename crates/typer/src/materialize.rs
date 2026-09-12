@@ -60,9 +60,9 @@ use scala_rs_span::Span;
 use crate::symbol::{SymKind, SymbolTable};
 
 /// `scala.reflect.api.TypeTags#TypeTag`, as the class file names it.
-const TYPE_TAG: &str = "scala/reflect/api/TypeTags$TypeTag";
+pub(crate) const TYPE_TAG: &str = "scala/reflect/api/TypeTags$TypeTag";
 /// `scala.reflect.api.TypeTags#WeakTypeTag`.
-const WEAK_TYPE_TAG: &str = "scala/reflect/api/TypeTags$WeakTypeTag";
+pub(crate) const WEAK_TYPE_TAG: &str = "scala/reflect/api/TypeTags$WeakTypeTag";
 const MIRROR: &str = "scala/reflect/api/Mirror";
 const TYPE_CREATOR: &str = "scala/reflect/api/TypeCreator";
 

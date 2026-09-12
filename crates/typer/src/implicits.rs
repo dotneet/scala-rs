@@ -671,12 +671,21 @@ impl Typer {
             // Reached as a module *class*; there is no back-pointer to the
             // module symbol, so nothing is recorded for it.
             SymKind::ModuleClass => (SymbolId::NONE, class_id),
-            _ => {
-                let Some(module) = self.st.companion_module(class_id) else {
-                    return out;
-                };
-                (module, self.st.module_class_of(module))
-            }
+            _ => match self.st.companion_module(class_id) {
+                Some(module) => (module, self.st.module_class_of(module)),
+                // A nested library class whose flattened class symbol and
+                // pickled companion module class share no name, joined by the
+                // JVM name instead. There is no module *symbol* to name, so
+                // the `implicit_via_module` bookkeeping below is skipped
+                // exactly as it is for a `ModuleClass` reached directly.
+                None => {
+                    let mcls = self.st.companion_module_class_for_implicits(class_id);
+                    if mcls.is_none() {
+                        return out;
+                    }
+                    (SymbolId::NONE, mcls)
+                }
+            },
         };
         // SLS 7.2 names the companion *object*, and an object's members
         // include the ones it inherits. slick declares every `Shape` instance
