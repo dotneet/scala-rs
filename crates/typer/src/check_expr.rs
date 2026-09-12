@@ -1304,7 +1304,31 @@ impl Typer {
                 // made `fromIterator[IO](it, chunkSize = 1)` an application of
                 // the method itself -- "named arguments (method parameters not
                 // resolved)", since a nullary method has none.
-                if matches!(fun_pt, Type::Method { .. }) && !matches!(fun.ty, Type::Overload(_)) {
+                // Never a *Java* method, though. Java has no parameterless
+                // methods: `Collections.emptyIterator[T]()` takes an empty
+                // clause, and the `()` that follows is that clause. The class
+                // file reader installs a zero-argument Java method with no
+                // clause at all, so it looked parameterless here, was
+                // auto-applied, and the `()` became an `apply()` on its
+                // result -- "value apply is not a member of Iterator[String]".
+                // Give it its empty clause back for the enclosing `Apply`.
+                let java_nullary = !fun.sym.is_none()
+                    && self
+                        .st
+                        .get(fun.sym)
+                        .flags
+                        .contains(scala_rs_parser::Flags::JAVA)
+                    && matches!(&fun.ty, Type::Method { paramss, .. } if paramss.is_empty());
+                if matches!(fun_pt, Type::Method { .. }) && java_nullary {
+                    if let Type::Method { ret, .. } = &fun.ty {
+                        fun.ty = Type::Method {
+                            paramss: vec![vec![]],
+                            ret: ret.clone(),
+                        };
+                    }
+                } else if matches!(fun_pt, Type::Method { .. })
+                    && !matches!(fun.ty, Type::Overload(_))
+                {
                     fun.ty = self.maybe_auto_apply(fun.ty.clone(), &Type::NoType);
                 }
                 let mut targs = Vec::new();
@@ -1794,7 +1818,9 @@ impl Typer {
                     self.adapt(elsep, &num);
                     tree.ty = num;
                 } else {
-                    let joined = self.lub_branches(&thenp.ty, &elsep.ty);
+                    // Library classes complete their parents lazily; a join
+                    // that fell to `AnyRef` asks for them (`join_branches`).
+                    let joined = self.join_branches(&thenp.ty, &elsep.ty);
                     tree.ty = self.branch_result_ty(pt, &branch_tys, joined);
                 }
             }
@@ -2284,6 +2310,17 @@ impl Typer {
                         );
                         return;
                     }
+                    // Whether the one clause is *implicit* is recorded in the
+                    // pickle and not in the class file, whose reader leaves it
+                    // an ordinary parameter. Without the pickled constructor
+                    // `new UnrolledBuffer[Int]` -- one implicit `ClassTag`
+                    // clause -- was neither filled nor reported, and codegen
+                    // emitted an `<init>()` the class does not have
+                    // (`NoSuchMethodError`). The applied path supplies them the
+                    // same way before picking a constructor.
+                    if let Some(cls) = self.st.class_sym_of(&tree.ty) {
+                        self.supply_binary_ctors(cls);
+                    }
                     let fillable = self.st.class_sym_of(&tree.ty).is_some_and(|cls| {
                         self.parent_ctor_is_fillable(cls) || self.bare_new_needs_application(cls)
                     });
@@ -2307,10 +2344,14 @@ impl Typer {
                         self.type_apply(tree, pt);
                         return;
                     }
+                    let written_targs = match &tree.ty {
+                        Type::Class { args, .. } => args.clone(),
+                        _ => Vec::new(),
+                    };
                     if let Some(msg) = self
                         .st
                         .class_sym_of(&tree.ty)
-                        .and_then(|cls| self.unapplied_new_error(cls))
+                        .and_then(|cls| self.unapplied_new_error(cls, &written_targs))
                     {
                         self.error(tree.span, msg);
                         tree.ty = Type::Error;

@@ -230,6 +230,12 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
     }
 
     attach_classpath_parents(st, classes, &installed);
+    // Everything after this point is this run's own source (or a pickle
+    // member supplied on demand). `class_rules::unapplied_new_error` judges
+    // only those: a constructor read from a classfile has no implicit marker,
+    // so `new UnrolledBuffer[Int]` -- whose clause is an implicit `ClassTag` --
+    // looked like a call missing its argument.
+    st.source_start = st.symbols.len() as u32;
 }
 
 /// Give each `-cp` class the parents its classfile header names.

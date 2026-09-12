@@ -41,7 +41,9 @@ mod macros;
 mod materialize;
 mod materialize_manifest;
 mod modifier_rules;
+mod name_based;
 mod named_eval_order;
+mod ops_shape;
 mod overload_ref;
 mod overload_value;
 mod override_check;
@@ -91,6 +93,7 @@ mod prelude_oshadow;
 mod prelude_ovl2;
 mod prelude_ovl3;
 mod prelude_paramnames;
+mod prelude_polymap;
 mod prelude_product;
 mod prelude_reflect;
 mod prelude_reflectruntime;
@@ -105,6 +108,7 @@ mod prelude_strhier;
 mod prelude_stringops8;
 mod prelude_strmap;
 mod prelude_text;
+mod prelude_toseq;
 mod prelude_tuple;
 mod prelude_universal;
 mod prelude_variance;
@@ -172,8 +176,8 @@ pub use rassoc::restore_rassoc_order;
 pub use source_features::{ParsedFeatures, SourceFeature, SourceFeatures};
 pub use specialize::{rewrite_specialized_calls, specialize_method_defs};
 pub use symbol::{
-    bool_shortcircuit_rhs, Intrinsic, MacroBinding, MethodVariant, SamSig, SeqPayload, SymKind,
-    Symbol, SymbolTable, AS_SEEN_FROM_MARK,
+    bool_shortcircuit_rhs, Intrinsic, MacroBinding, MethodVariant, NameBasedUnapply, SamSig,
+    SeqPayload, SymKind, Symbol, SymbolTable, UnapplySelectors, AS_SEEN_FROM_MARK,
 };
 pub use uncurry::uncurry;
 pub use value_companion::add_value_class_companions;

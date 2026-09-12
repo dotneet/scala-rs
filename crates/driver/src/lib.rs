@@ -1245,6 +1245,9 @@ object Main {
             xasync: false,
             no_specialization: false,
             kind_projector: false,
+            deprecation: false,
+            feature: false,
+            nowarn: false,
         };
         let result = compile_paths(&[src], &opts);
         assert!(result.ok(), "compile failed:\n{}", result.render_diags());
