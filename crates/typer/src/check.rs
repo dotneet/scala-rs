@@ -377,6 +377,11 @@ pub struct Typer {
     pub(crate) sigs_only: bool,
     /// Some source mentions `@compileTimeOnly`; see `crate::compile_time_only`.
     pub(crate) any_cto: bool,
+    /// `crate::annot_resolve` is resolving an annotation's own name. It
+    /// reaches `tree_to_type` with the annotation's span, and
+    /// `@compileTimeOnly` is reported at the annotated *definition*
+    /// (`note_cto_type_name`), so the type hook stays quiet there.
+    pub(crate) resolving_annot: bool,
     /// The definition whose written result type is being resolved; its own
     /// `@compileTimeOnly` covers it (the owner has been restored by then).
     pub(crate) cto_sig_owner: SymbolId,
@@ -1060,6 +1065,7 @@ impl Typer {
             import_text: HashMap::new(),
             sigs_only: false,
             any_cto: false,
+            resolving_annot: false,
             cto_sig_owner: SymbolId::NONE,
             cto_deferred: None,
             header_pass: false,

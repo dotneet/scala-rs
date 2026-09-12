@@ -97,7 +97,7 @@ impl Typer {
     /// A written type tree resolved to `sym`: report it unless the
     /// definition being typed is (inside) an annotated one.
     pub(crate) fn note_cto_ref(&mut self, sym: SymbolId, span: Span) {
-        if !self.any_cto || self.header_pass || sym.is_none() {
+        if !self.any_cto || self.header_pass || self.resolving_annot || sym.is_none() {
             return;
         }
         let Some(msg) = self.cto_message(sym) else {
