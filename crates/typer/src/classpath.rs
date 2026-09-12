@@ -1740,7 +1740,60 @@ fn mark_java_package_private(st: &mut SymbolTable, id: SymbolId, owner: SymbolId
     st.get_mut(id).private_within = Some(name);
 }
 
+/// The members a *Scala trait* defines itself although its interface declares
+/// them `ACC_ABSTRACT`.
+///
+/// A trait's `def` with a body compiles to a `default` method, so the class
+/// file says what the source said. Two shapes do not, and both are ordinary
+/// concrete definitions:
+///
+/// * a **`val` the trait initialises**. The value is assigned by the trait's
+///   `$init$` through a synthetic setter named `pkg$Owner$_setter_$x_$eq`, and
+///   the getter `x()` is left abstract for the implementing class's field. The
+///   setter exists only when the trait has a right-hand side to assign --
+///   `val api: API` in `BasicProfile` has none, `val capabilities = …` in the
+///   same trait has one -- so it is exactly the evidence wanted.
+/// * a **nested `object`**. Its accessor `X(): Owner$X$` is abstract in the
+///   interface for the same reason; the module class is what makes it a
+///   definition. slick's profile cake has thirteen of them (`SelectPart`,
+///   `FromPart`, `DDL`, `Sequence`, …).
+///
+/// nsc never asks the class file: `DEFERRED` comes from the pickle, where both
+/// shapes are concrete. Reading the JVM flag instead asked every
+/// `object X extends <jar profile>` to implement fourteen members it inherits
+/// (gitbucket's `BlockingPostgresDriver`).
+fn scala_trait_defined_members(
+    c: &crate::javaclass::JavaClass,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if !c.is_scala {
+        return out;
+    }
+    for m in &c.methods {
+        if let Some(rest) = m.name.split("$_setter_$").nth(1) {
+            if let Some(n) = rest.strip_suffix("_$eq") {
+                out.insert(n.to_string());
+            }
+        }
+        // `()LOwner$Name$;` and the method is called `Name`: the module
+        // accessor of an `object Name` nested in this very class.
+        let module = format!("(){}${}$;", module_desc_head(&c.internal_name), m.name);
+        if m.desc == module {
+            out.insert(m.name.clone());
+        }
+    }
+    out
+}
+
+/// `L<internal name>` -- the head of the descriptor of a class nested in
+/// `internal`, whose own `$` suffix (a module class) is not part of the
+/// nesting prefix.
+fn module_desc_head(internal: &str) -> String {
+    format!("L{}", internal.trim_end_matches('$'))
+}
+
 fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass::JavaClass) {
+    let trait_defined = scala_trait_defined_members(c);
     for m in &c.methods {
         if is_erased_scala_forwarder(st, owner, c, m) {
             continue;
@@ -1764,6 +1817,9 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                 if had.contains(pickled) {
                     f = f.with(pickled);
                 }
+            }
+            if trait_defined.contains(&m.name) {
+                f.set(Flags::ABSTRACT, false);
             }
             st.get_mut(id).flags = f;
             if st.get(id).jvm_name.is_empty() {
@@ -1823,7 +1879,10 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             }
         }
         let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
-        let flags = java_method_flags(m, c.is_scala);
+        let mut flags = java_method_flags(m, c.is_scala);
+        if trait_defined.contains(&m.name) {
+            flags.set(Flags::ABSTRACT, false);
+        }
         let id = add_method_types(st, owner, &m.name, names, params, ret);
         st.get_mut(id).flags = flags;
         mark_java_package_private(st, id, owner, m.access);

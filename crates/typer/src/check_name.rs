@@ -528,6 +528,27 @@ impl Typer {
     /// its `dateColumnType` -- as `gitbucket.core.model.Profile.profile`, the
     /// object's, where nsc has `X.this.profile`. One instance in gitbucket;
     /// for any other the program silently used the wrong one.
+    /// The class whose members an `import p._` in scope offered, given the
+    /// class that *declares* the member the name resolved to.
+    ///
+    /// `import profile.api._` on a `profile: JdbcProfile` offers the members
+    /// of `JdbcProfile#API`; the alias `BaseColumnType` the name binds to is
+    /// declared in its ancestor `RelationalProfile#API`. The import's own
+    /// class is the prefix nsc's `rebind` works against, and it is the only
+    /// thing that says which *profile* the alias's `C.this` means, so
+    /// [`Typer::rebind_outer_type_member`] needs it rather than the declaring
+    /// class.
+    pub(crate) fn import_prefix_class_for(&self, owner: SymbolId) -> Option<SymbolId> {
+        if owner.is_none() || self.term_import_prefixes.is_empty() {
+            return None;
+        }
+        self.term_import_prefixes
+            .iter()
+            .rev()
+            .map(|(o, _)| *o)
+            .find(|&o| o == owner || crate::pickle_supply::inherits_from(&self.st, o, owner))
+    }
+
     pub(crate) fn term_import_prefix_for(&self, owner: SymbolId) -> Option<Tree> {
         if owner.is_none() || self.term_import_prefixes.is_empty() {
             return None;

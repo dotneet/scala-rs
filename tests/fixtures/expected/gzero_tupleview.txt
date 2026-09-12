@@ -1,0 +1,7 @@
+a
+other1
+(a,other2)
+(other3,b)
+(c,other4,other5)
+((d,other6),other7)
+(e,other8)|(f,other9)

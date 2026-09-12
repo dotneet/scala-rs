@@ -183,6 +183,7 @@ impl Typer {
                     }
                 }
                 let ty = self.reject_unresolved_type(ty, &name, tpt.span);
+                let ty = self.rebind_imported_type_member(ty);
                 let ty = self.this_prefixed(ty);
                 self.import_prefixed(&name, ty, tpt.span)
             }
@@ -1473,7 +1474,8 @@ impl Typer {
                 self.pickle
                     .complete_type_member(&mut self.st, &mut self.binary, cls, name)
             {
-                return self.st.expand_in_type(prefix, &ty);
+                let ty = self.st.expand_in_type(prefix, &ty);
+                return self.rebind_outer_type_member(cls, SymbolId::NONE, ty);
             }
         }
         for m in found {
@@ -1483,7 +1485,8 @@ impl Typer {
                 _ => continue,
             };
             self.note_cto_ref(m, span);
-            return self.st.expand_in_type(prefix, &ty);
+            let ty = self.st.expand_in_type(prefix, &ty);
+            return self.rebind_outer_type_member(cls, m, ty);
         }
         // Nothing under that name yet. A class read from a jar has its members
         // completed one at a time, and its *type* members were never completed
@@ -1495,7 +1498,8 @@ impl Typer {
                 self.pickle
                     .complete_type_member(&mut self.st, &mut self.binary, cls, name)
             {
-                return self.st.expand_in_type(prefix, &ty);
+                let ty = self.st.expand_in_type(prefix, &ty);
+                return self.rebind_outer_type_member(cls, SymbolId::NONE, ty);
             }
         }
         self.error(
@@ -1506,6 +1510,228 @@ impl Typer {
             ),
         );
         Type::Error
+    }
+
+    /// [`Self::rebind_outer_type_member`] for a name an `import p._` brought
+    /// into scope, where the prefix is the import's qualifier rather than a
+    /// written one.
+    ///
+    /// `trait Profile { val profile: BlockingJdbcProfile; import
+    /// profile.blockingApi._; … BaseColumnType[java.sql.Timestamp] … }` is
+    /// gitbucket's own shape: the name binds to `RelationalProfile#API`'s
+    /// alias, and only the import says that the `C.this` in its right-hand
+    /// side is *this* profile.
+    fn rebind_imported_type_member(&mut self, ty: Type) -> Type {
+        let Some((alias, _)) = self.outer_this_alias_target(SymbolId::NONE, &ty) else {
+            return ty;
+        };
+        let owner = self.st.get(alias).owner;
+        let Some(cls) = self.import_prefix_class_for(owner) else {
+            return ty;
+        };
+        self.rebind_outer_type_member(cls, SymbolId::NONE, ty)
+    }
+
+    /// nsc's `Types.rebind`, for the one shape a pickle cannot record.
+    ///
+    /// A nested trait's alias may be written in terms of its *enclosing*
+    /// class's `this`: slick's `trait RelationalProfile { self =>` declares
+    /// `trait API { type BaseColumnType[T] = self.BaseColumnType[T] }`, whose
+    /// right-hand side is the abstract `type BaseColumnType[T] <:
+    /// ColumnType[T] with BaseTypedType[T]` of `RelationalTypesComponent`.
+    /// `SigType` has no room for a `THIStpe` prefix, so the pickle records it
+    /// beside the member (`binary_alias_prefixes`) and the converted
+    /// right-hand side arrives as a bare deferred member -- of a class that
+    /// the *use site's* enclosing instance may well fix.
+    ///
+    /// nsc never leaves such a reference abstract: every `TypeRef(pre, sym,
+    /// args)` it builds goes through `rebind`, which replaces an overridable
+    /// `sym` by `pre.nonPrivateMember(sym.name)`. `asSeenFrom` maps the
+    /// alias's `C.this` to the outer instance of the selection's own prefix,
+    /// so the overriding member is looked for in the enclosing classes of the
+    /// prefix's class: `profile.api.BaseColumnType[Timestamp]` on a `profile:
+    /// JdbcProfile` is `JdbcTypesComponent`'s `JdbcType[T] with
+    /// BaseTypedType[T]`, which is what lets the implicit
+    /// `timestampColumnType` fit gitbucket's `MappedColumnType.base[Date,
+    /// Timestamp]`.
+    ///
+    /// Only a *deferred* right-hand side of an alias that really carries a
+    /// `C.this` prefix is rebound, and only to a definition the enclosing
+    /// class really has: with nothing more derived in sight the abstract
+    /// member stands, exactly as before.
+    fn rebind_outer_type_member(&mut self, cls: SymbolId, m: SymbolId, seen: Type) -> Type {
+        if !self.library_abi || cls.is_none() {
+            return seen;
+        }
+        let Some((alias, d)) = self.outer_this_alias_target(m, &seen) else {
+            return seen;
+        };
+        // The class whose `this` the alias's right-hand side was written
+        // against, and the instance of it the prefix carries: an enclosing
+        // class of the prefix's own class.
+        let Some(this_class) = self.binary_alias_this_class(alias) else {
+            return seen;
+        };
+        self.rebind_deferred_in_outer(cls, d, this_class)
+            .unwrap_or(seen)
+    }
+
+    /// The definition of the deferred type member `d` that the first enclosing
+    /// class of `cls` deriving from `want` gives it, when there is one.
+    ///
+    /// `cls` is the class the *prefix* names, so its enclosing classes are the
+    /// outer instances the prefix carries; `want` is the class whose `this`
+    /// the reference was written against. Nothing is returned when the outer
+    /// class leaves the member abstract too, or when the definition does not
+    /// take the same number of parameters -- then the declaration stands.
+    fn rebind_deferred_in_outer(
+        &mut self,
+        cls: SymbolId,
+        d: SymbolId,
+        want: SymbolId,
+    ) -> Option<Type> {
+        let name = self.st.get(d).name.clone();
+        let arity = self.st.get(d).tparams.len();
+        for outer in self.st.enclosing_classes(cls) {
+            if outer == cls || !(outer == want || self.st.is_ancestor_of(want, outer)) {
+                continue;
+            }
+            let found =
+                self.pickle
+                    .complete_type_member(&mut self.st, &mut self.binary, outer, &name);
+            let ty = found?;
+            let same_or_abstract = match &ty {
+                Type::TypeMember(x) => *x == d || self.st.is_deferred_type_member(*x),
+                _ => false,
+            };
+            let fits = match &ty {
+                Type::TypeMember(x) => self.st.get(*x).tparams.len() == arity,
+                _ => arity == 0,
+            };
+            return (!same_or_abstract && fits).then_some(ty);
+        }
+        None
+    }
+
+    /// The deferred type members of a receiver's *outer* class that the
+    /// `import p._` the receiver was named through fixes.
+    ///
+    /// A jar method's signature may name an abstract type member of the class
+    /// that *encloses* its own: slick's `MappedColumnTypeFactory` is an inner
+    /// trait of `RelationalTypesComponent`, and its
+    /// `base[T: ClassTag, U: BaseColumnType]` means
+    /// `RelationalTypesComponent.this.BaseColumnType`. nsc reads that through
+    /// the receiver's prefix -- `profile.MappedColumnTypeFactory`, whose outer
+    /// is `profile.type` -- and `rebind`s it to the definition the profile
+    /// has. Here the receiver is a bare class type, so the outer instance
+    /// comes from the import the receiver was named through:
+    /// `import profile.blockingApi._` says that the enclosing profile is
+    /// `profile`, a `BlockingJdbcProfile`, whose `JdbcTypesComponent` fixes
+    /// `BaseColumnType[T] = JdbcType[T] with BaseTypedType[T]`. That is what
+    /// makes gitbucket's `MappedColumnType.base[java.util.Date,
+    /// java.sql.Timestamp]` find `timestampColumnType`.
+    ///
+    /// Only a member of a class the receiver's class is *nested in* is
+    /// rebound: one of the receiver's own is read through the receiver, which
+    /// [`Self::warm_receiver_type_members`] and the as-seen-from substitution
+    /// already do.
+    pub(crate) fn receiver_outer_rebinds(
+        &mut self,
+        qual: &Tree,
+        recv_ty: &Type,
+        found: &[SymbolId],
+    ) -> Vec<(SymbolId, Type)> {
+        if !self.library_abi || qual.sym.is_none() {
+            return Vec::new();
+        }
+        let Some(recv_cls) = self.st.class_sym_of(recv_ty) else {
+            return Vec::new();
+        };
+        let owner = self.st.get(qual.sym).owner;
+        let Some(import_cls) = self.import_prefix_class_for(owner) else {
+            return Vec::new();
+        };
+        let outers: Vec<SymbolId> = self
+            .st
+            .enclosing_classes(recv_cls)
+            .into_iter()
+            .skip(1)
+            .collect();
+        if outers.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(SymbolId, Type)> = Vec::new();
+        for &s in found {
+            let ty = self.st.get(s).ty.clone();
+            for d in self.st.type_members_in(&ty) {
+                if out.iter().any(|(x, _)| *x == d) || !self.st.is_deferred_type_member(d) {
+                    continue;
+                }
+                let o = self.st.get(d).owner;
+                if o.is_none() {
+                    continue;
+                }
+                let encloses = outers
+                    .iter()
+                    .any(|&e| e == o || self.st.is_ancestor_of(o, e));
+                if !encloses {
+                    continue;
+                }
+                if let Some(t) = self.rebind_deferred_in_outer(import_cls, d, o) {
+                    out.push((d, t));
+                }
+            }
+        }
+        out
+    }
+
+    /// The alias symbol behind `seen` and the deferred member its right-hand
+    /// side names, when that member is not one the prefix's own class has.
+    ///
+    /// `m` is the member the selection resolved to, which is the alias itself
+    /// for a nullary alias (whose right-hand side replaces it outright); for a
+    /// parameterised one `seen` is the alias symbol and the right-hand side
+    /// sits in its `ty`.
+    fn outer_this_alias_target(&self, m: SymbolId, seen: &Type) -> Option<(SymbolId, SymbolId)> {
+        let alias = match seen {
+            Type::TypeMember(a) if !self.st.get(*a).tparams.is_empty() => *a,
+            _ if self.st.get(m).kind == SymKind::TypeMember => m,
+            _ => return None,
+        };
+        let rhs = if alias == m {
+            seen.clone()
+        } else {
+            self.st.get(alias).ty.clone()
+        };
+        let core = match &rhs {
+            Type::Applied { ctor, .. } => (**ctor).clone(),
+            other => other.clone(),
+        };
+        let Type::TypeMember(d) = core else {
+            return None;
+        };
+        if d == alias || !self.st.is_deferred_type_member(d) {
+            return None;
+        }
+        Some((alias, d))
+    }
+
+    /// The class `C` of a `C.this.X` right-hand side the pickle recorded for
+    /// `alias`, when `C` encloses the alias's own owner (which is what makes
+    /// it an *outer* instance rather than the alias's own class).
+    fn binary_alias_this_class(&self, alias: SymbolId) -> Option<SymbolId> {
+        let owner = self.st.get(alias).owner;
+        let name = self.st.get(alias).name.clone();
+        let prefix = self.st.binary_alias_prefixes.get(&(owner, name))?;
+        let scala_rs_pickle::sym::SigType::This(full) = prefix else {
+            return None;
+        };
+        let internal = full.replace('.', "/");
+        let this_class =
+            self.st.enclosing_classes(owner).into_iter().find(|&c| {
+                c != owner && self.st.get(c).jvm_name.trim_end_matches('$') == internal
+            })?;
+        Some(this_class)
     }
 
     fn path_dependent_type(&mut self, span: Span, prefix: &Tree, name: &str) -> Type {
@@ -3140,6 +3366,24 @@ impl Typer {
                         args.push(self.classtag_apply_fallback(want, span).unwrap());
                     }
                     _ => {
+                        // SLS 7.2: an implicit parameter of type `A => B` is a
+                        // view request, and an `implicit def` answers it
+                        // eta-expanded -- the same fallback
+                        // `fill_implicit_params_in` makes for a method's own
+                        // clause. An *inserted conversion*'s clause never got
+                        // it, so a rule whose parameter is a view could not be
+                        // applied: slick's `Ordered.tuple2Ordered(t)(ev1, ev2)`
+                        // wants `ev2: Rep[Int] => Ordered`, which is
+                        // `columnToOrdered`, and gitbucket's
+                        // `sortBy { … => issue.issueId.desc -> commentId }` had
+                        // no `Ordered` for its pair.
+                        if let Some(lam) = self
+                            .identity_view(want, span)
+                            .or_else(|| self.conversion_view(want, span))
+                        {
+                            args.push(lam);
+                            continue;
+                        }
                         let diverged = self.diverged_implicit.borrow().clone();
                         self.error(span, self.missing_implicit_message(want, diverged));
                         return tree;

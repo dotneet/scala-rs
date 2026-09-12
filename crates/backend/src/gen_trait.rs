@@ -322,7 +322,101 @@ impl<'a> Gen<'a> {
                 None => {}
             }
         }
+        // A trait from a **jar** reaches the symbol table only through its
+        // pickle, member by member as the typer asks (`load_classpath` reads
+        // directories and loose class files, never jars), so the mixin setters
+        // -- which no source program ever names -- are simply not there. The
+        // class file is, and `BinaryParents` can read it.
+        for (name, ty, mutable) in self.classfile_trait_vals(trait_id) {
+            if !out.iter().any(|(n, _, _)| *n == name) {
+                out.push((name, ty, mutable));
+            }
+        }
         out
+    }
+
+    /// [`Gen::binary_trait_vals`] read off the trait's **class file** rather
+    /// than the symbol table, for a trait that came from a jar.
+    ///
+    /// The field's type is recovered from the setter's descriptor: a primitive
+    /// exactly, a reference through the run's JVM-name index, which holds
+    /// every class-like symbol the typer has. A reference whose class the
+    /// typer never named is skipped rather than guessed -- emitting a field of
+    /// the wrong descriptor would not implement the interface's setter at all.
+    fn classfile_trait_vals(&self, trait_id: SymbolId) -> Vec<(String, Type, bool)> {
+        let Some(bp) = &self.binary_parents else {
+            return Vec::new();
+        };
+        let internal = class_internal(self.st, trait_id);
+        // `scala.App` is the one trait the backend models by hand
+        // (`Gen::emit_app_library_members` writes its `executionStart`,
+        // `scala$App$$_args` and `scala$App$$initCode` fields, their accessors
+        // and their mixin setters, because `delayedInit` has no ordinary
+        // shape). It runs after this pass, so describing the same three `val`s
+        // here is a `ClassFormatError` -- a duplicate field and a duplicate
+        // method -- rather than anything a check would catch.
+        if internal == "scala/App" {
+            return Vec::new();
+        }
+        let Some(methods) = bp.methods_of(&internal) else {
+            return Vec::new();
+        };
+        let getters: HashSet<&str> = methods
+            .iter()
+            .filter(|(_, d, _)| d.starts_with("()"))
+            .map(|(n, _, _)| n.as_str())
+            .collect();
+        let mut out = Vec::new();
+        for (name, desc, access) in methods.iter() {
+            if access & ACC_STATIC != 0 {
+                continue;
+            }
+            let Some(param) = desc.strip_prefix('(').and_then(|d| d.strip_suffix(")V")) else {
+                continue;
+            };
+            let Some(ty) = self.type_of_field_desc(param) else {
+                continue;
+            };
+            let Some(field) = name.strip_suffix("_$eq") else {
+                continue;
+            };
+            match field.rsplit_once("$_setter_$") {
+                // `p$q$T$_setter_$v_$eq(T)`: a concrete `val` named `v`.
+                Some((_, v)) => out.push((decode_method_name(v), ty, false)),
+                // `v_$eq(T)` beside a `v()`: a `var`.
+                None if getters.contains(field) => out.push((decode_method_name(field), ty, true)),
+                None => {}
+            }
+        }
+        out
+    }
+
+    /// A single JVM field descriptor as a `Type` that erases back to it, or
+    /// `None` when the reference it names is not a class this run knows.
+    fn type_of_field_desc(&self, desc: &str) -> Option<Type> {
+        let prim = match desc {
+            "Z" => Some(Type::Boolean),
+            "B" => Some(Type::Byte),
+            "C" => Some(Type::Char),
+            "S" => Some(Type::Short),
+            "I" => Some(Type::Int),
+            "J" => Some(Type::Long),
+            "F" => Some(Type::Float),
+            "D" => Some(Type::Double),
+            _ => None,
+        };
+        if let Some(t) = prim {
+            return Some(t);
+        }
+        if let Some(elem) = desc.strip_prefix('[') {
+            return Some(Type::Array(Box::new(self.type_of_field_desc(elem)?)));
+        }
+        let cls = desc.strip_prefix('L')?.strip_suffix(';')?;
+        let sym = *self.jvm_index.get(cls)?;
+        Some(Type::Class {
+            sym,
+            args: Vec::new(),
+        })
     }
 
     /// Names a *class* in this linearization already provides, so a binary
@@ -3622,6 +3716,136 @@ impl<'a> Gen<'a> {
                 asm.getfield(&this_name, &fname, &mdesc);
                 asm.areturn();
             });
+        }
+    }
+
+    /// Member `object`s of a trait that arrived as a **class file**, as
+    /// `(accessor name, module class, the class its `$outer` is typed by)` --
+    /// all three JVM internal spellings.
+    ///
+    /// A trait's nested `object` is the implementing class's to hold: the
+    /// interface only declares `N(): Owner$N$`, and the field, the lazy
+    /// initialisation and the accessor body are emitted per class by nsc's
+    /// mixin phase ([`Gen::emit_member_module_accessors`] does that for a
+    /// trait of this run). A trait read from a jar has no tree to harvest, and
+    /// its nested module class never reaches the symbol table at all -- the
+    /// accessor's result arrives as an unresolved `Named("Owner$N$")` -- so
+    /// the class files are asked directly, as
+    /// [`crate::ifacebridge::BinaryParents`] is there for.
+    ///
+    /// The `$outer` is *not* always the trait: a cake component's nested
+    /// object takes the component's **self type**
+    /// (`JdbcStatementBuilderComponent$SelectPart$(JdbcProfile)`), so the
+    /// constructor descriptor is read rather than assumed.
+    ///
+    /// Leaving these out compiles `object O extends <jar trait>` to a class
+    /// that inherits the interface's *abstract* accessor, and the first read
+    /// from the trait's own code is an `AbstractMethodError`. slick's profile
+    /// cake has thirteen of them (`SelectPart`, `FromPart`, `DDL`,
+    /// `Sequence`, ...), which is what gitbucket's
+    /// `object BlockingPostgresDriver extends PostgresProfile with
+    /// BlockingJdbcProfile` inherits.
+    pub(crate) fn binary_member_modules(&self, parent: &str) -> Vec<(String, String, String)> {
+        let Some(bp) = &self.binary_parents else {
+            return Vec::new();
+        };
+        let Some(methods) = bp.methods_of(parent) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (name, desc, access) in methods.iter() {
+            if access & ACC_STATIC != 0 || access & ACC_ABSTRACT == 0 {
+                continue;
+            }
+            let module = format!("{parent}${name}$");
+            if *desc != format!("()L{module};") {
+                continue;
+            }
+            // The one-argument constructor names the enclosing instance's
+            // type; a module class with no such constructor is not a member
+            // object of `parent` and is left alone.
+            let Some(ctor) = bp
+                .ctors_of(&module)
+                .and_then(|cs| cs.iter().find(|d| d.ends_with(";)V")).cloned())
+            else {
+                continue;
+            };
+            let outer = ctor
+                .trim_start_matches('(')
+                .trim_end_matches(";)V")
+                .trim_start_matches('L');
+            if outer.contains(';') || outer.is_empty() {
+                continue;
+            }
+            out.push((name.clone(), module, outer.to_string()));
+        }
+        out
+    }
+
+    /// Field + accessor for each of [`Gen::binary_member_modules`], for every
+    /// binary interface in `class_id`'s linearization. `have` is every
+    /// accessor name the class already carries.
+    pub(crate) fn emit_binary_member_module_accessors(
+        &self,
+        b: &mut ClassBuilder,
+        class_id: SymbolId,
+        have: &mut HashSet<String>,
+    ) {
+        if class_id.is_none() || self.binary_parents.is_none() {
+            return;
+        }
+        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+            if !is_interface_sym(self.st, parent) || self.traits.modules.contains_key(&parent) {
+                continue;
+            }
+            let pjvm = class_internal(self.st, parent);
+            for (name, module, outer) in self.binary_member_modules(&pjvm) {
+                if !have.insert(name.clone()) {
+                    continue;
+                }
+                let this_name = b.this_name.clone();
+                let mdesc = format!("L{module};");
+                let fname = format!("{name}$module");
+                let adesc = format!("(){mdesc}");
+                let ctor_desc = format!("(L{outer};)V");
+                let cast_to = (outer != this_name).then(|| outer.clone());
+                b.fields.push(Field {
+                    access: ACC_PRIVATE | ACC_VOLATILE,
+                    name: fname.clone(),
+                    desc: mdesc.clone(),
+                });
+                b.add_code(ACC_PUBLIC, &name, &adesc, 3, |asm| {
+                    asm.aload(0);
+                    asm.getfield(&this_name, &fname, &mdesc);
+                    let done = asm.fresh_label();
+                    asm.ifnonnull(done);
+                    let lock = 1u16;
+                    asm.aload(0);
+                    asm.dup();
+                    asm.astore(lock);
+                    asm.monitorenter();
+                    asm.aload(0);
+                    asm.getfield(&this_name, &fname, &mdesc);
+                    let made = asm.fresh_label();
+                    asm.ifnonnull(made);
+                    asm.aload(0);
+                    asm.new_obj(&module);
+                    asm.dup();
+                    asm.aload(0);
+                    if let Some(c) = &cast_to {
+                        asm.checkcast(c);
+                    }
+                    asm.invokespecial(&module, "<init>", &ctor_desc);
+                    asm.putfield(&this_name, &fname, &mdesc);
+                    asm.mark(made);
+                    asm.aload(lock);
+                    asm.monitorexit();
+                    asm.mark(done);
+                    asm.aload(0);
+                    asm.getfield(&this_name, &fname, &mdesc);
+                    asm.areturn();
+                });
+            }
         }
     }
 

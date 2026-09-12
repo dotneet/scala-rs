@@ -2011,6 +2011,23 @@ impl Typer {
                         }
                     }
                     _ => {
+                        // SLS 7.2 again: a witness's *own* implicit parameter
+                        // of type `A => B` is a view request, and an
+                        // `implicit def` answers it eta-expanded. This
+                        // recursion only ever searched for a value, so a rule
+                        // whose clause wants a conversion could not be applied
+                        // even though `conv_implicits_resolve` had just shown
+                        // that it resolves -- slick's
+                        // `Ordered.tuple2Ordered(t)(ev1, ev2)` with `ev2 =
+                        // columnToOrdered` (gitbucket's `sortBy { … =>
+                        // issue.issueId.desc -> commentId }`).
+                        if let Some(lam) = self
+                            .identity_view(&want, span)
+                            .or_else(|| self.conversion_view(&want, span))
+                        {
+                            cargs.push(lam);
+                            continue;
+                        }
                         if !crate::check::type_is_erroneous(&want) {
                             let diverged = self.diverged_implicit.borrow().clone();
                             self.error(span, self.missing_implicit_message(&want, diverged));
@@ -2706,7 +2723,7 @@ impl Typer {
     }
 
     /// nsc: `A <: B` is a view `A => B` (identity / asInstanceOf).
-    fn identity_view(&mut self, pt: &Type, span: Span) -> Option<Tree> {
+    pub(crate) fn identity_view(&mut self, pt: &Type, span: Span) -> Option<Tree> {
         let Type::Function { params, ret } = pt else {
             return None;
         };

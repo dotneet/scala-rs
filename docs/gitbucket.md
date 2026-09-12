@@ -3492,3 +3492,191 @@ take from the self type), so they read the object's where nsc reads
 `XComponent.this`'s -- the same value in gitbucket, which has one instance.
 All 31 `mapTo` prefixes now arrive as `XComponent.this.profile.api`
 (`gbmac_selfimport.scala`, §7.25 "The receiver of a self-type member").
+
+## Fixed: three of the last four (the `agent/gbzero` slice)
+
+Measured on `batch/w2` (`8ece0269`) and again after merging `batch/w3`
+(`e3753bb7`, which brings cats to zero and carries the typer speedup
+`d74e97fb`): gitbucket **4 / 3 -> 1 / 1**. cats 0, scala library 126 / 49,
+slick 0 errors / 1504 classes, `tests/slick_run.sh` 12/12 -- none of them moved.
+
+Each root was reduced to a standalone program and checked against real scalac
+2.13.16 in both directions; the fixtures are `tests/fixtures/gzero_*` and
+`crates/cli/tests/gzero.rs`.
+
+### 38. An alias written against the *enclosing* class's `this` (typer)
+
+`Profile.scala:15`'s `MappedColumnType.base[java.util.Date, java.sql.Timestamp]`
+asked for `RelationalTypesComponent.BaseColumnType[Timestamp]` -- the *abstract*
+declaration -- and `timestampColumnType` cannot be shown to conform to that.
+
+slick's `trait RelationalProfile { self => trait API { type BaseColumnType[T] =
+self.BaseColumnType[T] } }` writes the alias against the profile's own `this`.
+`SigType` has no room for a `THIStpe` prefix, so the pickle records it beside
+the member (`SymbolTable::binary_alias_prefixes`, which until now was written
+and read by nothing) and the converted right-hand side arrives as a bare
+deferred member of a class the *use site's* profile may well fix. nsc never
+leaves such a reference abstract: every `TypeRef(pre, sym, args)` it builds goes
+through `Types.rebind`, which replaces an overridable `sym` by
+`pre.nonPrivateMember(sym.name)`, and `asSeenFrom` maps the alias's `C.this` to
+the outer instance of the selection's own prefix. For
+`profile.api.BaseColumnType[Timestamp]` on a `profile: JdbcProfile` that is
+`JdbcTypesComponent`'s `JdbcType[T] with BaseTypedType[T]`.
+
+`Typer::rebind_outer_type_member` (`check_types.rs`) does that, **after** the
+as-seen-from expansion rather than before: `expand_type_members` re-resolves a
+type member's *name* through the receiver's class and its lexically enclosing
+ones, and so put the abstract declaration straight back. Two prefixes reach it:
+a written path (`project_from_prefix_in`) and the name an `import profile.api._`
+offers, whose prefix is the import's own class
+(`Typer::import_prefix_class_for`, `rebind_imported_type_member`).
+
+The same rebind is needed for a *method signature* read through such a
+receiver. `MappedColumnType`'s type is the inner trait
+`RelationalTypesComponent#MappedColumnTypeFactory`, and its
+`base[T: ClassTag, U: BaseColumnType]` means
+`RelationalTypesComponent.this.BaseColumnType`. The receiver is a bare class
+type here, so the outer instance again comes from the import it was named
+through (`Typer::receiver_outer_rebinds`, applied in `check_select.rs` after
+the expansion for the same reason). `gzero_basecolumn.scala` holds gitbucket's
+definition verbatim; `gzero_basecolumn_bad.scala` is the near miss -- a `U`
+that really has no column type -- which both compilers still reject, and
+scala-rs now names the member nsc names (`JdbcProfile.BaseColumnType[...]`).
+
+Still open, and why `gzero_basecolumn.scala` does not pin it: written out as
+`profile.api.BaseColumnType[T]` the rebind happens only when no
+`import profile.api._` is in scope as well. Nothing in gitbucket writes that
+spelling.
+
+### 39. A trait's concrete members that its class file calls abstract (typer + backend)
+
+`DatabaseConfig.scala:124`'s `object BlockingPostgresDriver extends
+slick.jdbc.PostgresProfile with BlockingJdbcProfile` was "object creation
+impossible. Missing implementations for 14 members": thirteen nested `object`s
+of slick's cake (`SelectPart`, `FromPart`, `DDL`, `Sequence`, ...) and
+`val capabilities`.
+
+A trait's `def` with a body compiles to a `default` method, so the class file
+says what the source said. Two shapes do not:
+
+* a **`val` the trait initialises**. The value is assigned by `$init$` through a
+  synthetic `pkg$Owner$_setter_$x_$eq`, and the getter is left `ACC_ABSTRACT`
+  for the implementing class's field. The setter exists *only* when the trait
+  has a right-hand side to assign -- `val api: API` in `BasicProfile` has none,
+  `val capabilities = computeCapabilities` in the same trait has one.
+* a **nested `object`**. Its accessor `N(): Owner$N$` is abstract for the same
+  reason; the module class is what makes it a definition.
+
+nsc never asks the class file -- `DEFERRED` comes from the pickle, where both
+are concrete. `classpath::scala_trait_defined_members` reads exactly those two
+pieces of evidence off the method table and clears `ABSTRACT`.
+
+That alone would turn a compile error into a run-time one, so the backend owes
+the class what nsc's mixin phase emits:
+
+* a jar trait's `val`s and `var`s were already handled from the *symbol table*
+  (`Gen::binary_trait_vals`), which works for a `-cp` **directory** and not for
+  a jar: `load_classpath` reads directories and loose class files, never
+  archives, so a jar class reaches the table only through its pickle, member by
+  member as the typer asks -- and nothing ever asks for a mixin setter.
+  `Gen::classfile_trait_vals` reads them off the class file instead
+  (`ifacebridge::BinaryParents`), recovering each field's type from the setter's
+  descriptor through the run's JVM-name index;
+* a jar trait's nested `object`s had no handling at all: the accessor's result
+  arrives as an unresolved `Named("Owner$N$")`, so the symbol table has no
+  module class to key on. `Gen::binary_member_modules` works from the class
+  files -- an abstract `()LOwner$N$;` accessor named `N`, plus that module
+  class's own `<init>` descriptor, which is the only place the type of the
+  enclosing instance it wants is written down. For a cake component that is its
+  **self type** (`JdbcStatementBuilderComponent$SelectPart$(JdbcProfile)`), not
+  the component. `BinaryParents::ctors_of` is new for that; `methods_of`
+  deliberately drops `<init>`.
+
+`gzero_profileobj.scala` builds and *runs* `object Pg extends
+slick.jdbc.PostgresProfile`, printing an overridden `def` reached through the
+trait's own code, the trait `val` its `$init$` assigns, three nested objects
+from three different components, and their identity -- the same bytes under
+both compilers. `gzero_traitlib.scala` + `gzero_traitmixin.scala` do the same
+without slick: real scalac compiles the trait into a directory, scala-rs
+compiles the client against the class files.
+
+Two things the class files still cannot give: naming such a nested `object`
+from *outside* the class emits a descriptor without its package (the module
+class is still an unresolved name in the symbol table), and `eq` on one is "not
+a member" for the same reason. Both are about resolving a jar trait's nested
+module class, which this slice did not need.
+
+### 40. A view for a conversion's own implicit parameter (typer)
+
+`IssuesService.scala:867`'s
+`sortBy { case (issue, …) => issue.issueId.desc -> commentId }` had no
+`(ColumnOrdered[Int], Rep[Int]) => Ordered`. slick supplies one:
+`Ordered.tuple2Ordered[T1, T2](t: (T1, T2))(implicit ev1: T1 => Ordered,
+ev2: T2 => Ordered)`. Three things had to hold for it to apply, and none did.
+
+* **The conversion's parameters are solved from the tuple argument.**
+  `unify_conv_tparam` had no `Type::Tuple` case, and the two spellings of a
+  tuple type reach it mixed -- the pickle writes the parameter as a
+  `Type::Tuple`, the argument arrives as `Tuple2[…]`. `T1`/`T2` therefore stayed
+  open, and the clause was searched with them unsolved (where `$conforms` "fits"
+  anything, so every `tupleNOrdered` looked plausible and none applied).
+* **Eligibility must accept a clause parameter only a conversion can answer.**
+  SLS 7.2: an implicit parameter of type `A => B` is a *view* request.
+  `ev1: ColumnOrdered[Int] => Ordered` is a value (`Predef.$conforms`, by
+  variance), but `ev2: Rep[Int] => Ordered` is the conversion
+  `columnToOrdered`, which a value search can never find --
+  `conv_implicits_resolve` only did a value search, so the rule was refused as
+  unusable (`Typer::conv_param_view_resolves`). Re-entering the same conversion
+  is guarded with nsc's `openImplicits` and its `dominates`, so a *shrinking*
+  re-entry still works: the view for `((A, B), C)` legitimately asks for one for
+  `(A, B)`.
+* **So must the application**, in both places that fill a witness's own clause:
+  `implicit_tree`'s recursion (`check_args.rs`) and the clause of an *inserted*
+  conversion (`Typer::apply_conversion_implicits`, `check_types.rs`). Both now
+  fall back to `identity_view` / `conversion_view`, exactly as
+  `fill_implicit_params_in` does for a method's own clause.
+
+`gzero_tupleview.scala` is the whole thing without slick, and it runs: the
+converted values have to be the right ones in the right order, not merely
+typed. `gzero_tupleview_bad.scala` keeps the near misses out -- a tuple whose
+element has no view, in either position, and an arity no rule in scope covers --
+all three rejected on the same lines by both compilers. `gzero_sortby.scala` is
+the slick shape, including the `a.desc -> b` spelling gitbucket writes.
+
+### Left: `Repository.scala:77`, and a wrong acceptance under it
+
+The last error is `no matching overload for (M, OptionLift[M, O])O`: inside
+gitbucket's `Repository` table the `Some(...)` of `.shaped.<>(…, r => Some(…))`
+is slick's `Rep.Some`, not `scala.Some`.
+
+It is not about the projection, and not about nested tuples. The reduction is
+four lines:
+
+```scala
+abstract class X extends slick.lifted.Rep[Int] {
+  def n = forNodeUntyped[Int](null)          // scalac: not found: value forNodeUntyped
+}
+```
+
+scalac rejects that; scala-rs accepts it. Every member of `object Rep` is in
+scope unqualified inside *any* subclass of `class Rep` -- which every slick
+table is, through `AbstractTable` -- because scalac mirrors an accessible
+companion-object member onto the class's own file as a `static` forwarder,
+`classpath::fill_java_members` installs it like any other member, and
+`Typer::enter_inherited_members` (`check_template.rs`) enters a parent's members
+into the subclass's scope without asking. nsc's rule is "static Java members
+belong to companion objects in Scala; they are not inherited", and
+`check_overload::not_inherited_static` already applies it to a *selection*
+(root 26) -- `r.forNodeUntyped` really is "not a member". Only the unqualified
+scope is missing it.
+
+Skipping `Flags::STATIC` members there is not the whole fix: it takes gitbucket
+from 1 error to 29. The twelve names it removes are slick's
+`Rep.{Some, None, TypedRep, forNode, forNodeUntyped, columnPlaceholder}` and
+scalatra's `I18nSupport.{LocaleKey, MessagesKey, UserLocalesKey}`, and with them
+gone fourteen controllers lose `super.getAccountByUserName(...)`'s default
+argument ("no super implementation for `getAccountByUserName$default$2`", a
+backend diagnostic). Narrowing the skip to an owner that really has a companion
+object, and to names without a `$`, changes nothing about that -- so the
+super-accessor path is reading the default getter *through* one of those
+entries, and finding out which is where the next slice starts.
