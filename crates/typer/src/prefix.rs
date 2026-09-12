@@ -141,7 +141,8 @@ impl SymbolTable {
     /// instance exactly like one from source.
     pub fn is_binary_nested_class(&self, sym: SymbolId) -> bool {
         let s = self.get(sym);
-        if s.kind != SymKind::Class
+        if !self.binary_read.contains(&sym.0)
+            || s.kind != SymKind::Class
             || s.flags.contains(Flags::STATIC)
             || s.flags.contains(Flags::MODULE)
             || s.owner.is_none()

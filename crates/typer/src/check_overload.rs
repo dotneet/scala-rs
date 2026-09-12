@@ -479,6 +479,18 @@ impl Typer {
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         let mut module_apply_candidates = Vec::new();
+        // An inner class behind a prefix (`prefix.rs`) is applied as the
+        // class -- `Literal(c)` on `val Literal: Trees.this.LiteralExtractor`
+        // -- while its `apply` is still read through the view, which is what
+        // instantiates the enclosing class's parameters.
+        let fun_ty_full = fun_ty;
+        let stripped;
+        let fun_ty = if crate::prefix::view_prefix(fun_ty).is_some() {
+            stripped = crate::prefix::strip_view(fun_ty).clone();
+            &stripped
+        } else {
+            fun_ty
+        };
         // Which parameter clause these candidates come from: `f(a)(b = 1)`
         // applied as `f(1)()` leaves a residual method type whose only clause
         // is the *second* one, and that is where the defaults live.
@@ -632,7 +644,7 @@ impl Typer {
                     // extends (Int => String)` gets `Function1.apply`, and
                     // reading it raw made `m(3)` report
                     // `found: 3  required: T1`.
-                    let mty = self.st.subst_as_seen_from(fun_ty, &self.st.get(m).ty);
+                    let mty = self.st.subst_as_seen_from(fun_ty_full, &self.st.get(m).ty);
                     if let Type::Method { paramss, ret } = &mty {
                         cands.push((
                             m,
