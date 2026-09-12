@@ -68,7 +68,10 @@ fn parents_of(st: &SymbolTable, cls: SymbolId) -> Vec<SymbolId> {
         // A parent written as a function type is `scala.FunctionN`; the
         // linearization has to contain it, or an implementation of a
         // narrowed `apply` gets no bridge for `apply(Object)Object`.
-        .filter_map(|p| st.class_sym_of(&st.function_class_form(p).unwrap_or_else(|| p.clone())))
+        .filter_map(|p| {
+            let as_class = st.function_class_form(p);
+            st.class_sym_of(as_class.as_ref().unwrap_or(p))
+        })
         .filter(|p| !skip_parent(st, *p))
         .collect()
 }
