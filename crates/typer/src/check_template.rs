@@ -2176,6 +2176,9 @@ impl Typer {
                 }
             }
             Type::Class { sym, args } => {
+                // A `-cp` class has its declared variances only once its
+                // pickle is adopted (`kind_bounds.rs`).
+                self.complete_pending_class(*sym, span);
                 let vs = self.tparam_variances(*sym);
                 for (i, a) in args.iter().enumerate() {
                     let vp = vs.get(i).copied().unwrap_or(0);
@@ -2227,6 +2230,7 @@ impl Typer {
                 let vs = match ctor.as_ref() {
                     Type::TypeMember(id) | Type::TypeParam(id) => self.tparam_variances(*id),
                     Type::Class { sym, args: pre } => {
+                        self.complete_pending_class(*sym, span);
                         let mut vs = self.tparam_variances(*sym);
                         vs.drain(0..pre.len().min(vs.len()));
                         vs

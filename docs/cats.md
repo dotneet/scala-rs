@@ -3351,6 +3351,27 @@ stored the written name, so the variance check did not recognise it and the
 class-parameter half of the new member check rejected the file. The written
 name is resolved at construction and stored as the annotation's own.
 
+The full corpus found two more, both false refusals. `pos/t2994a` writes
+`curry[m#a, s]` for `trait curry[n[_[_], _], s[_]]`, where `m#a`'s parameters
+are bounded (`z <: NAT`) and `curry`'s are not, and scalac accepts it. Not
+because class type applications escape the bounds half of the check: a plain
+`type f = curry[C]` for `class C[z <: NAT]` *is* rejected by scalac
+("type z's bounds <: NAT are stricter than type _'s declared bounds"), as is
+the same `C` as a method's type argument. Thirteen probes drew the line where
+nsc's trees draw it, not where the language does: an application that is an
+argument of an abstract higher-kinded member's application (t2994a's
+`n#a[curry[m#a, s]#f, z]`), or written in a method body with top-level
+classes, is never visited by refchecks' bounds walk, while a local alias over
+local classes is. Copying that would be copying an accident, so a class type
+application's arguments are compared for arity and variance only; method
+type arguments keep the full comparison. `pos/t8708` is a
+separate-compilation test: `class X[+A]` from an earlier round arrives from
+`-cp` with a shallow signature whose parameters are all invariant until its
+pickle is adopted (`ensure_java_loaded`), and the variance checks read the
+variances directly -- the pre-existing member check (`def m: X[B]` in a class
+covariant in `B`) had the same false positive. The checks complete such a
+class before reading it.
+
 ### Found in passing, not fixed
 
 * `Option.map` (and the other hand-written collection `map`s in the prelude)

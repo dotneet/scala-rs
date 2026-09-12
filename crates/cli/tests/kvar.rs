@@ -193,6 +193,111 @@ fn kvar_kind_ok_runs() {
     check_runs("kvar_kind_ok", None);
 }
 
+/// Compile `kvar_sep_lib` first, then `kvar_sep_use` against its class files
+/// (the corpus's `_1`/`_2` rounds), run `Main`, and compare the output. The
+/// second round's classes come from `-cp`, where a class's variance is only
+/// in its pickle (`pos/t8708`).
+fn check_separate_rounds(scalac_path: Option<&Path>) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let dir = tmp_dir("sep");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    for name in ["kvar_sep_lib", "kvar_sep_use"] {
+        let src = fixtures_dir().join(format!("{name}.scala"));
+        let output = match scalac_path {
+            Some(sc) => Command::new(sc)
+                .args([
+                    "-classpath",
+                    &format!("{}:{}", out.display(), jar.display()),
+                ])
+                .args(["-d", out.to_str().unwrap()])
+                .arg(&src)
+                .output()
+                .expect("run scalac"),
+            None => Command::new(bin())
+                .arg("compile")
+                .arg(&src)
+                .args(["-d", out.to_str().unwrap()])
+                .args(["-cp", out.to_str().unwrap()])
+                .args(["--scala-library", jar.to_str().unwrap()])
+                .output()
+                .expect("run scala-rs compile"),
+        };
+        assert!(
+            output.status.success(),
+            "compile {name} failed:\n{}",
+            output_text(&output)
+        );
+    }
+    let expected =
+        fs::read_to_string(fixtures_dir().join("expected").join("kvar_sep_use.txt")).unwrap();
+    let cp = format!("{}:{}", out.display(), jar.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("run java");
+    assert!(
+        run.status.success(),
+        "java Main failed:\n{}",
+        output_text(&run)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), expected);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `name` must compile (no run): a program scalac accepts.
+fn accepted(name: &str, scalac_path: Option<&Path>) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let src = fixtures_dir().join(format!("{name}.scala"));
+    let dir = tmp_dir(name);
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let output = compile(&src, &out, &jar, scalac_path, &[]);
+    assert!(
+        output.status.success(),
+        "compile {name} failed:\n{}",
+        output_text(&output)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `pos/t2994a`: a class type application whose argument's parameter is
+/// bounded more strictly than the expected one is accepted (arity and
+/// variance are compared there, not bounds).
+#[test]
+fn kvar_t2994a_is_accepted() {
+    accepted("kvar_t2994a", None);
+}
+
+#[test]
+fn scalac_agrees_kvar_t2994a() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    accepted("kvar_t2994a", Some(&sc));
+}
+
+#[test]
+fn kvar_separate_rounds_keep_pickled_variance() {
+    check_separate_rounds(None);
+}
+
+#[test]
+fn scalac_agrees_kvar_separate_rounds() {
+    let Some(sc) = scalac() else {
+        eprintln!("skip: scalac not present");
+        return;
+    };
+    check_separate_rounds(Some(&sc));
+}
+
 #[test]
 fn scalac_agrees_kvar_kind_ok() {
     let Some(sc) = scalac() else {

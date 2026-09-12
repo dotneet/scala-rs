@@ -139,6 +139,40 @@ fn has_unresolved(ty: &Type) -> bool {
     }
 }
 
+/// Every class symbol `ty` names, constructors included.
+fn collect_class_syms(ty: &Type, out: &mut Vec<SymbolId>) {
+    match ty {
+        Type::Class { sym, args } => {
+            out.push(*sym);
+            args.iter().for_each(|a| collect_class_syms(a, out));
+        }
+        Type::Tuple(args) => args.iter().for_each(|a| collect_class_syms(a, out)),
+        Type::Applied { ctor, args } => {
+            collect_class_syms(ctor, out);
+            args.iter().for_each(|a| collect_class_syms(a, out));
+        }
+        Type::Function { params, ret } => {
+            params.iter().for_each(|a| collect_class_syms(a, out));
+            collect_class_syms(ret, out);
+        }
+        Type::Method { paramss, ret } => {
+            paramss
+                .iter()
+                .flatten()
+                .for_each(|a| collect_class_syms(a, out));
+            collect_class_syms(ret, out);
+        }
+        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => collect_class_syms(t, out),
+        Type::Annotated { tpe, .. } => collect_class_syms(tpe, out),
+        Type::BoundedWildcard { lo, hi } => {
+            lo.iter().for_each(|t| collect_class_syms(t, out));
+            hi.iter().for_each(|t| collect_class_syms(t, out));
+        }
+        Type::Refined { parents, .. } => parents.iter().for_each(|a| collect_class_syms(a, out)),
+        _ => {}
+    }
+}
+
 impl Typer {
     // ---------------------------------------------------------------------
     // 1. checkKindBounds
@@ -156,6 +190,7 @@ impl Typer {
         targs: &[Type],
         prefix: &str,
         location: &str,
+        strictness: bool,
         span: Span,
     ) -> bool {
         if tparams.len() != targs.len() || tparams.is_empty() {
@@ -167,9 +202,14 @@ impl Typer {
         if tparams.iter().all(|tp| self.st.get(*tp).tparams.is_empty()) {
             return false;
         }
+        // A class from `-cp` has its parameters' variance only once its
+        // pickle is adopted; read it before judging.
+        for targ in targs {
+            self.complete_pending_classes_in(targ, span);
+        }
         let mut explanations = Vec::new();
         for (tp, targ) in tparams.iter().zip(targs) {
-            if let Some(errs) = self.kind_errors_for(*tp, targ, tparams, targs) {
+            if let Some(errs) = self.kind_errors_for(*tp, targ, tparams, targs, strictness) {
                 let targ_s = self.st.display_type(targ);
                 let tp_s = format!("type {}", self.st.get(*tp).name);
                 explanations.push(errs.message(&targ_s, &tp_s));
@@ -224,6 +264,7 @@ impl Typer {
         targ: &Type,
         tparams: &[SymbolId],
         targs: &[Type],
+        strictness: bool,
     ) -> Option<KindErrors> {
         if self.st.get(tparam).tparams.is_empty() {
             return None;
@@ -259,7 +300,7 @@ impl Typer {
         let mut under = Vec::new();
         let mut with = Vec::new();
         self.check_kind_hk(
-            &arg, &param, false, tparams, targs, &mut under, &mut with, &mut errs,
+            &arg, &param, false, strictness, tparams, targs, &mut under, &mut with, &mut errs,
         );
         if errs.is_empty() {
             None
@@ -279,6 +320,7 @@ impl Typer {
         arg: &KParam,
         param: &KParam,
         flip: bool,
+        strictness: bool,
         tparams: &[SymbolId],
         targs: &[Type],
         under: &mut Vec<SymbolId>,
@@ -327,7 +369,13 @@ impl Typer {
                         .map(|t| self.instantiate_declared(t, tparams, targs, under, with)),
                 );
                 let argument = (hkarg.lo.clone(), hkarg.hi.clone());
-                let ok = if flip {
+                // nsc compares the bounds for a method's type arguments
+                // (`gm[C]` for `class C[z <: NAT]` is "type z's bounds <: NAT
+                // are stricter"), but accepts the same `C` written as a class
+                // type argument (`curry[C]`, `pos/t2994a`'s `curry[m#a, s]`).
+                let ok = if !strictness {
+                    true
+                } else if flip {
                     self.bounds_conform(&argument, &declared)
                 } else {
                     self.bounds_conform(&declared, &argument)
@@ -354,7 +402,9 @@ impl Typer {
                         with.push(Type::TypeParam(a.sym));
                     }
                 }
-                self.check_kind_hk(hkarg, hkparam, !flip, tparams, targs, under, with, errs);
+                self.check_kind_hk(
+                    hkarg, hkparam, !flip, strictness, tparams, targs, under, with, errs,
+                );
                 under.truncate(mark);
                 with.truncate(mark);
             }
@@ -521,6 +571,27 @@ impl Typer {
         }
     }
 
+    /// A class discovered on `-cp` carries a shallow signature until its
+    /// pickle is adopted (`ensure_java_loaded`), and the shallow one has
+    /// every type parameter invariant. Both checks here read variances, so
+    /// they complete such a class first; otherwise `type C = X[B]` in a class
+    /// covariant in `B`, with `class X[+A]` compiled in an earlier round, was
+    /// "covariant type B occurs in invariant position" (`pos/t8708`).
+    pub(crate) fn complete_pending_class(&mut self, sym: SymbolId, span: Span) {
+        if !sym.is_none() && self.st.pending_classpath_signatures.contains(&sym) {
+            self.ensure_java_loaded(sym, span);
+        }
+    }
+
+    /// [`Self::complete_pending_class`] for every class `ty` mentions.
+    pub(crate) fn complete_pending_classes_in(&mut self, ty: &Type, span: Span) {
+        let mut syms = Vec::new();
+        collect_class_syms(ty, &mut syms);
+        for s in syms {
+            self.complete_pending_class(s, span);
+        }
+    }
+
     // ---------------------------------------------------------------------
     // 2. variance of a type lambda's / higher-kinded member's own parameters
     // ---------------------------------------------------------------------
@@ -555,6 +626,9 @@ impl Typer {
             || hi.is_some_and(has_unresolved)
         {
             return;
+        }
+        for t in [rhs, lo, hi].into_iter().flatten() {
+            self.complete_pending_classes_in(t, span);
         }
         let shown = self.poly_type_display(&vars, rhs, lo, hi);
         for t in [rhs, lo, hi].into_iter().flatten() {
@@ -622,6 +696,9 @@ impl Typer {
             || hi.as_ref().is_some_and(has_unresolved)
         {
             return;
+        }
+        for t in [&rhs, &lo, &hi].into_iter().flatten() {
+            self.complete_pending_classes_in(t, span);
         }
         let desc = format!("type {name}");
         let shown = if own.is_empty() {
