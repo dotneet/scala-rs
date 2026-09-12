@@ -11,9 +11,9 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `631b238d` |
+| commit | `f16daac1` |
 |---|---|
-| updated | 2026-09-12 |
+| updated | 2026-09-13 |
 
 **Fifty-three composed gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
@@ -87,6 +87,7 @@ coordinator measured the merged tree each time, not the branches.
 | `c0c10f08` | collection extension precedence, ReusableBuilder parent recovery, SortedSet operators, Seq trait hierarchy, JDK 21 name data | 92 | 34 -> **31** |
 | `8ece0269` | twenty slices: element types, JDK 17 data, this.type/override, application/argument conformance, declarations, runtime crashes, gitbucket non-macro roots, output mismatches, hard inference, parser gaps, runtime probes, Slick `mapTo`, prefix-carrying types, `@compileTimeOnly`, wrong acceptances, erasure/ABI, warnings, reify/TypeTag, mixin/outer codegen, extractors and library surface, kind/variance | 92 -> **4** | 31 -> **2** |
 | `631b238d` | cats and gitbucket to **zero errors**: quasiquote patterns (so `FunctionKMacros.scala` compiles and there is no holdout), `immutable.Iterable` parents, macro tags of applied constructors, alias rebinding through an enclosing `this`, concrete trait members a class file calls abstract, views in a conversion's own implicit clause, a companion's statics are not inherited, super accessors for default getters, varargs anonymous classes, signature-path parent arguments | 4 -> **0** | 2 -> **0** |
+| `f16daac1` | library clusters (views, compound bounds, `private[this]` variance, array wrappers, `Function1[_, _]`, `= macro ???`, `AnyRef.clone`), a 9x faster typer (linearization and base-type caches), and a parallel gate | 0 | 0 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4192,6 +4193,74 @@ Exact summary block:
 ```text
 === summary
   HEAD=631b238d  logs=/private/tmp/scala-rs-gate-631b238d-20260912
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-six: library clusters, a 9x faster typer, a 14-minute gate (`f16daac1`)
+
+Run in `/private/tmp/scala-rs-gate-f16daac1` against the `corpus-631b238d`
+ledger. `VERDICT=PASS`, wall clock **14:38** (the previous full gate on the
+same machine took 52 minutes under comparable load).
+
+| measure | `631b238d` | `f16daac1` |
+|---|---:|---:|
+| scala library | 126 / 49 | **66 / 30** |
+| cats | 0 errors, 2976 classes | 0 errors, 2976 classes |
+| gitbucket | 0 errors, 1317 classes | 0 errors, 1317 classes |
+| slick | 0 errors / 1504 classes | 0 errors / 1504 classes |
+| corpus pos / neg / run | 1234 / 815 / 1002 | **1239** / 815 / 1002 |
+| workspace suite | 3106 | **3145** |
+| gitbucket measure wall | 161.7 s | **21.2 s** |
+
+The corpus kept every identity with `losses=0` and five gains
+(`pos/macro-qmarkqmarkqmark`, `pos/patmat`, `pos/t1756`, `pos/t3272`,
+`pos/t4345`). Saved ledger:
+[`baselines/corpus-f16daac1.tsv`](baselines/corpus-f16daac1.tsv), SHA-256
+`b9c3d2a702bed68bcb4ffc32eca9a67b08a9e5a592427e3637cbb960c07ea010`.
+
+**Library, 126 -> 66.** Two slices with disjoint files. `agent/libcoll`: a class
+that *inherits* `Function1` is a view (`<:<`, `=:=`, user `extends (A => B)`);
+a view whose result is a higher-kinded application needs the bound's instance;
+higher-kinded parameter bounds were resolved in the wrong scope, so every
+parameter after the first read the previous one's; `apply` insertion through an
+abstract receiver's bound; base-type arguments of a compound bound merged across
+parents instead of taken from the first; `private[this]` is exempt from variance
+checking (nsc's `isLocalToThis`); a view's type-parameter bound decides both
+applicability and specificity (`wrapRefArray` is not a candidate for
+`Array[Char]` and is strictly more specific than `genericWrapArray`). 
+`agent/libconc`: an unbounded `Function1[_, _]` formal reads as containment, not
+variance inversion; `= macro ???` is accepted at the definition and refused at
+the call, as nsc does; inference when both sides are bounded existentials;
+a parent that is a function type; and `protected def clone(): AnyRef`, which
+also uncovered that **every** protected member inherited from `AnyRef` had been
+rejected in subclasses.
+
+**The typer got 9x faster on gitbucket** (161.7 s -> 19.2 s, measured by
+retired instructions: 2.57e12 -> 2.86e11, run-to-run spread 0.06%, error set
+identical line by line). `agent/macroperf` found that macros were never the
+cost: expansion of all 68 sites totals 0.9 s. Linearization ran 44.5 million
+times (812 million node visits) and `base_type_args` 44.4 million times, both
+pure functions of a symbol graph that changed 405 801 times; both are now
+memoised and invalidated on a mutation generation. Implicit candidate types were
+re-derived O(n²) times by `most_specific`. The engine bridge cached its
+reflection, and `read_reply` had been spawning a `true` process per read.
+
+**The gate is parallel** (`agent/gateperf`): `slick_subset`, the workspace
+suite and the full corpus run concurrently, the workspace suite runs through
+the new `tests/workspace_tests.sh` (6 binaries x 4 threads: 37:45 -> 19:05),
+and three holes were closed — per-step exit statuses were being discarded by
+`| tail`, a test binary killed by a signal left no row and was not noticed, and
+the corpus's 40 s timeout turned a pass into a skip under load, which
+`compare_corpus.py` counts as a loss. The gate now prints per-step wall times,
+and **a loss is confirmed by a serial re-run of that one test** before it fails
+the gate (`run/t5857` asserts its own execution time is under 250 ms).
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=f16daac1  logs=/private/tmp/scala-rs-gate-f16daac1  wall=14:38
 VERDICT=PASS
 DONE
 ```
