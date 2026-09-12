@@ -463,7 +463,7 @@ impl<'a> Gen<'a> {
                     } else {
                         vd.ty.clone()
                     };
-                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
             asm.aload(0);
@@ -553,7 +553,7 @@ impl<'a> Gen<'a> {
                         } else {
                             vd.ty.clone()
                         };
-                        emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                        emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                     } else {
                         // A bare statement of the module body (SLS 5.1): part
                         // of module initialization, so it runs exactly once,

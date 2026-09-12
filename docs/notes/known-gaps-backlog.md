@@ -14,6 +14,43 @@ of most of these notes.
 
 ### Remaining
 
+- **Wrong acceptances still open in the scala/scala `neg` corpus** (found by
+  `agent/wrongacc`; each is a program scalac 2.13.16 rejects and scala-rs
+  compiles):
+  - `super.x` where `x` is a `val`, `var` or `lazy val` ("super may not be
+    used on value x"): `neg/t562`, `neg/t9911`, `neg/t11906`.
+  - value-class rules: `abstract` value class (`neg/t6283`), a secondary
+    constructor in a value class (`neg/t5799`).
+  - a `private[X]` / `protected[X]` qualifier that names no enclosing class
+    or package ("X is not an enclosing class"): `neg/t6962`, `neg/t7388`,
+    `neg/qualifying-class-error-2`; `this` in a parent's arguments
+    (`neg/qualifying-class-error-1`).
+  - arity limits: a function literal or eta-expansion over more than 22
+    parameters (`neg/t944`, `neg/t7299`), an extractor pattern with more than
+    22 arguments (`neg/error_tooManyArgsPattern`,
+    `neg/case-class-23-unrelated-unapply`).
+  - `case class C(implicit val c: Int)` (`neg/t10097b`), `trait T(x: Int)`
+    (`neg/t593`).
+  - erasure-level name clashes between a defined and an inherited member
+    (`neg/t663`, `neg/t7052`, `neg/t9286a`, `neg/t9286b`).
+  - ambiguous references between an import and another binding of the same
+    name (`neg/imp2`, `neg/t3160ambiguous`, `neg/t3836`, `neg/t8024`,
+    `neg/t11921`).
+  - a companion reached through a package object in another file
+    (`neg/t5031`); a second backquoted `` val `_` `` (`neg/t11374`, the parsed
+    tree cannot tell it from a wildcard).
+  - annotation names are not resolved in a file with a wildcard import of a
+    term (`opaque_import_files`), so `@Missing` there still compiles.
+- **Rejects valid code: a type member does not shadow a class type
+  parameter** (`agent/wrongacc`). `class G[T] { type T = Int; def t: T = 4 }`
+  is "type mismatch; found: 4 required: T"; scalac resolves `T` inside the
+  template to the member.
+- **An overload whose function-typed value alternative is strictly more
+  specific than every method** (`agent/wrongacc`). `val f: String => Int`
+  beside `def f(a: Any)`: `f("")` should call the value and calls the method.
+  (A tie is reported as ambiguous, and a value that alone applies is called
+  through its `apply`.)
+
 - **When the receiver of `t(i) op= x` is an ordinary method call** (`agent/stmtval`).
   `foo.bar(0) += 1` (where `bar` is a method) is an error in nsc as well,
   reported as `UnexpectedTreeAssignmentConversionError`, but our wording is

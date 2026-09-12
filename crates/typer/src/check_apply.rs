@@ -1718,6 +1718,10 @@ impl Typer {
                             }
                         }
                     }
+                    // `flatMap`'s declared lambda result with the call's open
+                    // variables as wildcards (`IterableOnce[?]`), for the one
+                    // body that has to be converted to it: an `Array`.
+                    let mut flatmap_array_proto: Option<Type> = None;
                     if let Some(elem) = recv_ty.as_ref().and_then(|t| self.elem_type(t)) {
                         if matches!(
                             fun_name.as_str(),
@@ -1743,8 +1747,21 @@ impl Typer {
                                 // where scalac's weak-conformance lub says
                                 // `List[Long]` (a silent runtime difference:
                                 // `List(Integer, Long)` element classes).
+                                //
+                                // `flatMap`'s declared result is recorded for the
+                                // argument loop below, which converts an `Array`
+                                // body to it (`flatmap_array_proto`).
                                 let undetermined = !sym.is_none()
                                     && mentions_tparam(fr, &self.st.get(sym).tparams);
+                                if undetermined
+                                    && fun_name == "flatMap"
+                                    && matches!(fr.as_ref(), Type::Class { .. })
+                                {
+                                    let tps = self.st.get(sym).tparams.clone();
+                                    let wilds = vec![Type::Wildcard; tps.len()];
+                                    flatmap_array_proto =
+                                        Some(crate::symbol::subst_tparams_slice(&tps, &wilds, fr));
+                                }
                                 let fret =
                                     if matches!(fr.as_ref(), Type::TypeParam(_)) || undetermined {
                                         Box::new(Type::Wildcard)
@@ -1973,6 +1990,33 @@ impl Typer {
                             self.type_expr(a, &pt_arg);
                             if relaxed_here {
                                 self.relaxed_pt_depth -= 1;
+                            }
+                            // A `flatMap` body that is an `Array` is converted by
+                            // a view, as nsc's `typedArgToPoly` does against the
+                            // lenient `A => IterableOnce[?]`: `Seq(1, 2).flatMap(x
+                            // => Array(x, x))` is `wrapIntArray(Array(x, x))`.
+                            // Left unconverted, the array was handed to `flatMap`
+                            // as its `IterableOnce` (`ClassCastException`,
+                            // run/t5652). Only an array: every other body keeps
+                            // the unchecked result -- checking it against the
+                            // declared class rejected `Stream` and `LazyList`
+                            // bodies scalac accepts, where this table's own
+                            // subtyping or prelude signatures fall short.
+                            let mut array_body_ret = None;
+                            if i == 0 {
+                                if let (Some(proto), TreeKind::Function { body, .. }) =
+                                    (flatmap_array_proto.as_ref(), &mut a.kind)
+                                {
+                                    if matches!(body.ty.widen_constant(), Type::Array(_)) {
+                                        self.adapt(body, proto);
+                                        array_body_ret = Some(body.ty.clone());
+                                    }
+                                }
+                            }
+                            if let (Some(r), Type::Function { ret, .. }) =
+                                (array_body_ret, &mut a.ty)
+                            {
+                                **ret = r;
                             }
                         }
                         // nsc adapts an argument before it constrains the call. An

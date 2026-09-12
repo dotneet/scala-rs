@@ -1108,9 +1108,17 @@ impl Typer {
             }
             let n = i + 1;
             let gname = format!("{name}$default${n}");
+            // Only a getter this owner *declares* makes a second one
+            // redundant. An inherited one is exactly what an override that
+            // writes its own default must replace: nsc emits `B.g$default$1`
+            // overriding `A.g$default$1`, and the call site invokes the getter
+            // virtually on the receiver. Looking through the parents here left
+            // `class B extends A { override def g(a: Int = 2) }` without a
+            // getter, so `new B().g()` ran with `A`'s default.
             if self
                 .st
-                .lookup_member(owner, &gname)
+                .get(owner)
+                .members
                 .iter()
                 .any(|&id| self.st.get(id).name == gname)
             {
@@ -1670,6 +1678,50 @@ impl Typer {
                     let f = self.st.get(*p).flags;
                     f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
                 }))
+    }
+
+    /// `new C` with no argument list is `new C()` (SLS 5.1.1), and when no
+    /// constructor of `C` takes an empty parameter list that is an ordinary
+    /// application whose overload resolution the empty argument list decides.
+    /// `parent_ctor_is_fillable` answers only for a *sole* constructor whose
+    /// parameters are all implicit or defaulted; this covers the rest of what
+    /// `new C()` accepts: a trailing repeated parameter (`class H(xs: Int*)`)
+    /// and several constructors, none of them nullary (`class Foo(x: A =
+    /// null) { def this(b: B*) = … }`, run/t8197). Left bare, both went out as
+    /// `invokespecial C.<init>()V`, a constructor the class does not have.
+    pub(crate) fn bare_new_needs_application(&self, class_id: SymbolId) -> bool {
+        let ctors: Vec<SymbolId> = self
+            .st
+            .lookup_member(class_id, "<init>")
+            .into_iter()
+            .filter(|&id| {
+                self.st.get(id).kind == crate::symbol::SymKind::Method
+                    && self.st.get(id).owner == class_id
+            })
+            .collect();
+        if ctors.is_empty() || ctors.iter().any(|&c| self.st.get(c).params.is_empty()) {
+            return false;
+        }
+        if ctors.len() >= 2 {
+            return true;
+        }
+        // The parameter symbol of `xs: Int*` is typed as the `Seq[Int]` the
+        // body sees; the repetition is recorded on the method type.
+        let last_repeated = match &self.st.get(ctors[0]).ty {
+            Type::Method { paramss, .. } => {
+                matches!(paramss.iter().flatten().last(), Some(Type::Repeated(_)))
+            }
+            _ => false,
+        };
+        let params = self.st.get(ctors[0]).params.clone();
+        let Some((_, init)) = params.split_last() else {
+            return false;
+        };
+        last_repeated
+            && init.iter().all(|p| {
+                let f = self.st.get(*p).flags;
+                f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
+            })
     }
 
     /// Append the constructor arguments a parent clause is allowed to leave

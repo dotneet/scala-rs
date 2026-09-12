@@ -108,3 +108,31 @@ object ArrowBad {
     def bad3[A, C](x: F[(A, C), Int]) = compose(x, swap) // error
   }
 }
+
+// An abstract type constructor parameter is applied at the variance its own
+// parameters declare; `F[_, _]` is invariant.
+object InvariantCtor {
+  def up[F[_, _]](x: F[(Int, Int), Int]): F[AnyRef, Int] = x // error
+  def upCo[F[+_, _]](x: F[(Int, Int), Int]): F[AnyRef, Int] = x
+  def downContra[F[-_, _]](x: F[AnyRef, Int]): F[(Int, Int), Int] = x
+  def upContra[F[-_, _]](x: F[(Int, Int), Int]): F[AnyRef, Int] = x // error
+  def same[F[_, _]](x: F[(Int, Int), Int]): F[Tuple2[Int, Int], Int] = x
+  def wild[F[_, _]](x: F[(Int, Int), Int]): F[_, Int] = x
+}
+
+// A polymorphic method value eta-expanded against an invariant result:
+// `F.pure[A]` at `B => F[BB]` is `A := BB` (cats' `Ior.to`,
+// `OptionT.getOrElseF`), and without `BB >: B` there is no such `A`.
+object EtaInvariantResult {
+  trait Ap[F[_]] { def pure[A](a: A): F[A] }
+  trait Mo[F[_]] { def flatMap[A, B](fa: F[A])(f: A => F[B]): F[B] }
+  final class Box[+B](val b: B) {
+    def fold[C](f: B => C): C = f(b)
+    def to[F[_], BB >: B](implicit F: Ap[F]): F[BB] = fold(F.pure)
+    def bad[F[_], BB](implicit F: Ap[F]): F[BB] = fold(F.pure) // error
+  }
+  final class OT[F[_], A](val value: F[Option[A]]) {
+    def getOrElseF[B >: A](default: => F[B])(implicit F: Ap[F], M: Mo[F]): F[B] =
+      M.flatMap(value)(_.fold(default)(F.pure))
+  }
+}

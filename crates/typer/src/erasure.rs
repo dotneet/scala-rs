@@ -671,12 +671,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
             if matches!(hi, Type::TypeParam(_)) {
                 Type::Any
             } else {
-                let e = erase_ty(&hi, st);
-                if is_primitive(&e) {
-                    Type::Any
-                } else {
-                    e
-                }
+                bound_erasure(erase_ty(&hi, st))
             }
         }
         // An *alias* member erases like its right-hand side (`type Scope =
@@ -731,12 +726,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                             }
                             _ => hi,
                         };
-                        let e = erase_ty(&hi, st);
-                        if is_primitive(&e) {
-                            Type::Any
-                        } else {
-                            e
-                        }
+                        bound_erasure(erase_ty(&hi, st))
                     }
                     _ => Type::Any,
                 },
@@ -794,7 +784,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         Type::Named { name, args } if name == "Array" && args.len() == 1 => {
             let e = erase_elem_ty(&args[0], st);
             if array_elem_is_abstract(&args[0])
-                && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal)
+                && (matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) || is_primitive(&e))
             {
                 Type::Any
             } else {
@@ -807,7 +797,13 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         },
         Type::Array(t) => {
             let e = erase_elem_ty(t, st);
-            if array_elem_is_abstract(t) && matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) {
+            // nsc's `unboundedGenericArrayLevel`: an abstract element whose
+            // bound is not a subclass of `Object` -- `Any`, `AnyVal`, or a
+            // primitive (`Array[A]` for `A <: Int`) -- makes the array itself
+            // erase to `Object`.
+            if array_elem_is_abstract(t)
+                && (matches!(e, Type::Any | Type::AnyRef | Type::AnyVal) || is_primitive(&e))
+            {
                 Type::Any
             } else {
                 Type::Array(Box::new(e))
@@ -832,6 +828,26 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| erase_ty(t, st)).collect()),
         Type::Overload(alts) => Type::Overload(alts.iter().map(|t| erase_ty(t, st)).collect()),
         other => other.clone(),
+    }
+}
+
+/// The erasure of an abstract type -- a type parameter or an abstract type
+/// member -- given the erasure `e` of its upper bound. nsc's `ErasureMap`
+/// takes the bound's erasure as it is (`apply(sym.info.upperBound)`), a
+/// primitive included: `def id[A <: Int](a: A): A` is `id(I)I` and `class
+/// P[A <: Int](val a: A)` has an `int` field and a `P(int)` constructor.
+/// Erasing to `Object` instead gave a different descriptor from the one a
+/// scalac-built caller links against, and a body that did arithmetic on the
+/// `Object` it had been handed did not verify.
+///
+/// `Unit` is the exception: nsc erases the `Unit` *type reference* to
+/// `BoxedUnit` (only a method's own `Unit` result becomes `V`), which this
+/// table has no type for; such a bound keeps the `Object` erasure.
+fn bound_erasure(e: Type) -> Type {
+    match e {
+        Type::Unit => Type::Any,
+        Type::Constant(lit) => bound_erasure(Type::lit_underlying(&lit)),
+        e => e,
     }
 }
 

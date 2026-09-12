@@ -4171,22 +4171,36 @@ impl Typer {
         if self.st.get(owner).tparams.is_empty() {
             return base;
         }
-        let this_ty = Type::Class {
-            sym: this,
-            args: self
-                .st
-                .get(this)
-                .tparams
-                .iter()
-                .map(|&t| Type::TypeParam(t))
-                .collect(),
-        };
-        match self.base_type_instance(&this_ty, owner, 0) {
-            Some(Type::Class { args, .. }) if !args.is_empty() => {
-                self.st.subst_tparams(owner, &args, &base)
+        // The class the alias is read *through*: `this` itself, or -- for a
+        // nested class naming an alias its enclosing class inherits -- that
+        // enclosing class. `class C extends Base[String] { class D { def
+        // foo[B1 <: B](b: B1) } }` reads `Base`'s `type B = A` as `C.this.B`,
+        // which is `String`; answering with `Base`'s own `A` erased `foo` to
+        // `(Object)I` where scalac emits `(String)I` (run/t7120b).
+        for site in self.st.enclosing_classes(this) {
+            if site == owner {
+                return base;
             }
-            _ => base,
+            if site != this && !self.st.is_ancestor_of(owner, site) {
+                continue;
+            }
+            let site_ty = Type::Class {
+                sym: site,
+                args: self
+                    .st
+                    .get(site)
+                    .tparams
+                    .iter()
+                    .map(|&t| Type::TypeParam(t))
+                    .collect(),
+            };
+            if let Some(Type::Class { args, .. }) = self.base_type_instance(&site_ty, owner, 0) {
+                if !args.is_empty() {
+                    return self.st.subst_tparams(owner, &args, &base);
+                }
+            }
         }
+        base
     }
 
     /// The `scala._` / `java.lang._` wildcard imports every source carries

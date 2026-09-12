@@ -331,6 +331,11 @@ pub struct Typer {
     /// Per-binary-name index for *local* classes/objects (`Main$Same$1`,
     /// `Main$Same$2`), keyed by the un-indexed binary name.
     pub(crate) local_class_n: std::collections::HashMap<String, u32>,
+    /// Set while a block statement's `class` / `object` is entered: it is a
+    /// local declaration even where no term owner shows it (a `val`
+    /// initializer's block is owned by the enclosing class). Taken by the
+    /// first `jvm_for_current`, so members of the local class are not local.
+    pub(crate) block_local_naming: bool,
     /// Enclosing package clauses; a nested one is relative to the last.
     pub(crate) pkg_nest: Vec<SymbolId>,
     /// Packages a file's `package` clauses actually *open*, by file index.
@@ -377,6 +382,11 @@ pub struct Typer {
     pub(crate) sigs_only: bool,
     /// Some source mentions `@compileTimeOnly`; see `crate::compile_time_only`.
     pub(crate) any_cto: bool,
+    /// `crate::annot_resolve` is resolving an annotation's own name. It
+    /// reaches `tree_to_type` with the annotation's span, and
+    /// `@compileTimeOnly` is reported at the annotated *definition*
+    /// (`note_cto_type_name`), so the type hook stays quiet there.
+    pub(crate) resolving_annot: bool,
     /// The definition whose written result type is being resolved; its own
     /// `@compileTimeOnly` covers it (the owner has been restored by then).
     pub(crate) cto_sig_owner: SymbolId,
@@ -996,6 +1006,9 @@ pub fn typecheck_units_src(
     // Default arguments are bodies, not signatures: typing them during the
     // pass above would let one name only the members of the units that come
     // before its own on the command line.
+    // Every source method has its parameters now; an override inherits the
+    // defaults of the method it overrides before any call is typed.
+    t.inherit_overridden_defaults();
     t.defer_default_rhs = false;
     t.type_pending_defaults();
     for (tree, file_index) in units.iter_mut() {
@@ -1052,6 +1065,7 @@ impl Typer {
             slot_source: Vec::new(),
             last_named_order: None,
             local_class_n: std::collections::HashMap::new(),
+            block_local_naming: false,
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
             open_pkg_chains: HashMap::new(),
@@ -1060,6 +1074,7 @@ impl Typer {
             import_text: HashMap::new(),
             sigs_only: false,
             any_cto: false,
+            resolving_annot: false,
             cto_sig_owner: SymbolId::NONE,
             cto_deferred: None,
             header_pass: false,
@@ -1871,6 +1886,19 @@ pub(crate) fn tree_contains_this(tree: &Tree) -> bool {
 /// are type parameters. Not used for implicit search (`is_sub_type`).
 pub(crate) fn class_ctor_matches_typeparam_args(arg: &Type, param: &Type) -> bool {
     match (arg, param) {
+        // `Array[T]` is the same shape as any other class application, only
+        // spelled with its own type node. Without it `new BO(Array(3))` on
+        // `class BO[T: Ordering](a: Array[T])` matched no constructor while
+        // `T` was still open, fell back to the fields, and went out with no
+        // constructor symbol at all -- the evidence clause was never filled
+        // and codegen called `BO.<init>(Object)` (`NoSuchMethodError`,
+        // run/t5284); with an explicit implicit clause it was a spurious
+        // "no matching overload".
+        (Type::Array(a), Type::Array(p)) => {
+            matches!(p.as_ref(), Type::TypeParam(_))
+                || a == p
+                || class_ctor_matches_typeparam_args(a, p)
+        }
         (Type::Class { sym: sa, args: aa }, Type::Class { sym: sp, args: pa })
             if sa == sp && aa.len() == pa.len() =>
         {

@@ -23,8 +23,9 @@ pub(crate) fn gen_match(
         return;
     }
     let end = asm.fresh_label();
-    if let Some(n) = join_class_of(ctx.st, result_ty) {
-        asm.set_join_class(end, &n);
+    let join = join_class_of(ctx.st, result_ty);
+    if let Some(n) = &join {
+        asm.set_join_class(end, n);
     }
     for c in cases {
         let fail = asm.fresh_label();
@@ -37,6 +38,7 @@ pub(crate) fn gen_match(
             gen_stat(asm, frame, ctx, &c.body);
         } else {
             gen_expr(asm, frame, ctx, &c.body);
+            cast_branch_to_join(asm, ctx.st, join.as_deref());
         }
         asm.goto(end);
         asm.mark(fail);
@@ -124,8 +126,9 @@ pub(crate) fn gen_int_switch(
     }
     let miss = asm.fresh_label();
     let end = asm.fresh_label();
-    if let Some(n) = join_class_of(ctx.st, result_ty) {
-        asm.set_join_class(end, &n);
+    let join = join_class_of(ctx.st, result_ty);
+    if let Some(n) = &join {
+        asm.set_join_class(end, n);
     }
     let def_lab = default_idx.map(|i| case_labs[i]).unwrap_or(miss);
     load(asm, tmp, sel_sort);
@@ -161,6 +164,7 @@ pub(crate) fn gen_int_switch(
             gen_stat(asm, frame, ctx, &c.body);
         } else {
             gen_expr(asm, frame, ctx, &c.body);
+            cast_branch_to_join(asm, ctx.st, join.as_deref());
         }
         asm.goto(end);
     }
@@ -521,11 +525,15 @@ fn gen_unapply_pattern(
     let fun_is_call = !fun.sym.is_none() && ctx.st.get(fun.sym).kind == SymKind::Method;
     if !owner.is_none() && (!is_module_class(ctx.st, owner) || fun_is_call) {
         gen_expr(asm, frame, ctx, fun);
-        // The extractor value's static type may be a trait over the class
-        // that declares `unapply`: `Date.unanchored` is an `UnanchoredRegex`
-        // (a trait extending `Regex`), an interface on the JVM, and
-        // `invokevirtual Regex.unapplySeq` on it does not verify.
-        crate::gen_desc::checkcast_method_receiver_sym(asm, ctx, uid, true);
+        // The extractor *value* erases to its own static type, which need not
+        // reach the class declaring `unapply`: `Date.unanchored` is an
+        // `UnanchoredRegex`, a trait -- a JVM interface -- whose `unapplySeq`
+        // is `Regex`'s, and the verifier cannot see an interface's class
+        // parent ("'UnanchoredRegex' is not assignable to 'Regex'"). nsc's
+        // erasure casts such a receiver; the `Apply` and paren-less `Select`
+        // paths already do, through the same stack-aware check (a module
+        // owner is left alone there).
+        checkcast_method_receiver_sym(asm, ctx, uid, true);
     } else if !owner.is_none() {
         // The `unapply` being called belongs to `owner`, so the receiver is
         // `owner`'s singleton -- not whatever the *name* in the pattern is
@@ -541,9 +549,11 @@ fn gen_unapply_pattern(
         gen_receiver(asm, frame, ctx, fun);
     }
     load(asm, tmp, sel_sort);
-    if sel_sort == JvmSort::Void {
-        // A `Unit` scrutinee occupies no slot, and the extractor's parameter
-        // (`unapply(u: Unit)`, or `Any`) takes the box (`run/t9029`).
+    // A `Unit` scrutinee occupies no slot, but the extractor still takes it
+    // as an argument -- `def unapply(u: Unit)` is `(Lscala/runtime/BoxedUnit;)`.
+    // `val X(y) = ()` called it with nothing pushed, so the module under the
+    // call became its argument (`VerifyError`, run/t9029).
+    if sel_sort == JvmSort::Void && param0.is_some() {
         asm.getstatic(
             "scala/runtime/BoxedUnit",
             "UNIT",
