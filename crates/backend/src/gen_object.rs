@@ -151,6 +151,12 @@ impl<'a> Gen<'a> {
         let mixin_modules = self.mixin_member_modules(cls, &own_modules);
         self.emit_member_module_accessors(&mut b, &own_modules);
         self.emit_member_module_accessors(&mut b, &mixin_modules);
+        let mut have_modules: std::collections::HashSet<String> = own_modules
+            .iter()
+            .chain(mixin_modules.iter())
+            .map(|&m| crate::gen_desc::module_accessor_name(self.st, m))
+            .collect();
+        self.emit_binary_member_module_accessors(&mut b, cls, &mut have_modules);
         self.emit_trait_outer_accessors(&mut b, cls, &impl_.parents);
         self.emit_lazy_accessors(&mut b, cls, &lazies, &binary_lazies);
         self.emit_val_getters(&mut b, &impl_.body);

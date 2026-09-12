@@ -720,6 +720,13 @@ impl Typer {
         } else {
             Vec::new()
         };
+        // A deferred type member of the receiver's *outer* class, read through
+        // the import the receiver was named by (`check_types.rs`).
+        let outer_rebinds = if ext_conv.is_none() {
+            self.receiver_outer_rebinds(qual, &recv_ty, &found)
+        } else {
+            Vec::new()
+        };
         // A receiver typed by an abstract type (`clone(): C`, `empty: C`) is
         // read through its bound, but `this.type` in the member stands for
         // the receiver itself: `clone() -= key` is a `C`. And `super.m` is
@@ -787,7 +794,12 @@ impl Typer {
                 Some(c) => self.st.expand_type_members(c, &ty),
                 None => ty,
             };
-            self.st.expand_in_type(&recv_ty, &ty)
+            let ty = self.st.expand_in_type(&recv_ty, &ty);
+            // After the as-seen-from expansion, which re-resolves a type
+            // member's *name* through the receiver's class and its lexically
+            // enclosing ones -- and so would put the outer class's abstract
+            // declaration back where the import says a definition stands.
+            apply_outer_rebinds(ty, &outer_rebinds)
         };
         if found.len() == 1 {
             let s = found[0];
@@ -4009,6 +4021,15 @@ impl Typer {
             _ => false,
         }
     }
+}
+
+/// Apply the (declaration, definition) rewrite `receiver_outer_rebinds` built.
+fn apply_outer_rebinds(ty: Type, map: &[(SymbolId, Type)]) -> Type {
+    let mut ty = ty;
+    for (decl, to) in map {
+        ty = crate::symbol::subst_type_member(&ty, *decl, to);
+    }
+    ty
 }
 
 /// Apply the (declaration, path member) rewrite `receiver_path_members` built.

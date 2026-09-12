@@ -103,6 +103,11 @@ struct Info {
     /// name, descriptor, access flags — synthetic and bridge members included,
     /// because a trait's `m$` static implementation is `ACC_SYNTHETIC`.
     methods: Rc<Vec<(String, String, u16)>>,
+    /// Descriptors of the `<init>`s, which `methods` deliberately leaves out.
+    /// A nested `object`'s single constructor parameter is the only place the
+    /// type of its enclosing instance is written down (see
+    /// [`BinaryParents::ctors_of`]).
+    ctors: Rc<Vec<String>>,
 }
 
 /// Class name, super types and method table. Deliberately not
@@ -141,6 +146,7 @@ fn parse(bytes: &[u8]) -> Option<Info> {
     }
     let nmethods = c.u2()? as usize;
     let mut methods = Vec::new();
+    let mut ctors = Vec::new();
     for _ in 0..nmethods {
         let acc = c.u2()?;
         let name_i = c.u2()?;
@@ -148,7 +154,9 @@ fn parse(bytes: &[u8]) -> Option<Info> {
         let name = cp.utf8(name_i)?;
         let desc = cp.utf8(desc_i)?;
         skip_attrs(&mut c)?;
-        if name != "<init>" && name != "<clinit>" {
+        if name == "<init>" {
+            ctors.push(desc);
+        } else if name != "<clinit>" {
             methods.push((name, desc, acc));
         }
     }
@@ -156,6 +164,7 @@ fn parse(bytes: &[u8]) -> Option<Info> {
         is_interface: access & ACC_INTERFACE != 0,
         supers,
         methods: Rc::new(methods),
+        ctors: Rc::new(ctors),
     })
 }
 
@@ -227,6 +236,19 @@ impl BinaryParents {
     /// `p$T$$super$m` accessors. The class file is where both are.
     pub fn methods_of(&self, name: &str) -> Option<Rc<Vec<(String, String, u16)>>> {
         self.info(name).map(|i| i.methods.clone())
+    }
+
+    /// The `<init>` descriptors of the class file `name`, which
+    /// [`BinaryParents::methods_of`] leaves out.
+    ///
+    /// A member `object` of a trait is constructed by the implementing class
+    /// ([`crate::gen::Gen::binary_member_modules`]), and its constructor's one
+    /// parameter is the *type of the enclosing instance* it wants -- a cake
+    /// component's self type rather than the component
+    /// (`JdbcStatementBuilderComponent$SelectPart$(JdbcProfile)`). Nothing
+    /// else in the class file says so.
+    pub fn ctors_of(&self, name: &str) -> Option<Rc<Vec<String>>> {
+        self.info(name).map(|i| i.ctors.clone())
     }
 
     /// `(name, instance descriptor)` of every member the Scala trait `name`

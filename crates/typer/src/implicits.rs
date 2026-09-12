@@ -2011,10 +2011,60 @@ impl Typer {
 
     /// Every implicit clause of a conversion has a witness.
     fn conv_implicits_resolve(&self, id: SymbolId, from: &Type) -> bool {
-        self.conv_implicit_params(id, from, &Type::NoType)
+        let wants = self.conv_implicit_params(id, from, &Type::NoType);
+        if wants.iter().flatten().next().is_none() {
+            return true;
+        }
+        // Checking the same conversion inside its own clause would not
+        // terminate; nsc's `openImplicits` is the same guard.
+        if self
+            .open_implicits
+            .borrow()
             .iter()
-            .flatten()
-            .all(|want| self.search_implicit_at(want, 1).is_found())
+            .any(|(sid, _)| *sid == id)
+        {
+            return false;
+        }
+        self.open_implicits.borrow_mut().push((id, Type::NoType));
+        let ok = wants.iter().flatten().all(|want| {
+            self.search_implicit_at(want, 1).is_found() || self.conv_param_view_resolves(want)
+        });
+        self.open_implicits.borrow_mut().pop();
+        ok
+    }
+
+    /// A conversion's own implicit parameter of type `A => B` is a **view**
+    /// request (SLS 7.2), not a value request: an `implicit def` answers it
+    /// eta-expanded, exactly as [`Typer::conversion_view`] answers one in a
+    /// method's clause.
+    ///
+    /// slick's `Ordered.tuple2Ordered[T1, T2](t: (T1, T2))(implicit ev1: T1 =>
+    /// Ordered, ev2: T2 => Ordered)` is the shape: with `T1`/`T2` solved from
+    /// the tuple, `ev1` is `Predef.$conforms` (a `ColumnOrdered[Int]` already
+    /// *is* an `Ordered`) but `ev2` is the conversion `columnToOrdered`, which
+    /// a value search can never find -- so the whole tuple view was refused
+    /// and gitbucket's `sortBy { … => issue.issueId.desc -> commentId }` had
+    /// no `Ordered` for its pair.
+    ///
+    /// A bare type parameter on either end is declined: a view out of a type
+    /// the search has not pinned down would let any conversion in scope claim
+    /// it, which is nsc's rule in `inferView` too.
+    fn conv_param_view_resolves(&self, want: &Type) -> bool {
+        let Type::Function { params, ret } = want else {
+            return false;
+        };
+        if params.len() != 1 {
+            return false;
+        }
+        let (from, to) = (&params[0], ret.as_ref());
+        if [from, to].iter().any(|t| {
+            t.is_no_type()
+                || t.is_error()
+                || matches!(t, Type::Wildcard | Type::TypeParam(_) | Type::Nothing)
+        }) {
+            return false;
+        }
+        self.search_conversion(from, to).is_found()
     }
 
     pub(crate) fn search_implicit(&self, pt: &Type) -> ImplicitSearch {
@@ -4261,6 +4311,23 @@ fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
             .iter()
             .zip(fa.iter())
             .find_map(|(p, f)| unify_conv_tparam(tp, p, f)),
+        // A tuple parameter. `Type::Tuple` and `TupleN[...]` are the same
+        // type and both spellings reach here -- the pickle writes slick's
+        // `Ordered.tuple2Ordered[T1, T2](t: (T1, T2))` parameter as a
+        // `Type::Tuple`, and the argument `(issue.issueId.desc, commentId)`
+        // as the class. Without this the parameters were never solved from
+        // the argument, the conversion's own `T1 => Ordered` / `T2 => Ordered`
+        // clause was searched with them open, and no tuple view applied at
+        // all (gitbucket's `sortBy { … => issue.issueId.desc -> commentId }`).
+        (Type::Tuple(pa), Type::Tuple(fa))
+        | (Type::Tuple(pa), Type::Class { args: fa, .. })
+        | (Type::Class { args: pa, .. }, Type::Tuple(fa))
+            if pa.len() == fa.len() =>
+        {
+            pa.iter()
+                .zip(fa.iter())
+                .find_map(|(p, f)| unify_conv_tparam(tp, p, f))
+        }
         // The parameter is an application of a higher-kinded parameter:
         // `implicit def toFlatMapOps[F[_], A](fa: F[A])`. Solving `F` from a
         // receiver `Box[Int]` means taking the receiver's type *constructor*,
