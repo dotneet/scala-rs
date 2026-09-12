@@ -3237,7 +3237,7 @@ impl<'a> Gen<'a> {
                         asm.invokestatic_interface(iface, static_name, static_desc);
                     }
                 }
-                emit_putfield_from_expr(asm, &class_name, &fname, &fdesc);
+                emit_putfield_from_expr(asm, st, &class_name, &fname, &fdesc);
                 asm.aload(0);
                 asm.aload(0);
                 asm.getfield(&class_name, &bitmap, "I");
