@@ -209,6 +209,18 @@ impl SymbolTable {
 
     /// `ThisType(c)` for a self alias `self` of `c`; the singleton otherwise.
     fn norm_singleton(&self, pre: &Type) -> Type {
+        // `r.ring` with `ring: BigInt.type` *is* `BigInt` (pos/t5777): a
+        // path whose declared type is itself a singleton denotes that value.
+        if let Type::SingleType { prefix, sym } = pre {
+            if !sym.is_none() {
+                let under = self.path_step_type(prefix, *sym);
+                if matches!(under, Type::ModuleRef(_) | Type::ThisType(_))
+                    || matches!(&under, Type::SingleType { sym: s2, .. } if s2 != sym)
+                {
+                    return self.norm_singleton(&under);
+                }
+            }
+        }
         match pre {
             // An object is one value however it is spelled: `O.type`,
             // `O.In`'s `ModuleRef`, or `this` inside `O`.
@@ -246,6 +258,26 @@ impl SymbolTable {
             (Type::ThisType(x), Type::ThisType(y)) => {
                 x == y || self.is_ancestor_of(*x, *y) || self.is_ancestor_of(*y, *x)
             }
+            // `p.X` against `P.this.X` where `p` is a `P`: a member declared
+            // bare in `P` and read through `p` means `p.X` in nsc, and this
+            // compiler does not rewrite every `P.this` on every road a type
+            // travels (an alias expanded after the selection, an implicit
+            // view's result, a dependent method's result). A value of the
+            // class is accepted as that class's `this`, while two *different
+            // values* (`a.In` against `b.In`), a value of a base class
+            // against a subclass's `this` (`P2.this.S1` against `p.S1` with
+            // `p: P`, neg/abstract-class-2), and `P.this.S1` against `p.S1`
+            // (the other direction: scalac says `found P.this.S1, required
+            // P.this.p.S1`) stay apart.
+            (v @ (Type::SingleType { .. } | Type::ModuleRef(_)), Type::ThisType(c)) => {
+                if c.is_none() {
+                    return false;
+                }
+                let wv = self.widen_prefix(v);
+                !wv.is_no_type()
+                    && !wv.is_error()
+                    && self.is_sub_type(&wv, &self.self_type_of_class(*c))
+            }
             (
                 Type::SingleType {
                     prefix: p1,
@@ -262,14 +294,22 @@ impl SymbolTable {
                 // are read as the same one (`run/t6135`).
                 if s1 != s2 {
                     let (x, y) = (self.get(*s1), self.get(*s2));
-                    let both_params = x.flags.contains(Flags::PARAM)
+                    let same_name = x.name == y.name && !x.owner.is_none() && !y.owner.is_none();
+                    let both_params = same_name
+                        && x.flags.contains(Flags::PARAM)
                         && y.flags.contains(Flags::PARAM)
-                        && x.name == y.name
-                        && !x.owner.is_none()
-                        && !y.owner.is_none()
                         && self.get(x.owner).kind == SymKind::Method
                         && self.get(y.owner).kind == SymKind::Method;
-                    if !both_params {
+                    // A member and its override (`val a` of `new Dep { val a
+                    // = new A; val b = a.mkB }` against `Dep.a` in `val b:
+                    // a.B`, pos/t5313): nsc's `equalSymsAndPrefixes` matches
+                    // two paths by name when the prefixes unify.
+                    let overriding = same_name
+                        && self.get(x.owner).is_class_like()
+                        && self.get(y.owner).is_class_like()
+                        && (self.is_ancestor_of(x.owner, y.owner)
+                            || self.is_ancestor_of(y.owner, x.owner));
+                    if !both_params && !overriding {
                         return false;
                     }
                 }
@@ -287,13 +327,28 @@ impl SymbolTable {
         }
     }
 
+    /// The declared type of the last step of a path, read as seen from the
+    /// steps before it: `ring: C` on `r: Poly[BigInt.type]` is `BigInt.type`
+    /// (pos/t5777). A step with no prefix is read bare.
+    fn path_step_type(&self, prefix: &Type, sym: SymbolId) -> Type {
+        let under = self.singleton_underlying(sym);
+        if prefix.is_no_type() || under.is_no_type() || matches!(under, Type::Method { .. }) {
+            return under;
+        }
+        let recv = self.widen_prefix(prefix);
+        if recv.is_no_type() || recv.is_error() || self.class_sym_of(&recv).is_none() {
+            return under;
+        }
+        self.subst_as_seen_from_at(&recv, Some(prefix), &under)
+    }
+
     /// The type a prefix's values have: what `p.In <: P#In` compares `p`
     /// against.
     pub fn widen_prefix(&self, pre: &Type) -> Type {
         match pre {
             Type::ThisType(c) if !c.is_none() => self.self_type_of_class(*c),
             Type::SingleType { prefix, sym } if !sym.is_none() => {
-                let t = self.singleton_underlying(*sym);
+                let t = self.path_step_type(prefix, *sym);
                 if t.is_no_type() || matches!(t, Type::Method { .. }) {
                     self.widen_prefix(prefix)
                 } else {
@@ -317,26 +372,7 @@ impl SymbolTable {
             if !self.is_singleton_prefix(a) {
                 return false;
             }
-            if self.same_singleton_prefix(a, b) {
-                return true;
-            }
-            // `p.X` against `P.this.X` where `p` is a `P`: a member declared
-            // bare in `P` and read through `p` means `p.X` in nsc, and this
-            // compiler does not rewrite every `P.this` on every road a
-            // member type travels (an alias expanded after the selection,
-            // say). A value of the class is accepted as that class's `this`;
-            // two *different values* (`a.In` against `b.In`) and a value
-            // against a path the required type names (`P2.this.S1` against
-            // `p.S1`, neg/abstract-class-2) stay apart.
-            if let Type::ThisType(c) = self.norm_singleton(b) {
-                if !c.is_none() && matches!(a, Type::SingleType { .. } | Type::ModuleRef(_)) {
-                    let wa = self.widen_prefix(a);
-                    return !wa.is_no_type()
-                        && !wa.is_error()
-                        && self.is_sub_type(&wa, &self.self_type_of_class(c));
-                }
-            }
-            return false;
+            return self.same_singleton_prefix(a, b);
         }
         let wa = self.widen_prefix(a);
         // A prefix that names no class (a type parameter left as a
@@ -529,6 +565,16 @@ impl SymbolTable {
         };
         map_views(&ty, &on_class, &|p| p.clone())
     }
+}
+
+/// `ty` with every view whose prefix is `K.this` read as the bare class:
+/// what a member of `K` means when nothing says which `K` it is read
+/// through.
+pub(crate) fn bare_this_views(ty: &Type, k: SymbolId) -> Type {
+    crate::symbol::map_type(ty, &mut |t| match view_prefix(t) {
+        Some(Type::ThisType(c)) if *c == k => strip_view(t).clone(),
+        _ => t.clone(),
+    })
 }
 
 /// The recursion of [`SymbolTable::attach_inner_prefixes`]: `on_class` sees

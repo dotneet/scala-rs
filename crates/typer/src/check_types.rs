@@ -1774,6 +1774,11 @@ impl Typer {
                     ) {
                         return arg.ty.clone();
                     }
+                    if let TreeKind::This { .. } = &arg.kind {
+                        if let Some(c) = self.st.class_sym_of(&arg.ty) {
+                            return Type::ThisType(c);
+                        }
+                    }
                     if self.is_stable_path(arg) {
                         if let Some(sym) = self.term_path_sym(arg) {
                             let prefix = match &arg.kind {

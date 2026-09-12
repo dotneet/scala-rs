@@ -1781,7 +1781,7 @@ impl Typer {
         if is_function_pt(p) {
             return true;
         }
-        match p {
+        match crate::prefix::strip_view(p) {
             Type::Class { sym, args } => {
                 self.st.function_class_shape(*sym, args).is_some() || self.st.sam_sig(p).is_some()
             }
@@ -2050,7 +2050,7 @@ impl Typer {
     /// `None` means "no opinion" -- the parameter is not function-shaped, so a
     /// literal's arity says nothing about it.
     fn shape_arity(&self, param: &Type) -> Option<usize> {
-        match param {
+        match crate::prefix::strip_view(param) {
             Type::ByName(inner) | Type::Repeated(inner) => self.shape_arity(inner),
             Type::Function { params, .. } => Some(params.len()),
             Type::Class { sym, args } => {
@@ -2738,7 +2738,7 @@ impl Typer {
         // function-against-function rule below has to see it: a literal whose
         // parameters are not inferred yet would otherwise be inapplicable to
         // every such method.
-        if let Type::Class { sym, args } = param {
+        if let Type::Class { sym, args } = crate::prefix::strip_view(param) {
             if let Some(f) = self.st.function_class_shape(*sym, args) {
                 return self.arg_score(arg, &f);
             }

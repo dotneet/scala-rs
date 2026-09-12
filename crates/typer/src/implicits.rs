@@ -122,6 +122,12 @@ pub(crate) struct ImplicitMemo {
     cut: bool,
     /// Last companion-route writes made by the subtree currently evaluated.
     routes: rustc_hash::FxHashMap<u32, SymbolId>,
+    /// The prefixes the wanted types of this search reached an inner class's
+    /// companion through (module class -> `o1` of `o1.Inner`), read by
+    /// [`Typer::implicit_candidate_ty`]: a conversion `object Inner {
+    /// implicit def fromOther(b: Bridge): Inner }` found for an `o1.Inner`
+    /// gives an `o1.Inner` (pos/t4947).
+    companion_prefixes: rustc_hash::FxHashMap<u32, Vec<Type>>,
 }
 
 struct MemoEntry {
@@ -232,6 +238,7 @@ impl Drop for MemoLive<'_> {
             m.probe = 0;
             m.cut = false;
             m.routes.clear();
+            m.companion_prefixes.clear();
         }
     }
 }
@@ -243,6 +250,11 @@ pub(crate) fn complexity(ty: &Type) -> usize {
         // type. Treating an annotated tail as one node falsely marks shrinking
         // recursive HList derivations as divergent.
         Type::Annotated { tpe, .. } => complexity(tpe),
+        // An inner class behind a prefix (`prefix.rs`): nsc counts the
+        // prefix as one node and the class's arguments as themselves.
+        Type::Refined { .. } if crate::prefix::view_prefix(ty).is_some() => {
+            1 + complexity(crate::prefix::strip_view(ty))
+        }
         Type::Class { args, .. } | Type::Named { args, .. } => {
             1 + args.iter().map(complexity).sum::<usize>()
         }
@@ -262,6 +274,9 @@ fn head_sym(typer: &Typer, ty: &Type) -> Option<SymbolId> {
     match ty {
         Type::Class { sym, .. } => Some(*sym),
         Type::Applied { ctor, .. } => head_sym(typer, ctor),
+        Type::Refined { .. } if crate::prefix::view_prefix(ty).is_some() => {
+            head_sym(typer, crate::prefix::strip_view(ty))
+        }
         _ => typer.st.class_sym_of(ty),
     }
 }
@@ -733,6 +748,27 @@ impl Typer {
                 // `StrTypes.BCT[String]` sees the implicits `object StrTypes`
                 // declares.
                 if let Some(pre) = crate::prefix::view_prefix(ty) {
+                    // The companion of an inner class reached through a
+                    // path: its members are read as seen from that path
+                    // (`implicit_candidate_ty`).
+                    if self.st.is_singleton_prefix(pre) {
+                        for p in parents {
+                            let Type::Class { sym, .. } = p else { continue };
+                            if !self.st.is_inner_class_of_class(*sym) {
+                                continue;
+                            }
+                            let Some(m) = self.st.companion_module(*sym) else {
+                                continue;
+                            };
+                            let mcls = self.st.module_class_of(m);
+                            if let Ok(mut memo) = self.implicit_memo.try_borrow_mut() {
+                                let v = memo.companion_prefixes.entry(mcls.0).or_default();
+                                if !v.contains(pre) {
+                                    v.push(pre.clone());
+                                }
+                            }
+                        }
+                    }
                     let pre = match pre {
                         Type::ThisType(c) if !c.is_none() => self.st.type_of_class(*c),
                         other => self.st.widen_prefix(other),
@@ -866,6 +902,24 @@ impl Typer {
         // family. Read aliases through the actual imported API before
         // substituting the receiver's ordinary type parameters.
         let expanded = self.st.expand_in_type(&prefix, ty);
+        // The companion of an inner class imported through a path (`import
+        // o1.Inner.fromOther`): its members are read as seen from the path
+        // (`Inner` is `o1.Inner`, pos/t4947).
+        if let Type::SingleType { prefix: p, sym: m } = &prefix {
+            if !m.is_none()
+                && self.st.get(*m).kind == SymKind::Module
+                && self.st.is_singleton_prefix(p)
+            {
+                let k = self.st.get(self.st.module_class_of(*m)).owner;
+                if !k.is_none() && self.st.get(k).kind == SymKind::Class {
+                    let mut recv = self.st.widen_prefix(p);
+                    if self.st.class_sym_of(&recv).is_none() {
+                        recv = self.st.type_of_class(k);
+                    }
+                    return Some(self.st.subst_as_seen_from_at(&recv, Some(p), &expanded));
+                }
+            }
+        }
         Some(self.st.subst_as_seen_from(&prefix, &expanded))
     }
 
@@ -898,6 +952,44 @@ impl Typer {
             .unwrap_or(id);
         if let Some(seen) = self.at_import_prefix_of(origin, ty) {
             return std::borrow::Cow::Owned(seen);
+        }
+        // A member of the companion of an inner class, reached through the
+        // prefix the wanted type carries (`companion_prefixes`): `object
+        // Inner { implicit def fromOther(b: Bridge): Inner }` found for an
+        // `o1.Inner` is read as seen from `o1`, so its result is `o1.Inner`
+        // and not `Outer.this.Inner` (pos/t4947). Reached through two
+        // different paths in one search (`b: s.E` with `b: r.E`, whose
+        // conversions come from both `r.E`'s and `s.E`'s companion,
+        // pos/t5340), the member keeps no prefix: the class is read bare,
+        // which conforms to either.
+        if !owner.is_none() && self.st.get(owner).kind == SymKind::ModuleClass {
+            let k = self.st.get(owner).owner;
+            if !k.is_none() && self.st.get(k).kind == SymKind::Class {
+                let pres = self
+                    .implicit_memo
+                    .try_borrow()
+                    .ok()
+                    .and_then(|m| m.companion_prefixes.get(&owner.0).cloned());
+                if let Some(pres) = pres {
+                    if pres.len() == 1 {
+                        let mut recv = self.st.widen_prefix(&pres[0]);
+                        if self.st.class_sym_of(&recv) != Some(k)
+                            && !self
+                                .st
+                                .class_sym_of(&recv)
+                                .is_some_and(|c| self.st.is_ancestor_of(k, c))
+                        {
+                            recv = self.st.type_of_class(k);
+                        }
+                        return std::borrow::Cow::Owned(self.st.subst_as_seen_from_at(
+                            &recv,
+                            Some(&pres[0]),
+                            ty,
+                        ));
+                    }
+                    return std::borrow::Cow::Owned(crate::prefix::bare_this_views(ty, k));
+                }
+            }
         }
         if this.is_none()
             || owner.is_none()
@@ -1717,6 +1809,25 @@ impl Typer {
     /// A parameterless implicit method is *not* a view: `<:<.refl[A]: A =:= A`
     /// would otherwise convert every type to itself.
     fn view_shape(&self, ty: &Type) -> Option<(Type, Type)> {
+        // An inner class behind a prefix (`prefix.rs`): the function it
+        // extends is read through the view (DeliteDSL's `T <~< P`).
+        if crate::prefix::view_prefix(ty).is_some() {
+            let f = self
+                .st
+                .base_type_seq(ty)
+                .into_iter()
+                .find_map(|b| match &b {
+                    Type::Function { .. } => Some(b.clone()),
+                    Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+                    _ => None,
+                });
+            return match f {
+                Some(Type::Function { params, ret }) if params.len() == 1 => {
+                    Some((params[0].clone(), (*ret).clone()))
+                }
+                _ => None,
+            };
+        }
         match ty {
             // A by-name parameter takes the value it delays: scalatra's
             // `implicit def booleanBlock2RouteMatcher(block: => Boolean):

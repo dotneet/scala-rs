@@ -6607,6 +6607,10 @@ impl SymbolTable {
     /// (`PickleSupply::concrete_method_names`) and passes it here rather than
     /// installing it; see that function for what installing it costs.
     pub fn sam_sig_over(&self, ty: &Type, overridden: &[String]) -> Option<SamSig> {
+        // An inner class behind a prefix (`prefix.rs`) is the class it views;
+        // the prefix is what its members' bare inner classes are read at.
+        let view_pre = crate::prefix::view_prefix(ty).cloned();
+        let ty = crate::prefix::strip_view(ty);
         let cls = self.class_sym_of(ty)?;
         let jvm = self.get(cls).jvm_name.clone();
         if jvm.starts_with("scala/Function") || jvm.ends_with("PartialFunction") {
@@ -6685,7 +6689,7 @@ impl SymbolTable {
                 args: Vec::new(),
             },
         };
-        let subst = |t: &Type| self.subst_as_seen_from(&recv, t);
+        let subst = |t: &Type| self.subst_as_seen_from_at(&recv, view_pre.as_ref(), t);
         let (raw_params, raw_ret) = match &self.get(method).ty {
             Type::Method { paramss, ret } => (
                 paramss.iter().flatten().cloned().collect::<Vec<_>>(),

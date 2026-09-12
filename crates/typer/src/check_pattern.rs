@@ -1019,6 +1019,9 @@ impl Typer {
         match &tree.kind {
             TreeKind::AppliedTypeTree { tpt, args } => {
                 let ctor = self.tree_to_type(tpt);
+                // An inner class behind a prefix (`prefix.rs`): the binders
+                // take the kinds of the class's parameters (pos/t4070).
+                let ctor = crate::prefix::strip_view(&ctor).clone();
                 let params = match &ctor {
                     Type::Class { sym, .. } | Type::TypeMember(sym) | Type::TypeParam(sym) => {
                         self.st.get(*sym).tparams.clone()
