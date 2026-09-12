@@ -601,6 +601,7 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
     // `add_try` wrote them as `(=> Any): Any`).
     crate::prelude_dbio::install(st);
     crate::prelude_polymap::install(st);
+    crate::prelude_toseq::install(st, library_abi);
     crate::prelude_lang::install(st);
     crate::prelude_lazyref::install(st);
 

@@ -139,3 +139,42 @@ instead of `Int` (nsc gets `Int` through `option2Iterable`).
   hold scalac's exhaustivity / `Null` lint warnings (agent/warn).
 * A user `Seq` subclass's `tail` needs `scala$collection$SeqOps$$super$
   sizeCompare`, which we do not emit (`AbstractMethodError`, agent/mixcg).
+
+## The five prelude items agent/erascg reported
+
+1. **`Set.toSeq` / `Map.toSeq` declared `List`** -- fixed
+   (`crates/typer/src/prelude_toseq.rs`). `IterableOnceOps.toSeq` is
+   `immutable.Seq[A]` and an `immutable.Seq` returns `this.type`, so the
+   prelude's `List` made the call name a descriptor the library does not have
+   and the *use* of the result failed verification. `run/t3563` passes.
+2. **`Map.empty ++ seq` after a `Set` operation** -- already correct on
+   batch/w2 (agent/erascg's own merge); `run/t2417` passes, and the `n7.scala`
+   repro now agrees with scalac.
+3. **`1.toByte.to(3.toByte)` is a `NumericRange`, scalac's is a `Range`** --
+   **not** fixed, and withholding the members is *not* the fix. The prelude
+   declares `to` / `until` on `RichByte` / `RichShort`, which the library's
+   `ScalaWholeNumberProxy` does not have; nsc widens the receiver to `Int` and
+   uses `RichInt.to`. Removing them (tried, reverted) turns valid programs
+   into "value to is not a member of Byte": our implicit-view search does not
+   widen a numeric receiver. That widening is the real repair, and it belongs
+   with whoever owns numeric view resolution; the prelude's `NumericRange`
+   declarations can go once it exists.
+4. **`Regex.pattern` / `UnanchoredRegex.pattern` "not a member"** -- root
+   found, not fixed. The pickle supply declines the member outright:
+   `scala/util/matching/Regex#pattern: unmappable result type Ref {
+   sym: "java.util.regex.Pattern" }` (`SCALA_RS_PICKLE_DEBUG=1`). A pickled
+   type naming a *Java* class has no Scala pickle to read, and `conv` gives up
+   instead of stubbing the class from the classpath
+   (`classpath::find_or_stub_java_class`). Every library member whose
+   signature mentions a JDK type is lost the same way, so the fix is worth
+   making in `pickle_supply::conv_ref` -- in the supply seam, needing the seam
+   test list.
+5. **`4.byteValue` / `4.doubleValue` "not a member"** -- root found, not
+   fixed, and it is wider than reported: `shortValue`, `longValue`,
+   `floatValue` and `byteValue`/`doubleValue` all fail, only `intValue`
+   resolves. The trace shows the member *is* supplied
+   (`scala.runtime.RichInt#byteValue: supplied 1 overload(s)`, from
+   `ScalaNumericAnyConversions` through RichInt's pickled parents) yet the
+   selection on the `Int` receiver still fails, and RichInt is also stubbed as
+   a module in the same run -- so the supplied member is not where the view
+   application looks for it.

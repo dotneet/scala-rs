@@ -109,6 +109,7 @@ mod prelude_strhier;
 mod prelude_stringops8;
 mod prelude_strmap;
 mod prelude_text;
+mod prelude_toseq;
 mod prelude_tuple;
 mod prelude_universal;
 mod prelude_variance;
