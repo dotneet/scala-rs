@@ -246,6 +246,9 @@ impl Typer {
     /// Returns `false` — leaving `fun` untouched — for anything else, so the
     /// caller reports the original failure.
     pub(crate) fn insert_apply_on_nullary(&mut self, fun: &mut Tree) -> bool {
+        if self.apply_function_value_alternative(fun) {
+            return true;
+        }
         let ret = match fun.ty.clone() {
             Type::Method { paramss, ret }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
@@ -336,6 +339,85 @@ impl Typer {
         };
         self.type_select(fun, &Type::NoType);
         !fun.ty.is_error() && !fun.ty.is_no_type()
+    }
+
+    /// An overload set whose only value-shaped alternative is a function-typed
+    /// `val`, applied to arguments no method alternative takes: nsc's
+    /// `followApply` makes the value an alternative through its `apply`.
+    ///
+    /// ```scala
+    /// val h: Any => String = _ => "value"
+    /// def h(s: String): String = "method"
+    /// h(1)   // the value: h.apply(1)
+    /// ```
+    ///
+    /// scala-rs offered only the method and reported "no matching overload".
+    /// The receiver is rebuilt on the value's own symbol: the overloaded
+    /// reference carries the group's first alternative, which may be the
+    /// method.
+    fn apply_function_value_alternative(&mut self, fun: &mut Tree) -> bool {
+        let Type::Overload(alts) = &fun.ty else {
+            return false;
+        };
+        if fun.sym.is_none()
+            || !matches!(fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+        {
+            return false;
+        }
+        let value_shaped = alts
+            .iter()
+            .filter(|a| match a {
+                Type::Method { paramss, .. } => {
+                    paramss.is_empty() || paramss.iter().all(|c| c.is_empty())
+                }
+                Type::Class { .. } | Type::ModuleRef(_) | Type::Function { .. } => true,
+                _ => false,
+            })
+            .count();
+        let fns: Vec<&Type> = alts
+            .iter()
+            .filter(|a| matches!(a, Type::Function { .. }))
+            .collect();
+        let ([fn_ty], 1) = (fns.as_slice(), value_shaped) else {
+            return false;
+        };
+        let fn_ty = (*fn_ty).clone();
+        let Some(group) = self.overload_member_types.get(&fun.sym.0) else {
+            return false;
+        };
+        let mut owners = group
+            .iter()
+            .filter(|(s, t)| *t == fn_ty && self.st.get(*s).kind == SymKind::Term);
+        let (Some((vsym, _)), None) = (owners.next(), owners.next()) else {
+            return false;
+        };
+        let vsym = *vsym;
+        let mut inner = fun.clone();
+        inner.sym = vsym;
+        inner.ty = fn_ty;
+        let span = fun.span;
+        let saved = fun.clone();
+        *fun = Tree {
+            id: NodeId(0),
+            span,
+            kind: TreeKind::Select {
+                qual: Box::new(inner),
+                name: "apply".into(),
+            },
+            ty: Type::NoType,
+            sym: SymbolId::NONE,
+            postfix: false,
+            scala_ref: false,
+            stable_pat: false,
+            byname_thunk: false,
+            byname_type_marker: false,
+        };
+        self.type_select(fun, &Type::NoType);
+        if fun.ty.is_error() || fun.ty.is_no_type() {
+            *fun = saved;
+            return false;
+        }
+        true
     }
 
     /// An overloaded module member competes through its apply methods. Once
@@ -479,6 +561,10 @@ impl Typer {
     ) -> OverloadPick {
         let mut cands: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         let mut module_apply_candidates = Vec::new();
+        // Value alternatives of function type (`val f: String => Int` beside
+        // `def f(s: String)`): nsc's `followApply` makes them compete through
+        // their `apply`. Only used to detect a tie below.
+        let mut function_values: Vec<(SymbolId, Vec<Type>, Type)> = Vec::new();
         // Which parameter clause these candidates come from: `f(a)(b = 1)`
         // applied as `f(1)()` leaves a residual method type whose only clause
         // is the *second* one, and that is where the defaults live.
@@ -549,6 +635,11 @@ impl Typer {
                                 paramss.first().cloned().unwrap_or_default(),
                                 (**ret).clone(),
                             ));
+                        }
+                        if let Type::Function { params, ret } = ty {
+                            if self.st.get(m).kind == SymKind::Term {
+                                function_values.push((m, params.clone(), (**ret).clone()));
+                            }
                         }
                         if let Type::ModuleRef(module) = ty {
                             for apply in
@@ -753,6 +844,14 @@ impl Typer {
             0 => OverloadPick::None,
             1 => {
                 let (s, p, r) = applicable.into_iter().next().unwrap();
+                if self.function_value_ties(
+                    &(s, p.clone(), r.clone()),
+                    &function_values,
+                    arg_tys,
+                    with_views,
+                ) {
+                    return OverloadPick::Ambiguous;
+                }
                 OverloadPick::Found(s, p, r)
             }
             _ => {
@@ -895,6 +994,11 @@ impl Typer {
                         winners = mono;
                     }
                 }
+                if let [w] = winners.as_slice() {
+                    if self.function_value_ties(w, &function_values, arg_tys, with_views) {
+                        return OverloadPick::Ambiguous;
+                    }
+                }
                 // nsc `isStrictlyMoreSpecific` weighs the owners too: an
                 // alternative earns a point for being as specific as the
                 // other and another for being defined in a proper subclass of
@@ -944,6 +1048,46 @@ impl Typer {
         }
     }
 
+    /// Whether a function-typed value alternative is applicable to the call
+    /// and ties with the method alternative `w` that won: nsc weighs the
+    /// value through its `apply` (`followApply`), and two alternatives of
+    /// the same owner whose parameter lists are each as specific as the
+    /// other are ambiguous.
+    ///
+    /// ```scala
+    /// val f: String => Int = _.length
+    /// def f(s: String): Int = 2
+    /// f("")   // ambiguous reference to overloaded definition
+    /// ```
+    ///
+    /// scala-rs never offered the value as an alternative and called the
+    /// method. Only the tie is reported here; a value alternative that is
+    /// strictly *more* specific than every method is not selected by this
+    /// resolver, and is left as it was.
+    fn function_value_ties(
+        &self,
+        w: &(SymbolId, Vec<Type>, Type),
+        values: &[(SymbolId, Vec<Type>, Type)],
+        arg_tys: &[Type],
+        with_views: bool,
+    ) -> bool {
+        if w.0.is_none() || values.is_empty() {
+            return false;
+        }
+        values.iter().any(|v| {
+            if v.1.len() != arg_tys.len()
+                || !self.is_applicable(v.0, 0, &v.1, arg_tys, with_views, &[], None)
+            {
+                return false;
+            }
+            let weight = |a: &(SymbolId, Vec<Type>, Type), b: &(SymbolId, Vec<Type>, Type)| {
+                u8::from(self.is_as_specific_method(a.0, b.0, &a.1, &b.1, with_views))
+                    + u8::from(self.owner_is_proper_subclass(a.0, b.0))
+            };
+            weight(w, v) <= weight(v, w) && weight(v, w) <= weight(w, v)
+        })
+    }
+
     /// One alternative's parameter and result types with its *own* type
     /// parameters rewritten to positional markers, so two declarations of the
     /// same signature compare equal however their type parameters were
@@ -990,7 +1134,7 @@ impl Typer {
     /// different class, and the first is a subclass of the second. Only real
     /// classes count -- two alternatives owned by the same class, or by
     /// anything that is not a class, are not ordered by this rule.
-    fn owner_is_proper_subclass(&self, a: SymbolId, b: SymbolId) -> bool {
+    pub(crate) fn owner_is_proper_subclass(&self, a: SymbolId, b: SymbolId) -> bool {
         if a.is_none() || b.is_none() {
             return false;
         }
@@ -1098,7 +1242,7 @@ impl Typer {
     /// `map(f: Char => Char): String` and `map[B](f: Char => B): IndexedSeq[B]`;
     /// without instantiating `B := Char` neither alternative is as specific as
     /// the other and every `"…".map(…)` was `ambiguous overload`.
-    fn is_as_specific_method(
+    pub(crate) fn is_as_specific_method(
         &self,
         a_sym: SymbolId,
         b_sym: SymbolId,

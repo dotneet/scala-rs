@@ -80,11 +80,13 @@ impl Typer {
         if tree.byname_thunk {
             return;
         }
-        if tree.id.is_pretyped_default() {
+        if tree.id.is_pretyped() {
             // A default argument's body, already typed in the scope it was
             // written in (`type_default_rhs_here`). Typing it again here would
             // resolve its names in the caller's scope -- which is the bug that
-            // typing it there fixes -- so only fit it to the expectation.
+            // typing it there fixes -- so only fit it to the expectation. The
+            // same holds for a macro's receiver or argument spliced back into
+            // its expansion unchanged (`NodeId::PRETYPED_SPLICE`).
             if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
                 self.adapt(tree, pt);
             }
@@ -1975,6 +1977,15 @@ impl Typer {
                             byname_type_marker: false,
                         };
                         self.type_apply(tree, pt);
+                        return;
+                    }
+                    if let Some(msg) = self
+                        .st
+                        .class_sym_of(&tree.ty)
+                        .and_then(|cls| self.unapplied_new_error(cls))
+                    {
+                        self.error(tree.span, msg);
+                        tree.ty = Type::Error;
                         return;
                     }
                     self.check_instantiated_self_type(&tree.ty, tree.span);

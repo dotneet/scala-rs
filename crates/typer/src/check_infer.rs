@@ -3195,8 +3195,19 @@ impl Typer {
         // An unapplied method where no function type is expected (nsc
         // `adaptMethodTypeToExpr`): an error in 2.13, eta-expanded under
         // `-Xsource:3` and then adapted like any other function value.
-        if !self.expects_function_value(pt) && self.adapt_method_value(tree) && tree.ty.is_error() {
-            return;
+        if !self.expects_function_value(pt) {
+            // An overloaded reference is resolved against `pt` first
+            // (`crate::overload_ref`); what it picks is an ordinary method
+            // value below.
+            if matches!(tree.ty, Type::Overload(_)) && self.adapt_overloaded_value(tree, pt) {
+                return;
+            }
+            if !matches!(tree.ty, Type::Overload(_))
+                && self.adapt_method_value(tree)
+                && tree.ty.is_error()
+            {
+                return;
+            }
         }
         self.complete_java_type(&tree.ty, tree.span);
         // By-name wrap must run before `Nothing <: pt` (Nothing inhabits every

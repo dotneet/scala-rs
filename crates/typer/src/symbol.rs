@@ -3513,6 +3513,27 @@ impl SymbolTable {
         }
     }
 
+    /// The class whose `this` an unqualified reference to a member of `owner`
+    /// is selected on: the innermost class enclosing the current one that is
+    /// `owner` or has it as a base class -- through its self type too
+    /// (`is_ancestor_of`), which is how a component trait with
+    /// `self: Profile =>` reaches `Profile`'s members. `None` when no
+    /// enclosing class does (a member reached some other way, an import).
+    pub(crate) fn enclosing_class_reaching(&self, owner: SymbolId) -> Option<SymbolId> {
+        let mut c = self.this_class;
+        while !c.is_none() {
+            if matches!(
+                self.get(c).kind,
+                SymKind::Class | SymKind::ModuleClass | SymKind::Module
+            ) && (c == owner || self.is_ancestor_of(owner, c))
+            {
+                return Some(c);
+            }
+            c = self.get(c).owner;
+        }
+        None
+    }
+
     pub(crate) fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
         let mut work = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();

@@ -242,6 +242,32 @@ impl Member {
             && !self.name.ends_with(' ')
     }
 
+    /// A case class's own `copy`, given the flags of the class declaring it.
+    ///
+    /// [`Member::is_case_synthetic`] was written on the premise that nsc
+    /// marks all three of a case class's derived members `CASE`; the
+    /// released 2.13.16 pickle says otherwise. The companion's `apply` and
+    /// `unapply` are `CASE | SYNTHETIC`, but the class's `copy` is only
+    /// `SYNTHETIC` (`slick.util.DumpInfo#copy` and a freshly compiled
+    /// `case class Foo(id: Int, name: String)` both read back as `<method>
+    /// <synthetic>` through the runtime mirror). So `copy` was dropped with
+    /// the synthetic plumbing and the class file's version stood in, with
+    /// parameters named `x$0`, `x$1`, … -- and `DumpInfo("a").copy(name =
+    /// "b")` was "unknown parameter name: name". Every slick `mapTo`
+    /// expansion writes `super.getDumpInfo.copy(name = …)`.
+    ///
+    /// What identifies it is the name, the flag, and the *declaring class*
+    /// being a case class; that last part is the caller's to supply.
+    pub fn is_case_copy(&self, owner_flags: u64) -> bool {
+        owner_flags & pflags::CASE != 0
+            && self.name == "copy"
+            && self.has(pflags::SYNTHETIC)
+            && self.has(pflags::METHOD)
+            && !self.has(pflags::PRIVATE)
+            && !self.has(pflags::BRIDGE)
+            && !self.has(pflags::LOCAL)
+    }
+
     /// The conversion method nsc derives from an `implicit class`.
     ///
     /// `implicit class RichX(x: X) { … }` expands to a plain `class RichX`

@@ -818,7 +818,7 @@ impl Typer {
             return;
         };
         // A synthesized application has no node id of its own to be keyed by.
-        if id == NodeId(0) || id.is_filled_arg() || id.is_pretyped_default() {
+        if id == NodeId(0) || id.is_filled_arg() || id.is_pretyped() {
             return;
         }
         let mut written = order.iter().flatten();

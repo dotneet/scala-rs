@@ -308,6 +308,15 @@ pub struct Typer {
     pub(crate) sources: Vec<std::rc::Rc<str>>,
     pub(crate) source_paths: Vec<String>,
     pub(crate) macro_next_node: u32,
+    /// Set while a macro expansion's *pattern* is being rebuilt
+    /// (`Typer::pattern_from_reply`), where nsc's `Ident(_)` is the wildcard
+    /// pattern rather than a name.
+    pub(crate) macro_reply_pattern: bool,
+    /// The typed receiver and arguments of the macro application whose reply
+    /// is being rebuilt, by the index they were sent under. A reply that
+    /// returns one of them unchanged (`(t "Orig" … K …)`) gets it back typed,
+    /// once; see `NodeId::PRETYPED_SPLICE`.
+    pub(crate) macro_splices: Vec<Option<Tree>>,
     /// Counter for synthetic names.
     pub(crate) gensym: u32,
     /// Where the argument in each parameter slot was written, as the last call
@@ -331,6 +340,11 @@ pub struct Typer {
     /// { … } }` opens both -- and nsc really does tell the two apart
     /// (2.13.16, with and without `-Xsource:3`). See `expose_unqualified`.
     pub(crate) open_pkgs: HashMap<usize, Vec<SymbolId>>,
+    /// The same, clause by clause: for each `package` clause of a file, the
+    /// packages open inside it, outermost first. `package p { class Top }`
+    /// beside `package p.q.r { … }` in one file opens `p` for the first
+    /// clause only; the flat list above cannot tell the second clause that.
+    pub(crate) open_pkg_chains: HashMap<usize, Vec<Vec<SymbolId>>>,
     /// What each compilation unit defines at the top level of its own package
     /// clauses: `file index -> name -> [(package, symbol)]`.
     ///
@@ -513,10 +527,6 @@ pub struct Typer {
     /// application currently being expanded, so a tree the engine hands over
     /// gets positions inside the file that asked for the expansion.
     pub(crate) macro_rpc_span: Span,
-    /// Classes this run is compiling that an answer to the engine had to name
-    /// but that scala-rs could not describe, with the reason. Cleared at the
-    /// start of every expansion (`crates/typer/src/expand_rpc.rs`).
-    pub(crate) macro_undescribed: Vec<(String, String)>,
     /// Types handed to the engine as *placeholder* symbols, by the full name
     /// the placeholder carries. A class this run is compiling has no class
     /// file for the engine's mirror to find, so it travels as its name alone
@@ -873,8 +883,13 @@ pub fn typecheck_units_src(
     t.link_tuple_products();
     t.link_string_parents();
     t.defer_default_rhs = true;
+    {
+        let refs: Vec<(&Tree, usize)> = units.iter().map(|(t, i)| (&**t, *i)).collect();
+        t.check_duplicate_names(&refs);
+    }
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
+        t.validate_modifiers(tree);
         t.namer(tree);
         t.register_sealed_from_namer(tree);
     }
@@ -1031,12 +1046,15 @@ impl Typer {
             sources: Vec::new(),
             source_paths: opts.source_paths.clone(),
             macro_next_node: 1,
+            macro_reply_pattern: false,
+            macro_splices: Vec::new(),
             gensym: 0,
             slot_source: Vec::new(),
             last_named_order: None,
             local_class_n: std::collections::HashMap::new(),
             pkg_nest: Vec::new(),
             open_pkgs: HashMap::new(),
+            open_pkg_chains: HashMap::new(),
             unit_pkg_defs: HashMap::new(),
             import_origin: 0,
             import_text: HashMap::new(),
@@ -1073,7 +1091,6 @@ impl Typer {
             macro_rpc_forcing: Vec::new(),
             macro_query_depth: 0,
             macro_rpc_span: Span::DUMMY,
-            macro_undescribed: Vec::new(),
             macro_local_tags: HashMap::new(),
             macro_lexical_owner: SymbolId::NONE,
             macro_mirror_owners: HashMap::new(),

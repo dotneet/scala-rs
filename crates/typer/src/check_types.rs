@@ -4089,7 +4089,15 @@ impl Typer {
     /// `SimpleFeatureNode` declares.
     fn type_member_here(&self, id: SymbolId) -> Type {
         let base = self.st.type_member_as_seen(id);
-        if matches!(base, Type::TypeMember(_)) {
+        // A deferred member stands for itself and has nothing to substitute.
+        // An alias whose right-hand side is *another* member does: `type
+        // Reader = M#Reader` (slick's `ResultConverter`) is an abstract
+        // projection through the owner's type parameter `M`, and seen from a
+        // subclass that fixes `M` it reduces -- `subst_tparams` does exactly
+        // that through `subst_projections`. Returning it unsubstituted left
+        // `r: Reader` in `class L extends Conv[IntDomain, String]` as `M#Reader`
+        // while `next[Int].read` wanted the reduced `Int`.
+        if matches!(base, Type::TypeMember(m) if m == id) {
             return base;
         }
         let owner = self.st.get(id).owner;

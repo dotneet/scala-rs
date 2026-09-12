@@ -188,7 +188,7 @@ impl Pass<'_> {
                 // Its cloned expression must read this same saved value.
                 if source_id != scala_rs_parser::NodeId(0)
                     && source_id != scala_rs_parser::NodeId::FILLED_ARG
-                    && source_id != scala_rs_parser::NodeId::PRETYPED_DEFAULT
+                    && !source_id.is_pretyped()
                 {
                     fn replace_copy(t: &mut Tree, id: scala_rs_parser::NodeId, value: &Tree) {
                         if t.id == id {
