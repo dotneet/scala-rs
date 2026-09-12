@@ -2854,8 +2854,17 @@ pub(crate) fn emit_from_erased_object(asm: &mut Assembler, st: &SymbolTable, ty:
         }
         return;
     }
-    if matches!(ty, Type::Tuple(_)) {
-        asm.checkcast("scala/Tuple2");
+    // `scala/Tuple{n}`, by the tuple's own arity. Hard-coding `Tuple2` here
+    // narrowed every tuple binder read out of an erased field to a pair, so
+    // `{ case (big, id) => … }` on a `((A, B, C), Long)` cast the inner triple
+    // to `Tuple2`: `ClassCastException: scala.Tuple3 cannot be cast to
+    // scala.Tuple2` -- gitbucket's `Repositories.*`, whose `.shaped.<>`
+    // projection destructures a `(Tuple12, Tuple8, Long)`, threw it on the first
+    // row read back.
+    if let Type::Tuple(ts) = ty {
+        if !ts.is_empty() {
+            asm.checkcast(&format!("scala/Tuple{}", ts.len()));
+        }
         return;
     }
     // An object's singleton type: `case x: Dingus.type => x.IamDingus` binds

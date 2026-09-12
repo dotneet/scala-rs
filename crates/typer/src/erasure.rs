@@ -922,6 +922,35 @@ fn is_ref_erased(ty: &Type) -> bool {
 }
 
 fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
+    // The two arms of an `if` (and every case of a `match`) meet at one stack
+    // slot, so a *primitive* arm of a **reference**-typed one has to box --
+    // whether or not anything outside asked for a type. When `expected` is
+    // `None` that answer has to come from the expression's own type:
+    //
+    //   def e(b: Boolean): String = { if (b) 1L else "x" }.asInstanceOf[String]
+    //
+    // passes nothing down (the receiver of `asInstanceOf` is typed on its own),
+    // and the `long` arm then reached a frame with one slot in it:
+    // "VerifyError: Inconsistent stackmap frames ... stack: { long, long_2nd }
+    // / Stackmap Frame ... stack: { top }". That is gitbucket's
+    // `ConfigUtil.convertType[A: ClassTag]`, whose body is exactly this shape
+    // with four arms of four different types -- and `DatabaseConfig` reads a
+    // config value through it before gitbucket does anything at all, so every
+    // one of this harness's programs died on it.
+    //
+    // Only `If` and `Match` below read `branch_pt`; every other tree kind keeps
+    // the `expected` it was given.
+    let branch_pt: Option<Type> = if expected.is_some() {
+        None
+    } else {
+        match &tree.ty {
+            Type::NoType | Type::Error | Type::Unit | Type::Nothing => None,
+            t => {
+                let e = erase_ty(t, st);
+                is_ref_erased(&e).then_some(e)
+            }
+        }
+    };
     match &mut tree.kind {
         TreeKind::PackageDef { stats, .. } => {
             for s in stats {
@@ -1017,8 +1046,9 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
         TreeKind::If { cond, thenp, elsep } => {
             erase_tree(cond, st, Some(&Type::Boolean));
-            erase_tree(thenp, st, expected);
-            erase_tree(elsep, st, expected);
+            let pt = expected.or(branch_pt.as_ref());
+            erase_tree(thenp, st, pt);
+            erase_tree(elsep, st, pt);
         }
         TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
             erase_tree(cond, st, Some(&Type::Boolean));
@@ -1047,13 +1077,14 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
         TreeKind::Match { selector, cases } => {
             erase_tree(selector, st, None);
+            let pt = expected.or(branch_pt.as_ref());
             for c in cases {
                 mark_value_class_patterns(&mut c.pat, st);
                 erase_tree(&mut c.pat, st, None);
                 if !c.guard.is_empty() {
                     erase_tree(&mut c.guard, st, Some(&Type::Boolean));
                 }
-                erase_tree(&mut c.body, st, expected);
+                erase_tree(&mut c.body, st, pt);
             }
         }
         TreeKind::Function { vparams, body } => {

@@ -985,11 +985,47 @@ impl Typer {
             }
         }
         if !evidence.is_empty() {
+            // nsc desugars view and context bounds into the method's *existing*
+            // trailing implicit clause, with the synthesized evidence *before*
+            // the explicitly written implicit parameters:
+            //
+            //   def a[E: Sem](implicit P: Par[List])
+            //     => def a[E](implicit evidence$1: Sem[E], P: Par[List])
+            //
+            // which scalac 2.13.16 emits as `a(Sem, Par)` -- evidence first.
+            // Pushing the evidence as a *second* implicit clause instead left
+            // the method with two implicit clauses, a shape no Scala 2 source
+            // can write; the call site filled only the first, so `O.a[Int]`
+            // compiled to a one-argument call against a two-parameter method
+            // and the first execution died with `VerifyError: Operand stack
+            // underflow` (cats
+            // `ParallelInstances.catsParallelForEitherTNestedParallelValidated`,
+            // whose whole class then failed to load). It also reversed our
+            // parameter order relative to scalac's ABI.
+            let merge = vparamss.last().is_some_and(|clause| {
+                clause.first().is_some_and(|p| {
+                    matches!(&p.kind,
+                        TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::IMPLICIT))
+                })
+            });
             let tys: Vec<Type> = evidence.iter().map(|e| e.ty.clone()).collect();
             let ids: Vec<SymbolId> = evidence.iter().map(|e| e.sym).collect();
-            paramss_ty.push(tys);
-            paramss_ids.push(ids);
-            vparamss.push(evidence);
+            if merge {
+                let last = vparamss.len() - 1;
+                let mut merged = evidence;
+                merged.append(&mut vparamss[last]);
+                vparamss[last] = merged;
+                paramss_ty[last].splice(0..0, tys);
+                paramss_ids[last].splice(0..0, ids);
+            } else {
+                paramss_ty.push(tys);
+                paramss_ids.push(ids);
+                vparamss.push(evidence);
+            }
+            // `all_params` drives the JVM descriptor (`gen_desc`), so it has to
+            // follow the clause order the merge just established rather than
+            // the order the evidence was synthesized in.
+            all_params = paramss_ids.iter().flatten().copied().collect();
         }
         // A *secondary* constructor's defaults are not ordinary method
         // defaults. `synthesize_default_getters` would declare an instance

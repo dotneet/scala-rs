@@ -603,6 +603,26 @@ pub(crate) fn add_set(st: &mut SymbolTable) {
         Type::Boolean,
         Intrinsic::None,
     );
+    // `SetOps.apply(elem: A): Boolean` -- a set used as its own membership
+    // predicate (`alreadyIn(a)` in cats' `TraverseFilter.ordDistinct`).
+    //
+    // `Set[A]` is also an `A => Boolean`, so without this declaration the
+    // symbol `apply` resolved to is `Function1`'s, whose result is the type
+    // parameter `R` and therefore erases to `Object`. Erasure then wrapped the
+    // call in `$unbox`, while the backend emitted the descriptor the *tree*
+    // carries -- `invokeinterface Set.apply:(Object)Z`, which is also what
+    // scalac 2.13.16 emits -- so `BoxesRunTime.unboxToBoolean` was handed an
+    // `int`: "VerifyError: Bad type on operand stack ... Type integer is not
+    // assignable to 'java/lang/Object'". `javap scala.collection.SetOps` says
+    // `public default boolean apply(A)`.
+    method(
+        st,
+        set,
+        "apply",
+        vec![Type::Any],
+        Type::Boolean,
+        Intrinsic::None,
+    );
     method(
         st,
         set,

@@ -1489,6 +1489,30 @@ pub(crate) fn checkcast_method_receiver_sym(
     asm.checkcast(&jn);
 }
 
+/// The same cast for a **field** receiver, which
+/// [`checkcast_method_receiver_sym`] does not cover: it returns early for
+/// anything that is not a `SymKind::Method`.
+///
+/// JVMS 4.10.1.9 checks a `getfield`/`putfield` receiver exactly as it checks
+/// an `invoke*` one. `fa.copy(_2 = f(fa))` on a `Tuple2[A0, Any]` lowers to
+/// `new Tuple2(fa._1, …)`, and inside a lambda whose body method takes its
+/// parameters as `Object` -- which is where cats'
+/// `NTupleMonadInstances.catsStdInstancesForTuple2` puts it -- the `getfield
+/// Tuple2._1` was applied to an `Object`: "Bad type on operand stack ... Type
+/// 'java/lang/Object' is not assignable to 'scala/Tuple2'", and
+/// `cats.package$`'s initializer could not load at all. scalac casts here too
+/// (its own body method is typed `(Tuple2, Function1)`).
+pub(crate) fn checkcast_field_receiver(asm: &mut Assembler, ctx: &EmitCtx, owner: &str) {
+    if owner.is_empty() || owner == "java/lang/Object" || owner.starts_with('[') {
+        return;
+    }
+    let Some(top) = asm.top_object() else { return };
+    if verifier_accepts_receiver(ctx.st, top, owner) {
+        return;
+    }
+    asm.checkcast(owner);
+}
+
 /// Whether JVMS 4.10.1.9 will accept an `invoke*` whose `Methodref` names
 /// `to` on a receiver the assembler tracks as JVM class `from`.
 ///
@@ -2415,8 +2439,26 @@ pub(crate) fn desc_param_sorts(desc: &str) -> Vec<JvmSort> {
     out
 }
 
+/// Whether a member the source wrote `private` is nevertheless **not**
+/// `ACC_PRIVATE` in the classfile.
+///
+/// Two reasons, and they amount to the same rule. `access_widened` marks a
+/// `private` member the typer saw read from another class (`expand_private.rs`);
+/// a *qualified* `private[p]` is the same situation stated in the source: every
+/// class in `p` may read it, and nsc erases the qualifier to `public` (`javap`
+/// on scalac 2.13.16: `private[data] def unwrap` in
+/// `cats.data.NonEmptyChainImpl` comes out `public <A> Chain<A> unwrap(Object)`).
+/// Emitting `ACC_PRIVATE` for it made `cats.data.NonEmptyChainOps.toChain`
+/// throw `IllegalAccessError` on its first call -- the two classes are in the
+/// same package, which `ACC_PRIVATE` does not help with; only the class itself
+/// may read a private member.
+///
+/// `gen_trait` already spelled the `private_within` half out at its own two
+/// call sites. Stating it here instead also settles it for
+/// `is_trait_private_def` and `gen_invoke`, which have to agree with that
+/// access flag or they emit a call to a method that was never declared.
 pub(crate) fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
-    !sym.is_none() && st.get(sym).access_widened
+    !sym.is_none() && (st.get(sym).access_widened || st.get(sym).private_within.is_some())
 }
 
 /// A trait method that stays genuinely `private` on the JVM (not widened by

@@ -1,0 +1,6 @@
+a:ParList,SemInt
+b:ParList,SemInt
+c:SemInt
+d:SemInt,OrdInt
+e:ParList,SemInt,OrdInt
+g:ParList,SemInt
