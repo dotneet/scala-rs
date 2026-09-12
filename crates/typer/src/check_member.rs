@@ -2101,10 +2101,83 @@ impl Typer {
         // signature pass's complaints about them are dropped, exactly as the
         // header pass's are (`typecheck_units`): anything real is raised again
         // by the pass that runs with every signature in hand.
+        //
+        // Dropping the complaint is not enough for an argument that *contains
+        // a local template*. `type_local_template` completes an anonymous
+        // class's bodies where the class stands, and the later passes do not
+        // revisit them -- `type_anon_class` keeps the symbol the signature
+        // pass made and `type_member_sig`'s `sig_done` keeps its members' --
+        // so `object M extends Mod("m", new Ver("v", new Mig { … JDBCUtil's
+        // implicit conversion … }))` froze a body typed before the unit that
+        // defines the conversion had any signatures: an `Error` type on a
+        // local `val` with its diagnostic dropped here, and
+        // "unresolved apply" out of the backend. Hand such an argument back
+        // untyped, exactly as `leave_sig_for_body_pass` hands a member back;
+        // `fill_parent_ctor_args` does nothing on this pass, so there is no
+        // synthesized argument to lose.
+        let saved = self
+            .sigs_only
+            .then(|| Self::parent_template_args(tree))
+            .filter(|s| !s.is_empty());
         let diag_mark = self.sigs_only.then_some(self.diags.len());
         self.type_parent_ctor_app_in(tree);
         if let Some(mark) = diag_mark {
+            let complained = self.diags[mark..]
+                .iter()
+                .any(|d| d.level == scala_rs_span::Level::Error);
             self.diags.truncate(mark);
+            if complained {
+                if let Some(saved) = saved {
+                    Self::restore_parent_template_args(tree, &saved);
+                }
+            }
+        }
+    }
+
+    /// Pristine copies of this parent clause's arguments that hold a class or
+    /// object definition of their own. See [`Self::type_parent_ctor_app`].
+    fn parent_template_args(tree: &Tree) -> Vec<Tree> {
+        fn has_template(t: &Tree) -> bool {
+            if matches!(
+                t.kind,
+                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+            ) {
+                return true;
+            }
+            let mut found = false;
+            crate::erasure::for_each_child(t, &mut |c| found |= has_template(c));
+            found
+        }
+        let mut out = Vec::new();
+        let mut cur = tree;
+        while let TreeKind::Apply { fun, args } = &cur.kind {
+            for a in args {
+                if has_template(a) {
+                    out.push(a.clone());
+                }
+            }
+            cur = fun;
+        }
+        out
+    }
+
+    /// Put each saved argument back where it now sits. Found by node id and
+    /// span rather than by index: typing may have reordered named arguments.
+    fn restore_parent_template_args(tree: &mut Tree, saved: &[Tree]) {
+        let mut cur = tree;
+        loop {
+            let TreeKind::Apply { fun, args } = &mut cur.kind else {
+                return;
+            };
+            for a in args.iter_mut() {
+                if let Some(orig) = saved
+                    .iter()
+                    .find(|o| o.id == a.id && o.span == a.span && !a.id.is_filled_arg())
+                {
+                    *a = orig.clone();
+                }
+            }
+            cur = fun;
         }
     }
 

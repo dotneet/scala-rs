@@ -1469,6 +1469,21 @@ impl Typer {
     }
 
     pub(crate) fn namer_member(&mut self, tree: &mut Tree) {
+        // This member is about to get a *fresh* symbol, so whatever
+        // `type_member_sig` did for the old one is gone with it. That guard is
+        // keyed by node id (`Typer::sig_done`), and a node id survives the one
+        // thing that runs the namer over an already-namer'd tree: the
+        // prototype rollback in `type_apply_in`, which restores a pristine
+        // clone of an argument and types it again. An anonymous class in that
+        // argument was re-entered with new symbols whose signatures were then
+        // skipped -- its method's own parameters were "not found", and the
+        // class came out without the member it defines ("object creation
+        // impossible"). See `tests/fixtures/gz2_varargs_anon.scala`.
+        if matches!(tree.kind, TreeKind::ValDef { .. } | TreeKind::DefDef { .. })
+            && tree.id != scala_rs_parser::NodeId(0)
+        {
+            self.sig_done.remove(&(self.file_index, tree.id));
+        }
         match &tree.kind {
             TreeKind::ValDef {
                 name, mods, rhs, ..

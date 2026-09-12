@@ -1620,6 +1620,30 @@ impl<'a> Gen<'a> {
         target_id: SymbolId,
     ) -> Option<(SymbolId, bool)> {
         for &s in lin.iter().skip(after_idx + 1) {
+            // A `name$default$n` getter is synthesized as a *symbol* carrying
+            // its body in `Symbol::default_rhs`, never as a `DefDef` in the
+            // trait's body, so `traits.impls` does not list it -- while
+            // `emit_trait_default_getters` does emit it on the interface, both
+            // as the `default` method and as the `name$default$n$` static a
+            // super accessor calls. Ask the symbol table for it, or
+            // `trait B extends A { def f(x: String) = super.m(x) }` over
+            // `trait A { def m(x: String, b: Boolean = false) = … }` reported
+            // "no super implementation for m$default$2" -- which is what
+            // fourteen gitbucket controllers hit through
+            // `RequestCache`'s `super.getAccountByUserName(userName)`.
+            if is_interface_sym(self.st, s)
+                && method.contains("$default$")
+                && self.st.get(s).members.iter().copied().any(|mid| {
+                    let mem = self.st.get(mid);
+                    mem.kind == SymKind::Method
+                        && mem.name == method
+                        && mem.default_rhs.is_some()
+                        && desc_params(&method_desc_from_sym(self.st, mid))
+                            == desc_params(expected_desc)
+                })
+            {
+                return Some((s, true));
+            }
             if let Some(ms) = self.traits.impls.get(&s) {
                 // A trait-private method never dispatches through `super`:
                 // it isn't part of the interface's signature, so it can't be

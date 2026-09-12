@@ -3643,13 +3643,13 @@ element has no view, in either position, and an arity no rule in scope covers --
 all three rejected on the same lines by both compilers. `gzero_sortby.scala` is
 the slick shape, including the `a.desc -> b` spelling gitbucket writes.
 
-### Left: `Repository.scala:77`, and a wrong acceptance under it
+### Fixed: `Repository.scala:77`, and a wrong acceptance under it (the `agent/gbzero2` slice)
 
-The last error is `no matching overload for (M, OptionLift[M, O])O`: inside
+The last error was `no matching overload for (M, OptionLift[M, O])O`: inside
 gitbucket's `Repository` table the `Some(...)` of `.shaped.<>(…, r => Some(…))`
 is slick's `Rep.Some`, not `scala.Some`.
 
-It is not about the projection, and not about nested tuples. The reduction is
+It was not about the projection, and not about nested tuples. The reduction is
 four lines:
 
 ```scala
@@ -3658,7 +3658,7 @@ abstract class X extends slick.lifted.Rep[Int] {
 }
 ```
 
-scalac rejects that; scala-rs accepts it. Every member of `object Rep` is in
+scalac rejects that; scala-rs accepted it. Every member of `object Rep` is in
 scope unqualified inside *any* subclass of `class Rep` -- which every slick
 table is, through `AbstractTable` -- because scalac mirrors an accessible
 companion-object member onto the class's own file as a `static` forwarder,
@@ -3668,15 +3668,78 @@ into the subclass's scope without asking. nsc's rule is "static Java members
 belong to companion objects in Scala; they are not inherited", and
 `check_overload::not_inherited_static` already applies it to a *selection*
 (root 26) -- `r.forNodeUntyped` really is "not a member". Only the unqualified
-scope is missing it.
+scope was missing it.
 
-Skipping `Flags::STATIC` members there is not the whole fix: it takes gitbucket
-from 1 error to 29. The twelve names it removes are slick's
-`Rep.{Some, None, TypedRep, forNode, forNodeUntyped, columnPlaceholder}` and
-scalatra's `I18nSupport.{LocaleKey, MessagesKey, UserLocalesKey}`, and with them
-gone fourteen controllers lose `super.getAccountByUserName(...)`'s default
-argument ("no super implementation for `getAccountByUserName$default$2`", a
-backend diagnostic). Narrowing the skip to an owner that really has a companion
-object, and to names without a `$`, changes nothing about that -- so the
-super-accessor path is reading the default getter *through* one of those
-entries, and finding out which is where the next slice starts.
+`Typer::enter_inherited_members` now asks `not_inherited_static` the same
+question the selection side asks, so there is one rule and not two. Everything
+else about a mirrored member still holds: it is selectable on the companion
+(`Rep.forNodeUntyped`), on the exact class that declares it, and through an
+`import` (`import Gz2Base._`, `import java.lang.Integer._`). The rule also
+closes the same wrong acceptance for a real Java class's statics, which `main`
+accepted: `class Gz2Thread extends Thread { def bad = currentThread() }` is
+"not found: value currentThread" in nsc and now here
+(`tests/fixtures/gz2_javastatic_bad.scala`).
+
+#### The 29 were never caused by the skip
+
+`agent/gbzero` read the jump from 1 error to 29 as the skip's own fallout. It
+is not: a compile measure **stops before codegen while any error remains**, so
+removing gitbucket's last *typer* error ran gitbucket's backend for the first
+time, and 28 of the 29 are backend diagnostics that were there all along. The
+twelve names the skip removes have nothing to do with them. Both are reproduced
+without gitbucket, and in both cases `main`'s binary fails the same way:
+
+* **`no super implementation for <m>$default$n` (28).** `trait B extends A { def
+  f(x: String) = super.m(x) }` over `trait A { def m(x: String, b: Boolean =
+  false) = … }` is enough. `super.m(x)` omits a defaulted argument, so the call
+  is `super.m(x, super.m$default$2)` and the class mixing `B` in owes a super
+  accessor for the getter too (nsc emits `C.B$$super$m$default$2()` forwarding
+  to `A.m$default$2$(A)`). `Gen::next_lin_impl` looks for the implementation in
+  `TraitImpls::impls`, which holds the trait's body `DefDef`s -- and a
+  `name$default$n` getter is never one: `synthesize_default_getters` makes a
+  *symbol* carrying its body in `Symbol::default_rhs`, and
+  `emit_trait_default_getters` emits it off the symbol table. So the accessor
+  was emitted as `throw new RuntimeException(...)` plus an emit error. It now
+  asks the symbol table for an interface member of that name with a
+  `default_rhs` and a matching descriptor. Fourteen gitbucket controllers reach
+  it through `RequestCache`'s `super.getAccountByUserName(userName)` and
+  `super.getAccountByMailAddress(mailAddress)`, which is why the count is 2 x 14.
+* **`unresolved apply` (1).** `GitBucketCoreModule.scala:97`'s `list.foreach`,
+  where `val list = conn.select(…) { rs => … }` came out `Type::Error` with no
+  diagnostic. Two defects, each enough on its own, and each fixed:
+  1. an **anonymous class passed to a repeated parameter**. A repeated
+     parameter's field symbol has the type it has inside the body (`Seq[T]`),
+     which is the expected type of no single argument -- nsc's `formalTypes`
+     expands `T*` into one `T` per argument. `type_apply_in` handed `Seq[Step]`
+     out as the prototype, the anonymous class did not conform, the
+     "a prototype is a hint, never a constraint" rollback restored the pristine
+     clone and typed it a **second** time -- and the second pass re-entered the
+     template's members with fresh symbols whose signatures `sig_done`, keyed by
+     *node id*, then skipped. The class came out without the member it defines:
+     "not found: value a" in its own method, then "object creation impossible"
+     (`gz2_varargs_anon`). `ctor_protos` now leaves a repeated slot to the
+     `sole_own_ctor` pass, whose `param_at` yields the element type, and
+     `namer_member` drops the `sig_done` mark of a member it is about to give a
+     fresh symbol.
+  2. a **parent constructor argument the signature pass could not type**.
+     `type_parent_ctor_app` drops the signature pass's complaints about parent
+     arguments because "the body pass types the very same tree again" -- which
+     is not true of an argument holding a local template:
+     `type_local_template` completes an anonymous class's bodies where the class
+     stands and the later passes do not revisit them (`type_anon_class` keeps
+     the symbol the signature pass made, `type_member_sig` keeps its members').
+     `object M extends Mod("m", new Ver("v", new Mig { … JDBCUtil's implicit
+     conversion … }))` therefore froze a body typed before the unit that
+     *defines* that conversion had any signatures -- gitbucket's
+     `GitBucketCoreModule.scala` sorts before `util/JDBCUtil.scala` -- and the
+     `value select is not a member of Connection` that proves it was dropped
+     here. Such an argument is now handed back untyped, exactly as
+     `leave_sig_for_body_pass` hands a member back; `fill_parent_ctor_args` does
+     nothing on the signature pass, so there is no synthesized argument to lose
+     (`gz2_convuse` + `gz2_convlib`, which only fails in that file order).
+
+Measured on `batch/w3` (`44d4f75d`): gitbucket **1 / 1 -> 0 / 0**,
+`files=354 skipped=0 errors=0 files_with_errors=0 classes=1317 compiler_exit=0
+java_sources=3`. cats 0 errors / 2976 classes, scala library 126 / 49, slick 0
+errors / 1504 classes -- none of them moved. Fixtures `tests/fixtures/gz2_*`,
+tests `crates/cli/tests/gz2.rs`.
