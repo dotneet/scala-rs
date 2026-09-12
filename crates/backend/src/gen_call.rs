@@ -296,11 +296,64 @@ pub(crate) fn adapt_type_member_arg(
         // Only a *class* target is cast: JVMS 4.10.1.2 makes every class type
         // assignable to an interface type, so an interface parameter never
         // owes one, and casting there would be noise on every call.
-        if is_interface_jvm(ctx.st, cls) || jvm_assignable(ctx.st, top, cls) {
+        //
+        // And Scala-level conformance is not enough when the value's erasure
+        // is an interface: `trait UnanchoredRegex extends Regex` is a
+        // `Regex`, but the verifier cannot see an interface's class parent,
+        // so `takeRegex(Date.unanchored)` did not verify ("'UnanchoredRegex'
+        // is not assignable to 'Regex'"). nsc's `adaptToType` casts there.
+        // `verifier_accepts_receiver` is the same question the receiver of a
+        // call already asks.
+        if is_interface_jvm(ctx.st, cls) || verifier_accepts_receiver(ctx.st, top, cls) {
             return;
         }
     }
     asm.checkcast(cls);
+}
+
+/// A value entering a slot of class `desc` -- a local, a field, a method's
+/// result -- whose tracked erasure is an *interface* that the class is a
+/// Scala-level parent of. `trait UnanchoredRegex extends Regex` conforms to
+/// `Regex`, but the verifier cannot see an interface's class parent, so
+/// `def f: Regex = Date.unanchored` failed with "Bad return type", and `val r:
+/// Regex = u; r.regex` stored the interface value into a local the assembler
+/// then believed was a `Regex`. nsc's erasure (`adaptToType`) casts wherever
+/// the erased type is not a subtype of the erased expected type; this is that
+/// cast for the one pair the JVM and Scala disagree on. Everything else is
+/// left to the paths that already handle it: an unknown class, a value that
+/// is not a reference, or one the verifier accepts as it stands.
+///
+/// The same question as a call receiver's (`verifier_accepts_receiver`) and
+/// an argument's (`adapt_type_member_arg`).
+pub(crate) fn cast_interface_value_to_class(asm: &mut Assembler, st: &SymbolTable, desc: &str) {
+    let Some(cls) = desc.strip_prefix('L').and_then(|d| d.strip_suffix(';')) else {
+        return;
+    };
+    if cls == "java/lang/Object" {
+        return;
+    }
+    let needs = match asm.top_object() {
+        Some(top) => {
+            top != cls && jvm_assignable(st, top, cls) && !verifier_accepts_receiver(st, top, cls)
+        }
+        None => false,
+    };
+    if needs {
+        asm.checkcast(cls);
+    }
+}
+
+/// The value one branch of an `if` / `match` leaves for the join, whose stack
+/// map declares `join` (`join_class_of` of the expression's type). `val r:
+/// Regex = if (c) Date else Date.unanchored` joined a `Regex` with an
+/// `UnanchoredRegex` -- an interface the verifier does not see as a `Regex`
+/// -- and the frame at the join refused it ("Instruction type does not match
+/// stack map"). Each branch is cast on its way in, by the same rule as every
+/// other class-typed slot (`cast_interface_value_to_class`).
+pub(crate) fn cast_branch_to_join(asm: &mut Assembler, st: &SymbolTable, join: Option<&str>) {
+    if let Some(n) = join.filter(|n| !n.starts_with('[')) {
+        cast_interface_value_to_class(asm, st, &format!("L{n};"));
+    }
 }
 
 /// Whether the JVM class named `jvm` is an interface, as far as the symbol
@@ -571,8 +624,17 @@ pub(crate) fn emit_getfield(asm: &mut Assembler, owner: &str, name: &str, desc: 
 /// Store into a field whose Scala type may be `Unit`, when the value comes
 /// from an *expression* rather than from a slot: a `Unit` expression leaves
 /// nothing behind, so the singleton is materialised here.
-pub(crate) fn emit_putfield_from_expr(asm: &mut Assembler, owner: &str, name: &str, desc: &str) {
+pub(crate) fn emit_putfield_from_expr(
+    asm: &mut Assembler,
+    st: &SymbolTable,
+    owner: &str,
+    name: &str,
+    desc: &str,
+) {
     fill_boxed_unit_slot(asm, desc);
+    // `val fr: Regex = anUnanchoredRegex` in a template: the field is the
+    // class, the value an interface (`cast_interface_value_to_class`).
+    cast_interface_value_to_class(asm, st, desc);
     asm.putfield(owner, name, desc);
 }
 

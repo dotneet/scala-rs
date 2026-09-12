@@ -130,7 +130,12 @@ const V_2_13_13: &[SourceFeature] = &[
 
 /// The features this compiler actually implements. Everything else is parsed
 /// and remembered, but changes nothing.
-const IMPLEMENTED: &[SourceFeature] = &[SourceFeature::CaseApplyCopyAccess];
+const IMPLEMENTED: &[SourceFeature] = &[
+    SourceFeature::CaseApplyCopyAccess,
+    // The lexer leaves unicode escapes in triple-quoted strings and `raw`
+    // interpolations alone under it (`tokenize_opts`).
+    SourceFeature::UnicodeEscapesRaw,
+];
 
 /// A set of `-Xsource-features` choices.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

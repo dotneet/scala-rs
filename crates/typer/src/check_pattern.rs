@@ -4,8 +4,8 @@
 //! Types the scrutinee and each pattern against it: constructor patterns and
 //! the type arguments they take from the scrutinee, `unapply` and
 //! `unapplySeq` extractors including their sequence and named-argument forms,
-//! bindings, and `super` selections used from a case body. Ends with the
-//! exhaustiveness check over a sealed hierarchy.
+//! bindings, and `super` selections used from a case body. Exhaustivity and
+//! reachability are checked after typing, by `warn_patmat`.
 
 use crate::check::*;
 use crate::symbol::SymKind;
@@ -63,26 +63,10 @@ impl Typer {
         } else {
             tree.ty = self.branch_result_ty(pt, &branch_tys, res);
         }
-        if let TreeKind::Match { selector, cases } = &tree.kind {
-            // The pattern-matching function a `for` generator desugars to is
-            // guarded by the `withFilter` the parser puts in front of it, so
-            // nsc marks it synthetic and never reports it as inexhaustive.
-            // Its scrutinee is the parser's own `x$forN` / `x$forfN`, a name
-            // no source writes.
-            let for_desugaring = selector
-                .name()
-                .is_some_and(|n| n.starts_with("x$for") && n.len() > 5);
-            if !for_desugaring {
-                self.check_match_exhaustive(span, &sel_ty, cases);
-            }
-            self.warn_duplicate_alternatives(&sel_ty, cases);
-            if tree_has_switch(selector) && !match_can_switch(&sel_ty, cases) {
-                self.warning(
-                    selector.span,
-                    "could not emit switch for @switch annotated match",
-                );
-            }
-        }
+        // Exhaustivity, reachability and switch emission are reported by the
+        // patmat pass after typing (`crate::warn_patmat`), as nsc's `patmat`
+        // phase does.
+        let _ = span;
     }
 
     pub(crate) fn type_case(&mut self, c: &mut CaseDef, pt: &Type) {
@@ -2437,102 +2421,6 @@ impl Typer {
                 }
             }
             other => vec![other],
-        }
-    }
-
-    fn check_match_exhaustive(&mut self, span: Span, sel_ty: &Type, cases: &[CaseDef]) {
-        let Some(cls) = self.st.class_sym_of(sel_ty) else {
-            return;
-        };
-        if !self.st.is_sealed(cls) {
-            return;
-        }
-        if cases
-            .iter()
-            .any(|c| c.guard.is_empty() && self.pattern_is_catchall(&c.pat))
-        {
-            return;
-        }
-        let leaves = self.st.sealed_leaves(cls);
-        if leaves.is_empty() {
-            return;
-        }
-        let mut missing = Vec::new();
-        for leaf in &leaves {
-            if !cases
-                .iter()
-                .any(|c| c.guard.is_empty() && self.pattern_covers(&c.pat, *leaf))
-            {
-                missing.push(self.st.get(*leaf).name.trim_end_matches('$').to_string());
-            }
-        }
-        if !missing.is_empty() {
-            self.warning(
-                span,
-                format!(
-                    "match may not be exhaustive. It would fail on the following input: {}",
-                    missing.join(", ")
-                ),
-            );
-        }
-    }
-
-    fn pattern_is_catchall(&self, pat: &Tree) -> bool {
-        match &pat.kind {
-            TreeKind::Wildcard | TreeKind::Empty => true,
-            TreeKind::Bind { body, .. } => self.pattern_is_catchall(body),
-            TreeKind::Ident { name } => {
-                let is_varid = scala_rs_parser::ast::is_variable_name(name);
-                is_varid && (pat.sym.is_none() || self.st.get(pat.sym).kind == SymKind::Term)
-            }
-            TreeKind::Typed { expr, .. } => self.pattern_is_catchall(expr),
-            _ => false,
-        }
-    }
-
-    fn pattern_covers(&self, pat: &Tree, leaf: SymbolId) -> bool {
-        if self.pattern_is_catchall(pat) {
-            return true;
-        }
-        match &pat.kind {
-            TreeKind::Typed { .. } => {
-                if let Some(ps) = self.st.class_sym_of(&pat.ty) {
-                    ps == leaf || self.st.is_sub_type(&self.st.type_of_class(leaf), &pat.ty)
-                } else {
-                    false
-                }
-            }
-            TreeKind::Ident { .. } => {
-                if pat.sym.is_none() {
-                    return false;
-                }
-                let s = self.st.get(pat.sym);
-                match s.kind {
-                    SymKind::Module | SymKind::ModuleClass => {
-                        self.st.module_class_of(pat.sym) == leaf
-                    }
-                    SymKind::Class => pat.sym == leaf,
-                    _ => false,
-                }
-            }
-            TreeKind::Apply { .. } | TreeKind::UnApply { .. } => {
-                if pat.sym.is_none() {
-                    return false;
-                }
-                let s = self.st.get(pat.sym);
-                if s.kind == SymKind::Class {
-                    pat.sym == leaf
-                } else if s.name == "unapply" {
-                    let owner = s.owner;
-                    let name = self.st.get(owner).name.trim_end_matches('$').to_string();
-                    self.st.get(leaf).name.trim_end_matches('$') == name
-                } else {
-                    false
-                }
-            }
-            TreeKind::Bind { body, .. } => self.pattern_covers(body, leaf),
-            TreeKind::Alternative { trees } => trees.iter().any(|t| self.pattern_covers(t, leaf)),
-            _ => false,
         }
     }
 }

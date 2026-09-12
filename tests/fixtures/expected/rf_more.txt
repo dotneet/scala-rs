@@ -1,0 +1,5 @@
+Select(This(TypeName("Main")), TermName("member"))
+Int
+Apply(Select(Ident(scala.math.package), TermName("max")), List(Literal(Constant(1)), Literal(Constant(2))))
+Int
+Ident(TermName("here"))

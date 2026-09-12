@@ -479,11 +479,10 @@ impl<'a> Gen<'a> {
             }
             // `def m(a: A, b: B = …)` in a trait: the `m$default$2` getter is
             // a synthesized *symbol*, not a tree, so the loop above never saw
-            // it. Declare it here; `emit_default_getters` puts the body on
-            // every implementing class.
-            for (n, d) in self.default_getter_sigs(class_id) {
-                b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT | ACC_SYNTHETIC, &n, &d);
-            }
+            // it. The interface carries it as a `default` method with its
+            // `m$default$2$` static (nsc's trait ABI); every implementing
+            // class also gets a copy from `emit_default_getters`.
+            self.emit_trait_default_getters(&mut b, class_id, &this_name);
             // The concrete half: `default` methods, their `m$` statics and
             // `$init$`, all on the interface itself (nsc 2.13's trait ABI).
             self.emit_trait_bodies(&mut b, class_id, &this_name);
@@ -1048,7 +1047,7 @@ impl<'a> Gen<'a> {
                     } else {
                         stt.ty.clone()
                     };
-                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 } else {
                     gen_expr(asm, &mut frame, &ctx, stt);
                     pop_if_value(asm, &stt.ty);
@@ -1280,7 +1279,7 @@ impl<'a> Gen<'a> {
                     early_locals.push(vd.sym);
                     asm.aload(0);
                     load(asm, slot, sort);
-                    emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                    emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                 }
             }
             asm.aload(0);
@@ -1411,7 +1410,7 @@ impl<'a> Gen<'a> {
                         } else {
                             vd.ty.clone()
                         };
-                        emit_putfield_from_expr(asm, &class_name, name, &jvm_desc_val(st, &ty));
+                        emit_putfield_from_expr(asm, st, &class_name, name, &jvm_desc_val(st, &ty));
                     } else {
                         // A bare statement of the template body (SLS 5.1),
                         // in its source position among the `val` stores.

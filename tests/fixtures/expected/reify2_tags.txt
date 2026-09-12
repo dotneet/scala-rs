@@ -1,0 +1,19 @@
+List[Nest.Inner]
+(Int, Nest.Inner)
+Nest.Inner
+Nest.Deep.Deeper
+Nest.Deep.O.type
+AnyRef
+true
+Main.type
+Main.Bar.type
+Main.Baz
+Nest
+true
+T
+TypeTag[Int]
+TypeTag[List[Int]]
+TypeRef(SingleType(TypeRef(ThisType(<root>), scala, List()), scala.Predef), TypeName("String"), List())
+true
+Array[Int]
+(Int, String) => Foo

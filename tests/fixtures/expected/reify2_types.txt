@@ -1,0 +1,11 @@
+reflective toolbox failed due to unresolved free type variables:
+  T defined by C in reify2_types.scala:11:11
+have you forgotten to use TypeTag annotations for type parameters external to a reifee?
+if you have troubles tracking free type variables, consider using -Xlog-free-types
+List(7)
+List[String]
+Apply(TypeApply(Select(Select(Ident(scala.package), TermName("List")), TermName("apply")), List(TypeTree())), List(Ident(TermName("t"))))
+(s,2,x,Some(1),2)
+Block(List(ValDef(Modifiers(), TermName("r"), Ident(TypeName("AnyRef")), Literal(Constant("s"))), ValDef(Modifiers(), TermName("a"), Ident(scala.Any), Literal(Constant(2))), ValDef(Modifiers(), TermName("s"), Select(Ident(scala.Predef), TypeName("String")), Literal(Constant("x"))), ValDef(Modifiers(), TermName("o"), AppliedTypeTree(Ident(scala.Option), List(Ident(scala.Int))), Apply(Select(Ident(scala.Some), TermName("apply")), List(Literal(Constant(1))))), ValDef(Modifiers(), TermName("f"), AppliedTypeTree(Ident(scala.Function1), List(Ident(scala.Int), Ident(scala.Int))), Function(List(ValDef(Modifiers(PARAM), TermName("i"), TypeTree(), EmptyTree)), Apply(Select(Ident(TermName("i")), TermName("$plus")), List(Literal(Constant(1))))))), Apply(Select(Ident(scala.Tuple5), TermName("apply")), List(Ident(TermName("r")), Ident(TermName("a")), Ident(TermName("s")), Ident(TermName("o")), Apply(Select(Ident(TermName("f")), TermName("apply")), List(Literal(Constant(1)))))))
+3
+Int

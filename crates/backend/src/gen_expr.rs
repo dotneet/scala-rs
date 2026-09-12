@@ -452,6 +452,7 @@ pub(crate) fn emit_body_return(
         pop_if_value(asm, &rhs.ty);
         asm.vreturn();
     } else {
+        cast_interface_value_to_class(asm, ctx.st, &jvm_desc(ctx.st, ret));
         emit_return(asm, ret);
     }
 }
@@ -691,6 +692,9 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
                 store(asm, slot, JvmSort::Ref);
                 return;
             }
+            // `val r: Regex = anUnanchoredRegex`: the local is declared at the
+            // class, so the interface value has to be cast on the way in.
+            cast_interface_value_to_class(asm, ctx.st, &jvm_desc_val(ctx.st, &ty));
             let slot = frame.alloc(tree.sym, sort);
             // Declared *before* the store: a `var` reassigned in a loop body
             // merges at the loop head, and the merge has to see the declared
@@ -1001,6 +1005,8 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                     gen_expr(asm, frame, ctx, expr);
                     if is_unit_like(&ctx.ret_ty) {
                         pop_if_value(asm, &expr.ty);
+                    } else {
+                        cast_interface_value_to_class(asm, ctx.st, &jvm_desc(ctx.st, &ctx.ret_ty));
                     }
                 }
                 match frame.finally_exits.last().copied() {
@@ -2008,6 +2014,7 @@ pub(crate) fn gen_assign(
                 gen_expr(asm, frame, ctx, rhs);
                 emit_putfield_from_expr(
                     asm,
+                    ctx.st,
                     &class_internal(ctx.st, s.owner),
                     &s.name,
                     &jvm_desc_val(ctx.st, &s.ty),
@@ -2069,7 +2076,7 @@ pub(crate) fn gen_assign(
             } else {
                 jvm_desc_val(ctx.st, &rhs.ty)
             };
-            emit_putfield_from_expr(asm, &owner, name, &desc);
+            emit_putfield_from_expr(asm, ctx.st, &owner, name, &desc);
         }
         _ => {
             gen_expr(asm, frame, ctx, rhs);
@@ -2090,8 +2097,9 @@ pub(crate) fn gen_if(
     gen_expr(asm, frame, ctx, cond);
     let else_l = asm.fresh_label();
     let end_l = asm.fresh_label();
-    if let Some(n) = join_class_of(ctx.st, result_ty) {
-        asm.set_join_class(end_l, &n);
+    let join = join_class_of(ctx.st, result_ty);
+    if let Some(n) = &join {
+        asm.set_join_class(end_l, n);
     }
     // `if (c) e` with no `else` and a non-`Unit` recorded type. nsc gives such
     // an expression the type `Unit`, so the branch's value is dropped and `()`
@@ -2106,6 +2114,7 @@ pub(crate) fn gen_if(
     } else {
         gen_expr(asm, frame, ctx, thenp);
         pad_unit_branch(asm, thenp, result_ty);
+        cast_branch_to_join(asm, ctx.st, join.as_deref());
     }
     asm.goto(end_l);
     asm.mark(else_l);
@@ -2114,6 +2123,7 @@ pub(crate) fn gen_if(
     } else {
         gen_expr(asm, frame, ctx, elsep);
         pad_unit_branch(asm, elsep, result_ty);
+        cast_branch_to_join(asm, ctx.st, join.as_deref());
     }
     asm.mark(end_l);
 }
@@ -2459,6 +2469,17 @@ pub(crate) fn gen_apply(
             gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
             return;
         }
+    }
+    // `(F: Int => F)(4)`: an ascription in call position is a *value* too,
+    // and the typer leaves a function-typed one unexpanded (any other type
+    // gets an explicit `apply` selection). `peel_fun` would strip the
+    // ascription and leave the bare `object F`, whose symbol then went out as
+    // a static call of a method named `F` on the empty package's class:
+    // `NoClassDefFoundError: scala/runtime/package` from a program scalac
+    // runs.
+    if matches!(fun.kind, TreeKind::Typed { .. }) && matches!(fun.ty, Type::Function { .. }) {
+        gen_function_apply(asm, frame, ctx, fun, args, &tree.ty);
+        return;
     }
 
     let fun0 = peel_fun(fun);

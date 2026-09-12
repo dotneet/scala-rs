@@ -129,11 +129,11 @@ Compiler flags (`agent/xflags`):
   `import scala.async.Async.async` is reported as `value async is not a member
   of object scala.async.Async`, where scalac reports the library's own
   `-Xasync` message.
-- **`-Xsource-features`: nine ignored features and one partial feature.**
-  `case-apply-copy-access` is implemented; `infer-override` is partial (below).
-  The remaining features
+- **`-Xsource-features`: eight ignored features and one partial feature.**
+  `case-apply-copy-access` and `unicode-escapes-raw` are implemented;
+  `infer-override` is partial (below). The remaining features
   (`case-companion-function`, `case-copy-by-name`,
-  `any2stringadd`, `unicode-escapes-raw`, `string-context-scope`,
+  `any2stringadd`, `string-context-scope`,
   `leading-infix`, `package-prefix-implicits`, `implicit-resolution`,
   `double-definitions`) are parsed and validated, and warn when named one by
   one, but change nothing. Naming a group (`_`, `v2.13.14`) does not warn,
@@ -153,7 +153,26 @@ Compiler flags (`agent/xflags`):
   with what real scalac produces for the same source. `tests/spec_classfiles.sh`
   measures the gap: over the corpus's 37 `pos/spec-*` tests scalac emits 700
   specialized classes and we emit none. See
-  [docs/specialization.md](specialization.md).
+  [docs/specialization.md](specialization.md). The phase's one default
+  warning — `type A is unused or used in non-specializable positions.` from
+  `normalizeMember` — is issued (`warn_refchecks.rs`).
+- **Default warnings still not issued.** The `warn_*` passes cover pattern
+  matching (exhaustivity, unreachability, `@switch`, variable patterns),
+  deprecations and their summary, pure expressions, `==` sensibility,
+  feature warnings, uninitialized reads, unused specialized type parameters
+  and the parser's syntax deprecations. Not yet issued:
+  explicitouter's `The outer reference in this type test cannot be checked at
+  run time.` (`run/t7171`, `neg/outer-ref-checks`); patmat's fruitless type
+  tests (`run/patmat-behavior`); warnings about trees a macro expands to
+  (`run/t7047`). `Reference to uninitialized` does not look inside patterns
+  (a stable-identifier pattern naming a later field).
+- **`enableRequired` language features.** `scala.language.postfixOps` and
+  `scala.language.dynamics` carry `@languageFeature(..., enableRequired =
+  true)`, so nsc reports using them without the import as an *error*
+  (`postfix operator bang needs to be enabled`, seen on
+  `tests/fixtures/postfix_ops_bad.scala`). We report the same text as a
+  feature warning, counted in the `-feature` summary, so such a file compiles
+  here and is rejected by scalac.
 - **The value class *implementation restrictions*.** The eight rules
   `neg/valueclasses.check` records — a `trait` may not extend `AnyVal`, a value
   class may not be nested or local, must have exactly one `val` parameter that

@@ -2856,6 +2856,19 @@ pub(crate) fn emit_from_erased_object(asm: &mut Assembler, st: &SymbolTable, ty:
     }
     if matches!(ty, Type::Tuple(_)) {
         asm.checkcast("scala/Tuple2");
+        return;
+    }
+    // An object's singleton type: `case x: Dingus.type => x.IamDingus` binds
+    // the scrutinee after an `eq` test, and the binder is read as the module
+    // class. Without the cast the member call met an `Object` (`VerifyError`,
+    // run/t576).
+    if matches!(ty, Type::ModuleRef(_) | Type::SingleType { .. }) {
+        let d = jvm_desc(st, ty);
+        if let Some(n) = d.strip_prefix('L').and_then(|d| d.strip_suffix(';')) {
+            if n != "java/lang/Object" {
+                asm.checkcast(n);
+            }
+        }
     }
 }
 

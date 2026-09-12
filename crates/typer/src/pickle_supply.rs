@@ -4223,6 +4223,49 @@ impl PickleSupply {
             || self.implicits_supplied.contains(&class_sym.0)
     }
 
+    /// The pickled signature of a library (or adopted) class or module class,
+    /// found under its dotted name the way `complete_named` finds it (the
+    /// `$` spelling first, then the nested one). `None` for a class this run
+    /// does not read pickles for.
+    pub(crate) fn class_sig_of(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        cls: SymbolId,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        if cls.is_none() || !self.pickle_readable(st, cls) {
+            return None;
+        }
+        let sym = st.get(cls);
+        if !sym.is_class_like() {
+            return None;
+        }
+        let is_module = sym.kind == SymKind::ModuleClass;
+        let plain = sym.jvm_name.trim_end_matches('$').replace('/', ".");
+        let mut src = BinSource(bin);
+        if let Ok(sig) = self.sigs.class_sig(&mut src, &plain, is_module) {
+            return Some(sig);
+        }
+        let dotted = scala_rs_pickle::names::nested_to_dotted(&plain);
+        if dotted != plain {
+            if let Ok(sig) = self.sigs.class_sig(&mut src, &dotted, is_module) {
+                return Some(sig);
+            }
+        }
+        None
+    }
+
+    /// The pickled signature of the library class `full_name` (dotted).
+    pub(crate) fn class_sig_by_name(
+        &mut self,
+        bin: &mut BinaryIndex,
+        full_name: &str,
+        module: bool,
+    ) -> Option<std::rc::Rc<scala_rs_pickle::sym::ClassSig>> {
+        let mut src = BinSource(bin);
+        self.sigs.class_sig(&mut src, full_name, module).ok()
+    }
+
     fn has_pickle(&mut self, bin: &mut BinaryIndex, full_name: &str, module: bool) -> bool {
         let mut src = BinSource(bin);
         let r = self.sigs.class_sig(&mut src, full_name, module);
@@ -4629,7 +4672,45 @@ fn adopt_tparam_kinds(
             set_tparam_arity(st, id, tparam_arity(tp));
         }
         st.get_mut(id).flags = st.get(id).flags.with(variance_flags(tp));
+        adopt_primitive_bound(st, id, tp);
     }
+}
+
+/// A class type parameter bounded by a primitive value class (`class P[A <:
+/// Int]`) erases to that primitive: the constructor is `P(int)` and the
+/// accessor `a()I`. The JVM generic signature cannot say so -- nsc writes
+/// `<A:Ljava/lang/Object;>` -- so a class read from `-cp` came without the
+/// bound, and the erasure of its members' `A` fell back to `Object`: the call
+/// site boxed the argument of `new P(3)` for a descriptor that takes an `int`
+/// (`VerifyError`, against scalac's classes and our own alike). Only the
+/// primitive bounds are taken from the pickle here; every other bound is
+/// either written in the generic signature or erases to a reference the
+/// descriptor already carries.
+fn adopt_primitive_bound(st: &mut SymbolTable, id: SymbolId, tp: &scala_rs_pickle::sym::TParam) {
+    if st.get(id).bound_hi.is_some() {
+        return;
+    }
+    let SigType::Bounds { hi, .. } = &tp.bounds else {
+        return;
+    };
+    let SigType::Ref { sym, args } = hi.as_ref() else {
+        return;
+    };
+    if !args.is_empty() {
+        return;
+    }
+    let prim = match sym.as_str() {
+        "scala.Int" => Type::Int,
+        "scala.Long" => Type::Long,
+        "scala.Double" => Type::Double,
+        "scala.Float" => Type::Float,
+        "scala.Boolean" => Type::Boolean,
+        "scala.Byte" => Type::Byte,
+        "scala.Short" => Type::Short,
+        "scala.Char" => Type::Char,
+        _ => return,
+    };
+    st.get_mut(id).bound_hi = Some(prim);
 }
 
 /// Make `id` a type constructor of `arity` parameters. The names are
@@ -6046,6 +6127,25 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
             Type::TypeMember(id) => match st.get(*id).bound_hi.clone() {
                 Some(hi) => hi,
                 None => return Some("Ljava/lang/Object;".into()),
+            },
+            // A type parameter is an unnamed reference slot -- except when
+            // it is bounded by a primitive, which it then erases to
+            // (`def id[A <: Int](a: A): A` is `id(I)I`; see
+            // `erasure::bound_erasure`). Left unnamed, it matched no
+            // descriptor at all and the member was never supplied.
+            Type::TypeParam(id) => match st.get(*id).bound_hi.clone() {
+                Some(
+                    hi @ (Type::Boolean
+                    | Type::Byte
+                    | Type::Short
+                    | Type::Char
+                    | Type::Int
+                    | Type::Long
+                    | Type::Float
+                    | Type::Double
+                    | Type::TypeParam(_)),
+                ) => hi,
+                _ => return None,
             },
             _ => return None,
         };

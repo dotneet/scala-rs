@@ -169,6 +169,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Class, flags, &jvm);
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).annotations = annots;
                 // `private[jdbc] class`/`object` kept only the PRIVATE flag,
                 // so the access check read it as plain `private` and every
@@ -280,7 +281,12 @@ impl Typer {
         // Same`. nsc appends a fresh index (`Main$Same$1`, `Main$Same$2`); we
         // did not, so the second classfile silently overwrote the first and
         // both call sites got the second one's code.
-        let mut local = false;
+        // A block statement is local wherever the block is: `val a = { class
+        // B; new B }` in a template has the class, not a term, as the owner
+        // it can see, and two such blocks each declaring a `B` both became
+        // `Test$B` -- the second classfile overwrote the first, and `a.bar`
+        // ran the other `B`'s code (run/t4171).
+        let mut local = std::mem::take(&mut self.block_local_naming);
         while !owner.is_none() {
             let ow = self.st.get(owner);
             if ow.kind == SymKind::Package {
@@ -525,6 +531,7 @@ impl Typer {
             let id = if tp.sym.is_none() {
                 let id = self.st.alloc(&name, owner, SymKind::TypeParam, flags, "");
                 tp.sym = id;
+                self.def_spans.insert(id, tp.span);
                 id
             } else {
                 tp.sym
@@ -1473,6 +1480,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Term, mods.flags, "");
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).deferred_val = deferred;
@@ -1504,6 +1512,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(name, self.st.owner, SymKind::Method, flags, "");
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).private_within = mods.private_within.clone();
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).abstract_override = abs_over;
@@ -1530,6 +1539,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(&name, self.st.owner, SymKind::TypeMember, flags, "");
+                self.def_spans.insert(id, tree.span);
                 self.st.get_mut(id).private_within = within;
                 self.st.get_mut(id).annotations = annots;
                 self.st.get_mut(id).is_type_alias = is_type_alias;
