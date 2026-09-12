@@ -3094,6 +3094,24 @@ impl Typer {
         if !mentions_any_tparam(&param) {
             return false;
         }
+        // A variable *this call* left undetermined is not what this rule is
+        // about: `solve_open_from_arg` above solves it from the argument, and
+        // scoring the alternative applicable without solving it leaves it open
+        // for good. `Set.empty ++ (0 to 3)` is the case -- the receiver's `?A`
+        // is undetermined, so the monomorphic `++(IterableOnce[?A])` would be
+        // scored applicable to a `Range` through `Range`'s base type at
+        // `IterableOnce`, win on specificity against the polymorphic
+        // `concat[B >: A]` that nsc picks, and come out
+        // `found Range required IterableOnce[A]` (corpus `run/t408`,
+        // `run/t2417`). This rule is for the *alternative's own* parameters,
+        // which are not in `undet_tvars` while alternatives are being scored.
+        if self
+            .undet_tvars
+            .iter()
+            .any(|tp| type_mentions_tparam(&param, *tp))
+        {
+            return false;
+        }
         let Some(ps) = self.st.class_sym_of(&param) else {
             return false;
         };
