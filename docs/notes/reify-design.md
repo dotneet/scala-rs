@@ -92,16 +92,56 @@ class's members is a local of the constructor's frame.
 
 ## 3. What was measured
 
-The subset of the corpus these diagnostics named (206 tests: `CORPUS_KINDS="run
-pos" CORPUS_SIZE=full`, filtered to the test names): see the slice report
-for the before/after numbers per bucket. Fixtures, each run through real
-scalac 2.13.16 and scala-rs with identical output: `tests/fixtures/reify2_
-free.scala` (free terms, `this` members, definitions, closures, patterns,
-`while`, `try`, interpolation, a nested reify, a `for`, an anonymous class),
-`reify2_types.scala` (free types and the toolbox's report of them, tags in
-scope, written types), `reify2_tags.scala` (the materialiser), `reify2_
-capture.scala`, `rf_more.scala`; and `reify2_bad.scala` for what is still
-refused (`crates/cli/tests/reify2.rs`).
+The subset of the corpus these diagnostics named -- 206 tests, 169 `run` and
+37 `pos` (`CORPUS_KINDS="run pos" CORPUS_SIZE=full`, filtered to the test
+names) -- against the integration branch's gate ledger
+(`/private/tmp/scala-rs-gate-c3afea7f-20260912/corpus.tsv`):
+
+| | run pass | pos pass |
+|---|---|---|
+| before (gate ledger, same 206 tests) | 12 | 3 |
+| after | **87** | **4** |
+
+77 tests newly pass and none of the 206 is lost. The remaining failures, by
+first diagnostic: whitebox macros (22; refused at the binding,
+`crates/typer/src/macros.rs`), the macro engine's placeholder for a
+current-run class at type arguments (`macro-reify-nested-*`, 6), a tag for an
+existential `_` (7), annotated definitions and parameters in a reify body
+(6), `import` inside a body (3), assignment to an outer `var` (4), tree
+printing of `reify_ann*` (`output-mismatch`, 5), lazy vals captured by the
+tree creator in a template block (`InvocationTargetException`, 4: `reify_
+newimpl_43/44/51/52`, a codegen bug in capturing a lazy local), and
+one-offs (`Manifest` interop, `liftList`, `Array.toList` via the prelude).
+
+Four `neg` tests that the old reifier rejected for the wrong reason
+(`compile-time-only-b`, `macro-reify-typetag-useabstypetag`,
+`reify_metalevel_breach_-1_refers_to_0_a/b`) are rejected again for nsc's
+reason: `Expr.splice` / `Expr.value` outside a `reify` are `@compileTimeOnly`
+placeholders (`crates/typer/src/compile_time_only.rs`), a `TypeTag` for an
+abstract type with only a `WeakTypeTag` in scope is "No TypeTag available",
+and a splice whose expression is itself a splice or a local of the body is a
+cross-stage evaluation.
+
+The whole corpus (`CORPUS_SIZE=full`, all three kinds) on the final tree,
+merged onto the integration branch `batch/w2` @ f65babc2: pos 1187, neg 755,
+run 916 passing. Against the newest gate ledger (c3afea7f) 146 tests are
+gained and none of the 16 "lost" tests is this slice's: every one of them
+(`pos/t5313`, `t5340`, `looping-jsig`, `t5958`, `t4947`, `t11174b`, `t8138`,
+`t11558`, `t12520`, `t2421_delitedsl`, `t4070`, `t5777`, `t8146b`, `t9392`,
+`run/t9114`, `run/t4658`) fails the same way with this slice's `crates/`
+reverted to f65babc2 -- they come with the integration branch (prefix-carrying
+inner-class types, mostly), and are recorded here so nobody measures them
+twice.
+
+Fixtures, each run through real scalac 2.13.16 and scala-rs with identical
+output (`crates/cli/tests/reify2.rs`): `tests/fixtures/reify2_free.scala`
+(free terms, `this` members, definitions, closures, patterns, `while`, `try`,
+interpolation, a nested reify, a `for`, an anonymous class), `reify2_types
+.scala` (free types and the toolbox's report of them, tags in scope, written
+types), `reify2_tags.scala` (the materialiser), `reify2_capture.scala`,
+`rf_more.scala`; and `reify2_bad.scala` for what is still refused. The
+former confessions `rb_bad`, `rf_bad`, `rd_defs_bad`, `ex_notag_bad` are now
+the accepted fixtures `rb_free`, `rf_more`, `rd_defs_typed`, `ex_notag`.
 
 ## 4. What is still refused, and what remains, in order
 
