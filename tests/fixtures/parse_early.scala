@@ -18,6 +18,16 @@ class Box(arg: String) {
   }
 }
 
+// A parent constructor argument reads an early value. nsc keeps the value in
+// a local of the constructor and passes the local: `getfield` on
+// `uninitializedThis` does not verify.
+class Arg(val s: String)
+class Thunk(val f: () => String)
+class ArgClass extends { val baz = "ac" } with Arg(baz + "!")
+class ArgLambda extends { val baz = "al" } with Thunk(() => baz)
+class ArgTwo extends { val a = "x"; val b = a + "y" } with Arg(a + b)
+object ArgObject extends { val baz = "ao" } with Arg(baz.toUpperCase)
+
 class Outer {
   val tag = "outer"
   // `this` in an early definition is the enclosing instance.
@@ -49,6 +59,10 @@ object Main {
     val t = new { val x = 2; val y = x + 1 } with T
     println(t.z)
     println(new { val s = "abc" } with AnyRef { override def toString = s }.toString)
+    println(new ArgClass().s)
+    println(new ArgLambda().f())
+    println(new ArgTwo().s)
+    println(ArgObject.s)
     val o = new Outer
     println((new o.Inner).self.tag)
   }
