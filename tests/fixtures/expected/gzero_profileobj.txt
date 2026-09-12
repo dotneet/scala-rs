@@ -1,0 +1,6 @@
+"abc"
+true
+slick.relational.RelationalSequenceComponent$Sequence$
+slick.sql.SqlProfile$DDL$
+slick.jdbc.JdbcTypesComponent$JdbcType$
+true

@@ -2019,16 +2019,19 @@ impl Typer {
             return true;
         }
         // Checking the same conversion inside its own clause would not
-        // terminate; nsc's `openImplicits` is the same guard.
+        // terminate; nsc's `openImplicits` is the same guard, and its
+        // `dominates` is what lets a *shrinking* re-entry through -- the view
+        // for `((A, B), C)` asks for one for `(A, B)`, which is the same rule
+        // on a smaller type and must be allowed.
         if self
             .open_implicits
             .borrow()
             .iter()
-            .any(|(sid, _)| *sid == id)
+            .any(|(sid, spt)| *sid == id && dominates(self, from, spt))
         {
             return false;
         }
-        self.open_implicits.borrow_mut().push((id, Type::NoType));
+        self.open_implicits.borrow_mut().push((id, from.clone()));
         let ok = wants.iter().flatten().all(|want| {
             self.search_implicit_at(want, 1).is_found() || self.conv_param_view_resolves(want)
         });

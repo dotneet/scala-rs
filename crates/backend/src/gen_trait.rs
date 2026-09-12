@@ -348,6 +348,16 @@ impl<'a> Gen<'a> {
             return Vec::new();
         };
         let internal = class_internal(self.st, trait_id);
+        // `scala.App` is the one trait the backend models by hand
+        // (`Gen::emit_app_library_members` writes its `executionStart`,
+        // `scala$App$$_args` and `scala$App$$initCode` fields, their accessors
+        // and their mixin setters, because `delayedInit` has no ordinary
+        // shape). It runs after this pass, so describing the same three `val`s
+        // here is a `ClassFormatError` -- a duplicate field and a duplicate
+        // method -- rather than anything a check would catch.
+        if internal == "scala/App" {
+            return Vec::new();
+        }
         let Some(methods) = bp.methods_of(&internal) else {
             return Vec::new();
         };

@@ -1727,11 +1727,10 @@ impl Typer {
             return None;
         };
         let internal = full.replace('.', "/");
-        let this_class = self
-            .st
-            .enclosing_classes(owner)
-            .into_iter()
-            .find(|&c| c != owner && self.st.get(c).jvm_name.trim_end_matches('$') == internal)?;
+        let this_class =
+            self.st.enclosing_classes(owner).into_iter().find(|&c| {
+                c != owner && self.st.get(c).jvm_name.trim_end_matches('$') == internal
+            })?;
         Some(this_class)
     }
 

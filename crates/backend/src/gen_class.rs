@@ -592,6 +592,14 @@ impl<'a> Gen<'a> {
             }
         }
         for (name, ty, extra) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
+            // Nothing is added twice. A trait with a dedicated emission --
+            // `scala.App`, whose `executionStart` / `initCode` fields and
+            // accessors are written out below -- already put its field here,
+            // and a second one of the same name is a `ClassFormatError`
+            // ("Duplicate field name") rather than a compile error.
+            if b.fields.iter().any(|f| f.name == name) {
+                continue;
+            }
             b.fields.push(Field {
                 access: ACC_PUBLIC | extra,
                 name,
