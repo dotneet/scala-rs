@@ -1304,7 +1304,31 @@ impl Typer {
                 // made `fromIterator[IO](it, chunkSize = 1)` an application of
                 // the method itself -- "named arguments (method parameters not
                 // resolved)", since a nullary method has none.
-                if matches!(fun_pt, Type::Method { .. }) && !matches!(fun.ty, Type::Overload(_)) {
+                // Never a *Java* method, though. Java has no parameterless
+                // methods: `Collections.emptyIterator[T]()` takes an empty
+                // clause, and the `()` that follows is that clause. The class
+                // file reader installs a zero-argument Java method with no
+                // clause at all, so it looked parameterless here, was
+                // auto-applied, and the `()` became an `apply()` on its
+                // result -- "value apply is not a member of Iterator[String]".
+                // Give it its empty clause back for the enclosing `Apply`.
+                let java_nullary = !fun.sym.is_none()
+                    && self
+                        .st
+                        .get(fun.sym)
+                        .flags
+                        .contains(scala_rs_parser::Flags::JAVA)
+                    && matches!(&fun.ty, Type::Method { paramss, .. } if paramss.is_empty());
+                if matches!(fun_pt, Type::Method { .. }) && java_nullary {
+                    if let Type::Method { ret, .. } = &fun.ty {
+                        fun.ty = Type::Method {
+                            paramss: vec![vec![]],
+                            ret: ret.clone(),
+                        };
+                    }
+                } else if matches!(fun_pt, Type::Method { .. })
+                    && !matches!(fun.ty, Type::Overload(_))
+                {
                     fun.ty = self.maybe_auto_apply(fun.ty.clone(), &Type::NoType);
                 }
                 let mut targs = Vec::new();
