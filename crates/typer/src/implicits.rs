@@ -4633,6 +4633,19 @@ fn fold_applied(ty: &Type) -> Type {
 }
 
 fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
+    // A cake's inner class -- `profile.ReturningInsertActionComposer[T, R]` --
+    // is a class type under an as-seen-from *view* that records its prefix
+    // (`prefix.rs`). The view is bookkeeping, not structure, and with no arm
+    // for it both sides fell through to `_ => None`: blocking-slick's
+    // `implicit class ReturningInsertActionComposer2[T, R](a:
+    // ReturningInsertActionComposer[T, R])` solved neither parameter, so
+    // gitbucket's `Accounts returning Accounts.map(_.accountId) insert account`
+    // had result type `Nothing` and `createAccount` became an unconditional
+    // `throw` (`VerifyError: uninitialized … on athrow`). Whether the
+    // conversion *applies* is `conv_param_matches`' decision, not this one's,
+    // so unifying through the view accepts nothing new.
+    let param = crate::prefix::strip_view(param);
+    let from = crate::prefix::strip_view(from);
     match (param, from) {
         (Type::TypeParam(id), actual) if *id == tp => Some(actual.widen_constant()),
         (

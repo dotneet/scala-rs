@@ -459,6 +459,32 @@ impl<'a> Gen<'a> {
         acc
     }
 
+    /// The traits this class *mixes in*, most derived first: the prefix of its
+    /// linearization that sits **before** the superclass. This is nsc's
+    /// `Symbol.mixinClasses`, `ancestors takeWhile (superClass != _)`, and the
+    /// superclass is the first non-interface entry because a class's own
+    /// linearization is a suffix of every subclass's (SLS 5.1.2).
+    ///
+    /// Everything from the superclass onward is already *its* business: that
+    /// class carries the field, the accessor, the `$init$` call and the mixin
+    /// forwarder, and repeating any of them here overrides what it emitted.
+    /// When the trait member is `final` the JVM refuses the class outright --
+    /// cats' `object all extends AllInstancesBinCompat` died with
+    /// `IncompatibleClassChangeError: class cats.instances.package$all$
+    /// overrides final method …catsStdShowForDurationUnambiguous()`, because
+    /// `CoreDurationInstances` declares it `implicit final val` and the
+    /// abstract class in the middle had already implemented it.
+    pub(crate) fn mixin_traits(&self, class_id: SymbolId) -> Vec<SymbolId> {
+        if class_id.is_none() {
+            return Vec::new();
+        }
+        linearize(self.st, class_id)
+            .into_iter()
+            .skip(1)
+            .take_while(|p| is_interface_sym(self.st, *p))
+            .collect()
+    }
+
     pub(crate) fn mixin_val_fields(
         &self,
         class_id: SymbolId,
@@ -483,11 +509,8 @@ impl<'a> Gen<'a> {
             return out;
         }
         let mut from_class: Option<HashSet<String>> = None;
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+        for parent in self.mixin_traits(class_id) {
             let Some(vals) = self.traits.vals.get(&parent) else {
-                if !is_interface_sym(self.st, parent) {
-                    continue;
-                }
                 let inherited = from_class
                     .get_or_insert_with(|| self.superclass_member_names(class_id))
                     .clone();
@@ -533,10 +556,7 @@ impl<'a> Gen<'a> {
                 _ => {}
             }
         }
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
-            if !is_interface_sym(self.st, parent) {
-                continue;
-            }
+        for parent in self.mixin_traits(class_id) {
             let Some(vals) = self.traits.lazy_vals.get(&parent) else {
                 continue;
             };
@@ -567,10 +587,7 @@ impl<'a> Gen<'a> {
             .iter()
             .map(|m| module_accessor_name(self.st, *m))
             .collect();
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
-            if !is_interface_sym(self.st, parent) {
-                continue;
-            }
+        for parent in self.mixin_traits(class_id) {
             let Some(mods) = self.traits.modules.get(&parent) else {
                 continue;
             };
@@ -629,8 +646,8 @@ impl<'a> Gen<'a> {
                 _ => {}
             }
         }
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
-            if !is_interface_sym(self.st, parent) || self.traits.impls.contains_key(&parent) {
+        for parent in self.mixin_traits(class_id) {
+            if self.traits.impls.contains_key(&parent) {
                 continue;
             }
             for m in self.st.get(parent).members.clone() {
@@ -739,13 +756,10 @@ impl<'a> Gen<'a> {
         let mut needed: Vec<(String, Type, SymbolId, bool, bool, bool)> = Vec::new();
         let mut seen = HashSet::new();
         let mut from_class: Option<HashSet<String>> = None;
-        for parent in linearize(self.st, class_id).into_iter().skip(1) {
+        for parent in self.mixin_traits(class_id) {
             let Some(vals) = self.traits.vals.get(&parent) else {
                 // A trait read from `-cp` has no source tree to harvest; its
                 // interface says what the class owes. See `binary_trait_vals`.
-                if !is_interface_sym(self.st, parent) {
-                    continue;
-                }
                 let inherited = from_class
                     .get_or_insert_with(|| self.superclass_member_names(class_id))
                     .clone();
@@ -1787,29 +1801,6 @@ impl<'a> Gen<'a> {
         hits.next().is_none().then_some(first)
     }
 
-    /// Whether a class on the superclass chain already declares a concrete
-    /// method that *is* the trait member `def` -- the same member, possibly at
-    /// a narrower erased descriptor, which `bridge_overrides` is the test for.
-    /// Used only for traits that sit past the superclass in the linearization
-    /// (see `emit_mixin_forwarders`).
-    pub(crate) fn superclass_implements(
-        &self,
-        super_impls: &[(String, Vec<Type>, SymbolId)],
-        def: &Tree,
-    ) -> bool {
-        let enc = encode_method_name(def.name().unwrap_or(""));
-        let declared = def_param_types(self.st, def);
-        let abstract_mask = self
-            .st
-            .erased_abstract_params
-            .get(&def.sym)
-            .copied()
-            .unwrap_or(0);
-        super_impls.iter().any(|(n, cps, sym)| {
-            *n == enc && *sym != def.sym && bridge_overrides(self.st, &declared, cps, abstract_mask)
-        })
-    }
-
     pub(crate) fn emit_mixin_forwarders(
         &self,
         b: &mut ClassBuilder,
@@ -1940,7 +1931,12 @@ impl<'a> Gen<'a> {
                     competing.insert(key);
                     continue;
                 }
-                if past_superclass && self.superclass_implements(&super_impls, m) {
+                // Past the superclass this trait is an ancestor of *it*, not a
+                // mixin of ours (nsc's `mixinClasses` stops at the
+                // superclass): that class already emitted the forwarder, and
+                // ours would override it -- fatally when the trait member is
+                // `final` (cats' `package$all$`, see `mixin_traits`).
+                if past_superclass {
                     continue;
                 }
                 chosen.push((name, iface.clone(), m.clone()));

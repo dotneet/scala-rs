@@ -161,9 +161,11 @@ typeset -A KNOWN_WHY
 if [[ -n ${KNOWN+x} ]]; then
   for p in ${=KNOWN}; do KNOWN_WHY[$p]="held out by KNOWN="; done
 else
-  KNOWN_WHY=(
-    Utils "'Accounts returning ... insert row' infers the inserted id as Nothing (docs/notes/rh-cats-gitbucket-run.md)"
-  )
+  # Empty since `agent/rhfix`: `Utils` passes on both axes. Two roots were in
+  # its way -- `returning … insert` inferring the id as `Nothing`, and `Byte`
+  # pickled as a root-owned reference -- both written up in
+  # `docs/notes/rh-cats-gitbucket-run.md`.
+  KNOWN_WHY=()
 fi
 
 PROGS=($@)

@@ -183,12 +183,10 @@ typeset -A KNOWN_WHY
 if [[ -n ${KNOWN+x} ]]; then
   for p in ${=KNOWN}; do KNOWN_WHY[$p]="held out by KNOWN="; done
 else
-  KNOWN_WHY=(
-    Chains "a redundant mixin forwarder overrides a final trait accessor (agent/mixcg): docs/notes/rh-cats-gitbucket-run.md"
-    Monoids "NonEmptySet's newtype ops are not in our pickle (docs/notes/rh-cats-gitbucket-run.md)"
-    NaturalTransforms "a lambda over a pattern-bound for-comprehension loses its captured outer, inside cats' own macro (docs/notes/rh-cats-gitbucket-run.md)"
-    Transformers "OptionT instance ambiguity: the instance traits' subclass order is not visible in our pickle (docs/notes/rh-cats-gitbucket-run.md)"
-  )
+  # Empty since `agent/rhfix`: `Chains`, `Monoids`, `NaturalTransforms` and
+  # `Transformers` all pass. What they were waiting for is in
+  # `docs/notes/rh-cats-gitbucket-run.md`, each with its reduced program.
+  KNOWN_WHY=()
 fi
 
 PROGS=($@)

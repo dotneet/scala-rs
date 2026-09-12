@@ -299,6 +299,10 @@ struct Pickler<'a> {
     current_owner: u32,
     exist_n: u32,
     collection_immutable: Option<u32>,
+    /// The class this pickle is written for. A type member it *inherits* from
+    /// a class the pickle does not contain is still written under this one's
+    /// `this` (see [`Pickler::external_type_member_ref`]).
+    root_class: SymbolId,
     /// Pickled `TypeRef` of each anonymous structural alias (a type lambda),
     /// keyed by its symbol. See `pickle_structural_alias`.
     structural_aliases: std::collections::HashMap<u32, u32>,
@@ -326,6 +330,7 @@ impl<'a> Pickler<'a> {
             current_owner: 0,
             exist_n: 0,
             collection_immutable: None,
+            root_class: SymbolId::NONE,
         };
         p.none = p.add(NONESYM, vec![]);
         p.notpe = p.add(NOTPE, vec![]);
@@ -578,8 +583,13 @@ impl<'a> Pickler<'a> {
 
     fn type_ref_named(&mut self, name: &str) -> u32 {
         match name {
-            "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
-            | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" => {
+            // `Byte` and `Short` were missing here, so every one of them was
+            // written as a root-owned `EXTref`: real scalac reading our
+            // gitbucket said `Symbol 'type <root>.Byte' is missing from the
+            // classpath` for `StringUtil.base64Encode(value: Array[Byte])`, and
+            // `new String(...)` could not be invoked with `Array[<root>.Byte]`.
+            "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Byte" | "Short"
+            | "Unit" | "Any" | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" => {
                 let sc = self.scala_module();
                 self.type_ref_in(sc, name)
             }
@@ -712,8 +722,9 @@ impl<'a> Pickler<'a> {
             .trim_end_matches('$')
             .to_string();
         match n.as_str() {
-            "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Unit" | "Any"
-            | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq" | "String" | "Object" => {
+            "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Byte" | "Short"
+            | "Unit" | "Any" | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" | "Seq"
+            | "String" | "Object" => {
                 if arg_refs.is_empty() {
                     self.type_ref_named(&n)
                 } else {
@@ -1009,7 +1020,17 @@ impl<'a> Pickler<'a> {
                 RefineDecl::Val { name, ty } => {
                     self.pickle_refined_def(idx, name, &[], ty);
                 }
-                RefineDecl::Type { .. } => {}
+                RefineDecl::Type {
+                    name,
+                    rhs,
+                    tparams,
+                    lo,
+                    hi,
+                } => {
+                    let (name, rhs, tparams, lo, hi) =
+                        (name.clone(), rhs.clone(), *tparams, lo.clone(), hi.clone());
+                    self.pickle_refined_type(idx, &name, rhs.as_ref(), tparams, &lo, &hi);
+                }
             }
         }
         let parent_refs: Vec<u32> = if parents.is_empty() {
@@ -1034,6 +1055,89 @@ impl<'a> Pickler<'a> {
             write_nat_to(&mut rb, p);
         }
         self.add(REFINEDTPE, rb)
+    }
+
+    /// A `type` declaration of a refinement: `R[F] { type Rep = ev.Rep }`.
+    ///
+    /// These used to be dropped, so every refinement that names a type came
+    /// out as its bare parent. cats' `Representable.apply[F](implicit ev:
+    /// Representable[F]): Representable.Aux[F, ev.Representation]` -- the
+    /// standard `Aux` pattern, where `Aux[F, R] = Representable[F] { type
+    /// Representation = R }` -- pickled as plain `Representable[F]`, so
+    /// `Representable[Function1[Boolean, *]].tabulate[Int](b => ...)` gave real
+    /// scalac `found: rep.Representation, required: Boolean`: the one thing the
+    /// result type exists to say was missing.
+    ///
+    /// `type Rep = X` is an `ALIASsym` whose info is `X`; `type Rep <: X` a
+    /// `TYPEsym` with `TYPEBOUNDStpe` and `DEFERRED`, the same shapes
+    /// [`Self::pickle_type_member_owned`] writes for a class's own members. A
+    /// declaration of kind `> 0` (`type F[_]`) gets that many anonymous
+    /// parameters under a `POLYtpe`, since an arity the reader cannot see makes
+    /// it reject every use.
+    fn pickle_refined_type(
+        &mut self,
+        owner_ref: u32,
+        name: &str,
+        rhs: Option<&Type>,
+        tparams: usize,
+        lo: &Option<Type>,
+        hi: &Option<Type>,
+    ) {
+        let tag = if rhs.is_some() { ALIASSYM } else { TYPESYM };
+        let name_ref = self.symbol_type_name(name);
+        let idx = self.add(tag, vec![]);
+        let saved = self.current_owner;
+        self.current_owner = idx;
+        let tparam_refs: Vec<u32> = (0..tparams).map(|i| self.anon_type_param(idx, i)).collect();
+        let info = match rhs {
+            Some(t) => self.pickle_type(t),
+            None => {
+                let lo_ref = match lo {
+                    Some(t) => self.pickle_type(t),
+                    None => self.type_ref_named("Nothing"),
+                };
+                let hi_ref = match hi {
+                    Some(t) => self.pickle_type(t),
+                    None => self.type_ref_named("Any"),
+                };
+                let mut b = Vec::new();
+                write_nat_to(&mut b, lo_ref);
+                write_nat_to(&mut b, hi_ref);
+                self.add(TYPEBOUNDSTPE, b)
+            }
+        };
+        let info = if tparam_refs.is_empty() {
+            info
+        } else {
+            let mut b = Vec::new();
+            write_nat_to(&mut b, info);
+            for r in &tparam_refs {
+                write_nat_to(&mut b, *r);
+            }
+            self.add(POLYTPE, b)
+        };
+        self.current_owner = saved;
+        // DEFERRED for the abstract form; an alias carries its right-hand side.
+        let extra = if rhs.is_some() { 0 } else { 1u64 << 4 };
+        let flags = pickled_from_our(Flags::EMPTY, SymKind::TypeMember, extra);
+        let body = self.symbol_info(name_ref, owner_ref, flags, info);
+        self.entries[idx as usize] = (tag, body);
+    }
+
+    /// An unnamed `TYPEsym` standing for one parameter of a refinement's
+    /// higher-kinded `type F[_]`, bounded `Nothing..Any`.
+    fn anon_type_param(&mut self, owner_ref: u32, i: usize) -> u32 {
+        let name_ref = self.symbol_type_name(&format!("x${i}"));
+        let lo = self.type_ref_named("Nothing");
+        let hi = self.type_ref_named("Any");
+        let mut b = Vec::new();
+        write_nat_to(&mut b, lo);
+        write_nat_to(&mut b, hi);
+        let bounds = self.add(TYPEBOUNDSTPE, b);
+        // PARAM | DEFERRED
+        let flags = raw_to_pickled((1u64 << 5) | (1u64 << 4));
+        let body = self.symbol_info(name_ref, owner_ref, flags, bounds);
+        self.add(TYPESYM, body)
     }
 
     fn pickle_refined_def(
@@ -1857,35 +1961,23 @@ impl<'a> Pickler<'a> {
                     {
                         self.pickle_structural_alias_at(*id, args)
                     }
+                    // A *named* type member applied to arguments: a
+                    // higher-kinded abstract type (`type Type[+A] <: Base with
+                    // Tag`, cats' no-boxing newtypes) or a polymorphic alias
+                    // reached through a path. `pickle_type(ctor)` wrote the
+                    // bare `TypeRef` and dropped every argument, so scalac
+                    // reading our cats saw `NonEmptyChain.Type` where the
+                    // signature said `Type[A]`: "type mismatch; found:
+                    // cats.data.NonEmptyChain.Type, required:
+                    // cats.data.NonEmptyChain.Type[A]", and with the ops
+                    // conversion's parameter type equally unapplied, every one
+                    // of `NonEmptySet`/`NonEmptyChain`'s operations was
+                    // invisible ("value head is not a member of Type").
+                    Type::TypeMember(id) => self.pickle_type_member_ref(*id, args),
                     _ => self.pickle_type(ctor),
                 }
             }
-            Type::TypeMember(id) => {
-                // A path-dependent member (`p.T`) is a typer-only symbol whose
-                // owner is the *term* `p`, which the pickle has no name for;
-                // an abstract projection (`E#T`) is one whose owner is a type
-                // parameter, which it has no name for either. Write the
-                // declaration each stands for, exactly as this compiler did
-                // before it could tell two prefixes apart. The typer keeps
-                // the distinction; the pickle and erasure agree with each
-                // other by both dropping it.
-                if let Some(d) = self.st.projected_decl(*id) {
-                    return self.pickle_projected_member(*id, d);
-                }
-                // An *anonymous* alias is a type lambda, and a parentless
-                // `ALIASsym` is not a type any reader can use. nsc writes the
-                // refinement it projects from. See `pickle_structural_alias`.
-                if self.st.get(*id).owner.is_none() && self.st.get(*id).is_type_alias {
-                    return self.pickle_structural_alias(*id);
-                }
-                let owner = self.st.get(*id).owner.0;
-                let pref = self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix);
-                let sym = self.pickle_type_member(*id);
-                let mut body = Vec::new();
-                write_nat_to(&mut body, pref);
-                write_nat_to(&mut body, sym);
-                self.add(TYPEREFTPE, body)
-            }
+            Type::TypeMember(id) => self.pickle_type_member_ref(*id, &[]),
             Type::Class { sym, args } => {
                 if args.iter().any(type_has_wildcard) {
                     let mut quantified = Vec::new();
@@ -2608,6 +2700,17 @@ impl<'a> Pickler<'a> {
             Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
             _ => (vec![], Type::Unit),
         };
+        // The parameter symbols, aligned with `params`: a result type may name
+        // one (`def apply[F](implicit ev: R[F]): R.Aux[F, ev.Rep]`), and then
+        // the prefix it needs is the entry this pickle writes for it below.
+        // Constructors are left out on purpose -- their parameter symbol is
+        // shared with the field's storage, and a later reference means the
+        // field.
+        let param_syms: Vec<SymbolId> = if s.name == "<init>" {
+            Vec::new()
+        } else {
+            s.params.clone()
+        };
         let params: Vec<(String, Type, Flags)> = if !s.params.is_empty() {
             let sig: Vec<Type> = paramss.iter().flatten().cloned().collect();
             s.params
@@ -2685,7 +2788,11 @@ impl<'a> Pickler<'a> {
             }
             let flags = pickled_from_our(parameter_flags, SymKind::Term, extra);
             let body = self.symbol_info(pn, meth_idx, flags, pty_ref);
-            param_refs.push(self.add(VALSYM, body));
+            let pref = self.add(VALSYM, body);
+            if let Some(ps) = param_syms.get(param_refs.len()) {
+                self.sym_index.entry(ps.0).or_insert(pref);
+            }
+            param_refs.push(pref);
         }
         let ret_ref = if meth_name == "<init>" {
             let class_id = self.st.get(method_id).owner;
@@ -2828,35 +2935,216 @@ impl<'a> Pickler<'a> {
         idx
     }
 
-    /// Abstract `type A` is TYPEsym + TYPEBOUNDStpe + DEFERRED.
-    /// Alias `type T = Int` is nsc ALIASsym with the aliased type as info.
+    /// A reference to a named type member, applied to `args` (empty for a
+    /// proper type).
+    ///
+    /// Two things used to be lost here. The arguments, for one: they were
+    /// written only when the head of an `Applied` was a `Class` or a
+    /// `TypeParam`, so a higher-kinded abstract type silently became a proper
+    /// one. cats' no-boxing newtypes are exactly that shape -- `type Type[+A]
+    /// <: Base with Tag` -- and real scalac reading our cats said "type
+    /// mismatch; found: cats.data.NonEmptyChain.Type, required:
+    /// cats.data.NonEmptyChain.Type[A]", with every operation of
+    /// `NonEmptySet`/`NonEmptyChain` invisible because the ops conversion's
+    /// parameter type was unapplied too ("value head is not a member of
+    /// Type").
+    ///
+    /// And the declaring class, for the other: see
+    /// [`Self::external_type_member_ref`].
+    fn pickle_type_member_ref(&mut self, id: SymbolId, args: &[Type]) -> u32 {
+        // A path-dependent member (`p.T`) is a typer-only symbol whose owner
+        // is the *term* `p`, which the pickle has no name for; an abstract
+        // projection (`E#T`) is one whose owner is a type parameter, which it
+        // has no name for either. Write the declaration each stands for,
+        // exactly as this compiler did before it could tell two prefixes
+        // apart. The typer keeps the distinction; the pickle and erasure agree
+        // with each other by both dropping it.
+        if let Some(d) = self.st.projected_decl(id) {
+            return self.pickle_projected_member(id, d, args);
+        }
+        // An *anonymous* alias is a type lambda, and a parentless `ALIASsym`
+        // is not a type any reader can use. nsc writes the refinement it
+        // projects from. See `pickle_structural_alias`.
+        if self.st.get(id).owner.is_none() && self.st.get(id).is_type_alias {
+            return self.pickle_structural_alias_at(id, args);
+        }
+        if let Some(r) = self.external_type_member_ref(id, args) {
+            return r;
+        }
+        let owner = self.st.get(id).owner.0;
+        let pref = self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix);
+        let sym = self.pickle_type_member(id);
+        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        for r in arg_refs {
+            write_nat_to(&mut body, r);
+        }
+        self.add(TYPEREFTPE, body)
+    }
+
+    /// A type member declared in a class this pickle does not contain, named
+    /// under that class: `C.this.T[args]`, which is nsc's own spelling.
+    ///
+    /// [`Self::pickle_type_member`] mints a *symbol entry* instead, and its
+    /// owner falls back to the root when the declaring class is absent. Every
+    /// class file that mentioned one then carried its own copy of the
+    /// declaration, and scalac comparing two of them reported the same type
+    /// against itself:
+    ///
+    /// ```text
+    /// found   : Type[Int] (in cats.data.NonEmptyChainImpl)
+    /// required: Type[Int] (in <none>)
+    /// ```
+    ///
+    /// -- the first from `NonEmptyChainImpl`'s own pickle, which has the
+    /// declaration and writes `ThisType`, the second from the `cats.data`
+    /// package object's alias, which did not. An external reference resolves
+    /// to the one real symbol, so the two agree.
+    ///
+    /// The prefix is the `this` of the class this pickle is written for when
+    /// that class inherits the declaration -- nsc writes `Type[A]` inside
+    /// `object NonEmptySetImpl extends Newtype` as
+    /// `TypeRef(ThisType(NonEmptySetImpl), Newtype.Type, [A])`, not under the
+    /// trait, so that the same type named from elsewhere as
+    /// `NonEmptySetImpl.Type[A]` is the same type. It also decides the implicit
+    /// scope: with `Newtype.this` as the prefix, `NonEmptySetImpl`'s
+    /// `catsNonEmptySetOps` is not part of the type, and scalac found no
+    /// operation on a `NonEmptySet` at all.
+    ///
+    /// `None` when the declaration is in this pickle, when its owner is (so the
+    /// ordinary `this_tpes` path is right), or when the owner has no name a
+    /// later compilation could spell.
+    fn external_type_member_ref(&mut self, id: SymbolId, args: &[Type]) -> Option<u32> {
+        if self.sym_index.contains_key(&id.0) {
+            return None;
+        }
+        let owner = self.st.get(id).owner;
+        if owner.is_none() || self.sym_index.contains_key(&owner.0) {
+            return None;
+        }
+        let os = self.st.get(owner);
+        if !os.is_class_like() || !os.jvm_name.contains('/') {
+            return None;
+        }
+        let pref = self.inherited_this_prefix(owner);
+        self.external_member_type_ref(owner, self.st.get(id).name.clone(), pref, args)
+    }
+
+    /// `ThisType` of the class this pickle is written for when it inherits a
+    /// member of `owner`, and `ThisType(owner)` otherwise.
+    fn inherited_this_prefix(&mut self, owner: SymbolId) -> u32 {
+        let root = self.root_class;
+        if !root.is_none() && root != owner && self.st.is_ancestor_of(owner, root) {
+            if let Some(&p) = self.this_tpes.get(&root.0) {
+                return p;
+            }
+        }
+        let owner_ref = self.external_class_like_ref(owner);
+        let mut pb = Vec::new();
+        write_nat_to(&mut pb, owner_ref);
+        self.add(THISTPE, pb)
+    }
+
+    /// `TypeRef(pref, <decl_owner>.name, args)`.
+    ///
+    /// The `EXTref`'s owner is the class that *declares* `name` and nothing
+    /// else: nsc's unpickler resolves an external reference with
+    /// `owner.info.decl(name)`, so naming the class that merely inherits the
+    /// declaration reports `Symbol 'type nt.NImpl.Type' is missing from the
+    /// classpath`. Where the member is *seen* is the prefix's business.
+    fn external_member_type_ref(
+        &mut self,
+        decl_owner: SymbolId,
+        name: String,
+        pref: u32,
+        args: &[Type],
+    ) -> Option<u32> {
+        let owner_ref = self.external_class_like_ref(decl_owner);
+        let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), owner_ref);
+        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
+        let mut body = Vec::new();
+        write_nat_to(&mut body, pref);
+        write_nat_to(&mut body, sym);
+        for r in arg_refs {
+            write_nat_to(&mut body, r);
+        }
+        Some(self.add(TYPEREFTPE, body))
+    }
+
+    /// [`Self::external_class_ref`] for a class *or* an object: a module class
+    /// is an `EXTMODCLASSref` under its package, not an `EXTref`, or nsc looks
+    /// for a `class NonEmptyChainImpl` that does not exist.
+    fn external_class_like_ref(&mut self, class_sym: SymbolId) -> u32 {
+        if self.st.get(class_sym).kind != SymKind::ModuleClass {
+            return self.external_class_ref(class_sym);
+        }
+        let jvm = self.st.get(class_sym).jvm_name.clone();
+        let name = jvm.rsplit('/').next().unwrap_or(&jvm).trim_end_matches('$');
+        let prefix = self.external_owner_ref(class_sym);
+        self.ext_mod(&crate::classfile::encode_method_name(name), Some(prefix))
+    }
+
     /// The declaration a path member (`self.T`) or an abstract projection
     /// (`E#T`) stands for, written as a *reference* when this pickle does not
     /// contain it.
     ///
-    /// `pickle_type_member` mints a symbol entry, and its owner falls back to
-    /// the root when the declaring class is not in this pickle. That is what
-    /// slick's `RelationalProfile$RelationalAPI` picked up as soon as
-    /// `agent/hkpath` let `type ColumnType[T] = self.ColumnType[T]` record a
-    /// prefix: `ColumnType` is declared in `RelationalTypesComponent`, a
-    /// different top-level trait, so the alias's right-hand side became a
-    /// fresh root-owned `type ColumnType[T] <: TypedType[T]` -- nsc reads
-    /// that as `<root>.ColumnType` and reports it missing from the classpath.
-    ///
-    /// An external reference names the real declaration instead, under the
-    /// enclosing instance the self alias stands for, which is nsc's own
-    /// `RelationalProfile.this.ColumnType`.
-    ///
-    /// Only a *self alias* is treated this way. The same root-owned fallback
-    /// is reachable for an abstract projection (`E#T` on a foreign `E`) and
-    /// for a path through a parameter, but both predate `agent/hkpath` and
-    /// both are written that way on `main` and on `ab18fc50` alike; widening
-    /// this to them moves ten more of slick's class files and belongs with
-    /// whoever owns `agent/absproj`, not to a repair slice.
-    fn pickle_projected_member(&mut self, id: SymbolId, decl: SymbolId) -> u32 {
+    /// An external reference names the real declaration under the enclosing
+    /// instance the self alias stands for, which is nsc's own
+    /// `RelationalProfile.this.ColumnType`. Without it slick's
+    /// `RelationalProfile$RelationalAPI` got a fresh root-owned `type
+    /// ColumnType[T] <: TypedType[T]` for `type ColumnType[T] =
+    /// self.ColumnType[T]`, because `ColumnType` is declared in
+    /// `RelationalTypesComponent`, a different top-level trait -- and nsc
+    /// reads that as `<root>.ColumnType` and reports it missing from the
+    /// classpath.
+    fn pickle_projected_member(&mut self, id: SymbolId, decl: SymbolId, args: &[Type]) -> u32 {
         let owner = self.st.get(decl).owner;
+        // `object NonEmptySetImpl extends Newtype`, and `NonEmptySetImpl.Type`
+        // is a path member over one stable module. nsc writes the *module* as
+        // the prefix; writing the declaration alone lost it, and then the type
+        // in `cats.data`'s `type NonEmptySet[A] = NonEmptySetImpl.Type[A]` was
+        // not the one `NonEmptySetImpl`'s own members talk about.
+        if let Some(m) = self.module_path_head(id) {
+            if !owner.is_none() && !self.sym_index.contains_key(&owner.0) {
+                let mref = self.external_class_like_ref(m);
+                let mut pb = Vec::new();
+                write_nat_to(&mut pb, mref);
+                let this = self.add(THISTPE, pb);
+                let name = self.st.get(decl).name.clone();
+                if let Some(r) = self.external_member_type_ref(owner, name, this, args) {
+                    return r;
+                }
+            }
+        }
+        // `def apply[F](implicit ev: R[F]): R.Aux[F, ev.Rep]` -- the `Aux`
+        // pattern. `ev` is a parameter of the very method being pickled, so the
+        // pickle *does* have a name for it and nsc's own `SingleType(NoPrefix,
+        // ev)` is writable. Without it the result type said `R.this.Rep`, an
+        // abstract member of the trait rather than the one this `ev` fixes, and
+        // `Representable[Function1[Boolean, *]].tabulate[Int](b => ...)` was
+        // rejected with `found: rep.Representation, required: Boolean`.
+        if let Some(pref) = self.local_term_path_prefix(id) {
+            let name = self.st.get(decl).name.clone();
+            if !owner.is_none() && !self.sym_index.contains_key(&owner.0) {
+                if let Some(r) = self.external_member_type_ref(owner, name, pref, args) {
+                    return r;
+                }
+            } else {
+                let sym = self.pickle_type_member(decl);
+                let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
+                let mut body = Vec::new();
+                write_nat_to(&mut body, pref);
+                write_nat_to(&mut body, sym);
+                for r in arg_refs {
+                    write_nat_to(&mut body, r);
+                }
+                return self.add(TYPEREFTPE, body);
+            }
+        }
         let Some(this_cls) = self.self_alias_class(id) else {
-            return self.pickle_type(&Type::TypeMember(decl));
+            return self.pickle_type_member_ref(decl, args);
         };
         if self.sym_index.contains_key(&decl.0)
             || owner.is_none()
@@ -2864,7 +3152,7 @@ impl<'a> Pickler<'a> {
             || !self.st.get(owner).is_class_like()
             || !self.st.get(owner).jvm_name.contains('/')
         {
-            return self.pickle_type(&Type::TypeMember(decl));
+            return self.pickle_type_member_ref(decl, args);
         }
         // A self alias is another spelling of `this`, so the prefix is the
         // `ThisType` of the class that declares it -- normally the class this
@@ -2877,10 +3165,56 @@ impl<'a> Pickler<'a> {
         let owner_ref = self.external_class_ref(owner);
         let name = self.st.get(decl).name.clone();
         let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), owner_ref);
+        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
         let mut body = Vec::new();
         write_nat_to(&mut body, pref);
         write_nat_to(&mut body, sym);
+        for r in arg_refs {
+            write_nat_to(&mut body, r);
+        }
         self.add(TYPEREFTPE, body)
+    }
+
+    /// `SingleType(NoPrefix, p)` when a path member's path is one term this
+    /// pickle already contains -- a parameter or a local `val` of the method
+    /// whose signature is being written. `None` for anything else: a path the
+    /// pickle has no entry for has no name a reader could resolve.
+    fn local_term_path_prefix(&mut self, id: SymbolId) -> Option<u32> {
+        let &[head] = self.st.path_member_path(id)? else {
+            return None;
+        };
+        if !matches!(self.st.get(head).kind, SymKind::Term) {
+            return None;
+        }
+        let href = self.sym_index.get(&head.0).copied()?;
+        let pre = self.noprefix;
+        let mut b = Vec::new();
+        write_nat_to(&mut b, pre);
+        write_nat_to(&mut b, href);
+        Some(self.add(SINGLETPE, b))
+    }
+
+    /// The module *class* a path member's path is, when the path is a single
+    /// `object` this pickle does not contain and whose name a later compilation
+    /// can spell. A module is stable and unique, so naming it as the prefix
+    /// loses nothing -- unlike a path through a `val`, which the pickle has no
+    /// name for.
+    fn module_path_head(&self, id: SymbolId) -> Option<SymbolId> {
+        let &[head] = self.st.path_member_path(id)? else {
+            return None;
+        };
+        if !matches!(
+            self.st.get(head).kind,
+            SymKind::Module | SymKind::ModuleClass
+        ) {
+            return None;
+        }
+        let mcls = self.st.module_class_of(head);
+        let s = self.st.get(mcls);
+        (s.kind == SymKind::ModuleClass
+            && s.jvm_name.contains('/')
+            && !self.sym_index.contains_key(&mcls.0))
+        .then_some(mcls)
     }
 
     /// The class whose self alias a path member's path starts at, if it does.
@@ -2914,13 +3248,10 @@ impl<'a> Pickler<'a> {
     /// refinement is owned by whatever is being pickled around it -- usually the
     /// method whose result type this is -- so the lambda's body can still name
     /// that method's type parameters.
-    fn pickle_structural_alias(&mut self, id: SymbolId) -> u32 {
-        self.pickle_structural_alias_at(id, &[])
-    }
-
-    /// [`Self::pickle_structural_alias`] with the leading captured parameters
-    /// already supplied -- the `Applied(TypeMember(Λ$), args)` shape the typer
-    /// uses for a partially applied lambda.
+    ///
+    /// `applied` supplies the leading captured parameters -- the
+    /// `Applied(TypeMember(Λ$), args)` shape the typer uses for a partially
+    /// applied lambda -- and is empty for a lambda written in full.
     fn pickle_structural_alias_at(&mut self, id: SymbolId, applied: &[Type]) -> u32 {
         if applied.is_empty() {
             if let Some(&r) = self.structural_aliases.get(&id.0) {
@@ -3503,6 +3834,7 @@ pub fn pickle_class(st: &SymbolTable, class_id: SymbolId) -> Vec<u8> {
         return Vec::new();
     }
     let mut p = Pickler::new(st);
+    p.root_class = class_id;
     p.pickle_class(class_id);
     p.finish()
 }
