@@ -690,9 +690,22 @@ impl<'a> Lexer<'a> {
             .filter(|c| *c != '_')
             .collect();
         match suffix {
-            NumSuffix::Long => match body.parse::<i64>() {
-                Ok(v) => self.emit(TokenKind::LongLit(v), lo, self.pos as u32),
-                Err(_) => self.error(lo, self.pos as u32, "integer literal out of range"),
+            // nsc `intVal`: the magnitude is compared against the type's
+            // *positive* limit plus one, because the parser may negate the
+            // literal (`-9223372036854775808L` is `Long.MinValue`, and the
+            // same digits on their own are "integer number too large").
+            // `parse_prefix_expr` does that negation, and rejects a bare
+            // boundary literal; here the value is stored wrapped.
+            NumSuffix::Long => match body.parse::<u64>() {
+                Ok(v) if v <= (i64::MAX as u64) + 1 => {
+                    self.emit(TokenKind::LongLit(v as i64), lo, self.pos as u32)
+                }
+                // nsc reports and goes on with a token, so the parser does
+                // not cascade on a missing expression.
+                _ => {
+                    self.error(lo, self.pos as u32, "integer number too large");
+                    self.emit(TokenKind::LongLit(0), lo, self.pos as u32);
+                }
             },
             NumSuffix::Float => match body.parse::<f32>() {
                 Ok(v) => self.emit(TokenKind::FloatLit(v), lo, self.pos as u32),
@@ -709,12 +722,16 @@ impl<'a> Lexer<'a> {
                     Err(_) => self.error(lo, self.pos as u32, "invalid double literal"),
                 }
             }
-            NumSuffix::None => match body.parse::<i64>() {
-                Ok(v) if v >= i32::MIN as i64 && v <= i32::MAX as i64 => {
-                    self.emit(TokenKind::IntLit(v as i32), lo, self.pos as u32)
+            // An integer literal with no `L` is an `Int`, however large the
+            // expected type is: nsc rejects `val x: Long = 10000000000`.
+            NumSuffix::None => match body.parse::<u64>() {
+                Ok(v) if v <= (i32::MAX as u64) + 1 => {
+                    self.emit(TokenKind::IntLit(v as u32 as i32), lo, self.pos as u32)
                 }
-                Ok(v) => self.emit(TokenKind::LongLit(v), lo, self.pos as u32),
-                Err(_) => self.error(lo, self.pos as u32, "integer literal out of range"),
+                _ => {
+                    self.error(lo, self.pos as u32, "integer number too large");
+                    self.emit(TokenKind::IntLit(0), lo, self.pos as u32);
+                }
             },
             _ => {
                 let _ = raw;

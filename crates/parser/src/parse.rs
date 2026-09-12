@@ -3410,13 +3410,16 @@ impl<'a> Parser<'a> {
                 // `-(5.abs)`. The same holds with a space (`- 5.abs`).
                 if name == "-" {
                     let neg = match self.kind().clone() {
-                        TokenKind::IntLit(n) => n.checked_neg().map(Lit::Int),
+                        // `MinValue` is reachable only this way: the lexer
+                        // stores the magnitude wrapped (nsc `intVal`, which
+                        // compares it against the limit *plus one* because the
+                        // parser may negate it), so `-2147483648` is
+                        // `Int.MinValue` and `-9223372036854775808L` is
+                        // `Long.MinValue`.
+                        TokenKind::IntLit(n) => Some(Lit::Int(n.wrapping_neg())),
                         TokenKind::DoubleLit(d) => Some(Lit::Double(-d)),
                         TokenKind::FloatLit(f) => Some(Lit::Float(-f)),
-                        // A `LongLit` of 2147483648 may be `-2147483648`
-                        // (an Int, lexed wide) or `-2147483648L`; the token
-                        // cannot say which, so that one stays a unary minus.
-                        TokenKind::LongLit(n) if n != 2147483648 => n.checked_neg().map(Lit::Long),
+                        TokenKind::LongLit(n) => Some(Lit::Long(n.wrapping_neg())),
                         _ => None,
                     };
                     if let Some(lit) = neg {
@@ -3444,6 +3447,22 @@ impl<'a> Parser<'a> {
             }
         }
         self.parse_simple_expr()
+    }
+
+    /// nsc `intVal`: the digits `2147483648` / `9223372036854775808` are in
+    /// range only as the operand of a unary `-` (`parse_prefix_expr` consumes
+    /// the literal itself there, so this is only reached without one). A
+    /// *hexadecimal* literal of the same value is the two's-complement
+    /// spelling of `MinValue` and is legal on its own (`0x80000000`).
+    fn reject_unnegated_min_value(&mut self, sp: Span) {
+        let text = self
+            .source
+            .src
+            .get(sp.lo.0 as usize..sp.hi.0 as usize)
+            .unwrap_or("");
+        if !text.starts_with("0x") && !text.starts_with("0X") {
+            self.error_span(sp, "integer number too large");
+        }
     }
 
     fn parse_simple_expr(&mut self) -> Tree {
@@ -3519,11 +3538,17 @@ impl<'a> Parser<'a> {
             TokenKind::IntLit(n) => {
                 let sp = self.span();
                 self.bump();
+                if n == i32::MIN {
+                    self.reject_unnegated_min_value(sp);
+                }
                 self.alloc(sp, TreeKind::Literal { lit: Lit::Int(n) })
             }
             TokenKind::LongLit(n) => {
                 let sp = self.span();
                 self.bump();
+                if n == i64::MIN {
+                    self.reject_unnegated_min_value(sp);
+                }
                 self.alloc(sp, TreeKind::Literal { lit: Lit::Long(n) })
             }
             TokenKind::DoubleLit(n) => {
