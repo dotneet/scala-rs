@@ -89,16 +89,25 @@ impl<'a> Finder<'a> {
             if let Some(cls) = self.anon_class_of(qual) {
                 if !t.sym.is_none() && self.t.st.get(t.sym).owner == cls {
                     let st = &self.t.st;
-                    let inherited = st
-                        .get(cls)
-                        .parents
-                        .iter()
-                        .filter_map(|p| st.class_sym_of(p))
-                        .any(|p| {
+                    let inherited = st.get(cls).parents.iter().any(|p| match p {
+                        // A function-type parent (`new (Short => Char) { def
+                        // apply(x: Short) = .. }`) is `scala.FunctionN`,
+                        // stored structurally; its members are the class's.
+                        Type::Function { params, .. } => {
+                            st.find_class_by_jvm(&format!("scala/Function{}", params.len()))
+                                .is_some_and(|f| {
+                                    st.members_including_inherited(f)
+                                        .iter()
+                                        .any(|m| st.get(*m).name == *name)
+                                })
+                                || *name == "apply"
+                        }
+                        _ => st.class_sym_of(p).is_some_and(|p| {
                             st.members_including_inherited(p)
                                 .iter()
                                 .any(|m| st.get(*m).name == *name)
-                        });
+                        }),
+                    });
                     if !inherited {
                         let s = st.get(t.sym);
                         let kind = if s.kind == SymKind::Term && !s.flags.contains(Flags::MUTABLE) {
