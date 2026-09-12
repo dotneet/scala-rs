@@ -323,7 +323,35 @@ if (( do_corpus )); then
     LOSSES=$(print "$CMP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["losses"])' 2>/dev/null || print "?")
     CHANGES=$(print "$CMP" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["changes"]))' 2>/dev/null || print "?")
     print "  vs $LEDGER: losses=$LOSSES changes=$CHANGES"
-    [[ $LOSSES == 0 ]] || FAIL+=("corpus losses=$LOSSES vs $LEDGER")
+    # A loss is confirmed by a *serial* re-run of just that test. Some corpus
+    # tests assert their own wall-clock time (`run/t5857`: "it should be less
+    # than, say, 250ms"), so on a machine running three heavy steps at once
+    # they fail for the load, not for the compiler -- and a gate that invents
+    # losses is as useless as one that hides them. A real regression fails
+    # both times; this costs seconds and only runs when there is a loss.
+    if [[ $LOSSES != 0 && $LOSSES != "?" ]]; then
+      LOSTSPECS=$(print "$CMP" | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+print(" ".join(c["kind"]+"/"+c["test"] for c in d["changes"] if c.get("loss")))' 2>/dev/null)
+      print "  re-running each loss serially: $LOSTSPECS"
+      STILL=()
+      for spec in ${=LOSTSPECS}; do
+        kind=${spec%%/*}; name=${spec#*/}
+        rlog=$GATE_DIR/retry-$kind-$name.tsv
+        CORPUS_KINDS=$kind CORPUS_SIZE=full CORPUS_JOBS=1 \
+          CORPUS_FILTER="^${name}$" CORPUS_LOG=$rlog CORPUS_NO_REPORT=1 \
+          SCALA_RS=$GATE_BIN SCALA_RS_PREBUILT=1 tests/scala_corpus.sh \
+          > $GATE_DIR/retry-$kind-$name.log 2>&1
+        st=$(awk -F'\t' -v n="$name" '$2==n {print $3}' $rlog 2>/dev/null | head -1)
+        print "    $spec -> ${st:-no-row}"
+        [[ $st == pass ]] || STILL+=("$spec(${st:-no-row})")
+      done
+      if (( ${#STILL[@]} )); then
+        FAIL+=("corpus losses=${#STILL[@]} vs $LEDGER: ${STILL[*]}")
+      else
+        NOTE+=("corpus: $LOSSES loss(es) passed on a serial re-run (load-sensitive, not a regression): $LOSTSPECS")
+      fi
+    fi
   else
     FAIL+=("corpus has no ledger to compare against (ledger='${LEDGER:-}', tsv=$GATE_DIR/corpus.tsv)")
   fi
