@@ -29,10 +29,19 @@
 #                 concurrently. Same checks, same numbers, ~2.5x the wall
 #                 time; keep it as the way to reproduce a confusing result
 #                 without the concurrency in the picture.
-#   GATE_TEST_THREADS   RUST_TEST_THREADS for the gate's `cargo test` (default
-#                 12). `.cargo/config.toml` pins the *interactive* default to
-#                 6 so a slice's `cargo test` leaves the machine usable; the
-#                 gate owns the machine, so it overrides that for itself only.
+#   GATE_TEST_JOBS / GATE_TEST_THREADS
+#                 how the workspace suite is fanned out: test binaries in
+#                 flight (default 6) x RUST_TEST_THREADS inside each (default
+#                 4). `.cargo/config.toml` pins the *interactive*
+#                 RUST_TEST_THREADS to 6 so a slice's `cargo test` leaves the
+#                 machine usable; that default is not touched -- the gate owns
+#                 the machine and sets the value for its own run only.
+#                 Raising RUST_TEST_THREADS alone is worth nothing here: the
+#                 per-binary times libtest reports summed to 1862 s at 6 and
+#                 1850 s at 12, because `cargo test` runs one binary at a time
+#                 and most binaries hold too few tests to use the threads.
+#                 tests/workspace_tests.sh runs the binaries themselves in
+#                 parallel, which is where the time actually was.
 #   GATE_CORPUS_JOBS    CORPUS_JOBS for the gate's corpus run (default 10;
 #                 an explicit CORPUS_JOBS in the environment wins).
 #   GATE_SUBSET_JOBS    javap fan-out inside tests/slick_subset.sh (default 6).
@@ -72,7 +81,8 @@ SKIP=${GATE_SKIP:-}
 skipped() { [[ " $SKIP " == *" $1 "* ]] }
 
 SERIAL=${GATE_SERIAL:-0}
-TEST_THREADS=${GATE_TEST_THREADS:-12}
+TEST_JOBS=${GATE_TEST_JOBS:-6}
+TEST_THREADS=${GATE_TEST_THREADS:-4}
 CORPUS_J=${GATE_CORPUS_JOBS:-${CORPUS_JOBS:-10}}
 SUBSET_J=${GATE_SUBSET_JOBS:-6}
 CORPUS_TMO=${GATE_CORPUS_TIMEOUT:-${CORPUS_TIMEOUT:-120}}
@@ -81,7 +91,7 @@ CORPUS_RTMO=${GATE_CORPUS_RUN_TIMEOUT:-${CORPUS_RUN_TIMEOUT:-60}}
 HEAD=$(git rev-parse --short=8 HEAD)
 DIRTY=$(git status --porcelain | wc -l | tr -d ' ')
 print "gate: HEAD=$HEAD dirty_files=$DIRTY dir=$GATE_DIR ledger=${LEDGER:-none}"
-print "gate: serial=$SERIAL test_threads=$TEST_THREADS corpus_jobs=$CORPUS_J subset_jobs=$SUBSET_J corpus_timeout=$CORPUS_TMO/$CORPUS_RTMO"
+print "gate: serial=$SERIAL test_jobs=${TEST_JOBS}x${TEST_THREADS} corpus_jobs=$CORPUS_J subset_jobs=$SUBSET_J corpus_timeout=$CORPUS_TMO/$CORPUS_RTMO"
 if [[ -n ${LEDGER:-} && ! -s $LEDGER ]]; then
   print "gate: ledger $LEDGER does not exist or is empty"
   LEDGER=""
@@ -227,8 +237,8 @@ run_subset() {
     tests/slick_subset.sh > "$GATE_DIR/subset.log" 2>&1
 }
 run_tests() {
-  RUST_TEST_THREADS=$TEST_THREADS \
-    cargo test --workspace --release --no-fail-fast > "$GATE_DIR/tests.log" 2>&1
+  WT_JOBS=$TEST_JOBS WT_THREADS=$TEST_THREADS WT_DIR=$GATE_DIR/wt \
+    tests/workspace_tests.sh > "$GATE_DIR/tests.log" 2>&1
 }
 run_corpus() {
   CORPUS_SIZE=full CORPUS_LOG=$GATE_DIR/corpus.tsv CORPUS_JOBS=$CORPUS_J \
@@ -259,14 +269,19 @@ fi
 if (( do_subset )); then
   step "slick subset + class validation"
   NF=${#FAIL[@]}
-  SUB=$(tail -3 "$GATE_DIR/subset.log" | tr '\n' ' '); print "  $SUB"
+  # `tail -3` is the contract with slick_subset.sh: its last three lines are the
+  # loader verdict, the lint verdict and the file/class counts, and when the
+  # script dies early those three lines are whatever it died saying. Its phase
+  # timings are the one thing that must not be counted, or they push the loader
+  # verdict out of the window -- which is exactly what happened the first time.
+  SUB=$(grep -v '^phase ' "$GATE_DIR/subset.log" | tail -3 | tr '\n' ' '); print "  $SUB"
   [[ $SUB == *"verified=1504 failed=0"* && $SUB == *"lint_problems=0"* ]] || FAIL+=("slick_subset: $SUB")
   harness_ok subset $NF
 fi
 
 # --- workspace suite --------------------------------------------------------
 if (( do_tests )); then
-  step "cargo test --workspace --release"
+  step "workspace tests (tests/workspace_tests.sh, --release)"
   NF=${#FAIL[@]}
   T=$(grep '^test result:' "$GATE_DIR/tests.log" | awk -F'[ ;]' '{p+=$4; f+=$7} END {print NR" rows, "p" passed, "f" failed"}')
   print "  $T"
@@ -274,6 +289,17 @@ if (( do_tests )); then
   if [[ $NFAIL -ne 0 ]]; then
     FAIL+=("workspace tests: $T")
     print "  failing:"; grep -A8 '^failures:' "$GATE_DIR/tests.log" | grep -E '^    [a-z_0-9]+' | sort -u | sed 's/^/   /'
+  fi
+  # Summing the `test result:` lines cannot notice a binary that printed none.
+  # The runner counts the binaries it launched and reports how many reported
+  # nothing back, which is the check the old `cargo test | grep` never had.
+  WT=$(grep -m1 '^workspace_tests: binaries=' "$GATE_DIR/tests.log")
+  print "  $WT"
+  if [[ -z $WT ]]; then
+    FAIL+=("workspace tests: runner printed no summary line")
+  elif [[ $WT != *" missing=0 "* || $WT != *" failed_bins=0 "* ]]; then
+    FAIL+=("workspace tests: $WT")
+    grep '^workspace_tests: \(MISSING\|NONZERO\)' "$GATE_DIR/tests.log" | sed 's/^/   /'
   fi
   harness_ok tests $NF
 fi
@@ -287,8 +313,10 @@ if (( do_corpus )); then
   # by itself (a pass that became a timeout is already a loss below), but it is
   # the number to look at when the gate ran next to something else: if it is not
   # tiny, the corpus was racing for the machine and the run is suspect.
-  TMOUT_ROWS=$(grep -cE $'\t'"skip"$'\t'"(run-)?timeout" "$GATE_DIR/corpus.tsv" 2>/dev/null || print 0)
-  print "  rows skipped on a timeout: $TMOUT_ROWS (limits ${CORPUS_TMO}s compile / ${CORPUS_RTMO}s run)"
+  # `grep -c` prints its count and exits 1 when that count is zero, so no `||`
+  # fallback here: one would print a second line.
+  TMOUT_ROWS=$(grep -cE $'\t'"skip"$'\t'"(run-)?timeout" "$GATE_DIR/corpus.tsv" 2>/dev/null)
+  print "  rows skipped on a timeout: ${TMOUT_ROWS:-?} (limits ${CORPUS_TMO}s compile / ${CORPUS_RTMO}s run)"
   if [[ -n ${LEDGER:-} && -s $GATE_DIR/corpus.tsv ]]; then
     CMP=$(python3 tests/compare_corpus.py "$LEDGER" "$GATE_DIR/corpus.tsv" 2>&1)
     print "$CMP" > "$GATE_DIR/compare.json"
