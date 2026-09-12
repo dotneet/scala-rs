@@ -1888,6 +1888,12 @@ impl Typer {
         // `ArrayBuffer.type` has to see `IterableFactory[ArrayBuffer]`, or `CC`
         // falls through to `AnyRef`.
         let targs = self.conv_targs(id, &self.align_to_param_class(&param, from));
+        // A conversion whose own parameter would have to break its declared
+        // bound is not applicable: `wrapRefArray[T <: AnyRef]` is no candidate
+        // for an `Array[Char]` (`scala/io/Source.scala`'s `fromIterable(Array(c))`).
+        if !self.conv_targs_within_bounds(id, &param, &targs) {
+            return false;
+        }
         let param_s = crate::symbol::subst_tparams_slice(&tps, &targs, &param);
         let ret_s = crate::symbol::subst_tparams_slice(&tps, &targs, &ret);
         if self.weak_conforms(from, &param_s)
@@ -2532,7 +2538,15 @@ impl Typer {
             return false;
         }
         match (self.conversion_arg_ty(a), self.conversion_arg_ty(b)) {
-            (Some(aa), Some(ab)) => self.st.is_sub_type(&aa, &ab),
+            // nsc's `isAsSpecific(ftpe1, ftpe2)`: `b` must be *applicable* to
+            // `a`'s parameter type with `a`'s own type parameters abstract.
+            // Comparing the two parameter types with `is_sub_type` instead left
+            // `Array[T]` and `Array[T <: AnyRef]` unordered in both directions,
+            // so `wrapRefArray` and `genericWrapArray` came out ambiguous for
+            // every `Array[String]` used as a `Seq` (`scala/Array.scala`,
+            // `scala/collection/concurrent/TrieMap.scala`, and the same pair
+            // with `wrapCharArray` in `scala/io/Source.scala`).
+            (Some(aa), Some(_)) => self.conv_accepts_opaque(b, &unwrap_byname(&aa)),
             (Some(_), None) => false,
             (None, Some(_)) => true,
             (None, None) => true,
@@ -3289,16 +3303,75 @@ impl Typer {
     /// type parameters on *both* sides, which makes those two equal.
     fn conv_param_strictly_more_specific(&self, a: SymbolId, b: SymbolId) -> bool {
         let as_specific = |x: SymbolId, y: SymbolId| -> bool {
-            match (self.conversion_arg_ty(x), self.conversion_arg_ty(y)) {
-                (Some(px), Some(py)) => {
-                    let px = unwrap_byname(&px);
-                    let py = self.erase_method_tparams(y, &unwrap_byname(&py));
-                    self.st.is_sub_type(&px, &py)
-                }
-                _ => false,
+            match self.conversion_arg_ty(x) {
+                Some(px) => self.conv_accepts_opaque(y, &unwrap_byname(&px)),
+                None => false,
             }
         };
         a != b && as_specific(a, b) && !as_specific(b, a)
+    }
+
+    /// Whether the view `y` is applicable to an argument of type `px`, whose
+    /// own type parameters are **abstract**: nsc's
+    /// `isApplicableSafe(Nil, ftpe2, ftpe1.paramTypes, WildcardType)`.
+    ///
+    /// The bounds are part of applicability, and that is what separates two
+    /// views an erasure to wildcards leaves equal:
+    ///
+    /// ```scala
+    /// implicit def genericWrapArray[T](xs: Array[T]): ArraySeq[T]
+    /// implicit def wrapRefArray[T <: AnyRef](xs: Array[T]): ArraySeq.ofRef[T]
+    /// ```
+    ///
+    /// `genericWrapArray` accepts an `Array[T']` for `wrapRefArray`'s abstract
+    /// `T'`; `wrapRefArray` does *not* accept an `Array[T]` for
+    /// `genericWrapArray`'s unbounded `T`, because nothing says `T <: AnyRef`.
+    /// So `wrapRefArray` is strictly the more specific, which is the one nsc
+    /// picks for an `Array[String]`. Both directions held before and the pair
+    /// was reported as "ambiguous implicit: wrapRefArray, genericWrapArray"
+    /// (`scala/Array.scala`, `scala/collection/concurrent/TrieMap.scala`).
+    fn conv_accepts_opaque(&self, y: SymbolId, px: &Type) -> bool {
+        let Some(py) = self.conversion_arg_ty(y) else {
+            return false;
+        };
+        let py = unwrap_byname(&py);
+        let tps = self.st.get(y).tparams.clone();
+        if tps.is_empty() {
+            return self.st.is_sub_type(px, &py);
+        }
+        let targs = self.conv_targs(y, px);
+        for (i, tp) in tps.iter().enumerate() {
+            if !crate::check::mentions_tparam(&py, &[*tp]) {
+                continue;
+            }
+            let (Some(arg), Some(hi)) = (targs.get(i), self.st.get(*tp).bound_hi.clone()) else {
+                continue;
+            };
+            let hi = crate::symbol::subst_tparams_slice(&tps, &targs, &hi);
+            if !self.arg_provably_within(arg, &hi) {
+                return false;
+            }
+        }
+        let inst = crate::symbol::subst_tparams_slice(&tps, &targs, &py);
+        self.st.is_sub_type(px, &inst)
+    }
+
+    /// `arg <: hi`, judged so that an **abstract** `arg` is only as good as its
+    /// own declared bound.
+    ///
+    /// `is_sub_type` lets a bare type parameter stand for any reference type
+    /// (`def c[T](t: T): AnyRef = t` is accepted, where scalac reports a
+    /// mismatch), and the specificity comparison above cannot use an answer
+    /// that is true of every parameter. Judged here rather than by tightening
+    /// conformance, which every part of the compiler leans on.
+    fn arg_provably_within(&self, arg: &Type, hi: &Type) -> bool {
+        match arg {
+            Type::TypeParam(id) | Type::TypeMember(id) => match self.st.get(*id).bound_hi.clone() {
+                Some(b) => self.st.is_sub_type(&b, hi),
+                None => matches!(hi, Type::Any),
+            },
+            _ => self.st.is_sub_type(arg, hi),
+        }
     }
 
     fn erase_method_tparams(&self, id: SymbolId, ty: &Type) -> Type {
@@ -3577,6 +3650,9 @@ impl Typer {
         let tps = &self.st.get(id).tparams;
         if !tps.is_empty() {
             let targs = self.conv_targs(id, from);
+            if !self.conv_targs_within_bounds(id, param, &targs) {
+                return false;
+            }
             let instantiated = crate::symbol::subst_tparams_slice(tps, &targs, param);
             if self.st.is_sub_type(from, &instantiated) {
                 return true;
@@ -3607,6 +3683,47 @@ impl Typer {
         // [`Self::conv_implicits_resolve`], [`Self::search_extension`] with
         // [`Self::drop_witnessless_conversions`], which may load first.
         fits_ctor
+    }
+
+    /// Whether the type arguments the receiver pins on a conversion's own
+    /// parameters respect their declared **upper bounds**.
+    ///
+    /// `Predef.wrapRefArray[T <: AnyRef](xs: Array[T])` is not a candidate for
+    /// an `Array[Char]`: `T` would have to be `Char`. Without the check it
+    /// stood beside `wrapCharArray` and `genericWrapArray` and every
+    /// `Array(c): Seq[Char]` in `scala/io/Source.scala` was "ambiguous
+    /// implicit: wrapRefArray, wrapCharArray, genericWrapArray". nsc's
+    /// `isApplicable` checks the bounds as part of deciding applicability, and
+    /// an inapplicable alternative never reaches the ambiguity report.
+    ///
+    /// Only a parameter the declared argument type actually mentions is
+    /// judged: that is the one [`Self::conv_targs`] solved from the receiver
+    /// structurally. A parameter the receiver says nothing about falls back to
+    /// `Nothing` (or stays itself) there, and holding that against the bound
+    /// would reject conversions nsc accepts. Lower bounds are left alone for
+    /// the same reason -- a `B >: A` is routinely solved as exactly `A` here,
+    /// and nsc widens it instead.
+    fn conv_targs_within_bounds(&self, id: SymbolId, param: &Type, targs: &[Type]) -> bool {
+        let tps = self.st.get(id).tparams.clone();
+        for (i, tp) in tps.iter().enumerate() {
+            let Some(arg) = targs.get(i) else {
+                continue;
+            };
+            if matches!(arg, Type::TypeParam(x) if x == tp) {
+                continue;
+            }
+            if !crate::check::mentions_tparam(param, &[*tp]) {
+                continue;
+            }
+            let Some(hi) = self.st.get(*tp).bound_hi.clone() else {
+                continue;
+            };
+            let hi = crate::symbol::subst_tparams_slice(&tps, targs, &hi);
+            if !self.st.is_sub_type(arg, &hi) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The single value parameter of a conversion, as declared.
