@@ -240,6 +240,24 @@ Syntax that can be parsed (or desugared):
   What remains is the shapes the parser normalises away along with the distinction nsc keeps
   (an `if` with no `else`, by-name types), mixing `..$` with ordinary arguments, and `type` definitions
   ([`docs/macros.md`](macros.md) §7.4 / §7.7)
+- **Quasiquotes in pattern position (`case q"..." =>`)**: a quasiquote that stands in a pattern is
+  **deconstructed** rather than built (`crates/typer/src/quasi_pattern.rs`). nsc expands the same
+  compiler-intrinsic macro with `nme.unapply` and emits a synthetic matcher whose inner pattern is
+  written in the universe's own extractors; scala-rs builds that inner pattern directly, with the hole
+  patterns spliced in where they stand — a rank-0 hole where a `Tree` is matched, a rank-1 hole where a
+  `List[Tree]` is. What can be deconstructed is literals, term identifiers and selections (operators in
+  their encoded spelling), applications with or without a written type-argument list
+  (through the total `SyntacticTypeApplied`), function literals whose parameters are spliced, blocks
+  (`SyntacticBlock`), and holes of rank 0 and 1. Every name the deconstruction writes is qualified
+  (`<universe>.Apply`, `_root_.scala.List`), because a package member outranks a wildcard import and the
+  file this was written for is in package `cats`, which declares a `cats.Apply`.
+  **Any shape that cannot be deconstructed is reported as
+  `unimplemented syntax: quasiquote q"..." in pattern position (which shape)`** and never silently
+  accepted: a `..$` hole mixed with written elements, a parameter written out rather than spliced,
+  a right-associative operator written infix, `new`, `if`, `...$`, and `tq"..."` / `pq"..."` / `cq"..."`
+  in pattern position. Verified by running 22 trees through 11 patterns against
+  `scala.reflect.runtime.universe` and diffing both compilers' output byte for byte
+  (`tests/fixtures/czero_quasipat.scala`) ([`docs/macros.md`](macros.md) §7.27)
 - **The 3 shapes that need fresh names**: the `_` placeholder function literal (`q"_.get"`),
   `_` type arguments, i.e. existentials (`tq"P[_, _]"`), and right-associative operators (`q"a :: b"`) expand in nsc
   not into a single expression but into a **block** that first places

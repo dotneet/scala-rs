@@ -43,6 +43,18 @@ Language:
   operators such as `a :: b` — are built with the same per-block `freshTermName` /
   `freshTypeName` blocks as nsc (`tests/fixtures/fn2_fresh.scala`).
 
+  In **pattern** position (`case q"..." =>`) a quasiquote is deconstructed into a
+  pattern over the universe's own extractors (`crates/typer/src/quasi_pattern.rs`,
+  §7.27). Literals, identifiers and selections, applications with or without a
+  written type-argument list, spliced function parameters, blocks, and holes of
+  rank 0 and 1 all work, checked by running 22 trees through 11 patterns against
+  the runtime universe and diffing against real scalac
+  (`tests/fixtures/czero_quasipat.scala`). What remains there: a `..$` hole mixed
+  with written elements, a parameter written out rather than spliced, a
+  right-associative operator written infix, `new`, `if`, `...$`, a rank-1 hole
+  standing for a list of `case` clauses (`q"{ case ..$cases }"`, `pos/t8411`), and
+  `tq"..."` / `pq"..."` / `cq"..."` in pattern position — each reported by name.
+
   What remains: forms the parser normalises away along with the distinction nsc
   preserves (`if` without `else`, by-name types, by-name and vararg parameters,
   procedure syntax, pattern definitions, self types, early definitions); mixing

@@ -72,6 +72,7 @@ unrealistic, it is stated as such.
   - 7.24 Source symbol ownership in the integration candidate
   - 7.25 `mapTo` against classes this run is compiling (the `agent/gbmacro` slice)
   - 7.26 `reify { … }` over the typed body (the `agent/reify` slice)
+  - 7.27 Quasiquotes in pattern position (the `agent/catszero` slice)
 
 (The two `7.10` entries above are not a typo in this table of contents: the numbering is duplicated
 in the document itself, and the numbers are left unchanged because other documents reference these
@@ -3690,3 +3691,116 @@ The design, the measured walls and what remains, in order, are in
 [`docs/notes/reify-design.md`](notes/reify-design.md); the fixtures are
 `tests/fixtures/reify2_*.scala` (`crates/cli/tests/reify2.rs`), each run
 through real scalac 2.13.16 with identical output.
+
+### 7.27 Quasiquotes in pattern position (the `agent/catszero` slice)
+
+`case q"..." =>` works. It was the last thing standing between cats and zero
+errors: `core/src/main/scala-2/cats/arrow/FunctionKMacros.scala` writes
+
+```scala
+case q"($param) => $trans[..$typeArgs]($arg)" if param.symbol == arg.symbol => …
+```
+
+and interpolated-string patterns in that position were not implemented at all,
+so that one file was held out of `tests/cats_measure.sh` (a parse error stops
+the run before typing, hiding the other 339 files' diagnostics). The holdout is
+gone; see [`docs/cats.md`](cats.md).
+
+#### What nsc does, and what we do instead
+
+nsc expands the same compiler-internal macro with `nme.unapply` rather than
+`nme.apply` and runs an `UnapplyReifier` over the same parsed body, which
+builds a synthetic matcher —
+
+```scala
+{ new { def unapply(tree: $u.Tree) = tree match { case <reified> => Some(…); case _ => None } } }
+  .unapply(<scrutinee>)
+```
+
+— whose inner pattern is written in the universe's own extractors.
+
+`crates/typer/src/quasi_pattern.rs` builds that inner pattern **directly**,
+with the hole patterns spliced in where they stand, and hands it back to
+ordinary pattern typing. No synthetic class, no `Option` tupling: a hole of
+rank 0 sits where a `Tree` is matched and a hole of rank 1 where a
+`List[Tree]` is, which is exactly what the author's pattern wants to bind.
+
+```text
+q"($param) => $trans[..$typeArgs]($arg)"
+  ⇒ u.Function(_root_.scala.List(param),
+               u.Apply(u.internal.reificationSupport.SyntacticTypeApplied(trans, typeArgs),
+                       _root_.scala.List(arg)))
+```
+
+Four things this had to get right, each checked against the real thing rather
+than reasoned about:
+
+1. **`SyntacticTypeApplied`, not `u.TypeApply`.** A quasiquote's written
+   type-argument list matches a call with *or without* type arguments, because
+   nsc's extractor is total — `unapply` returns `Some`, handing back `Nil` for
+   a plain `Apply`. Run under real scalac on `q"f(1)"` and `q"f[Int](1)"`,
+   `Apply(SyntacticTypeApplied(fun, targs), args)` and
+   `q"$fun[..$targs](..$args)"` answer identically. A written type argument
+   still discriminates: `q"$f[Int]($a)"` does not match `f(3)`, because
+   `List(Ident(TypeName("Int")))` does not match `Nil`.
+2. **Every name is qualified**: `u.Apply`, `_root_.scala.List`,
+   `_root_.scala.Nil`. A bare `Apply` is resolved lexically, and the file that
+   made this necessary is in package `cats`, which declares a `cats.Apply` of
+   its own — a package member outranks a wildcard import (SLS 2), so the bare
+   name bound to the type class and the pattern matched nothing at all. This
+   is why the whole thing looked like a typer bug when it was hand-desugared:
+   `case Apply(trans, List(arg))` in that package gives `arg: A` and
+   `trans: Any`.
+3. **Names are encoded.** Reflect `Name`s carry the encoded spelling, so
+   `q"$a + $b"` matches a selection of `$plus`. Matching the raw `+` would have
+   matched nothing, silently.
+4. **A rank-0 hole standing for the whole body is typed by `$u.Tree`**
+   (`case (x: u.Tree)`). nsc's generated matcher takes a `$u.Tree` parameter,
+   so the hole is typed by it; spliced in bare it would have been an ordinary
+   variable pattern binding the scrutinee at whatever type the scrutinee had,
+   and `case q"$a"` would have matched an `Option[Int]`.
+
+#### Shapes that work
+
+Term quasiquotes (`q"..."`): literals; term identifiers and selections
+(operators included, in their encoded spelling); applications, with or without
+a written type-argument list; function literals whose parameters are spliced;
+blocks (`SyntacticBlock`, which also answers for a single statement never
+wrapped in a block); holes of rank 0 anywhere a tree stands and of rank 1
+standing for a whole argument, type-argument, parameter or statement list.
+
+#### Shapes that are refused, by name
+
+Everything else is an error naming the shape, never a silent pass — a
+quasiquote pattern that quietly matched the wrong trees would make a macro
+implementation compile and then mis-expand. `tests/fixtures/
+czero_quasipat_bad.scala` pins eight of them: a `..$` hole mixed with written
+elements (`q"$f(..$as, y)"`), a parameter written out rather than spliced
+(`q"(x: Int) => $r"`), a right-associative operator written infix
+(`q"$a :: $b"`), `new`, `if`, the empty quasiquote, a `...$` hole, and
+`tq"..."` / `pq"..."` / `cq"..."` in pattern position. Real scalac accepts all
+but the `...$` one, so these are refusals and not wrong acceptances.
+
+Two shapes are refused further up, in the quasiquote *front end*
+(`crates/typer/src/quasiquote.rs`), and stay refused: a rank-1 hole standing
+for a list of `case` clauses (`q"{ case ..$cases }"`, which is `pos/t8411`)
+cannot be parsed, because the front end fills every hole with one placeholder
+*name* and a case clause needs a `case … =>` shaped filler.
+
+#### One documented difference from nsc
+
+nsc's matcher **casts** its argument to `Tree` where this **tests** it, so for
+a scrutinee statically wider than `Tree` the two differ: `x: Any` holding a
+`String`, matched against `case q"$a"`, throws a `MatchError` from inside
+nsc's synthetic `unapply` and falls through to the next case here. A type test
+is what every nested hole already gets (`u.Apply(…)` cannot match a `String`
+either), and no macro implementation has a scrutinee wider than `Tree`.
+
+#### Validation
+
+`tests/fixtures/czero_quasipat.scala` runs 22 trees through 11 quasiquote
+patterns against `scala.reflect.runtime.universe` and prints what each hole
+binds; `crates/cli/tests/czero.rs` compiles it with scala-rs *and* with real
+scalac 2.13.16 and requires both runs' stdout to be byte-identical to the
+recorded expectation, under `java -Xverify:all`. The matches and the
+non-matches are both in there, which is what makes it evidence.

@@ -58,6 +58,28 @@ fn path_of(t: &Tree) -> Option<String> {
 /// one (`crates/typer/src/pickle_supply.rs`), because the two differ only in
 /// how the type is obtained: nsc writes the same `MacroImplBinding.targs`
 /// either way.
+/// The *head* symbol of a tag's type argument, as nsc's `targ.typeSymbol`
+/// reads it: `F` for `F[Any]`, `F` for `F`, nothing for a concrete type.
+///
+/// `impl_tparams` is consulted by name as well as by identity, because a
+/// method read back from a class file scala-rs wrote carries its parameter
+/// types by simple name (`WeakTypeTag[F[Any]]` arrives as `Type::Named`).
+fn tag_head_symbol(
+    ty: &Type,
+    impl_tparams: &[SymbolId],
+    st: &crate::symbol::SymbolTable,
+) -> Option<SymbolId> {
+    match ty {
+        Type::TypeParam(tp) => Some(*tp),
+        Type::Applied { ctor, .. } => tag_head_symbol(ctor, impl_tparams, st),
+        Type::Named { name, .. } => impl_tparams
+            .iter()
+            .copied()
+            .find(|&t| st.get(t).name == *name),
+        _ => None,
+    }
+}
+
 pub(crate) fn macro_targ_of_type(
     st: &crate::symbol::SymbolTable,
     ty: &Type,
@@ -259,10 +281,8 @@ impl Typer {
             .iter()
             .map(|&p| {
                 if self.is_tag_param(p) {
-                    if let Some(Type::TypeParam(tp)) = self.tag_param_argument(p) {
-                        if let Some(index) = tparams.iter().position(|&t| t == tp) {
-                            return index as i32;
-                        }
+                    if let Some(index) = self.tag_param_tparam(p, &tparams) {
+                        return index as i32;
                     }
                 }
                 let display = self.st.display_type(&self.st.get(p).ty);
@@ -356,13 +376,7 @@ impl Typer {
         let impl_tparams = self.st.get(impl_sym).tparams.clone();
         let mut out = Vec::with_capacity(tag_params);
         for p in tags {
-            let Some(arg) = self.tag_param_argument(p) else {
-                return Vec::new();
-            };
-            let Type::TypeParam(tp) = arg else {
-                return Vec::new();
-            };
-            let Some(index) = impl_tparams.iter().position(|&t| t == tp) else {
+            let Some(index) = self.tag_param_tparam(p, &impl_tparams) else {
                 return Vec::new();
             };
             let Some(written) = ref_targs.get(index) else {
@@ -383,6 +397,24 @@ impl Typer {
             }
             _ => None,
         }
+    }
+
+    /// Which implementation type parameter a `c.WeakTypeTag[T]` is a tag *for*.
+    ///
+    /// nsc reads this off `targ.typeSymbol`
+    /// (`Helpers.transformTypeTagEvidenceParams`), which looks through an
+    /// application: `c.WeakTypeTag[F[Any]]` on `def lift[F[_], G[_]]` is a tag
+    /// for `F`, and that is the index its fingerprint carries. cats' only
+    /// macro is written that way --
+    /// `(implicit evF: c.WeakTypeTag[F[Any]], evG: c.WeakTypeTag[G[Any]])` on
+    /// `FunctionKMacros.lift` -- and reading only the bare-parameter form made
+    /// the whole trailing clause look like ordinary implicit values, so the
+    /// definition was refused with "macro implementation parameter shape does
+    /// not match the macro definition".
+    fn tag_param_tparam(&self, p: SymbolId, impl_tparams: &[SymbolId]) -> Option<usize> {
+        let arg = self.tag_param_argument(p)?;
+        let head = tag_head_symbol(&arg, impl_tparams, &self.st)?;
+        impl_tparams.iter().position(|&t| t == head)
     }
 
     /// Decide what one type argument written on the implementation reference
