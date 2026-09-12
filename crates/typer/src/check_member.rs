@@ -2949,7 +2949,16 @@ impl Typer {
         // relies on defaults (`def this() = this(null)` in front of eight) does
         // not match any candidate's arity and keeps the old behaviour.
         let self_call_protos: Vec<Type> = {
-            let fits: Vec<SymbolId> = self
+            // Every constructor the written argument count could reach at all:
+            // the parameters past the written ones must be implicit or
+            // defaulted. `class Chain(v: String) { def this(n: Int, sep: String
+            // = "-") = …; def this(f: Boolean) = this(if (f) 1 else 0) }` has
+            // two -- the primary, whose one parameter is a `String`, and the
+            // `Int` one with a default to fill -- so the single argument does
+            // not say which, and the pick stays the arguments' own business
+            // (`tests/fixtures/ctorgaps_secdefault.scala`,
+            // `secondaryctor_new.scala`).
+            let reachable: Vec<SymbolId> = self
                 .st
                 .lookup_member(class_id, "<init>")
                 .into_iter()
@@ -2957,26 +2966,34 @@ impl Typer {
                     self.st.get(id).kind == crate::symbol::SymKind::Method
                         && self.st.get(id).owner == class_id
                         && Some(id) != skip
+                        && matches!(&self.st.get(id).ty, Type::Method { .. })
                 })
                 .filter(|&id| {
-                    // The clauses of a curried delegation are folded into one
-                    // argument list before this runs
-                    // (`flatten_curried_ctor_delegation`), so the candidate's
-                    // are flattened too: `def this()(implicit ord: Ordering[K])
-                    // = this(RB.Tree.empty)(ord)` is two arguments against
-                    // `(tree: RB.Tree[K, V])(implicit ordering: Ordering[K])`
-                    // (`mutable/TreeMap.scala:48`, `mutable/TreeSet.scala:48`).
-                    // A delegation that writes fewer clauses than the callee
-                    // has -- leaving an implicit one to be filled in -- matches
-                    // no candidate's arity and keeps the old behaviour.
-                    let flat = flat_param_types(&self.st.get(id).ty);
-                    matches!(&self.st.get(id).ty, Type::Method { .. })
-                        && flat.len() == args.len()
-                        && !flat.iter().any(is_open_formal)
+                    let ps = self.st.get(id).params.clone();
+                    args.len() <= ps.len()
+                        && ps[args.len()..].iter().all(|p| {
+                            let f = self.st.get(*p).flags;
+                            f.contains(Flags::IMPLICIT) || f.contains(Flags::DEFAULTPARAM)
+                        })
                 })
                 .collect();
-            match fits[..] {
-                [only] => flat_param_types(&self.st.get(only).ty),
+            // ... and only when that one constructor has exactly the parameters
+            // the delegation wrote. The clauses of a curried delegation are
+            // folded into one argument list before this runs
+            // (`flatten_curried_ctor_delegation`), so the candidate's are
+            // flattened too: `def this()(implicit ord: Ordering[K]) =
+            // this(RB.Tree.empty)(ord)` is two arguments against
+            // `(tree: RB.Tree[K, V])(implicit ordering: Ordering[K])`
+            // (`mutable/TreeMap.scala:48`, `mutable/TreeSet.scala:48`).
+            match reachable[..] {
+                [only] if self.st.get(only).params.len() == args.len() => {
+                    let flat = flat_param_types(&self.st.get(only).ty);
+                    if flat.len() == args.len() && !flat.iter().any(is_open_formal) {
+                        flat
+                    } else {
+                        Vec::new()
+                    }
+                }
                 _ => Vec::new(),
             }
         };

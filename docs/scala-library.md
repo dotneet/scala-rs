@@ -4361,3 +4361,121 @@ is `no matching overload for (Char, (Char) => Char)Char with arguments (Char,
 own `PartialFunction` from source, where the declaration is the real one -- and
 the prelude's `PartialFunction` surface belongs to `agent/libsurf`, so it is
 recorded rather than changed.
+
+## `agent/libzero2`: 41 → 4 errors (2026-09-13)
+
+Measured with `tests/scalalib_measure.sh` (the `--no-scala-library`
+arrangement, 538 files). `classes=0` still, so the library does not reach code
+generation yet; the remaining four errors are in three files and each is written
+up below. cats (0 errors / 2977 classes), gitbucket (0 / 1317) and slick
+(0 / 1504) are unchanged throughout.
+
+Fifteen roots, each reduced to a standalone program and compared with real
+scalac 2.13.16 in **both** directions (`crates/cli/tests/lz2.rs`, fixtures
+`lz2_infer`, `lz2_infer_bad`, `lz2_resolve`, `lz2_resolve_bad`,
+`lz2_fwdref_bad`; the two positive fixtures are *run* under `-Xverify:all` and
+their output is produced again by scalac in the same suite).
+
+| root | library sites | errors |
+|---|---|---|
+| a method's type argument read off an expected type that is a **function**, through a base class of the result | `Predef.scala:510` | 1 |
+| a constructor **self-call**'s arguments typed against the one constructor the arity can mean | `concurrent/TrieMap.scala:711`, `immutable/HashMap.scala:45`, `immutable/HashSet.scala:40` | 3 |
+| the same with the clauses **folded** (`this(x)(y)`) | `mutable/TreeMap.scala:48`, `mutable/TreeSet.scala:48` | 2 |
+| a subclass method and an inherited one whose parameters name *unrelated* classes are two alternatives | `collection/Factory.scala:53` | 1 |
+| a **compound** receiver has its components' base types, and a compound conversion *parameter* is solved against the component that mentions the type parameters | `collection/convert/StreamExtensions.scala:190-213` | 8 |
+| a compound on the right of `<:` is **every** component, even against an applied abstract constructor | `collection/BuildFrom.scala:48,55,98` | 3 |
+| a closed argument position of an implicit candidate is a *conformance* question, at that position's variance | `concurrent/Future.scala:813,832` | 2 |
+| a type parameter nothing in the call determines, carried out through a **selection** | `concurrent/Future.scala:651` | 1 |
+| a SAM whose abstract method returns `Unit` **discards** the literal's value | `concurrent/impl/FutureConvertersImpl.scala:57` | 1 |
+| applicability between two conversions is **weak** conformance | `math/BigDecimal.scala:555` | 1 |
+| `Lscala/runtime/BoxedUnit;` in a **Java** class file means `BoxedUnit` | `Unit.scala:41` | 1 |
+| a block-local `def` with **no result type** is in scope for the whole block | `sys/process/Parser.scala:38` | 1 |
+| a parent that is an **inner class** is read through the prefix it was written with | `immutable/HashMap.scala:60,63,65` | 3 |
+| an overload's parameter reached only through a **base** type while the alternative's parameters are open | `collection/SeqView.scala:37` | 2 |
+| a **value** used as an extractor reads its `unapply` as seen from the receiver | `PartialFunction.scala:253` | 1 |
+| **type parameters in a structural refinement** | `collection/convert/StreamExtensions.scala:44,86,87,88` | 4 |
+| `Module(args)` sugar reads an inherited `apply` as seen from the module | `immutable/HashMap.scala:1777`, `util/Either.scala:419` | 2 |
+
+### Two backend defects the typer fixes uncovered
+
+Both were unreachable while the program did not type-check, and both are
+`VerifyError`s, not wrong output:
+
+* `gen_select`'s static-field arm popped the loaded reference whenever the
+  field's *descriptor* was `Lscala/runtime/BoxedUnit;`. Right for a `Unit`-typed
+  field (a `Unit` expression leaves nothing on the stack), wrong for
+  `scala.runtime.BoxedUnit.UNIT`, whose type really is `BoxedUnit`:
+  `def box(x: Unit): BoxedUnit = BoxedUnit.UNIT` emitted
+  `getstatic UNIT; pop; areturn`. The question is the selection's own type.
+* `type_ctor_delegation` filled a **curried** self-call's implicit clause a
+  second time, because `flatten_curried_ctor_delegation` folds the clauses into
+  one argument list while `pick_ctor` hands back the first clause's parameter
+  types. `def this()(implicit ord: Ordering[K]) = this(RB.Tree.empty)(ord)`
+  pushed `(tree, ord, ord)` for a two-parameter descriptor.
+
+### A wrong acceptance closed on the way: SLS 4.1
+
+Hoisting a block-local `def` makes it visible above its own definition, which is
+the point -- but a reference from an eager `val`/`var` initialiser to a
+definition that comes *later* in the block is a **forward reference over the
+definition of a value**, and scalac refuses it. The hole existed already for an
+annotated local `def` (those were always hoisted) and would have widened to
+every one. `Typer::check_forward_reference` now reports it, walking the open
+blocks from the innermost outward because the reference may sit in a block, a
+lambda or a nested `def` inside the value's right-hand side. The three legal
+neighbours -- a plain statement, another `def`'s body, a `lazy val`'s
+initialiser -- stay legal; six programs were compared with scalac 2.13.16, which
+rejects the same three at the same references.
+
+nsc reports this from **RefChecks**, which does not run once the typer has
+reported anything: a fixture carrying a type error hides scalac's verdict on it,
+so `lz2_fwdref_bad` is a file of its own.
+
+### What is left: 4 errors in 3 files
+
+1. `collection/Iterable.scala:570` — `groupBy`'s
+   `result = result.updated(k, v.result())` comes out a
+   `HashMap[K, AnyRef]` where `HashMap[K, C]` is declared: `updated[V1 >: V]`
+   took `V1 := AnyRef` instead of the `C` the builder's `result()` gives. Not
+   reproduced by a reduction of the same shape (`q04` in the probe harness
+   below), so the root is narrower than "a lower-bounded parameter from an
+   argument".
+2. `collection/Seq.scala:598,702` — one root, in `PermutationsItr.init`:
+   `val (es, is) = (self.toGenericSeq map (e => (e, m.getOrElseUpdate(e, m.size))) sortBy (_._2)).unzip`
+   gives `es` the element type `((A, Int), Int)` instead of `A`, i.e. `unzip`'s
+   `A1` was solved one tuple too wide. The same chain written outside
+   `SeqOps`'s inner class types correctly (`q06`), and `toGenericSeq` is not
+   reachable from a probe in another package, so the reduction is unfinished.
+3. `collection/mutable/ArrayDeque.scala:68` — `super.stepper(shape)` resolves to
+   `IterableOnce.stepper` (result `S`) instead of `IndexedSeqOps.stepper`
+   (result `S with EfficientSplit`). `super_select_member` takes the *last
+   written* parent clause that has any concrete member of that name, and
+   `ArrayDeque` mixes in `IterableFactoryDefaults` last, which reaches
+   `IterableOnce.stepper`; nsc walks `this`'s **linearization**, where
+   `IndexedSeqOps` is the more derived. Reduced (`q08` below: a trait with
+   `ArrayDeque`'s parent list reproduces it, and the same trait without
+   `IterableFactoryDefaults`/`StrictOptimizedSeqOps` does not).
+
+   Ranking the candidate clauses by the linearization position of the member
+   they found fixes it and takes the library to 3 errors, but returning only
+   that clause's member set loses the *other* clause's overloads:
+   gitbucket's `super.get(path) { … }`, whose one-clause and `ValueType`
+   alternatives sit in two different scalatra traits, became
+   `no matching overload for (String, ValueType[T])((T) => Any)Route with
+   arguments (String)` (2 errors). Unioning the sets instead keeps gitbucket at
+   zero but takes the library to 8: five members that `drop_overridden` cannot
+   relate become `ambiguous overload` (`JavaCollectionWrappers`,
+   `immutable/Range`, `immutable/Vector`, `mutable/CheckedIndexedSeqView`). The
+   honest fix is nsc's: one member set, ordered by the base-type sequence, with
+   an override reduction that can order two members reached through different
+   clauses. Reverted rather than shipped half-done.
+
+### The probe harness for library-source-only roots
+
+Three of the roots above exist only when the library's own sources supply the
+class: in jar mode `List` and `Vector` come from the prelude, so `Module(args)`
+reading an inherited `apply` raw is invisible. `/private/tmp/scala-rs-lz2/probes/lib.sh`
+compiles all 538 library files **plus one extra file** and prints only that
+file's diagnostics (3 s a run). `q01`-`q08` there are the reductions named
+above. It is the only way to reduce a root of this kind, and worth rebuilding
+for the next such slice.
