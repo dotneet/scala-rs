@@ -285,7 +285,19 @@ impl Typer {
                 let ty = self.tree_to_type(inner);
                 self.note_cto_type_name(annot, annot.span);
                 let path = annot.annotation_path();
-                let simple = path.rsplit('.').next().unwrap_or(path.as_str()).to_string();
+                let mut simple = path.rsplit('.').next().unwrap_or(path.as_str()).to_string();
+                // The variance checks look for `uncheckedVariance` by name;
+                // slick writes it through a renaming import (`import
+                // scala.annotation.unchecked.{uncheckedVariance => uv}`, then
+                // `type Self = HCons[H @uv, T @uv]`), so resolve the written
+                // name and keep the annotation's own.
+                if simple != "uncheckedVariance"
+                    && self.st.lookup_type(&simple).iter().any(|s| {
+                        self.st.get(*s).jvm_name == "scala/annotation/unchecked/uncheckedVariance"
+                    })
+                {
+                    simple = "uncheckedVariance".to_string();
+                }
                 Type::Annotated {
                     tpe: Box::new(ty),
                     annot: simple,
@@ -2178,6 +2190,27 @@ impl Typer {
             }
             t
         };
+        // `[-a]List[a]` puts its own parameter in the wrong position. nsc
+        // validates the refinement member wherever the refinement is written
+        // (`neg/t7872b`), naming it `type l` inside a `type` alias and `value
+        // <local l>` in a term's type (`kind_bounds.rs`).
+        {
+            let own = self.st.get(id).tparams.clone();
+            let desc = if self.alias_rhs_depth > 0 {
+                format!("type {name}")
+            } else {
+                format!("value <local {name}>")
+            };
+            let body = (!rhs.is_empty()).then_some(&rhs_ty);
+            self.check_hk_member_own_variance(
+                &own,
+                body,
+                lo_ty.as_ref(),
+                hi_ty.as_ref(),
+                r.span,
+                &desc,
+            );
+        }
         // A type lambda may mention type parameters of whatever encloses it:
         // `implicit def readerMonad[R]: Monad[({ type L[X] = Reader[R, X] })#L]`
         // captures `R`. A `Type::TypeMember` is only a symbol, so a later

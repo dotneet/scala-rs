@@ -63,6 +63,8 @@ fn function_class(st: &mut SymbolTable, n: usize) -> SymbolId {
         }
         tps.push(type_param(st, id, "R"));
         st.get_mut(id).tparams = tps;
+        // `prelude_variance::install` ran before this class existed.
+        crate::prelude_variance::apply_declared(st, id);
     }
     id
 }

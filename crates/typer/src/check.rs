@@ -424,6 +424,10 @@ pub struct Typer {
     /// position the same `TC[_]` is an existential over a proper type and nsc
     /// rejects it (`_$1 takes no type parameters, expected: 1`).
     pub(crate) pattern_tpt: bool,
+    /// Inside the right-hand side of a `type` alias. nsc names a type
+    /// lambda's refinement member `type l` there and `value <local l>` in
+    /// any other type position; only the variance diagnostic reads this.
+    pub(crate) alias_rhs_depth: usize,
     /// Typing the *function* of a constructor pattern (`case x :@ y`), where
     /// nsc's name lookup skips a non-stable method of that name.
     pub(crate) ctor_pattern_fun: bool,
@@ -1082,6 +1086,7 @@ impl Typer {
             strict_type_names: false,
             exist_quantified: Vec::new(),
             pattern_tpt: false,
+            alias_rhs_depth: 0,
             ctor_pattern_fun: false,
             sig_done: std::collections::HashSet::new(),
             lazy_val_presig: std::collections::HashSet::new(),
