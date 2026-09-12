@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `8ece0269` |
+| commit | `631b238d` |
 |---|---|
 | updated | 2026-09-12 |
 
@@ -86,6 +86,7 @@ coordinator measured the merged tree each time, not the branches.
 | `cd35fd83` | nested function application erasure, generic local conversions, README/docs cleanup | 92 | 34 |
 | `c0c10f08` | collection extension precedence, ReusableBuilder parent recovery, SortedSet operators, Seq trait hierarchy, JDK 21 name data | 92 | 34 -> **31** |
 | `8ece0269` | twenty slices: element types, JDK 17 data, this.type/override, application/argument conformance, declarations, runtime crashes, gitbucket non-macro roots, output mismatches, hard inference, parser gaps, runtime probes, Slick `mapTo`, prefix-carrying types, `@compileTimeOnly`, wrong acceptances, erasure/ABI, warnings, reify/TypeTag, mixin/outer codegen, extractors and library surface, kind/variance | 92 -> **4** | 31 -> **2** |
+| `631b238d` | cats and gitbucket to **zero errors**: quasiquote patterns (so `FunctionKMacros.scala` compiles and there is no holdout), `immutable.Iterable` parents, macro tags of applied constructors, alias rebinding through an enclosing `this`, concrete trait members a class file calls abstract, views in a conversion's own implicit clause, a companion's statics are not inherited, super accessors for default getters, varargs anonymous classes, signature-path parent arguments | 4 -> **0** | 2 -> **0** |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4139,6 +4140,58 @@ Exact summary block:
 ```text
 === summary
   HEAD=8ece0269  logs=/private/tmp/scala-rs-gate-8ece0269-20260912
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-five: cats and gitbucket at zero (`631b238d`)
+
+Run in `/private/tmp/scala-rs-gate-631b238d-20260912` against the
+`corpus-8ece0269` ledger. `VERDICT=PASS`.
+
+| measure | `8ece0269` | `631b238d` |
+|---|---:|---:|
+| cats | 2 errors (339 files, one held out) | **0 errors, 340 files, 2976 classes** |
+| gitbucket | 4 / 3 | **0 errors, 354 inputs, 1317 classes** |
+| scala library | 126 / 49 | 126 / 49 |
+| slick | 0 errors / 1504 classes | 0 errors / 1504 classes |
+| corpus pos / neg / run | 1234 / 814 / 1001 | 1234 / **815** / **1002** |
+| workspace suite | 3077 | **3106** |
+
+Both projects now reach code generation, which is the first time either has:
+cats emits 2976 class files and gitbucket 1317. `tests/cats_measure.sh` no
+longer holds a file out, and `tests/verify_merge.sh` requires `errors=0` from
+both — a regression there is a gate failure, not a number to report.
+
+The corpus kept all 5324 identities with `losses=0` and two gains
+(`neg/t4174`, `run/trait-defaults-modules2`). The saved ledger is
+[`baselines/corpus-631b238d.tsv`](baselines/corpus-631b238d.tsv), SHA-256
+`89f09d89ce610603160de9d2977fa4c60872140a8c51196783368d8e1654e0d6`.
+
+What the two slices closed:
+
+* **cats** — quasiquote *patterns* (`case q"..."`, a new
+  `crates/typer/src/quasi_pattern.rs`, which also fixed the engine's view of
+  macro tags for applied type constructors), `immutable.Iterable` as the first
+  parent of the immutable collections (no member of it had conformed), and
+  `NonEmptySet.toIterable`.
+* **gitbucket** — the alias `type BaseColumnType[T] = self.BaseColumnType[T]`
+  rebound through the enclosing `this` (nsc's `Types.rebind`), concrete trait
+  members that a class file marks `ACC_ABSTRACT` (trait `val`s and nested
+  `object`s of Slick's cake, read from the class file with both the typer and
+  the backend taught to supply them), views required by a conversion's own
+  implicit clause (SLS 7.2, Slick's `tuple2Ordered`), a companion's `static`
+  mirrors no longer entering a subclass's unqualified scope (nsc: static Java
+  members belong to the companion), super accessors for `name$default$n`
+  getters, anonymous classes passed to a varargs parameter, and parent
+  constructor arguments that contain a local template being left for the body
+  pass.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=631b238d  logs=/private/tmp/scala-rs-gate-631b238d-20260912
 VERDICT=PASS
 DONE
 ```
