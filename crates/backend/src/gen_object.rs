@@ -308,18 +308,19 @@ impl<'a> Gen<'a> {
     /// set, in reverse linearization order (base traits first). `$init$` is a
     /// `static` method on the interface itself, so the call is an
     /// `invokestatic` through an `InterfaceMethodref`.
+    ///
+    /// Only the traits this class actually mixes in ([`Gen::mixin_traits`]):
+    /// every trait from the superclass onward had its `$init$` run by that
+    /// class's own constructor, and running it again would re-assign fields
+    /// that class owns.
     pub(crate) fn mixin_init_calls(&self, class_id: SymbolId) -> Vec<(String, String)> {
         if class_id.is_none() {
             return Vec::new();
         }
-        linearize(self.st, class_id)
+        self.mixin_traits(class_id)
             .into_iter()
-            .skip(1)
             .rev()
             .filter_map(|p| {
-                if !is_interface_sym(self.st, p) {
-                    return None;
-                }
                 // A trait of this run: call `$init$` when it has something to
                 // run. A trait read from `-cp`: call it when the interface
                 // declares one, which is nsc's own rule for a binary trait.

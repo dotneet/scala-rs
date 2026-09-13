@@ -236,6 +236,23 @@ pub(crate) fn collect_free(
                 collect_free(a, bound, out, st);
             }
         }
+        // A pattern reads the enclosing instance through its *extractor*, and
+        // the three pattern-only nodes used to stop this walk. cats'
+        // `for (typeArg @ TypeTree() <- typeArgs) if (…)` desugars to a
+        // `withFilter` whose predicate matches `TypeTree()` -- `c.universe`'s
+        // extractor, i.e. a field of the enclosing `Lifter` -- under a `Bind`,
+        // so the predicate lambda was emitted with no outer parameter at all
+        // and `aload_0` read the *element* as the `Lifter`:
+        // `ClassCastException: Trees$TypeTree cannot be cast to
+        // FunctionKMacros$Lifter`, thrown inside scalac while it expanded our
+        // macro.
+        TreeKind::Bind { body, .. } => collect_free(body, bound, out, st),
+        TreeKind::Star { elem } => collect_free(elem, bound, out, st),
+        TreeKind::Alternative { trees } => {
+            for t in trees {
+                collect_free(t, bound, out, st);
+            }
+        }
         TreeKind::Apply { fun, args } => {
             collect_free(fun, bound, out, st);
             for a in args {

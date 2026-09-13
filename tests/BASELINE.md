@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `b6e4c00f` |
+| commit | `ce3e99ec` |
 |---|---|
 | updated | 2026-09-13 |
 
@@ -89,6 +89,7 @@ coordinator measured the merged tree each time, not the branches.
 | `631b238d` | cats and gitbucket to **zero errors**: quasiquote patterns (so `FunctionKMacros.scala` compiles and there is no holdout), `immutable.Iterable` parents, macro tags of applied constructors, alias rebinding through an enclosing `this`, concrete trait members a class file calls abstract, views in a conversion's own implicit clause, a companion's statics are not inherited, super accessors for default getters, varargs anonymous classes, signature-path parent arguments | 4 -> **0** | 2 -> **0** |
 | `f16daac1` | library clusters (views, compound bounds, `private[this]` variance, array wrappers, `Function1[_, _]`, `= macro ???`, `AnyRef.clone`), a 9x faster typer (linearization and base-type caches), and a parallel gate | 0 | 0 |
 | `b6e4c00f` | whitebox macros, the nested-companion implicit scope, the library's last inference roots (66 -> 41), and the cats/gitbucket **run** harnesses with the eleven miscompilations they found | 0 | 0 |
+| `ce3e99ec` | the five known-fail run programs: mixin forwarders scoped to nsc's `mixinClasses`, applied type members and refinement `type` declarations written to the pickle, pattern-bound lambda capture, conversion views through prefixes, `Byte`/`Short` pickle names | 0 | 0 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4334,6 +4335,68 @@ DONE
 === summary
   HEAD=b6e4c00f  logs=/private/tmp/scala-rs-gate-b6e4c00f-corpus  wall=4:21
   note: slick_subset SKIPPED / workspace tests SKIPPED / cats_run SKIPPED / gitbucket_run SKIPPED
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-eight: both run harnesses green (`ce3e99ec`)
+
+`/private/tmp/scala-rs-gate-w5`, `VERDICT=PASS`, wall 26:25 (a `codex` session
+was gating on the same machine). `run/t5857` came back as a loss and **passed on
+the gate's serial re-run**, which is what that mechanism is for.
+
+| check | `b6e4c00f` | `ce3e99ec` |
+|---|---|---|
+| `tests/cats_run.sh` | `progs=8 ok=4 fail=4 known_fail=4` | **`progs=8 ok=8 diff=0 fail=0 known_fail=0`** |
+| `tests/gitbucket_run.sh` | `progs=6 ok=5 fail=1 known_fail=1` | **`progs=6 ok=6 diff=0 fail=0 known_fail=0`** |
+| cats / gitbucket / slick | 0 errors each | unchanged (2977 / 1317 / 1504 classes) |
+| scala library | 41 / 20 | 41 / 20 (another slice owns it) |
+| corpus pos / neg / run | 1245 / 815 / 1010 | same, `losses=0` |
+| workspace suite | 3168 | **3175** |
+
+Both ledgers are now empty, so the gate's `new=0` rule means any of these
+fourteen programs failing again fails the gate.
+
+The five ledger entries were eight roots:
+
+* **Mixin forwarders were emitted for the whole linearization.** nsc's mixin
+  phase walks `mixinClasses` — the prefix of the linearization before the
+  superclass — so `object Leaf extends Base` (with `Base extends T`, `T` holding
+  an `implicit final val`) emitted the accessor and setter a second time and the
+  JVM refused the class (`IncompatibleClassChangeError: overrides final method
+  T$_setter_$v_$eq`). One new `Gen::mixin_traits` now feeds all seven paths.
+* **Three pickle defects around type members**: an applied type member
+  (`type Type[+A] <: Base with Tag`, cats' no-boxing newtype) lost its
+  arguments; a type member absent from the pickle was minted fresh per class
+  file, so our own pickles disagreed with each other; and a `type` declaration
+  inside a refinement was dropped entirely, which erased the `Aux` pattern
+  (`Representable.Aux[F, ev.Representation]` became `Representable[F]`) and was
+  also what made cats' `OptionT` instances ambiguous.
+* **A module-qualified inherited type member had no path**, so its implicit
+  scope was empty and every `NonEmptySet` operation disappeared.
+* **`collect_free` had no `Bind` / `Star` / `Alternative` arms**, so a lambda
+  over a pattern-bound `for` comprehension lost its captured outer — inside
+  cats' own macro, which made *scalac* throw while expanding.
+* **A conversion whose parameter is a cake's inner class** could not solve its
+  type parameter, because both sides carry a prefix view and `unify_conv_tparam`
+  had no arm for it; Slick's `returning … insert` then inferred the inserted id
+  as `Nothing` and gitbucket's `createAccount` threw unconditionally.
+* **`Byte` and `Short` were missing from the `scala`-package name list**, so they
+  pickled as root-owned external references (`Symbol 'type <root>.Byte' is
+  missing from the classpath`).
+
+Saved ledger: [`baselines/corpus-ce3e99ec.tsv`](baselines/corpus-ce3e99ec.tsv),
+SHA-256 `467d4c05cf04fdf347a0fa31687a87f3803e80ee8b2c3f6914c5492897dfc015`. Still open, recorded in
+`docs/notes/rh-cats-gitbucket-run.md`: `Database.forURL` resolving to
+`BasicBackend`'s factory through `import blockingApi._`, and polymorphic aliases
+being dealiased before pickling.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=ce3e99ec  logs=/private/tmp/scala-rs-gate-w5  wall=26:25
+  note: corpus: 1 loss(es) passed on a serial re-run (load-sensitive, not a regression): run/t5857
 VERDICT=PASS
 DONE
 ```

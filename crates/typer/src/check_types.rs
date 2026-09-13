@@ -202,7 +202,7 @@ impl Typer {
                     match self.st.get(id).kind {
                         SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
                         SymKind::TypeParam => Type::TypeParam(id),
-                        SymKind::TypeMember => Type::TypeMember(id),
+                        SymKind::TypeMember => self.module_path_type_member(qual, id),
                         _ if id == self.st.string_sym => Type::String,
                         _ => self.module_prefix_view(qual, id).unwrap_or(Type::Class {
                             sym: id,
@@ -1032,6 +1032,46 @@ impl Typer {
             return (!matches!(t, Type::Class { .. })).then_some(t);
         }
         None
+    }
+
+    /// `O.T` for an `object O` that *inherits* the deferred `type T`, with the
+    /// object kept as the path: `NonEmptySetImpl.Type`, where `Type` is
+    /// declared in the `Newtype` trait the object mixes in.
+    ///
+    /// nsc writes `TypeRef(NonEmptySetImpl.type, Newtype.Type, args)`. Reading
+    /// the declaration alone spelled one type two ways in our own pickles --
+    /// `NonEmptySetImpl.this.Type[A]` inside the object, `Newtype.this.Type[A]`
+    /// in `cats.data`'s `type NonEmptySet[A] = NonEmptySetImpl.Type[A]` -- and
+    /// real scalac reading them reported the one against the other. The prefix
+    /// also decides the implicit scope, which is where
+    /// `NonEmptySetImpl.catsNonEmptySetOps` lives, so with the object gone
+    /// every operation on a `NonEmptySet` was missing.
+    ///
+    /// Only a *deferred* member, and only one the object does not declare
+    /// itself: a concrete alias carries its right-hand side already, and a
+    /// declaration of the object's own needs no prefix beyond `this`.
+    fn module_path_type_member(&mut self, qual: &Tree, id: SymbolId) -> Type {
+        let plain = Type::TypeMember(id);
+        if !self.st.is_deferred_type_member(id) || self.st.path_member_decl(id).is_some() {
+            return plain;
+        }
+        let owner = self.st.get(id).owner;
+        if owner.is_none() || !matches!(self.st.get(owner).kind, SymKind::Class) {
+            return plain;
+        }
+        for o in self.qualified_type_owners(qual) {
+            let mcls = match self.st.get(o).kind {
+                SymKind::Module => self.st.module_class_of(o),
+                SymKind::ModuleClass => o,
+                _ => continue,
+            };
+            if mcls == owner || !self.st.is_ancestor_of(owner, mcls) {
+                continue;
+            }
+            let prefix = Type::ModuleRef(mcls);
+            return Type::TypeMember(self.st.path_member(&[o], id, &prefix));
+        }
+        plain
     }
 
     /// `A#B` written with a type prefix, where `B`'s enclosing class leaves an

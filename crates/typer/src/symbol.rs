@@ -2987,6 +2987,15 @@ impl SymbolTable {
         let hi = info.bound_hi.clone();
         let owner = *path.last().unwrap_or(&SymbolId::NONE);
         let id = self.alloc(name, owner, SymKind::TypeMember, flags, "");
+        // `p.T` is a type this compiler synthesizes, not a declaration `p`
+        // makes: `alloc` enters every symbol in its owner's scope, and there it
+        // would be a second `type T` that `p` itself declares. Harmless while
+        // every path was a `val` -- nothing looks up members of a term -- but
+        // `O.T` for an `object O` made `O` declare `T` beside the trait's, and
+        // the override check and the pickle both read it as one.
+        if let Some(ow) = self.symbols.get_mut(owner.0 as usize) {
+            ow.members.retain(|&m| m != id);
+        }
         // A deferred member stands for itself: `p.T` is abstract exactly when
         // `T` is, and a concrete `T` never reaches here (the alias expands and
         // carries the prefix along in its right-hand side).
@@ -3834,7 +3843,7 @@ impl SymbolTable {
             || !self.qualify_tparams.borrow().is_empty()
     }
 
-    pub(crate) fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
+    pub fn is_ancestor_of(&self, anc: SymbolId, cls: SymbolId) -> bool {
         let mut work = vec![cls];
         let mut seen = rustc_hash::FxHashSet::default();
         while let Some(c) = work.pop() {
