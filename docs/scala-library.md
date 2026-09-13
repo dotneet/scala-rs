@@ -4479,3 +4479,44 @@ compiles all 538 library files **plus one extra file** and prints only that
 file's diagnostics (3 s a run). `q01`-`q08` there are the reductions named
 above. It is the only way to reduce a root of this kind, and worth rebuilding
 for the next such slice.
+
+### Two corpus losses the overload rule cost, and what they taught
+
+`ctor_base_type_matches` (the `collection/SeqView.scala:37` root) first scored an
+alternative applicable whenever the argument reached the parameter's class
+through a base type and the parameter mentioned *any* type parameter. That
+included a variable **this call** had left undetermined, which
+`solve_open_from_arg` already solves from the argument a few lines above:
+`Set.empty ++ (0 to 3)` has an undetermined `?A` on the receiver, so the
+monomorphic `++(IterableOnce[?A])` became applicable to a `Range`, won on
+specificity against the polymorphic `concat[B >: A]` that nsc picks, and came out
+`found Range required IterableOnce[A]`. Two `run` tests (`t408`, `t2417`) were
+the only losses in the full corpus, and the rule now declines when the parameter
+mentions one of `undet_tvars`.
+
+The self-call formals cost three workspace tests in the same way -- by being
+*more* applicable than the arguments warranted -- and the fix is the same shape:
+hand the formals out only when exactly one constructor can take the written
+argument count at all, where "can" means every parameter past the written ones is
+implicit or defaulted. `class Chain(v: String) { def this(n: Int, sep: String =
+"-") = …; def this(f: Boolean) = this(if (f) 1 else 0) }` has two, so the single
+argument does not say which.
+
+### Verification
+
+| check | result |
+|---|---|
+| `tests/scalalib_measure.sh` | `files=538 errors=4 files_with_errors=3 classes=0` |
+| `tests/cats_measure.sh` | 0 errors / 2977 classes |
+| `tests/gitbucket_measure.sh` | 0 errors / 1317 classes |
+| `tests/slick_measure.sh` | 0 errors / 1504 classes |
+| `tests/workspace_tests.sh` | `binaries=335 rows=342 missing=0 failed_bins=0 doc_rows=7` |
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` |
+| `tests/cats_run.sh` | `progs=8 ok=4 known_fail=4 new=0 lint_problems=0` |
+| `tests/gitbucket_run.sh` | `progs=6 ok=5 known_fail=1 new=0 lint_problems=0` |
+| full corpus vs `corpus-b6e4c00f.tsv` | **losses=0**, gains 3 (`pos/lambdalift`, `pos/t11052`, `run/numbereq`); pos 1247, neg 815, run 1011 |
+
+`tests/classfile_lint.py` has nothing of the library to look at yet: the library
+still has errors, so `classes=0` and no library class file is emitted. The lint
+did run over everything that *is* emitted -- 2977 cats classes and 1317
+gitbucket ones, through `cats_run.sh` / `gitbucket_run.sh` -- with no problems.
