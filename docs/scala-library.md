@@ -4524,3 +4524,228 @@ Run on the tree with `main` (`6086f089`) merged in, against
 still has errors, so `classes=0` and no library class file is emitted. The lint
 did run over everything that *is* emitted -- 2977 cats classes and 1317
 gitbucket ones, through `cats_run.sh` / `gitbucket_run.sh` -- with no problems.
+
+## `agent/libfinal`: 4 → 2 errors, and the first look at the backend (2026-09-13)
+
+Measured with `tests/scalalib_measure.sh` (the `--no-scala-library`
+arrangement, 538 files). The **typer** now reports nothing at all on the
+standard library's own sources; the two remaining errors are one unimplemented
+feature, diagnosed rather than miscompiled, and they are the only thing between
+this measure and code generation. cats (0 errors / 2977 classes), gitbucket
+(0 / 1317) and slick (0 / 1504) are unchanged throughout.
+
+Seven roots, each reduced to a standalone program and compared with real scalac
+2.13.16 in **both** directions (`crates/cli/tests/lf.rs`, fixtures `lf_super`,
+`lf_super_bad`, `lf_seen`, `lf_seen_bad`, `lf_pkgname`, `lf_srt`; the positive
+ones are *run* under `-Xverify:all` and their output is produced again by scalac
+in the same suite).
+
+| root | library sites | errors removed |
+|---|---|---|
+| `super.m` is one member set over `this`'s **base type sequence**, not the last written parent clause's | `collection/mutable/ArrayDeque.scala:68` | 1 |
+| ...with **alpha-conversion** in the override reduction, so two polymorphic siblings are one member | `immutable/Range.scala:153`, `immutable/Vector.scala:196` | 2 prevented |
+| ...and nsc's `findMember` **shadowing**, so a matching member from a more derived base suppresses the later one | `tests/rtprobe/super_qualified.scala` | 1 miscompile prevented |
+| as-seen-from must not substitute into the arguments it just **inserted** | `collection/Iterable.scala:570`, `collection/Seq.scala:598,702` | 3 |
+| the generic-`Array` detour is gated on **having** `ScalaRunTime`, not on linking the jar | 230 backend sites | 230 |
+| `clone`'s terminal super member is declared on **AnyRef** | 57 backend sites | 57 |
+| a chained package clause whose first segment already exists keeps its package | 143 classes misnamed | 0 (names) |
+| a `super` call whose parent result is the parent's own **type parameter** needs erasure's cast | `immutable/List.appendedAll` and others | 0 (a `VerifyError`) |
+
+### The brief said three roots; two of them were one
+
+The brief handed over `Iterable.groupBy`'s `result.updated(k, v.result())`
+typed `HashMap[K, AnyRef]` and `Seq.PermutationsItr.init`'s `unzip` solving
+`A1` "one tuple too wide" as two separate, unreduced roots, each unreproducible
+by a reduction of the same shape. They are **one** root, and it is neither
+lower-bound inference nor `unzip`.
+
+Finding it needed a probe the previous slice had not built: a **writable copy**
+of the 538 library sources, so that a `val dbg: Nothing = e` could be inserted
+*inside* `IterableOps.groupBy` and the compiler made to print what it had
+inferred for each sub-expression. That harness is now
+**`tests/scalalib_probe.sh`** (`init` / `[tag]` / `add <probe.scala>`) rather
+than something the next slice has to write again -- two slices in a row built it
+from scratch. Three lines of it were enough:
+
+```
+val dbgM:   Nothing = m           // Map[K, Builder[A, C]]                         -- right
+val dbgMI:  Nothing = m.iterator  // Iterator[(K, Builder[(K, Builder[A, C]),
+                                  //                      Map[K, Builder[A, C]]])] -- wrong
+val dbgM3I: Nothing = mutable.Map.empty[K, String].iterator  // Iterator[(K, String)] -- right
+```
+
+`MapOps[K, V, …]` declares `iterator: Iterator[(K, V)]`, and `V := Builder[A, C]`
+is correct. The walk then reached `IterableOps` -- a base class of `Map`, where
+`A` is `(K, V)` and `C` is `Map[K, V]` -- and rewrote the `A` and `C` *inside the
+argument it had just inserted*, because `groupBy` is itself declared in
+`IterableOps` and those are literally that class's own type-parameter symbols.
+One `Builder[A, C]` became `Builder[(K, V), Map[K, V]]`, `v.result()` became a
+`Map`, and `updated[V1 >: V]` solved `V1 := AnyRef` from it. The `unzip` site is
+the same capture one class along: `SeqOps`' own `A`, read back through a receiver
+whose element type is `(A, Int)`, comes out `((A, Int), Int)` -- which is exactly
+"one tuple too wide".
+
+nsc cannot capture here because `asSeenFrom` is one `TypeMap`: when it meets a
+type-parameter reference it resolves the whole prefix chain at once and returns
+`baseargs(i)` **without** mapping it. `subst_as_seen_from_walk_at`'s parent walk
+substituted at every class it reached, in order, into the accumulated type. It
+now gathers every (class, arguments) pair the walk passes -- most derived first,
+each type parameter entered once -- and applies one substitution
+(`SymbolTable::apply_collected_subs`).
+
+The standalone reduction is three lines and mentions no collection:
+
+```scala
+trait Elem[A, C] { def readOne(c: Cell[Elem[A, C]]): Elem[A, C] = c.v }
+class Cell[T](val v: T) extends Elem[T, Cell[T]]
+// found: Elem[Elem[A, C], Cell[Elem[A, C]]]  required: Elem[A, C]
+```
+
+The method has to be declared in `Elem` itself: the capture needs the free type
+parameters to be the very symbols a base class of the receiver binds. That is
+why no reduction written *outside* the class reproduced it, and why the two
+library sites looked like two unrelated inference bugs.
+
+### `super.m`: the rule, and the two halves the narrow fix was missing
+
+nsc's `typedSuper` gives a bare `super` the type `SuperType(clazz.thisType,
+intersectionType(clazz.info.parents))`, so `findMember` gathers **one** member
+set over that intersection's base type sequence -- `clazz`'s linearization
+without `clazz` -- and reduces it. `super_select_member` took the last written
+parent clause that had any concrete member of the name, which is a different
+class whenever the written order and the linearization disagree.
+
+The brief recorded that ranking the clauses by linearization takes the library
+to 3 errors but costs gitbucket two, and that unioning the clauses' member sets
+costs the library eight (`ambiguous overload` at five sites). Both halves are
+needed, and each was missing a piece:
+
+* **The reduction has to run at `this`.** `drop_overridden_at(this_id, …)` is
+  the only receiver whose linearization can order two members reached through
+  different parent clauses. The union reduced at the *parent* -- which is what
+  the generic `drop_overridden_at` later in `type_select` sees -- is where the
+  eight came from.
+* **The reduction has to alpha-convert.** Two traits each writing
+  `def f[B](x: B)` have two distinct `B` symbols, so `same_member_at` -- which
+  substitutes at the receiver and then compares parameter lists *exactly* --
+  called every polymorphic pair different, and the sibling-override rule never
+  fired on one. `Range.map` (through `IndexedSeqOps` and
+  `StrictOptimizedIterableOps`) and `Vector.prepended` (through `IndexedSeqOps`
+  and `StrictOptimizedSeqOps`) are that pair. nsc's `matchesType` alpha-converts
+  in `matchesQuantified`; `same_member_at` now does it positionally, so a
+  different *number* of type parameters still makes the pair unequal outright.
+* **And then `findMember`'s shadowing, which is not overriding.** `class C
+  extends A with B` over two independent `trait A { def m = "A" }` /
+  `trait B { def m = "B" }` has no common declaration above the pair, so
+  `drop_sibling_overrides` declines by design -- and the union left both members
+  in the set, where the caller took whichever came first.
+  `tests/rtprobe/super_qualified.scala` printed `ABA` for scalac's `ABB`, and
+  `tests/rt_probe.sh` was the only check in the battery that saw it.
+  `Check::shadow_along_linearization` is nsc's loop: walk the candidates in
+  base-type-sequence order and enter one only when nothing already entered
+  matches it as this class sees it. A *deferred* keeper never shadows a
+  definition, so the concrete-member rule the slick `NoClassDefFoundError`
+  needed is intact.
+
+### What happens when the library reaches the backend
+
+The two local `object`s (`docs/not-implemented.md`) are the only typer-side
+errors left, so to see past them the writable copy was edited to hoist them out
+of their methods by hand -- `object partitioner` in
+`RedBlackTree.partitionEntries` and `object sub` in `TreeSet.removedAll` -- and
+*that* tree was compiled. It is 536 of 538 files verbatim, and it is not the
+library; it is a measurement of the backend on the library's own code.
+
+That first run reported **287 errors in 47 files, `classes=0`**, in two clusters,
+and both were the backend asking the wrong question:
+
+* **230 × `generic Array element access needs the scala-library ClassTag
+  runtime`.** `a(i)` / `a(i) = v` / `a.clone()` at an abstract element type are
+  `scala.runtime.ScalaRunTime` calls, and the gate was `ctx.library_abi` -- does
+  this run link the released jar -- when the question is whether the run *has*
+  that object. Compiling the standard library supplies it out of
+  `src/library/scala/runtime/ScalaRunTime.scala`. `a.length` was worse than
+  refused: in the same mode it silently emitted `arraylength` on an `Object`,
+  which is a `VerifyError`.
+* **57 × `no super implementation for clone`.** `linearize` omits
+  Any/AnyRef/Object, and the rule that resolves such a terminal member through
+  the nearest concrete superclass accepted only `Any`'s
+  `equals`/`hashCode`/`toString`. `scala.collection.mutable.Cloneable` is
+  `override def clone(): C = super.clone().asInstanceOf[C]`, and `clone` is
+  declared on **AnyRef** because only a reference has one. Reduced in six lines,
+  failing in *both* modes before the fix.
+
+With those two closed the hoisted tree compiles with **0 errors and emits 2614
+class files**, and `python3 tests/classfile_lint.py` reports
+`lint_classes=2614 lint_problems=0`.
+
+143 of those classes were being written with the wrong binary name, which no
+measure could see. `jvm_for_current` carried `ow.jvm_name != "scala/runtime"`
+from the first backend commit, so a class declared in `package scala` /
+`package runtime` -- how thirty-one library files write their package clause --
+lost its package and was written at the top level. `ScalaRunTime$.class` was one
+of them. Nine lines reproduce it in jar mode; scalac disagrees about the output
+path, so `lf_pkgname` asserts the path rather than the compile.
+
+### Loadable, and then not: running the emitted library
+
+Real scalac 2.13.16 **compiles a client against our library classes**, reading
+our pickles, with the 33 Java classfiles from the released jar beside them:
+
+```
+scalac -usejavacp:false -nobootcp -classpath "<our 2614 classes>:<javacp>" Client.scala   # exit 0
+```
+
+Running that client under `java -Xverify:all` then fails, and each failure is a
+backend root of its own. Two were found; one is fixed:
+
+* **`List.appendedAll` (fixed).** A `super` call whose parent result is the
+  parent's own type parameter returns `Object` on the JVM while the override
+  declares a class, and `gen_apply` deliberately skipped the cast for an
+  `Object`-returning super call ("its unboxing is decided elsewhere"). That is
+  right for a primitive -- `checkcast_internal` answers `None` for those -- and
+  wrong for a reference: `case _ => super.appendedAll(suffix)` left an `Object`
+  on one branch of a `match` whose other branch supplied a `List`, so the
+  verifier rejected the *merge* and named a line nowhere near the call. Twenty
+  lines reproduce it (`lf_super`'s `Cc`), and it is the first method the emitted
+  library loads.
+* **`StringOps.format` (not fixed).** Scala repeated parameters forwarded to a
+  *Java* varargs method are passed as the `Seq` itself, with no `Object[]`
+  conversion. Eight lines reproduce it with no library involved at all --
+  `def fmt(s: String, args: Any*) = s.format(args: _*)` throws
+  `MissingFormatArgumentException` where scalac prints the formatted string --
+  and inside the library it is `VerifyError: Bad type on operand stack` in
+  `format$extension`. Written up in `docs/not-implemented.md`; it is the next
+  thing a client of the emitted library hits.
+
+So "the library reaches code generation" is now true of the typer and of 2614
+lint-clean class files, and **not** yet true of a library you can run. That is
+the same sequence cats and gitbucket went through (gates fifty-five, fifty-seven
+and fifty-nine in `tests/BASELINE.md`): compiling green and running green are two
+different measurements, and only the second finds these.
+
+### A note on the 46 remaining top-level classes
+
+The emitted tree still has 46 class files in the default package whose names
+spell their package with `$` (`scala$PartialFunction$$$anonfun$3`). They are
+lambda / `$anonfun` classes and the naming predates this slice (45 of them were
+there before the package fix). Not diagnosed here.
+
+### Verification
+
+Run on the committed tree, against `tests/BASELINE.md`'s `de16571c` numbers.
+
+| check | result |
+|---|---|
+| `tests/scalalib_measure.sh` | `files=538 errors=2 files_with_errors=2 classes=0` (was 4 / 3) |
+| the same with the two local `object`s hoisted | `errors=0 classes=2614`, `lint_problems=0` |
+| `tests/cats_measure.sh` | 0 errors / 2977 classes |
+| `tests/gitbucket_measure.sh` | 0 errors / 1317 classes |
+| `tests/slick_measure.sh` | 0 errors / 1504 classes |
+| `tests/workspace_tests.sh` | `binaries=337 rows=344 missing=0 failed_bins=0 doc_rows=7` |
+| `tests/rt_probe.sh` | `programs=128 ok=114 MISCOMPILE=3 RUNTIME-ERR=0 WRONG-ACCEPT=0` |
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0`, 36/36 attempts |
+| `tests/slick_subset.sh` | `subset_files=184 classes=1504 verified=1504 failed=0 lint_problems=0` |
+| `tests/cats_run.sh` | `progs=8 ok=8 diff=0 fail=0 known_fail=0 new=0 lint_problems=0` |
+| `tests/gitbucket_run.sh` | `progs=6 ok=6 diff=0 fail=0 known_fail=0 new=0 lint_problems=0` |
+| full corpus vs `corpus-de16571c.tsv` | **losses=0, changes=0**; pos 1247, neg 815, run 1011 |

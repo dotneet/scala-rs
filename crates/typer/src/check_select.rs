@@ -1464,11 +1464,37 @@ impl Typer {
     /// against `Int` -- and compare them exactly. A substitution that does not
     /// fire leaves the two spellings unequal, so the rule declines rather than
     /// guesses.
-    fn same_member_at(&self, prefix: &Type, a: SymbolId, b: SymbolId) -> bool {
+    ///
+    /// The one renaming it *does* perform is alpha-conversion of the members'
+    /// **own** type parameters, which nsc's `matchesType` performs too
+    /// (`matchesQuantified` substitutes one quantifier's parameters for the
+    /// other's before comparing the bodies). Two `def map[B](f: A => B): CC[B]`
+    /// declared in two traits have two distinct `B` symbols, so comparing the
+    /// spellings literally called every polymorphic pair *different* and this
+    /// rule never fired on one: `scala.collection.immutable.Range`'s
+    /// `super.map(f)`, reached through `IndexedSeqOps` and
+    /// `StrictOptimizedIterableOps`, came out `ambiguous overload`
+    /// (`immutable/Range.scala:153`, `immutable/Vector.scala:196`). Renaming
+    /// positionally is not a guess: a different *number* of type parameters
+    /// makes the pair unequal outright.
+    pub(crate) fn same_member_at(&self, prefix: &Type, a: SymbolId, b: SymbolId) -> bool {
+        let atps = &self.st.get(a).tparams;
+        let btps = &self.st.get(b).tparams;
+        if atps.len() != btps.len() {
+            return false;
+        }
         let seen =
             |s: SymbolId| flat_param_types(&self.st.subst_as_seen_from(prefix, &self.st.get(s).ty));
         let ap = seen(a);
-        let bp = seen(b);
+        let bp = if btps.is_empty() {
+            seen(b)
+        } else {
+            let to: Vec<Type> = atps.iter().map(|&t| Type::TypeParam(t)).collect();
+            seen(b)
+                .iter()
+                .map(|t| self.st.subst_type_params(btps, &to, t))
+                .collect()
+        };
         ap.len() == bp.len() && ap.iter().zip(&bp).all(|(x, y)| x == y)
     }
 

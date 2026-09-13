@@ -290,10 +290,17 @@ impl Typer {
         while !owner.is_none() {
             let ow = self.st.get(owner);
             if ow.kind == SymKind::Package {
-                let base = if ow.name != "<_root_>"
-                    && !ow.jvm_name.is_empty()
-                    && ow.jvm_name != "scala/runtime"
-                {
+                // `ow.jvm_name != "scala/runtime"` used to stand here too, from
+                // the first backend commit: a class declared in `package
+                // scala.runtime` lost its package and was written as a bare
+                // top-level name. `package scala` / `package runtime` is how the
+                // standard library writes thirty-one of its own files, so
+                // `scala.runtime.ScalaRunTime` and the 142 classes beside it came
+                // out as `ScalaRunTime.class` -- a binary name no consumer can
+                // name and not the one the pickle claims. Real scalac writes
+                // `scala/runtime/ScalaRunTime$.class`; nothing about that package
+                // is special.
+                let base = if ow.name != "<_root_>" && !ow.jvm_name.is_empty() {
                     format!("{}/{}", ow.jvm_name, name)
                 } else {
                     name.to_string()

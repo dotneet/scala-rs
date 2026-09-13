@@ -3930,18 +3930,45 @@ impl SymbolTable {
     }
 
     /// The parent walk of `subst_as_seen_from`, without its `this.type` step.
+    ///
+    /// ## Why the walk *collects* and substitutes once
+    ///
+    /// It used to substitute into the accumulated type at every class it
+    /// reached, so an argument inserted by a derived class was handed to the
+    /// ancestors' substitutions as if it had been written in the member's own
+    /// signature. That captures: a receiver whose type arguments mention type
+    /// parameters of a class that is itself in the walk has those mentions
+    /// rewritten a second time.
+    ///
+    /// `IterableOps[+A, +CC[_], +C].groupBy` is exactly that shape. It writes
+    /// `mutable.Map.empty[K, Builder[A, C]]` and then reads `m.iterator`, whose
+    /// `MapOps[K, V, …]` declaration is `Iterator[(K, V)]`. `V := Builder[A, C]`
+    /// is right, and then the walk reached `IterableOps` -- a base class of
+    /// `Map`, where `A` is `(K, V)` and `C` is `Map[K, V]` -- and rewrote the
+    /// `A` and `C` *inside the argument it had just inserted*:
+    /// `Iterator[(K, Builder[(K, Builder[A, C]), Map[K, Builder[A, C]]])]`.
+    /// `v.result()` was then a `Map`, `result.updated(k, v.result())` a
+    /// `HashMap[K, AnyRef]`, and the declared `immutable.Map[K, C]` a type
+    /// mismatch (`collection/Iterable.scala:570`).
+    ///
+    /// nsc cannot capture here because `AsSeenFromMap` is one `TypeMap` over
+    /// the member's info: reaching a type-parameter reference it resolves the
+    /// whole prefix chain at once and returns `baseargs(i)` **without** mapping
+    /// it. This walk now does the same thing -- gather every (class, arguments)
+    /// pair it passes, most derived first, then apply one substitution in which
+    /// each type parameter appears once.
     fn subst_as_seen_from_walk_at(&self, recv: &Type, inner_pre: Option<&Type>, ty: &Type) -> Type {
         fn walk(
             st: &SymbolTable,
             recv: &Type,
-            ty: Type,
+            subs: &mut Vec<(SymbolId, Vec<Type>)>,
             seen: &mut rustc_hash::FxHashSet<u32>,
             base: &BaseTypeArgs,
-        ) -> Type {
+        ) {
             match recv {
                 Type::Class { sym, args } => {
                     if !seen.insert(sym.0) {
-                        return ty;
+                        return;
                     }
                     // A base class reachable through two parents has to be read
                     // at its **most derived** instantiation, and this walk takes
@@ -3951,11 +3978,9 @@ impl SymbolTable {
                     // the receiver does not have as a base -- one reached
                     // through a self type, a bound, or a refinement.
                     let args = base.get(&sym.0).unwrap_or(args);
-                    let mut t = if args.is_empty() {
-                        ty
-                    } else {
-                        st.subst_tparams(*sym, args, &ty)
-                    };
+                    if !args.is_empty() {
+                        subs.push((*sym, args.clone()));
+                    }
                     for i in 0..st.get(*sym).parents.len() {
                         // The parent is declared in terms of *this* class's
                         // type parameters, so it has to be instantiated before
@@ -3965,7 +3990,7 @@ impl SymbolTable {
                         // resolving `BR` to `Boolean` through
                         // `OptionMapper[BR, R]`.
                         let p = st.subst_tparams_cow(*sym, args, &st.get(*sym).parents[i]);
-                        t = walk(st, &p, t, seen, base);
+                        walk(st, &p, subs, seen, base);
                     }
                     // A self type is a second place `this` inherits members
                     // from, and they are declared in *its* vocabulary:
@@ -3975,21 +4000,18 @@ impl SymbolTable {
                     // unequal -- "type mismatch; found: A required: A".
                     if let Some(sf) = &st.get(*sym).self_type {
                         let sf = st.subst_tparams_cow(*sym, args, sf);
-                        t = walk(st, &sf, t, seen, base);
+                        walk(st, &sf, subs, seen, base);
                     }
-                    t
                 }
                 Type::ModuleRef(sym) => {
                     if !seen.insert(sym.0) {
-                        return ty;
+                        return;
                     }
-                    let mut t = ty;
                     for p in st.get(*sym).parents.clone() {
-                        t = walk(st, &p, t, seen, base);
+                        walk(st, &p, subs, seen, base);
                     }
-                    t
                 }
-                Type::Annotated { tpe, .. } => walk(st, tpe, ty, seen, base),
+                Type::Annotated { tpe, .. } => walk(st, tpe, subs, seen, base),
                 // `p.type` has the members of `p`'s type, at its arguments:
                 // `def f(b: Buf[Int]): b.type` and then `f(x).add(1)` reads
                 // `add` through `Buf[Int]`. Without this the walk stopped here
@@ -4000,23 +4022,22 @@ impl SymbolTable {
                 // so a term with no type yet gives nothing to walk.
                 Type::SingleType { sym, .. } => {
                     if !seen.insert(sym.0) {
-                        return ty;
+                        return;
                     }
                     let under = st.singleton_underlying(*sym);
-                    if under.is_no_type() || matches!(under, Type::Method { .. }) {
-                        ty
-                    } else {
-                        walk(st, &under, ty, seen, base)
+                    if !under.is_no_type() && !matches!(under, Type::Method { .. }) {
+                        walk(st, &under, subs, seen, base);
                     }
                 }
                 // `trait C[-T] extends (T => R)` inherits `Function1.apply`,
                 // and reading its type through `C[X]` means walking into
                 // `Function1[X, R]`. A structural function names no class, so
                 // it has to be read back as one first.
-                Type::Function { .. } => match st.function_class_form(recv) {
-                    Some(c) => walk(st, &c, ty, seen, base),
-                    None => ty,
-                },
+                Type::Function { .. } => {
+                    if let Some(c) = st.function_class_form(recv) {
+                        walk(st, &c, subs, seen, base);
+                    }
+                }
                 // `trait GetResult[+T] extends (PositionedResult => T) { self => }`
                 // and then `self.apply(rs)`: the receiver is the class's own
                 // `this`, so the member has to be read through the class's
@@ -4029,7 +4050,7 @@ impl SymbolTable {
                         .iter()
                         .map(|t| Type::TypeParam(*t))
                         .collect();
-                    walk(st, &Type::Class { sym: *sym, args }, ty, seen, base)
+                    walk(st, &Type::Class { sym: *sym, args }, subs, seen, base);
                 }
                 // Only heads that `apply_type_ctor` folds may be re-walked: an
                 // abstract type-member head (`ColumnType[U]`) folds to the very
@@ -4046,9 +4067,9 @@ impl SymbolTable {
                         // Still applied: the constructor is abstract (a type
                         // member or parameter), so it names no class to walk
                         // into. Recursing here would not terminate.
-                        return ty;
+                        return;
                     }
-                    walk(st, &t, ty, seen, base)
+                    walk(st, &t, subs, seen, base);
                 }
                 // A member reached through `Ops[F, A] { type TypeClassType =
                 // FlatMap[F] }` is declared by one of the parents and has to be
@@ -4056,9 +4077,8 @@ impl SymbolTable {
                 // syntax layer -- every result type simulacrum writes is a
                 // refinement -- handed back `flatMap`'s raw `A`.
                 Type::Refined { parents, .. } => {
-                    let mut t = ty;
                     for p in parents {
-                        t = walk(st, p, t, seen, base);
+                        walk(st, p, subs, seen, base);
                     }
                     // An inner class seen through a prefix, reached as the
                     // type of a path (`m.In` with `val m = o.mid`): the
@@ -4069,9 +4089,8 @@ impl SymbolTable {
                     // `attach_inner_prefixes`).
                     if let Some(pre) = crate::prefix::view_prefix(recv) {
                         let mut pseen = rustc_hash::FxHashSet::default();
-                        t = walk(st, pre, t, &mut pseen, base);
+                        walk(st, pre, subs, &mut pseen, base);
                     }
-                    t
                 }
                 // A member reached through an abstract type member (or a type
                 // parameter) is declared by its *upper bound*, and the bound is
@@ -4084,14 +4103,13 @@ impl SymbolTable {
                 // case-class fields with was never `Symbol`.
                 Type::TypeMember(id) | Type::TypeParam(id) => {
                     if !seen.insert(id.0) {
-                        return ty;
+                        return;
                     }
-                    match st.get(*id).bound_hi.clone() {
-                        Some(hi) => walk(st, &hi, ty, seen, base),
-                        None => ty,
+                    if let Some(hi) = st.get(*id).bound_hi.clone() {
+                        walk(st, &hi, subs, seen, base);
                     }
                 }
-                _ => ty,
+                _ => {}
             }
         }
         // A receiver that is an inner class seen through a prefix (`o.In`,
@@ -4143,7 +4161,9 @@ impl SymbolTable {
             _ => self.empty_base_type_args.clone(),
         };
         let mut seen = rustc_hash::FxHashSet::default();
-        let t = walk(self, core, ty.clone(), &mut seen, &base);
+        let mut subs: Vec<(SymbolId, Vec<Type>)> = Vec::new();
+        walk(self, core, &mut subs, &mut seen, &base);
+        let t = self.apply_collected_subs(&subs, ty);
         // nsc's as-seen-from for the enclosing instance: a bare inner class
         // of any class the walk went through means `C.this.In`, and read
         // through this receiver it is the receiver's `In`. The receiver is
@@ -4158,6 +4178,50 @@ impl SymbolTable {
             Some(o) => self.subst_as_seen_from_walk_at(o, None, &t),
             None => t,
         }
+    }
+
+    /// Apply the (class, arguments) pairs `subst_as_seen_from_walk_at`'s walk
+    /// collected, as **one** substitution.
+    ///
+    /// The pairs come in walk order -- most derived first -- and a type
+    /// parameter is owned by exactly one class, so a duplicate can only mean
+    /// one class was reached twice at two instantiations; the first wins, which
+    /// is the order `base_type_args` has already made the most derived one.
+    ///
+    /// One pass is the whole point: `subst_map` returns the argument it
+    /// substitutes in without walking it again, so a type parameter that is
+    /// *part of an argument* keeps its meaning instead of being re-read as the
+    /// base class's own. See this function's caller for the `groupBy` capture
+    /// that motivated it.
+    ///
+    /// `subst_projections` and the type-lambda reduction are
+    /// [`SymbolTable::subst_tparams`]'s other two steps, run once here over the
+    /// combined list for the same reason.
+    fn apply_collected_subs(&self, subs: &[(SymbolId, Vec<Type>)], ty: &Type) -> Type {
+        if subs.is_empty() {
+            return ty.clone();
+        }
+        let mut tps: Vec<SymbolId> = Vec::new();
+        let mut args: Vec<Type> = Vec::new();
+        for (cls, as_) in subs {
+            for (i, &tp) in self.get(*cls).tparams.iter().enumerate() {
+                let Some(a) = as_.get(i) else { break };
+                if tps.contains(&tp) {
+                    continue;
+                }
+                tps.push(tp);
+                args.push(a.clone());
+            }
+        }
+        if tps.is_empty() {
+            return ty.clone();
+        }
+        let out = subst_map(ty, &tps, &args);
+        let out = self.subst_projections(&tps, &args, &out);
+        if args.iter().any(|a| self.hk_alias(a).is_some()) {
+            return self.expand_hk_aliases(&out);
+        }
+        out
     }
 
     /// Every base class of `sym[args]`, mapped to the type arguments it is
