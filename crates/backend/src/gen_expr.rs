@@ -1658,7 +1658,10 @@ pub(crate) fn gen_select(
     }
     if name == "length" && !tree.sym.is_none() && ctx.st.get(tree.sym).owner == ctx.st.array_sym {
         // Generic `Array[T]` erases to Object; nsc uses ScalaRunTime.array_length.
-        if ctx.library_abi {
+        // `arraylength` on an `Object` is a `VerifyError`, not a fallback, so the
+        // question is whether the run has `ScalaRunTime` -- from the jar, or from
+        // its own sources when the standard library is what is being compiled.
+        if ctx.library_abi || scala_run_time_supplies(ctx.st, "array_length") {
             asm.getstatic(
                 "scala/runtime/ScalaRunTime$",
                 "MODULE$",
@@ -2580,6 +2583,43 @@ fn discarded_predef_poly(tree: &Tree, ctx: &EmitCtx) -> bool {
     }
 }
 
+/// `scala.runtime.ScalaRunTime`'s name for the generic-array detour of an
+/// `Array` member.
+fn srt_helper(member: &str) -> &'static str {
+    match member {
+        "apply" => "array_apply",
+        "update" => "array_update",
+        _ => "array_clone",
+    }
+}
+
+/// Does this run have `scala.runtime.ScalaRunTime.<helper>` to call?
+///
+/// True in `--scala-library` mode (the jar's own `ScalaRunTime$`) and also when
+/// the sources under compilation define it, which is what building the standard
+/// library itself does. False for ordinary `--no-scala-library` code, where the
+/// private runtime has no such object and the call would not link, so the
+/// diagnostic stays.
+fn scala_run_time_supplies(st: &SymbolTable, helper: &str) -> bool {
+    // Not `find_class_by_jvm`: that index is keyed on `Symbol::jvm_name`, which
+    // a module class defined by the sources under compilation does not carry
+    // (the backend computes its binary name from the owner chain instead). The
+    // package path is what is actually there either way.
+    let cls = st
+        .lookup_member(st.scala_pkg, "runtime")
+        .into_iter()
+        .flat_map(|rt| st.lookup_member(rt, "ScalaRunTime"))
+        .map(|m| match st.get(m).ty {
+            Type::ModuleRef(c) => c,
+            _ => m,
+        })
+        .find(|&c| matches!(st.get(c).kind, SymKind::ModuleClass));
+    let Some(cls) = cls else { return false };
+    st.lookup_member(cls, helper)
+        .into_iter()
+        .any(|m| st.get(m).kind == SymKind::Method)
+}
+
 pub(crate) fn gen_apply(
     asm: &mut Assembler,
     frame: &mut Frame,
@@ -3246,7 +3286,15 @@ pub(crate) fn gen_apply(
             && want == Some(args.len())
             && !matches!(qual.ty, Type::Array(_))
         {
-            if !ctx.library_abi {
+            // The detour is `scala.runtime.ScalaRunTime`'s, so the question is
+            // whether *this run* has that object, not whether it links the
+            // released jar: compiling the standard library from source
+            // (`--no-scala-library`) supplies `ScalaRunTime` out of
+            // `src/library/scala/runtime/ScalaRunTime.scala`, and 230 of the
+            // library's own `xs(i)` / `xs(i) = v` sites are generic. Ordinary
+            // `--no-scala-library` user code has no such object and still gets
+            // the diagnostic rather than a call to a class that is not there.
+            if !ctx.library_abi && !scala_run_time_supplies(ctx.st, srt_helper(name)) {
                 report_ctx_error(
                     ctx,
                     tree.span,
@@ -3535,6 +3583,22 @@ pub(crate) fn gen_apply(
         let desc = method_desc_from_sym(ctx.st, fun.sym);
         if !desc_returns_object(&desc) {
             maybe_unbox_erased_result(asm, ctx, &desc, Some(&tree.ty));
+        } else if let Some(want) = checkcast_internal(ctx.st, &tree.ty) {
+            // The parent's result is its own type parameter, so its descriptor
+            // returns `Object` while the override this `super` call sits in
+            // declares a class. `areturn` on such a branch is
+            // `VerifyError: Inconsistent stackmap frames` -- and with a `match`
+            // above it the *other* branch supplies the narrow type, so the
+            // error names the merge point and not the call.
+            // `scala.collection.immutable.List.appendedAll`'s
+            // `case _ => super.appendedAll(suffix)` is exactly that, and it is
+            // the first method the emitted standard library loads.
+            // `checkcast_internal` answers `None` for a primitive or a type
+            // parameter, which is what keeps the unboxing the comment above
+            // refers to where it already is.
+            if want != "java/lang/Object" && !want.is_empty() && !want.starts_with('(') {
+                asm.checkcast(&want);
+            }
         }
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);

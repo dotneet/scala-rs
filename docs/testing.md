@@ -24,6 +24,15 @@ The isolated loader delegates JDK classes to the platform loader so that
 modules such as `java.sql` remain available. Set `VERIFY_VERBOSE=true` to
 include exception causes and verifier details in the log.
 
+`tests/scalalib_probe.sh` is a debugging tool beside the `scalalib` measurement,
+not a gate step: it compiles a **writable copy** of the 538 library sources so
+that a probe can be written into a library file (`val dbg: Nothing = e` to make
+the compiler print what it inferred), and `add <probe.scala>` compiles the whole
+library plus one extra file and prints only that file's diagnostics. Several
+standard-library roots exist only when the run's own sources supply the class
+involved, and are invisible to any reduction written outside it; see
+[scala-library.md](scala-library.md).
+
 `bash tests/measurement_harness_test.sh` checks these result classifications
 with 16 shell cases and five small JVM cases, without rebuilding scala-rs or
 rerunning the corpus. See [development-plan.md](development-plan.md) for the

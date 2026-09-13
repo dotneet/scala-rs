@@ -1739,8 +1739,21 @@ impl<'a> Gen<'a> {
         // inherited Any member, though, and the class owes an accessor for
         // it. Resolve that terminal member through the nearest concrete
         // superclass so `invokespecial` names a legal superclass owner.
-        if self.st.get(target_id).owner == self.st.any_sym
+        //
+        // `clone` is the same shape one level down: `scala.collection.mutable
+        // .Cloneable` is `override def clone(): C = super.clone().asInstanceOf[C]`,
+        // and `clone` is declared on **AnyRef** rather than `Any` because only a
+        // reference has one. Restricting the rule to `Any` left every mutable
+        // collection that mixes that trait in without its
+        // `scala$collection$mutable$Cloneable$$super$clone` accessor (57 of them
+        // in the standard library's own build, where `java.lang.Object` is not a
+        // class file the run reads but the linearization's terminal symbol).
+        // nsc emits `invokespecial` on the nearest superclass, which resolves to
+        // `java.lang.Object.clone` by the JVM's own superclass walk.
+        let terminal_owner = self.st.get(target_id).owner;
+        if (terminal_owner == self.st.any_sym
             && matches!(method, "equals" | "hashCode" | "toString")
+            || terminal_owner == self.st.anyref_sym && matches!(method, "clone" | "finalize"))
             && desc_params(&method_desc_from_sym(self.st, target_id)) == desc_params(expected_desc)
         {
             if let Some(&owner) = lin

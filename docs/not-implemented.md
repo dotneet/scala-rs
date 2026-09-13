@@ -461,3 +461,34 @@ result type. ArraySeq-warmed grouped/sliding/scan results and SortedMap.keySet
 are independently reproduced remaining collection-supply issues. Name encoding
 uses JDK 17's BMP identifier classification; isolated UTF-16 surrogate strings
 cannot be represented by Rust strings and are not claimed as supported names.
+
+
+## A local `object` that captures (`agent/libfinal`)
+
+An `object` written inside a method body is still emitted as a static
+`MODULE$` singleton. nsc gives it one instance per call, held in a
+`scala.runtime.LazyRef` local, and hands its constructor both the enclosing
+instance and every captured local. Until that shape exists,
+`crates/typer/src/localobj.rs` refuses a local `object` whose body reads
+anything outside itself rather than emitting something that cannot run.
+
+These are the last two errors of the standard-library measure
+(`scala/collection/immutable/RedBlackTree.scala:1010` reads the enclosing
+method's parameters, `scala/collection/immutable/TreeSet.scala:192` reads the
+enclosing instance), and they are the only thing between that measure and code
+generation. `docs/scala-library.md` records what the backend does with the
+library when the two are hoisted out of their methods by hand.
+
+## Scala repeated parameters forwarded to a *Java* varargs method
+
+```scala
+def fmt(s: String, args: Any*): String = s.format(args: _*)
+fmt("%s-%s", "a", "b")   // scalac: a-b
+```
+
+throws `MissingFormatArgumentException`: the `Seq` is handed to
+`java.lang.String.format(String, Object...)` without the `Object[]` conversion
+nsc emits. Inside the standard library the same site is a
+`VerifyError: Bad type on operand stack` in
+`scala.collection.StringOps.format$extension`, which is the first thing a
+client of the emitted library hits after `List` loads.

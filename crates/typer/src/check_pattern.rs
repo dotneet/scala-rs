@@ -1598,22 +1598,48 @@ impl Typer {
         }
     }
 
-    /// `super.m`'s real target member, found by walking `this_id`'s actual
-    /// mixin parents (never a `self:` annotation -- see
-    /// `SymbolTable::lookup_member_real`) in linearization order.
+    /// `super.m`'s real target member, resolved the way nsc's `findMember`
+    /// resolves it: **one** member set, gathered over `this_id`'s base type
+    /// sequence and reduced by overriding, never a single parent clause's.
     ///
-    /// `super_target` above picks one parent (the syntactically last one) up
-    /// front, independent of which member will be selected, and
-    /// `lookup_member` (used for an ordinary selection on that parent's type)
-    /// also walks the parent's own self-type -- which found
-    /// `RelationalActionComponent { self: RelationalProfile => }`'s self-type
-    /// member for `super.computeCapabilities` inside `RelationalProfile`
-    /// itself, i.e. the very override being completed. This walks every real
-    /// parent, last-declared first (later mixins are more specific in Scala's
-    /// linearization, so `super` prefers them), and returns the first parent
-    /// whose *real* inheritance chain actually defines `name` -- `Relational
-    /// ActionComponent` has no `computeCapabilities` of its own, so the
-    /// search continues past it to `BasicProfile`, which does.
+    /// nsc's `typedSuper` gives a bare `super` the type
+    /// `SuperType(clazz.thisType, intersectionType(clazz.info.parents))`, and a
+    /// selection on it runs `findMember` over that intersection's base type
+    /// sequence -- which is `clazz`'s linearization without `clazz` itself.
+    /// Two facts follow, and both are load-bearing:
+    ///
+    ///  * the member set spans **every** parent clause, so an overload whose
+    ///    alternatives sit in two unrelated mixins stays complete (gitbucket's
+    ///    `super.get(path) { … }`, whose one-clause and `ValueType`
+    ///    alternatives live in two different scalatra traits);
+    ///  * what orders two candidates is `this_id`'s **linearization**, not
+    ///    which clause was written last. `scala.collection.mutable.ArrayDeque`
+    ///    mixes in `IterableFactoryDefaults` after `IndexedSeqOps`, and the
+    ///    former reaches only `IterableOnce.stepper` (result `S`) while the
+    ///    latter declares the override with result `S with EfficientSplit`;
+    ///    taking the last written clause read `super.stepper(shape)` at the
+    ///    weaker type (`collection/mutable/ArrayDeque.scala:68`).
+    ///
+    /// The reduction is [`Check::drop_overridden_at`] **at `this_id`**, which is
+    /// the only receiver that can relate two members reached through different
+    /// clauses: its owner rule drops `IterableOnce.stepper` under
+    /// `IndexedSeqOps.stepper`, and `drop_sibling_overrides` orders a pair of
+    /// unrelated mixins by this class's linearization. Returning one clause's
+    /// set instead lost the other clause's overloads (gitbucket, 2 errors);
+    /// unioning the sets without this reduction left five library sites
+    /// `ambiguous overload`.
+    ///
+    /// Parents are walked with `lookup_member_real`, never `lookup_member`: a
+    /// `self:` annotation is not a supertype and SLS 6.7.3 never lets `super`
+    /// reach through one. Reusing the ordinary member search let
+    /// `RelationalActionComponent { self: RelationalProfile => }` answer
+    /// `super.computeCapabilities` with `RelationalProfile`'s own
+    /// still-being-completed override -- a false "recursive method … needs
+    /// result type" instead of `BasicProfile`'s further up the real chain.
+    ///
+    /// The returned `SymbolId` is the parent *clause* the winning member is
+    /// reached through, which `super_decl_prefix_type` turns into the prefix to
+    /// read the declaration at.
     pub(crate) fn super_select_member(
         &self,
         this_id: SymbolId,
@@ -1639,34 +1665,123 @@ impl Typer {
             })
             .collect();
         if let Some(mix_name) = mix {
+            // `super[P].m` is nsc's `findMixinSuper`: only that one clause.
             parents.retain(|p| {
                 let n = self.st.get(*p).name.as_str();
                 n == mix_name || n.trim_end_matches('$') == mix_name
             });
-        } else {
-            parents.reverse();
         }
-        // nsc resolves `super.m` to the first *concrete* `m` along the
-        // linearization: a mixin that only re-declares `m` (slick's
-        // `BasicStreamingQueryActionExtensionMethodsImpl` narrows `result`
-        // covariantly and leaves it abstract) is not what `super.result`
-        // means, and calling it emitted an `invokestatic` on a `$class`
-        // holder that has no such method -- indeed no such class file, since
-        // the trait has no concrete member at all (`NoClassDefFoundError`).
-        let mut deferred: Option<(SymbolId, Vec<SymbolId>)> = None;
+        let mut per_clause: Vec<(SymbolId, Vec<SymbolId>)> = Vec::new();
+        let mut all: Vec<SymbolId> = Vec::new();
         for p in parents {
             let members = self.st.lookup_member_real(p, name);
             if members.is_empty() {
                 continue;
             }
-            if members.iter().any(|m| !self.is_deferred_member(*m)) {
-                return Some((p, members));
+            for m in &members {
+                if !all.contains(m) {
+                    all.push(*m);
+                }
             }
-            if deferred.is_none() {
-                deferred = Some((p, members));
+            per_clause.push((p, members));
+        }
+        if all.is_empty() {
+            return None;
+        }
+        let lin = crate::lin::linearize(&self.st, this_id);
+        // A member whose owner is not in the linearization at all (a pickled
+        // copy installed on some other class by `PickleSupply`) sorts last
+        // rather than first; `usize::MAX` would make it win every comparison.
+        let rank = |owner: SymbolId| {
+            lin.iter()
+                .position(|&c| c == owner)
+                .unwrap_or(usize::MAX - 1)
+        };
+        let kept = self.drop_overridden_at(this_id, all);
+        // nsc's `findMember` enters a declaration only when nothing it has
+        // already collected -- from a *more derived* base class -- has a
+        // matching type as seen from the prefix. That shadowing is not the same
+        // as overriding: it holds between two members whose owners are
+        // unrelated and which override no common declaration, which is where
+        // `drop_overridden_at`'s `drop_sibling_overrides` stops (it asks for a
+        // third candidate above both, and two independent traits have none).
+        // `class C extends A with B` over `trait A { def m = "A" }` and
+        // `trait B { def m = "B" }` is that pair: `super.m` is **B**'s, because
+        // C's linearization is C, B, A, and leaving both in the set made the
+        // caller take whichever came first (`tests/rtprobe/super_qualified.scala`
+        // printed `ABA` for scalac's `ABB`).
+        //
+        // `same_member_at` is the test, not `same_signature` alone: it
+        // substitutes both members at this class's own prefix and compares the
+        // parameter lists exactly, which is what keeps two genuine overloads
+        // (`h(String)` in one mixin, `h(Int)` in another) two.
+        let kept = self.shadow_along_linearization(this_id, kept, &rank);
+        // nsc resolves `super.m` to a *concrete* `m`: a mixin that only
+        // re-declares it (slick's
+        // `BasicStreamingQueryActionExtensionMethodsImpl` narrows `result`
+        // covariantly and leaves it abstract) is not what `super.result`
+        // means, and calling it emitted an `invokestatic` on a `$class` holder
+        // that has no such method -- indeed no such class file, since the
+        // trait has no concrete member at all (`NoClassDefFoundError`). The
+        // whole set is still handed back; only the *clause* is chosen by it,
+        // because that is what decides the prefix and the call target.
+        let best = |concrete_only: bool| {
+            kept.iter()
+                .copied()
+                .filter(|&m| !concrete_only || !self.is_deferred_member(m))
+                .min_by_key(|&m| rank(self.st.get(m).owner))
+        };
+        let winner = best(true).or_else(|| best(false))?;
+        let clause = per_clause
+            .iter()
+            .filter(|(_, ms)| ms.contains(&winner))
+            .min_by_key(|(p, _)| rank(*p))
+            .map(|(p, _)| *p)
+            .or_else(|| per_clause.first().map(|(p, _)| *p))?;
+        Some((clause, kept))
+    }
+
+    /// nsc's `findMember` shadowing step, for the member set of a `super`
+    /// selection: walk the candidates in base-type-sequence order and drop one
+    /// whose type, as this class sees it, matches a candidate already kept from
+    /// a more derived base class.
+    ///
+    /// A *deferred* keeper never shadows a definition: `super.m` means the
+    /// implementation, and a trait that only re-declares `m` is not it (see
+    /// `super_select_member`'s concrete-member rule, which this leaves intact).
+    fn shadow_along_linearization(
+        &self,
+        this_id: SymbolId,
+        mut cands: Vec<SymbolId>,
+        rank: &dyn Fn(SymbolId) -> usize,
+    ) -> Vec<SymbolId> {
+        if cands.len() < 2 {
+            return cands;
+        }
+        let prefix = Type::Class {
+            sym: this_id,
+            args: self
+                .st
+                .get(this_id)
+                .tparams
+                .iter()
+                .map(|&t| Type::TypeParam(t))
+                .collect(),
+        };
+        cands.sort_by_key(|&m| rank(self.st.get(m).owner));
+        let mut out: Vec<SymbolId> = Vec::with_capacity(cands.len());
+        for m in cands {
+            let shadowed = out.iter().copied().any(|k| {
+                self.st.get(k).owner != self.st.get(m).owner
+                    && !(self.is_deferred_member(k) && !self.is_deferred_member(m))
+                    && self.same_signature(k, m)
+                    && self.same_member_at(&prefix, k, m)
+            });
+            if !shadowed {
+                out.push(m);
             }
         }
-        deferred
+        out
     }
 
     /// The type `super.m`'s declaration is instantiated at.
