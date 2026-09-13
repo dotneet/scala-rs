@@ -4504,17 +4504,21 @@ argument does not say which.
 
 ### Verification
 
+Run on the tree with `main` (`6086f089`) merged in, against
+`tests/BASELINE.md`'s `ce3e99ec` numbers.
+
 | check | result |
 |---|---|
-| `tests/scalalib_measure.sh` | `files=538 errors=4 files_with_errors=3 classes=0` |
+| `tests/scalalib_measure.sh` | `files=538 errors=4 files_with_errors=3 classes=0` (was 41 / 20) |
 | `tests/cats_measure.sh` | 0 errors / 2977 classes |
 | `tests/gitbucket_measure.sh` | 0 errors / 1317 classes |
 | `tests/slick_measure.sh` | 0 errors / 1504 classes |
-| `tests/workspace_tests.sh` | `binaries=335 rows=342 missing=0 failed_bins=0 doc_rows=7` |
-| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0` |
-| `tests/cats_run.sh` | `progs=8 ok=4 known_fail=4 new=0 lint_problems=0` |
-| `tests/gitbucket_run.sh` | `progs=6 ok=5 known_fail=1 new=0 lint_problems=0` |
-| full corpus vs `corpus-b6e4c00f.tsv` | **losses=0**, gains 3 (`pos/lambdalift`, `pos/t11052`, `run/numbereq`); pos 1247, neg 815, run 1011 |
+| `tests/workspace_tests.sh` | `binaries=336 rows=343 missing=0 failed_bins=0 doc_rows=7` |
+| `tests/slick_run.sh` | `progs=12 ok=12 diff=0 fail=0`, 36/36 attempts |
+| `tests/slick_subset.sh` | `subset_files=184 classes=1504 verified=1504 failed=0 lint_problems=0` |
+| `tests/cats_run.sh` | `progs=8 ok=8 diff=0 fail=0 known_fail=0 new=0 lint_problems=0` |
+| `tests/gitbucket_run.sh` | `progs=6 ok=6 diff=0 fail=0 known_fail=0 new=0 lint_problems=0` |
+| full corpus vs `corpus-ce3e99ec.tsv` | **losses=0**, gains 4 (`pos/lambdalift`, `pos/t11052`, `run/numbereq`, `run/t5857`); pos 1247, neg 815, run 1011 |
 
 `tests/classfile_lint.py` has nothing of the library to look at yet: the library
 still has errors, so `classes=0` and no library class file is emitted. The lint
