@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `de16571c` |
+| commit | `ca3dfd6d` |
 |---|---|
 | updated | 2026-09-13 |
 
@@ -91,6 +91,7 @@ coordinator measured the merged tree each time, not the branches.
 | `b6e4c00f` | whitebox macros, the nested-companion implicit scope, the library's last inference roots (66 -> 41), and the cats/gitbucket **run** harnesses with the eleven miscompilations they found | 0 | 0 |
 | `ce3e99ec` | the five known-fail run programs: mixin forwarders scoped to nsc's `mixinClasses`, applied type members and refinement `type` declarations written to the pickle, pattern-bound lambda capture, conversion views through prefixes, `Byte`/`Short` pickle names | 0 | 0 |
 | `de16571c` | the library's last inference and resolution roots (41 -> 4): function-typed expected types, self-constructor delegation, compound base types, refinement type parameters, weak-conformance specificity, module `apply` sugar, plus two backend `VerifyError`s and the SLS 4.1 forward reference | 0 | 0 |
+| `ca3dfd6d` | `super` resolved against the linearization with alpha-renamed override reduction and nsc's shadowing, as-seen-from no longer re-substituting its own arguments, and three backend roots the library's first codegen exposed | 0 | 0 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4454,6 +4455,75 @@ Exact summary block:
 ```text
 === summary
   HEAD=de16571c  logs=/private/tmp/scala-rs-gate-w6  wall=15:42
+VERDICT=PASS
+DONE
+```
+
+## Gate sixty: the library type-checks (`ca3dfd6d`)
+
+`/private/tmp/scala-rs-lf/gate`, `VERDICT=PASS`, wall 23:49, `losses=0
+changes=0`.
+
+| measure | `de16571c` | `ca3dfd6d` |
+|---|---:|---:|
+| scala library | 4 errors / 3 files | **2 errors / 2 files** (one root: a captured local `object`) |
+| library with those two hoisted by hand | — | **0 errors, 2614 classes, `lint_problems=0`** |
+| cats / gitbucket / slick | 0 each | unchanged (2977 / 1317 / 1504 classes) |
+| `cats_run` / `gitbucket_run` / `slick_run` | 8/8, 6/6, 12/12 | unchanged |
+| corpus pos / neg / run | 1247 / 815 / 1011 | unchanged, `losses=0` |
+| workspace suite | 3185 | **3197** |
+
+**The library now type-checks.** The two remaining diagnostics are one
+unimplemented feature (a local `object` that captures, i.e. nsc's `LazyRef`
+shape), not a wrong answer; with those two definitions hoisted out of their
+methods in a writable copy the library compiles clean and emits 2614 classes
+that pass `tests/classfile_lint.py`, and **real scalac 2.13.16 reads our
+pickles and compiles a client against them**. Running that client still hits one
+wall: Scala varargs passed to a **Java** varargs method (`s.format(args: _*)`)
+arrive as a `Seq` with no `Object[]` conversion. So the library is green for
+type-checking and for 2614 lint-clean class files, and not yet green for
+execution — the same order cats and gitbucket went through.
+
+Seven roots, each reduced and checked against scalac both ways:
+
+* **`super.m` resolution.** We took the last written parent clause that has a
+  concrete member; nsc builds one member set over `this`'s base type sequence
+  (`findMember` on a `SuperType`). Getting that right needed three things the
+  earlier narrow attempt lacked: run the override reduction **through `this`**,
+  **alpha-rename** when comparing polymorphic members (`def f[B]` in two traits
+  are different symbols, so such pairs had never matched), and implement nsc's
+  **shadowing** — for two unrelated traits with no common declaration the derived
+  one wins, which `drop_sibling_overrides` deliberately declines to order. Only
+  `tests/rt_probe.sh` caught the shadowing regression; any slice touching `super`
+  must run it.
+* **As-seen-from re-substituted its own output.** Walking the parents of
+  `IterableOps`, the substitution for `Map`'s base `IterableOps` rewrote the `A`
+  and `C` that the previous step had just inserted — which is why `groupBy`'s
+  result came out `HashMap[K, AnyRef]` and `PermutationsItr.init`'s `unzip`
+  solved one tuple too wide, and why neither reduced outside the declaring
+  class. The walk now collects `(class, args)` and substitutes once. The brief
+  called these two separate roots; they were one.
+* **Three backend roots the library's first codegen exposed**: the generic
+  `Array` path gated on "is a jar linked" instead of "is `ScalaRunTime`
+  available" (230 errors), `clone`'s terminal super member owned by `Any`
+  instead of `AnyRef` (57), and a chained `package` clause starting with an
+  existing package dropping that package from 143 binary names. Plus an erasure
+  cast for a `super` call whose result is the parent's own type parameter
+  (`List.appendedAll`'s `VerifyError`).
+
+New tooling: `tests/scalalib_probe.sh`, which compiles the whole 538-file library
+plus one writable copy of a file and prints only that file's diagnostics — two
+slices in a row had built the same thing by hand, and it is how these roots were
+isolated (`val dbg: Nothing = e` to print an inferred type).
+
+Saved ledger: [`baselines/corpus-ca3dfd6d.tsv`](baselines/corpus-ca3dfd6d.tsv),
+SHA-256 `f420f0c4713624be0c7a976f938862cfab793fb4d659a95a638c0609793732c5`.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=ca3dfd6d  logs=/private/tmp/scala-rs-lf/gate  wall=23:49
 VERDICT=PASS
 DONE
 ```
