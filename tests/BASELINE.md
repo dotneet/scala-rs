@@ -11,7 +11,7 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `ce3e99ec` |
+| commit | `de16571c` |
 |---|---|
 | updated | 2026-09-13 |
 
@@ -90,6 +90,7 @@ coordinator measured the merged tree each time, not the branches.
 | `f16daac1` | library clusters (views, compound bounds, `private[this]` variance, array wrappers, `Function1[_, _]`, `= macro ???`, `AnyRef.clone`), a 9x faster typer (linearization and base-type caches), and a parallel gate | 0 | 0 |
 | `b6e4c00f` | whitebox macros, the nested-companion implicit scope, the library's last inference roots (66 -> 41), and the cats/gitbucket **run** harnesses with the eleven miscompilations they found | 0 | 0 |
 | `ce3e99ec` | the five known-fail run programs: mixin forwarders scoped to nsc's `mixinClasses`, applied type members and refinement `type` declarations written to the pickle, pattern-bound lambda capture, conversion views through prefixes, `Byte`/`Short` pickle names | 0 | 0 |
+| `de16571c` | the library's last inference and resolution roots (41 -> 4): function-typed expected types, self-constructor delegation, compound base types, refinement type parameters, weak-conformance specificity, module `apply` sugar, plus two backend `VerifyError`s and the SLS 4.1 forward reference | 0 | 0 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -4397,6 +4398,62 @@ Exact summary block:
 === summary
   HEAD=ce3e99ec  logs=/private/tmp/scala-rs-gate-w5  wall=26:25
   note: corpus: 1 loss(es) passed on a serial re-run (load-sensitive, not a regression): run/t5857
+VERDICT=PASS
+DONE
+```
+
+## Gate fifty-nine: the library within four errors (`de16571c`)
+
+`/private/tmp/scala-rs-gate-w6`, `VERDICT=PASS`, wall 15:42.
+
+| measure | `ce3e99ec` | `de16571c` |
+|---|---:|---:|
+| scala library | 41 / 20 | **4 / 3** |
+| cats | 0 errors, 2977 classes, run 8/8 | unchanged |
+| gitbucket | 0 errors, 1317 classes, run 6/6 | unchanged |
+| slick | 0 errors / 1504 classes, 12/12 | unchanged |
+| corpus pos / neg / run | 1245 / 815 / 1010 | **1247** / 815 **/ 1011** |
+| workspace suite | 3175 | **3185** |
+
+Sixteen roots, each reduced to a user program and checked against scalac both
+ways: type-argument inference when the expected type is a function type (read
+through the base type); a self-constructor delegation's arguments typed against
+the *target* constructor's parameters (including the curried case); `same_signature`
+treating unrelated classes' parameters as the same member; a block-local `def`
+with no result type referenced before its definition; `Lscala/runtime/BoxedUnit;`
+in a Java class file read as `Unit`; base types of a compound (`A with B`) and a
+conversion whose own parameter is compound; **type parameters in a structural
+refinement** (`RefineDecl::Def` carries its own, and `conforms_to_refinement`
+alpha-renames them); conversion specificity judged by weak conformance; a parent
+that is an inner class read through `parent_prefixes`; compound right-hand sides
+of `<:` ahead of an abstract constructor's bound; `unapply` on a *value*
+extractor read from the receiver; inherited `apply` for `Module(args)` sugar;
+implicit unification comparing closed argument positions along variance; a type
+variable the call does not fix solved through a selection; and a SAM whose
+abstract method returns `Unit` discarding the value.
+
+Two backend defects it uncovered, both `VerifyError` rather than wrong output: a
+static field selection deciding `pop` from the descriptor instead of the
+selection's own type (`BoxedUnit.UNIT`), and a curried self-delegation filling
+its implicit clause twice. It also closed a wrong acceptance: SLS 4.1 forward
+references from a `val`/`var` initialiser, matching scalac on six probes.
+
+The last four: `Iterable.groupBy`'s `result.updated(k, v.result())` typed as
+`HashMap[K, AnyRef]`; `Seq.PermutationsItr.init`'s `unzip` solving one tuple too
+wide (two errors); and `ArrayDeque`'s `super.stepper` resolving to
+`IterableOnce`'s rather than `IndexedSeqOps`'s — that one is reduced and its fix
+is known (nsc walks `this`'s linearization, not the last written parent clause),
+but the narrow version costs gitbucket two errors, so it was deliberately left
+out. `docs/scala-library.md` has all three reductions.
+
+Saved ledger: [`baselines/corpus-de16571c.tsv`](baselines/corpus-de16571c.tsv),
+SHA-256 `f420f0c4713624be0c7a976f938862cfab793fb4d659a95a638c0609793732c5`.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=de16571c  logs=/private/tmp/scala-rs-gate-w6  wall=15:42
 VERDICT=PASS
 DONE
 ```
