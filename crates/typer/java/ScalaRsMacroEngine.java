@@ -127,7 +127,8 @@ public final class ScalaRsMacroEngine {
         // output is payload, never another expansion reply.
         System.setOut(new PrintStream(new MacroOutput("stdout"), true, "UTF-8"));
         System.setErr(new PrintStream(new MacroOutput("stderr"), true, "UTF-8"));
-        macroCl = ScalaRsMacroEngine.class.getClassLoader();
+        ClassLoader baseCl = ScalaRsMacroEngine.class.getClassLoader();
+        macroCl = baseCl;
         try {
             Class<?> pkg = Class.forName("scala.reflect.runtime.package$", true, macroCl);
             Object mod = pkg.getField("MODULE$").get(null);
@@ -138,6 +139,11 @@ public final class ScalaRsMacroEngine {
             out.println(err("cannot start the macro engine: " + describe(t)));
             return;
         }
+        // Keep the runtime universe on the application loader. Reification
+        // records its mirror and refuses to migrate trees between mirrors;
+        // only loading the ScalaTest implementation needs the child-first
+        // compatibility loader.
+        macroCl = macroClassLoader(baseCl);
         out.println("(ready)");
         String line;
         while ((line = in.readLine()) != null) {
@@ -154,6 +160,89 @@ public final class ScalaRsMacroEngine {
             handleNanos += System.nanoTime() - handleStarted;
             out.println(reply);
         }
+    }
+
+    /**
+     * ScalaTest's assertion macros finish by calling scalactic's
+     * `MacroOwnerRepair`.  That helper casts the public macro `Context` to
+     * nsc's private concrete `scala.reflect.macros.contexts.Context` solely to
+     * obtain the call-site owner.  A scala-rs context deliberately implements
+     * the public interface through a proxy, so the cast cannot ever succeed.
+     *
+     * The expansion crosses back into scala-rs and is typechecked at the real
+     * call site before it is accepted.  Consequently nsc's in-JVM owner repair
+     * is both unavailable and redundant here.  Load only the ScalaTest classes
+     * that reach the helper in a child loader and replace that helper with the
+     * ABI-equivalent identity operation.  Other macro libraries and all Scala
+     * reflection classes remain parent-loaded.
+     */
+    static ClassLoader macroClassLoader(ClassLoader parent) throws Exception {
+        String[] entries = System.getProperty("java.class.path", "")
+            .split(java.util.regex.Pattern.quote(java.io.File.pathSeparator));
+        List<java.net.URL> urls = new ArrayList<>();
+        for (String entry : entries) {
+            if (!entry.isEmpty()) urls.add(new java.io.File(entry).toURI().toURL());
+        }
+        return new ScalaTestCompatLoader(urls.toArray(new java.net.URL[urls.size()]), parent);
+    }
+
+    static final class ScalaTestCompatLoader extends java.net.URLClassLoader {
+        ScalaTestCompatLoader(java.net.URL[] urls, ClassLoader parent) {
+            super(urls, parent);
+        }
+
+        static boolean childFirst(String name) {
+            return name.startsWith("org.scalatest.AssertionsMacro")
+                || name.startsWith("org.scalactic.BooleanMacro")
+                || name.startsWith("org.scalactic.MacroOwnerRepair");
+        }
+
+        @Override
+        protected Class<?> loadClass(String name, boolean resolve) throws ClassNotFoundException {
+            if (!childFirst(name)) return super.loadClass(name, resolve);
+            synchronized (getClassLoadingLock(name)) {
+                Class<?> cls = findLoadedClass(name);
+                if (cls == null) {
+                    if (name.equals("org.scalactic.MacroOwnerRepair")) {
+                        byte[] bytes;
+                        try {
+                            bytes = ownerRepairBytes();
+                        } catch (java.io.IOException e) {
+                            throw new ClassNotFoundException(name, e);
+                        }
+                        cls = defineClass(name, bytes, 0, bytes.length);
+                    } else {
+                        try {
+                            cls = findClass(name);
+                        } catch (ClassNotFoundException missing) {
+                            cls = super.loadClass(name, false);
+                        }
+                    }
+                }
+                if (resolve) resolveClass(cls);
+                return cls;
+            }
+        }
+    }
+
+    /** A Java-8 classfile for the public ABI of scalactic's owner repair. */
+    static byte[] ownerRepairBytes() throws java.io.IOException {
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream d = new java.io.DataOutputStream(bytes);
+        d.writeInt(0xcafebabe); d.writeShort(0); d.writeShort(52); d.writeShort(13);
+        utf(d, "org/scalactic/MacroOwnerRepair"); pair(d, 7, 1, 0);
+        utf(d, "java/lang/Object"); pair(d, 7, 3, 0);
+        utf(d, "<init>");
+        utf(d, "(Lscala/reflect/macros/whitebox/Context;)V");
+        utf(d, "Code"); utf(d, "()V"); pair(d, 12, 5, 8); pair(d, 10, 4, 9);
+        utf(d, "repairOwners");
+        utf(d, "(Lscala/reflect/api/Exprs$Expr;)Lscala/reflect/api/Exprs$Expr;");
+        d.writeShort(0x21); d.writeShort(2); d.writeShort(4);
+        d.writeShort(0); d.writeShort(0); d.writeShort(2);
+        code(d, 5, 6, 7, 1, 2, new byte[]{0x2a,(byte)0xb7,0,10,(byte)0xb1});
+        code(d, 11, 12, 7, 1, 2, new byte[]{0x2b,(byte)0xb0});
+        d.writeShort(0); d.flush();
+        return bytes.toByteArray();
     }
 
     // ---------------------------------------------------------------- request
@@ -479,7 +568,19 @@ public final class ScalaRsMacroEngine {
                     long id = Long.parseLong(meta.items.get(1).text());
                     if ("ValDef".equals(kind) || "DefDef".equals(kind) || "ClassDef".equals(kind)
                             || "Function".equals(kind)) symbol = sourceSymbol(id);
-                    else symbol = sourceSymbols.get(id);
+                    else {
+                        // References in a macro argument carry the source-run
+                        // identity of their definition.  Definitions and
+                        // functions are materialised above, but an Ident or
+                        // Select can reach this method before its definition
+                        // was otherwise needed by the mirror (most notably a
+                        // local val selected inside ScalaTest's BooleanMacro).
+                        // Leaving the symbol null loses the lexical owner and
+                        // makes the reflect macro inspect an error tree.  Rust
+                        // emits `sr` only for source-run symbols; classpath
+                        // references retain `(s0)` and never enter this branch.
+                        symbol = sourceSymbol(id);
+                    }
                 }
             }
         }
@@ -528,6 +629,27 @@ public final class ScalaRsMacroEngine {
             case "If":
                 return call(companion("If"), "apply", 3, buildTree(kids.get(0)),
                     buildTree(kids.get(1)), buildTree(kids.get(2)));
+            case "Match": {
+                List<Object> cases = new ArrayList<>();
+                for (Sexp k : kids.get(1).items.subList(1, kids.get(1).items.size())) {
+                    cases.add(buildTree(k));
+                }
+                return call(companion("Match"), "apply", 2,
+                    buildTree(kids.get(0)), list(cases));
+            }
+            case "CaseDef":
+                return call(companion("CaseDef"), "apply", 3,
+                    buildTree(kids.get(0)), buildTree(kids.get(1)), buildTree(kids.get(2)));
+            case "Bind":
+                return call(companion("Bind"), "apply", 2,
+                    buildName(kids.get(0)), buildTree(kids.get(1)));
+            case "Alternative":
+                return call(companion("Alternative"), "apply", 1, buildTrees(kids.get(0)));
+            case "UnApply":
+                return call(companion("UnApply"), "apply", 2,
+                    buildTree(kids.get(0)), buildTrees(kids.get(1)));
+            case "Star":
+                return call(companion("Star"), "apply", 1, buildTree(kids.get(0)));
             case "TypeTree": {
                 Object tree = call(companion("TypeTree"), "apply", 0);
                 if (!kids.isEmpty() && !kids.get(0).items.get(1).text().isEmpty()) {
@@ -757,6 +879,24 @@ public final class ScalaRsMacroEngine {
             loadClass("scala.reflect.internal.StdCreators$FixedMirrorTreeCreator");
         Object creator = ctor(creatorCls, 3).newInstance(universe, mirror, tree);
         return call(companion("Expr"), "apply", 3, mirror, creator, tag);
+    }
+
+    /** Build the small scalar expressions used by ScalaTest's assertion macros. */
+    static Object literalExpr(Object value) throws Exception {
+        Object tag;
+        if (value instanceof Boolean) {
+            tag = call(companion("WeakTypeTag"), "Boolean", 0);
+        } else if (value instanceof String) {
+            Object definitions = call(universe, "definitions", 0);
+            Object stringClass = call(definitions, "StringClass", 0);
+            Object stringType = call(call(stringClass, "asType", 0), "toType", 0);
+            tag = tagOf(stringType);
+        } else {
+            throw gap("Context.literal only supports String and Boolean for now");
+        }
+        Object constant = call(companion("Constant"), "apply", 1, value);
+        Object tree = call(companion("Literal"), "apply", 1, constant);
+        return mkExpr(tree, tag);
     }
 
     // ------------------------------------------------------- serialising back
@@ -1641,6 +1781,9 @@ public final class ScalaRsMacroEngine {
             }
             if (n.equals("Expr") && arity == 2) {
                 return mkExpr(a[0], a[1]);
+            }
+            if (n.equals("literal") && arity == 1) {
+                return literalExpr(a[0]);
             }
             if (n.startsWith("scala$reflect$macros$") && n.contains("_setter_")) {
                 return null;

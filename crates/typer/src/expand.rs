@@ -951,6 +951,18 @@ impl Typer {
             Type::Method { paramss, .. } => paramss.clone(),
             _ => Vec::new(),
         };
+        // Typing normally keeps one Apply node per source argument clause.
+        // `fill_defaults_and_implicits`, however, appends an automatically
+        // supplied implicit clause to the current node. That is harmless for
+        // ordinary JVM calls, but a macro implementation receives `argss`
+        // and relies on the clause boundary (ScalaTest's `assert` is
+        // `(Boolean)(Prettifier, Position)`). Recover that one conservative
+        // shape here rather than changing ordinary application typing: only a
+        // single flattened node, with no repeated parameter, and an exact
+        // match for every declared parameter is repartitioned.
+        let argss = repartition_macro_argss(&paramss, argss).unwrap_or_else(|| argss.to_vec());
+        let application_for_wire =
+            rebuild_macro_application(application, &argss).unwrap_or_else(|| application.clone());
         // Typing may auto-apply trailing empty clauses without an Apply node.
         // Nonempty clauses must still be supplied by the typed application.
         if argss.len() > paramss.len()
@@ -966,7 +978,7 @@ impl Typer {
         // trees are then written with the symbol table borrowed alone.
         let mut types = WireTypes::default();
         let mut actuals: Vec<String> = Vec::new();
-        for clause in argss {
+        for clause in &argss {
             for arg in clause {
                 self.collect_wire_types(arg, &mut types);
                 actuals.push(self.tag_wire(macro_argument_type(arg))?);
@@ -981,7 +993,7 @@ impl Typer {
         if let Some(p) = prefix {
             self.collect_wire_types(p, &mut types);
         }
-        self.collect_wire_types(application, &mut types);
+        self.collect_wire_types(&application_for_wire, &mut types);
         let cx = WireCx {
             st: &self.st,
             types: &types,
@@ -1113,7 +1125,7 @@ impl Typer {
         out.push(')');
         out.push_str(" (app ");
         let mut built = String::new();
-        match typed_tree_to_wire(&cx, application, &mut built) {
+        match typed_tree_to_wire(&cx, &application_for_wire, &mut built) {
             Err(why) => {
                 out.push_str("(no ");
                 quote_into(&mut out, &why);
@@ -1794,6 +1806,21 @@ impl Typer {
             "Star" if self.macro_reply_pattern => Ok(node(TreeKind::Star {
                 elem: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
             })),
+            // A typed extractor pattern. Macro implementations such as
+            // ScalaTest's assertion transformer preserve the typer-produced
+            // `UnApply` nodes from a match expression instead of returning
+            // the source-level `Apply` spelling.
+            "UnApply" if self.macro_reply_pattern => {
+                let fun = self.tree_from_reply(at(kids, 0)?, span)?;
+                let mut args = Vec::new();
+                for arg in at(kids, 1)?.list()?.iter().skip(1) {
+                    args.push(self.pattern_from_reply(arg, span)?);
+                }
+                Ok(node(TreeKind::UnApply {
+                    fun: Box::new(fun),
+                    args,
+                }))
+            }
             // `Function(vparams, body)` and the `ValDef`s under it. slick's
             // `TableQueryMacroImpl.apply` builds exactly this -- a function
             // literal whose one parameter is spelled out with a `Modifiers`,
@@ -2346,8 +2373,23 @@ fn mods_from_with(s: &Sexp, deferred_ok: bool) -> Result<Modifiers, String> {
 
 /// `a.b.C` as a term path.
 fn path_tree(full: &str, span: Span) -> Tree {
+    let qualified = full.contains('.');
     let mut parts = full.split('.');
-    let head = parts.next().unwrap_or("");
+    // A path returned by the macro engine is resolved in the call site's
+    // scope.  Start package-qualified paths at `_root_`, otherwise a local
+    // value named `org` (GitBucket's `GHOrganization` is a real example) can
+    // capture `org.scalactic...` when a ScalaTest macro's generated
+    // `Position` tree is retyped.
+    let head = if qualified {
+        "_root_"
+    } else {
+        parts.next().unwrap_or("")
+    };
+    let tail = if qualified {
+        full.split('.').collect::<Vec<_>>()
+    } else {
+        parts.collect::<Vec<_>>()
+    };
     let mut t = Tree {
         id: NodeId(0),
         span,
@@ -2362,7 +2404,7 @@ fn path_tree(full: &str, span: Span) -> Tree {
         byname_thunk: false,
         byname_type_marker: false,
     };
-    for p in parts {
+    for p in tail {
         t = Tree {
             id: NodeId(0),
             span,
@@ -2435,6 +2477,175 @@ fn apply_layers(tree: &Tree) -> usize {
         t = fun;
     }
     n
+}
+
+/// Recover parameter-clause boundaries that `fill_defaults_and_implicits`
+/// flattened into one Apply while typing a macro call.
+///
+/// This deliberately handles only the exact fixed-parameter shape. A
+/// repeated parameter needs a source-side boundary to know where the repeat
+/// starts, and a partial/default application must not be guessed here.
+fn repartition_macro_argss(paramss: &[Vec<Type>], argss: &[Vec<Tree>]) -> Option<Vec<Vec<Tree>>> {
+    if argss.len() != 1 || paramss.len() <= 1 {
+        return None;
+    }
+    // If only trailing empty clauses remain, the existing auto-application
+    // handling below already accepts the shape and there is nothing to split.
+    if paramss[1..].iter().all(Vec::is_empty) {
+        return None;
+    }
+    if paramss
+        .iter()
+        .flatten()
+        .any(|param| matches!(param, Type::Repeated(_)))
+    {
+        return None;
+    }
+    let expected = paramss
+        .iter()
+        .try_fold(0usize, |total, params| total.checked_add(params.len()))?;
+    let flattened = &argss[0];
+    if flattened.len() != expected {
+        return None;
+    }
+    let mut offset = 0;
+    Some(
+        paramss
+            .iter()
+            .map(|params| {
+                let end = offset + params.len();
+                let clause = flattened[offset..end].to_vec();
+                offset = end;
+                clause
+            })
+            .collect(),
+    )
+}
+
+/// Rebuild `c.macroApplication` with the same clauses used in the expansion
+/// request when the typer supplied one flattened Apply. The expansion itself
+/// still uses the original typed tree; this copy is only the tree exposed to
+/// the JVM macro implementation.
+fn rebuild_macro_application(application: &Tree, argss: &[Vec<Tree>]) -> Option<Tree> {
+    if argss.len() <= 1 {
+        return None;
+    }
+    let TreeKind::Apply { fun, args } = &application.kind else {
+        return None;
+    };
+    let total = argss
+        .iter()
+        .try_fold(0usize, |total, clause| total.checked_add(clause.len()))?;
+    if args.len() != total {
+        return None;
+    }
+    let mut current = (**fun).clone();
+    for clause in argss {
+        let mut layer = application.clone();
+        layer.kind = TreeKind::Apply {
+            fun: Box::new(current),
+            args: clause.clone(),
+        };
+        current = layer;
+    }
+    Some(current)
+}
+
+/// Recover the argument-clause slices of a curried call whose automatically
+/// supplied implicit clause was appended by `fill_implicit_params`.
+///
+/// Keep these as borrows of the original tree. Rebuilding cloned `Tree`s here
+/// used to invalidate the address-keyed [`WireTypes`] collected before
+/// serialisation, so a materialised `ClassTag` inside e.g. `Array.apply`
+/// could no longer find its resolved type while an outer macro was expanded.
+fn filled_application_clauses(application: &Tree) -> Option<Vec<&[Tree]>> {
+    let TreeKind::Apply { fun, args } = &application.kind else {
+        return None;
+    };
+    let filled_from = args.iter().position(|arg| arg.id == NodeId::FILLED_ARG)?;
+    if args[filled_from..]
+        .iter()
+        .any(|arg| arg.id != NodeId::FILLED_ARG)
+    {
+        return None;
+    }
+    let Type::Method { paramss, .. } = &fun.ty else {
+        return None;
+    };
+    let first = paramss.first()?;
+    let first_matches = match first.last() {
+        Some(Type::Repeated(_)) => filled_from >= first.len().saturating_sub(1),
+        _ => first.len() == filled_from,
+    };
+    if !first_matches
+        || paramss
+            .iter()
+            .skip(1)
+            .flatten()
+            .any(|param| matches!(param, Type::Repeated(_)))
+    {
+        return None;
+    }
+    let trailing = paramss
+        .iter()
+        .skip(1)
+        .try_fold(0usize, |total, params| total.checked_add(params.len()))?;
+    if args.len().checked_sub(filled_from) != Some(trailing) {
+        return None;
+    }
+    let mut clauses = Vec::with_capacity(paramss.len());
+    clauses.push(&args[..filled_from]);
+    let mut offset = filled_from;
+    for params in &paramss[1..] {
+        let end = offset + params.len();
+        clauses.push(&args[offset..end]);
+        offset = end;
+    }
+    Some(clauses)
+}
+
+/// Write the borrowed clause slices as nested `Apply` nodes. Only the first
+/// callee differs between a typed macro-application tree and an ordinary
+/// argument tree; every argument keeps its original address and identity.
+fn filled_application_to_wire(
+    cx: &WireCx,
+    fun: &Tree,
+    clauses: &[&[Tree]],
+    typed_fun: bool,
+    out: &mut String,
+) -> Result<(), String> {
+    fn layer(
+        cx: &WireCx,
+        fun: &Tree,
+        clauses: &[&[Tree]],
+        index: usize,
+        typed_fun: bool,
+        out: &mut String,
+    ) -> Result<(), String> {
+        out.push_str("(t \"Apply\" (s0) ");
+        if index == 0 {
+            if typed_fun && !matches!(fun.kind, TreeKind::New { .. }) {
+                typed_tree_to_wire(cx, fun, out)?;
+            } else {
+                application_fun_to_wire(cx, fun, out)?;
+            }
+        } else {
+            layer(cx, fun, clauses, index - 1, typed_fun, out)?;
+        }
+        out.push_str(" (l");
+        for arg in clauses[index] {
+            out.push(' ');
+            tree_to_wire(cx, arg, out)?;
+        }
+        out.push_str("))");
+        Ok(())
+    }
+
+    let last = clauses
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "macro argument clauses do not match its declaration".to_string())?;
+    layer(cx, fun, clauses, last, typed_fun, out)
 }
 
 /// The symbol at the head of an application spine, the way
@@ -2691,7 +2902,7 @@ pub(crate) fn this_qualifier_of(st: &SymbolTable, sym: SymbolId) -> Option<Strin
 fn typed_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let start = out.len();
     typed_tree_to_wire_body(cx, t, out)?;
-    mirror_tree_identity(t, start, out);
+    mirror_tree_identity(cx.st, t, start, out);
     Ok(())
 }
 
@@ -2720,6 +2931,9 @@ fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
             Ok(())
         }
         TreeKind::Apply { fun, args } => {
+            if let Some(clauses) = filled_application_clauses(t) {
+                return filled_application_to_wire(cx, fun, &clauses, true, out);
+            }
             out.push_str("(t \"Apply\" (s0) ");
             if matches!(fun.kind, TreeKind::New { .. }) {
                 application_fun_to_wire(cx, fun, out)?;
@@ -2749,7 +2963,7 @@ fn typed_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<()
 pub(crate) fn tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let start = out.len();
     tree_to_wire_body(cx, t, out)?;
-    mirror_tree_identity(t, start, out);
+    mirror_tree_identity(cx.st, t, start, out);
     Ok(())
 }
 
@@ -2764,6 +2978,36 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str("(t \"Literal\" (s0) ");
             lit_to_wire(lit, out)?;
             out.push(')');
+            Ok(())
+        }
+        TreeKind::InterpolatedString {
+            prefix,
+            parts,
+            args,
+        } => {
+            // nsc hands an outer macro the original fast-track interpolation
+            // call, not the String result it will eventually produce:
+            // `_root_.scala.StringContext(parts...).s(args...)`. Keeping the
+            // call also lets identity-preserving splices map back to the
+            // already typed scala-rs tree through `mirror_tree_identity`.
+            out.push_str(
+                "(t \"Apply\" (s0) (t \"Select\" (s0) (t \"Apply\" (s0) (t \"Select\" (s0) ",
+            );
+            root_path_to_wire("scala.StringContext", out);
+            out.push_str(" (n term \"apply\")) (l");
+            for part in parts {
+                out.push_str(" (t \"Literal\" (s0) ");
+                lit_to_wire(&Lit::String(part.clone()), out)?;
+                out.push(')');
+            }
+            out.push_str(")) (n term ");
+            quote_into(out, &encode_method_name(prefix));
+            out.push_str(") ) (l");
+            for arg in args {
+                out.push(' ');
+                tree_to_wire(cx, arg, out)?;
+            }
+            out.push_str("))");
             Ok(())
         }
         // `classOf[T]` as the typer materialised it for a `ClassTag`: an
@@ -2816,6 +3060,19 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             Ok(())
         }
         TreeKind::Apply { fun, args } => {
+            // An implicit clause following an explicit empty clause is
+            // flattened by ordinary application typing (`fail()` becomes
+            // `fail(Position)`). Macro arguments retain the typed tree, so
+            // restore the source clause boundary before the JVM macro sees
+            // it. This is the same conservative reconstruction used for a
+            // top-level macro application; nested calls such as ScalaTest's
+            // `fail()` in an `assert` condition need it too.
+            if let Some(clauses) = filled_application_clauses(t) {
+                return filled_application_to_wire(cx, fun, &clauses, false, out);
+            }
+            if let Some(clauses) = filled_application_clauses(t) {
+                return filled_application_to_wire(cx, fun, &clauses, false, out);
+            }
             out.push_str("(t \"Apply\" (s0) ");
             application_fun_to_wire(cx, fun, out)?;
             out.push_str(" (l");
@@ -2983,9 +3240,72 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push(')');
             Ok(())
         }
-        TreeKind::Match { .. } => unsupported("a `match`"),
+        TreeKind::Match { selector, cases } => {
+            out.push_str("(t \"Match\" (s0) ");
+            tree_to_wire(cx, selector, out)?;
+            out.push_str(" (l");
+            for case in cases {
+                out.push_str(" (t \"CaseDef\" (s0) ");
+                pattern_to_wire(cx, &case.pat, out)?;
+                out.push(' ');
+                tree_to_wire(cx, &case.guard, out)?;
+                out.push(' ');
+                tree_to_wire(cx, &case.body, out)?;
+                out.push(')');
+            }
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::Bind { name, body } => {
+            out.push_str("(t \"Bind\" (s0) (n term ");
+            quote_into(out, &encode_method_name(name));
+            out.push_str(") ");
+            pattern_to_wire(cx, body, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::Alternative { trees } => {
+            out.push_str("(t \"Alternative\" (s0) (l");
+            for tree in trees {
+                out.push(' ');
+                pattern_to_wire(cx, tree, out)?;
+            }
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::UnApply { fun, args } => {
+            out.push_str("(t \"UnApply\" (s0) ");
+            tree_to_wire(cx, fun, out)?;
+            out.push_str(" (l");
+            for arg in args {
+                out.push(' ');
+                pattern_to_wire(cx, arg, out)?;
+            }
+            out.push_str("))");
+            Ok(())
+        }
+        TreeKind::Star { elem } => {
+            out.push_str("(t \"Star\" (s0) ");
+            pattern_to_wire(cx, elem, out)?;
+            out.push(')');
+            Ok(())
+        }
+        // nsc represents the source wildcard pattern as `Ident(TermName("_"))`.
+        TreeKind::Wildcard => {
+            out.push_str("(t \"Ident\" (s0) (n term \"_\"))");
+            Ok(())
+        }
         _ => unsupported("an argument of this form"),
     }
+}
+
+/// Write one pattern below a macro argument's `CaseDef`.
+///
+/// Pattern-only shapes have explicit wire encodings above. All remaining
+/// shapes (literal, stable identifier, typed pattern, constructor pattern)
+/// use the same representation as an expression tree.
+fn pattern_to_wire(cx: &WireCx, pattern: &Tree, out: &mut String) -> Result<(), String> {
+    tree_to_wire(cx, pattern, out)
 }
 
 pub(crate) fn application_fun_to_wire(
@@ -3379,10 +3699,74 @@ mod tests {
     }
 }
 
-/// Preserve lexical symbol identities for definition/reference trees. The JVM
-/// only binds references whose definitions it has reconstructed in this exchange.
-pub(crate) fn mirror_tree_identity(t: &Tree, start: usize, out: &mut String) {
-    let marker = if !t.sym.is_none() {
+/// Whether a symbol belongs to this source run rather than to the prelude,
+/// classpath, or a lazily supplied binary pickle member.  The JVM mirror must
+/// only materialise source-run symbols: classpath symbols already have a
+/// runtime mirror and entering a second synthetic symbol for one can collide
+/// with the real package/class scope.
+fn is_source_run_symbol(st: &SymbolTable, mut sym: SymbolId) -> bool {
+    if sym.is_none() {
+        return false;
+    }
+    let is_source_class_like = |candidate: SymbolId| {
+        st.source_classes.contains(&candidate)
+            || st.source_classes.contains(&st.module_class_of(candidate))
+            // `source_classes` records a source object as its Module symbol,
+            // while a method owned by that object is reached through its
+            // ModuleClass symbol.  Keep both halves of that source pair
+            // source identities.
+            || st
+                .source_classes
+                .iter()
+                .any(|&source| st.module_class_of(source) == candidate)
+    };
+    for _ in 0..64 {
+        let s = st.get(sym);
+        if !s.pickled_origin.is_empty() || sym.0 < st.source_start {
+            return false;
+        }
+        if s.is_class_like() || matches!(s.kind, SymKind::Module) {
+            let class = st.module_class_of(sym);
+            // Scala library symbols can be materialised lazily from a pickle
+            // after `source_start`; unlike source declarations they have no
+            // `pickled_origin`, and their package owner belongs to the
+            // prelude. Treat those runtime identities as external unless the
+            // source pass explicitly recorded the class/object. Otherwise a
+            // generated `scala.reflect.ManifestFactory` tree is marked `(sr)`
+            // and the JVM mirror tries to enter a second object into the real
+            // `scala.reflect` package scope.
+            if s.jvm_name.starts_with("scala/") && !is_source_class_like(sym) {
+                return false;
+            }
+            if s.flags.contains(Flags::JAVA)
+                || st.binary_read.contains(&class.0)
+                || st.pending_classpath_signatures.contains(&class)
+            {
+                return false;
+            }
+            // `source_start` separates source declarations from the eager
+            // classpath inventory.  The provenance checks above also reject
+            // classes discovered lazily after that boundary, leaving this
+            // class-like symbol as a source declaration.  Keep the
+            // source_classes lookup as a compatibility aid for module/source
+            // pairs created by earlier passes, but do not require it: macro
+            // expansion can run before erasure records that set.
+            return is_source_class_like(sym) || sym.0 >= st.source_start;
+        }
+        sym = s.owner;
+        if sym.is_none() {
+            return false;
+        }
+    }
+    false
+}
+
+/// Preserve lexical symbol identities for source-run definition/reference
+/// trees.  External symbols intentionally keep the plain `(s0)` marker: the
+/// macro runtime resolves their names through its normal classpath mirror,
+/// while source-run locals need the identity to retain their lexical owner.
+pub(crate) fn mirror_tree_identity(st: &SymbolTable, t: &Tree, start: usize, out: &mut String) {
+    let marker = if is_source_run_symbol(st, t.sym) {
         format!("(sr {})", t.sym.0)
     } else if let TreeKind::Function { body, .. } = &t.kind {
         format!("(fn {})", body.id.0)

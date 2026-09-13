@@ -62,6 +62,10 @@ pub struct JavaClass {
     pub nested_static: bool,
     /// Scala classfile (`ScalaSig` / `Scala` / `ScalaSignature`).
     pub is_scala: bool,
+    /// The ScalaSignature identifies this file's symbol as a module class.
+    /// Scala 2 writes the complete signature on a static-forwarder `Foo.class`
+    /// even though the implementation class is named `Foo$`.
+    pub scala_module: bool,
     /// Has a `MODULE$` static field (Scala module class).
     pub has_module_field: bool,
     pub inner_classes: Vec<JavaInnerClass>,
@@ -522,6 +526,21 @@ fn parse_classfile_members(
     let is_scala = class_attrs.iter().any(|(n, _)| {
         n == "ScalaSig" || n == "Scala" || n == "ScalaSignature" || n == "ScalaLongSignature"
     });
+    // A Scala 2 object has its complete pickle on the static-forwarder class
+    // (`Foo.class`), while `Foo$.class` only carries a zero-length Scala
+    // marker. The pickle's MODULE flag is the authoritative answer for the
+    // former; the trailing `$` remains covered by classpath.rs for the latter.
+    let scala_module = if is_scala && !internal_name.ends_with('$') {
+        scala_rs_pickle::classfile::scala_signature_bytes(bytes)
+            .and_then(|raw| scala_rs_pickle::read_pickle(&raw).ok())
+            .map(|p| {
+                let full = internal_name.replace('/', ".");
+                scala_rs_pickle::is_object_only_class(&p, &full)
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
     let has_module_field = fields.iter().any(|f| f.name == "MODULE$");
     Ok(JavaClass {
         internal_name,
@@ -534,6 +553,7 @@ fn parse_classfile_members(
         signature,
         nested_static,
         is_scala,
+        scala_module,
         has_module_field,
         inner_classes,
         sole_instance_field,
@@ -1010,5 +1030,47 @@ mod tests {
                 .filter(|m| m.name == "compare")
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn recognizes_static_forwarder_scala_module_from_signature() {
+        let jar = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+        if !jar.is_file() {
+            return;
+        }
+        let mut idx = BinaryIndex::from_user_paths(vec![jar]);
+        let Some(bytes) = idx.find_class("scala/util/control/TailCalls").unwrap() else {
+            panic!("scala-library TailCalls.class must be readable");
+        };
+        let c = parse_java_classfile(&bytes).expect("parse TailCalls");
+        assert!(c.is_scala, "TailCalls must carry ScalaSignature: {c:?}");
+        assert!(
+            c.scala_module,
+            "TailCalls.class's ScalaSignature must identify its module class: {c:?}"
+        );
+        assert!(
+            !c.internal_name.ends_with('$'),
+            "this regression must cover the static-forwarder spelling: {c:?}"
+        );
+
+        let Some(list_bytes) = idx.find_class("scala/collection/immutable/List").unwrap() else {
+            panic!("scala-library List.class must be readable");
+        };
+        let list = parse_java_classfile(&list_bytes).expect("parse List");
+        assert!(list.is_scala, "List must carry ScalaSig: {list:?}");
+        assert!(
+            !list.scala_module,
+            "List.class has a same-name ordinary companion ClassSig and is not a module class: {list:?}"
+        );
+        for name in ["scala/Specializable", "scala/Option"] {
+            let Some(bytes) = idx.find_class(name).unwrap() else {
+                panic!("scala-library {name}.class must be readable");
+            };
+            let class = parse_java_classfile(&bytes).expect("parse companion class");
+            assert!(
+                !class.scala_module,
+                "{name}.class has an ordinary same-name ClassSig and is not a module class: {class:?}"
+            );
+        }
     }
 }

@@ -1208,6 +1208,95 @@ object M {
     }
 
     #[test]
+    fn adjacent_bare_blocks_are_not_block_arguments() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def body(): Int = {
+    {
+      val first = 1
+      first + 1
+    }
+    {
+      val second = 2
+      second + 2
+    }
+  }
+}
+"#,
+        );
+
+        fn find_def<'a>(t: &'a Tree, want: &str) -> Option<&'a Tree> {
+            match &t.kind {
+                TreeKind::PackageDef { stats, .. } => stats.iter().find_map(|s| find_def(s, want)),
+                TreeKind::ModuleDef { impl_, .. } | TreeKind::ClassDef { impl_, .. } => {
+                    impl_.body.iter().find_map(|s| find_def(s, want))
+                }
+                TreeKind::DefDef { name, .. } if name == want => Some(t),
+                _ => None,
+            }
+        }
+
+        let body = find_def(&t, "body").expect("body");
+        let TreeKind::DefDef { rhs, .. } = &body.kind else {
+            panic!("expected body definition, got {:?}", body.kind);
+        };
+        let TreeKind::Block { stats, expr } = &rhs.kind else {
+            panic!("expected body block, got {:?}", rhs.kind);
+        };
+        assert_eq!(stats.len(), 1, "the first bare block is a statement");
+        assert!(
+            matches!(stats[0].kind, TreeKind::Block { .. }),
+            "first bare block must stay a Block, got {:?}",
+            stats[0].kind
+        );
+        assert!(
+            matches!(expr.kind, TreeKind::Block { .. }),
+            "second bare block must stay the result Block, got {:?}",
+            expr.kind
+        );
+    }
+
+    #[test]
+    fn single_newline_before_a_block_stays_a_block_argument() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def g(n: Int): Int = n
+  def body(): Int =
+    g
+    { 40 }
+}
+"#,
+        );
+
+        fn find_def<'a>(t: &'a Tree, want: &str) -> Option<&'a Tree> {
+            match &t.kind {
+                TreeKind::PackageDef { stats, .. } => stats.iter().find_map(|s| find_def(s, want)),
+                TreeKind::ModuleDef { impl_, .. } | TreeKind::ClassDef { impl_, .. } => {
+                    impl_.body.iter().find_map(|s| find_def(s, want))
+                }
+                TreeKind::DefDef { name, .. } if name == want => Some(t),
+                _ => None,
+            }
+        }
+
+        let body = find_def(&t, "body").expect("body");
+        let TreeKind::DefDef { rhs, .. } = &body.kind else {
+            panic!("expected body definition, got {:?}", body.kind);
+        };
+        let TreeKind::Apply { args, .. } = &rhs.kind else {
+            panic!("g followed by a block must be an Apply, got {:?}", rhs.kind);
+        };
+        assert_eq!(args.len(), 1);
+        assert!(
+            matches!(args[0].kind, TreeKind::Literal { lit: Lit::Int(40) }),
+            "trailing block argument must stay the block's value, got {:?}",
+            args[0].kind
+        );
+    }
+
+    #[test]
     fn function_literal_body_stops_at_case() {
         let t = parse_ok(
             r#"

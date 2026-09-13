@@ -547,7 +547,11 @@ impl<'a> Gen<'a> {
         }
         if let Some(outer_desc) = outer_field_desc(self.st, class_id) {
             b.fields.push(Field {
-                access: ACC_PUBLIC | ACC_FINAL,
+                // nsc marks the hidden enclosing-instance field synthetic.
+                // The classpath reader uses that flag to distinguish the JVM
+                // constructor's leading `$outer` slot from source parameters
+                // when a scala-rs-built nested class is read back later.
+                access: ACC_PUBLIC | ACC_FINAL | ACC_SYNTHETIC,
                 name: "$outer".into(),
                 desc: outer_desc,
             });

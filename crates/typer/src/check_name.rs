@@ -389,8 +389,17 @@ impl Typer {
     /// never has to be typed as an expression (it has no type). Only a real
     /// term prefix (`import someVal.field._`) falls back to the typer.
     fn import_prefix(&mut self, qual: &mut Tree, span: Span) -> Vec<SymbolId> {
-        let syms = self.import_path_syms(qual, span);
+        let mut syms = self.import_path_syms(qual, span);
         if !syms.is_empty() {
+            // A class file and its companion object are separate binaries. If
+            // an earlier signature mentioned only the class, the symbolic
+            // path walk above can stop there even though `import C._` denotes
+            // the stable term `C`, hence its companion object. Resolve that
+            // companion at the import boundary before choosing the owner.
+            // This is deliberately local to imports: completing every class
+            // reference globally re-enters unrelated companion members.
+            syms = self.expose_class_companion(&syms, span);
+            syms = self.rank_import_prefixes(syms);
             qual.sym = syms[0];
             return syms.into_iter().map(|s| self.as_type_owner(s)).collect();
         }
@@ -869,6 +878,11 @@ impl Typer {
         {
             let mcls = self.st.module_class_of(id);
             self.adopt_cp_module_class(mcls);
+            // The package object may have been entered by an earlier term or
+            // import lookup. Its inherited type aliases are pickle-only, so
+            // the already-present module must still trigger the same lazy
+            // package-alias installation as the load path below.
+            self.install_pickled_package_aliases(owner, span);
             self.install_duration_syntax(owner, span);
             return Some(mcls);
         }
@@ -928,8 +942,24 @@ impl Typer {
         };
         for a in aliases {
             // Anything already there wins: the hand-written prelude, and any
-            // real class of the same name. This only fills a hole.
-            if a.name.is_empty() || !self.type_owner_members(pkg, &a.name).is_empty() {
+            // real type-namespace declaration of the same name. A module is
+            // only the term-side fallback here: Cats' Newtype encoding has
+            // `object NonEmptyLazyList` beside this inherited type alias, so
+            // treating the module as an occupied type slot would drop the
+            // polymorphic alias before `pickled_alias_type` can preserve its
+            // arity.
+            if a.name.is_empty()
+                || self.st.lookup_member(pkg, &a.name).iter().any(|&id| {
+                    let sym = self.st.get(id);
+                    matches!(sym.kind, SymKind::TypeMember | SymKind::TypeParam)
+                        // A Scala object's JVM mirror is represented by a
+                        // same-named Class. It is only the term-side
+                        // companion, not a competing type declaration; a
+                        // package alias may legitimately share that name.
+                        || (sym.kind == SymKind::Class
+                            && self.st.companion_module(id).is_none())
+                })
+            {
                 continue;
             }
             match self.pickled_alias_type(&a, span) {
@@ -1099,6 +1129,48 @@ impl Typer {
             }
             self.complete_binary_member(owner, from, span);
             let mut found = self.st.lookup_member(owner, from);
+            // A named import binds both Scala namespaces. If discovery found
+            // only the class, load its same-named companion now so the term
+            // side is imported too. Cats reaches `kernel.Eq` as a class stub
+            // through another pickle before `import cats.kernel.Eq`; without
+            // this import-local completion `Eq[Int]` sees no object instances.
+            let companions = self.expose_class_companion(&found, span);
+            for m in companions {
+                if self.st.get(m).kind == SymKind::Module && !found.contains(&m) {
+                    found.push(m);
+                }
+            }
+            // Conversely, a class nested in an `object` is recorded by
+            // Scala's `InnerClasses` attribute against the object's mirror
+            // class. `object SemigroupalTests { trait Isomorphisms[F[_]];
+            // object Isomorphisms }` therefore exposes only the nullary module
+            // from the stable prefix unless the mirror is consulted. Import
+            // only its type declarations; instance members do not become
+            // members of the object.
+            if self.st.get(owner).kind == SymKind::ModuleClass {
+                let module_jvm = self.st.get(owner).jvm_name.clone();
+                let mirror_jvm = module_jvm.trim_end_matches('$');
+                let mirror = crate::classpath::find_by_jvm(&self.st, mirror_jvm).or_else(|| {
+                    let name = self.st.get(owner).name.trim_end_matches('$');
+                    let held_by = self.st.get(owner).owner;
+                    self.st.get(held_by).members.iter().copied().find(|&id| {
+                        let s = self.st.get(id);
+                        s.kind == SymKind::Class && s.name == name
+                    })
+                });
+                if let Some(mirror) = mirror {
+                    self.complete_binary_member(mirror, from, span);
+                    for m in self.st.lookup_member(mirror, from) {
+                        if matches!(
+                            self.st.get(m).kind,
+                            SymKind::Class | SymKind::TypeMember | SymKind::TypeParam
+                        ) && !found.contains(&m)
+                        {
+                            found.push(m);
+                        }
+                    }
+                }
+            }
             if found.is_empty() {
                 if let Some(po) = self.package_object_of(owner, span) {
                     self.complete_binary_member(po, from, span);
@@ -1490,7 +1562,35 @@ impl Typer {
                     self.st.get(cur).kind,
                     SymKind::Package | SymKind::Module | SymKind::ModuleClass
                 );
-                if self.library_abi && !cur_is_module && !self.pickle.pickle_readable(&self.st, cur)
+                // A bytecode-only module can still reach this wildcard import
+                // with Scala's parameter clauses flattened into one JVM list.
+                // When its pickle records a trailing implicit clause, overload
+                // applicability needs that source boundary before names are
+                // entered. ScalaCheck's `Prop.forAll(f)(implicit ...)` is the
+                // concrete case. Ordinary modules stay on the existing path,
+                // avoiding duplicate members such as pos/t5639's `Baz`.
+                let needs_source_clauses = cur_is_module
+                    && self
+                        .pickle
+                        .has_trailing_implicit_clause(&self.st, &mut self.binary, cur);
+                // Nested objects declared by a package object are emitted as
+                // `package$child$`. scala-rs attaches the enclosing pickle to
+                // that classfile, so it can be precise before any inherited
+                // generic member has been loaded into `members`. Adopt this
+                // self-output shape up front; scalac's corresponding nested
+                // class carries only the empty `Scala` marker and the attempt
+                // is therefore a no-op.
+                let needs_package_nested_pickle = cur_is_module
+                    && self
+                        .st
+                        .get(cur)
+                        .jvm_name
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.starts_with("package$") && n.ends_with('$'));
+                if self.library_abi
+                    && (!cur_is_module || needs_source_clauses || needs_package_nested_pickle)
+                    && !self.pickle.pickle_readable(&self.st, cur)
                 {
                     self.pickle
                         .adopt_binary_class(&mut self.st, &mut self.binary, cur);

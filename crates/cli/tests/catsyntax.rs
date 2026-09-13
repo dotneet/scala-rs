@@ -33,7 +33,19 @@
 //!    clause (cats' `catsSyntaxApplicativeError[F[_], E, A]` gets `E` only
 //!    from the `ApplicativeError[F, E]` it asks for).
 //!
-//! 3--5 are exercised together by `a_simulacrum_style_syntax_layer_crosses_a_jar`,
+//! 6. **A derivation candidate's own witness has an implicit scope.** Cats'
+//!    `Isomorphisms.invariant[Option]` needs an `Invariant[Option]` that lives
+//!    in `Option`'s companion. The immutable implicit search cannot discover
+//!    that companion unless it is warmed before the candidate is tried.
+//!
+//! 7. **Reading scala-rs's own nested package-object modules.** Their
+//!    classfiles contain JVM mixin forwarders as well as an enclosing Scala
+//!    pickle. A raw forwarder such as `none[A]: Option[A]` can lose `A`, then
+//!    shadow the precise inherited declaration and leave `none[Int]` at raw
+//!    `Option`. `a_generic_syntax_module_round_trips_through_our_own_pickle`
+//!    compiles both halves with scala-rs to keep that path covered.
+//!
+//! 3--6 are exercised together by `a_simulacrum_style_syntax_layer_crosses_a_jar`,
 //! which builds a miniature cats with **real scalac** -- our own pickle writer
 //! does not emit a `REFINEDtpe`, so the fixture has to come from scalac to be
 //! worth anything.
@@ -303,6 +315,38 @@ object Box {
     def flatMap[A, B](fa: Box[A])(f: A => Box[B]): Box[B] = f(fa.a)
   }
 }
+
+object Laws {
+  trait Isomorphisms[F[_]]
+  object Isomorphisms {
+    implicit def invariant[F[_]](implicit F: Functor[F]): Isomorphisms[F] =
+      new Isomorphisms[F] {}
+  }
+}
+
+trait TinyEq[A]
+object TinyEq {
+  implicit val stringEq: TinyEq[String] = new TinyEq[String] {}
+}
+
+// Loading this signature first enters only a `TinyEq` class stub. A later
+// explicit import of `TinyEq` must still load its same-named companion.
+trait MentionsTinyEq { def eq: TinyEq[String] }
+
+trait Numeric[A]
+
+object Checks {
+  def forAll[A](f: A => Unit)(implicit N: Numeric[A]): String = "checked"
+}
+
+trait Pick[A] { def label: String }
+trait LowPriorityPick {
+  implicit def anyPick[A]: Pick[A] = new Pick[A] { def label = "any" }
+}
+object Pick extends LowPriorityPick {
+  implicit def numericPick[A](implicit N: Numeric[A]): Pick[A] =
+    new Pick[A] { def label = "numeric" }
+}
 "#;
 
 /// `all` is a nested object of the package object, exactly as `cats.syntax.all`
@@ -316,6 +360,7 @@ trait AllSyntax extends FlatMapSyntax
 
 package object syntax {
   object all extends AllSyntax
+  object eq extends AllSyntax
 }
 "#;
 
@@ -360,6 +405,145 @@ object Main {
 }
 "#;
 
+/// `eq` is also a member of `AnyRef`. Cats exposes its equality syntax under
+/// exactly this object name (`cats.syntax.eq`), so resolving the import must
+/// keep following the package-object member rather than the inherited method.
+const TINY_EQ_USER: &str = r#"
+import tinycats.Box
+import tinycats.syntax.eq._
+
+object Main {
+  def main(args: Array[String]): Unit =
+    println(new Box(3).flatMap(n => new Box(n + 1)).a)
+}
+"#;
+
+/// The result candidate is in the requested type's companion, while the
+/// witness for its implicit clause is in the type constructor's companion.
+/// No earlier expression in this compiler invocation warms `Box`'s scope.
+const TINY_DERIVATION_USER: &str = r#"
+import tinycats.{Box, Laws}
+
+object Main {
+  val isomorphisms: Laws.Isomorphisms[Box] =
+    implicitly[Laws.Isomorphisms[Box]]
+
+  def main(args: Array[String]): Unit = println("derived")
+}
+"#;
+
+const TINY_IMPORTED_NESTED_USER: &str = r#"
+import tinycats.Box
+import tinycats.Laws.Isomorphisms
+
+object Main {
+  val isomorphisms: Isomorphisms[Box] = Isomorphisms.invariant[Box]
+  def main(args: Array[String]): Unit = println("imported-nested")
+}
+"#;
+
+const TINY_STUBBED_COMPANION_USER: &str = r#"
+import tinycats.MentionsTinyEq
+import tinycats.TinyEq
+
+object Main {
+  val eq: TinyEq[String] = implicitly[TinyEq[String]]
+  def main(args: Array[String]): Unit = println("companion")
+}
+"#;
+
+/// A declaration on the derived companion must beat a same-result implicit
+/// inherited from its low-priority parent. An implicit-only clause is not a
+/// conversion argument and must not cancel the declaration-owner advantage.
+const TINY_LOW_PRIORITY_USER: &str = r#"
+import tinycats.{Numeric, Pick}
+
+object Main {
+  implicit val numeric: Numeric[Int] = new Numeric[Int] {}
+  val picked: Pick[Int] = implicitly[Pick[Int]]
+  def main(args: Array[String]): Unit = println(picked.label)
+}
+"#;
+
+/// A wildcard import from a binary object must recover Scala's parameter
+/// clause boundary. The JVM descriptor flattens `f` and `N` into one list;
+/// only the pickle says the second clause is implicit.
+const TINY_TRAILING_IMPLICIT_USER: &str = r#"
+import tinycats.Numeric
+import tinycats.Checks._
+
+object Main {
+  implicit val numeric: Numeric[Int] = new Numeric[Int] {}
+  val result: String = forAll((_: Int) => ())
+  def main(args: Array[String]): Unit = println(result)
+}
+"#;
+
+const SELF_PICKLE_LIB: &str = r#"
+package selfcats
+
+trait Show[A] { def render(a: A): String }
+object Show {
+  implicit val intShow: Show[Int] = new Show[Int] {
+    def render(a: Int): String = a.toString
+  }
+  implicit def optionShow[A](implicit A: Show[A]): Show[Option[A]] =
+    new Show[Option[A]] {
+      def render(a: Option[A]): String = if (a.isEmpty) "none" else A.render(a.get)
+    }
+}
+
+final class ShowOps[A](val value: A, val instance: Show[A]) {
+  def show: String = instance.render(value)
+}
+
+trait OptionSyntax {
+  def none[A]: Option[A] = Option.empty[A]
+}
+trait ShowSyntax {
+  implicit def toShowOps[A](a: A)(implicit A: Show[A]): ShowOps[A] =
+    new ShowOps[A](a, A)
+}
+
+package object syntax {
+  object option extends OptionSyntax
+  object show extends ShowSyntax
+}
+"#;
+
+const SELF_PICKLE_USER: &str = r#"
+import selfcats.Show
+import selfcats.syntax.option._
+import selfcats.syntax.show._
+
+object Main {
+  implicit val optionIntShow: Show[Option[Int]] = new Show[Option[Int]] {
+    def render(a: Option[Int]): String = if (a.isEmpty) "none" else a.get.toString
+  }
+  def main(args: Array[String]): Unit = println(none[Int].show)
+}
+"#;
+
+const SELF_PICKLE_JAVA_CASE_CLASS_LIB: &str = r#"
+package selfdate
+
+final case class Account(accountId: Long = 0L, registeredDate: java.util.Date, note: String)
+"#;
+
+const SELF_PICKLE_JAVA_CASE_CLASS_USER: &str = r#"
+import selfdate.Account
+
+object Main {
+  def build(d: java.util.Date): Account =
+    Account(note = "ok", registeredDate = d, accountId = 1L)
+
+  def main(args: Array[String]): Unit = {
+    val a = build(null)
+    println(s"${a.accountId}:${a.note}:${a.registeredDate == null}")
+  }
+}
+"#;
+
 fn compile_against(out: &Path, jar: &Path, src: &Path, extra_cp: &[PathBuf]) -> (bool, String) {
     let mut cmd = Command::new(bin());
     cmd.arg("compile").arg(src);
@@ -385,6 +569,75 @@ fn compile_against(out: &Path, jar: &Path, src: &Path, extra_cp: &[PathBuf]) -> 
 }
 
 #[test]
+fn a_generic_syntax_module_round_trips_through_our_own_pickle() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let dir = tmp_dir("self-pickle");
+    let lib = dir.join("lib.scala");
+    let user = dir.join("user.scala");
+    fs::write(&lib, SELF_PICKLE_LIB).unwrap();
+    fs::write(&user, SELF_PICKLE_USER).unwrap();
+
+    let lib_out = dir.join("libout");
+    fs::create_dir_all(&lib_out).unwrap();
+    let (ok, msgs) = compile_against(&lib_out, &jar, &lib, &[]);
+    assert!(
+        ok,
+        "scala-rs failed to build the miniature library:\n{msgs}"
+    );
+
+    let user_out = dir.join("userout");
+    fs::create_dir_all(&user_out).unwrap();
+    let (ok, msgs) = compile_against(&user_out, &jar, &user, std::slice::from_ref(&lib_out));
+    assert!(
+        ok,
+        "scala-rs failed to read its own nested syntax module:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    if java_available() {
+        let cp = format!("{}:{}", jar.display(), lib_out.display());
+        assert_eq!(run_java(&user_out, Some(&cp)), "none\n");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_case_class_apply_with_a_jdk_type_keeps_named_parameters_in_our_own_pickle() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let dir = tmp_dir("self-pickle-java-case-class");
+    let lib = dir.join("lib.scala");
+    let user = dir.join("user.scala");
+    fs::write(&lib, SELF_PICKLE_JAVA_CASE_CLASS_LIB).unwrap();
+    fs::write(&user, SELF_PICKLE_JAVA_CASE_CLASS_USER).unwrap();
+
+    let lib_out = dir.join("libout");
+    fs::create_dir_all(&lib_out).unwrap();
+    let (ok, msgs) = compile_against(&lib_out, &jar, &lib, &[]);
+    assert!(ok, "scala-rs failed to build the case class:\n{msgs}");
+
+    let user_out = dir.join("userout");
+    fs::create_dir_all(&user_out).unwrap();
+    let (ok, msgs) = compile_against(&user_out, &jar, &user, std::slice::from_ref(&lib_out));
+    assert!(
+        ok,
+        "scala-rs failed to read named parameters whose signature contains a JDK type:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    if java_available() {
+        let cp = format!("{}:{}", jar.display(), lib_out.display());
+        assert_eq!(run_java(&user_out, Some(&cp)), "1:ok:true\n");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_simulacrum_style_syntax_layer_crosses_a_jar() {
     let Some(jar) = scala_library_jar() else {
         eprintln!("skip: scala-library jar not present");
@@ -403,11 +656,23 @@ fn a_simulacrum_style_syntax_layer_crosses_a_jar() {
     let syn = dir.join("syntax.scala");
     let other = dir.join("other.scala");
     let user = dir.join("user.scala");
+    let eq_user = dir.join("eq-user.scala");
+    let derivation_user = dir.join("derivation-user.scala");
+    let imported_nested_user = dir.join("imported-nested-user.scala");
+    let stubbed_companion_user = dir.join("stubbed-companion-user.scala");
+    let low_priority_user = dir.join("low-priority-user.scala");
+    let trailing_implicit_user = dir.join("trailing-implicit-user.scala");
     let bad = dir.join("bad.scala");
     fs::write(&lib, TINY_LIB).unwrap();
     fs::write(&syn, TINY_SYNTAX).unwrap();
     fs::write(&other, TINY_OTHER).unwrap();
     fs::write(&user, TINY_USER).unwrap();
+    fs::write(&eq_user, TINY_EQ_USER).unwrap();
+    fs::write(&derivation_user, TINY_DERIVATION_USER).unwrap();
+    fs::write(&imported_nested_user, TINY_IMPORTED_NESTED_USER).unwrap();
+    fs::write(&stubbed_companion_user, TINY_STUBBED_COMPANION_USER).unwrap();
+    fs::write(&low_priority_user, TINY_LOW_PRIORITY_USER).unwrap();
+    fs::write(&trailing_implicit_user, TINY_TRAILING_IMPLICIT_USER).unwrap();
     fs::write(&bad, TINY_USER_BAD).unwrap();
     let lib_out = dir.join("libout");
     fs::create_dir_all(&lib_out).unwrap();
@@ -432,6 +697,85 @@ fn a_simulacrum_style_syntax_layer_crosses_a_jar() {
     assert!(ok, "user failed to compile against the jar:\n{msgs}");
     assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
 
+    let trailing_implicit_user_out = dir.join("trailing-implicit-userout");
+    fs::create_dir_all(&trailing_implicit_user_out).unwrap();
+    let (ok, msgs) = compile_against(
+        &trailing_implicit_user_out,
+        &jar,
+        &trailing_implicit_user,
+        std::slice::from_ref(&lib_jar),
+    );
+    assert!(
+        ok,
+        "trailing implicit user failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let imported_nested_user_out = dir.join("imported-nested-userout");
+    fs::create_dir_all(&imported_nested_user_out).unwrap();
+    let (ok, msgs) = compile_against(
+        &imported_nested_user_out,
+        &jar,
+        &imported_nested_user,
+        std::slice::from_ref(&lib_jar),
+    );
+    assert!(
+        ok,
+        "imported nested type user failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let low_priority_user_out = dir.join("low-priority-userout");
+    fs::create_dir_all(&low_priority_user_out).unwrap();
+    let (ok, msgs) = compile_against(
+        &low_priority_user_out,
+        &jar,
+        &low_priority_user,
+        std::slice::from_ref(&lib_jar),
+    );
+    assert!(
+        ok,
+        "low-priority implicit user failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let stubbed_companion_user_out = dir.join("stubbed-companion-userout");
+    fs::create_dir_all(&stubbed_companion_user_out).unwrap();
+    let (ok, msgs) = compile_against(
+        &stubbed_companion_user_out,
+        &jar,
+        &stubbed_companion_user,
+        std::slice::from_ref(&lib_jar),
+    );
+    assert!(
+        ok,
+        "stubbed companion user failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let derivation_user_out = dir.join("derivation-userout");
+    fs::create_dir_all(&derivation_user_out).unwrap();
+    let (ok, msgs) = compile_against(
+        &derivation_user_out,
+        &jar,
+        &derivation_user,
+        std::slice::from_ref(&lib_jar),
+    );
+    assert!(
+        ok,
+        "derived implicit user failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let eq_user_out = dir.join("eq-userout");
+    fs::create_dir_all(&eq_user_out).unwrap();
+    let (ok, msgs) = compile_against(&eq_user_out, &jar, &eq_user, std::slice::from_ref(&lib_jar));
+    assert!(
+        ok,
+        "eq syntax user failed to compile against the jar:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
     let bad_out = dir.join("badout");
     fs::create_dir_all(&bad_out).unwrap();
     let (ok, msgs) = compile_against(&bad_out, &jar, &bad, std::slice::from_ref(&lib_jar));
@@ -444,6 +788,21 @@ fn a_simulacrum_style_syntax_layer_crosses_a_jar() {
     if java_available() {
         let cp = format!("{}:{}", jar.display(), lib_jar.display());
         assert_eq!(run_java(&user_out, Some(&cp)), "4\n9\n");
+        assert_eq!(run_java(&eq_user_out, Some(&cp)), "4\n");
+        assert_eq!(run_java(&derivation_user_out, Some(&cp)), "derived\n");
+        assert_eq!(
+            run_java(&imported_nested_user_out, Some(&cp)),
+            "imported-nested\n"
+        );
+        assert_eq!(run_java(&low_priority_user_out, Some(&cp)), "numeric\n");
+        assert_eq!(
+            run_java(&trailing_implicit_user_out, Some(&cp)),
+            "checked\n"
+        );
+        assert_eq!(
+            run_java(&stubbed_companion_user_out, Some(&cp)),
+            "companion\n"
+        );
     }
     let _ = fs::remove_dir_all(&dir);
 }

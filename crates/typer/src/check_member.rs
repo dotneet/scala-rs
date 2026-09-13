@@ -311,6 +311,7 @@ impl Typer {
             ),
             _ => return,
         };
+        let mut pickle_ty = None;
         let ty = if tpt.is_empty() {
             if !tree.ty.is_no_type() {
                 tree.ty.clone()
@@ -322,11 +323,32 @@ impl Typer {
             // `def f(x: Zork)` and `val x: Zork` are `not found: type Zork`,
             // not a silently accepted program. See `strict_type_names`.
             let saved_cto = std::mem::replace(&mut self.cto_sig_owner, tree.sym);
+            self.begin_pickle_alias_capture();
             let ty = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
+            let written = self.finish_pickle_alias_capture();
             self.cto_sig_owner = saved_cto;
             self.check_proper_type(&ty, tree.span);
+            if let Some(written) = written {
+                // Only retain a directly written alias application. For an
+                // alias nested in `List[...]`, expanding the captured inner
+                // type would not describe the complete declaration, so the
+                // semantic type remains the pickle fallback.
+                let semantic = match &ty {
+                    Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                    _ => &ty,
+                };
+                if self.st.expand_applied_hk_alias(written.clone()) == *semantic {
+                    pickle_ty = Some(written);
+                }
+            }
             ty
         };
+        if flags.contains(Flags::BYNAME) {
+            pickle_ty = pickle_ty.map(|ty| Type::ByName(Box::new(ty)));
+        }
+        if matches!(ty, Type::Repeated(_)) {
+            pickle_ty = pickle_ty.map(|ty| Type::Repeated(Box::new(ty)));
+        }
         let ty = if flags.contains(Flags::BYNAME) && !matches!(ty, Type::ByName(_) | Type::NoType) {
             Type::ByName(Box::new(ty))
         } else {
@@ -349,6 +371,7 @@ impl Typer {
         }
         if !tree.sym.is_none() {
             self.st.get_mut(tree.sym).ty = ty.clone();
+            self.st.get_mut(tree.sym).pickle_ty = pickle_ty;
             self.st.get_mut(tree.sym).private_within = within;
             if flags.contains(Flags::DEFAULTPARAM) {
                 let f = self.st.get(tree.sym).flags.with(Flags::DEFAULTPARAM);
@@ -770,6 +793,8 @@ impl Typer {
         let saved_owner = self.st.owner;
         self.st.owner = tree.sym;
         let mut paramss_ty = Vec::new();
+        let mut pickle_paramss = Vec::new();
+        let mut has_pickle_alias = false;
         let mut all_params = Vec::new();
         let mut paramss_ids: Vec<Vec<SymbolId>> = Vec::new();
         if name == "<init>" {
@@ -817,6 +842,7 @@ impl Typer {
         }
         for clause in vparamss.iter_mut() {
             let mut ct = Vec::new();
+            let mut pickle_ct = Vec::new();
             let mut ids = Vec::new();
             let last_in_clause = clause.len().saturating_sub(1);
             for (pi, p) in clause.iter_mut().enumerate() {
@@ -881,8 +907,18 @@ impl Typer {
                     ids.push(p.sym);
                 }
                 ct.push(p.ty.clone());
+                let declared = if p.sym.is_none() {
+                    None
+                } else {
+                    self.st.get(p.sym).pickle_ty.clone()
+                };
+                if declared.is_some() {
+                    has_pickle_alias = true;
+                }
+                pickle_ct.push(declared.unwrap_or_else(|| p.ty.clone()));
             }
             paramss_ty.push(ct);
+            pickle_paramss.push(pickle_ct);
             paramss_ids.push(ids);
         }
         // nsc: `T <% V` becomes an extra implicit clause `(implicit evidence$n: T => V)`.
@@ -1015,10 +1051,14 @@ impl Typer {
                 let mut merged = evidence;
                 merged.append(&mut vparamss[last]);
                 vparamss[last] = merged;
+                let pickle_tys = tys.clone();
                 paramss_ty[last].splice(0..0, tys);
+                pickle_paramss[last].splice(0..0, pickle_tys);
                 paramss_ids[last].splice(0..0, ids);
             } else {
+                let pickle_tys = tys.clone();
                 paramss_ty.push(tys);
+                pickle_paramss.push(pickle_tys);
                 paramss_ids.push(ids);
                 vparamss.push(evidence);
             }
@@ -1044,6 +1084,7 @@ impl Typer {
             self.synthesize_default_getters(saved_owner, tree.sym, &name, &tp_ids, &paramss_ids);
         }
         self.st.owner = saved_owner;
+        let mut pickle_ret = None;
         let ret = if name == "<init>" {
             Type::Unit
         } else if tpt.is_empty() && local {
@@ -1068,9 +1109,17 @@ impl Typer {
             // by the time nsc looks at it, so an unresolved name is an error
             // and not a placeholder.
             let saved_cto = std::mem::replace(&mut self.cto_sig_owner, tree.sym);
+            self.begin_pickle_alias_capture();
             let ret = self.with_strict_sig_names(|s| s.tree_to_type(&tpt));
+            let written = self.finish_pickle_alias_capture();
             self.cto_sig_owner = saved_cto;
             self.check_proper_type(&ret, span);
+            if let Some(written) = written {
+                if self.st.expand_applied_hk_alias(written.clone()) == ret {
+                    pickle_ret = Some(written);
+                    has_pickle_alias = true;
+                }
+            }
             ret
         };
         if name == "<init>" && !tree.sym.is_none() {
@@ -1085,6 +1134,14 @@ impl Typer {
         tree.ty = mty.clone();
         if !tree.sym.is_none() {
             self.st.get_mut(tree.sym).ty = mty;
+            self.st.get_mut(tree.sym).pickle_ty = if has_pickle_alias {
+                Some(Type::Method {
+                    paramss: pickle_paramss,
+                    ret: Box::new(pickle_ret.unwrap_or_else(|| ret.clone())),
+                })
+            } else {
+                None
+            };
             self.st.get_mut(tree.sym).params = all_params;
             self.st.get_mut(tree.sym).paramss = paramss_ids;
             self.st.get_mut(tree.sym).private_within = mods_within;

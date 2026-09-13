@@ -5,8 +5,8 @@
 //! pickle crate depends on.
 
 use scala_rs_backend::pickle;
-use scala_rs_pickle::read::{read_pickle, tags, Entry};
-use scala_rs_pickle::sym::{class_sigs, render, MemberKind};
+use scala_rs_pickle::read::{pflags, read_pickle, tags, Entry};
+use scala_rs_pickle::sym::{class_sigs, render, MemberKind, SigType};
 
 #[test]
 fn tag_table_matches_the_writer() {
@@ -103,6 +103,102 @@ object Lib {
     assert!(seen_alias, "Lib.Alias ALIASsym not read back");
 }
 
+#[test]
+fn qualified_private_declarations_and_members_keep_private_within() {
+    let src = r#"
+package libp
+private[libp] class Qual
+private[libp] object Obj {
+  private[libp] def hidden: Int = 1
+}
+private[libp] trait Trait
+"#;
+    let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+    assert!(
+        !scala_rs_typer::has_errors(&diags),
+        "type errors: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    let mut found = std::collections::HashSet::new();
+    for raw in pickle::pickle_all(&st).values() {
+        let p = read_pickle(raw).expect("read qualified-private pickle");
+        // Exercise the backend's small reader too: the optional reference is
+        // between flags and info and must not be mistaken for the type info.
+        assert!(pickle::unpickle(raw).is_some(), "subset unpickle failed");
+        for entry in &p.entries {
+            let Some(info) = entry.sym_info() else {
+                continue;
+            };
+            let Some(name) = p.name(info.name) else {
+                continue;
+            };
+            if !matches!(name, "Qual" | "Obj" | "Trait" | "hidden") {
+                continue;
+            }
+            let within = info
+                .private_within
+                .expect("qualified declaration has privateWithin");
+            assert_eq!(p.sym_full_name(within).as_deref(), Some("libp"));
+            assert!(
+                !info.has(pflags::PRIVATE),
+                "nsc clears PRIVATE for private[p]"
+            );
+            found.insert(name.to_string());
+        }
+    }
+    assert_eq!(found.len(), 4, "qualified declarations/members: {found:?}");
+}
+
+#[test]
+fn pickle_inline_symannot_uses_scala_this_type() {
+    let src = r#"
+object Lib {
+  @inline def inlined: Int = 1
+}
+"#;
+    let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+    assert!(
+        !scala_rs_typer::has_errors(&diags),
+        "type errors: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+
+    let mut saw_inline = false;
+    let mut saw_empty_inline = false;
+    for raw in pickle::pickle_all(&st).values() {
+        let p = read_pickle(raw).expect("read inline pickle");
+        for entry in &p.entries {
+            let Entry::SymAnnot { annot, .. } = entry else {
+                continue;
+            };
+            let Some(Entry::TypeRefTpe { prefix, sym, .. }) = p.entry(annot.tpe) else {
+                continue;
+            };
+            if p.sym_name(*sym) != Some("inline") {
+                continue;
+            }
+            let owner = p
+                .sym_full_name(*sym)
+                .expect("inline annotation symbol has a full name");
+            if matches!(p.sym_owner(*sym), Some(owner) if p.sym_name(owner) == Some("<empty>")) {
+                saw_empty_inline = true;
+            }
+            if owner == "scala.inline"
+                && matches!(
+                    p.entry(*prefix),
+                    Some(Entry::ThisTpe(scala))
+                        if p.sym_full_name(*scala).as_deref() == Some("scala")
+                )
+            {
+                saw_inline = true;
+            }
+        }
+    }
+    assert!(saw_inline, "expected scala.inline with ThisType(scala)");
+    assert!(!saw_empty_inline, "must not emit <empty>.inline");
+}
+
 fn sigs_of(src: &str) -> Vec<scala_rs_pickle::ClassSig> {
     let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
     assert!(
@@ -116,6 +212,73 @@ fn sigs_of(src: &str) -> Vec<scala_rs_pickle::ClassSig> {
         out.extend(class_sigs(&p));
     }
     out
+}
+
+#[test]
+fn seq_alias_pickle_keeps_package_alias_identity() {
+    let jar = std::path::PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    if !jar.is_file() {
+        eprintln!("skip Seq pickle identity check: scala-library jar not obtainable");
+        return;
+    }
+    let src = r#"
+case class SeqRecord(owner: String, values: Seq[String])
+"#;
+    let opts = scala_rs_typer::TypecheckOptions {
+        library_abi: true,
+        binary_path: vec![jar],
+        ..scala_rs_typer::TypecheckOptions::default()
+    };
+    let (_t, st, diags) = scala_rs_typer::typecheck_str_opts(src, &opts);
+    assert!(
+        !scala_rs_typer::has_errors(&diags),
+        "type errors: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let mut sigs = Vec::new();
+    for raw in pickle::pickle_all(&st).values() {
+        let p = read_pickle(raw).expect("read SeqRecord pickle");
+        sigs.extend(class_sigs(&p));
+    }
+    let companion = sigs
+        .iter()
+        .find(|c| c.full_name == "SeqRecord" && c.is_module)
+        .expect("SeqRecord companion");
+    let apply = companion.member("apply").expect("SeqRecord.apply");
+    assert_eq!(
+        render(&apply.ty),
+        "(owner: java.lang.String, values: scala.package.Seq[java.lang.String])SeqRecord"
+    );
+    assert!(
+        companion.unresolved.is_empty(),
+        "SeqRecord companion had unresolved symbols: {:?}",
+        companion.unresolved
+    );
+}
+
+#[test]
+fn module_ref_pickle_uses_singleton_shape() {
+    let sigs = sigs_of(
+        r#"
+package modulepickle
+object Lib { val Alias = Predef }
+"#,
+    );
+    let lib = sigs
+        .iter()
+        .find(|sig| sig.full_name == "modulepickle.Lib" && sig.is_module)
+        .expect("Lib companion");
+    let alias = lib.member("Alias").expect("inferred Alias getter");
+    assert_eq!(
+        alias.ty,
+        SigType::Poly {
+            tparams: Vec::new(),
+            result: Box::new(SigType::Single {
+                prefix: Box::new(SigType::This("scala".into())),
+                sym: "scala.Predef".into(),
+            }),
+        }
+    );
 }
 
 #[test]

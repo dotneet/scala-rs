@@ -3566,7 +3566,16 @@ impl<'a> Parser<'a> {
                 can_apply = false;
                 self.parse_new()
             }
-            TokenKind::LBrace => self.parse_block_expr(),
+            // A bare block is an expression, not a callable value. Keep the
+            // `can_apply` bit false so adjacent blocks in a surrounding block
+            // remain separate statements (`{ a }\n{ b }`) instead of being
+            // parsed as a block argument application. A block following an
+            // identifier still uses the caller's `can_apply=true` path, so
+            // `f\n{ b }` remains the Scala block-argument form.
+            TokenKind::LBrace => {
+                can_apply = false;
+                self.parse_block_expr()
+            }
             TokenKind::LParen => self.parse_paren_expr(),
             TokenKind::This => {
                 let sp = self.span();

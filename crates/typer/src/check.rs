@@ -166,6 +166,9 @@ pub struct ClasspathMethod {
     pub access: u16,
     pub name: String,
     pub desc: String,
+    /// Generic JVM method signature, when present. The descriptor alone has
+    /// erased type arguments and is only the fallback representation.
+    pub signature: Option<String>,
 }
 
 /// An actual JVM field, distinct from a Scala accessor method.
@@ -221,6 +224,10 @@ pub struct ClasspathPickleMethod {
     pub name: String,
     pub param_names: Vec<String>,
     pub param_types: Vec<ClasspathType>,
+    /// Number of parameters in each source clause. The JVM method descriptor
+    /// is flat, but ScalaSignature retains nested `MethodType`s for curried
+    /// methods and the consumer must restore them before typing applications.
+    pub clause_sizes: Vec<usize>,
     /// Raw pickle flags for each value parameter, including DEFAULTPARAM.
     pub param_flags: Vec<u64>,
     pub ret: ClasspathType,

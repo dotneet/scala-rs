@@ -325,6 +325,22 @@ object Main {
     assert!(ok, "compile failed:\n{msgs}");
 }
 
+/// `ArraySeq.apply` is inherited through `EvidenceIterableFactory`. Its
+/// caller-facing evidence type is `ClassTag[A]`, but the declaring owner's
+/// type parameter erases to `Object` in the JVM descriptor.
+#[test]
+fn array_seq_apply_uses_the_declaring_owner_evidence_erasure() {
+    let src = r#"
+import scala.collection.immutable.ArraySeq
+object Main {
+  val inferred = ArraySeq(1, 2, 3)
+  val typed: ArraySeq[Int] = ArraySeq(1, 2, 3)
+}
+"#;
+    let (ok, msgs) = compile_src(src, "array-seq-apply");
+    assert!(ok, "compile failed:\n{msgs}");
+}
+
 /// `scala.#::` is overloaded. Taking the first alternative bound the tail of a
 /// `Stream` pattern at `LazyList`, which type-checked as far as the next call
 /// and then named a method the `Stream` does not have.

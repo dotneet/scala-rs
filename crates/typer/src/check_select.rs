@@ -132,10 +132,21 @@ impl Typer {
         // Scala declaration, including implicit clauses and bounds, even
         // when the shallow scan already installed a member with this name.
         if let Some(cls) = self.st.class_sym_of(&recv_ty) {
-            if self.st.pending_classpath_signatures.contains(&cls) {
+            let jvm = self.st.get(cls).jvm_name.clone();
+            // A Java class first encountered in another method's generic
+            // result is only an identity-preserving stub. Complete it before
+            // member/view lookup so conformance can see its interfaces. In
+            // particular `java.util.List[A]` must be known to implement
+            // `java.lang.Iterable[A]` for Twirl's imported
+            // `twirlJavaCollectionToScala` view to provide `.last`.
+            if self.st.pending_classpath_signatures.contains(&cls)
+                || (self.st.get(cls).flags.contains(Flags::JAVA)
+                    && (jvm.starts_with("java/") || jvm.starts_with("javax/")))
+            {
                 self.ensure_java_loaded(cls, tree.span);
             }
         }
+        self.settle_binary_parent_projections(&recv_ty, tree.span);
         // `xs #:: ys` on a `Stream`: `Stream.Deferrer` and the conversion that
         // reaches it can only be declared once `Stream` itself is in the
         // symbol table, which happens no earlier than here.
@@ -1526,8 +1537,86 @@ impl Typer {
             .iter()
             .copied()
             .filter(|&s| {
-                let origin = self.st.get(s).pickled_origin.as_str();
-                origin.is_empty() || seen.insert(origin)
+                let symbol = self.st.get(s);
+                let origin = symbol.pickled_origin.as_str();
+                if !origin.is_empty() {
+                    return seen.insert(origin);
+                }
+                // A class-file scan can leave the original generic declaration
+                // on its defining trait while completion installs the same
+                // declaration on the companion module with `pickled_origin`.
+                // They are one Scala member, but the former has no origin to
+                // participate in the ordinary origin-set collapse. Keep the
+                // pickle-derived copy: it carries the complete parameter
+                // clauses and is the symbol the call-site completion just
+                // repaired. Restrict this to non-prelude, descriptor-less
+                // declarations so a hand-written prelude member remains the
+                // authoritative source and a raw class-file forwarder is
+                // still handled by `drop_classfile_forwarders`.
+                if s.0 < self.st.prelude_end || !symbol.jvm_name.is_empty() {
+                    return true;
+                }
+                if symbol.kind != SymKind::Method {
+                    return true;
+                }
+                let Some((param_clause_shape, tparam_count)) = (match &symbol.ty {
+                    Type::Method { paramss, .. } => Some((
+                        paramss.iter().map(Vec::len).collect::<Vec<_>>(),
+                        symbol.tparams.len(),
+                    )),
+                    _ => None,
+                }) else {
+                    return true;
+                };
+                let shape = crate::pickle_supply::flat_erased_params(&self.st, &symbol.ty);
+                // The classpath source symbol may retain unresolved `Named`
+                // types for Java classes (`Config`, `ClassLoader`, ...), so
+                // its erasure has unknown slots while the pickle copy has the
+                // JVM descriptors. Unknown slots are compatible, but require
+                // one unique pickled origin: if two overloads have the same
+                // arity and all their unresolved slots, this source symbol
+                // cannot prove which one it represents and must stay.
+                let mut matching_origins = HashSet::new();
+                for &other in found.iter() {
+                    let other_symbol = self.st.get(other);
+                    if !other_symbol.pickled_origin.is_empty()
+                        && other_symbol.name == symbol.name
+                        && other_symbol.kind == SymKind::Method
+                        && other_symbol.tparams.len() == tparam_count
+                        && self.pickled_declaration_owner(other) == symbol.owner
+                    {
+                        let Some(other_clause_shape) = (match &other_symbol.ty {
+                            Type::Method { paramss, .. } => {
+                                Some(paramss.iter().map(Vec::len).collect::<Vec<_>>())
+                            }
+                            _ => None,
+                        }) else {
+                            continue;
+                        };
+                        let other_shape =
+                            crate::pickle_supply::flat_erased_params(&self.st, &other_symbol.ty);
+                        if shape.len() == other_shape.len()
+                            && param_clause_shape == other_clause_shape
+                            && shape
+                                .iter()
+                                .zip(other_shape.iter())
+                                .all(|(a, b)| match (a, b) {
+                                    (Some(a), Some(b)) => a == b,
+                                    // An unresolved source type can only stand
+                                    // for a reference slot. Never let it make
+                                    // a primitive overload look like its
+                                    // pickled sibling.
+                                    (None, Some(b)) | (Some(b), None) => {
+                                        b.starts_with('L') || b.starts_with('[')
+                                    }
+                                    (None, None) => true,
+                                })
+                        {
+                            matching_origins.insert(other_symbol.pickled_origin.as_str());
+                        }
+                    }
+                }
+                matching_origins.len() != 1
             })
             .collect()
     }
@@ -4239,5 +4328,112 @@ fn sig_head_class(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId
         | Type::Unit
         | Type::String => st.class_sym_of(ty),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod pickled_copy_tests {
+    use super::*;
+    use crate::check::{TypecheckOptions, Typer};
+    use crate::symbol::SymKind;
+    use scala_rs_parser::Flags;
+
+    fn method_ty(params: Vec<Type>) -> Type {
+        Type::Method {
+            paramss: vec![params],
+            ret: Box::new(Type::Int),
+        }
+    }
+
+    #[test]
+    fn unresolved_original_collapses_only_to_one_pickled_origin() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let base = typer.st.alloc(
+            "Base",
+            typer.st.root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "fixture/Base",
+        );
+        let module = typer.st.alloc(
+            "Thing$",
+            typer.st.root,
+            SymKind::ModuleClass,
+            Flags::MODULE,
+            "fixture/Thing$",
+        );
+        let config = typer.st.alloc(
+            "Config",
+            typer.st.root,
+            SymKind::Class,
+            Flags::EMPTY,
+            "fixture/Config",
+        );
+        // The classpath-only declaration cannot resolve Config by its simple
+        // name, while the pickle copy has the JVM class identity.
+        let unresolved = method_ty(vec![
+            Type::Named {
+                name: "Profile".into(),
+                args: vec![],
+            },
+            Type::String,
+            Type::Named {
+                name: "Config".into(),
+                args: vec![],
+            },
+            Type::String,
+        ]);
+        let precise = method_ty(vec![
+            Type::TypeParam(SymbolId(1)),
+            Type::String,
+            Type::Class {
+                sym: config,
+                args: vec![],
+            },
+            Type::String,
+        ]);
+        let genuine = method_ty(vec![
+            Type::TypeParam(SymbolId(1)),
+            Type::String,
+            Type::Int,
+            Type::String,
+        ]);
+        let raw = typer.st.alloc(
+            "f",
+            module,
+            SymKind::Method,
+            Flags::EMPTY,
+            "(Lfixture/Profile;Ljava/lang/String;Lfixture/Config;Ljava/lang/String;)I",
+        );
+        typer.st.get_mut(raw).ty = unresolved.clone();
+        let original = typer.st.alloc("f", base, SymKind::Method, Flags::EMPTY, "");
+        typer.st.get_mut(original).ty = unresolved;
+        let copy = typer
+            .st
+            .alloc("f", module, SymKind::Method, Flags::EMPTY, "");
+        typer.st.get_mut(copy).ty = precise.clone();
+        typer.st.get_mut(copy).pickled_origin =
+            "fixture.Base#f[None, Some(\"Ljava/lang/String;\"), Some(\"Lfixture/Config;\"), Some(\"Ljava/lang/String;\")]".into();
+        let same_copy = typer.st.alloc("f", base, SymKind::Method, Flags::EMPTY, "");
+        typer.st.get_mut(same_copy).ty = precise;
+        typer.st.get_mut(same_copy).pickled_origin = typer.st.get(copy).pickled_origin.clone();
+        let overload = typer
+            .st
+            .alloc("f", module, SymKind::Method, Flags::EMPTY, "");
+        typer.st.get_mut(overload).ty = genuine;
+        typer.st.get_mut(overload).pickled_origin =
+            "fixture.Base#f[None, Some(\"Ljava/lang/String;\"), Some(\"I\"), Some(\"Ljava/lang/String;\")]".into();
+        let collapsed =
+            typer.collapse_pickled_copies(vec![raw, copy, same_copy, original, overload]);
+        // The descriptor-less original is the one the classpath scan left
+        // behind. It is removed only because exactly one pickled origin is
+        // compatible with its known String slots; the distinct Int overload
+        // remains a real alternative.
+        assert!(collapsed.contains(&raw));
+        assert!(collapsed.contains(&copy));
+        assert!(collapsed.contains(&overload));
+        assert!(!collapsed.contains(&same_copy));
+        assert!(!collapsed.contains(&original));
+        assert_eq!(collapsed.len(), 3);
     }
 }

@@ -369,6 +369,33 @@ impl ClassSig {
 // Building signatures out of a parsed pickle
 // ---------------------------------------------------------------------------
 
+/// Whether `full_name` has only a module-class `ClassSym` in this pickle.
+///
+/// Scala 2 puts both the ordinary class and its companion object's module
+/// class under the same dotted name (`List` is the common example). A
+/// static-forwarder class such as `TailCalls.class` instead carries only the
+/// module-class entry. Callers that need just this identity distinction should
+/// use this entry-level scan rather than [`class_sigs`], which reconstructs
+/// every class's type parameters, parents, members, annotations, and children.
+pub fn is_object_only_class(p: &Pickle, full_name: &str) -> bool {
+    let mut has_module = false;
+    let mut has_class = false;
+    for (i, entry) in p.entries.iter().enumerate() {
+        let Entry::ClassSym { info, .. } = entry else {
+            continue;
+        };
+        if p.sym_full_name(i as Idx).as_deref() != Some(full_name) {
+            continue;
+        }
+        if info.has(pflags::MODULE) {
+            has_module = true;
+        } else {
+            has_class = true;
+        }
+    }
+    has_module && !has_class
+}
+
 /// Every class and module class in a pickle, in entry order.
 pub fn class_sigs(p: &Pickle) -> Vec<ClassSig> {
     let mut owners: HashMap<Idx, Vec<Idx>> = HashMap::new();

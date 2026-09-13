@@ -99,6 +99,72 @@ fn run_main(cp: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// A ScalaSignature on a scala-rs module class makes its implicit vals visible
+/// once during the eager directory classpath scan and again when the companion
+/// pickle is supplied on demand. The eager term must be replaced by the
+/// precise pickled method, not left beside it.
+#[test]
+fn rs_implicit_val_directory_classpath_is_not_duplicated() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip implicit val: needs the scala-library jar");
+        return;
+    };
+    if !java_available() {
+        return;
+    }
+    let lib_src = fixtures_dir().join("implicit_val_lib.scala");
+    let app_src = fixtures_dir().join("implicit_val_app.scala");
+    let lib = tmp_dir("implicit-val-lib");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            lib_src.to_str().unwrap(),
+            "-d",
+            lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs library compile");
+    assert!(
+        output.status.success(),
+        "scala-rs could not compile implicit_val_lib.scala:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let app = tmp_dir("implicit-val-app");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            app_src.to_str().unwrap(),
+            "-d",
+            app.to_str().unwrap(),
+            "-cp",
+            lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs application compile");
+    assert!(
+        output.status.success(),
+        "scala-rs duplicated the implicit val when reading a directory classpath:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let result = run_main(&format!(
+        "{}:{}:{}",
+        lib.display(),
+        app.display(),
+        jar.display()
+    ));
+    assert_eq!(result, "ok\n");
+    let _ = fs::remove_dir_all(lib);
+    let _ = fs::remove_dir_all(app);
+}
+
 /// scalac compiles `ic_lib.scala`; both compilers then take `ic_app.scala`
 /// against those class files, and the two programs print the same thing.
 #[test]
@@ -179,4 +245,85 @@ fn ic_app_matches_scalac() {
     for d in [lib, nsc_app, rs_app] {
         let _ = fs::remove_dir_all(d);
     }
+}
+
+/// A classfile accessor inherited from a classpath trait carries its exact
+/// JVM return type only in the method descriptor. The eager classpath scan
+/// must retain that identity as a loadable class symbol when the type is not
+/// visible by simple name; otherwise a later selection sees an inert
+/// `Type::Named` and cannot load the external API's members.
+#[test]
+fn classpath_descriptor_accessor_loads_external_members() {
+    let (Some(jar), Some(scalac_bin)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip classpath descriptor: needs scala-library and scalac 2.13.16");
+        return;
+    };
+    if !java_available() {
+        return;
+    }
+
+    let api_src = fixtures_dir().join("classpath_descriptor_api.scala");
+    let holder_src = fixtures_dir().join("classpath_descriptor_holder.scala");
+    let app_src = fixtures_dir().join("classpath_descriptor_app.scala");
+
+    // The API is nsc-produced and packaged separately, as it is in the
+    // original minimal reproduction. Its package is intentionally not open
+    // in the consumer, so simple-name lookup cannot resolve `Api`.
+    let api_jar = tmp_dir("descriptor-api").with_extension("jar");
+    run_scalac(
+        &scalac_bin,
+        &["-d", api_jar.to_str().unwrap(), api_src.to_str().unwrap()],
+    );
+
+    // Compile the accessor-bearing library with scala-rs. The raw
+    // `Base.api(): Ldescriptor/Api;` descriptor is the path under test.
+    let holder = tmp_dir("descriptor-holder");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            holder_src.to_str().unwrap(),
+            "-d",
+            holder.to_str().unwrap(),
+            "-cp",
+            api_jar.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs holder compile");
+    assert!(
+        output.status.success(),
+        "scala-rs could not compile the descriptor holder:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // Reading the holder directory is the regression: `Holder.api` must be a
+    // class-symbol-backed `descriptor.Api`, so the consumer can select
+    // `feature` from the external classpath jar.
+    let app = tmp_dir("descriptor-app");
+    let cp = format!("{}:{}", holder.display(), api_jar.display());
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            app_src.to_str().unwrap(),
+            "-d",
+            app.to_str().unwrap(),
+            "-cp",
+            &cp,
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs descriptor app compile");
+    assert!(
+        output.status.success(),
+        "scala-rs could not select a member from the external descriptor type:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let _ = fs::remove_file(api_jar);
+    let _ = fs::remove_dir_all(holder);
+    let _ = fs::remove_dir_all(app);
 }

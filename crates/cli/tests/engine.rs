@@ -236,6 +236,152 @@ fn eg_macros_expand_and_run() {
     let _ = fs::remove_dir_all(&uses);
 }
 
+/// An implicit source clause must stay a distinct `argss` entry after the
+/// typer fills it. This is the shape ScalaTest's `assert` macro uses.
+#[test]
+fn curried_implicit_macro_preserves_argument_clauses() {
+    if !prerequisites("macro_curried_use") {
+        return;
+    }
+    let impls = tmp_dir("macro_curried_impl");
+    let uses = tmp_dir("macro_curried_use");
+
+    let out = compile("macro_curried_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile macro_curried_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("macro_curried_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile macro_curried_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        scala_reflect_jar().unwrap().display(),
+        scala_library_jar().unwrap().display()
+    );
+    assert_eq!(run_main(&cp, "macro_curried_use"), "7\n");
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// `Context.literal` is the first Context member reached by ScalaTest's
+/// assertion implementation once its two argument clauses are transported.
+/// Exercise both scalar overloads without making this test depend on
+/// ScalaTest's published jars.
+#[test]
+fn context_literal_builds_boolean_and_string_exprs() {
+    if !prerequisites("macro_literal_use") {
+        return;
+    }
+    let impls = tmp_dir("macro_literal_impl");
+    let uses = tmp_dir("macro_literal_use");
+
+    let out = compile("macro_literal_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile macro_literal_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("macro_literal_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile macro_literal_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        scala_reflect_jar().unwrap().display(),
+        scala_library_jar().unwrap().display()
+    );
+    assert_eq!(run_main(&cp, "macro_literal_use"), "true\nok\n");
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// ScalaTest delegates its assertion expansion through scalactic's
+/// `MacroOwnerRepair`, which casts the public macro Context to nsc's private
+/// implementation.  scala-rs retypes returned trees at the call site, so its
+/// bridge bypasses that nsc-only repair while retaining the generated tree.
+#[test]
+fn scalatest_owner_repair_is_bypassed() {
+    if !prerequisites("scalatest_owner_use") {
+        return;
+    }
+    let impls = tmp_dir("scalatest_owner_impl");
+    let uses = tmp_dir("scalatest_owner_use");
+
+    let out = compile("scalatest_owner_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile scalatest_owner_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("scalatest_owner_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile scalatest_owner_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        scala_reflect_jar().unwrap().display(),
+        scala_library_jar().unwrap().display()
+    );
+    assert_eq!(run_main(&cp, "scalatest_owner_use"), "7\n7\n3\n3\n11\n2\n");
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
+/// A class compiled in the macro implementation run is binary to the use
+/// run.  Passing a member selected from a local value through a ScalaTest-like
+/// macro must preserve both source symbols while the macro inspects and
+/// untypechecks its argument tree.
+#[test]
+fn scalatest_binary_local_member_survives_retype() {
+    if !prerequisites("scalatest_binary_local_use") {
+        return;
+    }
+    let impls = tmp_dir("scalatest_binary_local_impl");
+    let uses = tmp_dir("scalatest_binary_local_use");
+
+    let out = compile("scalatest_binary_local_impl", &impls, &[]);
+    assert!(
+        out.status.success(),
+        "compile scalatest_binary_local_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile("scalatest_binary_local_use", &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile scalatest_binary_local_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        scala_reflect_jar().unwrap().display(),
+        scala_library_jar().unwrap().display()
+    );
+    assert_eq!(run_main(&cp, "scalatest_binary_local_use"), "7\n");
+    let _ = fs::remove_dir_all(&impls);
+    let _ = fs::remove_dir_all(&uses);
+}
+
 /// Two compiler processes may populate the same engine cache concurrently.
 /// The cache must expose either the old complete class or the new complete
 /// class, never a source directory whose class file is still being written.

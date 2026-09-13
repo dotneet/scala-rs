@@ -575,7 +575,7 @@ impl Typer {
 fn answer_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     let start = out.len();
     answer_tree_to_wire_body(cx, t, out)?;
-    super::expand::mirror_tree_identity(t, start, out);
+    super::expand::mirror_tree_identity(cx.st, t, start, out);
     Ok(())
 }
 

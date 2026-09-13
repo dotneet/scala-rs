@@ -498,6 +498,13 @@ pub struct Symbol {
     pub kind: SymKind,
     pub flags: Flags,
     pub ty: Type,
+    /// Source-declared type retained only for ScalaSignature pickling.
+    ///
+    /// Type aliases are expanded in `ty` for semantic typing, but nsc keeps a
+    /// parameterized alias application in a member's pickled signature. This
+    /// is populated only for source declarations whose written type can be
+    /// recovered safely; generated members leave it empty and use `ty`.
+    pub pickle_ty: Option<Type>,
     pub members: Vec<SymbolId>,
     pub jvm_name: String,
     /// Verified hidden enclosing-instance descriptor from a binary constructor.
@@ -1419,6 +1426,7 @@ impl SymbolTable {
                 kind: SymKind::NoSymbol,
                 flags: Flags::EMPTY,
                 ty: Type::NoType,
+                pickle_ty: None,
                 members: vec![],
                 jvm_name: String::new(),
                 binary_outer_desc: None,
@@ -1558,6 +1566,7 @@ impl SymbolTable {
             kind,
             flags,
             ty: Type::NoType,
+            pickle_ty: None,
             members: vec![],
             jvm_name: jvm_name.into(),
             binary_outer_desc: None,

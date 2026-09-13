@@ -435,7 +435,24 @@ impl<'a> Lifter<'a> {
         let orig = self.st.get(id).name.clone();
         let new_name = format!("{}${}", orig, self.gensym);
         self.st.get_mut(id).name = new_name.clone();
-        let flags = self.st.get(id).flags.with(Flags::SYNTHETIC);
+        // A method-local definition lifted from a trait body is an
+        // implementation detail of that trait. nsc emits its `loop$N`-style
+        // helpers as private interface methods; leaving the lifted symbol
+        // public turns two unrelated helpers with the same erased signature
+        // into an inherited name clash (for example Applicative/SemigroupK).
+        // Preserve the local marker so the backend can route calls to its
+        // private trait-helper ABI. Class-local helpers remain unchanged.
+        let trait_local = self.st.get(class_id).flags.contains(Flags::TRAIT);
+        let flags = if trait_local {
+            self.st
+                .get(id)
+                .flags
+                .with(Flags::SYNTHETIC)
+                .with(Flags::PRIVATE)
+                .with(Flags::LOCAL)
+        } else {
+            self.st.get(id).flags.with(Flags::SYNTHETIC)
+        };
         self.st.get_mut(id).flags = flags;
 
         let cap_tys: Vec<Type> = caps.iter().map(|c| self.st.get(*c).ty.clone()).collect();
@@ -449,7 +466,14 @@ impl<'a> Lifter<'a> {
         } = &mut def.kind
         {
             *name = new_name;
-            mods.flags = mods.flags.with(Flags::SYNTHETIC);
+            mods.flags = if trait_local {
+                mods.flags
+                    .with(Flags::SYNTHETIC)
+                    .with(Flags::PRIVATE)
+                    .with(Flags::LOCAL)
+            } else {
+                mods.flags.with(Flags::SYNTHETIC)
+            };
             let mut cap_vals = Vec::new();
             for (i, &cid) in caps.iter().enumerate() {
                 let mut vd = Tree::dummy(TreeKind::ValDef {

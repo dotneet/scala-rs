@@ -13,7 +13,49 @@ use crate::symbol::SymKind;
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
+// `tree_to_type` deliberately expands a parameterized alias before returning
+// its semantic type. Keep the written application around only while a member
+// signature is being checked so the backend can reproduce nsc's pickle. This
+// stack (rather than a Typer field) also handles a lazy signature completion
+// nested inside another signature without changing the shared checker state.
+thread_local! {
+    static PICKLE_ALIAS_CAPTURE: std::cell::RefCell<Vec<Option<Type>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Typer {
+    pub(crate) fn begin_pickle_alias_capture(&self) {
+        PICKLE_ALIAS_CAPTURE.with(|capture| capture.borrow_mut().push(None));
+    }
+
+    pub(crate) fn finish_pickle_alias_capture(&self) -> Option<Type> {
+        PICKLE_ALIAS_CAPTURE.with(|capture| capture.borrow_mut().pop().flatten())
+    }
+
+    /// Remember the first parameterized source alias reached in the current
+    /// written signature. A nested alias is intentionally left to the safe
+    /// semantic fallback unless the caller can prove it is the whole type.
+    fn capture_pickle_alias_application(&self, applied: &Type) {
+        let Type::Applied { ctor, args } = applied else {
+            return;
+        };
+        let Type::TypeMember(sym) = ctor.as_ref() else {
+            return;
+        };
+        let alias = self.st.get(*sym);
+        if args.is_empty() || !alias.is_type_alias || alias.tparams.is_empty() {
+            return;
+        }
+        PICKLE_ALIAS_CAPTURE.with(|capture| {
+            let mut capture = capture.borrow_mut();
+            if let Some(slot) = capture.last_mut() {
+                if slot.is_none() {
+                    *slot = Some(applied.clone());
+                }
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ namer
     pub(crate) fn namer(&mut self, tree: &mut Tree) {
         match &mut tree.kind {
@@ -816,6 +858,7 @@ impl Typer {
             }
         }
         let applied = crate::symbol::apply_type_ctor(ctor, args);
+        self.capture_pickle_alias_application(&applied);
         let before_bounds = self.diags.len();
         match &applied {
             Type::Class { sym, args } => self.check_written_type_bounds(*sym, args, span),

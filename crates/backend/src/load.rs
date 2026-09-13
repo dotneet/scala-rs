@@ -10,6 +10,10 @@ pub struct LoadedMethod {
     pub access: u16,
     pub name: String,
     pub desc: String,
+    /// Generic JVM method signature, when the classfile carries one. The
+    /// descriptor is erased, so retaining this is what lets a separate
+    /// consumer see (for example) `TableQuery[User]` rather than `TableQuery[E]`.
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,14 +99,15 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
         let desc_i = c.u2()?;
         let name = cp.utf8(name_i)?;
         let desc = cp.utf8(desc_i)?;
+        let signature = method_signature(&mut c, &cp)?;
         if name != "<init>" && name != "<clinit>" {
             methods.push(LoadedMethod {
                 access,
                 name: decode_method_name(&name),
                 desc,
+                signature,
             });
         }
-        skip_attrs(&mut c)?;
     }
     let nattrs = c.u2()? as usize;
     let mut pickle = None;
@@ -125,6 +130,27 @@ fn parse_classfile(bytes: &[u8]) -> Option<LoadedClass> {
         super_name,
         interfaces,
     })
+}
+
+/// Read just the optional generic signature from a method's attributes.
+///
+/// `skip_attrs` is intentionally lossless for the pickle reader, but the
+/// classpath typer also needs the method's generic return type. Keep this
+/// parser local to the lightweight loader so the shared classfile substrate
+/// remains unchanged.
+fn method_signature(c: &mut Cursor<'_>, cp: &Cp) -> Option<Option<String>> {
+    let nattrs = c.u2()? as usize;
+    let mut signature = None;
+    for _ in 0..nattrs {
+        let name_i = c.u2()?;
+        let len = c.u4()? as usize;
+        let body = c.bytes(len)?;
+        if cp.utf8(name_i).as_deref() == Some("Signature") && len == 2 {
+            let mut body_cursor = Cursor::new(body);
+            signature = cp.utf8(body_cursor.u2()?);
+        }
+    }
+    Some(signature)
 }
 
 fn parse_scala_signature(body: &[u8], cp: &Cp) -> Option<PickledClass> {

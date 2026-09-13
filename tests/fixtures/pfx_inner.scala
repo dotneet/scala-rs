@@ -110,6 +110,20 @@ class SB[F[_]] {
   class SB2[A, Z](a: F[A], z: F[Z]) { def both: (F[A], F[Z]) = (a, z) }
 }
 
+// A parameterless getter returning an inner callable class keeps an
+// as-seen-from prefix view. Implicit `.apply` insertion must inspect the core
+// class without discarding that view from the actual receiver.
+class CallableOuter {
+  var seen = 0
+  class Word { def apply(s: String)(body: => Any): Unit = { seen += 1; body } }
+  def word: Word = new Word
+  def check(): Int = {
+    word("a") {}
+    word("b") {}
+    seen
+  }
+}
+
 object Main {
   def mkSB[F[_], A, B](fa: F[A], fb: F[B]): SB[F]#SB2[A, B] = new SB[F] |@| fa |@| fb
   def useIn(o: Outer[String])(i: o.In): String = i.get
@@ -163,5 +177,6 @@ object Main {
     println(impl.run(2, "abc") + impl.k)
     val (fa, fb) = mkSB(Option(1), Option("s")).both
     println(fa.get + fb.get.length)
+    println(new CallableOuter().check())
   }
 }

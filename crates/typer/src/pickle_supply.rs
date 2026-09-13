@@ -120,10 +120,23 @@ pub struct PickleSupply {
     adopted: HashSet<u32>,
     /// Classes [`PickleSupply::supply_implicit_members`] has already served.
     implicits_supplied: HashSet<u32>,
+    /// `(class, selected member)` pairs whose relevant implicit conversions
+    /// have already been inspected for an extension search. The conversion
+    /// declaration has a different name from the selected member (`when` is
+    /// supplied by `convertToWordSpecStringWrapper`), so this cache belongs
+    /// beside the pickle lookup rather than the ordinary member-name cache.
+    implicit_extensions_checked: HashSet<(u32, String)>,
     /// What [`PickleSupply::implicit_member_names`] answered for each class.
     implicit_names: HashMap<u32, Vec<String>>,
     /// What [`PickleSupply::concrete_method_names`] answered for each class.
     concrete_names: HashMap<u32, Vec<String>>,
+    /// The declaration-side stable prefix attached to a pickled value/method
+    /// result. A Scala pickle cannot put `C.this` in the `SigType` of a
+    /// method result, so `BasicProfile.API#Database` stores the type as
+    /// `BasicBackend.DatabaseFactory` and carries
+    /// `BasicProfile.this.backend` here. The prefix must survive installation
+    /// until member selection can map it to the concrete receiver.
+    result_prefixes: HashMap<SymbolId, SigType>,
     /// What [`PickleSupply::complete_type_member`] answered for each
     /// `(class, name)`, so a miss costs one pickle walk and a hit stays
     /// stable. A memo of the *answer*, not just of having asked: a nullary
@@ -175,6 +188,14 @@ pub struct PickledTParam {
 impl PickleSupply {
     pub fn new() -> Self {
         PickleSupply::default()
+    }
+
+    /// Declaration-side outer path recorded for an installed pickled member.
+    /// The typer uses it to rebind a result such as
+    /// `BasicProfile.this.backend.DatabaseFactory` to the concrete profile
+    /// that supplied the selected API.
+    pub(crate) fn result_prefix_for(&self, member: SymbolId) -> Option<&SigType> {
+        self.result_prefixes.get(&member)
     }
 
     /// Try to install `name` on `class_sym` from the library pickles.
@@ -329,32 +350,49 @@ impl PickleSupply {
         bin: &mut BinaryIndex,
         po_full: &str,
     ) -> Result<Vec<PickledAlias>, String> {
-        let sig = {
-            let mut src = BinSource(bin);
-            self.sigs
-                .class_sig(&mut src, po_full, true)
-                .map_err(|e| e.to_string())?
-        };
+        // A package object can inherit exported aliases from a parent class:
+        // cats' `package object data extends ScalaVersionSpecificPackage`
+        // obtains `type NonEmptyLazyList[+A] = ...` this way.  `ClassSig` keeps
+        // only direct members, so reading just `package$` loses the alias even
+        // though its pickle is present on the parent.  Walk the same
+        // linearization used by ordinary member completion and apply each
+        // parent-to-child substitution before exposing the declaration.
+        let mut src = BinSource(bin);
+        self.sigs
+            .class_sig(&mut src, po_full, true)
+            .map_err(|e| e.to_string())?;
+        let mut errs = Vec::new();
+        let linearization = self.sigs.linearization(&mut src, po_full, true, &mut errs);
         let mut out = Vec::new();
-        for m in &sig.members {
-            if m.kind != MemberKind::TypeAlias || !m.is_public_api() {
+        let mut seen = HashSet::new();
+        for step in linearization {
+            let Ok(sig) = self.sigs.class_sig(&mut src, &step.class_name, step.module) else {
                 continue;
-            }
-            let (tps, rhs) = match &m.ty {
-                SigType::Poly { tparams, result } => (tparams.as_slice(), (**result).clone()),
-                other => (&[][..], other.clone()),
             };
-            out.push(PickledAlias {
-                name: m.name.clone(),
-                tparams: tps
-                    .iter()
-                    .map(|tp| PickledTParam {
-                        name: tp.name.clone(),
-                        arity: tparam_arity(tp),
-                    })
-                    .collect(),
-                rhs,
-            });
+            for m in &sig.members {
+                if m.kind != MemberKind::TypeAlias
+                    || !m.is_public_api()
+                    || !seen.insert(m.name.clone())
+                {
+                    continue;
+                }
+                let ty = scala_rs_pickle::sym::apply_subst(&m.ty, &step.subst);
+                let (tps, rhs) = match ty {
+                    SigType::Poly { tparams, result } => (tparams, *result),
+                    other => (Vec::new(), other),
+                };
+                out.push(PickledAlias {
+                    name: m.name.clone(),
+                    tparams: tps
+                        .iter()
+                        .map(|tp| PickledTParam {
+                            name: tp.name.clone(),
+                            arity: tparam_arity(tp),
+                        })
+                        .collect(),
+                    rhs,
+                });
+            }
         }
         Ok(out)
     }
@@ -531,6 +569,20 @@ impl PickleSupply {
                 names.push(src_name);
             }
         }
+        // A companion module's classfile may carry an erased `apply` forwarder
+        // for an inherited factory method even though the module's own pickle
+        // has no `apply` member. Read that name through the pickle now, so the
+        // erased forwarder cannot make an untyped varargs call enter the
+        // tupled-application retry before the inherited method is visible.
+        if is_module
+            && !names.iter().any(|name| name == "apply")
+            && st.get(class_sym).members.iter().any(|&member| {
+                let symbol = st.get(member);
+                symbol.kind == SymKind::Method && symbol.name == "apply"
+            })
+        {
+            names.push("apply".to_string());
+        }
         for name in names {
             // What the classfile reader put there, so it can be dropped once
             // the pickle has supplied something better.
@@ -541,18 +593,127 @@ impl PickleSupply {
                 .copied()
                 .filter(|&m| {
                     let s = st.get(m);
-                    s.kind == SymKind::Method && s.name == name
+                    s.name == name
+                        && (s.kind == SymKind::Method
+                            // The eager classpath reader represents a Scala
+                            // `val` accessor as a Term because the pickle
+                            // subset marks the declaration as a value.  The
+                            // full ScalaSignature later exposes that same
+                            // accessor as a zero-argument Method.  Keep the
+                            // prelude and source declarations intact, but
+                            // remove this origin-less classpath Term when the
+                            // richer pickled Method replaces it.
+                            || (s.kind == SymKind::Term
+                                && s.pickled_origin.is_empty()
+                                && m.0 >= st.prelude_end
+                                && m.0 < st.source_start))
                 })
                 .collect();
             let installed = self.complete_named(st, bin, class_sym, &name, false);
             if installed.is_empty() {
                 continue;
             }
+            // Scala 2's `Foo.class` static-forwarder view carries the full
+            // pickle for the module, but the pickle itself describes the
+            // source member as an instance method of `Foo$`. Preserve the
+            // bytecode declaration's STATIC bit when replacing the stale
+            // classfile member with that richer signature. Otherwise the
+            // typer finds the right method but codegen emits
+            // `Foo$.MODULE$.method`, even though the receiver selected the
+            // forwarder as `Foo.method`.
+            for &new_id in &installed {
+                let jvm = st.get(new_id).jvm_name.clone();
+                let forwarder = stale.iter().any(|&old_id| {
+                    let old = st.get(old_id);
+                    old.name == name && old.jvm_name == jvm && old.flags.contains(Flags::STATIC)
+                });
+                if forwarder {
+                    st.get_mut(new_id).flags =
+                        st.get(new_id).flags.with(Flags::STATIC).with(Flags::JAVA);
+                }
+            }
             drop_stale_members(st, class_sym, &stale, &installed);
         }
         self.drop_flattened_forwarders(st, bin, class_sym, &sig);
+        self.drop_generic_mixin_forwarders(st, bin, class_sym, &sig);
         self.settle_overriding_type_aliases(st, bin, class_sym, &sig, &full, is_module);
         true
+    }
+
+    /// Drop generic JVM forwarders of methods inherited by a nested
+    /// package-object module when its own Scala pickle is available.
+    ///
+    /// scala-rs emits an enclosing `ScalaSignature` on `package$child$`, while
+    /// its classfile also contains concrete mixin forwarders. The latter only
+    /// carry JVM generic signatures and can lose source precision: Cats'
+    /// `option.none[A]: Option[A]` was read back as raw `Option`, and the
+    /// direct forwarder then shadowed the precise `OptionSyntax#none` member.
+    /// A method absent from the module's own pickle but present in a pickled
+    /// parent is a forwarder, not a source override. Replace only generic
+    /// methods of that exact self-output shape; top-level modules (including
+    /// pos/t5639's monomorphic `Baz`) are untouched.
+    fn drop_generic_mixin_forwarders(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        sig: &scala_rs_pickle::sym::ClassSig,
+    ) {
+        let jvm = st.get(class_sym).jvm_name.clone();
+        let nested_package_module = st.get(class_sym).kind == SymKind::ModuleClass
+            && jvm
+                .rsplit('/')
+                .next()
+                .is_some_and(|n| n.starts_with("package$") && n.ends_with('$'));
+        if !nested_package_module {
+            return;
+        }
+        let own: Vec<String> = sig
+            .members
+            .iter()
+            .map(|m| scala_rs_pickle::names::decode_method_name(&m.name))
+            .collect();
+        let mut names = Vec::new();
+        for &m in &st.get(class_sym).members {
+            let s = st.get(m);
+            if s.kind == SymKind::Method
+                && !s.flags.contains(Flags::STATIC)
+                && !s.name.contains('$')
+                && !own.contains(&s.name)
+                && !names.contains(&s.name)
+            {
+                names.push(s.name.clone());
+            }
+        }
+        for name in names {
+            let stale: Vec<SymbolId> = st
+                .get(class_sym)
+                .members
+                .iter()
+                .copied()
+                .filter(|&m| {
+                    let s = st.get(m);
+                    s.kind == SymKind::Method && s.name == name && !s.flags.contains(Flags::STATIC)
+                })
+                .collect();
+            let installed = self.complete_named(st, bin, class_sym, &name, false);
+            if installed.is_empty() || !installed.iter().any(|&m| !st.get(m).tparams.is_empty()) {
+                continue;
+            }
+            let arities: Vec<usize> = installed.iter().map(|&m| st.get(m).params.len()).collect();
+            let stale: Vec<SymbolId> = stale
+                .into_iter()
+                .filter(|&m| arities.contains(&st.get(m).params.len()))
+                .collect();
+            if stale.is_empty() {
+                continue;
+            }
+            trace(format_args!(
+                "{jvm}#{name}: dropping {} generic mixin forwarder(s)",
+                stale.len()
+            ));
+            drop_stale_members(st, class_sym, &stale, &installed);
+        }
     }
 
     /// Drop a class file's *mixin forwarder* where the trait that really
@@ -854,7 +1015,12 @@ impl PickleSupply {
                 .copied()
                 .filter(|&m| {
                     let s = st.get(m);
-                    s.kind == SymKind::Method && s.name == name
+                    s.name == name
+                        && (s.kind == SymKind::Method
+                            || (s.kind == SymKind::Term
+                                && s.flags.contains(Flags::IMPLICIT)
+                                && s.pickled_origin.is_empty()
+                                && m.0 < st.source_start))
                 })
                 .collect();
             let installed = self.complete_named(st, bin, class_sym, &name, false);
@@ -873,6 +1039,183 @@ impl PickleSupply {
         }
         trace(format_args!("{full}: supplied {n} implicit member(s)"));
         n
+    }
+
+    /// Supply only the implicit declarations on `class_sym` whose result can
+    /// provide `member_name` as an extension.
+    ///
+    /// A classpath class's Scala implicit members are not necessarily present
+    /// in the shallow classpath scan.  This is especially visible for a
+    /// `WordSpec`: `"name" when { ... }` is backed by the implicit conversion
+    /// `convertToWordSpecStringWrapper`, whose declaration is in a pickled
+    /// parent, while the JVM mixin forwarder has no implicit flag.  The normal
+    /// extension search cannot discover that declaration until it has been
+    /// installed on the inherited class symbol.
+    ///
+    /// The selected member name is not the conversion method name, so asking
+    /// `complete_named` for `member_name` would be wrong.  Instead inspect the
+    /// result class of each own implicit declaration and complete just the
+    /// conversions whose result pickle declares the requested member.  When a
+    /// result cannot be inspected, retain the declaration conservatively: the
+    /// classfile may be the only description of that result type.
+    pub(crate) fn supply_implicit_extensions_for(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+        member_name: &str,
+    ) -> usize {
+        if class_sym.is_none()
+            || member_name.is_empty()
+            || !st.get(class_sym).is_class_like()
+            || !self.pickle_readable(st, class_sym)
+        {
+            return 0;
+        }
+        if !self
+            .implicit_extensions_checked
+            .insert((class_sym.0, member_name.to_string()))
+        {
+            return 0;
+        }
+        let Some(sig) = self.class_sig_of(st, bin, class_sym) else {
+            return 0;
+        };
+        let encoded = scala_rs_pickle::names::encode_method_name(member_name);
+        let internal = st.get(class_sym).jvm_name.clone();
+        let mut names = Vec::new();
+        for member in &sig.members {
+            if !matches!(member.kind, MemberKind::Def | MemberKind::Module)
+                || !member.has(pflags::IMPLICIT)
+                || (!member.is_public_api() && !implicit_class_conversion_from(&internal, member))
+            {
+                continue;
+            }
+            let source_name = scala_rs_pickle::names::decode_method_name(&member.name);
+            if source_name.is_empty() || source_name == "<init>" || source_name.contains('$') {
+                continue;
+            }
+            let relevant = match sig_result_class_name(&member.ty) {
+                Some(result) => self
+                    .pickled_result_has_member(bin, result, &encoded)
+                    .unwrap_or(true),
+                None => true,
+            };
+            if relevant && !names.contains(&source_name) {
+                names.push(source_name);
+            }
+        }
+        // A Scala trait's concrete implicit conversion is emitted into the
+        // implementing class as an ordinary one-argument JVM forwarder. It
+        // is not in the class's own pickle, so `adopt_binary_class` cannot
+        // replace it with a pickled declaration, and the forwarder would then
+        // shadow the inherited implicit by name in `implicits_in_scope`.
+        // Promote only a same-named Java forwarder when the parent pickle has
+        // the relevant implicit conversion. This keeps the classfile method
+        // (and its bytecode descriptor) while restoring the source-level
+        // implicit flag; unrelated ordinary members remain untouched.
+        let own_names: HashSet<String> = sig
+            .members
+            .iter()
+            .map(|m| scala_rs_pickle::names::decode_method_name(&m.name))
+            .collect();
+        let mut parent_work: Vec<String> = sig
+            .parents
+            .iter()
+            .filter_map(sig_parent_class_name)
+            .collect();
+        let mut parent_seen = HashSet::new();
+        let mut promoted = 0;
+        while let Some(parent) = parent_work.pop() {
+            if !parent_seen.insert(parent.clone()) {
+                continue;
+            }
+            let Ok(parent_sig) = ({
+                let mut src = BinSource(bin);
+                self.sigs.class_sig(&mut src, &parent, false)
+            }) else {
+                continue;
+            };
+            for member in &parent_sig.members {
+                if !matches!(member.kind, MemberKind::Def | MemberKind::Module)
+                    || !member.has(pflags::IMPLICIT)
+                {
+                    continue;
+                }
+                let source_name = scala_rs_pickle::names::decode_method_name(&member.name);
+                if source_name.is_empty()
+                    || source_name == "<init>"
+                    || source_name.contains('$')
+                    || own_names.contains(&source_name)
+                {
+                    continue;
+                }
+                let relevant = match sig_result_class_name(&member.ty) {
+                    Some(result) => self
+                        .pickled_result_has_member(bin, result, &encoded)
+                        .unwrap_or(true),
+                    None => true,
+                };
+                let forwarders: Vec<SymbolId> = st
+                    .get(class_sym)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        let symbol = st.get(id);
+                        symbol.owner == class_sym
+                            && symbol.kind == SymKind::Method
+                            && symbol.name == source_name
+                            && symbol.flags.contains(Flags::JAVA)
+                            && !symbol.flags.contains(Flags::IMPLICIT)
+                    })
+                    .collect();
+                let has_forwarder = !forwarders.is_empty();
+                for id in forwarders {
+                    st.get_mut(id).flags = st.get(id).flags.with(Flags::IMPLICIT);
+                    promoted += 1;
+                }
+                // A matching concrete forwarder already has the bytecode
+                // descriptor needed by the receiver, so do not install a
+                // second pickled copy on top of it. Without this guard the
+                // direct forwarder and the inherited declaration become
+                // duplicate candidates. If no forwarder exists, materialize
+                // only conversions relevant to the selected extension name.
+                // `enter_inherited_members` normally exposes the parent
+                // declaration in the template scope already.  Materializing
+                // a second copy on the child in that case would make
+                // `shadow_inherited_implicits` treat the copy as a nearer
+                // override and discard the actual parent candidate.  Only
+                // supply a child member when the inherited declaration is not
+                // otherwise visible (for example, a shallow classpath view
+                // whose parent pickle was unavailable during scope setup).
+                let scope_has_implicit = st.scopes.iter().rev().any(|scope| {
+                    scope.lookup_ranked(&source_name).iter().any(|binding| {
+                        let symbol = st.get(binding.sym);
+                        symbol.flags.contains(Flags::IMPLICIT) && symbol.name == source_name
+                    })
+                });
+                if !has_forwarder
+                    && !scope_has_implicit
+                    && relevant
+                    && !names.contains(&source_name)
+                {
+                    names.push(source_name.clone());
+                }
+            }
+            parent_work.extend(parent_sig.parents.iter().filter_map(sig_parent_class_name));
+        }
+        let mut supplied = 0;
+        for name in names {
+            supplied += self.complete_named(st, bin, class_sym, &name, false).len();
+        }
+        if supplied != 0 || promoted != 0 {
+            trace(format_args!(
+                "{}: supplied {supplied} implicit extension member(s) for {member_name} ({promoted} forwarder(s) promoted)",
+                st.get(class_sym).jvm_name
+            ));
+        }
+        supplied + promoted
     }
 
     /// The names of the implicit `def`s a class's own pickle declares.
@@ -1044,6 +1387,48 @@ impl PickleSupply {
         }
         self.implicit_names.insert(class_sym.0, names.clone());
         names
+    }
+
+    /// Whether this class declares a method with an explicit parameter clause
+    /// followed by an implicit one.
+    ///
+    /// A classfile flattens those clauses into one ordinary JVM parameter
+    /// list, so overload applicability cannot tell which trailing arguments
+    /// Scala is allowed to synthesize. A wildcard import has no selected name
+    /// to complete on demand; callers use this narrow predicate to adopt the
+    /// module's pickle before entering its members.
+    pub fn has_trailing_implicit_clause(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> bool {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return false;
+        }
+        let internal = st.get(class_sym).jvm_name.clone();
+        if internal.is_empty() || internal.starts_with("java/") || internal.starts_with("javax/") {
+            return false;
+        }
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, &internal, is_module) else {
+            return false;
+        };
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs.class_sig(&mut src, &full, is_module)
+        };
+        let Ok(sig) = sig else {
+            return false;
+        };
+        sig.members.iter().any(|m| {
+            m.kind == MemberKind::Def
+                && m.is_public_api()
+                && read_shape(&m.ty).is_some_and(|shape| {
+                    shape.clauses.first().is_some_and(|c| !c.implicit)
+                        && shape.clauses.iter().skip(1).any(|c| c.implicit)
+                })
+        })
     }
 
     /// The dotted name whose pickle describes `internal`, if there is one.
@@ -2259,6 +2644,15 @@ impl PickleSupply {
                 if m.has(pflags::LOCAL) && m.has(pflags::PRIVATE) {
                     st.get_mut(id).flags = st.get(id).flags.with(Flags::LOCAL);
                 }
+                // Preserve the declaration-side stable path of a value or
+                // method result. It may be needed later when this inherited
+                // member is selected through a concrete profile.
+                if let Some(prefix) = &m.result_prefix {
+                    trace(format_args!(
+                        "{internal}#{name}: recording result prefix for {id:?}: {prefix:?}"
+                    ));
+                    self.result_prefixes.insert(id, prefix.clone());
+                }
                 // A constructor's "result" is the class itself; its hidden
                 // outer slot is the backend's (`hidden_outer_desc`), not a
                 // prefix to record.
@@ -2989,6 +3383,73 @@ impl PickleSupply {
         ok.then_some(want)
     }
 
+    /// JVM erases a type parameter of the declaring owner to `Object`, even
+    /// when a receiver's parent substitution makes that parameter concrete.
+    /// Keep this relaxation limited to an implicit parameter whose raw
+    /// declaration is an application of the owner's type parameter. A direct
+    /// `ClassTag[A]` declaration must continue to require a ClassTag slot.
+    fn inherited_generic_evidence_slots(
+        &mut self,
+        bin: &mut BinaryIndex,
+        internal: &str,
+        pickle_owner: &str,
+        owner_module: bool,
+        name: &str,
+        shape: &Shape,
+    ) -> Option<Vec<bool>> {
+        let receiver = internal.replace('/', ".");
+        let owner = pickle_owner.replace('/', ".");
+        if receiver.trim_end_matches('$') == owner.trim_end_matches('$') {
+            return None;
+        }
+        if !shape.clauses.iter().any(|clause| clause.implicit) {
+            return None;
+        }
+        let sig = {
+            let mut src = BinSource(bin);
+            self.sigs
+                .class_sig(&mut src, pickle_owner, owner_module)
+                .ok()?
+        };
+        let owner_tparams: HashSet<String> = sig.tparams.iter().map(|tp| tp.name.clone()).collect();
+        if owner_tparams.is_empty() {
+            return None;
+        }
+        // Do not infer correspondence from arity alone when an owner has
+        // same-shaped overloads. The caller-facing member and the raw member
+        // must at least have the same clause/implicit layout.
+        let candidates: Vec<Shape> = sig
+            .members_named(name)
+            .filter(|member| member.kind == MemberKind::Def)
+            .filter_map(|member| read_shape(&member.ty))
+            .filter(|candidate| {
+                candidate.clauses.len() == shape.clauses.len()
+                    && candidate
+                        .clauses
+                        .iter()
+                        .zip(&shape.clauses)
+                        .all(|(raw, seen)| {
+                            raw.implicit == seen.implicit && raw.params.len() == seen.params.len()
+                        })
+            })
+            .collect();
+        let candidate = match candidates.as_slice() {
+            [candidate] => candidate,
+            _ => return None,
+        };
+        let mut slots = Vec::with_capacity(shape.arity());
+        let mut found = false;
+        for clause in &candidate.clauses {
+            for param in &clause.params {
+                let evidence = clause.implicit
+                    && sig_type_is_owner_tparam_application(&param.ty, &owner_tparams);
+                slots.push(evidence);
+                found |= evidence;
+            }
+        }
+        found.then_some(slots)
+    }
+
     /// Whether `anc` is a strict ancestor of `cls`, asked of the *pickle*.
     ///
     /// The symbol table cannot answer it: `scala.collection.MapOps` has no
@@ -3130,7 +3591,6 @@ impl PickleSupply {
             ));
             return None;
         };
-
         // The erased descriptor comes from the classfile itself rather than
         // from re-deriving scalac's erasure: the bytes are the truth, and a
         // descriptor we merely guessed would fail to link. Resolved now that
@@ -3289,19 +3749,57 @@ impl PickleSupply {
         let owner_file = scala_rs_pickle::sym::pickle_files_for(pickle_owner, owner_module)
             .into_iter()
             .find(|file| bin.find_class(file).ok().flatten().is_some());
-        let declared = owner_file.and_then(|owner| {
-            let params = self
-                .decl_site_want(st, bin, &scope, shape)
-                .unwrap_or_else(|| want.clone());
+        let decl_params = self
+            .decl_site_want(st, bin, &scope, shape)
+            .unwrap_or_else(|| want.clone());
+        let declared = owner_file.as_ref().and_then(|owner| {
             self.erased_desc_return(
                 bin,
-                &owner,
+                owner,
                 jvm_member,
-                &params,
-                erased_param_desc(st, &ret).as_deref(),
+                &decl_params,
+                erased_return_desc(st, &ret).as_deref(),
             )
         });
-        let found = match declared.or_else(|| self.erased_desc(bin, internal, jvm_member, &want)) {
+        let declared_generic_evidence = owner_file.as_ref().and_then(|owner| {
+            if declared.is_some() {
+                return None;
+            }
+            let slots = self.inherited_generic_evidence_slots(
+                bin,
+                internal,
+                pickle_owner,
+                owner_module,
+                name,
+                shape,
+            )?;
+            if slots.len() != decl_params.len() {
+                return None;
+            }
+            let mut relaxed = decl_params.clone();
+            for (param, evidence) in relaxed.iter_mut().zip(slots) {
+                if evidence {
+                    *param = None;
+                }
+            }
+            if relaxed == decl_params {
+                return None;
+            }
+            trace(format_args!(
+                "{internal}#{name}: retrying declaration descriptor with generic evidence slots as unknown references"
+            ));
+            self.erased_desc_return(
+                bin,
+                owner,
+                jvm_member,
+                &relaxed,
+                erased_return_desc(st, &ret).as_deref(),
+            )
+        });
+        let found = match declared
+            .or(declared_generic_evidence)
+            .or_else(|| self.erased_desc(bin, internal, jvm_member, &want))
+        {
             Some(found) => Some(found),
             // The signature and the descriptor are erased in *different*
             // vocabularies when a more derived class in the linearisation
@@ -3731,6 +4229,22 @@ impl PickleSupply {
         if let Some(id) = self.stubs.get(&key) {
             return Some(*id);
         }
+        // A Scala pickle may name a Java generic directly. Complete that
+        // classfile here: returning an existing or new placeholder is not
+        // enough because conversion of this very signature needs the class's
+        // type-parameter arity. TwirlHelperImports is the concrete case --
+        // its implicit `java.lang.Iterable[T] =>
+        // scala.collection.Iterable[T]` was dropped as unmappable when
+        // `Iterable` had not happened to be loaded first. Java classfiles are
+        // authoritative for this namespace, and their installer preserves
+        // the exact JVM identity and generic parents.
+        if full_name.starts_with("java.") || full_name.starts_with("javax.") {
+            let bytes = bin.find_class(&key).ok().flatten()?;
+            let class = crate::javaclass::parse_java_classfile(&bytes).ok()?;
+            let id = crate::classpath::install_java_class(st, &class);
+            self.stubs.insert(key, id);
+            return Some(id);
+        }
         // A symbol already in the table wins, whatever shape it is in. An
         // earlier version gave an under-specified one (`scala/collection/Seq`,
         // entered by `find_or_stub_java_class` with no type parameters) the
@@ -3832,8 +4346,21 @@ impl PickleSupply {
         let nested = is_nested_jvm_name(&base)
             && base.starts_with("scala/collection/")
             && self.pickle_reaches(bin, full_name, module, "scala.collection.IterableOnce");
-        let (owner, simple) = if nested {
-            let o = crate::classpath::java_class_owner(st, &base);
+        // A class nested in an object-only module has an unambiguous source
+        // owner even outside collections.  In particular TailCalls$TailRec
+        // is `TailCalls.TailRec`; flattening it into the package as a class
+        // literally named `TailCalls$TailRec` writes a different Scala type
+        // to our pickle.  Companion pairs remain on the conservative path:
+        // `java_class_owner` chooses their ordinary class half, so this only
+        // admits an owner already known to be a module class.
+        let object_nested = if is_nested_jvm_name(&base) {
+            let owner = crate::classpath::java_class_owner(st, &base);
+            (st.get(owner).kind == SymKind::ModuleClass).then_some(owner)
+        } else {
+            None
+        };
+        let (owner, simple) = if nested || object_nested.is_some() {
+            let o = object_nested.unwrap_or_else(|| crate::classpath::java_class_owner(st, &base));
             if o.is_none() || !st.get(o).is_class_like() {
                 return None;
             }
@@ -4313,6 +4840,23 @@ impl PickleSupply {
         None
     }
 
+    /// Whether a pickled result type declares `name`; `None` means that the
+    /// result has no readable pickle and must therefore be retained
+    /// conservatively by extension-candidate warming.
+    fn pickled_result_has_member(
+        &mut self,
+        bin: &mut BinaryIndex,
+        result: &str,
+        name: &str,
+    ) -> Option<bool> {
+        let full = self.pickled_full_name(bin, result, false)?;
+        let (hits, _errs) = {
+            let mut src = BinSource(bin);
+            self.sigs.lookup(&mut src, &full, false, name)
+        };
+        Some(!hits.is_empty())
+    }
+
     /// The pickled signature of the library class `full_name` (dotted).
     pub(crate) fn class_sig_by_name(
         &mut self,
@@ -4509,6 +5053,14 @@ fn read_shape(t: &SigType) -> Option<Shape> {
                 })
             }
         }
+    }
+}
+
+fn sig_type_is_owner_tparam_application(t: &SigType, owner_tparams: &HashSet<String>) -> bool {
+    match t {
+        SigType::Annotated(inner) => sig_type_is_owner_tparam_application(inner, owner_tparams),
+        SigType::Ref { sym, args } => owner_tparams.contains(sym) && !args.is_empty(),
+        _ => false,
     }
 }
 
@@ -4794,6 +5346,28 @@ fn tparam_arity(tp: &scala_rs_pickle::sym::TParam) -> usize {
     match &tp.bounds {
         SigType::Poly { tparams, .. } => tparams.len(),
         _ => 0,
+    }
+}
+
+/// Peel a pickled method type to the class named by its result.  Implicit
+/// conversions have a `Poly`/`Method` spine, while their result is normally a
+/// fully-qualified `Ref` such as `Foo.StringOps`.
+fn sig_result_class_name(t: &SigType) -> Option<&str> {
+    match t {
+        SigType::Poly { result, .. }
+        | SigType::Method { result, .. }
+        | SigType::Existential { result, .. }
+        | SigType::Annotated(result) => sig_result_class_name(result),
+        SigType::Ref { sym, .. } if sym.contains('.') => Some(sym),
+        _ => None,
+    }
+}
+
+fn sig_parent_class_name(t: &SigType) -> Option<String> {
+    match t {
+        SigType::Annotated(inner) => sig_parent_class_name(inner),
+        SigType::Ref { sym, .. } if sym.contains('.') => Some(sym.clone()),
+        _ => None,
     }
 }
 
@@ -5748,23 +6322,39 @@ impl PickleSupply {
         if member.is_empty() || !member.starts_with(|c: char| c.is_ascii_uppercase()) {
             return None;
         }
-        let owner = self.ensure_class(st, bin, owner_name, false)?;
-        if let Some(id) = st
-            .lookup_member(owner, member)
-            .into_iter()
-            .find(|&s| st.get(s).kind == SymKind::TypeMember)
-        {
-            return Some(Type::TypeMember(id));
+        // A path through an object (`NonEmptyLazyList.Type`) stores its
+        // abstract member on the module-class pickle, while an ordinary
+        // class stores it on the class pickle. Try both namespaces so a
+        // package alias can expand through either spelling.
+        let mut found = None;
+        for module in [false, true] {
+            let Some(owner) = self.ensure_class(st, bin, owner_name, module) else {
+                continue;
+            };
+            if let Some(id) = st
+                .lookup_member(owner, member)
+                .into_iter()
+                .find(|&s| st.get(s).kind == SymKind::TypeMember)
+            {
+                return Some(Type::TypeMember(id));
+            }
+            let Ok(sig) = (|| {
+                let mut src = BinSource(bin);
+                self.sigs.class_sig(&mut src, owner_name, module)
+            })() else {
+                continue;
+            };
+            if let Some(m) = sig
+                .members
+                .iter()
+                .find(|m| m.name == member && m.kind == MemberKind::AbstractType)
+                .cloned()
+            {
+                found = Some((owner, m));
+                break;
+            }
         }
-        let sig = {
-            let mut src = BinSource(bin);
-            self.sigs.class_sig(&mut src, owner_name, false).ok()?
-        };
-        let m = sig
-            .members
-            .iter()
-            .find(|m| m.name == member && m.kind == MemberKind::AbstractType)?
-            .clone();
+        let (owner, m) = found?;
         let id = st.alloc(member, owner, SymKind::TypeMember, Flags::EMPTY, "");
         st.get_mut(owner).members.push(id);
         // A *parameterised* abstract member (`type BaseColumnType[T] <:
@@ -6155,7 +6745,10 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
             Type::Long => return Some("J".into()),
             Type::Float => return Some("F".into()),
             Type::Double => return Some("D".into()),
-            Type::Unit => return Some("V".into()),
+            // `V` is legal only as a method return descriptor. In every value
+            // position scalac boxes Unit, including an ordinary parameter
+            // such as MUnit's implicit `unitToProp(unit: Unit)`.
+            Type::Unit => return Some("Lscala/runtime/BoxedUnit;".into()),
             Type::String => return Some("Ljava/lang/String;".into()),
             // These Scala top types have a definite erased reference slot.
             // Leaving AnyVal unknown confuses it with String/NodeSeq overloads.
@@ -6224,6 +6817,14 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
         };
     }
     None
+}
+
+fn erased_return_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
+    if matches!(ty, Type::Unit) {
+        Some("V".into())
+    } else {
+        erased_param_desc(st, ty)
+    }
 }
 
 /// Whether a candidate descriptor's parameters agree with the slots we could

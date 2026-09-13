@@ -690,3 +690,23 @@ fn a_value_class_block_is_wrapped_once() {
         "3m\n4m\n",
     );
 }
+
+/// A default method inherited through a generic trait still needs its erased
+/// entry point when the method returns a primitive.  The anonymous class only
+/// carries the typed forwarder, so a call through the parent trait exercises
+/// the `Object`-parameter bridge directly.
+#[test]
+fn inherited_generic_primitive_return_has_an_erased_bridge() {
+    prints(
+        "inherited-primitive",
+        "object Main {\n\
+         \x20 trait E[A] { def e(x: A, y: A): Int }\n\
+         \x20 trait ED[A] extends E[A] { override def e(x: A, y: A): Int = 7 }\n\
+         \x20 def main(a: Array[String]): Unit = {\n\
+         \x20   val e: E[String] = new ED[String] {}\n\
+         \x20   println(e.e(\"a\", \"b\"))\n\
+         \x20 }\n\
+         }\n",
+        "7\n",
+    );
+}

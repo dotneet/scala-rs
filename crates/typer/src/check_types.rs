@@ -1681,15 +1681,16 @@ impl Typer {
         recv_ty: &Type,
         found: &[SymbolId],
     ) -> Vec<(SymbolId, Type)> {
+        let mut out = self.receiver_result_prefix_rebinds(qual, recv_ty, found);
         if !self.library_abi || qual.sym.is_none() {
-            return Vec::new();
+            return out;
         }
         let Some(recv_cls) = self.st.class_sym_of(recv_ty) else {
-            return Vec::new();
+            return out;
         };
         let owner = self.st.get(qual.sym).owner;
         let Some(import_cls) = self.import_prefix_class_for(owner) else {
-            return Vec::new();
+            return out;
         };
         let outers: Vec<SymbolId> = self
             .st
@@ -1698,9 +1699,8 @@ impl Typer {
             .skip(1)
             .collect();
         if outers.is_empty() {
-            return Vec::new();
+            return out;
         }
-        let mut out: Vec<(SymbolId, Type)> = Vec::new();
         for &s in found {
             let ty = self.st.get(s).ty.clone();
             for d in self.st.type_members_in(&ty) {
@@ -1719,6 +1719,111 @@ impl Typer {
                 }
                 if let Some(t) = self.rebind_deferred_in_outer(import_cls, d, o) {
                     out.push((d, t));
+                }
+            }
+        }
+        out
+    }
+
+    /// Rebind a pickled member result whose outer path was recorded beside
+    /// the signature rather than in the converted type. Scala's pickle uses
+    /// this for inherited API members such as `BasicProfile.API#Database`:
+    /// the result is `BasicBackend.DatabaseFactory`, while
+    /// `result_prefix = BasicProfile.this.backend` says that the type member
+    /// belongs to the concrete profile's backend. The receiver's as-seen-from
+    /// view carries that concrete profile as its `<prefix>` marker.
+    ///
+    /// This is deliberately limited to `SigType::Single` paths whose prefix
+    /// is a declaration `this`. A `This` prefix on an inner class is already
+    /// handled by `with_pickled_this_prefix`, and arbitrary singleton paths
+    /// do not have a declaration-side outer instance to rebind.
+    fn receiver_result_prefix_rebinds(
+        &mut self,
+        qual: &Tree,
+        recv_ty: &Type,
+        found: &[SymbolId],
+    ) -> Vec<(SymbolId, Type)> {
+        let view = crate::prefix::view_prefix(recv_ty).cloned();
+        let outer_prefix = view.or_else(|| match &qual.kind {
+            TreeKind::Select { qual, .. } => self.singleton_prefix_of(qual),
+            _ => None,
+        });
+        if !self.library_abi {
+            return Vec::new();
+        }
+        let Some(outer_prefix) = outer_prefix else {
+            return Vec::new();
+        };
+        let Some(outer_cls) = self.st.class_sym_of(&outer_prefix) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &member in found {
+            let Some(scala_rs_pickle::sym::SigType::Single { prefix, sym }) =
+                self.pickle.result_prefix_for(member).cloned()
+            else {
+                continue;
+            };
+            let scala_rs_pickle::sym::SigType::This(_) = prefix.as_ref() else {
+                continue;
+            };
+            let Some(backend_name) = sym.rsplit('.').next() else {
+                continue;
+            };
+            // The outer class may expose an overriding accessor directly or
+            // inherit the profile's one. Either way its return type is the
+            // concrete backend vocabulary in which the result is seen.
+            let Some(backend_member) = self
+                .st
+                .lookup_member(outer_cls, backend_name)
+                .into_iter()
+                .find(|&s| matches!(self.st.get(s).kind, SymKind::Method | SymKind::Term))
+            else {
+                continue;
+            };
+            let backend_ty = self.st.singleton_underlying(backend_member);
+            if backend_ty.is_no_type() || backend_ty.is_error() {
+                continue;
+            }
+            let selected_ty = self.st.get(member).ty.clone();
+            // The concrete backend can be a class whose aliases have not
+            // been demanded yet. Complete each referenced type member before
+            // asking `expand_in_type`; otherwise `lookup_member` sees only
+            // the abstract declaration inherited from BasicBackend.
+            let mut completed_members = std::collections::HashMap::new();
+            if let Some(backend_cls) = self.st.class_sym_of(&backend_ty) {
+                for decl in self.st.type_members_in(&selected_ty) {
+                    let name = self.st.get(decl).name.clone();
+                    let completed = self.pickle.complete_type_member(
+                        &mut self.st,
+                        &mut self.binary,
+                        backend_cls,
+                        &name,
+                    );
+                    if let Some(t) = completed.clone() {
+                        completed_members.insert(name.clone(), t);
+                    }
+                }
+            }
+            for decl in self.st.type_members_in(&selected_ty) {
+                let name = self.st.get(decl).name.clone();
+                let seen = completed_members.get(&name).cloned().unwrap_or_else(|| {
+                    self.st.expand_in_type(&backend_ty, &Type::TypeMember(decl))
+                });
+                if matches!(seen, Type::TypeMember(id) if id == decl)
+                    || seen.is_no_type()
+                    || seen.is_error()
+                {
+                    continue;
+                }
+                if !out.iter().any(|(id, _)| *id == decl) {
+                    crate::pickle_supply::trace(format_args!(
+                        "{}: rebinding result member {} through {}",
+                        self.st.get(member).name,
+                        self.st.get(decl).name,
+                        backend_name
+                    ));
+                    out.push((decl, seen));
                 }
             }
         }
@@ -2859,6 +2964,19 @@ impl Typer {
     /// fold).
     pub(crate) fn type_owner_members(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let found = self.st.lookup_member(owner, name);
+        // A package object's inherited alias may share a name with the JVM
+        // mirror class of an object in that package (`object
+        // NonEmptyLazyList` plus `type NonEmptyLazyList[A] = ...`). The
+        // mirror is only the term-side fallback; in a type path the alias
+        // must answer before that class. Ordinary class/companion pairs keep
+        // the historical class-first ordering.
+        let package_alias = found.iter().copied().find(|&s| {
+            self.st.get(s).kind == SymKind::TypeMember
+                && self.st.get(s).owner == owner
+                && found.iter().any(|&c| {
+                    self.st.get(c).kind == SymKind::Class && self.st.companion_module(c).is_some()
+                })
+        });
         let mut out: Vec<SymbolId> = found
             .iter()
             .copied()
@@ -2872,6 +2990,10 @@ impl Typer {
             {
                 out.push(*s);
             }
+        }
+        if let Some(alias) = package_alias {
+            out.retain(|&s| s != alias);
+            out.insert(0, alias);
         }
         for s in found {
             let ok = matches!(
@@ -3022,16 +3144,43 @@ impl Typer {
                 }
                 return;
             }
-        } else if let Some(id) = self.st.lookup_member(owner, name).into_iter().find(|&id| {
-            matches!(
-                self.st.get(id).kind,
-                SymKind::Class | SymKind::Package | SymKind::Module | SymKind::ModuleClass
-            )
-        }) {
-            if self.st.get(id).kind == SymKind::Class {
+        } else {
+            let found = self.st.lookup_member(owner, name);
+            let has_module = found
+                .iter()
+                .any(|&id| matches!(self.st.get(id).kind, SymKind::Module | SymKind::ModuleClass));
+            if let Some(id) = found
+                .iter()
+                .copied()
+                .find(|&id| self.st.get(id).kind == SymKind::Class)
+            {
                 self.ensure_java_loaded(id, span);
+                return;
             }
-            return;
+            if found
+                .iter()
+                .any(|&id| self.st.get(id).kind == SymKind::Package)
+            {
+                return;
+            }
+            // At package scope an existing module is already the complete
+            // source-level answer. Its non-`$` classfile may be only Scala's
+            // static-forwarder view (`scala.Function.class`); loading that as
+            // though it were a missing class companion can replace the
+            // module's pickled curried signatures with flattened descriptors.
+            // The ambiguity below is specifically a nested-name ambiguity.
+            if self.st.get(owner).kind == SymKind::Package && has_module {
+                return;
+            }
+            // A nested companion can be discovered before its class. This is
+            // common for a constructor with defaults: `Outer$Nested$.class`
+            // is listed in the outer object's `InnerClasses` table and enters
+            // the term `Nested`, while `Outer$Nested.class` is still unread.
+            // Finding that module is not proof that the class half is loaded;
+            // continue through both binary candidates so a type-position use
+            // (`new Outer.Nested`) gets the class and its accessors too.
+            // Object-only names simply re-visit their already completed `$`
+            // candidate, so they retain the same symbol and behavior.
         }
         // Try every candidate, not just the first hit: a case class with a
         // companion (`Const` / `Const$`, or cats-effect's `Errored` /
@@ -3530,6 +3679,7 @@ impl Typer {
     /// implicit value of type Shape[_ <: FlatShapeLevel, Rep[String], T, G]"
     /// while naming `FlatShapeLevel` anywhere in the same file fixed it.
     pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
+        let mut completed = self.warm_inherited_implicit_members(wanted);
         let mut cands = self.implicits_in_scope();
         // The companion candidates too. `search_implicit_uncached` falls back
         // to `companion_implicits(pt)` when nothing lexical fits, so those are
@@ -3548,7 +3698,6 @@ impl Typer {
         }
         cands.sort_unstable_by_key(|id| id.0);
         cands.dedup_by_key(|id| id.0);
-        let mut completed = false;
         for &id in &cands {
             let before = self.st.get(id).ty.clone();
             let unknown = match &before {
@@ -3569,6 +3718,42 @@ impl Typer {
         for &id in &cands {
             completed |= self.prepare_implicit_instances(id, instance_depth);
         }
+        // A derivation candidate can ask for a witness whose companion the
+        // source never names. Cats' `Isomorphisms.invariant[F]`, for example,
+        // returns the wanted `Isomorphisms[Option]` but first needs an
+        // `Invariant[Option]`; the latter lives in `Option`'s companion. The
+        // immutable search cannot load that companion while trying the
+        // candidate, so warm just the clauses of candidates whose result can
+        // plausibly inhabit one of the wanted types. Warming every imported
+        // candidate here is both expensive and risks completing unrelated
+        // standard-library hierarchies.
+        let mut nested = Vec::new();
+        for &id in &cands {
+            if !self.only_implicit_clauses(id) {
+                continue;
+            }
+            if let Type::Method { paramss, ret } = &*self.implicit_candidate_ty(id) {
+                // This recovery is for typeclass-shaped results. For a
+                // non-class target `plausibly_inhabits` deliberately answers
+                // conservatively, which made nearly every imported implicit
+                // look relevant and warmed unrelated reflection hierarchies
+                // while compiling Cats/Slick macros.
+                if !wanted.iter().any(|w| {
+                    matches!((&**ret, w), (Type::Class { .. }, Type::Class { .. }))
+                        && self.plausibly_inhabits(ret, w)
+                }) {
+                    continue;
+                }
+                for p in paramss.iter().flatten() {
+                    if !nested.contains(p) {
+                        nested.push(p.clone());
+                    }
+                }
+            }
+        }
+        for n in nested {
+            completed |= self.warm_implicit_scope_once(&n);
+        }
         let tys: Vec<Type> = cands
             .into_iter()
             .map(|id| self.implicit_candidate_ty(id).into_owned())
@@ -3582,6 +3767,62 @@ impl Typer {
             // `warm_own_scope_once` documents -- and cost slick two new
             // `containsSymbol(Set[A])` overload errors when it was tried.
             fresh |= self.ensure_pickled_parents(&t);
+        }
+        fresh
+    }
+
+    /// Load implicit declarations inherited by the class currently being
+    /// typed. They are lexical candidates, but a jar parent exposes them only
+    /// through its pickle and immutable implicit search cannot complete that
+    /// pickle itself. MUnit's `ScalaCheckSuite.unitToProp` is the concrete
+    /// case: Cats' `forAll { ... assert(...) }` needs it as `Unit => Prop`.
+    ///
+    /// This runs only after a search failed. `supply_implicit_members` is
+    /// cached per class and installs just implicit declarations, so walking a
+    /// deep framework hierarchy does not adopt every ordinary API member.
+    fn warm_inherited_implicit_members(&mut self, _wanted: &[Type]) -> bool {
+        if !self.library_abi || self.st.this_class.is_none() {
+            return false;
+        }
+        // The only missing inherited candidate observed on real test-suite
+        // sources is MUnit ScalaCheckSuite's `unitToProp`. Loading every
+        // inherited implicit after every failed search also exposes Scalatra's
+        // `request2Session` beside a controller-local `session`, and eagerly
+        // changes reflection/quasiquote searches while compiling Cats and
+        // Slick themselves. First prove the current suite inherits that exact
+        // trait, then complete its inherited implicit environment.
+        let mut work = vec![self.st.this_class];
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut hierarchy = Vec::new();
+        let mut found_scalacheck_suite = false;
+        let mut fresh_parents = false;
+        while let Some(c) = work.pop() {
+            if c.is_none() || !seen.insert(c.0) {
+                continue;
+            }
+            hierarchy.push(c);
+            if c.0 >= self.st.prelude_end && !self.st.source_classes.contains(&c) {
+                let ty = self.st.type_of_class(c);
+                fresh_parents |= self.ensure_pickled_parents(&ty);
+                found_scalacheck_suite |= self.st.get(c).jvm_name == "munit/ScalaCheckSuite";
+            }
+            for p in self.st.get(c).parents.clone() {
+                if let Some(ps) = self.st.class_sym_of(&p) {
+                    work.push(ps);
+                }
+            }
+        }
+        if !found_scalacheck_suite {
+            return false;
+        }
+        let mut fresh = fresh_parents;
+        for c in hierarchy {
+            if c.0 >= self.st.prelude_end && !self.st.source_classes.contains(&c) {
+                fresh |= self
+                    .pickle
+                    .supply_implicit_members(&mut self.st, &mut self.binary, c)
+                    != 0;
+            }
         }
         fresh
     }
@@ -3854,7 +4095,6 @@ impl Typer {
             // does, without adopting an entire module beside existing members.
             if self.st.pending_classpath_signatures.contains(&c)
                 && !self.st.source_classes.contains(&c)
-                && !self.pickle.pickle_readable(&self.st, c)
             {
                 self.pickle
                     .supply_implicit_members(&mut self.st, &mut self.binary, c);
@@ -3987,7 +4227,19 @@ impl Typer {
             if simple.is_empty() {
                 continue;
             }
-            if !self.st.lookup_member(nest_owner, &simple).is_empty() {
+            // Check declarations, not inherited lookup. Every module class
+            // inherits `AnyRef.eq`; treating that method as an existing
+            // declaration made us skip the real nested `object eq` from a
+            // package object's `InnerClasses` table. Cats then exposed
+            // `cats.syntax.eq` only as the inherited Boolean method and the
+            // syntax import brought no implicit conversions into scope.
+            if self.st.get(nest_owner).members.iter().any(|&m| {
+                self.st.get(m).name == simple
+                    && matches!(
+                        self.st.get(m).kind,
+                        SymKind::Class | SymKind::Module | SymKind::ModuleClass
+                    )
+            }) {
                 continue;
             }
             if !self.load_binary_into(&inner.inner_jvm, nest_owner, span, false) {
@@ -4612,6 +4864,71 @@ impl Typer {
         }
     }
 
+    /// Complete the concrete aliases needed to reduce an abstract projection
+    /// in a binary receiver's generic parent.
+    ///
+    /// A JVM `Signature` cannot spell `E#TableElementType`: scalac writes
+    /// `TableQuery[E] extends Query[E, Object, Seq]` there and keeps the real
+    /// parent only in the Scala pickle.  `ensure_java_loaded` restores that
+    /// parent as `Query[E, E#TableElementType, Seq]`, but the projection can
+    /// only reduce after the concrete argument's own pickle has supplied its
+    /// overriding type alias.  That argument is otherwise just a type in the
+    /// accessor signature, so ordinary lazy member loading never visits it.
+    ///
+    /// Do this only for type parameters that actually prefix a retained
+    /// projection.  It neither adopts unrelated arguments nor guesses from a
+    /// bound: an abstract argument is left for the usual projection rules.
+    pub(crate) fn settle_binary_parent_projections(&mut self, recv_ty: &Type, span: Span) {
+        if !self.library_abi {
+            return;
+        }
+        let Type::Class { sym, args } = recv_ty else {
+            return;
+        };
+        if sym.is_none() || args.is_empty() {
+            return;
+        }
+
+        self.pickle
+            .ensure_parents(&mut self.st, &mut self.binary, *sym);
+        let tparams = self.st.get(*sym).tparams.clone();
+        let parents = self.st.get(*sym).parents.clone();
+        let mut targets: Vec<(Type, SymbolId)> = Vec::new();
+        for parent in &parents {
+            for member in self.st.type_members_in(parent) {
+                let Some((prefix, decl)) = self.st.abs_projection(member) else {
+                    continue;
+                };
+                let Some(i) = tparams.iter().position(|tp| *tp == prefix) else {
+                    continue;
+                };
+                let Some(arg) = args.get(i) else {
+                    continue;
+                };
+                if matches!(arg, Type::TypeParam(_))
+                    || matches!(arg, Type::TypeMember(id) if self.st.is_deferred_type_member(*id))
+                    || targets.iter().any(|(t, d)| t == arg && *d == decl)
+                {
+                    continue;
+                }
+                targets.push((arg.clone(), decl));
+            }
+        }
+
+        for (arg, decl) in targets {
+            let Some(cls) = self.st.class_sym_of(&arg) else {
+                continue;
+            };
+            self.ensure_java_loaded(cls, span);
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, cls);
+            let name = self.st.get(decl).name.clone();
+            let _ = self
+                .pickle
+                .complete_type_member(&mut self.st, &mut self.binary, cls, &name);
+        }
+    }
+
     /// Read raw members from a Scala classfile even when its pickle has
     /// already been adopted.  Most Scala members are supplied from pickles on
     /// demand; constructor default getters are the one JVM-only exception:
@@ -4877,11 +5194,27 @@ impl Typer {
             Some(t) if !self.builtin_type_shadowed(name) => t,
             _ => {
                 let found = self.st.lookup_type(name);
-                // Prefer the class of a case-class/companion pair (`Point` vs `Point$`).
-                let id = found
-                    .iter()
-                    .copied()
-                    .find(|s| matches!(self.st.get(*s).kind, SymKind::Class))
+                // Prefer a package alias over the JVM mirror class of an
+                // object with the same name. Cats' Newtype encoding has
+                // `object NonEmptyLazyList` beside inherited `type
+                // NonEmptyLazyList[A]`; the mirror is only a term fallback.
+                // Ordinary class/companion pairs retain class-first lookup.
+                let mirror_alias = found.iter().copied().find(|&alias| {
+                    self.st.get(alias).kind == SymKind::TypeMember
+                        && self.st.get(alias).owner != SymbolId::NONE
+                        && self.st.get(self.st.get(alias).owner).kind == SymKind::Package
+                        && found.iter().any(|&class| {
+                            self.st.get(class).kind == SymKind::Class
+                                && self.st.companion_module(class).is_some()
+                        })
+                });
+                let id = mirror_alias
+                    .or_else(|| {
+                        found
+                            .iter()
+                            .copied()
+                            .find(|s| matches!(self.st.get(*s).kind, SymKind::Class))
+                    })
                     .or_else(|| {
                         found.into_iter().find(|s| {
                             matches!(

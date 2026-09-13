@@ -177,6 +177,33 @@ fn outer_field_is_the_trait_interface() {
     let _ = fs::remove_dir_all(&out);
 }
 
+#[test]
+fn outer_field_is_synthetic_for_separate_compilation() {
+    let out = compile("outer", "outer-field-flags", &["--no-scala-library"]);
+    let output = Command::new("javap")
+        .args(["-p", "-v", "-cp", out.to_str().unwrap(), "T$Inner"])
+        .output()
+        .expect("javap -v");
+    assert!(
+        output.status.success(),
+        "javap T$Inner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let field = text
+        .split("public final T $outer;")
+        .nth(1)
+        .and_then(|rest| rest.split("\n\n").next())
+        .expect("verbose `$outer` field");
+    assert!(
+        field.contains("ACC_PUBLIC")
+            && field.contains("ACC_FINAL")
+            && field.contains("ACC_SYNTHETIC"),
+        "`$outer` must have nsc's public/final/synthetic flags:\n{field}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }

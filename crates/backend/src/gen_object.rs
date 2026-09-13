@@ -918,7 +918,15 @@ impl<'a> Gen<'a> {
             }
         }
         self.drain_lambdas(&mut b, lambda_wm);
-        attach_scala_sig(&mut b, self.st, class_id, &self.pickles);
+        // The companion classfile is named `C$`, but `class_id` is the
+        // ordinary case class `C`.  For a nested case class this used to put
+        // `pickle_class(C)` (whose first class symbol is the ordinary class)
+        // on `C$.class`; the classpath loader consequently installed the
+        // constructor members on the module class and never saw `apply`'s
+        // parameter symbols.  Pickle the module-class root so its first
+        // symbol is the companion and named arguments survive a separate
+        // compilation.
+        attach_scala_sig(&mut b, self.st, comp.unwrap_or(class_id), &self.pickles);
         self.out
             .push(b.finish_full(self.st, &self.jvm_index, SymbolId::NONE));
     }

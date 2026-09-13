@@ -2605,8 +2605,11 @@ pub(crate) fn invoke_method(
         // `is_trait_private_def`): every caller is textually inside the
         // trait, so its body is a `private static <name>$` on the interface
         // and reaching it is a same-class `invokestatic`, not
-        // `invokeinterface` on a declaration that doesn't exist.
-        if s.flags.contains(Flags::PRIVATE) && !widened(ctx.st, id) {
+        // `invokeinterface` on a declaration that doesn't exist. Method-local
+        // defs lifted onto a trait use the same path; their original owner is
+        // no longer available after lambda-lift, so keep this predicate in
+        // sync with the backend's complete private-helper classification.
+        if is_trait_private_sym(ctx.st, id) {
             let static_desc = trait_static_desc(&owner, &desc);
             asm.invokestatic_interface(&owner, &trait_static_name(name), &static_desc);
         } else {

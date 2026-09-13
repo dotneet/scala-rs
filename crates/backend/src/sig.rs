@@ -28,7 +28,7 @@
 
 use crate::gen_desc::{class_internal, is_interface_sym, jvm_desc, jvm_desc_val};
 use rustc_hash::FxHashMap as HashMap;
-use scala_rs_parser::{SymbolId, Type};
+use scala_rs_parser::{Flags, SymbolId, Type};
 use scala_rs_typer::{SymKind, SymbolTable};
 
 /// A member's generic signature, plus everything needed to check it against
@@ -131,12 +131,11 @@ impl<'a> Sig<'a> {
     fn new(st: &'a SymbolTable, in_scope: &[SymbolId]) -> Sig<'a> {
         let mut tvars = HashMap::default();
         for t in in_scope {
-            // A higher-kinded parameter (`F[_]`) is not a JVM type variable:
-            // nsc's `isTypeParameterInSig` excludes it and falls back to the
-            // erasure, so leaving it out of the map is what puts it there.
-            if !st.get(*t).tparams.is_empty() {
-                continue;
-            }
+            // Higher-kinded parameters still have an ordinary JVM type
+            // variable in Scala 2 signatures.  Their kind is represented by
+            // the ScalaSignature, while the classfile Signature uses `TF;`
+            // just like a first-order parameter (e.g. `Traverse[F[_]]`
+            // extends `Foldable[F]`).
             let name = st.get(*t).name.clone();
             tvars.insert(*t, (name, String::new()));
         }
@@ -390,10 +389,7 @@ impl<'a> Sig<'a> {
             // not an `Object`, and dropping to the erasure fallback here cost
             // `run/t8756` its one remaining line.
             Type::Refined { parents, .. } if !parents.is_empty() => {
-                let dom = parents
-                    .iter()
-                    .find(|p| !self.is_interface(p))
-                    .unwrap_or(&parents[0]);
+                let dom = intersection_dominator(parents, self.st).unwrap_or(&parents[0]);
                 self.jsig(dom, primitive_ok, depth + 1)
             }
             Type::SingleType { prefix, sym } => {
@@ -418,6 +414,75 @@ impl<'a> Sig<'a> {
             Type::Unit | Type::NoType => "V".to_string(),
             _ => self.jsig(ty, true, depth),
         }
+    }
+}
+
+/// The parent selected for a refined/intersection type's JVM signature must
+/// be the same dominator that erasure selected for its descriptor. Looking
+/// only for the first non-interface parent is insufficient for Slick's
+/// `Query[...] with TableQuery[...]`: `TableQuery` is a subclass of `Query`,
+/// so it is the unshadowed class and therefore the descriptor's owner.
+///
+/// This intentionally mirrors `typer::erasure::intersection_dominator` here
+/// rather than exposing the erasure implementation as a backend API. The
+/// backend records signatures before the destructive erasure pass, but both
+/// sides must still use the exact same class/interface and subclass rules.
+fn intersection_dominator<'a>(parents: &'a [Type], st: &SymbolTable) -> Option<&'a Type> {
+    if parents.len() < 2 {
+        return parents.first();
+    }
+    let syms: Vec<Option<SymbolId>> = parents.iter().map(head_type_sym).collect();
+    let unshadowed = |i: usize| match syms[i] {
+        None => true,
+        Some(p) => !syms
+            .iter()
+            .enumerate()
+            .any(|(j, q)| j != i && matches!(q, Some(q) if *q != p && inherits_class(st, *q, p))),
+    };
+    let is_class = |i: usize| {
+        syms[i].is_some_and(|s| {
+            let sym = st.get(s);
+            sym.kind == SymKind::Class
+                && !sym.flags.contains(Flags::TRAIT)
+                && !sym.flags.contains(Flags::INTERFACE)
+        })
+    };
+    let pick = (0..parents.len())
+        .find(|&i| is_class(i) && unshadowed(i))
+        .or_else(|| (0..parents.len()).find(|&i| unshadowed(i)))
+        .unwrap_or(0);
+    Some(&parents[pick])
+}
+
+/// Whether `sub` inherits `sup`, comparing the declared class symbols rather
+/// than resolving an abstract member to its bound. That distinction is part
+/// of nsc's intersection-dominator rule.
+fn inherits_class(st: &SymbolTable, sub: SymbolId, sup: SymbolId) -> bool {
+    if sub == sup {
+        return true;
+    }
+    if !st.get(sub).is_class_like() || !st.get(sup).is_class_like() {
+        return false;
+    }
+    let t = Type::Class {
+        sym: sub,
+        args: vec![],
+    };
+    st.base_type_seq(&t)
+        .iter()
+        .any(|p| head_type_sym(p) == Some(sup))
+}
+
+/// The symbol a parent is written with, without resolving a type member or a
+/// type parameter to its bound.
+fn head_type_sym(ty: &Type) -> Option<SymbolId> {
+    match ty {
+        Type::Applied { ctor, .. } | Type::Annotated { tpe: ctor, .. } => head_type_sym(ctor),
+        Type::Class { sym, .. }
+        | Type::ModuleRef(sym)
+        | Type::TypeMember(sym)
+        | Type::TypeParam(sym) => Some(*sym),
+        _ => None,
     }
 }
 
@@ -821,6 +886,41 @@ mod tests {
         assert_eq!(
             erase_signature("LOuter<Ljava/lang/String;>.Inner;", &[]).as_deref(),
             Some("LOuter$Inner;")
+        );
+    }
+
+    #[test]
+    fn intersection_signature_uses_the_unshadowed_class() {
+        let src = r#"
+class AT
+trait Dummy[X]
+sealed abstract class Query[+E, U, C[_]]
+class TableQuery[E <: AT] extends Query[E, Int, Dummy]
+object M {
+  def query[B <: AT, BU, C[_]](x: Query[B, BU, C] with TableQuery[B]): Int = 1
+}
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let method = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Method && s.name == "query")
+            .expect("query method");
+        let signatures = record_generic_signatures(&st);
+        let signature = signatures.get(&method.id).expect("query signature");
+        assert!(
+            signature.sig.contains("(LTableQuery<TB;>;)I"),
+            "intersection signature should erase through TableQuery: {}",
+            signature.sig
+        );
+        assert_eq!(
+            erase_signature(&signature.sig, &signature.tvars).as_deref(),
+            Some("(LTableQuery;)I")
         );
     }
 }

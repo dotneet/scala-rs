@@ -246,8 +246,20 @@ impl<'a> Gen<'a> {
         }
         // Only the `default` method carries the signature: the `m$` static
         // beside it takes `$this` as an extra parameter, which no Scala type
-        // describes, and nsc leaves that one unsigned too.
-        b.sign_last(self.sig_of(def.sym));
+        // describes, and nsc leaves that one unsigned too. A lazy-val was
+        // lowered from a value symbol to this synthetic zero-argument def;
+        // its recorded signature is the value type, so wrap it as a getter
+        // signature rather than handing the bare value signature to the
+        // method checker.
+        if let TreeKind::DefDef { mods, .. } = &def.kind {
+            if mods.flags.contains(Flags::LAZY) {
+                b.sign_last_accessor(self.sig_of(def.sym), false);
+            } else {
+                b.sign_last(self.sig_of(def.sym));
+            }
+        } else {
+            b.sign_last(self.sig_of(def.sym));
+        }
         // `public static m$($this, …)`: nsc's entry point for the mixin
         // forwarder every implementing class carries and for `super` calls
         // into the trait, forwarding to the `default` method with
@@ -621,13 +633,14 @@ impl<'a> Gen<'a> {
     /// On the interface a `lazy val` is indistinguishable from a concrete
     /// trait method -- a `default d()` with a `d$` static beside it -- and the
     /// caching is the implementing class's job. What tells the two apart is
-    /// the pickle: a `lazy val`'s accessor is pickled `ACCESSOR`, so
-    /// `install_classpath` gives it `SymKind::Term`, while a `def` is a
-    /// method. A *non*-lazy trait `val` has no static at all (the class
-    /// supplies its value through the mixin setter), so "term plus `d$`" is
-    /// exactly the set that needs a field and a `d$lzycompute` here. Without
-    /// it the class inherited the interface's `default`, which recomputes the
-    /// initialiser on every read.
+    /// the pickle: a `lazy val`'s accessor is pickled `ACCESSOR`. Eager
+    /// classpath installation represents it as a `Term`; on-demand pickle
+    /// completion may replace that with the zero-argument JVM `Method` while
+    /// preserving `ACCESSOR`. A *non*-lazy trait `val` has no static at all
+    /// (the class supplies its value through the mixin setter), so "stable
+    /// accessor plus `d$`" is exactly the set that needs a field and a
+    /// `d$lzycompute` here. Without it the class inherited the interface's
+    /// `default`, which recomputes the initialiser on every read.
     pub(crate) fn binary_mixin_lazy_vals(
         &self,
         class_id: SymbolId,
@@ -652,11 +665,24 @@ impl<'a> Gen<'a> {
             }
             for m in self.st.get(parent).members.clone() {
                 let s = self.st.get(m);
-                if s.kind != SymKind::Term || s.flags.contains(Flags::MUTABLE) {
-                    continue;
-                }
+                // Eager classpath installation represents a pickled value as
+                // a `Term`. If that member is later completed on demand,
+                // PickleSupply replaces it with its JVM getter: a zero-arg
+                // `Method` carrying `ACCESSOR`. Both are the same stable
+                // Scala value, and the adjacent `d$` static is what proves it
+                // is a lazy value rather than an ordinary trait `val`.
+                let ty = match s.kind {
+                    SymKind::Term if !s.flags.contains(Flags::MUTABLE) => s.ty.clone(),
+                    SymKind::Method
+                        if s.flags.contains(Flags::ACCESSOR)
+                            && !s.flags.contains(Flags::MUTABLE)
+                            && method_params_from_sym(self.st, m).is_empty() =>
+                    {
+                        method_ret_from_sym(self.st, m)
+                    }
+                    _ => continue,
+                };
                 let name = s.name.clone();
-                let ty = s.ty.clone();
                 if !self.binary_trait_defines(parent, &name) || !have.insert(name.clone()) {
                     continue;
                 }
@@ -753,7 +779,7 @@ impl<'a> Gen<'a> {
         }
         // (name, type, owning trait, is a `var`, first in linearization order,
         //  the trait declared it `final`)
-        let mut needed: Vec<(String, Type, SymbolId, bool, bool, bool)> = Vec::new();
+        let mut needed: Vec<(String, Type, SymbolId, SymbolId, bool, bool, bool)> = Vec::new();
         let mut seen = HashSet::new();
         let mut from_class: Option<HashSet<String>> = None;
         for parent in self.mixin_traits(class_id) {
@@ -768,7 +794,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     let first = seen.insert(name.clone());
-                    needed.push((name, ty, parent, mutable, first, false));
+                    needed.push((name, ty, parent, SymbolId::NONE, mutable, first, false));
                 }
                 continue;
             };
@@ -798,6 +824,7 @@ impl<'a> Gen<'a> {
                     name,
                     val_tree_ty(self.st, v),
                     parent,
+                    v.sym,
                     mutable,
                     first,
                     is_final,
@@ -805,7 +832,7 @@ impl<'a> Gen<'a> {
             }
         }
         let class_name = b.this_name.clone();
-        for (name, ty, owner, mutable, first, is_final) in needed {
+        for (name, ty, owner, value_sym, mutable, first, is_final) in needed {
             // nsc's mixin phase carries the trait `val`'s `final` onto the
             // accessors it copies into the class: `trait T { final val v = 1 }`
             // gives `public final int v()` and a final `T$_setter_$v_$eq`
@@ -856,6 +883,7 @@ impl<'a> Gen<'a> {
                 emit_getfield(asm, &class_c, &fname, &fdesc_c);
                 emit_return(asm, &ty);
             });
+            b.sign_last_accessor(self.sig_of(value_sym), false);
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
@@ -865,6 +893,7 @@ impl<'a> Gen<'a> {
                 asm.putfield(&class_c, &fname, &fdesc_c);
                 asm.vreturn();
             });
+            b.sign_last_accessor(self.sig_of(value_sym), true);
             skip.insert(name);
             skip.insert(setter);
         }
@@ -2785,9 +2814,13 @@ impl<'a> Gen<'a> {
                 let enc = encode_method_name(&ps.name);
                 let Some(cut) = pdesc.find(')') else { continue };
                 let (pparams, pret) = (&pdesc[..=cut], &pdesc[cut + 1..]);
-                if !(pret.starts_with('L') || pret.starts_with('[')) {
-                    continue;
-                }
+                // Parameter-erasure bridges are needed for primitive-returning
+                // methods too.  A generic trait method such as
+                // `Eq[A].eqv(A, A): Boolean` erases its parameters to Object,
+                // while an inherited default forwarder on an anonymous class
+                // may be emitted at `eqv(String, String): Boolean`.  The
+                // previous reference-return guard skipped that shape, leaving
+                // the erased interface entry point abstract.
                 if b.methods.iter().any(|m| m.name == enc && m.desc == pdesc) {
                     continue;
                 }
@@ -2799,7 +2832,8 @@ impl<'a> Gen<'a> {
                             && m.code.is_some()
                             && m.access & ACC_STATIC == 0
                             && m.desc.starts_with(pparams)
-                            && m.desc[pparams.len()..].starts_with('L')
+                            && (m.desc[pparams.len()..].starts_with('L')
+                                || m.desc[pparams.len()..] == *pret)
                     })
                     .map(|m| m.desc.clone())
                     .or_else(|| {
@@ -2832,8 +2866,11 @@ impl<'a> Gen<'a> {
                             m.name == enc
                                 && m.code.is_some()
                                 && m.access & ACC_STATIC == 0
-                                && m.desc[m.desc.find(')').map(|i| i + 1).unwrap_or(0)..]
-                                    .starts_with('L')
+                                && {
+                                    let mret_start = m.desc.find(')').map(|i| i + 1).unwrap_or(0);
+                                    m.desc[mret_start..].starts_with('L')
+                                        || m.desc[mret_start..] == *pret
+                                }
                                 && {
                                     let cs = desc_param_strs(&m.desc);
                                     cs.len() == pparam_strs.len()
@@ -2912,7 +2949,7 @@ impl<'a> Gen<'a> {
                         }
                         asm.invokevirtual(&cn, &name, &target);
                         if !emit_forwarded_nothing(asm, &target_ret) {
-                            asm.areturn();
+                            ret_of_sort(asm, ret_str_sort(&target_ret));
                         }
                     },
                 );
@@ -3545,36 +3582,39 @@ impl<'a> Gen<'a> {
             let library_abi = self.library_abi;
             let boxed_vars = &self.boxed_vars;
             let ret_for_body = ret.clone();
-            b.add_code(
-                ACC_PUBLIC | ACC_SYNTHETIC,
-                &name,
-                &desc,
-                max_locals,
-                |asm| {
-                    let mut frame = frame;
-                    let ctx = emit_ctx(
-                        st,
-                        class_id,
-                        &class_name,
-                        ret_for_body.clone(),
-                        extras,
-                        lambda_n,
-                        lambda_bodies,
-                        Some(&hoist_owner),
-                        source,
-                        library_abi,
-                        boxed_vars,
-                        std::rc::Rc::clone(&self.emit_errors),
-                    );
-                    gen_expr(asm, &mut frame, &ctx, &rhs);
-                    if is_unit_like(&ret_for_body) {
-                        pop_if_value(asm, &rhs.ty);
-                        asm.vreturn();
-                    } else {
-                        emit_return(asm, &ret_for_body);
-                    }
-                },
-            );
+            // nsc leaves instance default getters public but not synthetic.
+            // This is source-visible ABI: downstream named/default-argument
+            // resolution must be able to find `apply$default$n` in the class
+            // file. Our pickle reader deliberately ignores synthetic methods
+            // while matching ordinary declarations, so marking this getter
+            // synthetic made a scala-rs-built case class lose its entire
+            // pickled `apply` when read by the next scala-rs compilation.
+            // Static trait forwarders below remain synthetic, as nsc emits
+            // them.
+            b.add_code(ACC_PUBLIC, &name, &desc, max_locals, |asm| {
+                let mut frame = frame;
+                let ctx = emit_ctx(
+                    st,
+                    class_id,
+                    &class_name,
+                    ret_for_body.clone(),
+                    extras,
+                    lambda_n,
+                    lambda_bodies,
+                    Some(&hoist_owner),
+                    source,
+                    library_abi,
+                    boxed_vars,
+                    std::rc::Rc::clone(&self.emit_errors),
+                );
+                gen_expr(asm, &mut frame, &ctx, &rhs);
+                if is_unit_like(&ret_for_body) {
+                    pop_if_value(asm, &rhs.ty);
+                    asm.vreturn();
+                } else {
+                    emit_return(asm, &ret_for_body);
+                }
+            });
             // A value class's methods are called through their `$extension`
             // statics, and so are the default getters that go with them:
             // slick's `NodeOps.collect(pf, stopOnMatch = false)` compiled to
@@ -4016,7 +4056,7 @@ impl<'a> Gen<'a> {
         // traits carry their initialiser as a tree; one inherited from a trait
         // that arrived as a class file is a call to that trait's `d$` static,
         // which is where nsc put the initialiser. Both share the bitmap words.
-        let mut items: Vec<(String, Type, LazyInit, bool)> = Vec::new();
+        let mut items: Vec<(String, Type, LazyInit, bool, SymbolId)> = Vec::new();
         for stt in lazies {
             let TreeKind::ValDef {
                 name, mods, rhs, ..
@@ -4037,6 +4077,7 @@ impl<'a> Gen<'a> {
                 ty,
                 LazyInit::Rhs(rhs.clone()),
                 is_transient_val(stt),
+                stt.sym,
             ));
         }
         for v in binary {
@@ -4051,12 +4092,13 @@ impl<'a> Gen<'a> {
                     iface,
                 },
                 false,
+                SymbolId::NONE,
             ));
         }
         // Plain and transient `lazy val`s number their bits separately; see
         // `lazy_bitmap_fields`.
         let (mut plain_bits, mut trans_bits) = (0usize, 0usize);
-        for (name, ty, init, transient) in items.into_iter() {
+        for (name, ty, init, transient, value_sym) in items.into_iter() {
             let (bit, word_prefix) = if transient {
                 trans_bits += 1;
                 (trans_bits - 1, "bitmap$trans$")
@@ -4168,7 +4210,17 @@ impl<'a> Gen<'a> {
                 load(asm, result, jvm_sort(&ret_ty));
                 emit_return(asm, &ret_ty);
             });
+            self.sign_lazy_accessor(b, value_sym);
         }
+    }
+
+    /// Attach the value's generic type to the getter synthesized for a
+    /// `lazy val`.  The source symbol carries a value signature (`T`), while
+    /// the JVM member is a zero-argument method and therefore needs `()T`.
+    /// Classpath-only lazy vals have no source symbol and deliberately remain
+    /// unsigned; their binary metadata is supplied by the classfile reader.
+    fn sign_lazy_accessor(&self, b: &mut ClassBuilder, value_sym: SymbolId) {
+        b.sign_last_accessor(self.sig_of(value_sym), false);
     }
 
     /// nsc-style val getters (`def Red: Value`) so `scala.Enumeration` reflection

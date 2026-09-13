@@ -11,8 +11,16 @@
 // `replaceAllIn` line below checks -- it threw `NoSuchMethodError` before.
 
 object Main {
+  import scala.util.matching.Regex._
   val re = "a(b+)c".r
   val Num = """(\d+)-(\d+)""".r
+
+  // `Regex.Match` is a nested class, while `Regex.Match$` is its companion
+  // extractor object. Keep the annotation here: a classpath descriptor may
+  // mention the nested class before its classfile is read, but must not turn
+  // that class stub into the companion module.
+  def replaceExplicit(s: String): String =
+    re.replaceAllIn(s, (m: Match) => m.group(1))
 
   def main(args: Array[String]): Unit = {
     println(re.findFirstMatchIn("xabbcy").map(m => m.group(1)).getOrElse("none"))
@@ -20,6 +28,7 @@ object Main {
     println(re.findAllIn("abc abbc").size)
     println(re.findFirstIn("xabcy").getOrElse("none"))
     println(re.replaceAllIn("abc-abc", "Q"))
+    println(replaceExplicit("abbc-abc"))
     println(re.replaceFirstIn("abc-abc", "Q"))
     println(re.split("1abc2").length)
     "12-34" match {

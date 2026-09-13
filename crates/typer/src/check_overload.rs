@@ -275,7 +275,12 @@ impl Typer {
             }
             _ => return false,
         };
-        if matches!(*ret, Type::Array(_)) {
+        // An inner class reached through an enclosing instance carries an
+        // as-seen-from `Refined` view. Its core is still the callable class;
+        // keep the full view on the receiver, but inspect the core when
+        // deciding whether an implicit `.apply` is available.
+        let ret_core = crate::prefix::strip_view(&ret);
+        if matches!(ret_core, Type::Array(_)) {
             // A JVM zero-arg descriptor does not tell `def value` from
             // `def next()`. Keep the source clause identity or a matching
             // Scala property; Java/approximate prelude methods are not getters.
@@ -294,7 +299,7 @@ impl Typer {
             if sym.parameterless_method != Some(true) && !is_getter {
                 return false;
             }
-        } else if !matches!(*ret, Type::Class { .. } | Type::ModuleRef(_)) {
+        } else if !matches!(ret_core, Type::Class { .. } | Type::ModuleRef(_)) {
             return false;
         }
         // A Scala method with an explicit empty clause must be called before
@@ -302,8 +307,8 @@ impl Typer {
         if self.st.get(fun.sym).parameterless_method == Some(false) {
             return false;
         }
-        self.ensure_apply_supplied(&ret, fun.span);
-        let Some(cls) = self.st.class_sym_of(&ret) else {
+        self.ensure_apply_supplied(ret_core, fun.span);
+        let Some(cls) = self.st.class_sym_of(ret_core) else {
             return false;
         };
         if self.st.lookup_member(cls, "apply").is_empty() {

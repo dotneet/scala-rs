@@ -598,6 +598,17 @@ impl Typer {
                     if o.name != s.name
                         || o.owner == s.owner
                         || self.st.private_to_owner(other)
+                        // A Scala trait's inherited implicit `val` may have
+                        // only a plain JVM accessor on the concrete class.
+                        // That accessor is an implementation of the inherited
+                        // binding, not a source-level declaration that hides
+                        // it (the classfile has no implicit bit). Keep the
+                        // pickled parent candidate when the value type agrees;
+                        // ordinary Java methods still shadow as before.
+                        || (o.flags.contains(Flags::JAVA)
+                            && !o.flags.contains(Flags::IMPLICIT)
+                            && o.kind == crate::symbol::SymKind::Method
+                            && value_type(other) == value_type(c))
                         || (value_type(other) != value_type(c)
                             // An inferred val already occupies the term name
                             // while its initializer is being typed. It hides a
@@ -1787,7 +1798,7 @@ impl Typer {
     /// substituted base type on *both* sides before they can fail -- and,
     /// worse, a candidate that survives them recurses into
     /// [`Self::implicit_fit_open`] and searches for its own clauses.
-    fn plausibly_inhabits(&self, have: &Type, pt: &Type) -> bool {
+    pub(crate) fn plausibly_inhabits(&self, have: &Type, pt: &Type) -> bool {
         let (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, .. }) = (have, pt) else {
             return true;
         };
@@ -2667,16 +2678,27 @@ impl Typer {
         if !self.st.is_sub_type(&ra, &rb) {
             return false;
         }
-        // A view does not beat a value-shaped implicit on type alone.
+        // A view does not beat a value-shaped implicit on type alone. Keep the
+        // long-standing raw-clause distinction here: several reflection API
+        // candidates depend on it. The exception is the low-priority pattern
+        // this comparison's owner term exists to order: a candidate declared
+        // on the derived owner and carrying only implicit clauses is not a
+        // conversion merely because that clause has one parameter
+        // (`Shrink.shrinkIntegral` versus inherited `shrinkAny`).
         !matches!(
             (self.conversion_arg_ty(a), self.conversion_arg_ty(b)),
             (Some(_), None)
-        )
+        ) || (self.only_implicit_clauses(a)
+            && self.is_named_low_priority_origin(b)
+            && self.owner_is_proper_subclass(a, b))
     }
 
     /// Direct owner must be class-like (nsc `owner.isSubClass`). A method-local
     /// implicit's owner is the method, so it does not win on origin against an
-    /// inherited class member.
+    /// inherited class member. Scala object mirror classes do not inherit the
+    /// traits their modules mix in, so the direct relation is absent for the
+    /// conventional `LowPriority...` pattern; pickle linearisation is used
+    /// only for that explicitly lower-priority declaration.
     fn is_as_specific_origin(&self, a: SymbolId, b: SymbolId) -> bool {
         let oa = self.st.get(a).owner;
         let ob = self.st.get(b).owner;
@@ -2695,7 +2717,21 @@ impl Typer {
                 sym: ob,
                 args: vec![],
             },
-        )
+        ) || (self.is_named_low_priority_origin(b) && self.owner_is_proper_subclass(a, b))
+    }
+
+    fn is_named_low_priority_origin(&self, id: SymbolId) -> bool {
+        self.st
+            .get(id)
+            .pickled_origin
+            .split_once('#')
+            .map(|(owner, _)| {
+                owner
+                    .rsplit(['.', '$'])
+                    .next()
+                    .is_some_and(|name| name.contains("LowPriority"))
+            })
+            .unwrap_or(false)
     }
 
     /// nsc `Infer#isStrictlyMoreSpecific`: the *sum* of the specificity
@@ -2844,6 +2880,70 @@ impl Typer {
         }
     }
 
+    /// Load the source-level implicit conversions inherited by the class
+    /// currently being typed.  A Scala classpath scan can only install a
+    /// shallow classfile view, whose mixin forwarders do not carry Scala's
+    /// `implicit` flag.  The declaration in a parent pickle must be supplied
+    /// before `implicits_in_scope` builds the lexical candidate pool.
+    ///
+    /// The pickle helper is name-aware at the result type: `when` is supplied
+    /// by a conversion named `convertToWordSpecStringWrapper`, so completing
+    /// the selected name itself would never find it.  Only external Scala
+    /// parents are considered; source classes and the hand-written prelude
+    /// remain on their existing paths.
+    fn warm_inherited_extension_members(&mut self, name: &str, span: Span) -> bool {
+        if !self.library_abi || self.st.this_class.is_none() {
+            return false;
+        }
+        let mut work = vec![self.st.this_class];
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut warmed = false;
+        while let Some(class_sym) = work.pop() {
+            if class_sym.is_none() || !seen.insert(class_sym.0) {
+                continue;
+            }
+            let external = class_sym.0 >= self.st.prelude_end
+                && !self.st.source_classes.contains(&class_sym)
+                && {
+                    let jvm = &self.st.get(class_sym).jvm_name;
+                    !jvm.starts_with("java/") && !jvm.starts_with("javax/")
+                };
+            if external {
+                // A classpath class is initially represented by the JVM
+                // signature. Adopt its ScalaSignature before asking the
+                // pickle helper to complete an implicit conversion.
+                self.ensure_java_loaded(class_sym, span);
+                warmed |= self.pickle.supply_implicit_extensions_for(
+                    &mut self.st,
+                    &mut self.binary,
+                    class_sym,
+                    name,
+                ) != 0;
+            }
+            let parents = self.st.get(class_sym).parents.clone();
+            for parent in parents {
+                if let Some(parent_sym) = self.st.class_sym_of(&parent) {
+                    work.push(parent_sym);
+                }
+            }
+        }
+        if warmed {
+            // `implicits_in_scope` and implicit-search results are memoized
+            // while an implicit search is in flight. Installing new inherited
+            // candidates invalidates both views of that search; otherwise a
+            // previous empty pool would continue to hide the freshly supplied
+            // conversion.
+            let mut memo = self.implicit_memo.borrow_mut();
+            if memo.depth > 0 {
+                memo.in_scope = None;
+                memo.entries.clear();
+                memo.improves.clear();
+                memo.candidate_tys.clear();
+            }
+        }
+        warmed
+    }
+
     pub(crate) fn search_extension(
         &mut self,
         from: &Type,
@@ -2878,6 +2978,7 @@ impl Typer {
         // scope here as well: a conversion the receiver's own companion
         // supplies would otherwise be dropped for want of a class file.
         self.warm_implicit_scope(from);
+        self.warm_inherited_extension_members(name, span);
         // Lexical implicits have precedence over the implicit scope. This is
         // observable when a source-defined implicit class deliberately
         // redeclares a standard extension name: cats' compat layer imports
@@ -3028,6 +3129,25 @@ impl Typer {
                     .collect();
                 if declared.len() == 1 {
                     return Some(declared.into_iter().next().unwrap());
+                }
+                // A concrete wrapper can implement the broader verb wrapper
+                // exposed by another mixed-in trait.  Scalatest's
+                // `Matchers.StringShouldWrapper` is such a result: it is a
+                // subtype of `ShouldVerb.StringShouldWrapperForVerb`, and
+                // therefore wins the otherwise equal String views.  Use the
+                // result only after member declaration filtering, preserving
+                // the ordinary view rule for unrelated result types.
+                let result_winners: Vec<usize> = (0..declared.len())
+                    .filter(|&i| {
+                        (0..declared.len()).all(|j| {
+                            i == j
+                                || (self.st.is_sub_type(&declared[i].2, &declared[j].2)
+                                    && !self.st.is_sub_type(&declared[j].2, &declared[i].2))
+                        })
+                    })
+                    .collect();
+                if let [i] = result_winners.as_slice() {
+                    return Some(declared[*i].clone());
                 }
                 let mut pool = if declared.is_empty() { hits } else { declared };
                 // nsc priority: a conversion `Predef` declares itself beats one

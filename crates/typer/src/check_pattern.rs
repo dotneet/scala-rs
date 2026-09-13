@@ -1204,6 +1204,16 @@ impl Typer {
     /// Decide whether the two types can have a common instance. Unlike an
     /// assignment, a type test permits narrowing and unrelated open traits.
     fn typed_pattern_compatible(&mut self, pattern: &Type, scrutinee: &Type) -> bool {
+        // A JVM descriptor can mention a Java class before source lookup ever
+        // names it.  That leaves an exact `JAVA` stub whose provisional parent
+        // is only `AnyRef`; resolving the same name later therefore does not
+        // take the ordinary class-loading path.  Complete both sides before
+        // testing their hierarchy.  In particular, Slick's classpath stubs
+        // `java.lang.AbstractMethodError` early, and a subsequent
+        // `catch { case _: AbstractMethodError => ... }` must still see
+        // `AbstractMethodError <: Error <: Throwable`.
+        self.complete_java_type(pattern, Span::DUMMY);
+        self.complete_java_type(scrutinee, Span::DUMMY);
         if matches!(self.st.dealias(pattern), Type::Class { sym, .. } if sym == self.st.singleton_sym)
         {
             return true;

@@ -185,3 +185,75 @@ fn scalac_reads_generic_value_class_from_our_binary() {
         fs::read(fixture("expected/vcbridge_generic.txt")).unwrap()
     );
 }
+
+/// nsc permits boxing a private value class returned by a factory. The
+/// constructor remains private to source code, but erasure must be able to
+/// synthesize the `new` used when the value enters an erased generic type.
+#[test]
+fn scalac_boxes_private_value_class_from_our_binary() {
+    if !Path::new(JAR).is_file() || !Path::new(NSC).is_file() {
+        eprintln!("skip private value-class boxing: scala toolchain unavailable");
+        return;
+    }
+
+    let p = root();
+    let library_src = p.join("PrivateValue.scala");
+    fs::write(
+        &library_src,
+        r#"final class PrivateValue private (val value: Int) extends AnyVal
+object PrivateValue {
+  def one(value: Int): PrivateValue = new PrivateValue(value)
+}
+"#,
+    )
+    .unwrap();
+    let library = p.join("library");
+    let library_result = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
+        .args([
+            "compile",
+            "--scala-library",
+            JAR,
+            library_src.to_str().unwrap(),
+            "-d",
+            library.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        library_result.status.success(),
+        "scala-rs failed to compile private value class: {}{}",
+        String::from_utf8_lossy(&library_result.stdout),
+        String::from_utf8_lossy(&library_result.stderr)
+    );
+
+    let consumer_src = p.join("Consumer.scala");
+    fs::write(
+        &consumer_src,
+        r#"object Consumer {
+  val value: Either[PrivateValue, Int] = Left(PrivateValue.one(1))
+}
+"#,
+    )
+    .unwrap();
+    let consumer = p.join("consumer");
+    fs::create_dir_all(&consumer).unwrap();
+    let classpath = format!("{}:{JAR}", library.display());
+    let consumer_result = Command::new(NSC)
+        .args([
+            "-classpath",
+            &classpath,
+            "-d",
+            consumer.to_str().unwrap(),
+            consumer_src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        consumer_result.status.success(),
+        "real scalac rejected boxing from scala-rs output: {}{}",
+        String::from_utf8_lossy(&consumer_result.stdout),
+        String::from_utf8_lossy(&consumer_result.stderr)
+    );
+
+    let _ = fs::remove_dir_all(p);
+}

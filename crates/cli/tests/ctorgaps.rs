@@ -503,20 +503,11 @@ fn a_qualified_private_constructor_is_refused_outside_its_package() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The other half, still open and pinned on the acceptance so a later slice is
-/// told: this compiler does not **write** the boundary.
-///
-/// `backend::pickle::pickled_access_flags` drops the `PRIVATE` flag for a
-/// qualified-private member on purpose and emits no `privateWithin` entry at
-/// all, so a `private[libp]` constructor in a class file *we* wrote is
-/// indistinguishable from a public one -- to our own reader and to real
-/// scalac alike. Both are asserted, because the writing side is only proved by
-/// the compiler that did not write it.
-///
-/// Closing it is a pickle-format change: `SymInfo` gains a symbol reference,
-/// which moves every entry after it. It is not a matter of setting a flag.
+/// The writer half of qualified-private constructors. Both readers must reject
+/// the caller: their agreement alone would not prove the emitted pickle is in
+/// nsc's format.
 #[test]
-fn our_own_class_file_does_not_yet_carry_the_qualified_boundary() {
+fn our_own_constructor_pickle_carries_the_qualified_boundary() {
     let (Some(jar), Some(sc)) = (scala_library_jar(), scalac()) else {
         eprintln!("skip qualified private writer: jar or scalac not present");
         return;
@@ -532,13 +523,96 @@ fn our_own_class_file_does_not_yet_carry_the_qualified_boundary() {
         "BadQual",
         "package other\nclass BadQual { new libp.Qual(\"x\") }\n",
     );
-    ok(
+    rejected(
         compile_rs(&bad, &app, &jar, Some(&lib)),
-        "the known `private[p]` *writer* gap, read by us",
+        "scala-rs reads its constructor privateWithin",
+        "constructor Qual in class Qual cannot be accessed",
+    );
+    rejected(
+        compile_scalac(&sc, &bad, &ref_out, &jar, Some(&lib)),
+        "scalac reads scala-rs's constructor privateWithin",
+        "constructor Qual in class Qual cannot be accessed",
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A qualified-private method exercises the same optional SymInfo field on a
+/// normal member. This is the Cats shape: a method such as
+/// `private[syntax] def contains_` must not become an external implicit-view
+/// candidate after a separate compilation.
+#[test]
+fn our_own_method_pickle_carries_the_qualified_boundary() {
+    let (Some(jar), Some(sc)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip qualified private method writer: jar or scalac not present");
+        return;
+    };
+    let dir = tmp_dir("methodprivatew");
+    let lib = dir.join("lib");
+    let app = dir.join("app");
+    let ref_out = dir.join("ref");
+    for d in [&lib, &app, &ref_out] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let lib_src = write_src(
+        &dir,
+        "PrivateMethodLib",
+        "package libp\nobject Secret { private[libp] def hidden: Int = 1 }\n",
     );
     ok(
+        compile_rs(&lib_src, &lib, &jar, None),
+        "scala-rs writes a method privateWithin",
+    );
+    let bad = write_src(
+        &dir,
+        "BadSecret",
+        "package other\nclass BadSecret { val n = libp.Secret.hidden }\n",
+    );
+    let needle = "method hidden in object Secret cannot be accessed";
+    rejected(
+        compile_rs(&bad, &app, &jar, Some(&lib)),
+        "scala-rs reads its method privateWithin",
+        needle,
+    );
+    rejected(
         compile_scalac(&sc, &bad, &ref_out, &jar, Some(&lib)),
-        "the known `private[p]` *writer* gap, read by scalac",
+        "scalac reads scala-rs's method privateWithin",
+        needle,
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A class-level qualified access is the smallest writer-to-real-scalac
+/// probe: scala-rs writes the library class, then scalac must reject a use of
+/// that class from another package based solely on its ScalaSignature.
+#[test]
+fn our_class_pickle_private_within_is_read_by_scalac() {
+    let (Some(jar), Some(sc)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip qualified class writer: jar or scalac not present");
+        return;
+    };
+    let dir = tmp_dir("classprivatew");
+    let lib = dir.join("lib");
+    let ref_out = dir.join("ref");
+    fs::create_dir_all(&lib).unwrap();
+    fs::create_dir_all(&ref_out).unwrap();
+    let lib_src = write_src(
+        &dir,
+        "PrivateClassLib",
+        "package libp\nprivate[libp] class ClassOnly(val s: String)\n",
+    );
+    ok(
+        compile_rs(&lib_src, &lib, &jar, None),
+        "scala-rs writes a class-level privateWithin",
+    );
+    let bad = write_src(
+        &dir,
+        "BadClassOnly",
+        "package other\nclass BadClassOnly { new libp.ClassOnly(\"x\") }\n",
+    );
+    rejected(
+        compile_scalac(&sc, &bad, &ref_out, &jar, Some(&lib)),
+        "scalac reads scala-rs's class-level privateWithin",
+        "class ClassOnly in package libp cannot be accessed",
     );
     let _ = fs::remove_dir_all(&dir);
 }

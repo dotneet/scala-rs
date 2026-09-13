@@ -830,7 +830,36 @@ fn bt2_shapes_match_nscs() {
             "missing `{want}` from Stacked:\n{stacked}"
         );
     }
-    for d in [out, n_lib, r_app] {
+
+    // The same class over a binary trait's lazy val must own the caching
+    // field and accessor. Selecting `doubled` while typing the application
+    // replaces its eager classpath `Term` with an ACCESSOR `Method`; losing
+    // that equivalence silently inherits the interface default and computes
+    // the initializer on every read.
+    let r_app_vals = tmp_dir("bt2-shape-rs-app-vals");
+    compile_fixture(
+        "bt2_app",
+        &r_app_vals,
+        &[
+            "-cp",
+            n_lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ],
+    );
+    let sub = javap(&r_app_vals, "Sub");
+    for want in [
+        "private int doubled;",
+        "private int bitmap$0;",
+        "public int doubled();",
+        "InterfaceMethod bt2lib/Counter.doubled$:(Lbt2lib/Counter;)I",
+    ] {
+        assert!(
+            sub.contains(want),
+            "missing binary-lazy shape `{want}` from Sub:\n{sub}"
+        );
+    }
+    for d in [out, n_lib, r_app, r_app_vals] {
         let _ = fs::remove_dir_all(d);
     }
 }

@@ -1576,8 +1576,16 @@ pub(crate) fn member_module_outer(st: &SymbolTable, id: SymbolId) -> Option<Symb
     }
     let cls = module_class_id(st, id);
     let s = st.get(cls);
+    // A binary nested module may be owned by the outer *class* in the symbol
+    // table even though its InnerClasses entry is ACC_STATIC.  That is how a
+    // companion's nested object is represented (`ExecutionContext.Implicits`
+    // is owned by `ExecutionContext`, while its instance is still loaded from
+    // `ExecutionContext$Implicits$.MODULE$`).  Treating the owner alone as
+    // proof of an instance member makes codegen load `this`, cast it to the
+    // outer trait, and call a module accessor that does not exist at source.
     if !(s.kind == SymKind::ModuleClass || s.flags.contains(Flags::MODULE))
         || s.flags.contains(Flags::JAVA)
+        || s.flags.contains(Flags::STATIC)
     {
         return None;
     }
@@ -2461,6 +2469,26 @@ pub(crate) fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
     !sym.is_none() && (st.get(sym).access_widened || st.get(sym).private_within.is_some())
 }
 
+/// Whether `sym` is a trait-local helper that must not enter the inherited
+/// interface namespace. This includes an explicitly private method and a
+/// method-local definition lifted onto a trait by `lambda_lift`. The latter
+/// is marked `SYNTHETIC | LOCAL` while it is reparented; `LOCAL` alone cannot
+/// distinguish it because source `protected[this]` members carry that flag as
+/// well. The owner check also covers a pre-lift tree where the original method
+/// owner is still visible.
+pub(crate) fn is_trait_private_sym(st: &SymbolTable, sym: SymbolId) -> bool {
+    if sym.is_none() {
+        return false;
+    }
+    let s = st.get(sym);
+    let local_owner =
+        !s.owner.is_none() && matches!(st.get(s.owner).kind, SymKind::Method | SymKind::Term);
+    (s.flags.contains(Flags::PRIVATE)
+        || (s.flags.contains(Flags::SYNTHETIC) && s.flags.contains(Flags::LOCAL))
+        || local_owner)
+        && !widened(st, sym)
+}
+
 /// A trait method that stays genuinely `private` on the JVM (not widened by
 /// the typer). Real scalac keeps such a method's implementation entirely
 /// inside the interface as a `private` method with a body -- JVMS 4.6
@@ -2469,11 +2497,17 @@ pub(crate) fn widened(st: &SymbolTable, sym: SymbolId) -> bool {
 /// `private static <name>$` taking the receiver rather than a `private`
 /// instance method — the invariant is the same one: no declaration on the
 /// interface at all (nothing outside the trait's own code may call it), and
-/// no mixin forwarder on any implementing class.
+/// no mixin forwarder on any implementing class. A method-local definition
+/// lifted onto a trait has the same treatment: scalac emits it as a private
+/// helper, rather than a public default method that can clash with another
+/// trait's helper after erasure.
 pub(crate) fn is_trait_private_def(st: &SymbolTable, def: &Tree) -> bool {
     match &def.kind {
         TreeKind::DefDef { mods, .. } => {
-            mods.flags.contains(Flags::PRIVATE) && !widened(st, def.sym)
+            (mods.flags.contains(Flags::PRIVATE)
+                || (mods.flags.contains(Flags::SYNTHETIC) && mods.flags.contains(Flags::LOCAL))
+                || is_trait_private_sym(st, def.sym))
+                && !widened(st, def.sym)
         }
         _ => false,
     }
@@ -2595,4 +2629,33 @@ pub(crate) fn value_bridge_impl_name(st: &SymbolTable, id: SymbolId) -> Option<S
     let owner = class_internal(st, st.get(id).owner);
     let (prefix, _) = owner.rsplit_once("$anon$")?;
     Some(format!("{prefix}$anon$${}", st.get(id).name))
+}
+
+#[cfg(test)]
+mod member_module_outer_tests {
+    use super::*;
+
+    #[test]
+    fn binary_static_nested_module_has_no_outer_instance() {
+        let mut st = SymbolTable::new();
+        let root = st.root;
+        let outer = st.alloc("Outer", root, SymKind::Class, Flags::EMPTY, "p/Outer");
+        let instance = st.alloc(
+            "Instance$",
+            outer,
+            SymKind::ModuleClass,
+            Flags::MODULE,
+            "p/Outer$Instance$",
+        );
+        let static_nested = st.alloc(
+            "Static$",
+            outer,
+            SymKind::ModuleClass,
+            Flags::MODULE.with(Flags::STATIC),
+            "p/Outer$Static$",
+        );
+
+        assert_eq!(member_module_outer(&st, instance), Some(outer));
+        assert_eq!(member_module_outer(&st, static_nested), None);
+    }
 }

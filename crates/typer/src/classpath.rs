@@ -1,8 +1,9 @@
 //! Install symbols recovered from classpath classfiles / ScalaSignature pickles.
 
 use scala_rs_parser::{Flags, SymbolId, Type};
+use std::collections::HashMap;
 
-use crate::check::{ClasspathClass, ClasspathType, ClasspathTypeParam};
+use crate::check::{ClasspathClass, ClasspathMethod, ClasspathType, ClasspathTypeParam};
 use crate::symbol::{SymKind, SymbolTable};
 
 pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
@@ -159,6 +160,8 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                     install_ctor(st, owner, m, &accessors, &c.fields);
                     continue;
                 }
+                let fallback_names =
+                    method_type_name_fallbacks(st, c, &m.name, m.param_types.len());
                 let id = add_method(
                     st,
                     owner,
@@ -167,6 +170,8 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
                     m.param_types.clone(),
                     m.ret.clone(),
                     m.tparams.clone(),
+                    m.clause_sizes.clone(),
+                    &fallback_names,
                 );
                 if m.is_implicit {
                     let f = st.get(id).flags.with(Flags::IMPLICIT);
@@ -185,7 +190,7 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
             if m.name == "<init>" && !st.get(owner).ctor_fields.is_empty() {
                 continue;
             }
-            let (params, ret) = parse_method_desc(st, &m.desc);
+            let (params, ret) = parse_classpath_method(st, owner, m);
             let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
             let id = add_method_erased(st, owner, &m.name, names, params, ret);
             // Non-public methods can be absent from the pickle API subset.
@@ -479,6 +484,8 @@ fn install_ctor(
         m.param_types.clone(),
         ClasspathType::simple("Unit"),
         Vec::new(),
+        m.clause_sizes.clone(),
+        &HashMap::new(),
     );
 }
 
@@ -593,6 +600,8 @@ fn add_method(
     param_type_names: Vec<ClasspathType>,
     ret_name: ClasspathType,
     tparams: Vec<ClasspathTypeParam>,
+    clause_sizes: Vec<usize>,
+    fallback_names: &HashMap<String, Type>,
 ) -> SymbolId {
     let flags = if name.contains("$default$") {
         Flags::SYNTHETIC
@@ -606,9 +615,14 @@ fn add_method(
     st.get_mut(id).tparams = tp_ids.clone();
     let params: Vec<Type> = param_type_names
         .iter()
-        .map(|n| resolve_type_in(st, owner, n, &tp_ids))
+        .map(|n| {
+            replace_named_with_fallback(resolve_type_in(st, owner, n, &tp_ids), fallback_names)
+        })
         .collect();
-    let ret = resolve_type_in(st, owner, &ret_name, &tp_ids);
+    let ret = replace_named_with_fallback(
+        resolve_type_in(st, owner, &ret_name, &tp_ids),
+        fallback_names,
+    );
     let mut pids = Vec::new();
     for (i, (n, ty)) in param_names.iter().zip(params.iter()).enumerate() {
         let pname = if n.is_empty() {
@@ -620,14 +634,36 @@ fn add_method(
         st.get_mut(pid).ty = ty.clone();
         pids.push(pid);
     }
-    st.get_mut(id).params = pids.clone();
-    st.get_mut(id).paramss = if pids.is_empty() { vec![] } else { vec![pids] };
+    // The classfile descriptor has one flat parameter sequence, but the
+    // ScalaSignature's nested MethodTypes retain the source clause shape.
+    // Restore that shape here so a separately compiled `f(a)(b)` is not
+    // exposed as the unrelated `f(a, b)`.
+    let sizes = if !clause_sizes.is_empty() && clause_sizes.iter().sum::<usize>() == params.len() {
+        clause_sizes
+    } else if params.is_empty() {
+        Vec::new()
+    } else {
+        vec![params.len()]
+    };
+    let mut paramss = Vec::with_capacity(sizes.len());
+    let mut start = 0;
+    for &size in &sizes {
+        let end = start + size;
+        paramss.push(pids[start..end].to_vec());
+        start = end;
+    }
+    st.get_mut(id).params = pids;
+    st.get_mut(id).paramss = paramss.clone();
     st.get_mut(id).ty = Type::Method {
-        paramss: if params.is_empty() {
-            vec![]
-        } else {
-            vec![params]
-        },
+        paramss: sizes
+            .iter()
+            .scan(0usize, |start, &size| {
+                let end = *start + size;
+                let clause = params[*start..end].to_vec();
+                *start = end;
+                Some(clause)
+            })
+            .collect(),
         ret: Box::new(ret),
     };
     id
@@ -642,6 +678,207 @@ fn add_method_erased(
     ret: Type,
 ) -> SymbolId {
     add_method_types(st, owner, name, param_names, params, ret)
+}
+
+/// Recover the fully qualified classes hidden by the pickle subset's simple
+/// type names.  `ClasspathPickleMethod` intentionally keeps the compact names
+/// used by the backend pickle reader (`Git`, `ObjectId`, ...), while the JVM
+/// method descriptor and generic `Signature` retain their exact owners.  A
+/// method taking a JGit class therefore used to be stored as `Type::Named`
+/// and could not accept a value whose type came from the Java classpath.
+///
+/// Only unambiguous simple names are returned.  If one method mentions two
+/// classes with the same leaf name, guessing would be worse than leaving the
+/// name unresolved and letting the normal classpath path report it.
+fn method_type_name_fallbacks(
+    st: &mut SymbolTable,
+    class: &ClasspathClass,
+    name: &str,
+    arity: usize,
+) -> HashMap<String, Type> {
+    let mut candidates: HashMap<String, Option<Type>> = HashMap::new();
+    for method in class.methods.iter().filter(|m| m.name == name) {
+        let (desc_params, _) = parse_method_desc(st, &method.desc);
+        if desc_params.len() != arity {
+            continue;
+        }
+        if let Some(signature) = method.signature.as_deref() {
+            if let Some(parsed) = crate::javasign::parse_method_sig(signature) {
+                for ty in parsed.params.iter().chain(std::iter::once(&parsed.ret)) {
+                    collect_jtype_name_fallbacks(st, ty, &mut candidates);
+                }
+                continue;
+            }
+        }
+        // A method without a generic Signature still gives exact names in its
+        // descriptor. Pair those with the pickle's flat parameters.
+        if let Some(pickled) = class.pickle.as_ref().and_then(|methods| {
+            methods
+                .iter()
+                .find(|m| m.name == name && m.param_types.len() == arity)
+        }) {
+            for (pickled, descriptor) in pickled.param_types.iter().zip(desc_params) {
+                if let Type::Class { .. } = descriptor {
+                    record_type_name_fallback(&mut candidates, &pickled.name, descriptor);
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(name, ty)| ty.map(|ty| (name, ty)))
+        .collect()
+}
+
+fn collect_jtype_name_fallbacks(
+    st: &mut SymbolTable,
+    ty: &crate::javasign::JType,
+    out: &mut HashMap<String, Option<Type>>,
+) {
+    use crate::javasign::JType;
+    match ty {
+        JType::Class { jvm, args } => {
+            let simple = jvm.rsplit('/').next().unwrap_or(jvm);
+            let mapped = if jvm == "java/lang/String" {
+                Type::String
+            } else if jvm == "java/lang/Object" {
+                Type::Any
+            } else {
+                Type::Class {
+                    sym: find_or_stub_java_class(st, jvm),
+                    args: Vec::new(),
+                }
+            };
+            record_type_name_fallback(out, simple, mapped);
+            for arg in args {
+                collect_jtype_name_fallbacks(st, arg, out);
+            }
+        }
+        JType::Array(inner) | JType::Extends(inner) | JType::Super(inner) => {
+            collect_jtype_name_fallbacks(st, inner, out)
+        }
+        JType::Void
+        | JType::Boolean
+        | JType::Byte
+        | JType::Short
+        | JType::Char
+        | JType::Int
+        | JType::Long
+        | JType::Float
+        | JType::Double
+        | JType::Var(_)
+        | JType::Star => {}
+    }
+}
+
+fn record_type_name_fallback(out: &mut HashMap<String, Option<Type>>, name: &str, ty: Type) {
+    if name.is_empty() {
+        return;
+    }
+    match out.entry(name.to_string()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(ty));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if entry.get().as_ref() != Some(&ty) {
+                entry.insert(None);
+            }
+        }
+    }
+}
+
+/// Replace only unresolved pickle names with exact classpath identities.  The
+/// structural `FunctionN` representation is retained, but its argument types
+/// are repaired recursively, which is needed for lambdas calling methods on a
+/// Java parameter such as `CanonicalTreeParser`.
+fn replace_named_with_fallback(ty: Type, names: &HashMap<String, Type>) -> Type {
+    match ty {
+        Type::Named { name, args } => {
+            let args = args
+                .into_iter()
+                .map(|arg| replace_named_with_fallback(arg, names))
+                .collect::<Vec<_>>();
+            if let Some(mapped) = names.get(&name) {
+                match mapped.clone() {
+                    Type::Class { sym, .. } => Type::Class { sym, args },
+                    other if args.is_empty() => other,
+                    _ => Type::Named { name, args },
+                }
+            } else {
+                Type::Named { name, args }
+            }
+        }
+        Type::Array(inner) => Type::Array(Box::new(replace_named_with_fallback(*inner, names))),
+        Type::Tuple(items) => Type::Tuple(
+            items
+                .into_iter()
+                .map(|item| replace_named_with_fallback(item, names))
+                .collect(),
+        ),
+        Type::Function { params, ret } => Type::Function {
+            params: params
+                .into_iter()
+                .map(|param| replace_named_with_fallback(param, names))
+                .collect(),
+            ret: Box::new(replace_named_with_fallback(*ret, names)),
+        },
+        Type::Class { sym, args } => Type::Class {
+            sym,
+            args: args
+                .into_iter()
+                .map(|arg| replace_named_with_fallback(arg, names))
+                .collect(),
+        },
+        Type::Method { paramss, ret } => Type::Method {
+            paramss: paramss
+                .into_iter()
+                .map(|params| {
+                    params
+                        .into_iter()
+                        .map(|param| replace_named_with_fallback(param, names))
+                        .collect()
+                })
+                .collect(),
+            ret: Box::new(replace_named_with_fallback(*ret, names)),
+        },
+        Type::ByName(inner) => Type::ByName(Box::new(replace_named_with_fallback(*inner, names))),
+        Type::Repeated(inner) => {
+            Type::Repeated(Box::new(replace_named_with_fallback(*inner, names)))
+        }
+        Type::Overload(items) => Type::Overload(
+            items
+                .into_iter()
+                .map(|item| replace_named_with_fallback(item, names))
+                .collect(),
+        ),
+        Type::Applied { ctor, args } => Type::Applied {
+            ctor: Box::new(replace_named_with_fallback(*ctor, names)),
+            args: args
+                .into_iter()
+                .map(|arg| replace_named_with_fallback(arg, names))
+                .collect(),
+        },
+        Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
+            lo: lo.map(|inner| Box::new(replace_named_with_fallback(*inner, names))),
+            hi: hi.map(|inner| Box::new(replace_named_with_fallback(*inner, names))),
+        },
+        Type::SingleType { prefix, sym } => Type::SingleType {
+            prefix: Box::new(replace_named_with_fallback(*prefix, names)),
+            sym,
+        },
+        Type::Annotated { tpe, annot } => Type::Annotated {
+            tpe: Box::new(replace_named_with_fallback(*tpe, names)),
+            annot,
+        },
+        Type::Refined { parents, decls } => Type::Refined {
+            parents: parents
+                .into_iter()
+                .map(|parent| replace_named_with_fallback(parent, names))
+                .collect(),
+            decls,
+        },
+        other => other,
+    }
 }
 
 fn is_forwarder_of_module(classes: &[ClasspathClass], c: &ClasspathClass) -> bool {
@@ -671,17 +908,29 @@ fn nest_depth(jvm: &str) -> usize {
     let last = jvm.rsplit('/').next().unwrap_or(jvm);
     let mut name = last.trim_end_matches('$');
     let mut depth = 0;
-    while let Some(i) = scala_rs_pickle::names::last_nesting_separator(name) {
+    while let Some(i) = scala_nesting_separator(name) {
         depth += 1;
         name = &name[..i];
     }
     depth
 }
 
+/// The `$` after a package object's class name is a nesting separator even
+/// when the nested source name is `eq`: `package$eq$`. NameTransformer alone
+/// reads `$eq` as the encoded `=` operator and therefore sees no nesting.
+fn scala_nesting_separator(name: &str) -> Option<usize> {
+    if let Some(rest) = name.strip_prefix("package$").filter(|s| !s.is_empty()) {
+        return scala_rs_pickle::names::last_nesting_separator(rest)
+            .map(|i| "package$".len() + i)
+            .or(Some("package".len()));
+    }
+    scala_rs_pickle::names::last_nesting_separator(name)
+}
+
 fn classpath_nested_parent(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
     let last = jvm.rsplit('/').next().unwrap_or(jvm);
     let last_trim = last.trim_end_matches('$');
-    let idx = scala_rs_pickle::names::last_nesting_separator(last_trim)?;
+    let idx = scala_nesting_separator(last_trim)?;
     let outer_simple = &last_trim[..idx];
     let pkg = jvm.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     let module_jvm = if pkg.is_empty() {
@@ -951,7 +1200,7 @@ fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
     }
 }
 
-pub fn parse_method_desc(st: &SymbolTable, desc: &str) -> (Vec<Type>, Type) {
+pub fn parse_method_desc(st: &mut SymbolTable, desc: &str) -> (Vec<Type>, Type) {
     let rest = desc.strip_prefix('(').unwrap_or(desc);
     let (params_s, ret_s) = match rest.find(')') {
         Some(i) => (&rest[..i], &rest[i + 1..]),
@@ -971,7 +1220,39 @@ pub fn parse_method_desc(st: &SymbolTable, desc: &str) -> (Vec<Type>, Type) {
     (params, ret)
 }
 
-fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
+/// Recover a classpath method's generic shape when its classfile provides a
+/// JVM `Signature`; retain the erased descriptor as the fallback for methods
+/// whose signature is absent or has method-local type parameters. The eager
+/// classpath path otherwise loses the concrete type arguments on accessors
+/// before `PickleSupply` can complete a separate consumer's receiver.
+fn parse_classpath_method(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    method: &ClasspathMethod,
+) -> (Vec<Type>, Type) {
+    let Some(sig) = method.signature.as_deref() else {
+        return parse_method_desc(st, &method.desc);
+    };
+    let Some(parsed) = crate::javasign::parse_method_sig(sig) else {
+        return parse_method_desc(st, &method.desc);
+    };
+    // `add_method_erased` has no method-type-parameter slot. Keep the old
+    // descriptor path for that uncommon shape rather than installing a free
+    // `Type::Var` or changing the broader classpath method representation.
+    if !parsed.tparams.is_empty() {
+        return parse_method_desc(st, &method.desc);
+    }
+    let env = tparam_env(st, owner);
+    let params = parsed
+        .params
+        .iter()
+        .map(|t| jtype_to_type(st, t, &env))
+        .collect();
+    let ret = java_result_obj(jtype_to_type(st, &parsed.ret, &env));
+    (params, ret)
+}
+
+fn parse_field_ty(st: &mut SymbolTable, s: &str) -> (Type, usize) {
     if s.is_empty() {
         return (Type::Any, 0);
     }
@@ -1026,12 +1307,13 @@ fn parse_field_ty(st: &SymbolTable, s: &str) -> (Type, usize) {
                 // internal name is still exact, and beats giving up on a
                 // `Type::Named` that nothing can select a member from.
                 match by_name {
-                    Type::Named { .. } => match find_by_jvm(st, inner) {
-                        Some(id) => Type::Class {
-                            sym: id,
-                            args: vec![],
-                        },
-                        None => by_name,
+                    Type::Named { .. } => Type::Class {
+                        // A JVM descriptor is an exact binary identity. Keep
+                        // the identity even when the class has not been
+                        // loaded yet; `ensure_java_loaded` can complete this
+                        // stub when a later selection needs its members.
+                        sym: find_or_stub_java_class(st, inner),
+                        args: vec![],
                     },
                     t => t,
                 }
@@ -1113,6 +1395,61 @@ pub fn install_java_class_in(
         return id;
     }
     if let Some(id) = find_by_jvm(st, &c.internal_name) {
+        // An object-only Scala forwarder can be reached from a JVM descriptor
+        // before its classfile is read. Its owner is then a plain JAVA class
+        // stub. The ScalaSignature on `Foo.class` is authoritative, so promote
+        // that placeholder into the module-class half instead of leaving two
+        // symbols with one JVM name. Ordinary Scala classes (including nested
+        // `Regex$Match.class`) must remain class symbols.
+        if is_scala_module(c)
+            && st.get(id).kind == SymKind::Class
+            && st.get(id).flags.contains(Flags::JAVA)
+            && !st.source_classes.contains(&id)
+        {
+            st.get_mut(id).kind = SymKind::ModuleClass;
+            st.get_mut(id).name = format!("{simple}$");
+            st.get_mut(id).flags = Flags::MODULE.with(Flags::FINAL);
+            st.get_mut(id).ty = Type::ModuleRef(id);
+            let m = st.alloc(
+                &simple,
+                owner,
+                SymKind::Module,
+                Flags::MODULE,
+                &c.internal_name,
+            );
+            st.get_mut(m).ty = Type::ModuleRef(id);
+            if owner == st.root {
+                st.enter_in_current(&simple, m);
+            }
+            apply_java_class_meta(st, id, c);
+            fill_java_members(st, id, c);
+            return id;
+        }
+        // A JVM descriptor can mention a Scala class before its classfile is
+        // opened. At that point the generic Java-name fallback has no way to
+        // distinguish nesting dollars from encoded operators: the return
+        // type `Outer$$plus$plus` was stubbed as a class called `plus` under
+        // another class called `plus`, rather than `Outer#++`. Once the Scala
+        // classfile is loaded, both its decoded simple name and the owner that
+        // requested the nested binary are authoritative. Repair only that
+        // non-source Java placeholder; a real Java class and every source
+        // symbol keep the identity they were declared with.
+        if c.is_scala
+            && st.get(id).kind == SymKind::Class
+            && st.get(id).flags.contains(Flags::JAVA)
+            && !st.source_classes.contains(&id)
+            && (st.get(id).owner != owner || st.get(id).name != simple)
+        {
+            let previous_owner = st.get(id).owner;
+            if !previous_owner.is_none() {
+                st.get_mut(previous_owner).members.retain(|&m| m != id);
+            }
+            st.get_mut(id).owner = owner;
+            st.get_mut(id).name = simple.clone();
+            if !owner.is_none() && !st.get(owner).members.contains(&id) {
+                st.get_mut(owner).members.push(id);
+            }
+        }
         apply_java_class_meta(st, id, c);
         fill_java_members(st, id, c);
         enter_in_companion_scope(st, id, owner, &c.internal_name);
@@ -1155,19 +1492,22 @@ fn enter_in_companion_scope(st: &mut SymbolTable, id: SymbolId, owner: SymbolId,
         return;
     }
     let held_by = st.get(id).owner;
-    if held_by == owner || held_by.is_none() || st.get(held_by).kind != SymKind::Class {
+    if held_by == owner {
         return;
     }
     let module_jvm = st.get(owner).jvm_name.clone();
     let Some(outer) = module_jvm.strip_suffix('$') else {
         return;
     };
-    if outer.is_empty()
-        || st.get(held_by).jvm_name != outer
-        || !internal.starts_with(&format!("{outer}$"))
-    {
+    if outer.is_empty() || !internal.starts_with(&format!("{outer}$")) {
         return;
     }
+    // Usually the first reader installed the nested class under the class
+    // half of this companion. A scala-rs-written package object can instead
+    // mention its nested modules while the package/module half is current,
+    // so `held_by` is not necessarily that class. The JVM prefix above is the
+    // stable evidence: `Outer$Inner` is reachable through both `class Outer`
+    // and `object Outer`, irrespective of which route populated the table.
     if st.get(owner).members.contains(&id) {
         return;
     }
@@ -1253,7 +1593,7 @@ fn java_class_flags(c: &crate::javaclass::JavaClass) -> Flags {
 }
 
 fn is_scala_module(c: &crate::javaclass::JavaClass) -> bool {
-    c.internal_name.ends_with('$') && (c.has_module_field || c.is_scala)
+    c.scala_module || (c.internal_name.ends_with('$') && (c.has_module_field || c.is_scala))
 }
 
 fn install_java_module(
@@ -1262,6 +1602,16 @@ fn install_java_module(
     owner: SymbolId,
 ) -> SymbolId {
     let simple = scala_simple_name(&c.internal_name);
+    // An object-only ScalaSignature lives on two JVM classes with different
+    // jobs: `Foo.class` carries the pickle and static Java forwarders, while
+    // `Foo$.class` is the actual module class and owns `MODULE$`.  The former
+    // tells us that the source symbol is an object, but it must never become
+    // the runtime identity of that object.
+    let runtime_internal = if c.scala_module && !c.internal_name.ends_with('$') {
+        format!("{}$", c.internal_name)
+    } else {
+        c.internal_name.clone()
+    };
     if let Some(m) = st
         .lookup_member(owner, &simple)
         .into_iter()
@@ -1269,12 +1619,46 @@ fn install_java_module(
     {
         let cls = st.module_class_of(m);
         apply_java_class_meta(st, cls, c);
-        fill_java_members(st, cls, c);
+        // Static forwarders are a Java-facing view, not source members of the
+        // Scala module.  Its pickle (and, when loaded, `Foo$.class`) supplies
+        // the instance declarations with the correct owner and flags.
+        if !c.scala_module {
+            fill_java_members(st, cls, c);
+        }
         return cls;
     }
     if let Some(id) = find_by_jvm(st, &c.internal_name) {
+        // A descriptor can stub `Foo` before its object-only pickle is read.
+        // Promote that placeholder to the semantic module, but move its JVM
+        // identity to the implementation class which actually owns MODULE$.
+        if c.scala_module
+            && st.get(id).kind == SymKind::Class
+            && st.get(id).flags.contains(Flags::JAVA)
+            && !st.source_classes.contains(&id)
+        {
+            st.get_mut(id).kind = SymKind::ModuleClass;
+            st.get_mut(id).name = format!("{simple}$");
+            st.get_mut(id).flags = Flags::MODULE.with(Flags::FINAL);
+            st.get_mut(id).ty = Type::ModuleRef(id);
+            st.set_jvm_name(id, runtime_internal.clone());
+            let m = st.alloc(
+                &simple,
+                owner,
+                SymKind::Module,
+                Flags::MODULE,
+                &runtime_internal,
+            );
+            st.get_mut(m).ty = Type::ModuleRef(id);
+            if owner == st.root {
+                st.enter_in_current(&simple, m);
+            }
+            apply_java_class_meta(st, id, c);
+            return id;
+        }
         apply_java_class_meta(st, id, c);
-        fill_java_members(st, id, c);
+        if !c.scala_module {
+            fill_java_members(st, id, c);
+        }
         enter_module_in_companion_scope(st, id, owner, &c.internal_name);
         return id;
     }
@@ -1284,14 +1668,14 @@ fn install_java_module(
         owner,
         SymKind::ModuleClass,
         flags,
-        &c.internal_name,
+        &runtime_internal,
     );
     let m = st.alloc(
         &simple,
         owner,
         SymKind::Module,
         Flags::MODULE,
-        &c.internal_name,
+        &runtime_internal,
     );
     st.get_mut(m).ty = Type::ModuleRef(cls);
     st.get_mut(cls).ty = Type::ModuleRef(cls);
@@ -1299,7 +1683,9 @@ fn install_java_module(
         st.enter_in_current(&simple, m);
     }
     apply_java_class_meta(st, cls, c);
-    fill_java_members(st, cls, c);
+    if !c.scala_module {
+        fill_java_members(st, cls, c);
+    }
     cls
 }
 
@@ -1309,6 +1695,15 @@ fn scala_simple_name(internal: &str) -> String {
         .next()
         .unwrap_or(internal)
         .trim_end_matches('$');
+    // In `package$eq$`, the first `$` is a nesting separator and `eq` is the
+    // source identifier. NameTransformer alone cannot distinguish that from
+    // a top-level `package=` object, because the encoded `=` chunk is also
+    // `$eq`. A package object's JVM name fixes the boundary unambiguously.
+    if let Some(simple) = name.strip_prefix("package$").filter(|s| !s.is_empty()) {
+        let simple = scala_rs_pickle::names::last_nesting_separator(simple)
+            .map_or(simple, |i| &simple[i + 1..]);
+        return scala_rs_pickle::names::decode_method_name(simple);
+    }
     let simple =
         scala_rs_pickle::names::last_nesting_separator(name).map_or(name, |i| &name[i + 1..]);
     scala_rs_pickle::names::decode_method_name(simple)
@@ -1328,10 +1723,26 @@ pub fn java_simple_name(internal: &str) -> String {
 pub(crate) fn java_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
     let trimmed = internal.trim_end_matches('$');
     if let Some((outer, _)) = trimmed.rsplit_once('$') {
-        return find_or_stub_java_class(st, outer);
+        return find_or_stub_java_outer(st, outer);
     }
     let pkg = trimmed.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
     ensure_package(st, pkg)
+}
+
+/// Resolve an enclosing JVM class while honoring Scala's two classfile views
+/// of an object. A module-class symbol may retain either `Outer` (the
+/// static-forwarder class carrying the ScalaSignature) or `Outer$` (the
+/// implementation class), depending on which one was loaded first.
+fn find_or_stub_java_outer(st: &mut SymbolTable, outer: &str) -> SymbolId {
+    if let Some(id) = find_by_jvm(st, outer) {
+        return id;
+    }
+    if let Some(id) =
+        find_by_jvm(st, &format!("{outer}$")).filter(|&id| st.get(id).kind == SymKind::ModuleClass)
+    {
+        return id;
+    }
+    find_or_stub_java_class(st, outer)
 }
 
 /// The symbol *for* a JVM class.
@@ -1365,12 +1776,32 @@ pub(crate) fn find_or_stub_scala_class(st: &mut SymbolTable, internal: &str) -> 
     }
     let simple = scala_simple_name(internal);
     let trimmed = internal.trim_end_matches('$');
-    let owner = if let Some(i) = scala_rs_pickle::names::last_nesting_separator(trimmed) {
-        find_or_stub_scala_class(st, &trimmed[..i])
+    let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let owner = if let Some(i) = scala_nesting_separator(file_name) {
+        let pkg = trimmed.rsplit_once('/').map_or("", |(p, _)| p);
+        let outer = &file_name[..i];
+        let outer = if pkg.is_empty() {
+            outer.to_string()
+        } else {
+            format!("{pkg}/{outer}")
+        };
+        find_or_stub_scala_outer(st, &outer)
     } else {
         ensure_package(st, trimmed.rsplit_once('/').map_or("", |(p, _)| p))
     };
     stub_class_in(st, internal, simple, owner)
+}
+
+fn find_or_stub_scala_outer(st: &mut SymbolTable, outer: &str) -> SymbolId {
+    if let Some(id) = find_by_jvm(st, outer) {
+        return id;
+    }
+    if let Some(id) =
+        find_by_jvm(st, &format!("{outer}$")).filter(|&id| st.get(id).kind == SymKind::ModuleClass)
+    {
+        return id;
+    }
+    find_or_stub_scala_class(st, outer)
 }
 
 fn stub_class_in(
@@ -1445,13 +1876,54 @@ fn stub_class_in(
 }
 
 fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclass::JavaClass) {
+    // A value class's JVM header says only `extends Object`; `extends
+    // AnyVal` exists solely in its ScalaSignature. Lazy pickle adoption can
+    // recover that semantic parent before the nested classfile itself is
+    // completed. Keep it when installing the classfile metadata, otherwise a
+    // later completion silently turns the class back into an ordinary class
+    // and calls on its unboxed result become invalid instance calls. fs2's
+    // `Stream.PartiallyAppliedFromIterator` is reached in exactly this order
+    // while compiling all of Slick.
+    let preserve_anyval =
+        c.is_scala && st.get(id).parents.iter().any(|p| matches!(p, Type::AnyVal));
     st.binary_read.insert(id.0);
     let mut flags = st.get(id).flags.with(java_class_flags(c));
     if st.get(id).kind == SymKind::ModuleClass {
         flags = flags.with(Flags::MODULE).with(Flags::FINAL);
     }
     st.get_mut(id).flags = flags;
-    st.set_jvm_name(id, c.internal_name.clone());
+    // `Foo.class` and `Foo$.class` are two JVM views of the same Scala
+    // module. Keep whichever spelling established the module-class symbol;
+    // replacing `$` with the static-forwarder spelling (or vice versa) would
+    // make nested-owner lookup and method codegen order-dependent.
+    let keep_module_variant = st.get(id).kind == SymKind::ModuleClass && c.is_scala && {
+        let old = st.get(id).jvm_name.as_str();
+        let plain = c.internal_name.trim_end_matches('$');
+        let impl_name = format!("{plain}$");
+        (old == plain && c.internal_name == impl_name)
+            || (old == impl_name && c.internal_name == plain)
+    };
+    if !keep_module_variant {
+        st.set_jvm_name(id, c.internal_name.clone());
+    }
+    // A module class and its term are created together, but a descriptor can
+    // make one JVM view (`Foo$`) load before the static-forwarder view
+    // (`Foo.class`). Keep their JVM spelling paired when the second view is
+    // merged; otherwise codegen can load `Foo.MODULE$` and invoke a method on
+    // `Foo$`, which the verifier correctly rejects.
+    if st.get(id).kind == SymKind::ModuleClass {
+        let owner = st.get(id).owner;
+        let module = st
+            .get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&m| st.get(m).kind == SymKind::Module && st.module_class_of(m) == id);
+        if let Some(m) = module {
+            let jvm = st.get(id).jvm_name.clone();
+            st.set_jvm_name(m, jvm);
+        }
+    }
     if st.get(id).tparams.is_empty() {
         if let Some(sig) = &c.signature {
             if let Some(cs) = crate::javasign::parse_class_sig(sig) {
@@ -1459,7 +1931,11 @@ fn apply_java_class_meta(st: &mut SymbolTable, id: SymbolId, c: &crate::javaclas
             }
         }
     }
-    st.get_mut(id).parents = java_parents(st, id, c);
+    let mut parents = java_parents(st, id, c);
+    if preserve_anyval && !parents.iter().any(|p| matches!(p, Type::AnyVal)) {
+        parents.push(Type::AnyVal);
+    }
+    st.get_mut(id).parents = parents;
 }
 
 fn java_parents(
@@ -1817,6 +2293,18 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                 if had.contains(pickled) {
                     f = f.with(pickled);
                 }
+            }
+            // `Foo.class` and `Foo$.class` are two views of one Scala module.
+            // The former's static forwarder methods and the latter's
+            // instance methods have identical names/descriptors. Preserve a
+            // STATIC bit established by either view while merging the other,
+            // so classfile discovery order cannot turn a valid forwarder into
+            // an instance call on the wrong JVM receiver.
+            if c.is_scala
+                && st.get(owner).kind == SymKind::ModuleClass
+                && had.contains(Flags::STATIC)
+            {
+                f = f.with(Flags::STATIC);
             }
             if trait_defined.contains(&m.name) {
                 f.set(Flags::ABSTRACT, false);
@@ -2187,4 +2675,134 @@ fn desc_param_count(desc: &str) -> usize {
         }
     }
     n
+}
+
+#[cfg(test)]
+mod module_view_tests {
+    use super::*;
+    use crate::javaclass::{JavaClass, JavaField, JavaMethod};
+
+    fn object_view(internal_name: &str, carrier: bool) -> JavaClass {
+        JavaClass {
+            internal_name: internal_name.to_string(),
+            access: 0x0001,
+            super_name: Some("java/lang/Object".to_string()),
+            interfaces: Vec::new(),
+            methods: vec![JavaMethod {
+                name: "value".to_string(),
+                desc: "()I".to_string(),
+                access: if carrier { 0x0001 | 0x0008 } else { 0x0001 },
+                signature: None,
+            }],
+            fields: if carrier {
+                Vec::new()
+            } else {
+                vec![JavaField {
+                    name: "MODULE$".to_string(),
+                    desc: format!("L{internal_name};"),
+                    access: 0x0001 | 0x0008 | 0x0010,
+                    signature: None,
+                }]
+            },
+            outer_desc: None,
+            signature: None,
+            nested_static: false,
+            is_scala: true,
+            scala_module: carrier,
+            has_module_field: !carrier,
+            inner_classes: Vec::new(),
+            sole_instance_field: None,
+        }
+    }
+
+    #[test]
+    fn object_pickle_carrier_never_becomes_the_runtime_module_class() {
+        for carrier_first in [true, false] {
+            let mut st = SymbolTable::new();
+            let owner = ensure_package(&mut st, "example");
+            let carrier = object_view("example/O", true);
+            let implementation = object_view("example/O$", false);
+            let (first, second) = if carrier_first {
+                (&carrier, &implementation)
+            } else {
+                (&implementation, &carrier)
+            };
+
+            let cls = install_java_class_in(&mut st, first, owner);
+            let again = install_java_class_in(&mut st, second, owner);
+            assert_eq!(again, cls, "the two classfiles are one source module");
+            assert_eq!(st.get(cls).kind, SymKind::ModuleClass);
+            assert_eq!(st.get(cls).jvm_name, "example/O$");
+
+            let module = st
+                .get(owner)
+                .members
+                .iter()
+                .copied()
+                .find(|&m| st.get(m).kind == SymKind::Module && st.get(m).name == "O")
+                .expect("module term");
+            assert_eq!(st.module_class_of(module), cls);
+            assert_eq!(st.get(module).jvm_name, "example/O$");
+
+            let value = st
+                .get(cls)
+                .members
+                .iter()
+                .copied()
+                .find(|&m| st.get(m).kind == SymKind::Method && st.get(m).name == "value")
+                .expect("implementation method");
+            assert!(
+                !st.get(value).flags.contains(Flags::STATIC),
+                "the carrier's Java forwarder must not replace the module instance method"
+            );
+        }
+    }
+
+    #[test]
+    fn scala_classfile_completion_preserves_pickled_anyval_parent() {
+        let mut st = SymbolTable::new();
+        let owner = ensure_package(&mut st, "example");
+        let cls = stub_class_in(
+            &mut st,
+            "example/Outer$Partial",
+            "Partial".to_string(),
+            owner,
+        );
+        // The lazy ScalaSignature reader has the only evidence that this is a
+        // value class and has already recovered its representation field.
+        st.get_mut(cls).parents.push(Type::AnyVal);
+        let field = st.alloc("underlying", cls, SymKind::Term, Flags::EMPTY, "");
+        st.get_mut(field).ty = Type::Boolean;
+        st.get_mut(cls).ctor_fields.push(field);
+        assert!(st.is_value_class(cls));
+
+        // Its JVM class header cannot repeat `extends AnyVal`; it looks like
+        // an ordinary final class extending Object.
+        let classfile = JavaClass {
+            internal_name: "example/Outer$Partial".to_string(),
+            access: 0x0001 | 0x0010,
+            super_name: Some("java/lang/Object".to_string()),
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            fields: Vec::new(),
+            outer_desc: None,
+            signature: None,
+            nested_static: true,
+            is_scala: true,
+            scala_module: false,
+            has_module_field: false,
+            inner_classes: Vec::new(),
+            sole_instance_field: None,
+        };
+        apply_java_class_meta(&mut st, cls, &classfile);
+
+        assert!(
+            st.get(cls)
+                .parents
+                .iter()
+                .any(|parent| matches!(parent, Type::AnyVal)),
+            "classfile completion must not discard the ScalaSignature-only AnyVal parent"
+        );
+        assert!(st.is_value_class(cls));
+    }
 }

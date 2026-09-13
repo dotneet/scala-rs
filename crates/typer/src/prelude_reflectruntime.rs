@@ -1,4 +1,8 @@
-//! `java.lang.ClassLoader`, and `Class#getClassLoader(): ClassLoader`.
+//! Plain JDK classes that a Scala signature can mention even though they have
+//! no Scala pickle of their own.
+//!
+//! The first such class was `java.lang.ClassLoader`, together with
+//! `Class#getClassLoader(): ClassLoader`.
 //!
 //! `scala.reflect.api.JavaUniverse#runtimeMirror(loader: ClassLoader):
 //! JavaMirror` is a completely ordinary method with real bytecode (confirmed
@@ -32,7 +36,12 @@
 //! signature conversion this slice did not audit, and the existing comment
 //! there already explains a case (`ensure_class`'s "outside the library"
 //! branch) where a broader change made a working member stop resolving.
-//! Adding the one class actually needed is the narrower, safer fix.
+//! Adding only the concrete JDK classes reached by a measured signature is the
+//! narrower, safer fix. `java.util.Date` is the second one: a scala-rs-built
+//! case class whose generated `apply` mentions `Date` must retain that
+//! parameter (and its source name) when a downstream compilation reads our
+//! pickle. Otherwise the entire pickled `apply` is declined and the erased
+//! classfile fallback exposes only `v1`, `v2`, ... parameter names.
 
 use crate::prelude::{class, prelude_method};
 use crate::symbol::{Intrinsic, SymbolTable};
@@ -43,6 +52,13 @@ use scala_rs_parser::{Flags, Type};
 /// class present in every JVM regardless of which scala-library backs a run,
 /// so there is nothing to gate on `library_abi` here.
 pub fn install(st: &mut SymbolTable) {
+    let java_util = crate::classpath::ensure_package(st, "java/util");
+    if crate::classpath::find_by_jvm(st, "java/util/Date").is_none() {
+        let date = class(st, java_util, "Date", "java/util/Date", &[Type::AnyRef]);
+        let f = st.get(date).flags.with(Flags::JAVA);
+        st.get_mut(date).flags = f;
+    }
+
     let java_lang = crate::classpath::ensure_package(st, "java/lang");
     let loader = match crate::classpath::find_by_jvm(st, "java/lang/ClassLoader") {
         Some(id) => id,
