@@ -414,7 +414,21 @@ pub(crate) fn collect_free(
                 // lambda looks free of `this` while its `$outer` argument is
                 // exactly `this`; without the field, `load_this` pushed the
                 // lambda itself and the verifier rejected `<init>`.
-                if outer_field_class(st, cid).is_some() {
+                // A local class can also need the lexical receiver solely for
+                // its constructor ABI. This is common for classes nested in
+                // another local/anonymous class (the synthetic class still
+                // has to carry that receiver), and for an anonymous subclass
+                // of a named inner class such as Slick's `Accounts`. Such a
+                // class deliberately has no `$outer` field of its own, so
+                // `outer_field_class(cid)` cannot express the requirement.
+                if outer_field_class(st, cid).is_some()
+                    || enclosing_instance(st, cid)
+                        .map(|owner| {
+                            st.get(owner).name.starts_with("$anon$")
+                                || outer_field_class(st, owner).is_some()
+                        })
+                        .unwrap_or(false)
+                {
                     out.explicit_this = true;
                 }
             }

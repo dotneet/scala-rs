@@ -2921,6 +2921,22 @@ pub(crate) fn emit_from_erased_object(
         }
         return;
     }
+    // A captured alias/type selection can remain `Type::Named` after typing,
+    // while the closure field is still erased to `Object`. Resolve it through
+    // the symbol table rather than casting the spelling directly: a bare
+    // type parameter or an alias name is not necessarily a JVM class name.
+    // Passing the raw object to a member call otherwise leaves the verifier
+    // with `Object` where the selected class is required.
+    if let Some(sym) = st.class_sym_of(ty) {
+        let s = st.get(sym);
+        if s.is_class_like() {
+            let n = class_internal(st, sym);
+            if !n.is_empty() && n != "java/lang/Object" {
+                asm.checkcast(&n);
+            }
+        }
+        return;
+    }
     // An object's singleton type: `case x: Dingus.type => x.IamDingus` binds
     // the scrutinee after an `eq` test, and the binder is read as the module
     // class. Without the cast the member call met an `Object` (`VerifyError`,

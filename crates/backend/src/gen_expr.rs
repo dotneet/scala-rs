@@ -2437,6 +2437,15 @@ pub(crate) fn gen_new_with(
                     && outer_chain_reaches_owner(ctx.st, ctx.class_sym, outer))
             {
                 asm.aconst_null();
+            } else if ctx.outer_slot.is_none() && ctx.method_sym.is_none() {
+                // A hoisted lambda with no lexical receiver has no `this` at
+                // all: slot zero is its first SAM argument. Its nested local
+                // class still has the ABI's hidden outer parameter, but nsc
+                // fills that slot with null when the class does not retain an
+                // outer field. Calling `load_outer_arg` here would mistake a
+                // lambda argument for the enclosing instance and make the
+                // verifier reject the constructor call.
+                asm.aconst_null();
             } else {
                 load_outer_arg(asm, ctx, outer);
             }
