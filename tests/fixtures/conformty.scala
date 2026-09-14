@@ -1,4 +1,6 @@
 object Main {
+  final class Holder { var value: String = _ }
+
   def upcast[A, B](x: A)(implicit ev: A <:< B): B = ev(x)
   def sameType[A, B](x: A)(implicit ev: A =:= B): B = ev(x)
 
@@ -17,6 +19,11 @@ object Main {
     println(some.orNull)
     val none: Option[String] = None
     println(none.orNull)
+    // `=:=[A, A]` is the implicit witness for a `<:<[Null, String]`
+    // request. Inference has to read `=:=` at its `<:<` base before solving A.
+    val inferred: String = some.orNull
+    val holder = new Holder
+    holder.value = none.orNull
     println(sumAll(List(1, 2, 3, 4)))
   }
 }

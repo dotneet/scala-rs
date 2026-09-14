@@ -77,6 +77,10 @@ object Main {
     pairs(0) = 1 -> "one"
     pairs(1) = 2 -> "two"
     println(typeNames(pairs).toList.sortBy(_._1).mkString(","))
+    // No expected result type: K/V come from Array's IterableOnce base after
+    // the genericWrapArray view, rather than from unrelated class arity.
+    val inferredTypeNames = Map() ++ pairs
+    val inferredTypeNamesCheck: Map[Int, String] = inferredTypeNames
 
     val m: collection.Map[String, (String, Int)] = Map("k" -> (("s", 7)))
     println(expand(m, "k"))

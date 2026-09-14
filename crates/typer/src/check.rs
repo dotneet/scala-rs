@@ -3632,6 +3632,7 @@ pub(crate) fn unify_one_precise(
             // `Tuple2[K, V]` against `(Int, String)`: the tuple sugar and the
             // nominal class denote the same type (`is_sub_type` already treats
             // them as such), so unify positionally when the arity agrees.
+            let aligned;
             let aas = match actual {
                 // Type arguments only unify positionally when both sides are
                 // applications of the same class.  Treating unrelated
@@ -3645,6 +3646,31 @@ pub(crate) fn unify_one_precise(
                 // caller before this structural unification; without that
                 // alignment there is no positional correspondence to use.
                 Type::Class { sym: as_, args } if as_ == ps => args,
+                // A subtype is compared at the pattern's base class.  This
+                // path is also used outside ordinary argument inference (for
+                // example while fitting an implicit result), where the
+                // caller has no parameter/argument pair to align first.
+                Type::Class { sym: as_, args } => {
+                    let bases = st.base_type_args(*as_, args);
+                    if let Some(base_args) = bases.get(&ps.0) {
+                        aligned = base_args.clone();
+                        &aligned
+                    } else {
+                        // The pattern can itself be the subtype: an implicit
+                        // `A =:= A` is fitted to a wanted `Null <:< String` by
+                        // reading `=:=` at its `<:<` base before solving `A`.
+                        let pattern_bases = st.base_type_args(*ps, pas);
+                        let Some(base_args) = pattern_bases.get(&as_.0) else {
+                            return None;
+                        };
+                        for (p, a) in base_args.iter().zip(args) {
+                            if let Some(t) = unify_one_precise(st, tp, p, a) {
+                                return Some(t);
+                            }
+                        }
+                        return None;
+                    }
+                }
                 Type::Tuple(ts) if ts.len() == pas.len() => ts,
                 // A *compound* actual is each of its components: slick hands a
                 // `ScalaType[U] with BaseTypedType[U]` to a `ColumnType[U']`
