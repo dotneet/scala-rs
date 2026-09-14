@@ -7,6 +7,8 @@ mod java_pattern_parent;
 mod javanest;
 #[path = "../jvarargs.rs"]
 mod jvarargs;
+#[path = "../jvm_inaccessible_parent.rs"]
+mod jvm_inaccessible_parent;
 #[path = "../jwarm.rs"]
 mod jwarm;
 #[path = "../kernel.rs"]

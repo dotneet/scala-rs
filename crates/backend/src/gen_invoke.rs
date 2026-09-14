@@ -15,9 +15,53 @@ pub(crate) fn invoke_method(
     id: SymbolId,
     result_ty: Option<&Type>,
 ) {
+    invoke_method_with_receiver(asm, ctx, id, result_ty, None);
+}
+
+/// Emit an instance call while retaining the receiver's static JVM type.
+///
+/// A Java class may inherit a public method from a package-private
+/// superclass.  The JVM checks the owner in the constant-pool Methodref at
+/// linkage time, so naming that superclass is an `IllegalAccessError` even
+/// though source-level lookup was legal through the public subclass.  The
+/// Java compiler resolves this shape as a call on the visible receiver class
+/// (which in turn performs ordinary virtual lookup).  Keep that information
+/// here instead of relying only on the selected method symbol's declaration
+/// owner.
+pub(crate) fn invoke_method_with_receiver(
+    asm: &mut Assembler,
+    ctx: &EmitCtx,
+    id: SymbolId,
+    result_ty: Option<&Type>,
+    receiver_ty: Option<&Type>,
+) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
     let mut owner = class_internal(ctx.st, owner_id);
+    let mut owner_is_interface = is_interface_sym(ctx.st, owner_id);
+    if let Some(receiver_ty) = receiver_ty {
+        if let Some(receiver_id) = ctx.st.class_sym_of(receiver_ty) {
+            let receiver = class_internal(ctx.st, receiver_id);
+            // Only Java declarations need this adjustment. Scala's pickled
+            // `declaring_class` path below already records the bytecode owner
+            // when a Scala hierarchy is not JVM-reachable, and changing that
+            // owner would turn a valid interface/super dispatch into a
+            // NoSuchMethodError.
+            if ctx.st.get(owner_id).flags.contains(Flags::JAVA)
+                && receiver != owner
+                && !receiver.is_empty()
+            {
+                owner = receiver;
+                // Keep the constant-pool tag and invoke opcode in sync with
+                // the rewritten owner. javac uses a Methodref/invokevirtual
+                // for `Impl.defaultMethod()` and an
+                // InterfaceMethodref/invokeinterface for the same inherited
+                // declaration through a sub-interface. Mixing the original
+                // declaration kind with the receiver owner is an ICCE.
+                owner_is_interface = is_interface_sym(ctx.st, receiver_id);
+            }
+        }
+    }
     let owner_is_package = ctx.st.get(owner_id).kind == SymKind::Package;
     if owner_is_package {
         // `scala.math.{abs,max,min,Pi}` and `scala.reflect.runtime.universe`
@@ -52,7 +96,7 @@ pub(crate) fn invoke_method(
         // must be InterfaceMethodref constant` -- a silent miscompile of
         // every Java 9+ interface factory (`Map.entry`, `List.of`, `Set.of`,
         // `Comparator.comparing`, …).
-        if is_interface_sym(ctx.st, owner_id) && !is_module_class(ctx.st, owner_id) {
+        if owner_is_interface && !is_module_class(ctx.st, owner_id) {
             asm.invokestatic_interface(&owner, name, &desc);
         } else {
             asm.invokestatic(&owner, name, &desc);
@@ -2600,7 +2644,7 @@ pub(crate) fn invoke_method(
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
     }
-    if is_interface_sym(ctx.st, owner_id) {
+    if owner_is_interface {
         // A trait-private method has no interface signature (see
         // `is_trait_private_def`): every caller is textually inside the
         // trait, so its body is a `private static <name>$` on the interface

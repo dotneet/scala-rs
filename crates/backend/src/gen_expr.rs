@@ -1931,7 +1931,7 @@ pub(crate) fn gen_select(
                     {
                         emit_box(asm, &qual.ty);
                     }
-                    invoke_method(asm, ctx, tree.sym, Some(&tree.ty));
+                    invoke_method_with_receiver(asm, ctx, tree.sym, Some(&tree.ty), Some(&qual.ty));
                 }
                 return;
             }
@@ -3637,7 +3637,11 @@ pub(crate) fn gen_apply(
     } else if value_owner.is_some() {
         invoke_value_extension(asm, ctx, fun.sym, Some(&tree.ty), ext_module_pushed);
     } else {
-        invoke_method(asm, ctx, fun.sym, Some(&tree.ty));
+        let receiver_ty = match &fun.kind {
+            TreeKind::Select { qual, .. } => Some(&qual.ty),
+            _ => None,
+        };
+        invoke_method_with_receiver(asm, ctx, fun.sym, Some(&tree.ty), receiver_ty);
     }
 }
 
