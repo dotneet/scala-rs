@@ -240,6 +240,68 @@ fn seqpat_ids_private_runtime() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// The Scala 2.13 typer can leave the standard `List(...)` extractor as the
+/// companion module symbol instead of its synthetic `unapplySeq` method.  A
+/// match nested in a callback is the shape emitted by GitBucket's
+/// `AccountServiceSpec`; it must call `List$.unapplySeq` and leave a `List`,
+/// not pass the `List$` module to `Option.isEmpty`.
+#[test]
+fn list_module_extractor_verifies_and_runs() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip list module extractor: scala-library jar not present");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap().to_string();
+    let dir = tmp_dir("list_module_extractor");
+    let src = dir.join("list_module_extractor.scala");
+    fs::write(
+        &src,
+        r#"case class Account(
+  id: Int,
+  userName: String,
+  displayName: String,
+  mail: String,
+  extra: String,
+  active: Boolean,
+  a: Int,
+  b: Int,
+  c: Int,
+  owner: Option[String],
+  group: Option[String],
+  admin: Boolean,
+  locked: Boolean,
+  note: Option[String]
+)
+object Main {
+  val RootMailAddress = "root@localhost"
+  def getAllUsers(): List[Account] =
+    List(Account(1, "root", "root", RootMailAddress, "unused", true, 0, 0, 0, None, None, false, false, None))
+  def withCallback(action: () => Boolean): Boolean = action()
+  def check(): Boolean = withCallback(() => {
+    getAllUsers() match {
+      case List(Account(_, "root", "root", RootMailAddress, _, true, _, _, _, None, None, false, false, None)) => true
+      case _ => false
+    }
+  })
+  def main(args: Array[String]): Unit = println(check())
+}
+"#,
+    )
+    .unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let (ok, msgs) = compile(&out, &[src], &["--scala-library", &jar_s]);
+    assert!(ok, "compile list module extractor failed:\n{msgs}");
+    if java_available() {
+        assert_eq!(
+            run_main(&out, Some(&jar_s)),
+            "true\n",
+            "List module extractor did not execute the expected match"
+        );
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The relaxation must not swallow what scalac still rejects: a final class,
 /// `String`, or a primitive on either side of a stable-identifier pattern.
 #[test]

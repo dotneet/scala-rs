@@ -429,8 +429,19 @@ fn gen_unapply_pattern(
     } else {
         ctx.st.get(uid).owner
     };
-    let is_seq = !uid.is_none() && ctx.st.get(uid).name == "unapplySeq";
-    let shape = if uid.is_none() {
+    // The typer leaves the standard `List(...)` extractor as the companion
+    // module symbol rather than installing its synthetic `unapplySeq` method
+    // symbol. Treat that form as the real `List$.unapplySeq` call: evaluating
+    // the module's package forwarder here would leave an extra `List$` on the
+    // stack and then try to call `Option.isEmpty` on it (a verifier failure).
+    let builtin_list = !uid.is_none()
+        && ctx.st.get(uid).kind == SymKind::Module
+        && class_internal(ctx.st, module_class_id(ctx.st, uid))
+            == "scala/collection/immutable/List$";
+    let is_seq = builtin_list || (!uid.is_none() && ctx.st.get(uid).name == "unapplySeq");
+    let shape = if builtin_list {
+        SeqPatShape::List
+    } else if uid.is_none() {
         SeqPatShape::List
     } else {
         seq_pat_shape(ctx.st, uid)
@@ -523,7 +534,9 @@ fn gen_unapply_pattern(
     // has no static `MODULE$`, and the call has to run anyway (nsc evaluates
     // it once per test; `run/sd167` counts the side effect).
     let fun_is_call = !fun.sym.is_none() && ctx.st.get(fun.sym).kind == SymKind::Method;
-    if !owner.is_none() && (!is_module_class(ctx.st, owner) || fun_is_call) {
+    if builtin_list {
+        load_module_instance(asm, ctx, module_class_id(ctx.st, uid));
+    } else if !owner.is_none() && (!is_module_class(ctx.st, owner) || fun_is_call) {
         gen_expr(asm, frame, ctx, fun);
         // The extractor *value* erases to its own static type, which need not
         // reach the class declaring `unapply`: `Date.unanchored` is an
@@ -606,7 +619,16 @@ fn gen_unapply_pattern(
             }
         }
     }
-    invoke_method(asm, ctx, uid, None);
+    if builtin_list {
+        asm.checkcast("scala/collection/SeqOps");
+        asm.invokevirtual(
+            "scala/collection/immutable/List$",
+            "unapplySeq",
+            "(Lscala/collection/SeqOps;)Lscala/collection/SeqOps;",
+        );
+    } else {
+        invoke_method(asm, ctx, uid, None);
+    }
     if ret_bool {
         asm.ifeq(fail);
         return;
@@ -620,7 +642,7 @@ fn gen_unapply_pattern(
     if is_seq && ctx.abi.is_library() {
         match shape {
             // scala-library `List.unapplySeq` is identity on SeqOps, not Option.
-            SeqPatShape::List if is_list_unapply_seq(ctx.st, uid) => {
+            SeqPatShape::List if builtin_list || is_list_unapply_seq(ctx.st, uid) => {
                 gen_unapply_seq_bind(asm, frame, ctx, args, fail);
                 return;
             }
