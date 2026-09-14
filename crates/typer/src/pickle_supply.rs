@@ -584,9 +584,6 @@ impl PickleSupply {
             names.push("apply".to_string());
         }
         for name in names {
-            let pickled_stable = sig.members.iter().any(|m| {
-                m.has(pflags::STABLE) && scala_rs_pickle::names::decode_method_name(&m.name) == name
-            });
             // What the classfile reader put there, so it can be dropped once
             // the pickle has supplied something better.
             let stale: Vec<SymbolId> = st
@@ -613,27 +610,6 @@ impl PickleSupply {
                 })
                 .collect();
             let installed = self.complete_named(st, bin, class_sym, &name, false);
-            if pickled_stable {
-                // A classpath directory may have installed a shallow `Term`
-                // from its pickle subset before the full ScalaSignature was
-                // adopted. `complete_named` normally replaces that term with
-                // a richer method, but an abstract accessor whose erased
-                // descriptor is expressed through an unresolved type member
-                // can have no matching JVM descriptor and therefore remain
-                // as the fallback term. The full pickle's STABLE bit is the
-                // authoritative source for path stability in that case.
-                let members = st.get(class_sym).members.clone();
-                for id in members {
-                    let symbol = st.get(id);
-                    if symbol.owner == class_sym
-                        && symbol.kind == SymKind::Term
-                        && symbol.name == name
-                        && symbol.pickled_origin.is_empty()
-                    {
-                        st.get_mut(id).flags = st.get(id).flags.with(Flags::ACCESSOR);
-                    }
-                }
-            }
             if installed.is_empty() {
                 continue;
             }
