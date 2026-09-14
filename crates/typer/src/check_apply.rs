@@ -2900,7 +2900,16 @@ impl Typer {
                                 ret = t;
                             }
                         }
-                    } else if method_name == "flatMap" {
+                    // A second Apply can call the function returned by a
+                    // partially-applied method (`fn1.flatMap(fa)(f)`).  That
+                    // outer call has no receiver of its own; its result was
+                    // already determined by the FunctionN application path
+                    // above.  The collection-specific reconstruction below
+                    // is valid only for a receiver-backed flatMap call.  In
+                    // particular, deriving the result from `f` here can turn
+                    // a Function1 result into a nominal subtype and make
+                    // erasure emit an invalid checkcast.
+                    } else if method_name == "flatMap" && recv_ty.is_some() {
                         if self.is_array_ops_ty(recv_ty.as_ref()) {
                             if let Some(a0) = args.first() {
                                 if let Type::Function { ret: fr, .. } = &a0.ty {

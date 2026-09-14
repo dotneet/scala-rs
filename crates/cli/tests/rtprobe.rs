@@ -200,6 +200,11 @@ runs!(
     scalac_agrees_rtp_widen_elem,
     "rtp_widen_elem"
 );
+runs!(
+    rtp_andthen_fn1_runs,
+    scalac_agrees_rtp_andthen_fn1,
+    "andthen_fn1"
+);
 
 #[test]
 fn rtp_rejects_map_of_non_pair() {

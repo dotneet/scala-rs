@@ -2940,9 +2940,16 @@ impl Typer {
         ) = (param, arg)
         {
             if pps.len() == aps.len() {
+                // A function-shaped parameter may receive a nominal subclass
+                // of `FunctionN` (for example `AndThen[T, B]`).  Its base
+                // function type is the shape from which type variables in the
+                // parameter's result are inferred; comparing the nominal class
+                // directly loses that constraint and leaves `B` open.
+                let ret_arg = self.function_view(ar);
+                let ret_arg = ret_arg.as_ref().unwrap_or(ar);
                 return Type::Function {
                     params: aps.clone(),
-                    ret: Box::new(self.align_arg_to_param(pr, ar)),
+                    ret: Box::new(self.align_arg_to_param(pr, ret_arg)),
                 };
             }
         }
