@@ -3131,7 +3131,30 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             Some(Type::Method { paramss, ret })
                 if paramss.iter().flatten().count() == s.params.len() =>
             {
-                (paramss, *ret)
+                // `pickle_ty` preserves aliases in parameter types so a
+                // reader can recover the spelling the source wrote. For an
+                // inferred method result, however, `type_def_body` records
+                // `NoType` in that alternate signature while the body is
+                // still pending; the semantic symbol gets the real result
+                // later. Treating that placeholder as a value type makes
+                // `pickle_type` encode it as `Unit`, even though the JVM
+                // descriptor and the method's semantic type are `Rep[R]`.
+                // Keep the useful parameter aliases and fall back only for
+                // that incomplete result, leaving an explicitly written
+                // `Unit` untouched.
+                let ret = if ret.is_no_type() || ret.is_error() {
+                    match &s.ty {
+                        Type::Method { ret: fallback, .. }
+                            if !fallback.is_no_type() && !fallback.is_error() =>
+                        {
+                            (**fallback).clone()
+                        }
+                        _ => *ret,
+                    }
+                } else {
+                    *ret
+                };
+                (paramss, ret)
             }
             _ => match &s.ty {
                 Type::Method { paramss, ret } => (paramss.clone(), (**ret).clone()),
@@ -5583,6 +5606,60 @@ object Lib {
         assert_eq!(
             scala_rs_pickle::sym::render(&getter.ty),
             "=> Lib.Al[scala.Int]"
+        );
+    }
+
+    #[test]
+    fn pickle_inferred_result_survives_parameter_alias_capture() {
+        // The implicit parameter's `o#To[...]` is a path-dependent alias. It
+        // is retained in `pickle_ty` so a Scala reader can reconstruct the
+        // source spelling, but the result of `inSet` is inferred from the
+        // body. While the body is pending, the alternate signature carries
+        // `NoType`; that placeholder must not turn the public result into
+        // `Unit` in the emitted ScalaSignature.
+        let src = r#"
+trait PM[B1, P1] {
+  type To[BR, PR]
+}
+trait OM[BR, R]
+trait E[B1, P1] {
+  protected type O = PM[B1, P1]
+}
+trait Rep[T]
+trait C[B1, P1] extends E[B1, P1] {
+  def inSet[R](xs: List[B1])(implicit om: O#To[Boolean, R]) =
+    null.asInstanceOf[Rep[R]]
+}
+"#;
+        let (_t, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let c = st
+            .symbols
+            .iter()
+            .find(|s| s.name == "C" && s.kind == scala_rs_typer::SymKind::Class)
+            .map(|s| s.id)
+            .expect("C");
+        let raw = pickle_class(&st, c);
+        let parsed = scala_rs_pickle::read_pickle(&raw).expect("read C pickle");
+        let sig = scala_rs_pickle::sym::class_sigs(&parsed)
+            .into_iter()
+            .find(|sig| sig.full_name == "C" && !sig.is_module)
+            .expect("C signature");
+        let method = sig
+            .members
+            .iter()
+            .find(|member| {
+                member.name == "inSet" && member.kind == scala_rs_pickle::sym::MemberKind::Def
+            })
+            .expect("inSet");
+        let rendered = scala_rs_pickle::sym::render(&method.ty);
+        assert!(
+            rendered.ends_with(")Rep[R]"),
+            "inferred result was lost in ScalaSignature: {rendered}"
         );
     }
 
