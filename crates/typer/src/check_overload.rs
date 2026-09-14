@@ -3355,7 +3355,7 @@ impl Typer {
             // parser wrote with no type: `missing parameter type for expanded
             // function`.
             let arity = expected_function_arity(pt)
-                .or_else(|| self.st.sam_sig(pt).map(|s| s.param_tys.len()));
+                .or_else(|| self.sam_sig_here(pt).map(|s| s.param_tys.len()));
             if let Some(n) = arity {
                 if n > 1 {
                     self.expand_case_block_to_arity(vparams, body, n);
@@ -3368,7 +3368,7 @@ impl Typer {
             None
         };
         let sam = if pf_result.is_none() {
-            self.st.sam_sig(pt)
+            self.sam_sig_here(pt)
         } else {
             None
         };

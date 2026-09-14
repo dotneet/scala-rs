@@ -3646,7 +3646,7 @@ impl Typer {
         if matches!(tree.ty, Type::Overload(_)) {
             self.pick_overload_for_function(tree, pt);
         }
-        if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
+        if is_function_pt(pt) || self.sam_sig_here(pt).is_some() {
             if let Some(Type::Function { params, ret }) = self.implicit_eta_shape(tree) {
                 // Type the generated application normally: that infers method
                 // variables and supplies real evidence in the lexical scope.
@@ -3664,7 +3664,7 @@ impl Typer {
             }
         }
         if let Type::Method { paramss, ret } = &tree.ty {
-            if is_function_pt(pt) || self.st.sam_sig(pt).is_some() {
+            if is_function_pt(pt) || self.sam_sig_here(pt).is_some() {
                 let paramss = paramss.clone();
                 let params: Vec<Type> = paramss.iter().flatten().cloned().collect();
                 let ret = (**ret).clone();
@@ -4125,7 +4125,29 @@ impl Typer {
     /// See `SymbolTable::sam_sig_over` for why a library class arrives here
     /// with holes in it, and `PickleSupply::concrete_method_names` for why
     /// the holes are *read* rather than filled.
-    fn sam_sig_here(&mut self, pt: &Type) -> Option<crate::symbol::SamSig> {
+    pub(crate) fn sam_sig_here(&mut self, pt: &Type) -> Option<crate::symbol::SamSig> {
+        // The backend's anonymous SAM class must see every Scala default that
+        // can conflict with an abstract parent method.  The ordinary
+        // on-demand member policy leaves those defaults out when no source
+        // expression names them, which is enough for typechecking but makes
+        // the JVM throw AbstractMethodError after an upcast.  Only a class
+        // already on the SAM path reaches this completion, so collection and
+        // other large library hierarchies retain lazy loading.
+        if self.library_abi {
+            if let Some(cls) = self.st.class_sym_of(pt) {
+                // A partially loaded library class can look like a one-method
+                // SAM even when its parent defaults have not been installed
+                // yet (`Ordering` initially exposes only `compare`).  The
+                // count-one check is therefore part of the trigger, not just
+                // the inherited-deferred-name check.
+                if !self.st.inherited_deferred_method_names(cls).is_empty()
+                    || self.st.sam_method_count(cls) == 1
+                {
+                    self.pickle
+                        .complete_sam_defaults(&mut self.st, &mut self.binary, cls);
+                }
+            }
+        }
         if let Some(sam) = self.st.sam_sig(pt) {
             return Some(sam);
         }

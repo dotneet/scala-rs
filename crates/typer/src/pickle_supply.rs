@@ -1341,6 +1341,56 @@ impl PickleSupply {
         names
     }
 
+    /// Materialize Scala default methods needed by a SAM anonymous class.
+    ///
+    /// A library class is normally completed one member name at a time.  That
+    /// is the right trade-off for ordinary typing, but it is not enough for a
+    /// generated SAM class: the JVM can resolve an inherited abstract method
+    /// through a parent interface even when the child interface supplies a
+    /// default, so the backend needs the child's complete default set to emit
+    /// the same forwarding methods as scalac.  Keep this narrowly scoped to a
+    /// type already being considered as a SAM; ordinary collection classes do
+    /// not trigger eager completion.
+    pub fn complete_sam_defaults(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) {
+        let mut work = vec![class_sym];
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(cls) = work.pop() {
+            if cls.is_none() || !seen.insert(cls.0) {
+                continue;
+            }
+            let names = self.concrete_method_names(st, bin, cls);
+            for name in names {
+                // A prelude/classfile scan may already have the concrete
+                // declaration.  Re-reading that name through the pickle can
+                // resolve an inherited declaration instead of the class's
+                // own override (Ordering#equiv is the motivating shape),
+                // replacing a known default with a deferred parent symbol.
+                // Only ask the pickle for names that are not already
+                // represented by a concrete member on this class.
+                let already_concrete = st.get(cls).members.iter().any(|m| {
+                    let member = st.get(*m);
+                    member.kind == SymKind::Method
+                        && member.name == name
+                        && !st.method_is_deferred(*m)
+                });
+                if !already_concrete {
+                    self.complete_on_class(st, bin, cls, &name);
+                }
+            }
+            let parents = st.get(cls).parents.clone();
+            for parent in parents {
+                if let Some(p) = st.class_sym_of(&parent) {
+                    work.push(p);
+                }
+            }
+        }
+    }
+
     pub fn implicit_member_names(
         &mut self,
         st: &SymbolTable,

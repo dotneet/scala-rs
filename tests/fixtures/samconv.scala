@@ -67,6 +67,11 @@ object Main {
     // The inherited concrete members still work on the converted value.
     println(byLast.equiv("qa", "ra"))
     println(byLast.lt("qa", "rb"))
+    // `tryCompare` is abstract on PartialOrdering but a default on
+    // Ordering.  The generated SAM class must materialize the forwarding
+    // bridge so the JVM can resolve it after this parent-interface upcast.
+    val asPartial: scala.math.PartialOrdering[String] = byLast
+    println(asPartial.tryCompare("a", "bb").getOrElse(99))
 
     // 5. `Hashing`, straight out of the jar with no prelude entry at all.
     val h: Hashing[String] = Conv.toHashing((s: String) => s.length)

@@ -4,7 +4,7 @@
 //! comparison, `synchronized`, string concatenation and interpolation, and
 //! `try` / `catch` / `finally`.
 
-use crate::classfile::{EmittedClass, ACC_INTERFACE, ACC_PRIVATE, ACC_STATIC};
+use crate::classfile::{encode_method_name, EmittedClass, ACC_INTERFACE, ACC_PRIVATE, ACC_STATIC};
 use crate::classfile::{Field, ACC_BRIDGE, ACC_FINAL, ACC_PUBLIC, ACC_SUPER, ACC_SYNTHETIC};
 use crate::code::{Assembler, StackEntry};
 use crate::gen::*;
@@ -13,7 +13,7 @@ use scala_rs_parser::{Lit, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::SymKind;
 use scala_rs_typer::SymbolTable;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 pub(crate) fn collect_boxed_vars(
@@ -1081,6 +1081,216 @@ fn emit_sam_bridge(
     );
 }
 
+/// Emit the concrete default methods that a Scala SAM class has to materialize
+/// when one of its parents still declares the same method abstract.
+///
+/// A same-descriptor default is resolved by the JVM through the maximally
+/// specific interface, so it does not need a special parent bridge.  A
+/// covariant reference return is different: method resolution is descriptor
+/// exact, so a child `(A,A)Some` method does not implement a parent
+/// `(A,A)Option` entry point.  scalac emits an ordinary child forwarder to the
+/// trait's static `$` helper and a synthetic parent-descriptor bridge that
+/// invokes that forwarder.  Without the latter a valid SAM lambda throws
+/// `AbstractMethodError` only after it is viewed through the parent interface.
+fn emit_sam_default_conflict_bridges(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    target: SymbolId,
+    sam_name: &str,
+) {
+    // A target's direct default is matched against the effective declarations
+    // of its direct parents.  A default inherited from a more distant parent
+    // already wins over that parent's abstract declaration (e.g.
+    // PartialOrdering.equiv over Equiv.equiv), so flattening the whole
+    // hierarchy into one set would emit unnecessary forwarders and diverge
+    // from scalac's shape.
+    let mut parent_methods: HashMap<(String, String), SymbolId> = HashMap::new();
+    let mut seen = HashSet::new();
+    fn collect_parent_methods(
+        st: &SymbolTable,
+        class_sym: SymbolId,
+        seen: &mut HashSet<u32>,
+        methods: &mut HashMap<(String, String), SymbolId>,
+    ) {
+        if class_sym.is_none() || !seen.insert(class_sym.0) {
+            return;
+        }
+        for &id in &st.get(class_sym).members {
+            let s = st.get(id);
+            if s.kind != SymKind::Method || s.name == "<init>" {
+                continue;
+            }
+            // `Flags::JAVA` marks every binary class, including Scala classes
+            // read from a class file.  The JVM package name is the reliable
+            // distinction here: Java defaults have no Scala trait `$`
+            // implementation helper to call.
+            let owner_name = &st.get(s.owner).jvm_name;
+            if owner_name.starts_with("java/") || owner_name.starts_with("javax/") {
+                continue;
+            }
+            let desc = method_desc_from_sym(st, id);
+            // JVM overriding permits a covariant reference return.  The
+            // parent abstract declaration and the child default therefore
+            // need only agree on the erased parameter descriptor, not on the
+            // complete method descriptor (`Option` versus `Some` in
+            // Ordering.tryCompare).
+            let key = (s.name.clone(), desc_params(&desc).to_string());
+            match methods.get(&key).copied() {
+                Some(prev) if !st.method_is_deferred(prev) => {}
+                _ => {
+                    methods.insert(key, id);
+                }
+            }
+        }
+        let parents = st.get(class_sym).parents.clone();
+        for parent in parents {
+            let Some(parent) = st.class_sym_of(&parent) else {
+                continue;
+            };
+            collect_parent_methods(st, parent, seen, methods);
+        }
+    }
+    for parent in st.get(target).parents.clone() {
+        if let Some(parent) = st.class_sym_of(&parent) {
+            collect_parent_methods(st, parent, &mut seen, &mut parent_methods);
+        }
+    }
+    let mut emitted = HashSet::new();
+    for id in st.get(target).members.iter().copied() {
+        let s = st.get(id);
+        if s.kind != SymKind::Method
+            || s.name == "<init>"
+            || s.name == sam_name
+            || s.flags.contains(Flags::STATIC)
+            || !is_interface_sym(st, s.owner)
+            // Java 8 interfaces have real defaults, not Scala's companion
+            // static `$` implementation helpers.  A Java SAM's inherited
+            // methods are resolved by the JVM directly and must be left
+            // alone here.
+            || st
+                .get(s.owner)
+                .jvm_name
+                .starts_with("java/")
+            || st
+                .get(s.owner)
+                .jvm_name
+                .starts_with("javax/")
+            || st.method_is_deferred(id)
+        {
+            continue;
+        }
+        let desc = method_desc_from_sym(st, id);
+        let Some(parent) = parent_methods
+            .get(&(s.name.clone(), desc_params(&desc).to_string()))
+            .copied()
+        else {
+            continue;
+        };
+        if !st.method_is_deferred(parent) || !emitted.insert((s.name.clone(), desc.clone())) {
+            continue;
+        }
+        let owner = class_internal(st, s.owner);
+        if owner.is_empty() {
+            continue;
+        }
+        let static_desc = trait_static_desc(&owner, &desc);
+        let bridge_desc = method_desc_from_sym(st, parent);
+        if !method_return_is_covariant(st, &desc, &bridge_desc) {
+            continue;
+        }
+        let name = encode_method_name(&s.name);
+        let static_name = trait_static_name(&s.name);
+        let mut slot = 1u16;
+        let loads: Vec<(u16, JvmSort)> = desc_param_sorts(desc_params(&bridge_desc))
+            .into_iter()
+            .map(|sort| {
+                let at = slot;
+                slot += sort.slots();
+                (at, sort)
+            })
+            .collect();
+        let child_ret = desc
+            .rsplit_once(')')
+            .map(|(_, r)| r.to_string())
+            .unwrap_or_else(|| "V".to_string());
+        let parent_ret = bridge_desc
+            .rsplit_once(')')
+            .map(|(_, r)| r.to_string())
+            .unwrap_or_else(|| "V".to_string());
+        let child_desc = desc.clone();
+        let child_owner = owner.clone();
+        let child_static_desc = static_desc.clone();
+        let child_static_name = static_name.clone();
+        let child_name = name.clone();
+        let child_loads = loads.clone();
+        b.add_code(
+            ACC_PUBLIC,
+            &child_name,
+            &child_desc,
+            slot.max(1),
+            move |a| {
+                a.aload(0);
+                for (at, sort) in &child_loads {
+                    load(a, *at, *sort);
+                }
+                a.invokestatic_interface(&child_owner, &child_static_name, &child_static_desc);
+                ret_of_sort(a, ret_str_sort(&child_ret));
+            },
+        );
+        if child_desc != bridge_desc {
+            let class_name = b.this_name.clone();
+            let bridge_name = name.clone();
+            let invoke_name = bridge_name.clone();
+            let bridge_target = child_desc.clone();
+            let bridge_ret = parent_ret;
+            let bridge_loads = loads;
+            b.add_code(
+                ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
+                &bridge_name,
+                &bridge_desc,
+                slot.max(1),
+                move |a| {
+                    a.aload(0);
+                    for (at, sort) in &bridge_loads {
+                        load(a, *at, *sort);
+                    }
+                    a.invokevirtual(&class_name, &invoke_name, &bridge_target);
+                    ret_of_sort(a, ret_str_sort(&bridge_ret));
+                },
+            );
+        }
+    }
+}
+
+/// Whether a child method descriptor may override a parent descriptor.
+///
+/// Parameters have already been matched by [`desc_params`].  JVM method
+/// descriptors are otherwise invariant except for reference-return
+/// covariance, so accepting unrelated returns here would manufacture a
+/// linkage-compatible method that is not a legal override.
+fn method_return_is_covariant(st: &SymbolTable, child: &str, parent: &str) -> bool {
+    let Some((_, child_ret)) = child.rsplit_once(')') else {
+        return false;
+    };
+    let Some((_, parent_ret)) = parent.rsplit_once(')') else {
+        return false;
+    };
+    if child_ret == parent_ret {
+        return true;
+    }
+    let (Some(child_name), Some(parent_name)) = (
+        child_ret
+            .strip_prefix('L')
+            .and_then(|r| r.strip_suffix(';')),
+        parent_ret
+            .strip_prefix('L')
+            .and_then(|r| r.strip_suffix(';')),
+    ) else {
+        return false;
+    };
+    jvm_assignable(st, child_name, parent_name)
+}
+
 pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
     let (vparams, body) = match &tree.kind {
         TreeKind::Function { vparams, body } => (vparams, body),
@@ -1562,6 +1772,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 typed_ret,
                 abi,
             );
+            emit_sam_default_conflict_bridges(&mut b, st, s.class, name);
         }
     }
     if is_pf {
