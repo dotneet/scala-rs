@@ -85,6 +85,20 @@ fn run_java(out: &Path, cp_extra: &str, main: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn run_java_small_stack(out: &Path, cp_extra: &str, main: &str) -> String {
+    let cp = format!("{}:{}", out.display(), cp_extra);
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-Xss256k", "-cp", &cp, main])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all -Xss256k {main} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// Compile a fixture with scala-rs against the real scala-library and run it.
 fn scala_rs_runs(name: &str, tag: &str) {
     let jar = scala_library_jar().expect("checked by the caller");
@@ -111,6 +125,37 @@ fn scala_rs_runs(name: &str, tag: &str) {
         String::from_utf8_lossy(&output.stdout)
     );
     assert_eq!(run_java(&out, &jar_s, "Main"), expected_stdout(name));
+    let _ = fs::remove_dir_all(&out);
+}
+
+fn scala_rs_runs_small_stack(name: &str, tag: &str) {
+    let jar = scala_library_jar().expect("checked by the caller");
+    let jar_s = jar.to_str().unwrap().to_string();
+    let out = tmp_dir(tag);
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            fixtures_dir()
+                .join(format!("{name}.scala"))
+                .to_str()
+                .unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            &jar_s,
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compile {name} failed:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        run_java_small_stack(&out, &jar_s, "Main"),
+        expected_stdout(name)
+    );
     let _ = fs::remove_dir_all(&out);
 }
 
@@ -289,6 +334,18 @@ fn fixtures_tt_tailrec_generic_local_is_stack_safe() {
         return;
     }
     scala_rs_runs("tt_tailrec_generic_local", "tailrec-generic-local");
+}
+
+/// A mutable local captured by a lifted helper is passed as a runtime Ref
+/// cell. Its loop-head StackMap frame must retain that descriptor type across
+/// the back edge, rather than widening the parameter slot to Object.
+#[test]
+fn fixtures_tt_tailrec_captured_mutable_is_verifier_safe_and_stack_safe() {
+    if !java_available() || scala_library_jar().is_none() {
+        eprintln!("skip: java or the scala-library jar is not present");
+        return;
+    }
+    scala_rs_runs_small_stack("tt_tailrec_captured_mutable", "tailrec-captured-mutable");
 }
 
 #[test]

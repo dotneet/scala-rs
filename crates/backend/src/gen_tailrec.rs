@@ -155,8 +155,24 @@ pub(crate) fn begin_tail_loop(
     // frames.  Without this, the first iteration enters a branch with the
     // descriptor type while the back edge reaches it as Object, which the JVM
     // verifier rejects.
-    for ((slot, _), ty) in params.iter().zip(&types) {
-        declare_local_ty(asm, ctx.st, *slot, ty);
+    for (idx, ((slot, _), ty)) in params.iter().zip(&types).enumerate() {
+        // Lambda lifting passes a captured mutable local as its runtime Ref
+        // cell, while the method symbol deliberately keeps the source
+        // variable's element type.  The emitted descriptor already accounts
+        // for that distinction (`def_method_desc_boxed`); make the loop-head
+        // frame describe the same ABI.  Otherwise the back edge merges a
+        // captured `ObjectRef` parameter with its source type and degrades the
+        // slot to `Object`, so the first `getfield ObjectRef.elem` fails JVM
+        // verification.
+        if s.params
+            .get(idx)
+            .is_some_and(|id| ctx.boxed_vars.contains(id))
+        {
+            let id = s.params[idx];
+            asm.set_local_class(*slot, runtime_ref_class(&ctx.st.get(id).ty));
+        } else {
+            declare_local_ty(asm, ctx.st, *slot, ty);
+        }
     }
     let head = asm.fresh_label();
     asm.mark(head);
