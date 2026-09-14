@@ -2862,7 +2862,7 @@ impl SymbolTable {
             // A trait and its companion share a name; in type position the
             // class wins, so `object B extends B` does not become its own
             // parent.
-            Type::Named { name, .. } => {
+            Type::Named { name, args } => {
                 let found = self.lookup_type(name);
                 found
                     .iter()
@@ -2875,6 +2875,17 @@ impl SymbolTable {
                     // class is loaded, but never resolve a short name here:
                     // short names must still obey lexical/member lookup.
                     .or_else(|| crate::classpath::find_by_fully_qualified_name(self, name))
+                    // A path-dependent type member can survive signature
+                    // conversion as a fully-qualified `Named` rather than a
+                    // `TypeMember` (for example `C.F[A]` in an inherited
+                    // classfile method result).  It has no global type-scope
+                    // binding and no classfile of its own, so ordinary name
+                    // lookup cannot recover its upper bound.  Reconnect the
+                    // declaration by its owner path and instantiate that
+                    // bound.  This is the type-system equivalent of nsc's
+                    // `TypeRef(prefix, member, args)`; it deliberately does
+                    // not guess from the simple member name.
+                    .or_else(|| self.named_type_member_class(name, args))
             }
             // An unbounded type parameter's members are `Any`'s; a bounded one
             // resolves through its bound, as in nsc. `[A <: A]` and mutually
@@ -2966,6 +2977,81 @@ impl SymbolTable {
                 .find(|s| self.get(*s).is_class_like()),
             _ => None,
         }
+    }
+
+    /// Resolve a fully-qualified `Named` that denotes an applied abstract
+    /// type member.  Pickle/classpath conversion normally retains a
+    /// `TypeMember`, but inherited signatures whose prefix is unavailable can
+    /// lose that path and leave `owner.Member[args]` behind.  The declaration
+    /// is still present in the symbol graph; use its upper bound as the class
+    /// supplying ordinary members.
+    fn named_type_member_class(&self, name: &str, args: &[Type]) -> Option<SymbolId> {
+        let (owner_path, member_name) = name.rsplit_once('.')?;
+        // The written owner can be a derived component while the member is
+        // declared by one of its parents (`JdbcActionComponent.ProfileAction`
+        // is inherited from `SqlActionComponent`).  Ask the normal member
+        // walk for the owner, so the declaration's bound remains available.
+        // `find_by_fully_qualified_name` uses the incremental JVM reverse
+        // index and handles both top-level and nested class spellings.  The
+        // old fallback scanned every symbol and rebuilt its dotted owner path
+        // for each candidate, which made this recovery path needlessly
+        // allocation-heavy as the symbol table grew.
+        let owner = crate::classpath::find_by_fully_qualified_name(self, owner_path)?;
+        for member_id in self.lookup_type_member(owner, member_name) {
+            let member = self.get(member_id);
+            if member.kind != SymKind::TypeMember || member.tparams.len() != args.len() {
+                continue;
+            }
+            let Some(bound) = member.bound_hi.clone().or_else(|| {
+                (!matches!(member.ty, Type::NoType | Type::Error | Type::TypeMember(_)))
+                    .then(|| member.ty.clone())
+            }) else {
+                continue;
+            };
+            let bound = subst_tparams_slice(&member.tparams, args, &bound);
+            if let Some(class) = self.class_sym_of(&bound) {
+                return Some(class);
+            }
+        }
+        None
+    }
+
+    /// Find inherited type members without walking ordinary members or
+    /// self-types.  `named_type_member_class` is a recovery path for a
+    /// classfile type projection, so it must inspect a declaration's parents,
+    /// but it never needs the term-member and self-type semantics of
+    /// `lookup_member`.  Keeping this walk type-only matters for unresolved
+    /// `Named` types: most candidates are not type members and should not
+    /// traverse a large component's complete member graph.
+    fn lookup_type_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
+        let mut out = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut work = vec![owner];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id.0) {
+                continue;
+            }
+            let sym = self.get(id);
+            let inherited = id != owner;
+            for member in &sym.members {
+                let member_sym = self.get(*member);
+                if member_sym.kind == SymKind::TypeMember
+                    && member_sym.name == name
+                    && !(inherited && self.private_to_owner(*member))
+                {
+                    out.push(*member);
+                }
+            }
+            for parent in &sym.parents {
+                if let Some(parent_class) = self.class_sym_of(parent) {
+                    work.push(parent_class);
+                }
+            }
+            if let Some(self_type) = &sym.self_type {
+                work.extend(self.self_type_classes(self_type));
+            }
+        }
+        out
     }
 
     /// Companion module of a class (same name, `SymKind::Module`, same owner).
@@ -8506,5 +8592,55 @@ mod api_boundary_tests {
 
         let _ = st.get_mut(term);
         assert_eq!(st.mutation_gen.get(), generation.wrapping_add(1));
+    }
+
+    #[test]
+    fn named_applied_type_member_uses_inherited_upper_bound() {
+        let mut st = SymbolTable::new();
+        let pkg = st.alloc(
+            "namedmember",
+            st.root,
+            SymKind::Package,
+            Flags::EMPTY,
+            "namedmember",
+        );
+        let action = st.alloc(
+            "Action",
+            pkg,
+            SymKind::Class,
+            Flags::EMPTY,
+            "namedmember/Action",
+        );
+        let base = st.alloc(
+            "Base",
+            pkg,
+            SymKind::Class,
+            Flags::EMPTY,
+            "namedmember/Base",
+        );
+        let derived = st.alloc(
+            "Derived",
+            pkg,
+            SymKind::Class,
+            Flags::EMPTY,
+            "namedmember/Derived",
+        );
+        st.get_mut(derived).parents.push(Type::Class {
+            sym: base,
+            args: vec![],
+        });
+        let member = st.alloc("F", base, SymKind::TypeMember, Flags::EMPTY, "");
+        let param = st.alloc("A", member, SymKind::TypeParam, Flags::EMPTY, "");
+        st.get_mut(member).tparams.push(param);
+        st.get_mut(member).bound_hi = Some(Type::Class {
+            sym: action,
+            args: vec![],
+        });
+
+        let named = Type::Named {
+            name: "namedmember.Derived.F".into(),
+            args: vec![Type::Int],
+        };
+        assert_eq!(st.class_sym_of(&named), Some(action));
     }
 }
