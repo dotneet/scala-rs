@@ -5393,6 +5393,39 @@ impl SymbolTable {
                     }
                     continue;
                 }
+                // An applied abstract type constructor is a nominal subtype
+                // of its upper bound.  Keep that bound in the ancestry walk,
+                // with the applied arguments substituted, so LUBs of an
+                // abstract action (`ProfileAction[A, S, E]`) and another
+                // `DBIOAction` still meet at their common action class rather
+                // than falling through to `Any`.  This is the same view used
+                // by `base_type_instance` during argument inference, but the
+                // LUB path has to expose it too when a heterogeneous `Seq` is
+                // built before `DBIO.sequence` can inspect its elements.
+                Type::Applied { ctor, args } => {
+                    let folded = apply_type_ctor((**ctor).clone(), args.clone());
+                    if folded != cur {
+                        if !seen.contains(&folded) {
+                            seen.push(folded.clone());
+                            out.push(folded.clone());
+                            queue.push_back(folded);
+                        }
+                        continue;
+                    }
+                    let id = match ctor.as_ref() {
+                        Type::TypeParam(id) | Type::TypeMember(id) => *id,
+                        _ => continue,
+                    };
+                    if let Some(hi) = self.get(id).bound_hi.clone() {
+                        let hi = self.subst_tparams(id, args, &hi);
+                        if !seen.contains(&hi) {
+                            seen.push(hi.clone());
+                            out.push(hi.clone());
+                            queue.push_back(hi);
+                        }
+                    }
+                    continue;
+                }
                 // A compound bound is every one of its parts. The reflect API
                 // is written in these -- `type Ident >: Null <: IdentApi with
                 // RefTree` -- and stopping here left `Ident` and `Literal`

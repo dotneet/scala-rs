@@ -3672,6 +3672,23 @@ pub(crate) fn unify_one_precise(
                     }
                 }
                 Type::Tuple(ts) if ts.len() == pas.len() => ts,
+                // An applied abstract type constructor is a nominal subtype
+                // of its upper bound.  When it appears below another
+                // constructor (for example `M[ProfileAction[A, S, E]]`),
+                // there is no outer argument-adaptation pass to line it up
+                // with the parameter's `DBIOAction[A, S, E]`.  Read the
+                // member's bound here, substituting its applied arguments,
+                // so nested inference sees the same base type as ordinary
+                // conformance and top-level argument inference.
+                Type::Applied { ctor, args } => {
+                    let id = match ctor.as_ref() {
+                        Type::TypeMember(id) | Type::TypeParam(id) => *id,
+                        _ => return None,
+                    };
+                    let hi = st.get(id).bound_hi.clone()?;
+                    let hi = st.subst_tparams(id, args, &hi);
+                    return unify_one_precise(st, tp, pattern, &hi);
+                }
                 // A *compound* actual is each of its components: slick hands a
                 // `ScalaType[U] with BaseTypedType[U]` to a `ColumnType[U']`
                 // (= `ScalaType[U']`) parameter, and nothing else says what

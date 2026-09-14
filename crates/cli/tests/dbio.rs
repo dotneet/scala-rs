@@ -271,6 +271,23 @@ fn dbio_seq_infers_intersection_effect() {
     real_scalac_dual_run("dbio_seq");
 }
 
+/// `DBIO.sequence` places the action type below an inferred higher-kinded
+/// collection constructor.  An abstract action constructor (the shape of
+/// Slick's `ProfileAction`) must be aligned with its upper bound even at that
+/// nested position, so the element result and effect parameters are inferred
+/// from `Vector[ProfileAction[...]]`.
+#[test]
+fn dbio_sequence_reads_nested_abstract_action_bound() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip nested DBIO sequence inference: scala-library jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("dbio_abstract_seq", &["--scala-library", jar_s]);
+    assert!(out.join("Main.class").is_file());
+    let _ = fs::remove_dir_all(out);
+}
+
 /// A producer/consumer check for the effect intersection in DBIOAction's
 /// method result.  The JVM generic Signature necessarily erases the result
 /// to `E`: the JVM grammar has no intersection result type.  Scala's
