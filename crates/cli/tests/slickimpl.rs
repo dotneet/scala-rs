@@ -343,6 +343,32 @@ fn query_filter_comparison_finds_can_be_query_condition() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// The same witness must remain available through a dependent profile path,
+/// which is how Slick's testkit imports `tdb.profile.api._`.
+#[test]
+fn query_filter_comparison_through_dependent_profile_path() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip canbeqc_tdb: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip canbeqc_tdb: slick dependencies not cached");
+        return;
+    };
+    let (ok, msgs, out) = compile(
+        "canbeqc_tdb",
+        &[
+            "-cp",
+            &classpath(&jars),
+            "--scala-library",
+            lib.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "canbeqc_tdb failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    let _ = fs::remove_dir_all(&out);
+}
+
 fn real_scalac() -> Option<PathBuf> {
     let p = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
     p.is_file().then_some(p)
@@ -403,4 +429,6 @@ fn real_scalac_agrees_on_every_fixture() {
             && msgs.contains("could not find implicit value for parameter e"),
         "scalac rejected slickimpl_jar_bad for other reasons:\n{msgs}"
     );
+    let (ok, msgs) = scalac_run(&scalac, "canbeqc_tdb", Some(&cp));
+    assert!(ok, "scalac rejected canbeqc_tdb:\n{msgs}");
 }

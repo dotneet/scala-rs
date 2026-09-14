@@ -104,6 +104,40 @@ object Lib {
 }
 
 #[test]
+fn subset_reader_preserves_intersection_type_member_bounds() {
+    // This is the source shape behind Slick's `BaseColumnType[T]`: an
+    // abstract higher-kinded member whose upper bound is a compound type.
+    // Losing the REFINEDtpe here widens the member to Any on a later
+    // compilation and makes every dependent-profile implicit disappear.
+    let src = r#"
+trait TT[T]
+trait BT[T] extends TT[T]
+trait Base {
+  type CT[T] <: TT[T]
+  type BCT[T] <: CT[T] with BT[T]
+}
+"#;
+    let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+    assert!(
+        !scala_rs_typer::has_errors(&diags),
+        "type errors: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let base = pickle::pickle_all(&st)
+        .values()
+        .filter_map(|raw| pickle::unpickle(raw))
+        .find(|class| class.name == "Base")
+        .expect("Base pickle");
+    let member = base
+        .type_members
+        .iter()
+        .find(|member| member.name == "BCT")
+        .expect("Base.BCT member");
+    assert_eq!(member.upper_bound.name, "&");
+    assert_eq!(member.upper_bound.args.len(), 2);
+}
+
+#[test]
 fn qualified_private_declarations_and_members_keep_private_within() {
     let src = r#"
 package libp

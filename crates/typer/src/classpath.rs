@@ -645,6 +645,23 @@ fn resolve_type_in(
     if name == "_" {
         return Type::Wildcard;
     }
+    // `REFINEDtpe` intersections use the compact ABI sentinel emitted by the
+    // pickle reader; retain every parent when rebuilding the semantic type.
+    if name == "&" {
+        return Type::Refined {
+            parents: args,
+            decls: Vec::new(),
+        };
+    }
+    // An external `EXTref` carries its package/module owner separately from
+    // the leaf name. The pickle reader preserves that owner as a dotted name;
+    // resolve it by JVM identity before trying the receiver's lexical scopes.
+    if name.contains('.') {
+        let jvm = name.replace('.', "/");
+        if let Some(sym) = find_by_jvm(st, &jvm) {
+            return Type::Class { sym, args };
+        }
+    }
     for id in method_tps.iter().chain(st.get(owner).tparams.iter()) {
         if st.get(*id).name == name {
             return apply_args(Type::TypeParam(*id), args);

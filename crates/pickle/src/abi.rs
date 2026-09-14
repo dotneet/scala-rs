@@ -268,6 +268,18 @@ impl PickledType {
             args: Vec::new(),
         }
     }
+
+    /// The eager classpath ABI's lossless spelling for a Scala intersection
+    /// (`A with B`). The nsc pickle has a dedicated `REFINEDtpe` entry, while
+    /// this compact ABI otherwise only carries a name and type arguments.
+    /// Keeping the parents in `args` lets the typer reconstruct the actual
+    /// intersection instead of silently widening an abstract bound to `Any`.
+    pub fn intersection(parents: Vec<Self>) -> Self {
+        Self {
+            name: "&".into(),
+            args: parents,
+        }
+    }
 }
 
 impl PartialEq<str> for PickledType {

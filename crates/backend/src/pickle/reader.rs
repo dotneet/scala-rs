@@ -75,7 +75,10 @@ enum Entry {
         info: u32,
         flags: u64,
     },
-    ExtRef(u32),
+    ExtRef {
+        name: u32,
+        owner: Option<u32>,
+    },
     NoTpe,
     ThisTpe(u32),
     SingleTpe {
@@ -93,6 +96,9 @@ enum Entry {
     TypeBounds {
         lo: u32,
         hi: u32,
+    },
+    RefinedTpe {
+        parents: Vec<u32>,
     },
     /// `CLASSINFOtpe len_Nat classsym_Ref {tpe_Ref}`. The parents used to be
     /// dropped here; `extends AnyVal` lives nowhere else, because a value
@@ -236,8 +242,9 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             }
             EXTREF | EXTMODCLASSREF => {
                 let n = r.read_nat().unwrap_or(0);
+                let owner = if r.pos < end { r.read_nat() } else { None };
                 r.pos = end;
-                Entry::ExtRef(n)
+                Entry::ExtRef { name: n, owner }
             }
             NOTPE | NOPREFIXTPE => {
                 r.pos = end;
@@ -321,6 +328,22 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 r.pos = end;
                 Entry::TypeBounds { lo, hi }
             }
+            REFINEDTPE => {
+                // REFINEDtpe = refinement-class ref followed by parent refs.
+                // The synthetic class carries the declarations; the compact
+                // classpath ABI only needs the parent intersection for bounds.
+                let _refinement = r.read_nat().unwrap_or(0);
+                let mut parents = Vec::new();
+                while r.pos < end {
+                    if let Some(parent) = r.read_nat() {
+                        parents.push(parent);
+                    } else {
+                        break;
+                    }
+                }
+                r.pos = end;
+                Entry::RefinedTpe { parents }
+            }
             CLASSINFOTPE => {
                 let _classsym = r.read_nat().unwrap_or(0);
                 let mut parents = Vec::new();
@@ -381,13 +404,61 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
     fn name_of(entries: &[Entry], i: u32) -> String {
         match entries.get(i as usize) {
             Some(Entry::TermName(s) | Entry::TypeName(s)) => s.clone(),
-            Some(Entry::ExtRef(n)) => name_of(entries, *n),
+            Some(Entry::ExtRef { name, .. }) => name_of(entries, *name),
             Some(
                 Entry::TypeSym { name, .. }
                 | Entry::ClassSym { name, .. }
                 | Entry::ModuleSym { name, .. },
             ) => name_of(entries, *name),
             _ => String::new(),
+        }
+    }
+
+    /// Resolve an external reference's owner chain into the dotted source
+    /// name that classpath lookup needs. `name_of` intentionally keeps the
+    /// simple leaf name for members; type refs to external classes need the
+    /// package because a Scala pickle's `EXTref` carries that owner separately.
+    fn external_name(entries: &[Entry], name: u32, owner: Option<u32>, depth: usize) -> String {
+        if depth > MAX_TYPE_DEPTH {
+            return name_of(entries, name);
+        }
+        let leaf = name_of(entries, name);
+        let Some(owner) = owner else {
+            return leaf;
+        };
+        let prefix = match entries.get(owner as usize) {
+            Some(Entry::ExtRef {
+                name: owner_name,
+                owner: owner_owner,
+            }) => external_name(entries, *owner_name, *owner_owner, depth + 1),
+            _ => String::new(),
+        };
+        if prefix.is_empty() || prefix == "<empty>" || prefix == "<root>" {
+            leaf
+        } else {
+            format!("{prefix}.{leaf}")
+        }
+    }
+
+    /// Keep the compact reader's historical leaf spelling for standard
+    /// library references. Their owners are still retained for resolving
+    /// non-standard external classes (for example `slick.ast.BaseTypedType`),
+    /// but exposing `scala.Int` or `scala.package.List` here would change the
+    /// ABI returned by the reader and break existing callers.
+    fn external_type_name(
+        entries: &[Entry],
+        name: u32,
+        owner: Option<u32>,
+        depth: usize,
+    ) -> String {
+        let qualified = external_name(entries, name, owner, depth);
+        if qualified.starts_with("scala.")
+            || qualified.starts_with("java.")
+            || qualified.starts_with("javax.")
+        {
+            name_of(entries, name)
+        } else {
+            qualified
         }
     }
 
@@ -406,7 +477,12 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         }
         match entries.get(i as usize) {
             Some(Entry::TypeRef { sym, args, .. }) => {
-                let n = name_of(entries, *sym);
+                let n = match entries.get(*sym as usize) {
+                    Some(Entry::ExtRef { name, owner }) => {
+                        external_type_name(entries, *name, *owner, depth + 1)
+                    }
+                    _ => name_of(entries, *sym),
+                };
                 if n.is_empty() {
                     return type_of(entries, *sym, depth + 1);
                 }
@@ -421,7 +497,9 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                         .collect(),
                 }
             }
-            Some(Entry::ExtRef(n)) => PickledType::simple(name_of(entries, *n)),
+            Some(Entry::ExtRef { name, owner }) => {
+                PickledType::simple(external_type_name(entries, *name, *owner, depth + 1))
+            }
             Some(Entry::TermName(s) | Entry::TypeName(s)) => PickledType::simple(s.clone()),
             Some(Entry::NoTpe) => PickledType::simple("Any"),
             Some(Entry::Existential(t)) => type_of(entries, *t, depth + 1),
@@ -434,6 +512,12 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             Some(Entry::AnnotatedTpe(t)) => type_of(entries, *t, depth + 1),
             Some(Entry::SingleTpe { prefix, .. }) => type_of(entries, *prefix, depth + 1),
             Some(Entry::ConstantTpe(c)) => type_of(entries, *c, depth + 1),
+            Some(Entry::RefinedTpe { parents }) => PickledType::intersection(
+                parents
+                    .iter()
+                    .map(|p| type_of(entries, *p, depth + 1))
+                    .collect(),
+            ),
             Some(Entry::LiteralTy(s)) => PickledType::simple(s.clone()),
             _ => PickledType::simple("Any"),
         }
