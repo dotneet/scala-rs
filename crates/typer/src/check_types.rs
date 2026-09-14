@@ -2268,7 +2268,7 @@ impl Typer {
         )
     }
 
-    pub(crate) fn is_stable_path(&self, t: &Tree) -> bool {
+    pub(crate) fn is_stable_path(&mut self, t: &Tree) -> bool {
         match &t.kind {
             TreeKind::This { .. } | TreeKind::Super { .. } => true,
             TreeKind::Ident { name } => self.ident_is_stable(name),
@@ -2468,19 +2468,28 @@ impl Typer {
         })
     }
 
-    fn member_is_stable(&self, qual: &Tree, name: &str) -> bool {
+    fn member_is_stable(&mut self, qual: &Tree, name: &str) -> bool {
         let Some(pty) = self.term_path_type(qual) else {
             // `p.HNil` under a package prefix: the package has no type.
             return match self.path_owner_sym(qual) {
-                Some(owner) => self.st.lookup_member(owner, name).iter().any(|s| {
-                    let sy = self.st.get(*s);
-                    match sy.kind {
-                        SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
-                        SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
-                        SymKind::Method => sy.flags.contains(Flags::ACCESSOR),
-                        _ => false,
-                    }
-                }),
+                Some(owner) => {
+                    // Classpath discovery installs a shallow owner symbol first;
+                    // its members are read lazily. Stable-path checking runs
+                    // before ordinary selection, so complete the requested
+                    // member here as well. Without this, a classfile-backed
+                    // accessor such as `profile.backend` is mistaken for an
+                    // unstable path and its dependent type is never reached.
+                    self.complete_binary_member(owner, name, qual.span);
+                    self.st.lookup_member(owner, name).iter().any(|s| {
+                        let sy = self.st.get(*s);
+                        match sy.kind {
+                            SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+                            SymKind::Term => !sy.flags.contains(Flags::MUTABLE),
+                            SymKind::Method => sy.flags.contains(Flags::ACCESSOR),
+                            _ => false,
+                        }
+                    })
+                }
                 None => false,
             };
         };
@@ -2505,6 +2514,11 @@ impl Typer {
         let Some(cls) = self.path_member_owner(&pty) else {
             return false;
         };
+        // `term_path_type` can resolve the receiver class while its member
+        // table is still only a classpath stub. Populate the requested member
+        // before judging whether the path is stable; this mirrors the lazy
+        // completion performed by qualified selection/type lookup.
+        self.complete_binary_member(cls, name, qual.span);
         self.st.lookup_member(cls, name).iter().any(|s| {
             let sy = self.st.get(*s);
             match sy.kind {

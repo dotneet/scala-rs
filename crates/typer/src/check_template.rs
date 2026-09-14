@@ -451,6 +451,16 @@ impl Typer {
                 self.type_import(stt);
             }
         }
+        // Explicitly typed value members provide the stable receivers of
+        // path-dependent aliases below. They do not need the alias expansion
+        // pass, while delaying them until after aliases makes an earlier
+        // `type DB = profile.backend.BasicDatabaseDef[IO]` see `profile` as
+        // `<notype>` and report a spurious stable-identifier error.
+        for stt in body.iter_mut() {
+            if matches!(&stt.kind, TreeKind::ValDef { tpt, .. } if !tpt.is_empty()) {
+                self.type_member_sig_deferrable(stt);
+            }
+        }
         // type aliases / abstract type members before other signatures
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::TypeDef { .. }) {
