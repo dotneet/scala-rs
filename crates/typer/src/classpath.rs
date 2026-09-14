@@ -379,14 +379,13 @@ fn declare_type_members(
     members: &[crate::check::ClasspathTypeMember],
 ) {
     for member in members {
-        // Concrete aliases are completed by PickleSupply, which preserves the
-        // declaring path and inherited override information. Eagerly adding
-        // the compact classpath spelling here would shadow that richer view
-        // and break aliases used as binary parent constructors (`Owner.Alias`)
-        // before their receiver is typed. Abstract members have no RHS for
-        // PickleSupply to reduce and are the declarations this eager path must
-        // retain (for example `BasicProfile.SchemaDescription`).
-        if member.alias.is_some() {
+        // Parameterised aliases are completed by PickleSupply, which preserves
+        // their declaring path and inherited override information. Eagerly
+        // adding the compact spelling would shadow that richer view. A
+        // nullary concrete alias is already complete, however, and must be
+        // installed here so inherited signatures can reduce it before
+        // on-demand completion (for example `FSIntProperty.T = Int`).
+        if member.alias.is_some() && !member.tparams.is_empty() {
             continue;
         }
         if st.get(owner).members.iter().any(|&id| {
@@ -399,8 +398,13 @@ fn declare_type_members(
         let id = st.alloc(&member.name, owner, SymKind::TypeMember, Flags::EMPTY, "");
         let tparams = alloc_tparams(st, id, &member.tparams);
         st.get_mut(id).tparams = tparams.clone();
-        // Abstract members remain opaque until a concrete subclass fixes them.
-        st.get_mut(id).ty = Type::TypeMember(id);
+        if let Some(alias) = &member.alias {
+            st.get_mut(id).ty = resolve_type_in(st, owner, alias, &tparams);
+            st.get_mut(id).is_type_alias = true;
+        } else {
+            // Abstract members remain opaque until a concrete subclass fixes them.
+            st.get_mut(id).ty = Type::TypeMember(id);
+        }
         st.get_mut(owner).members.push(id);
     }
 }
