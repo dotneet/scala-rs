@@ -2353,7 +2353,26 @@ impl PickleSupply {
                     "{owner_name}#{name}: type alias right-hand side {rhs:?} does not convert"
                 ));
             }
-            return conv.map(|t| self.with_pickled_this_prefix(st, bin, this_prefix, t));
+            let Some(target) = conv else {
+                return None;
+            };
+            let target = self.with_pickled_this_prefix(st, bin, this_prefix, target);
+            // A nullary alias is normally transparent, but a path-dependent
+            // nested class needs its enclosing prefix retained.  That prefix
+            // is represented as a refinement, which cannot itself be entered
+            // into an import scope as a type symbol.  Keep a local alias
+            // symbol for this one non-transparent shape so `import O.{A => B}`
+            // preserves both the source-level type name and the constructor's
+            // enclosing instance.
+            if matches!(&target, Type::Refined { decls, .. } if decls.iter().any(|d| matches!(d, scala_rs_parser::RefineDecl::Type { name, .. } if name == "<prefix>")))
+            {
+                let id = st.alloc(name, owner, SymKind::TypeMember, Flags::EMPTY, "");
+                st.get_mut(id).ty = target;
+                st.get_mut(id).is_type_alias = true;
+                st.get_mut(owner).members.push(id);
+                return Some(Type::TypeMember(id));
+            }
+            return Some(target);
         }
         // Owned but not yet a member: a right-hand side that will not convert
         // must leave the owner exactly as it was.
@@ -4337,6 +4356,25 @@ impl PickleSupply {
         // kinds now, since that is what the signature being converted is about
         // to apply.
         if !full_name.starts_with("scala.") {
+            // A Scala nested class may have no ScalaSignature of its own: the
+            // enclosing class carries the pickle for source aliases, while
+            // `Owner$Empty.class` still carries the constructor and members
+            // needed by a nullary alias such as `type EmptyAlias = Empty`.
+            // Materialize that ordinary classfile here instead of declining
+            // the alias RHS and leaving the imported type as an unresolved
+            // prefix refinement. This is the same binary loader path used by
+            // `Typer::load_binary_into`, kept local so conversion can finish
+            // in one pass.
+            if let Ok(Some(bytes)) = bin.find_class(&key) {
+                if let Ok(class) = crate::javaclass::parse_java_classfile(&bytes) {
+                    let id = crate::classpath::install_java_class(st, &class);
+                    if st.get(id).jvm_name == key {
+                        self.stubs.insert(key, id);
+                        self.give_stub_its_kinds(st, bin, id, full_name, module);
+                        return Some(id);
+                    }
+                }
+            }
             if !self.has_pickle(bin, full_name, module) {
                 return None;
             }
