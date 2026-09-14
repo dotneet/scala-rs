@@ -599,6 +599,10 @@ impl<'a> Gen<'a> {
                 b.field_constants.insert("serialVersionUID".into(), uid);
             }
         }
+        // Reserve classpath lazy-val names before copying ordinary trait vals.
+        // Pickle loading exposes the same member to both scans; emitting both
+        // copies gives the JVM a duplicate-field ClassFormatError.
+        let binary_lazies = self.binary_mixin_lazy_vals(class_id, &impl_.body);
         for (name, ty, extra) in self.mixin_val_fields(class_id, vparamss, &impl_.body) {
             // Nothing is added twice. A trait with a dedicated emission --
             // `scala.App`, whose `executionStart` / `initCode` fields and
@@ -608,6 +612,9 @@ impl<'a> Gen<'a> {
             if b.fields.iter().any(|f| f.name == name) {
                 continue;
             }
+            if binary_lazies.iter().any(|v| v.name == name) {
+                continue;
+            }
             b.fields.push(Field {
                 access: ACC_PUBLIC | extra,
                 name,
@@ -615,7 +622,6 @@ impl<'a> Gen<'a> {
             });
         }
         let lazies = self.all_lazy_vals(class_id, &impl_.body);
-        let binary_lazies = self.binary_mixin_lazy_vals(class_id, &impl_.body);
         for v in &self.mixin_lazy_vals(class_id, &impl_.body) {
             b.fields.push(Field {
                 access: Self::mixin_lazy_field_access(v),

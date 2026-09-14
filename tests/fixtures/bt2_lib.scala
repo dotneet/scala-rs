@@ -22,6 +22,12 @@ trait Twice extends Base {
 
 trait Counter {
   var count: Int = 2
+  // Keep an ordinary val whose name is also used by a default method.  The
+  // binary-trait reader must not mistake the method's `a$` helper for the
+  // lazy-val helper of the field `a` (the same collision exists in
+  // scalatest's Matchers trait).
+  val a: String = "a"
+  def a(i: Int): String = a + i
   // A trait `lazy val` is the one `val` whose accessor is concrete on the
   // interface: the initialiser is a `default` method with a `doubled$` static
   // beside it, and the implementing class's `doubled$lzycompute` calls that

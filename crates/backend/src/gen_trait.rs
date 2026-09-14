@@ -683,7 +683,20 @@ impl<'a> Gen<'a> {
                     _ => continue,
                 };
                 let name = s.name.clone();
-                if !self.binary_trait_defines(parent, &name) || !have.insert(name.clone()) {
+                // A binary trait's `name$` helper is normally the marker for
+                // a lazy val.  Do not use `binary_trait_defines` here: a
+                // regular val can legitimately share its source name with a
+                // default method (Matchers' `a`/`an` are the concrete
+                // example), and that method also gets an `a$`/`an$` helper.
+                // A lazy-val helper has the exact erased shape
+                // `(<trait>)<getter-result>`, whereas a default method with
+                // the same name has its actual parameters after the trait
+                // receiver.  Requiring that shape keeps ordinary mixin
+                // fields out of the lazy-field list.
+                if !self.binary_trait_defines(parent, &name)
+                    || !self.binary_trait_lazy_helper(parent, &name, &ty)
+                    || !have.insert(name.clone())
+                {
                     continue;
                 }
                 out.push(BinaryLazyVal {
@@ -694,6 +707,22 @@ impl<'a> Gen<'a> {
             }
         }
         out
+    }
+
+    /// Whether a binary trait has the interface-side lazy-val helper for
+    /// `name`.  The helper is distinguishable from a same-named default
+    /// method by its descriptor: nsc emits exactly one receiver parameter and
+    /// the getter's erased return type (`foo$(T): R`).
+    fn binary_trait_lazy_helper(&self, trait_id: SymbolId, name: &str, ty: &Type) -> bool {
+        let Some(methods) = self.binary_methods(trait_id) else {
+            return false;
+        };
+        let trait_desc = format!("L{};", class_internal(self.st, trait_id));
+        let want_desc = format!("({}){}", trait_desc, jvm_desc_val(self.st, ty));
+        let want_name = trait_static_name(name);
+        methods.iter().any(|(method, desc, access)| {
+            method == &want_name && desc == &want_desc && access & ACC_STATIC != 0
+        })
     }
 
     /// The class's own `lazy val`s followed by the inherited ones: one list so
