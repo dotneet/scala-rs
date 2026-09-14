@@ -438,6 +438,19 @@ impl Typer {
                     out.push(self.pretype_spliced_default(pid, rhs));
                     continue;
                 }
+                // A constructor read from a class file has the default
+                // expression only in its companion/class getter, not in the
+                // parameter symbol.  Named arguments still have to fill an
+                // omitted slot before the constructor overload is selected;
+                // use the getter as the fallback when there is no source RHS
+                // to splice.
+                if flags.contains(Flags::DEFAULTPARAM) {
+                    let idx = self.default_getter_index(fun, pid);
+                    if let Some(filled) = self.default_getter_apply(fun, pid, idx, &out) {
+                        out.push(filled);
+                        continue;
+                    }
+                }
             } else if flags.contains(Flags::DEFAULTPARAM) {
                 let idx = self.default_getter_index(fun, pid);
                 if let Some(filled) = self.default_getter_apply(fun, pid, idx, &out) {
@@ -677,7 +690,27 @@ impl Typer {
             );
             return false;
         }
-        self.place_named_args(args, fun, &ids, repeated_last, true)
+        // `fun` names the class at a `new C(...)` site, but default getters
+        // belong to the selected `<init>` symbol.  Source constructors carry
+        // their RHS on the parameter and do not need this distinction; a
+        // constructor read from a class file does not, so pass the selected
+        // constructor through to `default_getter_apply` for omitted named
+        // slots.  The one-clause case covers the normal constructor path;
+        // matching the parameter symbols also handles overloaded clauses.
+        let ctor = alts.iter().copied().find(|candidate| {
+            let candidate_ids = self.first_clause_of(*candidate).0;
+            candidate_ids == ids
+        });
+        let ctor_fun = ctor.map_or_else(
+            || fun.clone(),
+            |ctor| {
+                let mut f = fun.clone();
+                f.sym = ctor;
+                f.ty = self.st.get(ctor).ty.clone();
+                f
+            },
+        );
+        self.place_named_args(args, &ctor_fun, &ids, repeated_last, true)
     }
 
     /// The parameters to map named arguments onto, and whether the clause ends

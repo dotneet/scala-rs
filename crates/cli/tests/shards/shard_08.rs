@@ -3,6 +3,8 @@
 
 #[path = "../protected_this.rs"]
 mod protected_this;
+#[path = "../stc.rs"]
+mod stc;
 #[path = "../tail4.rs"]
 mod tail4;
 #[path = "../tail5.rs"]
