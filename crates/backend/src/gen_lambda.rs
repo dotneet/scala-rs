@@ -347,9 +347,17 @@ pub(crate) fn collect_free(
         TreeKind::Match { selector, cases } => {
             collect_free(selector, bound, out, st);
             for c in cases {
-                collect_free(&c.pat, bound, out, st);
-                collect_free(&c.body, bound, out, st);
-                collect_free(&c.guard, bound, out, st);
+                // Pattern binders are locals of this case, not captures of
+                // the enclosing method. Without extending `bound`, a
+                // `case Some(a) => ...` lambda treats `a` as an unresolved
+                // free term and conservatively retains an unused `$outer`.
+                // That makes a serializable SAM closure retain the enclosing
+                // (often non-serializable) receiver.
+                let mut case_bound = bound.clone();
+                pattern_binders(&c.pat, &mut case_bound);
+                collect_free(&c.pat, &case_bound, out, st);
+                collect_free(&c.body, &case_bound, out, st);
+                collect_free(&c.guard, &case_bound, out, st);
             }
         }
         TreeKind::InterpolatedString { args, .. } => {
@@ -364,9 +372,11 @@ pub(crate) fn collect_free(
         } => {
             collect_free(block, bound, out, st);
             for c in catches {
-                collect_free(&c.pat, bound, out, st);
-                collect_free(&c.body, bound, out, st);
-                collect_free(&c.guard, bound, out, st);
+                let mut catch_bound = bound.clone();
+                pattern_binders(&c.pat, &mut catch_bound);
+                collect_free(&c.pat, &catch_bound, out, st);
+                collect_free(&c.body, &catch_bound, out, st);
+                collect_free(&c.guard, &catch_bound, out, st);
             }
             collect_free(finalizer, bound, out, st);
         }
@@ -394,6 +404,61 @@ pub(crate) fn collect_free(
                 }
             }
             collect_free(tpt, bound, out, st);
+        }
+        _ => {}
+    }
+}
+
+/// Add the variables introduced by a pattern to one match/catch case's
+/// lexical scope. Stable identifiers are expressions, not binders; a
+/// lowercase identifier in a pattern is the same variable-pattern spelling
+/// that the typer recognizes as a binder.
+fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
+    if pat.stable_pat {
+        return;
+    }
+    match &pat.kind {
+        TreeKind::Bind { .. } => {
+            if !pat.sym.is_none() {
+                out.insert(pat.sym);
+            }
+        }
+        TreeKind::Ident { name } => {
+            if scala_rs_parser::ast::is_variable_name(name) && !pat.sym.is_none() {
+                out.insert(pat.sym);
+            }
+        }
+        _ => {}
+    }
+    match &pat.kind {
+        TreeKind::Bind { body, .. } | TreeKind::Star { elem: body } => pattern_binders(body, out),
+        TreeKind::Alternative { trees } => {
+            for tree in trees {
+                pattern_binders(tree, out);
+            }
+        }
+        TreeKind::Apply { fun, args }
+        | TreeKind::TypeApply { fun, args }
+        | TreeKind::UnApply { fun, args } => {
+            pattern_binders(fun, out);
+            for arg in args {
+                pattern_binders(arg, out);
+            }
+        }
+        TreeKind::Typed { expr, tpt } => {
+            pattern_binders(expr, out);
+            pattern_binders(tpt, out);
+        }
+        TreeKind::Select { qual, .. } => pattern_binders(qual, out),
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            pattern_binders(tpt, out);
+            pattern_binders(annot, out);
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            pattern_binders(tpt, out);
+            for arg in args {
+                pattern_binders(arg, out);
+            }
         }
         _ => {}
     }

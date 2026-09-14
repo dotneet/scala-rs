@@ -200,6 +200,14 @@ fn unused_outer_is_serializable() {
     check_both("unused_outer");
 }
 
+/// Pattern binders in a serializable SAM closure must not retain the
+/// enclosing receiver merely because the free-variable walk visits the case
+/// pattern before its body.
+#[test]
+fn pattern_lambda_is_serializable() {
+    check_both("serialization_outer");
+}
+
 /// A nested case-class companion is an instance member of its enclosing class.
 /// Lambdas that call `Row(...)` must capture that enclosing instance so the
 /// generated `$anonfun` does not treat its first captured collection value as
