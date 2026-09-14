@@ -243,7 +243,7 @@ fn fixtures_bt_companion_bad_is_error() {
         &["-cp", lib_out.to_str().unwrap(), "--scala-library", jar_s],
         &[
             "(Int)Holder[Int] with arguments (\"s\")",
-            "Empty with arguments (3)",
+            "value apply is not a member of Empty[Int]",
             "value missing is not a member of Holder$",
         ],
     );

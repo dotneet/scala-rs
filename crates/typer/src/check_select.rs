@@ -854,12 +854,12 @@ impl Typer {
         let this_prefix = match (&qual.ty, super_this) {
             (_, Some(here)) if ext_conv.is_none() => Some(Type::ThisType(here)),
             (Type::TypeParam(_) | Type::TypeMember(_), None)
-                if ext_conv.is_none() && recv_ty != qual.ty =>
+                if ext_conv.is_none() && member_recv_ty != qual.ty =>
             {
                 Some(qual.ty.clone())
             }
             (Type::Applied { .. }, None)
-                if applied_abstract && ext_conv.is_none() && recv_ty != qual.ty =>
+                if applied_abstract && ext_conv.is_none() && member_recv_ty != qual.ty =>
             {
                 Some(qual.ty.clone())
             }
