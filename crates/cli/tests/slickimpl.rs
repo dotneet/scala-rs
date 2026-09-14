@@ -252,6 +252,34 @@ fn slicks_dsl_resolves_through_its_published_jar() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// A type alias reached through a value import must beat a same-named class
+/// imported by an outer scope. This is the shape used by Slick's testkit:
+/// `import tdb.profile.api._` inside a table-owning class, with an unrelated
+/// `Table` also visible from an outer wildcard import.
+#[test]
+fn nested_profile_api_type_import_outweighs_outer_model_import() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip nested profile import: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip nested profile import: slick dependencies not cached");
+        return;
+    };
+    let (ok, msgs, out) = compile(
+        "slick_profile_nested",
+        &[
+            "-cp",
+            &classpath(&jars),
+            "--scala-library",
+            lib.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "nested profile import failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// Reading the pickled parent has to *narrow* what the class file said.
 /// `BaseTypedType` is invariant, so the specialized parent's `Object` must not
 /// leak back in, and a type nothing declares a column type for is still not
@@ -286,6 +314,32 @@ fn the_specialized_parents_object_does_not_come_back() {
     ] {
         assert!(msgs.contains(want), "expected {want:?} in:\n{msgs}");
     }
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// A comparison inside `Query.filter` must infer `Rep[Boolean]` and find
+/// Slick's contravariant `CanBeQueryCondition[Rep[Boolean]]` witness.
+#[test]
+fn query_filter_comparison_finds_can_be_query_condition() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip canbeqc: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip canbeqc: slick dependencies not cached");
+        return;
+    };
+    let (ok, msgs, out) = compile(
+        "canbeqc",
+        &[
+            "-cp",
+            &classpath(&jars),
+            "--scala-library",
+            lib.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "canbeqc failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
     let _ = fs::remove_dir_all(&out);
 }
 

@@ -1803,6 +1803,9 @@ impl Typer {
         if name.is_empty() {
             return;
         }
+        if self.st.has_real_type_entry(name) && self.expose_current_type_wildcards(name, span) {
+            return;
+        }
         let default_type = self.st.has_only_default_type_binding(name);
         if self.st.has_real_type_entry(name) && !default_type {
             // The type namespace has an answer, but an *import's* answer is
@@ -2069,6 +2072,104 @@ impl Typer {
         } else {
             self.st.lookup(name)
         }
+    }
+
+    /// Complete a type offered by a wildcard in an enclosing scope before a
+    /// binding from an outer scope makes the name look settled.
+    ///
+    /// A wildcard whose prefix is a value of a binary class cannot enumerate
+    /// its type aliases at import time. The ordinary early return in
+    /// `expose_unqualified_type` is still needed for a definition or an
+    /// explicit import in this scope, but it used to make an outer wildcard
+    /// win over an inner `import profile.api._` simply because the latter's
+    /// `Table` alias had not been read yet. Scopes are considered from the
+    /// inside out: an outer wildcard must not be allowed to shadow a nearer
+    /// scope, and a definition/explicit import in any nearer scope must
+    /// continue to hide every wildcard.
+    fn expose_current_type_wildcards(&mut self, name: &str, span: Span) -> bool {
+        let scopes: Vec<(bool, bool, Vec<(SymbolId, u64)>)> = self
+            .st
+            .scopes
+            .iter()
+            .rev()
+            .map(|scope| {
+                let has_type = scope.lookup_ranked(name).iter().any(|b| {
+                    matches!(
+                        self.st.get(b.sym).kind,
+                        SymKind::Class | SymKind::TypeMember | SymKind::TypeParam
+                    )
+                });
+                let blocked = scope.lookup_ranked(name).iter().any(|b| {
+                    matches!(
+                        self.st.get(b.sym).kind,
+                        SymKind::Class | SymKind::TypeMember | SymKind::TypeParam
+                    ) && matches!(b.rank, BindRank::Definition | BindRank::Explicit)
+                });
+                let owners = scope
+                    .wildcards()
+                    .iter()
+                    .filter(|w| w.offers(name))
+                    .map(|w| (w.owner, w.origin))
+                    .collect();
+                (has_type, blocked, owners)
+            })
+            .collect();
+        for (has_type, blocked, owners) in scopes {
+            if blocked {
+                return false;
+            }
+            for (owner, origin) in owners {
+                if owner.is_none() {
+                    continue;
+                }
+                self.complete_binary_member(owner, name, span);
+                let mut found: Vec<SymbolId> = self
+                    .st
+                    .lookup_member(owner, name)
+                    .into_iter()
+                    .filter(|&id| {
+                        matches!(
+                            self.st.get(id).kind,
+                            SymKind::Class | SymKind::TypeMember | SymKind::TypeParam
+                        ) && (!self.st.private_to_owner(id)
+                            || (self.st.get(id).owner == owner
+                                && self.private_member_visible_here(id)))
+                    })
+                    .collect();
+                if found.is_empty() && self.library_abi {
+                    match self.pickle.complete_type_member(
+                        &mut self.st,
+                        &mut self.binary,
+                        owner,
+                        name,
+                    ) {
+                        Some(Type::TypeMember(id)) => found.push(id),
+                        // A nullary alias has no symbol of its own. When its
+                        // RHS is a plain class, that class is what the
+                        // wildcard names.
+                        Some(Type::Class { sym, args }) if args.is_empty() && !sym.is_none() => {
+                            found.push(sym)
+                        }
+                        _ => {}
+                    }
+                }
+                if found.is_empty() {
+                    continue;
+                }
+                for id in found {
+                    self.st
+                        .enter_import_in_current(name, id, BindRank::Wildcard, origin);
+                }
+                return true;
+            }
+            // A binding in this scope hides every outer scope. A wildcard in
+            // the same scope has already had its chance above, so leave the
+            // normal resolver to use the existing binding.
+            if has_type {
+                return false;
+            }
+        }
+        false
     }
 
     pub(crate) fn expose_unqualified(&mut self, name: &str, span: Span) {
