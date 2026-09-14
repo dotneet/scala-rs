@@ -4362,16 +4362,18 @@ impl PickleSupply {
             // needed by a nullary alias such as `type EmptyAlias = Empty`.
             // Materialize that ordinary classfile here instead of declining
             // the alias RHS and leaving the imported type as an unresolved
-            // prefix refinement. This is the same binary loader path used by
-            // `Typer::load_binary_into`, kept local so conversion can finish
-            // in one pass.
-            if let Ok(Some(bytes)) = bin.find_class(&key) {
-                if let Ok(class) = crate::javaclass::parse_java_classfile(&bytes) {
-                    let id = crate::classpath::install_java_class(st, &class);
-                    if st.get(id).jvm_name == key {
-                        self.stubs.insert(key, id);
-                        self.give_stub_its_kinds(st, bin, id, full_name, module);
-                        return Some(id);
+            // prefix refinement. Top-level Scala classes must continue
+            // through the signature-aware placeholder path below; eagerly
+            // installing their classfile would discard ScalaSignature data.
+            if is_nested_jvm_name(&key) && !self.has_pickle(bin, full_name, module) {
+                if let Ok(Some(bytes)) = bin.find_class(&key) {
+                    if let Ok(class) = crate::javaclass::parse_java_classfile(&bytes) {
+                        let id = crate::classpath::install_java_class(st, &class);
+                        if st.get(id).jvm_name == key {
+                            self.stubs.insert(key, id);
+                            self.give_stub_its_kinds(st, bin, id, full_name, module);
+                            return Some(id);
+                        }
                     }
                 }
             }
