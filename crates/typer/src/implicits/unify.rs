@@ -246,6 +246,36 @@ impl<'a> Unify<'a> {
             }
             return self.unify_at(&ca, &cb, depth + 1);
         }
+        // A class that inherits `FunctionN` is also a structural function
+        // type.  Implicit result fitting has to use that fact in the same
+        // direction as ordinary subtyping: a generic tuple reader can extend
+        // a row-reader trait that extends `(Positioned => T)`, and its tuple
+        // factory can be an implicit method.  Matching the factory's result
+        // directly against the structural function wanted type used to fail
+        // before the factory's element-reader clauses could solve `T1`..`T4`.
+        //
+        // `base_type_instance` reads the inherited `FunctionN` arguments at
+        // the concrete class's type parameters; converting a structural
+        // function to that same class form handles the reverse direction as
+        // well.  This stays generic: any user class extending `FunctionN`
+        // has the same relation.
+        match (a, b) {
+            (Type::Class { .. }, Type::Function { .. }) => {
+                if let Some(function_class @ Type::Class { sym, .. }) =
+                    self.typer.st.function_class_form(b)
+                {
+                    if let Some(base) = self.typer.base_type_instance(a, sym, 0) {
+                        return self.unify_at(&base, &function_class, depth + 1);
+                    }
+                }
+            }
+            (Type::Function { .. }, Type::Class { .. }) => {
+                if let Some(function_class) = self.typer.st.function_class_form(a) {
+                    return self.unify_at(&function_class, b, depth + 1);
+                }
+            }
+            _ => {}
+        }
         // `_` in the wanted type is a position the search is not asking about.
         // slick writes `packedValue[R](implicit ev: Shape[? <: Level, T, ?, R])`
         // and the witness in scope is a `Shape[? <: Level, E, U, R]`: matching

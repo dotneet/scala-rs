@@ -335,6 +335,37 @@ fn an_implicit_object_is_not_ambiguous_with_itself() {
     );
 }
 
+/// A generic implicit factory may return a class that inherits a function
+/// type.  A tuple reader extending a row-reader trait has this shape, and the
+/// factory's nominal result has to fit the structural function wanted type.
+/// Before this was handled, implicit search reported a missing reader before
+/// it could solve the element-reader clauses.
+#[test]
+fn a_function_subtype_implicit_fills_a_structural_function() {
+    accepts(
+        "itail_function_subtype_implicit",
+        "class Positioned\n\
+         trait RowReader[+T] extends (Positioned => T)\n\
+         class TupleReader[+T <: Product](children: RowReader[_]*) extends RowReader[T] {\n\
+         \x20 def apply(r: Positioned): T = null.asInstanceOf[T]\n\
+         }\n\
+         object RowReader {\n\
+         \x20 implicit val getString: RowReader[String] = new RowReader[String] {\n\
+         \x20\x20 def apply(r: Positioned): String = \"\"\n\
+         \x20 }\n\
+         \x20 implicit def tuple4[A, B, C, D](implicit a: RowReader[A], b: RowReader[B], c: RowReader[C], d: RowReader[D]): TupleReader[(A, B, C, D)] =\n\
+         \x20\x20 new TupleReader[(A, B, C, D)]()\n\
+         }\n\
+         object ResultAction {\n\
+         \x20 def apply[R](f: Unit => Unit)(implicit read: Positioned => R): R = read(new Positioned)\n\
+         }\n\
+         object M {\n\
+         \x20 import RowReader._\n\
+         \x20 val row = ResultAction[(String, String, String, String)](_ => ())\n\
+         }\n",
+    );
+}
+
 /// A `case class` with a repeated parameter: nsc gives it no `copy`, but
 /// scala-rs does, and typing its `copy$default$n` (`this.cells`) against the
 /// repeated type reported a mismatch on a tree the user never wrote.
