@@ -12,6 +12,7 @@ object CanBeQcProbe {
   val users = TableQuery[Users](t => new Users(t))
   val filtered = users.filter(_.id === 1)
   val filteredExplicit = users.filter(u => u.id === 1)
+  val filteredAnd = users.filter(u => (u.id === 1) && (u.id === 2))
 }
 
 trait CanBeQcDb {

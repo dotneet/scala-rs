@@ -938,4 +938,105 @@ object M {
             Some("(LTableQuery;)I")
         );
     }
+
+    #[test]
+    fn inherited_receiver_type_parameter_survives_method_signature() {
+        let src = r#"
+class Rep[A]
+class OptionMapper2[A, B, C, P1, P2, R]
+trait ExtensionMethods[B1, P1]
+class BooleanColumnExtensionMethods[P1] extends ExtensionMethods[Boolean, P1] {
+  def and[P2, R](b: Rep[P2])(implicit om: OptionMapper2[Boolean, Boolean, Boolean, P1, P2, R]): Rep[R] = null
+}
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let method = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Method && s.name == "and")
+            .expect("and method");
+        let signatures = record_generic_signatures(&st);
+        let signature = signatures.get(&method.id).expect("and signature");
+        assert_eq!(
+            signature.sig,
+            "<P2:Ljava/lang/Object;R:Ljava/lang/Object;>(LRep<TP2;>;LOptionMapper2<Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;TP1;TP2;TR;>;)LRep<TR;>;"
+        );
+    }
+
+    #[test]
+    fn projected_option_mapper_keeps_enclosing_type_parameter() {
+        let src = r#"
+class Rep[A]
+class OptionMapper2[A, B, C, P1, P2, R]
+object OptionMapperDSL {
+  type arg[B1, P1] = {
+    type to[BR, PR] = OptionMapper2[Boolean, B1, BR, Boolean, P1, PR]
+    type arg[B2, P2] = {
+      type to[BR, PR] = OptionMapper2[B1, B2, BR, P1, P2, PR]
+    }
+  }
+}
+trait ExtensionMethods[B1, P1] {
+  protected type o = OptionMapperDSL.arg[B1, P1]
+}
+class BooleanColumnExtensionMethods[P1] extends ExtensionMethods[Boolean, P1] {
+  def and[P2, R](b: Rep[P2])(implicit om: o#arg[Boolean, P2]#to[Boolean, R]): Rep[R] = null
+}
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let method = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Method && s.name == "and")
+            .expect("and method");
+        let signatures = record_generic_signatures(&st);
+        let signature = signatures.get(&method.id).expect("and signature");
+        assert_eq!(
+            signature.sig,
+            "<P2:Ljava/lang/Object;R:Ljava/lang/Object;>(LRep<TP2;>;LOptionMapper2<Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;TP1;TP2;TR;>;)LRep<TR;>;"
+        );
+    }
+
+    #[test]
+    fn refinement_alias_does_not_capture_unused_outer_parameter() {
+        let src = r#"
+class Rep[A]
+object DSL {
+  type arg[A] = { type to[X] = Rep[X] }
+}
+trait Ops[P] {
+  protected type o = DSL.arg[P]
+}
+class NoCapture[P] extends Ops[P] {
+  def noCapture[X](value: o#to[X]): Rep[X] = null
+}
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let method = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Method && s.name == "noCapture")
+            .expect("noCapture method");
+        let signatures = record_generic_signatures(&st);
+        let signature = signatures.get(&method.id).expect("noCapture signature");
+        assert_eq!(
+            signature.sig,
+            "<X:Ljava/lang/Object;>(LRep<TX;>;)LRep<TX;>;"
+        );
+    }
 }

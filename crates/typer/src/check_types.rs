@@ -2881,7 +2881,7 @@ impl Typer {
         if !rhs.is_empty() {
             let own = self.st.get(id).tparams.clone();
             let mut free = Vec::new();
-            collect_tparams(&rhs_ty, &mut free);
+            self.collect_type_alias_captures(&rhs_ty, &mut free);
             captured = free.into_iter().filter(|t| !own.contains(t)).collect();
             if !captured.is_empty() {
                 let all = captured.iter().copied().chain(own).collect();
@@ -2905,6 +2905,124 @@ impl Typer {
             lo: lo_ty,
             hi: hi_ty,
         })
+    }
+
+    /// Collect parameters an alias body needs from its enclosing scopes.
+    ///
+    /// `collect_tparams` intentionally treats a `TypeMember` as opaque, which
+    /// is correct for an abstract member but loses captures when an alias is a
+    /// refinement containing another alias. `OptionMapperDSL.arg[B1, P1]` is
+    /// the important shape: its nested `arg[B2, P2]` member stores a body that
+    /// still mentions the outer `B1` and `P1`. If those captures are not made
+    /// explicit on the nested member, applying the outer alias leaves the
+    /// original symbols in the method signature and they erase to `Object`.
+    /// Walk nested alias bodies, hiding each member's own parameters while
+    /// retaining parameters that were not captured by that member. Explicit
+    /// arguments on an applied member are visited normally.
+    fn collect_type_alias_captures(&self, ty: &Type, out: &mut Vec<SymbolId>) {
+        fn visit(
+            st: &SymbolTable,
+            ty: &Type,
+            bound: &[SymbolId],
+            out: &mut Vec<SymbolId>,
+            stack: &mut Vec<SymbolId>,
+        ) {
+            match ty {
+                Type::TypeParam(id) => {
+                    if !bound.contains(id) && !out.contains(id) {
+                        out.push(*id);
+                    }
+                }
+                Type::TypeMember(id) => {
+                    let info = st.get(*id);
+                    // Named aliases already run this capture pass when their
+                    // own body is entered. The extra walk is for the symbols
+                    // allocated for nested refinement members (which have no
+                    // owner); following every named alias here would turn a
+                    // standard-library alias graph into a quadratic walk.
+                    if !info.is_type_alias || !info.owner.is_none() || stack.contains(id) {
+                        return;
+                    }
+                    let mut nested_bound = bound.to_vec();
+                    nested_bound.extend(info.tparams.iter().copied());
+                    stack.push(*id);
+                    visit(st, &info.ty, &nested_bound, out, stack);
+                    stack.pop();
+                }
+                Type::Class { args, .. }
+                | Type::Tuple(args)
+                | Type::Named { args, .. }
+                | Type::Overload(args) => {
+                    for arg in args {
+                        visit(st, arg, bound, out, stack);
+                    }
+                }
+                Type::Applied { ctor, args } => {
+                    visit(st, ctor, bound, out, stack);
+                    for arg in args {
+                        visit(st, arg, bound, out, stack);
+                    }
+                }
+                Type::Array(t)
+                | Type::ByName(t)
+                | Type::Repeated(t)
+                | Type::Annotated { tpe: t, .. } => visit(st, t, bound, out, stack),
+                Type::Function { params, ret } => {
+                    for param in params {
+                        visit(st, param, bound, out, stack);
+                    }
+                    visit(st, ret, bound, out, stack);
+                }
+                Type::Method { paramss, ret } => {
+                    for params in paramss {
+                        for param in params {
+                            visit(st, param, bound, out, stack);
+                        }
+                    }
+                    visit(st, ret, bound, out, stack);
+                }
+                Type::Refined { parents, decls } => {
+                    for parent in parents {
+                        visit(st, parent, bound, out, stack);
+                    }
+                    for decl in decls {
+                        match decl {
+                            RefineDecl::Type { rhs, lo, hi, .. } => {
+                                if let Some(rhs) = rhs {
+                                    visit(st, rhs, bound, out, stack);
+                                }
+                                if let Some(lo) = lo {
+                                    visit(st, lo, bound, out, stack);
+                                }
+                                if let Some(hi) = hi {
+                                    visit(st, hi, bound, out, stack);
+                                }
+                            }
+                            RefineDecl::Def {
+                                tparams,
+                                paramss,
+                                ret,
+                                ..
+                            } => {
+                                let mut method_bound = bound.to_vec();
+                                method_bound.extend(tparams.iter().copied());
+                                for params in paramss {
+                                    for param in params {
+                                        visit(st, param, &method_bound, out, stack);
+                                    }
+                                }
+                                visit(st, ret, &method_bound, out, stack);
+                            }
+                            RefineDecl::Val { ty, .. } => visit(st, ty, bound, out, stack),
+                        }
+                    }
+                }
+                Type::SingleType { prefix, .. } => visit(st, prefix, bound, out, stack),
+                _ => {}
+            }
+        }
+
+        visit(&self.st, ty, &[], out, &mut Vec::new());
     }
 
     /// `p.T` where `T` is a type alias declared by a class read from a jar.
