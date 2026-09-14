@@ -141,3 +141,33 @@ fn real_scalac_uses_the_traits_that_declared_inherited_overloads() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn inherited_compose_prefers_nontrait_superclass() {
+    let Some(library) = scala_library() else {
+        eprintln!("skip inherited compose bridge: Scala 2.13.16 toolchain unavailable");
+        return;
+    };
+    let root = temp_dir();
+    let producer = root.join("producer");
+    fs::create_dir_all(&producer).unwrap();
+
+    compile_producer(&fixture("inherited_compose_super"), &producer, &library);
+    let run_cp = format!("{}:{}", producer.display(), library.display());
+    let run = Command::new("java")
+        .args(["-Xverify:all", "-cp", &run_cp, "nestedbridge.Main"])
+        .output()
+        .expect("run inherited compose bridge fixture");
+    assert!(
+        run.status.success(),
+        "superclass implementation was not selected:\n{}{}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "nestedbridge.R$$anon$1\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

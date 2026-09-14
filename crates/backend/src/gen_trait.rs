@@ -2811,6 +2811,25 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// Whether an inherited method is already provided by the class's
+    /// non-trait superclass.  A class can implement the same base trait both
+    /// through its superclass and through a more-specific mixed-in trait. In
+    /// that shape the superclass owns the wide JVM entry point, while the
+    /// mixed-in trait's narrower overload must not be selected as the bridge
+    /// target.  This is the shape of `Reducible.compose` versus
+    /// `NonEmptyTraverse.compose` in Cats (and the small `R`/`N` toy).
+    fn inherited_from_nontrait_superclass(&self, class_id: SymbolId, base: SymbolId) -> bool {
+        let Some(superclass) = linearize(self.st, class_id)
+            .into_iter()
+            .skip(1)
+            .find(|&id| !is_interface_sym(self.st, id))
+        else {
+            return false;
+        };
+        let owner = self.st.get(base).owner;
+        !owner.is_none() && linearize(self.st, superclass).contains(&owner)
+    }
+
     pub(crate) fn emit_inherited_covariant_bridges(
         &self,
         b: &mut ClassBuilder,
@@ -2861,6 +2880,14 @@ impl<'a> Gen<'a> {
                 if b.methods.iter().any(|m| m.name == enc && m.desc == pdesc) {
                     continue;
                 }
+                // If the declaration is already inherited through the
+                // non-trait superclass, its JVM entry point is owned there.
+                // A more-specific mixed-in trait may expose a same-named
+                // narrower overload, but it is not an implementation of this
+                // parent method and must not become this class's bridge target.
+                if self.inherited_from_nontrait_superclass(class_id, pmid) {
+                    continue;
+                }
                 let same_params = b
                     .methods
                     .iter()
@@ -2876,6 +2903,9 @@ impl<'a> Gen<'a> {
                     .or_else(|| {
                         self.st
                             .inherited_method_implementation(class_id, pmid)
+                            .filter(|&implementation| {
+                                !method_overloads(self.st, implementation, pmid)
+                            })
                             .map(|implementation| method_desc_from_sym(self.st, implementation))
                             .filter(|desc| desc != &pdesc)
                     });
