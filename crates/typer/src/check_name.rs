@@ -2619,7 +2619,7 @@ impl Typer {
     /// `object x extends BaseScalaTemplate[Html, Format[Html]]`. The result
     /// came back as the bare `T`, so the template's own declared result type
     /// did not match it.
-    fn ident_ty_as_seen_from_this(&self, s: SymbolId, ty: Type) -> Type {
+    pub(crate) fn ident_ty_as_seen_from_this(&self, s: SymbolId, ty: Type) -> Type {
         if self.st.this_class.is_none() {
             return ty;
         }

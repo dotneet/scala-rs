@@ -75,3 +75,30 @@ fn generic_profile_accessor_is_a_stable_path_after_separate_compilation() {
 
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn inherited_profile_accessor_preserves_a_narrowed_api_bound() {
+    let jar = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    if !jar.is_file() {
+        eprintln!("skip inherited profile API: scala-library jar not obtainable");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-inherited-profile-api-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).unwrap();
+
+    compile(
+        &fixtures_dir().join("profile_api_inherited.scala"),
+        &root,
+        &jar,
+        None,
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}

@@ -2569,7 +2569,23 @@ impl Typer {
                         // is not a member of Resource$" even once `Resource`
                         // itself resolved as a stable path.
                         SymKind::Term | SymKind::Method => {
-                            Some(self.maybe_auto_apply(sy.ty.clone(), &Type::NoType))
+                            // An inherited stable member is read through the
+                            // current class, just like an unqualified
+                            // expression in `bind_found`. This matters for
+                            // `val profile: Profile` where the subclass
+                            // narrows the inherited abstract `type Profile`:
+                            // without this as-seen-from step, `profile.type`
+                            // keeps the parent's `BasicProfile` bound and
+                            // `profile.api.Table` loses the relational API.
+                            let mut ty = self.ident_ty_as_seen_from_this(s, sy.ty.clone());
+                            if matches!(
+                                self.st.get(sy.owner).kind,
+                                SymKind::Class | SymKind::ModuleClass | SymKind::Module
+                            ) && !self.st.this_class.is_none()
+                            {
+                                ty = self.st.expand_type_members(self.st.this_class, &ty);
+                            }
+                            Some(self.maybe_auto_apply(ty, &Type::NoType))
                         }
                         SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
                         _ => None,
