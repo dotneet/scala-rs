@@ -341,12 +341,12 @@ pub(crate) fn param_adapt(st: &SymbolTable, from: &Type, to: &Type) -> Adapt {
     }
 }
 
-pub(crate) fn emit_adapt(asm: &mut Assembler, adapt: &Adapt) {
+pub(crate) fn emit_adapt(asm: &mut Assembler, adapt: &Adapt, abi: AbiMode) {
     match adapt {
         Adapt::None => {}
         Adapt::Cast(cn) => asm.checkcast(cn),
         Adapt::Box(ty) => emit_box(asm, ty),
-        Adapt::Unbox(ty) => emit_unbox(asm, ty),
+        Adapt::Unbox(ty) => emit_unbox(asm, ty, abi),
     }
 }
 
@@ -918,10 +918,7 @@ pub(crate) fn reads_via_accessor(st: &SymbolTable, id: SymbolId) -> bool {
     // accessor for. A prelude or classfile symbol says how to reach it in
     // `jvm_name` (empty means "read the field", which is right for the private
     // runtime's `Tuple2._1`).
-    !o.is_none()
-        && st.get(o).is_class_like()
-        && !is_interface_sym(st, o)
-        && st.source_classes.contains(&o)
+    !o.is_none() && st.get(o).is_class_like() && !is_interface_sym(st, o) && st.is_source_class(o)
 }
 
 pub(crate) fn trait_static_desc(iface: &str, inst_desc: &str) -> String {
@@ -2335,7 +2332,7 @@ pub(crate) fn emit_class_constant(asm: &mut Assembler, ctx: &EmitCtx, ty: &Type)
         // The private runtime ships `Tuple2` alone.
         Type::Function { .. } | Type::Tuple(_)
             if checkcast_internal(ctx.st, ty).is_some()
-                && (ctx.library_abi || !matches!(ty, Type::Tuple(ts) if ts.len() != 2)) =>
+                && (ctx.abi.is_library() || !matches!(ty, Type::Tuple(ts) if ts.len() != 2)) =>
         {
             asm.ldc_class(&checkcast_internal(ctx.st, ty).unwrap_or_default());
         }
@@ -2592,11 +2589,11 @@ pub(crate) fn value_bridge_clashes(st: &SymbolTable, id: SymbolId) -> bool {
         return false;
     }
     let s = st.get(id);
-    if !st.value_class_results.contains_key(&id)
+    if st.value_class_for_result(id).is_none()
         && !s
             .params
             .iter()
-            .any(|p| st.value_class_terms.contains_key(p))
+            .any(|&p| st.value_class_for_term(p).is_some())
     {
         return false;
     }
@@ -2606,9 +2603,9 @@ pub(crate) fn value_bridge_clashes(st: &SymbolTable, id: SymbolId) -> bool {
             let ps = st.get(pm);
             if ps.kind == SymKind::Method
                 && ps.name == s.name
-                && !st.value_class_results.contains_key(&pm)
-                && (st.value_class_results.contains_key(&id)
-                    || st.erased_abstract_params.get(&pm).copied().unwrap_or(0) != 0)
+                && st.value_class_for_result(pm).is_none()
+                && (st.value_class_for_result(id).is_some()
+                    || st.erased_abstract_param_mask(pm) != 0)
                 && method_desc_from_sym(st, pm) == desc
                 && !method_overloads(st, id, pm)
             {

@@ -140,7 +140,7 @@ impl Pass<'_> {
             "",
         );
         self.st.get_mut(cell).ty = cell_ty.clone();
-        self.st.local_lazy_cells.insert(cell);
+        self.st.record_local_lazy_cell(cell);
 
         // Named after the val, like nsc: lambda-lift appends its own `$n`, so
         // the emitted method comes out as `x$1` the way scalac's does.
@@ -161,7 +161,7 @@ impl Pass<'_> {
         self.st.get_mut(acc).ty = mty.clone();
         self.st.get_mut(acc).params = vec![cell];
         self.st.get_mut(acc).paramss = vec![vec![cell]];
-        self.st.local_lazy_accessors.insert(acc, cell);
+        self.st.record_local_lazy_accessor(acc, cell);
 
         let TreeKind::ValDef { mods, rhs, .. } = &mut vd.kind else {
             return None;
@@ -174,7 +174,7 @@ impl Pass<'_> {
         let mut returns = Vec::new();
         collect_return_targets(&mut rhs, &mut returns);
         for r in returns {
-            self.st.local_lazy_nlr.insert(r);
+            self.st.record_local_lazy_nlr(r);
         }
         let mut cell_mods = Modifiers::new(mods.flags);
         cell_mods.flags = cell_mods.flags.with(Flags::SYNTHETIC);

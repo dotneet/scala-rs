@@ -121,46 +121,93 @@ pub fn skip_attrs(c: &mut Cursor) -> Option<()> {
 /// it. Handles the `ScalaLongSignature` form (an array of strings, used for
 /// classes whose pickle exceeds the 64K constant-pool string limit).
 pub fn scala_signature_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    scala_signature_bytes_result(bytes).ok().flatten()
+}
+
+/// Result-returning form of [`scala_signature_bytes`].
+///
+/// `Ok(None)` means that no Scala signature is present. An invalid classfile
+/// or invalid annotation is an error, so an ABI loader need not silently
+/// downgrade a Scala class to a Java class.
+pub fn scala_signature_bytes_result(bytes: &[u8]) -> Result<Option<Vec<u8>>, ClassfileError> {
     let mut c = Cursor::new(bytes);
-    if c.u4()? != 0xCAFEBABE {
-        return None;
+    if c.u4().ok_or(ClassfileError::Truncated("magic"))? != 0xCAFEBABE {
+        return Err(ClassfileError::BadMagic);
     }
-    let _minor = c.u2()?;
-    let _major = c.u2()?;
-    let cp = parse_cp(&mut c)?;
-    let _access = c.u2()?;
-    let _this = c.u2()?;
-    let _super = c.u2()?;
-    let niface = c.u2()? as usize;
+    let _minor = c.u2().ok_or(ClassfileError::Truncated("version"))?;
+    let _major = c.u2().ok_or(ClassfileError::Truncated("version"))?;
+    let cp = parse_cp(&mut c).ok_or(ClassfileError::Malformed("constant pool"))?;
+    let _access = c.u2().ok_or(ClassfileError::Truncated("class header"))?;
+    let _this = c.u2().ok_or(ClassfileError::Truncated("class header"))?;
+    let _super = c.u2().ok_or(ClassfileError::Truncated("class header"))?;
+    let niface = c.u2().ok_or(ClassfileError::Truncated("interfaces"))? as usize;
     for _ in 0..niface {
-        let _ = c.u2()?;
+        let _ = c.u2().ok_or(ClassfileError::Truncated("interfaces"))?;
     }
-    for _ in 0..(c.u2()? as usize) {
-        let _ = c.u2()?;
-        let _ = c.u2()?;
-        let _ = c.u2()?;
-        skip_attrs(&mut c)?;
+    for _ in 0..(c.u2().ok_or(ClassfileError::Truncated("fields"))? as usize) {
+        let _ = c.u2().ok_or(ClassfileError::Truncated("field"))?;
+        let _ = c.u2().ok_or(ClassfileError::Truncated("field"))?;
+        let _ = c.u2().ok_or(ClassfileError::Truncated("field"))?;
+        skip_attrs(&mut c).ok_or(ClassfileError::Truncated("field attributes"))?;
     }
-    for _ in 0..(c.u2()? as usize) {
-        let _ = c.u2()?;
-        let _ = c.u2()?;
-        let _ = c.u2()?;
-        skip_attrs(&mut c)?;
+    for _ in 0..(c.u2().ok_or(ClassfileError::Truncated("methods"))? as usize) {
+        let _ = c.u2().ok_or(ClassfileError::Truncated("method"))?;
+        let _ = c.u2().ok_or(ClassfileError::Truncated("method"))?;
+        let _ = c.u2().ok_or(ClassfileError::Truncated("method"))?;
+        skip_attrs(&mut c).ok_or(ClassfileError::Truncated("method attributes"))?;
     }
-    let nattrs = c.u2()? as usize;
+    scala_signature_bytes_from_class_attributes(&mut c, &cp)
+}
+
+/// Extract a Scala signature from the class attributes at the cursor's current
+/// position, reusing a constant pool that the caller has already parsed.
+///
+/// This is public for the backend classfile loader; most callers should use
+/// [`scala_signature_bytes_result`].
+#[doc(hidden)]
+pub fn scala_signature_bytes_from_class_attributes(
+    c: &mut Cursor<'_>,
+    cp: &Cp,
+) -> Result<Option<Vec<u8>>, ClassfileError> {
+    let nattrs = c
+        .u2()
+        .ok_or(ClassfileError::Truncated("class attributes"))? as usize;
     for _ in 0..nattrs {
-        let name_i = c.u2()?;
-        let len = c.u4()? as usize;
-        let body = c.bytes(len)?;
+        let name_i = c.u2().ok_or(ClassfileError::Truncated("class attribute"))?;
+        let len = c.u4().ok_or(ClassfileError::Truncated("class attribute"))? as usize;
+        let body = c
+            .bytes(len)
+            .ok_or(ClassfileError::Truncated("class attribute body"))?;
         if cp.utf8(name_i).as_deref() != Some("RuntimeVisibleAnnotations") {
             continue;
         }
-        if let Some(s) = signature_string(body, &cp) {
-            return Some(crate::codec::decode_annotation_string(&s));
+        if let Some(s) = signature_string(body, cp)
+            .map_err(|()| ClassfileError::Malformed("RuntimeVisibleAnnotations"))?
+        {
+            return Ok(Some(crate::codec::decode_annotation_string(&s)));
         }
     }
-    None
+    Ok(None)
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassfileError {
+    BadMagic,
+    Truncated(&'static str),
+    Malformed(&'static str),
+}
+
+impl std::fmt::Display for ClassfileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadMagic => f.write_str("not a classfile (bad magic)"),
+            Self::Truncated(part) => write!(f, "truncated classfile {part}"),
+            Self::Malformed(part) => write!(f, "malformed classfile {part}"),
+        }
+    }
+}
+
+impl std::error::Error for ClassfileError {}
 
 pub fn parse_cp(c: &mut Cursor) -> Option<Cp> {
     let cp_count = c.u2()? as usize;
@@ -201,29 +248,29 @@ pub fn parse_cp(c: &mut Cursor) -> Option<Cp> {
 
 /// Concatenated `bytes` payload of `ScalaSignature` or `ScalaLongSignature`,
 /// still in its `avoidZero`/7-bit encoding.
-fn signature_string(body: &[u8], cp: &Cp) -> Option<String> {
+fn signature_string(body: &[u8], cp: &Cp) -> Result<Option<String>, ()> {
     let mut c = Cursor::new(body);
-    let nann = c.u2()? as usize;
+    let nann = c.u2().ok_or(())? as usize;
     for _ in 0..nann {
-        let type_i = c.u2()?;
+        let type_i = c.u2().ok_or(())?;
         let ty = cp.utf8(type_i).unwrap_or_default();
         let is_sig = ty.contains("ScalaSignature") || ty.contains("ScalaLongSignature");
-        let npairs = c.u2()? as usize;
+        let npairs = c.u2().ok_or(())? as usize;
         let mut found: Option<String> = None;
         for _ in 0..npairs {
-            let name_i = c.u2()?;
+            let name_i = c.u2().ok_or(())?;
             let name = cp.utf8(name_i).unwrap_or_default();
             let mut sink = String::new();
-            read_element_value(&mut c, cp, &mut sink)?;
+            read_element_value(&mut c, cp, &mut sink).ok_or(())?;
             if is_sig && name == "bytes" {
                 found = Some(sink);
             }
         }
         if let Some(s) = found {
-            return Some(s);
+            return Ok(Some(s));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Walk one `element_value`, appending any string constants to `sink`.
@@ -258,4 +305,32 @@ fn read_element_value(c: &mut Cursor, cp: &Cp, sink: &mut String) -> Option<()> 
         _ => return None,
     }
     Some(())
+}
+
+#[cfg(test)]
+mod result_tests {
+    use super::*;
+
+    #[test]
+    fn result_api_distinguishes_absent_signature_from_malformed_classfile() {
+        let mut bare = Vec::new();
+        bare.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        bare.extend_from_slice(&0u16.to_be_bytes());
+        bare.extend_from_slice(&52u16.to_be_bytes());
+        bare.extend_from_slice(&1u16.to_be_bytes()); // empty constant pool
+        bare.extend_from_slice(&0u16.to_be_bytes()); // access
+        bare.extend_from_slice(&0u16.to_be_bytes()); // this
+        bare.extend_from_slice(&0u16.to_be_bytes()); // super
+        bare.extend_from_slice(&0u16.to_be_bytes()); // interfaces
+        bare.extend_from_slice(&0u16.to_be_bytes()); // fields
+        bare.extend_from_slice(&0u16.to_be_bytes()); // methods
+        bare.extend_from_slice(&0u16.to_be_bytes()); // attributes
+
+        assert_eq!(scala_signature_bytes_result(&bare), Ok(None));
+        assert_eq!(
+            scala_signature_bytes_result(b"not a class"),
+            Err(ClassfileError::BadMagic)
+        );
+        assert!(scala_signature_bytes_result(&bare[..8]).is_err());
+    }
 }

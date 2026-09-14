@@ -21,9 +21,13 @@ pub mod runtime;
 pub mod sig;
 
 pub use classfile::EmittedClass;
-pub use gen::{emit, emit_opts, EmitError, EmitOpts, EmitResult};
+pub use gen::{emit, emit_opts, AbiMode, EmitError, EmitOpts, EmitResult};
 pub use ifacebridge::BinaryParents;
-pub use load::{load_classpath, scala_signature_bytes, LoadedClass, LoadedMethod};
+pub use load::{
+    load_classpath, load_classpath_checked, parse_abi_class, scala_signature_bytes,
+    scala_signature_bytes_result, AbiClassError, AbiLoadedClass, AbiLoadedField, AbiLoadedMethod,
+    ClassfileError, ClasspathLoadError, LoadedClass, LoadedField, LoadedMethod,
+};
 pub use pickle::{PickledType, PickledTypeParam};
 pub use runtime::emit_runtime;
 pub use sig::{record_generic_signatures, GenericSignature, GenericSignatures};

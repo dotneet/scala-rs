@@ -1326,6 +1326,236 @@ impl Typer {
         self.gensym += 1;
         format!("{prefix}${}$", self.gensym)
     }
+
+    // The typer is one mutable context, but these fields are dynamically
+    // scoped. Closure-based scopes make restoration unconditional for normal
+    // early results (`Result`, `Option`, and so on), without unsafe guards or
+    // shared ownership of the Typer.
+    pub(crate) fn with_owner<R>(&mut self, owner: SymbolId, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.st.owner;
+        self.st.owner = owner;
+        let result = f(self);
+        self.st.owner = saved;
+        result
+    }
+
+    pub(crate) fn with_this_class<R>(
+        &mut self,
+        this_class: SymbolId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.st.this_class;
+        self.st.this_class = this_class;
+        let result = f(self);
+        self.st.this_class = saved;
+        result
+    }
+
+    pub(crate) fn with_return_meth<R>(
+        &mut self,
+        return_meth: Option<SymbolId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.return_meth;
+        self.return_meth = return_meth;
+        let result = f(self);
+        self.return_meth = saved;
+        result
+    }
+
+    pub(crate) fn with_owner_this<R>(
+        &mut self,
+        owner: SymbolId,
+        this_class: SymbolId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved_owner = self.st.owner;
+        let saved_this = self.st.this_class;
+        self.st.owner = owner;
+        self.st.this_class = this_class;
+        let result = f(self);
+        self.st.this_class = saved_this;
+        self.st.owner = saved_owner;
+        result
+    }
+
+    pub(crate) fn with_owner_this_return<R>(
+        &mut self,
+        owner: SymbolId,
+        this_class: SymbolId,
+        return_meth: Option<SymbolId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved_owner = self.st.owner;
+        let saved_this = self.st.this_class;
+        let saved_return = self.return_meth;
+        self.st.owner = owner;
+        self.st.this_class = this_class;
+        self.return_meth = return_meth;
+        let result = f(self);
+        self.return_meth = saved_return;
+        self.st.this_class = saved_this;
+        self.st.owner = saved_owner;
+        result
+    }
+
+    pub(crate) fn with_import_origin<R>(
+        &mut self,
+        import_origin: u64,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.import_origin;
+        self.import_origin = import_origin;
+        let result = f(self);
+        self.import_origin = saved;
+        result
+    }
+
+    pub(crate) fn with_typing_callee<R>(
+        &mut self,
+        typing_callee: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.typing_callee;
+        self.typing_callee = typing_callee;
+        let result = f(self);
+        self.typing_callee = saved;
+        result
+    }
+
+    pub(crate) fn with_typing_type_callee<R>(
+        &mut self,
+        typing_type_callee: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.typing_type_callee;
+        self.typing_type_callee = typing_type_callee;
+        let result = f(self);
+        self.typing_type_callee = saved;
+        result
+    }
+
+    pub(crate) fn with_typing_qualifier<R>(
+        &mut self,
+        typing_qualifier: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.typing_qualifier;
+        self.typing_qualifier = typing_qualifier;
+        let result = f(self);
+        self.typing_qualifier = saved;
+        result
+    }
+
+    pub(crate) fn with_typing_call_args<R>(
+        &mut self,
+        typing_call_args: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.typing_call_args;
+        self.typing_call_args = typing_call_args;
+        let result = f(self);
+        self.typing_call_args = saved;
+        result
+    }
+
+    pub(crate) fn with_callee_arity<R>(
+        &mut self,
+        callee_arity: Option<usize>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.callee_arity;
+        self.callee_arity = callee_arity;
+        let result = f(self);
+        self.callee_arity = saved;
+        result
+    }
+
+    pub(crate) fn with_parent_context<R>(
+        &mut self,
+        parent_ctx: Option<(SymbolId, SymbolId)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.parent_ctx;
+        self.parent_ctx = parent_ctx;
+        let result = f(self);
+        self.parent_ctx = saved;
+        result
+    }
+
+    pub(crate) fn with_parent_arg_scope<R>(
+        &mut self,
+        parent_arg_scope: Option<(SymbolId, Vec<SymbolId>)>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.parent_arg_scope.take();
+        self.parent_arg_scope = parent_arg_scope;
+        let result = f(self);
+        self.parent_arg_scope = saved;
+        result
+    }
+
+    pub(crate) fn with_sigs_only<R>(
+        &mut self,
+        sigs_only: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.sigs_only;
+        self.sigs_only = sigs_only;
+        let result = f(self);
+        self.sigs_only = saved;
+        result
+    }
+
+    pub(crate) fn with_ctor_pattern_fun<R>(
+        &mut self,
+        ctor_pattern_fun: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.ctor_pattern_fun;
+        self.ctor_pattern_fun = ctor_pattern_fun;
+        let result = f(self);
+        self.ctor_pattern_fun = saved;
+        result
+    }
+
+    pub(crate) fn with_pattern_tpt<R>(
+        &mut self,
+        pattern_tpt: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.pattern_tpt;
+        self.pattern_tpt = pattern_tpt;
+        let result = f(self);
+        self.pattern_tpt = saved;
+        result
+    }
+
+    pub(crate) fn with_parent_ctor_scope<R>(
+        &mut self,
+        parent_ctor_scope: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.parent_ctor_scope;
+        self.parent_ctor_scope = parent_ctor_scope;
+        let result = f(self);
+        self.parent_ctor_scope = saved;
+        result
+    }
+
+    pub(crate) fn with_spec_probe<R>(&self, spec_probe: bool, f: impl FnOnce() -> R) -> R {
+        let saved = self.spec_probe.replace(spec_probe);
+        let result = f();
+        self.spec_probe.set(saved);
+        result
+    }
+
+    pub(crate) fn with_provisional_arg_sites<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.provisional_arg_sites.clone();
+        let result = f(self);
+        self.provisional_arg_sites = saved;
+        result
+    }
 }
 
 /// Whether a built signature still contains a name that resolved to nothing.
@@ -3951,5 +4181,58 @@ pub(crate) fn expected_function_arity(pt: &Type) -> Option<usize> {
             (!args.is_empty()).then(|| args.len() - 1)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod scoped_state_tests {
+    use super::*;
+
+    #[test]
+    fn nested_scopes_restore_context_after_result() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let outer_owner = SymbolId(11);
+        let outer_this = SymbolId(12);
+        let outer_return = Some(SymbolId(13));
+        typer.st.owner = outer_owner;
+        typer.st.this_class = outer_this;
+        typer.return_meth = outer_return;
+        typer.import_origin = 14;
+
+        let result: Result<(), &'static str> =
+            typer.with_owner_this_return(SymbolId(21), SymbolId(22), Some(SymbolId(23)), |typer| {
+                assert_eq!(typer.st.owner, SymbolId(21));
+                assert_eq!(typer.st.this_class, SymbolId(22));
+                assert_eq!(typer.return_meth, Some(SymbolId(23)));
+                typer.with_import_origin(24, |typer| {
+                    assert_eq!(typer.import_origin, 24);
+                    Err("leave child scope")
+                })
+            });
+
+        assert_eq!(result, Err("leave child scope"));
+        assert_eq!(typer.st.owner, outer_owner);
+        assert_eq!(typer.st.this_class, outer_this);
+        assert_eq!(typer.return_meth, outer_return);
+        assert_eq!(typer.import_origin, 14);
+    }
+
+    #[test]
+    fn typing_flags_restore_when_nested_work_returns_early() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.typing_callee = true;
+        typer.typing_call_args = true;
+        typer.typing_qualifier = true;
+
+        let result: Option<()> = typer.with_typing_callee(false, |typer| {
+            typer.with_typing_call_args(false, |typer| {
+                typer.with_typing_qualifier(false, |_typer| None)
+            })
+        });
+
+        assert_eq!(result, None);
+        assert!(typer.typing_callee);
+        assert!(typer.typing_call_args);
+        assert!(typer.typing_qualifier);
     }
 }

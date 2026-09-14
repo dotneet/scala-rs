@@ -37,7 +37,7 @@ pub(crate) fn invoke_method(
         asm.invokespecial(&owner, "<init>", &d);
         return;
     }
-    if owner_is_package && ctx.library_abi {
+    if owner_is_package && ctx.abi.is_library() {
         asm.invokestatic(&owner, name, &desc);
         maybe_unbox_erased_result(asm, ctx, &desc, result_ty);
         return;
@@ -79,7 +79,7 @@ pub(crate) fn invoke_method(
     // symbol table exposes the owner and pair-returning descriptor even for
     // that inherited overload, so select the erased generic entry point from
     // the inferred result before falling through to the normal invocation.
-    if ctx.library_abi
+    if ctx.abi.is_library()
         && owner == "scala/collection/MapOps$WithFilter"
         && matches!(name, "map" | "flatMap")
         && result_ty.is_some_and(|t| !builds_pairs(ctx, t))
@@ -94,7 +94,7 @@ pub(crate) fn invoke_method(
         }
         return;
     }
-    if ctx.library_abi && !pickled_with_implicit_clause(ctx.st, id) {
+    if ctx.abi.is_library() && !pickled_with_implicit_clause(ctx.st, id) {
         // `MapOps.map` / `flatMap` / `collect` *build a map*: they require the
         // function to return a pair, and 2.13 picks the `IterableOps` overload
         // of the same name whenever it does not
@@ -832,7 +832,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else {
                             checkcast_to(asm, ctx, result_ty, "java/lang/Object");
                         }
@@ -927,7 +927,7 @@ pub(crate) fn invoke_method(
                                 }
                             }
                         } else if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         }
                     }
                     return;
@@ -953,7 +953,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         }
                     }
                     return;
@@ -1553,7 +1553,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else {
                             checkcast_to(asm, ctx, result_ty, "java/lang/Object");
                         }
@@ -1655,7 +1655,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else if !is_unit_like(ty) {
                             let cls = jvm_desc(ctx.st, ty);
                             if let Some(inner) =
@@ -1751,7 +1751,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else if !is_unit_like(ty) {
                             let cls = jvm_desc(ctx.st, ty);
                             if let Some(inner) =
@@ -1806,7 +1806,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else if !is_unit_like(ty) {
                             let cls = jvm_desc(ctx.st, ty);
                             if let Some(inner) =
@@ -2249,7 +2249,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else if !is_unit_like(ty) {
                             let cls = jvm_desc(ctx.st, ty);
                             if let Some(inner) =
@@ -2300,7 +2300,7 @@ pub(crate) fn invoke_method(
                     );
                     if let Some(ty) = result_ty {
                         if is_jvm_primitive(ty) && !is_unit_like(ty) {
-                            emit_unbox(asm, ty);
+                            emit_unbox(asm, ty, ctx.abi);
                         } else if !is_unit_like(ty) {
                             let cls = jvm_desc(ctx.st, ty);
                             if let Some(inner) =
@@ -2516,7 +2516,7 @@ pub(crate) fn invoke_method(
                         "product",
                         "(Lscala/math/Numeric;)Ljava/lang/Object;",
                     );
-                    emit_unbox(asm, &Type::Int);
+                    emit_unbox(asm, &Type::Int, ctx.abi);
                     return;
                 }
                 "min" | "max" => {
@@ -2681,7 +2681,7 @@ pub(crate) fn erased_load_needs_narrowing(st: &SymbolTable, from_desc: &str, wan
 /// tree's instantiated type so `name + arg._1` can `append(String)`.
 pub(crate) fn maybe_cast_erased_load(asm: &mut Assembler, ctx: &EmitCtx, from: &Type, want: &Type) {
     if is_jvm_primitive(want) && !is_unit_like(want) && !is_jvm_primitive(from) {
-        emit_unbox(asm, want);
+        emit_unbox(asm, want, ctx.abi);
         return;
     }
     if matches!(want, Type::String) && !matches!(from, Type::String) {
@@ -2813,8 +2813,8 @@ pub(crate) fn maybe_unbox_erased_result(
     if is_jvm_primitive(ty) && !is_unit_like(ty) {
         // Private-runtime Option/Iterator already emit unboxed shapes; the
         // library ABI erases those to Object.
-        if ctx.library_abi {
-            emit_unbox(asm, ty);
+        if ctx.abi.is_library() {
+            emit_unbox(asm, ty, ctx.abi);
         }
         return;
     }
@@ -2836,10 +2836,15 @@ pub(crate) fn maybe_unbox_erased_result(
 
 /// Lambda captures (and similar) are stored as `Object`. Restore the JVM type
 /// before the body uses the local (`iastore` needs `[I`, not `Object`).
-pub(crate) fn emit_from_erased_object(asm: &mut Assembler, st: &SymbolTable, ty: &Type) {
+pub(crate) fn emit_from_erased_object(
+    asm: &mut Assembler,
+    st: &SymbolTable,
+    ty: &Type,
+    abi: AbiMode,
+) {
     let ty = &ty.widen_constant();
     if is_jvm_primitive(ty) {
-        emit_unbox(asm, ty);
+        emit_unbox(asm, ty, abi);
         return;
     }
     if matches!(ty, Type::String) {
@@ -3579,7 +3584,7 @@ pub(crate) fn seq_pat_shape(st: &SymbolTable, uid: SymbolId) -> SeqPatShape {
 /// non-`List` sequence through `SeqFactory$UnapplySeqWrapper$` (an `Array`
 /// through `Array$UnapplySeqWrapper$`), which is what those shapes emit.
 pub(crate) fn user_unapply_seq_shape(ctx: &EmitCtx, uid: SymbolId) -> SeqPatShape {
-    match ctx.st.seq_extractor_payload.get(&uid) {
+    match ctx.st.seq_extractor_payload(uid) {
         Some(SeqPayload::Array) => SeqPatShape::Array,
         Some(SeqPayload::Seq) => SeqPatShape::SeqOps,
         None => SeqPatShape::List,

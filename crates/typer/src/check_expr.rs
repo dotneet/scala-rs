@@ -83,9 +83,7 @@ mod universe_tests {
 
 impl Typer {
     pub(crate) fn type_qualifier(&mut self, tree: &mut Tree, pt: &Type) {
-        let saved = std::mem::replace(&mut self.typing_qualifier, true);
-        self.type_expr(tree, pt);
-        self.typing_qualifier = saved;
+        self.with_typing_qualifier(true, |this| this.type_expr(tree, pt));
     }
 
     pub(crate) fn type_expr_arg_prototype(
@@ -129,10 +127,10 @@ impl Typer {
                 _ => {}
             }
         }
-        let saved = self.provisional_arg_sites.clone();
-        value_sites(tree, self.file_index, &mut self.provisional_arg_sites);
-        self.type_expr(tree, pt);
-        self.provisional_arg_sites = saved;
+        self.with_provisional_arg_sites(|this| {
+            value_sites(tree, this.file_index, &mut this.provisional_arg_sites);
+            this.type_expr(tree, pt);
+        });
     }
 
     pub(crate) fn type_expr(&mut self, tree: &mut Tree, pt: &Type) {
@@ -1354,10 +1352,11 @@ impl Typer {
                     Type::Method { .. } => pt.clone(),
                     _ => Type::NoType,
                 };
-                self.typing_callee = true;
-                self.typing_type_callee = true;
-                self.type_expr(fun, &fun_pt);
-                self.typing_callee = false;
+                self.with_typing_callee(true, |this| {
+                    this.with_typing_type_callee(true, |this| {
+                        this.type_expr(fun, &fun_pt);
+                    });
+                });
                 // The `Method` expectation is for the overload set's sake
                 // alone. Everything else this position holds is still read in
                 // value position: fs2's `Stream.fromIterator[F]` is a

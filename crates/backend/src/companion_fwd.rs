@@ -71,7 +71,7 @@ pub(crate) fn companion_class_of(st: &SymbolTable, module_class: SymbolId) -> Op
         // A previous compilation's mirror may be on the classpath. Its
         // static forwarders are outputs to replace, not companion members
         // that conflict with the new module's forwarders.
-        st.source_classes.contains(&m) && st.get(m).kind == SymKind::Class && st.get(m).name == base
+        st.is_source_class(m) && st.get(m).kind == SymKind::Class && st.get(m).name == base
     })
 }
 

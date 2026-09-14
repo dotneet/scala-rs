@@ -25,6 +25,34 @@ pub(crate) use crate::gen_match::*;
 pub(crate) use crate::gen_object::*;
 use scala_rs_span::Span;
 
+/// ABI used by the emitter when selecting runtime/library classes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AbiMode {
+    /// Emit calls against scala-rs' private runtime.
+    #[default]
+    PrivateRuntime,
+    /// Emit calls against the real scala-library ABI.
+    ScalaLibrary,
+}
+
+impl AbiMode {
+    pub(crate) const fn is_library(self) -> bool {
+        matches!(self, Self::ScalaLibrary)
+    }
+
+    pub(crate) const fn is_private(self) -> bool {
+        matches!(self, Self::PrivateRuntime)
+    }
+
+    pub(crate) const fn from_library_abi(library_abi: bool) -> Self {
+        if library_abi {
+            Self::ScalaLibrary
+        } else {
+            Self::PrivateRuntime
+        }
+    }
+}
+
 /// Options for [`emit_opts`].
 #[derive(Clone, Debug, Default)]
 pub struct EmitOpts {
@@ -65,6 +93,16 @@ pub struct EmitOpts {
     /// emits no `Signature` attribute at all, which is what a caller that
     /// never ran [`crate::sig::record_generic_signatures`] must get.
     pub generic_sigs: Option<Rc<crate::sig::GenericSignatures>>,
+}
+
+impl EmitOpts {
+    /// Resolve the legacy `library_abi` option into the explicit emitter mode.
+    ///
+    /// The boolean remains for source compatibility with the driver and
+    /// downstream users; all code-generation state uses [`AbiMode`].
+    pub fn abi_mode(&self) -> AbiMode {
+        AbiMode::from_library_abi(self.library_abi)
+    }
 }
 
 /// A backend limitation discovered while lowering a typed tree.
@@ -408,23 +446,9 @@ pub(crate) fn collect_trait_impls(tree: &Tree, into: &mut TraitImpls) {
     }
 }
 
-thread_local! {
-    /// Whether the unit being emitted on this thread links against the real
-    /// scala-library, for the few emitters that are too far down the call
-    /// graph to be handed an [`EmitCtx`] (see [`emit_unbox`]). Emission of a
-    /// unit runs on one thread, and [`emit_opts`] sets this before any code is
-    /// generated.
-    static LIBRARY_ABI: Cell<bool> = const { Cell::new(false) };
-}
-
-/// See [`LIBRARY_ABI`].
-pub(crate) fn emitting_library_abi() -> bool {
-    LIBRARY_ABI.with(Cell::get)
-}
-
 /// Walk a typed compilation unit and emit classes.
 pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpts) -> EmitResult {
-    LIBRARY_ABI.with(|c| c.set(opts.library_abi));
+    let abi = opts.abi_mode();
     // A shared map already holds this unit's own trait members: the driver
     // harvests every unit of the run before emitting any, and the harvest is a
     // function of the tree alone, so doing it again here would insert the same
@@ -447,7 +471,7 @@ pub fn emit_opts(tree: &Tree, st: &SymbolTable, source_name: &str, opts: EmitOpt
         lambda_n: Cell::new(0),
         traits,
         lambda_bodies: RefCell::new(Vec::new()),
-        library_abi: opts.library_abi,
+        abi,
         pickles: opts.pickles,
         // `scala.runtime.*Ref` exists in both ABIs: on the jar, and as a
         // private-runtime classfile (see `runtime::REF_BOXES`).
@@ -506,7 +530,7 @@ pub(crate) struct Gen<'a> {
     /// Member `object`s declared in a trait. Like a trait `lazy val` these are
     /// not set from `$init$`: every implementing class gets its own
     /// `<name>$module` field and `<name>()` accessor, as nsc's mixin phase does.
-    pub(crate) library_abi: bool,
+    pub(crate) abi: AbiMode,
     pub(crate) pickles: Rc<HashMap<u32, Vec<u8>>>,
     /// Locals boxed into `scala.runtime.IntRef` / `ObjectRef` (library ABI).
     pub(crate) boxed_vars: HashSet<SymbolId>,
@@ -624,7 +648,7 @@ pub(crate) struct EmitCtx<'a> {
     /// parameter of a *static* method, not a field of a closure object:
     /// `load_this` reads this local slot instead of `this.$outer`.
     pub(crate) outer_slot: Option<u16>,
-    pub(crate) library_abi: bool,
+    pub(crate) abi: AbiMode,
     /// Named JVM method being emitted; `NONE` inside lambdas.
     pub(crate) method_sym: SymbolId,
     /// Captured `var`s lowered to `scala.runtime.*Ref`.
@@ -647,7 +671,7 @@ pub(crate) fn emit_ctx<'a>(
     lambda_bodies: &'a RefCell<Vec<PendingBody>>,
     hoist_owner: Option<&'a str>,
     source: &'a str,
-    library_abi: bool,
+    abi: AbiMode,
     boxed_vars: &'a HashSet<SymbolId>,
     emit_errors: Rc<RefCell<Vec<EmitError>>>,
 ) -> EmitCtx<'a> {
@@ -666,7 +690,7 @@ pub(crate) fn emit_ctx<'a>(
         presuper_outer: None,
         presuper: false,
         outer_slot: None,
-        library_abi,
+        abi,
         method_sym: SymbolId::NONE,
         boxed_vars,
         value_ext: None,
@@ -1170,6 +1194,11 @@ pub(crate) struct ClassBuilder {
     pub(crate) strict_fp: bool,
 }
 
+/// Stable handle to a method in a [`ClassBuilder`]. Metadata attachment can
+/// use this handle instead of depending on whichever method is last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MethodIndex(usize);
+
 /// nsc `Symbol.isStrictFP` minus `isDeferred` (only methods with code ask):
 /// `sym` or anything it is nested in carries `@strictfp`.
 pub(crate) fn is_strictfp(st: &SymbolTable, sym: SymbolId) -> bool {
@@ -1222,7 +1251,7 @@ impl ClassBuilder {
         desc: &str,
         max_locals: u16,
         gen: impl FnOnce(&mut Assembler),
-    ) {
+    ) -> MethodIndex {
         let access = if self.strict_fp {
             access | ACC_STRICT
         } else {
@@ -1252,9 +1281,10 @@ impl ClassBuilder {
             java_annots: Vec::new(),
             signature: None,
         });
+        MethodIndex(self.methods.len() - 1)
     }
 
-    pub(crate) fn add_abstract(&mut self, access: u16, name: &str, desc: &str) {
+    pub(crate) fn add_abstract(&mut self, access: u16, name: &str, desc: &str) -> MethodIndex {
         self.methods.push(Method {
             access,
             name: encode_method_name(name),
@@ -1263,28 +1293,23 @@ impl ClassBuilder {
             java_annots: Vec::new(),
             signature: None,
         });
+        MethodIndex(self.methods.len() - 1)
     }
 
-    /// Attach a JVMS §4.7.9 `Signature` to the method just emitted.
-    ///
-    /// Two conditions, both refusals rather than repairs (see
-    /// [`crate::sig`]): a signature that *is* the descriptor says nothing, and
-    /// one that does not erase back to the descriptor would contradict it.
-    /// Either way the member keeps no attribute, which is what it had before
-    /// this existed.
-    pub(crate) fn sign_last(&mut self, sig: Option<&crate::sig::GenericSignature>) {
+    /// Attach a generic signature to a particular method.
+    pub(crate) fn sign_method(
+        &mut self,
+        index: MethodIndex,
+        sig: Option<&crate::sig::GenericSignature>,
+    ) {
         let Some(g) = sig else { return };
-        let Some(m) = self.methods.last_mut() else {
+        let Some(m) = self.methods.get_mut(index.0) else {
             return;
         };
         if g.sig == m.desc {
             return;
         }
         if crate::sig::erase_signature(&g.sig, &g.tvars).as_deref() != Some(m.desc.as_str()) {
-            // Refusing is always safe, so a member that quietly loses its
-            // signature leaves no trace. `SCALA_RS_SIG_DEBUG=1` prints the
-            // rejects, which is how one finds the erasure disagreements that
-            // are worth fixing next.
             if std::env::var_os("SCALA_RS_SIG_DEBUG").is_some() {
                 eprintln!(
                     "SIGDROP {} {} sig={} erased={:?} tvars={:?}",
@@ -1298,6 +1323,21 @@ impl ClassBuilder {
             return;
         }
         m.signature = Some(g.sig.clone());
+    }
+
+    /// Attach a JVMS §4.7.9 `Signature` to the method just emitted.
+    ///
+    /// Two conditions, both refusals rather than repairs (see
+    /// [`crate::sig`]): a signature that *is* the descriptor says nothing, and
+    /// one that does not erase back to the descriptor would contradict it.
+    /// Either way the member keeps no attribute, which is what it had before
+    /// this existed.
+    #[allow(dead_code)]
+    pub(crate) fn sign_last(&mut self, sig: Option<&crate::sig::GenericSignature>) {
+        let Some(index) = self.methods.len().checked_sub(1).map(MethodIndex) else {
+            return;
+        };
+        self.sign_method(index, sig);
     }
 
     /// The same, for a field. `name` is the field's source name.
@@ -1327,8 +1367,22 @@ impl ClassBuilder {
     /// -- currently only the getter and setter synthesized for a `val`, whose
     /// type signature is recorded on the value symbol rather than on a method
     /// symbol of its own.
+    #[allow(dead_code)]
     pub(crate) fn sign_last_accessor(
         &mut self,
+        sig: Option<&crate::sig::GenericSignature>,
+        setter: bool,
+    ) {
+        let Some(index) = self.methods.len().checked_sub(1).map(MethodIndex) else {
+            return;
+        };
+        self.sign_method_accessor(index, sig, setter);
+    }
+
+    /// Attach a value's accessor signature to a particular method.
+    pub(crate) fn sign_method_accessor(
+        &mut self,
+        index: MethodIndex,
         sig: Option<&crate::sig::GenericSignature>,
         setter: bool,
     ) {
@@ -1343,7 +1397,7 @@ impl ClassBuilder {
             tvars: g.tvars.clone(),
             parents: Vec::new(),
         };
-        self.sign_last(Some(&g));
+        self.sign_method(index, Some(&g));
     }
 
     /// Assemble and attach the class's own `Signature`: the formal type

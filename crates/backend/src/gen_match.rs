@@ -319,7 +319,7 @@ pub(crate) fn gen_ctor_fields_pattern(
                 Some(h)
             } else if !acc.is_empty() {
                 Some(acc)
-            } else if !ctx.st.source_classes.contains(&class_id)
+            } else if !ctx.st.is_source_class(class_id)
                 && has_nullary_accessor(ctx.st, class_id, &fname)
             {
                 Some(fname.clone())
@@ -332,7 +332,7 @@ pub(crate) fn gen_ctor_fields_pattern(
             }
             if repeated && i + 1 == fields.len() {
                 let tail = args.get(i..).unwrap_or(&[]);
-                if ctx.library_abi {
+                if ctx.abi.is_library() {
                     gen_unapply_wrapper_bind(asm, frame, ctx, tail, fail, SeqPatShape::SeqOps);
                 } else {
                     gen_unapply_seq_bind(asm, frame, ctx, tail, fail);
@@ -362,7 +362,7 @@ pub(crate) fn gen_ctor_fields_pattern(
                 jvm_sort(&fty)
             } else {
                 if erased_load_needs_narrowing(ctx.st, &fdesc, &a.ty) {
-                    emit_from_erased_object(asm, ctx.st, &a.ty);
+                    emit_from_erased_object(asm, ctx.st, &a.ty, ctx.abi);
                 }
                 jvm_sort(&a.ty)
             };
@@ -455,7 +455,7 @@ fn gen_unapply_pattern(
                 // `Array$` only exists with the jar, so this arm is only
                 // reachable there; the private runtime never sees it.
                 SeqPatShape::Array => {
-                    if ctx.library_abi {
+                    if ctx.abi.is_library() {
                         asm.getstatic(
                             "scala/runtime/ScalaRunTime$",
                             "MODULE$",
@@ -560,7 +560,7 @@ fn gen_unapply_pattern(
             "Lscala/runtime/BoxedUnit;",
         );
     }
-    if is_seq && ctx.library_abi && shape == SeqPatShape::SeqOps {
+    if is_seq && ctx.abi.is_library() && shape == SeqPatShape::SeqOps {
         // The forwarder's parameter is `SeqOps`; the scrutinee's static type
         // may be anything the test above let through.
         asm.checkcast(&seq_pat_test_class(ctx, param0.as_ref()));
@@ -570,7 +570,7 @@ fn gen_unapply_pattern(
         // A primitive-parameter `unapply` reached through an erased field:
         // the descriptor wants the unboxed value.
         if let Some(p) = param0.as_ref().filter(|p| is_jvm_primitive(p)) {
-            emit_unbox(asm, p);
+            emit_unbox(asm, p, ctx.abi);
         }
     }
     if let Some(p) = &param0 {
@@ -612,12 +612,12 @@ fn gen_unapply_pattern(
         return;
     }
     if !is_seq {
-        if let Some(nb) = ctx.st.name_based_unapply.get(&uid) {
+        if let Some(nb) = ctx.st.name_based_unapply(uid) {
             gen_name_based_result(asm, frame, ctx, uid, nb, args, fail);
             return;
         }
     }
-    if is_seq && ctx.library_abi {
+    if is_seq && ctx.abi.is_library() {
         match shape {
             // scala-library `List.unapplySeq` is identity on SeqOps, not Option.
             SeqPatShape::List if is_list_unapply_seq(ctx.st, uid) => {
@@ -644,7 +644,7 @@ fn gen_unapply_pattern(
     asm.mark(nonempty);
     asm.invokevirtual("scala/Option", "get", "()Ljava/lang/Object;");
     if is_seq {
-        let payload = if ctx.library_abi {
+        let payload = if ctx.abi.is_library() {
             user_unapply_seq_shape(ctx, uid)
         } else {
             SeqPatShape::List
@@ -662,7 +662,7 @@ fn gen_unapply_pattern(
         } else {
             asm.pop();
         }
-    } else if let Some(sels) = ctx.st.unapply_selectors.get(&(uid, args.len())) {
+    } else if let Some(sels) = ctx.st.unapply_selectors(uid, args.len()) {
         // `Option[Product2[Int, String]]` with two sub-patterns reads the
         // product's own `_1` / `_2`; it is not a `Tuple2`.
         bind_product_selectors(asm, frame, ctx, sels, args, fail);
@@ -744,7 +744,7 @@ fn gen_name_based_result(
         }
         _ => {
             read_tmp_member(asm, frame, ctx, &tmp, nb.get, &raw);
-            match ctx.st.unapply_selectors.get(&(uid, args.len())) {
+            match ctx.st.unapply_selectors(uid, args.len()) {
                 Some(sels) => bind_product_selectors(asm, frame, ctx, sels, args, fail),
                 None => bind_tuple_fields(asm, frame, ctx, args, fail),
             }
@@ -892,7 +892,7 @@ pub(crate) fn coerce_subpattern(asm: &mut Assembler, ctx: &EmitCtx, pat: &Tree) 
         return JvmSort::Ref;
     }
     if is_jvm_primitive(&pat.ty) {
-        emit_unbox(asm, &pat.ty);
+        emit_unbox(asm, &pat.ty, ctx.abi);
     } else {
         emit_pattern_cast(asm, ctx, &pat.ty);
     }
@@ -1042,7 +1042,7 @@ pub(crate) fn emit_pattern_eq_jump(
             asm.ifne(fail);
         }
         JvmSort::Ref => {
-            if ctx.library_abi {
+            if ctx.abi.is_library() {
                 // What nsc emits: it also equates a boxed `1` with a boxed
                 // `1L`, which `Integer.equals` does not.
                 asm.invokestatic(
@@ -1196,7 +1196,7 @@ pub(crate) fn gen_unapply_seq_bind(
 }
 
 pub(crate) fn emit_list_head(asm: &mut Assembler, ctx: &EmitCtx) {
-    if ctx.library_abi {
+    if ctx.abi.is_library() {
         // `head` is on LinearSeqOps; List itself has no `head()Object` method.
         asm.invokeinterface(
             "scala/collection/LinearSeqOps",
@@ -1213,7 +1213,7 @@ pub(crate) fn emit_list_head(asm: &mut Assembler, ctx: &EmitCtx) {
 }
 
 pub(crate) fn emit_list_tail(asm: &mut Assembler, ctx: &EmitCtx) {
-    if ctx.library_abi {
+    if ctx.abi.is_library() {
         asm.invokevirtual(
             "scala/collection/immutable/List",
             "tail",
@@ -1319,7 +1319,7 @@ pub(crate) fn gen_pattern(
             let sort = jvm_sort(&pat.ty);
             load(asm, tmp, sel_sort);
             if sel_sort == JvmSort::Ref {
-                emit_from_erased_object(asm, ctx.st, &pat.ty);
+                emit_from_erased_object(asm, ctx.st, &pat.ty, ctx.abi);
             }
             let slot = if pat.sym.is_none() {
                 frame.alloc_tmp(sort)
@@ -1427,7 +1427,7 @@ pub(crate) fn gen_pattern(
             // and the bound value is then left as the `Object` it is.
             // Erasure stamps `array_sym` on such a pattern
             // (`mark_value_class_patterns`): its type is `Object` by now.
-            if ctx.library_abi
+            if ctx.abi.is_library()
                 && (pat.sym == ctx.st.array_sym
                     || matches!(pat.ty.widen_constant(), Type::Array(ref e) if !is_concrete_array_elem(e)))
             {
@@ -1469,7 +1469,7 @@ pub(crate) fn gen_pattern(
             let binds = !matches!(expr.kind, TreeKind::Wildcard | TreeKind::Empty);
             if binds && (want != sel_sort || jvm != "java/lang/Object") {
                 load(asm, tmp, sel_sort);
-                emit_from_erased_object(asm, ctx.st, &pat.ty);
+                emit_from_erased_object(asm, ctx.st, &pat.ty, ctx.abi);
                 let narrowed = frame.alloc_tmp(want);
                 store(asm, narrowed, want);
                 gen_pattern(asm, frame, ctx, expr, narrowed, want, fail);
@@ -1587,7 +1587,7 @@ fn bind_singleton_pattern(
     }
     load(asm, tmp, sel_sort);
     if sel_sort == JvmSort::Ref {
-        emit_from_erased_object(asm, ctx.st, &pat.ty);
+        emit_from_erased_object(asm, ctx.st, &pat.ty, ctx.abi);
     }
     let narrowed = frame.alloc_tmp(want);
     store(asm, narrowed, want);

@@ -61,30 +61,29 @@ impl Typer {
         match &mut tree.kind {
             TreeKind::PackageDef { pid, stats } => {
                 let pkg = self.enter_package_path(pid);
-                let saved = self.st.owner;
-                self.st.owner = pkg;
-                self.pkg_nest.push(pkg);
-                let opened = self.open_pkgs.entry(self.file_index).or_default();
-                if !opened.contains(&pkg) {
-                    opened.push(pkg);
-                }
-                let chain = self.pkg_nest.clone();
-                let chains = self.open_pkg_chains.entry(self.file_index).or_default();
-                if !chains.contains(&chain) {
-                    chains.push(chain);
-                }
-                self.st.push_scope();
-                // First pass: enter classes/modules so they can forward-ref.
-                for stt in stats.iter_mut() {
-                    self.namer_enter_tmpl(stt);
-                }
-                for stt in stats.iter_mut() {
-                    self.namer(stt);
-                }
-                self.record_unit_pkg_defs(pkg, stats);
-                self.st.pop_scope();
-                self.pkg_nest.pop();
-                self.st.owner = saved;
+                self.with_owner(pkg, |this| {
+                    this.pkg_nest.push(pkg);
+                    let opened = this.open_pkgs.entry(this.file_index).or_default();
+                    if !opened.contains(&pkg) {
+                        opened.push(pkg);
+                    }
+                    let chain = this.pkg_nest.clone();
+                    let chains = this.open_pkg_chains.entry(this.file_index).or_default();
+                    if !chains.contains(&chain) {
+                        chains.push(chain);
+                    }
+                    this.st.push_scope();
+                    // First pass: enter classes/modules so they can forward-ref.
+                    for stt in stats.iter_mut() {
+                        this.namer_enter_tmpl(stt);
+                    }
+                    for stt in stats.iter_mut() {
+                        this.namer(stt);
+                    }
+                    this.record_unit_pkg_defs(pkg, stats);
+                    this.st.pop_scope();
+                    this.pkg_nest.pop();
+                });
                 tree.sym = pkg;
             }
             TreeKind::ClassDef { .. } => self.namer_class(tree),

@@ -87,7 +87,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let inits = inits.to_vec();
         let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
@@ -110,7 +110,7 @@ impl<'a> Gen<'a> {
                     lambda_bodies,
                     Some(&hoist_owner),
                     source,
-                    library_abi,
+                    abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );
@@ -195,7 +195,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
         let caps = trait_capture_accessors(self.st, boxed_vars, trait_id);
@@ -214,7 +214,7 @@ impl<'a> Gen<'a> {
             (ACC_PUBLIC, name.clone(), inst_desc.clone())
         };
         let mut tailrec_error = None;
-        b.add_code(body_acc, &body_name, &body_desc, max_locals, |asm| {
+        let method = b.add_code(body_acc, &body_name, &body_desc, max_locals, |asm| {
             let mut frame = frame;
             let mut ctx = emit_ctx(
                 st,
@@ -226,7 +226,7 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
@@ -253,12 +253,12 @@ impl<'a> Gen<'a> {
         // method checker.
         if let TreeKind::DefDef { mods, .. } = &def.kind {
             if mods.flags.contains(Flags::LAZY) {
-                b.sign_last_accessor(self.sig_of(def.sym), false);
+                b.sign_method_accessor(method, self.sig_of(def.sym), false);
             } else {
-                b.sign_last(self.sig_of(def.sym));
+                b.sign_method(method, self.sig_of(def.sym));
             }
         } else {
-            b.sign_last(self.sig_of(def.sym));
+            b.sign_method(method, self.sig_of(def.sym));
         }
         // `public static m$($this, …)`: nsc's entry point for the mixin
         // forwarder every implementing class carries and for `super` calls
@@ -878,22 +878,23 @@ impl<'a> Gen<'a> {
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(ACC_PUBLIC | fin, &name, &gdesc, 1, |asm| {
+            let getter = b.add_code(ACC_PUBLIC | fin, &name, &gdesc, 1, |asm| {
                 asm.aload(0);
                 emit_getfield(asm, &class_c, &fname, &fdesc_c);
                 emit_return(asm, &ty);
             });
-            b.sign_last_accessor(self.sig_of(value_sym), false);
+            b.sign_method_accessor(getter, self.sig_of(value_sym), false);
             let fname = name.clone();
             let class_c = class_name.clone();
             let fdesc_c = fdesc.clone();
-            b.add_code(ACC_PUBLIC | fin, &setter, &sdesc, 1 + sort.slots(), |asm| {
-                asm.aload(0);
-                load(asm, 1, sort);
-                asm.putfield(&class_c, &fname, &fdesc_c);
-                asm.vreturn();
-            });
-            b.sign_last_accessor(self.sig_of(value_sym), true);
+            let setter_method =
+                b.add_code(ACC_PUBLIC | fin, &setter, &sdesc, 1 + sort.slots(), |asm| {
+                    asm.aload(0);
+                    load(asm, 1, sort);
+                    asm.putfield(&class_c, &fname, &fdesc_c);
+                    asm.vreturn();
+                });
+            b.sign_method_accessor(setter_method, self.sig_of(value_sym), true);
             skip.insert(name);
             skip.insert(setter);
         }
@@ -1256,7 +1257,7 @@ impl<'a> Gen<'a> {
                         if let Some(to) = call_params.get(i) {
                             if jvm_desc(self.st, &pts[i]) != jvm_desc(self.st, to) {
                                 let adapt = param_adapt(self.st, &pts[i], to);
-                                emit_adapt(asm, &adapt);
+                                emit_adapt(asm, &adapt, self.abi);
                             }
                         }
                     }
@@ -1819,12 +1820,7 @@ impl<'a> Gen<'a> {
         let wide_params = desc_params(&wide_desc).to_string();
         let wide_strs = desc_param_strs(&wide_desc);
         let declared = def_param_types(self.st, def);
-        let abstract_mask = self
-            .st
-            .erased_abstract_params
-            .get(&def.sym)
-            .copied()
-            .unwrap_or(0);
+        let abstract_mask = self.st.erased_abstract_param_mask(def.sym);
         let mut hits = impls.iter().filter(|(n, d, cps, sym)| {
             *n == enc
                 && *sym != def.sym
@@ -2144,7 +2140,7 @@ impl<'a> Gen<'a> {
         }
         self.emit_binary_mixin_forwarders(b, &lin, super_idx, &super_impls);
         self.emit_trait_capture_accessors(b, class_id, &lin);
-        if !self.library_abi {
+        if self.abi.is_private() {
             let by_name: HashSet<String> = defined.iter().map(|(n, _)| n.clone()).collect();
             self.emit_ordered_forwarders(b, class_id, &by_name);
         }
@@ -2305,12 +2301,7 @@ impl<'a> Gen<'a> {
     ) -> bool {
         let enc = encode_method_name(&self.st.get(mid).name);
         let declared = method_params_from_sym(self.st, mid);
-        let abstract_mask = self
-            .st
-            .erased_abstract_params
-            .get(&mid)
-            .copied()
-            .unwrap_or(0);
+        let abstract_mask = self.st.erased_abstract_param_mask(mid);
         super_impls.iter().any(|(n, cps, sym)| {
             *n == enc && *sym != mid && bridge_overrides(self.st, &declared, cps, abstract_mask)
         })
@@ -2425,7 +2416,7 @@ impl<'a> Gen<'a> {
             Self::emit_case_module_methods(b, &name, &defined);
             // A `case object` is a zero-field `Product`: every index is out of
             // range, and `productIterator` is empty.
-            emit_product_accessors(b, &defined, &class_jvm, &[], &[], self.library_abi, true);
+            emit_product_accessors(b, &defined, &class_jvm, &[], &[], self.abi, true);
             return;
         }
         let field_info: Vec<(String, Type, String)> = fields
@@ -2442,7 +2433,7 @@ impl<'a> Gen<'a> {
         let field_vc: Vec<Option<(String, String)>> = fields
             .iter()
             .map(|f| {
-                let c = *self.st.value_class_terms.get(f)?;
+                let c = self.st.value_class_for_term(*f)?;
                 let under = self.st.value_class_underlying(c)?;
                 Some((
                     class_internal(self.st, c),
@@ -2477,7 +2468,7 @@ impl<'a> Gen<'a> {
             &class_jvm,
             &field_info,
             &field_vc,
-            self.library_abi,
+            self.abi,
             false,
         );
         // nsc's SyntheticMethods gives every non-public case field a public
@@ -2584,7 +2575,7 @@ impl<'a> Gen<'a> {
             // `true`. `Objects.equals` compared the boxes' classes too.
             let cooperative: Vec<bool> = fi
                 .iter()
-                .map(|(_, ty, _)| self.library_abi && maybe_boxed(self.st, ty))
+                .map(|(_, ty, _)| self.abi.is_library() && maybe_boxed(self.st, ty))
                 .collect();
             b.add_code(ACC_PUBLIC, "equals", "(Ljava/lang/Object;)Z", 3, |asm| {
                 let yes = asm.fresh_label();
@@ -2669,7 +2660,7 @@ impl<'a> Gen<'a> {
         }
 
         if !defined.contains("hashCode") {
-            emit_case_hash_code(b, &class_jvm, &field_info, &field_vc, self.library_abi);
+            emit_case_hash_code(b, &class_jvm, &field_info, &field_vc, self.abi);
         }
     }
 
@@ -2838,12 +2829,8 @@ impl<'a> Gen<'a> {
                     .map(|m| m.desc.clone())
                     .or_else(|| {
                         self.st
-                            .inherited_method_implementations
-                            .iter()
-                            .find(|(cls, _, base)| *cls == class_id && *base == pmid)
-                            .map(|(_, implementation, _)| {
-                                method_desc_from_sym(self.st, *implementation)
-                            })
+                            .inherited_method_implementation(class_id, pmid)
+                            .map(|implementation| method_desc_from_sym(self.st, implementation))
                             .filter(|desc| desc != &pdesc)
                     });
                 // The same rule with the parameters narrowed rather than the
@@ -2945,7 +2932,7 @@ impl<'a> Gen<'a> {
                         asm.aload(0);
                         for (slot, sort, adapt) in &loads {
                             load(asm, *slot, *sort);
-                            emit_adapt(asm, adapt);
+                            emit_adapt(asm, adapt, self.abi);
                         }
                         asm.invokevirtual(&cn, &name, &target);
                         if !emit_forwarded_nothing(asm, &target_ret) {
@@ -3100,7 +3087,7 @@ impl<'a> Gen<'a> {
                     continue;
                 }
                 let adapt = param_adapt(self.st, &parent_ty, child_ty);
-                let vc = self.st.value_class_terms.get(&cid).map(|&c| {
+                let vc = self.st.value_class_for_term(cid).map(|c| {
                     let under = self.st.value_class_underlying(c).unwrap();
                     (
                         class_internal(self.st, c),
@@ -3122,7 +3109,7 @@ impl<'a> Gen<'a> {
                             asm.checkcast(class);
                             asm.invokevirtual(class, getter, desc);
                         } else {
-                            emit_adapt(asm, &adapt);
+                            emit_adapt(asm, &adapt, self.abi);
                         }
                         asm.invokevirtual(&cn, &name, &cdesc);
                         asm.vreturn();
@@ -3224,12 +3211,7 @@ impl<'a> Gen<'a> {
                 // that overrides this parent method -- not just the first one
                 // spelled the same way.
                 let parent_params = params_of(pmid);
-                let parent_abstract = self
-                    .st
-                    .erased_abstract_params
-                    .get(&pmid)
-                    .copied()
-                    .unwrap_or(0);
+                let parent_abstract = self.st.erased_abstract_param_mask(pmid);
                 let Some((_, cid)) = own.iter().find(|(n, id)| {
                     n == &ps.name
                         && *id != pmid
@@ -3261,9 +3243,9 @@ impl<'a> Gen<'a> {
                 let impl_name = value_bridge_impl_name(self.st, *cid);
                 if pdesc == cdesc && impl_name.is_none() {
                     if self.st.get(*cid).kind == SymKind::Term
-                        && self.st.value_class_terms.contains_key(cid)
-                        && !self.st.value_class_terms.contains_key(&pmid)
-                        && !self.st.value_class_results.contains_key(&pmid)
+                        && self.st.value_class_for_term(*cid).is_some()
+                        && self.st.value_class_for_term(pmid).is_none()
+                        && self.st.value_class_for_result(pmid).is_none()
                     {
                         report_emit_error(
                             &self.emit_errors,
@@ -3287,10 +3269,9 @@ impl<'a> Gen<'a> {
                 // the subclass narrowed to a primitive arrives boxed.
                 let result_box = self
                     .st
-                    .value_class_results
-                    .get(cid)
-                    .or_else(|| self.st.value_class_terms.get(cid))
-                    .and_then(|&c| {
+                    .value_class_for_result(*cid)
+                    .or_else(|| self.st.value_class_for_term(*cid))
+                    .and_then(|c| {
                         (impl_name.is_some()
                             || jvm_desc(self.st, &ret) != jvm_desc(self.st, &child_ret))
                         .then(|| {
@@ -3341,11 +3322,11 @@ impl<'a> Gen<'a> {
                     };
                     let unbox = child_param_syms
                         .get(casts.len())
-                        .and_then(|p| self.st.value_class_terms.get(p))
+                        .and_then(|&p| self.st.value_class_for_term(p))
                         .filter(|_| {
                             impl_name.is_some() || jvm_desc(self.st, pty) != jvm_desc(self.st, cty)
                         })
-                        .map(|&c| {
+                        .map(|c| {
                             let field = self.st.get(c).ctor_fields[0];
                             (
                                 class_internal(self.st, c),
@@ -3379,9 +3360,9 @@ impl<'a> Gen<'a> {
                             if let Some((class, field, desc, adapt)) = &value_unboxes[i] {
                                 asm.checkcast(class);
                                 asm.invokevirtual(class, field, desc);
-                                emit_adapt(asm, adapt);
+                                emit_adapt(asm, adapt, self.abi);
                             } else if let Some(a) = casts.get(i) {
-                                emit_adapt(asm, a);
+                                emit_adapt(asm, a, self.abi);
                             }
                         }
                         asm.invokevirtual(
@@ -3396,10 +3377,10 @@ impl<'a> Gen<'a> {
                             emit_boxed_unit(asm);
                         }
                         if let Some((class, desc, adapt)) = &result_box {
-                            emit_adapt(asm, adapt);
+                            emit_adapt(asm, adapt, self.abi);
                             asm.invokespecial(class, "<init>", desc);
                         }
-                        emit_adapt(asm, &ret_adapt);
+                        emit_adapt(asm, &ret_adapt, self.abi);
                         emit_return(asm, &ret);
                     },
                 );
@@ -3579,7 +3560,7 @@ impl<'a> Gen<'a> {
             let lambda_bodies = &self.lambda_bodies;
             let hoist_owner = b.this_name.clone();
             let source = self.source_name;
-            let library_abi = self.library_abi;
+            let abi = self.abi;
             let boxed_vars = &self.boxed_vars;
             let ret_for_body = ret.clone();
             // nsc leaves instance default getters public but not synthetic.
@@ -3603,7 +3584,7 @@ impl<'a> Gen<'a> {
                     lambda_bodies,
                     Some(&hoist_owner),
                     source,
-                    library_abi,
+                    abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );
@@ -3668,7 +3649,7 @@ impl<'a> Gen<'a> {
                         lambda_bodies,
                         Some(&hoist_owner),
                         source,
-                        library_abi,
+                        abi,
                         boxed_vars,
                         std::rc::Rc::clone(&self.emit_errors),
                     );
@@ -3994,7 +3975,7 @@ impl<'a> Gen<'a> {
             let lambda_bodies = &self.lambda_bodies;
             let hoist_owner = b.this_name.clone();
             let source = self.source_name;
-            let library_abi = self.library_abi;
+            let abi = self.abi;
             let boxed_vars = &self.boxed_vars;
             // The prefix may be a local of the enclosing method, captured
             // into a field of this class (`anon_capture`): read the captures
@@ -4016,7 +3997,7 @@ impl<'a> Gen<'a> {
                     lambda_bodies,
                     Some(&hoist_owner),
                     source,
-                    library_abi,
+                    abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );
@@ -4117,13 +4098,13 @@ impl<'a> Gen<'a> {
             let lambda_bodies = &self.lambda_bodies;
             let hoist_owner = b.this_name.clone();
             let source = self.source_name;
-            let library_abi = self.library_abi;
+            let abi = self.abi;
             let boxed_vars = &self.boxed_vars;
             let mask = 1i32 << (bit % 32);
             let bitmap = format!("{word_prefix}{}", bit / 32);
             let ret_ty = ty.clone();
             let caps = capture_slots(self.st, &self.boxed_vars, class_id);
-            b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
+            let method = b.add_code(ACC_PUBLIC, &fname, &desc, 4, |asm| {
                 let mut frame = Frame::instance();
                 emit_capture_prologue(asm, &mut frame, &class_name, &caps);
                 let lock = frame.alloc_tmp(JvmSort::Ref);
@@ -4158,7 +4139,7 @@ impl<'a> Gen<'a> {
                             lambda_bodies,
                             Some(&hoist_owner),
                             source,
-                            library_abi,
+                            abi,
                             boxed_vars,
                             std::rc::Rc::clone(&self.emit_errors),
                         );
@@ -4210,7 +4191,7 @@ impl<'a> Gen<'a> {
                 load(asm, result, jvm_sort(&ret_ty));
                 emit_return(asm, &ret_ty);
             });
-            self.sign_lazy_accessor(b, value_sym);
+            self.sign_lazy_accessor(b, method, value_sym);
         }
     }
 
@@ -4219,8 +4200,8 @@ impl<'a> Gen<'a> {
     /// the JVM member is a zero-argument method and therefore needs `()T`.
     /// Classpath-only lazy vals have no source symbol and deliberately remain
     /// unsigned; their binary metadata is supplied by the classfile reader.
-    fn sign_lazy_accessor(&self, b: &mut ClassBuilder, value_sym: SymbolId) {
-        b.sign_last_accessor(self.sig_of(value_sym), false);
+    fn sign_lazy_accessor(&self, b: &mut ClassBuilder, method: MethodIndex, value_sym: SymbolId) {
+        b.sign_method_accessor(method, self.sig_of(value_sym), false);
     }
 
     /// nsc-style val getters (`def Red: Value`) so `scala.Enumeration` reflection
@@ -4289,12 +4270,12 @@ impl<'a> Gen<'a> {
                     let cn = class_name.clone();
                     let fd = fdesc.clone();
                     let ret_ty = ty.clone();
-                    b.add_code(access, name, &getter, 1, move |asm| {
+                    let method = b.add_code(access, name, &getter, 1, move |asm| {
                         asm.aload(0);
                         emit_getfield(asm, &cn, &fname, &fd);
                         emit_return(asm, &ret_ty);
                     });
-                    b.sign_last_accessor(self.sig_of(p.sym), false);
+                    b.sign_method_accessor(method, self.sig_of(p.sym), false);
                 }
                 // The parent may declare the member with an erased signature
                 // (`def value: T` becomes `value()Object`); bridge to it.
@@ -4317,7 +4298,7 @@ impl<'a> Gen<'a> {
                     let cdesc = getter.clone();
                     let child_ty = ty.clone();
                     let ret_ty = pret.clone();
-                    b.add_code(
+                    let _bridge_method = b.add_code(
                         ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE,
                         name,
                         &pdesc,
@@ -4341,12 +4322,13 @@ impl<'a> Gen<'a> {
                         let cn = class_name.clone();
                         let fd = fdesc.clone();
                         let sort = jvm_slot_sort(&ty);
-                        b.add_code(access, &setter_name, &setter, 3, move |asm| {
-                            asm.aload(0);
-                            load(asm, 1, sort);
-                            asm.putfield(&cn, &fname, &fd);
-                            asm.vreturn();
-                        });
+                        let _setter_method =
+                            b.add_code(access, &setter_name, &setter, 3, move |asm| {
+                                asm.aload(0);
+                                load(asm, 1, sort);
+                                asm.putfield(&cn, &fname, &fd);
+                                asm.vreturn();
+                            });
                     }
                 }
             }
@@ -4383,12 +4365,12 @@ impl<'a> Gen<'a> {
             let fdesc = jvm_desc_val(self.st, &ty);
             let ret_ty = ty.clone();
             let cls = class_name.clone();
-            b.add_code(access, &fname, &desc, 1, |asm| {
+            let method = b.add_code(access, &fname, &desc, 1, |asm| {
                 asm.aload(0);
                 emit_getfield(asm, &cls, &fname, &fdesc);
                 emit_return(asm, &ret_ty);
             });
-            b.sign_last_accessor(self.sig_of(stt.sym), false);
+            b.sign_method_accessor(method, self.sig_of(stt.sym), false);
             // A `var` also gets nsc's `v_$eq`; that is the setter an abstract
             // `var` declared in a mixed-in trait resolves to.
             if !mods.flags.contains(Flags::MUTABLE) {
@@ -4402,7 +4384,7 @@ impl<'a> Gen<'a> {
             let fdesc = jvm_desc_val(self.st, &ty);
             let cls = class_name.clone();
             let sort = jvm_slot_sort(&ty);
-            b.add_code(
+            let method = b.add_code(
                 access,
                 &setter,
                 &format!("({fdesc})V"),
@@ -4414,7 +4396,7 @@ impl<'a> Gen<'a> {
                     asm.vreturn();
                 },
             );
-            b.sign_last_accessor(self.sig_of(stt.sym), true);
+            b.sign_method_accessor(method, self.sig_of(stt.sym), true);
         }
     }
 }
@@ -4492,9 +4474,9 @@ fn emit_case_hash_code(
     class_jvm: &str,
     field_info: &[(String, Type, String)],
     field_vc: &[Option<(String, String)>],
-    library_abi: bool,
+    abi: AbiMode,
 ) {
-    if !library_abi {
+    if abi.is_private() {
         let fi = field_info.to_vec();
         let cj = class_jvm.to_string();
         b.add_code(ACC_PUBLIC, "hashCode", "()I", 2, |asm| {

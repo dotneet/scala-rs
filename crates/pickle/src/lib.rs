@@ -10,13 +10,19 @@
 //! - [`read`]: pickle bytes to an entry table.
 //! - [`sym`]: entry table to class signatures, with inheritance resolved.
 
+pub mod abi;
 pub mod classfile;
 pub mod codec;
 pub mod names;
 pub mod read;
 pub mod sym;
 
-pub use classfile::scala_signature_bytes;
+pub use abi::{
+    AbiError, JvmClassFlags, JvmDescriptor, JvmInternalName, JvmMemberFlags, JvmMemberKind,
+    LoadedClass, LoadedField, LoadedMethod, PickledClass, PickledMethod, PickledType,
+    PickledTypeParam, ScalaSignatureError,
+};
+pub use classfile::{scala_signature_bytes, scala_signature_bytes_result, ClassfileError};
 pub use read::{read_pickle, Pickle, ReadError};
 pub use sym::{
     class_sigs, is_object_only_class, ClassSig, ClassSource, Member, MemberHit, SigCache,

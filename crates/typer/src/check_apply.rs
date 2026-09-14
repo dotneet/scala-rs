@@ -963,11 +963,11 @@ impl Typer {
         };
         // Expected type Method so nullary methods (`unary_-`, `def f: Int` called as `f()`)
         // are not auto-applied before this Apply is typed.
-        self.typing_callee = true;
-        let saved_arity = self.callee_arity.replace(args.len());
-        self.type_expr(fun, &dummy_method);
-        self.callee_arity = saved_arity;
-        self.typing_callee = false;
+        self.with_typing_callee(true, |this| {
+            this.with_callee_arity(Some(args.len()), |this| {
+                this.type_expr(fun, &dummy_method);
+            });
+        });
 
         // A function-typed value is applied through FunctionN.apply. Its
         // symbol still points at the declaration that produced the value (for

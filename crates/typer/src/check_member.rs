@@ -594,26 +594,26 @@ impl Typer {
         let pt = inherited.clone().unwrap_or_else(|| declared.clone());
         // A definition owns its inference boundary, including in a by-name
         // argument whose enclosing application is still being inferred.
-        let saved_call_args = std::mem::take(&mut self.typing_call_args);
         // An early definition is typed in the constructor context, outside
         // the template (see `crate::presuper`).
-        let ctor_ctx = if presuper {
+        let mut ctor_ctx = if presuper {
             self.enter_presuper_scope(tree.sym)
         } else {
             None
         };
-        self.type_expr(rhs, &pt);
-        // An inferred value has no expected type to trigger adapt's backstop.
-        // A missing implicit is still an error, not a function to eta-expand.
-        // Nor is a method with explicit parameters: nsc's "missing argument
-        // list", or its eta-expansion under `-Xsource:3`.
-        if pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
-            self.adapt_method_value(rhs);
-        }
-        if let Some(saved) = ctor_ctx {
-            self.leave_presuper_scope(saved);
-        }
-        self.typing_call_args = saved_call_args;
+        self.with_typing_call_args(false, |this| {
+            this.type_expr(rhs, &pt);
+            // An inferred value has no expected type to trigger adapt's backstop.
+            // A missing implicit is still an error, not a function to eta-expand.
+            // Nor is a method with explicit parameters: nsc's "missing argument
+            // list", or its eta-expansion under `-Xsource:3`.
+            if pt.is_no_type() && !this.reject_unapplied_implicit_clause(rhs) {
+                this.adapt_method_value(rhs);
+            }
+            if let Some(saved) = ctor_ctx.take() {
+                this.leave_presuper_scope(saved);
+            }
+        });
         // A strict *local* value may not mention itself in its own
         // initializer (nsc refchecks: "forward reference extends over
         // definition of value x"): the slot is read before it is written.
@@ -1360,13 +1360,11 @@ impl Typer {
             return;
         };
         let saved_scopes = self.swap_in_scopes(Some(&scopes), owner);
-        let saved_owner = std::mem::replace(&mut self.st.owner, owner);
-        let saved_this = std::mem::replace(&mut self.st.this_class, this_class);
         let saved_file = std::mem::replace(&mut self.file_index, file_index);
-        self.type_default_rhs_in_scope(rhs, pty);
+        self.with_owner_this(owner, this_class, |this| {
+            this.type_default_rhs_in_scope(rhs, pty);
+        });
         self.file_index = saved_file;
-        self.st.this_class = saved_this;
-        self.st.owner = saved_owner;
         self.swap_back_scopes(saved_scopes);
         rhs.id = NodeId::PRETYPED_DEFAULT;
     }
@@ -1584,12 +1582,12 @@ impl Typer {
             // the method's *inferred result type* became that method type
             // (`jdbc/JdbcModelBuilder.scala:159`). The same definition written
             // above its use compiled fine, which is what gives the flag away.
-            let saved_call_args = std::mem::take(&mut self.typing_call_args);
-            self.type_expr(rhs, &ret_pt);
-            if ret_pt.is_no_type() && !self.reject_unapplied_implicit_clause(rhs) {
-                self.adapt_method_value(rhs);
-            }
-            self.typing_call_args = saved_call_args;
+            self.with_typing_call_args(false, |this| {
+                this.type_expr(rhs, &ret_pt);
+                if ret_pt.is_no_type() && !this.reject_unapplied_implicit_clause(rhs) {
+                    this.adapt_method_value(rhs);
+                }
+            });
             self.warn_trivial_self_reference(tree.sym, rhs);
             if !ret_pt.is_no_type() {
                 self.adapt(rhs, &ret_pt);
@@ -1944,9 +1942,10 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         };
-        let saved = std::mem::replace(&mut self.parent_ctor_scope, true);
-        let _ = self.fill_defaults_and_implicits(span, args, &param_tys, &ctor_fun, &Type::NoType);
-        self.parent_ctor_scope = saved;
+        self.with_parent_ctor_scope(true, |this| {
+            let _ =
+                this.fill_defaults_and_implicits(span, args, &param_tys, &ctor_fun, &Type::NoType);
+        });
     }
 
     /// The class a `new` at the head of an `Apply` chain names, when a plain

@@ -70,9 +70,7 @@ pub fn expand_private_names(tree: &mut Tree, st: &mut SymbolTable) {
         let old = st.get(id).name.clone();
         let new = expanded_name(st, owner, &old);
         if st.get(owner).ctor_fields.contains(&id) {
-            st.constructor_parameter_names
-                .entry(id)
-                .or_insert_with(|| old.clone());
+            st.record_constructor_parameter_name(id, old.clone());
         }
         st.get_mut(id).name = new.clone();
         st.get_mut(id).access_widened = true;

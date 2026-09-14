@@ -212,7 +212,7 @@ pub(crate) fn lazy_cell_elem(internal: &str) -> Option<&'static str> {
 /// Only `LazyRef` needs this; the unboxed cells already hold the right sort.
 pub(crate) fn lazy_cell_from_object(asm: &mut Assembler, ctx: &EmitCtx, ret: &Type) {
     if is_jvm_primitive(ret) && !is_unit_like(ret) {
-        emit_unbox(asm, ret);
+        emit_unbox(asm, ret, ctx.abi);
         return;
     }
     if matches!(ret, Type::String) {
@@ -387,7 +387,7 @@ pub(crate) fn finish_method_body(
     // A method-local `lazy val`'s accessor: `rhs` is the initialiser, and it
     // runs at most once, behind the cell this method was handed.
     if !ctx.method_sym.is_none() {
-        if let Some(&cell) = ctx.st.local_lazy_accessors.get(&ctx.method_sym) {
+        if let Some(cell) = ctx.st.local_lazy_cell_for_accessor(ctx.method_sym) {
             emit_local_lazy_body(asm, frame, ctx, rhs, ret, cell);
             return;
         }
@@ -396,7 +396,7 @@ pub(crate) fn finish_method_body(
         && (tree_has_nlr_to(rhs, ctx.method_sym)
             // A `return` that moved into a hoisted local-`lazy val` accessor is
             // no longer visible in this method's own body.
-            || ctx.st.local_lazy_nlr.contains(&ctx.method_sym));
+            || ctx.st.local_lazy_needs_nlr(ctx.method_sym));
     if wrap {
         asm.capture_try_locals();
         let start = asm.fresh_label();
@@ -592,7 +592,7 @@ pub(crate) fn throw_match_error(asm: &mut Assembler, ctx: &EmitCtx, sel_ty: &Typ
     asm.dup();
     load(asm, tmp, sel_sort);
     if sel_sort == JvmSort::Void {
-        if ctx.library_abi {
+        if ctx.abi.is_library() {
             emit_boxed_unit(asm);
         } else {
             asm.aconst_null();
@@ -647,7 +647,7 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
             // A method-local `lazy val`'s cell: `new scala/runtime/LazyInt()`
             // and nothing else. The initialiser moved into the accessor
             // `lazy_local::lazy_locals` put next to it.
-            if !tree.sym.is_none() && ctx.st.local_lazy_cells.contains(&tree.sym) {
+            if !tree.sym.is_none() && ctx.st.is_local_lazy_cell(tree.sym) {
                 let cn = class_internal(ctx.st, ctx.st.class_sym_of(&ty).unwrap_or(SymbolId::NONE));
                 asm.new_obj(&cn);
                 asm.dup();
@@ -763,7 +763,7 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
                 // `goto` merges two different stack heights -- exactly what nsc
                 // emits (`invokevirtual id; pop`).
                 if unit_stat_leaves_ref(tree, ctx.st)
-                    || (ctx.library_abi && unit_call_leaves_ref(tree, ctx.st))
+                    || (ctx.abi.is_library() && unit_call_leaves_ref(tree, ctx.st))
                     || discarded_predef_poly(tree, ctx)
                 {
                     asm.pop();
@@ -946,7 +946,7 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
                         if is_jvm_primitive(&qual.ty) && !is_unit_like(&qual.ty) {
                             emit_box(asm, &qual.ty.widen_constant());
                         }
-                        if ctx.library_abi
+                        if ctx.abi.is_library()
                             && args.first().is_some_and(|a| a.sym == ctx.st.array_sym)
                         {
                             // `x.isInstanceOf[Array[_]]`: see `emit_is_array`.
@@ -986,7 +986,7 @@ pub(crate) fn gen_expr_inner(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitC
             // receiver's own enclosing instance (`SymbolTable::copy_receivers`).
             let mut copied = false;
             if let [recv] = stats.as_slice() {
-                if ctx.st.copy_receivers.contains(&recv.sym) {
+                if ctx.st.is_copy_receiver(recv.sym) {
                     if let TreeKind::Apply { fun, args } = &expr.kind {
                         if let TreeKind::New { tpt } = &fun.kind {
                             gen_new_with(asm, frame, ctx, tpt, args, expr.sym, Some(recv.sym));
@@ -1231,7 +1231,7 @@ pub(crate) fn gen_ident(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, t
     }
     let ic = ctx.st.get(id).intrinsic;
     if matches!(ic, Intrinsic::NotImplemented) {
-        if ctx.library_abi {
+        if ctx.abi.is_library() {
             emit_predef_nyi(asm);
             // `Nothing` is handled generically by `gen_expr`'s `athrow`-append.
             if is_unit_like(&tree.ty) {
@@ -1503,7 +1503,7 @@ pub(crate) fn gen_structural_call(
         | Type::Float
         | Type::Byte
         | Type::Short => {
-            emit_unbox(asm, result);
+            emit_unbox(asm, result, ctx.abi);
         }
         Type::Unit | Type::NoType => {
             asm.pop();
@@ -1661,7 +1661,7 @@ pub(crate) fn gen_select(
         // `arraylength` on an `Object` is a `VerifyError`, not a fallback, so the
         // question is whether the run has `ScalaRunTime` -- from the jar, or from
         // its own sources when the standard library is what is being compiled.
-        if ctx.library_abi || scala_run_time_supplies(ctx.st, "array_length") {
+        if ctx.abi.is_library() || scala_run_time_supplies(ctx.st, "array_length") {
             asm.getstatic(
                 "scala/runtime/ScalaRunTime$",
                 "MODULE$",
@@ -1883,7 +1883,7 @@ pub(crate) fn gen_select(
                 } else if matches!(ic, Intrinsic::IsInstanceOf) {
                     emit_is_instance_of(asm, ctx, &tree.ty);
                 } else if matches!(ic, Intrinsic::NotImplemented) {
-                    if ctx.library_abi {
+                    if ctx.abi.is_library() {
                         // Receiver was already pushed; Predef.??? is MODULE$.???().
                         asm.pop();
                         emit_predef_nyi(asm);
@@ -2427,7 +2427,7 @@ pub(crate) fn gen_new_with(
             ctx,
             args,
             &field_tys,
-            ctx.library_abi,
+            ctx.abi.is_library(),
             java_varargs,
             ctor_sym,
             false,
@@ -2561,7 +2561,7 @@ fn discarded_predef_poly(tree: &Tree, ctx: &EmitCtx) -> bool {
             let Some(name) = predef_poly_name(fun, ic) else {
                 return false;
             };
-            if ctx.library_abi {
+            if ctx.abi.is_library() {
                 return true;
             }
             match (name, args.first()) {
@@ -2683,11 +2683,13 @@ pub(crate) fn gen_apply(
         Intrinsic::None
     };
 
-    if ctx.library_abi && (matches!(ic, Intrinsic::Println) || unresolved_print(fun, "println")) {
+    if ctx.abi.is_library()
+        && (matches!(ic, Intrinsic::Println) || unresolved_print(fun, "println"))
+    {
         gen_predef_println(asm, frame, ctx, args, true);
         return;
     }
-    if ctx.library_abi && (matches!(ic, Intrinsic::Print) || unresolved_print(fun, "print")) {
+    if ctx.abi.is_library() && (matches!(ic, Intrinsic::Print) || unresolved_print(fun, "print")) {
         gen_predef_println(asm, frame, ctx, args, false);
         return;
     }
@@ -2715,7 +2717,7 @@ pub(crate) fn gen_apply(
                 if is_jvm_primitive(&a.ty) {
                     emit_box(asm, &a.ty);
                 }
-                emit_unbox(asm, &prim);
+                emit_unbox(asm, &prim, ctx.abi);
             }
             return;
         }
@@ -2741,7 +2743,7 @@ pub(crate) fn gen_apply(
     if fun.name() == Some("$unbox") {
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
-            emit_unbox(asm, &tree.ty);
+            emit_unbox(asm, &tree.ty, ctx.abi);
         } else {
             push_default(asm, &tree.ty);
         }
@@ -2764,7 +2766,7 @@ pub(crate) fn gen_apply(
         asm.dup();
         if let Some(a) = args.first() {
             gen_expr(asm, frame, ctx, a);
-            emit_adapt(asm, &param_adapt(ctx.st, &a.ty, &under));
+            emit_adapt(asm, &param_adapt(ctx.st, &a.ty, &under), ctx.abi);
         } else {
             push_default(asm, &under);
         }
@@ -2793,19 +2795,19 @@ pub(crate) fn gen_apply(
         }
         asm.checkcast(&internal);
         asm.invokevirtual(&internal, &name, &format!("(){}", jvm_desc(ctx.st, &under)));
-        emit_adapt(asm, &param_adapt(ctx.st, &under, &tree.ty));
+        emit_adapt(asm, &param_adapt(ctx.st, &under, &tree.ty), ctx.abi);
         return;
     }
 
-    if ctx.library_abi && matches!(ic, Intrinsic::Assert) {
+    if ctx.abi.is_library() && matches!(ic, Intrinsic::Assert) {
         gen_predef_assert_require(asm, frame, ctx, args, true);
         return;
     }
-    if ctx.library_abi && matches!(ic, Intrinsic::Require) {
+    if ctx.abi.is_library() && matches!(ic, Intrinsic::Require) {
         gen_predef_assert_require(asm, frame, ctx, args, false);
         return;
     }
-    if ctx.library_abi && matches!(ic, Intrinsic::NotImplemented) {
+    if ctx.abi.is_library() && matches!(ic, Intrinsic::NotImplemented) {
         emit_predef_nyi(asm);
         // `Predef.???` is declared to return `Nothing$` but always throws.
         // Drop the phantom slot so a `Unit` statement (e.g. `try ???`) does
@@ -2832,7 +2834,7 @@ pub(crate) fn gen_apply(
         push_default(asm, &tree.ty);
         return;
     }
-    if ctx.library_abi {
+    if ctx.abi.is_library() {
         if let Some(name) = predef_poly_name(fun, ic) {
             gen_predef_poly(asm, frame, ctx, args, &tree.ty, name);
             return;
@@ -2863,7 +2865,7 @@ pub(crate) fn gen_apply(
                 if is_unit_like(&tree.ty) {
                     asm.pop();
                 } else if is_jvm_primitive(&tree.ty) {
-                    emit_unbox(asm, &tree.ty);
+                    emit_unbox(asm, &tree.ty, ctx.abi);
                 } else if matches!(tree.ty, Type::String) {
                     asm.checkcast("java/lang/String");
                 }
@@ -2894,7 +2896,7 @@ pub(crate) fn gen_apply(
         } else {
             asm.aconst_null();
         }
-        emit_unbox(asm, &prim);
+        emit_unbox(asm, &prim, ctx.abi);
         return;
     }
     if matches!(ic, Intrinsic::Any2StringAdd) {
@@ -3003,7 +3005,7 @@ pub(crate) fn gen_apply(
         return;
     }
 
-    if !ctx.library_abi && is_arrow_assoc_arrow(ctx, fun) {
+    if ctx.abi.is_private() && is_arrow_assoc_arrow(ctx, fun) {
         gen_tuple2_arrow(asm, frame, ctx, fun, args);
         return;
     }
@@ -3208,7 +3210,7 @@ pub(crate) fn gen_apply(
             _ => {}
         }
 
-        if !ctx.library_abi && name == "+" && matches!(tree.ty, Type::String) {
+        if ctx.abi.is_private() && name == "+" && matches!(tree.ty, Type::String) {
             if let Some(r) = args.first() {
                 gen_string_concat(asm, frame, ctx, qual, r);
                 return;
@@ -3294,7 +3296,7 @@ pub(crate) fn gen_apply(
             // library's own `xs(i)` / `xs(i) = v` sites are generic. Ordinary
             // `--no-scala-library` user code has no such object and still gets
             // the diagnostic rather than a call to a class that is not there.
-            if !ctx.library_abi && !scala_run_time_supplies(ctx.st, srt_helper(name)) {
+            if ctx.abi.is_private() && !scala_run_time_supplies(ctx.st, srt_helper(name)) {
                 report_ctx_error(
                     ctx,
                     tree.span,
@@ -3469,7 +3471,7 @@ pub(crate) fn gen_apply(
         arg_ctx,
         args,
         &param_tys,
-        value_owner.is_some() || (ctx.library_abi && !array_elem_op),
+        value_owner.is_some() || (ctx.abi.is_library() && !array_elem_op),
         java_varargs,
         fun.sym,
         interface_super,
@@ -3517,7 +3519,7 @@ pub(crate) fn gen_apply(
             if concrete {
                 asm.invokevirtual(&desc, "clone", "()Ljava/lang/Object;");
                 asm.checkcast(&desc);
-            } else if ctx.library_abi {
+            } else if ctx.abi.is_library() {
                 asm.getstatic(
                     "scala/runtime/ScalaRunTime$",
                     "MODULE$",
@@ -4539,7 +4541,7 @@ pub(crate) fn invoke_value_extension(
 /// puts the statics on the class itself, whatever its nesting.
 pub(crate) fn value_extension_module(st: &SymbolTable, id: SymbolId) -> Option<String> {
     let owner_id = st.get(id).owner;
-    if st.source_value_classes.contains(&owner_id) {
+    if st.is_source_value_class(owner_id) {
         return None;
     }
     let owner = class_internal(st, owner_id);
@@ -4752,7 +4754,7 @@ pub(crate) fn box_value_class_receiver(
     // takes the underlying value. Handing it the box was a `VerifyError`.
     if matches!(&qual.ty, Type::Class { sym, .. } if *sym == owner)
         && !matches!(qual.kind, TreeKind::This { .. } | TreeKind::Super { .. })
-        && ctx.st.source_value_classes.contains(&owner)
+        && ctx.st.is_source_value_class(owner)
     {
         if let Some(field) = ctx.st.get(owner).ctor_fields.first().copied() {
             let internal = class_internal(ctx.st, owner);

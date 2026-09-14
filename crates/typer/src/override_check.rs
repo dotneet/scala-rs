@@ -1285,21 +1285,19 @@ pub fn record_method_override_families(st: &mut SymbolTable) {
             }
         }
     }
-    st.inherited_method_implementations.extend(inherited_pairs);
-    st.method_override_families.extend(pairs);
-    st.method_overload_pairs.extend(overloads);
+    st.record_override_metadata(inherited_pairs, pairs, overloads);
 }
 
 /// Whether `child` is in the pre-erasure override family of `base`.
 pub fn method_overrides(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
-    child == base || st.method_override_families.contains(&(child, base))
+    child == base || st.method_is_in_override_family(child, base)
 }
 
 /// Whether `child` and `base` were *proven* to be two methods before erasure.
 /// The backend's bridge emitters ask this to keep from bridging an overload;
 /// `false` means "not proven", never "these override".
 pub fn method_overloads(st: &SymbolTable, child: SymbolId, base: SymbolId) -> bool {
-    child != base && st.method_overload_pairs.contains(&(child, base))
+    child != base && st.methods_are_proven_overloads(child, base)
 }
 
 /// Same-named, non-final base members — the "Note:" scalac appends to

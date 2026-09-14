@@ -450,9 +450,9 @@ impl Typer {
                 // of that name does not qualify. Only a bare `Ident` needs the
                 // rule; a `Select`'s qualifier must keep ordinary resolution.
                 let ctor_pat = matches!(fun.kind, TreeKind::Ident { .. });
-                let saved_ctor_pat = std::mem::replace(&mut self.ctor_pattern_fun, ctor_pat);
-                self.type_expr(fun, &Type::NoType);
-                self.ctor_pattern_fun = saved_ctor_pat;
+                self.with_ctor_pattern_fun(ctor_pat, |this| {
+                    this.type_expr(fun, &Type::NoType);
+                });
                 self.prefer_extractor_object(fun);
                 // `case (a, b) =>` is `scala.Tuple2(a, b)`: a synthesized name
                 // is resolved in package `scala`, never lexically. Note the
@@ -868,11 +868,11 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
             TreeKind::Typed { expr, tpt } => {
-                let saved = std::mem::replace(&mut self.pattern_tpt, true);
                 let binders = self.enter_pattern_type_binders(tpt);
                 self.inherit_pattern_binder_params(tpt, &binders);
-                let ty = self.with_strict_type_names(|this| this.tree_to_type(tpt));
-                self.pattern_tpt = saved;
+                let ty = self.with_pattern_tpt(true, |this| {
+                    this.with_strict_type_names(|this| this.tree_to_type(tpt))
+                });
                 let ty = self.refine_pattern_type_binders(ty, sel_ty, &binders);
                 let ty = self.pattern_targs_from_scrutinee(&ty, sel_ty);
                 if matches!(ty, Type::AnyVal) {
@@ -2406,7 +2406,7 @@ impl Typer {
             Type::Class { sym, .. } if self.is_non_list_seq(*sym) => crate::symbol::SeqPayload::Seq,
             _ => return,
         };
-        self.st.seq_extractor_payload.insert(unapply, payload);
+        self.st.record_seq_extractor_payload(unapply, payload);
     }
 
     /// A sequence class that is not `List`: the head/tail walk would

@@ -988,6 +988,11 @@ fn two_imports_tie(slot: &[Binding], pred: impl Fn(SymbolId) -> bool) -> bool {
     false
 }
 
+/// Arena-backed symbols and the phase metadata retained alongside them.
+///
+/// The metadata collections remain public for source compatibility. Compiler
+/// code should prefer the query and recording methods below, which document
+/// whether a write participates in symbol-graph cache invalidation.
 pub struct SymbolTable {
     /// Stable module outer arguments resolved from a parent's singleton path.
     pub parent_outer_modules: HashMap<SymbolId, SymbolId>,
@@ -1621,6 +1626,211 @@ impl SymbolTable {
     pub fn get_mut(&mut self, id: SymbolId) -> &mut Symbol {
         self.note_mutation();
         &mut self.symbols[id.0 as usize]
+    }
+
+    // The maps below retain facts from an earlier compiler phase. They are
+    // not part of the symbol graph, so their writers deliberately do not call
+    // `note_mutation`: `LinCache` and `BtaCache` are functions only of
+    // `Symbol` fields. Code that changes a symbol must still go through
+    // `get_mut`, whose deliberately conservative invalidation covers every
+    // mutable `Symbol` field.
+
+    /// The user value class a term had before erasure.
+    pub fn value_class_for_term(&self, term: SymbolId) -> Option<SymbolId> {
+        self.value_class_terms.get(&term).copied()
+    }
+
+    pub(crate) fn record_value_class_term(&mut self, term: SymbolId, class: SymbolId) {
+        self.value_class_terms.insert(term, class);
+    }
+
+    /// The user value class a method returned before erasure.
+    pub fn value_class_for_result(&self, method: SymbolId) -> Option<SymbolId> {
+        self.value_class_results.get(&method).copied()
+    }
+
+    pub(crate) fn record_value_class_result(&mut self, method: SymbolId, class: SymbolId) {
+        self.value_class_results.insert(method, class);
+    }
+
+    /// The retained, pre-erasure underlying field type of a value class.
+    pub fn recorded_value_class_underlying(&self, class: SymbolId) -> Option<&Type> {
+        self.value_class_underlying_types.get(&class)
+    }
+
+    /// Retain the first (and therefore least-erased) underlying type observed.
+    pub(crate) fn record_value_class_underlying(&mut self, class: SymbolId, ty: Type) {
+        self.value_class_underlying_types.entry(class).or_insert(ty);
+    }
+
+    pub(crate) fn record_value_class_getter(&mut self, class: SymbolId, name: String) {
+        self.value_class_getters.insert(class, name);
+    }
+
+    /// Pre-erasure parameter positions whose types were abstract.
+    pub fn erased_abstract_param_mask(&self, method: SymbolId) -> u32 {
+        self.erased_abstract_params
+            .get(&method)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn record_erased_abstract_params(&mut self, method: SymbolId, mask: u32) {
+        if mask != 0 {
+            self.erased_abstract_params.insert(method, mask);
+        }
+    }
+
+    pub fn is_source_value_class(&self, class: SymbolId) -> bool {
+        self.source_value_classes.contains(&class)
+    }
+
+    pub(crate) fn record_source_value_classes(
+        &mut self,
+        classes: impl IntoIterator<Item = SymbolId>,
+    ) {
+        self.source_value_classes.extend(classes);
+    }
+
+    /// Whether this exact class or module definition belongs to a source unit.
+    pub fn is_source_class(&self, class: SymbolId) -> bool {
+        self.source_classes.contains(&class)
+    }
+
+    /// [`Self::is_source_class`] accepting the module-class spelling used by
+    /// method owners as well as the module spelling recorded from `ModuleDef`.
+    pub fn is_source_owner(&self, owner: SymbolId) -> bool {
+        if self.is_source_class(owner) {
+            return true;
+        }
+        self.get(owner).kind == SymKind::ModuleClass
+            && self
+                .source_classes
+                .iter()
+                .copied()
+                .any(|module| self.module_class_of(module) == owner)
+    }
+
+    pub(crate) fn record_source_classes(&mut self, classes: impl IntoIterator<Item = SymbolId>) {
+        self.source_classes.extend(classes);
+    }
+
+    /// The inherited concrete method already proven to implement `base` in
+    /// `class`, before erasure made the relationship ambiguous.
+    pub fn inherited_method_implementation(
+        &self,
+        class: SymbolId,
+        base: SymbolId,
+    ) -> Option<SymbolId> {
+        self.inherited_method_implementations.iter().find_map(
+            |&(owner, implementation, inherited)| {
+                (owner == class && inherited == base).then_some(implementation)
+            },
+        )
+    }
+
+    pub(crate) fn record_override_metadata(
+        &mut self,
+        inherited: impl IntoIterator<Item = (SymbolId, SymbolId, SymbolId)>,
+        overrides: impl IntoIterator<Item = (SymbolId, SymbolId)>,
+        overloads: impl IntoIterator<Item = (SymbolId, SymbolId)>,
+    ) {
+        self.inherited_method_implementations.extend(inherited);
+        self.method_override_families.extend(overrides);
+        self.method_overload_pairs.extend(overloads);
+    }
+
+    pub(crate) fn method_is_in_override_family(&self, child: SymbolId, base: SymbolId) -> bool {
+        self.method_override_families.contains(&(child, base))
+    }
+
+    pub(crate) fn methods_are_proven_overloads(&self, child: SymbolId, base: SymbolId) -> bool {
+        self.method_overload_pairs.contains(&(child, base))
+    }
+
+    pub fn name_based_unapply(&self, unapply: SymbolId) -> Option<&NameBasedUnapply> {
+        self.name_based_unapply.get(&unapply)
+    }
+
+    pub(crate) fn record_name_based_unapply(
+        &mut self,
+        unapply: SymbolId,
+        metadata: NameBasedUnapply,
+    ) -> bool {
+        if self.name_based_unapply.contains_key(&unapply) {
+            return false;
+        }
+        self.name_based_unapply.insert(unapply, metadata);
+        true
+    }
+
+    pub fn unapply_selectors(&self, unapply: SymbolId, arity: usize) -> Option<&UnapplySelectors> {
+        self.unapply_selectors.get(&(unapply, arity))
+    }
+
+    pub(crate) fn record_unapply_selectors(
+        &mut self,
+        unapply: SymbolId,
+        arity: usize,
+        metadata: UnapplySelectors,
+    ) -> bool {
+        if self.unapply_selectors.contains_key(&(unapply, arity)) {
+            return false;
+        }
+        self.unapply_selectors.insert((unapply, arity), metadata);
+        true
+    }
+
+    pub fn seq_extractor_payload(&self, unapply: SymbolId) -> Option<SeqPayload> {
+        self.seq_extractor_payload.get(&unapply).copied()
+    }
+
+    pub(crate) fn record_seq_extractor_payload(&mut self, unapply: SymbolId, payload: SeqPayload) {
+        self.seq_extractor_payload.insert(unapply, payload);
+    }
+
+    pub fn is_local_lazy_cell(&self, term: SymbolId) -> bool {
+        self.local_lazy_cells.contains(&term)
+    }
+
+    pub fn local_lazy_cell_for_accessor(&self, accessor: SymbolId) -> Option<SymbolId> {
+        self.local_lazy_accessors.get(&accessor).copied()
+    }
+
+    pub fn local_lazy_needs_nlr(&self, method: SymbolId) -> bool {
+        self.local_lazy_nlr.contains(&method)
+    }
+
+    pub(crate) fn record_local_lazy_cell(&mut self, term: SymbolId) {
+        self.local_lazy_cells.insert(term);
+    }
+
+    pub(crate) fn record_local_lazy_accessor(&mut self, accessor: SymbolId, cell: SymbolId) {
+        self.local_lazy_accessors.insert(accessor, cell);
+    }
+
+    pub(crate) fn record_local_lazy_nlr(&mut self, method: SymbolId) {
+        self.local_lazy_nlr.insert(method);
+    }
+
+    pub fn is_copy_receiver(&self, term: SymbolId) -> bool {
+        self.copy_receivers.contains(&term)
+    }
+
+    pub(crate) fn record_copy_receiver(&mut self, term: SymbolId) {
+        self.copy_receivers.insert(term);
+    }
+
+    pub fn constructor_parameter_name(&self, param: SymbolId) -> Option<&str> {
+        self.constructor_parameter_names
+            .get(&param)
+            .map(String::as_str)
+    }
+
+    pub(crate) fn record_constructor_parameter_name(&mut self, param: SymbolId, name: String) {
+        self.constructor_parameter_names
+            .entry(param)
+            .or_insert(name);
     }
 
     /// Say that a symbol is about to change, so every read-only cache over the
@@ -8215,3 +8425,30 @@ impl BaseTypeArgs {
 /// walk: `(sub, sup, answer)`, scanned linearly because it holds a handful of
 /// entries.
 type AncMemo = Vec<(u32, u32, bool)>;
+
+#[cfg(test)]
+mod api_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn phase_metadata_does_not_invalidate_symbol_graph_caches() {
+        let mut st = SymbolTable::new();
+        let term = st.alloc("term", st.root, SymKind::Term, Flags::EMPTY, "");
+        let class = st.alloc("Value", st.root, SymKind::Class, Flags::EMPTY, "Value");
+        let generation = st.mutation_gen.get();
+
+        st.record_value_class_term(term, class);
+        st.record_source_value_classes([class]);
+        st.record_source_classes([class]);
+        st.record_local_lazy_cell(term);
+
+        assert_eq!(st.value_class_for_term(term), Some(class));
+        assert!(st.is_source_value_class(class));
+        assert!(st.is_source_class(class));
+        assert!(st.is_local_lazy_cell(term));
+        assert_eq!(st.mutation_gen.get(), generation);
+
+        let _ = st.get_mut(term);
+        assert_eq!(st.mutation_gen.get(), generation.wrapping_add(1));
+    }
+}

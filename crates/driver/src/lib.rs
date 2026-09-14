@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scala_rs_backend::{emit_opts, emit_runtime, load_classpath, EmitOpts};
+use scala_rs_backend::{emit_opts, emit_runtime, load_classpath_checked, EmitOpts};
 use scala_rs_parser::{dump_tree, parse_file_opts, ParseOptions, Tree};
 use scala_rs_span::{
     finish_diagnostics, render_all, Diagnostic, Level, SourceFile, Span, WarnSettings,
@@ -12,9 +12,7 @@ use scala_rs_typer::{
     add_value_class_companions, check_local_case_class_captures, check_local_objects, erase,
     expand_private_names, expand_trait_private_vals, find_mains, hoist_default_receivers,
     lambda_lift, lazy_locals, mark_anon_captures, note_source_value_classes,
-    restore_named_arg_order, restore_rassoc_order, typecheck_units_src, uncurry, ClasspathClass,
-    ClasspathField, ClasspathMethod, ClasspathPickleMethod, ClasspathType, ClasspathTypeParam,
-    TypecheckOptions,
+    restore_named_arg_order, restore_rassoc_order, typecheck_units_src, uncurry, TypecheckOptions,
 };
 
 pub use scala_rs_backend::EmittedClass;
@@ -290,6 +288,19 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
     // error, in which case nothing is emitted anyway.
     let mut generic_sigs: Option<std::rc::Rc<scala_rs_backend::GenericSignatures>> = None;
     {
+        let classpath = match load_cp(&opts.class_path) {
+            Ok(classpath) => classpath,
+            Err(errors) => {
+                diags.extend(errors.into_iter().map(|error| {
+                    Diagnostic::error(
+                        0,
+                        Span::DUMMY,
+                        format!("cannot load classpath ABI: {error}"),
+                    )
+                }));
+                return failed_result(diags, sources);
+            }
+        };
         // One symbol table for the whole run: every unit is named before any
         // is typed, so files can reference each other.
         let mut refs: Vec<(&mut Tree, usize)> = units
@@ -308,7 +319,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                 // promotion of each warning to an error is for API callers.
                 fatal_warnings: false,
                 library_abi: opts.scala_library.is_some(),
-                classpath: load_cp(&opts.class_path),
+                classpath,
                 binary_path: {
                     let mut p = opts.class_path.clone();
                     if let Some(j) = &opts.scala_library {
@@ -844,82 +855,13 @@ fn class_path(out_dir: &Path, internal_name: &str) -> PathBuf {
     dest
 }
 
-fn cp_type(t: &scala_rs_backend::PickledType) -> ClasspathType {
-    ClasspathType {
-        name: t.name.clone(),
-        args: t.args.iter().map(cp_type).collect(),
-    }
-}
-
-fn cp_tparam(t: &scala_rs_backend::PickledTypeParam) -> ClasspathTypeParam {
-    ClasspathTypeParam {
-        name: t.name.clone(),
-        tparams: t.tparams.iter().map(cp_tparam).collect(),
-    }
-}
-
-fn load_cp(paths: &[PathBuf]) -> Vec<ClasspathClass> {
+fn load_cp(
+    paths: &[PathBuf],
+) -> Result<Vec<scala_rs_typer::ClasspathClass>, Vec<scala_rs_backend::ClasspathLoadError>> {
     if paths.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    load_classpath(paths)
-        .into_iter()
-        .map(|c| {
-            let pickle_tparams = c
-                .pickle
-                .as_ref()
-                .map(|p| p.tparams.iter().map(cp_tparam).collect())
-                .unwrap_or_default();
-            let extends_anyval = c.pickle.as_ref().is_some_and(|p| p.extends_anyval);
-            ClasspathClass {
-                jvm_name: c.internal_name,
-                is_module: c.is_module,
-                fields: c
-                    .fields
-                    .into_iter()
-                    .map(|f| ClasspathField {
-                        access: f.access,
-                        name: f.name,
-                        desc: f.desc,
-                    })
-                    .collect(),
-                methods: c
-                    .methods
-                    .into_iter()
-                    .map(|m| ClasspathMethod {
-                        access: m.access,
-                        name: m.name,
-                        desc: m.desc,
-                        signature: m.signature,
-                    })
-                    .collect(),
-                pickle: c.pickle.map(|p| {
-                    p.methods
-                        .into_iter()
-                        .map(|m| ClasspathPickleMethod {
-                            name: m.name,
-                            param_names: m.param_names,
-                            param_types: m.param_types.iter().map(cp_type).collect(),
-                            clause_sizes: m.clause_sizes,
-                            param_flags: m.param_flags,
-                            ret: cp_type(&m.ret),
-                            tparams: m.tparams.iter().map(cp_tparam).collect(),
-                            is_val: m.is_val,
-                            is_ctor: m.is_ctor,
-                            is_implicit: m.is_implicit,
-                            is_deferred: m.is_deferred,
-                            is_mutable: m.is_mutable,
-                        })
-                        .collect()
-                }),
-                pickle_tparams,
-                is_interface: c.is_interface,
-                super_name: c.super_name,
-                interfaces: c.interfaces,
-                extends_anyval,
-            }
-        })
-        .collect()
+    load_classpath_checked(paths).map(scala_rs_typer::adapt_classpath)
 }
 
 /// Run `java -cp out_dir[:extra...] main_class args...`.
@@ -1216,6 +1158,29 @@ object Main {
         assert!(!result.ok());
         assert!(result.emitted.is_empty());
         assert!(result.diags.iter().any(|d| d.message.contains("not found")));
+    }
+
+    #[test]
+    fn malformed_classpath_class_is_reported() {
+        let tmp = fresh_dir();
+        let src = tmp.0.join("Main.scala");
+        let bad_class = tmp.0.join("Broken.class");
+        std::fs::write(&src, "object Main {}\n").unwrap();
+        std::fs::write(&bad_class, b"not a classfile").unwrap();
+        let opts = CompileOptions {
+            out_dir: tmp.0.join("out"),
+            class_path: vec![bad_class],
+            ..CompileOptions::default()
+        };
+
+        let result = compile_paths(&[src], &opts);
+
+        assert!(!result.ok());
+        assert!(result.emitted.is_empty());
+        assert!(result.diags.iter().any(|diag| {
+            diag.message.contains("cannot load classpath ABI")
+                && diag.message.contains("not a classfile (bad magic)")
+        }));
     }
 
     #[test]

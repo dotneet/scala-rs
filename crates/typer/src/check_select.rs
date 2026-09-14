@@ -49,17 +49,16 @@ impl Typer {
         if qual.ty.is_no_type() || qual.ty.is_error() {
             // The enclosing application's argument count belongs to *this*
             // selection, not to whatever the qualifier turns out to be.
-            let saved_arity = self.callee_arity.take();
             // An explicit apply has the same receiver-inference boundary as
             // the inserted apply: its arguments can still constrain the
             // result of a parameterless factory.
-            let saved_callee = self.typing_callee;
-            if name == "apply" {
-                self.typing_callee = true;
-            }
-            self.type_qualifier(qual, &Type::NoType);
-            self.typing_callee = saved_callee;
-            self.callee_arity = saved_arity;
+            self.with_callee_arity(None, |this| {
+                if name == "apply" {
+                    this.with_typing_callee(true, |this| this.type_qualifier(qual, &Type::NoType));
+                } else {
+                    this.type_qualifier(qual, &Type::NoType);
+                }
+            });
         }
         // A *qualifier* is never "an argument still waiting for its
         // alternative": `pack` in `SV(pack.to[Seq], "x")` has to be a
@@ -78,9 +77,9 @@ impl Typer {
         // (`ExBox[ExRow]` printed as `ExRow`). Only a clause that
         // actually survived is retried.
         if self.implicit_only_result(qual).is_some() {
-            let saved = std::mem::replace(&mut self.typing_call_args, false);
-            self.adapt_implicit_apply(qual, &Type::NoType);
-            self.typing_call_args = saved;
+            self.with_typing_call_args(false, |this| {
+                this.adapt_implicit_apply(qual, &Type::NoType);
+            });
         }
         // …and a clause that could not be filled even then is the missing
         // implicit, not `value to is not a member of (Sh[Int, R])Qy[R]`.
@@ -4066,7 +4065,7 @@ impl Typer {
             if let TreeKind::Block { stats, .. } = &tree.kind {
                 if let Some(t) = stats.first() {
                     if !t.sym.is_none() {
-                        self.st.copy_receivers.insert(t.sym);
+                        self.st.record_copy_receiver(t.sym);
                     }
                 }
             }

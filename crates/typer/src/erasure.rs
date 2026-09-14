@@ -239,9 +239,9 @@ fn erase_symbols(st: &mut SymbolTable) {
     // may instantiate the same value class at different type arguments.
     for i in 1..n {
         let id = SymbolId(i as u32);
-        if !st.value_class_underlying_types.contains_key(&id) {
+        if st.recorded_value_class_underlying(id).is_none() {
             if let Some(under) = st.value_class_underlying(id) {
-                st.value_class_underlying_types.insert(id, under);
+                st.record_value_class_underlying(id, under);
             }
         }
     }
@@ -277,19 +277,17 @@ fn erase_symbols(st: &mut SymbolTable) {
         if kind == crate::symbol::SymKind::Method {
             if let Type::Method { ret, .. } = &st.get(id).ty {
                 if let Some(c) = value_class_of(ret, st) {
-                    st.value_class_results.insert(id, c);
+                    st.record_value_class_result(id, c);
                 }
             }
         }
         if let Some(c) = value_class {
-            st.value_class_terms.insert(id, c);
+            st.record_value_class_term(id, c);
         }
         // Only ever recorded, never cleared: `erase_symbols` runs to a
         // fixpoint, and on the second pass the parameters have already lost
         // the shape this is reading.
-        if abstract_params != 0 {
-            st.erased_abstract_params.insert(id, abstract_params);
-        }
+        st.record_erased_abstract_params(id, abstract_params);
         if st.get(id).ty != erased {
             changed = true;
             st.get_mut(id).ty = erased;
@@ -650,8 +648,7 @@ fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
                     args: vec![],
                 },
                 Some(_g) => match st
-                    .value_class_underlying_types
-                    .get(sym)
+                    .recorded_value_class_underlying(*sym)
                     .cloned()
                     .or_else(|| st.value_class_underlying(*sym))
                 {
@@ -994,7 +991,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 Some(erase_ty(&tree.ty, st))
             };
             erase_tree(rhs, st, pt.as_ref());
-            if let (Some(&cls), Some(pt)) = (st.value_class_terms.get(&tree.sym), pt) {
+            if let (Some(cls), Some(pt)) = (st.value_class_for_term(tree.sym), pt) {
                 unbox_value_class_result(rhs, cls, &pt);
             }
         }
@@ -1029,7 +1026,7 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             // declared to return the value class must return its underlying
             // representation, even when that representation is Object.
             // Methods declared Any or a universal trait keep the box.
-            if let Some(&cls) = st.value_class_results.get(&tree.sym) {
+            if let Some(cls) = st.value_class_for_result(tree.sym) {
                 if let Some(ret) = ret {
                     unbox_value_class_result(rhs, cls, &ret);
                 }
@@ -1380,8 +1377,8 @@ fn adapt_member_read(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>)
             // A declaration of the value class itself returns its underlying
             // value, including String/Object. Only an abstract declaration
             // stores a boxed value class, as on the Apply path below.
-            let declared_value_class = st.value_class_terms.contains_key(&tree.sym)
-                || st.value_class_results.contains_key(&tree.sym);
+            let declared_value_class = st.value_class_for_term(tree.sym).is_some()
+                || st.value_class_for_result(tree.sym).is_some();
             if is_ref_erased(&ret_erased) && !declared_value_class {
                 let under = erase_ty(&orig, st);
                 tree.ty = ret_erased;
@@ -1555,7 +1552,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             _ => true,
         };
         if !fun.sym.is_none() && sym_denotes_callee {
-            declared_value_result = st.value_class_results.contains_key(&fun.sym);
+            declared_value_result = st.value_class_for_result(fun.sym).is_some();
             match &st.get(fun.sym).ty {
                 Type::Method { ret, .. } | Type::Function { ret, .. } => {
                     fun_ty = Type::Method {
@@ -1579,7 +1576,7 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             } else {
                 st.get(callee).params.get(i).copied()
             };
-            let declared_vc = formal.and_then(|id| st.value_class_terms.get(&id)).copied();
+            let declared_vc = formal.and_then(|id| st.value_class_for_term(id));
             let vc_elem = if declared_vc.is_some() {
                 None
             } else {
@@ -1880,10 +1877,10 @@ fn is_abstract_elem_array(ty: &Type, st: &SymbolTable) -> bool {
 pub fn note_source_value_classes(tree: &Tree, st: &mut SymbolTable) {
     let mut found = Vec::new();
     collect_source_value_classes(tree, st, &mut found);
-    st.source_value_classes.extend(found);
+    st.record_source_value_classes(found);
     let mut all = Vec::new();
     collect_source_classes(tree, &mut all);
-    st.source_classes.extend(all);
+    st.record_source_classes(all);
 }
 
 /// Every class and object this unit defines.

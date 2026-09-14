@@ -3708,18 +3708,7 @@ fn is_source_run_symbol(st: &SymbolTable, mut sym: SymbolId) -> bool {
     if sym.is_none() {
         return false;
     }
-    let is_source_class_like = |candidate: SymbolId| {
-        st.source_classes.contains(&candidate)
-            || st.source_classes.contains(&st.module_class_of(candidate))
-            // `source_classes` records a source object as its Module symbol,
-            // while a method owned by that object is reached through its
-            // ModuleClass symbol.  Keep both halves of that source pair
-            // source identities.
-            || st
-                .source_classes
-                .iter()
-                .any(|&source| st.module_class_of(source) == candidate)
-    };
+    let is_source_class_like = |candidate: SymbolId| st.is_source_owner(candidate);
     for _ in 0..64 {
         let s = st.get(sym);
         if !s.pickled_origin.is_empty() || sym.0 < st.source_start {

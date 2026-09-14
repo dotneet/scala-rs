@@ -426,7 +426,7 @@ impl PickleSupply {
         bin: &mut BinaryIndex,
         class_sym: SymbolId,
     ) {
-        if class_sym.is_none() || st.source_classes.contains(&class_sym) {
+        if class_sym.is_none() || st.is_source_class(class_sym) {
             return;
         }
         let internal = st.get(class_sym).jvm_name.clone();
@@ -7081,7 +7081,7 @@ fn ensure_value_class_field(st: &mut SymbolTable, bin: &mut BinaryIndex, class_s
         .iter()
         .any(|m| m.name == f.name && m.desc == format!("(){}", f.desc))
     {
-        st.value_class_getters.insert(class_sym, f.name.clone());
+        st.record_value_class_getter(class_sym, f.name.clone());
     }
     if !st.get(class_sym).ctor_fields.is_empty() {
         return;

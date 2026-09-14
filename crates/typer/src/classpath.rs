@@ -6,6 +6,11 @@ use std::collections::HashMap;
 use crate::check::{ClasspathClass, ClasspathMethod, ClasspathType, ClasspathTypeParam};
 use crate::symbol::{SymKind, SymbolTable};
 
+mod abi;
+mod descriptor;
+
+pub use abi::adapt_classpath;
+
 pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
     let mut installed: Vec<(usize, SymbolId)> = Vec::new();
     // Nested classfiles (`enrich/package$Rich`) must see their outer module
@@ -1200,24 +1205,41 @@ fn resolve_bare_type_name(st: &SymbolTable, name: &str) -> Type {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorSource {
+    /// A ScalaSignature member whose names are the pickle's compact names.
+    ScalaPickle,
+    /// A descriptor emitted by scalac. Unit and the bottom types have Scala's
+    /// erased runtime spellings in value positions.
+    ScalaErased,
+    /// A descriptor emitted by javac or another Java classfile producer.
+    Java,
+}
+
 pub fn parse_method_desc(st: &mut SymbolTable, desc: &str) -> (Vec<Type>, Type) {
-    let rest = desc.strip_prefix('(').unwrap_or(desc);
-    let (params_s, ret_s) = match rest.find(')') {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => ("", rest),
-    };
-    let mut params = Vec::new();
-    let mut s = params_s;
-    while !s.is_empty() {
-        let (t, n) = parse_field_ty(st, s);
-        params.push(t);
-        s = &s[n..];
-        if n == 0 {
-            break;
-        }
+    parse_method_desc_with_source(st, desc, DescriptorSource::ScalaPickle)
+}
+
+fn parse_method_desc_with_source(
+    st: &mut SymbolTable,
+    desc: &str,
+    source: DescriptorSource,
+) -> (Vec<Type>, Type) {
+    if let Some(method) = descriptor::method(desc) {
+        let params = method
+            .params
+            .into_iter()
+            .map(|field| descriptor_type(st, &field.ty, source))
+            .collect();
+        let ret = descriptor_type(st, &method.ret.ty, source);
+        return (params, ret);
     }
-    let (ret, _) = parse_field_ty(st, ret_s);
-    (params, ret)
+
+    // Preserve the old reader's lenient fallback for a malformed or bare
+    // descriptor: without a closing `)` it treated the entire suffix as the
+    // result and exposed no parameters.
+    let rest = desc.strip_prefix('(').unwrap_or(desc);
+    (Vec::new(), parse_field_ty_with_source(st, rest, source).0)
 }
 
 /// Recover a classpath method's generic shape when its classfile provides a
@@ -1252,76 +1274,132 @@ fn parse_classpath_method(
     (params, ret)
 }
 
-fn parse_field_ty(st: &mut SymbolTable, s: &str) -> (Type, usize) {
-    if s.is_empty() {
-        return (Type::Any, 0);
+fn parse_field_ty_with_source(
+    st: &mut SymbolTable,
+    input: &str,
+    source: DescriptorSource,
+) -> (Type, usize) {
+    if let Some(field) = descriptor::field(input) {
+        let len = field.len;
+        return (descriptor_type(st, &field.ty, source), len);
     }
-    match s.as_bytes()[0] {
-        b'V' => (Type::Unit, 1),
-        b'Z' => (Type::Boolean, 1),
-        b'I' => (Type::Int, 1),
-        b'J' => (Type::Long, 1),
-        b'F' => (Type::Float, 1),
-        b'D' => (Type::Double, 1),
-        b'C' => (Type::Char, 1),
-        b'B' => (Type::Byte, 1),
-        b'S' => (Type::Short, 1),
-        b'[' => {
-            let (inner, n) = parse_field_ty(st, &s[1..]);
-            (Type::Array(Box::new(inner)), n + 1)
-        }
-        b'L' => {
-            let end = s.find(';').unwrap_or(s.len());
-            let inner = &s[1..end];
+    if input.as_bytes().first() == Some(&b'[') {
+        // Keep the previous malformed-array behavior (`[Q` became
+        // `Array[Any]`) even though the shared scanner rejects `Q`.
+        let (inner, len) = parse_field_ty_with_source(st, &input[1..], source);
+        return (Type::Array(Box::new(inner)), len + 1);
+    }
+    (Type::Any, usize::from(!input.is_empty()))
+}
+
+fn descriptor_type(
+    st: &mut SymbolTable,
+    raw: &descriptor::RawType<'_>,
+    source: DescriptorSource,
+) -> Type {
+    match source {
+        DescriptorSource::ScalaPickle => scala_pickle_descriptor_type(st, raw),
+        DescriptorSource::ScalaErased => scala_erased_descriptor_type(st, raw),
+        DescriptorSource::Java => java_descriptor_type(st, raw),
+    }
+}
+
+fn primitive_descriptor_type(primitive: descriptor::Primitive) -> Type {
+    use descriptor::Primitive;
+    match primitive {
+        Primitive::Void => Type::Unit,
+        Primitive::Boolean => Type::Boolean,
+        Primitive::Byte => Type::Byte,
+        Primitive::Short => Type::Short,
+        Primitive::Char => Type::Char,
+        Primitive::Int => Type::Int,
+        Primitive::Long => Type::Long,
+        Primitive::Float => Type::Float,
+        Primitive::Double => Type::Double,
+    }
+}
+
+fn exact_descriptor_class(st: &mut SymbolTable, internal: &str) -> Type {
+    Type::Class {
+        sym: find_or_stub_java_class(st, internal),
+        args: vec![],
+    }
+}
+
+fn scala_pickle_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<'_>) -> Type {
+    use descriptor::RawType;
+    match raw {
+        RawType::Primitive(primitive) => primitive_descriptor_type(*primitive),
+        RawType::Array(inner) => Type::Array(Box::new(scala_pickle_descriptor_type(st, inner))),
+        RawType::Object(object) => {
+            let inner = object.as_str();
             let name = inner.rsplit('/').next().unwrap_or(inner);
-            let ty = if inner == "java/lang/String" || name == "String" {
-                Type::String
-            } else if inner == "java/lang/Object" {
-                Type::Any
-            } else if inner == "scala/runtime/BoxedUnit" {
-                // `Unit` erases to `BoxedUnit` in every *value* position (a
-                // parameter, a field, an array element), so reading a
-                // descriptor back has to undo that -- otherwise a separately
-                // compiled `case class K(k: Unit, n: Int)` came back as
-                // `(BoxedUnit, Int)` and `K((), 2)` no longer type-checked
-                // against our own classfile. nsc's own classfile reader makes
-                // the same mapping.
-                Type::Unit
-            } else if inner == "scala/runtime/Nothing$" {
-                Type::Nothing
-            } else if inner == "scala/runtime/Null$" {
-                // The other bottom type's erasure. `jtype_to_type` already
-                // undoes it for a *generic* signature; a plain descriptor is
-                // where a separately compiled `def take(x: Null)` arrives.
-                Type::Null
-            } else if name.starts_with("Function") {
-                Type::Function {
+            if inner == "java/lang/String" || name == "String" {
+                return Type::String;
+            }
+            if inner == "java/lang/Object" {
+                return Type::Any;
+            }
+            if inner == "scala/runtime/BoxedUnit" {
+                // Unit erases to BoxedUnit in every Scala value position.
+                return Type::Unit;
+            }
+            if inner == "scala/runtime/Nothing$" {
+                return Type::Nothing;
+            }
+            if inner == "scala/runtime/Null$" {
+                return Type::Null;
+            }
+            if name.starts_with("Function") {
+                return Type::Function {
                     params: vec![Type::Any],
                     ret: Box::new(Type::Any),
-                }
-            } else {
-                let by_name = resolve_type_name(st, name);
-                // A descriptor names one exact class. When the simple name is
-                // not in scope -- `scala.reflect.api.JavaUniverse` is a member
-                // of its package, not of any open scope -- resolving it by
-                // internal name is still exact, and beats giving up on a
-                // `Type::Named` that nothing can select a member from.
-                match by_name {
-                    Type::Named { .. } => Type::Class {
-                        // A JVM descriptor is an exact binary identity. Keep
-                        // the identity even when the class has not been
-                        // loaded yet; `ensure_java_loaded` can complete this
-                        // stub when a later selection needs its members.
-                        sym: find_or_stub_java_class(st, inner),
-                        args: vec![],
-                    },
-                    t => t,
-                }
-            };
-            let consumed = if end < s.len() { end + 1 } else { end };
-            (ty, consumed)
+                };
+            }
+            match resolve_type_name(st, name) {
+                Type::Named { .. } => exact_descriptor_class(st, inner),
+                ty => ty,
+            }
         }
-        _ => (Type::Any, 1),
+    }
+}
+
+fn scala_erased_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<'_>) -> Type {
+    use descriptor::RawType;
+    match raw {
+        RawType::Primitive(primitive) => primitive_descriptor_type(*primitive),
+        RawType::Array(inner) => Type::Array(Box::new(scala_erased_descriptor_type(st, inner))),
+        RawType::Object(object) => {
+            let inner = object.as_str();
+            match inner {
+                "java/lang/String" => Type::String,
+                "java/lang/Object" => Type::Any,
+                "scala/runtime/BoxedUnit" => Type::Unit,
+                "scala/runtime/Nothing$" => Type::Nothing,
+                "scala/runtime/Null$" => Type::Null,
+                _ => exact_descriptor_class(st, inner),
+            }
+        }
+    }
+}
+
+fn java_descriptor_type(st: &mut SymbolTable, raw: &descriptor::RawType<'_>) -> Type {
+    use descriptor::RawType;
+    match raw {
+        RawType::Primitive(primitive) => primitive_descriptor_type(*primitive),
+        RawType::Array(inner) => Type::Array(Box::new(java_descriptor_type(st, inner))),
+        RawType::Object(object) => {
+            let inner = object.as_str();
+            match inner {
+                "java/lang/String" => Type::String,
+                "java/lang/Object" => Type::Any,
+                "scala/runtime/Nothing$" => Type::Nothing,
+                "scala/runtime/Null$" => Type::Null,
+                // BoxedUnit is a real Java class when the descriptor comes
+                // from javac, not Scala's erased representation of Unit.
+                _ => exact_descriptor_class(st, inner),
+            }
+        }
     }
 }
 
@@ -1404,7 +1482,7 @@ pub fn install_java_class_in(
         if is_scala_module(c)
             && st.get(id).kind == SymKind::Class
             && st.get(id).flags.contains(Flags::JAVA)
-            && !st.source_classes.contains(&id)
+            && !st.is_source_class(id)
         {
             st.get_mut(id).kind = SymKind::ModuleClass;
             st.get_mut(id).name = format!("{simple}$");
@@ -1437,7 +1515,7 @@ pub fn install_java_class_in(
         if c.is_scala
             && st.get(id).kind == SymKind::Class
             && st.get(id).flags.contains(Flags::JAVA)
-            && !st.source_classes.contains(&id)
+            && !st.is_source_class(id)
             && (st.get(id).owner != owner || st.get(id).name != simple)
         {
             let previous_owner = st.get(id).owner;
@@ -1634,7 +1712,7 @@ fn install_java_module(
         if c.scala_module
             && st.get(id).kind == SymKind::Class
             && st.get(id).flags.contains(Flags::JAVA)
-            && !st.source_classes.contains(&id)
+            && !st.is_source_class(id)
         {
             st.get_mut(id).kind = SymKind::ModuleClass;
             st.get_mut(id).name = format!("{simple}$");
@@ -2098,29 +2176,18 @@ fn method_params_agree(s: &crate::symbol::Symbol, desc: &str) -> bool {
             .all(|(t, d)| param_matches_desc(t, d))
 }
 
-/// The parameter descriptors of a method descriptor, one string each.
-fn desc_param_descs(desc: &str) -> Vec<String> {
-    let rest = desc.strip_prefix('(').unwrap_or(desc);
-    let params = rest.split_once(')').map(|(p, _)| p).unwrap_or("");
-    let b = params.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        while i < b.len() && b[i] == b'[' {
-            i += 1;
-        }
-        if i < b.len() && b[i] == b'L' {
-            while i < b.len() && b[i] != b';' {
-                i += 1;
-            }
-            i += 1;
-        } else if i < b.len() {
-            i += 1;
-        }
-        out.push(params[start..i.min(params.len())].to_string());
-    }
-    out
+/// The parameter descriptor slices of a method descriptor. The scanner owns
+/// no input and therefore this does not allocate a `String` per parameter.
+fn desc_param_descs(desc: &str) -> Vec<&str> {
+    descriptor::method(desc)
+        .map(|method| {
+            method
+                .params
+                .into_iter()
+                .map(|field| field.source)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn param_matches_desc(ty: &Type, d: &str) -> bool {
@@ -2345,7 +2412,12 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             let ret = java_result_obj(jtype_to_type(st, &ms.ret, &env));
             (params, ret, tp_ids)
         } else {
-            let (p, r) = parse_method_desc_java(st, &m.desc, c.is_scala);
+            let source = if c.is_scala {
+                DescriptorSource::ScalaErased
+            } else {
+                DescriptorSource::Java
+            };
+            let (p, r) = parse_method_desc_with_source(st, &m.desc, source);
             (p, java_result_obj(r), Vec::new())
         };
         let mut params = params;
@@ -2406,7 +2478,14 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
             .as_deref()
             .and_then(crate::javasign::parse_field_sig)
             .map(|jt| jtype_to_type(st, &jt, &env))
-            .unwrap_or_else(|| parse_field_ty_java(st, &f.desc, c.is_scala).0);
+            .unwrap_or_else(|| {
+                let source = if c.is_scala {
+                    DescriptorSource::ScalaErased
+                } else {
+                    DescriptorSource::Java
+                };
+                parse_field_ty_with_source(st, &f.desc, source).0
+            });
         let java_object_field = !c.is_scala && ty == Type::Any;
         let ty = if !c.is_scala { java_result_obj(ty) } else { ty };
         let mut flags = Flags::JAVA;
@@ -2486,7 +2565,7 @@ fn jtype_to_type(
             // so scalac stands in with the synthetic runtime placeholder
             // classes: `case object Canceled extends Outcome[Nothing]`'s own
             // class Signature reads `Outcome<Lscala/runtime/Nothing$;>`.
-            // `parse_field_ty` (descriptor parsing, no generics) already
+            // The raw descriptor mapping (without generics) already
             // makes this substitution; a generic-signature parent left it as
             // an ordinary class stub named `Nothing$`, so `Outcome[Nothing]`
             // was not recognised as a subtype of `Outcome[Int]` -- the
@@ -2536,94 +2615,10 @@ fn java_array_element(t: Type) -> Type {
     }
 }
 
-fn parse_method_desc_java(
-    st: &mut SymbolTable,
-    desc: &str,
-    scala_erased: bool,
-) -> (Vec<Type>, Type) {
-    let rest = desc.strip_prefix('(').unwrap_or(desc);
-    let (params_s, ret_s) = match rest.find(')') {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => ("", rest),
-    };
-    let mut params = Vec::new();
-    let mut s = params_s;
-    while !s.is_empty() {
-        let (t, n) = parse_field_ty_java(st, s, scala_erased);
-        params.push(t);
-        s = &s[n..];
-        if n == 0 {
-            break;
-        }
-    }
-    let (ret, _) = parse_field_ty_java(st, ret_s, scala_erased);
-    (params, ret)
-}
-
 /// One JVM field descriptor as a type. Used by `pickle_supply` to give a
 /// `-cp` value class the constructor field its underlying representation is.
 pub(crate) fn field_ty_from_desc(st: &mut SymbolTable, desc: &str) -> Type {
-    parse_field_ty_java(st, desc, true).0
-}
-
-/// One JVM descriptor as a type.
-///
-/// `scala_erased` says whether the class file this descriptor came from was
-/// produced by *scalac*. Only then does `Lscala/runtime/BoxedUnit;` mean `Unit`
-/// -- that mapping undoes scalac's own erasure of `Unit` in a value position.
-/// `BoxedUnit` is itself a **Java** class, and its
-/// `public static final BoxedUnit UNIT` field came back typed `Unit`, so
-/// `def box(x: Unit): scala.runtime.BoxedUnit = scala.runtime.BoxedUnit.UNIT`
-/// was `found: Unit required: BoxedUnit` (`scala/Unit.scala:41`). javac cannot
-/// erase a type it has no notion of, so a Java descriptor means exactly what it
-/// says.
-fn parse_field_ty_java(st: &mut SymbolTable, s: &str, scala_erased: bool) -> (Type, usize) {
-    if s.is_empty() {
-        return (Type::Any, 0);
-    }
-    match s.as_bytes()[0] {
-        b'V' => (Type::Unit, 1),
-        b'Z' => (Type::Boolean, 1),
-        b'I' => (Type::Int, 1),
-        b'J' => (Type::Long, 1),
-        b'F' => (Type::Float, 1),
-        b'D' => (Type::Double, 1),
-        b'C' => (Type::Char, 1),
-        b'B' => (Type::Byte, 1),
-        b'S' => (Type::Short, 1),
-        b'[' => {
-            let (inner, n) = parse_field_ty_java(st, &s[1..], scala_erased);
-            (Type::Array(Box::new(inner)), n + 1)
-        }
-        b'L' => {
-            let end = s.find(';').unwrap_or(s.len());
-            let inner = &s[1..end];
-            let consumed = if end < s.len() { end + 1 } else { end };
-            let ty = if inner == "java/lang/String" {
-                Type::String
-            } else if inner == "java/lang/Object" {
-                Type::Any
-            } else if inner == "scala/runtime/BoxedUnit" && scala_erased {
-                Type::Unit
-            } else if inner == "scala/runtime/Nothing$" {
-                Type::Nothing
-            } else if inner == "scala/runtime/Null$" {
-                Type::Null
-            } else {
-                // A JVM descriptor is an exact binary identity, including
-                // scala packages and the default package. Simple-name lookup
-                // would confuse scala.custom.List with scala.collection's
-                // List, or leave a forward reference such as MainNode as an
-                // unbound name. A stub retains that identity until completion.
-                Type::Class {
-                    sym: find_or_stub_java_class(st, inner),
-                    args: vec![],
-                }
-            };
-            (ty, consumed)
-        }
-        _ => (Type::Any, 1),
-    }
+    parse_field_ty_with_source(st, desc, DescriptorSource::ScalaErased).0
 }
 
 fn method_arity(s: &crate::symbol::Symbol) -> usize {
@@ -2639,42 +2634,86 @@ fn method_arity(s: &crate::symbol::Symbol) -> usize {
 }
 
 fn desc_param_count(desc: &str) -> usize {
-    let rest = desc.strip_prefix('(').unwrap_or(desc);
-    let params = rest.split_once(')').map(|(p, _)| p).unwrap_or("");
-    let b = params.as_bytes();
-    let mut n = 0;
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' => {
-                n += 1;
-                i += 1;
+    descriptor::method(desc).map_or(0, |method| method.params.len())
+}
+
+#[cfg(test)]
+mod descriptor_semantics_tests {
+    use super::*;
+
+    #[test]
+    fn scala_pickle_mapping_covers_primitives_arrays_objects_and_bottoms() {
+        let mut st = SymbolTable::new();
+        let (params, ret) = parse_method_desc(
+            &mut st,
+            "(ZBCSIJFD[[Ljava/lang/String;Lscala/runtime/BoxedUnit;Lpkg/Outer$Inner;)Lscala/runtime/Null$;",
+        );
+
+        assert_eq!(
+            &params[..8],
+            &[
+                Type::Boolean,
+                Type::Byte,
+                Type::Char,
+                Type::Short,
+                Type::Int,
+                Type::Long,
+                Type::Float,
+                Type::Double,
+            ]
+        );
+        assert_eq!(
+            params[8],
+            Type::Array(Box::new(Type::Array(Box::new(Type::String))))
+        );
+        assert_eq!(params[9], Type::Unit);
+        let nested = match &params[10] {
+            Type::Class { sym, args } => {
+                assert!(args.is_empty());
+                *sym
             }
-            b'[' => {
-                while i < b.len() && b[i] == b'[' {
-                    i += 1;
-                }
-                if i < b.len() && b[i] == b'L' {
-                    while i < b.len() && b[i] != b';' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else {
-                    i += 1;
-                }
-                n += 1;
-            }
-            b'L' => {
-                while i < b.len() && b[i] != b';' {
-                    i += 1;
-                }
-                i += 1;
-                n += 1;
-            }
-            _ => i += 1,
-        }
+            other => panic!("expected nested JVM class, got {other:?}"),
+        };
+        assert_eq!(st.get(nested).jvm_name, "pkg/Outer$Inner");
+        assert_eq!(ret, Type::Null);
+        assert_eq!(desc_param_count("(I[[Ljava/lang/String;)V"), 2);
+        assert_eq!(
+            desc_param_descs("(I[[Ljava/lang/String;)V"),
+            vec!["I", "[[Ljava/lang/String;"]
+        );
     }
-    n
+
+    #[test]
+    fn java_and_scala_erased_mapping_keep_boxed_unit_distinct() {
+        let mut st = SymbolTable::new();
+        let (scala_params, _) = parse_method_desc_with_source(
+            &mut st,
+            "(Lscala/runtime/BoxedUnit;[Lpkg/Outer$Inner;)V",
+            DescriptorSource::ScalaErased,
+        );
+        assert_eq!(scala_params[0], Type::Unit);
+
+        let (java_params, _) = parse_method_desc_with_source(
+            &mut st,
+            "(Lscala/runtime/BoxedUnit;[Lpkg/Outer$Inner;)V",
+            DescriptorSource::Java,
+        );
+        assert!(matches!(java_params[0], Type::Class { .. }));
+        assert!(!matches!(java_params[0], Type::Unit));
+        let inner = match &java_params[1] {
+            Type::Array(inner) => match &**inner {
+                Type::Class { sym, .. } => *sym,
+                other => panic!("expected nested array element class, got {other:?}"),
+            },
+            other => panic!("expected array, got {other:?}"),
+        };
+        assert_eq!(st.get(inner).jvm_name, "pkg/Outer$Inner");
+
+        assert_eq!(
+            field_ty_from_desc(&mut st, "[Lscala/runtime/BoxedUnit;"),
+            Type::Array(Box::new(Type::Unit))
+        );
+    }
 }
 
 #[cfg(test)]

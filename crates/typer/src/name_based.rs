@@ -402,10 +402,10 @@ impl Typer {
         };
         match is_empty {
             Some((is_empty, ty)) if matches!(self.st.dealias(&ty), Type::Boolean) => {
-                if !self.st.name_based_unapply.contains_key(&unapply) {
+                if self.st.name_based_unapply(unapply).is_none() {
                     let result_class = self.st.class_sym_of(ret).unwrap_or(SymbolId::NONE);
                     let result_tmp = self.alloc_extractor_tmp("unapply$result", ret);
-                    self.st.name_based_unapply.insert(
+                    self.st.record_name_based_unapply(
                         unapply,
                         NameBasedUnapply {
                             is_empty,
@@ -463,11 +463,12 @@ impl Typer {
         if tys.is_empty() {
             return vec![get_ty.clone()];
         }
-        if tys.len() == n && !self.st.unapply_selectors.contains_key(&(unapply, n)) {
+        if tys.len() == n && self.st.unapply_selectors(unapply, n).is_none() {
             let class = self.st.class_sym_of(get_ty).unwrap_or(SymbolId::NONE);
             let tmp = self.alloc_extractor_tmp("unapply$get", get_ty);
-            self.st.unapply_selectors.insert(
-                (unapply, n),
+            self.st.record_unapply_selectors(
+                unapply,
+                n,
                 UnapplySelectors {
                     selectors,
                     tmp,

@@ -167,6 +167,7 @@ pub use check::{
     typecheck_units_src, ClasspathClass, ClasspathField, ClasspathMethod, ClasspathPickleMethod,
     ClasspathType, ClasspathTypeParam, TypecheckOptions, Typer,
 };
+pub use classpath::adapt_classpath;
 pub use default_recv::hoist_default_receivers;
 pub use erasure::{erase, erase_type, note_source_value_classes};
 pub use expand_private::{expand_private_names, expand_trait_private_vals};

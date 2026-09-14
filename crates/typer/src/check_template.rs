@@ -91,13 +91,11 @@ impl Typer {
     /// completed local bodies: the later template pass does not revisit them.
     /// Top-level and member templates still use the ordinary two-pass entry.
     pub(crate) fn type_local_template(&mut self, tree: &mut Tree) {
-        let saved = std::mem::replace(&mut self.sigs_only, false);
-        match &tree.kind {
-            TreeKind::ClassDef { .. } => self.type_class(tree),
-            TreeKind::ModuleDef { .. } => self.type_module(tree),
+        self.with_sigs_only(false, |this| match &tree.kind {
+            TreeKind::ClassDef { .. } => this.type_class(tree),
+            TreeKind::ModuleDef { .. } => this.type_module(tree),
             _ => unreachable!("local template must be a class or object"),
-        }
-        self.sigs_only = saved;
+        });
     }
 
     pub(crate) fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {
@@ -374,24 +372,24 @@ impl Typer {
             }
         }
         let mut pts = Vec::new();
-        let saved_parent_ctx = self.parent_ctx.replace((id, saved_this));
         let mut visible_in_args: Vec<SymbolId> = self.st.get(id).tparams.clone();
         visible_in_args.extend(all_ctor_params.iter().copied());
-        let saved_arg_scope = self.parent_arg_scope.replace((id, visible_in_args));
-        for p in parents.iter_mut() {
-            self.type_parent(p);
-            // A parent is stored as the class it names: every reader of
-            // `parents` matches `Type::Class`. The prefix an inner-class
-            // parent was written with is kept beside it (`prefix.rs`).
-            if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
-                self.st
-                    .parent_prefixes
-                    .insert((id.0, pts.len()), pre.clone());
-            }
-            pts.push(crate::prefix::parent_form(&p.ty));
-        }
-        self.parent_arg_scope = saved_arg_scope;
-        self.parent_ctx = saved_parent_ctx;
+        self.with_parent_context(Some((id, saved_this)), |this| {
+            this.with_parent_arg_scope(Some((id, visible_in_args)), |this| {
+                for p in parents.iter_mut() {
+                    this.type_parent(p);
+                    // A parent is stored as the class it names: every reader of
+                    // `parents` matches `Type::Class`. The prefix an inner-class
+                    // parent was written with is kept beside it (`prefix.rs`).
+                    if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
+                        this.st
+                            .parent_prefixes
+                            .insert((id.0, pts.len()), pre.clone());
+                    }
+                    pts.push(crate::prefix::parent_form(&p.ty));
+                }
+            });
+        });
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
         }
@@ -762,22 +760,22 @@ impl Typer {
             _ => return,
         };
         let mut pts = Vec::new();
-        let saved_parent_ctx = self.parent_ctx.replace((cls, saved_this));
-        let saved_arg_scope = self.parent_arg_scope.replace((cls, Vec::new()));
-        for p in parents.iter_mut() {
-            // Parents are types: `object B extends B` extends the *trait* B,
-            // not itself. Typing them as expressions picks the module.
-            self.type_parent(p);
-            if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
-                self.st
-                    .parent_prefixes
-                    .insert((cls.0, pts.len()), pre.clone());
-            }
-            pts.push(crate::prefix::parent_form(&p.ty));
-        }
+        self.with_parent_context(Some((cls, saved_this)), |this| {
+            this.with_parent_arg_scope(Some((cls, Vec::new())), |this| {
+                for p in parents.iter_mut() {
+                    // Parents are types: `object B extends B` extends the *trait* B,
+                    // not itself. Typing them as expressions picks the module.
+                    this.type_parent(p);
+                    if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
+                        this.st
+                            .parent_prefixes
+                            .insert((cls.0, pts.len()), pre.clone());
+                    }
+                    pts.push(crate::prefix::parent_form(&p.ty));
+                }
+            });
+        });
         pts.retain(|t| !matches!(t, Type::ModuleRef(m) if *m == cls));
-        self.parent_arg_scope = saved_arg_scope;
-        self.parent_ctx = saved_parent_ctx;
         if !pts.is_empty() {
             self.st.get_mut(cls).parents = pts;
         }
@@ -1594,7 +1592,7 @@ impl Typer {
             // Source and prelude symbols already have their authoritative
             // hierarchy. Loading a classfile here would replace approximated
             // collection declarations while an unrelated class is checked.
-            if c.0 >= self.st.prelude_end && !self.st.source_classes.contains(&c) {
+            if c.0 >= self.st.prelude_end && !self.st.is_source_class(c) {
                 self.ensure_java_loaded(c, span);
             }
             for parent in self.st.get(c).parents.clone() {

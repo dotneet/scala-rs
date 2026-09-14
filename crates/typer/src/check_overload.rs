@@ -1303,11 +1303,10 @@ impl Typer {
                 .map(|p| crate::symbol::subst_tparams_slice(&tps, &tys, p))
                 .collect()
         };
-        let saved = self.spec_probe.replace(true);
-        let out = self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[], None)
-            && self.function_params_conform(&a_ps, &b_ps);
-        self.spec_probe.set(saved);
-        out
+        self.with_spec_probe(true, || {
+            self.is_applicable(SymbolId::NONE, 0, &b_ps, &a_ps, with_views, &[], None)
+                && self.function_params_conform(&a_ps, &b_ps)
+        })
     }
 
     /// `A`'s parameter types read as the *argument* types of the hypothetical

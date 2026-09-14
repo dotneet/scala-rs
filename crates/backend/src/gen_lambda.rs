@@ -380,7 +380,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
     ctx_hoist: Option<&'a str>,
     source: &'a str,
     class_sym: SymbolId,
-    library_abi: bool,
+    abi: AbiMode,
     orig_class: &str,
     lam_name: &str,
     outer_desc: &str,
@@ -415,7 +415,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
     b.add_code(ACC_PUBLIC, "isDefinedAt", "(Ljava/lang/Object;)Z", 8, |a| {
         let mut fr = Frame::instance();
         fr.next_slot = 2;
-        pf_bind_arg_and_captures(a, &mut fr, st, &lam1, &vparams1, &caps1, boxed_vars);
+        pf_bind_arg_and_captures(a, &mut fr, st, &lam1, &vparams1, &caps1, boxed_vars, abi);
         let some = a.fresh_label();
         let no = a.fresh_label();
         let sel_sort = jvm_sort(&sel1);
@@ -447,7 +447,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
                         presuper_outer: None,
                         presuper: false,
                         outer_slot: None,
-                        library_abi,
+                        abi,
                         method_sym: SymbolId::NONE,
                         boxed_vars,
                         value_ext: None,
@@ -479,7 +479,16 @@ pub(crate) fn emit_partial_function_methods<'a>(
         |a| {
             let mut fr = Frame::instance();
             fr.next_slot = 3;
-            pf_bind_arg_and_captures(a, &mut fr, st, &lam_name, &vparams, &local_caps, boxed_vars);
+            pf_bind_arg_and_captures(
+                a,
+                &mut fr,
+                st,
+                &lam_name,
+                &vparams,
+                &local_caps,
+                boxed_vars,
+                abi,
+            );
             let end = a.fresh_label();
             let sel_sort = jvm_sort(&sel_ty);
             if let Some(p) = vparams.first() {
@@ -510,7 +519,7 @@ pub(crate) fn emit_partial_function_methods<'a>(
                             presuper_outer: None,
                             presuper: false,
                             outer_slot: None,
-                            library_abi,
+                            abi,
                             method_sym: SymbolId::NONE,
                             boxed_vars,
                             value_ext: None,
@@ -566,18 +575,19 @@ pub(crate) fn pf_bind_arg_and_captures(
     vparams: &[Tree],
     local_caps: &[SymbolId],
     boxed: &HashSet<SymbolId>,
+    abi: AbiMode,
 ) {
     if let Some(p) = vparams.first() {
         a.aload(1);
         if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
-            emit_unbox(a, &p.ty);
+            emit_unbox(a, &p.ty, abi);
         } else if let Type::Class { sym, .. } = &p.ty {
             let n = class_internal(st, *sym);
             if !n.is_empty() && n != "java/lang/Object" {
                 a.checkcast(&n);
             }
         } else {
-            emit_unbox(a, &p.ty);
+            emit_unbox(a, &p.ty, abi);
         }
         let sort = jvm_sort(&p.ty);
         let slot = fr.alloc(p.sym, sort);
@@ -592,7 +602,7 @@ pub(crate) fn pf_bind_arg_and_captures(
             let slot = fr.alloc(*id, JvmSort::Ref);
             store(a, slot, JvmSort::Ref);
         } else {
-            emit_from_erased_object(a, st, &ty);
+            emit_from_erased_object(a, st, &ty, abi);
             let sort = jvm_sort(&ty);
             let slot = fr.alloc(*id, sort);
             store(a, slot, sort);
@@ -702,7 +712,7 @@ pub(crate) fn gen_function_indy(
         &impl_name,
         &impl_desc,
         owner_is_iface,
-        ctx.library_abi,
+        ctx.abi.is_library(),
     );
 
     ctx.lambda_bodies.borrow_mut().push(PendingBody {
@@ -730,7 +740,7 @@ pub(crate) fn emit_lambda_body(
     lambda_n: &Cell<u32>,
     lambda_bodies: &RefCell<Vec<PendingBody>>,
     source: &str,
-    library_abi: bool,
+    abi: AbiMode,
     boxed: &HashSet<SymbolId>,
     emit_errors: Rc<RefCell<Vec<EmitError>>>,
     pb: PendingBody,
@@ -764,7 +774,7 @@ pub(crate) fn emit_lambda_body(
                 st.get(p.sym).ty.clone()
             };
             a.aload(obj_slot);
-            unerase_lambda_param(a, st, &ty);
+            unerase_lambda_param(a, st, &ty, abi);
             let sort = jvm_sort(&ty);
             let slot = fr.alloc(p.sym, sort);
             store(a, slot, sort);
@@ -777,7 +787,7 @@ pub(crate) fn emit_lambda_body(
                 let slot = fr.alloc(*id, JvmSort::Ref);
                 store(a, slot, JvmSort::Ref);
             } else {
-                emit_from_erased_object(a, st, &ty);
+                emit_from_erased_object(a, st, &ty, abi);
                 let sort = jvm_sort(&ty);
                 let slot = fr.alloc(*id, sort);
                 store(a, slot, sort);
@@ -798,7 +808,7 @@ pub(crate) fn emit_lambda_body(
             presuper_outer: None,
             presuper: false,
             outer_slot: if pb.has_outer { Some(0) } else { None },
-            library_abi,
+            abi,
             method_sym: SymbolId::NONE,
             boxed_vars: boxed,
             value_ext: None,
@@ -820,9 +830,9 @@ pub(crate) fn emit_lambda_body(
 
 /// Bring a lambda parameter back from the erased `Object` slot the SAM hands
 /// it in. Shared by the `invokedynamic` body and the anonymous-class `apply`.
-pub(crate) fn unerase_lambda_param(a: &mut Assembler, st: &SymbolTable, ty: &Type) {
+pub(crate) fn unerase_lambda_param(a: &mut Assembler, st: &SymbolTable, ty: &Type, abi: AbiMode) {
     if is_jvm_primitive(ty) || matches!(ty, Type::String) {
-        emit_unbox(a, ty);
+        emit_unbox(a, ty, abi);
     } else if let Type::Array(elem) = ty {
         // An `Array` parameter arrives in the erased `Object` slot, and
         // `arraylength` / `aaload` / `aastore` all reject a plain `Object`:
@@ -848,7 +858,7 @@ pub(crate) fn unerase_lambda_param(a: &mut Assembler, st: &SymbolTable, ty: &Typ
         // the verifier threw the whole method out for.
         a.checkcast(&format!("scala/Tuple{}", ts.len().max(1)));
     } else {
-        emit_unbox(a, ty);
+        emit_unbox(a, ty, abi);
     }
 }
 
@@ -1063,7 +1073,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     let hoist_owner = ctx.hoist_owner;
     let source = ctx.source;
     let class_sym = ctx.class_sym;
-    let library_abi = ctx.library_abi;
+    let abi = ctx.abi;
     let boxed = ctx.boxed_vars;
     let orig_class = ctx.class_name.to_string();
     let lam_name2 = lam_name.clone();
@@ -1170,7 +1180,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 }
                 a.aload(obj_slot);
                 if is_jvm_primitive(&p.ty) || matches!(p.ty, Type::String) {
-                    emit_unbox(a, &p.ty);
+                    emit_unbox(a, &p.ty, abi);
                 } else if let Type::Array(elem) = &p.ty {
                     // An `Array` parameter arrives in the erased `Object` slot,
                     // and `arraylength` / `aaload` / `aastore` all reject a plain
@@ -1191,7 +1201,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 } else if let Type::Tuple(ts) = &p.ty {
                     a.checkcast(&format!("scala/Tuple{}", ts.len().max(1)));
                 } else {
-                    emit_unbox(a, &p.ty);
+                    emit_unbox(a, &p.ty, abi);
                 }
                 let sort = jvm_sort(&p.ty);
                 let slot = fr.alloc(p.sym, sort);
@@ -1206,7 +1216,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                     let slot = fr.alloc(*id, JvmSort::Ref);
                     store(a, slot, JvmSort::Ref);
                 } else {
-                    emit_from_erased_object(a, st, &ty);
+                    emit_from_erased_object(a, st, &ty, abi);
                     let sort = jvm_sort(&ty);
                     let slot = fr.alloc(*id, sort);
                     store(a, slot, sort);
@@ -1234,7 +1244,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 presuper_outer: None,
                 presuper: false,
                 outer_slot: None,
-                library_abi,
+                abi,
                 method_sym: SymbolId::NONE,
                 boxed_vars: boxed,
                 value_ext: None,
@@ -1275,7 +1285,7 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
             hoist_owner,
             source,
             class_sym,
-            library_abi,
+            abi,
             &orig_class,
             &lam_name2,
             &outer_desc,
@@ -1534,8 +1544,8 @@ pub(crate) fn gen_any_eq(
     // that is not reflexive, saw `x == x` skip it.
     let arg_ty = arg.map(|a| a.ty.clone()).unwrap_or(Type::Null);
     let any_comparator =
-        !ctx.library_abi || (maybe_boxed(ctx.st, &recv_ty) && maybe_boxed(ctx.st, &arg_ty));
-    if ctx.library_abi && any_comparator {
+        ctx.abi.is_private() || (maybe_boxed(ctx.st, &recv_ty) && maybe_boxed(ctx.st, &arg_ty));
+    if ctx.abi.is_library() && any_comparator {
         asm.invokestatic(
             "scala/runtime/BoxesRunTime",
             "equals",
@@ -1707,7 +1717,7 @@ pub(crate) fn gen_synchronized(
             }
             _ => {
                 if matches!(&produced_ty, Type::Function { .. }) {
-                    emit_unbox(asm, result_ty);
+                    emit_unbox(asm, result_ty, ctx.abi);
                 }
             }
         }

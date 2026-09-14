@@ -319,7 +319,7 @@ impl<'a> Gen<'a> {
                 &self.lambda_n,
                 &self.lambda_bodies,
                 self.source_name,
-                self.library_abi,
+                self.abi,
                 &self.boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
                 pb,
@@ -390,8 +390,8 @@ impl<'a> Gen<'a> {
                     if !is_trait_private_def(self.st, stt) && rhs.is_empty() {
                         let acc = method_access_flags(mods.flags, widened(self.st, stt.sym))
                             | ACC_ABSTRACT;
-                        b.add_abstract(acc, name, &def_method_desc(self.st, stt));
-                        b.sign_last(self.sig_of(stt.sym));
+                        let method = b.add_abstract(acc, name, &def_method_desc(self.st, stt));
+                        b.sign_method(method, self.sig_of(stt.sym));
                     }
                     let mut super_accesses = Vec::new();
                     collect_super_accesses(rhs, &mut super_accesses);
@@ -431,22 +431,26 @@ impl<'a> Gen<'a> {
                     // static beside it and leaves the caching to the
                     // implementing class. `emit_trait_bodies` emits both.
                     if !(mods.flags.contains(Flags::LAZY) && !rhs.is_empty()) {
-                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
-                        b.sign_last_accessor(self.sig_of(stt.sym), false);
+                        let method = b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, name, &gdesc);
+                        b.sign_method_accessor(method, self.sig_of(stt.sym), false);
                     }
                     let sdesc = format!("({})V", jvm_desc_val(self.st, &ty));
                     if mods.flags.contains(Flags::MUTABLE) {
                         // A trait `var` — abstract or not — is a getter plus a
                         // public `v_$eq`, exactly as nsc emits it.
-                        b.add_abstract(ACC_PUBLIC | ACC_ABSTRACT, &var_setter_name(name), &sdesc);
-                        b.sign_last_accessor(self.sig_of(stt.sym), true);
+                        let method = b.add_abstract(
+                            ACC_PUBLIC | ACC_ABSTRACT,
+                            &var_setter_name(name),
+                            &sdesc,
+                        );
+                        b.sign_method_accessor(method, self.sig_of(stt.sym), true);
                     } else if !rhs.is_empty() && !mods.flags.contains(Flags::LAZY) {
-                        b.add_abstract(
+                        let method = b.add_abstract(
                             ACC_PUBLIC | ACC_ABSTRACT,
                             &trait_val_setter_name(self.st, class_id, name),
                             &sdesc,
                         );
-                        b.sign_last_accessor(self.sig_of(stt.sym), true);
+                        b.sign_method_accessor(method, self.sig_of(stt.sym), true);
                     }
                 }
             }
@@ -728,7 +732,7 @@ impl<'a> Gen<'a> {
         let class_name = b.this_name.clone();
         let is_app = extends_app(self.st, class_id);
         if is_app {
-            if self.library_abi {
+            if self.abi.is_library() {
                 self.emit_app_library_members(b, &class_name, is_module);
             } else {
                 self.emit_app_private_members(b, &class_name);
@@ -1039,7 +1043,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let stats: Vec<Tree> = body
             .iter()
@@ -1059,7 +1063,7 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
@@ -1219,7 +1223,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
         let delayed_stats = Gen::has_delayed_stats(body);
@@ -1239,7 +1243,7 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
@@ -1359,7 +1363,7 @@ impl<'a> Gen<'a> {
                     &ctx_early,
                     &super_args,
                     &super_field_tys,
-                    library_abi,
+                    abi.is_library(),
                     java_varargs,
                     ctor,
                     false,
@@ -1410,12 +1414,12 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
             if delayed {
-                if library_abi && is_app {
+                if abi.is_library() && is_app {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
@@ -1503,16 +1507,16 @@ impl<'a> Gen<'a> {
         let ret = method_ret_ty(def);
         let acc = method_access_flags(mods.flags, widened(self.st, def.sym));
         if mods.flags.contains(Flags::NATIVE) {
-            b.add_abstract(acc, name, &desc);
-            b.sign_last(self.sig_of(def.sym));
+            let method = b.add_abstract(acc, name, &desc);
+            b.sign_method(method, self.sig_of(def.sym));
             if let Some(d) = java_deprecated_desc(mods) {
                 b.add_java_annot_to_last(d);
             }
             return;
         }
         if rhs.is_empty() {
-            b.add_abstract(acc | ACC_ABSTRACT, name, &desc);
-            b.sign_last(self.sig_of(def.sym));
+            let method = b.add_abstract(acc | ACC_ABSTRACT, name, &desc);
+            b.sign_method(method, self.sig_of(def.sym));
             if let Some(d) = java_deprecated_desc(mods) {
                 b.add_java_annot_to_last(d);
             }
@@ -1554,7 +1558,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let meth = def.sym;
         let caps = if acc & ACC_STATIC == 0 {
@@ -1570,7 +1574,7 @@ impl<'a> Gen<'a> {
         } else {
             acc
         };
-        b.add_code(acc, name, &desc, max_locals, |asm| {
+        let method = b.add_code(acc, name, &desc, max_locals, |asm| {
             let mut frame = frame;
             let mut ctx = emit_ctx(
                 st,
@@ -1582,7 +1586,7 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
@@ -1597,7 +1601,7 @@ impl<'a> Gen<'a> {
         if let Some(error) = tailrec_error {
             b.format_errors.push(error);
         }
-        b.sign_last(self.sig_of(def.sym));
+        b.sign_method(method, self.sig_of(def.sym));
         if let Some(d) = java_deprecated_desc(mods) {
             b.add_java_annot_to_last(d);
         }
@@ -1792,7 +1796,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let method = def.sym;
         let mut tailrec_error = None;
@@ -1813,7 +1817,7 @@ impl<'a> Gen<'a> {
                     lambda_bodies,
                     Some(&hoist_owner),
                     source,
-                    library_abi,
+                    abi,
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );

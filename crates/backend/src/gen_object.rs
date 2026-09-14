@@ -232,7 +232,7 @@ impl<'a> Gen<'a> {
             if self.st.get(class_id).flags.contains(Flags::CASE)
                 && !impl_.body.iter().any(|t| t.name() == Some("unapply"))
             {
-                emit_case_unapply(&mut b, self.st, class_id, self.library_abi);
+                emit_case_unapply(&mut b, self.st, class_id, self.abi);
             }
         }
 
@@ -371,7 +371,7 @@ impl<'a> Gen<'a> {
         let lambda_bodies = &self.lambda_bodies;
         let hoist_owner = b.this_name.clone();
         let source = self.source_name;
-        let library_abi = self.library_abi;
+        let abi = self.abi;
         let boxed_vars = &self.boxed_vars;
         let delayed = extends_delayed_init(st, class_id);
         let delayed_stats = Gen::has_delayed_stats(body);
@@ -416,7 +416,7 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
@@ -448,7 +448,7 @@ impl<'a> Gen<'a> {
                 lambda_bodies,
                 Some(&hoist_owner),
                 source,
-                library_abi,
+                abi,
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
@@ -526,7 +526,7 @@ impl<'a> Gen<'a> {
                     &ctx_early,
                     &super_args,
                     &super_field_tys,
-                    library_abi,
+                    abi.is_library(),
                     java_varargs,
                     ctor,
                     false,
@@ -559,7 +559,7 @@ impl<'a> Gen<'a> {
                 asm.invokestatic_interface(iface, "$init$", init_desc);
             }
             if delayed {
-                if library_abi && is_app {
+                if abi.is_library() && is_app {
                     asm.aload(0);
                     asm.invokestatic_interface("scala/App", "$init$", "(Lscala/App;)V");
                 }
@@ -894,9 +894,9 @@ impl<'a> Gen<'a> {
             self.emit_module_clinit(&mut b);
         }
         emit_case_apply(&mut b, self.st, class_id);
-        emit_case_unapply(&mut b, self.st, class_id, self.library_abi);
+        emit_case_unapply(&mut b, self.st, class_id, self.abi);
         if abs_fn.is_some() {
-            emit_case_apply_bridge(&mut b, self.st, class_id);
+            emit_case_apply_bridge(&mut b, self.st, class_id, self.abi);
         }
         // nsc's `caseModuleToStringMethod`: a case class's companion prints as
         // the class's name. Without it the companion inherited
@@ -953,7 +953,7 @@ impl<'a> Gen<'a> {
     /// the private runtime has no `scala/Product`, and naming an interface
     /// that will not be on the classpath makes the class unloadable.
     pub(crate) fn add_product_interfaces(&self, b: &mut ClassBuilder) {
-        if self.library_abi && !b.interfaces.iter().any(|i| i == "scala/Product") {
+        if self.abi.is_library() && !b.interfaces.iter().any(|i| i == "scala/Product") {
             b.interfaces.push("scala/Product".into());
         }
         self.add_serializable(b);
@@ -1128,7 +1128,7 @@ pub(crate) fn emit_product_accessors(
     class_jvm: &str,
     field_info: &[(String, Type, String)],
     field_vc: &[Option<(String, String)>],
-    library_abi: bool,
+    abi: AbiMode,
     module: bool,
 ) {
     let n = field_info.len();
@@ -1169,7 +1169,7 @@ pub(crate) fn emit_product_accessors(
                     }
                 }
                 asm.mark(dflt);
-                emit_ioobe(asm, library_abi, false);
+                emit_ioobe(asm, abi, false);
             },
         );
     }
@@ -1182,7 +1182,7 @@ pub(crate) fn emit_product_accessors(
             3,
             move |asm| {
                 if module {
-                    emit_default_product_element_name(asm, library_abi, n as i32);
+                    emit_default_product_element_name(asm, abi, n as i32);
                     return;
                 }
                 let dflt = asm.fresh_label();
@@ -1197,11 +1197,11 @@ pub(crate) fn emit_product_accessors(
                     }
                 }
                 asm.mark(dflt);
-                emit_ioobe(asm, library_abi, true);
+                emit_ioobe(asm, abi, true);
             },
         );
     }
-    if !library_abi {
+    if abi.is_private() {
         return;
     }
     if !defined.contains("productIterator") {
@@ -1252,12 +1252,8 @@ pub(crate) fn emit_product_accessors(
 ///
 /// Without the jar the same message is built here, so the two library modes do
 /// not disagree about what a `case object` throws.
-pub(crate) fn emit_default_product_element_name(
-    asm: &mut Assembler,
-    library_abi: bool,
-    arity: i32,
-) {
-    if library_abi {
+pub(crate) fn emit_default_product_element_name(asm: &mut Assembler, abi: AbiMode, arity: i32) {
+    if abi.is_library() {
         asm.aload(0);
         asm.iload(1);
         asm.invokestatic_interface(
@@ -1309,8 +1305,8 @@ pub(crate) fn emit_default_product_element_name(
 /// writes `areturn` after the call even though it never returns; without the
 /// jar the throw is written out here instead, and then there is nothing to
 /// return from.
-pub(crate) fn emit_ioobe(asm: &mut Assembler, library_abi: bool, as_string: bool) {
-    if library_abi {
+pub(crate) fn emit_ioobe(asm: &mut Assembler, abi: AbiMode, as_string: bool) {
+    if abi.is_library() {
         asm.iload(1);
         asm.invokestatic("scala/runtime/Statics", "ioobe", "(I)Ljava/lang/Object;");
         if as_string {
@@ -1383,7 +1379,12 @@ pub(crate) fn emit_case_companion_to_string(
 /// extends `scala.runtime.AbstractFunctionN` has to implement. nsc emits it as
 /// `public java.lang.Object apply(java.lang.Object, java.lang.Object)` right
 /// after the typed `apply`.
-pub(crate) fn emit_case_apply_bridge(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+pub(crate) fn emit_case_apply_bridge(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    class_id: SymbolId,
+    abi: AbiMode,
+) {
     let fields = st.get(class_id).ctor_fields.clone();
     let tys: Vec<Type> = fields.iter().map(|f| st.get(*f).ty.clone()).collect();
     let ret = Type::Class {
@@ -1413,7 +1414,7 @@ pub(crate) fn emit_case_apply_bridge(b: &mut ClassBuilder, st: &SymbolTable, cla
             if erases_to_boxed_unit(ty) {
                 asm.checkcast(BOXED_UNIT);
             } else if is_jvm_primitive(ty) {
-                emit_unbox(asm, ty);
+                emit_unbox(asm, ty, abi);
             } else if let Some(internal) = checkcast_internal(st, ty) {
                 asm.checkcast(&internal);
             }
@@ -1570,7 +1571,7 @@ pub(crate) fn emit_case_unapply(
     b: &mut ClassBuilder,
     st: &SymbolTable,
     class_id: SymbolId,
-    library_abi: bool,
+    abi: AbiMode,
 ) {
     let sym = case_unapply_sym(st, class_id);
     if sym.is_none() {
@@ -1612,7 +1613,7 @@ pub(crate) fn emit_case_unapply(
     // `TupleN` above 2 is not part of the private runtime, so a wider case
     // class keeps the gap it has today rather than getting a method that
     // cannot link.
-    if arity > 2 && !library_abi {
+    if arity > 2 && abi.is_private() {
         return;
     }
     let class_jvm = class_internal(st, class_id);
@@ -1671,7 +1672,7 @@ pub(crate) fn emit_case_unapply(
         .iter()
         .map(|f| {
             let s = st.get(*f);
-            let vc = st.value_class_terms.get(f).and_then(|&c| {
+            let vc = st.value_class_for_term(*f).and_then(|c| {
                 let under = st.value_class_underlying(c)?;
                 Some((
                     class_internal(st, c),

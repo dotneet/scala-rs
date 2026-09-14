@@ -43,7 +43,7 @@ pub(crate) fn gen_java_varargs_array(
             if is_jvm_primitive(&a.ty) && !is_unit_like(&a.ty) {
                 emit_prim_qualifier_cast(asm, &a.ty, &elem);
             } else {
-                emit_unbox(asm, &elem);
+                emit_unbox(asm, &elem, ctx.abi);
             }
         } else if is_jvm_primitive(&a.ty) {
             emit_box(asm, &a.ty);
@@ -204,7 +204,7 @@ pub(crate) fn gen_wrap_varargs(
             "wrapIntArray",
             "([I)Lscala/collection/immutable/ArraySeq;",
         );
-    } else if all_unit && ctx.library_abi {
+    } else if all_unit && ctx.abi.is_library() {
         // nsc `Array((), ())` uses wrapUnitArray of BoxedUnit.UNIT, not null.
         // Erasure may wrap some elems in `$box`, so treat those as Unit too.
         asm.anewarray("scala/runtime/BoxedUnit");
@@ -597,10 +597,10 @@ pub(crate) fn gen_call_args(
         //
         // A *Java* varargs method is the exception: its parameter is the
         // array itself, and nsc passes an `Array` straight through.
-        if !java_varargs && ctx.library_abi && matches!(inner.ty, Type::Array(_)) {
+        if !java_varargs && ctx.abi.is_library() && matches!(inner.ty, Type::Array(_)) {
             emit_array_copy_to_immutable_seq(asm);
         }
-        if java_varargs && ctx.library_abi {
+        if java_varargs && ctx.abi.is_library() {
             let elem_ty = match &var_args[0].ty {
                 Type::Repeated(t) => t.as_ref().clone(),
                 _ => elem.clone(),
@@ -804,15 +804,7 @@ pub(crate) fn method_erases_unit_to_ref(fun: &Tree, st: &SymbolTable) -> bool {
 /// `SymbolTable::source_classes` records an `object`'s *module* symbol, while
 /// a method's owner is the module *class*, so both spellings have to match.
 pub(crate) fn owner_defined_in_source(st: &SymbolTable, owner: SymbolId) -> bool {
-    if st.source_classes.contains(&owner) {
-        return true;
-    }
-    if st.get(owner).kind != SymKind::ModuleClass {
-        return false;
-    }
-    st.source_classes
-        .iter()
-        .any(|&m| st.module_class_of(m) == owner)
+    st.is_source_owner(owner)
 }
 
 /// A `Unit`-typed expression in *statement* position whose emitted code left a
@@ -1178,11 +1170,11 @@ pub(crate) fn emit_box_inner(asm: &mut Assembler, ty: &Type) {
     }
 }
 
-pub(crate) fn emit_unbox(asm: &mut Assembler, ty: &Type) {
-    emit_unbox_inner(asm, &ty.widen_constant())
+pub(crate) fn emit_unbox(asm: &mut Assembler, ty: &Type, abi: AbiMode) {
+    emit_unbox_inner(asm, &ty.widen_constant(), abi)
 }
 
-pub(crate) fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
+pub(crate) fn emit_unbox_inner(asm: &mut Assembler, ty: &Type, abi: AbiMode) {
     // nsc unboxes through `BoxesRunTime.unboxToX`, which answers the zero of
     // the type for `null` -- a `null.asInstanceOf[Int]`, or an erased `A`
     // instantiated at `Int` that nobody assigned (`fold[Int, Int]` handing
@@ -1190,7 +1182,7 @@ pub(crate) fn emit_unbox_inner(asm: &mut Assembler, ty: &Type) {
     // reference is a `NullPointerException` (`run/function-null-unbox`,
     // `run/t7584b`, `run/t7899`, `run/t5866`). The private runtime has no
     // `BoxesRunTime`, so it keeps the direct form.
-    if emitting_library_abi() {
+    if abi.is_library() {
         let unbox = match ty {
             Type::Int => Some(("unboxToInt", "(Ljava/lang/Object;)I")),
             Type::Boolean => Some(("unboxToBoolean", "(Ljava/lang/Object;)Z")),
@@ -1278,7 +1270,7 @@ pub(crate) fn boxed_internal_name(ty: &Type) -> Option<&'static str> {
 /// emits `checkcast` against a type with real runtime class information.
 pub(crate) fn emit_as_instance_of(asm: &mut Assembler, ctx: &EmitCtx, target: &Type) {
     if boxed_internal_name(target).is_some() {
-        emit_unbox(asm, target);
+        emit_unbox(asm, target, ctx.abi);
         return;
     }
     match target {
@@ -1429,9 +1421,9 @@ pub(crate) fn gen_function_apply(
     desc.push_str(")Ljava/lang/Object;");
     asm.invokeinterface(&iface, "apply", &desc);
     if is_jvm_primitive(result_ty) {
-        emit_unbox(asm, result_ty);
+        emit_unbox(asm, result_ty, ctx.abi);
     } else if matches!(result_ty, Type::String) {
-        emit_unbox(asm, result_ty);
+        emit_unbox(asm, result_ty, ctx.abi);
     } else if let Some(cn) = checkcast_internal(ctx.st, result_ty) {
         // `FunctionN.apply` erases to `Object`; every reference result owes a
         // cast. This used to name only `Class` and `Function` (the latter for

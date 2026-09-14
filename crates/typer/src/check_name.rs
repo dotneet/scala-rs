@@ -248,49 +248,53 @@ impl Typer {
             self.language_reflective_calls = true;
         }
         let span = tree.span;
-        let saved_origin = self.import_origin;
-        self.import_origin = ((self.file_index as u64 + 1) << 32) | (span.lo.0 as u64 + 1);
-        self.record_import_text(span);
-        match &mut expr.kind {
-            TreeKind::Select { qual, name } if name == "_" => {
-                let owners = self.import_prefix(qual, span);
-                self.import_wildcard(&owners, &[], span, qual);
-            }
-            TreeKind::Select { qual, name } if name.starts_with('{') => {
-                let sels = decode_import_selectors(name);
-                let owners = self.import_prefix(qual, span);
-                let hidden: Vec<String> = sels
-                    .iter()
-                    .filter(|(from, to)| from != "_" && to == "_")
-                    .map(|(from, _)| from.clone())
-                    .collect();
-                let qual = (**qual).clone();
-                for (from, to) in &sels {
-                    if from == "_" || to == "_" {
-                        continue;
+        let origin = ((self.file_index as u64 + 1) << 32) | (span.lo.0 as u64 + 1);
+        self.with_import_origin(origin, |this| {
+            this.record_import_text(span);
+            match &mut expr.kind {
+                TreeKind::Select { qual, name } if name == "_" => {
+                    let owners = this.import_prefix(qual, span);
+                    this.import_wildcard(&owners, &[], span, qual);
+                }
+                TreeKind::Select { qual, name } if name.starts_with('{') => {
+                    let sels = decode_import_selectors(name);
+                    let owners = this.import_prefix(qual, span);
+                    let hidden: Vec<String> = sels
+                        .iter()
+                        .filter(|(from, to)| from != "_" && to == "_")
+                        .map(|(from, _)| from.clone())
+                        .collect();
+                    let qual = (**qual).clone();
+                    for (from, to) in &sels {
+                        if from == "_" || to == "_" {
+                            continue;
+                        }
+                        this.import_named(&owners, from, to, span, &qual);
                     }
-                    self.import_named(&owners, from, to, span, &qual);
+                    if sels.iter().any(|(from, _)| from == "_") {
+                        this.import_wildcard(&owners, &hidden, span, &qual);
+                    }
                 }
-                if sels.iter().any(|(from, _)| from == "_") {
-                    self.import_wildcard(&owners, &hidden, span, &qual);
+                TreeKind::Select { qual, name } => {
+                    let n = name.clone();
+                    let owners = this.import_prefix(qual, span);
+                    let qual = (**qual).clone();
+                    this.import_named(&owners, &n, &n, span, &qual);
                 }
-            }
-            TreeKind::Select { qual, name } => {
-                let n = name.clone();
-                let owners = self.import_prefix(qual, span);
-                let qual = (**qual).clone();
-                self.import_named(&owners, &n, &n, span, &qual);
-            }
-            TreeKind::Ident { name } => {
-                let n = name.clone();
-                for f in self.st.lookup(&n) {
-                    self.st
-                        .enter_import_in_current(&n, f, BindRank::Explicit, self.import_origin);
+                TreeKind::Ident { name } => {
+                    let n = name.clone();
+                    for f in this.st.lookup(&n) {
+                        this.st.enter_import_in_current(
+                            &n,
+                            f,
+                            BindRank::Explicit,
+                            this.import_origin,
+                        );
+                    }
                 }
+                _ => {}
             }
-            _ => {}
-        }
-        self.import_origin = saved_origin;
+        });
         tree.ty = Type::NoType;
     }
 

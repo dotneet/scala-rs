@@ -414,9 +414,6 @@ impl Typer {
             )
         });
         self.lazy_completing.push(id);
-        let saved_owner = self.st.owner;
-        let saved_this = self.st.this_class;
-        let saved_ret = self.return_meth;
         let saved_file = self.file_index;
         // A block-local definition keeps the live stack, cut back to its
         // block's own height (see `PendingSig::block_depth`); everything else
@@ -425,9 +422,6 @@ impl Typer {
             Some(d) if d <= self.st.scopes.len() => (Vec::new(), Some(self.st.scopes.split_off(d))),
             _ => (self.swap_in_pending_scopes(&p), None),
         };
-        self.st.owner = p.owner;
-        self.st.this_class = p.this_class;
-        self.return_meth = None;
         // The tree being completed carries spans relative to *its own* unit,
         // not whichever one was being typed when the forward/self reference
         // triggered this completion. Without this, a diagnostic raised while
@@ -445,30 +439,34 @@ impl Typer {
         self.file_index = p.file_index;
 
         let mut t = p.tree;
-        let is_val = matches!(t.kind, TreeKind::ValDef { .. });
-        if matches!(t.kind, TreeKind::TypeDef { .. }) {
-            self.complete_type_alias_tree(&mut t);
-        } else {
-            if !p.sig_done {
-                if is_val {
-                    self.type_val_sig(&mut t);
+        self.with_owner_this(p.owner, p.this_class, |this| {
+            this.with_return_meth(None, |this| {
+                let is_val = matches!(t.kind, TreeKind::ValDef { .. });
+                if matches!(t.kind, TreeKind::TypeDef { .. }) {
+                    this.complete_type_alias_tree(&mut t);
                 } else {
-                    self.type_def_sig(&mut t);
+                    if !p.sig_done {
+                        if is_val {
+                            this.type_val_sig(&mut t);
+                        } else {
+                            this.type_def_sig(&mut t);
+                        }
+                    } else {
+                        // `sig_done` means `type_def_sig` ran during the signature
+                        // pass, where an `override def` with no result type may have
+                        // found nothing to borrow only because the overridden member's
+                        // own file had not been walked yet. This is the last point
+                        // before the body is typed, so ask again.
+                        this.retry_overridden_ret(&mut t);
+                    }
+                    if is_val {
+                        this.type_val_body(&mut t);
+                    } else {
+                        this.type_def_body(&mut t);
+                    }
                 }
-            } else {
-                // `sig_done` means `type_def_sig` ran during the signature
-                // pass, where an `override def` with no result type may have
-                // found nothing to borrow only because the overridden member's
-                // own file had not been walked yet. This is the last point
-                // before the body is typed, so ask again.
-                self.retry_overridden_ret(&mut t);
-            }
-            if is_val {
-                self.type_val_body(&mut t);
-            } else {
-                self.type_def_body(&mut t);
-            }
-        }
+            });
+        });
 
         match block_tail {
             Some(tail) => {
@@ -479,9 +477,6 @@ impl Typer {
             }
             None => self.swap_back_scopes(saved_scopes),
         }
-        self.st.owner = saved_owner;
-        self.st.this_class = saved_this;
-        self.return_meth = saved_ret;
         self.file_index = saved_file;
         self.lazy_completing.pop();
         // A completion forced during the signature pass can read a member
