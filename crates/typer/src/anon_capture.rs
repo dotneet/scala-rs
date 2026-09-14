@@ -149,6 +149,18 @@ fn member_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool
         return false;
     }
     let owner = s.owner;
+    // `private[this]` members are not inherited (SLS 5.2), even when the
+    // enclosing anonymous class extends the declaring class.  The source
+    // reference therefore targets the lexical outer instance, not the
+    // anonymous class's inherited member namespace.
+    if s.flags.contains(Flags::PRIVATE)
+        && s.flags.contains(Flags::LOCAL)
+        && outer_chain(st, current)
+            .into_iter()
+            .any(|outer| outer == owner)
+    {
+        return true;
+    }
     // A template self alias is not an inherited member.  It denotes the
     // *particular enclosing instance* whose template declared it, even when
     // the anonymous class also inherits that template.  Treating it like an
