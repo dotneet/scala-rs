@@ -3888,6 +3888,25 @@ impl Typer {
 
     /// The conversion's own type arguments, solved from the receiver type.
     fn conv_targs(&self, id: SymbolId, from: &Type) -> Vec<Type> {
+        self.conv_targs_impl(id, from, true, false)
+    }
+
+    /// Solve a conversion's parameters from its receiver only.  A parameter
+    /// that appears solely in an implicit clause must stay open when the
+    /// conversion is being inserted with a known result; otherwise a witness
+    /// such as `Ordering[A]` can bind it before the result (and its actual
+    /// element type) is considered.
+    fn conv_targs_without_implicit_solution(&self, id: SymbolId, from: &Type) -> Vec<Type> {
+        self.conv_targs_impl(id, from, false, true)
+    }
+
+    fn conv_targs_impl(
+        &self,
+        id: SymbolId,
+        from: &Type,
+        solve_from_implicits: bool,
+        preserve_unresolved: bool,
+    ) -> Vec<Type> {
         let tps = &self.st.get(id).tparams;
         if tps.is_empty() {
             // No type arguments to infer. Callers still check the view's
@@ -3942,7 +3961,9 @@ impl Typer {
             .iter()
             .map(|tp| unify_conv_tparam(*tp, param, from))
             .collect();
-        self.solve_conv_targs_from_implicits(&cand_ty, tps, &mut solved);
+        if solve_from_implicits {
+            self.solve_conv_targs_from_implicits(&cand_ty, tps, &mut solved);
+        }
         let ret = match &*cand_ty {
             Type::Method { ret, .. } | Type::Function { ret, .. } => Some(ret.as_ref()),
             _ => None,
@@ -3954,7 +3975,9 @@ impl Typer {
                 t.unwrap_or_else(|| {
                     // A parameter escaping in the view result is still open.
                     // Replacing it with Object also fabricates ClassTag evidence.
-                    if ret.is_some_and(|r| crate::check::mentions_tparam(r, &[*tp])) {
+                    if preserve_unresolved
+                        || ret.is_some_and(|r| crate::check::mentions_tparam(r, &[*tp]))
+                    {
                         Type::TypeParam(*tp)
                     } else {
                         self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing)
@@ -4049,7 +4072,19 @@ impl Typer {
             return Vec::new();
         }
         let tps = self.st.get(id).tparams.clone();
-        let mut targs = self.conv_targs(id, from);
+        // When the conversion is being inserted for a call whose result is
+        // already known, defer solving parameters that occur only in its
+        // implicit clause until the result has had a chance to constrain
+        // them.  `EvidenceIterableFactory.toFactory` is the important case:
+        // `A` is absent from the receiver and its `Ordering[A]` witness in
+        // scope is the caller's element ordering, but `toFactory`'s `A` is
+        // the element type of the collection being built.  For
+        // `zipWithIndex`, that is `(A, Int)`, not `A`.
+        let mut targs = if to.is_no_type() {
+            self.conv_targs(id, from)
+        } else {
+            self.conv_targs_without_implicit_solution(id, from)
+        };
         // Open-view inference has already solved the conversion's result.
         // Parameters absent from the receiver (A in EvidenceIterableFactory)
         // must use that solution before searching Ordering[A]/ClassTag[A].
@@ -4059,6 +4094,28 @@ impl Typer {
         for (tp, arg) in tps.iter().zip(targs.iter_mut()) {
             if !to.is_no_type() && *arg == Type::TypeParam(*tp) {
                 if let Some(solved) = unify_conv_tparam(*tp, &result, to) {
+                    *arg = solved;
+                }
+            }
+        }
+        // Result inference takes precedence, but a parameter not mentioned by
+        // the result still needs the conversion's implicit clause to solve
+        // it.  Keep those slots open while solving the result, then use the
+        // witness only for the slots that remain open.  This preserves cases
+        // such as a conversion whose type parameter appears only in a
+        // `ClassTag[T]` clause while preventing `Ordering[A]` from stealing
+        // `toFactory`'s result element type.
+        if !to.is_no_type() {
+            let mut solved: Vec<Option<Type>> = tps
+                .iter()
+                .zip(targs.iter())
+                .map(|(tp, arg)| {
+                    (!matches!(arg, Type::TypeParam(open) if *open == *tp)).then_some(arg.clone())
+                })
+                .collect();
+            self.solve_conv_targs_from_implicits(&cand_ty, &tps, &mut solved);
+            for (arg, solved) in targs.iter_mut().zip(solved) {
+                if let Some(solved) = solved {
                     *arg = solved;
                 }
             }

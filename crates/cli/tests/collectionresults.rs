@@ -137,6 +137,7 @@ fn evidence_bearing_factories() {
     matrix(
         &[
             ("sorted_factory", true),
+            ("sorted_factory_generic", true),
             ("set_factories", true),
             ("map_factories", true),
             ("factory_bad_order", false),
