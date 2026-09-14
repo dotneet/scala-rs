@@ -2869,6 +2869,12 @@ impl SymbolTable {
                     .copied()
                     .find(|s| self.get(*s).kind == SymKind::Class)
                     .or_else(|| found.into_iter().find(|s| self.get(*s).is_class_like()))
+                    // Classpath ScalaSignature bounds may be converted
+                    // before the referenced class is adopted, leaving a
+                    // fully-qualified `Named` behind. Reconnect it once the
+                    // class is loaded, but never resolve a short name here:
+                    // short names must still obey lexical/member lookup.
+                    .or_else(|| crate::classpath::find_by_fully_qualified_name(self, name))
             }
             // An unbounded type parameter's members are `Any`'s; a bounded one
             // resolves through its bound, as in nsc. `[A <: A]` and mutually

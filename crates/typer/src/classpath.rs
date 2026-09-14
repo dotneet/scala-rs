@@ -691,8 +691,7 @@ fn resolve_type_in(
     // as `O.EmptyAlias = Owner.Empty` must retain its as-seen-from prefix.
     let mut lexical_name = name;
     if name.contains('.') {
-        let jvm = name.replace('.', "/");
-        if let Some(sym) = find_by_jvm(st, &jvm) {
+        if let Some(sym) = find_by_fully_qualified_name(st, name) {
             return Type::Class { sym, args };
         }
         lexical_name = name.rsplit('.').next().unwrap_or(name);
@@ -722,18 +721,6 @@ fn resolve_type_in(
             };
         }
         cur = st.get(cur).owner;
-    }
-    // If the declaring owner is not lexical (an unrelated external nested
-    // class), recover Scala's `$` JVM spelling as a final exact fallback.
-    if name.contains('.') {
-        for (split, _) in name.match_indices('.').rev().skip(1) {
-            let package = name[..split].replace('.', "/");
-            let nested = name[split + 1..].replace('.', "$");
-            let jvm = format!("{package}/{nested}");
-            if let Some(sym) = find_by_jvm(st, &jvm) {
-                return Type::Class { sym, args };
-            }
-        }
     }
     resolve_type_name_args(st, name, args)
 }
@@ -2064,6 +2051,38 @@ pub fn find_by_jvm(st: &SymbolTable, jvm: &str) -> Option<SymbolId> {
     st.find_class_by_jvm(jvm)
 }
 
+/// Resolve a fully-qualified Scala source name against a class that has
+/// already been loaded from the classpath.
+///
+/// Classpath ScalaSignature bounds can be converted before the referenced
+/// class is adopted.  `resolve_type_in` therefore preserves an external
+/// bound as `Type::Named("pkg.Type")`; a later classpath lookup must be able
+/// to reconnect that name without treating a short name as global.  The
+/// exact dotted-to-JVM spelling handles top-level classes, while the
+/// remaining candidates cover Scala's `$` spelling for nested classes.
+///
+/// Deliberately require a dot: resolving a short `Named("Type")` here would
+/// bypass lexical/member lookup and could bind an unrelated class with the
+/// same simple name.
+pub(crate) fn find_by_fully_qualified_name(st: &SymbolTable, name: &str) -> Option<SymbolId> {
+    if !name.contains('.') {
+        return None;
+    }
+    let exact = name.replace('.', "/");
+    if let Some(sym) = find_by_jvm(st, &exact) {
+        return Some(sym);
+    }
+    for (split, _) in name.match_indices('.').rev().skip(1) {
+        let package = name[..split].replace('.', "/");
+        let nested = name[split + 1..].replace('.', "$");
+        let jvm = format!("{package}/{nested}");
+        if let Some(sym) = find_by_jvm(st, &jvm) {
+            return Some(sym);
+        }
+    }
+    None
+}
+
 pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId {
     if let Some(id) = find_by_jvm(st, internal) {
         return id;
@@ -2896,6 +2915,20 @@ mod descriptor_semantics_tests {
                 args: Vec::new(),
             }
         );
+    }
+
+    #[test]
+    fn fully_qualified_late_lookup_does_not_use_short_names() {
+        let mut st = SymbolTable::new();
+        let package = ensure_package(&mut st, "example");
+        let profile = stub_class_in(&mut st, "example/Profile", "Profile".to_string(), package);
+
+        assert_eq!(
+            find_by_fully_qualified_name(&st, "example.Profile"),
+            Some(profile)
+        );
+        assert_eq!(find_by_fully_qualified_name(&st, "Profile"), None);
+        assert_eq!(find_by_fully_qualified_name(&st, "other.Profile"), None);
     }
 
     #[test]

@@ -18,6 +18,11 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn compile(src: &Path, out: &Path, jar: &Path, cp: Option<&Path>) {
+    let cp = cp.map(|path| path.to_string_lossy().into_owned());
+    compile_with_classpath(src, out, jar, cp.as_deref());
+}
+
+fn compile_with_classpath(src: &Path, out: &Path, jar: &Path, cp: Option<&str>) {
     let mut cmd = Command::new(bin());
     cmd.args([
         "compile",
@@ -28,7 +33,7 @@ fn compile(src: &Path, out: &Path, jar: &Path, cp: Option<&Path>) {
         out.to_str().unwrap(),
     ]);
     if let Some(cp) = cp {
-        cmd.args(["-cp", cp.to_str().unwrap()]);
+        cmd.args(["-cp", cp]);
     }
     let output = cmd.output().expect("run scala-rs compile");
     assert!(
@@ -38,6 +43,20 @@ fn compile(src: &Path, out: &Path, jar: &Path, cp: Option<&Path>) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn slick_jar() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let root = PathBuf::from(home).join(
+        "Library/Caches/Coursier/v1/https/repo1.maven.org/maven2/com/typesafe/slick/slick_2.13",
+    );
+    for version in ["3.6.1", "3.4.1"] {
+        let jar = root.join(version).join(format!("slick_2.13-{version}.jar"));
+        if jar.is_file() {
+            return Some(jar);
+        }
+    }
+    None
 }
 
 #[test]
@@ -98,6 +117,51 @@ fn inherited_profile_accessor_preserves_a_narrowed_api_bound() {
         &root,
         &jar,
         None,
+    );
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn abstract_profile_upper_bound_reconnects_after_a_producer_consumer_boundary() {
+    let library = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    let Some(slick) = slick_jar() else {
+        eprintln!("skip abstract profile API: slick jar not obtainable");
+        return;
+    };
+    if !library.is_file() {
+        eprintln!("skip abstract profile API: scala-library jar not obtainable");
+        return;
+    }
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-abstract-profile-api-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let producer = root.join("producer");
+    let consumer = root.join("consumer");
+    fs::create_dir_all(&producer).unwrap();
+    fs::create_dir_all(&consumer).unwrap();
+
+    // The producer's Profile bound is recorded in ScalaSignature, while the
+    // JVM accessor descriptor only carries JdbcProfile's erasure. The
+    // consumer must therefore reconnect the fully-qualified upper bound after
+    // JdbcProfile is loaded from the separate Slick jar.
+    compile_with_classpath(
+        &fixtures_dir().join("slick_abstract_profile_lib.scala"),
+        &producer,
+        &library,
+        Some(slick.to_str().unwrap()),
+    );
+    let consumer_cp = format!("{}:{}", producer.display(), slick.display());
+    compile_with_classpath(
+        &fixtures_dir().join("slick_abstract_profile_use.scala"),
+        &consumer,
+        &library,
+        Some(&consumer_cp),
     );
 
     fs::remove_dir_all(root).unwrap();
