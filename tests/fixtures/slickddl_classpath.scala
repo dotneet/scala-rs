@@ -7,5 +7,6 @@ import slickddlmini.Profile
 class SlickDdlClasspathUse(val profile: Profile) {
   import profile.api._
   val schema: profile.SchemaDescription = ???
+  val combined = schema ++ schema
   val createAction = schema.create
 }

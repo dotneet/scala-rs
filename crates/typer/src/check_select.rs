@@ -146,6 +146,15 @@ impl Typer {
             }
         }
         self.settle_binary_parent_projections(&recv_ty, tree.span);
+        // A receiver may be an abstract type member whose upper bound is a
+        // nested class read from a classfile (for example
+        // `BasicProfile.SchemaDescription <: SchemaDescriptionDef`).  Its
+        // bound supplies ordinary members such as `++`, but the nested class
+        // is not necessarily installed until a source names it directly.
+        // Warm that bound before the regular member and pickle lookup so a
+        // direct selection observes the same classfile shape as an extension
+        // conversion.
+        let receiver_class = self.class_sym_for_bounded_member_lookup(&recv_ty, tree.span);
         // `xs #:: ys` on a `Stream`: `Stream.Deferrer` and the conversion that
         // reaches it can only be declared once `Stream` itself is in the
         // symbol table, which happens no earlier than here.
@@ -292,7 +301,7 @@ impl Typer {
         // for apply with arguments (Date)", `docs/gitbucket.md` root 26.
         let instance_receiver = !self.is_type_qualifier(qual);
         if found.is_empty() {
-            if let Some(o) = self.st.class_sym_of(&recv_ty) {
+            if let Some(o) = receiver_class.or_else(|| self.st.class_sym_of(&recv_ty)) {
                 found = self.st.lookup_member(o, &name);
                 found.retain(|&m| {
                     !instance_receiver || !self.st.get(m).flags.contains(Flags::STATIC)
@@ -701,10 +710,10 @@ impl Typer {
         }
         // The receiver's linearization is what orders two sibling overrides of
         // one member, so it is passed rather than looked up again.
-        found = self.drop_overridden_at(
-            self.st.class_sym_of(&recv_ty).unwrap_or(SymbolId::NONE),
-            found,
-        );
+        let receiver_class = receiver_class
+            .or_else(|| self.st.class_sym_of(&recv_ty))
+            .unwrap_or(SymbolId::NONE);
+        found = self.drop_overridden_at(receiver_class, found);
         // `x.toString` finds both `Any.toString` and `Int.toString`; they have
         // the same type, so this is one member, not an ambiguous overload.
         if found.len() > 1 {

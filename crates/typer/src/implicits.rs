@@ -3027,7 +3027,18 @@ impl Typer {
                 let Some(to) = self.conversion_result(id, from) else {
                     continue;
                 };
-                let Some(cls) = self.st.class_sym_of(&to) else {
+                // A profile API commonly returns an abstract type member:
+                // `type SchemaActionExtensionMethods <:
+                // RelationalSchemaActionExtensionMethodsImpl`.  The upper
+                // bound is a named nested class, and the classfile reader may
+                // not have installed that class yet because no source has
+                // named it directly.  Extension lookup still has to inspect
+                // the bound's members (`create`, `drop`, ...), so load the
+                // class lazily rather than treating the type member as a
+                // result with no runtime shape.  This remains a lookup-only
+                // widening; the conversion's result type is kept unchanged
+                // for typing and code generation.
+                let Some(cls) = self.class_sym_for_bounded_member_lookup(&to, span) else {
                     continue;
                 };
                 // The conversion is applied to the receiver as written; the
@@ -3196,6 +3207,42 @@ impl Typer {
                 pool.into_iter().find(|(c, _, _)| *c == winners[0])
             }
         }
+    }
+
+    /// Resolve the class that supplies members for a type whose shape is
+    /// hidden behind a bounded member. Most types are ordinary class types
+    /// and need no special handling; classfile APIs also expose receiver and
+    /// result classes behind abstract members whose upper bound is a nested
+    /// class that has not been named directly yet.
+    pub(crate) fn class_sym_for_bounded_member_lookup(
+        &mut self,
+        ty: &Type,
+        span: Span,
+    ) -> Option<SymbolId> {
+        if let Some(cls) = self.st.class_sym_of(ty) {
+            return Some(cls);
+        }
+        let mut current = ty.clone();
+        for _ in 0..8 {
+            current = match current {
+                Type::TypeMember(id) | Type::TypeParam(id) => self.st.get(id).bound_hi.clone()?,
+                Type::BoundedWildcard { hi: Some(hi), .. } => *hi,
+                Type::Applied { ctor, .. } => *ctor,
+                _ => return None,
+            };
+            if let Some(cls) = self.st.class_sym_of(&current) {
+                return Some(cls);
+            }
+            let Type::Named { name, .. } = &current else {
+                continue;
+            };
+            let cls = self
+                .pickle
+                .ensure_class(&mut self.st, &mut self.binary, name, false)?;
+            self.ensure_java_loaded(cls, span);
+            return Some(cls);
+        }
+        None
     }
 
     /// A stand-in for a `Predef` member does not compete with the member

@@ -3,6 +3,7 @@ package slickddlmini
 trait Profile {
   type SchemaDescription <: SchemaDescriptionDef
   trait SchemaDescriptionDef {
+    def ++(other: SchemaDescription): SchemaDescription
     def show: String
   }
   trait API {
