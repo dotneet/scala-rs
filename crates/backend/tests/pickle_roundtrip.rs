@@ -282,6 +282,34 @@ object Lib { val Alias = Predef }
 }
 
 #[test]
+fn nested_module_ref_pickle_uses_owner_relative_name() {
+    let src = r#"
+object Outer {
+  object Inner { val n: Int = 1 }
+}
+class Consumer {
+  val alias = Outer.Inner
+}
+"#;
+    let sigs = sigs_of(src);
+    let consumer = sigs
+        .iter()
+        .find(|sig| sig.full_name == "Consumer" && !sig.is_module)
+        .expect("Consumer");
+    let alias = consumer.member("alias").expect("alias getter");
+    assert_eq!(
+        alias.ty,
+        SigType::Poly {
+            tparams: Vec::new(),
+            result: Box::new(SigType::Single {
+                prefix: Box::new(SigType::This("Outer".into())),
+                sym: "Outer.Inner".into(),
+            }),
+        }
+    );
+}
+
+#[test]
 fn recovers_a_polymorphic_method_signature() {
     let sigs = sigs_of(
         r#"

@@ -2306,7 +2306,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 }
                 let jvm = self.facts.get(*s).jvm_name.clone();
                 let n = self.facts.get(*s).name.trim_end_matches('$').to_string();
-                if !jvm.contains('/') {
+                // A module in the default package still needs a singleton
+                // reference (`Outer$Inner$` / `Lib$`). Only a plain class
+                // name without a nesting marker can use the compact named
+                // type form.
+                if !jvm.contains('/') && !jvm.trim_end_matches('$').contains('$') {
                     return self.type_ref_named(&n);
                 }
                 // `ModuleRef(C)` is the singleton type `C.type`, not a
