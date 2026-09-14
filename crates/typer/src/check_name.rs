@@ -1625,6 +1625,15 @@ impl Typer {
                 // which then competed with the `request2Session` nsc picks.
                 let inherited = cur != o;
                 for m in self.st.get(cur).members.clone() {
+                    // A method's type parameters are owned by the method,
+                    // not by the class whose member list temporarily held
+                    // them while a classfile signature was decoded. They are
+                    // never names exported by `import owner._`; importing
+                    // them would leak e.g. `catsStdOrderForEither[A, B]`'s
+                    // parameters into the caller's type namespace.
+                    if self.st.get(m).kind == SymKind::TypeParam {
+                        continue;
+                    }
                     // A `private` member of a *strict* ancestor of `o` is not
                     // one of `o`'s (above), and a `private` member of `o`
                     // itself is not one the reference site may see. SLS 5.2,

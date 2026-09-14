@@ -49,6 +49,33 @@ fn java_available() -> bool {
     Command::new("java").arg("-version").output().is_ok()
 }
 
+fn jar_tool() -> Option<PathBuf> {
+    let out = Command::new("which").arg("jar").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    path.is_file().then_some(path)
+}
+
+fn pack_jar(classes: &Path, dest: &Path) {
+    let output = Command::new(jar_tool().expect("jar tool"))
+        .args([
+            "cf",
+            dest.to_str().unwrap(),
+            "-C",
+            classes.to_str().unwrap(),
+            ".",
+        ])
+        .output()
+        .expect("run jar");
+    assert!(
+        output.status.success(),
+        "jar failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn expected_stdout(name: &str) -> String {
     fs::read_to_string(fixtures_dir().join("expected").join(format!("{name}.txt"))).unwrap()
 }
@@ -77,12 +104,57 @@ fn compile(names: &[&str], jar: &Path, out: &Path, extra: &[&str]) -> std::proce
     cmd.output().expect("run scala-rs compile")
 }
 
+fn compile_with_classpath(
+    names: &[&str],
+    jar: &Path,
+    classpath: &Path,
+    out: &Path,
+) -> std::process::Output {
+    let mut cmd = Command::new(bin());
+    cmd.arg("compile");
+    for n in names {
+        cmd.arg(fixture(n));
+    }
+    cmd.args([
+        "-d",
+        out.to_str().unwrap(),
+        "--scala-library",
+        jar.to_str().unwrap(),
+        "-cp",
+        classpath.to_str().unwrap(),
+    ]);
+    cmd.output().expect("run scala-rs compile")
+}
+
 fn run_main(out: &Path, jar: &Path) -> String {
     let output = Command::new("java")
         .args([
             "-Xverify:all",
             "-cp",
             &format!("{}:{}", out.display(), jar.display()),
+            "Main",
+        ])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java Main failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn run_main_with_classpath(out: &Path, jar: &Path, classpath: &Path) -> String {
+    let output = Command::new("java")
+        .args([
+            "-Xverify:all",
+            "-cp",
+            &format!(
+                "{}:{}:{}",
+                out.display(),
+                classpath.display(),
+                jar.display()
+            ),
             "Main",
         ])
         .output()
@@ -152,6 +224,55 @@ fn jar_packages_every_selector_shape() {
 #[test]
 fn language_feature_imports_resolve() {
     check_runs("imports_lang", &["imports_lang"], &[]);
+}
+
+/// Method-local type parameters completed from an external jar are not members
+/// exported by a wildcard import. The first source unit fixes the lazy-load
+/// order that exposed this in Cats' `Foldable.partitionEitherM`.
+#[test]
+fn jar_method_type_params_do_not_shadow_caller_type_params() {
+    let Some(scala_library) = scala_library_jar() else {
+        eprintln!("skip import type-param jar: scala-library not available");
+        return;
+    };
+    if jar_tool().is_none() {
+        eprintln!("skip import type-param jar: jar tool not available");
+        return;
+    }
+
+    let root = tmp_dir("tparam_jar");
+    let lib_out = root.join("lib");
+    let app_out = root.join("app");
+    fs::create_dir_all(&lib_out).unwrap();
+    fs::create_dir_all(&app_out).unwrap();
+
+    let output = compile(&["imports_tparam_lib"], &scala_library, &lib_out, &[]);
+    assert!(
+        output.status.success(),
+        "external library failed to compile:\n{}",
+        diagnostics(&output)
+    );
+    let external_jar = root.join("external.jar");
+    pack_jar(&lib_out, &external_jar);
+
+    let output = compile_with_classpath(
+        &["imports_tparam_preload", "imports_tparam_use"],
+        &scala_library,
+        &external_jar,
+        &app_out,
+    );
+    assert!(
+        output.status.success(),
+        "caller type parameters were shadowed by the wildcard import:\n{}",
+        diagnostics(&output)
+    );
+    if java_available() {
+        assert_eq!(
+            run_main_with_classpath(&app_out, &scala_library, &external_jar),
+            expected_stdout("imports_tparam_use")
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
 }
 
 // ------------------------------------------------------- error handling

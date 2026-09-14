@@ -2449,7 +2449,16 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
         st.set_jvm_name(id, m.desc.clone());
         if !mtparams.is_empty() {
             for tid in &mtparams {
+                // Method type parameters had to be allocated before the
+                // method symbol existed, so `alloc` temporarily entered them
+                // as class members. Move them with their owner: leaving them
+                // on the class makes inherited lookup and wildcard imports
+                // expose names that exist only inside this method.
+                st.get_mut(owner).members.retain(|member| member != tid);
                 st.get_mut(*tid).owner = id;
+                if !st.get(id).members.contains(tid) {
+                    st.get_mut(id).members.push(*tid);
+                }
             }
             st.get_mut(id).tparams = mtparams;
         }
@@ -2713,6 +2722,77 @@ mod descriptor_semantics_tests {
             field_ty_from_desc(&mut st, "[Lscala/runtime/BoxedUnit;"),
             Type::Array(Box::new(Type::Unit))
         );
+    }
+}
+
+#[cfg(test)]
+mod method_type_param_tests {
+    use super::*;
+    use crate::javaclass::{JavaClass, JavaMethod};
+    use std::collections::HashSet;
+
+    #[test]
+    fn method_type_params_are_owned_by_method_not_class() {
+        let mut st = SymbolTable::new();
+        let owner = st.alloc("C", st.root, SymKind::Class, Flags::EMPTY, "example/C");
+        let class = JavaClass {
+            internal_name: "example/C".into(),
+            access: 0x0001,
+            super_name: Some("java/lang/Object".into()),
+            interfaces: Vec::new(),
+            methods: vec![JavaMethod {
+                name: "id".into(),
+                desc: "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;".into(),
+                access: 0x0001,
+                signature: Some("<A:Ljava/lang/Object;B:Ljava/lang/Object;>(TA;TB;)TA;".into()),
+            }],
+            fields: Vec::new(),
+            outer_desc: None,
+            signature: None,
+            nested_static: false,
+            is_scala: false,
+            scala_module: false,
+            has_module_field: false,
+            inner_classes: Vec::new(),
+            sole_instance_field: None,
+        };
+
+        fill_java_members(&mut st, owner, &class);
+
+        let method = st
+            .lookup_member(owner, "id")
+            .into_iter()
+            .find(|&id| st.get(id).kind == SymKind::Method)
+            .expect("generic method");
+        let tparams = st.get(method).tparams.clone();
+        assert_eq!(tparams.len(), 2);
+        assert_eq!(
+            tparams.iter().copied().collect::<HashSet<_>>().len(),
+            tparams.len(),
+            "method type-parameter IDs must be unique"
+        );
+        assert!(
+            tparams
+                .iter()
+                .all(|&tp| st.get(owner).members.iter().all(|&m| m != tp)),
+            "method type parameters must not remain class members"
+        );
+        assert!(
+            tparams.iter().all(|&tp| st.get(tp).owner == method),
+            "method type parameters must point back to their method"
+        );
+        let method_members = &st.get(method).members;
+        assert!(
+            method_members.iter().copied().collect::<HashSet<_>>().len() == method_members.len(),
+            "method members must not contain duplicate IDs"
+        );
+        for &tp in &tparams {
+            assert_eq!(
+                method_members.iter().filter(|&&m| m == tp).count(),
+                1,
+                "each method type parameter must be registered once"
+            );
+        }
     }
 }
 
