@@ -240,6 +240,12 @@ fn generic_value_class_conversion_keeps_underlying_type_arguments() {
         ),
         "generic value-class conversion lost its underlying type arguments:\n{text}"
     );
+    assert!(
+        text.contains(
+            "<B:Ljava/lang/Object;C:Ljava/lang/Object;>(Lvc_generic_signature/Query<Lvc_generic_signature/Rep<TB;>;*TC;>;)Lvc_generic_signature/Query<Lvc_generic_signature/Rep<TB;>;*TC;>;"
+        ),
+        "Slick-shaped value-class conversion lost its underlying type arguments:\n{text}"
+    );
     let _ = fs::remove_dir_all(&out);
 }
 
