@@ -2443,7 +2443,23 @@ impl PickleSupply {
         name: &str,
         synthetic_ok: bool,
     ) -> Vec<SymbolId> {
-        if class_sym.is_none() || name.is_empty() || !self.pickle_readable(st, class_sym) {
+        // A nested Scala class normally has no ScalaSignature of its own:
+        // scalac puts the pickle for it on the enclosing top-level class.
+        // The nested classfile can carry only an empty `Scala` marker while
+        // the enclosing top-level class carries the nested declaration.
+        // `pickle_readable` intentionally remains the cheap class-only
+        // predicate used by callers without a BinaryIndex; this lookup has
+        // the index, so admit a nested class when its enclosing pickle can be
+        // found.
+        let nested_pickle = if class_sym.is_none() {
+            false
+        } else {
+            self.nested_pickle_readable(st, bin, class_sym)
+        };
+        if class_sym.is_none()
+            || name.is_empty()
+            || (!self.pickle_readable(st, class_sym) && !nested_pickle)
+        {
             return Vec::new();
         }
         if !self.tried.insert((class_sym.0, name.to_string())) {
@@ -2476,7 +2492,7 @@ impl PickleSupply {
         // has taken over: those two are the pickles the typer reads. A plain
         // Java classfile on `-cp` has no pickle at all and keeps its own path
         // in through `install_java_class`.
-        if !self.pickle_readable(st, class_sym) {
+        if !self.pickle_readable(st, class_sym) && !nested_pickle {
             return Vec::new();
         }
         let is_module = sym.kind == SymKind::ModuleClass;
@@ -4910,6 +4926,39 @@ impl PickleSupply {
         st.get(class_sym).jvm_name.starts_with("scala/")
             || self.adopted.contains(&class_sym.0)
             || self.implicits_supplied.contains(&class_sym.0)
+    }
+
+    /// Whether a nested Scala class's enclosing top-level class carries the
+    /// pickle that describes it.  Scala 2 emits an empty `Scala` attribute on
+    /// nested classfiles and stores all nested class signatures in the
+    /// top-level `ScalaSignature`; the class-only `pickle_readable` predicate
+    /// cannot see that because it deliberately has no BinaryIndex argument.
+    fn nested_pickle_readable(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        class_sym: SymbolId,
+    ) -> bool {
+        if class_sym.is_none() || !st.get(class_sym).is_class_like() {
+            return false;
+        }
+        let internal = st.get(class_sym).jvm_name.as_str();
+        if internal.is_empty()
+            || internal.starts_with("java/")
+            || internal.starts_with("javax/")
+            || !is_nested_jvm_name(internal)
+        {
+            return false;
+        }
+        let is_module = st.get(class_sym).kind == SymKind::ModuleClass;
+        let Some(full) = self.pickled_full_name(bin, internal, is_module) else {
+            return false;
+        };
+        // `pickled_full_name` can resolve the nested dotted name through its
+        // enclosing class even when the nested classfile itself has no
+        // signature.  Re-read the signature here only as a readability test;
+        // the subsequent complete_named lookup uses the same cached value.
+        self.has_pickle(bin, &full, is_module)
     }
 
     /// The pickled signature of a library (or adopted) class or module class,
