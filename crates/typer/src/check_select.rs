@@ -897,6 +897,22 @@ impl Typer {
                     .st
                     .subst_as_seen_from_at(&member_recv_ty, inner_prefix.as_ref(), &ty),
             };
+            // A member selected on a nested abstract type is still read in
+            // the current class's lexical context. `TableClass` in
+            // `StringGenerator.StringTable` is declared by the generic outer
+            // `Generator`, but its bound (`TableClassDef`) carries no
+            // `StringGenerator` prefix for the ordinary receiver walk to
+            // follow. Re-read this narrow form through `this` so
+            // `TableClass.elementType` sees `TypeName = String` (and the same
+            // context specializes `Code` / `TermName` in sibling selections).
+            // Keep the original `recv_ty` test: `member_recv_ty` may already
+            // be the concrete bounded view installed for member lookup.
+            let ty = if matches!(recv_ty, Type::TypeMember(_)) {
+                self.st
+                    .subst_as_seen_from(&Type::ThisType(self.st.this_class), &ty)
+            } else {
+                ty
+            };
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
                     return self.st.subst_tparams(owner, &subst_args, &ty);
