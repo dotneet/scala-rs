@@ -5,7 +5,7 @@
 //! `try` / `catch` / `finally`.
 
 use crate::classfile::{EmittedClass, ACC_INTERFACE, ACC_PRIVATE, ACC_STATIC};
-use crate::classfile::{Field, ACC_FINAL, ACC_PUBLIC, ACC_SUPER, ACC_SYNTHETIC};
+use crate::classfile::{Field, ACC_BRIDGE, ACC_FINAL, ACC_PUBLIC, ACC_SUPER, ACC_SYNTHETIC};
 use crate::code::{Assembler, StackEntry};
 use crate::gen::*;
 use scala_rs_parser::Flags;
@@ -195,7 +195,31 @@ pub(crate) struct FreeVars {
 /// a nested `def`'s locals, whose owner is a method.
 pub(crate) fn ident_reads_enclosing_this(st: &SymbolTable, id: SymbolId) -> bool {
     let s = st.get(id);
-    if s.kind != SymKind::Method {
+    // A nested class is reached through its enclosing instance even when the
+    // source uses the class name (or its companion) without an explicit
+    // `this`.  A lambda constructing a nested case class therefore captures
+    // the owner just like `this.someMethod` does.
+    if matches!(
+        s.kind,
+        SymKind::Class | SymKind::ModuleClass | SymKind::Module
+    ) {
+        // Binary/Java classes and static symbols are reached by their own
+        // owner (or by a static field), never by the enclosing Scala `this`.
+        // Treating e.g. `FileUtils` as an outer capture shifts every lambda
+        // argument by one slot and leaves `Seq.foreach` with no receiver.
+        if s.flags.contains(Flags::JAVA)
+            || s.flags.contains(Flags::STATIC)
+            // Classpath placeholders can lose JAVA while they are completed.
+            // Their JVM name still distinguishes a top-level class such as
+            // `org/apache/commons/io/FileUtils` from a Scala nested class
+            // (`Holder$Row`), whose owner really is an enclosing instance.
+            || !s.jvm_name.contains('$')
+        {
+            return false;
+        }
+        return matches!(st.get(s.owner).kind, SymKind::Class);
+    }
+    if !matches!(s.kind, SymKind::Method | SymKind::Term) || s.flags.contains(Flags::STATIC) {
         return false;
     }
     matches!(st.get(s.owner).kind, SymKind::Class)
@@ -766,6 +790,23 @@ pub(crate) fn emit_lambda_body(
         fr.next_slot = n_params;
         for (i, p) in pb.vparams.iter().enumerate() {
             let obj_slot = base + n_caps + i as u16;
+            let value_class = (!p.sym.is_none())
+                .then(|| st.value_class_for_term(p.sym))
+                .flatten()
+                .or_else(|| value_class_symbol(st, &p.ty));
+            if let Some(class) = value_class {
+                // A FunctionN.apply boundary is Object, and a value-class
+                // argument is boxed there. Keep that wrapper in the hoisted
+                // body's local frame so a member selection (for example
+                // `_.value`) does not first cast it to the underlying class
+                // and then try to cast it back to the wrapper.
+                let internal = class_internal(st, class);
+                a.aload(obj_slot);
+                a.checkcast(&internal);
+                let slot = fr.alloc(p.sym, JvmSort::Ref);
+                store(a, slot, JvmSort::Ref);
+                continue;
+            }
             // A parameter instantiated at a value class receives the boxed
             // instance; erasure recorded that on the symbol.
             let ty = if p.sym.is_none() {
@@ -860,6 +901,152 @@ pub(crate) fn unerase_lambda_param(a: &mut Assembler, st: &SymbolTable, ty: &Typ
     } else {
         emit_unbox(a, ty, abi);
     }
+}
+
+fn value_class_symbol(st: &SymbolTable, ty: &Type) -> Option<SymbolId> {
+    match ty {
+        Type::Class { sym, .. } if st.is_value_class(*sym) => Some(*sym),
+        Type::Applied { ctor, .. } | Type::Annotated { tpe: ctor, .. } => {
+            value_class_symbol(st, ctor)
+        }
+        _ => None,
+    }
+}
+
+/// Adapt one erased SAM bridge argument to the typed implementation method.
+/// A value-class argument is a boxed wrapper at the bridge boundary, so its
+/// getter supplies the underlying value the typed implementation consumes.
+fn emit_sam_bridge_arg(
+    a: &mut Assembler,
+    st: &SymbolTable,
+    raw_ty: &Type,
+    boxed_ty: &Type,
+    typed_ty: &Type,
+    abi: AbiMode,
+) {
+    if let Some(cls) = value_class_symbol(st, boxed_ty) {
+        let internal = class_internal(st, cls);
+        // Use the getter's post-erasure type for its descriptor. The recorded
+        // type can still be a type parameter (`Wrapped[A]`), while the emitted
+        // getter is `Object`, a bounded primitive, or another concrete erasure.
+        let under = st
+            .value_class_underlying(cls)
+            .or_else(|| st.recorded_value_class_underlying(cls).cloned())
+            .unwrap_or_else(|| typed_ty.clone());
+        a.checkcast(&internal);
+        a.invokevirtual(
+            &internal,
+            st.value_class_getter(cls),
+            &format!("(){}", jvm_desc(st, &under)),
+        );
+        emit_adapt(a, &param_adapt(st, &under, typed_ty), abi);
+        return;
+    }
+    let raw_ref = jvm_slot_sort(raw_ty) == JvmSort::Ref;
+    if raw_ref && is_jvm_primitive(typed_ty) && !is_unit_like(typed_ty) {
+        emit_unbox(a, typed_ty, abi);
+    } else if raw_ref && is_unit_like(typed_ty) {
+        a.checkcast(BOXED_UNIT);
+    } else {
+        unerase_lambda_param(a, st, typed_ty, abi);
+    }
+}
+
+/// Add the erased SAM bridge when the instantiated implementation has a
+/// narrower descriptor. The bridge is the only method visible to callers
+/// through the generic interface; it unboxes value-class arguments before
+/// invoking the typed implementation and boxes a value-class result back.
+#[allow(clippy::too_many_arguments)]
+fn emit_sam_bridge(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    lam_name: &str,
+    method_name: &str,
+    raw_desc: &str,
+    typed_desc: &str,
+    raw_params: &[Type],
+    boxed_params: &[Type],
+    typed_params: &[Type],
+    raw_ret: &Type,
+    boxed_ret: &Type,
+    typed_ret: &Type,
+    abi: AbiMode,
+) {
+    if raw_desc == typed_desc {
+        return;
+    }
+    let raw_params = raw_params.to_vec();
+    let boxed_params = boxed_params.to_vec();
+    let typed_params = typed_params.to_vec();
+    let raw_ret = raw_ret.clone();
+    let boxed_ret = boxed_ret.clone();
+    let typed_ret = typed_ret.clone();
+    let lam_name = lam_name.to_string();
+    let method_name = method_name.to_string();
+    let raw_desc = raw_desc.to_string();
+    let typed_desc = typed_desc.to_string();
+    let mut next = 1u16;
+    for ty in &raw_params {
+        next += param_slots(ty);
+    }
+    let mut frame = Frame::instance();
+    frame.next_slot = next;
+    let max_locals = next + 4;
+    let bridge_name = method_name.clone();
+    b.add_code(
+        ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC,
+        &bridge_name,
+        &raw_desc,
+        max_locals,
+        move |a| {
+            let mut slot = 1u16;
+            a.aload(0);
+            for (i, raw_ty) in raw_params.iter().enumerate() {
+                let sort = jvm_slot_sort(raw_ty);
+                load(a, slot, sort);
+                emit_sam_bridge_arg(
+                    a,
+                    st,
+                    raw_ty,
+                    boxed_params.get(i).unwrap_or(raw_ty),
+                    typed_params.get(i).unwrap_or(raw_ty),
+                    abi,
+                );
+                slot += param_slots(raw_ty);
+            }
+            a.invokevirtual(&lam_name, &method_name, &typed_desc);
+
+            if let Some(cls) = value_class_symbol(st, &boxed_ret) {
+                let under = st
+                    .value_class_underlying(cls)
+                    .or_else(|| st.recorded_value_class_underlying(cls).cloned())
+                    .unwrap_or_else(|| typed_ret.clone());
+                let sort = jvm_slot_sort(&typed_ret);
+                let result_slot = frame.alloc_tmp(sort);
+                store(a, result_slot, sort);
+                let internal = class_internal(st, cls);
+                a.new_obj(&internal);
+                a.dup();
+                load(a, result_slot, sort);
+                a.invokespecial(
+                    &internal,
+                    "<init>",
+                    &format!("({})V", jvm_desc_val(st, &under)),
+                );
+            } else if is_unit_like(&typed_ret) && jvm_slot_sort(&raw_ret) == JvmSort::Ref {
+                emit_boxed_unit(a);
+            } else if is_jvm_primitive(&typed_ret) && jvm_slot_sort(&raw_ret) == JvmSort::Ref {
+                emit_box(a, &typed_ret);
+            }
+            if is_unit_like(&raw_ret) {
+                a.vreturn();
+            } else if is_jvm_primitive(&raw_ret) {
+                emit_return(a, &raw_ret);
+            } else {
+                a.areturn();
+            }
+        },
+    );
 }
 
 pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tree: &Tree) {
@@ -1053,20 +1240,56 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
         apply_desc.push_str("Ljava/lang/Object;");
     }
     apply_desc.push_str(")Ljava/lang/Object;");
+    let st = ctx.st;
+    // `erase_symbols` has already rewritten a SAM method's declaration to its
+    // erased `Object` shape. The lambda parameter symbols retain the source
+    // value-class identity, however; use that fact to reconstruct the
+    // instantiated SAM type for the typed implementation and bridge.
+    let sam_boxed_params: Vec<Type> = vparams
+        .iter()
+        .map(|p| {
+            (!p.sym.is_none())
+                .then(|| p.sym)
+                .and_then(|id| st.value_class_for_term(id))
+                .map(|class| Type::Class {
+                    sym: class,
+                    args: vec![],
+                })
+                .unwrap_or_else(|| p.ty.clone())
+        })
+        .collect();
+    // The parameter trees have already gone through erasure and therefore
+    // retain the exact instantiated underlying descriptor. Re-erasing the
+    // boxed identity above loses generic arguments and incorrectly unboxes
+    // value classes nested in arrays.
+    let sam_typed_params: Vec<Type> = sam
+        .as_ref()
+        .map(|_| vparams.iter().map(|p| p.ty.clone()).collect())
+        .unwrap_or_default();
+    // Likewise, the erased SAM declaration is authoritative for its result.
+    // Reconstructing a generic value class from only its class symbol loses
+    // the type arguments (`Wrapped[String]` became `Object`).
+    let sam_typed_ret = sam.as_ref().map(|s| s.raw_ret_ty.clone());
     let sam_emit = sam.as_ref().map(|s| {
+        let raw_desc = jvm_method_desc(st, &s.raw_param_tys, &s.raw_ret_ty);
+        let typed_ret = sam_typed_ret
+            .clone()
+            .unwrap_or_else(|| s.raw_ret_ty.clone());
         (
             s.name.clone(),
-            jvm_method_desc(ctx.st, &s.raw_param_tys, &s.raw_ret_ty),
-            s.raw_ret_ty.clone(),
+            raw_desc,
+            s.raw_param_tys.clone(),
+            jvm_method_desc(st, &sam_typed_params, &typed_ret),
+            sam_typed_params.clone(),
+            typed_ret,
         )
     });
-    let (meth_name, meth_desc) = if let Some((n, d, _)) = &sam_emit {
+    let (meth_name, meth_desc) = if let Some((n, _, _, d, _, _)) = &sam_emit {
         (n.as_str(), d.as_str())
     } else {
         ("apply", apply_desc.as_str())
     };
 
-    let st = ctx.st;
     let extras = ctx.extras;
     let lambda_n = ctx.lambda_n;
     let lambda_bodies = ctx.lambda_bodies;
@@ -1086,8 +1309,10 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     let local_caps_pf = local_caps.clone();
     let ret_ty = if is_pf {
         body.ty.clone()
-    } else if let Some(sam) = &sam {
-        sam.ret_ty.clone()
+    } else if sam.is_some() {
+        sam_typed_ret
+            .clone()
+            .unwrap_or_else(|| sam.as_ref().map(|s| s.ret_ty.clone()).unwrap_or(Type::Any))
     } else {
         match &tree.ty {
             Type::Function { ret, .. } => (**ret).clone(),
@@ -1095,16 +1320,16 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
         }
     };
     let ret_ty_pf = ret_ty.clone();
-    let sam_ret = sam_emit.as_ref().map(|(_, _, r)| r.clone());
+    let sam_ret = sam_emit.as_ref().map(|(_, _, _, _, _, r)| r.clone());
     // Where each parameter arrives. A `FunctionN.apply` takes `Object`s, one
     // slot each; a user SAM's method is emitted at its own descriptor, so an
     // `apply(i: Int)` receives an `int` -- and a `Long`/`Double` takes two
     // slots. Reading every parameter as an `Object` in slot `1 + i` made
     // `val l: IntToString = (x: Int) => …` fail verification at its first
     // instruction (`aload_1` on an `int`, `run/lambda-serialization-security`).
-    let raw_params: Vec<Option<Type>> = match &sam {
-        Some(s) if s.raw_param_tys.len() == arity => {
-            s.raw_param_tys.iter().map(|t| Some(t.clone())).collect()
+    let raw_params: Vec<Option<Type>> = match &sam_emit {
+        Some((_, _, _, _, typed, _)) if typed.len() == arity => {
+            typed.iter().map(|t| Some(t.clone())).collect()
         }
         _ => vec![None; arity],
     };
@@ -1139,21 +1364,21 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
             },
         );
     } else {
+        let typed_sam = sam_emit.is_some();
         b.add_code(ACC_PUBLIC, &meth_name_owned, &meth_desc_owned, 8, |a| {
             let mut fr = Frame::instance();
             let mut arg_slots = Vec::with_capacity(arity);
             let mut next = 1u16;
             for raw in &raw_params {
                 arg_slots.push(next);
-                next += match raw {
-                    Some(t) if is_jvm_primitive(t) && !is_unit_like(t) => jvm_sort(t).slots(),
-                    _ => 1,
-                };
+                next += raw.as_ref().map(param_slots).unwrap_or(1);
             }
             fr.next_slot = next;
-            // apply args occupy slots 1..arity as Object; remap param symbols after unbox
+            // A typed SAM implementation receives its erased underlying
+            // parameters directly. Plain FunctionN/partial-function methods
+            // still receive Object arguments and adapt them below.
             for (i, p) in vparams.iter().enumerate() {
-                let obj_slot = arg_slots.get(i).copied().unwrap_or(1 + i as u16);
+                let arg_slot = arg_slots.get(i).copied().unwrap_or(1 + i as u16);
                 // A parameter instantiated at a value class receives the boxed
                 // instance; erasure recorded that on the symbol.
                 let p = &Tree {
@@ -1164,6 +1389,19 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                     },
                     ..p.clone()
                 };
+                if typed_sam {
+                    let ty = raw_params
+                        .get(i)
+                        .and_then(|t| t.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| p.ty.clone());
+                    let sort = jvm_sort(&ty);
+                    load(a, arg_slot, sort);
+                    let slot = fr.alloc_param(p.sym, sort, &ty);
+                    store(a, slot, sort);
+                    continue;
+                }
+                let obj_slot = arg_slot;
                 if let Some(Some(raw)) = raw_params.get(i) {
                     if is_jvm_primitive(raw) && !is_unit_like(raw) {
                         load(a, obj_slot, jvm_sort(raw));
@@ -1274,6 +1512,25 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
                 a.areturn();
             }
         });
+    }
+    if let Some((name, raw_desc, raw_params, typed_desc, typed_params, typed_ret)) = &sam_emit {
+        if let Some(s) = &sam {
+            emit_sam_bridge(
+                &mut b,
+                st,
+                &lam_name,
+                name,
+                raw_desc,
+                typed_desc,
+                raw_params,
+                &sam_boxed_params,
+                typed_params,
+                &s.raw_ret_ty,
+                &s.ret_ty,
+                typed_ret,
+                abi,
+            );
+        }
     }
     if is_pf {
         emit_partial_function_methods(

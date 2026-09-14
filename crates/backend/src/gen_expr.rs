@@ -685,6 +685,24 @@ pub(crate) fn gen_stat(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx, tr
                 frame.alloc(tree.sym, sort);
                 return;
             }
+            // Eta expansion materializes a synthetic receiver for a Java
+            // static method (`val eta$receiver$ = FileUtils; dir =>
+            // FileUtils.deleteQuietly(dir)`). A class name has no runtime
+            // value, and `gen_ident` deliberately emits nothing for it; using
+            // the ordinary path here would consume the method receiver that
+            // is already on the stack (`Seq.foreach` then underflows). Keep a
+            // harmless null placeholder for the synthetic capture. The
+            // selected static method ignores this receiver, matching nsc's
+            // static invocation while preserving the lambda ABI.
+            if matches!(rhs.kind, TreeKind::Ident { .. })
+                && !rhs.sym.is_none()
+                && ctx.st.get(rhs.sym).kind == SymKind::Class
+            {
+                asm.aconst_null();
+                let slot = frame.alloc(tree.sym, sort);
+                store(asm, slot, sort);
+                return;
+            }
             gen_expr(asm, frame, ctx, rhs);
             if is_boxed_var(ctx, tree.sym) {
                 emit_runtime_ref_create(asm, &ty);

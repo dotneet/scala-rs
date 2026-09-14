@@ -948,6 +948,12 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             }
         }
     };
+    // Keep the instantiated SAM target on the lambda tree. The backend needs
+    // it to distinguish `Eq[Wrapped]` from raw `Eq` when it emits the typed
+    // underlying implementation and the boxed bridge. Ordinary function
+    // values still erase their target type as before; a SAM's method
+    // descriptor is recovered from the erased parameter symbols below.
+    let preserve_sam_target = st.sam_sig(&tree.ty).is_some();
     match &mut tree.kind {
         TreeKind::PackageDef { stats, .. } => {
             for s in stats {
@@ -1320,9 +1326,13 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     let orig = tree.ty.clone();
     // A lambda parameter instantiated at a value class holds the boxed
     // instance (see `erase`); every reference to it has to agree.
-    tree.ty = match boxed_value_class_ref(tree, st) {
-        Some(t) => t,
-        None => erase_ty(&orig, st),
+    tree.ty = if preserve_sam_target {
+        orig.clone()
+    } else {
+        match boxed_value_class_ref(tree, st) {
+            Some(t) => t,
+            None => erase_ty(&orig, st),
+        }
     };
     if forwards_expected_to_result(&tree.kind) {
         // Already adapted through the branches: only record the type they now

@@ -108,6 +108,9 @@ impl<'a> Gen<'a> {
                 });
             }
         }
+        // A classpath lazy val is visible to both the ordinary trait-val and
+        // pickle lazy-val scans. Keep the dedicated lazy field only.
+        let binary_lazies = self.binary_mixin_lazy_vals(cls, &impl_.body);
         for (name, ty, extra) in self.mixin_val_fields(cls, &[], &impl_.body) {
             // Nothing is added twice. A trait with a dedicated emission --
             // `scala.App`, whose `executionStart` / `initCode` fields and
@@ -117,6 +120,9 @@ impl<'a> Gen<'a> {
             if b.fields.iter().any(|f| f.name == name) {
                 continue;
             }
+            if binary_lazies.iter().any(|v| v.name == name) {
+                continue;
+            }
             b.fields.push(Field {
                 access: ACC_PUBLIC | extra,
                 name,
@@ -124,7 +130,6 @@ impl<'a> Gen<'a> {
             });
         }
         let lazies = self.all_lazy_vals(cls, &impl_.body);
-        let binary_lazies = self.binary_mixin_lazy_vals(cls, &impl_.body);
         for v in &self.mixin_lazy_vals(cls, &impl_.body) {
             b.fields.push(Field {
                 access: Self::mixin_lazy_field_access(v),

@@ -329,6 +329,12 @@ impl<'a> Sig<'a> {
                 let e = match elem.widen_constant() {
                     // Both bottom types: see `jvm_desc_array_elem`.
                     Type::Nothing | Type::Null => "Ljava/lang/Object;".to_string(),
+                    // A user value class is boxed in an array element slot,
+                    // even though the ordinary JVM value position below
+                    // erases it to its underlying representation.
+                    _ if head_type_sym(elem).is_some_and(|s| self.st.is_value_class(s)) => {
+                        self.jsig(elem, false, depth + 1)
+                    }
                     _ => self.jsig(elem, true, depth + 1),
                 };
                 format!("[{e}")
@@ -356,7 +362,15 @@ impl<'a> Sig<'a> {
                 }
                 if self.st.is_value_class(*sym) {
                     if let Some(u) = self.st.value_class_underlying(*sym) {
-                        if !(is_primitive(&u) && !primitive_ok) {
+                        // A value class is erased only in a JVM value
+                        // position (method/field descriptor).  In a generic
+                        // Signature argument it remains the boxed class:
+                        // `Eq[Wrapper]` must be written as `Eq<Wrapper>`, not
+                        // `Eq<underlying>`.  The latter is a different type
+                        // to Java reflection and to separately compiled
+                        // Scala clients, even though the descriptor still
+                        // uses the underlying representation.
+                        if primitive_ok {
                             return self.jsig(&u, primitive_ok, depth + 1);
                         }
                     }
@@ -484,21 +498,6 @@ fn head_type_sym(ty: &Type) -> Option<SymbolId> {
         | Type::TypeParam(sym) => Some(*sym),
         _ => None,
     }
-}
-
-fn is_primitive(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Boolean
-            | Type::Byte
-            | Type::Short
-            | Type::Int
-            | Type::Long
-            | Type::Float
-            | Type::Double
-            | Type::Char
-            | Type::Unit
-    )
 }
 
 fn is_top(ty: &Type) -> bool {
