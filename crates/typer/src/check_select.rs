@@ -4270,6 +4270,68 @@ impl Typer {
         true
     }
 
+    /// Expand the tuple argument produced by a left-associative infix call
+    /// when the selected method has a matching multi-parameter clause. The
+    /// parser intentionally represents both `x op (a, b)` and `x.op((a, b))`
+    /// as one argument; only the former gets Scala's infix tuple adaptation.
+    pub(crate) fn expand_infix_tuple_arg(&self, fun: &Tree, args: &mut Vec<Tree>) {
+        if args.len() != 1 || !self.written_infix_select(fun) {
+            return;
+        }
+        let tuple_arity = match &args[0].kind {
+            TreeKind::Apply { fun, args } => match &fun.kind {
+                TreeKind::Ident { name } if name.starts_with("Tuple") => Some(args.len()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(tuple_arity) = tuple_arity else {
+            return;
+        };
+        if tuple_arity < 2
+            || !self.infix_accepts_arity(&fun.ty, tuple_arity)
+            || self.infix_accepts_arity(&fun.ty, 1)
+        {
+            return;
+        }
+        let tuple = args.pop().expect("one tuple argument checked above");
+        let TreeKind::Apply { args: elems, .. } = tuple.kind else {
+            unreachable!("tuple argument checked above");
+        };
+        args.extend(elems);
+    }
+
+    fn infix_accepts_arity(&self, ty: &Type, arity: usize) -> bool {
+        match ty {
+            Type::Method { paramss, .. } => {
+                paramss.first().is_some_and(|params| params.len() == arity)
+            }
+            Type::Overload(alts) => alts.iter().any(|alt| match alt {
+                Type::Method { paramss, .. } => {
+                    paramss.first().is_some_and(|params| params.len() == arity)
+                }
+                _ => false,
+            }),
+            _ => false,
+        }
+    }
+
+    /// Whether `fun`'s selection was written as `receiver op`, rather than as
+    /// a dotted method selection. The parser's tree shape is shared by both
+    /// forms, so the source gap between the receiver and operator is the
+    /// reliable distinction (and also handles alphabetic infix methods).
+    fn written_infix_select(&self, fun: &Tree) -> bool {
+        let TreeKind::Select { qual, .. } = &fun.kind else {
+            return false;
+        };
+        let Some(src) = self.sources.get(self.file_index) else {
+            return false;
+        };
+        let lo = qual.span.hi.0 as usize;
+        let hi = fun.span.hi.0 as usize;
+        lo <= hi && hi <= src.len() && !src[lo..hi].contains('.')
+    }
+
     /// Whether the callee's first clause ends in a repeated parameter.
     fn callee_takes_repeated(&self, fun: &Tree) -> bool {
         let is_varargs = |t: &Type| {

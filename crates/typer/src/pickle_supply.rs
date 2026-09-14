@@ -553,7 +553,7 @@ impl PickleSupply {
             // so the class file reader's description of them -- which cannot
             // say "implicit clause" or "this parameter has a default" -- is
             // dropped here rather than left to shadow the pickled one.
-            if !m.is_public_api()
+            if !m.is_inheritable_api()
                 && !(m.has(pflags::PRIVATE) && !m.has(pflags::BRIDGE) && !m.has(pflags::SYNTHETIC))
                 && !m.is_case_synthetic()
                 && !m.is_case_copy(sig.flags)
@@ -2665,7 +2665,7 @@ impl PickleSupply {
                 && m.name == "copy"
                 && m.has(pflags::SYNTHETIC)
                 && m.is_case_copy(self.declared_class_flags(bin, &hit.owner, hit.owner_module));
-            if !m.is_public_api()
+            if !m.is_inheritable_api()
                 && !(m.has(pflags::PRIVATE)
                     && hit.owner == full
                     && !m.has(pflags::BRIDGE)
@@ -2710,7 +2710,7 @@ impl PickleSupply {
                 // protected[p], private[p], or private[this].
                 st.get_mut(id).flags = st.get(id).flags.with(ctor_access_flags(m));
                 st.get_mut(id).private_within = ctor_access_within(m);
-                if m.has(pflags::LOCAL) && m.has(pflags::PRIVATE) {
+                if m.has(pflags::LOCAL) {
                     st.get_mut(id).flags = st.get(id).flags.with(Flags::LOCAL);
                 }
                 // Preserve the declaration-side stable path of a value or

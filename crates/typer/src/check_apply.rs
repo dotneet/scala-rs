@@ -972,6 +972,15 @@ impl Typer {
             });
         });
 
+        // The parser keeps `recv op (a, b)` as an infix application with one
+        // tuple-valued argument.  nsc's `adaptToArguments` expands that tuple
+        // when the operator's first parameter clause takes the tuple's
+        // elements -- Slick's `(a, b) <> (to, from)` is the common example.
+        // A regular call such as `recv.<>((a, b))` must stay one argument, so
+        // use the source spelling of the selection and only expand when the
+        // callee has no one-parameter alternative that could accept the tuple.
+        self.expand_infix_tuple_arg(fun, args);
+
         // A function-typed value is applied through FunctionN.apply. Its
         // symbol still points at the declaration that produced the value (for
         // example `g` in `g(1)`), but that declaration's parameter lists are

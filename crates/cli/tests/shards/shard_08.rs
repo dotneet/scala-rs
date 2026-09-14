@@ -15,6 +15,8 @@ mod temp_nonce;
 mod testkit;
 #[path = "../testkit2.rs"]
 mod testkit2;
+#[path = "../protected_this.rs"]
+mod protected_this;
 #[path = "../thiscast.rs"]
 mod thiscast;
 #[path = "../tmember.rs"]

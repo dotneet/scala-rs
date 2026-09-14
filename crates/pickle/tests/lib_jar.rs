@@ -482,3 +482,36 @@ fn flag_bits_match_the_library() {
     }
     assert!(saw_default, "lastIndexOf(elem, end) not found");
 }
+
+#[test]
+fn protected_this_methods_are_inheritable_but_not_public_api() {
+    use scala_rs_pickle::read::pflags;
+    use scala_rs_pickle::sym::{Member, MemberKind, SigType};
+
+    let member = |flags| Member {
+        name: "next".into(),
+        kind: MemberKind::Def,
+        flags,
+        ty: SigType::None,
+        alias_prefix: None,
+        result_prefix: None,
+        macro_impl: None,
+        private_within: None,
+        has_private_within: false,
+        deprecated: None,
+    };
+    let protected_this = member(pflags::PROTECTED | pflags::LOCAL | pflags::METHOD);
+    assert!(!protected_this.is_public_api());
+    assert!(protected_this.is_protected_this_method());
+    assert!(protected_this.is_inheritable_api());
+
+    for flags in [
+        pflags::PROTECTED | pflags::LOCAL | pflags::METHOD | pflags::PRIVATE,
+        pflags::PROTECTED | pflags::LOCAL | pflags::METHOD | pflags::BRIDGE,
+        pflags::PROTECTED | pflags::LOCAL | pflags::METHOD | pflags::SYNTHETIC,
+        pflags::PROTECTED | pflags::METHOD,
+    ] {
+        let member = member(flags);
+        assert!(!member.is_protected_this_method(), "flags={flags:#x}");
+    }
+}

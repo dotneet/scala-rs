@@ -229,6 +229,33 @@ impl Member {
             && !self.name.ends_with(' ')
     }
 
+    /// A `protected[this]` method is not part of the public API, but it is
+    /// still inherited by a subclass. This matters for classpath-only
+    /// expansion of macros: Slick's `SimpleFastPathResultConverter.next` is
+    /// such a method, and its generic result type is needed by the anonymous
+    /// converter that `ShapedValue.mapTo` creates. The JVM member scan has no
+    /// generic Scala type, so omitting this pickle entry leaves a raw method
+    /// returning `Any` in its place.
+    pub fn is_protected_this_method(&self) -> bool {
+        self.kind == MemberKind::Def
+            && self.has(pflags::PROTECTED)
+            && self.has(pflags::LOCAL)
+            && !self.has(pflags::PRIVATE)
+            && !self.has(pflags::BRIDGE)
+            && !self.has(pflags::SYNTHETIC)
+            && !self.name.contains("$default$")
+            && !self.name.ends_with(' ')
+    }
+
+    /// Members that can replace a JVM-only classpath description with the
+    /// richer ScalaSignature declaration. In addition to public members this
+    /// includes `protected[this]` methods, which are valid on an inherited
+    /// receiver even though they are intentionally hidden from external
+    /// callers.
+    pub fn is_inheritable_api(&self) -> bool {
+        self.is_public_api() || self.is_protected_this_method()
+    }
+
     /// A `case class`'s compiler-generated API: the companion's `apply` and
     /// `unapply`, and the class's own `copy`.
     ///
