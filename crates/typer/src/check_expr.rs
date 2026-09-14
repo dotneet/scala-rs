@@ -1720,6 +1720,61 @@ impl Typer {
                         }
                     }
                 }
+                // A local inferred `lazy val` is visible to the whole block,
+                // including an earlier local class. Enter those names before
+                // the header pass below, but register their RHS later in
+                // source order so imports keep their lexical scope.
+                for s in stats.iter_mut() {
+                    let TreeKind::ValDef { tpt, mods, .. } = &s.kind else {
+                        continue;
+                    };
+                    if !mods.flags.contains(Flags::LAZY)
+                        || !tpt.is_empty()
+                        || s.id == scala_rs_parser::NodeId(0)
+                    {
+                        continue;
+                    }
+                    let Some(name) = s.name().map(str::to_string) else {
+                        continue;
+                    };
+                    if s.sym.is_none() {
+                        let id = self.st.alloc(
+                            name.clone(),
+                            self.st.owner,
+                            SymKind::Term,
+                            mods.flags,
+                            "",
+                        );
+                        s.sym = id;
+                        self.def_spans.insert(id, s.span);
+                    }
+                    if !s.sym.is_none() {
+                        self.st.enter_in_current(&name, s.sym);
+                    }
+                }
+                // Install local class/object headers only in blocks that have
+                // an inferred lazy value to complete. The full body pass below
+                // still follows source order, while ordinary local templates
+                // keep their established single-pass behavior.
+                let has_inferred_lazy = stats.iter().any(|s| {
+                    matches!(
+                        &s.kind,
+                        TreeKind::ValDef { tpt, mods, .. }
+                            if mods.flags.contains(Flags::LAZY)
+                                && tpt.is_empty()
+                                && s.id != scala_rs_parser::NodeId(0)
+                    )
+                });
+                if has_inferred_lazy {
+                    for s in stats.iter_mut() {
+                        if matches!(
+                            s.kind,
+                            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                        ) {
+                            self.type_local_template_header(s);
+                        }
+                    }
+                }
                 // `implicit class C(x: P) { ... }` desugars to a synthetic
                 // `implicit def C(x: P): C = new C(x)` (SLS: nsc does this at
                 // the namer). `type_class`/`namer_class` and `namer_module`
@@ -1840,9 +1895,37 @@ impl Typer {
                     }
                     // A local `lazy val` is in scope for the whole block as well:
                     // `lazy val a: Int = b + 1; lazy val b: Int = 2` is legal (an
-                    // eager `val` may not be forward-referenced). As above, only
-                    // the signature is built here; the initialiser waits, and with
-                    // it the point at which the `lazy val` is forced.
+                    // eager `val` may not be forward-referenced). The same holds
+                    // when its result type is inferred: a local class or another
+                    // definition may use `lazy val bs = TableQuery[B]` before the
+                    // declaration. Allocate the term now and leave its RHS for
+                    // the lazy signature completer; otherwise the forward use is
+                    // reported as `not found` even though scalac has entered it.
+                    if let TreeKind::ValDef { tpt, mods, .. } = &s.kind {
+                        if mods.flags.contains(Flags::LAZY)
+                            && tpt.is_empty()
+                            && s.id != scala_rs_parser::NodeId(0)
+                        {
+                            if let Some(name) = s.name().map(str::to_string) {
+                                if s.sym.is_none() {
+                                    let id = self.st.alloc(
+                                        name.clone(),
+                                        self.st.owner,
+                                        SymKind::Term,
+                                        mods.flags,
+                                        "",
+                                    );
+                                    s.sym = id;
+                                    self.def_spans.insert(id, s.span);
+                                }
+                                self.st.enter_in_current(&name, s.sym);
+                                self.register_block_sig(s);
+                            }
+                        }
+                    }
+                    // With an explicit type, build the signature immediately;
+                    // with an inferred type, the branch above has only entered
+                    // the name and registered its RHS for on-demand completion.
                     if let TreeKind::ValDef { tpt, mods, .. } = &s.kind {
                         if mods.flags.contains(Flags::LAZY)
                             && !tpt.is_empty()

@@ -195,6 +195,20 @@ impl Typer {
         });
     }
 
+    /// Build a local class/object's header and member signatures before any
+    /// block-local inferred value can force a `TableQuery[LaterClass]`-like
+    /// RHS.  Local templates normally run as one complete expression, but an
+    /// inferred lazy value can be named by a class written earlier in the
+    /// block; in that case the later class must already have its parents and
+    /// members installed when the value's signature is completed.
+    pub(crate) fn type_local_template_header(&mut self, tree: &mut Tree) {
+        self.with_sigs_only(true, |this| match &tree.kind {
+            TreeKind::ClassDef { .. } => this.type_class(tree),
+            TreeKind::ModuleDef { .. } => this.type_module(tree),
+            _ => unreachable!("local template must be a class or object"),
+        });
+    }
+
     pub(crate) fn type_eta(&mut self, tree: &mut Tree, pt: &Type) {
         let dummy_method = Type::Method {
             paramss: vec![],

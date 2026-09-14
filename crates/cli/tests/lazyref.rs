@@ -228,6 +228,20 @@ fn real_scalac_dual_run_lr_edge() {
     scalac_dual_run("lr_edge");
 }
 
+/// A local class header is available before an inferred local `lazy val` is
+/// completed. This is the dependency shape used by Slick's local table
+/// definitions: the earlier class's method names a later table query, whose
+/// RHS itself names a later local class and its members.
+#[test]
+fn fixtures_lr_forward_class() {
+    check_both_abis("lr_forward_class");
+}
+
+#[test]
+fn real_scalac_dual_run_lr_forward_class() {
+    scalac_dual_run("lr_forward_class");
+}
+
 /// A hoisted def calling another hoisted def has to be able to pass on its
 /// captures. This was already broken for plain nested `def`s (the call came
 /// out one argument short and the callee ran on a shifted frame); a local
