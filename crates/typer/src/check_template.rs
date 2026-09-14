@@ -14,6 +14,82 @@ use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 use std::collections::HashSet;
 
+/// Find explicit value members used as prefixes in member type aliases. A
+/// bare identifier is left out because it belongs to the type namespace; only
+/// a select such as `profile.backend.Database` can require a stable value.
+fn path_alias_value_ids(body: &[Tree]) -> HashSet<NodeId> {
+    let mut needed = HashSet::new();
+    for stat in body {
+        if let TreeKind::TypeDef { rhs, .. } = &stat.kind {
+            collect_path_alias_value_names(rhs, &mut needed);
+        }
+    }
+    body.iter()
+        .filter_map(|stat| match &stat.kind {
+            TreeKind::ValDef { name, tpt, .. }
+                if !tpt.is_empty() && needed.contains(name.as_str()) =>
+            {
+                Some(stat.id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_path_alias_value_names<'a>(tree: &'a Tree, needed: &mut HashSet<&'a str>) {
+    match &tree.kind {
+        TreeKind::Select { qual, .. }
+        | TreeKind::SelectFromTypeTree {
+            qual, hash: false, ..
+        } => {
+            if let Some(root) = path_root_name(qual) {
+                needed.insert(root);
+            }
+            collect_path_alias_value_names(qual, needed);
+        }
+        TreeKind::AppliedTypeTree { tpt, args } => {
+            collect_path_alias_value_names(tpt, needed);
+            for arg in args {
+                collect_path_alias_value_names(arg, needed);
+            }
+        }
+        TreeKind::SingletonTypeTree { ref_ } => collect_path_alias_value_names(ref_, needed),
+        TreeKind::AnnotatedTypeTree { tpt, annot } => {
+            collect_path_alias_value_names(tpt, needed);
+            collect_path_alias_value_names(annot, needed);
+        }
+        TreeKind::CompoundTypeTree {
+            parents,
+            refinements,
+        } => {
+            for parent in parents {
+                collect_path_alias_value_names(parent, needed);
+            }
+            for refinement in refinements {
+                collect_path_alias_value_names(refinement, needed);
+            }
+        }
+        TreeKind::ExistentialTypeTree { tpt, clauses } => {
+            collect_path_alias_value_names(tpt, needed);
+            for clause in clauses {
+                collect_path_alias_value_names(clause, needed);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn path_root_name(tree: &Tree) -> Option<&str> {
+    match &tree.kind {
+        TreeKind::Ident { name } => Some(name),
+        TreeKind::Select { qual, .. }
+        | TreeKind::SelectFromTypeTree {
+            qual, hash: false, ..
+        } => path_root_name(qual),
+        _ => None,
+    }
+}
+
 impl Typer {
     /// Type a template parent, preserving its source form for the second
     /// signature round when an enclosing import is not ready yet.
@@ -165,6 +241,18 @@ impl Typer {
         let saved = self.macro_enter_owner(tree.sym);
         self.type_class_with_macro_owner(tree);
         self.macro_lexical_owner = saved;
+    }
+
+    /// Type only explicit values that alias signatures use as path heads.
+    /// Ordinary signatures remain deferred until after aliases, preserving
+    /// source/type namespace ordering for unrelated members.
+    fn type_path_alias_values(&mut self, body: &mut [Tree]) {
+        let needed = path_alias_value_ids(body);
+        for member in body {
+            if matches!(member.kind, TreeKind::ValDef { .. }) && needed.contains(&member.id) {
+                self.type_member_sig_deferrable(member);
+            }
+        }
     }
 
     fn type_class_with_macro_owner(&mut self, tree: &mut Tree) {
@@ -475,6 +563,7 @@ impl Typer {
                 self.type_import(stt);
             }
         }
+        self.type_path_alias_values(body);
         // type aliases / abstract type members before other signatures
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::TypeDef { .. }) {
@@ -824,6 +913,7 @@ impl Typer {
                 self.type_import(stt);
             }
         }
+        self.type_path_alias_values(body);
         for stt in body.iter_mut() {
             if matches!(stt.kind, TreeKind::TypeDef { .. }) {
                 self.type_type_member(stt);

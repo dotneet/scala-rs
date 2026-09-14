@@ -1979,6 +1979,21 @@ object Main {
     }
 
     #[test]
+    fn path_dependent_alias_types_its_explicit_prefix_first() {
+        let (_, _, diags) = typecheck_str(
+            r#"
+trait Backend { type Database }
+trait Profile {
+  type BackendType <: Backend
+  val backend: BackendType
+  type DatabaseAlias = backend.Database
+}
+"#,
+        );
+        assert!(!has_errors(&diags), "unexpected diagnostics: {:?}", diags);
+    }
+
+    #[test]
     fn cyclic_type_alias_is_diagnosed() {
         let (_, _, diags) = typecheck_str(
             r#"
