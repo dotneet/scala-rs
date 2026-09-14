@@ -944,6 +944,7 @@ impl Typer {
             tree.sym = s;
             let ty = expand(subst(self.st.get(s).ty.clone()));
             let ty = self.opaque_projection_params(&qual.ty, ty);
+            let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless(s, ty, pt);
             if let Type::Array(elem) = &qual.ty {

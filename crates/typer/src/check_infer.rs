@@ -1172,6 +1172,33 @@ impl Typer {
         }
     }
 
+    /// Restore the empty parameter clause that the Java classfile reader
+    /// cannot distinguish from a Scala parameterless method.
+    ///
+    /// A Java `static T make()` may be used as a `() => T` when that function
+    /// type is expected. Its classfile signature currently arrives as a
+    /// `Method` with no clauses, the same representation as Scala's
+    /// `def make: T`; [`Self::maybe_auto_apply`] must auto-apply the latter and
+    /// therefore also consumed the Java method before `adapt` could eta-expand
+    /// it. The symbol's `JAVA` flag is the missing source-level distinction.
+    pub(crate) fn java_empty_clause_for_eta(&self, sym: SymbolId, ty: Type, pt: &Type) -> Type {
+        if sym.is_none()
+            || !self.st.get(sym).flags.contains(Flags::JAVA)
+            || self.st.get(sym).flags.contains(Flags::ACCESSOR)
+            || matches!(pt, Type::Method { .. })
+            || !self.expects_function_value(pt)
+        {
+            return ty;
+        }
+        match ty {
+            Type::Method { paramss, ret } if paramss.is_empty() => Type::Method {
+                paramss: vec![vec![]],
+                ret,
+            },
+            other => other,
+        }
+    }
+
     pub(crate) fn is_nullary_method_sym(&self, id: SymbolId) -> bool {
         match &self.st.get(id).ty {
             Type::Method { paramss, .. } => {

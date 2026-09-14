@@ -214,3 +214,89 @@ fn external_stable_accessor_is_type_prefix() {
     let _ = fs::remove_dir_all(reference);
     let _ = fs::remove_dir_all(ours);
 }
+
+/// A zero-argument Java method has an explicit empty parameter clause even
+/// though the classfile representation shares scala-rs's internal shape for a
+/// Scala parameterless method. The `JAVA` symbol flag must preserve that
+/// distinction when a `Function0` is expected, without accepting a different
+/// function arity.
+#[test]
+fn java_zero_arg_method_eta_expands_with_function0_expected() {
+    if !java_available() {
+        return;
+    }
+    let (Some(sc), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip Java nullary eta dual-run: scalac, scala-library, or Java unavailable");
+        return;
+    };
+    let reference = tmp_dir("java-nullary-reference");
+    let ours = tmp_dir("java-nullary-ours");
+    let bad_reference = tmp_dir("java-nullary-bad-reference");
+    let bad_ours = tmp_dir("java-nullary-bad-ours");
+    let src = fixtures_dir().join("stc_java_nullary_eta.scala");
+    let bad_src = fixtures_dir().join("stc_java_nullary_eta_bad.scala");
+    let jar_s = jar.to_str().unwrap();
+
+    let status = Command::new(&sc)
+        .args([src.to_str().unwrap(), "-d", reference.to_str().unwrap()])
+        .status()
+        .expect("scalac stc_java_nullary_eta");
+    assert!(status.success(), "scalac rejected Java nullary eta");
+    let expected = run_java(&reference, jar_s);
+
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            ours.to_str().unwrap(),
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("scala-rs stc_java_nullary_eta");
+    assert!(
+        output.status.success(),
+        "scala-rs rejected Java nullary eta: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        run_java(&ours, jar_s),
+        expected,
+        "scala-rs Java nullary eta output differs from real scalac"
+    );
+
+    let status = Command::new(&sc)
+        .args([
+            bad_src.to_str().unwrap(),
+            "-d",
+            bad_reference.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scalac stc_java_nullary_eta_bad");
+    assert!(
+        !status.success(),
+        "scalac unexpectedly accepted wrong eta arity"
+    );
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            bad_src.to_str().unwrap(),
+            "-d",
+            bad_ours.to_str().unwrap(),
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("scala-rs stc_java_nullary_eta_bad");
+    assert!(
+        !output.status.success(),
+        "scala-rs unexpectedly accepted wrong eta arity"
+    );
+
+    let _ = fs::remove_dir_all(reference);
+    let _ = fs::remove_dir_all(ours);
+    let _ = fs::remove_dir_all(bad_reference);
+    let _ = fs::remove_dir_all(bad_ours);
+}

@@ -2980,6 +2980,7 @@ impl Typer {
                     }
                 }
             }
+            ty = self.java_empty_clause_for_eta(s, ty, pt);
             ty = self.maybe_auto_apply(ty, pt);
             ty = self.instantiate_parameterless(s, ty, pt);
             // Only a *member* of a class is seen through `this`. A local or a
@@ -3011,6 +3012,7 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let ty = self.ident_ty_as_seen_from_this(s, first_ty);
+            let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless(s, ty, pt);
             return;
