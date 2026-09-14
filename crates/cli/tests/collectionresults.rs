@@ -121,6 +121,16 @@ fn sorted_results_and_existing_set_operations() {
         true,
     );
 }
+
+#[test]
+fn sorted_set_lazyzip_buildfrom_is_order_independent() {
+    matrix_ordered(
+        &[("sortedset_lazyzip_order", true)],
+        Some("sortedset_warm"),
+        JAR,
+    );
+}
+
 #[test]
 fn value_class_and_nullary_overload_execute() {
     matrix(

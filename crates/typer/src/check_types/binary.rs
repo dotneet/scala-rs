@@ -576,6 +576,17 @@ impl Typer {
     /// closure of cats-effect and takes minutes.
     pub(crate) fn warm_implicit_scope(&mut self, pt: &Type) {
         self.warm_implicit_scope_once(pt);
+        // BuildFrom's F-bound is checked while ranking witnesses. A generic
+        // witness may already fit (for example after a List.lazyZip call),
+        // so waiting for a failed search before loading the source's parents
+        // leaves a later SortedSet search with only buildFromIterableOps.
+        // Keep this narrow to BuildFrom's source constructor; warming every
+        // implicit type here would eagerly complete unrelated library APIs.
+        if let Type::Class { sym, .. } = pt {
+            if self.st.get(*sym).jvm_name == "scala/collection/BuildFrom" {
+                self.warm_buildfrom_source_parents(std::slice::from_ref(pt));
+            }
+        }
     }
 
     /// The same, for the *candidates* rather than the wanted type.
