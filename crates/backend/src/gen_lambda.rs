@@ -225,6 +225,34 @@ pub(crate) fn ident_reads_enclosing_this(st: &SymbolTable, id: SymbolId) -> bool
     matches!(st.get(s.owner).kind, SymKind::Class)
 }
 
+/// Is `qual` the compiler-generated class-side receiver alias of a static Java
+/// method selection? Such a selection has no JVM receiver, so this one use of
+/// the alias is not a free-variable read. Checking the alias itself for
+/// `SYNTHETIC` keeps an ordinary/shadowing local conservative, and deciding at
+/// the use site means another real read of the same symbol is still captured.
+fn is_static_java_method_alias(st: &SymbolTable, method: SymbolId, qual: &Tree) -> bool {
+    fn alias_id(tree: &Tree) -> Option<SymbolId> {
+        match &tree.kind {
+            TreeKind::Ident { .. } if !tree.sym.is_none() => Some(tree.sym),
+            TreeKind::Typed { expr, .. } | TreeKind::TypeApply { fun: expr, .. } => alias_id(expr),
+            _ => None,
+        }
+    }
+
+    let Some(alias) = alias_id(qual) else {
+        return false;
+    };
+    let alias = st.get(alias);
+    if alias.kind != SymKind::Term || !alias.flags.contains(Flags::SYNTHETIC) || method.is_none() {
+        return false;
+    }
+    let method = st.get(method);
+    method.kind == SymKind::Method
+        && method.flags.contains(Flags::STATIC)
+        && (method.flags.contains(Flags::JAVA)
+            || (!method.owner.is_none() && st.get(method.owner).flags.contains(Flags::JAVA)))
+}
+
 pub(crate) fn collect_free(
     tree: &Tree,
     bound: &HashSet<SymbolId>,
@@ -253,7 +281,11 @@ pub(crate) fn collect_free(
             collect_free(body, &b, out, st);
         }
         TreeKind::Super { .. } | TreeKind::This { .. } => out.uses_this = true,
-        TreeKind::Select { qual, .. } => collect_free(qual, bound, out, st),
+        TreeKind::Select { qual, .. } => {
+            if !is_static_java_method_alias(st, tree.sym, qual) {
+                collect_free(qual, bound, out, st);
+            }
+        }
         TreeKind::UnApply { fun, args } => {
             collect_free(fun, bound, out, st);
             for a in args {

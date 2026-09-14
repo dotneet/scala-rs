@@ -366,7 +366,7 @@ fn java_static_function_does_not_capture_enclosing_receiver() {
     let jar_s = jar.to_str().expect("scala-library path");
     let out = compile_fixture_with("lambda_java_static", &["--scala-library", jar_s]);
     let got = run_java(&out, Some(jar_s), "Main");
-    assert_eq!(got, "ok\n");
+    assert_eq!(got, "1\n2\nshadow\nok\n");
     let _ = fs::remove_dir_all(&out);
 }
 
