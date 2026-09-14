@@ -4114,9 +4114,13 @@ impl Typer {
                 })
                 .collect();
             self.solve_conv_targs_from_implicits(&cand_ty, &tps, &mut solved);
-            for (arg, solved) in targs.iter_mut().zip(solved) {
+            for ((tp, arg), solved) in tps.iter().zip(targs.iter_mut()).zip(solved) {
                 if let Some(solved) = solved {
                     *arg = solved;
+                } else if *arg == Type::TypeParam(*tp)
+                    && !crate::check::mentions_tparam(ret, &[*tp])
+                {
+                    *arg = self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing);
                 }
             }
         }
