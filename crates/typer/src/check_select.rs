@@ -599,6 +599,14 @@ impl Typer {
             self.rewrite_select_dynamic(tree, pt);
             return;
         }
+        // An abstract type member can expose a concrete class through its
+        // upper bound (`API#Ops[Int] <: OpsImpl[Int]`). Member lookup already
+        // uses that bound to find `add`; use the instantiated bound for
+        // as-seen-from substitution too, while retaining `recv_ty` as the
+        // expression's original nominal/path-dependent type.
+        let member_recv_ty = self
+            .type_instance_for_bounded_member_lookup(&recv_ty)
+            .unwrap_or_else(|| recv_ty.clone());
         // No second `supply_from_pickle` here: the search above already ran it
         // for this receiver, and `PickleSupply::complete_named` memoizes
         // `(class, name)` — asking twice returns the class's *raw* members
@@ -884,10 +892,10 @@ impl Typer {
                 self.at_import_prefix_of(ext_conv, &ty).unwrap_or(ty)
             };
             let ty = match &this_prefix {
-                Some(p) => self.st.subst_as_seen_from_prefix(&recv_ty, p, &ty),
+                Some(p) => self.st.subst_as_seen_from_prefix(&member_recv_ty, p, &ty),
                 None => self
                     .st
-                    .subst_as_seen_from_at(&recv_ty, inner_prefix.as_ref(), &ty),
+                    .subst_as_seen_from_at(&member_recv_ty, inner_prefix.as_ref(), &ty),
             };
             if !subst_args.is_empty() {
                 if let Some(owner) = found.first().map(|s| self.st.get(*s).owner) {
@@ -908,7 +916,7 @@ impl Typer {
                 Some(c) => self.st.expand_type_members(c, &ty),
                 None => ty,
             };
-            let ty = self.st.expand_in_type(&recv_ty, &ty);
+            let ty = self.st.expand_in_type(&member_recv_ty, &ty);
             // After the as-seen-from expansion, which re-resolves a type
             // member's *name* through the receiver's class and its lexically
             // enclosing ones -- and so would put the outer class's abstract

@@ -275,3 +275,21 @@ fn real_scalac_reads_scala_rs_classfiles() {
     let _ = fs::remove_dir_all(&usr);
     let _ = fs::remove_dir_all(&lib);
 }
+
+/// A member selected through an applied abstract type must substitute the
+/// arguments into its upper bound. This is the small path-dependent analogue
+/// of Slick's `profile.api` conversion result: `Ops[Int] <: OpsImpl[Int]`,
+/// whose `add(Iterable[T])` must accept `Seq[Int]`.
+#[test]
+fn fixtures_testkit_bounded_member_uses_applied_arguments() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip bounded-member test: scala-library jar not obtainable");
+        return;
+    };
+    let out = compile_fixtures_with(
+        "testkit-bound",
+        &["testkit_bound"],
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    let _ = fs::remove_dir_all(&out);
+}

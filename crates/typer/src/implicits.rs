@@ -3245,6 +3245,35 @@ impl Typer {
         None
     }
 
+    /// The instantiated class view of a type whose members are exposed by an
+    /// upper bound. `c: API#Ops[Int]` is looked up through `Ops`'s bound
+    /// `OpsImpl[T]`, but member substitution must use `OpsImpl[Int]`, not the
+    /// opaque `Ops[Int]`: otherwise `def add(xs: Iterable[T])` keeps its
+    /// declaration parameter `T` and rejects `Seq[Int]`. Keep this view local
+    /// to member typing; the original projected type remains the expression's
+    /// type and therefore preserves path-dependent/nominal semantics.
+    pub(crate) fn type_instance_for_bounded_member_lookup(&self, ty: &Type) -> Option<Type> {
+        let mut current = ty.clone();
+        for _ in 0..8 {
+            current = match current {
+                Type::TypeMember(id) | Type::TypeParam(id) => self.st.get(id).bound_hi.clone()?,
+                Type::BoundedWildcard { hi: Some(hi), .. } => *hi,
+                Type::Applied { ctor, args } => match ctor.as_ref() {
+                    Type::TypeMember(id) | Type::TypeParam(id) => {
+                        let hi = self.st.get(*id).bound_hi.clone()?;
+                        self.st.subst_tparams(*id, &args, &hi)
+                    }
+                    _ => return Some(Type::Applied { ctor, args }),
+                },
+                _ => return Some(current),
+            };
+            if self.st.class_sym_of(&current).is_some() {
+                return Some(current);
+            }
+        }
+        None
+    }
+
     /// A stand-in for a `Predef` member does not compete with the member
     /// itself once the run's own sources have supplied it.
     ///
@@ -4731,6 +4760,42 @@ mod memo_tests {
         assert_eq!(
             typer.implicit_via_module.borrow().get(&witness.0),
             Some(&module_b)
+        );
+    }
+
+    #[test]
+    fn bounded_type_member_view_substitutes_applied_arguments() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let impl_cls = typer
+            .st
+            .alloc("OpsImpl", root, SymKind::Class, Flags::EMPTY, "OpsImpl");
+        let impl_tp = typer
+            .st
+            .alloc("T", impl_cls, SymKind::TypeParam, Flags::EMPTY, "T");
+        typer.st.get_mut(impl_cls).tparams = vec![impl_tp];
+        let member = typer
+            .st
+            .alloc("Ops", root, SymKind::TypeMember, Flags::EMPTY, "Ops");
+        let member_tp = typer
+            .st
+            .alloc("A", member, SymKind::TypeParam, Flags::EMPTY, "A");
+        let member_info = typer.st.get_mut(member);
+        member_info.tparams = vec![member_tp];
+        member_info.bound_hi = Some(Type::Class {
+            sym: impl_cls,
+            args: vec![Type::TypeParam(member_tp)],
+        });
+        let applied = Type::Applied {
+            ctor: Box::new(Type::TypeMember(member)),
+            args: vec![Type::Int],
+        };
+        assert_eq!(
+            typer.type_instance_for_bounded_member_lookup(&applied),
+            Some(Type::Class {
+                sym: impl_cls,
+                args: vec![Type::Int],
+            })
         );
     }
 }
