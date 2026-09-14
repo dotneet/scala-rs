@@ -576,6 +576,10 @@ pub struct Symbol {
     /// reads. Each becomes a private field plus a trailing constructor
     /// parameter (see `anon_capture`).
     pub captures: Vec<SymbolId>,
+    /// Whether a local/anonymous class actually reads the enclosing instance.
+    /// The JVM ABI still has the hidden outer constructor slot for such a
+    /// class, but scalac only stores `$outer` when the body needs it.
+    pub captures_outer: bool,
     /// Set on `def f = macro Impl.method`. Such a symbol has no bytecode: every
     /// call site must be replaced by the implementation's expansion.
     pub macro_impl: Option<MacroBinding>,
@@ -1457,6 +1461,7 @@ impl SymbolTable {
                 is_type_alias: false,
                 is_pattern_skolem: false,
                 captures: vec![],
+                captures_outer: false,
                 macro_impl: None,
                 declaring_class: String::new(),
                 declaring_is_interface: false,
@@ -1597,6 +1602,7 @@ impl SymbolTable {
             is_type_alias: false,
             is_pattern_skolem: false,
             captures: vec![],
+            captures_outer: false,
             macro_impl: None,
             declaring_class: String::new(),
             declaring_is_interface: false,
@@ -5977,6 +5983,13 @@ impl SymbolTable {
                                 // type to flip against rejected every
                                 // `SetTupleParameter(c1, c2, …)`.
                                 self.is_sub_type(x, y)
+                            } else if is_wildcard_arg(x) {
+                                // The existential on the left denotes one
+                                // unknown argument, not every concrete one.
+                                // Flipping ordinary contravariance here asks
+                                // `y <: _` and makes a generic `C[_]` as
+                                // specific as a concrete `C[Option[A]]`.
+                                false
                             } else {
                                 self.is_sub_type(y, x)
                             }

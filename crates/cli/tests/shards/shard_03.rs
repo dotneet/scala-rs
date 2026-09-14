@@ -1,6 +1,9 @@
 //! Aggregated CLI integration tests (alphabetical slice 3/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../support/mod.rs"]
+mod support;
+
 #[path = "../gaps.rs"]
 mod gaps;
 #[path = "../gbimplicit.rs"]
@@ -27,6 +30,8 @@ mod gz2;
 mod gzero;
 #[path = "../hinf.rs"]
 mod hinf;
+#[path = "../hk_emptiness.rs"]
+mod hk_emptiness;
 #[path = "../hkbound.rs"]
 mod hkbound;
 #[path = "../hkfield.rs"]

@@ -1146,9 +1146,13 @@ impl<'a> Gen<'a> {
     ) {
         let params: Vec<&Tree> = vparamss.iter().flatten().collect();
         let mut frame = Frame::instance();
+        // The hidden ABI parameter exists for every non-static nested class;
+        // only `outer` below denotes a field that is actually retained.
+        let ctor_outer = enclosing_instance(self.st, class_id);
         let outer = outer_field_class(self.st, class_id);
+        let ctor_outer_ty = outer.or(ctor_outer);
         let outer_desc = outer_field_desc(self.st, class_id);
-        if outer.is_some() {
+        if ctor_outer_ty.is_some() {
             frame.next_slot += 1; // slot 1 is $outer
         }
         let mut param_info = Vec::new();
@@ -1178,7 +1182,7 @@ impl<'a> Gen<'a> {
             .filter(|s| !s.is_none() && self.st.get(*s).flags.contains(Flags::MUTABLE))
             .collect();
         let mut types: Vec<Type> = Vec::new();
-        if let Some(o) = outer {
+        if let Some(o) = ctor_outer_ty {
             types.push(Type::Class {
                 sym: o,
                 args: vec![],
@@ -1205,7 +1209,7 @@ impl<'a> Gen<'a> {
         let super_name = b.super_name.clone();
         let (super_owner, super_desc, super_args, super_cls, super_field_tys) =
             parent_super_ctor(self.st, parents, &super_name);
-        let super_outer = outer_field_class(self.st, super_cls).or_else(|| {
+        let super_outer = enclosing_instance(self.st, super_cls).or_else(|| {
             self.st
                 .get(super_cls)
                 .binary_outer_desc
@@ -1338,7 +1342,9 @@ impl<'a> Gen<'a> {
                     load_module_instance(asm, &ctx_early, *module);
                 } else if let Some(prefix) = prefix {
                     gen_expr(asm, &mut frame, &ctx_early, prefix);
-                } else if has_outer && is_owner_compatible(st, outer.unwrap_or(SymbolId::NONE), o) {
+                } else if ctor_outer.is_some()
+                    && is_owner_compatible(st, ctor_outer.unwrap_or(SymbolId::NONE), o)
+                {
                     asm.aload(1);
                 } else {
                     load_outer_arg(asm, &ctx_early, o);
@@ -1499,7 +1505,7 @@ impl<'a> Gen<'a> {
         // `(RelationalProfile, Tag, String)V`: `NoSuchMethodError` on the
         // first table definition.
         let ctor_outer = (name == "<init>")
-            .then(|| outer_field_class(self.st, class_id))
+            .then(|| enclosing_instance(self.st, class_id))
             .flatten();
         if ctor_outer.is_some() {
             desc = with_enclosing_outer_param(self.st, class_id, &desc);

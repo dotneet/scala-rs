@@ -2894,25 +2894,12 @@ impl PickleSupply {
         let mut scope = class_scope.clone();
         let mut tparams = Vec::new();
         for tp in &shape.tparams {
-            let id = st.alloc(&tp.name, m, SymKind::TypeParam, Flags::EMPTY, "");
-            st.get_mut(id).ty = Type::TypeParam(id);
-            set_tparam_arity(st, id, tp.arity);
+            let id = alloc_shape_tparam(st, m, tp);
             scope.insert(tp.name.clone(), Type::TypeParam(id));
             tparams.push(id);
         }
         for (tp, id) in shape.tparams.iter().zip(tparams.iter().copied()) {
-            if let Some(hi) = &tp.hi {
-                if let Some(t) = self.conv(st, bin, &scope, hi) {
-                    st.get_mut(id).bound_hi = Some(t);
-                }
-            }
-            if let Some(lo) = &tp.lo {
-                if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") {
-                    if let Some(t) = self.conv(st, bin, &scope, lo) {
-                        st.get_mut(id).bound_lo = Some(t);
-                    }
-                }
-            }
+            self.resolve_shape_tparam_bounds(st, bin, &scope, tp, id);
         }
         let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
         let mut paramss_sym: Vec<Vec<SymbolId>> = Vec::new();
@@ -3469,6 +3456,38 @@ impl PickleSupply {
             .any(|s| s.class_name == anc)
     }
 
+    /// Resolve a pickled method type parameter's bounds in the vocabulary of
+    /// both its enclosing method and its own higher-kinded binders.
+    fn resolve_shape_tparam_bounds(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        outer_scope: &HashMap<String, Type>,
+        shape: &ShapeTParam,
+        id: SymbolId,
+    ) {
+        let mut scope = outer_scope.clone();
+        let inner_ids = st.get(id).tparams.clone();
+        for (inner, inner_id) in shape.inner.iter().zip(inner_ids.iter().copied()) {
+            scope.insert(inner.name.clone(), Type::TypeParam(inner_id));
+        }
+        for (inner, inner_id) in shape.inner.iter().zip(inner_ids.iter().copied()) {
+            self.resolve_shape_tparam_bounds(st, bin, &scope, inner, inner_id);
+        }
+        if let Some(hi) = &shape.hi {
+            if let Some(t) = self.conv(st, bin, &scope, hi) {
+                st.get_mut(id).bound_hi = Some(t);
+            }
+        }
+        if let Some(lo) = &shape.lo {
+            if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") {
+                if let Some(t) = self.conv(st, bin, &scope, lo) {
+                    st.get_mut(id).bound_lo = Some(t);
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn install(
         &mut self,
@@ -3497,9 +3516,7 @@ impl PickleSupply {
         let mut scope = class_scope.clone();
         let mut tparams = Vec::new();
         for tp in &shape.tparams {
-            let id = st.alloc(&tp.name, m, SymKind::TypeParam, Flags::EMPTY, "");
-            st.get_mut(id).ty = Type::TypeParam(id);
-            set_tparam_arity(st, id, tp.arity);
+            let id = alloc_shape_tparam(st, m, tp);
             scope.insert(tp.name.clone(), Type::TypeParam(id));
             tparams.push(id);
         }
@@ -3507,18 +3524,7 @@ impl PickleSupply {
         // The lower bound matters as much as the upper one: `[B >: A]` is what
         // lets the typer solve `B` from the receiver for `xs.reduceOption`.
         for (tp, id) in shape.tparams.iter().zip(tparams.iter().copied()) {
-            if let Some(hi) = &tp.hi {
-                if let Some(t) = self.conv(st, bin, &scope, hi) {
-                    st.get_mut(id).bound_hi = Some(t);
-                }
-            }
-            if let Some(lo) = &tp.lo {
-                if !matches!(lo, SigType::Ref { sym, .. } if sym == "scala.Nothing") {
-                    if let Some(t) = self.conv(st, bin, &scope, lo) {
-                        st.get_mut(id).bound_lo = Some(t);
-                    }
-                }
-            }
+            self.resolve_shape_tparam_bounds(st, bin, &scope, tp, id);
         }
 
         let mut paramss_ty: Vec<Vec<Type>> = Vec::new();
@@ -4903,12 +4909,17 @@ impl PickleSupply {
 // Pickled signature -> method shape
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct ShapeTParam {
     name: String,
     lo: Option<SigType>,
     hi: Option<SigType>,
-    /// Its own kind arity: 1 for the `G[_]` of `def mapK[G[_]](…)`.
-    arity: usize,
+    /// The binders inside a higher-kinded parameter's `PolyType`-shaped
+    /// bounds.  Their names are the vocabulary of `lo` / `hi`: ScalaTest's
+    /// `OPT[e] <: Option[e]`, for example, cannot be converted with only the
+    /// enclosing method's `E` and `OPT` in scope.
+    inner: Vec<ShapeTParam>,
+    variance: i8,
 }
 
 struct Param {
@@ -5012,16 +5023,7 @@ fn read_shape(t: &SigType) -> Option<Shape> {
                 result,
             } => {
                 for tp in tps {
-                    let (lo, hi) = match &tp.bounds {
-                        SigType::Bounds { lo, hi } => (Some((**lo).clone()), Some((**hi).clone())),
-                        _ => (None, None),
-                    };
-                    tparams.push(ShapeTParam {
-                        name: tp.name.clone(),
-                        lo,
-                        hi,
-                        arity: tparam_arity(tp),
-                    });
+                    tparams.push(shape_tparam(tp));
                 }
                 cur = result;
             }
@@ -5054,6 +5056,43 @@ fn read_shape(t: &SigType) -> Option<Shape> {
             }
         }
     }
+}
+
+fn shape_tparam(tp: &scala_rs_pickle::sym::TParam) -> ShapeTParam {
+    let (inner, bounds) = match &tp.bounds {
+        SigType::Poly { tparams, result } => {
+            (tparams.iter().map(shape_tparam).collect(), result.as_ref())
+        }
+        bounds => (Vec::new(), bounds),
+    };
+    let (lo, hi) = match bounds {
+        SigType::Bounds { lo, hi } => (Some((**lo).clone()), Some((**hi).clone())),
+        _ => (None, None),
+    };
+    ShapeTParam {
+        name: tp.name.clone(),
+        lo,
+        hi,
+        inner,
+        variance: tp.variance,
+    }
+}
+
+fn alloc_shape_tparam(st: &mut SymbolTable, owner: SymbolId, shape: &ShapeTParam) -> SymbolId {
+    let flags = match shape.variance {
+        1 => Flags::COVARIANT,
+        -1 => Flags::CONTRAVARIANT,
+        _ => Flags::EMPTY,
+    };
+    let id = st.alloc(&shape.name, owner, SymKind::TypeParam, flags, "");
+    st.get_mut(id).ty = Type::TypeParam(id);
+    let inner = shape
+        .inner
+        .iter()
+        .map(|p| alloc_shape_tparam(st, id, p))
+        .collect();
+    st.get_mut(id).tparams = inner;
+    id
 }
 
 fn sig_type_is_owner_tparam_application(t: &SigType, owner_tparams: &HashSet<String>) -> bool {
@@ -5104,7 +5143,8 @@ fn pin_undetermined_tparams(shape: Shape) -> Option<Shape> {
                 name: tp.name.clone(),
                 lo: tp.lo.clone(),
                 hi: tp.hi.clone(),
-                arity: tp.arity,
+                inner: tp.inner.clone(),
+                variance: tp.variance,
             })
         };
         if determined.contains(&tp.name) {

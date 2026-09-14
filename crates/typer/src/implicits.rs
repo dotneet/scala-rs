@@ -1669,13 +1669,11 @@ impl Typer {
     /// `List(1, 2).lazyZip(…).map(_ + _)` type-checked and then died with
     /// `class ::$ cannot be cast to class scala.collection.BitSet`.
     ///
-    /// Only a *first-order* parameter is checked here. A higher-kinded one
-    /// arrives with its bound already folded into the type
-    /// (`buildFromSortedSetOps` is
-    /// `BuildFrom[CC[A0] with SortedSet[A0], A, CC[A] with SortedSet[A]]`),
-    /// where the unifier enforces it directly; re-deriving that from
-    /// `CC`'s own F-bounded, higher-kinded `bound_hi` would only risk
-    /// dropping a candidate nsc accepts.
+    /// A higher-kinded argument is checked after applying it to the bounded
+    /// parameter's own binders. ScalaTest's `OPT[e] <: Option[e]` fitted to
+    /// `Emptiness[Option[A]]` solves `OPT := Option`; the actual question is
+    /// then `Option[e] <: Option[e]`. The otherwise shape-identical
+    /// `TRAV[e] <: Iterable[e]` must fail at `Option[e] <: Iterable[e]`.
     ///
     /// The test is deliberately the permissive one -- conformance, or failing
     /// that merely having the bound's class among the solution's base classes.
@@ -1686,31 +1684,47 @@ impl Typer {
             return true;
         }
         for (tp, targ) in tps.iter().zip(targs) {
-            if !self.st.get(*tp).tparams.is_empty() {
-                continue;
-            }
             let Some(hi) = self.st.get(*tp).bound_hi.clone() else {
                 continue;
             };
-            if targ.is_no_type() || targ.is_error() || matches!(targ, Type::TypeParam(_)) {
+            if targ.is_no_type()
+                || targ.is_error()
+                || matches!(
+                    targ,
+                    Type::TypeParam(_)
+                        | Type::Wildcard
+                        | Type::BoundedWildcard { .. }
+                        | Type::Any
+                        | Type::Nothing
+                )
+            {
                 continue;
             }
+            let inner = self.st.get(*tp).tparams.clone();
+            let subject = if inner.is_empty() {
+                targ.clone()
+            } else {
+                crate::symbol::apply_type_ctor(
+                    targ.clone(),
+                    inner.iter().map(|p| Type::TypeParam(*p)).collect(),
+                )
+            };
             let hi = crate::symbol::subst_tparams_slice(tps, targs, &hi);
             let parents: Vec<Type> = match &hi {
                 Type::Refined { parents, .. } => parents.clone(),
                 other => vec![other.clone()],
             };
             for parent in &parents {
-                if self.st.is_sub_type(targ, parent) {
+                if self.st.is_sub_type(&subject, parent) {
                     continue;
                 }
                 let Some(psym) = self.st.class_sym_of(parent) else {
                     continue;
                 };
-                if self.st.class_sym_of(targ) == Some(psym) {
+                if self.st.class_sym_of(&subject) == Some(psym) {
                     continue;
                 }
-                if self.base_type_instance(targ, psym, 0).is_none() {
+                if self.base_type_instance(&subject, psym, 0).is_none() {
                     return false;
                 }
             }
@@ -3660,8 +3674,80 @@ impl Typer {
         if tps.is_empty() {
             return ty.clone();
         }
-        let wilds = vec![Type::Wildcard; tps.len()];
-        crate::symbol::subst_tparams_slice(&tps, &wilds, ty)
+        let range = |lo: Option<Type>, hi: Option<Type>| {
+            let lo = lo.filter(|t| !matches!(t, Type::Nothing));
+            let hi = hi.filter(|t| !matches!(t, Type::Any));
+            if lo.is_none() && hi.is_none() {
+                Type::Wildcard
+            } else {
+                Type::BoundedWildcard {
+                    lo: lo.map(Box::new),
+                    hi: hi.map(Box::new),
+                }
+            }
+        };
+
+        // `OPT[E]` for `OPT[e] <: Option[e]` is one existential proper type,
+        // `_ <: Option[_]`. Replacing its constructor and argument separately
+        // produces `_[_]`, which loses the only fact that distinguishes the
+        // Option instance from equally shaped Iterable/Java-collection ones.
+        // Leave ordinary method parameters in the instantiated bound for the
+        // substitution below; it walks through bounded wildcards as well.
+        let collapsed = crate::symbol::map_type(ty, &mut |node| {
+            let Type::Applied { ctor, args } = node else {
+                return node.clone();
+            };
+            let Type::TypeParam(tp) = ctor.as_ref() else {
+                return node.clone();
+            };
+            if !tps.contains(tp) {
+                return node.clone();
+            }
+            let inner = self.st.get(*tp).tparams.clone();
+            if inner.len() != args.len() || inner.is_empty() {
+                return node.clone();
+            }
+            let lo = self
+                .st
+                .get(*tp)
+                .bound_lo
+                .as_ref()
+                .map(|t| crate::symbol::subst_tparams_slice(&inner, args, t));
+            let hi = self
+                .st
+                .get(*tp)
+                .bound_hi
+                .as_ref()
+                .map(|t| crate::symbol::subst_tparams_slice(&inner, args, t));
+            range(lo, hi)
+        });
+
+        let plain = vec![Type::Wildcard; tps.len()];
+        let wilds: Vec<Type> = tps
+            .iter()
+            .map(|tp| {
+                // A bare higher-kinded parameter is not a proper type. Its
+                // useful bound is instantiated only at an application, which
+                // the pass above has already collapsed.
+                if !self.st.get(*tp).tparams.is_empty() {
+                    return Type::Wildcard;
+                }
+                let lo = self
+                    .st
+                    .get(*tp)
+                    .bound_lo
+                    .as_ref()
+                    .map(|t| crate::symbol::subst_tparams_slice(&tps, &plain, t));
+                let hi = self
+                    .st
+                    .get(*tp)
+                    .bound_hi
+                    .as_ref()
+                    .map(|t| crate::symbol::subst_tparams_slice(&tps, &plain, t));
+                range(lo, hi)
+            })
+            .collect();
+        crate::symbol::subst_tparams_slice(&tps, &wilds, &collapsed)
     }
 
     /// A candidate that is a one-argument function *by inheritance*, read as

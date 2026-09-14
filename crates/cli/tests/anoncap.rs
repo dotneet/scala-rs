@@ -192,6 +192,23 @@ fn anoncap3_var_and_local_class() {
     check_both("anoncap3");
 }
 
+/// The constructor keeps the hidden ABI outer slot, but an anonymous class
+/// that never reads its enclosing instance must not retain a serializable
+/// `$outer` field.
+#[test]
+fn unused_outer_is_serializable() {
+    check_both("unused_outer");
+}
+
+/// A nested case-class companion is an instance member of its enclosing class.
+/// Lambdas that call `Row(...)` must capture that enclosing instance so the
+/// generated `$anonfun` does not treat its first captured collection value as
+/// the receiver of `Row()`.
+#[test]
+fn nested_case_companion_lambda_captures_outer() {
+    check_both("lambda_capture_nested");
+}
+
 #[test]
 fn anoncap1_bad_unknown_capture_is_error() {
     compile_fails("anoncap1_bad", "not found: value missingLocal");

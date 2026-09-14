@@ -419,7 +419,11 @@ pub(crate) fn with_enclosing_outer_param(
     class_id: SymbolId,
     desc: &str,
 ) -> String {
-    let Some(outer_ty) = outer_field_desc(st, class_id) else {
+    // The hidden constructor slot is part of the Scala ABI even when scalac
+    // elides the corresponding `$outer` field (notably for unused anonymous
+    // classes).  Do not use `outer_field_desc` here: field materialisation and
+    // the constructor signature are deliberately separate decisions.
+    let Some(outer_ty) = enclosing_instance_desc(st, class_id) else {
         return desc.to_string();
     };
     let Some(rest) = desc.strip_prefix('(') else {
@@ -439,7 +443,7 @@ pub(crate) fn ctor_desc(st: &SymbolTable, class_id: SymbolId, args: &[Tree]) -> 
         return with_enclosing_outer_param(st, class_id, &method_desc_from_sym(st, id));
     }
     let mut d = String::from("(");
-    if let Some(outer_ty) = outer_field_desc(st, class_id) {
+    if let Some(outer_ty) = enclosing_instance_desc(st, class_id) {
         d.push_str(&outer_ty);
     }
     let fields = &st.get(class_id).ctor_fields;
@@ -592,7 +596,7 @@ pub(crate) fn parent_super_ctor(
     for p in parents {
         if let Some(cls) = st.class_sym_of(&p.ty) {
             if class_internal(st, cls) == super_name {
-                if let Some(outer_ty) = outer_field_desc(st, cls) {
+                if let Some(outer_ty) = enclosing_instance_desc(st, cls) {
                     return (
                         super_name.to_string(),
                         format!("({outer_ty})V"),
@@ -683,7 +687,30 @@ pub(crate) fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option
 /// field can always stand in for the enclosing instance itself.
 pub(crate) fn outer_field_class(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> {
     let owner = enclosing_instance(st, class_id)?;
+    // Named member classes retain the traditional outer field because their
+    // methods may be called later and still refer to the enclosing instance.
+    // Local/anonymous classes are more precise: typer marks only those whose
+    // body actually reaches an outer `this` or member.
+    let sym = st.get(class_id);
+    let local_or_anon = sym.name.starts_with("$anon$")
+        || matches!(st.get(sym.owner).kind, SymKind::Method | SymKind::Term);
+    if local_or_anon && !sym.captures_outer {
+        return None;
+    }
     Some(self_repr_class(st, owner))
+}
+
+/// Descriptor of the hidden enclosing-instance constructor parameter.  This
+/// remains present for local/anonymous classes even when no `$outer` field is
+/// emitted, matching scalac's ABI shape and allowing a null slot at call sites.
+pub(crate) fn enclosing_instance_desc(st: &SymbolTable, class_id: SymbolId) -> Option<String> {
+    let owner = enclosing_instance(st, class_id)?;
+    // For a member class nsc uses the enclosing template's self type in both
+    // the `$outer` field and the leading constructor parameter.  Unused
+    // local/anonymous classes have no field, so their ABI slot falls back to
+    // the lexical owner itself.
+    let ty = outer_field_class(st, class_id).unwrap_or(owner);
+    Some(format!("L{};", class_internal(st, ty)))
 }
 
 pub(crate) fn self_repr_class(st: &SymbolTable, owner: SymbolId) -> SymbolId {

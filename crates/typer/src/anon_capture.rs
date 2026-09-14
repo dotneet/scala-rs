@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use scala_rs_parser::{SymbolId, Tree, TreeKind};
+use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind};
 
 use crate::symbol::{SymKind, SymbolTable};
 
@@ -25,6 +25,174 @@ pub fn mark_anon_captures(tree: &Tree, st: &mut SymbolTable) {
         st.get_mut(cls).captures = caps;
     }
     inherit_trait_captures(st, &classes);
+    mark_outer_captures(tree, st);
+}
+
+/// Mark the local/anonymous classes whose bodies really need the enclosing
+/// instance.  The hidden constructor argument is an ABI detail and is kept
+/// for every non-static nested class, but scalac does not materialise an
+/// `$outer` field for an anonymous class that never reads the enclosing
+/// `this` or one of its members.  Keeping that distinction is important for
+/// serializable typeclass singletons: an otherwise unused outer object would
+/// make Java serialization walk into a non-serializable package module.
+fn mark_outer_captures(tree: &Tree, st: &mut SymbolTable) {
+    match &tree.kind {
+        TreeKind::ClassDef { impl_, .. } => {
+            if !tree.sym.is_none() && is_local_or_anonymous(st, tree.sym) {
+                let needed = class_uses_outer(tree, st, tree.sym);
+                st.get_mut(tree.sym).captures_outer = needed;
+            }
+            // A nested class is a separate lexical body.  Its use of an
+            // enclosing member must not accidentally mark this class too.
+            for p in &impl_.parents {
+                mark_outer_captures(p, st);
+            }
+            for s in &impl_.body {
+                mark_outer_captures(s, st);
+            }
+        }
+        TreeKind::ModuleDef { impl_, .. } => {
+            for p in &impl_.parents {
+                mark_outer_captures(p, st);
+            }
+            for s in &impl_.body {
+                mark_outer_captures(s, st);
+            }
+        }
+        _ => each_child(tree, &mut |c| mark_outer_captures(c, st)),
+    }
+}
+
+fn is_local_or_anonymous(st: &SymbolTable, id: SymbolId) -> bool {
+    let s = st.get(id);
+    if s.name.starts_with("$anon$") {
+        return true;
+    }
+    matches!(st.get(s.owner).kind, SymKind::Method | SymKind::Term)
+}
+
+/// The lexical class around a source class.  This intentionally mirrors the
+/// backend's `enclosing_instance`: method/block owners are implementation
+/// scopes, while a class owner is the instance that can supply members.
+fn enclosing_instance(st: &SymbolTable, class_id: SymbolId) -> Option<SymbolId> {
+    if class_id.is_none() {
+        return None;
+    }
+    let s = st.get(class_id);
+    if s.flags.contains(Flags::JAVA) || s.flags.contains(Flags::STATIC) {
+        return None;
+    }
+    let mut owner = s.owner;
+    while !owner.is_none() && matches!(st.get(owner).kind, SymKind::Method | SymKind::Term) {
+        owner = st.get(owner).owner;
+    }
+    let o = st.get(owner);
+    if o.kind == SymKind::Class && !o.flags.contains(Flags::MODULE) {
+        return Some(owner);
+    }
+    // A class declared in a member `object` is still per enclosing instance;
+    // top-level objects remain static singletons.  Keep this small mirror of
+    // the backend's `member_module_outer` so an anonymous class in the former
+    // can be marked when it reads the object's members.
+    if (o.kind == SymKind::ModuleClass || o.flags.contains(Flags::MODULE))
+        && module_has_outer(st, owner)
+    {
+        return Some(owner);
+    }
+    None
+}
+
+fn module_has_outer(st: &SymbolTable, module: SymbolId) -> bool {
+    let owner = st.get(module).owner;
+    if owner.is_none() {
+        return false;
+    }
+    let o = st.get(owner);
+    if o.kind == SymKind::Class && !o.flags.contains(Flags::MODULE) {
+        return true;
+    }
+    (o.kind == SymKind::ModuleClass || o.flags.contains(Flags::MODULE))
+        && module_has_outer(st, owner)
+}
+
+fn outer_chain(st: &SymbolTable, class_id: SymbolId) -> Vec<SymbolId> {
+    let mut out = Vec::new();
+    let mut cur = class_id;
+    let mut seen = HashSet::new();
+    while let Some(owner) = enclosing_instance(st, cur) {
+        if !seen.insert(owner.0) {
+            break;
+        }
+        out.push(owner);
+        cur = owner;
+    }
+    out
+}
+
+fn outer_supplies_owner(st: &SymbolTable, outer: SymbolId, owner: SymbolId) -> bool {
+    if owner == outer || st.is_ancestor_of(owner, outer) {
+        return true;
+    }
+    st.get(outer).self_type.as_ref().is_some_and(|ty| {
+        st.self_type_classes(ty)
+            .into_iter()
+            .any(|c| c == owner || st.is_ancestor_of(owner, c))
+    })
+}
+
+fn member_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool {
+    if id.is_none() {
+        return false;
+    }
+    let s = st.get(id);
+    if !matches!(s.kind, SymKind::Term | SymKind::Method) || s.owner.is_none() {
+        return false;
+    }
+    let owner = s.owner;
+    // A member inherited by the class being emitted is reached through its
+    // own `this`; only a member belonging to a lexical owner outside it is an
+    // enclosing-instance read.
+    if owner == current || st.is_ancestor_of(owner, current) {
+        return false;
+    }
+    outer_chain(st, current)
+        .into_iter()
+        .any(|outer| outer_supplies_owner(st, outer, owner))
+}
+
+fn this_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool {
+    if id.is_none() || id == current || st.is_ancestor_of(id, current) {
+        return false;
+    }
+    outer_chain(st, current)
+        .into_iter()
+        .any(|outer| outer == id || st.is_ancestor_of(id, outer))
+}
+
+/// Scan one class body without descending into nested class/module bodies.
+fn class_uses_outer(class_def: &Tree, st: &SymbolTable, current: SymbolId) -> bool {
+    let TreeKind::ClassDef { impl_, .. } = &class_def.kind else {
+        return false;
+    };
+    impl_.parents.iter().any(|t| scan_outer(t, st, current))
+        || impl_.body.iter().any(|t| scan_outer(t, st, current))
+}
+
+fn scan_outer(tree: &Tree, st: &SymbolTable, current: SymbolId) -> bool {
+    match &tree.kind {
+        TreeKind::Ident { .. } => member_needs_outer(st, current, tree.sym),
+        TreeKind::This { .. } | TreeKind::Super { .. } => this_needs_outer(st, current, tree.sym),
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => false,
+        _ => {
+            let mut found = false;
+            each_child(tree, &mut |c| {
+                if !found && scan_outer(c, st, current) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
 }
 
 /// A local `trait` has no constructor, so it cannot hold the enclosing-method

@@ -2376,40 +2376,54 @@ pub(crate) fn gen_new_with(
     // class file's `$outer` field), and the parent-constructor path already
     // resolves that class. Without it the slot was left unfilled: a
     // `VerifyError` (`uninitialized ... is not assignable to pfxlib/C`).
-    let outer_cls = outer_field_class(ctx.st, class_id).or_else(|| {
-        ctx.st
-            .get(class_id)
-            .binary_outer_desc
-            .as_deref()
-            .and_then(|d| d.strip_prefix('L')?.strip_suffix(';'))
-            .and_then(|jvm| ctx.st.find_class_by_jvm(jvm))
-    });
-    if let Some((slot, sort, od)) = receiver_outer {
-        load(asm, slot, sort);
-        asm.getfield(&internal, "$outer", &od);
+    let source_outer = outer_field_class(ctx.st, class_id);
+    let binary_outer = ctx
+        .st
+        .get(class_id)
+        .binary_outer_desc
+        .as_deref()
+        .and_then(|d| d.strip_prefix('L')?.strip_suffix(';'))
+        .and_then(|jvm| ctx.st.find_class_by_jvm(jvm));
+    let outer_cls = enclosing_instance(ctx.st, class_id).or(binary_outer);
+    let stores_outer = source_outer.is_some() || binary_outer.is_some();
+    /*
+     * A local/anonymous class whose body never reaches its lexical owner
+     * still has the hidden constructor slot, but scalac passes null and emits
+     * no `$outer` field.  Use the field decision only for the value placed in
+     * that slot; the descriptor above deliberately uses `enclosing_instance`.
+     */
+    if !stores_outer {
+        if outer_cls.is_some() {
+            asm.aconst_null();
+        }
     } else if let Some(outer) = outer_cls {
-        match new_prefix_instance(ctx, tpt, outer) {
-            // `new i.Deep()` / `new c.Inner`: the enclosing instance is the
-            // prefix that was written, not the current `this`.
-            // `new_prefix_instance` already checked the prefix conforms.
-            Some(pfx) => gen_expr(asm, frame, ctx, pfx),
-            // `class Child extends Parent(new Foo {})`: the anonymous class is
-            // created before `Child`'s super constructor has run, and its
-            // enclosing instance would be the `Child` under construction --
-            // `uninitializedThis`, which JVMS §4.10.1.9 lets nothing but a
-            // `putfield` take (`VerifyError`, `run/t6957`, `run/t6506`). nsc
-            // gives such a class no outer reference at all, and rejects
-            // ("implementation restriction: … requires premature access")
-            // one that would need it; so it can never be read, and the slot is
-            // filled with `null`.
-            None if ctx.presuper
-                && self_reaches_owner(ctx.st, ctx.class_sym, outer)
-                && !(ctx.presuper_outer.is_some()
-                    && outer_chain_reaches_owner(ctx.st, ctx.class_sym, outer)) =>
-            {
-                asm.aconst_null();
+        if let Some((slot, sort, od)) = receiver_outer {
+            load(asm, slot, sort);
+            asm.getfield(&internal, "$outer", &od);
+        } else {
+            match new_prefix_instance(ctx, tpt, outer) {
+                // `new i.Deep()` / `new c.Inner`: the enclosing instance is the
+                // prefix that was written, not the current `this`.
+                // `new_prefix_instance` already checked the prefix conforms.
+                Some(pfx) => gen_expr(asm, frame, ctx, pfx),
+                // `class Child extends Parent(new Foo {})`: the anonymous class is
+                // created before `Child`'s super constructor has run, and its
+                // enclosing instance would be the `Child` under construction --
+                // `uninitializedThis`, which JVMS §4.10.1.9 lets nothing but a
+                // `putfield` take (`VerifyError`, `run/t6957`, `run/t6506`). nsc
+                // gives such a class no outer reference at all, and rejects
+                // ("implementation restriction: … requires premature access")
+                // one that would need it; so it can never be read, and the slot is
+                // filled with `null`.
+                None if ctx.presuper
+                    && self_reaches_owner(ctx.st, ctx.class_sym, outer)
+                    && !(ctx.presuper_outer.is_some()
+                        && outer_chain_reaches_owner(ctx.st, ctx.class_sym, outer)) =>
+                {
+                    asm.aconst_null();
+                }
+                None => load_outer_arg(asm, ctx, outer),
             }
-            None => load_outer_arg(asm, ctx, outer),
         }
     }
     // A repeated constructor parameter (`class C(xs: T*)`) is one `Seq`
