@@ -219,7 +219,16 @@ pub(crate) fn ident_reads_enclosing_this(st: &SymbolTable, id: SymbolId) -> bool
         }
         return matches!(st.get(s.owner).kind, SymKind::Class);
     }
-    if !matches!(s.kind, SymKind::Method | SymKind::Term) || s.flags.contains(Flags::STATIC) {
+    if !matches!(s.kind, SymKind::Method | SymKind::Term)
+        || s.flags.contains(Flags::STATIC)
+        // A constructor parameter accessor is also represented as a member
+        // owned by the class (`PRIVATE | LOCAL | PARAM`).  While its source
+        // name is used in a lambda, the constructor frame still contains the
+        // parameter value, so it is a local capture rather than an enclosing
+        // instance read.  If the frame no longer contains it (e.g. a method
+        // lambda), the caller's `frame.get` check still requires an outer.
+        || s.flags.contains(Flags::PARAM)
+    {
         return false;
     }
     matches!(st.get(s.owner).kind, SymKind::Class)
