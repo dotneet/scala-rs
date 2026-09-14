@@ -219,6 +219,25 @@ fn jar_packages_every_selector_shape() {
     check_runs("imports_jar", &["imports_jar"], &["-Xsource:3"]);
 }
 
+/// A renamed selector is excluded from the trailing wildcard. In particular,
+/// `java.sql.{Array => SQLArray, _}` must not make the non-generic JDBC
+/// `java.sql.Array` shadow Scala's generic `scala.Array`.
+#[test]
+fn renamed_java_array_does_not_shadow_scala_array() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip imports renamed java array: scala-library not available");
+        return;
+    };
+    let out = tmp_dir("renamed_java_array");
+    let output = compile(&["imports_sql_array"], &jar, &out, &[]);
+    assert!(
+        output.status.success(),
+        "renamed java.sql.Array shadowed scala.Array:\n{}",
+        diagnostics(&output)
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// Every `scala.language` feature is an importable name, in every shape,
 /// including the nested `scala.language.experimental.macros`.
 #[test]

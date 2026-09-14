@@ -261,7 +261,14 @@ impl Typer {
                     let owners = this.import_prefix(qual, span);
                     let hidden: Vec<String> = sels
                         .iter()
-                        .filter(|(from, to)| from != "_" && to == "_")
+                        // A renamed selector is not also re-exported by the
+                        // wildcard. `import java.sql.{Array => SQLArray, _}`
+                        // must leave the predef `Array` visible; importing
+                        // the original `java.sql.Array` as well would make
+                        // `Array[Byte]` resolve to the non-generic JDBC
+                        // class. `A => _` is the same exclusion explicitly
+                        // written by the user.
+                        .filter(|(from, to)| from != "_" && (to == "_" || to != from))
                         .map(|(from, _)| from.clone())
                         .collect();
                     let qual = (**qual).clone();
