@@ -170,6 +170,27 @@ fn compile(name: &str, extra: &[&str]) -> (bool, String, PathBuf) {
     (output.status.success(), msgs, out)
 }
 
+/// Compile fixtures in the given order. Keeping that order is important for
+/// cross-unit signature regressions: callers must not require their providers
+/// to occur earlier on the command line.
+fn compile_many(names: &[&str], extra: &[&str]) -> (bool, String, PathBuf) {
+    let out = tmp_dir(names[0]);
+    let mut cmd = Command::new(bin());
+    cmd.arg("compile");
+    for name in names {
+        cmd.arg(fixtures_dir().join(format!("{name}.scala")));
+    }
+    cmd.args(["-d", out.to_str().unwrap()]);
+    cmd.args(extra);
+    let output = cmd.output().expect("run scala-rs compile");
+    let msgs = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), msgs, out)
+}
+
 fn run_main(cp: &str, main: &str) -> String {
     let output = Command::new("java")
         .args(["-Xverify:all", "-cp", cp, main])
@@ -280,6 +301,33 @@ fn nested_profile_api_type_import_outweighs_outer_model_import() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// The importing class may precede the unit that finishes the dependent
+/// profile path. Its nested template has to participate in the same second
+/// signature round as an ordinary member signature.
+#[test]
+fn nested_template_retries_an_import_completed_by_a_later_unit() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip late nested profile import: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip late nested profile import: slick dependencies not cached");
+        return;
+    };
+    let (ok, msgs, out) = compile_many(
+        &["slick_profile_nested_late", "slick_profile_nested_late_db"],
+        &[
+            "-cp",
+            &classpath(&jars),
+            "--scala-library",
+            lib.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "late nested profile import failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// Reading the pickled parent has to *narrow* what the class file said.
 /// `BaseTypedType` is invariant, so the specialized parent's `Object` must not
 /// leak back in, and a type nothing declares a column type for is still not
@@ -375,19 +423,19 @@ fn real_scalac() -> Option<PathBuf> {
 }
 
 fn scalac_run(scalac: &Path, name: &str, cp: Option<&str>) -> (bool, String) {
-    let out = tmp_dir(name);
+    scalac_run_many(scalac, &[name], cp)
+}
+
+fn scalac_run_many(scalac: &Path, names: &[&str], cp: Option<&str>) -> (bool, String) {
+    let out = tmp_dir(names[0]);
     let mut cmd = Command::new(scalac);
     if let Some(cp) = cp {
         cmd.args(["-classpath", cp, "-Xsource:3-cross"]);
     }
-    cmd.args([
-        "-d",
-        out.to_str().unwrap(),
-        fixtures_dir()
-            .join(format!("{name}.scala"))
-            .to_str()
-            .unwrap(),
-    ]);
+    cmd.args(["-d", out.to_str().unwrap()]);
+    for name in names {
+        cmd.arg(fixtures_dir().join(format!("{name}.scala")));
+    }
     let output = cmd.output().expect("run scalac");
     let msgs = format!(
         "{}{}",
@@ -431,4 +479,13 @@ fn real_scalac_agrees_on_every_fixture() {
     );
     let (ok, msgs) = scalac_run(&scalac, "canbeqc_tdb", Some(&cp));
     assert!(ok, "scalac rejected canbeqc_tdb:\n{msgs}");
+    let (ok, msgs) = scalac_run_many(
+        &scalac,
+        &["slick_profile_nested_late", "slick_profile_nested_late_db"],
+        Some(&cp),
+    );
+    assert!(
+        ok,
+        "scalac rejected the late nested profile import:\n{msgs}"
+    );
 }

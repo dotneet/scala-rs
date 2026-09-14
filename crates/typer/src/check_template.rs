@@ -15,6 +15,27 @@ use scala_rs_span::Span;
 use std::collections::HashSet;
 
 impl Typer {
+    /// Type a template parent, preserving its source form for the second
+    /// signature round when an enclosing import is not ready yet.
+    ///
+    /// Parent applications rewrite an unqualified head to the binding chosen
+    /// on this pass. If `import db.profile.api._` is still unresolved, that
+    /// can be an outer wildcard's same-named class; the failed application is
+    /// then an `Error`, but the rewritten `outer.Table` would make the later
+    /// round repeat the stale choice. Returning the pristine tree lets the
+    /// caller record this pass's result and then restore the source spelling.
+    fn type_template_parent_deferrable(&mut self, parent: &mut Tree) -> Option<Tree> {
+        let saved = (self.sigs_only && !self.sig_final_round && self.import_prefix_missed)
+            .then(|| parent.clone());
+        self.type_parent(parent);
+        if saved.is_some() && type_mentions_unresolved(&parent.ty) {
+            self.sig_deferred = true;
+            saved
+        } else {
+            None
+        }
+    }
+
     // ------------------------------------------------------------------ typer
     pub(crate) fn typer(&mut self, tree: &mut Tree) {
         match &mut tree.kind {
@@ -377,7 +398,7 @@ impl Typer {
         self.with_parent_context(Some((id, saved_this)), |this| {
             this.with_parent_arg_scope(Some((id, visible_in_args)), |this| {
                 for p in parents.iter_mut() {
-                    this.type_parent(p);
+                    let retry = this.type_template_parent_deferrable(p);
                     // A parent is stored as the class it names: every reader of
                     // `parents` matches `Type::Class`. The prefix an inner-class
                     // parent was written with is kept beside it (`prefix.rs`).
@@ -387,6 +408,9 @@ impl Typer {
                             .insert((id.0, pts.len()), pre.clone());
                     }
                     pts.push(crate::prefix::parent_form(&p.ty));
+                    if let Some(saved) = retry {
+                        *p = saved;
+                    }
                 }
             });
         });
@@ -765,13 +789,16 @@ impl Typer {
                 for p in parents.iter_mut() {
                     // Parents are types: `object B extends B` extends the *trait* B,
                     // not itself. Typing them as expressions picks the module.
-                    this.type_parent(p);
+                    let retry = this.type_template_parent_deferrable(p);
                     if let Some(pre) = crate::prefix::view_prefix(&p.ty) {
                         this.st
                             .parent_prefixes
                             .insert((cls.0, pts.len()), pre.clone());
                     }
                     pts.push(crate::prefix::parent_form(&p.ty));
+                    if let Some(saved) = retry {
+                        *p = saved;
+                    }
                 }
             });
         });
