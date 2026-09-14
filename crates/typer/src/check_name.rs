@@ -2123,6 +2123,12 @@ impl Typer {
                     continue;
                 }
                 self.complete_binary_member(owner, name, span);
+                // Ordinary classes are already enumerable when their wildcard
+                // is registered. Re-entering one here can hide its same-named
+                // companion term (for example `RepositoryService.RepositoryInfo`).
+                // This late path exists for aliases that only a pickle can
+                // reveal, so accept alias symbols and type parameters here;
+                // a nullary alias whose RHS is a class is handled below.
                 let mut found: Vec<SymbolId> = self
                     .st
                     .lookup_member(owner, name)
@@ -2130,7 +2136,7 @@ impl Typer {
                     .filter(|&id| {
                         matches!(
                             self.st.get(id).kind,
-                            SymKind::Class | SymKind::TypeMember | SymKind::TypeParam
+                            SymKind::TypeMember | SymKind::TypeParam
                         ) && (!self.st.private_to_owner(id)
                             || (self.st.get(id).owner == owner
                                 && self.private_member_visible_here(id)))

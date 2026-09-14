@@ -275,6 +275,36 @@ fn jar_method_type_params_do_not_shadow_caller_type_params() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A wildcard import exposes both a class/trait and its same-named companion.
+/// A qualified type must keep the companion-backed nested class (`Service.Info`)
+/// rather than stopping at the class side of `Service`.
+#[test]
+fn wildcard_class_companion_keeps_nested_type() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip nested companion type: scala-library not available");
+        return;
+    };
+    let out = tmp_dir("nested_companion_type");
+    let output = compile(
+        &["nested_companion_type_lib", "nested_companion_type_use"],
+        &jar,
+        &out,
+        &["-Xsource:3"],
+    );
+    assert!(
+        output.status.success(),
+        "nested companion type failed:\n{}",
+        diagnostics(&output)
+    );
+    if java_available() {
+        assert_eq!(
+            run_main(&out, &jar),
+            expected_stdout("nested_companion_type_use")
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
 // ------------------------------------------------------- error handling
 
 /// `.*` is a Scala 3 spelling: without `-Xsource:3` nothing is imported, and
