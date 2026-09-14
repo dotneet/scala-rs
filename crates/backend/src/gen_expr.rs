@@ -2419,8 +2419,27 @@ pub(crate) fn gen_new_with(
      * that slot; the descriptor above deliberately uses `enclosing_instance`.
      */
     if !stores_outer {
-        if outer_cls.is_some() {
-            asm.aconst_null();
+        if let Some(outer) = outer_cls {
+            // Even without a retained `$outer` field, the constructor's
+            // hidden slot may be needed while evaluating a superclass
+            // argument.  `new PR(tag) { ... }` is the representative case:
+            // the anonymous body does not mention `outer`, but its
+            // pre-super argument invokes `tag` on the enclosing `PR`.  A null
+            // slot would make that legal receiver load fail at runtime.
+            // An anonymous class created in the *enclosing* class's own
+            // pre-super arguments is the exception: its lexical owner is the
+            // still-uninitialized object under construction, so passing that
+            // object would merely move the verifier failure to the nested
+            // constructor.  Keep scalac's null slot for that shape.
+            if ctx.presuper
+                && self_reaches_owner(ctx.st, ctx.class_sym, outer)
+                && !(ctx.presuper_outer.is_some()
+                    && outer_chain_reaches_owner(ctx.st, ctx.class_sym, outer))
+            {
+                asm.aconst_null();
+            } else {
+                load_outer_arg(asm, ctx, outer);
+            }
         }
     } else if let Some(outer) = outer_cls {
         if let Some((slot, sort, od)) = receiver_outer {

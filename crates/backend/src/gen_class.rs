@@ -1344,8 +1344,15 @@ impl<'a> Gen<'a> {
             // `uninitializedThis` -- but never a `getfield`, which is why the
             // pre-super code below reads the argument instead of the field.
             ctx_early.presuper = true;
+            // The hidden `$outer` parameter is present even for an anonymous
+            // class whose body does not retain an outer field.  Superclass
+            // arguments are evaluated in this pre-super context, however, and
+            // may still refer to a member of the enclosing instance (for
+            // example `new PR(tag) { ... }`).  Make the parameter available to
+            // receiver loading in that region independently of whether the
+            // class has a `$outer` field to store.
+            ctx_early.presuper_outer = presuper_outer_of(st, class_id);
             if has_outer {
-                ctx_early.presuper_outer = presuper_outer_of(st, class_id);
                 if let Some(od) = &outer_desc_c {
                     asm.aload(0);
                     asm.aload(1);
