@@ -3628,12 +3628,23 @@ pub(crate) fn unify_one_precise(
                 .and_then(|h| unify_one_precise(st, tp, h, actual))
         }
         Type::Wildcard => None,
-        Type::Class { args: pas, .. } => {
+        Type::Class { sym: ps, args: pas } => {
             // `Tuple2[K, V]` against `(Int, String)`: the tuple sugar and the
             // nominal class denote the same type (`is_sub_type` already treats
             // them as such), so unify positionally when the arity agrees.
             let aas = match actual {
-                Type::Class { args, .. } => args,
+                // Type arguments only unify positionally when both sides are
+                // applications of the same class.  Treating unrelated
+                // classes as though their arguments had the same constructor
+                // made `Rep[P2]` against `Option[A]` infer `P2 = A` before
+                // overload adaptation had a chance to insert Slick's
+                // `valueToConstColumn` view.  That closed the open `P2` and
+                // changed the required type to `Rep[A]`, rejecting the valid
+                // `Option[A]` argument to `OptionColumnExtensionMethods.===`.
+                // A subclass is aligned to the parameter's class by the
+                // caller before this structural unification; without that
+                // alignment there is no positional correspondence to use.
+                Type::Class { sym: as_, args } if as_ == ps => args,
                 Type::Tuple(ts) if ts.len() == pas.len() => ts,
                 // A *compound* actual is each of its components: slick hands a
                 // `ScalaType[U] with BaseTypedType[U]` to a `ColumnType[U']`

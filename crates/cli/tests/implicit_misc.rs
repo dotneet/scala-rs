@@ -479,3 +479,21 @@ fn tq_openview_bad_is_rejected() {
         "could not find implicit value of type OM[Long, Long, R]",
     );
 }
+
+/// Keep nominal type constructors distinct while inferring an OptionMapper2
+/// witness.  Slick's `===` has this shape: its value argument is `Rep[P2]`,
+/// but an `Option[A]` literal reaches that parameter through `valueToRep`,
+/// and the implicit clause determines the result type.  Unifying the
+/// unrelated `Rep[P2]` and `Option[A]` constructors positionally inferred
+/// `P2 = A` too early and rejected both Some and None.
+#[test]
+fn optionmapper2_nominal_inference_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip optionmapper2 fixture: scala-library jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("optionmapper2", &["--scala-library", jar_s]);
+    assert_no_private_stdlib(&out);
+    let _ = fs::remove_dir_all(&out);
+}
