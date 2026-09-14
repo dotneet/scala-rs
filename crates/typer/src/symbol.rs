@@ -4388,6 +4388,34 @@ impl SymbolTable {
         let mut seen = rustc_hash::FxHashSet::default();
         let mut subs: Vec<(SymbolId, Vec<Type>)> = Vec::new();
         walk(self, core, &mut subs, &mut seen, &base);
+        // A nested class inherits the type vocabulary of its lexical outer
+        // class even when that outer class is not an ancestor in the class
+        // hierarchy. `StringGenerator.StringDef` therefore still reads
+        // `Generator.Code` through `StringGenerator extends
+        // Generator[String]`, although `StringDef`'s own parent list only
+        // contains `Generator.Def`. The ordinary walk cannot reach that
+        // enclosing parent, so collect its substitutions separately. Keep a
+        // separate seen set: these classes provide the vocabulary for the
+        // signature, but must not make bare nested result types look as if
+        // they were selected through the receiver's own class.
+        if crate::prefix::view_prefix(recv).is_none() {
+            if let Some(rc) = self.class_sym_of(core) {
+                if self.is_inner_class_of_class(rc) {
+                    let mut outer_seen = rustc_hash::FxHashSet::default();
+                    for outer in self.enclosing_classes(rc).into_iter().skip(1) {
+                        if self.get(outer).is_class_like() {
+                            walk(
+                                self,
+                                &Type::ThisType(outer),
+                                &mut subs,
+                                &mut outer_seen,
+                                &base,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let t = self.apply_collected_subs(&subs, ty);
         // nsc's as-seen-from for the enclosing instance: a bare inner class
         // of any class the walk went through means `C.this.In`, and read

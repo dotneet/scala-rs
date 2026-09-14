@@ -90,6 +90,8 @@ mod cfwd;
 mod classtag_inference;
 #[path = "../codegen_diag.rs"]
 mod codegen_diag;
+#[path = "../codegen_nested_generic.rs"]
+mod codegen_nested_generic;
 #[path = "../coll.rs"]
 mod coll;
 #[path = "../collectionresults.rs"]
