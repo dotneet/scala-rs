@@ -1772,13 +1772,24 @@ impl Typer {
                 continue;
             };
             // The outer class may expose an overriding accessor directly or
-            // inherit the profile's one. Either way its return type is the
-            // concrete backend vocabulary in which the result is seen.
-            let Some(backend_member) = self
+            // inherit the profile's one. Complete its pickle first: a
+            // classfile-only hierarchy can otherwise contain just
+            // BasicBackend's abstract accessor even though JdbcProfile's
+            // concrete override is available in the pickle. Then apply the
+            // normal most-derived-member reduction instead of depending on
+            // lookup_member's traversal order.
+            self.pickle
+                .complete(&mut self.st, &mut self.binary, outer_cls, backend_name);
+            let backend_candidates: Vec<SymbolId> = self
                 .st
                 .lookup_member(outer_cls, backend_name)
                 .into_iter()
-                .find(|&s| matches!(self.st.get(s).kind, SymKind::Method | SymKind::Term))
+                .filter(|&s| matches!(self.st.get(s).kind, SymKind::Method | SymKind::Term))
+                .collect();
+            let Some(backend_member) = self
+                .drop_overridden_at(outer_cls, backend_candidates)
+                .into_iter()
+                .next()
             else {
                 continue;
             };
