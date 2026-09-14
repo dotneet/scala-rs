@@ -2437,7 +2437,7 @@ pub(crate) fn gen_new_with(
                     && outer_chain_reaches_owner(ctx.st, ctx.class_sym, outer))
             {
                 asm.aconst_null();
-            } else if ctx.outer_slot.is_none() && ctx.method_sym.is_none() {
+            } else if ctx.outer_slot.is_none() && ctx.method_sym.is_none() && ctx.outer.is_none() {
                 // A hoisted lambda with no lexical receiver has no `this` at
                 // all: slot zero is its first SAM argument. Its nested local
                 // class still has the ABI's hidden outer parameter, but nsc
