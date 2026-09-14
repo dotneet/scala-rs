@@ -177,6 +177,30 @@ fn assert_capture_field(out: &Path, class_file: &str, field: &str) {
     );
 }
 
+fn assert_no_field(out: &Path, class_file: &str, field: &str) {
+    let class_name = class_file
+        .strip_suffix(".class")
+        .expect("class file suffix");
+    let output = Command::new("javap")
+        .args(["-private", "-classpath", out.to_str().unwrap(), class_name])
+        .output()
+        .expect("javap anonymous classfile");
+    assert!(
+        output.status.success(),
+        "javap failed for {class_file}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !text.lines().any(|line| {
+            line.split_whitespace()
+                .last()
+                .is_some_and(|decl| decl == format!("{field};"))
+        }),
+        "{class_file} unexpectedly contains field {field}"
+    );
+}
+
 #[test]
 fn anoncap1_param_and_local_captures() {
     check_both("anoncap1");
@@ -198,6 +222,31 @@ fn anoncap3_var_and_local_class() {
 #[test]
 fn unused_outer_is_serializable() {
     check_both("unused_outer");
+}
+
+/// An anonymous class may read its lexical outer while initializing an eager
+/// field, but does not need that receiver after construction. The hidden
+/// constructor argument remains part of the ABI; scalac does not retain an
+/// unnecessary `$outer` field that would make serialization visit a
+/// non-serializable enclosing object.
+#[test]
+fn eager_initializer_outer_is_serializable() {
+    if !java_available() {
+        return;
+    }
+    let out = compile_fixture_with("eager_outer", &["--no-scala-library"]);
+    assert_eq!(run_java(&out, None), "outer\n");
+    assert_no_field(&out, "EagerOuter$$anon$1.class", "$outer");
+    let _ = fs::remove_dir_all(&out);
+
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip eager_outer library run: jar not obtainable");
+        return;
+    };
+    let out = compile_fixture_with("eager_outer", &["--scala-library", jar.to_str().unwrap()]);
+    assert_eq!(run_java(&out, Some(&jar)), "outer\n");
+    assert_no_field(&out, "EagerOuter$$anon$1.class", "$outer");
+    let _ = fs::remove_dir_all(&out);
 }
 
 /// Pattern binders in a serializable SAM closure must not retain the

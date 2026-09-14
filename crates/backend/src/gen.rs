@@ -639,6 +639,16 @@ pub(crate) struct EmitCtx<'a> {
     /// parameter it arrived in, which is what nsc reads there too.
     /// `(slot, class we step into, static type on the stack)`.
     pub(crate) presuper_outer: Option<(u16, SymbolId, SymbolId)>,
+    /// Set while emitting eager template initializers of a class that does
+    /// not retain `$outer`. Such code may still read the enclosing instance,
+    /// but scalac uses the hidden constructor argument directly because the
+    /// receiver cannot be needed after `<init>` returns.
+    pub(crate) ctor_outer: Option<(u16, SymbolId, SymbolId)>,
+    /// Whether this context emits a class or module constructor. Constructor
+    /// code has a real `this` after the super call, even though it has no
+    /// method symbol; that distinction matters when passing an unused outer
+    /// argument to a nested class.
+    pub(crate) in_constructor: bool,
     /// Set for the same region as `presuper_outer` -- the code of an `<init>`
     /// that runs before its super (or self) constructor call -- whether or not
     /// the class has an enclosing instance. `this` cannot be handed to
@@ -688,6 +698,8 @@ pub(crate) fn emit_ctx<'a>(
         source,
         outer: None,
         presuper_outer: None,
+        ctor_outer: None,
+        in_constructor: false,
         presuper: false,
         outer_slot: None,
         abi,
@@ -731,7 +743,8 @@ pub(crate) fn presuper_outer_of(
 /// caller is about to step out at least once; in the pre-super part of a
 /// nested class's `<init>` that first hop cannot be a `getfield` (see
 /// `EmitCtx::presuper_outer`), so it is the constructor's own `$outer`
-/// argument instead.
+/// argument instead. Eager initializers of a class without a physical outer
+/// field use the same constructor slot after the super call (`ctor_outer`).
 pub(crate) fn start_outer_walk(
     asm: &mut Assembler,
     ctx: &EmitCtx,
@@ -739,6 +752,10 @@ pub(crate) fn start_outer_walk(
 ) -> (SymbolId, SymbolId) {
     if needs_hop {
         if let Some((slot, next, held)) = ctx.presuper_outer {
+            asm.aload(slot);
+            return (next, held);
+        }
+        if let Some((slot, next, held)) = ctx.ctor_outer {
             asm.aload(slot);
             return (next, held);
         }

@@ -580,6 +580,13 @@ pub struct Symbol {
     /// The JVM ABI still has the hidden outer constructor slot for such a
     /// class, but scalac only stores `$outer` when the body needs it.
     pub captures_outer: bool,
+    /// Whether an enclosing-instance reference outlives the constructor.
+    ///
+    /// A class can read its outer instance while initializing an eager field
+    /// (or evaluating a template statement) without retaining that instance:
+    /// scalac uses the hidden constructor argument directly in that case.
+    /// Methods, lazy fields, and closures need a physical `$outer` field.
+    pub requires_outer_field: bool,
     /// Set on `def f = macro Impl.method`. Such a symbol has no bytecode: every
     /// call site must be replaced by the implementation's expansion.
     pub macro_impl: Option<MacroBinding>,
@@ -1462,6 +1469,7 @@ impl SymbolTable {
                 is_pattern_skolem: false,
                 captures: vec![],
                 captures_outer: false,
+                requires_outer_field: false,
                 macro_impl: None,
                 declaring_class: String::new(),
                 declaring_is_interface: false,
@@ -1603,6 +1611,7 @@ impl SymbolTable {
             is_pattern_skolem: false,
             captures: vec![],
             captures_outer: false,
+            requires_outer_field: false,
             macro_impl: None,
             declaring_class: String::new(),
             declaring_is_interface: false,

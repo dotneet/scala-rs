@@ -39,8 +39,10 @@ fn mark_outer_captures(tree: &Tree, st: &mut SymbolTable) {
     match &tree.kind {
         TreeKind::ClassDef { impl_, .. } => {
             if !tree.sym.is_none() && is_local_or_anonymous(st, tree.sym) {
-                let needed = class_uses_outer(tree, st, tree.sym);
-                st.get_mut(tree.sym).captures_outer = needed;
+                let uses = class_outer_use(tree, st, tree.sym);
+                let sym = st.get_mut(tree.sym);
+                sym.captures_outer = uses.any;
+                sym.requires_outer_field = uses.requires_field;
             }
             // A nested class is a separate lexical body.  Its use of an
             // enclosing member must not accidentally mark this class too.
@@ -255,13 +257,110 @@ fn this_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool {
 }
 
 /// Scan one class body without descending into nested class/module bodies.
-fn class_uses_outer(class_def: &Tree, st: &SymbolTable, current: SymbolId) -> bool {
+#[derive(Clone, Copy, Default)]
+struct OuterUse {
+    any: bool,
+    requires_field: bool,
+}
+
+impl OuterUse {
+    fn retained(any: bool) -> Self {
+        Self {
+            any,
+            requires_field: any,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.any |= other.any;
+        self.requires_field |= other.requires_field;
+    }
+}
+
+/// Classify enclosing-instance reads by how long their receiver must live.
+///
+/// Parent expressions, eager value initializers, and bare template statements
+/// execute in the constructor and may read the hidden outer argument directly.
+/// A method or lazy initializer can run after construction, so any outer read
+/// in one requires a physical `$outer` field. Nested templates are analyzed by
+/// their own class symbol and deliberately do not affect this class.
+fn class_outer_use(class_def: &Tree, st: &SymbolTable, current: SymbolId) -> OuterUse {
     let TreeKind::ClassDef { impl_, .. } = &class_def.kind else {
-        return false;
+        return OuterUse::default();
     };
-    inherited_trait_needs_outer(st, current, &impl_.parents)
-        || impl_.parents.iter().any(|t| scan_outer(t, st, current))
-        || impl_.body.iter().any(|t| scan_outer(t, st, current))
+    let mut uses = OuterUse::retained(inherited_trait_needs_outer(st, current, &impl_.parents));
+    for parent in &impl_.parents {
+        let used = scan_outer(parent, st, current);
+        uses.merge(OuterUse {
+            any: used,
+            // A closure nested in a parent argument can outlive this
+            // constructor just like one nested in an eager field initializer.
+            requires_field: scan_outer_deferred(parent, st, current),
+        });
+    }
+    for tree in &impl_.body {
+        let used = match &tree.kind {
+            TreeKind::DefDef { .. } => OuterUse::retained(scan_outer(tree, st, current)),
+            TreeKind::ValDef { mods, rhs, .. } => {
+                let used = scan_outer(rhs, st, current);
+                if mods.flags.contains(Flags::LAZY) {
+                    OuterUse::retained(used)
+                } else {
+                    // A lambda (or a nested `def`) in an eager initializer is
+                    // itself emitted as code that runs after construction.  A
+                    // read of the enclosing instance from that deferred body
+                    // therefore still needs this class's `$outer` field.  The
+                    // initializer's direct reads remain constructor-only.
+                    OuterUse {
+                        any: used,
+                        requires_field: scan_outer_deferred(rhs, st, current),
+                    }
+                }
+            }
+            TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => OuterUse::default(),
+            _ => {
+                let used = scan_outer(tree, st, current);
+                OuterUse {
+                    any: used,
+                    requires_field: scan_outer_deferred(tree, st, current),
+                }
+            }
+        };
+        uses.merge(used);
+    }
+    uses
+}
+
+/// Find enclosing-instance reads that occur in code retained beyond the
+/// constructor.  This is intentionally separate from [`scan_outer`]: an
+/// eager value such as `val x = outer.member` can use the hidden constructor
+/// slot directly, but `val x = () => outer.member` must retain `$outer` for
+/// the generated lambda body.  Nested class/module bodies have their own
+/// capture analysis and are skipped here.
+fn scan_outer_deferred(tree: &Tree, st: &SymbolTable, current: SymbolId) -> bool {
+    match &tree.kind {
+        TreeKind::Ident { .. } if member_needs_outer(st, current, tree.sym) => false,
+        TreeKind::This { .. } | TreeKind::Super { .. }
+            if this_needs_outer(st, current, tree.sym) =>
+        {
+            false
+        }
+        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => false,
+        TreeKind::Function { body, .. } => scan_outer(body, st, current),
+        TreeKind::DefDef { .. } => scan_outer(tree, st, current),
+        TreeKind::ValDef { mods, rhs, .. } if mods.flags.contains(Flags::LAZY) => {
+            scan_outer(rhs, st, current)
+        }
+        _ => {
+            let mut found = false;
+            each_child(tree, &mut |c| {
+                if !found && scan_outer_deferred(c, st, current) {
+                    found = true;
+                }
+            });
+            found
+        }
+    }
 }
 
 fn scan_outer(tree: &Tree, st: &SymbolTable, current: SymbolId) -> bool {

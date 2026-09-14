@@ -100,7 +100,7 @@ impl<'a> Gen<'a> {
             |asm| {
                 let mut frame = Frame::instance();
                 emit_trait_capture_prologue(asm, &mut frame, &iface_owned, &caps);
-                let ctx = emit_ctx(
+                let mut ctx = emit_ctx(
                     st,
                     trait_id,
                     &iface_owned,
@@ -114,6 +114,12 @@ impl<'a> Gen<'a> {
                     boxed_vars,
                     std::rc::Rc::clone(&self.emit_errors),
                 );
+                // Trait `$init$` is the constructor-time body for each
+                // implementing instance. Anonymous classes created by an
+                // eager trait initializer therefore receive slot 0 as their
+                // hidden outer argument, even though the trait has no JVM
+                // constructor of its own.
+                ctx.in_constructor = true;
                 for vd in &inits {
                     if let TreeKind::ValDef {
                         name, mods, rhs, ..

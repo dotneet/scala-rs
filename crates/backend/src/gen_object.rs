@@ -412,7 +412,7 @@ impl<'a> Gen<'a> {
             if own_outer.is_some() {
                 frame.next_slot += 1; // slot 1 is $outer
             }
-            let ctx = emit_ctx(
+            let mut ctx = emit_ctx(
                 st,
                 class_id,
                 &class_name,
@@ -426,6 +426,7 @@ impl<'a> Gen<'a> {
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
+            ctx.in_constructor = true;
             if own_outer.is_some() {
                 // nsc rejects a null enclosing instance up front.
                 asm.aload(1);
@@ -458,6 +459,7 @@ impl<'a> Gen<'a> {
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
+            ctx_early.in_constructor = true;
             ctx_early.presuper = true;
             if own_outer.is_some() {
                 ctx_early.presuper_outer = presuper_outer_of(st, class_id);

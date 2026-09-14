@@ -1344,6 +1344,7 @@ impl<'a> Gen<'a> {
             // `uninitializedThis` -- but never a `getfield`, which is why the
             // pre-super code below reads the argument instead of the field.
             ctx_early.presuper = true;
+            ctx_early.in_constructor = true;
             // The hidden `$outer` parameter is present even for an anonymous
             // class whose body does not retain an outer field.  Superclass
             // arguments are evaluated in this pre-super context, however, and
@@ -1517,6 +1518,15 @@ impl<'a> Gen<'a> {
                 boxed_vars,
                 std::rc::Rc::clone(&self.emit_errors),
             );
+            // An eager initializer may still read the lexical outer even when
+            // no method or lazy field needs it after construction. scalac
+            // keeps the hidden constructor slot for that read but omits the
+            // serializability-poisoning `$outer` field.
+            let mut ctx = ctx;
+            ctx.in_constructor = true;
+            if outer.is_none() {
+                ctx.ctor_outer = presuper_outer_of(st, class_id);
+            }
             if delayed {
                 if abi.is_library() && is_app {
                     asm.aload(0);
