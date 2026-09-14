@@ -3986,7 +3986,14 @@ impl Typer {
         // `F[BB]`: `F.pure[A]` against `B => F[BB]` is `A := BB`, not the
         // `A := B` the parameter alone says, which gives a `B => F[B]` that
         // an invariant `F` does not accept.
-        let mut inst = self.add_expected_constraints(sym, &ret, &pt_ret, inst);
+        // An eta-expanded method value is checked against a concrete function
+        // prototype, so its covariant result is part of the expected shape.
+        // `Left.apply _` assigned to `A => Either[A, C]` must therefore solve
+        // `Left`'s otherwise-unmentioned right parameter to `C`.  Ordinary
+        // calls retain the default (non-covariant) rule in
+        // `add_expected_constraints`: a covariant result alone should not
+        // force `def empty[T]: List[T]` to choose the expected `List[X]`.
+        let mut inst = self.add_expected_constraints_in(sym, &ret, &pt_ret, inst, true);
         // An instantiation the parameter's own bounds refuse is not an
         // instantiation. Leaving the variable open is what the caller expects:
         // `record_open_tparams` hands it outward and the mismatch is reported

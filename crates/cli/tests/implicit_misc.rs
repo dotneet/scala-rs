@@ -497,3 +497,21 @@ fn optionmapper2_nominal_inference_fixture() {
     assert_no_private_stdlib(&out);
     let _ = fs::remove_dir_all(&out);
 }
+
+/// A polymorphic constructor method used as a function value must use the
+/// expected result to solve type parameters that occur only covariantly.
+/// `KleisliArrowChoice.choose` writes `F.map(f(a))(Left.apply _)` and the
+/// corresponding `Right.apply _`; both are expected to produce an
+/// `Either[C, D]`, although the constructor methods themselves return the
+/// narrower `Left[A, B]` / `Right[A, B]` classes.
+#[test]
+fn kleisli_arrowchoice_choose_inference_fixture() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip kleisli choose fixture: scala-library jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("kleisli_choose", &["--scala-library", jar_s]);
+    assert_no_private_stdlib(&out);
+    let _ = fs::remove_dir_all(&out);
+}
