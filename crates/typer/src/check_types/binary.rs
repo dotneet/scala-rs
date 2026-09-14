@@ -1800,6 +1800,20 @@ impl Typer {
         match peeled {
             Type::ModuleRef(c) => Some(c),
             Type::Class { sym: c, .. } if self.st.get(c).kind == SymKind::ModuleClass => Some(c),
+            // A path-dependent module accessor is represented as `p.type`.
+            // Its symbol is a zero-argument method, so the module class sits
+            // behind `singleton_underlying` rather than directly in the
+            // singleton type. This is the shape of a path-dependent module
+            // application; without peeling it, the application never reaches
+            // the module's polymorphic `apply` and its evidence is searched
+            // against the unresolved singleton instead.
+            Type::SingleType { sym: c, .. } => match self.st.singleton_underlying(c) {
+                Type::ModuleRef(m) => Some(m),
+                Type::Class { sym: m, .. } if self.st.get(m).kind == SymKind::ModuleClass => {
+                    Some(m)
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2067,5 +2081,39 @@ impl Typer {
         // its real descriptor; this also covers an auxiliary constructor whose
         // default getter is forwarded from the class.
         self.supply_binary_ctors(class_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_class_of_value_peels_singleton_accessor() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let module = typer.st.alloc(
+            "Factory$",
+            typer.st.root,
+            SymKind::ModuleClass,
+            Flags::MODULE,
+            "pkg/Factory$",
+        );
+        typer.st.get_mut(module).ty = Type::ModuleRef(module);
+        let accessor = typer.st.alloc(
+            "Factory",
+            typer.st.root,
+            SymKind::Method,
+            Flags::ACCESSOR,
+            "()Lpkg/Factory$;",
+        );
+        typer.st.get_mut(accessor).ty = Type::ModuleRef(module);
+        let singleton = Type::SingleType {
+            prefix: Box::new(Type::ModuleRef(module)),
+            sym: accessor,
+        };
+        assert_eq!(
+            typer.module_class_of_value(accessor, &singleton),
+            Some(module)
+        );
     }
 }

@@ -1395,6 +1395,25 @@ impl Typer {
                 if self.st.get(m).kind == SymKind::TypeParam {
                     continue;
                 }
+                // The class-file pickle also exposes each generic parameter
+                // as an abstract `TypeMember` of its declaring class (`T` in
+                // `Rep[T]` is present twice: once as `TypeParam`, once as a
+                // member). It is the same non-inherited parameter, not a
+                // source-declared `type T`. Entering that mirror made a
+                // nested class's inherited `Table.T` hide an enclosing
+                // method type parameter, while scalac resolves the lexical
+                // parameter (the latter is what `column[T]` in a generic
+                // local table needs).
+                if self.st.get(m).kind == SymKind::TypeMember
+                    && self
+                        .st
+                        .get(pid)
+                        .tparams
+                        .iter()
+                        .any(|tp| self.st.get(*tp).name == n)
+                {
+                    continue;
+                }
                 // Neither is a parent's self alias (see `Symbol::self_alias`).
                 if Some(m) == alias {
                     continue;

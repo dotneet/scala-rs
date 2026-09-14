@@ -441,6 +441,72 @@ object Main {
 "#);
     }
 
+    /// A classpath pickle exposes a generic class parameter both as its
+    /// `TypeParam` and as an abstract member of the declaring class. The
+    /// member mirror is not inherited: letting it enter a nested class scope
+    /// hides an enclosing method parameter of the same name, unlike scalac.
+    #[test]
+    fn inherited_binary_type_parameter_mirror_does_not_shadow_lexical_type() {
+        let parent = ClasspathClass {
+            jvm_name: "pkg/Parent".into(),
+            is_module: false,
+            methods: vec![],
+            fields: vec![],
+            pickle: Some(vec![ClasspathPickleMethod {
+                name: "<init>".into(),
+                param_names: vec![],
+                param_types: vec![],
+                clause_sizes: vec![0],
+                param_flags: vec![],
+                ret: "Unit".into(),
+                tparams: vec![],
+                is_val: false,
+                is_ctor: true,
+                is_implicit: false,
+                is_deferred: false,
+                is_mutable: false,
+            }]),
+            type_members: vec![ClasspathTypeMember {
+                name: "T".into(),
+                lower_bound: "Nothing".into(),
+                upper_bound: "Any".into(),
+                alias: None,
+                tparams: vec![],
+            }],
+            pickle_tparams: vec![ClasspathTypeParam::simple("T")],
+            is_interface: false,
+            super_name: None,
+            interfaces: vec![],
+            extends_anyval: false,
+        };
+        let (_, _, diags) = typecheck_str_opts(
+            r#"
+import pkg.Parent
+object Main {
+  def use[T](value: T): T = {
+    class Child extends Parent[T] {
+      def id(v: T): T = v
+    }
+    new Child().id(value)
+  }
+}
+"#,
+            &TypecheckOptions {
+                fatal_warnings: false,
+                library_abi: false,
+                classpath: vec![parent],
+                binary_path: Vec::new(),
+                language_features: Vec::new(),
+                ..TypecheckOptions::default()
+            },
+        );
+        assert!(
+            !has_errors(&diags),
+            "binary type-parameter mirror must not shadow lexical type: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn list_for_typechecks() {
         ok(r#"
