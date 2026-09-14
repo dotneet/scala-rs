@@ -353,8 +353,8 @@ object Main {
     // `Unit`, which is right in statement position and wrong when the value
     // is an argument, so this line was `VerifyError: Operand stack underflow`
     // on an unmodified build of the branch point. It now leaves the value,
-    // as nsc does, and `gen_expr::discarded_predef_poly` drops it where it is
-    // discarded. See `crates/cli/tests/unitpop.rs`.
+    // as nsc does, and the generic assembler-stack cleanup drops it where it
+    // is discarded. See `crates/cli/tests/unitpop.rs`.
     println(identity(()))
   }
 }

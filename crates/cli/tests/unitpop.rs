@@ -19,14 +19,15 @@
 //! emitted no `BoxedUnit` of its own and `Predef$.println` was handed an empty
 //! stack. nsc keeps the value (`javap`: `invokevirtual identity; invokevirtual
 //! println`) and lets the generic statement-position discard remove it; so does
-//! this now, through `gen_expr::discarded_predef_poly`.
+//! this now, by comparing the assembler's operand-stack depth before and after
+//! emitting a discarded expression.
 //!
 //! The private runtime was failing the *mirror* image of the same disagreement
-//! and is fixed by the same predicate: it inlines the intrinsic, erasure boxes
-//! a `Unit` argument, and `unit_stat_leaves_ref` refuses every symbol carrying
-//! an `Intrinsic` — so a discarded `identity(())` left a `BoxedUnit` nobody
-//! popped. Straight-line code merely leaked a slot; `if (b) identity(()) else
-//! side()` was `VerifyError: Inconsistent stackmap frames`.
+//! and is fixed by the same stack-depth rule: it inlines the intrinsic and
+//! erasure boxes a `Unit` argument, so a discarded `identity(())` used to leave
+//! a `BoxedUnit` nobody popped. Straight-line code merely leaked a slot;
+//! `if (b) identity(()) else side()` was `VerifyError: Inconsistent stackmap
+//! frames`.
 //!
 //! **This class of defect is invisible to every check but running the
 //! program.** Both shapes compile clean, and only `-Xverify:all` or execution
@@ -235,6 +236,49 @@ object Main {
         assert_eq!(
             run_java(&out, cp.as_deref(), "Main"),
             "f\ngt\ngf\n",
+            "[{tag}]"
+        );
+        let _ = fs::remove_dir_all(out.parent().unwrap());
+    }
+}
+
+/// A classpath method can be typed as `Unit` while its erased JVM descriptor
+/// returns `Object`: `List[Unit].head` is the smallest example. The value must
+/// still be discarded before the following branch join; otherwise the class
+/// fails verification with an `Object` left on one edge of the join.
+#[test]
+fn a_discarded_erased_library_result_is_popped() {
+    if !java_available() {
+        return;
+    }
+    let src = r#"
+object Main {
+  def side(s: String): Unit = println(s)
+  def add(x: Long, y: Int): Unit = println(x + y)
+  def f(b: Boolean): Unit = {
+    List(()).head
+    if (b) side("t") else side("f")
+  }
+  def main(args: Array[String]): Unit = {
+    f(true); f(false)
+    // Keep a category-2 argument below the discarded result. The cleanup must
+    // remove only the value produced by `head`, not the caller's pending stack.
+    add(40L, { List(()).head; 2 })
+  }
+}
+"#;
+    for (tag, extra, cp) in both_modes() {
+        // The embedded private runtime does not expose the full collection
+        // library (`List.apply` is unavailable there); this regression targets
+        // the classpath-erased method path used by the application ABI.
+        if tag == "private" {
+            continue;
+        }
+        let flags: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let out = compile(&format!("unitpop-erased-{tag}"), src, &flags);
+        assert_eq!(
+            run_java(&out, cp.as_deref(), "Main"),
+            "t\nf\n42\n",
             "[{tag}]"
         );
         let _ = fs::remove_dir_all(out.parent().unwrap());

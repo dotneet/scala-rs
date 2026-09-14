@@ -807,99 +807,6 @@ pub(crate) fn owner_defined_in_source(st: &SymbolTable, owner: SymbolId) -> bool
     st.is_source_owner(owner)
 }
 
-/// A `Unit`-typed expression in *statement* position whose emitted code left a
-/// reference behind, so it has to be dropped -- `def id[A](a: A): A` is
-/// `(Object)Object` even at `id(())`, and nsc pops it too.
-///
-/// Deliberately narrower than `unit_leaves_boxed_ref`, which answers the same
-/// question for a *value* position: only a method **defined in this
-/// compilation unit** counts. Library members reach the backend through
-/// emitters of their own that already drop the value where they produce it
-/// (`Using.resource`, `Breaks.catchBreak`, `ArrayOps`), and popping it a
-/// second time underflows the stack. A callee declared to return `Unit`
-/// returns `V` and leaves nothing at all either way.
-pub(crate) fn unit_stat_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
-    match &tree.kind {
-        TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => {
-            unit_stat_leaves_ref(expr, st)
-        }
-        // A function *value* applied (`mk(p)(x)`, where `mk` returns an
-        // `Int => Unit`) goes out as `FunctionN.apply`, and
-        // `gen_function_apply` already drops the `BoxedUnit` a `Unit` result
-        // comes back as. The symbol on the inner call is `mk`, whose result
-        // is not `Unit`, so asking `leaves_ref_sym` popped a second time --
-        // `VerifyError: Operand stack underflow` (`run/Course-2002-06`).
-        TreeKind::Apply { fun, .. } if matches!(fun.ty, Type::Function { .. }) => false,
-        TreeKind::Apply { fun, .. } => {
-            let f = peel_fun(fun);
-            leaves_ref_sym(f.sym, st, false)
-        }
-        // A **nilary** `def` has no argument list, so calling it builds a bare
-        // `Select` with no `Apply` above it and the arm above never sees it:
-        // `b.get` on a `Box[Unit]`, where `trait Box[A] { def get: A }`, still
-        // invokes `get()Ljava/lang/Object;`. Discarded without a `pop` the
-        // reference survives into the next stackmap frame, and the first
-        // branch after it (a `try`, an `if`, a `while`) is
-        // `VerifyError: Inconsistent stackmap frames`. Straight-line code got
-        // away with it, which is why this went unnoticed.
-        TreeKind::Select { .. } | TreeKind::Ident { .. } => {
-            field_leaves_unit_ref(tree, st) || leaves_ref_sym(tree.sym, st, true)
-        }
-        _ => false,
-    }
-}
-
-/// The shared test behind both arms of `unit_stat_leaves_ref`: a member this
-/// compilation unit defines whose *declared* result is not `Unit`, so its JVM
-/// signature returns a value even where the use site's type is `Unit`.
-///
-/// `only_methods` is set for the bare-`Select` arm. An `Apply` may be a call
-/// through a function-typed `val` (`Function1.apply` erases to
-/// `(Object)Object` too), but a bare `Select` of a `val` is a field read whose
-/// descriptor `pop_if_value` already covers from the tree's own type, and
-/// popping it a second time would underflow the stack.
-pub(crate) fn leaves_ref_sym(sym: SymbolId, st: &SymbolTable, only_methods: bool) -> bool {
-    if sym.is_none() {
-        return false;
-    }
-    let s = st.get(sym);
-    if only_methods && s.kind != SymKind::Method {
-        return false;
-    }
-    if !matches!(s.intrinsic, Intrinsic::None) || !owner_defined_in_source(st, s.owner) {
-        return false;
-    }
-    match &s.ty {
-        Type::Method { ret, .. } | Type::Function { ret, .. } => {
-            !matches!(ret.as_ref(), Type::Unit | Type::NoType | Type::Nothing)
-        }
-        _ => false,
-    }
-}
-
-/// True when the code just emitted for `tree` left a reference on the stack
-/// even though `tree`'s Scala type is `Unit`: `pf.apply(x)` for a
-/// `PartialFunction[A, Unit]` still invokes `(Object)Object`. Discarding such
-/// an expression has to `pop`, or a later `goto` merges two stack heights.
-///
-/// Deliberately narrow. Most `Unit` expressions leave nothing behind, and the
-/// intrinsics that do erase through `Object` (`Breaks.catchBreak`,
-/// `Using.resource`) already drop the value where they are emitted.
-pub(crate) fn unit_call_leaves_ref(tree: &Tree, st: &SymbolTable) -> bool {
-    match &tree.kind {
-        TreeKind::Typed { expr, .. } | TreeKind::Block { expr, .. } => {
-            unit_call_leaves_ref(expr, st)
-        }
-        TreeKind::Apply { fun, .. } => match &peel_fun(fun).kind {
-            TreeKind::Select { qual, name } => {
-                name == "apply" && is_partial_function_ty(st, &qual.ty)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 pub(crate) fn emit_predef_nyi(asm: &mut Assembler) {
     load_predef_module(asm);
     asm.invokevirtual("scala/Predef$", "???", "()Lscala/runtime/Nothing$;");
@@ -997,9 +904,7 @@ pub(crate) fn gen_predef_poly(
 ///
 /// nsc leaves the `BoxedUnit` here too (`javap`: `invokevirtual identity;
 /// invokevirtual println`) and lets the generic statement-position discard in
-/// `gen_stat` drop it — see `gen_expr::discarded_predef_poly`, which answers
-/// the dispatch question `gen_expr::predef_poly_name` asks, so the two cannot
-/// disagree about which calls this emitter claims.
+/// `gen_stat` drop whatever value the emitted path actually left behind.
 fn predef_poly_result(asm: &mut Assembler, ctx: &EmitCtx, result_ty: &Type) {
     if is_unit_like(result_ty) {
         // nsc emits no cast at all: the value flows on as the `Object` the
