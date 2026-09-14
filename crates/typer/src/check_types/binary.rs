@@ -1355,6 +1355,22 @@ impl Typer {
         if found.iter().any(|&m| self.st.get(m).owner == cls) {
             return;
         }
+        // `=:=` re-declares the `substituteBoth` / `substituteCo` /
+        // `substituteContra` and `liftCo` / `liftContra` family with invariant
+        // higher kinds, narrowing the variance accepted by the inherited
+        // `<:<` declarations. Prelude setup intentionally leaves that class
+        // lazy, so an earlier `<:<` selection can make an inherited member
+        // look complete before the equality witness is selected. Complete
+        // this derived declaration before overload reduction; otherwise
+        // valid invariant type lambdas (Cats' `Is[A, *]`) are rejected as
+        // covariant.
+        if self.st.get(cls).jvm_name == "scala/$eq$colon$eq" {
+            let own = self.supply_from_pickle_class(cls, name);
+            if own.iter().any(|&m| self.st.get(m).owner == cls) {
+                *found = self.st.lookup_member(cls, name);
+            }
+            return;
+        }
         // A real extra JVM signature is an overload, not merely a receiver
         // substitution. Preserve the established overload completion first:
         // TreeMap.map(f)(Ordering) must not disappear when Map.map was loaded

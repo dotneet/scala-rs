@@ -193,6 +193,45 @@ fn kvar_kind_ok_runs() {
     check_runs("kvar_kind_ok", None);
 }
 
+/// `=:=` narrows the inherited `<:<.substituteCo` method from a covariant
+/// higher-kinded parameter (`F[+_]`) to an invariant one (`F[_]`).  A prior
+/// `<:<` selection could populate the lazy classpath member before the
+/// equality witness was selected, leaving only that inherited shape and
+/// rejecting Cats' invariant `Is[A, *]` lambda.  Keep the earlier selection
+/// in a separate source so this lazy-loading order remains covered.
+#[test]
+fn kvar_eqeq_substitute_co_keeps_derived_variance() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip: scala-library jar not present");
+        return;
+    };
+    let dir = tmp_dir("eqeq-substitute-co");
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let sources = [
+        "kvar_is_support_0.scala",
+        "kvar_is_support_a.scala",
+        "kvar_is_support_b.scala",
+    ];
+    let mut cmd = Command::new(bin());
+    cmd.arg("compile");
+    for source in sources {
+        cmd.arg(fixtures_dir().join(source));
+    }
+    let output = cmd
+        .args(["-d", out.to_str().unwrap()])
+        .args(["--scala-library", jar.to_str().unwrap()])
+        .args(["-Xsource:3", "-Ykind-projector"])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compile eqeq substituteCo failed:\n{}",
+        output_text(&output)
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Compile `kvar_sep_lib` first, then `kvar_sep_use` against its class files
 /// (the corpus's `_1`/`_2` rounds), run `Main`, and compare the output. The
 /// second round's classes come from `-cp`, where a class's variance is only
