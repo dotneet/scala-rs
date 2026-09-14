@@ -1750,10 +1750,18 @@ impl<'a> Gen<'a> {
         let Some(last) = vparamss.last().and_then(|c| c.last()) else {
             return;
         };
-        let pty = if last.ty.is_no_type() && !last.sym.is_none() {
-            self.st.get(last.sym).ty.clone()
-        } else {
-            last.ty.clone()
+        // `erasure` rewrites the parameter tree to its Seq representation, but
+        // the method symbol retains the source-level Repeated shape. Read it
+        // there so an annotated `@varargs` method still gets its Java array
+        // forwarder after the backend receives the erased tree.
+        let pty = match &self.st.get(def.sym).ty {
+            Type::Method { paramss, .. } => paramss
+                .last()
+                .and_then(|clause| clause.last())
+                .cloned()
+                .unwrap_or_else(|| last.ty.clone()),
+            _ if last.ty.is_no_type() && !last.sym.is_none() => self.st.get(last.sym).ty.clone(),
+            _ => last.ty.clone(),
         };
         let Type::Repeated(elem) = pty else { return };
         let elem_desc = jvm_desc_val(self.st, &elem);
