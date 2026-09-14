@@ -198,6 +198,51 @@ fn fixtures_vc_ok_lib() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// The implicit conversion synthesized for a generic value class returns the
+/// wrapper's underlying type at the JVM boundary.  The generic Signature must
+/// instantiate that underlying type with the conversion method's parameters;
+/// leaving the value class's own parameter symbols in place turns both tuple
+/// elements into Object for downstream classfile consumers.
+#[test]
+fn generic_value_class_conversion_keeps_underlying_type_arguments() {
+    if !java_available() {
+        eprintln!("skip generic value-class signature: Java tools are unavailable");
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip generic value-class signature: scala-library jar not present");
+        return;
+    };
+    let out = compile_fixture(
+        "vc_generic_signature",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    let javap = Command::new("javap")
+        .args([
+            "-p",
+            "-v",
+            "-classpath",
+            out.to_str().unwrap(),
+            "vc_generic_signature.Conversions$",
+        ])
+        .output()
+        .expect("run javap");
+    assert!(
+        javap.status.success(),
+        "javap failed: {}{}",
+        String::from_utf8_lossy(&javap.stderr),
+        String::from_utf8_lossy(&javap.stdout)
+    );
+    let text = String::from_utf8_lossy(&javap.stdout);
+    assert!(
+        text.contains(
+            "<A:Ljava/lang/Object;B:Ljava/lang/Object;>(Lscala/Tuple2<TA;TB;>;)Lscala/Tuple2<TA;TB;>;"
+        ),
+        "generic value-class conversion lost its underlying type arguments:\n{text}"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// Every restriction, at scalac's own line, and **nothing else**: the count is
 /// asserted too, because nsc's reporter drops a second error at a position
 /// that already has one and this check reproduces that (a `trait` gets the

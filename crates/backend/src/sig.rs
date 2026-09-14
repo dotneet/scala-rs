@@ -370,6 +370,17 @@ impl<'a> Sig<'a> {
                 }
                 if self.st.is_value_class(*sym) {
                     if let Some(u) = self.st.value_class_underlying(*sym) {
+                        // A value class erases to its underlying field, but
+                        // that field is declared in terms of the value
+                        // class's own type parameters.  Instantiate those
+                        // parameters from the applied value-class type before
+                        // spelling the JVM signature.  In particular, the
+                        // synthetic conversion for
+                        // `implicit class Ops[A](val a: Box[A]) extends AnyVal`
+                        // returns `Ops[A]` while its descriptor returns
+                        // `Box`; using the raw field type here would mention
+                        // Ops's (out-of-scope) `A` and degrade it to Object.
+                        let u = self.st.subst_tparams(*sym, args, &u);
                         // A value class is erased only in a JVM value
                         // position (method/field descriptor).  In a generic
                         // Signature argument it remains the boxed class:
@@ -965,6 +976,32 @@ class BooleanColumnExtensionMethods[P1] extends ExtensionMethods[Boolean, P1] {
         assert_eq!(
             signature.sig,
             "<P2:Ljava/lang/Object;R:Ljava/lang/Object;>(LRep<TP2;>;LOptionMapper2<Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;TP1;TP2;TR;>;)LRep<TR;>;"
+        );
+    }
+
+    #[test]
+    fn generic_value_class_underlying_is_instantiated_in_method_signature() {
+        let src = r#"
+object Conversions {
+  implicit class PairOps[A, B](val pair: (A, B)) extends AnyVal
+}
+"#;
+        let (_tree, st, diags) = scala_rs_typer::typecheck_str(src);
+        assert!(
+            !scala_rs_typer::has_errors(&diags),
+            "type errors: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let method = st
+            .symbols
+            .iter()
+            .find(|s| s.kind == SymKind::Method && s.name == "PairOps")
+            .expect("implicit value-class conversion");
+        let signatures = record_generic_signatures(&st);
+        let signature = signatures.get(&method.id).expect("PairOps signature");
+        assert_eq!(
+            signature.sig,
+            "<A:Ljava/lang/Object;B:Ljava/lang/Object;>(Lscala/Tuple2<TA;TB;>;)Lscala/Tuple2<TA;TB;>;"
         );
     }
 
