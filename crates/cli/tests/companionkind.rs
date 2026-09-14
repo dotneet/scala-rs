@@ -214,6 +214,57 @@ fn fixtures_ckind_future() {
     let _ = fs::remove_dir_all(&out);
 }
 
+/// A generic `try`/`catch` whose failure branch is `Future.failed` must keep
+/// the covariant successful branch's type. This is the small API-only shape
+/// behind slick/future/Database.scala's `fut.andThen { case _ => tryClose() }`.
+#[test]
+fn fixtures_ckind_future_try() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip scala-library dual-run: jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("ckind_future_try", &["--scala-library", jar_s]);
+    assert_eq!(
+        run_java(&out, Some(jar_s)),
+        expected_stdout("ckind_future_try"),
+        "stdout mismatch for library dual-run ckind_future_try"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
+/// Pin the same generic try/catch typing against scalac's output.
+#[test]
+fn real_scalac_dual_run_ckind_future_try() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(scalac)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip real-scalac dual-run: jar or scalac not obtainable");
+        return;
+    };
+    let dir = tmp_dir("ckind_future_try-scalac");
+    let out = Command::new(&scalac)
+        .arg("-d")
+        .arg(&dir)
+        .arg(fixtures_dir().join("ckind_future_try.scala"))
+        .output()
+        .expect("run scalac");
+    assert!(
+        out.status.success(),
+        "scalac rejected ckind_future_try:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        run_java(&dir, Some(jar.to_str().unwrap())),
+        expected_stdout("ckind_future_try"),
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The same source through **real scalac**, so the fixture is pinned to what
 /// Scala 2.13.16 actually prints and not just to our own output.
 #[test]

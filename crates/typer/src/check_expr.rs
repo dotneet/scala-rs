@@ -2596,7 +2596,7 @@ impl Typer {
                 } else if no_unit && !handlers.iter().all(|t| self.st.is_sub_type(t, &block.ty)) {
                     tree.ty = handlers
                         .into_iter()
-                        .fold(block.ty.clone(), |a, b| self.lub_ty(&a, &b));
+                        .fold(block.ty.clone(), |a, b| self.join_branches(&a, &b));
                 } else {
                     tree.ty = block.ty.clone();
                 }
