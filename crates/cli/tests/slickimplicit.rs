@@ -44,15 +44,15 @@
 //! parameters and used as `Applied { ctor: TypeMember, args }`, which
 //! `is_sub_type` already substitutes the bound for.
 //!
+//! A separate round-trip test below protects the recursive form of Root A.
+//! Each implicit application needs fresh type-parameter symbols when a
+//! `tupleNShape` derives another `tupleNShape`; it also checks that compiling
+//! the producer to a ScalaSignature does not erase the four arguments of the
+//! implicit `Shape` clause. The latter is the exact supply path used when a
+//! freshly compiled Slick library is consumed by its testkit or gitbucket.
+//!
 //! **Not fixed, and deliberately pinned as such below:**
 //!
-//! * a *recursive* derivation whose leftover parameters are still open --
-//!   `Shape[_ <: FlatShapeLevel, ((Rep[A], Rep[B]), Rep[C]), ((A, B), C), _]`.
-//!   `Unify` keys its unknowns by symbol id, and when `tuple2Shape` derives
-//!   `tuple2Shape` the candidate's own `P1` and the caller's open `P1` are the
-//!   *same symbol*: the occurs check then rejects `P1 := (P1, P2)` and the
-//!   candidate is dropped. nsc gives each application fresh type variables.
-//!   One nested-tuple site is left in gitbucket.
 //! * `MappedColumnType.base[T, U]`'s own `U : BaseColumnType` when `U` is not
 //!   one of slick's built-ins (`java.sql.Timestamp`). The prefix a cake type
 //!   member is named through decides whether it is the abstract declaration or
@@ -327,6 +327,66 @@ fn si_shapefit_bad_is_still_rejected() {
             "real scalac rejected si_shapefit_bad for other reasons:\n{msgs}"
         );
     }
+}
+
+/// Compile both halves separately with scala-rs. The producer deliberately
+/// mirrors Slick's nested profile API and uses Scala 3 wildcard syntax under
+/// `-Xsource:3`; the consumer requires a recursive tuple Shape whose packed
+/// type remains open. This simultaneously guards the emitted ScalaSignature
+/// and fresh type variables at each recursive implicit application.
+#[test]
+fn recursive_shape_survives_scala_signature_round_trip() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip sm_nested_shape: scala-library jar not present");
+        return;
+    };
+    let (ok, msgs, lib_out) = compile(
+        "sm_nested_shape_lib",
+        &["--scala-library", jar.to_str().unwrap(), "-Xsource:3"],
+    );
+    assert!(ok, "nested Shape producer failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    let (ok, msgs, user_out) = compile(
+        "sm_nested_shape_consumer",
+        &[
+            "--scala-library",
+            jar.to_str().unwrap(),
+            "-cp",
+            lib_out.to_str().unwrap(),
+            "-Xsource:3",
+        ],
+    );
+    assert!(ok, "nested Shape consumer failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    if java_available() {
+        let cp = format!(
+            "{}:{}:{}",
+            user_out.display(),
+            lib_out.display(),
+            jar.display()
+        );
+        assert_eq!(run_main(&cp), "triple\n");
+    }
+
+    if let Some(scalac) = real_scalac() {
+        let scalac_out = tmp_dir("sm_nested_shape_scalac_consumer");
+        let output = Command::new(scalac)
+            .args(["-Xsource:3", "-cp", lib_out.to_str().unwrap(), "-d"])
+            .arg(&scalac_out)
+            .arg(fixtures_dir().join("sm_nested_shape_consumer.scala"))
+            .output()
+            .expect("run scalac against scala-rs Shape producer");
+        assert!(
+            output.status.success(),
+            "real scalac rejected scala-rs Shape classes:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = fs::remove_dir_all(&scalac_out);
+    }
+    let _ = fs::remove_dir_all(&user_out);
+    let _ = fs::remove_dir_all(&lib_out);
 }
 
 // ---------------------------------------------------------------------------
