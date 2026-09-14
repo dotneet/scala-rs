@@ -4571,6 +4571,15 @@ fn unify_conv_tparam(tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
                 .zip(fa.iter())
                 .find_map(|(p, f)| unify_conv_tparam(tp, p, f))
         }
+        // Value-class extension receivers often constrain a type parameter
+        // with an intersection (`T with Rep[_]`). The concrete receiver still
+        // supplies the parameter through the first intersected component;
+        // without descending here, Slick's `Tuple2ExtensionMethods[T1 <: Rep,
+        // T2 <: Rep]` stayed at an unresolved `T1`/`T2`, so chaining `~`
+        // produced `(T, Rep[String])` and the next extension lookup failed.
+        (Type::Refined { parents, .. }, actual) => parents
+            .iter()
+            .find_map(|p| unify_conv_tparam(tp, p, actual)),
         // The parameter is an application of a higher-kinded parameter:
         // `implicit def toFlatMapOps[F[_], A](fa: F[A])`. Solving `F` from a
         // receiver `Box[Int]` means taking the receiver's type *constructor*,
