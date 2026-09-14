@@ -342,7 +342,17 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         };
-        self.type_select(fun, &Type::NoType);
+        // The inserted selection is the callee of the application we are
+        // already typing. Keep its method (or overload) shape until that
+        // application has seen the arguments; selecting it in value mode can
+        // auto-apply a parameterless alternative and hide the callable one.
+        self.type_select(
+            fun,
+            &Type::Method {
+                paramss: vec![],
+                ret: Box::new(Type::NoType),
+            },
+        );
         !fun.ty.is_error() && !fun.ty.is_no_type()
     }
 

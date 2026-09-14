@@ -2527,11 +2527,9 @@ impl Typer {
                 .first()
                 .and_then(|ps| param_at(ps, i))
                 .filter(|p| {
-                    !self.sigs_only
-                        && !mentions_tparam(p, &raw_tparams)
-                        && prototypes.iter().all(|ps| param_at(ps, i) == Some(*p))
+                    !self.sigs_only && prototypes.iter().all(|ps| param_at(ps, i) == Some(*p))
                 })
-                .cloned()
+                .map(|p| self.ctor_arg_proto(p, &raw_tparams))
                 .unwrap_or(Type::NoType);
             let prototype = match prototype {
                 // An earlier parent signature pass may already have wrapped
@@ -2607,7 +2605,19 @@ impl Typer {
                             if matches!(a.kind, TreeKind::Function { .. })
                                 && !is_annotated_lambda(a)
                             {
-                                self.type_expr(a, p);
+                                // The signature pass cannot infer a parent's
+                                // unwritten type arguments from an untyped
+                                // lambda yet. Typing the lambda against the
+                                // parent's raw `E` here poisons the same tree
+                                // with `Error`, before the body pass can use the
+                                // fixed input part of `Tag => E` as its
+                                // prototype. Keep the placeholder intact; the
+                                // body pass above types it as `Tag => _`, then
+                                // `infer_parent_targs` supplies `E = Row` and
+                                // this final pass checks `Tag => Row`.
+                                if !self.sigs_only || !mentions_tparam(p, &raw_tparams) {
+                                    self.type_expr(a, p);
+                                }
                             } else {
                                 self.adapt(a, p);
                             }
@@ -2727,7 +2737,16 @@ impl Typer {
     /// is left alone -- writing nothing there keeps today's behaviour rather
     /// than inventing an `Any`.
     fn infer_parent_targs(&self, class_id: SymbolId, class_ty: &Type, arg_tys: &[Type]) -> Type {
-        if !matches!(class_ty, Type::Class { args, .. } if args.is_empty()) {
+        // A parent imported through a type alias can remain a `TypeMember`
+        // even though `class_sym_of` has already resolved the class it names.
+        // With no written arguments it needs the same constructor inference as
+        // a bare `Class` head; returning the resolved applied class below is the
+        // inferred expansion of that alias.
+        let unapplied = matches!(class_ty, Type::Class { sym, args }
+            if *sym == class_id && args.is_empty())
+            || matches!(class_ty, Type::TypeMember(_)
+                if self.st.class_sym_of(class_ty) == Some(class_id));
+        if !unapplied {
             return class_ty.clone();
         }
         let tps = self.st.get(class_id).tparams.clone();

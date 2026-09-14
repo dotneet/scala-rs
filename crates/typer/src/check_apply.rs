@@ -570,12 +570,9 @@ impl Typer {
                         } else {
                             declared.clone()
                         };
-                        if self.is_closed_ctor_proto(declared, &tps)
-                            && !mentions_tparam(&t, &tps)
-                            && !t.is_error()
-                            && !type_mentions_wildcard(&t)
-                        {
-                            *slot = t;
+                        let proto = self.ctor_arg_proto(&t, &tps);
+                        if !proto.is_no_type() {
+                            *slot = proto;
                         }
                     }
                 }
@@ -588,6 +585,12 @@ impl Typer {
                 if let TreeKind::Function { vparams, .. } = &a.kind {
                     if is_annotated_lambda(a) {
                         self.type_expr(a, &Type::NoType);
+                        arg_tys.push(a.argument_type());
+                        continue;
+                    }
+                    let pt_arg = ctor_protos.get(ai).cloned().unwrap_or(Type::NoType);
+                    if !pt_arg.is_no_type() {
+                        self.type_expr(a, &pt_arg);
                         arg_tys.push(a.argument_type());
                         continue;
                     }
@@ -1015,6 +1018,23 @@ impl Typer {
             }
         }
         self.rewrite_receiver_apply(fun);
+        // A parameterless accessor used with arguments calls `apply` on the
+        // value it returns. Do that before pre-typing the arguments, rather
+        // than only after overload resolution has failed below: the selected
+        // `apply` is what supplies a placeholder lambda's parameter types.
+        //
+        // This is notably how an imported stable alias such as
+        // `api.TableQuery` is represented after classpath loading -- a
+        // nullary method returning the companion module. Leaving the accessor
+        // in place until the retry typed `TableQuery(new Row(_))` as an
+        // untyped function, inferred the factory element as `Nothing`, and
+        // could not recover the row type afterwards. Explicit
+        // `TableQuery.apply(new Row(_))` already took this eager path.
+        if matches!(&fun.ty, Type::Method { paramss, .. }
+            if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()))
+        {
+            self.insert_apply_on_nullary(fun);
+        }
         Self::auto_apply_nullary_function(fun, args.len());
         let placed = self.reorder_named_args(args, fun);
         self.record_named_arg_order(tree_id);
@@ -4317,6 +4337,47 @@ impl Typer {
                     && self.is_closed_ctor_proto(ret, tps)
             }
             _ => false,
+        }
+    }
+
+    /// A constructor argument prototype that can be handed out before the
+    /// constructed class's type parameters have been inferred.
+    ///
+    /// A fully closed formal is unchanged. A function formal may additionally
+    /// expose its already closed *parameter* types while leaving an open result
+    /// as a wildcard for the lambda body to determine. This is nsc's
+    /// `typedFunction` shape for `new Factory(tag => new Row(tag))` when the
+    /// factory class's `E` occurs only as the function result: `Tag => E`
+    /// becomes the prototype `Tag => _`, and the resulting `Tag => Row` then
+    /// infers `E = Row`.
+    pub(crate) fn ctor_arg_proto(&self, ty: &Type, tps: &[SymbolId]) -> Type {
+        if self.is_closed_ctor_proto(ty, tps)
+            && !mentions_tparam(ty, tps)
+            && !ty.is_error()
+            && !type_mentions_wildcard(ty)
+        {
+            return ty.clone();
+        }
+        let shaped = match ty {
+            Type::Class { sym, args } => self.st.function_class_shape(*sym, args),
+            Type::Function { .. } => Some(ty.clone()),
+            _ => None,
+        };
+        let Some(Type::Function { params, .. }) = shaped else {
+            return Type::NoType;
+        };
+        if params.iter().any(|p| {
+            p.is_no_type()
+                || p.is_error()
+                || type_mentions_wildcard(p)
+                || mentions_tparam(p, tps)
+                || !self.is_closed_ctor_proto(p, tps)
+        }) {
+            return Type::NoType;
+        }
+        Type::Function {
+            params,
+            ret: Box::new(Type::Wildcard),
         }
     }
 

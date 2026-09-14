@@ -164,5 +164,33 @@ fn abstract_profile_upper_bound_reconnects_after_a_producer_consumer_boundary() 
         Some(&consumer_cp),
     );
 
+    // Real scalac accepts the same producer/consumer boundary and all four
+    // factory shapes in the fixture: explicit type arguments, inferred
+    // `TableQuery(new Users(_))`, an object parent and an anonymous subclass.
+    let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    if scalac.is_file() {
+        let scalac_consumer = root.join("scalac-consumer");
+        let use_src = fixtures_dir().join("slick_abstract_profile_use.scala");
+        fs::create_dir_all(&scalac_consumer).unwrap();
+        let output = Command::new(&scalac)
+            .args([
+                "-cp",
+                &consumer_cp,
+                "-d",
+                scalac_consumer.to_str().unwrap(),
+                use_src.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run real scalac");
+        assert!(
+            output.status.success(),
+            "real scalac rejected abstract profile factory fixture:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    } else {
+        eprintln!("skip abstract profile scalac comparison: scalac 2.13.16 not obtainable");
+    }
+
     fs::remove_dir_all(root).unwrap();
 }
