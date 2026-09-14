@@ -271,6 +271,178 @@ fn dbio_seq_infers_intersection_effect() {
     real_scalac_dual_run("dbio_seq");
 }
 
+/// A producer/consumer check for the effect intersection in DBIOAction's
+/// method result.  The JVM generic Signature necessarily erases the result
+/// to `E`: the JVM grammar has no intersection result type.  Scala's
+/// downstream typechecker reads the intersection from ScalaSignature instead,
+/// so this compiles the consumer against classfiles produced by scala-rs and
+/// proves both `flatMap` and `andThen` retain `E with E2` across that boundary.
+#[test]
+fn dbio_signature_effect_intersection_survives_classpath() {
+    if !java_available() {
+        return;
+    }
+    let (Some(scalac), Some(jar)) = (find_scalac(), scala_library_jar()) else {
+        eprintln!("skip DBIO ScalaSignature producer/consumer check: scalac or jar not obtainable");
+        return;
+    };
+    let root = tmp_dir("signature");
+    let producer_out = root.join("producer");
+    let consumer_scalac_out = root.join("consumer-scalac");
+    let consumer_rs_out = root.join("consumer-rs");
+    fs::create_dir_all(&producer_out).unwrap();
+    fs::create_dir_all(&consumer_scalac_out).unwrap();
+    fs::create_dir_all(&consumer_rs_out).unwrap();
+    let producer = fixtures_dir().join("dbio_signature_lib.scala");
+    let consumer = fixtures_dir().join("dbio_signature_use.scala");
+    let bad_consumer = fixtures_dir().join("dbio_signature_bad.scala");
+    let jar_s = jar.to_str().unwrap();
+
+    let writer = Command::new(bin())
+        .args([
+            "compile",
+            producer.to_str().unwrap(),
+            "-d",
+            producer_out.to_str().unwrap(),
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("run scala-rs DBIO signature producer");
+    assert!(
+        writer.status.success(),
+        "scala-rs DBIO signature producer failed: {}{}",
+        String::from_utf8_lossy(&writer.stdout),
+        String::from_utf8_lossy(&writer.stderr)
+    );
+
+    let javap = Command::new("javap")
+        .args([
+            "-p",
+            "-v",
+            "-classpath",
+            producer_out.to_str().unwrap(),
+            "dbio_signature.Action",
+        ])
+        .output()
+        .expect("inspect DBIO JVM Signature");
+    assert!(
+        javap.status.success(),
+        "javap could not inspect DBIO signature producer: {}{}",
+        String::from_utf8_lossy(&javap.stdout),
+        String::from_utf8_lossy(&javap.stderr)
+    );
+    let javap_text = String::from_utf8_lossy(&javap.stdout);
+    assert!(
+        javap_text.contains(
+            "(Lscala/Function1<TR;Ldbio_signature/Action<TR2;TS2;TE2;>;>;)Ldbio_signature/Action<TR2;TS2;TE;>;"
+        ),
+        "JVM Signature must carry DBIO's erased effect parameter E: {javap_text}"
+    );
+    assert!(
+        javap_text.contains(
+            "(Ldbio_signature/Action<TR2;TS2;TE2;>;)Ldbio_signature/Action<TR2;TS2;TE;>;"
+        ),
+        "JVM Signature must carry andThen's erased effect parameter E: {javap_text}"
+    );
+
+    let classpath = format!("{}:{}", producer_out.display(), jar.display());
+    let reader = Command::new(&scalac)
+        .args([
+            "-classpath",
+            &classpath,
+            "-d",
+            consumer_scalac_out.to_str().unwrap(),
+            consumer.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scalac DBIO signature consumer");
+    assert!(
+        reader.status.success(),
+        "scalac could not consume scala-rs DBIO signature: {}{}",
+        String::from_utf8_lossy(&reader.stdout),
+        String::from_utf8_lossy(&reader.stderr)
+    );
+
+    let consumer_reader = Command::new(bin())
+        .args([
+            "compile",
+            consumer.to_str().unwrap(),
+            "-d",
+            consumer_rs_out.to_str().unwrap(),
+            "-cp",
+            &classpath,
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("run scala-rs DBIO signature consumer");
+    assert!(
+        consumer_reader.status.success(),
+        "scala-rs could not consume its DBIO signature: {}{}",
+        String::from_utf8_lossy(&consumer_reader.stdout),
+        String::from_utf8_lossy(&consumer_reader.stderr)
+    );
+
+    // The negative control distinguishes a preserved intersection from an
+    // erased result: with only E in the producer's ScalaSignature, both of
+    // these assignments would incorrectly compile.
+    let bad_scalac_out = root.join("bad-scalac");
+    let bad_rs_out = root.join("bad-rs");
+    fs::create_dir_all(&bad_scalac_out).unwrap();
+    fs::create_dir_all(&bad_rs_out).unwrap();
+    let bad_reader = Command::new(&scalac)
+        .args([
+            "-classpath",
+            &classpath,
+            "-d",
+            bad_scalac_out.to_str().unwrap(),
+            bad_consumer.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scalac DBIO signature negative consumer");
+    assert!(
+        !bad_reader.status.success(),
+        "scalac accepted a consumer after the DBIO effect intersection was erased: {}{}",
+        String::from_utf8_lossy(&bad_reader.stdout),
+        String::from_utf8_lossy(&bad_reader.stderr)
+    );
+    let bad_consumer_reader = Command::new(bin())
+        .args([
+            "compile",
+            bad_consumer.to_str().unwrap(),
+            "-d",
+            bad_rs_out.to_str().unwrap(),
+            "-cp",
+            &classpath,
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("run scala-rs DBIO signature negative consumer");
+    assert!(
+        !bad_consumer_reader.status.success(),
+        "scala-rs accepted a consumer after the DBIO effect intersection was erased: {}{}",
+        String::from_utf8_lossy(&bad_consumer_reader.stdout),
+        String::from_utf8_lossy(&bad_consumer_reader.stderr)
+    );
+    assert!(
+        producer_out.join("dbio_signature/Action.class").is_file(),
+        "producer did not emit Action.class"
+    );
+    assert!(
+        consumer_scalac_out
+            .join("dbio_signature/Use.class")
+            .is_file(),
+        "scalac did not emit consumer class"
+    );
+    assert!(
+        consumer_rs_out.join("dbio_signature/Use.class").is_file(),
+        "scala-rs did not emit consumer class"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// The private runtime backs no `scala.util.Either`, so the fixture has to be
 /// diagnosed there, not quietly accepted.
 #[test]
