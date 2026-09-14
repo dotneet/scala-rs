@@ -6371,7 +6371,17 @@ impl PickleSupply {
         // preferring the abstract member over it broke
         // `crates/cli/tests/aliaslookup.rs`. An applied member has no such
         // competition, since there is no erased descriptor to lose.
-        if args.is_empty() && !allow_nullary && !internal.starts_with("scala/") {
+        // Module classes have no erased type-member descriptor to compete
+        // with this lookup. A companion object can inherit an abstract type
+        // member from its class (for example `Tracer.Type`), and pickled
+        // signatures of the object's own macros refer to it by the bare name.
+        // Keep the historical nullary restriction for ordinary classes, where
+        // a classfile-backed member may still be the more precise answer.
+        if args.is_empty()
+            && !allow_nullary
+            && !internal.ends_with('$')
+            && !internal.starts_with("scala/")
+        {
             return None;
         }
         if internal.is_empty()

@@ -147,6 +147,26 @@ fn compile_with_scala_rs(name: &str, out: &Path, lib: &Path) -> std::process::Ou
         .expect("run scala-rs compile")
 }
 
+fn compile_without_reflect(name: &str, out: &Path, lib: &Path) -> std::process::Output {
+    let jar = scala_library_jar().unwrap();
+    Command::new(bin())
+        .args([
+            "compile",
+            fixtures_dir()
+                .join(format!("{name}.scala"))
+                .to_str()
+                .unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-cp",
+            lib.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile")
+}
+
 fn run_main(cp: &str, what: &str) -> String {
     let run = Command::new("java")
         .args(["-Xverify:all", "-cp", cp, "Main"])
@@ -259,6 +279,55 @@ fn tq_type_argument_from_this_run_expands() {
         out.status.success(),
         "expected tq_muse_local to compile: {}",
         diagnostics(&out)
+    );
+    let _ = fs::remove_dir_all(&out_dir);
+    let _ = fs::remove_dir_all(&lib);
+}
+
+/// An inherited abstract type member in a companion module is part of a
+/// pickled macro's result type. It must be retained when the macro candidate
+/// is reconstructed; otherwise the candidate disappears and the caller gets
+/// a misleading "no implicit" diagnostic. The fixture deliberately omits
+/// scala-reflect from the consumer classpath, so the test stops immediately
+/// after candidate discovery with the known macro-engine diagnostic.
+#[test]
+fn pickled_macro_with_module_inherited_type_is_supplied() {
+    if !prerequisites("tracer_mdef") {
+        return;
+    }
+    let scalac = find_scalac().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let lib = tmp_dir("tracer-mdef");
+    let built = Command::new(scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            lib.to_str().unwrap(),
+            fixtures_dir().join("tracer_mdef.scala").to_str().unwrap(),
+        ])
+        .output()
+        .expect("scalac");
+    assert!(
+        built.status.success(),
+        "real scalac rejected tracer_mdef.scala: {}",
+        diagnostics(&built)
+    );
+
+    let out_dir = tmp_dir("tracer-muse");
+    let out = compile_without_reflect("tracer_muse", &out_dir, &lib);
+    let text = diagnostics(&out);
+    assert!(
+        !out.status.success(),
+        "expected missing scala-reflect to stop expansion"
+    );
+    assert!(
+        text.contains("macro expansion is not implemented"),
+        "expected macro candidate to be supplied, got: {text}"
+    );
+    assert!(
+        !text.contains("no implicit"),
+        "macro candidate was lost during pickle reconstruction: {text}"
     );
     let _ = fs::remove_dir_all(&out_dir);
     let _ = fs::remove_dir_all(&lib);
