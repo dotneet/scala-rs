@@ -97,3 +97,76 @@ fn schema_description_extension_survives_classfile_round_trip() {
     );
     let _ = fs::remove_dir_all(out);
 }
+
+/// A Scala signature can mention a class before the classfile loader has read
+/// its JVM header. Keep the header's transitive interface parents in that
+/// placeholder: `Fixed` extends `Action[..., Streaming[T], ...]` and
+/// `Streaming[T] extends NoStream`, so a `Fixed[..., ...]` value must be
+/// accepted where `Action[..., NoStream, ...]` is expected.
+#[test]
+fn scala_signature_placeholder_keeps_transitive_interface_parents() {
+    let scala_library = PathBuf::from("/tmp/scala-rs-lib/scala-library-2.13.16.jar");
+    if !scala_library.is_file() {
+        eprintln!("skip scala_signature_placeholder: scala-library not cached");
+        return;
+    }
+    let out = tmp_dir();
+    let library_out = out.join("library");
+    let consumer_out = out.join("consumer");
+    let library_jar = out.join("library.jar");
+    fs::create_dir_all(&library_out).unwrap();
+    fs::create_dir_all(&consumer_out).unwrap();
+
+    let library_fixture = fixture("slick_streaming_parent_lib.scala");
+    let library_args = [
+        "compile",
+        library_fixture.to_str().unwrap(),
+        "-d",
+        library_out.to_str().unwrap(),
+        "--scala-library",
+        scala_library.to_str().unwrap(),
+    ];
+    let (ok, diagnostics) = compile(&library_args);
+    assert!(
+        ok,
+        "placeholder fixture library failed to compile:\n{diagnostics}"
+    );
+
+    let jar = Command::new("jar")
+        .args([
+            "cf",
+            library_jar.to_str().unwrap(),
+            "-C",
+            library_out.to_str().unwrap(),
+            ".",
+        ])
+        .output()
+        .expect("create placeholder fixture jar");
+    assert!(
+        jar.status.success(),
+        "jar failed: {}",
+        String::from_utf8_lossy(&jar.stderr)
+    );
+
+    let consumer_fixture = fixture("slick_streaming_parent.scala");
+    let consumer_args = [
+        "compile",
+        consumer_fixture.to_str().unwrap(),
+        "-d",
+        consumer_out.to_str().unwrap(),
+        "-cp",
+        library_jar.to_str().unwrap(),
+        "--scala-library",
+        scala_library.to_str().unwrap(),
+    ];
+    let (ok, diagnostics) = compile(&consumer_args);
+    assert!(
+        ok && !diagnostics.contains("error:"),
+        "placeholder fixture consumer failed to compile:\n{diagnostics}"
+    );
+    assert!(
+        fs::read_dir(&consumer_out).unwrap().next().is_some(),
+        "placeholder fixture emitted no consumer classes"
+    );
+    let _ = fs::remove_dir_all(out);
+}

@@ -1599,6 +1599,80 @@ pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass)
     install_java_class_in(st, c, owner)
 }
 
+/// Fill the JVM metadata of a class symbol that was created from a Scala
+/// signature before its classfile was needed.
+///
+/// A pickle contains the source-level API but does not retain the JVM header
+/// (`interfaces`/`super_class`).  `ensure_class` therefore creates a cheap
+/// symbol for a class named by another pickle.  Leaving that symbol at its
+/// initial `[AnyRef]` parents loses ordinary JVM inheritance: Slick's
+/// `Streaming[T]` is a `NoStream`, for example, so a streaming action cannot
+/// be passed to a `DBIOAction[..., NoStream, ...]` parameter.  Read only the
+/// class metadata here; member installation remains lazy and is still owned
+/// by `ensure_java_loaded`.
+pub(crate) fn install_classpath_metadata(
+    st: &mut SymbolTable,
+    bin: &mut crate::javaclass::BinaryIndex,
+    id: SymbolId,
+) -> bool {
+    if id.is_none()
+        || id.0 < st.prelude_end
+        || st.is_source_class(id)
+        || st.binary_read.contains(&id.0)
+    {
+        return false;
+    }
+    let internal = st.get(id).jvm_name.clone();
+    if internal.is_empty() {
+        return false;
+    }
+    let Ok(Some(bytes)) = bin.find_class(&internal) else {
+        return false;
+    };
+    let Ok(class) = crate::javaclass::parse_java_classfile(&bytes) else {
+        return false;
+    };
+    if class.internal_name != internal {
+        return false;
+    }
+    apply_java_class_meta(st, id, &class);
+    // `java_parents` resolves the JVM header's names to cheap symbols. Those
+    // symbols can themselves be Scala-signature placeholders: in
+    // `Fixed[... ] extends Action[..., Streaming[T], ...]`, the first pass
+    // installs `Fixed -> Action` but leaves `Streaming` at `[AnyRef]`. Walk
+    // the newly attached graph so subtype checks can use the complete direct
+    // parent chain without eagerly installing any members.
+    let parents = st.get(id).parents.clone();
+    for parent in parents {
+        install_classpath_type_metadata(st, bin, &parent);
+    }
+    true
+}
+
+fn install_classpath_type_metadata(
+    st: &mut SymbolTable,
+    bin: &mut crate::javaclass::BinaryIndex,
+    ty: &Type,
+) {
+    match ty {
+        Type::Class { sym, args } => {
+            install_classpath_metadata(st, bin, *sym);
+            for arg in args {
+                install_classpath_type_metadata(st, bin, arg);
+            }
+        }
+        Type::Array(inner) | Type::ByName(inner) | Type::Repeated(inner) => {
+            install_classpath_type_metadata(st, bin, inner)
+        }
+        Type::Tuple(items) => {
+            for item in items {
+                install_classpath_type_metadata(st, bin, item);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub fn install_java_class_in(
     st: &mut SymbolTable,
     c: &crate::javaclass::JavaClass,

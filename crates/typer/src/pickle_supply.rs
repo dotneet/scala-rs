@@ -4314,6 +4314,9 @@ impl PickleSupply {
         if let Some(id) = crate::classpath::find_by_jvm(st, &key) {
             self.stubs.insert(key.clone(), id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
+            if !full_name.starts_with("scala.") {
+                crate::classpath::install_classpath_metadata(st, bin, id);
+            }
             // A classfile descriptor can introduce ReusableBuilder as a bare
             // placeholder before its Scala signature is needed. `Vector`
             // returns `ReusableBuilder[A, Vector[A]]`, whose pickled parent is
@@ -4348,6 +4351,7 @@ impl PickleSupply {
             }
             self.stubs.insert(key, id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
+            crate::classpath::install_classpath_metadata(st, bin, id);
             return Some(id);
         }
         let sig = {
