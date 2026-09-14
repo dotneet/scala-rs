@@ -207,7 +207,7 @@ struct Pickler<'facts, 'symbols> {
     collection_immutable: Option<u32>,
     /// The class this pickle is written for. A type member it *inherits* from
     /// a class the pickle does not contain is still written under this one's
-    /// `this` (see [`Pickler::external_type_member_ref`]).
+    /// `this` (see [`Pickler::external_type_member_ref_with_refs`]).
     root_class: SymbolId,
     /// Pickled `TypeRef` of each anonymous structural alias (a type lambda),
     /// keyed by its symbol. See `pickle_structural_alias`.
@@ -1099,6 +1099,18 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                         },
                         quantified,
                     )
+                }
+                Type::TypeMember(id) => {
+                    // A wildcard inside an applied type member still needs
+                    // the existential slot allocated by this pack. Passing
+                    // the original `Type`s to `pickle_type_member_ref` would
+                    // re-enter `pickle_type`, turn that wildcard into
+                    // `AnyRef`, and silently drop the remaining arguments.
+                    let arg_refs: Vec<u32> = args
+                        .iter()
+                        .map(|a| self.pickle_type_pack(a, quantified))
+                        .collect();
+                    self.pickle_type_member_ref_with_refs(*id, args, &arg_refs)
                 }
                 _ => self.pickle_type(ctor),
             },
@@ -3423,15 +3435,30 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
     /// Type").
     ///
     /// And the declaring class, for the other: see
-    /// [`Self::external_type_member_ref`].
+    /// [`Self::external_type_member_ref_with_refs`].
     fn pickle_type_member_ref(&mut self, id: SymbolId, args: &[Type]) -> u32 {
+        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
+        self.pickle_type_member_ref_with_refs(id, args, &arg_refs)
+    }
+
+    /// The same type-member spelling as [`Self::pickle_type_member_ref`],
+    /// with type arguments already packed for an existential. Keeping the
+    /// references separate from the source `Type`s is what lets a wildcard
+    /// retain its quantified symbol while all prefix/owner rules below stay
+    /// shared with ordinary type-member pickling.
+    fn pickle_type_member_ref_with_refs(
+        &mut self,
+        id: SymbolId,
+        args: &[Type],
+        arg_refs: &[u32],
+    ) -> u32 {
         // A path-dependent member (`p.T`) is a typer-only symbol whose owner
         // is the *term* `p`, which the pickle has no name for. An abstract
-        // projection (`E#T`) is handled by `pickle_projected_member`, which
+        // projection (`E#T`) is handled by `pickle_projected_member_with_refs`, which
         // preserves its type-parameter prefix; only the path-dependent case
         // falls back to the declaration spelling below.
         if let Some(d) = self.facts.projected_decl(id) {
-            return self.pickle_projected_member(id, d, args);
+            return self.pickle_projected_member_with_refs(id, d, args, arg_refs);
         }
         // An *anonymous* alias is a type lambda, and a parentless `ALIASsym`
         // is not a type any reader can use. nsc writes the refinement it
@@ -3443,12 +3470,14 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             let owner = self.facts.get(id).owner;
             let name = self.facts.get(id).name.clone();
             if !owner.is_none() && !self.sym_index.contains_key(&owner.0) {
-                if let Some(r) = self.external_member_type_ref(owner, name, pref, args) {
+                if let Some(r) =
+                    self.external_member_type_ref_with_refs(owner, name, pref, arg_refs)
+                {
                     return r;
                 }
             }
         }
-        if let Some(r) = self.external_type_member_ref(id, args) {
+        if let Some(r) = self.external_type_member_ref_with_refs(id, arg_refs) {
             return r;
         }
         let owner = self.facts.get(id).owner.0;
@@ -3463,12 +3492,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             self.this_tpes.get(&owner).copied().unwrap_or(self.noprefix)
         };
         let sym = self.pickle_type_member(id);
-        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
         let mut body = Vec::new();
         write_nat_to(&mut body, pref);
         write_nat_to(&mut body, sym);
         for r in arg_refs {
-            write_nat_to(&mut body, r);
+            write_nat_to(&mut body, *r);
         }
         self.add(TYPEREFTPE, body)
     }
@@ -3505,7 +3533,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
     /// `None` when the declaration is in this pickle, when its owner is (so the
     /// ordinary `this_tpes` path is right), or when the owner has no name a
     /// later compilation could spell.
-    fn external_type_member_ref(&mut self, id: SymbolId, args: &[Type]) -> Option<u32> {
+    fn external_type_member_ref_with_refs(
+        &mut self,
+        id: SymbolId,
+        arg_refs: &[u32],
+    ) -> Option<u32> {
         if self.sym_index.contains_key(&id.0) {
             return None;
         }
@@ -3518,7 +3550,12 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             return None;
         }
         let pref = self.inherited_this_prefix(owner);
-        self.external_member_type_ref(owner, self.facts.get(id).name.clone(), pref, args)
+        self.external_member_type_ref_with_refs(
+            owner,
+            self.facts.get(id).name.clone(),
+            pref,
+            arg_refs,
+        )
     }
 
     /// `ThisType` of the class this pickle is written for when it inherits a
@@ -3562,21 +3599,20 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
     /// `owner.info.decl(name)`, so naming the class that merely inherits the
     /// declaration reports `Symbol 'type nt.NImpl.Type' is missing from the
     /// classpath`. Where the member is *seen* is the prefix's business.
-    fn external_member_type_ref(
+    fn external_member_type_ref_with_refs(
         &mut self,
         decl_owner: SymbolId,
         name: String,
         pref: u32,
-        args: &[Type],
+        arg_refs: &[u32],
     ) -> Option<u32> {
         let owner_ref = self.external_class_like_ref(decl_owner);
         let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), owner_ref);
-        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
         let mut body = Vec::new();
         write_nat_to(&mut body, pref);
         write_nat_to(&mut body, sym);
         for r in arg_refs {
-            write_nat_to(&mut body, r);
+            write_nat_to(&mut body, *r);
         }
         Some(self.add(TYPEREFTPE, body))
     }
@@ -3606,7 +3642,13 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
     /// `RelationalTypesComponent`, a different top-level trait -- and nsc
     /// reads that as `<root>.ColumnType` and reports it missing from the
     /// classpath.
-    fn pickle_projected_member(&mut self, id: SymbolId, decl: SymbolId, args: &[Type]) -> u32 {
+    fn pickle_projected_member_with_refs(
+        &mut self,
+        id: SymbolId,
+        decl: SymbolId,
+        args: &[Type],
+        arg_refs: &[u32],
+    ) -> u32 {
         let owner = self.facts.get(decl).owner;
         // An abstract projection such as `E#TableElementType` must retain the
         // type-parameter prefix. Falling through to the declaration-only
@@ -3628,17 +3670,16 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 && self.facts.get(owner).jvm_name.contains('/')
             {
                 return self
-                    .external_member_type_ref(owner, name, prefix_ref, args)
+                    .external_member_type_ref_with_refs(owner, name, prefix_ref, arg_refs)
                     .expect("class-like projected member has an external reference");
             }
 
             let sym = self.pickle_type_member(decl);
-            let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
             let mut body = Vec::new();
             write_nat_to(&mut body, prefix_ref);
             write_nat_to(&mut body, sym);
             for r in arg_refs {
-                write_nat_to(&mut body, r);
+                write_nat_to(&mut body, *r);
             }
             return self.add(TYPEREFTPE, body);
         }
@@ -3654,7 +3695,9 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 write_nat_to(&mut pb, mref);
                 let this = self.add(THISTPE, pb);
                 let name = self.facts.get(decl).name.clone();
-                if let Some(r) = self.external_member_type_ref(owner, name, this, args) {
+                if let Some(r) =
+                    self.external_member_type_ref_with_refs(owner, name, this, arg_refs)
+                {
                     return r;
                 }
             }
@@ -3669,17 +3712,18 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         if let Some(pref) = self.local_term_path_prefix(id) {
             let name = self.facts.get(decl).name.clone();
             if !owner.is_none() && !self.sym_index.contains_key(&owner.0) {
-                if let Some(r) = self.external_member_type_ref(owner, name, pref, args) {
+                if let Some(r) =
+                    self.external_member_type_ref_with_refs(owner, name, pref, arg_refs)
+                {
                     return r;
                 }
             } else {
                 let sym = self.pickle_type_member(decl);
-                let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
                 let mut body = Vec::new();
                 write_nat_to(&mut body, pref);
                 write_nat_to(&mut body, sym);
                 for r in arg_refs {
-                    write_nat_to(&mut body, r);
+                    write_nat_to(&mut body, *r);
                 }
                 return self.add(TYPEREFTPE, body);
             }
@@ -3689,24 +3733,25 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             if let Some(pref) = self.stable_term_path_prefix(id) {
                 let name = self.facts.get(decl).name.clone();
                 if !owner.is_none() && !self.sym_index.contains_key(&owner.0) {
-                    if let Some(r) = self.external_member_type_ref(owner, name, pref, args) {
+                    if let Some(r) =
+                        self.external_member_type_ref_with_refs(owner, name, pref, arg_refs)
+                    {
                         return r;
                     }
                 } else {
                     let sym = self.pickle_type_member(decl);
-                    let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
                     let mut body = Vec::new();
                     write_nat_to(&mut body, pref);
                     write_nat_to(&mut body, sym);
                     for r in arg_refs {
-                        write_nat_to(&mut body, r);
+                        write_nat_to(&mut body, *r);
                     }
                     return self.add(TYPEREFTPE, body);
                 }
             }
         }
         let Some(this_cls) = self_alias else {
-            return self.pickle_type_member_ref(decl, args);
+            return self.pickle_type_member_ref_with_refs(decl, args, arg_refs);
         };
         if self.sym_index.contains_key(&decl.0)
             || owner.is_none()
@@ -3714,7 +3759,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             || !self.facts.get(owner).is_class_like()
             || !self.facts.get(owner).jvm_name.contains('/')
         {
-            return self.pickle_type_member_ref(decl, args);
+            return self.pickle_type_member_ref_with_refs(decl, args, arg_refs);
         }
         // A self alias is another spelling of `this`, so the prefix is the
         // `ThisType` of the class that declares it -- normally the class this
@@ -3727,12 +3772,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         let owner_ref = self.external_class_ref(owner);
         let name = self.facts.get(decl).name.clone();
         let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), owner_ref);
-        let arg_refs: Vec<u32> = args.iter().map(|a| self.pickle_type(a)).collect();
         let mut body = Vec::new();
         write_nat_to(&mut body, pref);
         write_nat_to(&mut body, sym);
         for r in arg_refs {
-            write_nat_to(&mut body, r);
+            write_nat_to(&mut body, *r);
         }
         self.add(TYPEREFTPE, body)
     }

@@ -371,6 +371,44 @@ class Box[A](val get: A) {
 }
 
 #[test]
+fn wildcard_in_applied_type_member_keeps_all_arguments() {
+    let sigs = sigs_of(
+        r#"
+package wildcardalias
+trait Query[+E, U, C[_]]
+trait Aliases {
+  type Q[+E, U, C[_]] = wildcardalias.Query[E, U, C]
+}
+trait Api extends Aliases {
+  def extension[U, C[_]](q: Q[_, U, C]): Unit = ()
+}
+"#,
+    );
+    let api = sigs
+        .iter()
+        .find(|sig| sig.full_name == "wildcardalias.Api" && !sig.is_module)
+        .expect("wildcardalias.Api");
+    let member = api.member("extension").expect("Api.extension");
+    let SigType::Poly { result, .. } = &member.ty else {
+        panic!("extension should be polymorphic: {:?}", member.ty);
+    };
+    let SigType::Method { params, .. } = result.as_ref() else {
+        panic!("extension should take a parameter: {:?}", result);
+    };
+    let Some(param) = params.first() else {
+        panic!("extension parameter missing");
+    };
+    let SigType::Existential { result, .. } = &param.ty else {
+        panic!("wildcard parameter should be existential: {:?}", param.ty);
+    };
+    let SigType::Ref { sym, args } = result.as_ref() else {
+        panic!("alias application missing: {:?}", result);
+    };
+    assert_eq!(sym, "wildcardalias.Aliases.Q");
+    assert_eq!(args.len(), 3, "wildcard alias application lost arguments");
+}
+
+#[test]
 fn parents_and_module_classes_are_recovered() {
     let sigs = sigs_of(
         r#"
