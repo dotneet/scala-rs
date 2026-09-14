@@ -597,3 +597,59 @@ fn si_coltype_jar_bad_is_still_rejected() {
         );
     }
 }
+
+/// The real Slick `RepShapeImplicits` chain contains two recursive Option
+/// derivations and an `anyOptionShape` fallback for an Option of a tuple. The
+/// result's wildcard positions are completed from the candidate's own Shape
+/// witness, with its bounded `Level` parameter defaulted to `ShapeLevel`.
+#[test]
+fn slick_option_shapes_resolve_through_its_published_jar() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip si_optionshape: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip si_optionshape: slick 3.4.1 not in the local Coursier cache");
+        return;
+    };
+    let cp = classpath(&jars);
+    let (ok, msgs, out) = compile(
+        "si_optionshape",
+        &["--scala-library", lib.to_str().unwrap(), "-cp", cp.as_str()],
+    );
+    assert!(ok, "si_optionshape failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    let _ = fs::remove_dir_all(&out);
+    if let Some(scalac) = real_scalac() {
+        let (ok, msgs) = scalac_run(&scalac, "si_optionshape", Some(&cp));
+        assert!(ok, "real scalac rejected si_optionshape:\n{msgs}");
+    }
+}
+
+/// `AbstractTable.foreignKey` has three source clauses. Its default action
+/// getters take the preceding clause arguments but not the earlier parameters
+/// in the same clause, while the final clause is implicit. Both details are
+/// absent from the JVM descriptor and must come from the ScalaSignature.
+#[test]
+fn slick_foreign_key_shapes_resolve_through_its_published_jar() {
+    let Some(lib) = scala_library_jar() else {
+        eprintln!("skip si_foreignkey: scala-library jar not present");
+        return;
+    };
+    let Some(jars) = slick_jars() else {
+        eprintln!("skip si_foreignkey: slick 3.4.1 not in the local Coursier cache");
+        return;
+    };
+    let cp = classpath(&jars);
+    let (ok, msgs, out) = compile(
+        "si_foreignkey",
+        &["--scala-library", lib.to_str().unwrap(), "-cp", cp.as_str()],
+    );
+    assert!(ok, "si_foreignkey failed to compile:\n{msgs}");
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+    let _ = fs::remove_dir_all(&out);
+    if let Some(scalac) = real_scalac() {
+        let (ok, msgs) = scalac_run(&scalac, "si_foreignkey", Some(&cp));
+        assert!(ok, "real scalac rejected si_foreignkey:\n{msgs}");
+    }
+}

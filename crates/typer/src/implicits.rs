@@ -1616,6 +1616,39 @@ impl Typer {
             }
         }
         self.open_implicits.borrow_mut().pop();
+        // A type parameter constrained only by its declaration bound can be
+        // inferred even when the result has a wildcard in that position. In
+        // particular, Slick's `optionShape` has `Level <: ShapeLevel`; the
+        // outer `Shape[?, Rep[Option[Int]], ?, ?]` leaves `Level` open while
+        // its `Shape[Rep[Int], ...]` witness settles `U` and `P`. scalac
+        // instantiates that remaining parameter with its explicit upper bound
+        // (`ShapeLevel`). Treating every unresolved parameter as a failure
+        // discarded the otherwise valid witness and made nested Option Shapes
+        // diverge. Only a non-top bound is useful here: `T <: Any` still
+        // carries no information and must remain an unresolved failure.
+        let mut still_open = Vec::new();
+        for tp in open.drain(..) {
+            let Some(pos) = tps.iter().position(|x| *x == tp) else {
+                still_open.push(tp);
+                continue;
+            };
+            let Some(hi) = self.st.get(tp).bound_hi.clone() else {
+                still_open.push(tp);
+                continue;
+            };
+            let hi = crate::symbol::subst_tparams_slice(&tps, &targs, &hi);
+            if matches!(hi, Type::Any | Type::AnyRef | Type::AnyVal)
+                || crate::check::type_mentions_tparam(&hi, tp)
+                || tps
+                    .iter()
+                    .any(|other| crate::check::type_mentions_tparam(&hi, *other))
+            {
+                still_open.push(tp);
+            } else {
+                targs[pos] = self.simplify_solved(&hi);
+            }
+        }
+        open = still_open;
         if !ok || !open.is_empty() {
             return None;
         }

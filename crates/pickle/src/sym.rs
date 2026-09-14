@@ -975,8 +975,7 @@ impl Builder<'_> {
                     decls: Vec::new(),
                 }
             }
-            Some(Entry::MethodTpe { result, params })
-            | Some(Entry::ImplicitMethodTpe { result, params }) => {
+            Some(Entry::MethodTpe { result, params }) => {
                 let (result, params) = (*result, params.clone());
                 let implicit = params.first().is_some_and(|&p| {
                     self.p
@@ -988,6 +987,21 @@ impl Builder<'_> {
                 SigType::Method {
                     params: ps,
                     implicit,
+                    result: Box::new(self.ty(result, d)),
+                }
+            }
+            // The dedicated `IMPLICITMETHODtpe` tag is the source-level
+            // clause marker.  Unlike an ordinary `METHODtpe`, its parameter
+            // symbols need not carry `IMPLICIT` themselves (the FK helper
+            // methods in Slick are the concrete example), so consulting only
+            // the first parameter loses the clause and leaves the method as
+            // an unapplied function at the call site.
+            Some(Entry::ImplicitMethodTpe { result, params }) => {
+                let (result, params) = (*result, params.clone());
+                let ps: Vec<Param> = params.into_iter().map(|p| self.param(p)).collect();
+                SigType::Method {
+                    params: ps,
+                    implicit: true,
                     result: Box::new(self.ty(result, d)),
                 }
             }

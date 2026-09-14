@@ -3960,18 +3960,22 @@ impl PickleSupply {
                 return None;
             };
             // `default_getter_apply` passes the arguments that precede the
-            // defaulted one, truncated to the getter's own arity: scalac emits
-            // a *nullary* getter whenever the default does not read an earlier
-            // parameter (`SeqOps.lastIndexOf$default$2()` takes nothing though
-            // `elem` comes first). Anything between those two shapes is a
-            // convention we do not know how to call, and a call we cannot make
-            // correctly is worse than a member we do not supply.
+            // defaulted one, truncated to the getter's own arity.  scalac's
+            // getter includes a prefix of those arguments: a nullary getter
+            // is common when the default does not read an earlier parameter
+            // (`SeqOps.lastIndexOf$default$2()` takes nothing though `elem`
+            // comes first), and a later clause can omit the preceding
+            // parameters from its own clause (`AbstractTable.foreignKey$default$5`
+            // takes the three arguments from the first clause, not the
+            // `targetColumns` argument that precedes `onUpdate` in source).
+            // Any arity up to the global prefix is therefore linkable; the
+            // caller truncates to exactly this count below.
             let want_args = slot - 1;
             let got_args = st.get(gid).params.len();
-            if got_args != want_args && got_args != 0 {
+            if got_args > want_args {
                 trace(format_args!(
                     "{internal}#{name}: {getter} takes {got_args} argument(s), which is \
-                     neither none nor the {want_args} that precede the default"
+                     more than the {want_args} arguments that precede the default"
                 ));
                 return None;
             }
