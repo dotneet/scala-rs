@@ -261,6 +261,16 @@ fn real_scalac_dual_run_db_lib() {
     real_scalac_dual_run("db_lib");
 }
 
+/// A varargs parameter with a contravariant effect must infer the greatest
+/// lower bound of heterogeneous arguments.  This is the small source-level
+/// shape of Slick's `DBIOAction.seq`: `Read` and `Write` meet at
+/// `Read with Write`, allowing both the direct call and a generic forwarding
+/// method to typecheck just as they do under scalac.
+#[test]
+fn dbio_seq_infers_intersection_effect() {
+    real_scalac_dual_run("dbio_seq");
+}
+
 /// The private runtime backs no `scala.util.Either`, so the fixture has to be
 /// diagnosed there, not quietly accepted.
 #[test]

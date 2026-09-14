@@ -2022,7 +2022,18 @@ impl Typer {
                     Some(prev) => {
                         let prev = self.minimize_undet(&prev);
                         let t = self.minimize_undet(&t);
-                        if all_direct {
+                        if contra {
+                            // A contravariant occurrence contributes an
+                            // upper constraint: `DBIOAction[-E]` accepts an
+                            // argument only when the inferred `E` is below
+                            // that argument's effect.  Repeated arguments
+                            // therefore meet at their greatest lower bound
+                            // (`Read with Write` for `seq(read, write)`), not
+                            // the ordinary least upper bound (`Effect`).
+                            // The latter loses the constraint and leaves the
+                            // varargs call inapplicable.
+                            self.st.glb(&prev, &t)
+                        } else if all_direct {
                             self.lub_ty(&prev, &t)
                         } else {
                             self.st.lub(&prev, &t)
