@@ -14,8 +14,8 @@ source "$ROOT/tests/baseline_invariants.sh"
   print -u2 'accepted scalalib baseline is not 2/2'
   exit 1
 }
-[[ $(read_corpus_baseline "$ROOT/tests/BASELINE.md" "$ROOT/tests/baselines") == "$ROOT/tests/baselines/corpus-ca3dfd6d.tsv" ]] || {
-  print -u2 'current corpus baseline does not resolve to ca3dfd6d'
+[[ $(read_corpus_baseline "$ROOT/tests/BASELINE.md" "$ROOT/tests/baselines") == "$ROOT/tests/baselines/corpus-ff08907d.tsv" ]] || {
+  print -u2 'current corpus baseline does not resolve to ff08907d'
   exit 1
 }
 

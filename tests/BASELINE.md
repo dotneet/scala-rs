@@ -11,11 +11,11 @@ disagrees with what you measure on an unmodified tree, **stop and report** —
 that means either this file is stale or your branch is not where you think it
 is, and both invalidate everything downstream.
 
-| commit | `ca3dfd6d` |
+| commit | `ff08907d` |
 |---|---|
-| updated | 2026-09-13 |
+| updated | 2026-09-14 |
 
-**Fifty-three composed gates have been accepted this session**, covering the earlier
+**Sixty-one gates have been accepted this session**, covering the earlier
 ninety-nine slices, the type-identity/macro-transport batch, and the combined
 SQL, constructor-storage, value-class-access and reflection-parent batch,
 the Forms inference and Scala/JVM name interoperability batch, and the
@@ -92,6 +92,7 @@ coordinator measured the merged tree each time, not the branches.
 | `ce3e99ec` | the five known-fail run programs: mixin forwarders scoped to nsc's `mixinClasses`, applied type members and refinement `type` declarations written to the pickle, pattern-bound lambda capture, conversion views through prefixes, `Byte`/`Short` pickle names | 0 | 0 |
 | `de16571c` | the library's last inference and resolution roots (41 -> 4): function-typed expected types, self-constructor delegation, compound base types, refinement type parameters, weak-conformance specificity, module `apply` sugar, plus two backend `VerifyError`s and the SLS 4.1 forward reference | 0 | 0 |
 | `ca3dfd6d` | `super` resolved against the linearization with alpha-renamed override reduction and nsc's shadowing, as-seen-from no longer re-substituting its own arguments, and three backend roots the library's first codegen exposed | 0 | 0 |
+| `ff08907d` | P0-P2 Rust ownership/API refactoring, sharded CLI tests, content-addressed fixture cache and fail-closed merge gate | 0 | 0 |
 
 Four of those slices move no number and are the most important. **`linterm`
 and `subtypeterm` fixed non-termination**: `lin` and `is_sub_type` were bounded
@@ -2593,7 +2594,6 @@ VERDICT=PASS
 DONE
 ```
 
-
 ## Rejected candidate nineteen: SQL and constructor storage batch
 
 Frozen candidate `ee80efb0a3e0341a4551299dd9956faa84e83e21`, tree
@@ -4524,6 +4524,42 @@ Exact summary block:
 ```text
 === summary
   HEAD=ca3dfd6d  logs=/private/tmp/scala-rs-lf/gate  wall=23:49
+VERDICT=PASS
+DONE
+```
+
+## Gate sixty-one: P0-P2 refactoring (`ff08907d`)
+
+`/tmp/scala-rs-refactor-gate-20260914-final6`, `VERDICT=PASS`, wall 17:03,
+`losses=0 changes=0` against the pre-refactoring `da9bf3d9` ledger.
+
+| measure | accepted result |
+|---|---:|
+| Slick compile / execution | 184 files, 0 errors, 1504 classes; 12/12 programs, 36/36 attempts |
+| Cats compile / execution | 340 files, 0 errors, 2977 classes; 9/9 programs, `known_fail=0` |
+| GitBucket compile / execution | 354 files, 0 errors, 1317 classes; 6/6 programs, `known_fail=0` |
+| scala library | 538 files, 2 errors / 2 files (accepted local-object baseline) |
+| workspace suite | 3272 passed / 0 failed, 30 rows, 23 binaries, 7 doc-test rows |
+| corpus pos / neg / run | 1251 / 813 / 1018 passes; 5324 identities, 0 timeout skips introduced |
+
+The compiler refactor makes classfile ABI data and backend modes explicit,
+uses scoped mutable-state restoration instead of shared interior mutability,
+and splits descriptor, unification, pickle-reader and binary-expression logic
+along ownership boundaries. The test refactor gives every fixture a single
+shard owner, centralises typed command outcomes and RAII cleanup, validates
+toolchain/artifact manifests by content, serialises checkout and publish
+mutations, and makes every required gate step fail closed. Hostile inherited
+`SCALA_RS`, `PICKLE`, `KNOWN`, `RUNS` and documentation-skip settings are covered
+by the gate self-test.
+
+Saved ledger: [`baselines/corpus-ff08907d.tsv`](baselines/corpus-ff08907d.tsv),
+SHA-256 `3cd75db4e51c5300fb0ca40be963a796d68096be99b56ef3f18a27d935bb3a84`.
+
+Exact summary block:
+
+```text
+=== summary
+  HEAD=da9bf3d9  logs=/tmp/scala-rs-refactor-gate-20260914-final6  wall=17:03
 VERDICT=PASS
 DONE
 ```
