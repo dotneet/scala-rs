@@ -2955,7 +2955,7 @@ impl Typer {
                                 // following `foreach` resolve to `ConstArray`'s
                                 // and `checkcast`ed the anonymous `ConstArrayOp`
                                 // to a `ConstArray`.
-                                if self.receiver_conforms_to(&r, &ret) {
+                                if self.same_receiver_class_or_unknown(&r, &ret) {
                                     ret = r;
                                 }
                             }
@@ -3936,24 +3936,23 @@ impl Typer {
             })
     }
 
-    /// Whether `recv`'s class is `decl`'s class or a subclass of it — the
-    /// shape in which replacing a declared result type by the receiver's is a
-    /// *narrowing* rather than a jump to an unrelated class. An unknown class
-    /// on either side answers `true`, which keeps the existing behaviour for
-    /// everything the prelude supplies without a class symbol.
-    fn receiver_conforms_to(&self, recv: &Type, decl: &Type) -> bool {
+    /// Whether a `withFilter` declaration's result is the receiver itself.
+    /// A receiver subtype is not enough: Slick's `TableQuery` inherits
+    /// `Query.withFilter`, whose declared result is `Query`, but the actual
+    /// implementation returns a `WrappingQuery`. Treating every subtype as
+    /// the returned receiver inserts a `checkcast TableQuery` that fails at
+    /// runtime. Unknown classes retain the old fallback used by the prelude.
+    fn same_receiver_class_or_unknown(&self, recv: &Type, decl: &Type) -> bool {
         let (Some(rc), Some(dc)) = (self.st.class_sym_of(recv), self.st.class_sym_of(decl)) else {
+            // Keep the old fallback for prelude types whose symbols are not
+            // available to this compilation.
             return true;
         };
+        // A subtype is not enough. Slick's TableQuery inherits Query's
+        // withFilter, but that call returns a WrappingQuery at runtime rather
+        // than the TableQuery receiver. Narrowing it to the subtype would
+        // emit a checkcast that fails before the query is executed.
         rc == dc
-            || self
-                .st
-                .base_type_seq(&Type::Class {
-                    sym: rc,
-                    args: vec![],
-                })
-                .iter()
-                .any(|b| self.st.class_sym_of(b) == Some(dc))
     }
 
     fn is_with_filter_ty(&self, ty: Option<&Type>) -> bool {

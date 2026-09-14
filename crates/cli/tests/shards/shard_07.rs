@@ -77,3 +77,5 @@ mod tail1;
 mod tail2;
 #[path = "../tail3.rs"]
 mod tail3;
+#[path = "../withfilter_subtype.rs"]
+mod withfilter_subtype;
