@@ -351,6 +351,16 @@ pub(crate) fn emit_adapt(asm: &mut Assembler, adapt: &Adapt, abi: AbiMode) {
 }
 
 pub(crate) fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> {
+    checkcast_internal_depth(st, ty, 0)
+}
+
+fn checkcast_internal_depth(st: &SymbolTable, ty: &Type, depth: usize) -> Option<String> {
+    // Bounds can be recursive (`A <: A`) in a legal Scala signature. Keep
+    // resolving existential/type-parameter upper bounds finite rather than
+    // turning a malformed or self-referential bound into compiler recursion.
+    if depth > 64 {
+        return None;
+    }
     match ty {
         Type::Null => Some("scala/runtime/Null$".into()),
         Type::Class { sym, .. } | Type::ModuleRef(sym) => Some(class_internal(st, *sym)),
@@ -366,6 +376,12 @@ pub(crate) fn checkcast_internal(st: &SymbolTable, ty: &Type) -> Option<String> 
         // `VerifyError: Type 'java/lang/Object' is not assignable to '[I'`.
         Type::Array(_) => Some(jvm_desc(st, ty)),
         Type::Named { name, .. } => Some(name.replace('.', "/")),
+        Type::TypeParam(id) => st
+            .get(*id)
+            .bound_hi
+            .as_ref()
+            .and_then(|hi| checkcast_internal_depth(st, hi, depth + 1)),
+        Type::BoundedWildcard { hi: Some(hi), .. } => checkcast_internal_depth(st, hi, depth + 1),
         _ => None,
     }
 }
