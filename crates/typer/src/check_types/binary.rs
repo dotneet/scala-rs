@@ -1728,7 +1728,20 @@ impl Typer {
         match self.binary.find_class(&jvm) {
             Ok(Some(bytes)) => match crate::javaclass::parse_java_classfile(&bytes) {
                 Ok(jc) => {
+                    // A jar-only Scala class can first enter the table as a
+                    // lazy stub. `settle_binary_parent_projections` may then
+                    // recover a parent that the JVM Signature cannot express
+                    // (`E#TableElementType`) before the classfile's ordinary
+                    // members are requested. Installing those members must
+                    // not put the erased Java parent (`Object`) back. The
+                    // directory/classpath path below already has the same
+                    // preservation rule in `ensure_classfile_members_loaded`.
+                    let scala_parents = (jc.is_scala && self.pickle.parents_loaded(class_id))
+                        .then(|| self.st.get(class_id).parents.clone());
                     let id = crate::classpath::install_java_class(&mut self.st, &jc);
+                    if let Some(parents) = scala_parents {
+                        self.st.get_mut(id).parents = parents;
+                    }
                     // A `-cp` stub reached through a parent list arrives here
                     // as "javaish" even when it is a Scala trait: see
                     // `adopt_binary_class`.

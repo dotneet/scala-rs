@@ -196,3 +196,72 @@ fn scalac_binary_parent_projection_is_adopted_lazily() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+/// GitBucket compiles in three layers: Slick first, its nested table classes
+/// second, and the test sources last. The projected `TableElementType` must
+/// therefore survive two independent scala-rs writer/reader boundaries.
+#[test]
+fn nested_table_projection_survives_two_binary_boundaries() {
+    let (Some(library), Some(scalac)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip layered TableQuery projection: compiler unavailable");
+        return;
+    };
+
+    let root = temp_dir();
+    let base = root.join("base");
+    let base_jar = root.join("base.jar");
+    let model = root.join("model");
+    let consumer = root.join("consumer");
+    fs::create_dir_all(&base).unwrap();
+    fs::create_dir_all(&model).unwrap();
+    fs::create_dir_all(&consumer).unwrap();
+
+    let base_stage = Command::new(scalac)
+        .arg(fixtures_dir().join("tablequery_projected_base.scala"))
+        .args(["-d", base.to_str().unwrap()])
+        .output()
+        .expect("run scalac");
+    assert!(
+        base_stage.status.success(),
+        "scalac base writer failed:\n{}",
+        diagnostics(&base_stage)
+    );
+    let jar_stage = Command::new("jar")
+        .args(["--create", "--file"])
+        .arg(&base_jar)
+        .args(["-C", base.to_str().unwrap(), "."])
+        .output()
+        .expect("package base classes");
+    assert!(
+        jar_stage.status.success(),
+        "jar packaging failed:\n{}",
+        diagnostics(&jar_stage)
+    );
+
+    let model_stage = compile(
+        &fixtures_dir().join("tablequery_projected_lib.scala"),
+        &model,
+        Some(&base_jar),
+        &library,
+    );
+    assert!(
+        model_stage.status.success(),
+        "scala-rs model writer failed:\n{}",
+        diagnostics(&model_stage)
+    );
+
+    let layered_cp = PathBuf::from(format!("{}:{}", base_jar.display(), model.display()));
+    let consumer_stage = compile(
+        &fixtures_dir().join("tablequery_projected_use.scala"),
+        &consumer,
+        Some(&layered_cp),
+        &library,
+    );
+    assert!(
+        consumer_stage.status.success(),
+        "scala-rs layered reader failed:\n{}",
+        diagnostics(&consumer_stage)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
