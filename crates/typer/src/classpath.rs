@@ -379,15 +379,23 @@ fn declare_type_members(
     members: &[crate::check::ClasspathTypeMember],
 ) {
     for member in members {
-        // Parameterised aliases are completed by PickleSupply, which preserves
-        // their declaring path and inherited override information. Eagerly
-        // adding the compact spelling would shadow that richer view. A
-        // nullary concrete alias is already complete, however, and must be
-        // installed here so inherited signatures can reduce it before
-        // on-demand completion (for example `FSIntProperty.T = Int`).
-        if member.alias.is_some() && !member.tparams.is_empty() {
-            continue;
-        }
+        // PickleSupply preserves the declaring path and inherited substitution
+        // of concrete aliases. Install a nullary alias eagerly only when its
+        // RHS is already closed and prefix-free: `FSIntProperty.T = Int` needs
+        // that early reduction, while `Base.B = A` and
+        // `Owner.EmptyAlias = Owner.Empty` still need as-seen-from completion.
+        let eager_alias = if let Some(alias) = &member.alias {
+            if !member.tparams.is_empty() {
+                continue;
+            }
+            let rhs = resolve_type_in(st, owner, alias, &[]);
+            if classpath_alias_needs_completion(st, &rhs) {
+                continue;
+            }
+            Some(rhs)
+        } else {
+            None
+        };
         if st.get(owner).members.iter().any(|&id| {
             st.get(id).owner == owner
                 && st.get(id).kind == SymKind::TypeMember
@@ -398,8 +406,8 @@ fn declare_type_members(
         let id = st.alloc(&member.name, owner, SymKind::TypeMember, Flags::EMPTY, "");
         let tparams = alloc_tparams(st, id, &member.tparams);
         st.get_mut(id).tparams = tparams.clone();
-        if let Some(alias) = &member.alias {
-            st.get_mut(id).ty = resolve_type_in(st, owner, alias, &tparams);
+        if let Some(alias) = eager_alias {
+            st.get_mut(id).ty = alias;
             st.get_mut(id).is_type_alias = true;
         } else {
             // Abstract members remain opaque until a concrete subclass fixes them.
@@ -407,6 +415,25 @@ fn declare_type_members(
         }
         st.get_mut(owner).members.push(id);
     }
+}
+
+/// Whether an eager classpath alias would discard information that
+/// PickleSupply needs in order to complete it through the selecting prefix.
+fn classpath_alias_needs_completion(st: &SymbolTable, ty: &Type) -> bool {
+    crate::symbol::any_type(ty, &mut |part| match part {
+        Type::NoType
+        | Type::Error
+        | Type::Named { .. }
+        | Type::TypeParam(_)
+        | Type::TypeMember(_)
+        | Type::Wildcard
+        | Type::BoundedWildcard { .. }
+        | Type::ThisType(_)
+        | Type::SingleType { .. }
+        | Type::ModuleRef(_) => true,
+        Type::Class { sym, .. } => st.is_inner_class_of_class(*sym),
+        _ => false,
+    })
 }
 
 /// Resolve bounds after every classpath class has its parent links. A bound
