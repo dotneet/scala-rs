@@ -305,6 +305,37 @@ object Main {
 }
 ";
 
+const EXTERNAL_PARENT_CTOR_LIB: &str = "\
+package ctorlib
+
+trait Eq0[A]
+trait Order0[A]
+
+class Parent0[K, V](implicit ev: Eq0[V]) {
+  private def this(ev: Eq0[V], ord: Order0[K]) = this()(ev)
+  def answer: Int = 1
+}
+
+class Parent1[K, V](implicit val ev: Eq0[V]) {
+  def answer: Int = 2
+}
+";
+
+const EXTERNAL_PARENT_CTOR_USER: &str = "\
+import ctorlib.{Eq0, Order0, Parent0, Parent1}
+
+class Child0[K, V](implicit ev: Eq0[V], ord: Order0[K]) extends Parent0[K, V]
+class Child1[K, V](implicit ev: Eq0[V], ord: Order0[K]) extends Parent1[K, V]
+
+object Main {
+  def main(args: Array[String]): Unit = {
+    val eq = new Eq0[String] {}
+    val ord = new Order0[String] {}
+    println(new Child0[String, String](eq, ord).answer + new Child1[String, String](eq, ord).answer)
+  }
+}
+";
+
 fn compile_against(out: &Path, jar: &Path, src: &Path, extra_cp: &[PathBuf]) -> (bool, String) {
     let mut cmd = Command::new(bin());
     cmd.arg("compile").arg(src);
@@ -376,6 +407,50 @@ fn a_higher_kinded_companion_implicit_crosses_a_jar() {
     if java_available() {
         let cp = format!("{}:{}", jar.display(), lib_jar.display());
         assert_eq!(run_java(&user_out, Some(&cp)), "7\n");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A classpath Scala constructor can preserve an empty explicit clause before
+/// its implicit clause (`Parent()` followed by `(implicit ev)`) even though
+/// the JVM method type is flattened. The subclass's `V` must be substituted
+/// before filling that implicit, or a bare `extends Parent[K, V]` searches for
+/// the parent's unresolved `Parent.V` and fails to compile.
+#[test]
+fn external_implicit_parent_ctor_uses_subclass_type_args() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip external parent ctor round trip: scala-library jar not present");
+        return;
+    };
+    if jar_tool().is_none() {
+        eprintln!("skip external parent ctor round trip: no `jar` tool");
+        return;
+    }
+    let dir = tmp_dir("external-parent-ctor");
+    let lib_src = dir.join("lib.scala");
+    let user_src = dir.join("user.scala");
+    fs::write(&lib_src, EXTERNAL_PARENT_CTOR_LIB).unwrap();
+    fs::write(&user_src, EXTERNAL_PARENT_CTOR_USER).unwrap();
+    let lib_out = dir.join("libout");
+    let user_out = dir.join("userout");
+    fs::create_dir_all(&lib_out).unwrap();
+    fs::create_dir_all(&user_out).unwrap();
+
+    let (ok, msgs) = compile_against(&lib_out, &jar, &lib_src, &[]);
+    assert!(ok, "external-parent library failed to compile:\n{msgs}");
+    let lib_jar = dir.join("ctorlib.jar");
+    pack_jar(&lib_out, &lib_jar);
+
+    let (ok, msgs) = compile_against(&user_out, &jar, &user_src, &[lib_jar.clone()]);
+    assert!(
+        ok,
+        "subclass failed to compile against external implicit parent:\n{msgs}"
+    );
+    assert!(!msgs.contains("error:"), "unexpected diagnostics:\n{msgs}");
+
+    if java_available() {
+        let cp = format!("{}:{}", jar.display(), lib_jar.display());
+        assert_eq!(run_java(&user_out, Some(&cp)), "3\n");
     }
     let _ = fs::remove_dir_all(&dir);
 }

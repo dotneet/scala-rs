@@ -1719,9 +1719,12 @@ impl Typer {
                 // would -- otherwise codegen emits `TypedRep.<init>()`, which
                 // type-checks here and fails with `NoSuchMethodError` at run
                 // time.
-                if !self.sigs_only {
-                    self.supply_binary_ctors(id);
-                }
+                // Constructor metadata is needed in both passes. The
+                // signature pass must still recognize a bare external parent
+                // whose only constructor clause is implicit; otherwise it
+                // reports a spurious "no matching overload" before the body
+                // pass gets a chance to fill the clause.
+                self.supply_binary_ctors(id);
                 if !self.sigs_only && self.parent_ctor_is_fillable(id) {
                     let head = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                     *tree = Tree {

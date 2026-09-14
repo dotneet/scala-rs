@@ -1143,14 +1143,31 @@ impl Typer {
             if all_impl && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
                 // Prefer the (possibly TypeApply-substituted) method type so
                 // `mk[Int](2)` searches `ClassTag[Int]`, not raw `ClassTag[T]`.
-                let rest_tys: Vec<Type> = match fun_ty {
-                    Type::Method { paramss, .. } if paramss.len() > 1 => {
-                        paramss[1..].iter().flatten().cloned().collect()
+                let rest_tys: Vec<Type> = if self.st.get(sym).name == "<init>"
+                    && param_tys.len()
+                        == paramss_ids.iter().map(|clause| clause.len()).sum::<usize>()
+                    && args.len() <= param_tys.len()
+                {
+                    // Constructor arguments are flattened before this helper
+                    // is called, while an external pickle can still preserve
+                    // an empty first clause (`C()(implicit ev: E)`) in
+                    // `paramss_ids`.  The constructor method type is already
+                    // flat and its raw trailing-clause types mention the
+                    // parent's type parameters, so use the call-site types
+                    // handed over by the caller (which have been substituted
+                    // at the subclass's type arguments) for the residual
+                    // implicit clause.
+                    param_tys[args.len()..].to_vec()
+                } else {
+                    match fun_ty {
+                        Type::Method { paramss, .. } if paramss.len() > 1 => {
+                            paramss[1..].iter().flatten().cloned().collect()
+                        }
+                        _ => rest_ids
+                            .iter()
+                            .map(|id| self.st.get(*id).ty.clone())
+                            .collect(),
                     }
-                    _ => rest_ids
-                        .iter()
-                        .map(|id| self.st.get(*id).ty.clone())
-                        .collect(),
                 };
                 let rest_tys = if rest_tys.len() == rest_ids.len() {
                     rest_tys
