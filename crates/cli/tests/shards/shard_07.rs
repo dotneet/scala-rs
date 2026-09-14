@@ -31,6 +31,8 @@ mod signature;
 mod singleton;
 #[path = "../singleton_metadata.rs"]
 mod singleton_metadata;
+#[path = "../slickddl.rs"]
+mod slickddl;
 #[path = "../slickimpl.rs"]
 mod slickimpl;
 #[path = "../slickimplicit.rs"]

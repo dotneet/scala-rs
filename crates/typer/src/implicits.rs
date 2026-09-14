@@ -4028,6 +4028,28 @@ impl Typer {
 
     fn conv_param_matches(&self, id: SymbolId, from: &Type, param: &Type) -> bool {
         let param = &unwrap_byname(param);
+        // A conversion imported through a value has two sides that must be
+        // read in the same vocabulary.  `import tdb.profile.api._` can make
+        // the candidate's parameter `RelationalP.this.SchemaDescriptionDef`
+        // while the receiver still carries `BasicP.SchemaDescription`; the
+        // latter is the abstract declaration, not the alias selected by the
+        // imported profile.  Normalize both through that one import prefix,
+        // using the general as-seen-from/type-member expansion.  Keep the
+        // origin here: imported aliases may be proxy symbols whose owner is
+        // not the declaration that supplied the import.
+        let origin = self
+            .implicit_instance_origins
+            .get(&id)
+            .copied()
+            .unwrap_or(id);
+        let from_seen = self
+            .at_import_prefix_of(origin, from)
+            .unwrap_or_else(|| from.clone());
+        let param_seen = self
+            .at_import_prefix_of(origin, param)
+            .unwrap_or_else(|| param.clone());
+        let from = &from_seen;
+        let param = &param_seen;
         // Match a polymorphic conversion against the receiver after solving
         // its own parameters structurally. Erasing them to wildcards first
         // loses the variance of nested function types such as
