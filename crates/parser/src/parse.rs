@@ -3428,7 +3428,13 @@ impl<'a> Parser<'a> {
             // (`xs toList`, `42 abs`).
             let after_ident = self.pos;
             self.bump();
-            if is_operator_name(&op) && matches!(self.kind(), TokenKind::Newline) {
+            // A newline after an infix identifier does not terminate the
+            // expression when the following token can start its right-hand
+            // operand.  This applies to alphabetic method names as well as
+            // symbolic operators (`xs map\n f`, `table insert\n row`).
+            // `looks_like_prefix_start` below still leaves a genuine postfix
+            // use alone when there is no following operand.
+            if matches!(self.kind(), TokenKind::Newline) {
                 self.skip_nl();
             }
             if !self.looks_like_prefix_start() {

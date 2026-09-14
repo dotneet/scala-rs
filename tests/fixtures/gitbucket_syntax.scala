@@ -12,6 +12,12 @@ trait ReadWrite { self: Readable with Writable =>
 
 object Cake extends Readable with Writable with ReadWrite
 
+final class Sink {
+  private var stored = ""
+  def insert(value: String): Unit = stored = value
+  def value: String = stored
+}
+
 object Main {
   // gitbucket writes `Database() withTransaction { implicit session => ... }`
   // fifteen times: a block whose only statement is a function literal with an
@@ -51,5 +57,12 @@ object Main {
     val u = n +/*1.5*/ 1
     println(u)
     println(Cake.rw)
+    // RepositoryService uses this exact layout for Slick inserts.  An
+    // alphabetic infix operator at end-of-line continues on the next line;
+    // it is not a postfix statement followed by an unrelated expression.
+    val sink = new Sink
+    sink insert
+      "row"
+    println(sink.value)
   }
 }

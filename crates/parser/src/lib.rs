@@ -778,6 +778,25 @@ object M {
     }
 
     #[test]
+    fn alphabetic_infix_operator_continues_after_newline() {
+        let t = parse_ok(
+            r#"
+object M {
+  def f(xs: List[Int]): List[Int] =
+    xs map
+      (x => x + 1)
+}
+"#,
+        );
+        let dump = dump_tree(&t);
+        assert!(dump.contains("Apply\n        Select map"), "{dump}");
+        assert!(
+            !dump.contains("Select map postfix"),
+            "continued alphabetic infix call must not become a postfix statement: {dump}"
+        );
+    }
+
+    #[test]
     fn xml_literal_elem_text_splice_desugars() {
         let t = parse_ok(
             r#"
