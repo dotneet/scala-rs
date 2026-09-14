@@ -2424,7 +2424,24 @@ impl<'a> Gen<'a> {
         if class_id.is_none() || !self.st.get(class_id).flags.contains(Flags::CASE) {
             return;
         }
-        let fields = self.st.get(class_id).ctor_fields.clone();
+        let mut fields = self.st.get(class_id).ctor_fields.clone();
+        // `ctor_fields` is the flattened primary-constructor argument list:
+        // companion `apply` and `copy` need all of it. Product, equality and
+        // string methods use only the first case parameter clause. The
+        // synthetic apply retains the original clause grouping after uncurry,
+        // so it is the authoritative boundary here.
+        let apply = case_apply_sym(self.st, class_id);
+        if !apply.is_none() {
+            let a = self.st.get(apply);
+            if let Some(first) = a
+                .pickle_clauses
+                .first()
+                .copied()
+                .or_else(|| a.paramss.first().map(Vec::len))
+            {
+                fields.truncate(first);
+            }
+        }
         let class_jvm = b.this_name.clone();
         let simple = self.st.get(class_id).name.clone();
         let mut defined: HashSet<String> = b.methods.iter().map(|m| m.name.clone()).collect();

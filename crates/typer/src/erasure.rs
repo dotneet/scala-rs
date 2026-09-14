@@ -216,6 +216,25 @@ pub(crate) fn for_each_child(tree: &Tree, f: &mut impl FnMut(&Tree)) {
     }
 }
 
+/// Whether `tree` contains a term reference (`Ident` or `Select`) to `sym`.
+///
+/// The backend uses this after typing to decide whether a later, bare case
+/// class constructor parameter needs physical storage. Unlike the first case
+/// parameter clause, such a parameter is not a case accessor, and nsc may
+/// omit its field when no code that outlives the constructor reads it.
+pub fn tree_mentions_symbol(tree: &Tree, sym: SymbolId) -> bool {
+    if matches!(tree.kind, TreeKind::Ident { .. } | TreeKind::Select { .. }) && tree.sym == sym {
+        return true;
+    }
+    let mut found = false;
+    for_each_child(tree, &mut |child| {
+        if !found && tree_mentions_symbol(child, sym) {
+            found = true;
+        }
+    });
+    found
+}
+
 /// Erase every symbol's type in place.
 ///
 /// `erase` runs once per compilation unit and this pass is over the *whole*
@@ -991,6 +1010,19 @@ fn erase_tree(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
         }
         TreeKind::ValDef { tpt, rhs, .. } => {
             erase_tree(tpt, st, None);
+            // A declaration's symbol is its ABI type. A path-dependent
+            // inferred value can leave an as-seen-from refinement on the
+            // ValDef tree (`object Color extends Enumeration; val Red =
+            // Value`) while the symbol has the concrete erased
+            // `Enumeration$Value`. Emitting the field from the tree then made
+            // it `Object`, even though every selection linked against the
+            // symbol's `Enumeration$Value` descriptor.
+            if !tree.sym.is_none() {
+                let sty = st.get(tree.sym).ty.clone();
+                if !sty.is_no_type() && !sty.is_error() {
+                    tree.ty = sty;
+                }
+            }
             let pt = if tree.ty.is_no_type() {
                 None
             } else {
@@ -1489,6 +1521,30 @@ fn is_thunk_slot(ty: &Type) -> bool {
     }
 }
 
+fn type_apply_type_arg(tree: &Tree) -> Option<Type> {
+    match &tree.kind {
+        TreeKind::TypeApply { args, .. } => args.first().map(|arg| arg.ty.clone()),
+        TreeKind::Typed { expr, .. } => type_apply_type_arg(expr),
+        _ => None,
+    }
+}
+
+fn is_scala_class_tag_apply(tree: &Tree, st: &SymbolTable) -> bool {
+    match &tree.kind {
+        TreeKind::TypeApply { fun, .. } | TreeKind::Typed { expr: fun, .. } => {
+            is_scala_class_tag_apply(fun, st)
+        }
+        TreeKind::Select { name, .. } if name == "apply" && !tree.sym.is_none() => {
+            let owner = st.get(tree.sym).owner;
+            matches!(
+                st.jvm_internal(owner).as_str(),
+                "scala/reflect/ClassTag" | "scala/reflect/ClassTag$"
+            )
+        }
+        _ => false,
+    }
+}
+
 fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
     // `new Meter(x)` erases to `x` (the unique ctor arg) in the happy path.
     {
@@ -1536,6 +1592,17 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
             TreeKind::Apply { fun, args } => (fun, args),
             _ => return,
         };
+        // `ClassTag.apply[T](classOf[T])` is lowered to a plain `Select` by
+        // later phases, but its `$classOf` child still needs the concrete T.
+        // Keep that type before erasing the TypeApply: otherwise a context
+        // bound such as `new CustomSerializer[Foo](...)` materializes
+        // `ClassTag[Object]`, making ClassTag-keyed serializers invisible at
+        // runtime. The type argument is only copied for the compiler's
+        // synthetic `$classOf` marker below; ordinary user calls are
+        // unaffected.
+        let class_tag_type_arg = is_scala_class_tag_apply(fun, st)
+            .then(|| type_apply_type_arg(fun))
+            .flatten();
         // The pre-erasure type still records which parameters were
         // *instantiated* at a value class (`Array[Meters].update(i, x)`,
         // `Array(m1, m2)`); after erasure that is indistinguishable from a
@@ -1593,6 +1660,12 @@ fn erase_apply(tree: &mut Tree, st: &SymbolTable, expected: Option<&Type>) {
                 vc_arg_expected(st, &pre_params, &param_tys, i)
             };
             let p = vc_elem.or_else(|| param_tys.get(i).cloned());
+            if i == 0
+                && matches!(&a.kind, TreeKind::Ident { name } if name == "$classOf")
+                && class_tag_type_arg.is_some()
+            {
+                a.ty = class_tag_type_arg.clone().unwrap();
+            }
             erase_tree(a, st, p.as_ref());
             if let (Some(cls), Some(pt)) = (declared_vc, p.as_ref()) {
                 unbox_value_class_result(a, cls, pt);

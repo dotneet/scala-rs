@@ -116,6 +116,8 @@ impl B {
             code: Some(code),
             java_annots: Vec::new(),
             signature: None,
+            param_names: Vec::new(),
+            param_flags: Vec::new(),
         });
     }
 
@@ -127,6 +129,8 @@ impl B {
             code: None,
             java_annots: Vec::new(),
             signature: None,
+            param_names: Vec::new(),
+            param_flags: Vec::new(),
         });
     }
 

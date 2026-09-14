@@ -319,6 +319,14 @@ impl<'a> Sig<'a> {
             Type::Constant(lit) => self.jsig(&Type::lit_underlying(lit), primitive_ok, depth),
             Type::Annotated { tpe, .. } => self.jsig(tpe, primitive_ok, depth),
             Type::Array(elem) => {
+                // Scala's generic `Array[A]` is represented as `Object` at a
+                // JVM boundary when `A` itself is a type variable. nsc does
+                // not write `[TA;` here: that signature erases to `Object[]`
+                // and contradicts the actual `Object` descriptor. Nested
+                // parameterization (`Array[List[A]]`) remains a real array.
+                if matches!(elem.widen_constant(), Type::TypeParam(_)) {
+                    return "Ljava/lang/Object;".to_string();
+                }
                 // `Array[T]` for an unbounded `T` erases to `Object`, not to
                 // an array type; take the erasure's word for which of the two
                 // this is.
@@ -564,7 +572,15 @@ fn value_signature(st: &SymbolTable, id: SymbolId) -> Option<GenericSignature> {
 /// A signature that erases to itself says nothing the descriptor does not, and
 /// nsc does not emit one either.
 fn informative(sig: String, tvars: Vec<(String, String)>) -> Option<GenericSignature> {
-    if erase_signature(&sig, &tvars).as_deref() == Some(sig.as_str()) {
+    // A constructor (or a method inherited from a generic class) can carry a
+    // class-scoped type variable without declaring a method formal of its own.
+    // Its erased descriptor is therefore identical to the signature even
+    // though `(TA;)` is essential to reflection and ScalaSignature readers.
+    // Keep such references; only a truly raw signature is redundant.
+    let has_type_variable_ref = tvars
+        .iter()
+        .any(|(name, _)| sig.contains(&format!("T{name};")));
+    if !has_type_variable_ref && erase_signature(&sig, &tvars).as_deref() == Some(sig.as_str()) {
         return None;
     }
     Some(GenericSignature {

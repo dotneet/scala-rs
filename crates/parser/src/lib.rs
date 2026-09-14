@@ -1316,6 +1316,49 @@ object Main {
     }
 
     #[test]
+    fn local_case_class_after_lambda_statement() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def f(xs: List[Int]) = xs.flatMap { _ =>
+    val x = 1
+    case class Pair(a: Int)
+    Pair(x)
+  }
+}
+"#,
+        );
+        assert!(dump_tree(&t).contains("CaseClass Pair"));
+    }
+
+    #[test]
+    fn local_case_class_after_chained_lambda_block() {
+        let t = parse_ok(
+            r#"
+object Main {
+  def f(ts: List[Int]) = {
+    ts.flatMap { _ =>
+      val q = ((for { m <- ts } yield m) groupBy identity map {
+        case (id, data) => (id, data)
+      }).to[Set]
+      db.run(mark("q", q)).map(_ shouldBe Set(1))
+    }.flatMap { _ =>
+      case class Pair(a: Int, b: Option[Int])
+      class T4(tag: Tag) extends Table[Pair](tag, "t4") {
+        def a = column[Int]("a")
+        def b = column[Option[Int]]("b")
+        def * = (a, b).mapTo[Pair]
+      }
+      Pair(1, Some(1))
+    }
+  }
+}
+"#,
+        );
+        assert!(dump_tree(&t).contains("CaseClass Pair"));
+    }
+
+    #[test]
     fn function_literal_body_stops_at_case() {
         let t = parse_ok(
             r#"

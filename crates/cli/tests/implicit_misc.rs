@@ -425,6 +425,23 @@ fn ct_classtag_fixture() {
     dual_run_fixture("ct_classtag");
 }
 
+/// The ClassTag lowering is restricted to the `scala/reflect` owner.  A
+/// user-defined companion with the same short name must remain an ordinary
+/// `apply` call; otherwise its `String` result is replaced by a ClassTag and
+/// the generated method body fails verification or linking.
+#[test]
+fn ct_classtag_name_collision_is_not_rewritten() {
+    let out = compile_fixture("class_tag_collision");
+    if java_available() {
+        assert_eq!(
+            run_java(&out),
+            expected_stdout("class_tag_collision"),
+            "a user-defined ClassTag companion must not use the intrinsic"
+        );
+    }
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// The refusing half: `classTag[T]` and `implicitly[ClassTag[T]]` for a bare
 /// type parameter, one with an upper bound, a class's own parameter, an
 /// abstract `type` member, and `Array[T]`. All seven diagnostics match

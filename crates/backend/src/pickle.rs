@@ -607,7 +607,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             "Int" | "Long" | "Float" | "Double" | "Boolean" | "Char" | "Byte" | "Short"
             | "Unit" | "Any" | "AnyRef" | "AnyVal" | "Nothing" | "Null" | "Array" => {
                 let sc = self.scala_module();
-                self.type_ref_in(sc, name)
+                // nsc roots Scala's standard types at scala.ThisType. A
+                // NoPrefix type-ref happens to work for most consumers, but
+                // json4s' ScalaSigReader uses the prefix to recognize
+                // primitive arguments (notably Option[Boolean]).
+                self.type_ref_this_in(sc, name)
             }
             "Seq" => {
                 let pkg = self.scala_package_module();
@@ -615,7 +619,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             }
             n if n.starts_with("Function") => {
                 let sc = self.scala_module();
-                self.type_ref_in(sc, n)
+                self.type_ref_this_in(sc, n)
             }
             "String" | "Object" => {
                 let jl = self.java_lang_module();

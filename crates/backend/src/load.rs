@@ -426,6 +426,8 @@ mod tests {
                 code: None,
                 java_annots: Vec::new(),
                 signature: None,
+                param_names: Vec::new(),
+                param_flags: Vec::new(),
             }],
             source: "Metadata.scala".into(),
             scala_signature: None,

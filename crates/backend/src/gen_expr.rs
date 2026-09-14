@@ -2660,6 +2660,26 @@ pub(crate) fn gen_apply(
     fun: &Tree,
     args: &[Tree],
 ) {
+    // `ClassTag.apply[T](classOf[T])` is the evidence value nsc materializes
+    // for a context bound such as `new CustomSerializer[Foo](...)`.  After
+    // erasure the `$classOf` argument is typed as the method's abstract `T`,
+    // while the surrounding `TypeApply` still carries the concrete `Foo`.
+    // Treating that abstract type as `Object` makes the serializer advertise
+    // `ClassTag[Object]` at runtime, so json4s (and any other ClassTag keyed
+    // API) cannot find its serializer.  Preserve the type argument while it
+    // is still present instead of asking `gen_java_class_of` to erase T.
+    if let Some(tag_ty) = class_tag_apply_type(ctx, fun, args) {
+        if let TreeKind::Select { qual, .. } = peel_fun(fun).kind.clone() {
+            gen_expr(asm, frame, ctx, &qual);
+            gen_java_class_of(asm, ctx, &tag_ty);
+            asm.invokevirtual(
+                "scala/reflect/ClassTag$",
+                "apply",
+                "(Ljava/lang/Class;)Lscala/reflect/ClassTag;",
+            );
+            return;
+        }
+    }
     // `f.asInstanceOf[A => B](v)`: the cast yields a *value*, and the
     // arguments belong to that value's `apply`. `peel_fun` below strips the
     // `TypeApply` and would call `asInstanceOf` itself -- with an argument it
@@ -3642,6 +3662,61 @@ pub(crate) fn gen_apply(
             _ => None,
         };
         invoke_method_with_receiver(asm, ctx, fun.sym, Some(&tree.ty), receiver_ty);
+    }
+}
+
+/// Concrete type argument of the compiler-generated `ClassTag.apply[T]`
+/// expression.  The type argument is deliberately read from the `TypeApply`
+/// tree rather than from the `$classOf` child: erasure has already changed the
+/// latter to the abstract method parameter `T`.
+fn class_tag_apply_type(ctx: &EmitCtx, fun: &Tree, args: &[Tree]) -> Option<Type> {
+    if args.len() != 1 || !matches!(&args[0].kind, TreeKind::Ident { name } if name == "$classOf") {
+        return None;
+    }
+    let tag_ty = match &fun.kind {
+        TreeKind::TypeApply { args: targs, .. } if targs.len() == 1 => targs[0].ty.clone(),
+        // The implicit-evidence expansion normally leaves the `TypeApply`
+        // around.  Some retyping/erasure paths consume it, however, after
+        // specializing the `$classOf` child to the concrete class.  In that
+        // form the child is the only reliable source of the tag type.
+        _ => args[0].ty.clone(),
+    };
+    let selected = peel_fun(fun);
+    let TreeKind::Select { qual, name } = &selected.kind else {
+        return None;
+    };
+    if name != "apply" {
+        return None;
+    }
+    if selected.sym.is_none() {
+        return None;
+    }
+    let owner = ctx.st.get(selected.sym).owner;
+    // Match the library symbol by its complete JVM path.  A simple-name
+    // check would rewrite an unrelated user-defined `ClassTag` companion.
+    let owner_internal = ctx.st.jvm_internal(owner);
+    if owner_internal != "scala/reflect/ClassTag" && owner_internal != "scala/reflect/ClassTag$" {
+        return None;
+    }
+    // The selected receiver must be the corresponding library class or
+    // companion as well; this keeps a same-named member in another namespace
+    // out of the compiler intrinsic.
+    let Some(receiver) = ctx.st.class_sym_of(&qual.ty) else {
+        return None;
+    };
+    let receiver_internal = ctx.st.jvm_internal(receiver);
+    if receiver_internal != "scala/reflect/ClassTag"
+        && receiver_internal != "scala/reflect/ClassTag$"
+    {
+        return None;
+    }
+    if matches!(
+        tag_ty,
+        Type::Any | Type::AnyRef | Type::AnyVal | Type::TypeParam(_)
+    ) {
+        None
+    } else {
+        Some(tag_ty)
     }
 }
 

@@ -219,7 +219,8 @@ impl<'a> Gen<'a> {
             if self.st.get(class_id).flags.contains(Flags::CASE)
                 && !case_apply_sym(self.st, class_id).is_none()
             {
-                emit_case_apply(&mut b, self.st, class_id);
+                let apply_sym = case_apply_sym(self.st, class_id);
+                emit_case_apply(&mut b, self.st, class_id, self.sig_of(apply_sym));
                 // nsc emits no forwarder for an `apply` that is not public.
                 // With `-Xsource-features:case-apply-copy-access` the `public
                 // static C apply(int)` on the case class itself disappears for
@@ -406,7 +407,7 @@ impl<'a> Gen<'a> {
             None => (ACC_PRIVATE, "()V".to_string(), 4),
         };
         let outer_cls = inner_outer.unwrap_or(SymbolId::NONE);
-        b.add_code(acc, "<init>", &ctor_desc, max_locals, |asm| {
+        let ctor_method = b.add_code(acc, "<init>", &ctor_desc, max_locals, |asm| {
             let mut frame = Frame::instance();
             if own_outer.is_some() {
                 frame.next_slot += 1; // slot 1 is $outer
@@ -605,6 +606,15 @@ impl<'a> Gen<'a> {
             }
             asm.vreturn();
         });
+        if own_outer.is_some() {
+            b.set_method_params(
+                ctor_method,
+                vec![(
+                    Some("$outer".to_string()),
+                    ACC_FINAL | crate::classfile::ACC_SYNTHETIC,
+                )],
+            );
+        }
     }
 
     pub(crate) fn emit_module_clinit(&self, b: &mut ClassBuilder) {
@@ -898,7 +908,8 @@ impl<'a> Gen<'a> {
         if inner_outer.is_none() {
             self.emit_module_clinit(&mut b);
         }
-        emit_case_apply(&mut b, self.st, class_id);
+        let apply_sym = case_apply_sym(self.st, class_id);
+        emit_case_apply(&mut b, self.st, class_id, self.sig_of(apply_sym));
         emit_case_unapply(&mut b, self.st, class_id, self.abi);
         if abs_fn.is_some() {
             emit_case_apply_bridge(&mut b, self.st, class_id, self.abi);
@@ -1429,7 +1440,12 @@ pub(crate) fn emit_case_apply_bridge(
     });
 }
 
-pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: SymbolId) {
+pub(crate) fn emit_case_apply(
+    b: &mut ClassBuilder,
+    st: &SymbolTable,
+    class_id: SymbolId,
+    signature: Option<&crate::sig::GenericSignature>,
+) {
     let fields = st.get(class_id).ctor_fields.clone();
     let class_jvm = class_internal(st, class_id);
     // `case class C[T](y: T) extends AnyVal`: the class erases to its
@@ -1448,10 +1464,26 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
             return;
         }
         let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
-        b.add_code(acc, "apply", &desc, 1 + sort.slots(), move |asm| {
+        let method = b.add_code(acc, "apply", &desc, 1 + sort.slots(), move |asm| {
             load(asm, 1, sort);
             ret_of_sort(asm, sort);
         });
+        b.set_method_param_names(method, vec![Some(st.get(fields[0]).name.clone())]);
+        // The erased value-class apply is the identity on its underlying
+        // value. Its generic return is therefore the same type as its sole
+        // argument (`<A>(TA;)TA;`), not the erased `Object` that may remain on
+        // the synthetic apply symbol after value-class lowering.
+        let value_signature = signature.cloned().map(|mut g| {
+            if let (Some(open), Some(close)) = (g.sig.find('('), g.sig.find(')')) {
+                if open < close {
+                    let underlying = g.sig[open + 1..close].to_string();
+                    g.sig.truncate(close + 1);
+                    g.sig.push_str(&underlying);
+                }
+            }
+            g
+        });
+        b.sign_method(method, value_signature.as_ref());
         return;
     }
     let mut params = Vec::new();
@@ -1494,7 +1526,7 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         base_ctor_d
     };
     let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
-    b.add_code(acc, "apply", &desc, locals.max(1), |asm| {
+    let method = b.add_code(acc, "apply", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
         asm.dup();
         if let Some((owner, d)) = &outer {
@@ -1507,6 +1539,14 @@ pub(crate) fn emit_case_apply(b: &mut ClassBuilder, st: &SymbolTable, class_id: 
         asm.invokespecial(&class_jvm, "<init>", &ctor_d);
         asm.areturn();
     });
+    b.set_method_param_names(
+        method,
+        fields
+            .iter()
+            .map(|f| Some(st.get(*f).name.clone()))
+            .collect(),
+    );
+    b.sign_method(method, signature);
 }
 
 /// The erased type a `case class … extends AnyVal`'s companion `apply` and
@@ -1602,11 +1642,14 @@ pub(crate) fn emit_case_unapply(
             .copied()
             // The primary constructor is the one whose sections account for
             // exactly the case fields; an auxiliary `def this` does not.
-            .find(|&m| {
-                st.get(m).name == "<init>"
-                    && st.get(m).paramss.iter().map(|ps| ps.len()).sum::<usize>() == n_fields
+            .find(|&m| st.get(m).name == "<init>" && st.get(m).params.len() == n_fields)
+            .and_then(|m| {
+                let ctor = st.get(m);
+                ctor.pickle_clauses
+                    .first()
+                    .copied()
+                    .or_else(|| ctor.paramss.first().map(Vec::len))
             })
-            .and_then(|m| st.get(m).paramss.first().map(|ps| ps.len()))
             .unwrap_or(n_fields)
     };
     // A shape the two sides disagree about is one this emitter does not

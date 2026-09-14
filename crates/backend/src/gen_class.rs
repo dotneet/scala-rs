@@ -12,6 +12,50 @@ use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::SymKind;
 use std::collections::{HashMap, HashSet};
 
+/// Whether a primary-constructor parameter owns a physical JVM field.
+///
+/// Every ordinary-class parameter does, as does the first parameter clause of
+/// a case class. A bare parameter in a later case-class clause is different:
+/// nsc stores it only when code that outlives the constructor reads it. An
+/// eager initializer can use the constructor local directly; an ordinary
+/// method cannot. Explicit `val`/`var` parameters remain fields regardless of
+/// their clause.
+fn ctor_param_needs_field(
+    st: &scala_rs_typer::SymbolTable,
+    class_id: SymbolId,
+    clause_idx: usize,
+    param: &Tree,
+    body: &[Tree],
+) -> bool {
+    if class_id.is_none() || !st.get(class_id).flags.contains(Flags::CASE) || clause_idx == 0 {
+        return true;
+    }
+    let flags = match &param.kind {
+        TreeKind::ValDef { mods, .. } => mods.flags,
+        _ => return true,
+    };
+    flags.contains(Flags::ACCESSOR)
+        || flags.contains(Flags::MUTABLE)
+        || (!param.sym.is_none()
+            && body.iter().any(|tree| match &tree.kind {
+                // Eager value initializers and bare template statements run
+                // inside `<init>`, where the constructor local is still
+                // available; they do not force retained storage. A method,
+                // lazy initializer, or nested template can run after `<init>`
+                // and therefore does.
+                TreeKind::DefDef { rhs, .. } => {
+                    scala_rs_typer::tree_mentions_symbol(rhs, param.sym)
+                }
+                TreeKind::ValDef { mods, rhs, .. } if mods.flags.contains(Flags::LAZY) => {
+                    scala_rs_typer::tree_mentions_symbol(rhs, param.sym)
+                }
+                TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. } => {
+                    scala_rs_typer::tree_mentions_symbol(tree, param.sym)
+                }
+                _ => false,
+            }))
+}
+
 impl<'a> Gen<'a> {
     /// The generic signature recorded for `sym` before erasure, if any.
     /// `SymbolId::NONE` and every symbol the pass skipped answer `None`, which
@@ -525,9 +569,12 @@ impl<'a> Gen<'a> {
         }
 
         // constructor / body fields
-        for clause in vparamss {
+        for (clause_idx, clause) in vparamss.iter().enumerate() {
             for p in clause {
                 if let TreeKind::ValDef { name, mods, .. } = &p.kind {
+                    if !ctor_param_needs_field(self.st, class_id, clause_idx, p, &impl_.body) {
+                        continue;
+                    }
                     let ty = if p.ty.is_no_type() && !p.sym.is_none() {
                         self.st.get(p.sym).ty.clone()
                     } else {
@@ -1162,19 +1209,23 @@ impl<'a> Gen<'a> {
             frame.next_slot += 1; // slot 1 is $outer
         }
         let mut param_info = Vec::new();
-        for p in &params {
-            let ty = if p.ty.is_no_type() && !p.sym.is_none() {
-                self.st.get(p.sym).ty.clone()
-            } else {
-                p.ty.clone()
-            };
-            // The field store below moves the argument straight through, so
-            // the slot sort is what the JVM actually passes: a `Unit`
-            // parameter arrives as `BoxedUnit`, not as nothing.
-            let sort = jvm_slot_sort(&ty);
-            let slot = frame.alloc_param(p.sym, jvm_sort(&ty), &ty);
-            let fname = p.name().unwrap_or("").to_string();
-            param_info.push((slot, sort, fname, jvm_desc_val(self.st, &ty)));
+        for (clause_idx, clause) in vparamss.iter().enumerate() {
+            for p in clause {
+                let ty = if p.ty.is_no_type() && !p.sym.is_none() {
+                    self.st.get(p.sym).ty.clone()
+                } else {
+                    p.ty.clone()
+                };
+                // The field store below moves the argument straight through, so
+                // the slot sort is what the JVM actually passes: a `Unit`
+                // parameter arrives as `BoxedUnit`, not as nothing.
+                let sort = jvm_slot_sort(&ty);
+                let slot = frame.alloc_param(p.sym, jvm_sort(&ty), &ty);
+                let fname = p.name().unwrap_or("").to_string();
+                if ctor_param_needs_field(self.st, class_id, clause_idx, p, body) {
+                    param_info.push((slot, sort, fname, jvm_desc_val(self.st, &ty)));
+                }
+            }
         }
         // The class body reaches a `var` parameter through its *field*, the
         // way nsc does. While the constructor's own local stayed bound to the
@@ -1208,9 +1259,38 @@ impl<'a> Gen<'a> {
             let slot = frame.alloc(*id, *sort);
             cap_info.push((slot, *sort, fname.clone(), fdesc.clone()));
         }
+        // Keep the constructor's source names in the classfile. Java
+        // reflection (and json4s' ParanamerReader) uses MethodParameters,
+        // not the Scala signature, to match constructor arguments to case
+        // class properties. nsc names the enclosing-instance parameter
+        // `$outer` and marks it FINAL | SYNTHETIC; lambda-lifted captures keep
+        // their generated names and are FINAL like ordinary parameters.
+        let mut ctor_params = Vec::new();
+        if ctor_outer_ty.is_some() {
+            ctor_params.push((Some("$outer".to_string()), ACC_FINAL | ACC_SYNTHETIC));
+        }
+        ctor_params.extend(
+            params
+                .iter()
+                .map(|p| (p.name().map(std::string::ToString::to_string), ACC_FINAL)),
+        );
+        ctor_params.extend(
+            caps.iter()
+                .map(|(_, name, _, _)| (Some(name.clone()), ACC_FINAL)),
+        );
+        let capture_desc = capture_params_desc(self.st, &self.boxed_vars, class_id);
+        let outer_param_desc = ctor_outer_ty.map_or_else(String::new, |o| {
+            jvm_desc_val(
+                self.st,
+                &Type::Class {
+                    sym: o,
+                    args: vec![],
+                },
+            )
+        });
         let desc = desc_with_extra_params(
             &jvm_method_desc(self.st, &types, &Type::Unit),
-            &capture_params_desc(self.st, &self.boxed_vars, class_id),
+            &capture_desc,
         );
         let super_name = b.super_name.clone();
         let (super_owner, super_desc, super_args, super_cls, super_field_tys) =
@@ -1241,7 +1321,7 @@ impl<'a> Gen<'a> {
         let has_outer = outer.is_some();
         let outer_desc_c = outer_desc.clone();
         let mixin_inits = self.mixin_init_calls(class_id);
-        b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
+        let ctor_method = b.add_code(ACC_PUBLIC, "<init>", &desc, max_locals, |asm| {
             let mut frame = frame;
             let mut ctx_early = emit_ctx(
                 st,
@@ -1473,6 +1553,25 @@ impl<'a> Gen<'a> {
             }
             asm.vreturn();
         });
+        b.set_method_params(ctor_method, ctor_params);
+        // Generic constructor parameter types are part of the public class
+        // shape.  In particular json4s obtains `Option[Restrictions]` from
+        // the case-class constructor's Signature; without it the JVM exposes
+        // a raw Option and extraction eventually calls `typeArgs.head`.
+        // Auxiliary constructors have their own DefDef symbols and are signed
+        // by `emit_def`; identify this primary constructor by its source
+        // parameter symbols.
+        let ctor_param_ids: Vec<SymbolId> = params.iter().map(|p| p.sym).collect();
+        let ctor_sym = self.st.get(class_id).members.iter().copied().find(|&m| {
+            let s = self.st.get(m);
+            s.name == "<init>" && s.params == ctor_param_ids
+        });
+        b.sign_constructor(
+            ctor_method,
+            ctor_sym.and_then(|s| self.sig_of(s)),
+            &outer_param_desc,
+            &capture_desc,
+        );
     }
 
     pub(crate) fn emit_def(&self, b: &mut ClassBuilder, class_id: SymbolId, def: &Tree) {

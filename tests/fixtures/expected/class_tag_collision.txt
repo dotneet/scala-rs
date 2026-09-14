@@ -1,0 +1,1 @@
+custom:class java.lang.String

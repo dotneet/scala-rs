@@ -1,0 +1,8 @@
+value,extra
+value,extra
+public GenericMeta(A,scala.collection.immutable.List<A>)
+public <A> GenericMeta<A> GenericMeta$.apply(A,scala.collection.immutable.List<A>)
+1
+GenericMeta(value)
+Nested(value)
+nested:value!

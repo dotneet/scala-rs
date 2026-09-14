@@ -22,6 +22,8 @@ pub const ACC_TRANSIENT: u16 = 0x0080;
 /// a Java varargs array (`@scala.annotation.varargs`).
 pub const ACC_VARARGS: u16 = 0x0080;
 pub const ACC_SYNTHETIC: u16 = 0x1000;
+/// Method-parameter flag (JVMS §4.7.24).
+pub const ACC_MANDATED: u16 = 0x8000;
 /// `strictfp` (`@scala.annotation.strictfp`); meaningful up to class file
 /// version 60, and this writer emits 52.
 pub const ACC_STRICT: u16 = 0x0800;
@@ -441,6 +443,33 @@ pub struct Method {
     /// through [`crate::gen::ClassBuilder::sign_last`], which refuses any
     /// string that does not erase back to `desc`.
     pub signature: Option<String>,
+    /// JVMS §4.7.24 `MethodParameters`, in descriptor order. `None` keeps a
+    /// parameter slot unnamed (for example the synthetic enclosing-instance
+    /// argument of a nested class). Reflection libraries such as json4s use
+    /// these names when selecting a constructor for a case class.
+    pub param_names: Vec<Option<String>>,
+    /// JVMS `MethodParameters` access flags, parallel to `param_names`.
+    pub param_flags: Vec<u16>,
+}
+
+fn method_parameter_count(desc: &str) -> usize {
+    let Some(end) = desc.find(')') else { return 0 };
+    let bytes = desc.as_bytes();
+    let mut i = usize::from(bytes.first() == Some(&b'('));
+    let mut count = 0;
+    while i < end {
+        count += 1;
+        while i < end && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i < end && bytes[i] == b'L' {
+            while i < end && bytes[i] != b';' {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    count
 }
 
 #[derive(Clone, Debug)]
@@ -615,13 +644,51 @@ impl ClassEmit {
         } else {
             None
         };
+        let method_params_attr = if self.methods.iter().any(|m| !m.param_names.is_empty()) {
+            Some(pool.utf8("MethodParameters"))
+        } else {
+            None
+        };
         let mut methods_data = Vec::new();
         for m in &self.methods {
             let n = pool.utf8(&m.name);
             let d = pool.utf8(&m.desc);
             let annots: Vec<u16> = m.java_annots.iter().map(|a| pool.utf8(a)).collect();
             let sig = m.signature.as_deref().map(|s| pool.utf8(s));
-            methods_data.push((m.access, n, d, m.code.clone(), annots, sig));
+            if m.param_names.len() != m.param_flags.len()
+                || (!m.param_names.is_empty()
+                    && m.param_names.len() != method_parameter_count(&m.desc))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "MethodParameters count for {}{} does not match its descriptor",
+                        m.name, m.desc
+                    ),
+                ));
+            }
+            if m.param_flags
+                .iter()
+                .any(|flags| flags & !(ACC_FINAL | ACC_SYNTHETIC | ACC_MANDATED) != 0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("illegal MethodParameters flags on {}{}", m.name, m.desc),
+                ));
+            }
+            let param_names: Vec<(Option<u16>, u16)> = m
+                .param_names
+                .iter()
+                .zip(&m.param_flags)
+                .map(|(name, flags)| (name.as_deref().map(|n| pool.utf8(n)), *flags))
+                .collect();
+            if param_names.len() > u8::MAX as usize {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("too many MethodParameters entries on {}{}", m.name, m.desc),
+                ));
+            }
+            methods_data.push((m.access, n, d, m.code.clone(), annots, sig, param_names));
         }
         let mut out = Vec::new();
         out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
@@ -654,13 +721,14 @@ impl ClassEmit {
             }
         }
         out.extend_from_slice(&(methods_data.len() as u16).to_be_bytes());
-        for (acc, n, d, code, annots, sig) in methods_data {
+        for (acc, n, d, code, annots, sig, param_names) in methods_data {
             out.extend_from_slice(&acc.to_be_bytes());
             out.extend_from_slice(&n.to_be_bytes());
             out.extend_from_slice(&d.to_be_bytes());
             let n_attrs = u16::from(code.is_some())
                 + u16::from(!annots.is_empty())
-                + u16::from(sig.is_some());
+                + u16::from(sig.is_some())
+                + u16::from(!param_names.is_empty());
             out.extend_from_slice(&n_attrs.to_be_bytes());
             if let Some(c) = code {
                 out.extend_from_slice(&code_attr.to_be_bytes());
@@ -704,6 +772,16 @@ impl ClassEmit {
                 out.extend_from_slice(&a.to_be_bytes());
                 out.extend_from_slice(&2u32.to_be_bytes());
                 out.extend_from_slice(&s.to_be_bytes());
+            }
+            if !param_names.is_empty() {
+                let a = method_params_attr.expect("MethodParameters utf8");
+                out.extend_from_slice(&a.to_be_bytes());
+                out.extend_from_slice(&((1 + param_names.len() * 4) as u32).to_be_bytes());
+                out.push(param_names.len() as u8);
+                for (name, flags) in param_names {
+                    out.extend_from_slice(&name.unwrap_or(0).to_be_bytes());
+                    out.extend_from_slice(&flags.to_be_bytes());
+                }
             }
         }
         let n_class_attrs = 1u16

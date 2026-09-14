@@ -1280,6 +1280,8 @@ impl ClassBuilder {
             code: Some(code),
             java_annots: Vec::new(),
             signature: None,
+            param_names: Vec::new(),
+            param_flags: Vec::new(),
         });
         MethodIndex(self.methods.len() - 1)
     }
@@ -1292,8 +1294,36 @@ impl ClassBuilder {
             code: None,
             java_annots: Vec::new(),
             signature: None,
+            param_names: Vec::new(),
+            param_flags: Vec::new(),
         });
         MethodIndex(self.methods.len() - 1)
+    }
+
+    /// Attach source/synthetic parameter names to one emitted method. The
+    /// names are written as the JVM `MethodParameters` attribute, so Java
+    /// reflection can recover them even when debug local-variable tables are
+    /// absent.
+    pub(crate) fn set_method_param_names(
+        &mut self,
+        index: MethodIndex,
+        names: Vec<Option<String>>,
+    ) {
+        if let Some(method) = self.methods.get_mut(index.0) {
+            method.param_flags = vec![ACC_FINAL; names.len()];
+            method.param_names = names;
+        }
+    }
+
+    pub(crate) fn set_method_params(
+        &mut self,
+        index: MethodIndex,
+        params: Vec<(Option<String>, u16)>,
+    ) {
+        if let Some(method) = self.methods.get_mut(index.0) {
+            method.param_names = params.iter().map(|(name, _)| name.clone()).collect();
+            method.param_flags = params.into_iter().map(|(_, flags)| flags).collect();
+        }
     }
 
     /// Attach a generic signature to a particular method.
@@ -1310,19 +1340,39 @@ impl ClassBuilder {
             return;
         }
         if crate::sig::erase_signature(&g.sig, &g.tvars).as_deref() != Some(m.desc.as_str()) {
-            if std::env::var_os("SCALA_RS_SIG_DEBUG").is_some() {
-                eprintln!(
-                    "SIGDROP {} {} sig={} erased={:?} tvars={:?}",
-                    m.name,
-                    m.desc,
-                    g.sig,
-                    crate::sig::erase_signature(&g.sig, &g.tvars),
-                    g.tvars
-                );
-            }
             return;
         }
         m.signature = Some(g.sig.clone());
+    }
+
+    /// Attach a source-level constructor signature whose JVM descriptor also
+    /// contains compiler-added ABI parameters. nsc leaves the synthetic
+    /// enclosing instance and lambda-lift captures out of `Signature`, even
+    /// though they remain in the descriptor and `MethodParameters`.
+    pub(crate) fn sign_constructor(
+        &mut self,
+        index: MethodIndex,
+        sig: Option<&crate::sig::GenericSignature>,
+        prefix_desc: &str,
+        suffix_desc: &str,
+    ) {
+        let Some(g) = sig else { return };
+        let Some(m) = self.methods.get_mut(index.0) else {
+            return;
+        };
+        let Some(erased) = crate::sig::erase_signature(&g.sig, &g.tvars) else {
+            return;
+        };
+        let Some(rest) = erased.strip_prefix('(') else {
+            return;
+        };
+        let Some((params, ret)) = rest.split_once(')') else {
+            return;
+        };
+        let abi_desc = format!("({prefix_desc}{params}{suffix_desc}){ret}");
+        if abi_desc == m.desc {
+            m.signature = Some(g.sig.clone());
+        }
     }
 
     /// Attach a JVMS §4.7.9 `Signature` to the method just emitted.

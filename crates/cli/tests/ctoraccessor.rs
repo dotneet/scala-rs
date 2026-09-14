@@ -291,6 +291,149 @@ fn method_descs(class_file: &Path, name: &str) -> Vec<String> {
     descs
 }
 
+/// Full `javap -v` output for metadata assertions.  The companion method's
+/// generic Signature and MethodParameters are both part of the public ABI;
+/// checking only the erased descriptor would miss the json4s failure.
+fn javap_verbose(out: &Path, class: &str) -> String {
+    let output = Command::new("javap")
+        .args(["-p", "-v", "-cp", out.to_str().unwrap(), class])
+        .output()
+        .expect("javap -v");
+    assert!(
+        output.status.success(),
+        "javap -v {class} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn javap_method<'a>(output: &'a str, declaration: &str) -> &'a str {
+    let start = output
+        .find(declaration)
+        .unwrap_or_else(|| panic!("javap declaration {declaration:?} is missing:\n{output}"));
+    let rest = &output[start..];
+    let end = rest[declaration.len()..]
+        .find("\n  public ")
+        .map_or(rest.len(), |offset| declaration.len() + offset);
+    &rest[..end]
+}
+
+fn method_parameter_rows(method: &str) -> Vec<String> {
+    let Some((_, table)) = method.split_once("    MethodParameters:\n") else {
+        return Vec::new();
+    };
+    table
+        .lines()
+        .skip(1) // `Name Flags` heading
+        .take_while(|line| line.starts_with("      "))
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect()
+}
+
+/// A generic case class's constructor and synthetic companion `apply` must
+/// retain both kinds of source metadata.  Java reflection is what json4s
+/// uses at runtime, while `javap` makes the exact classfile attributes
+/// visible in this regression.  The second parameter list is intentional:
+/// it was the shape that exposed the missing synthetic-apply names.
+#[test]
+fn generic_case_class_ctor_and_apply_metadata() {
+    if !java_available() {
+        return;
+    }
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip generic case metadata: scala-library jar not obtainable");
+        return;
+    };
+    let jar_s = jar.to_str().unwrap();
+    let out = compile_fixture_with("generic_case_metadata", &["--scala-library", jar_s]);
+
+    // Reflection sees the source parameter names and the generic type shape
+    // through the same APIs used by Java/Scala serializers.
+    assert_eq!(
+        run_java(&out, Some(jar_s)),
+        expected_stdout("generic_case_metadata"),
+        "constructor/apply reflection metadata differs"
+    );
+
+    let ctor = javap_verbose(&out, "GenericMeta");
+    assert!(
+        ctor.contains("Signature:")
+            && ctor.contains("(TA;Lscala/collection/immutable/List<TA;>;)V"),
+        "generic constructor Signature is missing or malformed:\n{ctor}"
+    );
+    assert!(
+        ctor.contains("      value                          final")
+            && ctor.contains("      extra                          final"),
+        "constructor MethodParameters must preserve both source names:\n{ctor}"
+    );
+    assert!(
+        !ctor.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("private final ") && line.ends_with(" extra;")
+        }),
+        "an unused later bare case-class parameter must not become a field:\n{ctor}"
+    );
+
+    let companion = javap_verbose(&out, "GenericMeta$");
+    assert!(
+        companion.contains(
+            "<A:Ljava/lang/Object;>(TA;Lscala/collection/immutable/List<TA;>;)LGenericMeta<TA;>;"
+        ),
+        "generic companion apply Signature is missing or malformed:\n{companion}"
+    );
+    assert!(
+        companion.contains("      value                          final")
+            && companion.contains("      extra                          final"),
+        "companion apply MethodParameters must preserve both source names:\n{companion}"
+    );
+    assert!(
+        companion.contains("Field GenericMeta.value:")
+            && !companion.contains("Field GenericMeta.extra:"),
+        "unapply must extract only the first case-parameter section:\n{companion}"
+    );
+
+    let value_companion = javap_verbose(&out, "GenericValue$");
+    assert!(
+        value_companion.contains("<A:Ljava/lang/Object;>(TA;)TA;"),
+        "generic value-class apply must return its underlying type variable:\n{value_companion}"
+    );
+    assert!(
+        value_companion.contains("      value                          final"),
+        "generic value-class apply must retain its source parameter name:\n{value_companion}"
+    );
+
+    // Hidden constructor parameters stay in descriptor/MethodParameters
+    // order but not in the generic Signature, matching nsc 2.13.16. The
+    // `$outer` entry is synthetic; an ordinary lambda-lift capture is not.
+    let nested = javap_verbose(&out, "GenericOuter$Nested");
+    let nested_ctor = javap_method(&nested, "  public GenericOuter$Nested(");
+    assert!(
+        nested_ctor.contains("descriptor: (LGenericOuter;Ljava/lang/Object;)V")
+            && nested_ctor.contains("// (TA;)V"),
+        "nested constructor must exclude only its outer parameter from Signature:\n{nested_ctor}"
+    );
+    assert_eq!(
+        method_parameter_rows(nested_ctor),
+        ["$outer final synthetic", "value final"],
+        "nested constructor MethodParameters count/order/flags differ"
+    );
+
+    let captured = javap_verbose(&out, "GenericOuter$Captured$1");
+    let captured_ctor = javap_method(&captured, "  public GenericOuter$Captured$1(");
+    assert!(
+        captured_ctor
+            .contains("descriptor: (LGenericOuter;Ljava/lang/Object;Ljava/lang/String;)V")
+            && captured_ctor.contains("// (TA;)V"),
+        "capturing constructor must exclude outer/capture parameters from Signature:\n{captured_ctor}"
+    );
+    assert_eq!(
+        method_parameter_rows(captured_ctor),
+        ["$outer final synthetic", "item final", "suffix$1 final"],
+        "capturing constructor MethodParameters count/order/flags differ"
+    );
+    let _ = fs::remove_dir_all(&out);
+}
+
 /// `f.tupled` / `f.curried` / `Function.untupled`, against the real library.
 #[test]
 fn scala_library_dual_run_ctacc_fn() {

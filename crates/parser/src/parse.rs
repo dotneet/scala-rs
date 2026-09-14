@@ -3340,10 +3340,17 @@ impl<'a> Parser<'a> {
         let saved_template = std::mem::replace(&mut self.template_stats, false);
         loop {
             self.skip_nl();
-            if matches!(
-                self.kind(),
-                TokenKind::Case | TokenKind::RBrace | TokenKind::Eof
-            ) {
+            // A local `case class` / `case object` is a definition in the
+            // lambda body, not the next clause of an enclosing partial
+            // function. Without this lookahead, `{ _ => case class Pair ...
+            // }` returns an empty lambda body and leaves `case` for the outer
+            // block parser, which reports it as an unterminated statement.
+            let case_definition = matches!(self.kind(), TokenKind::Case)
+                && matches!(self.kind_at(1), TokenKind::Class | TokenKind::Object);
+            if matches!(self.kind(), TokenKind::RBrace | TokenKind::Eof) {
+                break;
+            }
+            if matches!(self.kind(), TokenKind::Case) && !case_definition {
                 break;
             }
             if matches!(self.kind(), TokenKind::Semi) {
