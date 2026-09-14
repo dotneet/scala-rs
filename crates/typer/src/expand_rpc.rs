@@ -33,7 +33,7 @@
 //! cannot answer *this* question -- which becomes a compile diagnostic naming
 //! what was missing. A question scala-rs would have to guess at is the third.
 
-use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
+use scala_rs_parser::{Flags, NodeId, SymbolId, Tree, TreeKind, Type};
 use scala_rs_pickle::names::encode_method_name;
 use scala_rs_span::Level;
 
@@ -111,7 +111,17 @@ impl Typer {
                 .get(&(self.file_index, scala_rs_parser::NodeId(id)))
             {
                 Some(sym) => format!("(a ref {})", sym.0),
-                None => refusal("the function has not been typed at this call site"),
+                // A typed macro result can contain a function nested in a
+                // generated class body.  Its enclosing class is rebuilt only
+                // when a later macro reads that class as `c.prefix`, so the
+                // ordinary function-literal typer has not visited the body
+                // yet.  Allocate the same per-run synthetic symbol lazily;
+                // this preserves the lexical owner without cloning the
+                // subtree or keeping engine-global state.
+                None => {
+                    let sym = self.macro_function_symbol(NodeId(id));
+                    format!("(a ref {})", sym.0)
+                }
             };
         }
         let sym = SymbolId(id);

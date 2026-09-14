@@ -3395,11 +3395,13 @@ placeholder a current-run class travels as (§5.1). Six of the 31 name two class
 
 The integration candidate extends the engine protocol with blocks, local
 methods, functions, conditionals, type ascriptions, constructor applications,
-repeated argument groups, and concrete local classes with empty superclass
+repeated argument groups, and concrete local classes with superclass
 constructor arguments. Every reconstructed node receives a fresh identity;
 sharing NodeId(0) let an earlier block-local declaration hide a later class
 member. Class templates retain initialization statements and constructor
-parameters; unsupported superclass argument transport is still diagnosed.
+parameters, and superclass applications retain their arguments. Type-definition
+bounds remain explicitly refused because the wire has no `TypeBoundsTree`
+representation yet.
 
 `c.typecheck` preserves attachments when adapting a tree and rejects unresolved
 TERM overloads before serialization, so `silent = true` returns EmptyTree as
@@ -3480,6 +3482,10 @@ class implementing a trait's abstract `val`s, with a default, `Option` and times
 scala-rs and by real scalac 2.13.16, both run against in-memory H2 under `-Xverify:all` and print the
 same rows, the same `toMapped` / `toBase` results and the same fast-path converter names
 (`Fast Path of (String, Int, Option[String]).mapTo[gbmacm.Account]`).
+
+`tests/fixtures/gbmac_prefix.scala` isolates the remaining transport edge: two inner `mapTo`s feed an
+outer `mapTo` in a local table, so the outer implementation reads the generated converter through
+`c.prefix`. Both scala-rs and real scalac compile and run it, printing the same `prefix` result.
 
 #### 1. A class this run is compiling travels as its identity, and is described lazily, in nsc's shape
 

@@ -667,6 +667,12 @@ public final class ScalaRsMacroEngine {
             case "Annotated":
                 return call(companion(kind), "apply", 2,
                     buildTree(kids.get(0)), buildTree(kids.get(1)));
+            case "TypeDef":
+                return call(companion(kind), "apply", 4, buildMods(kids.get(0)),
+                    buildName(kids.get(1)), buildTrees(kids.get(2)), buildTree(kids.get(3)));
+            case "ExistentialTypeTree":
+                return call(companion(kind), "apply", 2,
+                    buildTree(kids.get(0)), buildTrees(kids.get(1)));
             case "Function":
                 return call(companion(kind), "apply", 2,
                     buildTrees(kids.get(0)), buildTree(kids.get(1)));

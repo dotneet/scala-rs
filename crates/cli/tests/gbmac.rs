@@ -9,6 +9,8 @@
 //! * `gbmac_mapto` -- the whole thing, run against an in-memory H2 database
 //!   under `-Xverify:all`, and its near misses (`gbmac_mapto_bad`), which
 //!   both compilers reject;
+//! * `gbmac_prefix` -- nested `mapTo` expansions whose generated converter is
+//!   read by an outer macro through `c.prefix`, with both compilers compared;
 //! * `gbmac_decls_*` -- what the engine's mirror answers about classes this
 //!   run is compiling, flag for flag, and what it refuses by name;
 //! * `gbmac_caseinfo_use` -- `mapToImpl`'s opening on such classes, the
@@ -285,6 +287,16 @@ fn gbmac_mapto_expands_and_runs_on_h2() {
 #[test]
 fn scalac_agrees_gbmac_mapto() {
     slick_program("gbmac_mapto", "gbmacm.Main", true);
+}
+
+#[test]
+fn gbmac_mapto_prefix_expands_and_runs() {
+    slick_program("gbmac_prefix", "Main", false);
+}
+
+#[test]
+fn scalac_agrees_gbmac_mapto_prefix() {
+    slick_program("gbmac_prefix", "Main", true);
 }
 
 #[test]

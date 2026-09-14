@@ -3048,6 +3048,14 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str("))");
             Ok(())
         }
+        TreeKind::Super { qual, mix } => {
+            out.push_str("(t \"Super\" (s0) (t \"This\" (s0) (n type ");
+            quote_into(out, qual.as_deref().unwrap_or(""));
+            out.push_str(")) (n type ");
+            quote_into(out, mix.as_deref().unwrap_or(""));
+            out.push_str("))");
+            Ok(())
+        }
         TreeKind::Select { qual, name } => {
             if class_path_member(cx, t, qual, name, out) {
                 return Ok(());
@@ -3135,6 +3143,44 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push(')');
             Ok(())
         }
+        TreeKind::TypeDef {
+            mods,
+            name,
+            tparams,
+            rhs,
+            lo,
+            hi,
+            views,
+            ctx_bounds,
+        } => {
+            // Reflect's TypeDef tree has a single fourth child: either its
+            // alias RHS or a TypeBoundsTree.  The parser keeps bounds and
+            // view/context bounds separately, and the outbound wire has no
+            // TypeBoundsTree representation yet.  Carry the representable
+            // declaration shape without cloning the borrowed subtree; reject
+            // the rest explicitly rather than silently changing its meaning.
+            if lo.is_some() || hi.is_some() || !views.is_empty() || !ctx_bounds.is_empty() {
+                return unsupported("a type definition with bounds");
+            }
+            out.push_str("(t \"TypeDef\" (s0) ");
+            mods_to_wire(cx, mods, out)?;
+            out.push_str(" (n type ");
+            quote_into(out, name);
+            out.push_str(") ");
+            trees_to_wire(cx, tparams, out)?;
+            out.push(' ');
+            tree_to_wire(cx, rhs, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::ExistentialTypeTree { tpt, clauses } => {
+            out.push_str("(t \"ExistentialTypeTree\" (s0) ");
+            type_tree_to_wire(cx, tpt, out)?;
+            out.push(' ');
+            trees_to_wire(cx, clauses, out)?;
+            out.push(')');
+            Ok(())
+        }
         TreeKind::TypeApply { fun, args } => {
             out.push_str("(t \"TypeApply\" (s0) ");
             tree_to_wire(cx, fun, out)?;
@@ -3182,14 +3228,17 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             trees_to_wire(cx, tparams, out)?;
             out.push_str(" (t \"Template\" (s0) (l");
             for parent in &impl_.parents {
-                if matches!(parent.kind, TreeKind::Apply { .. }) {
-                    return Err(
-                        "macro class transport cannot preserve superclass arguments yet"
-                            .to_string(),
-                    );
-                }
                 out.push(' ');
-                type_tree_to_wire(cx, parent, out)?;
+                // A reflect Template parent is either a type tree (`C`) or
+                // its constructor application (`C(args)`).  Keep the latter
+                // as an Apply instead of dropping its arguments; mapTo's
+                // anonymous fast-path converter extends a parameterised
+                // superclass and relies on this exact shape.
+                if matches!(parent.kind, TreeKind::Apply { .. }) {
+                    tree_to_wire(cx, parent, out)?;
+                } else {
+                    type_tree_to_wire(cx, parent, out)?;
+                }
             }
             out.push_str(") (t \"ValDef\" (s0) (mods (f) (rest \"0\") \"\" (l)) (n term ");
             quote_into(out, impl_.self_name.as_deref().unwrap_or("_"));
