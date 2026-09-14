@@ -658,13 +658,17 @@ fn resolve_type_in(
         };
     }
     // An external `EXTref` carries its package/module owner separately from
-    // the leaf name. The pickle reader preserves that owner as a dotted name;
-    // resolve it by JVM identity before trying the receiver's lexical scopes.
+    // the leaf name. The pickle reader preserves that owner as a dotted name.
+    // Prefer an exact top-level JVM identity, but keep a nested member's leaf
+    // available to the lexical owner walk below: a path-dependent alias such
+    // as `O.EmptyAlias = Owner.Empty` must retain its as-seen-from prefix.
+    let mut lexical_name = name;
     if name.contains('.') {
         let jvm = name.replace('.', "/");
         if let Some(sym) = find_by_jvm(st, &jvm) {
             return Type::Class { sym, args };
         }
+        lexical_name = name.rsplit('.').next().unwrap_or(name);
     }
     for id in method_tps.iter().chain(st.get(owner).tparams.iter()) {
         if st.get(*id).name == name {
@@ -675,7 +679,7 @@ fn resolve_type_in(
     let mut seen = std::collections::HashSet::new();
     while !cur.is_none() && seen.insert(cur.0) {
         if let Some(id) = st
-            .lookup_member(cur, name)
+            .lookup_member(cur, lexical_name)
             .into_iter()
             .find(|&s| st.get(s).is_class_like() || st.get(s).kind == SymKind::TypeMember)
         {
@@ -691,6 +695,18 @@ fn resolve_type_in(
             };
         }
         cur = st.get(cur).owner;
+    }
+    // If the declaring owner is not lexical (an unrelated external nested
+    // class), recover Scala's `$` JVM spelling as a final exact fallback.
+    if name.contains('.') {
+        for (split, _) in name.match_indices('.').rev().skip(1) {
+            let package = name[..split].replace('.', "/");
+            let nested = name[split + 1..].replace('.', "$");
+            let jvm = format!("{package}/{nested}");
+            if let Some(sym) = find_by_jvm(st, &jvm) {
+                return Type::Class { sym, args };
+            }
+        }
     }
     resolve_type_name_args(st, name, args)
 }
@@ -2759,6 +2775,27 @@ fn desc_param_count(desc: &str) -> usize {
 #[cfg(test)]
 mod descriptor_semantics_tests {
     use super::*;
+
+    #[test]
+    fn qualified_pickle_type_resolves_nested_scala_jvm_name() {
+        let mut st = SymbolTable::new();
+        let package = ensure_package(&mut st, "example");
+        let outer = stub_class_in(&mut st, "example/Outer", "Outer".to_string(), package);
+        let inner = stub_class_in(&mut st, "example/Outer$Inner", "Inner".to_string(), outer);
+
+        assert_eq!(
+            resolve_type_in(
+                &st,
+                package,
+                &ClasspathType::simple("example.Outer.Inner"),
+                &[],
+            ),
+            Type::Class {
+                sym: inner,
+                args: Vec::new(),
+            }
+        );
+    }
 
     #[test]
     fn scala_pickle_mapping_covers_primitives_arrays_objects_and_bottoms() {
