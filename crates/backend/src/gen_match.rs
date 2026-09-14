@@ -362,7 +362,35 @@ pub(crate) fn gen_ctor_fields_pattern(
                 jvm_sort(&fty)
             } else {
                 if erased_load_needs_narrowing(ctx.st, &fdesc, &a.ty) {
-                    emit_from_erased_object(asm, ctx.st, &a.ty, ctx.abi);
+                    // A value class in a generic product is boxed while it
+                    // crosses the product's `Object` slot.  Erasure keeps
+                    // the pattern tree's type at the underlying value
+                    // (`Seq` for `NonEmptySeq`), so the ordinary narrowed
+                    // load would cast the box straight to that underlying
+                    // class.  Recover the declaration fact recorded before
+                    // erasure and unbox the real value-class instance first,
+                    // matching scalac's `checkcast NonEmptySeq; invokevirtual
+                    // toSeq` sequence for `case Some(t)`.
+                    let boxed_vc = (!a.sym.is_none())
+                        .then(|| ctx.st.value_class_for_term(a.sym))
+                        .flatten();
+                    if let Some(vc) = boxed_vc {
+                        let class = class_internal(ctx.st, vc);
+                        asm.checkcast(&class);
+                        let under = ctx
+                            .st
+                            .recorded_value_class_underlying(vc)
+                            .cloned()
+                            .or_else(|| ctx.st.value_class_underlying(vc))
+                            .unwrap_or_else(|| a.ty.clone());
+                        asm.invokevirtual(
+                            &class,
+                            ctx.st.value_class_getter(vc),
+                            &format!("(){}", jvm_desc(ctx.st, &under)),
+                        );
+                    } else {
+                        emit_from_erased_object(asm, ctx.st, &a.ty, ctx.abi);
+                    }
                 }
                 jvm_sort(&a.ty)
             };

@@ -204,6 +204,14 @@ fn fixtures_vcls_hnil_type() {
     check_library_mode("vcls_hnil", "hl.Main");
 }
 
+/// A value class stored in an `Option` is boxed at the product field and
+/// unboxed again when a pattern binds it.  The underlying `Seq` must not be
+/// used as the `Some` payload's JVM class.
+#[test]
+fn value_class_option_product_unboxes_pattern_binding() {
+    check_library_mode("vc_option_product", "Main");
+}
+
 #[test]
 fn vcls_bad_is_error() {
     let text = diagnostics("vcls_bad");
