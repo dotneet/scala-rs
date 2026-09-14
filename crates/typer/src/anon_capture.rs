@@ -478,7 +478,28 @@ fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
         }
         _ => {}
     }
-    each_child(pat, &mut |c| pattern_binders(c, out));
+    // A constructor or extractor callee is a stable expression, not a
+    // pattern. Do not recurse through `fun` or a selected qualifier:
+    // `outer.Extractor(x)` may qualify the extractor with a lowercase local,
+    // which must remain a captured value rather than becoming a binder.
+    match &pat.kind {
+        TreeKind::Bind { body, .. } | TreeKind::Star { elem: body } => pattern_binders(body, out),
+        TreeKind::Alternative { trees } => {
+            for tree in trees {
+                pattern_binders(tree, out);
+            }
+        }
+        TreeKind::Apply { args, .. }
+        | TreeKind::TypeApply { args, .. }
+        | TreeKind::UnApply { args, .. } => {
+            for arg in args {
+                pattern_binders(arg, out);
+            }
+        }
+        TreeKind::Typed { expr, .. } => pattern_binders(expr, out),
+        // Selected stable identifiers and type trees introduce no binders.
+        _ => {}
+    }
 }
 
 /// Visit every sub-tree that can hold expressions.

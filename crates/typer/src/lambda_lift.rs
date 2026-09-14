@@ -758,8 +758,30 @@ fn pattern_binders(pat: &Tree, out: &mut HashSet<SymbolId>) {
         }
         _ => {}
     }
-    for c in child_trees(pat) {
-        pattern_binders(c, out);
+    // The callee of a constructor/extractor pattern is a stable expression,
+    // not a pattern.  In particular, the qualifier in `outer.Extractor(x)`
+    // may be a lowercase local; treating it as a variable pattern hides the
+    // enclosing receiver from capture analysis.  Only the pattern arguments
+    // can introduce binders here.
+    match &pat.kind {
+        TreeKind::Bind { body, .. } | TreeKind::Star { elem: body } => pattern_binders(body, out),
+        TreeKind::Alternative { trees } => {
+            for tree in trees {
+                pattern_binders(tree, out);
+            }
+        }
+        TreeKind::Apply { args, .. }
+        | TreeKind::TypeApply { args, .. }
+        | TreeKind::UnApply { args, .. } => {
+            for arg in args {
+                pattern_binders(arg, out);
+            }
+        }
+        TreeKind::Typed { expr, .. } => pattern_binders(expr, out),
+        // A selected stable identifier is an expression, even when its
+        // qualifier happens to have a variable-shaped name.
+        TreeKind::Select { .. } => {}
+        _ => {}
     }
 }
 
@@ -803,7 +825,9 @@ fn collect_captures(
             collect_captures(rhs, &bound, out, st);
         }
         TreeKind::ValDef { rhs, .. } => collect_captures(rhs, own, out, st),
-        TreeKind::Apply { fun, args } | TreeKind::TypeApply { fun, args } => {
+        TreeKind::Apply { fun, args }
+        | TreeKind::TypeApply { fun, args }
+        | TreeKind::UnApply { fun, args } => {
             collect_captures(fun, own, out, st);
             for a in args {
                 collect_captures(a, own, out, st);
