@@ -604,6 +604,15 @@ impl Typer {
     /// while naming `FlatShapeLevel` anywhere in the same file fixed it.
     pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
         let mut completed = self.warm_inherited_implicit_members(wanted);
+        // BuildFrom's general witness carries an F-bound on the source
+        // constructor (`CC[X] <: Iterable[X] with IterableOps[X, CC, _]`).
+        // The prelude deliberately omits the real library's intermediate
+        // `SeqOps`/`IterableOps` edges, so a collection that has not otherwise
+        // been used still fails that bound until its own pickle parents are
+        // attached. Warm only BuildFrom's source constructor here; doing this
+        // for every standard-library type would change the prelude's carefully
+        // limited hierarchy and can expose duplicate methods.
+        completed |= self.warm_buildfrom_source_parents(wanted);
         let mut cands = self.implicits_in_scope();
         // The companion candidates too. `search_implicit_uncached` falls back
         // to `companion_implicits(pt)` when nothing lexical fits, so those are
@@ -691,6 +700,51 @@ impl Typer {
             // `warm_own_scope_once` documents -- and cost slick two new
             // `containsSymbol(Set[A])` overload errors when it was tried.
             fresh |= self.ensure_pickled_parents(&t);
+        }
+        fresh
+    }
+
+    /// Attach the standard-library hierarchy needed by BuildFrom's higher-kind
+    /// source bound. This is intentionally narrower than
+    /// [`Self::ensure_pickled_parents`], which skips `scala/*` classes because
+    /// loading their complete member sets can perturb the hand-written
+    /// prelude. Only parent declarations are attached here, and only for the
+    /// concrete source constructor of a BuildFrom search.
+    fn warm_buildfrom_source_parents(&mut self, wanted: &[Type]) -> bool {
+        let mut work = Vec::new();
+        for ty in wanted {
+            let Type::Class { sym, args } = ty else {
+                continue;
+            };
+            if self.st.get(*sym).jvm_name != "scala/collection/BuildFrom" {
+                continue;
+            }
+            let Some(source) = args.first() else {
+                continue;
+            };
+            let Some(source_sym) = self.st.class_sym_of(source) else {
+                continue;
+            };
+            work.push(source_sym);
+        }
+        work.sort_by_key(|id| id.0);
+        work.dedup_by_key(|id| id.0);
+
+        let mut fresh = false;
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cls) = work.pop() {
+            if cls.is_none() || !seen.insert(cls.0) {
+                continue;
+            }
+            let before = self.st.get(cls).parents.len();
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, cls);
+            fresh |= self.st.get(cls).parents.len() != before;
+            for parent in self.st.get(cls).parents.clone() {
+                if let Some(parent_sym) = self.st.class_sym_of(&parent) {
+                    work.push(parent_sym);
+                }
+            }
         }
         fresh
     }
