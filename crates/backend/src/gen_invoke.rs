@@ -50,6 +50,7 @@ pub(crate) fn invoke_method_with_receiver(
             if ctx.st.get(owner_id).flags.contains(Flags::JAVA)
                 && receiver != owner
                 && !receiver.is_empty()
+                && !is_interface_sym(ctx.st, receiver_id)
                 && jvm_assignable(ctx.st, &receiver, &owner)
             {
                 owner = receiver;
