@@ -32,6 +32,10 @@ fn multi_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/multi/implicit_wildcard_binary")
 }
 
+fn module_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/multi/implicit_module_directory")
+}
+
 fn tmp_dir(tag: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -80,6 +84,21 @@ fn build_library(scalac: &Path, tag: &str) -> PathBuf {
     out
 }
 
+/// Compile a provider with several declarations into a directory. Keeping
+/// this as a directory (rather than a jar) exercises the eager classpath ABI
+/// scan used by local build outputs.
+fn build_module_library(scalac: &Path, tag: &str) -> PathBuf {
+    let out = tmp_dir(tag);
+    let status = Command::new(scalac)
+        .arg("-d")
+        .arg(&out)
+        .arg(module_dir().join("Lib_1.scala"))
+        .status()
+        .expect("run scalac");
+    assert!(status.success(), "scalac implicit module provider failed");
+    out
+}
+
 fn run_java(out: &Path, cp_extra: &str, main: &str) -> String {
     let cp = format!("{}:{}", out.display(), cp_extra);
     let output = Command::new("java")
@@ -89,6 +108,19 @@ fn run_java(out: &Path, cp_extra: &str, main: &str) -> String {
     assert!(
         output.status.success(),
         "java {main} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn run_java_cp(cp: &str, main: &str) -> String {
+    let output = Command::new("java")
+        .args(["-Xverify:all", "-cp", cp, main])
+        .output()
+        .expect("java");
+    assert!(
+        output.status.success(),
+        "java -Xverify:all -cp {cp} {main} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -171,4 +203,52 @@ fn multi_implicit_wildcard_plain_def_is_not_a_conversion() {
         "expected `plainly` to be rejected, got: {err}"
     );
     let _ = fs::remove_dir_all(&out);
+}
+
+/// A Scala object with several declarations is read from a class-file
+/// directory, not a jar. Its classfile methods do not retain implicit
+/// parameter-list/member flags, so both wildcard and named imports must
+/// request the pending module pickle before the lookup returns.
+#[test]
+fn multi_implicit_module_directory_wildcard_and_named() {
+    if !java_available() {
+        return;
+    }
+    let (Some(jar), Some(scalac)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip implicit_module_directory: scala-library jar or scalac not obtainable");
+        return;
+    };
+    let dir = module_dir();
+    let provider = build_module_library(&scalac, "implicit-module-provider");
+    let consumer = tmp_dir("implicit-module-consumer");
+    let output = Command::new(bin())
+        .args(["compile"])
+        .arg(dir.join("Main_1.scala"))
+        .arg("-cp")
+        .arg(&provider)
+        .arg("-d")
+        .arg(&consumer)
+        .args(["--scala-library", jar.to_str().unwrap(), "-Xsource:3-cross"])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "compiling both imports against scalac's directory class files failed: {}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        run_java_cp(
+            &format!(
+                "{}:{}:{}",
+                provider.display(),
+                consumer.display(),
+                jar.display()
+            ),
+            "Main"
+        ),
+        fs::read_to_string(dir.join("expected.txt")).unwrap()
+    );
+    let _ = fs::remove_dir_all(provider);
+    let _ = fs::remove_dir_all(consumer);
 }

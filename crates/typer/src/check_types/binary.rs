@@ -30,15 +30,17 @@ impl Typer {
                 // `java.util.Map.Entry[String, Int]` drew "Entry does not take
                 // type parameters". The nested class file is what carries the
                 // nested `Signature` (`<K:…;V:…>`), so complete it too.
-                for id in found {
+                for &id in &found {
                     if self.st.get(id).kind == SymKind::Class {
                         self.ensure_java_loaded(id, span);
                     }
                 }
+                self.supply_pending_module_implicits(&found);
                 return;
             }
         } else {
             let found = self.st.lookup_member(owner, name);
+            self.supply_pending_module_implicits(&found);
             let has_module = found
                 .iter()
                 .any(|&id| matches!(self.st.get(id).kind, SymKind::Module | SymKind::ModuleClass));
@@ -48,6 +50,7 @@ impl Typer {
                 .find(|&id| self.st.get(id).kind == SymKind::Class)
             {
                 self.ensure_java_loaded(id, span);
+                self.supply_pending_module_implicits(&found);
                 return;
             }
             if found
@@ -63,6 +66,7 @@ impl Typer {
             // module's pickled curried signatures with flattened descriptors.
             // The ambiguity below is specifically a nested-name ambiguity.
             if self.st.get(owner).kind == SymKind::Package && has_module {
+                self.supply_pending_module_implicits(&found);
                 return;
             }
             // A nested companion can be discovered before its class. This is
@@ -117,6 +121,33 @@ impl Typer {
                 let _ = self.package_object_of(owner, span);
             }
             self.complete_package_object_member(owner, name, span);
+        }
+    }
+
+    /// A directory classpath is installed eagerly with the shallow pickle
+    /// shape needed for name lookup.  When an existing module is found through
+    /// that path, complete the module's implicit declarations before returning
+    /// from the lookup.  This is deliberately limited to pending directory
+    /// signatures: jar/source paths already use their normal lazy pickle
+    /// adoption, and ordinary Scala 2 parsing must not gain source-3 behavior.
+    fn supply_pending_module_implicits(&mut self, members: &[SymbolId]) {
+        if !self.library_abi {
+            return;
+        }
+        let modules: Vec<SymbolId> = members
+            .iter()
+            .filter_map(|&id| match self.st.get(id).kind {
+                SymKind::Module => Some(self.st.module_class_of(id)),
+                SymKind::ModuleClass => Some(id),
+                _ => None,
+            })
+            .filter(|&id| {
+                self.st.pending_classpath_signatures.contains(&id) && !self.st.is_source_class(id)
+            })
+            .collect();
+        for class_sym in modules {
+            self.pickle
+                .supply_implicit_members(&mut self.st, &mut self.binary, class_sym);
         }
     }
 
