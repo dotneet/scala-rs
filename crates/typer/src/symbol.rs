@@ -3016,13 +3016,13 @@ impl SymbolTable {
         None
     }
 
-    /// Find inherited type members without walking ordinary members or
-    /// self-types.  `named_type_member_class` is a recovery path for a
+    /// Find inherited type members without walking ordinary term members.
+    /// `named_type_member_class` is a recovery path for a
     /// classfile type projection, so it must inspect a declaration's parents,
-    /// but it never needs the term-member and self-type semantics of
-    /// `lookup_member`.  Keeping this walk type-only matters for unresolved
-    /// `Named` types: most candidates are not type members and should not
-    /// traverse a large component's complete member graph.
+    /// and self-type classes, but it never needs the term-member lookup
+    /// semantics of `lookup_member`. Keeping this walk type-only matters for
+    /// unresolved `Named` types: most candidates are not type members and
+    /// should not traverse a large component's complete member graph.
     fn lookup_type_member(&self, owner: SymbolId, name: &str) -> Vec<SymbolId> {
         let mut out = Vec::new();
         let mut seen = rustc_hash::FxHashSet::default();
