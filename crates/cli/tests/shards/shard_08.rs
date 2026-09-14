@@ -1,6 +1,8 @@
 //! Aggregated CLI integration tests (alphabetical slice 8/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../protected_this.rs"]
+mod protected_this;
 #[path = "../tail4.rs"]
 mod tail4;
 #[path = "../tail5.rs"]
@@ -15,8 +17,6 @@ mod temp_nonce;
 mod testkit;
 #[path = "../testkit2.rs"]
 mod testkit2;
-#[path = "../protected_this.rs"]
-mod protected_this;
 #[path = "../thiscast.rs"]
 mod thiscast;
 #[path = "../tmember.rs"]

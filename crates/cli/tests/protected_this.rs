@@ -20,7 +20,12 @@ fn scala_library_jar() -> Option<PathBuf> {
 
 fn compile(source: &Path, out: &Path, library: &Path, classpath: Option<&Path>) {
     let mut cmd = Command::new(bin());
-    cmd.args(["compile", source.to_str().unwrap(), "-d", out.to_str().unwrap()]);
+    cmd.args([
+        "compile",
+        source.to_str().unwrap(),
+        "-d",
+        out.to_str().unwrap(),
+    ]);
     cmd.args(["--scala-library", library.to_str().unwrap()]);
     if let Some(cp) = classpath {
         cmd.args(["-cp", cp.to_str().unwrap()]);
@@ -41,10 +46,7 @@ fn protected_this_generic_method_survives_separate_compilation() {
         eprintln!("skip protected[this] regression: scala-library jar not present");
         return;
     };
-    let root = std::env::temp_dir().join(format!(
-        "scala-rs-protected-this-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("scala-rs-protected-this-{}", std::process::id()));
     let producer = root.join("producer.scala");
     let consumer = root.join("consumer.scala");
     let producer_out = root.join("producer-out");
