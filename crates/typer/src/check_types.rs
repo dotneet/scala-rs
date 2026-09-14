@@ -1598,10 +1598,11 @@ impl Typer {
     /// `timestampColumnType` fit gitbucket's `MappedColumnType.base[Date,
     /// Timestamp]`.
     ///
-    /// Only a *deferred* right-hand side of an alias that really carries a
-    /// `C.this` prefix is rebound, and only to a definition the enclosing
-    /// class really has: with nothing more derived in sight the abstract
-    /// member stands, exactly as before.
+    /// Only a *deferred* right-hand side of an alias that carries a `C.this`
+    /// prefix—or whose enclosing class can be recovered from the class
+    /// hierarchy when scalac omitted that prefix—is rebound, and only to a
+    /// definition the enclosing class really has: with nothing more derived
+    /// in sight the abstract member stands, exactly as before.
     fn rebind_outer_type_member(&mut self, cls: SymbolId, m: SymbolId, seen: Type) -> Type {
         if !self.library_abi || cls.is_none() {
             return seen;
@@ -1612,7 +1613,10 @@ impl Typer {
         // The class whose `this` the alias's right-hand side was written
         // against, and the instance of it the prefix carries: an enclosing
         // class of the prefix's own class.
-        let Some(this_class) = self.binary_alias_this_class(alias) else {
+        let Some(this_class) = self
+            .binary_alias_this_class(alias)
+            .or_else(|| self.inferred_alias_this_class(alias, d))
+        else {
             return seen;
         };
         self.rebind_deferred_in_outer(cls, d, this_class)
@@ -1891,6 +1895,36 @@ impl Typer {
                 c != owner && self.st.get(c).jvm_name.trim_end_matches('$') == internal
             })?;
         Some(this_class)
+    }
+
+    /// Some scalac pickles omit the `This` prefix of a self-referential alias
+    /// after reducing it to an inherited member. The alias owner still tells
+    /// us which enclosing class supplied that self type: choose the nearest
+    /// enclosing class that inherits the deferred member's owner. This is the
+    /// same `asSeenFrom` relationship as the recorded prefix, recovered from
+    /// the class hierarchy rather than from a library-specific name.
+    fn inferred_alias_this_class(&self, alias: SymbolId, deferred: SymbolId) -> Option<SymbolId> {
+        let owner = self.st.get(alias).owner;
+        let target = self.st.get(deferred).owner;
+        let enclosing = self.st.enclosing_classes(owner);
+        if let Some(c) = enclosing
+            .into_iter()
+            .skip(1)
+            .find(|&c| c == target || self.st.is_ancestor_of(target, c))
+        {
+            return Some(c);
+        }
+        // A companion object may own the nested class symbol when the
+        // enclosing trait also has a same-named companion. Recover the
+        // trait/interface by its JVM nesting prefix; unlike a name-specific
+        // exception this is valid for any companion pair.
+        let outer_jvm = self.st.get(owner).jvm_name.rsplit_once('$')?.0;
+        let candidate = self.st.find_class_by_jvm(outer_jvm)?;
+        // The index is class-like (it also contains module classes), while
+        // this recovery specifically needs the enclosing class/interface.
+        (self.st.get(candidate).kind == SymKind::Class
+            && (candidate == target || self.st.is_ancestor_of(target, candidate)))
+        .then_some(candidate)
     }
 
     fn path_dependent_type(&mut self, span: Span, prefix: &Tree, name: &str) -> Type {
