@@ -149,6 +149,18 @@ fn member_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool
         return false;
     }
     let owner = s.owner;
+    // A template self alias is not an inherited member.  It denotes the
+    // *particular enclosing instance* whose template declared it, even when
+    // the anonymous class also inherits that template.  Treating it like an
+    // ordinary inherited member made a lambda in `new Rep { self.index(...) }`
+    // emit a `$outer` read while the capture pass omitted the field.
+    if st.get(owner).self_alias == Some(id)
+        && outer_chain(st, current)
+            .into_iter()
+            .any(|outer| outer == owner)
+    {
+        return true;
+    }
     // A member inherited by the class being emitted is reached through its
     // own `this`; only a member belonging to a lexical owner outside it is an
     // enclosing-instance read.
@@ -160,13 +172,74 @@ fn member_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool
         .any(|outer| outer_supplies_owner(st, outer, owner))
 }
 
+/// Does a source parent name the instance of `outer` explicitly (`p.C`)?
+///
+/// This is the typer-side counterpart of the backend's
+/// `parent_prefix_instance`.  Such a prefix is captured directly (when it is
+/// a local), so it must not force retention of the anonymous class's lexical
+/// `$outer`.
+fn parent_has_instance_prefix(st: &SymbolTable, parent: &Tree, outer: SymbolId) -> bool {
+    let mut head = parent;
+    while let TreeKind::Apply { fun, .. } = &head.kind {
+        head = fun;
+    }
+    prefix_supplies_outer(st, head, outer)
+}
+
+fn prefix_supplies_outer(st: &SymbolTable, tree: &Tree, outer: SymbolId) -> bool {
+    let qual = match &tree.kind {
+        TreeKind::Select { qual, .. } => qual,
+        TreeKind::AppliedTypeTree { tpt, .. }
+        | TreeKind::TypeApply { fun: tpt, .. }
+        | TreeKind::AnnotatedTypeTree { tpt, .. } => {
+            return prefix_supplies_outer(st, tpt, outer);
+        }
+        _ => return false,
+    };
+    st.class_sym_of(&qual.ty)
+        .is_some_and(|p| outer_supplies_owner(st, p, outer))
+}
+
+/// A nested trait has no field of its own: its default methods call an
+/// expanded outer accessor implemented by the anonymous class.  Therefore a
+/// class with an otherwise empty body can still need its lexical `$outer`.
+/// Keep it only when that lexical chain supplies the trait's enclosing
+/// instance; path-prefixed parents (`new p.T {}`) return `p` directly.
+fn inherited_trait_needs_outer(st: &SymbolTable, current: SymbolId, parents: &[Tree]) -> bool {
+    let outers = outer_chain(st, current);
+    crate::lin::linearize(st, current)
+        .into_iter()
+        .skip(1)
+        .filter(|&parent| crate::lin::is_interface(st, parent))
+        .any(|parent| {
+            let Some(want) = enclosing_instance(st, parent) else {
+                return false;
+            };
+            outers
+                .iter()
+                .copied()
+                .any(|outer| outer_supplies_owner(st, outer, want))
+                && !parents
+                    .iter()
+                    .any(|p| parent_has_instance_prefix(st, p, want))
+        })
+}
+
 fn this_needs_outer(st: &SymbolTable, current: SymbolId, id: SymbolId) -> bool {
-    if id.is_none() || id == current || st.is_ancestor_of(id, current) {
+    if id.is_none() || id == current {
         return false;
     }
-    outer_chain(st, current)
-        .into_iter()
-        .any(|outer| outer == id || st.is_ancestor_of(id, outer))
+    let outers = outer_chain(st, current);
+    // A qualified `Outer.this` / `Outer.super` names the lexical instance by
+    // identity even when the anonymous class happens to inherit `Outer`.
+    // Test the lexical chain before the ordinary inherited-`this` shortcut.
+    if outers.contains(&id) {
+        return true;
+    }
+    if st.is_ancestor_of(id, current) {
+        return false;
+    }
+    outers.into_iter().any(|outer| st.is_ancestor_of(id, outer))
 }
 
 /// Scan one class body without descending into nested class/module bodies.
@@ -174,7 +247,8 @@ fn class_uses_outer(class_def: &Tree, st: &SymbolTable, current: SymbolId) -> bo
     let TreeKind::ClassDef { impl_, .. } = &class_def.kind else {
         return false;
     };
-    impl_.parents.iter().any(|t| scan_outer(t, st, current))
+    inherited_trait_needs_outer(st, current, &impl_.parents)
+        || impl_.parents.iter().any(|t| scan_outer(t, st, current))
         || impl_.body.iter().any(|t| scan_outer(t, st, current))
 }
 
