@@ -350,6 +350,15 @@ fn sp_annot_bad_is_rejected() {
     compile_fails("sp_annot_bad", "type mismatch");
 }
 
+/// A specialized implementation inherited through a trait still has to
+/// expose the erased parent entry point.  Calls through `Generic[Boolean]`
+/// arrive as `render(Object)`, while the implementation is emitted at
+/// `render(boolean)`; the bridge unboxes the argument before dispatch.
+#[test]
+fn specialized_trait_inheritance_emits_erased_bridge() {
+    check("specialized_bridge");
+}
+
 fn javap_class(out: &Path, class: &str, flags: &[&str]) -> String {
     let mut cmd = Command::new("javap");
     cmd.args(["-classpath", out.to_str().unwrap()]);

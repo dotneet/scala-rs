@@ -2907,10 +2907,34 @@ impl<'a> Gen<'a> {
                                 && {
                                     let cs = desc_param_strs(&m.desc);
                                     cs.len() == pparam_strs.len()
-                                        && cs
-                                            .iter()
-                                            .zip(&pparam_strs)
-                                            .all(|(c, p)| self.desc_narrows(p, c))
+                                        && cs.iter().zip(&pparam_strs).all(|(c, p)| {
+                                            // Scala's `@specialized` keeps the
+                                            // generic parent entry point at an
+                                            // erased reference descriptor while
+                                            // the inherited implementation is
+                                            // emitted at the primitive
+                                            // descriptor.  That is the same
+                                            // bridge shape as a narrowed
+                                            // reference parameter: the erased
+                                            // value arrives boxed and must be
+                                            // unboxed before dispatch.  Without
+                                            // accepting this pair, a class that
+                                            // inherits `f(Boolean)` from a trait
+                                            // still has no `f(Object)` for calls
+                                            // through `P[Boolean]`.
+                                            self.desc_narrows(p, c)
+                                                || (p == "Ljava/lang/Object;"
+                                                    && matches!(
+                                                        c.as_str(),
+                                                        "Z" | "B"
+                                                            | "S"
+                                                            | "C"
+                                                            | "I"
+                                                            | "J"
+                                                            | "F"
+                                                            | "D"
+                                                    ))
+                                        })
                                 }
                         });
                         let Some(first) = fits.next().map(|m| m.desc.clone()) else {
