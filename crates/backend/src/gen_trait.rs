@@ -3050,8 +3050,40 @@ impl<'a> Gen<'a> {
             .iter()
             .map(|m| (m.name.clone(), m.desc.clone()))
             .collect();
+        // `BinaryParents` cannot see classes emitted in this run.  When a
+        // source superclass supplies `toString`/`hashCode`/`equals`, its
+        // implementation still wins over a binary trait default on the JVM;
+        // do not add the trait's object-clash forwarder in that case.  This
+        // matters for a case class such as AndThen.Single: its inherited
+        // AndThen.toString must not be shadowed by Function1.toString$.
+        let source_object_methods: HashSet<(String, String)> = linearize(self.st, class_id)
+            .into_iter()
+            .skip(1)
+            .filter(|&parent| self.st.is_source_class(parent) && !is_interface_sym(self.st, parent))
+            .flat_map(|parent| self.st.get(parent).members.iter().copied())
+            .filter_map(|mid| {
+                let method = self.st.get(mid);
+                if method.kind != SymKind::Method
+                    || method.flags.contains(Flags::STATIC)
+                    || method.flags.contains(Flags::ABSTRACT)
+                    || method.flags.contains(Flags::SYNTHETIC)
+                    || !matches!(method.name.as_str(), "toString" | "hashCode" | "equals")
+                {
+                    return None;
+                }
+                Some((
+                    encode_method_name(&method.name),
+                    method_desc_from_sym(self.st, mid),
+                ))
+            })
+            .collect();
         let class_name = b.this_name.clone();
         for br in bp.bridges(&roots, &have) {
+            if matches!(&br.kind, BridgeKind::Static { .. })
+                && source_object_methods.contains(&(br.name.clone(), br.desc.clone()))
+            {
+                continue;
+            }
             let Some(cut) = br.desc.find(')') else {
                 continue;
             };

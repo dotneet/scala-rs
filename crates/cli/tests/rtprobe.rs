@@ -205,6 +205,11 @@ runs!(
     scalac_agrees_rtp_andthen_fn1,
     "andthen_fn1"
 );
+runs!(
+    rtp_andthen_super_tostring_runs,
+    scalac_agrees_rtp_andthen_super_tostring,
+    "andthen_super_tostring"
+);
 
 #[test]
 fn rtp_rejects_map_of_non_pair() {
