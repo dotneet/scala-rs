@@ -1826,7 +1826,13 @@ pub(crate) fn gen_select(
                                 // the first parent, and `toTermName` is
                                 // `NameApi`'s. Stack-aware, so it costs three
                                 // bytes only where the verifier needs them.
-                                checkcast_method_receiver_sym(asm, ctx, tree.sym, true);
+                                checkcast_method_receiver_sym(
+                                    asm,
+                                    ctx,
+                                    tree.sym,
+                                    true,
+                                    Some(&qual.ty),
+                                );
                             } else {
                                 asm.checkcast(&dc);
                             }

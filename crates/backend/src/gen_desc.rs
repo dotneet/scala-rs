@@ -1423,6 +1423,36 @@ pub(crate) fn maybe_checkcast_owner(asm: &mut Assembler, ctx: &EmitCtx, owner: S
     }
 }
 
+/// Resolve the JVM owner used by an ordinary instance call. Java's compiler
+/// names an inherited method on a visible concrete receiver when its declared
+/// owner is a package-private superclass; the same owner must be used by any
+/// receiver cast emitted before that call, or the class fails verification.
+pub(crate) fn effective_method_owner(
+    ctx: &EmitCtx,
+    id: SymbolId,
+    receiver_ty: Option<&Type>,
+) -> (String, bool) {
+    let s = ctx.st.get(id);
+    let owner_id = s.owner;
+    let mut owner = class_internal(ctx.st, owner_id);
+    let mut owner_is_interface = is_interface_sym(ctx.st, owner_id);
+    if let Some(receiver_ty) = receiver_ty {
+        if let Some(receiver_id) = ctx.st.class_sym_of(receiver_ty) {
+            let receiver = class_internal(ctx.st, receiver_id);
+            if ctx.st.get(owner_id).flags.contains(Flags::JAVA)
+                && receiver != owner
+                && !receiver.is_empty()
+                && !is_interface_sym(ctx.st, receiver_id)
+                && jvm_assignable(ctx.st, &receiver, &owner)
+            {
+                owner = receiver;
+                owner_is_interface = is_interface_sym(ctx.st, receiver_id);
+            }
+        }
+    }
+    (owner, owner_is_interface)
+}
+
 pub(crate) fn checkcast_refined_receiver(
     asm: &mut Assembler,
     ctx: &EmitCtx,
@@ -1439,7 +1469,13 @@ pub(crate) fn checkcast_refined_receiver(
     if owner.is_none() {
         return;
     }
-    let jn = class_internal(ctx.st, owner);
+    // Keep the cast in sync with `invoke_method_with_receiver`: a Java method
+    // inherited through a visible concrete receiver is named on that receiver
+    // to avoid an inaccessible declaration owner. Casting only to the
+    // selected interface (for example `Closeable`) and then invoking the
+    // receiver class (`DatabaseDef`) leaves an operand whose verifier type is
+    // too weak for the Methodref.
+    let (jn, _) = effective_method_owner(ctx, method_id, Some(qual_ty));
     if jn.is_empty() || jn == "java/lang/Object" {
         return;
     }
@@ -1453,7 +1489,11 @@ pub(crate) fn checkcast_erased_method_receiver(asm: &mut Assembler, ctx: &EmitCt
     if fun.sym.is_none() || fun_is_super(fun) {
         return;
     }
-    checkcast_method_receiver_sym(asm, ctx, fun.sym, false);
+    let receiver_ty = match &fun.kind {
+        TreeKind::Select { qual, .. } => Some(&qual.ty),
+        _ => None,
+    };
+    checkcast_method_receiver_sym(asm, ctx, fun.sym, false, receiver_ty);
 }
 
 /// The same, for a receiver already on the stack under a call this function's
@@ -1477,6 +1517,7 @@ pub(crate) fn checkcast_method_receiver_sym(
     ctx: &EmitCtx,
     id: SymbolId,
     require_known: bool,
+    receiver_ty: Option<&Type>,
 ) {
     if require_known && asm.top_object().is_none() {
         return;
@@ -1497,8 +1538,9 @@ pub(crate) fn checkcast_method_receiver_sym(
     // The call names the declaring class when the owner's own class file does
     // not reach the method, so the receiver has to be cast to that class and
     // not to the owner (`Symbol::declaring_class`).
+    let (effective_owner, _) = effective_method_owner(ctx, id, receiver_ty);
     let jn = if s.declaring_class.is_empty() {
-        class_internal(ctx.st, s.owner)
+        effective_owner
     } else {
         s.declaring_class.clone()
     };

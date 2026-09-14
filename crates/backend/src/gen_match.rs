@@ -574,7 +574,7 @@ fn gen_unapply_pattern(
         // erasure casts such a receiver; the `Apply` and paren-less `Select`
         // paths already do, through the same stack-aware check (a module
         // owner is left alone there).
-        checkcast_method_receiver_sym(asm, ctx, uid, true);
+        checkcast_method_receiver_sym(asm, ctx, uid, true, None);
     } else if !owner.is_none() {
         // The `unapply` being called belongs to `owner`, so the receiver is
         // `owner`'s singleton -- not whatever the *name* in the pattern is

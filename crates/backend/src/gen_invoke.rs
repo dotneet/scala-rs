@@ -37,33 +37,7 @@ pub(crate) fn invoke_method_with_receiver(
 ) {
     let s = ctx.st.get(id);
     let owner_id = s.owner;
-    let mut owner = class_internal(ctx.st, owner_id);
-    let mut owner_is_interface = is_interface_sym(ctx.st, owner_id);
-    if let Some(receiver_ty) = receiver_ty {
-        if let Some(receiver_id) = ctx.st.class_sym_of(receiver_ty) {
-            let receiver = class_internal(ctx.st, receiver_id);
-            // Only Java declarations need this adjustment. Scala's pickled
-            // `declaring_class` path below already records the bytecode owner
-            // when a Scala hierarchy is not JVM-reachable, and changing that
-            // owner would turn a valid interface/super dispatch into a
-            // NoSuchMethodError.
-            if ctx.st.get(owner_id).flags.contains(Flags::JAVA)
-                && receiver != owner
-                && !receiver.is_empty()
-                && !is_interface_sym(ctx.st, receiver_id)
-                && jvm_assignable(ctx.st, &receiver, &owner)
-            {
-                owner = receiver;
-                // Keep the constant-pool tag and invoke opcode in sync with
-                // the rewritten owner. javac uses a Methodref/invokevirtual
-                // for `Impl.defaultMethod()` and an
-                // InterfaceMethodref/invokeinterface for the same inherited
-                // declaration through a sub-interface. Mixing the original
-                // declaration kind with the receiver owner is an ICCE.
-                owner_is_interface = is_interface_sym(ctx.st, receiver_id);
-            }
-        }
-    }
+    let (mut owner, owner_is_interface) = effective_method_owner(ctx, id, receiver_ty);
     let owner_is_package = ctx.st.get(owner_id).kind == SymKind::Package;
     if owner_is_package {
         // `scala.math.{abs,max,min,Pi}` and `scala.reflect.runtime.universe`

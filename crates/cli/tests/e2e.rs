@@ -2747,6 +2747,65 @@ fn try_finally_verifies() {
 }
 
 #[test]
+fn java_close_owner_verifies_and_matches_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = compile_fixture_with(
+        "close_owner_verify",
+        &["--scala-library", jar.to_str().unwrap()],
+    );
+    let cp = format!("{}:{}", out.display(), jar.display());
+    let ours = Command::new("java")
+        .args(["-Xverify:all", "-cp", &cp, "Main"])
+        .output()
+        .expect("java -Xverify:all close_owner_verify");
+    assert!(
+        ours.status.success(),
+        "scala-rs close_owner_verify failed: {}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    let expected = expected_stdout("close_owner_verify");
+    assert_eq!(String::from_utf8_lossy(&ours.stdout), expected);
+
+    let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    if scalac.is_file() {
+        let scalac_out = tmp_dir("close_owner_verify-scalac");
+        let control = Command::new(&scalac)
+            .args([
+                "-classpath",
+                jar.to_str().unwrap(),
+                "-d",
+                scalac_out.to_str().unwrap(),
+                fixtures_dir()
+                    .join("close_owner_verify.scala")
+                    .to_str()
+                    .unwrap(),
+            ])
+            .output()
+            .expect("run scalac close_owner_verify");
+        assert!(
+            control.status.success(),
+            "scalac close_owner_verify failed: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+        let scalac_cp = format!("{}:{}", scalac_out.display(), jar.display());
+        let control_run = Command::new("java")
+            .args(["-Xverify:all", "-cp", &scalac_cp, "Main"])
+            .output()
+            .expect("run scalac close_owner_verify");
+        assert!(
+            control_run.status.success(),
+            "scalac close_owner_verify failed at runtime: {}",
+            String::from_utf8_lossy(&control_run.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&control_run.stdout), expected);
+        let _ = fs::remove_dir_all(scalac_out);
+    }
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
 fn update_assign_verifies() {
     if !java_available() {
         return;
