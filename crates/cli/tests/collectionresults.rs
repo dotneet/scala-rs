@@ -166,7 +166,17 @@ fn for_value_guards_execute() {
 
 #[test]
 fn actual_gitbucket_java_patch_helper_executes() {
-    let base=Path::new("/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/gitbucket");
+    // Keep this probe on the same fixture root as the GitBucket measurement
+    // scripts.  The old session-specific scratchpad path was deleted after
+    // the probe was recorded, making this test fail before javac was invoked.
+    let base = std::env::var_os("GITBUCKET_FIXTURE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("SCALA_RS_FIXTURE_ROOT")
+                .map(PathBuf::from)
+                .map(|root| root.join("gitbucket"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("scala-rs-fixtures/gitbucket"));
     let source = base.join("gitbucket/src/main/java/gitbucket/core/util");
     let out = std::env::temp_dir().join(format!(
         "collection-gitbucket-java-{}-{}",

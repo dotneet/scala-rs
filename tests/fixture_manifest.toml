@@ -1,0 +1,51 @@
+# External compiler fixtures used by the focused compatibility measurements.
+# Keep this file free of machine-local paths.  The scripts resolve `url` and
+# `revision` below into SCALA_RS_FIXTURE_ROOT (or its /tmp default).  Scala
+# toolchain paths are relative to SCALA_RS_TOOLCHAIN_ROOT (or /tmp)
+# so one manifest controls every measure/run script without changing the
+# established /tmp locations.
+manifest_version = 1
+
+[toolchain]
+scala_version = "2.13.16"
+scala_home = "scala-2.13.16"
+scala_library = "scala-rs-lib/scala-library-2.13.16.jar"
+scala_library_jar = "scala-rs-lib/scala-library-2.13.16.jar"
+scala_launcher_library_jar = "scala-2.13.16/lib/scala-library.jar"
+scala_compiler_jar = "scala-2.13.16/lib/scala-compiler.jar"
+scala_reflect_jar = "scala-2.13.16/lib/scala-reflect.jar"
+scalac_launcher = "scala-2.13.16/bin/scalac"
+
+[cats]
+url = "https://github.com/typelevel/cats.git"
+revision = "32a50dcfad9d897459bb755c4b5a22b4c7bc745c"
+source_count = 340
+source_count_kernel = 95
+source_count_core = 245
+generated_count = 16
+generated_state = "kernel/core managed sources"
+
+[slick]
+url = "https://github.com/slick/slick.git"
+revision = "475fc6e7719867025e832fa0e6ac7fb21b36bbc3"
+source_count = 184
+generated_count = 7
+generated_state = "FreeMarker expansion"
+
+[gitbucket]
+url = "https://github.com/gitbucket/gitbucket.git"
+revision = "3e1e429c8e54ab726a663d9ba14ccf341933adbe"
+source_count = 354
+source_count_scala = 214
+source_count_twirl = 140
+generated_count = 140
+generated_state = "Twirl managed sources"
+java_source_count = 3
+
+[scalalib]
+url = "https://github.com/scala/scala.git"
+revision = "3f6bdaeafde17d790023cc3f299b81eaaf876ca3"
+source_count = 538
+generated_count = 0
+generated_state = "none"
+java_class_count = 33

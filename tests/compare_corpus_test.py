@@ -2,11 +2,13 @@
 
 import tempfile
 from pathlib import Path
+import json
+import subprocess
 import sys
 import unittest
 
 sys.dont_write_bytecode = True
-from compare_corpus import compare, read_ledger
+from compare_corpus import compare, read_ledger, validate_result
 
 
 class CorpusComparisonTest(unittest.TestCase):
@@ -42,6 +44,46 @@ class CorpusComparisonTest(unittest.TestCase):
                 path.write_bytes(data)
                 with self.assertRaises(ValueError):
                     read_ledger(path)
+
+    def test_valid_loss_keeps_structured_result_when_cli_returns_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "baseline.tsv"
+            candidate = Path(directory) / "candidate.tsv"
+            baseline.write_text("pos\tx\tpass\n", encoding="utf-8")
+            candidate.write_text("pos\tx\tfail\n", encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("compare_corpus.py")),
+                 str(baseline), str(candidate)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(completed.stderr, "")
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["losses"], 1)
+            self.assertEqual(validate_result(result), result)
+
+    def test_valid_no_loss_keeps_structured_result_when_cli_returns_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / "baseline.tsv"
+            candidate = Path(directory) / "candidate.tsv"
+            baseline.write_text("pos\tx\tpass\n", encoding="utf-8")
+            candidate.write_text("pos\tx\tpass\n", encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, str(Path(__file__).with_name("compare_corpus.py")),
+                 str(baseline), str(candidate)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stderr, "")
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["losses"], 0)
+            self.assertEqual(validate_result(result), result)
+
+    def test_structured_result_rejects_inconsistent_loss_count(self):
+        result = compare({("pos", "x"): "pass"}, {("pos", "x"): "fail"})
+        result["losses"] = 0
+        with self.assertRaisesRegex(ValueError, "losses"):
+            validate_result(result)
 
 
 if __name__ == "__main__":

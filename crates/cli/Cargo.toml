@@ -4,10 +4,47 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "scala-rs command-line compiler"
+autotests = false
 
 [[bin]]
 name = "scala-rs"
 path = "src/main.rs"
+
+# Keep the historical fixture files as modules, but compile them in a small
+# number of harnesses. All 344 direct test files are listed exactly once in
+# the eight shard sources; this preserves test names and CARGO_BIN_EXE_scala-rs
+# while avoiding one monolithic integration-test binary.
+[[test]]
+name = "cli_shard_01"
+path = "tests/shards/shard_01.rs"
+
+[[test]]
+name = "cli_shard_02"
+path = "tests/shards/shard_02.rs"
+
+[[test]]
+name = "cli_shard_03"
+path = "tests/shards/shard_03.rs"
+
+[[test]]
+name = "cli_shard_04"
+path = "tests/shards/shard_04.rs"
+
+[[test]]
+name = "cli_shard_05"
+path = "tests/shards/shard_05.rs"
+
+[[test]]
+name = "cli_shard_06"
+path = "tests/shards/shard_06.rs"
+
+[[test]]
+name = "cli_shard_07"
+path = "tests/shards/shard_07.rs"
+
+[[test]]
+name = "cli_shard_08"
+path = "tests/shards/shard_08.rs"
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }

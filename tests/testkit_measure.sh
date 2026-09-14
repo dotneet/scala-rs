@@ -29,15 +29,17 @@
 #                    classfile-emit/read bug, not a testkit bug.
 #   TESTKIT_LOG      log path (default $TESTKIT_DIR/<stage>.txt)
 set -e
+ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
+source "$ROOT/tests/fixture_cache.sh"
 SP=/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/slick
 TK=${TESTKIT_DIR:-/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/testkit}
 STAGE=${1:-main}
 if [[ $STAGE == main || $STAGE == test || $STAGE == all || $STAGE == both ]]; then shift; else STAGE=main; fi
-ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 BIN=${SCALA_RS:-$ROOT/target/release/scala-rs}
 mkdir -p $TK
 # slick_measure.sh owns the checkout/toolchain self-restore; reuse it.
-if [[ ! -d $SP/slick/.git || ! -s $SP/deps.cp || ! -x /tmp/scala-2.13.16/bin/scalac ]]; then
+SCALAC=$(fixture_scalac_path)
+if [[ ! -d $SP/slick/.git || ! -s $SP/deps.cp || ! -x $SCALAC ]]; then
   echo "slick checkout/toolchain missing -- run tests/slick_measure.sh once first" >&2
   exit 1
 fi
@@ -59,8 +61,8 @@ if [[ -z ${SCALA_RS:-} ]]; then
   (cd "$ROOT" && cargo build -p scala-rs-cli --release) >/dev/null 2>$TK/build.log \
     || { cat $TK/build.log; exit 1; }
 fi
-LIB=/tmp/scala-rs-lib/scala-library-2.13.16.jar
-REFLECT=/tmp/scala-2.13.16/lib/scala-reflect.jar
+LIB=$(fixture_toolchain_library)
+REFLECT=$(fixture_toolchain_reflect)
 # Coursier resolves a *newer* scala-library (2.13.18) and an older scala-reflect
 # into both fetched classpaths. Either on -cp shadows the jar we link against
 # and the run measures a different library. Drop them.

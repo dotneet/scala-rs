@@ -59,7 +59,7 @@ Use `scala-rs --help` for all compiler options.
 Run the workspace tests with:
 
 ```sh
-cargo test --workspace
+cargo test --workspace --release
 ```
 
 The test suites cover parsing, typing, bytecode generation, runtime behavior,

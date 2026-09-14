@@ -1,29 +1,16 @@
 //! Applied abstract type bounds participate in typed-pattern compatibility.
-#[path = "support/temp_nonce.rs"]
-mod temp_nonce;
+use crate::support;
 
-use std::{
-    fs,
-    path::PathBuf,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, process::Command};
 
 #[test]
 fn abstract_pattern_bounds_match_scalac() {
-    let root = std::env::temp_dir().join(format!(
-        "scala-rs-abstract-pattern-bounds-{}-{}",
-        std::process::id(),
-        temp_nonce::unique_stamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
-    let scalac = "/tmp/scala-2.13.16/bin/scalac";
+    let toolchain = support::toolchain();
+    let (Some(scalac), Some(jar)) = (toolchain.scalac(), toolchain.scala_library()) else {
+        eprintln!("skip abstract pattern differential test: Scala toolchain unavailable");
+        return;
+    };
+    let root = support::TestDir::new("abstract-pattern-bounds");
     let fixtures =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/multi/abstract_pattern_bounds");
     for (name, accepted) in [("t10272", true), ("t12077", true), ("bad", false)] {
@@ -33,22 +20,28 @@ fn abstract_pattern_bounds_match_scalac() {
         for ours in [false, true] {
             let out = root.join(format!("{name}-{ours}"));
             fs::create_dir_all(&out).unwrap();
-            let mut cmd = if ours {
-                let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
-                c.args(["compile", "--scala-library", jar]);
-                c
+            let result = if ours {
+                support::CompileCommand::new(&src, &out)
+                    .scala_library(jar)
+                    .run()
             } else {
-                Command::new(scalac)
+                support::CompileOutcome::from_output(
+                    Command::new(scalac)
+                        .arg(&src)
+                        .arg("-d")
+                        .arg(&out)
+                        .output()
+                        .unwrap(),
+                )
             };
-            let result = cmd.arg(&src).arg("-d").arg(&out).output().unwrap();
             assert_eq!(
-                result.status.success(),
+                result.success(),
                 accepted,
                 "{name}, ours={ours}: {}",
-                String::from_utf8_lossy(&result.stderr)
+                result.diagnostics()
             );
             if !accepted {
-                let diagnostic = String::from_utf8_lossy(&result.stderr);
+                let diagnostic = result.diagnostics();
                 assert!(
                     diagnostic.contains("incompatible"),
                     "{name}, ours={ours}: {diagnostic}"
@@ -56,5 +49,4 @@ fn abstract_pattern_bounds_match_scalac() {
             }
         }
     }
-    fs::remove_dir_all(root).unwrap();
 }

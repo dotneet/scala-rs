@@ -21,10 +21,11 @@
 #
 # Env:
 #   GATE_DIR      where every log goes (default: a fresh per-invocation dir)
-#   GATE_LEDGER   corpus baseline to compare against (default: newest tests/baselines/corpus-*.tsv)
-#   GATE_SKIP     space-separated steps to skip, e.g. "corpus" -- each skip is
-#                 printed in the summary, because a skipped check must never
-#                 read as a passing one.
+#   GATE_LEDGER   corpus baseline to compare against (default: ledger named by
+#                 the current row in tests/BASELINE.md)
+#   GATE_SKIP     space-separated heavy steps to skip, e.g. "corpus". A skipped
+#                 required check produces VERDICT=FAIL; it can never read as a
+#                 passing merge gate.
 #   GATE_SERIAL=1 run the heavy steps one after another instead of
 #                 concurrently. Same checks, same numbers, ~2.5x the wall
 #                 time; keep it as the way to reproduce a confusing result
@@ -66,8 +67,61 @@ set -u
 zmodload -i zsh/datetime        # EPOCHREALTIME, for the step-time table
 ROOT=${ROOT:-$(cd "$(dirname $0)/.." && pwd)}
 cd "$ROOT"
+source "$ROOT/tests/gate_result.sh"
+source "$ROOT/tests/baseline_invariants.sh"
 GATE_DIR=${GATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/scala-rs-gate-XXXXXX")}
 mkdir -p "$GATE_DIR"
+
+# A caller may intentionally reuse GATE_DIR to keep all evidence in one place.
+# Serialize those runs before touching any evidence, and recover only a lock
+# whose recorded owner is demonstrably gone. A lock with no valid owner is
+# treated as busy: removing it could erase a live run's results.
+GATE_LOCK=$GATE_DIR/.gate.lock
+gate_lock_failed() {
+  print "gate: GATE_DIR is locked by another or an unverifiable run: $GATE_DIR" >&2
+  print "VERDICT=FAIL"
+  print "DONE"
+  exit 1
+}
+gate_setup_failed() {
+  print "gate: cannot prepare exclusive GATE_DIR: $GATE_DIR" >&2
+  print "VERDICT=FAIL"
+  print "DONE"
+  exit 1
+}
+if ! mkdir "$GATE_LOCK" 2>/dev/null; then
+  GATE_OWNER=$(cat "$GATE_LOCK/pid" 2>/dev/null || print -- "")
+  if [[ $GATE_OWNER != <-> ]] || kill -0 "$GATE_OWNER" 2>/dev/null; then
+    gate_lock_failed
+  fi
+  rmdir "$GATE_LOCK" 2>/dev/null || gate_lock_failed
+  mkdir "$GATE_LOCK" 2>/dev/null || gate_lock_failed
+fi
+print -r -- "$$" > "$GATE_LOCK/pid" || gate_lock_failed
+trap 'rm -f "$GATE_LOCK/pid"; rmdir "$GATE_LOCK" 2>/dev/null' EXIT
+
+# Clear only files/directories this script owns, after the lock is held. This
+# prevents a reused directory from satisfying checks with a prior run's logs,
+# corpus TSV, timing files, or structured records.
+STEP_ORDER=(build m_slick m_cats m_gitbucket m_library slick_run subset cats_run gb_run tests corpus corpus_compare fmt)
+TDIR=$GATE_DIR/steps
+mkdir -p "$TDIR" || gate_setup_failed
+GATE_CLEAN_RC=0
+for step_name in $STEP_ORDER; do
+  rm -f "$TDIR/$step_name.result.json" "$TDIR/$step_name.rc" "$TDIR/$step_name.secs" || GATE_CLEAN_RC=$?
+done
+for owned_file in build.log m_slick.log m_cats.log m_gitbucket.log m_library.log \
+                  slick_run.log subset.log cats_run.log gb_run.log tests.log \
+                  corpus.log corpus.tsv corpus.tsv.part compare.json gate-result.json \
+                  scala-rs; do
+  rm -f "$GATE_DIR/$owned_file" || GATE_CLEAN_RC=$?
+done
+for stale_retry in "$GATE_DIR"/retry-*.tsv(N) "$GATE_DIR"/retry-*.log(N); do
+  rm -f "$stale_retry" || GATE_CLEAN_RC=$?
+done
+rm -rf "$GATE_DIR/wt" || GATE_CLEAN_RC=$?
+(( GATE_CLEAN_RC == 0 )) || gate_setup_failed
+
 # The ledger to compare the corpus against. `tests/BASELINE.md` names the
 # current one and the coordinator keeps it up to date, so read it from there.
 #
@@ -85,13 +139,11 @@ else
   # file chose a ledger one or more gates old (the header is followed by the
   # history of every gate), so the gate compared against stale data and its
   # "losses" were noise.
-  CUR=$(grep -m1 -oE '^\| commit \| `[0-9a-f]{8}`' tests/BASELINE.md 2>/dev/null | grep -oE '[0-9a-f]{8}')
-  if [[ -n $CUR && -s tests/baselines/corpus-$CUR.tsv ]]; then
-    LEDGER=tests/baselines/corpus-$CUR.tsv
-  else
-    LEDGER=$(grep -oE 'tests/baselines/corpus-[0-9a-f]{8}\.tsv|baselines/corpus-[0-9a-f]{8}\.tsv' tests/BASELINE.md 2>/dev/null \
-               | sed 's|^baselines/|tests/baselines/|' | head -1)
-  fi
+  # Never fall back to the first historical link. If the current header is
+  # malformed or its ledger is absent, leave this unresolved so the corpus
+  # step fails closed instead of comparing against an old accepted gate.
+  LEDGER=""
+  LEDGER=$(read_corpus_baseline) || LEDGER=""
 fi
 # The corpus checkout the runner defaults to has been found gutted (a `.git`
 # with no HEAD or refs), and `scala_corpus.sh` then dies on `git rev-parse`
@@ -137,14 +189,10 @@ step() { print "\n=== $1"; }
 # Every timed step writes `<name>.secs` and `<name>.rc` into $TDIR, whether it
 # ran in the foreground or as one of the concurrent jobs, so the table below
 # is built the same way in both modes.
-TDIR=$GATE_DIR/steps
-mkdir -p "$TDIR"
 # The table is printed in this order; a step with no `.secs` file (skipped, or
 # never reached) is left out. A fixed list rather than one appended to as the
-# gate runs, because the four measures are timed inside a command substitution
-# and a subshell cannot append to its parent's array.
-STEP_ORDER=(build m_slick m_cats m_gitbucket m_library slick_run subset cats_run gb_run tests corpus fmt)
-
+# gate runs; each step writes its own result record so shell output parsing never
+# has to carry an exit status through a command-substitution pipeline.
 timed() {  # name, command...
   local name=$1; shift
   local t0=$EPOCHREALTIME rc=0
@@ -154,12 +202,76 @@ timed() {  # name, command...
   return $rc
 }
 
-spawn() {  # name, command... -- same bookkeeping, in the background
+last_nonempty_line() {
+  local log_file=$1
+  awk 'NF { line=$0 } END { if (line != "") print line }' "$log_file" 2>/dev/null
+}
+
+summary_for() {
+  local name=$1 log_file=$2
+  case $name in
+    subset)
+      # The subset contract is three non-phase lines: loader, lint, counts.
+      awk '!/^phase / { lines[++n]=$0 }
+        END {
+          first=n-2; if (first < 1) first=1
+          for (i=first; i<=n; i++) { if (i > first) printf " "; printf "%s", lines[i] }
+          if (n) print ""
+        }' "$log_file" 2>/dev/null
+      ;;
+    cats_run|gb_run)
+      awk '/^progs=/ { line=$0 } END { if (line != "") print line }' "$log_file" 2>/dev/null
+      ;;
+    tests)
+      awk '/^workspace_tests: binaries=/ { line=$0 } END { if (line != "") print line }' "$log_file" 2>/dev/null
+      ;;
+    corpus)
+      awk '/^(pos|neg|run): total/ { line=$0 } END { if (line != "") print line }' "$log_file" 2>/dev/null
+      ;;
+    *)
+      last_nonempty_line "$log_file"
+      ;;
+  esac
+}
+
+run_timed_capture() {  # name, log, command...
+  local name=$1 log_file=$2; shift 2
+  local rc=0 summary result_status=pass
+  timed "$name" "$@" > "$log_file" 2>&1 || rc=$?
+  summary=$(summary_for "$name" "$log_file")
+  (( rc == 0 )) || result_status=fail
+  if ! gate_result_write "$TDIR/$name.result.json" "$name" "$result_status" "$rc" "$summary"; then
+    print "gate: could not write structured result for $name" >&2
+    return 125
+  fi
+  return $rc
+}
+
+require_result() {
+  local name=$1 result_path="$TDIR/$1.result.json"
+  if ! gate_result_read "$result_path" "$name"; then
+    FAIL+=("$name result missing or malformed: $result_path")
+    return 1
+  fi
+  if [[ $GATE_RESULT_STATUS != pass || $GATE_RESULT_RC != 0 ]]; then
+    FAIL+=("$name result status=$GATE_RESULT_STATUS exit_code=$GATE_RESULT_RC")
+    return 1
+  fi
+  return 0
+}
+
+spawn() {  # name, log, command... -- same bookkeeping, in the background
   local name=$1; shift
+  local log_file=$1; shift
   ( t0=$EPOCHREALTIME; rc=0
-    "$@" || rc=$?
+    "$@" > "$log_file" 2>&1 || rc=$?
     printf '%.1f\n' $(( EPOCHREALTIME - t0 )) > "$TDIR/$name.secs"
     print -r -- $rc > "$TDIR/$name.rc"
+    summary=$(summary_for "$name" "$log_file")
+    result_status=pass
+    (( rc == 0 )) || result_status=fail
+    gate_result_write "$TDIR/$name.result.json" "$name" "$result_status" "$rc" "$summary" ||
+      print "gate: could not write structured result for $name" >&2
   ) &
 }
 
@@ -170,7 +282,7 @@ rc_of()   { cat "$TDIR/$1.rc"   2>/dev/null || print -- "?" }
 # text checks used to read as a pass. `harness_ok` is the backstop: if a step
 # exited non-zero and contributed no failure of its own, that is a harness
 # error and it is named. (In the serial gate this hole was real too: every
-# heavy step was run through a `| tail` pipeline, which discards the status.)
+# heavy step was run through a summary pipeline, which discarded the status.)
 harness_ok() {  # name, FAIL count taken before the step's own checks
   local name=$1 before=$2 rc=$(rc_of $1)
   (( ${#FAIL[@]} > before )) && return
@@ -179,10 +291,27 @@ harness_ok() {  # name, FAIL count taken before the step's own checks
 
 GATE_T0=$EPOCHREALTIME
 
+finish_gate() {
+  local verdict=PASS gate_status=pass rc=0
+  if (( ${#FAIL[@]} != 0 )); then
+    verdict=FAIL; gate_status=fail; rc=1
+  fi
+  if ! gate_result_write "$GATE_DIR/gate-result.json" gate "$gate_status" "$rc" "verdict=$verdict failures=${#FAIL[@]}"; then
+    print "gate: could not write final structured result" >&2
+    verdict=FAIL; rc=1
+  fi
+  print "VERDICT=$verdict"
+  print "DONE"
+  return $rc
+}
+
 step "build"
-if ! timed build cargo build --release -p scala-rs-cli > "$GATE_DIR/build.log" 2>&1; then
+BUILD_RC=0
+run_timed_capture build "$GATE_DIR/build.log" cargo build --release -p scala-rs-cli || BUILD_RC=$?
+if (( BUILD_RC != 0 )); then
   print "BUILD FAILED"; tail -30 "$GATE_DIR/build.log"
-  print "VERDICT=FAIL (build)"; print "DONE"; exit 1
+  FAIL+=("build exited $BUILD_RC")
+  finish_gate; exit $?
 fi
 
 # The binary the concurrent steps run. `cargo test --workspace --release` may
@@ -191,7 +320,10 @@ fi
 # reason that has nothing to do with the tree. So the heavy steps get an
 # immutable snapshot of the binary we just built, handed to them as $SCALA_RS.
 GATE_BIN=$GATE_DIR/scala-rs
-cp target/release/scala-rs "$GATE_BIN"
+if ! cp target/release/scala-rs "$GATE_BIN"; then
+  FAIL+=("could not snapshot target/release/scala-rs")
+  finish_gate; exit $?
+fi
 
 # --- compile measures -------------------------------------------------------
 # Each script validates its own result; we keep the summary line and check the
@@ -201,10 +333,18 @@ cp target/release/scala-rs "$GATE_BIN"
 # which is macro-bound), and a measure that competes with another measure --
 # or with itself -- is no longer a measurement of anything.
 step "compile measures"
-SLICK=$(timed m_slick env SLICK_LOG=$GATE_DIR/slick.txt tests/slick_measure.sh 2>&1 | tail -1); print "  slick     $SLICK"
-CATS=$(timed m_cats env CATS_LOG=$GATE_DIR/cats.txt tests/cats_measure.sh 2>&1 | tail -1);      print "  cats      $CATS"
-GB=$(timed m_gitbucket env GITBUCKET_LOG=$GATE_DIR/gitbucket.txt tests/gitbucket_measure.sh 2>&1 | tail -1); print "  gitbucket $GB"
-LIB=$(timed m_library env SCALALIB_LOG=$GATE_DIR/scalalib.txt tests/scalalib_measure.sh 2>&1 | tail -1);     print "  library   $LIB"
+MRC=0; run_timed_capture m_slick "$GATE_DIR/m_slick.log" env SCALA_RS="$GATE_BIN" SLICK_LOG=$GATE_DIR/slick.txt tests/slick_measure.sh || MRC=$?
+if require_result m_slick; then SLICK=$GATE_RESULT_SUMMARY; else SLICK=""; fi
+print "  slick     $SLICK"
+MRC=0; run_timed_capture m_cats "$GATE_DIR/m_cats.log" env SCALA_RS="$GATE_BIN" CATS_LOG=$GATE_DIR/cats.txt tests/cats_measure.sh || MRC=$?
+if require_result m_cats; then CATS=$GATE_RESULT_SUMMARY; else CATS=""; fi
+print "  cats      $CATS"
+MRC=0; run_timed_capture m_gitbucket "$GATE_DIR/m_gitbucket.log" env SCALA_RS="$GATE_BIN" GITBUCKET_LOG=$GATE_DIR/gitbucket.txt tests/gitbucket_measure.sh || MRC=$?
+if require_result m_gitbucket; then GB=$GATE_RESULT_SUMMARY; else GB=""; fi
+print "  gitbucket $GB"
+MRC=0; run_timed_capture m_library "$GATE_DIR/m_library.log" env SCALA_RS="$GATE_BIN" SCALALIB_LOG=$GATE_DIR/scalalib.txt tests/scalalib_measure.sh || MRC=$?
+if require_result m_library; then LIB=$GATE_RESULT_SUMMARY; else LIB=""; fi
+print "  library   $LIB"
 
 # A measure that compiled the wrong number of files is not a measure. Only
 # slick used to be checked here, so on 2026-09-09 a gate printed
@@ -218,8 +358,9 @@ check_measure() {  # name, summary line, expected `files=` count
   if [[ $line == *"measurement invalid"* ]]; then
     FAIL+=("$what measure invalid: $line"); return
   fi
-  local got=$(print -r -- "$line" | grep -oE '(^| )files=[0-9]+' | head -1 | grep -oE '[0-9]+')
-  if [[ -z $got ]]; then
+  local got got_rc=0
+  got=$(gate_measure_field "$line" files) || got_rc=$?
+  if (( got_rc != 0 )); then
     FAIL+=("$what measure printed no files= count: $line")
   elif [[ $got != $want ]]; then
     FAIL+=("$what compiled $got files, expected $want: $line")
@@ -233,6 +374,23 @@ check_measure gitbucket "$GB"    354
 # now reaches codegen (1317 classes). Zero is an invariant here too.
 [[ $GB == *"errors=0 files_with_errors=0"* ]] || FAIL+=("gitbucket measure: $GB")
 check_measure library   "$LIB"   538
+SCALALIB_BASELINE_RC=0
+SCALALIB_EXPECTED=$(read_scalalib_baseline) || SCALALIB_BASELINE_RC=$?
+if (( SCALALIB_BASELINE_RC != 0 )); then
+  FAIL+=("scalalib baseline invariant is missing or malformed in tests/BASELINE.md")
+else
+  IFS=$'\t' read -r SCALALIB_EXPECTED_ERRORS SCALALIB_EXPECTED_FILES <<< "$SCALALIB_EXPECTED"
+  SCALALIB_ERRORS_RC=0; SCALALIB_ERRORS=$(gate_measure_field "$LIB" errors) || SCALALIB_ERRORS_RC=$?
+  SCALALIB_BADFILES_RC=0; SCALALIB_BADFILES=$(gate_measure_field "$LIB" files_with_errors) || SCALALIB_BADFILES_RC=$?
+  if (( SCALALIB_ERRORS_RC != 0 || SCALALIB_BADFILES_RC != 0 )); then
+    FAIL+=("scalalib measure has malformed errors/files_with_errors fields: $LIB")
+  else
+    [[ $SCALALIB_ERRORS == $SCALALIB_EXPECTED_ERRORS ]] || \
+      FAIL+=("scalalib errors=$SCALALIB_ERRORS, baseline requires $SCALALIB_EXPECTED_ERRORS: $LIB")
+    [[ $SCALALIB_BADFILES == $SCALALIB_EXPECTED_FILES ]] || \
+      FAIL+=("scalalib files_with_errors=$SCALALIB_BADFILES, baseline requires $SCALALIB_EXPECTED_FILES: $LIB")
+  fi
+fi
 [[ $SLICK == *"errors=0 files_with_errors=0 classes=1504"* ]] || FAIL+=("slick measure: $SLICK")
 # cats compiles clean since `agent/catszero` (quasiquote patterns made the
 # last held-out file compile, so there is no holdout any more). Zero is now
@@ -247,7 +405,9 @@ check_measure library   "$LIB"   538
 # Timing noise and machine load are part of what it measures, so it gets the
 # machine to itself.
 step "slick execution"
-RUN=$(timed slick_run env MODE=b tests/slick_run.sh 2>&1 | tail -1); print "  $RUN"
+RRC=0; run_timed_capture slick_run "$GATE_DIR/slick_run.log" env SCALA_RS="$GATE_BIN" MODE=b RUNS=3 tests/slick_run.sh || RRC=$?
+if require_result slick_run; then RUN=$GATE_RESULT_SUMMARY; else RUN=""; fi
+print "  $RUN"
 [[ $RUN == *"ok=12 diff=0 fail=0"* ]] || FAIL+=("slick_run: $RUN")
 
 # --- the parallel block -----------------------------------------------------
@@ -265,17 +425,17 @@ RUN=$(timed slick_run env MODE=b tests/slick_run.sh 2>&1 | tail -1); print "  $R
 # below are applied afterwards in the old order, so the summary reads the same.
 run_subset() {
   SLICK_SEED_LOG=$GATE_DIR/slick.txt SCALA_RS=$GATE_BIN SUBSET_JOBS=$SUBSET_J \
-    tests/slick_subset.sh > "$GATE_DIR/subset.log" 2>&1
+    tests/slick_subset.sh
 }
 run_tests() {
-  WT_JOBS=$TEST_JOBS WT_THREADS=$TEST_THREADS WT_DIR=$GATE_DIR/wt \
-    tests/workspace_tests.sh > "$GATE_DIR/tests.log" 2>&1
+  WT_JOBS=$TEST_JOBS WT_THREADS=$TEST_THREADS WT_NO_DOC=0 WT_DIR=$GATE_DIR/wt \
+    tests/workspace_tests.sh
 }
 run_corpus() {
   CORPUS_SIZE=full CORPUS_LOG=$GATE_DIR/corpus.tsv CORPUS_JOBS=$CORPUS_J \
   CORPUS_TIMEOUT=$CORPUS_TMO CORPUS_RUN_TIMEOUT=$CORPUS_RTMO \
   SCALA_RS=$GATE_BIN SCALA_RS_PREBUILT=1 \
-    tests/scala_corpus.sh > "$GATE_DIR/corpus.log" 2>&1
+    tests/scala_corpus.sh
 }
 # The two differential *execution* harnesses for cats and gitbucket. They belong
 # in this block for the same reason `slick_subset` does: each one recompiles its
@@ -288,46 +448,68 @@ run_corpus() {
 # machine to itself: they compare stdout byte for byte and they compile the
 # clients with real scalac.
 run_cats_run() {
-  SCALA_RS=$GATE_BIN CATSRUN_JOBS=2 tests/cats_run.sh > "$GATE_DIR/cats_run.log" 2>&1
+  SCALA_RS=$GATE_BIN CATSRUN_JOBS=2 PICKLE=1 KNOWN='' tests/cats_run.sh
 }
 run_gb_run() {
-  SCALA_RS=$GATE_BIN GBRUN_JOBS=2 tests/gitbucket_run.sh > "$GATE_DIR/gb_run.log" 2>&1
+  SCALA_RS=$GATE_BIN GBRUN_JOBS=2 PICKLE=1 KNOWN='' tests/gitbucket_run.sh
 }
 
 do_subset=1; do_tests=1; do_corpus=1; do_cats_run=1; do_gb_run=1
-skipped subset && { do_subset=0; NOTE+=("slick_subset SKIPPED"); }
-skipped tests  && { do_tests=0;  NOTE+=("workspace tests SKIPPED"); }
-skipped corpus && { do_corpus=0; NOTE+=("corpus SKIPPED"); }
-skipped cats_run && { do_cats_run=0; NOTE+=("cats_run SKIPPED"); }
-skipped gb_run && { do_gb_run=0; NOTE+=("gitbucket_run SKIPPED"); }
+for requested_skip in ${=SKIP}; do
+  case $requested_skip in
+    subset|tests|corpus|cats_run|gb_run) ;;
+    *) FAIL+=("unknown GATE_SKIP step: $requested_skip") ;;
+  esac
+done
+if skipped subset; then
+  do_subset=0; NOTE+=("slick_subset SKIPPED")
+  gate_result_write "$TDIR/subset.result.json" subset skip 0 "skipped via GATE_SKIP" || FAIL+=("subset result write failed")
+  FAIL+=("required step skipped: subset")
+fi
+if skipped tests; then
+  do_tests=0; NOTE+=("workspace tests SKIPPED")
+  gate_result_write "$TDIR/tests.result.json" tests skip 0 "skipped via GATE_SKIP" || FAIL+=("tests result write failed")
+  FAIL+=("required step skipped: tests")
+fi
+if skipped corpus; then
+  do_corpus=0; NOTE+=("corpus SKIPPED")
+  gate_result_write "$TDIR/corpus.result.json" corpus skip 0 "skipped via GATE_SKIP" || FAIL+=("corpus result write failed")
+  FAIL+=("required step skipped: corpus")
+fi
+if skipped cats_run; then
+  do_cats_run=0; NOTE+=("cats_run SKIPPED")
+  gate_result_write "$TDIR/cats_run.result.json" cats_run skip 0 "skipped via GATE_SKIP" || FAIL+=("cats_run result write failed")
+  FAIL+=("required step skipped: cats_run")
+fi
+if skipped gb_run; then
+  do_gb_run=0; NOTE+=("gitbucket_run SKIPPED")
+  gate_result_write "$TDIR/gb_run.result.json" gb_run skip 0 "skipped via GATE_SKIP" || FAIL+=("gb_run result write failed")
+  FAIL+=("required step skipped: gb_run")
+fi
 
 if [[ $SERIAL == 1 ]]; then
   step "heavy steps (serial, GATE_SERIAL=1)"
-  (( do_subset ))   && timed subset   run_subset
-  (( do_cats_run )) && timed cats_run run_cats_run
-  (( do_gb_run ))   && timed gb_run   run_gb_run
-  (( do_tests ))    && timed tests    run_tests
-  (( do_corpus ))   && timed corpus   run_corpus
+  if (( do_subset )); then run_timed_capture subset "$GATE_DIR/subset.log" run_subset || STEP_RC=$?; fi
+  if (( do_cats_run )); then run_timed_capture cats_run "$GATE_DIR/cats_run.log" run_cats_run || STEP_RC=$?; fi
+  if (( do_gb_run )); then run_timed_capture gb_run "$GATE_DIR/gb_run.log" run_gb_run || STEP_RC=$?; fi
+  if (( do_tests )); then run_timed_capture tests "$GATE_DIR/tests.log" run_tests || STEP_RC=$?; fi
+  if (( do_corpus )); then run_timed_capture corpus "$GATE_DIR/corpus.log" run_corpus || STEP_RC=$?; fi
 else
   step "heavy steps (concurrent): slick_subset + cats_run + gitbucket_run + workspace tests + corpus"
   print "  launched; the logs are subset.log, cats_run.log, gb_run.log, tests.log, corpus.log in $GATE_DIR"
-  (( do_subset ))   && spawn subset   run_subset
-  (( do_cats_run )) && spawn cats_run run_cats_run
-  (( do_gb_run ))   && spawn gb_run   run_gb_run
-  (( do_tests ))    && spawn tests    run_tests
-  (( do_corpus ))   && spawn corpus   run_corpus
+  (( do_subset ))   && spawn subset   "$GATE_DIR/subset.log" run_subset
+  (( do_cats_run )) && spawn cats_run "$GATE_DIR/cats_run.log" run_cats_run
+  (( do_gb_run ))   && spawn gb_run   "$GATE_DIR/gb_run.log" run_gb_run
+  (( do_tests ))    && spawn tests    "$GATE_DIR/tests.log" run_tests
+  (( do_corpus ))   && spawn corpus   "$GATE_DIR/corpus.log" run_corpus
   wait
 fi
 
 if (( do_subset )); then
   step "slick subset + class validation"
   NF=${#FAIL[@]}
-  # `tail -3` is the contract with slick_subset.sh: its last three lines are the
-  # loader verdict, the lint verdict and the file/class counts, and when the
-  # script dies early those three lines are whatever it died saying. Its phase
-  # timings are the one thing that must not be counted, or they push the loader
-  # verdict out of the window -- which is exactly what happened the first time.
-  SUB=$(grep -v '^phase ' "$GATE_DIR/subset.log" | tail -3 | tr '\n' ' '); print "  $SUB"
+  if require_result subset; then SUB=$GATE_RESULT_SUMMARY; else SUB=""; fi
+  print "  $SUB"
   [[ $SUB == *"verified=1504 failed=0"* && $SUB == *"lint_problems=0"* ]] || FAIL+=("slick_subset: $SUB")
   harness_ok subset $NF
 fi
@@ -347,7 +529,7 @@ for h in cats_run gb_run; do
   step "$what"
   NF=${#FAIL[@]}
   grep '^   known-fail ' "$log" | sed 's/^ */  /'
-  H=$(grep -m1 '^progs=' "$log")
+  if require_result "$h"; then H=$GATE_RESULT_SUMMARY; else H=""; fi
   print "  ${H:-(no summary line)}"
   if [[ -z $H ]]; then
     FAIL+=("$h printed no summary line; see $log")
@@ -362,9 +544,18 @@ done
 if (( do_tests )); then
   step "workspace tests (tests/workspace_tests.sh, --release)"
   NF=${#FAIL[@]}
-  T=$(grep '^test result:' "$GATE_DIR/tests.log" | awk -F'[ ;]' '{p+=$4; f+=$7} END {print NR" rows, "p" passed, "f" failed"}')
+  TEST_COUNTS_RC=0
+  TEST_COUNTS=$(gate_workspace_counts "$GATE_DIR/tests.log") || TEST_COUNTS_RC=$?
+  if (( TEST_COUNTS_RC == 0 )); then
+    IFS=$'\t' read -r TEST_ROWS TEST_PASSED TEST_FAILED <<< "$TEST_COUNTS"
+    T="$TEST_ROWS rows, $TEST_PASSED passed, $TEST_FAILED failed"
+  else
+    TEST_ROWS=0; TEST_PASSED=0; TEST_FAILED=0
+    T="0 rows, 0 passed, 0 failed"
+    FAIL+=("workspace tests: malformed or missing test result rows")
+  fi
   print "  $T"
-  NFAIL=$(grep '^test result:' "$GATE_DIR/tests.log" | awk -F'[ ;]' '{f+=$7} END {print f+0}')
+  NFAIL=$TEST_FAILED
   if [[ $NFAIL -ne 0 ]]; then
     FAIL+=("workspace tests: $T")
     print "  failing:"; grep -A8 '^failures:' "$GATE_DIR/tests.log" | grep -E '^    [a-z_0-9]+' | sort -u | sed 's/^/   /'
@@ -374,11 +565,15 @@ if (( do_tests )); then
   # nothing back, which is the check the old `cargo test | grep` never had.
   WT=$(grep -m1 '^workspace_tests: binaries=' "$GATE_DIR/tests.log")
   print "  $WT"
+  TRC=0; require_result tests >/dev/null || TRC=$?
   if [[ -z $WT ]]; then
     FAIL+=("workspace tests: runner printed no summary line")
-  elif [[ $WT != *" missing=0 "* || $WT != *" failed_bins=0 "* ]]; then
-    FAIL+=("workspace tests: $WT")
-    grep '^workspace_tests: \(MISSING\|NONZERO\)' "$GATE_DIR/tests.log" | sed 's/^/   /'
+  else
+    WT_DOC_RC=0; WT_DOC_ROWS=$(gate_measure_field "$WT" doc_rows) || WT_DOC_RC=$?
+    if [[ $WT != *" missing=0 "* || $WT != *" failed_bins=0 "* || $WT_DOC_ROWS != 7 ]] || (( WT_DOC_RC != 0 )); then
+      FAIL+=("workspace tests: $WT")
+      grep '^workspace_tests: \(MISSING\|NONZERO\)' "$GATE_DIR/tests.log" | sed 's/^/   /'
+    fi
   fi
   harness_ok tests $NF
 fi
@@ -387,6 +582,7 @@ fi
 if (( do_corpus )); then
   step "scala/scala corpus (full)"
   NF=${#FAIL[@]}
+  CRC=0; require_result corpus >/dev/null || CRC=$?
   grep -E '^(pos|neg|run): total' "$GATE_DIR/corpus.log" | sed 's/^/  /'
   # How many rows were lost to a clock rather than to a compiler. Not a failure
   # by itself (a pass that became a timeout is already a loss below), but it is
@@ -397,21 +593,56 @@ if (( do_corpus )); then
   TMOUT_ROWS=$(grep -cE $'\t'"skip"$'\t'"(run-)?timeout" "$GATE_DIR/corpus.tsv" 2>/dev/null)
   print "  rows skipped on a timeout: ${TMOUT_ROWS:-?} (limits ${CORPUS_TMO}s compile / ${CORPUS_RTMO}s run)"
   if [[ -n ${LEDGER:-} && -s $GATE_DIR/corpus.tsv ]]; then
-    CMP=$(python3 tests/compare_corpus.py "$LEDGER" "$GATE_DIR/corpus.tsv" 2>&1)
+    CMP_RC=0
+    CMP=$(python3 tests/compare_corpus.py "$LEDGER" "$GATE_DIR/corpus.tsv" 2>&1) || CMP_RC=$?
     print "$CMP" > "$GATE_DIR/compare.json"
-    LOSSES=$(print "$CMP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["losses"])' 2>/dev/null || print "?")
-    CHANGES=$(print "$CMP" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["changes"]))' 2>/dev/null || print "?")
-    print "  vs $LEDGER: losses=$LOSSES changes=$CHANGES"
-    # A loss is confirmed by a *serial* re-run of just that test. Some corpus
+    CMP_PARSE_RC=0
+    CMP_PARSE=$(PYTHONPATH="$ROOT/tests${PYTHONPATH:+:$PYTHONPATH}" python3 -c 'import json,sys
+from compare_corpus import validate_result
+try:
+ result=json.load(sys.stdin)
+ validate_result(result)
+ print("{}\t{}".format(result["losses"], len(result["changes"])))
+except (ValueError,TypeError,KeyError,json.JSONDecodeError):
+ raise SystemExit(2)' <<< "$CMP" 2>/dev/null) || CMP_PARSE_RC=$?
+    if (( CMP_PARSE_RC != 0 )); then
+      FAIL+=("corpus comparison failed or returned malformed JSON (compare_rc=$CMP_RC parse_rc=$CMP_PARSE_RC)")
+      LOSSES="?"; CHANGES="?"
+      gate_result_write "$TDIR/corpus_compare.result.json" corpus_compare error 2 \
+        "comparison unavailable compare_rc=$CMP_RC parse_rc=$CMP_PARSE_RC" || \
+        FAIL+=("corpus comparison result write failed")
+    else
+      IFS=$'\t' read -r LOSSES CHANGES <<< "$CMP_PARSE"
+      EXPECTED_CMP_RC=0
+      (( LOSSES != 0 )) && EXPECTED_CMP_RC=1
+      COMPARE_STATUS=pass; COMPARE_RESULT_RC=$CMP_RC
+      if (( CMP_RC != EXPECTED_CMP_RC )); then
+        FAIL+=("corpus comparison exit code $CMP_RC is inconsistent with losses=$LOSSES")
+        COMPARE_STATUS=error
+        (( COMPARE_RESULT_RC == 0 )) && COMPARE_RESULT_RC=2
+      elif (( LOSSES != 0 )); then
+        COMPARE_STATUS=fail
+      fi
+      gate_result_write "$TDIR/corpus_compare.result.json" corpus_compare \
+        "$COMPARE_STATUS" "$COMPARE_RESULT_RC" "losses=$LOSSES changes=$CHANGES" || \
+        FAIL+=("corpus comparison result write failed")
+    fi
+    print "  vs $LEDGER: losses=${LOSSES:-?} changes=${CHANGES:-?}"
+    # A loss is classified by a *serial* re-run of just that test. Some corpus
     # tests assert their own wall-clock time (`run/t5857`: "it should be less
     # than, say, 250ms"), so on a machine running three heavy steps at once
-    # they fail for the load, not for the compiler -- and a gate that invents
-    # losses is as useless as one that hides them. A real regression fails
-    # both times; this costs seconds and only runs when there is a loss.
+    # they fail for the load, not for the compiler. The retry identifies that
+    # condition for follow-up, but it can never turn a candidate loss green:
+    # the merge gate remains FAIL until the full candidate ledger is clean.
     if [[ $LOSSES != 0 && $LOSSES != "?" ]]; then
-      LOSTSPECS=$(print "$CMP" | python3 -c 'import json,sys
+      LOSTSPECS_RC=0
+      LOSTSPECS=$(python3 -c 'import json,sys
 d=json.load(sys.stdin)
-print(" ".join(c["kind"]+"/"+c["test"] for c in d["changes"] if c.get("loss")))' 2>/dev/null)
+print(" ".join(c["kind"]+"/"+c["test"] for c in d["changes"] if c.get("loss")))' 2>/dev/null <<< "$CMP") || LOSTSPECS_RC=$?
+      if (( LOSTSPECS_RC != 0 )); then
+        FAIL+=("corpus comparison changes could not be parsed (rc=$LOSTSPECS_RC)")
+        LOSTSPECS=""
+      fi
       print "  re-running each loss serially: $LOSTSPECS"
       STILL=()
       for spec in ${=LOSTSPECS}; do
@@ -428,18 +659,22 @@ print(" ".join(c["kind"]+"/"+c["test"] for c in d["changes"] if c.get("loss")))'
       if (( ${#STILL[@]} )); then
         FAIL+=("corpus losses=${#STILL[@]} vs $LEDGER: ${STILL[*]}")
       else
-        NOTE+=("corpus: $LOSSES loss(es) passed on a serial re-run (load-sensitive, not a regression): $LOSTSPECS")
+        FAIL+=("corpus losses=$LOSSES vs $LEDGER (all serial retries passed; load-sensitive, gate remains FAIL): $LOSTSPECS")
       fi
     fi
   else
     FAIL+=("corpus has no ledger to compare against (ledger='${LEDGER:-}', tsv=$GATE_DIR/corpus.tsv)")
+    gate_result_write "$TDIR/corpus_compare.result.json" corpus_compare error 2 \
+      "comparison unavailable ledger=${LEDGER:-none} tsv=$GATE_DIR/corpus.tsv" || \
+      FAIL+=("corpus comparison result write failed")
   fi
   harness_ok corpus $NF
 fi
 
 # --- hygiene ----------------------------------------------------------------
 step "fmt"
-timed fmt cargo fmt --all --check > "$GATE_DIR/fmt.log" 2>&1 || FAIL+=("cargo fmt --check")
+FRC=0; run_timed_capture fmt "$GATE_DIR/fmt.log" cargo fmt --all --check || FRC=$?
+require_result fmt >/dev/null || FRC=$?
 
 GATE_SECS=$(printf '%.0f' $(( EPOCHREALTIME - GATE_T0 )))
 
@@ -458,13 +693,8 @@ printf '  %-12s %8s %8s\n' TOTAL $GATE_SECS "$(mmss $GATE_SECS)"
 print "\n=== summary"
 print "  HEAD=$HEAD  logs=$GATE_DIR  wall=$(mmss $GATE_SECS)"
 for n in ${NOTE[@]:-}; do print "  note: $n"; done
-if [[ ${#FAIL[@]} -eq 0 ]]; then
-  print "VERDICT=PASS"
-else
-  for f in ${FAIL[@]}; do print "  fail: $f"; done
-  print "VERDICT=FAIL"
-fi
-print "DONE"
+for f in ${FAIL[@]}; do print "  fail: $f"; done
 # Keep the completion sentinel on both paths, then propagate the verdict to
-# callers that also check the process status.
-(( ${#FAIL[@]} == 0 ))
+# callers that also check the process status. The final JSON record is written
+# before either marker so a reader can validate the result after DONE.
+finish_gate

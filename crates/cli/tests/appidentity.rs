@@ -1,37 +1,34 @@
 //! Runtime identities, not simple names, select Scala initialization protocols.
-#[path = "support/temp_nonce.rs"]
-mod temp_nonce;
+use crate::support;
 
 use std::{fs, path::Path, process::Command};
-const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 #[test]
 fn shadowed_initialization_traits_match_scalac() {
-    let root = std::env::temp_dir().join(format!(
-        "appidentity-{}-{}",
-        std::process::id(),
-        temp_nonce::unique_stamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-    ));
-    fs::create_dir(&root).unwrap();
+    let toolchain = support::toolchain();
+    let (Some(scalac), Some(jar), Some(java)) = (
+        toolchain.scalac(),
+        toolchain.scala_library(),
+        toolchain.java(),
+    ) else {
+        eprintln!("skip appidentity differential test: Scala/JVM toolchain unavailable");
+        return;
+    };
+    let root = support::TestDir::new("appidentity");
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     let expected = fs::read(fixtures.join("expected/appidentity.txt")).unwrap();
     for mode in ["nsc", "jar", "private"] {
         for bad in [false, true] {
             let out = root.join(format!("{mode}-{bad}"));
-            fs::create_dir(&out).unwrap();
+            fs::create_dir_all(&out).unwrap();
             let mut c = if mode == "nsc" {
-                Command::new("/tmp/scala-2.13.16/bin/scalac")
+                Command::new(scalac)
             } else {
-                let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
+                let mut c = Command::new(support::scala_rs());
                 c.arg("compile");
                 if mode == "private" {
                     c.arg("--no-scala-library");
                 } else {
-                    c.args(["--scala-library", JAR]);
+                    c.args(["--scala-library", jar.to_str().unwrap()]);
                 }
                 c
             };
@@ -55,9 +52,9 @@ fn shadowed_initialization_traits_match_scalac() {
                 let cp = if mode == "private" {
                     out.display().to_string()
                 } else {
-                    format!("{}:{JAR}", out.display())
+                    format!("{}:{}", out.display(), jar.display())
                 };
-                let r = Command::new("java")
+                let r = Command::new(java)
                     .args(["-Xverify:all", "-cp", &cp, "Main"])
                     .output()
                     .unwrap();
@@ -70,5 +67,4 @@ fn shadowed_initialization_traits_match_scalac() {
             }
         }
     }
-    fs::remove_dir_all(root).unwrap();
 }

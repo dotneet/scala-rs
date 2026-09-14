@@ -1,29 +1,20 @@
 //! Default type imports remain available after same-named terms are loaded.
-#[path = "support/temp_nonce.rs"]
-mod temp_nonce;
+use crate::support;
 
-use std::{
-    fs,
-    path::PathBuf,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, path::PathBuf, process::Command};
 
 #[test]
 fn default_type_imports_after_term_completion_match_scalac() {
-    let root = std::env::temp_dir().join(format!(
-        "scala-rs-default-type-imports-{}-{}",
-        std::process::id(),
-        temp_nonce::unique_stamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
-    let scalac = "/tmp/scala-2.13.16/bin/scalac";
+    let toolchain = support::toolchain();
+    let (Some(scalac), Some(jar), Some(_java)) = (
+        toolchain.scalac(),
+        toolchain.scala_library(),
+        toolchain.java(),
+    ) else {
+        eprintln!("skip default type imports differential test: Scala/JVM toolchain unavailable");
+        return;
+    };
+    let root = support::TestDir::new("default-type-imports");
     let positive = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/default_type_imports.scala");
     for (name, source, accepted) in [
@@ -40,23 +31,29 @@ fn default_type_imports_after_term_completion_match_scalac() {
         for ours in [false, true] {
             let out = root.join(format!("{name}-{ours}"));
             fs::create_dir_all(&out).unwrap();
-            let mut cmd = if ours {
-                let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
-                c.args(["compile", "--scala-library", jar]);
-                c
+            let result = if ours {
+                support::CompileCommand::new(&src, &out)
+                    .scala_library(jar)
+                    .run()
             } else {
-                Command::new(scalac)
+                support::CompileOutcome::from_output(
+                    Command::new(scalac)
+                        .arg(&src)
+                        .arg("-d")
+                        .arg(&out)
+                        .output()
+                        .unwrap(),
+                )
             };
-            let result = cmd.arg(&src).arg("-d").arg(&out).output().unwrap();
             assert_eq!(
-                result.status.success(),
+                result.success(),
                 accepted,
                 "{name}, ours={ours}: {}",
-                String::from_utf8_lossy(&result.stderr)
+                result.diagnostics()
             );
             if accepted {
-                let cp = format!("{}:{jar}", out.display());
-                let result = Command::new("java")
+                let cp = format!("{}:{}", out.display(), jar.display());
+                let result = Command::new(toolchain.java().unwrap())
                     .args(["-Xverify:all", "-cp", &cp, "Main"])
                     .output()
                     .unwrap();
@@ -70,10 +67,9 @@ fn default_type_imports_after_term_completion_match_scalac() {
                     "List(1)\nList(a)\n"
                 );
             } else {
-                let diagnostic = String::from_utf8_lossy(&result.stderr);
+                let diagnostic = String::from_utf8_lossy(result.stderr());
                 assert!(diagnostic.contains("type mismatch"), "{name}, ours={ours}: {diagnostic}");
             }
         }
     }
-    fs::remove_dir_all(root).unwrap();
 }

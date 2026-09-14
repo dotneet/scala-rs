@@ -66,7 +66,7 @@ parameters are updated in place.
 ## Regression test
 
 ```sh
-CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 cargo test -p scala-rs-cli --release --test trc_tailrec
+CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 tests/cli_test.sh trc_tailrec
 ```
 
 `tests/fixtures/trc_deep.scala` runs one to two million recursive calls with
@@ -88,7 +88,7 @@ scalac against scala-rs classfiles to exercise the static extension ABI across a
 compilation boundary.
 
 ```sh
-cargo test -p scala-rs-cli --release --test trc_bool
+tests/cli_test.sh trc_bool
 ```
 
 `tests/fixtures/trc_bool.scala` reproduces all seven library `&&` / `||` shapes

@@ -1,21 +1,18 @@
 //! Function Unit arity and the real Either companion retain Scala identities.
-#[path = "support/temp_nonce.rs"]
-mod temp_nonce;
+use crate::support;
 
 use std::{fs, path::Path, process::Command};
-const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 fn check_cases(cases: &[(&str, bool)]) {
-    let root = std::env::temp_dir().join(format!(
-        "batchtypes-{}-{}",
-        std::process::id(),
-        temp_nonce::unique_stamp(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-    ));
-    fs::create_dir(&root).unwrap();
+    let toolchain = support::toolchain();
+    let (Some(scalac), Some(jar), Some(_java)) = (
+        toolchain.scalac(),
+        toolchain.scala_library(),
+        toolchain.java(),
+    ) else {
+        eprintln!("skip batchtypes differential test: Scala/JVM toolchain unavailable");
+        return;
+    };
+    let root = support::TestDir::new("batchtypes");
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     for &(name, good) in cases {
         for mode in ["nsc", "jar", "private"] {
@@ -25,14 +22,14 @@ fn check_cases(cases: &[(&str, bool)]) {
             let out = root.join(format!("{name}-{mode}"));
             fs::create_dir(&out).unwrap();
             let mut c = if mode == "nsc" {
-                Command::new("/tmp/scala-2.13.16/bin/scalac")
+                Command::new(scalac)
             } else {
-                let mut c = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
+                let mut c = Command::new(support::scala_rs());
                 c.arg("compile");
                 if mode == "private" {
                     c.arg("--no-scala-library");
                 } else {
-                    c.args(["--scala-library", JAR]);
+                    c.args(["--scala-library", jar.to_str().unwrap()]);
                 }
                 c
             };
@@ -52,9 +49,9 @@ fn check_cases(cases: &[(&str, bool)]) {
                 let cp = if mode == "private" {
                     out.display().to_string()
                 } else {
-                    format!("{}:{JAR}", out.display())
+                    format!("{}:{}", out.display(), jar.display())
                 };
-                let r = Command::new("java")
+                let r = Command::new(toolchain.java().unwrap())
                     .args(["-Xverify:all", "-cp", &cp, "Main"])
                     .output()
                     .unwrap();
@@ -70,7 +67,6 @@ fn check_cases(cases: &[(&str, bool)]) {
             }
         }
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

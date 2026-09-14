@@ -58,9 +58,7 @@ Validation:
 
 ```sh
 cargo test --release --offline --workspace --lib --no-fail-fast
-cargo test --release --offline -p scala-rs-cli \
-  --test quasi --test reify --test reify2 --test rf_reify \
-  --test linearization --test implicitmemo --no-fail-fast
+tests/cli_test.sh quasi reify reify2 rf_reify linearization implicitmemo
 ```
 
 All **350 library tests** passed with JDK 17, and all **58 integration tests**
@@ -121,11 +119,9 @@ witnesses, local/by-name conversions, and JVM execution in both runtime modes:
 
 ```sh
 cargo test --release --offline --workspace --lib --no-fail-fast
-cargo test --release --offline -p scala-rs-cli \
-  --test conversion_inference --test convimpl --test implicitmemo \
-  --test implicit_misc --test localconv --test btmeet --test bparent \
-  --test linearization --test traitextends --test ifacebridge --test javanest \
-  --test function_pattern --test byname_followup --no-fail-fast
+tests/cli_test.sh conversion_inference convimpl implicitmemo implicit_misc \
+  localconv btmeet bparent linearization traitextends ifacebridge javanest \
+  function_pattern byname_followup
 ```
 
 ### Reuse import-prefix resolution within one immutable search
@@ -179,12 +175,9 @@ including reference-scalac comparisons and JVM execution:
 
 ```sh
 cargo test --release --offline --workspace --lib --no-fail-fast
-cargo test --release --offline -p scala-rs-cli \
-  --test imports --test quasi --test reify --test reify2 --test rf_reify \
-  --test lexicalcontext --test contextualinference --test nameamb --test pfx \
-  --test pathdep --test implicitmemo --test implicit_misc \
-  --test conversion_inference --test convimpl --test localconv \
-  --test bparent --test btmeet --test byname_followup --no-fail-fast
+tests/cli_test.sh imports quasi reify reify2 rf_reify lexicalcontext \
+  contextualinference nameamb pfx pathdep implicitmemo implicit_misc \
+  conversion_inference convimpl localconv bparent btmeet byname_followup
 ```
 
 ### Historical measurements

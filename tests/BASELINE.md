@@ -300,7 +300,7 @@ specialization remain explicitly red; this is not a completion claim.
 | `tests/slick_measure.sh` (184 files) | **0** | **0** | **1504** |
 | `tests/cats_measure.sh` (339, 1 skipped) | **31** | **21** | — |
 | `tests/gitbucket_measure.sh` (354, none skipped, 3 real Java sources) | **92** | **43** | — |
-| `tests/scalalib_measure.sh` (538) | **383** | **107** | — |
+| `tests/scalalib_measure.sh` (538) | **2** | **2** | — |
 
 Gate `913fb1c0` expanded gitbucket input coverage: that candidate on the previous
 353-source, Java-disabled input reported **115/54**. Its expanded **108/52** result

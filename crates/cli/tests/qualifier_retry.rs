@@ -1,33 +1,21 @@
 //! Cross-unit inference must revisit provisional qualifier errors, while
 //! preserving genuine argument errors at their originating call.
-#[path = "support/temp_nonce.rs"]
-mod temp_nonce;
+use crate::support;
 
-use std::{
-    fs,
-    process::Command,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{fs, process::Command};
 
 #[test]
 fn inferred_parent_argument_qualifier_is_retried() {
-    let root = std::env::temp_dir().join(format!(
-        "scala-rs-qualifier-retry-{}-{}",
-        std::process::id(),
-        temp_nonce::unique_stamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let scalac = "/tmp/scala-2.13.16/bin/scalac";
-    let jar = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
-    assert!(
-        std::path::Path::new(scalac).is_file() && std::path::Path::new(jar).is_file(),
-        "requires Scala 2.13.16"
-    );
+    let toolchain = support::toolchain();
+    let (Some(scalac), Some(jar), Some(java)) = (
+        toolchain.scalac(),
+        toolchain.scala_library(),
+        toolchain.java(),
+    ) else {
+        eprintln!("skip qualifier retry differential test: Scala/JVM toolchain unavailable");
+        return;
+    };
+    let root = support::TestDir::new("qualifier-retry");
     let source = root.join("Source.scala");
     let helper = root.join("Helper.scala");
     fs::write(
@@ -62,8 +50,8 @@ object Main { def main(args: Array[String]): Unit = println(new Composer(new Com
                 let out = root.join(format!("{valid}-{reverse}-{ours}"));
                 fs::create_dir_all(&out).unwrap();
                 let mut cmd = if ours {
-                    let mut cmd = Command::new(env!("CARGO_BIN_EXE_scala-rs"));
-                    cmd.args(["compile", "--scala-library", jar]);
+                    let mut cmd = Command::new(support::scala_rs());
+                    cmd.args(["compile", "--scala-library", jar.to_str().unwrap()]);
                     cmd
                 } else {
                     Command::new(scalac)
@@ -81,8 +69,8 @@ object Main { def main(args: Array[String]): Unit = println(new Composer(new Com
                     "valid={valid} reverse={reverse} ours={ours}: {stderr}"
                 );
                 if valid {
-                    let cp = format!("{}:{jar}", out.display());
-                    let result = Command::new("java")
+                    let cp = format!("{}:{}", out.display(), jar.display());
+                    let result = Command::new(java)
                         .args(["-Xverify:all", "-cp", &cp, "Main"])
                         .output()
                         .unwrap();
@@ -103,7 +91,6 @@ object Main { def main(args: Array[String]): Unit = println(new Composer(new Com
             }
         }
     }
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -111,36 +98,28 @@ fn erroneous_application_chain_does_not_repeat_dynamic_receiver_typing() {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let root = std::env::temp_dir().join(format!(
-        "scala-rs-qualifier-growth-{}-{}",
-        std::process::id(),
-        temp_nonce::unique_stamp(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-    ));
-    fs::create_dir_all(&root).unwrap();
+    let root = support::TestDir::new("qualifier-growth");
     let source = root.join("Main.scala");
     fs::write(
         &source,
         format!("object Main {{ val x = missing{} }}\n", ".f(0)".repeat(80)),
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scala-rs"))
-        .args([
-            "compile",
-            "--scala-library",
-            "/tmp/scala-rs-lib/scala-library-2.13.16.jar",
-        ])
-        .arg(&source)
-        .arg("-d")
-        .arg(&root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = support::ChildGuard::new(
+        Command::new(support::scala_rs())
+            .args([
+                "compile",
+                "--scala-library",
+                "/tmp/scala-rs-lib/scala-library-2.13.16.jar",
+            ])
+            .arg(&source)
+            .arg("-d")
+            .arg(&root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     // The repaired release compiler takes less than a second here. The old
     // repeated traversal already exceeded five seconds at depth 16, so 80
     // makes this a generous termination check rather than a microbenchmark.
@@ -164,5 +143,4 @@ fn erroneous_application_chain_does_not_repeat_dynamic_receiver_typing() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("not found: value missing"), "{stderr}");
     assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
-    fs::remove_dir_all(root).unwrap();
 }

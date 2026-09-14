@@ -42,7 +42,7 @@ pre-erasure metadata. A second defect was at the call site: erase_apply
 only unboxed generic results when the underlying representation was primitive.
 It now also unboxes reference-backed value classes.
 
-`cargo test --release -p scala-rs-cli --test vcbridge` passes (1 test),
+`tests/cli_test.sh vcbridge` passes (1 test),
 comparing stdout bytes with scalac using java -Xverify:all. The LazyList
 fixture runs in library ABI mode. A separate Int/String-backed value-class
 fixture runs in both modes and prints `5` and `ok!`. The private runtime

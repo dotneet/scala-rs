@@ -4,6 +4,29 @@
 cargo test --workspace --release
 ```
 
+The CLI integration suite keeps its fixture sources under `crates/cli/tests/`,
+but Cargo links them through eight shard targets to avoid hundreds of separate
+test binaries. Run one or more fixture modules by source name with:
+
+```bash
+tests/cli_test.sh vcbridge
+tests/cli_test.sh conversion_inference implicitmemo bparent
+```
+
+The helper resolves each module to its shard and applies a module-qualified
+test filter, so it does not execute unrelated tests in that shard. Direct
+commands such as `cargo test --test vcbridge` are no longer valid Cargo target
+names; use `tests/cli_test.sh` for focused work and
+`tests/workspace_tests.sh` for the parallel full workspace suite.
+
+The workspace runner applies an 1800-second wall-clock limit to each test
+binary. A timeout kills the binary's process group (including compiler/JVM
+children), records a deterministic `workspace_tests: TIMEOUT` marker, and is
+counted as both a missing result and a non-zero binary. Set `WT_TIMEOUT=0` only
+for an intentional, unbounded run; malformed values fail before the build.
+`tests/run_with_timeout_test.sh` smoke-tests the guard without building the
+workspace.
+
 The four compile measurements (`slick`, `cats`, `gitbucket`, `scalalib`)
 report `compiler_exit` alongside their counts. Exit 1 with actual diagnostics
 is a valid measurement of unsupported sources; abnormal exits, a failure
@@ -11,6 +34,18 @@ without diagnostics, no source files, and a supposedly successful build with
 no classes fail the measurement. These are not zero-error results.
 `slick_run.sh` additionally requires the compilation itself to succeed and
 propagates structural lint failures through its output pipeline.
+
+The external fixture scripts take the Scala 2.13.16 home, library, compiler
+jars, and `scalac` launcher from `[toolchain]` in
+`tests/fixture_manifest.toml`. Relative paths use `/tmp` by default (the
+existing fixture layout); set `SCALA_RS_TOOLCHAIN_ROOT` to relocate them, or
+use `SCALA_HOME`, `SCALA_LIBRARY_JAR`, `SCALA_LAUNCHER_LIBRARY_JAR`,
+`SCALA_COMPILER_JAR`, `SCALA_REFLECT_JAR`, or `SCALAC` to override the
+corresponding Scala path, or `JAVA`/`JAVAC` for explicit JDK tools. The latter
+take precedence, followed by the
+corresponding `JAVA_HOME/bin` tools, then `PATH`; the same selected `java` is
+recorded in cache fingerprints and embedded in the generated `scalac`
+launcher.
 
 `tests/verify_all.sh` reports `verify_loaded` and `verify_incomplete` as well
 as `verify_classes` and `verify_failures`. Missing dependencies and failed

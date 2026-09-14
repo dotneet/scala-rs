@@ -19,7 +19,7 @@ overload instead of replacing both candidates with one JVM call. A
 `SortedMap` combination that widens only the value type retains the key type,
 the existing `Ordering`, and the `SortedMap` result.
 
-`cargo test --release -p scala-rs-cli --test overload_module` compares the
+`tests/cli_test.sh overload_module` compares the
 behavior with scalac 2.13.16. The test checks rejection of ambiguous calls,
 selection by specificity, single evaluation of the receiver, and the exit
 status and stdout of `java -Xverify:all` for ordinary and element-widening set
