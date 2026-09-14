@@ -130,3 +130,87 @@ fn external_ctor_named_defaults_type_lambda() {
     let _ = fs::remove_dir_all(reference);
     let _ = fs::remove_dir_all(ours);
 }
+
+/// A selected stable accessor remains a term prefix in type position. Real
+/// scalac first proves that the scala-rs producer exported the path correctly;
+/// scala-rs must then accept the same consumer and construct the inner class
+/// with the selected value as its enclosing instance.
+#[test]
+fn external_stable_accessor_is_type_prefix() {
+    if !java_available() {
+        return;
+    }
+    let (Some(sc), Some(jar)) = (scalac(), scala_library_jar()) else {
+        eprintln!("skip stc stable-prefix dual-run: scalac, scala-library, or Java unavailable");
+        return;
+    };
+    let lib = tmp_dir("stable-lib");
+    let reference = tmp_dir("stable-reference");
+    let ours = tmp_dir("stable-ours");
+    let lib_src = fixtures_dir().join("stc_stable_lib.scala");
+    let use_src = fixtures_dir().join("stc_stable_use.scala");
+    let jar_s = jar.to_str().unwrap();
+
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            lib_src.to_str().unwrap(),
+            "-d",
+            lib.to_str().unwrap(),
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("scala-rs stc_stable_lib");
+    assert!(
+        output.status.success(),
+        "scala-rs failed to compile stc_stable_lib: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let status = Command::new(&sc)
+        .args([
+            use_src.to_str().unwrap(),
+            "-cp",
+            lib.to_str().unwrap(),
+            "-d",
+            reference.to_str().unwrap(),
+        ])
+        .status()
+        .expect("scalac stc_stable_use");
+    assert!(
+        status.success(),
+        "scalac failed to read scala-rs stable path"
+    );
+    let expected = run_java(&reference, &format!("{}:{jar_s}", lib.display()));
+
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            use_src.to_str().unwrap(),
+            "-cp",
+            lib.to_str().unwrap(),
+            "-d",
+            ours.to_str().unwrap(),
+            "--scala-library",
+            jar_s,
+        ])
+        .output()
+        .expect("scala-rs stc_stable_use");
+    assert!(
+        output.status.success(),
+        "scala-rs failed to compile stc_stable_use: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        run_java(&ours, &format!("{}:{jar_s}", lib.display())),
+        expected,
+        "scala-rs stable-prefix output differs from real scalac"
+    );
+
+    let _ = fs::remove_dir_all(lib);
+    let _ = fs::remove_dir_all(reference);
+    let _ = fs::remove_dir_all(ours);
+}

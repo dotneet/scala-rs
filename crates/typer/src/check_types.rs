@@ -603,7 +603,9 @@ impl Typer {
                     .iter()
                     .any(|s| matches!(self.st.get(*s).kind, SymKind::Term | SymKind::Method))
             }
-            TreeKind::Select { qual, .. } => self.type_select_is_term_prefix(qual),
+            TreeKind::Select { .. } => self
+                .term_path_sym(t)
+                .is_some_and(|s| matches!(self.st.get(s).kind, SymKind::Term | SymKind::Method)),
             _ => false,
         }
     }
