@@ -211,6 +211,12 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
             let (params, ret) = parse_classpath_method(st, owner, m);
             let names: Vec<String> = (0..params.len()).map(|i| format!("x${i}")).collect();
             let id = add_method_erased(st, owner, &m.name, names, params, ret);
+            // Classpath fallback methods come directly from the JVM classfile;
+            // preserve ACC_STATIC so Scala companion forwarders are not
+            // treated as inherited instance members by name lookup.
+            if crate::javaclass::is_java_static(m.access) {
+                st.get_mut(id).flags = st.get(id).flags.with(Flags::STATIC);
+            }
             // Non-public methods can be absent from the pickle API subset.
             // Their classfile fallback still has real access restrictions;
             // treating it as public allowed calls that fail on the JVM.

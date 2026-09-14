@@ -1709,6 +1709,16 @@ impl Typer {
             .pickle
             .complete(&mut self.st, &mut self.binary, cls, name);
         for id in found {
+            // Class-file readers expose Scala companion members as static
+            // forwarders on the implementing class. They are useful through
+            // the companion itself, but Scala does not inherit them into a
+            // subclass. The eager template walk applies the same rule; keep
+            // the lazy bare-name path consistent or `Some`/`None` inside a
+            // Slick `Table` resolve to `Rep.Some`/`Rep.None` instead of the
+            // standard-library constructors.
+            if !crate::check_overload::not_inherited_static(&self.st, id, cls) {
+                continue;
+            }
             self.st.enter_in_current(name, id);
         }
         if self.exposure_lookup(name, terms_only).is_empty() {

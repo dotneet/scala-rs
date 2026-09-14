@@ -12,6 +12,9 @@ class Gz2Rows(tag: Tag) extends Table[Gz2Row](tag, "GZ2") {
   def name = column[String]("NAME")
   def size = column[Int]("SIZE")
   def note = column[String]("NOTE")
+  // `None` is another static forwarder on Rep.class. It must remain the
+  // standard-library value while defining an Option column default.
+  def noneDefault = column[Option[Boolean]]("NONE_DEFAULT", O Default None)
   def * = (name, size, note.?).shaped.<>(
     { case (n, s, o) => Gz2Row(n, s, o) },
     { (r: Gz2Row) => Some((r.name, r.size, r.note)) }
