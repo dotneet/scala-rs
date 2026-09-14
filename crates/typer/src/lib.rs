@@ -2302,6 +2302,25 @@ object Main {
     }
 
     #[test]
+    fn applied_abstract_type_member_aligns_its_base_type() {
+        ok(r#"
+trait Base[+R, +S, -E]
+trait ActionComponent {
+  type ProfileAction[+R, +S, -E] <: Base[R, S, E]
+}
+trait Database {
+  type Profile <: ActionComponent
+  val profile: Profile
+}
+trait Read
+class AbstractBoundUse(val db: Database) {
+  def run[R](a: Base[R, String, Nothing]): Unit = ()
+  def accept(a: db.profile.ProfileAction[Int, String, Read]): Unit = run(a)
+}
+"#);
+    }
+
+    #[test]
     fn higher_kinded_type_member_kind_mismatch() {
         let (_, _, diags) = typecheck_str(
             r#"

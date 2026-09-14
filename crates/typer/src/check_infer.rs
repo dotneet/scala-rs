@@ -2912,6 +2912,7 @@ impl Typer {
         match arg {
             Type::Class { sym: as_, .. } if as_ == ps => return arg.clone(),
             Type::Class { .. }
+            | Type::Applied { .. }
             | Type::Refined { .. }
             | Type::ModuleRef(_)
             | Type::ThisType(_)

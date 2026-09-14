@@ -1998,6 +1998,28 @@ impl Typer {
             Type::Annotated { tpe, .. } => {
                 return self.base_type_instance(tpe, target, depth + 1);
             }
+            // An abstract higher-kinded member is still a nominal subtype of
+            // its declared upper bound after application.  `ProfileAction[R,
+            // S, E]` is declared as `BasicAction[R, S, E]`, for example.  The
+            // class parent walk in `base_type_instance` used to stop at the
+            // applied member, so method inference could not align that action
+            // with `DBIOAction[R, NoStream, Nothing]` even though ordinary
+            // conformance correctly followed the same bound.  Follow the
+            // bound with the member's arguments substituted; aliases are
+            // folded first and recurse normally.
+            Type::Applied { ctor, args } => {
+                let folded = crate::symbol::apply_type_ctor((**ctor).clone(), args.clone());
+                if folded != *ty {
+                    return self.base_type_instance(&folded, target, depth + 1);
+                }
+                let id = match ctor.as_ref() {
+                    Type::TypeMember(id) | Type::TypeParam(id) => *id,
+                    _ => return None,
+                };
+                let hi = self.st.get(id).bound_hi.clone()?;
+                let hi = self.st.subst_tparams(id, args, &hi);
+                return self.base_type_instance(&hi, target, depth + 1);
+            }
             // An inner class behind a prefix (`prefix.rs`): its parents are
             // written in the enclosing class's vocabulary, and the prefix is
             // what instantiates them -- `hm.KeySet` for `class KeySet extends
