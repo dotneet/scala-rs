@@ -376,6 +376,28 @@ fn samconv_emits_an_anonymous_class_per_sam_literal() {
         "the Ordering SAM class must not declare `equiv`; the library's default method is:\n{text}"
     );
 
+    // `tryCompare` is the one inherited default whose child return is
+    // covariant (`Some`) with respect to `PartialOrdering`'s parent entry
+    // point (`Option`). JVM resolution is descriptor-exact, so scalac emits
+    // an ordinary child forwarder and a synthetic bridge at the parent
+    // descriptor. Keep both the ABI shape and the bridge flags pinned here;
+    // a direct Option-returning static call happens to run but is not the
+    // classfile contract callers and reflection observe.
+    let o = Command::new("javap")
+        .args(["-p", "-v", "-cp", dir.to_str().unwrap(), "Conv$$$anonfun$1"])
+        .output()
+        .expect("javap");
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        o.status.success()
+            && text.contains("public scala.Some tryCompare(java.lang.Object, java.lang.Object);")
+            && text.contains("descriptor: (Ljava/lang/Object;Ljava/lang/Object;)Lscala/Some;")
+            && text.contains("public scala.Option tryCompare(java.lang.Object, java.lang.Object);")
+            && text.contains("descriptor: (Ljava/lang/Object;Ljava/lang/Object;)Lscala/Option;")
+            && text.contains("flags: (0x1041) ACC_PUBLIC, ACC_BRIDGE, ACC_SYNTHETIC"),
+        "the Ordering SAM class must carry the covariant child forwarder and parent bridge:\n{text}"
+    );
+
     // A trait declared in this run gets JVM `default` methods for its
     // concrete members, which is why the SAM literal's class needs no
     // forwarder for `neqv` (and why `agent/samfwd`'s mixin-forwarder fix is
