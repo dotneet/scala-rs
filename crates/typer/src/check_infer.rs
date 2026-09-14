@@ -2945,11 +2945,20 @@ impl Typer {
                 // function type is the shape from which type variables in the
                 // parameter's result are inferred; comparing the nominal class
                 // directly loses that constraint and leaves `B` open.
-                let ret_arg = self.function_view(ar);
-                let ret_arg = ret_arg.as_ref().unwrap_or(ar);
+                // A nominal function subtype (for example `AndThen`) has to
+                // be viewed structurally when the expected return is itself
+                // a function. Collection values such as `List[Int]` also
+                // inherit `PartialFunction[Int, Int]`, but that view is not
+                // valid when the expected return is `IterableOnce[B]`:
+                // `flatMap` must infer `B = Int`, not `B = Int => Int`.
+                let ret_arg = if matches!(&**pr, Type::Function { .. }) {
+                    self.function_view(ar).unwrap_or_else(|| (**ar).clone())
+                } else {
+                    (**ar).clone()
+                };
                 return Type::Function {
                     params: aps.clone(),
-                    ret: Box::new(self.align_arg_to_param(pr, ret_arg)),
+                    ret: Box::new(self.align_arg_to_param(pr, &ret_arg)),
                 };
             }
         }
