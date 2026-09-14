@@ -451,7 +451,15 @@ impl<'a> Lifter<'a> {
                 .with(Flags::PRIVATE)
                 .with(Flags::LOCAL)
         } else {
-            self.st.get(id).flags.with(Flags::SYNTHETIC)
+            // A lifted local def remains non-overridable even when its
+            // enclosing class is open.  Keep that fact on the symbol so the
+            // backend can apply the ordinary self-tail-call transform to
+            // generic helpers such as cats' local `tailRecM` loops.
+            self.st
+                .get(id)
+                .flags
+                .with(Flags::SYNTHETIC)
+                .with(Flags::LOCAL)
         };
         self.st.get_mut(id).flags = flags;
 
@@ -472,7 +480,7 @@ impl<'a> Lifter<'a> {
                     .with(Flags::PRIVATE)
                     .with(Flags::LOCAL)
             } else {
-                mods.flags.with(Flags::SYNTHETIC)
+                mods.flags.with(Flags::SYNTHETIC).with(Flags::LOCAL)
             };
             let mut cap_vals = Vec::new();
             for (i, &cid) in caps.iter().enumerate() {

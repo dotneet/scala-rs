@@ -279,6 +279,27 @@ fn scalac_agrees_tt_tailrec_output() {
     scalac_runs("tt_tailrec", "scalac-tailrec");
 }
 
+/// A generic local `@tailrec` helper in an open class is lifted onto that
+/// class.  It must retain its local/non-overridable status so the backend can
+/// lower its self-call to a loop instead of emitting ordinary recursion.
+#[test]
+fn fixtures_tt_tailrec_generic_local_is_stack_safe() {
+    if !java_available() || scala_library_jar().is_none() {
+        eprintln!("skip: java or the scala-library jar is not present");
+        return;
+    }
+    scala_rs_runs("tt_tailrec_generic_local", "tailrec-generic-local");
+}
+
+#[test]
+fn scalac_agrees_tt_tailrec_generic_local_output() {
+    if !java_available() || scalac().is_none() || scala_library_jar().is_none() {
+        eprintln!("skip: java, scalac or the scala-library jar is not present");
+        return;
+    }
+    scalac_runs("tt_tailrec_generic_local", "scalac-tailrec-generic-local");
+}
+
 #[test]
 fn tt_tailrec_bad_is_rejected() {
     if scala_library_jar().is_none() {

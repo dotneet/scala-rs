@@ -103,6 +103,7 @@ pub(crate) fn begin_tail_loop(
     let eligible = annotated
         || s.flags.contains(Flags::FINAL)
         || s.flags.contains(Flags::PRIVATE)
+        || s.flags.contains(Flags::LOCAL)
         || owner.flags.contains(Flags::FINAL)
         || matches!(
             owner.kind,
