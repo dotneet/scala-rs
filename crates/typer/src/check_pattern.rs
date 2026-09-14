@@ -8,6 +8,7 @@
 //! reachability are checked after typing, by `warn_patmat`.
 
 use crate::check::*;
+use crate::implicits::ImplicitSearch;
 use crate::symbol::SymKind;
 use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
@@ -905,6 +906,7 @@ impl Typer {
                     pat.sym = self.st.singleton_sym;
                 }
                 pat.ty = ty;
+                self.lower_classtag_type_pattern(pat, sel_ty);
             }
             TreeKind::Alternative { trees } => {
                 for t in trees {
@@ -916,6 +918,73 @@ impl Typer {
                 pat.ty = sel_ty.clone();
             }
         }
+    }
+
+    /// nsc's `TypeTestTreeMaker`: an abstract type pattern uses the
+    /// `ClassTag[T]` available at the match site rather than testing the
+    /// parameter's erased upper bound.  Preserve that semantic decision in
+    /// the typed tree by lowering to the extractor form the backend already
+    /// understands (`tag.unapply(scrutinee)`).
+    ///
+    /// This is deliberately optional.  A type parameter without evidence
+    /// remains an unchecked erased type test, exactly as before and as nsc
+    /// specifies.  The evidence tree, rather than only its symbol, is carried
+    /// forward so imported members and implicit methods retain their receiver
+    /// and argument structure through erasure.
+    fn lower_classtag_type_pattern(&mut self, pat: &mut Tree, sel_ty: &Type) {
+        let target = pat.ty.clone();
+        if !matches!(
+            self.st.dealias(&target),
+            Type::TypeParam(_) | Type::TypeMember(_)
+        ) {
+            return;
+        }
+        let Some(class_tag) = crate::classpath::find_by_jvm(&self.st, "scala/reflect/ClassTag")
+        else {
+            return;
+        };
+        let wanted = Type::Class {
+            sym: class_tag,
+            args: vec![target.clone()],
+        };
+        let ImplicitSearch::Found(evidence) = self.search_implicit(&wanted) else {
+            return;
+        };
+
+        let mut receiver = self.implicit_tree(evidence, &wanted, pat.span, 0);
+        self.adapt(&mut receiver, &wanted);
+        if receiver.ty.is_error() {
+            return;
+        }
+        let mut fun = Tree::dummy(TreeKind::Select {
+            qual: Box::new(receiver),
+            name: "unapply".into(),
+        });
+        fun.span = pat.span;
+        self.type_expr(&mut fun, &Type::NoType);
+        if fun.sym.is_none() || fun.ty.is_error() {
+            return;
+        }
+        let unapply = fun.sym;
+        // `UnApply.fun` denotes the extractor value; `UnApply.sym` denotes
+        // the method to invoke on it.  Keeping the selected method as `fun`
+        // would evaluate `unapply` once with no scrutinee and then ask the
+        // backend to invoke it a second time.
+        let TreeKind::Select { qual: receiver, .. } = fun.kind else {
+            return;
+        };
+
+        let original = std::mem::replace(&mut pat.kind, TreeKind::Empty);
+        let TreeKind::Typed { expr, .. } = original else {
+            pat.kind = original;
+            return;
+        };
+        pat.sym = unapply;
+        pat.ty = sel_ty.clone();
+        pat.kind = TreeKind::UnApply {
+            fun: receiver,
+            args: vec![*expr],
+        };
     }
 
     /// nsc's GADT refinement (`Infer.inferTypedPattern` /

@@ -2189,6 +2189,14 @@ fn scala_library_dual_run_classtag() {
     dual_run_fixture("classtag");
 }
 
+/// An abstract type pattern with `ClassTag[T]` evidence is a checked extractor
+/// test, not an `instanceof` of `T`'s erased upper bound.  Both values satisfy
+/// the `Throwable` bound, but only the requested exception class may match.
+#[test]
+fn scala_library_dual_run_classtag_type_pattern() {
+    dual_run_fixture("ct_pattern");
+}
+
 #[test]
 fn scala_library_dual_run_context_bounds() {
     dual_run_fixture("context_bounds");

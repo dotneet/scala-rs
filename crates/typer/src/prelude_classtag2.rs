@@ -41,6 +41,21 @@ pub(crate) fn add_classtag(st: &mut SymbolTable, jclass: SymbolId) -> SymbolId {
         Type::Array(Box::new(Type::TypeParam(t))),
         Intrinsic::None,
     );
+    // `case value: T` for an abstract `T` with a `ClassTag[T]` in scope is
+    // lowered by nsc through `tag.unapply(value)`.  Keep the member in the
+    // prelude so pattern typing can represent that lowering explicitly; the
+    // JVM method is `unapply(Object): Option` on scala-library's ClassTag.
+    method(
+        st,
+        ct,
+        "unapply",
+        vec![Type::Any],
+        Type::Class {
+            sym: st.option_sym,
+            args: vec![Type::TypeParam(t)],
+        },
+        Intrinsic::None,
+    );
     let ctm = module(st, reflect, "ClassTag", "scala/reflect/ClassTag$");
     let mc = st.module_class_of(ctm);
     let tag = |elem: Type| Type::Class {

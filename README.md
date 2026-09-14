@@ -63,7 +63,8 @@ cargo test --workspace --release
 ```
 
 The test suites cover parsing, typing, bytecode generation, runtime behavior,
-separate compilation, Java interoperation, and comparisons with scalac. The
+separate compilation, Java interoperation, checked abstract type patterns via
+`ClassTag`, and comparisons with scalac. The
 long-running compatibility gates are documented in
 [the testing guide](docs/testing.md); their accepted measurements are recorded
 in [`tests/BASELINE.md`](tests/BASELINE.md).
