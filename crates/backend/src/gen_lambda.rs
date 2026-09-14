@@ -182,12 +182,14 @@ pub(crate) fn walk_boxed_vars(tree: &Tree, st: &SymbolTable, out: &mut HashSet<S
 #[derive(Default)]
 pub(crate) struct FreeVars {
     pub(crate) vars: Vec<SymbolId>,
-    /// The body mentions the enclosing `this` — written out (`this.f`, `super.f`)
-    /// or, far more often, left implicit in a call to a method of the enclosing
-    /// class. Without this the lambda class gets no `$outer` and codegen's
-    /// `load_this` reads slot 0, which inside `apply` is the *lambda*:
-    /// `C$$anonfun$0 cannot be cast to C` at runtime.
-    pub(crate) uses_this: bool,
+    /// Class-owned identifiers normally imply an enclosing receiver, but an
+    /// early-definition value can be copied into the constructor's local
+    /// frame and captured directly. Keep those identifiers separate so that
+    /// the caller can distinguish a real receiver use from such a capture.
+    pub(crate) this_vars: Vec<SymbolId>,
+    /// Explicit `this`/`super` (and nested-class outer) uses always need the
+    /// receiver, even when named class members happen to be locals.
+    pub(crate) explicit_this: bool,
 }
 
 /// Does an `Ident` naming `id` compile to a call on the enclosing instance?
@@ -276,7 +278,9 @@ pub(crate) fn collect_free(
                     out.vars.push(tree.sym);
                 }
                 if ident_reads_enclosing_this(st, tree.sym) {
-                    out.uses_this = true;
+                    if !out.this_vars.contains(&tree.sym) {
+                        out.this_vars.push(tree.sym);
+                    }
                 }
             }
         }
@@ -289,7 +293,9 @@ pub(crate) fn collect_free(
             }
             collect_free(body, &b, out, st);
         }
-        TreeKind::Super { .. } | TreeKind::This { .. } => out.uses_this = true,
+        TreeKind::Super { .. } | TreeKind::This { .. } => {
+            out.explicit_this = true;
+        }
         TreeKind::Select { qual, .. } => {
             if !is_static_java_method_alias(st, tree.sym, qual) {
                 collect_free(qual, bound, out, st);
@@ -409,7 +415,7 @@ pub(crate) fn collect_free(
                 // exactly `this`; without the field, `load_this` pushed the
                 // lambda itself and the verifier rejected `<init>`.
                 if outer_field_class(st, cid).is_some() {
-                    out.uses_this = true;
+                    out.explicit_this = true;
                 }
             }
             collect_free(tpt, bound, out, st);
@@ -1389,7 +1395,13 @@ pub(crate) fn gen_function(asm: &mut Assembler, frame: &mut Frame, ctx: &EmitCtx
     collect_free(body, &bound, &mut free, ctx.st);
 
     let mut local_caps = Vec::new();
-    let mut need_outer = free.uses_this;
+    // A class-owned early value may be available in the constructor frame and
+    // then captured as an ordinary local. It must not force an outer capture:
+    // before the superclass constructor runs, slot zero is uninitializedThis
+    // and LambdaMetafactory rejects it. Named members not present in the frame
+    // (or explicit this/super) still require the enclosing receiver.
+    let mut need_outer =
+        free.explicit_this || free.this_vars.iter().any(|id| frame.get(*id).is_none());
     for id in &free.vars {
         if frame.get(*id).is_some() {
             local_caps.push(*id);
