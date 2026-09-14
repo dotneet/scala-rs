@@ -5612,7 +5612,26 @@ impl PickleSupply {
                 {
                     return Some(t);
                 }
-                if let Some(cls) = self.ensure_class(st, bin, sym, true) {
+                // nsc's pickle printer can encode a nested module's owner in
+                // the `Single` symbol using the JVM spelling of the final
+                // segment as well as the source spelling.  For example the
+                // case object `slick.ast.ColumnOption.PrimaryKey` may arrive
+                // as `slick.ast.ColumnOption.ColumnOption$PrimaryKey` even
+                // though its class file is `ColumnOption$PrimaryKey$.class`.
+                // The first spelling makes `pickle_files_for` look for a
+                // package named `ColumnOption` and leaves the singleton
+                // unmappable, widening `O.PrimaryKey` to `Any`.  Try the
+                // source-style nested spelling after the original so this is
+                // still conservative for ordinary `$`-bearing names.
+                let singleton_names = singleton_type_names(sym);
+                let mut module = None;
+                for name in singleton_names {
+                    if let Some(cls) = self.ensure_class(st, bin, &name, true) {
+                        module = Some(cls);
+                        break;
+                    }
+                }
+                if let Some(cls) = module {
                     // A member module belongs to the particular enclosing
                     // instance named by its singleton prefix. Static package
                     // modules have no such path-dependent identity.
@@ -6789,6 +6808,41 @@ fn names_class(candidate: &str, full_name: &str) -> bool {
     &last[start..] == simple
 }
 
+/// The source-style names to try for a pickled singleton reference.
+///
+/// Most `Single` references use a dotted Scala name, but some nsc pickles
+/// carry a binary nested name in the final segment while retaining the
+/// enclosing source path.  `ColumnOption.PrimaryKey` is the representative
+/// shape: `ColumnOption.ColumnOption$PrimaryKey` must be looked up as
+/// `ColumnOption.PrimaryKey`.  Keep the original first so a legitimate class
+/// whose source name contains `$` retains its existing interpretation.
+fn singleton_type_names(sym: &str) -> Vec<String> {
+    let mut names = vec![sym.to_string()];
+    let Some((prefix, last)) = sym.rsplit_once('.') else {
+        return names;
+    };
+    let mut nested = last.split('$');
+    let Some(root) = nested.next() else {
+        return names;
+    };
+    let tail: Vec<&str> = nested.filter(|part| !part.is_empty()).collect();
+    if tail.is_empty() {
+        return names;
+    }
+    let prefix_parts: Vec<&str> = prefix.split('.').collect();
+    let Some(root_index) = prefix_parts.iter().rposition(|part| *part == root) else {
+        return names;
+    };
+    let mut source_parts = prefix_parts[..root_index].to_vec();
+    source_parts.push(root);
+    source_parts.extend(tail);
+    let source = source_parts.join(".");
+    if source != sym {
+        names.push(source);
+    }
+    names
+}
+
 /// Every value parameter of a pickled member's type, across all its clauses.
 fn sig_value_params(t: &SigType) -> Vec<scala_rs_pickle::sym::Param> {
     match t {
@@ -7301,5 +7355,30 @@ object Main {
         );
         assert_eq!(desc_arity("(I[[Ljava/lang/String;J)V"), Some(3));
         assert_eq!(desc_arity("no"), None);
+    }
+
+    #[test]
+    fn singleton_type_names_restore_nested_source_spelling() {
+        assert_eq!(
+            singleton_type_names("slick.ast.ColumnOption.ColumnOption$PrimaryKey"),
+            vec![
+                "slick.ast.ColumnOption.ColumnOption$PrimaryKey".to_string(),
+                "slick.ast.ColumnOption.PrimaryKey".to_string(),
+            ]
+        );
+        assert_eq!(
+            singleton_type_names(
+                "slick.relational.RelationalProfile.ColumnOption.RelationalProfile$ColumnOption$Length"
+            ),
+            vec![
+                "slick.relational.RelationalProfile.ColumnOption.RelationalProfile$ColumnOption$Length"
+                    .to_string(),
+                "slick.relational.RelationalProfile.ColumnOption.Length".to_string(),
+            ]
+        );
+        assert_eq!(
+            singleton_type_names("scala.collection.immutable.List$Nil"),
+            vec!["scala.collection.immutable.List$Nil".to_string()]
+        );
     }
 }
