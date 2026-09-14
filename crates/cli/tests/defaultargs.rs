@@ -220,6 +220,55 @@ fn fixtures_da_defaults_bad_lib() {
     );
 }
 
+/// A parameterless default getter is itself a call. It must not be mistaken
+/// for a value whose result is being applied: `Set[String].apply` is an
+/// `(String)Boolean` instance method, so auto-applying the getter's `Set`
+/// result with zero arguments produces a misleading overload error.
+#[test]
+fn parameterless_default_getter_is_not_auto_applied() {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip parameterless default getter regression: scala-library jar unavailable");
+        return;
+    };
+    let root = tmp_dir("default-getter-apply-regression");
+    let src = root.join("DefaultGetterApply.scala");
+    fs::write(
+        &src,
+        r#"import java.util.Properties
+
+object BeanConfigurator {
+  def configure(o: AnyRef, p: Properties, allowed: Set[String] = Set.empty): Unit = ()
+}
+
+object Main {
+  def run(propsO: Option[Properties], ds: AnyRef): Unit =
+    propsO.foreach(BeanConfigurator.configure(ds, _))
+}
+"#,
+    )
+    .unwrap();
+    let out = root.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            src.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "parameterless default getter was incorrectly auto-applied:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The class-file root: `dalib` is compiled by **real scalac**, so the
 /// consumer sees only its class files and pickle -- the situation gitbucket's
 /// json4s and scalatra calls are in.

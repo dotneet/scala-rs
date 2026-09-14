@@ -1030,7 +1030,8 @@ impl Typer {
         // untyped function, inferred the factory element as `Nothing`, and
         // could not recover the row type afterwards. Explicit
         // `TableQuery.apply(new Row(_))` already took this eager path.
-        if self.st.get(fun.sym).parameterless_method == Some(true)
+        if !args.is_empty()
+            && self.st.get(fun.sym).parameterless_method == Some(true)
             && matches!(&fun.ty, Type::Method { paramss, .. }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()))
         {
