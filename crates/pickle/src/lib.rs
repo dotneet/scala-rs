@@ -20,7 +20,7 @@ pub mod sym;
 pub use abi::{
     AbiError, JvmClassFlags, JvmDescriptor, JvmInternalName, JvmMemberFlags, JvmMemberKind,
     LoadedClass, LoadedField, LoadedMethod, PickledClass, PickledMethod, PickledType,
-    PickledTypeParam, ScalaSignatureError,
+    PickledTypeMember, PickledTypeParam, ScalaSignatureError,
 };
 pub use classfile::{scala_signature_bytes, scala_signature_bytes_result, ClassfileError};
 pub use read::{read_pickle, Pickle, ReadError};

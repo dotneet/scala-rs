@@ -344,13 +344,25 @@ pub struct PickledMethod {
     pub is_mutable: bool,
 }
 
-/// A class or module class from the eager ScalaSignature subset.
+/// A type member recovered from a ScalaSignature. The JVM has no entry for
+/// `type T`, so classpath consumers carry the declaration alongside methods.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickledTypeMember {
+    pub name: String,
+    pub lower_bound: PickledType,
+    pub upper_bound: PickledType,
+    pub alias: Option<PickledType>,
+    pub tparams: Vec<PickledTypeParam>,
+}
+
+/// A class or module class from a pickle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickledClass {
     pub name: String,
     pub is_module: bool,
     pub tparams: Vec<PickledTypeParam>,
     pub methods: Vec<PickledMethod>,
+    pub type_members: Vec<PickledTypeMember>,
     pub extends_anyval: bool,
 }
 

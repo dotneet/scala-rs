@@ -113,13 +113,26 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         }
     }
 
+    // Install all declaration shells before connecting parents. This keeps
+    // class type parameters and direct abstract members visible to the
+    // hierarchy pass; their bounds are resolved only after the complete graph
+    // exists.
+    for (i, owner) in &installed {
+        let (i, owner) = (*i, *owner);
+        let c = &classes[i];
+        install_tparams(st, owner, &c.pickle_tparams);
+        declare_type_members(st, owner, &c.type_members);
+    }
+
+    attach_classpath_parents(st, classes, &installed);
+
     for (i, owner) in &installed {
         let (i, owner) = (*i, *owner);
         let c = &classes[i];
         if owner.0 >= st.prelude_end {
             st.pending_classpath_signatures.insert(owner);
         }
-        install_tparams(st, owner, &c.pickle_tparams);
+        resolve_type_member_bounds(st, owner, &c.type_members);
         let accessors = nullary_accessors(c);
         if let Some(p) = &c.pickle {
             for m in p {
@@ -239,7 +252,6 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
         }
     }
 
-    attach_classpath_parents(st, classes, &installed);
     // Everything after this point is this run's own source (or a pickle
     // member supplied on demand). `class_rules::unapplied_new_error` judges
     // only those: a constructor read from a classfile has no implicit marker,
@@ -256,9 +268,11 @@ pub fn install_classpath(st: &mut SymbolTable, classes: &[ClasspathClass]) {
 /// and a member that *is* found is attributed to the wrong owner. The classfile
 /// header is where `super_class`/`interfaces` survive intact.
 ///
-/// Run after every class is installed, so a parent that comes later in the scan
-/// is already there, and after members are installed, so `has_member` keeps
-/// deciding on a class's *own* declarations exactly as before.
+/// Run after every class symbol is installed, so a parent that comes later in
+/// the scan is already there, and before member decoding so inherited type
+/// members are available while method signatures are resolved. `has_member`
+/// remains owner-local and therefore does not let these early parent links hide
+/// a class's own declarations.
 ///
 /// Type arguments are not recoverable from the header (`extends Base[Int]` is
 /// just `Base` there), so a parent is attached without them. That is why an
@@ -336,9 +350,15 @@ fn attach_classpath_parents(
 }
 
 fn has_member(st: &SymbolTable, owner: SymbolId, name: &str) -> bool {
-    st.lookup_member(owner, name)
-        .iter()
-        .any(|&id| matches!(st.get(id).kind, SymKind::Method | SymKind::Term))
+    // Parent links are attached before member decoding so inherited type
+    // members can resolve method signatures. Only the owner's own method/term
+    // declarations suppress another eager installation; using lookup_member
+    // here would make an inherited `n` hide a class's own `n`.
+    st.get(owner).members.iter().any(|&id| {
+        st.get(id).owner == owner
+            && matches!(st.get(id).kind, SymKind::Method | SymKind::Term)
+            && st.get(id).name == name
+    })
 }
 
 fn install_tparams(st: &mut SymbolTable, owner: SymbolId, tps: &[ClasspathTypeParam]) {
@@ -347,6 +367,69 @@ fn install_tparams(st: &mut SymbolTable, owner: SymbolId, tps: &[ClasspathTypePa
     }
     let ids = alloc_tparams(st, owner, tps);
     st.get_mut(owner).tparams = ids;
+}
+
+/// Install the type declarations a ScalaSignature carries but the JVM class
+/// file cannot. They must be present before methods are decoded: an
+/// unqualified `type T` in an inherited API otherwise becomes `Type::Named`
+/// and cannot match a path-dependent `p.T` at a call site.
+fn declare_type_members(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    members: &[crate::check::ClasspathTypeMember],
+) {
+    for member in members {
+        // Concrete aliases are completed by PickleSupply, which preserves the
+        // declaring path and inherited override information. Eagerly adding
+        // the compact classpath spelling here would shadow that richer view
+        // and break aliases used as binary parent constructors (`Owner.Alias`)
+        // before their receiver is typed. Abstract members have no RHS for
+        // PickleSupply to reduce and are the declarations this eager path must
+        // retain (for example `BasicProfile.SchemaDescription`).
+        if member.alias.is_some() {
+            continue;
+        }
+        if st.get(owner).members.iter().any(|&id| {
+            st.get(id).owner == owner
+                && st.get(id).kind == SymKind::TypeMember
+                && st.get(id).name == member.name
+        }) {
+            continue;
+        }
+        let id = st.alloc(&member.name, owner, SymKind::TypeMember, Flags::EMPTY, "");
+        let tparams = alloc_tparams(st, id, &member.tparams);
+        st.get_mut(id).tparams = tparams.clone();
+        // Abstract members remain opaque until a concrete subclass fixes them.
+        st.get_mut(id).ty = Type::TypeMember(id);
+        st.get_mut(owner).members.push(id);
+    }
+}
+
+/// Resolve bounds after every classpath class has its parent links. A bound
+/// can name an inherited class/member, so doing this during per-class
+/// installation makes the answer depend on classpath iteration order.
+fn resolve_type_member_bounds(
+    st: &mut SymbolTable,
+    owner: SymbolId,
+    members: &[crate::check::ClasspathTypeMember],
+) {
+    for member in members {
+        if member.alias.is_some() {
+            continue;
+        }
+        let Some(id) = st.get(owner).members.iter().copied().find(|&id| {
+            st.get(id).owner == owner
+                && st.get(id).kind == SymKind::TypeMember
+                && st.get(id).name == member.name
+        }) else {
+            continue;
+        };
+        let tparams = st.get(id).tparams.clone();
+        let lower = resolve_type_in(st, owner, &member.lower_bound, &tparams);
+        let upper = resolve_type_in(st, owner, &member.upper_bound, &tparams);
+        st.get_mut(id).bound_lo = Some(lower);
+        st.get_mut(id).bound_hi = Some(upper);
+    }
 }
 
 /// Allocate type parameter symbols, keeping each one's own parameters. Without
@@ -573,10 +656,16 @@ fn resolve_type_in(
         if let Some(id) = st
             .lookup_member(cur, name)
             .into_iter()
-            .find(|&s| st.get(s).is_class_like())
+            .find(|&s| st.get(s).is_class_like() || st.get(s).kind == SymKind::TypeMember)
         {
             return match st.get(id).kind {
                 SymKind::Module | SymKind::ModuleClass => apply_args(Type::ModuleRef(id), args),
+                // A pickle writes an unqualified reference to an enclosing
+                // abstract type member (for example `SchemaDescription` in
+                // RelationalAPI). Keep that member identity so it can match
+                // the same inherited member on a path-dependent receiver;
+                // aliases still expose their right-hand side here.
+                SymKind::TypeMember => apply_args(st.type_member_as_seen(id), args),
                 _ => Type::Class { sym: id, args },
             };
         }

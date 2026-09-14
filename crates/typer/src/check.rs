@@ -244,6 +244,16 @@ pub struct ClasspathPickleMethod {
     pub is_mutable: bool,
 }
 
+/// A type member recovered from a classpath ScalaSignature.
+#[derive(Clone, Debug)]
+pub struct ClasspathTypeMember {
+    pub name: String,
+    pub lower_bound: ClasspathType,
+    pub upper_bound: ClasspathType,
+    pub alias: Option<ClasspathType>,
+    pub tparams: Vec<ClasspathTypeParam>,
+}
+
 /// Binary class/object visible to namer/typer via `-cp`.
 #[derive(Clone, Debug)]
 pub struct ClasspathClass {
@@ -252,6 +262,9 @@ pub struct ClasspathClass {
     pub methods: Vec<ClasspathMethod>,
     pub fields: Vec<ClasspathField>,
     pub pickle: Option<Vec<ClasspathPickleMethod>>,
+    /// Type members have no JVM method/field entry and are carried separately
+    /// by the eager ScalaSignature subset.
+    pub type_members: Vec<ClasspathTypeMember>,
     /// Class type parameters recovered from the pickle, in order.
     pub pickle_tparams: Vec<ClasspathTypeParam>,
     /// The classfile is an interface -- a Scala trait, or a Java interface.

@@ -56,7 +56,9 @@ pub use scala_rs_pickle::codec::{
     avoid_zero, decode7to8, decode_annotation_string, encode8to7, encode_bytes,
     encode_to_annotation_string, regenerate_zero, MAJOR, MINOR,
 };
-pub use scala_rs_pickle::{PickledClass, PickledMethod, PickledType, PickledTypeParam};
+pub use scala_rs_pickle::{
+    PickledClass, PickledMethod, PickledType, PickledTypeMember, PickledTypeParam,
+};
 
 pub const TERMNAME: u8 = 1;
 pub const TYPENAME: u8 = 2;
@@ -908,11 +910,45 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
     /// distinct from [`external_owner_ref`], which is the *prefix* used by a
     /// type reference.  For a top-level `Base.foo`, the latter is `<empty>`;
     /// the former is `<empty>.Base`.
+    ///
+    /// For a nested class/object the JVM basename includes its enclosing
+    /// class (`Outer$Inner`).  The pickle owner already carries `Outer`, so
+    /// repeating that basename produces `Outer.Outer$Inner` and cannot be
+    /// resolved by a later reader.  Keep the JVM spelling (including
+    /// NameTransformer escapes), but use only the member suffix when the
+    /// owner chain proves that this is a nested class.
+    fn external_member_name(&self, class_sym: SymbolId) -> String {
+        let symbol = self.facts.get(class_sym);
+        let jvm = symbol.jvm_name.trim_end_matches('$');
+        let basename = jvm.rsplit('/').next().unwrap_or(jvm);
+        let owner = symbol.owner;
+        let owner_class = if owner.is_none() {
+            SymbolId::NONE
+        } else if self.facts.get(owner).kind == SymKind::Module {
+            self.facts.module_class_of(owner)
+        } else {
+            owner
+        };
+        if !owner_class.is_none() {
+            let owner_jvm_full = self.facts.get(owner_class).jvm_name.trim_end_matches('$');
+            let owner_jvm = owner_jvm_full.rsplit('/').next().unwrap_or(owner_jvm_full);
+            if let Some(rest) = basename.strip_prefix(&format!("{owner_jvm}$")) {
+                // A nested class can itself be nested. Only the final
+                // segment is the name under the owner represented here.
+                let rest = rest.trim_end_matches('$');
+                if let Some(i) = scala_rs_pickle::names::last_nesting_separator(rest) {
+                    return rest[i + 1..].to_string();
+                }
+                return rest.to_string();
+            }
+        }
+        basename.to_string()
+    }
+
     fn external_class_ref(&mut self, class_sym: SymbolId) -> u32 {
-        let jvm = self.facts.get(class_sym).jvm_name.clone();
-        let name = jvm.rsplit('/').next().unwrap_or(&jvm).trim_end_matches('$');
+        let name = self.external_member_name(class_sym);
         let prefix = self.external_owner_ref(class_sym);
-        self.ext_ref_owned(name, prefix)
+        self.ext_ref_owned(&name, prefix)
     }
 
     /// The owner a `CLASSsym` names, preferring an entry in *this* pickle.
@@ -3484,15 +3520,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         let mut tb = Vec::new();
         write_nat_to(&mut tb, package);
         let this_package = self.add(THISTPE, tb);
-        let module_name = self
-            .facts
-            .get(module_class)
-            .jvm_name
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('$')
-            .to_string();
+        let module_name = self.external_member_name(module_class);
         let module_term = self.ext_term_ref_owned(&module_name, package);
         let mut sb = Vec::new();
         write_nat_to(&mut sb, this_package);
@@ -3533,10 +3561,9 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         if self.facts.get(class_sym).kind != SymKind::ModuleClass {
             return self.external_class_ref(class_sym);
         }
-        let jvm = self.facts.get(class_sym).jvm_name.clone();
-        let name = jvm.rsplit('/').next().unwrap_or(&jvm).trim_end_matches('$');
+        let name = self.external_member_name(class_sym);
         let prefix = self.external_owner_ref(class_sym);
-        self.ext_mod(&crate::classfile::encode_method_name(name), Some(prefix))
+        self.ext_mod(&crate::classfile::encode_method_name(&name), Some(prefix))
     }
 
     /// The declaration a path member (`self.T`) or an abstract projection

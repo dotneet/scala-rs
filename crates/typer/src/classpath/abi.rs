@@ -2,7 +2,7 @@
 
 use crate::check::{
     ClasspathClass, ClasspathField, ClasspathMethod, ClasspathPickleMethod, ClasspathType,
-    ClasspathTypeParam,
+    ClasspathTypeMember, ClasspathTypeParam,
 };
 
 /// Consume classfile/ScalaSignature metadata without cloning its recursive
@@ -12,21 +12,23 @@ pub fn adapt_classpath(classes: Vec<scala_rs_pickle::LoadedClass>) -> Vec<Classp
 }
 
 fn adapt_class(c: scala_rs_pickle::LoadedClass) -> ClasspathClass {
-    let (pickle, pickle_tparams, extends_anyval) = match c.pickle {
+    let (pickle, pickle_tparams, type_members, extends_anyval) = match c.pickle {
         Some(p) => {
             let scala_rs_pickle::PickledClass {
                 tparams,
                 methods,
+                type_members,
                 extends_anyval,
                 ..
             } = p;
             (
                 Some(methods.into_iter().map(adapt_pickle_method).collect()),
                 tparams.into_iter().map(adapt_tparam).collect(),
+                type_members.into_iter().map(adapt_type_member).collect(),
                 extends_anyval,
             )
         }
-        None => (None, Vec::new(), false),
+        None => (None, Vec::new(), Vec::new(), false),
     };
     ClasspathClass {
         jvm_name: c.internal_name.into_string(),
@@ -52,6 +54,7 @@ fn adapt_class(c: scala_rs_pickle::LoadedClass) -> ClasspathClass {
             .collect(),
         pickle,
         pickle_tparams,
+        type_members,
         is_interface: c.flags.is_interface(),
         super_name: c.super_name.map(|n| n.into_string()),
         interfaces: c.interfaces.into_iter().map(|n| n.into_string()).collect(),
@@ -69,6 +72,16 @@ fn adapt_type(t: scala_rs_pickle::PickledType) -> ClasspathType {
 fn adapt_tparam(t: scala_rs_pickle::PickledTypeParam) -> ClasspathTypeParam {
     ClasspathTypeParam {
         name: t.name,
+        tparams: t.tparams.into_iter().map(adapt_tparam).collect(),
+    }
+}
+
+fn adapt_type_member(t: scala_rs_pickle::PickledTypeMember) -> ClasspathTypeMember {
+    ClasspathTypeMember {
+        name: t.name,
+        lower_bound: adapt_type(t.lower_bound),
+        upper_bound: adapt_type(t.upper_bound),
+        alias: t.alias.map(adapt_type),
         tparams: t.tparams.into_iter().map(adapt_tparam).collect(),
     }
 }
@@ -134,6 +147,7 @@ mod tests {
                     is_deferred: true,
                     is_mutable: false,
                 }],
+                type_members: Vec::new(),
                 extends_anyval: true,
             }),
             super_name: Some(JvmInternalName::new("java/lang/Object").unwrap()),

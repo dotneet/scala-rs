@@ -56,6 +56,7 @@ enum Entry {
         name: u32,
         owner: u32,
         info: u32,
+        alias: bool,
     },
     ClassSym {
         name: u32,
@@ -88,6 +89,10 @@ enum Entry {
         prefix: u32,
         sym: u32,
         args: Vec<u32>,
+    },
+    TypeBounds {
+        lo: u32,
+        hi: u32,
     },
     /// `CLASSINFOtpe len_Nat classsym_Ref {tpe_Ref}`. The parents used to be
     /// dropped here; `extends AnyVal` lives nowhere else, because a value
@@ -197,7 +202,12 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             TYPESYM | ALIASSYM => {
                 let (name, owner, _flags, info) = read_symbol_info(&mut r, end, &entry_tags)?;
                 r.pos = end;
-                Entry::TypeSym { name, owner, info }
+                Entry::TypeSym {
+                    name,
+                    owner,
+                    info,
+                    alias: tag == ALIASSYM,
+                }
             }
             CLASSSYM => {
                 let (name, owner, flags, info) = read_symbol_info(&mut r, end, &entry_tags)?;
@@ -304,6 +314,12 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 }
                 r.pos = end;
                 Entry::TypeRef { prefix, sym, args }
+            }
+            TYPEBOUNDSTPE => {
+                let lo = r.read_nat().unwrap_or(0);
+                let hi = r.read_nat().unwrap_or(0);
+                r.pos = end;
+                Entry::TypeBounds { lo, hi }
             }
             CLASSINFOTPE => {
                 let _classsym = r.read_nat().unwrap_or(0);
@@ -492,6 +508,60 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         _ => false,
     };
 
+    // `type` declarations have no JVM member to recover them from, so keep
+    // their ScalaSignature entries in the classpath ABI as well. In
+    // particular, `RelationalProfile.SchemaDescription` is inherited by the
+    // API's `schemaActionExtensionMethods` parameter and must not become an
+    // unresolved `Named` type when the profile is supplied as classfiles.
+    let mut type_members = Vec::new();
+    for e in &entries {
+        let Entry::TypeSym {
+            name,
+            owner,
+            info,
+            alias,
+        } = e
+        else {
+            continue;
+        };
+        if *owner != ci as u32 {
+            continue;
+        }
+        let name = crate::classfile::decode_method_name(&name_of(&entries, *name));
+        if name.is_empty() {
+            continue;
+        }
+        let (tparams, rest) = peel_info(&entries, *info);
+        if *alias {
+            type_members.push(PickledTypeMember {
+                name,
+                lower_bound: PickledType::simple("Nothing"),
+                upper_bound: PickledType::simple("Any"),
+                alias: Some(type_of(&entries, rest, 0)),
+                tparams,
+            });
+        } else if let Some(Entry::TypeBounds { lo, hi }) = entries.get(rest as usize) {
+            type_members.push(PickledTypeMember {
+                name,
+                lower_bound: type_of(&entries, *lo, 0),
+                upper_bound: type_of(&entries, *hi, 0),
+                alias: None,
+                tparams,
+            });
+        } else {
+            // Keep malformed/older abstract entries usable with the same
+            // conservative bounds the source typechecker uses for an
+            // unbounded member rather than dropping the declaration.
+            type_members.push(PickledTypeMember {
+                name,
+                lower_bound: PickledType::simple("Nothing"),
+                upper_bound: PickledType::simple("Any"),
+                alias: None,
+                tparams,
+            });
+        }
+    }
+
     // Pickled flags. The first twelve bits are re-encoded by nsc's
     // `rawToPickledFlags` (`DEFERRED` moves from `1 << 4` to `1 << 8`);
     // everything above bit 11 keeps its raw position, which is why `STABLE`
@@ -623,6 +693,7 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
         is_module,
         tparams: class_tparams,
         methods,
+        type_members,
         extends_anyval,
     })
 }

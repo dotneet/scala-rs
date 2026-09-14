@@ -165,7 +165,7 @@ pub use anon_capture::mark_anon_captures;
 pub use check::{
     find_mains, has_errors, typecheck, typecheck_opts, typecheck_opts_src, typecheck_units,
     typecheck_units_src, ClasspathClass, ClasspathField, ClasspathMethod, ClasspathPickleMethod,
-    ClasspathType, ClasspathTypeParam, TypecheckOptions, Typer,
+    ClasspathType, ClasspathTypeMember, ClasspathTypeParam, TypecheckOptions, Typer,
 };
 pub use classpath::adapt_classpath;
 pub use default_recv::hoist_default_receivers;
@@ -3082,6 +3082,7 @@ object Main {
                 is_deferred: false,
                 is_mutable: false,
             }]),
+            type_members: vec![],
             pickle_tparams: vec![],
             is_interface: false,
             super_name: None,
@@ -3128,6 +3129,7 @@ object Main {
                     is_mutable: false,
                 },
             ]),
+            type_members: vec![],
             pickle_tparams: vec![],
             is_interface: false,
             super_name: None,

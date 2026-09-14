@@ -33,6 +33,8 @@ mod singleton;
 mod singleton_metadata;
 #[path = "../slickddl.rs"]
 mod slickddl;
+#[path = "../slickddl_classpath.rs"]
+mod slickddl_classpath;
 #[path = "../slickimpl.rs"]
 mod slickimpl;
 #[path = "../slickimplicit.rs"]
