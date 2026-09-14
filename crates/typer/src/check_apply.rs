@@ -2939,7 +2939,57 @@ impl Typer {
                                 || ret.is_no_type();
                             if open {
                                 if let Type::Function { ret: fr, .. } = &a0.ty {
-                                    ret = (**fr).clone();
+                                    // Infer the element produced by the lambda without
+                                    // discarding the callee's collection constructor.  The
+                                    // generic `IterableOnce[B]` wrapper is a nominal class,
+                                    // so `unify_method_tparams` cannot always see through a
+                                    // concrete `List[Int]` result.  Replacing `CC[B]` with
+                                    // that whole `List[Int]` used to turn `IndexedSeq.flatMap`
+                                    // into a `List` result and emitted a `List` checkcast for
+                                    // the actual `Vector1` returned by the JVM method.
+                                    let elem = self
+                                        .elem_type(fr)
+                                        .unwrap_or_else(|| (**fr).clone())
+                                        .widen_constant();
+                                    // `MapOps.flatMap` (and its sorted
+                                    // counterpart) iterates pairs.  Its
+                                    // concrete result is therefore a
+                                    // two-parameter map when the lambda
+                                    // returns `(K2, V2)`, not `Map[K, (K2,
+                                    // V2)]`.  Rebuild from the pair before the
+                                    // single-parameter fallback below; the
+                                    // latter is correct for ordinary
+                                    // `IterableOps.flatMap`, but nests the
+                                    // pair in the value slot of a map.
+                                    let pair_rebuilt = self.pair_args(&elem).and_then(|pair| {
+                                        let r =
+                                            self.receiver_ops_root(recv_ty.as_ref(), OpsSlot::Cc)?;
+                                        (self.st.get(r).tparams.len() == 2)
+                                            .then_some(Type::Class { sym: r, args: pair })
+                                    });
+                                    if let Some(t) = pair_rebuilt {
+                                        ret = t;
+                                    } else {
+                                        let tps = (!sym.is_none())
+                                            .then(|| self.st.get(sym).tparams.clone())
+                                            .unwrap_or_default();
+                                        let result_tps: Vec<_> = tps
+                                            .iter()
+                                            .copied()
+                                            .filter(|tp| {
+                                                mentions_tparam(&ret, std::slice::from_ref(tp))
+                                            })
+                                            .collect();
+                                        if result_tps.len() == 1 {
+                                            ret = crate::symbol::subst_tparams_slice(
+                                                &result_tps,
+                                                std::slice::from_ref(&elem),
+                                                &ret,
+                                            );
+                                        } else if ret.is_no_type() || sym.is_none() {
+                                            ret = elem;
+                                        }
+                                    }
                                 }
                             }
                             // `flatMap` is `CC[B]` like `map` is: the class is the
