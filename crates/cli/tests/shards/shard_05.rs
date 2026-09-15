@@ -61,6 +61,8 @@ mod negchecks;
 mod neglit;
 #[path = "../nelpkg.rs"]
 mod nelpkg;
+#[path = "../nested_lambda_result.rs"]
+mod nested_lambda_result;
 #[path = "../nestedcasepickle.rs"]
 mod nestedcasepickle;
 #[path = "../nestedobj.rs"]
