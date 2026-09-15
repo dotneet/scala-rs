@@ -1535,6 +1535,119 @@ impl Typer {
         result
     }
 
+    pub(crate) fn with_implicit_macros_disabled<R>(
+        &mut self,
+        disabled: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.implicit_macros_disabled;
+        self.implicit_macros_disabled = disabled;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.implicit_macros_disabled = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_macro_query_depth<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.macro_query_depth;
+        self.macro_query_depth = saved.saturating_add(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.macro_query_depth = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_macro_depth<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let saved = self.macro_depth;
+        self.macro_depth = saved.saturating_add(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.macro_depth = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_macro_splices<R>(
+        &mut self,
+        splices: Vec<Option<Tree>>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = std::mem::replace(&mut self.macro_splices, splices);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.macro_splices = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_macro_reply_pattern<R>(
+        &mut self,
+        pattern: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.macro_reply_pattern;
+        self.macro_reply_pattern = pattern;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.macro_reply_pattern = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_macro_engine_busy<R>(
+        &mut self,
+        busy: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.macro_engine_busy;
+        self.macro_engine_busy = busy;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.macro_engine_busy = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_building_implicit<R>(
+        &mut self,
+        implicit: (SymbolId, Type),
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.building_implicits.clone();
+        self.building_implicits.push(implicit);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.building_implicits = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_isolated_macro_failure<R>(
+        &mut self,
+        key: (usize, u32, u32),
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, Option<String>) {
+        let saved = self.macro_failures.remove(&key);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        let nested = self.macro_failures.remove(&key);
+        if let Some(reason) = saved {
+            self.macro_failures.insert(key, reason);
+        }
+        match result {
+            Ok(value) => (value, nested),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub(crate) fn with_ctor_pattern_fun<R>(
         &mut self,
         ctor_pattern_fun: bool,
@@ -4316,5 +4429,100 @@ mod scoped_state_tests {
         assert!(typer.typing_callee);
         assert!(typer.typing_call_args);
         assert!(typer.typing_qualifier);
+    }
+
+    #[test]
+    fn macro_query_flags_restore_when_nested_work_returns_early() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.implicit_macros_disabled = false;
+        typer.macro_query_depth = 4;
+        typer.macro_splices = vec![None];
+        typer.macro_reply_pattern = false;
+        typer.macro_engine_busy = false;
+
+        let result: Result<(), &'static str> = typer.with_implicit_macros_disabled(true, |typer| {
+            assert!(typer.implicit_macros_disabled);
+            typer.with_macro_query_depth(|typer| {
+                assert_eq!(typer.macro_query_depth, 5);
+                typer.with_macro_splices(vec![None, None], |typer| {
+                    assert_eq!(typer.macro_splices.len(), 2);
+                    typer.with_macro_reply_pattern(true, |typer| {
+                        assert!(typer.macro_reply_pattern);
+                        typer.with_macro_engine_busy(true, |typer| {
+                            assert!(typer.macro_engine_busy);
+                            Err("leave query")
+                        })
+                    })
+                })
+            })
+        });
+
+        assert_eq!(result, Err("leave query"));
+        assert!(!typer.implicit_macros_disabled);
+        assert_eq!(typer.macro_query_depth, 4);
+        assert_eq!(typer.macro_splices.len(), 1);
+        assert!(!typer.macro_reply_pattern);
+        assert!(!typer.macro_engine_busy);
+    }
+
+    #[test]
+    fn macro_dynamic_state_restores_after_panic_and_typer_is_reusable() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.macro_query_depth = 3;
+        typer.macro_splices = vec![None];
+        let original_building = (SymbolId(7), Type::Int);
+        typer.building_implicits.push(original_building.clone());
+        let failure_key = (0, 1, 2);
+        typer
+            .macro_failures
+            .insert(failure_key, "outer failure".to_string());
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            typer.with_implicit_macros_disabled(true, |typer| {
+                typer.with_macro_query_depth(|typer| {
+                    typer.with_macro_depth(|typer| {
+                        typer.with_macro_splices(vec![None, None], |typer| {
+                            typer.with_macro_reply_pattern(true, |typer| {
+                                typer.with_macro_engine_busy(true, |typer| {
+                                    typer.with_building_implicit(
+                                        (SymbolId(8), Type::String),
+                                        |typer| {
+                                            typer.with_isolated_macro_failure(
+                                                failure_key,
+                                                |typer| {
+                                                    typer.macro_failures.insert(
+                                                        failure_key,
+                                                        "nested failure".to_string(),
+                                                    );
+                                                    panic!("test unwind")
+                                                },
+                                            )
+                                        },
+                                    )
+                                })
+                            })
+                        })
+                    })
+                })
+            })
+        }));
+        assert!(panic.is_err());
+        assert!(!typer.implicit_macros_disabled);
+        assert_eq!(typer.macro_query_depth, 3);
+        assert_eq!(typer.macro_depth, 0);
+        assert_eq!(typer.macro_splices.len(), 1);
+        assert!(!typer.macro_reply_pattern);
+        assert!(!typer.macro_engine_busy);
+        assert_eq!(typer.building_implicits, vec![original_building]);
+        assert_eq!(
+            typer.macro_failures.get(&failure_key).map(String::as_str),
+            Some("outer failure")
+        );
+
+        assert_eq!(
+            typer.with_macro_query_depth(|typer| typer.macro_query_depth),
+            4
+        );
+        assert_eq!(typer.macro_query_depth, 3);
     }
 }

@@ -119,8 +119,17 @@ public final class ScalaRsMacroEngine {
     /** Nanoseconds inside {@link #handle}: the whole exchange, of which
      * `invokeNanos` is the implementation's own run. */
     static long handleNanos = 0;
+    static final int MAX_WIRE_CHARS = 16 * 1024 * 1024;
+    static final int MAX_WIRE_DEPTH = 512;
 
     public static void main(String[] args) throws Exception {
+        if (args.length == 1 && "--protocol-self-test".equals(args[0])) {
+            protocolSelfTest();
+            return;
+        }
+        if (args.length != 0) {
+            throw new IllegalArgumentException("unexpected macro engine argument");
+        }
         out = new PrintStream(System.out, true, "UTF-8");
         in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         // Keep the original stream for protocol packets; macro println/Console
@@ -146,7 +155,7 @@ public final class ScalaRsMacroEngine {
         macroCl = macroClassLoader(baseCl);
         out.println("(ready)");
         String line;
-        while ((line = in.readLine()) != null) {
+        while ((line = readWireLine(in)) != null) {
             if (line.isEmpty()) {
                 continue;
             }
@@ -456,13 +465,16 @@ public final class ScalaRsMacroEngine {
     static Sexp query(String q) throws Exception {
         out.println(q);
         long waitStarted = System.nanoTime();
-        String line = in.readLine();
+        String line = readWireLine(in);
         waitNanos += System.nanoTime() - waitStarted;
         if (line == null) {
             throw new Gap("scala-rs closed the pipe while the macro was asking it a question");
         }
         Sexp ans = Sexp.parse(line);
         if (ans.isList() && !ans.items.isEmpty() && "no".equals(ans.items.get(0).atom)) {
+            if (ans.items.size() != 2 || ans.items.get(1).isList()) {
+                throw new Gap("scala-rs returned a malformed refusal to a macro query");
+            }
             throw gap(ans.items.get(1).text());
         }
         return ans;
@@ -507,7 +519,7 @@ public final class ScalaRsMacroEngine {
         sb.append(' ').append(Sexp.quote(modeName)).append(' ')
           .append(silent ? "1" : "0").append(')');
         Sexp ans = query(sb.toString());
-        String verdict = ans.items.get(1).atom;
+        String verdict = validateTypecheckAnswer(ans);
         if ("fail".equals(verdict)) {
             String msg = ans.items.get(2).text();
             if (silent) {
@@ -526,23 +538,69 @@ public final class ScalaRsMacroEngine {
         return call(support, "setType", 2, built, tpe);
     }
 
+    /** Exact response grammar for `c.typecheck`; never index a partial reply. */
+    static String validateTypecheckAnswer(Sexp ans) {
+        if (!ans.isList() || ans.items.size() < 2 || !"a".equals(ans.items.get(0).atom)
+                || ans.items.get(1).isList()) {
+            throw gap("scala-rs returned a malformed c.typecheck answer");
+        }
+        String verdict = ans.items.get(1).atom;
+        if ("fail".equals(verdict)) {
+            if (ans.items.size() != 3 || ans.items.get(2).isList()) {
+                throw gap("scala-rs returned a malformed c.typecheck `fail` answer");
+            }
+            return verdict;
+        }
+        if (!"ok".equals(verdict) || ans.items.size() != 4
+                || !ans.items.get(2).isList() || !ans.items.get(3).isList()) {
+            throw gap("scala-rs returned a malformed c.typecheck `ok` answer");
+        }
+        return verdict;
+    }
+
     /** `c.inferImplicitValue`: the implicit scope lives in scala-rs. */
-    static Object inferImplicitValue(Object pt, boolean silent, boolean noMacros)
+    static Object inferImplicitValue(
+            Object pt, boolean silent, boolean noMacros, Object pos, Object enclosing)
             throws Exception {
+        if (!java.util.Objects.equals(pos, enclosing)) {
+            throw gap("scala-rs does not implement c.inferImplicitValue with a non-default `pos`");
+        }
         StringBuilder sb = new StringBuilder("(q inferImplicitValue ");
         serType(pt, sb);
         sb.append(' ').append(silent ? "1" : "0")
           .append(' ').append(noMacros ? "1" : "0").append(')');
         Sexp ans = query(sb.toString());
-        if ("none".equals(ans.items.get(1).atom)) {
-            return call(universe, "EmptyTree", 0);
-        }
-        if (!"ok".equals(ans.items.get(1).atom)) {
+        if (!ans.isList() || ans.items.size() < 2 || !"a".equals(ans.items.get(0).atom)
+                || ans.items.get(1).isList()) {
             throw gap("scala-rs returned a malformed c.inferImplicitValue answer");
         }
-        Object tpe = ans.items.get(2).isList()
-                && "same".equals(ans.items.get(2).items.get(0).atom)
-            ? pt : typeFor(ans.items.get(2));
+        String verdict = ans.items.get(1).atom;
+        if ("none".equals(verdict)) {
+            if (ans.items.size() != 2) {
+                throw gap("scala-rs returned a malformed c.inferImplicitValue `none` answer");
+            }
+            return call(universe, "EmptyTree", 0);
+        }
+        if (!"ok".equals(verdict) || ans.items.size() != 4) {
+            throw gap("scala-rs returned a malformed c.inferImplicitValue answer");
+        }
+        Sexp typeAnswer = ans.items.get(2);
+        if (!typeAnswer.isList() || typeAnswer.items.isEmpty()
+                || typeAnswer.items.get(0).isList()) {
+            throw gap("scala-rs returned a malformed c.inferImplicitValue type answer");
+        }
+        String typeTag = typeAnswer.items.get(0).atom;
+        boolean same = typeAnswer.isList() && typeAnswer.items.size() == 1
+            && "same".equals(typeTag);
+        if ("same".equals(typeTag) && !same) {
+            throw gap("scala-rs returned a malformed c.inferImplicitValue `same` type");
+        }
+        if (!same && !"ty".equals(typeTag) && !"src".equals(typeTag)
+                && !"cst".equals(typeTag)) {
+            throw gap("scala-rs returned unknown c.inferImplicitValue type tag `"
+                + typeTag + "`");
+        }
+        Object tpe = same ? pt : typeFor(typeAnswer);
         Object built = buildTree(ans.items.get(3));
         Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
         return call(support, "setType", 2, built, tpe);
@@ -1016,8 +1074,7 @@ public final class ScalaRsMacroEngine {
     }
 
     /** The tree's symbol, when it is one a name can find again. */
-    static void serSym(Object t, StringBuilder sb) {
-        try {
+    static void serSym(Object t, StringBuilder sb) throws Exception {
             Object sym = call(t, "symbol", 0);
             Long sourceId = sourceSymbolIds.get(sym);
             if (sourceId != null) {
@@ -1062,9 +1119,6 @@ public final class ScalaRsMacroEngine {
             }
             sb.append("(s ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))))
               .append(')');
-        } catch (Throwable e) {
-            sb.append("(s0)");
-        }
     }
 
     /**
@@ -1123,6 +1177,22 @@ public final class ScalaRsMacroEngine {
         if (!Boolean.TRUE.equals(call(sym, "isClass", 0))) {
             Object owner = call(sym, "owner", 0);
             if (Boolean.TRUE.equals(call(owner, "isClass", 0)) && staticByOwners(owner)) {
+                Object pre = call(d, "pre", 0);
+                Object term = call(pre, "termSymbol", 0);
+                Object noPrefix = call(universe, "NoPrefix", 0);
+                Object termOwner = term == null || term == call(universe, "NoSymbol", 0)
+                    ? null : call(term, "owner", 0);
+                boolean noPrefixType = pre == noPrefix;
+                boolean staticTermPrefix = termOwner != null
+                    && Boolean.TRUE.equals(call(termOwner, "isClass", 0))
+                    && staticByOwners(termOwner);
+                if (!noPrefixType && !staticTermPrefix) {
+                    // A local/parameter/instance prefix is part of the type's
+                    // identity. Sending only the declaration would turn p.T
+                    // into every other q.T from the same owner.
+                    sb.append("(tyx ").append(Sexp.quote(String.valueOf(tpe))).append(')');
+                    return;
+                }
                 sb.append("(mem ")
                   .append(Sexp.quote(String.valueOf(call(owner, "fullName", 0))))
                   .append(' ')
@@ -1130,18 +1200,12 @@ public final class ScalaRsMacroEngine {
                 // A path-dependent member is identified by both its
                 // declaration and the stable value prefix.  `a.Type` and
                 // `b.Type` share the declaration but are distinct types.
-                Object pre = call(d, "pre", 0);
-                Object term = call(pre, "termSymbol", 0);
-                if (term != null && term != call(universe, "NoSymbol", 0)) {
-                    Object termOwner = call(term, "owner", 0);
-                    if (Boolean.TRUE.equals(call(termOwner, "isClass", 0))
-                            && staticByOwners(termOwner)) {
-                        sb.append(" (pre ")
-                          .append(Sexp.quote(String.valueOf(call(termOwner, "fullName", 0))))
-                          .append(' ')
-                          .append(Sexp.quote(String.valueOf(call(term, "name", 0))))
-                          .append(')');
-                    }
+                if (staticTermPrefix) {
+                    sb.append(" (pre ")
+                      .append(Sexp.quote(String.valueOf(call(termOwner, "fullName", 0))))
+                      .append(' ')
+                      .append(Sexp.quote(String.valueOf(call(term, "name", 0))))
+                      .append(')');
                 }
                 Object args = call(d, "typeArgs", 0);
                 Object it = call(args, "iterator", 0);
@@ -1907,7 +1971,11 @@ public final class ScalaRsMacroEngine {
                     (Boolean) a[5]);
             }
             if (n.equals("inferImplicitValue") && arity == 4) {
-                return inferImplicitValue(a[0], (Boolean) a[1], (Boolean) a[2]);
+                Object enclosing = appTree == null
+                    ? call(universe, "NoPosition", 0)
+                    : call(appTree, "pos", 0);
+                return inferImplicitValue(
+                    a[0], (Boolean) a[1], (Boolean) a[2], a[3], enclosing);
             }
             if (n.equals("TypecheckException") && arity == 0) {
                 return loadClass("scala.reflect.macros.TypecheckException$")
@@ -2140,6 +2208,94 @@ public final class ScalaRsMacroEngine {
         return "(err " + Sexp.quote(msg) + ")";
     }
 
+    /** Read one protocol packet without allowing an unterminated line to grow forever. */
+    static String readWireLine(BufferedReader reader) throws java.io.IOException {
+        return readWireLine(reader, MAX_WIRE_CHARS);
+    }
+
+    static String readWireLine(BufferedReader reader, int limit) throws java.io.IOException {
+        StringBuilder sb = new StringBuilder();
+        int seen = 0;
+        while (true) {
+            int value = reader.read();
+            if (value < 0) {
+                if (seen == 0) return null;
+                return sb.toString();
+            }
+            if (value == '\n') {
+                // Accept the platform's CRLF transport, but never trim parser
+                // input or a CR escaped inside a quoted payload.
+                if (sb.length() > 0 && sb.charAt(sb.length() - 1) == '\r') {
+                    sb.setLength(sb.length() - 1);
+                }
+                return sb.toString();
+            }
+            seen++;
+            if (seen > limit) throw new java.io.IOException(
+                "macro protocol line exceeds " + limit + " characters");
+            sb.append((char) value);
+        }
+    }
+
+    static void protocolSelfTest() throws Exception {
+        for (String bad : new String[] {
+                "(ok) trailing", "(ok))", "(ok", "(err \"unterminated)",
+                "(err \"bad\\q\")"}) {
+            boolean rejected = false;
+            try { Sexp.parse(bad); }
+            catch (IllegalArgumentException expected) { rejected = true; }
+            if (!rejected) throw new AssertionError("accepted malformed packet: " + bad);
+        }
+        if (!"\r".equals(Sexp.parse("\"\\r\"").text())) {
+            throw new AssertionError("CR escape was not decoded");
+        }
+        boolean rejected = false;
+        try { Sexp.parseWithLimits("((a))", 32, 1); }
+        catch (IllegalArgumentException expected) { rejected = true; }
+        if (!rejected) throw new AssertionError("accepted over-deep packet");
+
+        for (String bad : new String[] {
+                "(a)", "(a maybe x)", "(a ok)", "(a ok atom (t))",
+                "(a ok (ty \"scala.Int\") atom)", "(a fail)", "(a fail \"x\" extra)"}) {
+            rejected = false;
+            try { validateTypecheckAnswer(Sexp.parse(bad)); }
+            catch (Gap expected) { rejected = true; pendingGap = null; }
+            if (!rejected) throw new AssertionError("accepted malformed typecheck answer: " + bad);
+        }
+        if (!"ok".equals(validateTypecheckAnswer(
+                Sexp.parse("(a ok (ty \"scala.Int\") (t \"EmptyTree\" (s0)))")))) {
+            throw new AssertionError("rejected valid typecheck ok answer");
+        }
+        if (!"fail".equals(validateTypecheckAnswer(Sexp.parse("(a fail \"no\")")))) {
+            throw new AssertionError("rejected valid typecheck fail answer");
+        }
+
+        BufferedReader bounded = new BufferedReader(new java.io.StringReader("123456\n(ok)\r\n"));
+        rejected = false;
+        try { readWireLine(bounded, 5); }
+        catch (java.io.IOException expected) { rejected = true; }
+        if (!rejected) {
+            throw new AssertionError("bounded line reader accepted an oversized packet");
+        }
+
+        final int[] reads = new int[] { 0 };
+        java.io.Reader producer = new java.io.Reader() {
+            public int read(char[] chars, int offset, int length) {
+                reads[0]++;
+                chars[offset] = 'x';
+                return 1;
+            }
+            public void close() {}
+        };
+        rejected = false;
+        try { readWireLine(new BufferedReader(producer), 5); }
+        catch (java.io.IOException expected) { rejected = true; }
+        if (!rejected || reads[0] > 6) {
+            throw new AssertionError("bounded line reader drained an unterminated producer");
+        }
+        System.out.println("ok");
+    }
+
     // ------------------------------------------------------------------ sexp
 
     /** The wire format: atoms, quoted strings and lists. */
@@ -2180,18 +2336,35 @@ public final class ScalaRsMacroEngine {
         }
 
         static Sexp parse(String s) {
+            return parseWithLimits(s, MAX_WIRE_CHARS, MAX_WIRE_DEPTH);
+        }
+
+        static Sexp parseWithLimits(String s, int maxChars, int maxDepth) {
+            if (s == null || s.length() > maxChars) {
+                throw new IllegalArgumentException("macro protocol packet is too large");
+            }
             int[] p = {0};
-            Sexp v = parse(s, p);
+            Sexp v = parse(s, p, 0, maxDepth);
+            while (p[0] < s.length() && s.charAt(p[0]) == ' ') p[0]++;
+            if (p[0] != s.length()) {
+                throw new IllegalArgumentException("trailing input after macro protocol packet");
+            }
             return v;
         }
 
-        static Sexp parse(String s, int[] p) {
+        static Sexp parse(String s, int[] p, int depth, int maxDepth) {
             while (p[0] < s.length() && s.charAt(p[0]) == ' ') {
                 p[0]++;
+            }
+            if (p[0] >= s.length()) {
+                throw new IllegalArgumentException("empty macro protocol packet");
             }
             char c = s.charAt(p[0]);
             Sexp v = new Sexp();
             if (c == '(') {
+                if (depth >= maxDepth) {
+                    throw new IllegalArgumentException("macro protocol packet is nested too deeply");
+                }
                 p[0]++;
                 v.items = new ArrayList<>();
                 while (true) {
@@ -2199,13 +2372,13 @@ public final class ScalaRsMacroEngine {
                         p[0]++;
                     }
                     if (p[0] >= s.length()) {
-                        break;
+                        throw new IllegalArgumentException("unterminated macro protocol list");
                     }
                     if (s.charAt(p[0]) == ')') {
                         p[0]++;
                         break;
                     }
-                    v.items.add(parse(s, p));
+                    v.items.add(parse(s, p, depth + 1, maxDepth));
                 }
                 return v;
             }
@@ -2215,19 +2388,36 @@ public final class ScalaRsMacroEngine {
                 while (p[0] < s.length() && s.charAt(p[0]) != '"') {
                     char ch = s.charAt(p[0]++);
                     if (ch == '\\') {
+                        if (p[0] >= s.length()) {
+                            throw new IllegalArgumentException("unterminated macro protocol escape");
+                        }
                         char e = s.charAt(p[0]++);
-                        sb.append(e == 'n' ? '\n' : e == 't' ? '\t' : e);
+                        if (e == 'n') sb.append('\n');
+                        else if (e == 't') sb.append('\t');
+                        else if (e == 'r') sb.append('\r');
+                        else if (e == '"' || e == '\\') sb.append(e);
+                        else throw new IllegalArgumentException(
+                            "unknown macro protocol escape: \\" + e);
                     } else {
                         sb.append(ch);
                     }
+                }
+                if (p[0] >= s.length()) {
+                    throw new IllegalArgumentException("unterminated macro protocol string");
                 }
                 p[0]++;
                 v.atom = sb.toString();
                 return v;
             }
+            if (c == ')') {
+                throw new IllegalArgumentException("unexpected ) in macro protocol packet");
+            }
             StringBuilder sb = new StringBuilder();
             while (p[0] < s.length() && " ()".indexOf(s.charAt(p[0])) < 0) {
                 sb.append(s.charAt(p[0]++));
+            }
+            if (sb.length() == 0) {
+                throw new IllegalArgumentException("empty macro protocol atom");
             }
             v.atom = sb.toString();
             return v;

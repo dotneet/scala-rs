@@ -320,20 +320,57 @@ impl Typer {
     /// the macro call site; speculative diagnostics are otherwise rolled
     /// back.
     fn answer_infer_implicit_value(&mut self, items: &[Sexp]) -> String {
-        let (Ok(wanted), Ok(silent), Ok(no_macros)) = (
-            at(items, 2),
-            at(items, 3).map(|s| s.text() == "1"),
-            at(items, 4).map(|s| s.text() == "1"),
-        ) else {
+        if items.len() != 5 {
+            return refusal("the macro engine asked a malformed `c.inferImplicitValue`");
+        }
+        let Ok(wanted) = at(items, 2) else {
             return refusal("the macro engine asked a malformed `c.inferImplicitValue`");
         };
+        let Some(silent) = wire_bool(items.get(3)) else {
+            return refusal(
+                "the macro engine asked a malformed `c.inferImplicitValue` `silent` flag",
+            );
+        };
+        let Some(no_macros) = wire_bool(items.get(4)) else {
+            return refusal(
+                "the macro engine asked a malformed `c.inferImplicitValue` `withMacrosDisabled` flag",
+            );
+        };
+        if self.macro_query_depth >= MAX_QUERY_DEPTH {
+            return refusal(&format!(
+                "`c.inferImplicitValue` was asked more than {MAX_QUERY_DEPTH} deep; \
+                 scala-rs stops rather than recurse further"
+            ));
+        }
+        self.with_macro_query_depth(|this| {
+            this.answer_infer_implicit_value_in(wanted, silent, no_macros)
+        })
+    }
+
+    fn answer_infer_implicit_value_in(
+        &mut self,
+        wanted: &Sexp,
+        silent: bool,
+        no_macros: bool,
+    ) -> String {
         let span = self.macro_rpc_span;
         let mark = self.diags.len();
-        let pt = match self.query_type_from_wire(wanted, span) {
+        let resolved = self.query_type_from_wire(wanted, span);
+        // Resolution may have emitted diagnostics before discovering that
+        // the requested wire is unsupported. Every exit from the query is
+        // speculative until `silent = false` deliberately reports a miss.
+        let resolution_error = self.take_probe_errors(mark);
+        let pt = match resolved {
             Ok(t) => t,
-            Err(why) => return refusal(&format!("`c.inferImplicitValue` asked for {why}")),
+            Err(why) => {
+                let detail = match resolution_error {
+                    Some(msg) => format!("{why}: {msg}"),
+                    None => why,
+                };
+                return refusal(&format!("`c.inferImplicitValue` asked for {detail}"));
+            }
         };
-        if let Some(msg) = self.take_probe_errors(mark) {
+        if let Some(msg) = resolution_error {
             return refusal(&format!(
                 "`c.inferImplicitValue` asked for a type scala-rs could not resolve: {msg}"
             ));
@@ -345,62 +382,85 @@ impl Typer {
         }
 
         self.warm_implicit_scope(&pt);
-        let saved_no_macros = self.implicit_macros_disabled;
-        self.implicit_macros_disabled = no_macros;
-        let mut search = self.search_implicit(&pt);
+        self.with_implicit_macros_disabled(no_macros, |this| {
+            this.answer_infer_implicit_search(&pt, silent, mark)
+        })
+    }
+
+    fn answer_infer_implicit_search(&mut self, pt: &Type, silent: bool, mark: usize) -> String {
+        let span = self.macro_rpc_span;
+        let mut search = self.search_implicit(pt);
         if matches!(search, crate::implicits::ImplicitSearch::None)
-            && self.warm_implicit_candidates(std::slice::from_ref(&pt))
+            && self.warm_implicit_candidates(std::slice::from_ref(pt))
         {
-            search = self.search_implicit(&pt);
+            search = self.search_implicit(pt);
         }
-        let answer = match search {
+        match search {
             crate::implicits::ImplicitSearch::Found(id) => {
-                let mut tree = self.implicit_tree(id, &pt, span, 0);
-                self.adapt(&mut tree, &pt);
+                // `implicit_tree` expands a selected implicit macro. During a
+                // reverse query the engine is already busy with the outer
+                // macro, so a normal macro records a failure and remains an
+                // unexpanded reference. Never serialize that reference as a
+                // successful implicit answer.
+                let key = self.macro_failure_key(span);
+                let (mut tree, nested_failure) = self
+                    .with_isolated_macro_failure(key, |this| this.implicit_tree(id, pt, span, 0));
+                let selected_unexpanded_macro =
+                    self.st.get(id).macro_impl.is_some() && tree.sym == id;
+                self.adapt(&mut tree, pt);
                 let failures = self.take_probe_errors(mark);
+                if let Some(why) = nested_failure {
+                    return refusal(&format!(
+                        "`c.inferImplicitValue` selected implicit macro `{}`, but scala-rs could not expand it while answering the outer macro: {why}",
+                        self.st.get(id).name
+                    ));
+                }
+                if selected_unexpanded_macro {
+                    return refusal(&format!(
+                        "`c.inferImplicitValue` selected implicit macro `{}`, but its expansion did not complete",
+                        self.st.get(id).name
+                    ));
+                }
                 if tree.ty.is_error() || failures.is_some() {
                     if !silent {
                         self.error(
                             span,
-                            failures.unwrap_or_else(|| self.missing_implicit_message(&pt, None)),
+                            failures.unwrap_or_else(|| self.missing_implicit_message(pt, None)),
                         );
                     }
-                    "(a none)".to_string()
+                    return "(a none)".to_string();
+                }
+
+                // An abstract/path-dependent result equal to the target is
+                // already present as the JVM `pt` object. Sending a class
+                // name for it would name a different type.
+                let ty = if tree.ty == *pt {
+                    "(same)".to_string()
                 } else {
-                    // An abstract/path-dependent result equal to the target
-                    // is already present as the JVM `pt` object.  Sending a
-                    // class name for it would name a different type, so tell
-                    // the engine to reuse that exact object.  A genuinely
-                    // narrower result must still be described faithfully.
-                    let ty = if tree.ty == pt {
-                        "(same)".to_string()
-                    } else {
-                        match self.type_to_wire(&tree.ty) {
-                            Ok(ty) => ty,
-                            Err(why) => {
-                                self.implicit_macros_disabled = saved_no_macros;
-                                return refusal(&format!(
-                                    "`c.inferImplicitValue` found an implicit of {why}, which scala-rs cannot describe to the macro engine"
-                                ));
-                            }
+                    match self.type_to_wire(&tree.ty) {
+                        Ok(ty) => ty,
+                        Err(why) => {
+                            return refusal(&format!(
+                                "`c.inferImplicitValue` found an implicit of {why}, which scala-rs cannot describe to the macro engine"
+                            ));
                         }
-                    };
-                    let mut built = String::new();
-                    let types = crate::expand::WireTypes::default();
-                    let cx = crate::expand::WireCx {
-                        st: &self.st,
-                        types: &types,
-                    };
-                    match answer_tree_to_wire(&cx, &tree, &mut built) {
-                        Ok(()) => format!("(a ok {ty} {built})"),
-                        Err(why) => refusal(&format!("`c.inferImplicitValue` produced {why}")),
                     }
+                };
+                let mut built = String::new();
+                let types = crate::expand::WireTypes::default();
+                let cx = crate::expand::WireCx {
+                    st: &self.st,
+                    types: &types,
+                };
+                match answer_tree_to_wire(&cx, &tree, &mut built) {
+                    Ok(()) => format!("(a ok {ty} {built})"),
+                    Err(why) => refusal(&format!("`c.inferImplicitValue` produced {why}")),
                 }
             }
             crate::implicits::ImplicitSearch::None => {
                 self.diags.truncate(mark);
                 if !silent {
-                    self.error(span, self.missing_implicit_message(&pt, None));
+                    self.error(span, self.missing_implicit_message(pt, None));
                 }
                 "(a none)".to_string()
             }
@@ -414,9 +474,7 @@ impl Typer {
                 }
                 "(a none)".to_string()
             }
-        };
-        self.implicit_macros_disabled = saved_no_macros;
-        answer
+        }
     }
 
     /// Read a type the macro universe asked the call-site typer about.
@@ -509,12 +567,19 @@ impl Typer {
     /// does, and so does slick's own `TableQuery` probing) must not leave an
     /// error behind on the way.
     fn answer_typecheck(&mut self, items: &[Sexp]) -> String {
-        let (Ok(tree_sexp), Ok(mode)) = (at(items, 2), at(items, 3).map(|s| s.text())) else {
+        if items.len() != 5 {
+            return refusal("the macro engine asked a malformed `c.typecheck`");
+        }
+        let (Ok(tree_sexp), Ok(mode_sexp)) = (at(items, 2), at(items, 3)) else {
             // Unreachable through the engine, which always writes all three;
             // said rather than unwrapped, because a malformed line must not
             // leave the engine blocked on a read.
             return refusal("the macro engine asked a malformed `c.typecheck`");
         };
+        if matches!(mode_sexp, Sexp::List(_)) || wire_bool(items.get(4)).is_none() {
+            return refusal("the macro engine asked a malformed `c.typecheck`");
+        }
+        let mode = mode_sexp.text();
         // `c.typecheck` is re-entrant in nsc. Here each nested question would
         // need its own conversation on a pipe that carries one, and the
         // `converse` loop is what serialises them -- but a *tree* that itself
@@ -526,9 +591,26 @@ impl Typer {
             ));
         }
         let span = self.macro_rpc_span;
-        let mut tree = match self.tree_from_reply(tree_sexp, span) {
-            Ok(t) => t,
-            Err(why) => return refusal(&why),
+        // Tree reconstruction is part of the speculative transaction too:
+        // resolving a returned path-dependent symbol can complete a binary
+        // member and emit diagnostics before ultimately refusing the wire.
+        let mark = self.diags.len();
+        let rebuilt = self.tree_from_reply(tree_sexp, span);
+        let reconstruction_errors = self.take_probe_errors(mark);
+        let mut tree = match rebuilt {
+            Ok(t) if reconstruction_errors.is_none() => t,
+            Ok(_) => {
+                return refusal(&format!(
+                    "`c.typecheck` could not rebuild its tree: {}",
+                    reconstruction_errors.unwrap()
+                ))
+            }
+            Err(why) => {
+                let detail = reconstruction_errors
+                    .map(|diagnostic| format!("{why}: {diagnostic}"))
+                    .unwrap_or(why);
+                return refusal(&detail);
+            }
         };
         // A macro application inside the tree is refused (`macro_engine_busy`),
         // and the refusal is recorded against the span every node of a rebuilt
@@ -536,25 +618,16 @@ impl Typer {
         // be a reason attached to a call that succeeded, so it is put back the
         // way it was, exactly like the diagnostics.
         let key = self.macro_failure_key(span);
-        let outer_failure = self.macro_failures.get(&key).cloned();
-        self.macro_query_depth += 1;
-        let answer = match mode.as_str() {
-            "TERM" => self.typecheck_term(&mut tree),
-            "TYPE" => self.typecheck_type(&tree),
-            other => refusal(&format!(
-                "`c.typecheck` was asked for {other}mode, which scala-rs does \
-                 not implement (only TERMmode and TYPEmode)"
-            )),
-        };
-        self.macro_query_depth -= 1;
-        match outer_failure {
-            Some(why) => {
-                self.macro_failures.insert(key, why);
-            }
-            None => {
-                self.macro_failures.remove(&key);
-            }
-        }
+        let (answer, _nested_failure) = self.with_isolated_macro_failure(key, |this| {
+            this.with_macro_query_depth(|this| match mode.as_str() {
+                "TERM" => this.typecheck_term(&mut tree),
+                "TYPE" => this.typecheck_type(&tree),
+                other => refusal(&format!(
+                    "`c.typecheck` was asked for {other}mode, which scala-rs does \
+                     not implement (only TERMmode and TYPEmode)"
+                )),
+            })
+        });
         answer
     }
 
@@ -647,6 +720,14 @@ impl Typer {
 
 /// How deep a chain of `c.typecheck` questions may go.
 const MAX_QUERY_DEPTH: usize = 16;
+
+fn wire_bool(s: Option<&Sexp>) -> Option<bool> {
+    match s?.atom()? {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
 
 fn refusal(why: &str) -> String {
     format!("(no {})", quoted(why))
@@ -857,6 +938,90 @@ fn answer_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(
             Ok(())
         }
         _ => super::expand::tree_to_wire(cx, t, out).map_err(|why| format!("a tree: {why}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::TypecheckOptions;
+
+    fn atom(value: &str) -> Sexp {
+        Sexp::Atom(value.to_string())
+    }
+
+    fn string(value: &str) -> Sexp {
+        Sexp::Str(value.to_string())
+    }
+
+    fn infer_question(wanted: Sexp, silent: &str, no_macros: &str) -> Vec<Sexp> {
+        vec![
+            atom("q"),
+            atom("inferImplicitValue"),
+            wanted,
+            atom(silent),
+            atom(no_macros),
+        ]
+    }
+
+    #[test]
+    fn infer_query_rejects_malformed_flags_and_length() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let wanted = Sexp::List(vec![atom("ty"), string("scala.Int")]);
+        let malformed_flag = typer.answer_query(&infer_question(wanted, "true", "0"));
+        assert!(malformed_flag.contains("malformed") && malformed_flag.contains("silent"));
+
+        let short = vec![atom("q"), atom("inferImplicitValue")];
+        assert!(typer.answer_query(&short).contains("malformed"));
+    }
+
+    #[test]
+    fn infer_query_rolls_back_failed_type_resolution_and_honours_depth_limit() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let before = typer.diags.len();
+        let missing = Sexp::List(vec![atom("ty"), string("no.such.Missing")]);
+        let answer = typer.answer_query(&infer_question(missing, "1", "0"));
+        assert!(answer.starts_with("(no "), "{answer}");
+        assert_eq!(typer.diags.len(), before);
+
+        typer.macro_query_depth = MAX_QUERY_DEPTH;
+        let wanted = Sexp::List(vec![atom("ty"), string("scala.Int")]);
+        let answer = typer.answer_query(&infer_question(wanted, "1", "0"));
+        assert!(
+            answer.contains("more than") && answer.contains("deep"),
+            "{answer}"
+        );
+        assert_eq!(typer.macro_query_depth, MAX_QUERY_DEPTH);
+    }
+
+    #[test]
+    fn typecheck_query_rolls_back_failed_tree_reconstruction() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let before = typer.diags.len();
+        let returned_tree = Sexp::List(vec![
+            atom("t"),
+            string("TypeTree"),
+            Sexp::List(vec![
+                atom("tm"),
+                string("no.such.MissingOwner"),
+                string("Type"),
+            ]),
+            Sexp::List(vec![atom("ty"), string("scala.Int")]),
+        ]);
+        let question = vec![
+            atom("q"),
+            atom("typecheck"),
+            returned_tree,
+            string("TYPE"),
+            atom("1"),
+        ];
+        let answer = typer.answer_query(&question);
+        assert!(answer.starts_with("(no "), "{answer}");
+        assert_eq!(typer.diags.len(), before);
+
+        let mut malformed = question;
+        malformed[4] = atom("true");
+        assert!(typer.answer_query(&malformed).contains("malformed"));
     }
 }
 

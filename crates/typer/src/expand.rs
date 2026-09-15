@@ -61,8 +61,18 @@ const ENGINE_JAVA_RELEASE: &str = "8";
 const ENGINE_CACHE_VERSION: &str = "java8-target-v2";
 
 const MAX_ENGINE_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+/// One protocol packet. Expansion trees can be large, but the pipe must not
+/// allocate without limit when a macro writes a line that never ends.
+const MAX_WIRE_BYTES: usize = 16 * 1024 * 1024;
+/// Both protocol parsers are recursive. Bound adversarial nesting before it
+/// can overflow the compiler or engine stack.
+const MAX_WIRE_DEPTH: usize = 512;
 const ENGINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
+const ENGINE_TIMING_TIMEOUT: Duration = Duration::from_secs(2);
 const ENGINE_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+
+#[cfg(windows)]
+const ENGINE_WINDOWS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
 
 /// nsc's `-Ymacro-expand-depth`. A macro whose expansion calls itself has to
 /// stop somewhere, and stopping with a diagnostic beats a stack overflow.
@@ -79,26 +89,31 @@ const MAX_ENGINE_QUERIES: u32 = 1024;
 /// The engine process, started on the first expansion of a run.
 pub(crate) struct MacroEngine {
     child: Child,
+    containment: EngineContainment,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Temporarily `None` while a timed reader thread owns the pipe. A timeout
+    /// poisons the engine, so that thread never has to hand a placeholder back.
+    stdout: Option<BufReader<ChildStdout>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     stderr_done: Arc<AtomicBool>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
-    /// Set when an expansion timed out and the child was killed: the pipe is
-    /// no longer in sync with the requests, so nothing more may be asked.
+    /// Set when a timeout or protocol failure killed the process group. The
+    /// pipe is no longer in sync with the requests, so nothing more may be
+    /// asked.
     poisoned: bool,
-    /// The closed pipe that holds `stdout`'s place while the reader thread has
-    /// it ([`dead_pipe`]), kept so it is made once per engine rather than once
-    /// per read. Making it spawns a process, and a gitbucket build reads 600
-    /// lines off this pipe: 1.2 s of the 1.5 s that conversation cost was
-    /// `posix_spawn` for a `true` that was thrown away again.
-    spare_stdout: Option<BufReader<ChildStdout>>,
+    /// Process/PID ownership is consumed exactly once. In particular, an
+    /// explicitly rejected startup hello must not make `Drop` target the
+    /// already-reaped child's now-stale PID or process-group id again.
+    terminated: bool,
+    #[cfg(test)]
+    termination_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for MacroEngine {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Err(reason) = self.terminate_once() {
+            eprintln!("warning: {reason}");
+        }
         // Dropping the handle detaches the bounded collector.  A macro is
         // allowed to spawn a child process that inherits stderr; joining here
         // would make compiler shutdown wait forever for that unrelated child.
@@ -129,19 +144,57 @@ fn expansion_timeout() -> Option<Duration> {
 }
 
 impl MacroEngine {
+    fn unavailable_reason() -> String {
+        "the macro engine was shut down after a timeout or unsafe protocol \
+         failure; later expansions in this run cannot be trusted and are not \
+         attempted"
+            .to_string()
+    }
+
+    fn poison_and_terminate(&mut self) -> Option<String> {
+        self.poisoned = true;
+        self.terminate_once().err()
+    }
+
+    fn terminate_once(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        if self.terminated {
+            return Ok(None);
+        }
+        self.terminated = true;
+        #[cfg(test)]
+        {
+            self.termination_attempts
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        terminate_engine_process(&mut self.child, &mut self.containment)
+    }
+
+    fn protocol_failure<T>(&mut self, mut reason: String) -> Result<T, String> {
+        if let Some(stop_error) = self.poison_and_terminate() {
+            reason.push_str("; ");
+            reason.push_str(&stop_error);
+        }
+        Err(reason)
+    }
+
     /// Write one line to the engine. `Err` is a reason, already phrased for a
     /// user.
     pub(crate) fn send(&mut self, line: &str) -> Result<(), String> {
         if self.poisoned {
-            return Err("the macro engine was shut down after an expansion \
-                        timed out; later expansions in this run cannot be \
-                        trusted and are not attempted"
-                .to_string());
+            return Err(Self::unavailable_reason());
         }
-        writeln!(self.stdin, "{line}").map_err(|e| format!("the macro engine died ({e})"))?;
-        self.stdin
-            .flush()
-            .map_err(|e| format!("the macro engine died ({e})"))
+        if line.len().saturating_add(1) > MAX_WIRE_BYTES {
+            return self.protocol_failure(format!(
+                "macro protocol request exceeds {MAX_WIRE_BYTES} bytes"
+            ));
+        }
+        if let Err(e) = writeln!(self.stdin, "{line}") {
+            return self.protocol_failure(format!("the macro engine died ({e})"));
+        }
+        if let Err(e) = self.stdin.flush() {
+            return self.protocol_failure(format!("the macro engine died ({e})"));
+        }
+        Ok(())
     }
 
     /// Read one line the engine wrote, waiting at most what is left of
@@ -162,33 +215,45 @@ impl MacroEngine {
     /// subtracted, so the total an implementation gets is the same 20 seconds
     /// whether it asks nothing or asks a hundred times.
     pub(crate) fn read_reply(&mut self, budget: &mut Option<Duration>) -> Result<Sexp, String> {
+        self.read_reply_with_limit(budget, MAX_WIRE_BYTES)
+    }
+
+    fn read_reply_with_limit(
+        &mut self,
+        budget: &mut Option<Duration>,
+        wire_limit: usize,
+    ) -> Result<Sexp, String> {
         if self.poisoned {
-            return Err("the macro engine was shut down after an expansion \
-                        timed out; later expansions in this run cannot be \
-                        trusted and are not attempted"
-                .to_string());
+            return Err(Self::unavailable_reason());
         }
         let Some(limit) = *budget else {
-            let mut line = String::new();
-            return match self.stdout.read_line(&mut line) {
-                Ok(0) => Err("the macro engine exited without a reply".to_string()),
-                Ok(_) => Sexp::parse(line.trim_end()),
-                Err(e) => Err(format!("the macro engine died ({e})")),
+            let Some(stdout) = self.stdout.as_mut() else {
+                return self.protocol_failure(
+                    "the macro engine reply pipe is unavailable after a timed read".to_string(),
+                );
+            };
+            let result = match read_wire_line_with_limit(stdout, wire_limit) {
+                Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
+                Ok((_, line)) => Sexp::parse(wire_line_payload(&line)),
+                Err(e) => Err(format!("the macro engine protocol failed ({e})")),
+            };
+            return match result {
+                Ok(reply) => Ok(reply),
+                Err(reason) => self.protocol_failure(reason),
             };
         };
 
         // `read_line` cannot be interrupted, so it runs where it can be
         // abandoned. The reader owns the handle for the duration and gives it
         // back with the line; on a timeout it is dropped along with the child.
-        let placeholder = self
-            .spare_stdout
-            .take()
-            .unwrap_or_else(|| BufReader::new(dead_pipe()));
-        let mut stdout = std::mem::replace(&mut self.stdout, placeholder);
+        let Some(mut stdout) = self.stdout.take() else {
+            return self.protocol_failure(
+                "the macro engine reply pipe is unavailable after a timed read".to_string(),
+            );
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut line = String::new();
-            let r = stdout.read_line(&mut line).map(|n| (n, line));
+            let r = read_wire_line_with_limit(&mut stdout, wire_limit);
             let _ = tx.send((stdout, r));
         });
         let started = Instant::now();
@@ -196,43 +261,90 @@ impl MacroEngine {
         *budget = Some(limit.saturating_sub(started.elapsed()));
         match outcome {
             Ok((stdout, r)) => {
-                // The placeholder goes back into the spare slot for the next
-                // read; only a timeout loses it, along with the child.
-                self.spare_stdout = Some(std::mem::replace(&mut self.stdout, stdout));
-                match r {
+                self.stdout = Some(stdout);
+                let result = match r {
                     Ok((0, _)) => Err("the macro engine exited without a reply".to_string()),
-                    Ok((_, line)) => Sexp::parse(line.trim_end()),
-                    Err(e) => Err(format!("the macro engine died ({e})")),
+                    Ok((_, line)) => Sexp::parse(wire_line_payload(&line)),
+                    Err(e) => Err(format!("the macro engine protocol failed ({e})")),
+                };
+                match result {
+                    Ok(reply) => Ok(reply),
+                    Err(reason) => self.protocol_failure(reason),
                 }
             }
             Err(_) => {
-                self.poisoned = true;
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-                Err(format!(
+                let mut reason = format!(
                     "the macro implementation did not return within {}s -- it \
                      is looping, deadlocked, or waiting on something that \
                      never arrives (set SCALA_RS_MACRO_TIMEOUT_SECS to change \
                      or 0 to disable)",
                     limit.as_secs()
-                ))
+                );
+                if let Some(stop_error) = self.poison_and_terminate() {
+                    reason.push_str("; ");
+                    reason.push_str(&stop_error);
+                }
+                Err(reason)
             }
         }
     }
 }
 
-/// A closed pipe to hold `stdout`'s place while the reader thread has it.
-/// Reading it yields EOF, which is the truth once the child has been killed.
-fn dead_pipe() -> ChildStdout {
-    // `Stdio::null()` cannot become a `ChildStdout`, so borrow one from a
-    // process that exits immediately.
-    let mut c = Command::new("true")
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn placeholder");
-    let out = c.stdout.take().expect("placeholder stdout");
-    let _ = c.wait();
-    out
+/// Read one bounded protocol line. Once the limit is reached, fail immediately
+/// without draining attacker-controlled input. The caller poisons and kills
+/// the process group, so there is deliberately no next packet to align with.
+fn read_wire_line<R: BufRead>(reader: &mut R) -> std::io::Result<(usize, String)> {
+    read_wire_line_with_limit(reader, MAX_WIRE_BYTES)
+}
+
+fn read_wire_line_with_limit<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<(usize, String)> {
+    let mut bytes = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let (take, ended) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                let line = String::from_utf8(bytes).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "macro protocol line is not UTF-8",
+                    )
+                })?;
+                return Ok((total, line));
+            }
+            let ended = available.iter().position(|b| *b == b'\n');
+            let take = ended.map_or(available.len(), |at| at + 1);
+            if total.saturating_add(take) > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("macro protocol line exceeds {limit} bytes"),
+                ));
+            }
+            total += take;
+            bytes.extend_from_slice(&available[..take]);
+            (take, ended.is_some())
+        };
+        reader.consume(take);
+        if ended {
+            let line = String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "macro protocol line is not UTF-8",
+                )
+            })?;
+            return Ok((total, line));
+        }
+    }
+}
+
+/// Remove only the transport terminator. Parser-significant trailing spaces
+/// remain and are checked as part of the packet.
+fn wire_line_payload(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 /// Compile the engine into a cache directory and start it.
@@ -259,46 +371,83 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
         cp.push(sep);
         cp.push_str(&p.display().to_string());
     }
-    let mut child = Command::new(jdk_tool("java"))
+    let mut command = Command::new(jdk_tool("java"));
+    command
         .arg("-cp")
         .arg(&cp)
         .arg("ScalaRsMacroEngine")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_engine_command(&mut command);
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start `java` to expand macros: {e}"))?;
+    // On Windows the child was created suspended. Attach it before its first
+    // instruction, then resume only after the Job owns it, so neither JVM
+    // agents nor classpath-shadowed initializers can escape the Job.
+    let mut containment = match EngineContainment::attach(&child) {
+        Ok(containment) => containment,
+        Err(reason) => {
+            return Err(abort_uncontained_engine(
+                &mut child,
+                format!("cannot contain the macro engine process tree: {reason}"),
+            ));
+        }
+    };
+    if let Err(reason) = start_contained_engine(&mut child, &mut containment) {
+        return Err(reason);
+    }
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let stderr = child.stderr.take().expect("piped stderr");
     let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
-    let (stdout, hello_result) = read_engine_hello(stdout);
-    let hello = match hello_result {
-        Ok(hello) => hello,
-        Err(reason) => {
-            let status = stop_engine(&mut child, Some(stderr_thread));
+    let (stdout, hello) = match read_engine_hello(stdout) {
+        Ok(result) => result,
+        Err(mut reason) => {
+            let status = match stop_engine(&mut child, &mut containment, Some(stderr_thread)) {
+                Ok(status) => status,
+                Err(stop_error) => {
+                    reason.push_str("; ");
+                    reason.push_str(&stop_error);
+                    None
+                }
+            };
             wait_for_stderr(&stderr_done);
             return Err(startup_failure(&reason, status, &stderr));
         }
     };
     let engine = MacroEngine {
         child,
+        containment,
         stdin,
-        stdout,
+        stdout: Some(stdout),
         stderr,
         stderr_done,
         stderr_thread: Some(stderr_thread),
         poisoned: false,
-        spare_stdout: None,
+        terminated: false,
+        #[cfg(test)]
+        termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
-    if hello.trim_end() != "(ready)" {
-        let why = match Sexp::parse(hello.trim_end()) {
-            Ok(s) => s.reason().unwrap_or_else(|| hello.trim_end().to_string()),
-            Err(_) => hello.trim_end().to_string(),
+    let hello = wire_line_payload(&hello);
+    if hello != "(ready)" {
+        let mut why = match Sexp::parse(hello) {
+            Ok(s) => s.reason().unwrap_or_else(|| hello.to_string()),
+            Err(_) => hello.to_string(),
         };
         // Dropped here so the failed child does not outlive the diagnostic.
         let mut engine = engine;
-        let status = stop_engine(&mut engine.child, engine.stderr_thread.take());
+        engine.poisoned = true;
+        let status = match engine.terminate_once() {
+            Ok(status) => status,
+            Err(stop_error) => {
+                why.push_str("; ");
+                why.push_str(&stop_error);
+                None
+            }
+        };
+        let _ = engine.stderr_thread.take();
         wait_for_stderr(&engine.stderr_done);
         return Err(startup_failure(&why, status, &engine.stderr));
     }
@@ -463,40 +612,439 @@ fn bounded_text(bytes: &[u8]) -> String {
 
 fn read_engine_hello(
     stdout: BufReader<ChildStdout>,
-) -> (BufReader<ChildStdout>, Result<String, String>) {
+) -> Result<(BufReader<ChildStdout>, String), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut stdout = stdout;
-        let mut hello = String::new();
-        let result = stdout.read_line(&mut hello).map(|n| (n, hello));
+        let result = read_wire_line(&mut stdout);
         let _ = tx.send((stdout, result));
     });
     match rx.recv_timeout(ENGINE_STARTUP_TIMEOUT) {
-        Ok((stdout, Ok((0, _)))) => (
-            stdout,
-            Err("the macro engine exited at startup".to_string()),
-        ),
-        Ok((stdout, Ok((_, hello)))) => (stdout, Ok(hello)),
-        Ok((stdout, Err(e))) => (
-            stdout,
-            Err(format!("the macro engine died at startup ({e})")),
-        ),
-        Err(_) => (
-            BufReader::new(dead_pipe()),
-            Err(format!(
-                "the macro engine did not report readiness within {}s",
-                ENGINE_STARTUP_TIMEOUT.as_secs()
-            )),
-        ),
+        Ok((_stdout, Ok((0, _)))) => Err("the macro engine exited at startup".to_string()),
+        Ok((stdout, Ok((_, hello)))) => Ok((stdout, hello)),
+        Ok((_stdout, Err(e))) => Err(format!("the macro engine died at startup ({e})")),
+        Err(_) => Err(format!(
+            "the macro engine did not report readiness within {}s",
+            ENGINE_STARTUP_TIMEOUT.as_secs()
+        )),
     }
 }
 
 fn stop_engine(
     child: &mut Child,
+    containment: &mut EngineContainment,
     _stderr_thread: Option<std::thread::JoinHandle<()>>,
-) -> Option<std::process::ExitStatus> {
+) -> Result<Option<std::process::ExitStatus>, String> {
+    terminate_engine_process(child, containment)
+}
+
+struct EngineContainment {
+    #[cfg(windows)]
+    job: windows_job::Job,
+}
+
+impl EngineContainment {
+    fn attach(child: &Child) -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            return Ok(Self {
+                job: windows_job::Job::attach(child)?,
+            });
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Ok(Self {})
+        }
+    }
+
+    fn start(&mut self, child: &Child) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            return windows_job::resume_primary_thread(child);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = child;
+            Ok(())
+        }
+    }
+
+    fn terminate(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            return self.job.terminate();
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
+    }
+}
+
+fn abort_uncontained_engine(child: &mut Child, mut reason: String) -> String {
+    match child.kill() {
+        Ok(()) => {
+            if let Err(error) = child.wait() {
+                reason.push_str(&format!(
+                    "; cannot reap the suspended macro engine: {error}"
+                ));
+            }
+        }
+        Err(error) => {
+            // Waiting after a failed termination could block forever. Report
+            // the failure immediately; on Windows this process is still
+            // suspended and therefore could not have created descendants.
+            reason.push_str(&format!(
+                "; cannot kill the suspended macro engine: {error}"
+            ));
+        }
+    }
+    reason
+}
+
+fn start_contained_engine(
+    child: &mut Child,
+    containment: &mut EngineContainment,
+) -> Result<(), String> {
+    if let Err(mut reason) = containment.start(child) {
+        if let Err(stop_error) = terminate_engine_process(child, containment) {
+            reason.push_str("; ");
+            reason.push_str(&stop_error);
+        }
+        return Err(format!("cannot start the contained macro engine: {reason}"));
+    }
+    Ok(())
+}
+
+/// Put the JVM and every process a macro spawns in one dedicated process
+/// group. A descendant may inherit stdout/stderr after the JVM itself dies;
+/// killing only the direct child would leave our reader threads blocked on
+/// those still-open pipe handles.
+fn configure_engine_command(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_SUSPENDED closes the spawn-to-Job-assignment race. The
+        // primary thread is resumed only by `EngineContainment::start`, after
+        // the kill-on-close Job owns the process. CREATE_NEW_PROCESS_GROUP
+        // also isolates console control events.
+        command.creation_flags(ENGINE_WINDOWS_CREATION_FLAGS);
+    }
+}
+
+fn terminate_engine_process(
+    child: &mut Child,
+    containment: &mut EngineContainment,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    #[cfg(unix)]
+    {
+        // `process_group(0)` makes the child's pid its process-group id. The
+        // negative pid is POSIX's group target. SIGKILL is used because this
+        // path is reached for untrusted, timed-out macro code and must not
+        // wait for a handler in that code.
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        let pid = child.id();
+        if pid <= i32::MAX as u32 {
+            // SAFETY: `kill` receives only integer values and borrows no Rust
+            // memory. The pid is the dedicated group created at spawn.
+            let _ = unsafe { kill(-(pid as i32), SIGKILL) };
+        }
+    }
+    let containment_result = containment.terminate();
     let _ = child.kill();
-    child.wait().ok()
+    let status = child.wait().ok();
+    containment_result.map(|()| status)
+}
+
+#[cfg(windows)]
+mod windows_job {
+    use std::ffi::c_void;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    type Handle = *mut c_void;
+
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimitInformation {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(
+            job: Handle,
+            information_class: i32,
+            information: *const c_void,
+            information_length: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+        fn CloseHandle(handle: Handle) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
+        fn ResumeThread(thread: Handle) -> u32;
+    }
+
+    pub(super) struct Job {
+        // Store the pointer value as an integer so ownership remains Send in
+        // the same way `Child` is. It is converted back only at FFI calls.
+        handle: Option<isize>,
+    }
+
+    impl Job {
+        pub(super) fn attach(child: &Child) -> Result<Self, String> {
+            // SAFETY: null security attributes/name ask Windows to allocate a
+            // fresh unnamed Job Object; no Rust memory is borrowed.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(format!(
+                    "CreateJobObjectW failed ({})",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut job = Self {
+                handle: Some(handle as isize),
+            };
+            let mut info = ExtendedLimitInformation::default();
+            info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `info` has the documented C layout and remains alive for
+            // the duration of the call; the handle is owned by `job`.
+            if unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    &info as *const _ as *const c_void,
+                    size_of::<ExtendedLimitInformation>() as u32,
+                )
+            } == 0
+            {
+                let error = std::io::Error::last_os_error();
+                let _ = job.close();
+                return Err(format!("SetInformationJobObject failed ({error})"));
+            }
+            // SAFETY: `Child` owns a valid process handle until it is dropped;
+            // Windows retains the job membership after this call returns.
+            if unsafe { AssignProcessToJobObject(handle, child.as_raw_handle() as Handle) } == 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = job.close();
+                return Err(format!("AssignProcessToJobObject failed ({error})"));
+            }
+            Ok(job)
+        }
+
+        pub(super) fn terminate(&mut self) -> Result<(), String> {
+            let Some(raw) = self.handle else {
+                return Ok(());
+            };
+            // SAFETY: `raw` is an owned live Job Object handle. Terminating a
+            // job ends the assigned JVM and every descendant still in it.
+            let terminated = unsafe { TerminateJobObject(raw as Handle, 1) };
+            let terminate_error = (terminated == 0).then(std::io::Error::last_os_error);
+            let close_result = self.close();
+            match (terminate_error, close_result) {
+                (None, Ok(())) => Ok(()),
+                (Some(error), Ok(())) => Err(format!(
+                    "TerminateJobObject failed ({error}); kill-on-close was applied"
+                )),
+                (None, Err(error)) => Err(error),
+                (Some(terminate), Err(close)) => {
+                    Err(format!("TerminateJobObject failed ({terminate}); {close}"))
+                }
+            }
+        }
+
+        fn close(&mut self) -> Result<(), String> {
+            let Some(raw) = self.handle.take() else {
+                return Ok(());
+            };
+            // SAFETY: `raw` is owned exactly once by this value.
+            if unsafe { CloseHandle(raw as Handle) } == 0 {
+                self.handle = Some(raw);
+                return Err(format!(
+                    "CloseHandle(macro engine Job Object) failed ({})",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            if let Err(reason) = self.close() {
+                eprintln!("warning: {reason}");
+            }
+        }
+    }
+
+    pub(super) fn resume_primary_thread(child: &Child) -> Result<(), String> {
+        // `std::process::Command` closes CreateProcessW's primary-thread
+        // handle. The process has not executed yet, so its primary thread is
+        // the sole entry owned by this pid and can be recovered without a
+        // race from the system thread snapshot.
+        let invalid_handle = (-1isize) as Handle;
+        // SAFETY: this creates a kernel snapshot and borrows no Rust memory.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == invalid_handle {
+            return Err(format!(
+                "CreateToolhelp32Snapshot failed ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let result = find_only_thread(snapshot, child.id());
+        let close_snapshot = close_handle(snapshot, "thread snapshot");
+        let thread_id = match (result, close_snapshot) {
+            (Ok(thread_id), Ok(())) => thread_id,
+            (Err(reason), Ok(())) | (Ok(_), Err(reason)) => return Err(reason),
+            (Err(mut reason), Err(close_error)) => {
+                reason.push_str("; ");
+                reason.push_str(&close_error);
+                return Err(reason);
+            }
+        };
+
+        // SAFETY: `thread_id` belongs to the still-live suspended child.
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() {
+            return Err(format!(
+                "OpenThread(primary macro engine thread) failed ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `thread` is an owned handle with suspend/resume access.
+        let previous_count = unsafe { ResumeThread(thread) };
+        let resume_result = if previous_count == u32::MAX {
+            Err(format!(
+                "ResumeThread failed ({})",
+                std::io::Error::last_os_error()
+            ))
+        } else if previous_count != 1 {
+            Err(format!(
+                "the macro engine primary thread had unexpected suspend count {previous_count}"
+            ))
+        } else {
+            Ok(())
+        };
+        let close_thread = close_handle(thread, "primary macro engine thread");
+        match (resume_result, close_thread) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(reason), Ok(())) | (Ok(()), Err(reason)) => Err(reason),
+            (Err(mut reason), Err(close_error)) => {
+                reason.push_str("; ");
+                reason.push_str(&close_error);
+                Err(reason)
+            }
+        }
+    }
+
+    fn find_only_thread(snapshot: Handle, process_id: u32) -> Result<u32, String> {
+        let mut entry = ThreadEntry32 {
+            size: size_of::<ThreadEntry32>() as u32,
+            ..ThreadEntry32::default()
+        };
+        // SAFETY: `entry` is initialized with the required size and remains
+        // writable for the duration of each enumeration call.
+        if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
+            return Err(format!(
+                "Thread32First failed ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut found = None;
+        loop {
+            if entry.owner_process_id == process_id {
+                if found.replace(entry.thread_id).is_some() {
+                    return Err(
+                        "the suspended macro engine unexpectedly has multiple threads".to_string(),
+                    );
+                }
+            }
+            // SAFETY: same initialized entry and live snapshot as above.
+            if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+                    return Err(format!("Thread32Next failed ({error})"));
+                }
+                break;
+            }
+        }
+        found.ok_or_else(|| "the suspended macro engine primary thread was not found".to_string())
+    }
+
+    fn close_handle(handle: Handle, label: &str) -> Result<(), String> {
+        // SAFETY: callers pass an owned handle and never use it after this
+        // function, irrespective of the close result.
+        if unsafe { CloseHandle(handle) } == 0 {
+            return Err(format!(
+                "CloseHandle({label}) failed ({})",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn startup_failure(
@@ -643,7 +1191,6 @@ impl Typer {
                 built.span = tree.span;
                 *tree = built;
                 let retype_started = self.macro_timing.enabled.then(Instant::now);
-                self.macro_depth += 1;
                 // A blackbox macro's expansion is typechecked *against the
                 // declared result type* and keeps it, whatever more precise
                 // type the expansion itself has (nsc ascribes the expansion
@@ -658,12 +1205,13 @@ impl Typer {
                 // difference is for: typed against the declared `Any` the tree
                 // is an `Any`, and `val x: Option[Int] = Macros.foo` does not
                 // typecheck.
-                if binding.blackbox {
-                    self.type_expr(tree, &declared);
-                } else {
-                    self.type_expr(tree, &Type::NoType);
-                }
-                self.macro_depth -= 1;
+                self.with_macro_depth(|this| {
+                    if binding.blackbox {
+                        this.type_expr(tree, &declared);
+                    } else {
+                        this.type_expr(tree, &Type::NoType);
+                    }
+                });
                 if let Some(t) = retype_started {
                     let elapsed = t.elapsed();
                     if let Some(slot) = self.macro_timing.expansions.last_mut() {
@@ -693,9 +1241,9 @@ impl Typer {
         // and its macro runner are the same process), and this bridge cannot
         // without a second engine and a second conversation.
         if self.macro_engine_busy {
-            return Err("this macro application is inside a tree a macro \
-                        implementation asked `c.typecheck` about, and the \
-                        engine is already running that implementation; \
+            return Err("this macro application was selected while scala-rs was \
+                        answering a reverse query from another macro, and the \
+                        engine is already running that outer implementation; \
                         scala-rs does not expand a macro from inside another \
                         expansion's query yet"
                 .to_string());
@@ -748,20 +1296,20 @@ impl Typer {
         let items = reply.list()?;
         match items.first().and_then(|s| s.atom()) {
             Some("ok") => {
-                let saved = std::mem::replace(
-                    &mut self.macro_splices,
-                    splices.into_iter().map(Some).collect(),
-                );
-                let rebuild_started = self.macro_timing.enabled.then(Instant::now);
-                let built = self.tree_from_reply(at(items, 1)?, tree.span);
-                if let Some(t) = rebuild_started {
-                    let elapsed = t.elapsed();
-                    if let Some(slot) = self.macro_timing.expansions.last_mut() {
-                        slot.rebuild += elapsed;
+                self.with_macro_splices(splices.into_iter().map(Some).collect(), |this| {
+                    let rebuild_started = this.macro_timing.enabled.then(Instant::now);
+                    let built = (|| {
+                        let expansion = at(items, 1)?;
+                        this.tree_from_reply(expansion, tree.span)
+                    })();
+                    if let Some(t) = rebuild_started {
+                        let elapsed = t.elapsed();
+                        if let Some(slot) = this.macro_timing.expansions.last_mut() {
+                            slot.rebuild += elapsed;
+                        }
                     }
-                }
-                self.macro_splices = saved;
-                built
+                    built
+                })
             }
             Some("abort") => {
                 // `c.abort` is the implementation asking for a compile error
@@ -801,27 +1349,27 @@ impl Typer {
     /// of it spent blocked on an answer from here. The difference is what the
     /// JVM actually computed for this expansion.
     fn engine_timing(&mut self) -> (Duration, Duration, Duration) {
-        let Some(mut engine) = self.macro_engine.take() else {
-            return (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-        };
-        let answer = engine
-            .send("(timing)")
-            .and_then(|()| engine.read_reply(&mut None));
-        self.macro_engine = Some(engine);
-        let nanos =
-            |s: &Sexp| -> Duration { Duration::from_nanos(s.text().parse::<u64>().unwrap_or(0)) };
-        match answer {
-            Ok(reply) => match reply.list() {
-                Ok(items) => match (at(items, 1), at(items, 2), at(items, 3)) {
-                    (Ok(invoke), Ok(wait), Ok(handle)) => {
-                        (nanos(invoke), nanos(wait), nanos(handle))
-                    }
-                    _ => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
-                },
-                Err(_) => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
-            },
-            Err(_) => (Duration::ZERO, Duration::ZERO, Duration::ZERO),
-        }
+        self.engine_timing_with_timeout(ENGINE_TIMING_TIMEOUT)
+    }
+
+    fn engine_timing_with_timeout(&mut self, timeout: Duration) -> (Duration, Duration, Duration) {
+        self.with_engine_conversation(|_this, engine| {
+            engine.send("(timing)")?;
+            let mut budget = Some(timeout);
+            let reply = engine.read_reply(&mut budget)?;
+            let items = reply.list()?;
+            if items.len() != 4 || items.first().and_then(Sexp::atom) != Some("timing") {
+                return Err("the macro engine returned a malformed timing reply".to_string());
+            }
+            let nanos = |index| -> Result<Duration, String> {
+                let value = at(items, index)?.text().parse::<u64>().map_err(|_| {
+                    "the macro engine returned a malformed timing reply".to_string()
+                })?;
+                Ok(Duration::from_nanos(value))
+            };
+            Ok((nanos(1)?, nanos(2)?, nanos(3)?))
+        })
+        .unwrap_or((Duration::ZERO, Duration::ZERO, Duration::ZERO))
     }
 
     /// Send one request and read the reply, answering whatever the engine
@@ -842,16 +1390,48 @@ impl Typer {
     /// is what stops an expansion nested inside an answer from starting a
     /// second engine.
     fn converse(&mut self, request: &str) -> Result<Sexp, String> {
+        let mut budget = expansion_timeout();
+        self.with_engine_conversation(|this, engine| {
+            this.with_macro_engine_busy(true, |this| {
+                this.converse_with(engine, request, &mut budget)
+            })
+        })
+    }
+
+    /// Temporarily lend the running engine to a conversation, restoring the
+    /// field even if an answer panics. Any error or unwind can leave the two
+    /// sides at different protocol positions, so the process group is killed
+    /// before the poisoned handle is restored for a prompt later diagnostic.
+    fn with_engine_conversation<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self, &mut MacroEngine) -> Result<R, String>,
+    ) -> Result<R, String> {
         let Some(mut engine) = self.macro_engine.take() else {
             return Err("the macro engine is not running".to_string());
         };
-        let outer_busy = self.macro_engine_busy;
-        self.macro_engine_busy = true;
-        let mut budget = expansion_timeout();
-        let result = self.converse_with(&mut engine, request, &mut budget);
-        self.macro_engine_busy = outer_busy;
-        self.macro_engine = Some(engine);
-        result
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self, &mut engine)));
+        match outcome {
+            Ok(Ok(value)) => {
+                self.macro_engine = Some(engine);
+                Ok(value)
+            }
+            Ok(Err(mut reason)) => {
+                if let Some(stop_error) = engine.poison_and_terminate() {
+                    reason.push_str("; ");
+                    reason.push_str(&stop_error);
+                }
+                self.macro_engine = Some(engine);
+                Err(reason)
+            }
+            Err(payload) => {
+                if let Some(reason) = engine.poison_and_terminate() {
+                    eprintln!("warning: {reason}");
+                }
+                self.macro_engine = Some(engine);
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 
     fn converse_with(
@@ -1484,28 +2064,39 @@ impl Typer {
         }
         let kind = at(items, 1)?.text();
         let sym = at(items, 2)?.list()?;
-        let full = if sym.first().and_then(|s| s.atom()) == Some("s") {
-            Some(at(sym, 1)?.text())
-        } else {
-            None
-        };
-        let source_sym = if sym.first().and_then(|s| s.atom()) == Some("sr") {
-            let id = at(sym, 1)?
-                .text()
-                .parse::<u32>()
-                .map_err(|e| e.to_string())?;
-            if id == 0 || id as usize >= self.st.symbols.len() {
-                return Err("invalid returned source symbol identity".to_string());
-            }
-            SymbolId(id)
-        } else {
-            SymbolId::NONE
-        };
-        let returned_type_member = if sym.first().and_then(|s| s.atom()) == Some("tm") {
-            Some(self.macro_type_member(&at(sym, 1)?.text(), &at(sym, 2)?.text(), span)?)
-        } else {
-            None
-        };
+        let (full, source_sym, returned_type_member) =
+            match (sym.first().and_then(|s| s.atom()), sym.len()) {
+                (Some("s0"), 1) => (None, SymbolId::NONE, None),
+                (Some("s"), 2) => {
+                    if matches!(sym[1], Sexp::List(_)) {
+                        return Err("malformed returned static symbol descriptor".to_string());
+                    }
+                    (Some(sym[1].text()), SymbolId::NONE, None)
+                }
+                (Some("sr"), 2) => {
+                    if matches!(sym[1], Sexp::List(_)) {
+                        return Err("malformed returned source symbol descriptor".to_string());
+                    }
+                    let id = sym[1].text().parse::<u32>().map_err(|e| e.to_string())?;
+                    if id == 0 || id as usize >= self.st.symbols.len() {
+                        return Err("invalid returned source symbol identity".to_string());
+                    }
+                    (None, SymbolId(id), None)
+                }
+                (Some("tm"), 3) => {
+                    if matches!(sym[1], Sexp::List(_)) || matches!(sym[2], Sexp::List(_)) {
+                        return Err("malformed returned type-member symbol descriptor".to_string());
+                    }
+                    let member = self.macro_type_member(&sym[1].text(), &sym[2].text(), span)?;
+                    (None, SymbolId::NONE, Some(member))
+                }
+                (Some(tag), _) => {
+                    return Err(format!(
+                        "unknown or malformed returned symbol descriptor `{tag}`"
+                    ))
+                }
+                (None, _) => return Err("malformed returned symbol descriptor".to_string()),
+            };
         let kids = items.get(3..).unwrap_or(&[]);
         let id = NodeId(self.macro_next_node);
         self.macro_next_node = self
@@ -1659,9 +2250,9 @@ impl Typer {
                 }
                 // A pattern's type is a type, not a pattern: nsc's `Ident(_)`
                 // cannot occur there, and the flag must not reach it.
-                let saved = std::mem::replace(&mut self.macro_reply_pattern, false);
-                let tpt = self.tree_from_reply(at(kids, 1)?, span);
-                self.macro_reply_pattern = saved;
+                let tpt = self.with_macro_reply_pattern(false, |this| {
+                    this.tree_from_reply(at(kids, 1)?, span)
+                });
                 Ok(node(TreeKind::Typed {
                     expr: Box::new(expr),
                     tpt: Box::new(tpt?),
@@ -2123,10 +2714,7 @@ impl Typer {
 
     /// Rebuild a pattern: nsc's `Ident(_)` is the wildcard there.
     fn pattern_from_reply(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
-        let saved = std::mem::replace(&mut self.macro_reply_pattern, true);
-        let pat = self.tree_from_reply(s, span);
-        self.macro_reply_pattern = saved;
-        pat
+        self.with_macro_reply_pattern(true, |this| this.tree_from_reply(s, span))
     }
 
     /// One `CaseDef(pat, guard, body)`.
@@ -2140,14 +2728,12 @@ impl Typer {
             return Err(format!("the macro engine sent {s} where a case belongs"));
         }
         let kids = items.get(3..).unwrap_or(&[]);
-        let saved = std::mem::replace(&mut self.macro_reply_pattern, false);
-        let parts = (|| -> Result<_, String> {
-            let pat = self.pattern_from_reply(at(kids, 0)?, span)?;
-            let guard = self.tree_from_reply(at(kids, 1)?, span)?;
-            let body = self.tree_from_reply(at(kids, 2)?, span)?;
+        let parts = self.with_macro_reply_pattern(false, |this| -> Result<_, String> {
+            let pat = this.pattern_from_reply(at(kids, 0)?, span)?;
+            let guard = this.tree_from_reply(at(kids, 1)?, span)?;
+            let body = this.tree_from_reply(at(kids, 2)?, span)?;
             Ok((pat, guard, body))
-        })();
-        self.macro_reply_pattern = saved;
+        });
         let (pat, guard, body) = parts?;
         Ok(scala_rs_parser::CaseDef {
             pat,
@@ -3646,13 +4232,28 @@ pub(crate) enum Sexp {
 
 impl Sexp {
     fn parse(s: &str) -> Result<Sexp, String> {
+        Sexp::parse_with_limits(s, MAX_WIRE_BYTES, MAX_WIRE_DEPTH)
+    }
+
+    fn parse_with_limits(s: &str, max_bytes: usize, max_depth: usize) -> Result<Sexp, String> {
+        if s.len() > max_bytes {
+            return Err(format!(
+                "the macro engine sent a reply larger than {max_bytes} bytes"
+            ));
+        }
         let bytes: Vec<char> = s.chars().collect();
         let mut i = 0;
-        let v = Sexp::parse_at(&bytes, &mut i)?;
+        let v = Sexp::parse_at(&bytes, &mut i, 0, max_depth)?;
+        while i < bytes.len() && bytes[i] == ' ' {
+            i += 1;
+        }
+        if i != bytes.len() {
+            return Err("the macro engine sent trailing input after its reply".to_string());
+        }
         Ok(v)
     }
 
-    fn parse_at(s: &[char], i: &mut usize) -> Result<Sexp, String> {
+    fn parse_at(s: &[char], i: &mut usize, depth: usize, max_depth: usize) -> Result<Sexp, String> {
         while *i < s.len() && s[*i] == ' ' {
             *i += 1;
         }
@@ -3661,6 +4262,11 @@ impl Sexp {
         }
         match s[*i] {
             '(' => {
+                if depth >= max_depth {
+                    return Err(format!(
+                        "the macro engine sent a reply nested more than {max_depth} deep"
+                    ));
+                }
                 *i += 1;
                 let mut items = Vec::new();
                 loop {
@@ -3674,7 +4280,7 @@ impl Sexp {
                         *i += 1;
                         break;
                     }
-                    items.push(Sexp::parse_at(s, i)?);
+                    items.push(Sexp::parse_at(s, i, depth + 1, max_depth)?);
                 }
                 Ok(Sexp::List(items))
             }
@@ -3684,27 +4290,45 @@ impl Sexp {
                 while *i < s.len() && s[*i] != '"' {
                     let c = s[*i];
                     *i += 1;
-                    if c == '\\' && *i < s.len() {
+                    if c == '\\' {
+                        if *i >= s.len() {
+                            return Err(
+                                "the macro engine sent an unterminated string escape".to_string()
+                            );
+                        }
                         let e = s[*i];
                         *i += 1;
                         out.push(match e {
                             'n' => '\n',
                             't' => '\t',
                             'r' => '\r',
-                            other => other,
+                            '"' => '"',
+                            '\\' => '\\',
+                            other => {
+                                return Err(format!(
+                                    "the macro engine sent the unknown string escape `\\{other}`"
+                                ))
+                            }
                         });
                     } else {
                         out.push(c);
                     }
                 }
+                if *i >= s.len() {
+                    return Err("the macro engine sent an unterminated string".to_string());
+                }
                 *i += 1;
                 Ok(Sexp::Str(out))
             }
+            ')' => Err("the macro engine sent an unexpected `)`".to_string()),
             _ => {
                 let mut out = String::new();
                 while *i < s.len() && !matches!(s[*i], ' ' | '(' | ')') {
                     out.push(s[*i]);
                     *i += 1;
+                }
+                if out.is_empty() {
+                    return Err("the macro engine sent an empty atom".to_string());
                 }
                 Ok(Sexp::Atom(out))
             }
@@ -3798,8 +4422,8 @@ mod tests {
 
     #[test]
     fn unescapes_strings() {
-        let s = Sexp::parse(r#"(err "a \"b\" c\nd")"#).unwrap();
-        assert_eq!(s.reason().unwrap(), "a \"b\" c\nd");
+        let s = Sexp::parse(r#"(err "a \"b\" c\nd\r")"#).unwrap();
+        assert_eq!(s.reason().unwrap(), "a \"b\" c\nd\r");
     }
 
     #[test]
@@ -3807,6 +4431,322 @@ mod tests {
         let mut out = String::new();
         quote_into(&mut out, "a\"b\\c\n");
         assert_eq!(Sexp::parse(&out).unwrap().text(), "a\"b\\c\n");
+    }
+
+    #[test]
+    fn rejects_trailing_unterminated_oversized_and_overdeep_packets() {
+        for malformed in [
+            "(ok) trailing",
+            "(ok))",
+            "(ok",
+            r#"(err "unterminated)"#,
+            r#"(err "bad\q")"#,
+        ] {
+            assert!(Sexp::parse(malformed).is_err(), "accepted {malformed:?}");
+        }
+        assert!(Sexp::parse_with_limits("12345", 4, 8).is_err());
+        assert!(Sexp::parse_with_limits("((a))", 32, 1).is_err());
+    }
+
+    #[test]
+    fn bounded_line_reader_rejects_without_draining_an_oversized_packet() {
+        let mut input = std::io::Cursor::new(b"123456\n(ok)\r\n".as_slice());
+        assert!(read_wire_line_with_limit(&mut input, 6).is_err());
+        assert_eq!(input.position(), 0);
+    }
+
+    #[cfg(unix)]
+    fn shell_engine(script: &str) -> MacroEngine {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_engine_command(&mut command);
+        let mut child = command.spawn().expect("spawn fake macro engine");
+        let containment = EngineContainment::attach(&child).expect("contain fake macro engine");
+        let stdin = child.stdin.take().expect("fake stdin");
+        let stdout = Some(BufReader::new(child.stdout.take().expect("fake stdout")));
+        let stderr = child.stderr.take().expect("fake stderr");
+        let (stderr, stderr_done, stderr_thread) = collect_engine_stderr(stderr);
+        MacroEngine {
+            child,
+            containment,
+            stdin,
+            stdout,
+            stderr,
+            stderr_done,
+            stderr_thread: Some(stderr_thread),
+            poisoned: false,
+            terminated: false,
+            termination_attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn query_limit_poisons_engine_before_a_second_expansion() {
+        use crate::check::TypecheckOptions;
+
+        let script = format!(
+            "IFS= read -r request || exit 1\n\
+             i=0\n\
+             while [ \"$i\" -le {MAX_ENGINE_QUERIES} ]; do\n\
+               printf '%s\\n' '(q enclosingOwner)'\n\
+               IFS= read -r answer || exit 0\n\
+               i=$((i + 1))\n\
+             done\n\
+             printf '%s\\n' '(ok stale)'\n\
+             IFS= read -r second || exit 0\n\
+             printf '%s\\n' '(ok wrong-expansion)'\n"
+        );
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.macro_engine = Some(shell_engine(&script));
+
+        let first = typer.converse("(expand first)").unwrap_err();
+        assert!(first.contains("more than"), "{first}");
+        assert!(typer.macro_engine.as_ref().unwrap().poisoned);
+        let started = Instant::now();
+        let second = typer.converse("(expand second)").unwrap_err();
+        assert!(second.contains("shut down"), "{second}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn message_limit_poisons_engine_before_a_second_expansion() {
+        use crate::check::TypecheckOptions;
+
+        let script = format!(
+            "IFS= read -r request || exit 1\n\
+             i=0\n\
+             while [ \"$i\" -le {MAX_ENGINE_QUERIES} ]; do\n\
+               printf '%s\\n' '(log \"stdout\" \"\")'\n\
+               i=$((i + 1))\n\
+             done\n\
+             printf '%s\\n' '(ok stale)'\n\
+             IFS= read -r second || exit 0\n\
+             printf '%s\\n' '(ok wrong-expansion)'\n"
+        );
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.macro_engine = Some(shell_engine(&script));
+
+        let first = typer.converse("(expand first)").unwrap_err();
+        assert!(first.contains("too many protocol messages"), "{first}");
+        assert!(typer.macro_engine.as_ref().unwrap().poisoned);
+        let started = Instant::now();
+        let second = typer.converse("(expand second)").unwrap_err();
+        assert!(second.contains("shut down"), "{second}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_unterminated_reply_is_bounded_and_poisons_engine() {
+        let mut engine = shell_engine(
+            "IFS= read -r request || exit 1\n\
+             printf '123456789'\n\
+             sleep 30\n",
+        );
+        engine.send("(expand)").unwrap();
+        let mut budget = Some(Duration::from_secs(2));
+        let started = Instant::now();
+        let error = engine.read_reply_with_limit(&mut budget, 8).unwrap_err();
+        assert!(error.contains("exceeds 8 bytes"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(engine.poisoned);
+        assert!(engine
+            .send("(expand again)")
+            .unwrap_err()
+            .contains("shut down"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timing_reply_has_a_deadline_and_poisons_a_hung_engine() {
+        use crate::check::TypecheckOptions;
+
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.macro_engine = Some(shell_engine(
+            "IFS= read -r request || exit 1\n\
+             sleep 30\n",
+        ));
+        let started = Instant::now();
+        assert_eq!(
+            typer.engine_timing_with_timeout(Duration::from_millis(50)),
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(typer.macro_engine.as_ref().unwrap().poisoned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_startup_stop_and_drop_attempt_termination_only_once() {
+        let mut engine = shell_engine("sleep 30");
+        let attempts = Arc::clone(&engine.termination_attempts);
+        engine.poisoned = true;
+        engine.terminate_once().unwrap();
+        assert!(engine.terminated);
+        drop(engine);
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_kill_closes_pipes_inherited_by_descendants() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & printf '(ready)\\n'; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_engine_command(&mut command);
+        let mut child = command.spawn().expect("spawn process group");
+        let mut containment = EngineContainment::attach(&child).expect("contain process group");
+        let mut stdout = BufReader::new(child.stdout.take().expect("group stdout"));
+        let (_, ready) = read_wire_line_with_limit(&mut stdout, 64).unwrap();
+        assert_eq!(wire_line_payload(&ready), "(ready)");
+
+        terminate_engine_process(&mut child, &mut containment).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut tail = Vec::new();
+            let result = stdout.read_to_end(&mut tail);
+            let _ = tx.send(result);
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_job_object_owns_and_terminates_the_engine() {
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_engine_command(&mut command);
+        let mut child = command.spawn().expect("spawn Windows engine process");
+        let mut containment = EngineContainment::attach(&child).expect("attach Windows Job Object");
+        containment
+            .start(&child)
+            .expect("resume contained Windows engine");
+        assert!(terminate_engine_process(&mut child, &mut containment)
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_engine_cannot_run_before_job_attachment() {
+        assert_eq!(ENGINE_WINDOWS_CREATION_FLAGS & 0x0000_0004, 0x0000_0004);
+        assert_eq!(ENGINE_WINDOWS_CREATION_FLAGS & 0x0000_0200, 0x0000_0200);
+
+        let marker = std::env::temp_dir().join(format!(
+            "scala-rs-suspended-engine-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("echo ran>\"{}\"", marker.display());
+        let mut command = Command::new("cmd.exe");
+        command
+            .arg("/C")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_engine_command(&mut command);
+        let mut child = command.spawn().expect("spawn suspended Windows engine");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "engine ran before Job attachment");
+
+        let mut containment = EngineContainment::attach(&child).expect("attach Windows Job Object");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!marker.exists(), "engine ran before its explicit resume");
+        containment.start(&child).expect("resume primary thread");
+        assert!(child.wait().expect("wait for engine").success());
+        assert!(marker.exists(), "engine did not run after Job attachment");
+        std::fs::remove_file(marker).expect("remove engine marker");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resume_failure_cleans_up_the_contained_engine() {
+        let marker = std::env::temp_dir().join(format!(
+            "scala-rs-failed-resume-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!("echo escaped>\"{}\"", marker.display());
+        let mut command = Command::new("cmd.exe");
+        command
+            .arg("/C")
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_engine_command(&mut command);
+        let mut child = command.spawn().expect("spawn suspended Windows engine");
+        let mut containment = EngineContainment::attach(&child).expect("attach Windows Job Object");
+
+        // Remove the only thread to force the production resume-error path.
+        // The process was suspended throughout, so its payload cannot run.
+        child.kill().expect("kill suspended engine");
+        child.wait().expect("reap suspended engine");
+        let error = start_contained_engine(&mut child, &mut containment).unwrap_err();
+        assert!(error.contains("primary thread"), "{error}");
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!marker.exists(), "failed startup executed its payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_field_and_busy_flag_restore_after_panic() {
+        use crate::check::TypecheckOptions;
+
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        typer.macro_engine = Some(shell_engine("sleep 30"));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), String> = typer.with_engine_conversation(|typer, _engine| {
+                typer.with_macro_engine_busy(true, |_typer| panic!("test unwind"))
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(!typer.macro_engine_busy);
+        assert!(typer.macro_engine.as_ref().unwrap().poisoned);
+        let error = typer.converse("(expand after panic)").unwrap_err();
+        assert!(error.contains("shut down"), "{error}");
+    }
+
+    #[test]
+    fn returned_symbol_descriptors_are_exact() {
+        use crate::check::TypecheckOptions;
+
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        for malformed in [
+            r#"(t "Literal" (mystery) (c "Int" "1"))"#,
+            r#"(t "Literal" (s0 extra) (c "Int" "1"))"#,
+            r#"(t "Literal" (s) (c "Int" "1"))"#,
+            r#"(t "Literal" (sr) (c "Int" "1"))"#,
+            r#"(t "Literal" (tm "Owner") (c "Int" "1"))"#,
+        ] {
+            let reply = Sexp::parse(malformed).unwrap();
+            let error = typer.tree_from_reply(&reply, Span::DUMMY).unwrap_err();
+            assert!(error.contains("symbol descriptor"), "{error}");
+        }
     }
 }
 
