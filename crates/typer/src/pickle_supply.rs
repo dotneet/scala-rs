@@ -912,7 +912,7 @@ impl PickleSupply {
                     false
                 };
                 if has_unary_flat {
-                    value_class_forwarder && sole_implicit
+                    sole_implicit
                 } else {
                     symbol.paramss.len() > 1 || sole_implicit || richer_nullary
                 }
