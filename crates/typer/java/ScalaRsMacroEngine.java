@@ -740,6 +740,7 @@ public final class ScalaRsMacroEngine {
             }
             case "Super":
                 return call(companion(kind), "apply", 2, buildTree(kids.get(0)), buildName(kids.get(1)));
+            case "SingletonTypeTree":
             case "New":
                 return call(companion(kind), "apply", 1, buildTree(kids.get(0)));
             case "Typed":
@@ -845,10 +846,11 @@ public final class ScalaRsMacroEngine {
      * The `universe.Type` a type descriptor names.
      *
      * `(ty "a.b.C" <arg>…)` is a class the mirror finds on the macro
-     * classpath, applied to its type arguments; `(src <id>)` is one the
-     * calling run is compiling, which has no class file for the mirror to
+     * classpath, applied to its type arguments; `(src <id> <arg>...)` is a
+     * source class or weak type parameter, with no class file for the mirror to
      * find, built by {@link #sourceSymbol} with its info asked for only when
-     * forced; `(annot "A" <type>)` is `<type> @A`; `(cst (c "Int" "1"))` is
+     * forced; `(mod "a.b.Obj")` is a binary object's singleton;
+     * `(annot "A" <type>)` is `<type> @A`; `(cst (c "Int" "1"))` is
      * the constant type nsc gives a literal, which `c.typecheck(q"1").tpe`
      * has to be if it is to be the type nsc reports.
      */
@@ -859,9 +861,18 @@ public final class ScalaRsMacroEngine {
                 constant(s.items.get(1)));
         }
         String name = s.items.get(1).text();
+        if ("mod".equals(head)) {
+            Object mod = call(mirror, "staticModule", 1, name);
+            return call(call(universe, "internal", 0), "singleType", 2,
+                call(call(mod, "owner", 0), "thisType", 0), mod);
+        }
         if ("src".equals(head)) {
             Object sym = sourceSymbol(Long.parseLong(name));
-            return ownedTypeRef(call(sym, "owner", 0), sym);
+            List<Object> args = new ArrayList<>();
+            for (Sexp arg : s.items.subList(2, s.items.size())) args.add(typeFor(arg));
+            Object base = ownedTypeRef(call(sym, "owner", 0), sym);
+            return call(call(universe, "internal", 0), "typeRef", 3,
+                call(base, "pre", 0), sym, list(args));
         }
         if ("annot".equals(head)) {
             // `T @A` for an annotation class `A` taking no arguments -- the
@@ -1139,6 +1150,13 @@ public final class ScalaRsMacroEngine {
             sb.append("(ty \"\")");
             return;
         }
+        if (isA(tpe, "scala.reflect.internal.Types$SingleType")) {
+            Object term = call(tpe, "termSymbol", 0);
+            if (Boolean.TRUE.equals(call(term, "isModule", 0)) && staticByOwners(term)) {
+                sb.append("(mod ").append(Sexp.quote(String.valueOf(call(term, "fullName", 0)))).append(')');
+                return;
+            }
+        }
         if (!isA(tpe, "scala.reflect.internal.Types$TypeRef")) {
             sb.append("(tyx ").append(Sexp.quote(String.valueOf(tpe))).append(')');
             return;
@@ -1151,12 +1169,11 @@ public final class ScalaRsMacroEngine {
         // chain's flags.
         Object d = tpe;
         Object sym = call(d, "typeSymbolDirect", 0);
-        if (sourceSymbolIds.containsKey(sym) && Boolean.TRUE.equals(call(sym, "isClass", 0))) {
-            // A class the calling run is compiling, which scala-rs sent as
-            // its identity: it recognises it again by its full name, wherever
-            // the class is nested (a table class inside a component trait has
-            // no static path at all).
-            sb.append("(ty ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))));
+        if (sourceSymbolIds.containsKey(sym) && (Boolean.TRUE.equals(call(sym, "isClass", 0))
+                || Boolean.TRUE.equals(call(sym, "isTypeParameter", 0)))) {
+            // Return source identities directly: names cannot distinguish
+            // nested classes or type parameters belonging to different owners.
+            sb.append("(src ").append(sourceSymbolIds.get(sym));
             Object args = call(d, "typeArgs", 0);
             Object it = call(args, "iterator", 0);
             while ((Boolean) call(it, "hasNext", 0)) {
@@ -1470,6 +1487,9 @@ public final class ScalaRsMacroEngine {
             symbol = newSourceSymbol("MethodSymbol", owner, termName(name), pos, flags | internalFlag("METHOD"));
         } else if ("Term".equals(kind)) {
             symbol = newSourceSymbol("TermSymbol", owner, termName(name), pos, flags);
+        } else if ("TypeParam".equals(kind)) {
+            symbol = call(internal, "newTypeSymbol", 4, owner, typeName(name), pos,
+                Long.valueOf(flags | internalFlag("PARAM") | internalFlag("DEFERRED")));
         } else {
             throw gap("macro mirror cannot describe source symbol kind " + kind);
         }
@@ -1525,6 +1545,7 @@ public final class ScalaRsMacroEngine {
     static Object ownedTypeRef(Object owner, Object symbol) throws Exception {
         Object internal = call(universe, "internal", 0);
         Object prefix = Boolean.TRUE.equals(call(owner, "isClass", 0))
+                && !Boolean.TRUE.equals(call(symbol, "isTypeParameter", 0))
             ? call(internal, "thisType", 1, owner) : call(universe, "NoPrefix", 0);
         return call(internal, "typeRef", 3, prefix, symbol, list(new ArrayList<>()));
     }
@@ -1749,6 +1770,15 @@ public final class ScalaRsMacroEngine {
         Object internal = call(universe, "internal", 0);
         if ("notype".equals(kind)) return call(universe, "NoType", 0);
         if ("nullary".equals(kind)) return call(internal, "nullaryMethodType", 1, sourceInfo(owner, s.items.get(1)));
+        if ("bounds".equals(kind)) return call(internal, "typeBounds", 2,
+            typeFor(s.items.get(1)), typeFor(s.items.get(2)));
+        if ("poly".equals(kind)) {
+            List<Object> params = new ArrayList<>();
+            for (Sexp id : s.items.get(1).items.subList(1, s.items.get(1).items.size())) {
+                params.add(sourceSymbol(Long.parseLong(id.text())));
+            }
+            return call(internal, "polyType", 2, list(params), sourceInfo(owner, s.items.get(2)));
+        }
         if ("method".equals(kind)) {
             List<Object> params = new ArrayList<>();
             for (Sexp arg : s.items.get(1).items.subList(1, s.items.get(1).items.size())) {

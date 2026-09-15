@@ -2489,24 +2489,29 @@ impl Typer {
         }
     }
 
-    /// The leftmost identifier of a path has to be brought into scope before
-    /// the path can be resolved: `p.HNil.type` in package `p` only sees `p`
-    /// once `expose_unqualified` has entered it.
-    fn expose_path_head(&mut self, t: &Tree) {
+    /// Bring the path's head and qualified binary members into scope before
+    /// checking stability: `p.Obj.type` may be the first use of `p.Obj`.
+    fn expose_singleton_path(&mut self, t: &Tree) {
         match &t.kind {
             TreeKind::Ident { name } => {
                 let name = name.clone();
                 self.expose_unqualified(&name, t.span);
             }
-            TreeKind::Select { qual, .. } | TreeKind::SelectFromTypeTree { qual, .. } => {
-                self.expose_path_head(qual)
+            TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
+                self.expose_singleton_path(qual);
+                // A qualified binary object need not have been imported or
+                // used as a value yet. Load each selected member before the
+                // immutable stability check asks whether it is a module.
+                for owner in self.qualified_type_owners(qual) {
+                    self.complete_binary_member(owner, name, t.span);
+                }
             }
             _ => {}
         }
     }
 
     pub(crate) fn singleton_to_type(&mut self, span: Span, ref_: &Tree) -> Type {
-        self.expose_path_head(ref_);
+        self.expose_singleton_path(ref_);
         match &ref_.kind {
             TreeKind::This { qual } => {
                 let id = if let Some(name) = qual {
@@ -2644,6 +2649,9 @@ impl Typer {
                 })
         };
         match &t.kind {
+            TreeKind::Ident { name } if name == "_root_" && self.st.lookup(name).is_empty() => {
+                Some(self.st.root)
+            }
             TreeKind::Ident { name } => pick(&self.st, self.st.lookup_term(name)),
             TreeKind::Select { qual, name } | TreeKind::SelectFromTypeTree { qual, name, .. } => {
                 let owner = self.path_owner_sym(qual)?;
@@ -2665,6 +2673,9 @@ impl Typer {
     }
 
     fn ident_is_stable(&self, name: &str) -> bool {
+        if name == "_root_" && self.st.lookup(name).is_empty() {
+            return true;
+        }
         let found = self.st.lookup_term(name);
         found.iter().any(|s| {
             let sy = self.st.get(*s);

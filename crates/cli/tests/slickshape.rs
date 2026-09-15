@@ -335,3 +335,59 @@ fn sh_shape_jar_bad_is_still_rejected() {
         );
     }
 }
+
+/// A binary companion's own apply supplies names, even if its FunctionN
+/// parent has already been loaded. A wide writer parameter only constrains
+/// the projection result from above; the reader still determines its type.
+#[test]
+fn named_options_and_optional_projection_match_scalac() {
+    let Some(lib) = scala_library_jar() else {
+        return;
+    };
+    let Some(jars) = slick_jars() else { return };
+    let Some(scalac) = real_scalac() else { return };
+    let cp = format!("{}:{}", lib.display(), classpath(&jars));
+    let (ok, msgs) = scalac_run(&scalac, "slick_projection_named", Some(&cp));
+    assert!(ok, "scalac: {msgs}");
+    let (ok, msgs, out) = compile(
+        "slick_projection_named",
+        &["-cp", &cp, "--scala-library", lib.to_str().unwrap()],
+    );
+    assert!(ok, "scala-rs: {msgs}");
+    assert_eq!(
+        run_main(&format!("{}:{cp}", out.display())),
+        "UnassignedType\n"
+    );
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
+fn hlist_projection_finds_base_companion_shape() {
+    let Some(lib) = scala_library_jar() else {
+        return;
+    };
+    let Some(jars) = slick_jars() else { return };
+    let Some(scalac) = real_scalac() else { return };
+    let reflect = PathBuf::from("/tmp/scala-2.13.16/lib/scala-reflect.jar");
+    if !reflect.is_file() {
+        return;
+    }
+    let cp = format!(
+        "{}:{}:{}",
+        lib.display(),
+        reflect.display(),
+        classpath(&jars)
+    );
+    let (ok, msgs) = scalac_run(&scalac, "slick_hlist_shape", Some(&cp));
+    assert!(ok, "scalac: {msgs}");
+    let (ok, msgs, out) = compile(
+        "slick_hlist_shape",
+        &["-cp", &cp, "--scala-library", lib.to_str().unwrap()],
+    );
+    assert!(ok, "scala-rs: {msgs}");
+    assert_eq!(
+        run_main(&format!("{}:{cp}", out.display())),
+        "42\nok\n42\nok\ntrue\nUnassignedType\nUnassignedType\n"
+    );
+    let _ = fs::remove_dir_all(out);
+}

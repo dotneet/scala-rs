@@ -2651,22 +2651,30 @@ impl PickleSupply {
         // crude `(): Object` from the class file *and* the pickled `():
         // TypecheckMode`, and filling in the default at `tb.typecheck(t)` was
         // "ambiguous overload for typecheck$default$2 with arguments ()".
-        let stale: Vec<SymbolId> = if synthetic_ok && is_default_getter(&jvm_member) {
-            st.get(class_sym)
-                .members
-                .iter()
-                .copied()
-                .filter(|&m| {
-                    let s = st.get(m);
-                    s.kind == SymKind::Method
-                        && s.name == name
-                        && s.pickled_origin.is_empty()
-                        && m.0 >= st.prelude_end
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // An inherited stable accessor is absent from this class's own
+        // pickle, so adoption cannot replace its erased mixin forwarder.
+        // Complete it here too: a singleton return otherwise leaves both
+        // `Class(module)` and `ModuleRef(module)` as competing alternatives.
+        let stable_accessor = hits.iter().any(|hit| hit.member.has(pflags::STABLE));
+        let stale: Vec<SymbolId> =
+            if (synthetic_ok && is_default_getter(&jvm_member)) || stable_accessor {
+                st.get(class_sym)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&m| {
+                        let s = st.get(m);
+                        s.kind == SymKind::Method
+                            && s.name == name
+                            && s.pickled_origin.is_empty()
+                            && m.0 >= st.prelude_end
+                            && (!stable_accessor
+                                || (s.params.is_empty() && !s.flags.contains(Flags::STATIC)))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // A *prelude* class's `apply` is hand-written and authoritative --
         // `adopt_binary_class` refuses such a class outright for the same
         // reason. Offering the pickled `Some$.apply` from here made
@@ -2860,7 +2868,7 @@ impl PickleSupply {
         if !installed.is_empty() && !stale.is_empty() {
             drop_stale_members(st, class_sym, &stale, &installed);
             trace(format_args!(
-                "{full}#{name}: replaced {} class-file default getter(s)",
+                "{full}#{name}: replaced {} class-file accessor(s)",
                 stale.len()
             ));
         }
@@ -6276,6 +6284,15 @@ impl PickleSupply {
         // `BaseColumnType[T]`, a type member of the profile cake, so refusing
         // an applied one made every one of them an unmappable result type.
         if !sym.contains('.') && scope.get(sym).is_none() {
+            // A concrete nullary alias retains information that an erased
+            // descriptor cannot express (for example HCons.Self). Abstract
+            // nullary members still use the historical fallback below.
+            if args.is_empty() {
+                if let Some(t) = self.self_type_member_at(st, bin, scope, sym, args, d, true, true)
+                {
+                    return Some(t);
+                }
+            }
             if let Some(t) = self.self_type_member(st, bin, scope, sym, args, d) {
                 return Some(t);
             }
@@ -6837,13 +6854,16 @@ impl PickleSupply {
         d: u32,
     ) -> Option<Type> {
         let (owner, simple) = sym.rsplit_once('.')?;
+        // Type references use encoded names, while signature declarations
+        // use source names (for example HList.$colon$colon versus `::`).
+        let simple = scala_rs_pickle::names::decode_method_name(simple);
         // A companion's signature may exist without declaring this alias.
         // Continue to the class signature instead of treating that as a hit.
         let (module, alias) = [true, false].into_iter().find_map(|module| {
             let mut src = BinSource(bin);
             let sig = self.sigs.class_sig(&mut src, owner, module).ok()?;
             let alias = sig
-                .members_named(simple)
+                .members_named(&simple)
                 .find(|m| m.kind == MemberKind::TypeAlias)
                 .cloned();
             alias.map(|alias| (module, alias))
@@ -6881,7 +6901,7 @@ impl PickleSupply {
                 // parameters and RHS instead of confusing a companion object
                 // with the type (for example `type Id[A] = A; object Id`).
                 let owner = self.ensure_class(st, bin, owner, module)?;
-                return self.install_type_alias(st, bin, owner, simple, &alias.ty, None);
+                return self.install_type_alias(st, bin, owner, &simple, &alias.ty, None);
             }
             return None;
         }

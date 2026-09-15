@@ -712,6 +712,12 @@ impl Typer {
             // `containsSymbol(Set[A])` overload errors when it was tried.
             fresh |= self.ensure_pickled_parents(&t);
         }
+        // Loading these parents can add base-class companions to the wanted
+        // type's implicit scope. The first scope snapshot could not see them
+        // (for example HList's Shape witnesses for a previously stubbed HCons).
+        for w in wanted {
+            fresh |= self.warm_implicit_scope_once(w);
+        }
         fresh
     }
 
@@ -1079,10 +1085,15 @@ impl Typer {
             if c.is_none() || !walked.insert(c.0) {
                 continue;
             }
-            // Directory discovery can have installed the companion already.
+            // Directory discovery or a binary type reference can have
+            // installed the companion already, without its implicit flags.
             // Read only its implicit declarations, just as lazy jar discovery
             // does, without adopting an entire module beside existing members.
-            if self.st.pending_classpath_signatures.contains(&c) && !self.st.is_source_class(c) {
+            if c.0 >= self.st.prelude_end
+                && !self.st.is_source_class(c)
+                && (self.st.pending_classpath_signatures.contains(&c)
+                    || !self.pickle.pickle_readable(&self.st, c))
+            {
                 self.pickle
                     .supply_implicit_members(&mut self.st, &mut self.binary, c);
             }

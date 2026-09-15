@@ -186,6 +186,16 @@ impl Typer {
             return Ok("(notype)".to_string());
         }
         let s = self.st.get(sym).clone();
+        if s.kind == SymKind::TypeParam {
+            if !s.tparams.is_empty() {
+                return Err(
+                    "higher-kinded source type parameter mirror is not implemented".to_string(),
+                );
+            }
+            let lo = self.type_to_wire(s.bound_lo.as_ref().unwrap_or(&Type::Nothing))?;
+            let hi = self.type_to_wire(s.bound_hi.as_ref().unwrap_or(&Type::Any))?;
+            return Ok(format!("(bounds {lo} {hi})"));
+        }
         if s.is_class_like() {
             return self.mirror_class_info(sym);
         }
@@ -205,7 +215,14 @@ impl Typer {
             let ret = if s.name == "<init>" && self.st.get(s.owner).is_class_like() {
                 Type::Class {
                     sym: s.owner,
-                    args: Vec::new(),
+                    args: self
+                        .st
+                        .get(s.owner)
+                        .tparams
+                        .iter()
+                        .copied()
+                        .map(Type::TypeParam)
+                        .collect(),
                 }
             } else {
                 *ret
@@ -743,30 +760,20 @@ impl Typer {
     /// A type the engine can rebuild in the runtime universe, or why it
     /// cannot.
     ///
-    /// `(ty "a.b.C" <arg>…)` is a class its mirror finds on the macro
-    /// classpath, applied to its type arguments written the same way;
-    /// `(cst …)` is the constant type nsc gives a literal, which
-    /// `c.typecheck(Literal(Constant(1))).tpe` has to be if it is to be the
-    /// type nsc reports; and `(syn "a.b.C")` is **a class this run is
-    /// compiling**.
-    ///
-    /// That last one is the mirror. A class the current run defines has no
-    /// class file, so `mirror.staticClass` can never find it and the engine
-    /// cannot be told about it by name resolution at all -- the same wall
-    /// `docs/macros.md` §5.1 hits for a type *argument*, reached here from
-    /// the other side: it is the answer to a question the implementation
-    /// asked. The type is remembered under that name so a later mention of it
-    /// in the expansion is read back as the `Type` the typer already has
-    /// rather than resolved again (`Typer::macro_local_tags`).
-    ///
-    /// Everything else is refused by name. A singleton type, a refinement or
-    /// an abstract type has no faithful spelling on the other side, and an
-    /// approximate one would have the implementation reasoning about a type
-    /// that is not the one it asked about.
+    /// `(ty "a.b.C" <arg>…)` resolves a classpath class; `(src <id> <arg>…)`
+    /// retains a source class or weak type parameter identity. Constant and
+    /// structural types use their corresponding reflection representations.
+    /// Unsupported shapes are refused rather than widened to another type.
     pub(crate) fn type_to_wire(&mut self, ty: &Type) -> Result<String, String> {
         // An inner class behind a prefix (`prefix.rs`) is the class it views;
         // the engine is handed the class, as for the bare type.
         let ty = crate::prefix::strip_view(ty);
+        if let Some(wire) = self.source_type_wire(ty)? {
+            return Ok(wire);
+        }
+        if let Some(wire) = self.binary_module_type_wire(ty) {
+            return Ok(wire);
+        }
         let structural = match ty {
             Type::Function { params, ret } if params.len() <= 22 => {
                 let mut args = params.clone();
@@ -796,18 +803,6 @@ impl Typer {
         }
         if let Type::Class { sym, args } = ty {
             let sym = *sym;
-            if matches!(self.st.get(sym).kind, SymKind::Class) && self.is_current_run_class(sym) {
-                let full = scala_full_name(&self.st, sym);
-                if !args.is_empty() {
-                    return Err(format!(
-                        "`{full}`, a class this run is compiling applied to type \
-                         arguments; the engine is given such a class as its \
-                         identity, and its type parameters would have nothing to bind"
-                    ));
-                }
-                self.macro_local_tags.insert(full.clone(), ty.clone());
-                return Ok(format!("(src {})", sym.0));
-            }
             if !args.is_empty() {
                 let name = crate::materialize::static_class_of_sym(&self.st, sym)
                     .map_err(|why| format!("a type whose class is {why}"))?;
@@ -830,6 +825,62 @@ impl Typer {
         quote_into(&mut out, &name);
         out.push(')');
         Ok(out)
+    }
+
+    /// A top-level binary object's singleton is resolved as a module, never
+    /// widened to its module class. Instance and source paths need identities
+    /// that a runtime mirror's staticModule lookup cannot supply.
+    pub(crate) fn binary_module_type_wire(&mut self, ty: &Type) -> Option<String> {
+        let id = match ty {
+            Type::ModuleRef(id) => *id,
+            Type::Class { sym, args } if args.is_empty() => *sym,
+            Type::SingleType { sym, .. } => *sym,
+            _ => return None,
+        };
+        let id = self.st.module_class_of(id);
+        if self.is_current_run_class(id) {
+            return None;
+        }
+        let s = self.st.get(id);
+        if s.kind != SymKind::ModuleClass || self.st.get(s.owner).kind != SymKind::Package {
+            return None;
+        }
+        let name = s.jvm_name.strip_suffix('$')?;
+        if name.is_empty() || name.contains('$') {
+            return None;
+        }
+        Some(format!("(mod {})", quoted(&name.replace('/', "."))))
+    }
+
+    /// Preserve source type identities and arguments in both directions.
+    /// Type parameters are weak types with their declared bounds, not their
+    /// erasures or a runtime ClassTag approximation.
+    pub(crate) fn source_type_wire(&mut self, ty: &Type) -> Result<Option<String>, String> {
+        let (id, args) = match ty {
+            Type::Class { sym, args }
+                if self.st.get(*sym).kind == SymKind::Class && self.is_current_run_class(*sym) =>
+            {
+                (*sym, args.as_slice())
+            }
+            Type::TypeParam(id) => {
+                let owner = self.st.get(*id).owner;
+                let source_class_parameter = self.st.get(owner).is_class_like()
+                    && self.st.get(owner).tparams.contains(id)
+                    && self.is_current_run_class(owner);
+                if !self.tparam_in_scope(*id) && !source_class_parameter {
+                    return Ok(None);
+                }
+                (*id, &[][..])
+            }
+            _ => return Ok(None),
+        };
+        let mut wire = format!("(src {}", id.0);
+        for arg in args {
+            wire.push(' ');
+            wire.push_str(&self.type_to_wire(arg)?);
+        }
+        wire.push(')');
+        Ok(Some(wire))
     }
 
     /// Whether `sym` is a class this compilation run is itself defining --
@@ -1082,6 +1133,8 @@ fn member_flags_wire(flags: Flags, kind: SymKind, ctor: bool) -> String {
     }
     for (bit, name) in [
         (Flags::PARAM, "PARAM"),
+        (Flags::COVARIANT, "COVARIANT"),
+        (Flags::CONTRAVARIANT, "CONTRAVARIANT"),
         (Flags::DEFAULTPARAM, "DEFAULTPARAM"),
         (Flags::LOCAL, "LOCAL"),
         (Flags::PRIVATE, "PRIVATE"),

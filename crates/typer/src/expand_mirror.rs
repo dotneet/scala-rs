@@ -176,9 +176,6 @@ impl Typer {
     /// run is compiling.
     pub(crate) fn mirror_class_info(&mut self, cls: SymbolId) -> Result<String, String> {
         let name = self.st.get(cls).name.clone();
-        if !self.st.get(cls).tparams.is_empty() {
-            return Err(format!("`{name}` has type parameters"));
-        }
         let parents = self.mirror_parents(cls)?;
         let decls = match self.st.get(cls).kind {
             SymKind::Class => self.mirror_class_decls(cls)?,
@@ -186,11 +183,23 @@ impl Typer {
             other => return Err(format!("`{name}` is a {other:?}, not a class")),
         };
         let decls: Vec<String> = decls.iter().map(Decl::wire).collect();
-        Ok(format!(
+        let info = format!(
             "(classinfo (parents {}) (decls {}))",
             parents.join(" "),
             decls.join(" ")
-        ))
+        );
+        let params = self
+            .st
+            .get(cls)
+            .tparams
+            .iter()
+            .map(|id| id.0.to_string())
+            .collect::<Vec<_>>();
+        Ok(if params.is_empty() {
+            info
+        } else {
+            format!("(poly (params {}) {info})", params.join(" "))
+        })
     }
 
     /// The case class a module class is the companion of, if it is one.
@@ -471,7 +480,7 @@ impl Typer {
         let mut copy_defaults = Vec::new();
         let mut modelled: Vec<(String, SymbolId)> = Vec::new();
         for m in s.members.clone() {
-            if Some(m) == ctor || s.ctor_fields.contains(&m) {
+            if Some(m) == ctor || s.ctor_fields.contains(&m) || s.tparams.contains(&m) {
                 continue;
             }
             let ms = self.st.get(m).clone();

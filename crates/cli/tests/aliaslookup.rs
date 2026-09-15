@@ -198,6 +198,43 @@ trait JdbcBackend extends BaseBackend {
 
 object JdbcBackend extends JdbcBackend
 
+final class Projection[R](val value: R)
+final class Shape[U](val value: U) {
+  def map[R](read: U => R, write: R => Option[U]): Projection[R] = new Projection(read(value))
+}
+
+abstract class Chain {
+  type Self <: Chain
+  type ::[E] = Link[E, Self]
+  def self: Self
+  def ::[E](e: E): this.::[E] = new Link(e, self)
+}
+final class Link[H, T <: Chain](val head: H, val tail: T) extends Chain {
+  type Self = Link[H, T]
+  def self: Self = this
+}
+object Link {
+  def unapply[H, T <: Chain](link: Link[H, T]): Some[(H, T)] = Some((link.head, link.tail))
+}
+object End extends Chain { type Self = End.type; def self: Self = this }
+object Target { def create(s: String): String = s }
+trait ExportedAliases { val Target = alib.Target }
+package object exported extends ExportedAliases
+
+class DefaultContext(val seed: String) {
+  def run(prefix: String)(implicit ctx: Ctx = new Ctx(prefix + seed)): String = ctx.tag
+  def only(implicit ctx: Ctx = new Ctx(seed)): String = ctx.tag
+}
+
+trait Evidence[A] { def value: A }
+trait ExtraEvidence
+trait MissingEvidence
+object Evidence {
+  implicit def stringEvidence: Evidence[String] with ExtraEvidence =
+    new Evidence[String] with ExtraEvidence { def value: String = "evidence" }
+  def read[A](implicit ev: Evidence[A]): A = ev.value
+}
+
 class NamedPool(val host: String = "localhost", val port: Int = 6379,
                 val database: Int = 0, val timeout: Int = 1000) {
   def label: String = host + ":" + port + "/" + database + "@" + timeout
@@ -827,4 +864,259 @@ object Main {
         true,
         "ok42\n",
     );
+}
+
+#[test]
+fn binary_lambda_result_is_not_fixed_by_contravariant_sibling() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("binary-lambda-result");
+    let lib = build_lib_jar(&dir);
+    for (label, result, write, accepted) in [
+        ("wide-input", "Option[Int]", "Any", true),
+        ("exact-input", "Option[Int]", "Option[Int]", true),
+        ("wrong-result", "Option[String]", "Any", false),
+        ("narrow-input", "Option[Int]", "String", false),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                r#"
+object Main {{ def main(args: Array[String]): Unit = {{
+  val p: alib.Projection[{result}] = new alib.Shape(Option(42)).map(
+    r => r.map(_ + 1), (_: {write}) => throw new Exception("unused"))
+  println(p.value.get)
+}} }}
+"#
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    "43\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Encoded type aliases retain the receiver's concrete Self, and a stable
+/// inherited package accessor replaces its erased classfile forwarder.
+#[test]
+fn binary_symbolic_alias_and_reexported_object_match_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("symbolic-alias");
+    let lib = build_lib_jar(&dir);
+    for (label, head, accepted) in [("valid", "Int", true), ("wrong-head", "String", false)] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                r#"
+import alib.End
+import alib.exported.Target
+object Main {{ def main(args: Array[String]): Unit = {{
+  val xs: alib.Link[{head}, alib.Link[String, End.type]] = 42 :: "ok" :: End
+  println(xs.head)
+  println(xs.tail.head)
+  println(Target.create("alias"))
+  xs match {{
+    case alib.Link(i, alib.Link(s, End)) =>
+      val head: Int = i
+      val tail: String = s
+      println(head + tail.length)
+  }}
+}} }}
+"#
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    "42\nok\nalias\n44\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn binary_implicit_defaults_use_getters_and_prefer_supplied_values() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("implicit-default");
+    let lib = build_lib_jar(&dir);
+    for (label, source, expected) in [
+        (
+            "valid",
+            r#"
+object Main {
+  val instance = new alib.DefaultContext("seed")
+  def defaults(): String = instance.run("prefix-") + ":" + instance.only
+  def supplied(): String = {
+    implicit val ctx: alib.Ctx = new alib.Ctx("provided")
+    instance.run("ignored") + ":" + instance.only
+  }
+  def main(args: Array[String]): Unit = { println(defaults()); println(supplied()) }
+}
+"#,
+            Some("prefix-seed:seed\nprovided:provided\n"),
+        ),
+        (
+            "ambiguous",
+            r#"
+object Main {
+  implicit val first: alib.Ctx = new alib.Ctx("one")
+  implicit val second: alib.Ctx = new alib.Ctx("two")
+  val value = new alib.DefaultContext("fallback").only
+}
+"#,
+            None,
+        ),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(&src, source).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, expected.is_some(), "{label}, ours={ours}: {diagnostic}");
+            if let Some(expected) = expected {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    expected
+                );
+            } else {
+                assert!(diagnostic.contains("ambiguous implicit"), "{diagnostic}");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn intersection_witness_infers_open_target_without_losing_requirements() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("intersection-evidence");
+    let lib = build_lib_jar(&dir);
+    for (label, expression, accepted) in [
+        (
+            "inferred",
+            "val inferred = alib.Evidence.read; val result: String = inferred; println(result)",
+            true,
+        ),
+        ("wrong-element", "implicitly[alib.Evidence[Int]]", false),
+        (
+            "missing-parent",
+            "implicitly[alib.Evidence[String] with alib.MissingEvidence]",
+            false,
+        ),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                "object Main {{ def main(args: Array[String]): Unit = {{ {expression}; () }} }}"
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    "evidence\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
 }

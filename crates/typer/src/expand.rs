@@ -1882,22 +1882,10 @@ impl Typer {
     /// A class the engine's mirror can find on the macro classpath travels as
     /// its name, `(ty "a.b.C")`, and `mirror.staticClass` rebuilds it.
     ///
-    /// A class **this run is compiling** has no class file for that mirror to
-    /// find. slick's `TableQuery[Issues]` is exactly that shape -- the type
-    /// argument is the table class declared a few lines from the call -- and
-    /// it used to be refused outright. It now travels as `(syn "a.b.C")`, a
-    /// *placeholder* symbol built in the runtime universe that carries the
-    /// full name and no info at all, and the type it stands for is remembered
-    /// here so that the expansion's own mention of it is read back as the
-    /// type scala-rs already has rather than resolved again by name.
-    ///
-    /// The placeholder is deliberately empty. scala-rs cannot describe the
-    /// class truthfully at this point in its own run: while
-    /// `lazy val Issues = TableQuery[Issues]` is being typed, the members of
-    /// `class Issues` are still un-inferred. An implementation that asks the
-    /// placeholder a real question therefore gets an exception rather than a
-    /// quiet wrong answer, and that becomes a diagnostic
-    /// ([`Typer::macro_expansion`]).
+    /// Source classes and weak type parameters travel as `(src <id> <arg>…)`.
+    /// The engine creates their symbols once and requests bounds, parents and
+    /// members lazily. Returned TypeTrees retain these identities and their
+    /// arguments rather than resolving source names against the runtime jar.
     fn tag_descriptor(&mut self, ty: &Type) -> Result<String, String> {
         // `f(42)` types its argument as the *constant* type `42`; the tag nsc
         // builds for the `Expr` that wraps it is `Int`. Only the outermost
@@ -1922,8 +1910,7 @@ impl Typer {
     /// takes a `c.Expr[ClassTag[R]]`, so the request could not be built and
     /// the implementation was never invoked (`docs/macros.md` §7.20, §7.21).
     ///
-    /// A type argument that is a class **this run is compiling** still travels
-    /// as the empty placeholder of §5.1, at whatever depth it occurs.
+    /// Source types retain their symbol identities at every nesting depth.
     fn tag_wire(&mut self, ty: &Type) -> Result<String, String> {
         // An inner class behind a prefix (`prefix.rs`) travels as the class:
         // the wire names classes, and gitbucket's `TableQuery[Repositories]`
@@ -1935,19 +1922,11 @@ impl Typer {
         } else {
             ty
         };
-        if let Some(sym) = plain_class_of(&self.st, ty) {
-            if self.is_current_run_class(sym) {
-                // The class goes over as its identity. The engine builds its
-                // symbol under the class's real owner and asks for the info
-                // -- parents, declarations -- only if the implementation
-                // forces it (`crate::expand_mirror`), so a macro that merely
-                // splices the type (`TableQuery[Issues]`) costs nothing, and
-                // one that interrogates it (`mapTo[Account]`) is answered in
-                // nsc's shape.
-                let full = scala_full_name(&self.st, sym);
-                self.macro_local_tags.insert(full, ty.clone());
-                return Ok(format!("(src {})", sym.0));
-            }
+        if let Some(wire) = self.source_type_wire(ty)? {
+            return Ok(wire);
+        }
+        if let Some(wire) = self.binary_module_type_wire(ty) {
+            return Ok(wire);
         }
         // A constant type nested inside a type argument. nsc's tag for
         // `Tag[1]` carries `Int(1)`, and widening it here would hand the
@@ -1995,20 +1974,6 @@ impl Typer {
         let named = |n: &str, args: Vec<Type>| Ok(Some((n.to_string(), args)));
         match ty {
             Type::Class { sym, args } if !args.is_empty() => {
-                // A class this run is compiling has no class file for
-                // `mirror.staticClass` to find, and the placeholder that
-                // stands in for one carries a name and nothing else -- so its
-                // type parameters would have nothing to bind. Refused by name
-                // rather than sent as a name the mirror fails to resolve.
-                if self.is_current_run_class(*sym) {
-                    return Err(format!(
-                        "scala-rs cannot build a type tag for `{}`, a class this run \
-                         is compiling applied to type arguments; the engine is given \
-                         such a class as its identity, and its type parameters would \
-                         have nothing to bind",
-                        scala_full_name(&self.st, *sym)
-                    ));
-                }
                 let name = crate::materialize::static_class_of_sym(&self.st, *sym)
                     .map_err(|why| format!("scala-rs cannot build a type tag for {why}"))?;
                 Ok(Some((name, args.clone())))
@@ -2254,6 +2219,12 @@ impl Typer {
                 Ok(node(TreeKind::Typed {
                     expr: Box::new(expr),
                     tpt: Box::new(tpt?),
+                }))
+            }
+            "SingletonTypeTree" => {
+                let ref_ = self.tree_from_reply(at(kids, 0)?, span)?;
+                Ok(node(TreeKind::SingletonTypeTree {
+                    ref_: Box::new(ref_),
                 }))
             }
             "TypeTree" => {
@@ -2781,6 +2752,49 @@ impl Typer {
     pub(crate) fn type_tree_from_wire(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
         let items = s.list()?;
         match items.first().and_then(|s| s.atom()) {
+            Some("mod") => {
+                let ref_ = path_tree(&at(items, 1)?.text(), span);
+                return self.macro_node(
+                    TreeKind::SingletonTypeTree {
+                        ref_: Box::new(ref_),
+                    },
+                    span,
+                );
+            }
+            Some("src") => {
+                let id = SymbolId(
+                    at(items, 1)?
+                        .text()
+                        .parse::<u32>()
+                        .map_err(|e| e.to_string())?,
+                );
+                if id.is_none() || id.0 as usize >= self.st.symbols.len() {
+                    return Err("unknown source type identity in macro result".to_string());
+                }
+                let mut args = Vec::new();
+                for arg in &items[2..] {
+                    let tree = self.type_tree_from_wire(arg, span)?;
+                    args.push(self.tree_to_type(&tree));
+                }
+                let ty = match self.st.get(id).kind {
+                    crate::symbol::SymKind::Class => Type::Class { sym: id, args },
+                    crate::symbol::SymKind::TypeParam if args.is_empty() => Type::TypeParam(id),
+                    _ => {
+                        return Err(
+                            "unsupported source type application in macro result".to_string()
+                        )
+                    }
+                };
+                let mut tree = self.macro_node(
+                    TreeKind::Ident {
+                        name: crate::materialize::RESOLVED_TYPE.to_string(),
+                    },
+                    span,
+                )?;
+                tree.sym = id;
+                tree.ty = ty;
+                return Ok(tree);
+            }
             Some("ty") => {}
             Some("tyx") => {
                 return Err(format!(
@@ -3838,9 +3852,9 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str("))");
             Ok(())
         }
-        TreeKind::AppliedTypeTree { .. } | TreeKind::AnnotatedTypeTree { .. } => {
-            type_tree_to_wire(cx, t, out)
-        }
+        TreeKind::AppliedTypeTree { .. }
+        | TreeKind::AnnotatedTypeTree { .. }
+        | TreeKind::SingletonTypeTree { .. } => type_tree_to_wire(cx, t, out),
         TreeKind::ValDef {
             mods,
             name,
@@ -4067,6 +4081,12 @@ fn trees_to_wire(cx: &WireCx, trees: &[Tree], out: &mut String) -> Result<(), St
 
 fn type_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
+        TreeKind::SingletonTypeTree { ref_ } => {
+            out.push_str("(t \"SingletonTypeTree\" (s0) ");
+            tree_to_wire(cx, ref_, out)?;
+            out.push(')');
+            Ok(())
+        }
         TreeKind::Empty => {
             out.push_str("(t \"TypeTree\" (s0) (ty \"\"))");
             Ok(())
@@ -4181,19 +4201,6 @@ pub(crate) fn lit_to_wire(lit: &Lit, out: &mut String) -> Result<(), String> {
     quote_into(out, &text);
     out.push(')');
     Ok(())
-}
-
-/// The class symbol of a monomorphic class type, if that is what `ty` is.
-///
-/// Only such a type can travel as a placeholder: the placeholder carries a
-/// name, and a name is all a class *is* to the engine.
-fn plain_class_of(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId> {
-    match ty {
-        Type::Class { sym, args } if args.is_empty() => {
-            matches!(st.get(*sym).kind, crate::symbol::SymKind::Class).then_some(*sym)
-        }
-        _ => None,
-    }
 }
 
 /// A class's full Scala name, from the class file name scala-rs would give it.

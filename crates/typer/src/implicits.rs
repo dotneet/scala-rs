@@ -1567,7 +1567,17 @@ impl Typer {
                 .then(ImplicitFit::default);
         }
         let mut u = Unify::new(self, tps.iter().copied(), undet.iter().copied());
-        if !u.unify(ret, pt) {
+        // A candidate returning A with B can supply A on its own. Infer
+        // against that base type; requiring B to unify with A loses open
+        // wanted parameters (for example MonadError[Future, E]). The final
+        // conformance check below still checks the complete candidate result.
+        let projected = match (ret, pt) {
+            (Type::Refined { .. }, Type::Class { sym, .. }) => {
+                self.base_type_instance(ret, *sym, 0)
+            }
+            _ => None,
+        };
+        if !u.unify(projected.as_ref().unwrap_or(ret), pt) {
             // Fall back to the one-sided guess. It cannot solve `undet`, so a
             // call whose type parameters only the witness can pin down fails
             // here rather than guessing.

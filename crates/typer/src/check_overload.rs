@@ -489,7 +489,15 @@ impl Typer {
         let Some(cls) = self.st.class_sym_of(fun_ty) else {
             return;
         };
-        if !self.st.lookup_member(cls, "apply").is_empty() {
+        // An inherited FunctionN.apply does not prove that this class's
+        // overriding apply has been loaded. Its own signature supplies the
+        // precise parameter types, names and defaults.
+        if self
+            .st
+            .lookup_member(cls, "apply")
+            .iter()
+            .any(|id| self.st.get(*id).owner == cls)
+        {
             return;
         }
         // Nested binary classes may have no pickle index until their own
