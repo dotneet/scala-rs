@@ -1761,14 +1761,55 @@ impl Typer {
         let Some(outer_prefix) = outer_prefix else {
             return Vec::new();
         };
-        let Some(outer_cls) = self.st.class_sym_of(&outer_prefix) else {
+        let outer_cls = match &outer_prefix {
+            Type::SingleType { sym, .. }
+                if !sym.is_none()
+                    && matches!(self.st.get(*sym).kind, SymKind::Method | SymKind::Term)
+                    && matches!(self.st.get(*sym).ty, Type::TypeMember(_)) =>
+            {
+                self.concrete_class_of_prefix(&outer_prefix)
+            }
+            _ => self.st.class_sym_of(&outer_prefix),
+        };
+        let Some(outer_cls) = outer_cls else {
             return Vec::new();
         };
         let mut out = Vec::new();
         for &member in found {
-            let Some(scala_rs_pickle::sym::SigType::Single { prefix, sym }) =
-                self.pickle.result_prefix_for(member).cloned()
-            else {
+            let Some(result_prefix) = self.pickle.result_prefix_for(member).cloned() else {
+                continue;
+            };
+            let selected_ty = self.st.get(member).ty.clone();
+            if let scala_rs_pickle::sym::SigType::This(_) = result_prefix {
+                let mut rebound = false;
+                for decl in self.st.type_members_in(&selected_ty) {
+                    let name = self.st.get(decl).name.clone();
+                    let seen = self
+                        .pickle
+                        .complete_type_member(&mut self.st, &mut self.binary, outer_cls, &name)
+                        .or_else(|| {
+                            Some(
+                                self.st
+                                    .expand_in_type(&outer_prefix, &Type::TypeMember(decl)),
+                            )
+                        });
+                    let Some(seen) = seen else { continue };
+                    if matches!(seen, Type::TypeMember(id) if id == decl)
+                        || seen.is_no_type()
+                        || seen.is_error()
+                    {
+                        continue;
+                    }
+                    if !out.iter().any(|(id, _)| *id == decl) {
+                        out.push((decl, seen));
+                        rebound = true;
+                    }
+                }
+                if rebound {
+                    continue;
+                }
+            }
+            let scala_rs_pickle::sym::SigType::Single { prefix, sym } = result_prefix else {
                 continue;
             };
             let scala_rs_pickle::sym::SigType::This(_) = prefix.as_ref() else {
@@ -1803,7 +1844,6 @@ impl Typer {
             if backend_ty.is_no_type() || backend_ty.is_error() {
                 continue;
             }
-            let selected_ty = self.st.get(member).ty.clone();
             // The concrete backend can be a class whose aliases have not
             // been demanded yet. Complete each referenced type member before
             // asking `expand_in_type`; otherwise `lookup_member` sees only
@@ -1846,6 +1886,32 @@ impl Typer {
             }
         }
         out
+    }
+
+    /// Resolve the class of a stable path after reading inherited members in
+    /// the current class.  A path such as `tdb.profile` stores the accessor's
+    /// declaration type (`BasicProfile`) in its final symbol, while the
+    /// enclosing receiver may provide a concrete `Profile = JdbcProfile`
+    /// alias.  Re-read that accessor as seen from `this` before falling back
+    /// to the declaration class; this keeps path-dependent inner members
+    /// tied to the concrete enclosing instance without naming a library type.
+    pub(crate) fn concrete_class_of_prefix(&self, prefix: &Type) -> Option<SymbolId> {
+        if let Type::SingleType { sym, .. } = prefix {
+            if !sym.is_none() {
+                let seen = self.ident_ty_as_seen_from_this(*sym, self.st.get(*sym).ty.clone());
+                let seen = match prefix {
+                    Type::SingleType { prefix: parent, .. } => self
+                        .concrete_class_of_prefix(parent)
+                        .map(|cls| self.st.expand_type_members(cls, &seen))
+                        .unwrap_or_else(|| self.st.expand_type_members(self.st.this_class, &seen)),
+                    _ => self.st.expand_type_members(self.st.this_class, &seen),
+                };
+                if let Some(cls) = self.st.class_sym_of(&seen) {
+                    return Some(cls);
+                }
+            }
+        }
+        self.st.class_sym_of(prefix)
     }
 
     /// The alias symbol behind `seen` and the deferred member its right-hand

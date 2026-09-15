@@ -20,6 +20,10 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/slickddl.scala")
 }
 
+fn sequence_fixture() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/slicksequence.scala")
+}
+
 fn tmp_dir() -> PathBuf {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let nanos = SystemTime::now()
@@ -93,5 +97,41 @@ fn schema_description_extension_resolves_through_profile_api_import() {
     );
     let class_count = fs::read_dir(&out).unwrap().count();
     assert!(class_count > 0, "fixture emitted no class files");
+    let _ = fs::remove_dir_all(out);
+}
+
+#[test]
+fn sequence_schema_create_statements_resolves_through_concrete_profile_alias() {
+    let (Some(scala_library), Some(classpath)) = (scala_library(), slick_classpath()) else {
+        eprintln!("skip slicksequence: scala-library or Slick dependencies not cached");
+        return;
+    };
+    let out = tmp_dir();
+    let result = Command::new(bin())
+        .args([
+            "compile",
+            sequence_fixture().to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "-cp",
+            &classpath,
+            "--scala-library",
+            scala_library.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        result.status.success() && !diagnostics.contains("error:"),
+        "Slick Sequence DDL fixture failed to compile:\n{diagnostics}"
+    );
+    assert!(
+        out.join("SequenceUse.class").is_file(),
+        "fixture emitted no SequenceUse class"
+    );
     let _ = fs::remove_dir_all(out);
 }

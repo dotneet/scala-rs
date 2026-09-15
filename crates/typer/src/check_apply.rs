@@ -3241,11 +3241,13 @@ impl Typer {
                             .tparams
                             .iter()
                             .any(|&tp| crate::check::type_mentions_tparam(&ret, tp));
-                    tree.ty = if impl_missing && leaks {
+                    let result_ty = if impl_missing && leaks {
                         Type::Error
                     } else {
                         ret
                     };
+                    let result_ty = self.attach_result_inner_prefix(fun, result_ty);
+                    tree.ty = result_ty;
                 }
                 OverloadPick::Ambiguous => {
                     // An argument that already failed cannot pick an alternative;
@@ -4472,5 +4474,83 @@ impl Typer {
             }
             _ => false,
         }
+    }
+
+    /// Preserve the stable outer prefix of an inner class returned by a
+    /// method call.  Scala's `H2Profile.api.Sequence.apply` returns the
+    /// profile's `Sequence`, whose `schema` result is the profile's concrete
+    /// `SchemaDescription`; dropping the `api`/profile view when the result is
+    /// assigned to a local turns that into the abstract `BasicProfile` member.
+    /// The source type model stores the class and its arguments separately, so
+    /// carry the existing as-seen-from prefix on the result instead.  This is
+    /// deliberately based on the class ownership relation and the typed
+    /// callee path, not on any library or member name.
+    fn attach_result_inner_prefix(&self, fun: &Tree, result: Type) -> Type {
+        let Type::Class { sym, .. } = crate::prefix::strip_view(&result) else {
+            return result;
+        };
+        if !self.st.is_inner_class_of_class(*sym) {
+            return result;
+        }
+
+        fn view_path_class(typer: &Typer, tree: &Tree) -> Option<SymbolId> {
+            match &tree.kind {
+                TreeKind::Select { qual, .. } => {
+                    // A nested API selection itself has a view, so its class
+                    // is the API trait rather than the stable profile value.
+                    // Walk through that view until the first ordinary value
+                    // qualifier supplies the enclosing instance's class.
+                    if crate::prefix::view_prefix(&qual.ty).is_none() {
+                        if let Some(c) = typer.st.class_sym_of(&qual.ty) {
+                            return Some(c);
+                        }
+                    }
+                    view_path_class(typer, qual)
+                }
+                TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => {
+                    view_path_class(typer, fun)
+                }
+                _ => None,
+            }
+        }
+
+        fn find(typer: &Typer, tree: &Tree) -> Option<(Type, Option<SymbolId>)> {
+            if let Some(prefix) = crate::prefix::view_prefix(&tree.ty) {
+                return Some((prefix.clone(), None));
+            }
+            match &tree.kind {
+                TreeKind::TypeApply { fun, .. } => find(typer, fun),
+                TreeKind::Select { qual, .. } => {
+                    if let Some(prefix) = crate::prefix::view_prefix(&qual.ty) {
+                        // The view belongs to the stable value that supplied
+                        // the API/member path.  Its own singleton type may
+                        // be declared on an abstract base (for example
+                        // `tdb.profile.api` through `BasicProfile`), while
+                        // the qualifier still carries the concrete profile
+                        // selected at the use site.
+                        return Some((prefix.clone(), view_path_class(typer, qual)));
+                    }
+                    if let Some(prefix) = typer.singleton_prefix_of(qual) {
+                        return Some((prefix, None));
+                    }
+                    find(typer, qual)
+                }
+                TreeKind::Apply { fun, .. } => find(typer, fun),
+                _ => None,
+            }
+        }
+
+        let Some((prefix, path_class)) = find(self, fun) else {
+            return result;
+        };
+        let Some(prefix_class) = path_class.or_else(|| self.concrete_class_of_prefix(&prefix))
+        else {
+            return result;
+        };
+        let owner = self.st.get(*sym).owner;
+        if owner != prefix_class && !self.st.is_ancestor_of(owner, prefix_class) {
+            return result;
+        }
+        crate::prefix::with_prefix(result, prefix)
     }
 }
