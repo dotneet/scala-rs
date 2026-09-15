@@ -1180,13 +1180,30 @@ impl Typer {
     /// `Method` with no clauses, the same representation as Scala's
     /// `def make: T`; [`Self::maybe_auto_apply`] must auto-apply the latter and
     /// therefore also consumed the Java method before `adapt` could eta-expand
-    /// it. The symbol's `JAVA` flag is the missing source-level distinction.
+    /// it. The symbol's `JAVA` flag and the expected callable arity are the
+    /// missing source-level distinctions. A SAM contributes its abstract
+    /// method's arity to the same gate; later adaptation still decides whether
+    /// the method value can inhabit that SAM.
     pub(crate) fn java_empty_clause_for_eta(&self, sym: SymbolId, ty: Type, pt: &Type) -> Type {
+        let pt = match pt {
+            Type::ByName(t) | Type::Repeated(t) => t.as_ref(),
+            t => t,
+        };
+        let pt = self.st.dealias(pt);
+        let arity = expected_function_arity(&pt)
+            .or_else(|| match &pt {
+                Type::Class { sym, args } => self
+                    .st
+                    .function_class_shape(*sym, args)
+                    .and_then(|t| expected_function_arity(&t)),
+                _ => None,
+            })
+            .or_else(|| self.st.sam_sig(&pt).map(|sam| sam.param_tys.len()));
         if sym.is_none()
             || !self.st.get(sym).flags.contains(Flags::JAVA)
             || self.st.get(sym).flags.contains(Flags::ACCESSOR)
             || matches!(pt, Type::Method { .. })
-            || !self.expects_function_value(pt)
+            || arity != Some(0)
         {
             return ty;
         }
