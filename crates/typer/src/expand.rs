@@ -395,9 +395,7 @@ fn start_engine(classpath: &[PathBuf]) -> Result<MacroEngine, String> {
             ));
         }
     };
-    if let Err(reason) = start_contained_engine(&mut child, &mut containment) {
-        return Err(reason);
-    }
+    start_contained_engine(&mut child, &mut containment)?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
     let stderr = child.stderr.take().expect("piped stderr");

@@ -538,14 +538,14 @@ impl Typer {
         member_name: &str,
         span: scala_rs_span::Span,
     ) -> Result<scala_rs_parser::SymbolId, String> {
-        let owner_tree = crate::expand::path_tree(&owner_name, span);
+        let owner_tree = crate::expand::path_tree(owner_name, span);
         let owner_ty = self.tree_to_type(&owner_tree);
         let owner = self.st.class_sym_of(&owner_ty).ok_or_else(|| {
             format!("the member owner `{owner_name}` does not resolve to a class")
         })?;
-        self.complete_binary_member(owner, &member_name, span);
+        self.complete_binary_member(owner, member_name, span);
         self.st
-            .lookup_member(owner, &member_name)
+            .lookup_member(owner, member_name)
             .into_iter()
             .find(|id| self.st.get(*id).kind == SymKind::TypeMember)
             .ok_or_else(|| format!("type member `{owner_name}.{member_name}` does not resolve"))
