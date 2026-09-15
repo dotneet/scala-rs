@@ -213,7 +213,22 @@ impl Typer {
     /// defaults across *all* parameter clauses, so `f(a, b = 1)(c, d = 2)`
     /// gets `f$default$2` and `f$default$4`, not `$default$2` twice.
     fn default_getter_index(&self, fun: &Tree, param: SymbolId) -> usize {
-        let sym = fun.sym;
+        // On an overloaded classpath method `fun.sym` is the first (erased)
+        // alternative, while the parameter came from the pickled, generic
+        // alternative selected for named-argument placement.  Looking up the
+        // parameter in the former cannot find it and used index 1 for every
+        // default (`DatabaseConfig.forURL(..., driver = ..., ...)`).  A
+        // parameter's owner is the declaration that numbers its getter, so
+        // prefer that method whenever it is available.
+        let param_owner = self.st.get(param).owner;
+        let sym = if !param_owner.is_none()
+            && self.st.get(param_owner).kind == SymKind::Method
+            && (fun.sym.is_none() || self.st.get(param_owner).name == self.st.get(fun.sym).name)
+        {
+            param_owner
+        } else {
+            fun.sym
+        };
         if sym.is_none() {
             return 1;
         }
