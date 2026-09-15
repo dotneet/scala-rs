@@ -1055,6 +1055,16 @@ impl Typer {
     /// declaration of the object's own needs no prefix beyond `this`.
     fn module_path_type_member(&mut self, qual: &Tree, id: SymbolId) -> Type {
         let plain = Type::TypeMember(id);
+        // A nullary alias is transparent even when completion had to retain a
+        // declaration symbol so a later dependent path can recover its owner.
+        // `lookup_qualified_type` sees that retained symbol on the receiver's
+        // inherited member walk before `qualified_pickled_type_member` gets a
+        // chance to return the expanded RHS. Preserve the source-level
+        // transparency here; otherwise `HtmlFormat.Appendable` is diagnosed
+        // as `Format.Appendable` after its first use.
+        if self.st.get(id).is_type_alias && self.st.get(id).tparams.is_empty() {
+            return self.st.type_member_as_seen(id);
+        }
         if !self.st.is_deferred_type_member(id) || self.st.path_member_decl(id).is_some() {
             return plain;
         }

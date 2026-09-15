@@ -1386,6 +1386,13 @@ impl Typer {
                     .get(&id)
                     .copied()
                     .unwrap_or(id);
+                let same_origin_open = self.open_implicits.borrow().iter().any(|(prior, _)| {
+                    self.implicit_instance_origins
+                        .get(prior)
+                        .copied()
+                        .unwrap_or(*prior)
+                        == origin
+                });
                 let shrinking = self
                     .open_implicits
                     .borrow()
@@ -1399,7 +1406,14 @@ impl Typer {
                             && (complexity(pt) < complexity(previous)
                                 || contravariant_driver_shrinks(self, pt, previous))
                     });
-                if depth >= MAX_IMPLICIT_DEPTH && !shrinking {
+                // Depth alone is not a recursion proof: a valid derivation
+                // may be deeper than the historical cutoff (e.g. a 12-level
+                // Pack/Cons witness). Keep the safety cutoff for a repeated
+                // declaration only when its target is not structurally
+                // smaller; this is the same progress relation used by the
+                // divergence check below and still bounds non-progressing
+                // cycles even when their detached identities differ.
+                if depth >= MAX_IMPLICIT_DEPTH && same_origin_open && !shrinking {
                     // The enclosing memo entry was decided by the depth limit,
                     // so it does not travel to a shallower search.
                     self.implicit_memo.borrow_mut().cut = true;
