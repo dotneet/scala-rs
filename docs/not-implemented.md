@@ -14,9 +14,7 @@ Language:
   (JVM bridge)" above). What is still missing:
   **whitebox macros** / **macro bundles** (`class B(val c: Context)`) /
   **anonymous class definitions returned by macro expansions** / **general inferred
-  type argument tags outside resolved implicit evidence** / **`c.enclosingPosition` /
-  `c.typecheck` / `c.inferImplicitValue`** (calling one makes the engine throw
-  `UnsupportedOperationException`, and its name appears in the diagnostic) /
+  type argument tags outside resolved implicit evidence** / **`c.inferImplicitView`** /
   **passing blocks, function literals, `new` and similar arguments (and the receiver)
   through to the implementation** / **`c.prefix` for a call written without a
   receiver** (nsc's `This(<enclosing class>)`) /

@@ -50,6 +50,7 @@ pub(crate) fn query_kind(items: &[Sexp]) -> &'static str {
     };
     match kind.text().as_str() {
         "typecheck" => "typecheck",
+        "inferImplicitValue" => "inferImplicitValue",
         "enclosingOwner" => "enclosingOwner",
         "functionSymbol" => "functionSymbol",
         "symbol" => "symbol",
@@ -297,6 +298,7 @@ impl Typer {
         };
         match kind.as_str() {
             "typecheck" => self.answer_typecheck(items),
+            "inferImplicitValue" => self.answer_infer_implicit_value(items),
             "enclosingOwner" => format!("(a ref {})", self.macro_current_owner().0),
             "functionSymbol" | "symbol" | "symbolInfo" | "companion" | "modulePair" => {
                 self.answer_mirror_symbol(items)
@@ -306,6 +308,189 @@ impl Typer {
                 "the macro engine asked scala-rs `{other}`, which it does not answer"
             )),
         }
+    }
+
+    /// `c.inferImplicitValue(pt, silent, withMacrosDisabled, pos)`.
+    ///
+    /// The engine can inspect and construct reflect types, but the implicit
+    /// scope belongs to this typer.  Bring the requested type back, run the
+    /// same search and tree construction used for an omitted implicit
+    /// argument, and return the fully typed witness.  A miss is `EmptyTree`,
+    /// as in nsc.  When `silent` is false its diagnostic remains attached to
+    /// the macro call site; speculative diagnostics are otherwise rolled
+    /// back.
+    fn answer_infer_implicit_value(&mut self, items: &[Sexp]) -> String {
+        let (Ok(wanted), Ok(silent), Ok(no_macros)) = (
+            at(items, 2),
+            at(items, 3).map(|s| s.text() == "1"),
+            at(items, 4).map(|s| s.text() == "1"),
+        ) else {
+            return refusal("the macro engine asked a malformed `c.inferImplicitValue`");
+        };
+        let span = self.macro_rpc_span;
+        let mark = self.diags.len();
+        let pt = match self.query_type_from_wire(wanted, span) {
+            Ok(t) => t,
+            Err(why) => return refusal(&format!("`c.inferImplicitValue` asked for {why}")),
+        };
+        if let Some(msg) = self.take_probe_errors(mark) {
+            return refusal(&format!(
+                "`c.inferImplicitValue` asked for a type scala-rs could not resolve: {msg}"
+            ));
+        }
+        if pt.is_error() || pt.is_no_type() || matches!(pt, Type::Named { .. }) {
+            return refusal(
+                "`c.inferImplicitValue` asked for a type scala-rs could not resolve at the macro call site",
+            );
+        }
+
+        self.warm_implicit_scope(&pt);
+        let saved_no_macros = self.implicit_macros_disabled;
+        self.implicit_macros_disabled = no_macros;
+        let mut search = self.search_implicit(&pt);
+        if matches!(search, crate::implicits::ImplicitSearch::None)
+            && self.warm_implicit_candidates(std::slice::from_ref(&pt))
+        {
+            search = self.search_implicit(&pt);
+        }
+        let answer = match search {
+            crate::implicits::ImplicitSearch::Found(id) => {
+                let mut tree = self.implicit_tree(id, &pt, span, 0);
+                self.adapt(&mut tree, &pt);
+                let failures = self.take_probe_errors(mark);
+                if tree.ty.is_error() || failures.is_some() {
+                    if !silent {
+                        self.error(
+                            span,
+                            failures.unwrap_or_else(|| self.missing_implicit_message(&pt, None)),
+                        );
+                    }
+                    "(a none)".to_string()
+                } else {
+                    // An abstract/path-dependent result equal to the target
+                    // is already present as the JVM `pt` object.  Sending a
+                    // class name for it would name a different type, so tell
+                    // the engine to reuse that exact object.  A genuinely
+                    // narrower result must still be described faithfully.
+                    let ty = if tree.ty == pt {
+                        "(same)".to_string()
+                    } else {
+                        match self.type_to_wire(&tree.ty) {
+                            Ok(ty) => ty,
+                            Err(why) => {
+                                self.implicit_macros_disabled = saved_no_macros;
+                                return refusal(&format!(
+                                    "`c.inferImplicitValue` found an implicit of {why}, which scala-rs cannot describe to the macro engine"
+                                ));
+                            }
+                        }
+                    };
+                    let mut built = String::new();
+                    let types = crate::expand::WireTypes::default();
+                    let cx = crate::expand::WireCx {
+                        st: &self.st,
+                        types: &types,
+                    };
+                    match answer_tree_to_wire(&cx, &tree, &mut built) {
+                        Ok(()) => format!("(a ok {ty} {built})"),
+                        Err(why) => refusal(&format!("`c.inferImplicitValue` produced {why}")),
+                    }
+                }
+            }
+            crate::implicits::ImplicitSearch::None => {
+                self.diags.truncate(mark);
+                if !silent {
+                    self.error(span, self.missing_implicit_message(&pt, None));
+                }
+                "(a none)".to_string()
+            }
+            crate::implicits::ImplicitSearch::Ambiguous(ids) => {
+                self.diags.truncate(mark);
+                if !silent {
+                    self.error(
+                        span,
+                        format!("ambiguous implicit: {}", self.describe_implicits(&ids)),
+                    );
+                }
+                "(a none)".to_string()
+            }
+        };
+        self.implicit_macros_disabled = saved_no_macros;
+        answer
+    }
+
+    /// Read a type the macro universe asked the call-site typer about.
+    ///
+    /// Ordinary class types reuse the expansion wire. `(mem owner name ...)`
+    /// is a path-dependent or abstract member: the JVM sends the member's
+    /// static declaration owner and identity, and this side installs that
+    /// exact pickled symbol. Sending its printed prefix (`x.T`) would require
+    /// the implementation's `x` to be in the call site's lexical scope,
+    /// which it is not -- ZIO's `Tracer.instance.Type` is the concrete case.
+    fn query_type_from_wire(
+        &mut self,
+        wire: &Sexp,
+        span: scala_rs_span::Span,
+    ) -> Result<Type, String> {
+        let items = wire.list()?;
+        if items.first().and_then(|s| s.atom()) != Some("mem") {
+            let tpt = self.type_tree_from_wire(wire, span)?;
+            return Ok(self.tree_to_type(&tpt));
+        }
+        let owner_name = at(items, 1)?.text();
+        let member_name = at(items, 2)?.text();
+        let member = self.macro_type_member(&owner_name, &member_name, span)?;
+        let mut base = Type::TypeMember(member);
+        let mut arg_start = 3;
+        if let Some(prefix) = items.get(3).and_then(|p| p.list().ok()) {
+            if prefix.first().and_then(|p| p.atom()) == Some("pre") {
+                let term_owner = at(prefix, 1)?.text();
+                let term_name = at(prefix, 2)?.text();
+                let prefix_tree =
+                    crate::expand::path_tree(&format!("{term_owner}.{term_name}"), span);
+                base = self
+                    .macro_path_dependent_type(&prefix_tree, &member_name, span)
+                    .ok_or_else(|| {
+                        format!("stable prefix `{term_owner}.{term_name}` does not resolve")
+                    })?;
+                arg_start = 4;
+            }
+        }
+        let args = items.get(arg_start..).unwrap_or(&[]);
+        if args.is_empty() {
+            return Ok(base);
+        }
+        let args = args
+            .iter()
+            .map(|arg| self.query_type_from_wire(arg, span))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Type::Applied {
+            ctor: Box::new(base),
+            args,
+        })
+    }
+
+    /// Resolve the declaration identity the macro engine uses for a
+    /// path-dependent type.  Both query types and returned tree symbols use
+    /// this path, so an abstract member round-trips as the same pickled
+    /// symbol rather than a nominal approximation.
+    pub(crate) fn macro_type_member(
+        &mut self,
+        owner_name: &str,
+        member_name: &str,
+        span: scala_rs_span::Span,
+    ) -> Result<scala_rs_parser::SymbolId, String> {
+        let owner_tree = crate::expand::path_tree(&owner_name, span);
+        let owner_ty = self.tree_to_type(&owner_tree);
+        let owner = self.st.class_sym_of(&owner_ty).ok_or_else(|| {
+            format!("the member owner `{owner_name}` does not resolve to a class")
+        })?;
+        self.complete_binary_member(owner, &member_name, span);
+        self.st
+            .lookup_member(owner, &member_name)
+            .into_iter()
+            .find(|id| self.st.get(*id).kind == SymKind::TypeMember)
+            .ok_or_else(|| format!("type member `{owner_name}.{member_name}` does not resolve"))
     }
 
     /// `c.typecheck(tree, mode, pt, silent, …)`.

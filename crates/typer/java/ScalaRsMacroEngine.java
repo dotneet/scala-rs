@@ -526,6 +526,28 @@ public final class ScalaRsMacroEngine {
         return call(support, "setType", 2, built, tpe);
     }
 
+    /** `c.inferImplicitValue`: the implicit scope lives in scala-rs. */
+    static Object inferImplicitValue(Object pt, boolean silent, boolean noMacros)
+            throws Exception {
+        StringBuilder sb = new StringBuilder("(q inferImplicitValue ");
+        serType(pt, sb);
+        sb.append(' ').append(silent ? "1" : "0")
+          .append(' ').append(noMacros ? "1" : "0").append(')');
+        Sexp ans = query(sb.toString());
+        if ("none".equals(ans.items.get(1).atom)) {
+            return call(universe, "EmptyTree", 0);
+        }
+        if (!"ok".equals(ans.items.get(1).atom)) {
+            throw gap("scala-rs returned a malformed c.inferImplicitValue answer");
+        }
+        Object tpe = ans.items.get(2).isList()
+                && "same".equals(ans.items.get(2).items.get(0).atom)
+            ? pt : typeFor(ans.items.get(2));
+        Object built = buildTree(ans.items.get(3));
+        Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
+        return call(support, "setType", 2, built, tpe);
+    }
+
     /** `scala.reflect.macros.TypecheckException(NoPosition, msg)`. */
     static Throwable newTypecheckException(String msg) throws Exception {
         Class<?> cls = loadClass("scala.reflect.macros.TypecheckException");
@@ -1003,13 +1025,38 @@ public final class ScalaRsMacroEngine {
                 return;
             }
             if (sym == null || sym == call(universe, "NoSymbol", 0)) {
-                sb.append("(s0)");
-                return;
+                // Synthetic type trees in a macro result quite often have no
+                // symbol field even though their attributed type retains the
+                // exact member symbol.  CompoundTypeTree parents produced by
+                // ZIO's autoTrace macro are one such case.
+                Object tpe = call(t, "tpe", 0);
+                if (tpe != null && tpe != call(universe, "NoType", 0)
+                        && isA(tpe, "scala.reflect.internal.Types$TypeRef")) {
+                    sym = call(tpe, "typeSymbolDirect", 0);
+                }
+                if (sym == null || sym == call(universe, "NoSymbol", 0)) {
+                    sb.append("(s0)");
+                    return;
+                }
             }
             // Only a *static* symbol survives the trip: scala-rs resolves it
             // by full name, and a local or a parameter has no such name.
             Object isStatic = call(sym, "isStatic", 0);
             if (!Boolean.TRUE.equals(isStatic)) {
+                // A path-dependent type has no static path of its own, but
+                // its declaration does. Preserve that member identity so the
+                // call-site typer need not re-resolve the engine's prefix.
+                Object owner = call(sym, "owner", 0);
+                if (Boolean.TRUE.equals(call(sym, "isType", 0))
+                        && Boolean.TRUE.equals(call(owner, "isClass", 0))
+                        && staticByOwners(owner)) {
+                    sb.append("(tm ")
+                      .append(Sexp.quote(String.valueOf(call(owner, "fullName", 0))))
+                      .append(' ')
+                      .append(Sexp.quote(String.valueOf(call(sym, "name", 0))))
+                      .append(')');
+                    return;
+                }
                 sb.append("(s0)");
                 return;
             }
@@ -1072,6 +1119,39 @@ public final class ScalaRsMacroEngine {
                 return;
             }
             sym = call(d, "typeSymbolDirect", 0);
+        }
+        if (!Boolean.TRUE.equals(call(sym, "isClass", 0))) {
+            Object owner = call(sym, "owner", 0);
+            if (Boolean.TRUE.equals(call(owner, "isClass", 0)) && staticByOwners(owner)) {
+                sb.append("(mem ")
+                  .append(Sexp.quote(String.valueOf(call(owner, "fullName", 0))))
+                  .append(' ')
+                  .append(Sexp.quote(String.valueOf(call(sym, "name", 0))));
+                // A path-dependent member is identified by both its
+                // declaration and the stable value prefix.  `a.Type` and
+                // `b.Type` share the declaration but are distinct types.
+                Object pre = call(d, "pre", 0);
+                Object term = call(pre, "termSymbol", 0);
+                if (term != null && term != call(universe, "NoSymbol", 0)) {
+                    Object termOwner = call(term, "owner", 0);
+                    if (Boolean.TRUE.equals(call(termOwner, "isClass", 0))
+                            && staticByOwners(termOwner)) {
+                        sb.append(" (pre ")
+                          .append(Sexp.quote(String.valueOf(call(termOwner, "fullName", 0))))
+                          .append(' ')
+                          .append(Sexp.quote(String.valueOf(call(term, "name", 0))))
+                          .append(')');
+                    }
+                }
+                Object args = call(d, "typeArgs", 0);
+                Object it = call(args, "iterator", 0);
+                while ((Boolean) call(it, "hasNext", 0)) {
+                    sb.append(' ');
+                    serType(call(it, "next", 0), sb);
+                }
+                sb.append(')');
+                return;
+            }
         }
         if (!Boolean.TRUE.equals(call(sym, "isClass", 0))
                 || Boolean.TRUE.equals(call(sym, "isModuleClass", 0))
@@ -1825,6 +1905,9 @@ public final class ScalaRsMacroEngine {
             if (n.equals("typecheck") && arity == 6) {
                 return typecheck(a[0], a[1], a[2], (Boolean) a[3], (Boolean) a[4],
                     (Boolean) a[5]);
+            }
+            if (n.equals("inferImplicitValue") && arity == 4) {
+                return inferImplicitValue(a[0], (Boolean) a[1], (Boolean) a[2]);
             }
             if (n.equals("TypecheckException") && arity == 0) {
                 return loadClass("scala.reflect.macros.TypecheckException$")

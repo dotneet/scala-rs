@@ -1501,6 +1501,11 @@ impl Typer {
         } else {
             SymbolId::NONE
         };
+        let returned_type_member = if sym.first().and_then(|s| s.atom()) == Some("tm") {
+            Some(self.macro_type_member(&at(sym, 1)?.text(), &at(sym, 2)?.text(), span)?)
+        } else {
+            None
+        };
         let kids = items.get(3..).unwrap_or(&[]);
         let id = NodeId(self.macro_next_node);
         self.macro_next_node = self
@@ -1539,12 +1544,44 @@ impl Typer {
             }
             "Select" => {
                 let qual = self.tree_from_reply(at(kids, 0)?, span)?;
-                let name = decode_method_name(&name_from(at(kids, 1)?)?);
+                let name_wire = at(kids, 1)?;
+                let name = decode_method_name(&name_from(name_wire)?);
+                let is_type_name = name_wire
+                    .list()
+                    .ok()
+                    .and_then(|n| n.get(1))
+                    .and_then(|n| n.atom())
+                    == Some("type");
                 // `new C(args)` is `Apply(Select(New(tpt), <init>), args)` in
                 // reflect and `Apply(New(tpt), args)` here: the constructor
                 // selection is spelled out there and implicit in our tree.
                 if name == "<init>" && matches!(qual.kind, TreeKind::New { .. }) {
                     return Ok(qual);
+                }
+                // A path-dependent type selection in the expansion must keep
+                // both the declaration identity and the stable singleton
+                // prefix.  Synthesised reflect trees frequently carry no
+                // symbol, so first resolve from the qualifier itself and use
+                // the engine's `(tm owner name)` identity as a fallback.
+                if is_type_name {
+                    let inferred = self.macro_path_dependent_type(&qual, &name, span);
+                    if let Some(ty) = inferred.or_else(|| {
+                        returned_type_member.map(|member| {
+                            self.singleton_prefix_of(&qual)
+                                .map_or(Type::TypeMember(member), |pre| {
+                                    crate::prefix::with_prefix(Type::TypeMember(member), pre)
+                                })
+                        })
+                    }) {
+                        let mut resolved = node(TreeKind::Ident {
+                            name: crate::materialize::RESOLVED_TYPE.to_string(),
+                        });
+                        resolved.ty = ty;
+                        if let Some(member) = returned_type_member {
+                            resolved.sym = member;
+                        }
+                        return Ok(resolved);
+                    }
                 }
                 Ok(node(TreeKind::Select {
                     qual: Box::new(qual),
@@ -1634,6 +1671,31 @@ impl Typer {
                 let mut t = self.type_tree_from_wire(at(kids, 0)?, span)?;
                 t.id = id;
                 Ok(t)
+            }
+            // Reflect represents `A with B { ... }` as a CompoundTypeTree
+            // containing a Template.  Our AST carries only the template's
+            // parents and refinement declarations; the synthetic empty self
+            // ValDef is not a declaration.  ZIO's autoTrace expansion uses
+            // exactly `Tracer.instance.Type with Tracer.Traced` as the target
+            // of an `asInstanceOf`.
+            "CompoundTypeTree" => {
+                let template = at(kids, 0)?.list()?;
+                if at(template, 1)?.text() != "Template" {
+                    return Err("macro CompoundTypeTree has no Template".to_string());
+                }
+                let parents = self.reply_trees(at(template, 3)?, span)?;
+                let self_def = at(template, 4)?.list()?;
+                let self_name = name_from(at(self_def, 4)?)?;
+                if !self_name.is_empty() && self_name != "_" {
+                    return Err(format!(
+                        "the expansion's compound type has self `{self_name}`, which scala-rs cannot rebuild yet"
+                    ));
+                }
+                let refinements = self.reply_trees(at(template, 5)?, span)?;
+                Ok(node(TreeKind::CompoundTypeTree {
+                    parents,
+                    refinements,
+                }))
             }
             // `Bind(name, body)`. A *term* name is a pattern binder, `x @ p`
             // (nsc writes a plain variable pattern `x` as `Bind(x, Ident(_))`,
@@ -2132,7 +2194,7 @@ impl Typer {
     /// `(tyx "why")` is a type the engine refused to spell (a singleton, a
     /// refinement, an existential, an abstract type, a class nested in a
     /// class): a name for any of those would stand for a different type.
-    fn type_tree_from_wire(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
+    pub(crate) fn type_tree_from_wire(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
         let items = s.list()?;
         match items.first().and_then(|s| s.atom()) {
             Some("ty") => {}
@@ -2372,7 +2434,7 @@ fn mods_from_with(s: &Sexp, deferred_ok: bool) -> Result<Modifiers, String> {
 }
 
 /// `a.b.C` as a term path.
-fn path_tree(full: &str, span: Span) -> Tree {
+pub(crate) fn path_tree(full: &str, span: Span) -> Tree {
     let qualified = full.contains('.');
     let mut parts = full.split('.');
     // A path returned by the macro engine is resolved in the call site's

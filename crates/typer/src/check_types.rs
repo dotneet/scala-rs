@@ -2056,6 +2056,97 @@ impl Typer {
         self.at_term_path(prefix, &pty, t)
     }
 
+    /// Resolve a type selection reconstructed from an attributed macro tree.
+    ///
+    /// A reflect `Select` can lose its symbol field when a macro synthesises
+    /// it (ZIO's `Tracer.instance.Type` does), so the reverse-RPC tree cannot
+    /// rely on `Tree.symbol`.  Complete the last term in the stable prefix
+    /// from its binary owner, then use the ordinary path-dependent type path;
+    /// this preserves the singleton prefix instead of approximating the
+    /// result as the bare abstract member.
+    pub(crate) fn macro_path_dependent_type(
+        &mut self,
+        prefix: &Tree,
+        name: &str,
+        span: Span,
+    ) -> Option<Type> {
+        let mut explicit_term = None;
+        if let TreeKind::Select {
+            qual,
+            name: term_name,
+        } = &prefix.kind
+        {
+            if let Some(owner) = self.path_owner_sym(qual) {
+                self.complete_binary_member(owner, term_name, span);
+            }
+            let owner_ty = self.tree_to_type(qual);
+            if let Some(owner) = self.path_member_owner(&owner_ty) {
+                self.complete_binary_member(owner, term_name, span);
+                let companion = self.st.companion_module_class_for_implicits(owner);
+                if !companion.is_none() {
+                    self.complete_binary_member(companion, term_name, span);
+                }
+                let term_owner = if companion.is_none() {
+                    owner
+                } else {
+                    companion
+                };
+                explicit_term = self
+                    .st
+                    .lookup_member(term_owner, term_name)
+                    .into_iter()
+                    .find(|id| {
+                        matches!(
+                            self.st.get(*id).kind,
+                            SymKind::Term
+                                | SymKind::Method
+                                | SymKind::Module
+                                | SymKind::ModuleClass
+                        )
+                    })
+                    .map(|id| (id, term_owner));
+                if explicit_term.is_none() && term_owner != owner {
+                    explicit_term = self
+                        .st
+                        .lookup_member(owner, term_name)
+                        .into_iter()
+                        .find(|id| {
+                            matches!(
+                                self.st.get(*id).kind,
+                                SymKind::Term
+                                    | SymKind::Method
+                                    | SymKind::Module
+                                    | SymKind::ModuleClass
+                            )
+                        })
+                        .map(|id| (id, owner));
+                }
+            }
+        }
+        if self.type_select_is_term_prefix(prefix) {
+            return Some(self.path_dependent_type(span, prefix, name));
+        }
+        let (term, term_owner) = explicit_term?;
+        let pty = self.maybe_auto_apply(self.st.get(term).ty.clone(), &Type::NoType);
+        let singleton = self.singleton_of_sym(term, Some(Type::ModuleRef(term_owner)));
+        let projected = self.project_from_prefix_at(span, &pty, name, &singleton);
+        let Type::TypeMember(member) = projected else {
+            return Some(projected);
+        };
+        let declaration = self
+            .st
+            .abs_projection(member)
+            .map_or(member, |(_, decl)| decl);
+        if !self.can_be_path_member(declaration, &pty) {
+            return Some(Type::TypeMember(member));
+        }
+        Some(Type::TypeMember(self.st.path_member(
+            &[term],
+            declaration,
+            &pty,
+        )))
+    }
+
     /// Complete the signature of the term a type path starts from, when it is
     /// still pending (an unannotated `val` of the template being typed).
     fn complete_path_head(&mut self, prefix: &Tree, span: Span) {

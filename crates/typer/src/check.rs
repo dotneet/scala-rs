@@ -840,6 +840,11 @@ pub struct Typer {
     /// that declares them; the receiver is the object. Filled by the companion
     /// half of the implicit scope, read when the reference is materialised.
     pub(crate) implicit_via_module: std::cell::RefCell<HashMap<u32, SymbolId>>,
+    /// Set only while answering `c.inferImplicitValue(...,
+    /// withMacrosDisabled = true)`.  The query is still an ordinary implicit
+    /// search in the call-site typer; this bit removes macro candidates at
+    /// the same point every recursive search builds its candidate set.
+    pub(crate) implicit_macros_disabled: bool,
     /// Modules (or module classes) through which a still-abstract
     /// `Type::TypeMember` was ever selected as a qualified `p.T` (keyed by
     /// `T`'s own defining symbol), for the implicit search's
@@ -1279,6 +1284,7 @@ impl Typer {
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
+            implicit_macros_disabled: false,
             type_member_prefixes: std::cell::RefCell::new(HashMap::new()),
             implicit_undet_solved: Vec::new(),
             implicit_arg_missing: false,
