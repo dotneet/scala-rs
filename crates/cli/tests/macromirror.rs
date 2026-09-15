@@ -65,6 +65,11 @@ fn scala_reflect_jar() -> Option<PathBuf> {
     cached.is_file().then_some(cached)
 }
 
+fn find_scalac() -> Option<PathBuf> {
+    let cached = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    cached.is_file().then_some(cached)
+}
+
 fn prerequisites(tag: &str) -> bool {
     if !tool_available("java") || !tool_available("javac") {
         eprintln!("skip {tag}: java / javac not available");
@@ -162,6 +167,90 @@ fn mtc_typecheck_expands_and_runs() {
     assert_eq!(run_main(&cp, "mtc_use"), expected, "stdout mismatch");
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
+}
+
+/// `inferImplicitValue` is answered by the call-site implicit scope, including
+/// a stable path-dependent target, and `withMacrosDisabled` removes the
+/// companion macro without hiding an ordinary local witness.
+#[test]
+fn infer_implicit_value_matches_real_scalac() {
+    if !prerequisites("miv_use") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        eprintln!("skip miv_use oracle: scalac 2.13.16 not available");
+        return;
+    };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("miv-impl");
+    let uses = tmp_dir("miv-use");
+    let scalac_uses = tmp_dir("miv-scalac-use");
+
+    // The macro implementation is a real scalac classpath artifact, as ZIO's
+    // stack-tracer macros are. Both compilers consume the identical classes.
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+        ])
+        .arg(fixtures_dir().join("miv_impl.scala"))
+        .output()
+        .expect("compile miv_impl with scalac");
+    assert!(
+        out.status.success(),
+        "scalac miv_impl failed: {}",
+        diagnostics(&out)
+    );
+    let out = compile(&["miv_use"], &uses, &[&impls]);
+    assert!(
+        out.status.success(),
+        "compile miv_use failed: {}",
+        diagnostics(&out)
+    );
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", impls.display(), reflect.display()),
+            "-d",
+            scalac_uses.to_str().unwrap(),
+        ])
+        .arg(fixtures_dir().join("miv_use.scala"))
+        .output()
+        .expect("compile miv_use with scalac");
+    assert!(
+        out.status.success(),
+        "scalac miv_use failed: {}",
+        diagnostics(&out)
+    );
+
+    let ours_cp = format!(
+        "{}:{}:{}:{}",
+        uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let scalac_cp = format!(
+        "{}:{}:{}:{}",
+        scalac_uses.display(),
+        impls.display(),
+        reflect.display(),
+        jar.display()
+    );
+    let ours = run_main(&ours_cp, "miv_use scala-rs");
+    let oracle = run_main(&scalac_cp, "miv_use scalac");
+    assert_eq!(ours, oracle, "scala-rs differs from scalac");
+    assert_eq!(
+        ours,
+        fs::read_to_string(fixtures_dir().join("expected/miv_use.txt")).unwrap()
+    );
+
+    for dir in [impls, uses, scalac_uses] {
+        let _ = fs::remove_dir_all(dir);
+    }
 }
 
 /// Every question the mirror cannot answer is refused *by name*.

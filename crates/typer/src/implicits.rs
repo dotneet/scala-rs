@@ -2521,12 +2521,16 @@ impl Typer {
         let mut fits: Vec<(SymbolId, ImplicitFit)> = self
             .implicits_in_scope()
             .into_iter()
+            .filter(|id| !self.implicit_macros_disabled || self.st.get(*id).macro_impl.is_none())
             .filter_map(|id| self.implicit_fit_at(id, pt, depth, undet).map(|f| (id, f)))
             .collect();
         if fits.is_empty() {
             fits = self
                 .companion_implicits(pt)
                 .into_iter()
+                .filter(|id| {
+                    !self.implicit_macros_disabled || self.st.get(*id).macro_impl.is_none()
+                })
                 .filter_map(|id| self.implicit_fit_at(id, pt, depth, undet).map(|f| (id, f)))
                 .collect();
             fits.sort_by_key(|(id, _)| id.0);

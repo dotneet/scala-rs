@@ -2804,13 +2804,12 @@ coordinator hand-off rather than here.
    with parameters can round-trip through an actual macro invocation the way `val` now does.
 4. Free terms for a local or a parameter bound *outside* the reify body — unchanged from §7.17.
 
-### 7.20 Reverse RPC: `c.typecheck`, and a mirror over the current run's symbols (the `agent/macromirror` slice)
+### 7.20 Reverse RPC: `c.typecheck`, `c.inferImplicitValue`, and a mirror over the current run's symbols
 
 §7.18 named two pieces of work, in order, and said the first one is "a real mirror over the current
 run's symbols … *reverse RPC* from the engine to the typer … and it is also what `c.typecheck` and
 `c.inferImplicitValue` need, so it is one piece of work and not three". This slice built the channel
-and the first two things that travel on it. `c.inferImplicitValue` is still unimplemented, and
-`mapTo` is still refused — see "The premise this slice had to correct" below, which is the part of
+and the things that travel on it. `mapTo` is still refused — see "The premise this slice had to correct" below, which is the part of
 §7.18 that turned out not to hold.
 
 #### The channel
@@ -2909,6 +2908,20 @@ write — does not match. An implementation that catches it therefore decided wh
 something it was not told, so the expansion is **refused with that reason** rather than accepted.
 Closing this needs a generated `Context` class instead of a proxy, which is a much larger change than
 it sounds: it means writing all 72 members out by hand in Java, against a Scala interface.
+
+#### `c.inferImplicitValue`
+
+`c.inferImplicitValue(pt, silent, withMacrosDisabled, pos)` asks the Rust typer to run its real
+implicit search in the macro call site's live scope. A miss returns `EmptyTree`; a found witness is
+materialised and adapted exactly as an omitted implicit argument is. Speculative diagnostics are
+rolled back when `silent` is true. `withMacrosDisabled` is applied while candidate sets are built,
+including recursive searches, rather than removing a winner after the search has already run.
+
+The requested type wire preserves abstract-member identity and a stable singleton prefix:
+`Tracer.instance.Type` is sent as its `Tracer.Type` declaration plus the `Tracer.instance` prefix.
+Returned trees likewise rebuild compound type trees such as
+`Tracer.instance.Type with Tracer.Traced`, preserving the prefix while the expansion is typechecked
+at the call site. Unsupported result types are refused rather than widened to a class name.
 
 #### The mirror over the current run's symbols
 
@@ -3042,12 +3055,15 @@ accept before.
   each refused with a reason that names the missing capability. **Five of the seven are programs real
   scalac compiles and runs** (printing `Int(1) / Int(1) / Int(1) / caught / Bag`); scala-rs answers
   none of them. `mtc_unanswerable_questions_are_named` pins each refusal's wording.
+* `tests/fixtures/miv_impl.scala` + `miv_use.scala` — path-dependent and ordinary
+  `c.inferImplicitValue` queries plus a ZIO-shaped compound-type expansion. The implementation is
+  compiled once by real scalac; scala-rs and scalac then compile and execute the same use site, and
+  `infer_implicit_value_matches_real_scalac` requires identical output.
 
 #### What remains
 
-1. **`c.inferImplicitValue` / `c.inferImplicitView`**, the other half of what §7.18 said this channel
-   is for. The channel is built; implicit search already exists in `crates/typer/src/implicits.rs`;
-   what is missing is the query and the same all-or-nothing rule about what may be written back.
+1. **`c.inferImplicitView`**. It needs conversion search and a faithful representation of both
+   requested endpoint types; it is not an alias for `inferImplicitValue`.
 2. ~~**A tag descriptor that carries type arguments** (`Typer::tag_descriptor`).~~ Done in §7.21,
    where it turned out to be half a phantom: the tag it could not build for `c.Expr[ClassTag[R]]` is
    one **nsc never builds** (`Expr[Nothing](arg)(TypeTag.Nothing)`). gitbucket's 31 sites now stop
