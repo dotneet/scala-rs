@@ -373,6 +373,28 @@ fn hidden_selector_stays_hidden() {
     let _ = fs::remove_dir_all(&out);
 }
 
+#[test]
+fn unbraced_source3_hidden_selector() {
+    check_runs(
+        "imports_unbraced_hide",
+        &["imports_unbraced_hide"],
+        &["-Xsource:3"],
+    );
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let out = tmp_dir("unbraced_hide_bad");
+    let output = compile(&["imports_unbraced_hide_bad"], &jar, &out, &["-Xsource:3"]);
+    assert!(!output.status.success(), "hidden selector leaked");
+    assert!(diagnostics(&output).contains("not found: value Drop"));
+    let output = compile(&["imports_unbraced_hide"], &jar, &out, &[]);
+    assert!(
+        !output.status.success(),
+        "Scala 3 import accepted without source flag"
+    );
+    let _ = fs::remove_dir_all(out);
+}
+
 /// An import that names nothing is an error, not a silent no-op.
 #[test]
 fn unknown_selector_is_reported() {

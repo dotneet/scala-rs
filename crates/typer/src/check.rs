@@ -2877,7 +2877,7 @@ pub(crate) fn apply_context_bound(bound: Type, tp: SymbolId) -> Type {
         },
         // `U: BaseColumnType` where `BaseColumnType` is a *parameterized type
         // member* (or another type parameter) still means `BaseColumnType[U]`.
-        bound @ (Type::TypeMember(_) | Type::TypeParam(_)) => {
+        bound @ (Type::TypeMember(_) | Type::TypeParam(_) | Type::Applied { .. }) => {
             crate::symbol::apply_type_ctor(bound, vec![Type::TypeParam(tp)])
         }
         other => other,

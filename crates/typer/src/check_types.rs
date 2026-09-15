@@ -1050,22 +1050,12 @@ impl Typer {
     /// `NonEmptySetImpl.catsNonEmptySetOps` lives, so with the object gone
     /// every operation on a `NonEmptySet` was missing.
     ///
-    /// Only a *deferred* member, and only one the object does not declare
-    /// itself: a concrete alias carries its right-hand side already, and a
-    /// declaration of the object's own needs no prefix beyond `this`.
+    /// Inherited deferred members retain the selected object's prefix;
+    /// inherited concrete aliases expand their right-hand side at that object.
+    /// A declaration of the object's own needs no prefix beyond `this`.
     fn module_path_type_member(&mut self, qual: &Tree, id: SymbolId) -> Type {
         let plain = Type::TypeMember(id);
-        // A nullary alias is transparent even when completion had to retain a
-        // declaration symbol so a later dependent path can recover its owner.
-        // `lookup_qualified_type` sees that retained symbol on the receiver's
-        // inherited member walk before `qualified_pickled_type_member` gets a
-        // chance to return the expanded RHS. Preserve the source-level
-        // transparency here; otherwise `HtmlFormat.Appendable` is diagnosed
-        // as `Format.Appendable` after its first use.
-        if self.st.get(id).is_type_alias && self.st.get(id).tparams.is_empty() {
-            return self.st.type_member_as_seen(id);
-        }
-        if !self.st.is_deferred_type_member(id) || self.st.path_member_decl(id).is_some() {
+        if self.st.path_member_decl(id).is_some() {
             return plain;
         }
         let owner = self.st.get(id).owner;
@@ -1082,6 +1072,12 @@ impl Typer {
                 continue;
             }
             let prefix = Type::ModuleRef(mcls);
+            // An inherited alias can mention abstract members of its owner.
+            // Read its RHS at the selected object, where those members may
+            // be implemented (Family.Items = List[Elem], Ints.Elem = Int).
+            if !self.st.is_deferred_type_member(id) {
+                return self.st.expand_in_type(&prefix, &plain);
+            }
             return Type::TypeMember(self.st.path_member(&[o], id, &prefix));
         }
         plain

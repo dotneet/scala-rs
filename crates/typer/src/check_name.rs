@@ -550,9 +550,16 @@ impl Typer {
         if owner.is_none() || qual.sym.is_none() {
             return;
         }
+        // Implicit conversions reuse this receiver directly, without typing
+        // another Select. Resolve the whole path now so its package/object
+        // qualifiers carry symbols when the backend emits that conversion.
+        let mut prefix = qual.clone();
+        if prefix.ty.is_no_type() {
+            self.type_expr(&mut prefix, &Type::NoType);
+        }
         self.term_import_prefixes
             .retain(|(o, q)| !(*o == owner && path_display(q) == path_display(qual)));
-        self.term_import_prefixes.push((owner, qual.clone()));
+        self.term_import_prefixes.push((owner, prefix));
     }
 
     /// Whether an `import <a value>._` prefix can still be written here.

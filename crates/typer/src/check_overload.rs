@@ -3506,7 +3506,10 @@ impl Typer {
             }
             param_tys.push(p.ty.clone());
         }
-        self.type_expr(body, &ret_pt);
+        // The function body is a value expression, even when the function
+        // itself is being probed as a call argument. Its implicit-only
+        // methods must be instantiated before inferring the result type.
+        self.with_typing_call_args(false, |this| this.type_expr(body, &ret_pt));
         // A body with nothing expected of it is still a value: `x => add` is
         // nsc's "missing argument list" (eta-expanded under `-Xsource:3`).
         // With an expectation, `adapt` below applies the same rule.

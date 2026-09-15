@@ -28,6 +28,16 @@ impl Typer {
     /// is still the more useful type here (the argument of a following call can
     /// pin it), and nsc's own instantiation point is later than ours.
     pub(crate) fn instantiate_parameterless(&self, sym: SymbolId, ty: Type, pt: &Type) -> Type {
+        self.instantiate_parameterless_at(sym, ty, pt, None)
+    }
+
+    pub(crate) fn instantiate_parameterless_at(
+        &self,
+        sym: SymbolId,
+        ty: Type,
+        pt: &Type,
+        receiver: Option<&Type>,
+    ) -> Type {
         if sym.is_none() || pt.is_no_type() || pt.is_error() {
             return ty;
         }
@@ -64,6 +74,12 @@ impl Typer {
             } else {
                 s.bound_lo.clone().unwrap_or(Type::Nothing)
             };
+            // A bound such as toSet[B >: A] names the receiver's A.
+            // Returning that declaration parameter leaks it into the call.
+            let solved = receiver.map_or_else(
+                || solved.clone(),
+                |recv| self.st.subst_as_seen_from(recv, &solved),
+            );
             ty = crate::symbol::subst_tparams_slice(&[tp], &[solved], &ty);
         }
         ty

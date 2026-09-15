@@ -108,9 +108,16 @@ fn add_c_member(
         let p = if name == "collect" {
             partial_fn(st, &ta, &tb)
         } else {
-            // `flatMap`'s argument is `A => IterableOnce[B]`, but the erasure is
-            // `Function1`, so only the element type has to line up.
-            fn1(&ta, &tb)
+            let Some(iterable_once) = find_iface(st, "scala/collection/IterableOnce") else {
+                return;
+            };
+            fn1(
+                &ta,
+                &Type::Class {
+                    sym: iterable_once,
+                    args: vec![tb.clone()],
+                },
+            )
         };
         (p, tb)
     };

@@ -657,7 +657,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         set,
         "+=",
         vec![ta.clone()],
-        set_t.clone(),
+        Type::ThisType(set),
         Intrinsic::None,
     );
     method(
@@ -665,7 +665,7 @@ fn add_mutable_set(st: &mut SymbolTable, iterator_sym: SymbolId) -> SymbolId {
         set,
         "-=",
         vec![ta.clone()],
-        set_t.clone(),
+        Type::ThisType(set),
         Intrinsic::None,
     );
     method(

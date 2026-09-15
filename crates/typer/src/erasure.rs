@@ -28,6 +28,31 @@ pub fn erase(tree: &mut Tree, st: &mut SymbolTable) {
     erase_tree(tree, st, None);
 }
 
+/// Default getters are stored on symbols instead of in the compilation-unit
+/// tree. Erase value-class results there too, after all units' symbols have
+/// been erased, so a copy getter reads the underlying field representation.
+pub fn erase_value_class_default_getters(st: &mut SymbolTable) {
+    let getters: Vec<_> = st
+        .symbols
+        .iter()
+        .filter_map(|s| {
+            if !s.name.contains("$default$") || s.default_rhs.is_none() {
+                return None;
+            }
+            st.value_class_for_result(s.id).map(|class| (s.id, class))
+        })
+        .collect();
+    for (id, class) in getters {
+        let Some(mut rhs) = st.get_mut(id).default_rhs.take() else {
+            continue;
+        };
+        let ret = st.get(id).ty.result().clone();
+        erase_tree(&mut rhs, st, Some(&ret));
+        unbox_value_class_result(&mut rhs, class, &ret);
+        st.get_mut(id).default_rhs = Some(rhs);
+    }
+}
+
 fn value_class_lambda_params(tree: &Tree, st: &SymbolTable) -> Vec<(SymbolId, SymbolId)> {
     let mut out = Vec::new();
     collect_value_class_lambda_params(tree, st, &mut out);

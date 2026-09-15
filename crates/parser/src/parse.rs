@@ -713,7 +713,13 @@ impl<'a> Parser<'a> {
             if self.opts.source3 && matches!(self.kind(), TokenKind::Ident(s) if s == "as") {
                 self.bump();
                 self.skip_nl();
-                let (to, tsp) = self.expect_ident();
+                let (to, tsp) = if matches!(self.kind(), TokenKind::Underscore) {
+                    let sp = self.span();
+                    self.bump();
+                    ("_".into(), sp)
+                } else {
+                    self.expect_ident()
+                };
                 let qual = t.annotation_path();
                 self.note_specialization_alias(&qual, &name, &to);
                 t = self.alloc(
