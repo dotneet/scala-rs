@@ -1,6 +1,8 @@
 //! Aggregated CLI integration tests (alphabetical slice 8/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../compiledquery.rs"]
+mod compiledquery;
 #[path = "../protected_this.rs"]
 mod protected_this;
 #[path = "../stc.rs"]

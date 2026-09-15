@@ -2050,24 +2050,46 @@ impl Typer {
         span: Span,
         depth: usize,
     ) -> Tree {
-        if self
-            .building_implicits
-            .iter()
-            .any(|(prior, wanted)| *prior == id && crate::implicits::dominates(self, pt, wanted))
-        {
+        // Searches normally prepare detached instances before fitting a
+        // polymorphic derivation rule. A witness reached through a dependent
+        // result can be materialized after that warm-up, though; make sure
+        // its nested clauses get a distinct instance at the next depth
+        // instead of reusing the outer rule and tripping the recursion guard.
+        let origin = self
+            .implicit_instance_origins
+            .get(&id)
+            .copied()
+            .unwrap_or(id);
+        // Search already prepares the selected rule at the depth it is
+        // fitting. Materialization only needs that one detached identity;
+        // extending by MAX on every nested call made the instance vector grow
+        // again for each level of a recursive implicit.
+        self.prepare_implicit_instances(origin, depth.min(crate::implicits::MAX_IMPLICIT_DEPTH));
+        let effective_id = self
+            .implicit_instances
+            .get(&origin)
+            .and_then(|(_, instances)| instances.get(depth))
+            .copied()
+            .unwrap_or(id);
+        if self.building_implicits.iter().any(|(prior, wanted)| {
+            *prior == effective_id && crate::implicits::dominates(self, pt, wanted)
+        }) {
             self.error(
                 span,
                 format!(
                     "diverging implicit expansion starting with method {}",
-                    self.st.get(id).name
+                    self.st.get(effective_id).name
                 ),
             );
             let mut failed = Tree::dummy(TreeKind::Empty);
             failed.ty = Type::Error;
             return failed;
         }
-        self.building_implicits.push((id, pt.clone()));
-        let mut result = self.implicit_tree_in(id, pt, span, depth);
+        self.building_implicits.push((effective_id, pt.clone()));
+        // Detached instances exist only to give recursive searches fresh
+        // identities. Emit the original declaration so its owner still
+        // supplies the receiver/static access path during code generation.
+        let mut result = self.implicit_tree_in(origin, pt, span, depth);
         // Synthesized evidence does not pass through type_expr. Expand the
         // selected macro here, while the implicit recursion guard is active.
         self.expand_macro_application(&mut result);
@@ -2099,7 +2121,7 @@ impl Typer {
         // (`<:<.refl[A]` fitted to `Int <:< Any` gives `A = Int`), so the tree
         // carries the instantiated type rather than the declared `=:=[A, A]`.
         let targs = self
-            .implicit_fit_at(id, pt, 0, &[])
+            .implicit_fit_at(id, pt, depth, &[])
             .map(|f| f.targs)
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
@@ -2152,7 +2174,12 @@ impl Typer {
             for p in clause {
                 let want = inst(p);
                 self.warm_implicit_scope(&want);
-                match self.search_implicit(&want) {
+                // Keep the derivation depth while materializing the witness.
+                // Starting every clause at depth zero reuses the same
+                // `tuple2Shape` instance for a nested tuple and the
+                // recursion guard mistakes the inner, smaller shape for a
+                // non-shrinking expansion.
+                match self.search_implicit_at(&want, depth + 1) {
                     ImplicitSearch::Found(inner) => {
                         cargs.push(self.implicit_tree(inner, &want, span, depth + 1))
                     }
