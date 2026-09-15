@@ -50,6 +50,11 @@ fn source(name: &str) -> PathBuf {
     fixtures_dir().join(format!("{name}.scala"))
 }
 
+fn expected(name: &str) -> String {
+    fs::read_to_string(fixtures_dir().join("expected").join(format!("{name}.txt")))
+        .expect("read expected output")
+}
+
 fn compile_rs(name: &str, out: &Path, extra: &[&str]) -> Output {
     Command::new(bin())
         .args([
@@ -109,7 +114,7 @@ fn assert_run(out: &Path, jar: Option<&Path>) {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "outer-capture\nconstant\n"
+        expected("oc_outer_capture")
     );
 }
 
@@ -186,7 +191,7 @@ fn constructor_only_outer_capture_matches_scalac_runtime_and_abi() {
 }
 
 #[test]
-fn constructor_only_outer_capture_negative_is_rejected_by_both_compilers() {
+fn unresolved_initializer_reference_is_rejected_by_both_compilers() {
     let Some(jar) = scala_library() else {
         eprintln!("skip outer-capture negative: scala-library is unavailable");
         return;
