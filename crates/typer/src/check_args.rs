@@ -2061,9 +2061,23 @@ impl Typer {
     }
 
     fn implicit_tree_in(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
-        let (paramss, ret) = match self.implicit_candidate_ty(id).into_owned() {
+        let reference = self.ref_implicit_with_receiver(id, span);
+        // An imported member of an inner object can carry an as-seen-from
+        // view whose prefix is the stable object path. Preserve that view
+        // while instantiating the method; ordinary implicit methods continue
+        // to use the declaration-side candidate type.
+        let has_stable_view = crate::symbol::any_type(&reference.ty, &mut |nested| {
+            crate::prefix::view_prefix(nested)
+                .is_some_and(|prefix| !matches!(prefix, Type::ThisType(_)))
+        });
+        let candidate_ty = if has_stable_view {
+            reference.ty.clone()
+        } else {
+            self.implicit_candidate_ty(id).into_owned()
+        };
+        let (paramss, ret) = match candidate_ty {
             Type::Method { paramss, ret } => (paramss, (*ret).clone()),
-            _ => return self.ref_implicit_with_receiver(id, span),
+            _ => return reference,
         };
         let tps = self.st.get(id).tparams.clone();
         // The solved type arguments of a polymorphic implicit
@@ -2074,7 +2088,7 @@ impl Typer {
             .map(|f| f.targs)
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
-        let mut reference = self.ref_implicit_with_receiver(id, span);
+        let mut reference = reference;
         if self.st.get(id).macro_impl.is_some() && !targs.is_empty() {
             let args = targs
                 .iter()

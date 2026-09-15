@@ -626,6 +626,76 @@ fn slick_option_shapes_resolve_through_its_published_jar() {
     }
 }
 
+/// Keep the recursive-implicit termination relation independent of Slick's
+/// names. These fixtures are accepted by both scala-rs and scalac: a
+/// contravariant input may shrink while the result, or another input,
+/// grows. The open stack compares every earlier vector, so a later
+/// componentwise non-decreasing target is still rejected as a cycle.
+fn assert_product_order_fixture(name: &str) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip {name}: scala-library jar not present");
+        return;
+    };
+    let (ok, msgs, out) = compile(name, &["--scala-library", jar.to_str().unwrap()]);
+    assert!(ok, "{name} failed to compile with scala-rs:\n{msgs}");
+    assert!(
+        !msgs.contains("error:"),
+        "unexpected diagnostics for {name}:\n{msgs}"
+    );
+    let _ = fs::remove_dir_all(&out);
+    if let Some(scalac) = real_scalac() {
+        let (ok, msgs) = scalac_run(scalac.as_path(), name, None);
+        assert!(ok, "{name} failed to compile with real scalac:\n{msgs}");
+    }
+}
+
+/// A recursive rule from one inner-class instance must not be made to answer
+/// a wanted type selected from another stable instance. Both compilers reject
+/// this probe; in particular, scala-rs must terminate while the missing tail
+/// evidence is searched instead of erasing the prefixes and looping.
+fn assert_product_order_rejected(name: &str) {
+    let Some(jar) = scala_library_jar() else {
+        eprintln!("skip {name}: scala-library jar not present");
+        return;
+    };
+    let (ok, msgs, out) = compile(name, &["--scala-library", jar.to_str().unwrap()]);
+    assert!(!ok, "{name} unexpectedly compiled with scala-rs:\n{msgs}");
+    assert!(
+        !msgs.contains("diverging implicit expansion"),
+        "{name} should terminate as an ordinary missing implicit:\n{msgs}"
+    );
+    let _ = fs::remove_dir_all(&out);
+    if let Some(scalac) = real_scalac() {
+        let (ok, msgs) = scalac_run(scalac.as_path(), name, None);
+        assert!(!ok, "real scalac accepted {name}:\n{msgs}");
+    }
+}
+
+#[test]
+fn recursive_product_order_accepts_concrete_result_growth() {
+    assert_product_order_fixture("si_shape_product_concrete");
+}
+
+#[test]
+fn recursive_product_order_ignores_rigid_tag_parameters() {
+    assert_product_order_fixture("si_shape_product_rigid_tag");
+}
+
+#[test]
+fn recursive_product_order_accepts_multiple_contravariant_inputs() {
+    assert_product_order_fixture("si_shape_product_multi");
+}
+
+#[test]
+fn path_dependent_product_order_preserves_stable_prefixes() {
+    assert_product_order_fixture("si_shape_product_path");
+}
+
+#[test]
+fn path_dependent_product_order_rejects_a_distinct_prefix() {
+    assert_product_order_rejected("si_shape_product_distinct_prefix");
+}
+
 /// `AbstractTable.foreignKey` has three source clauses. Its default action
 /// getters take the preceding clause arguments but not the earlier parameters
 /// in the same clause, while the final clause is implicit. Both details are

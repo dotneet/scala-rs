@@ -20,7 +20,12 @@
 //! Two cut-offs bound that: [`MAX_IMPLICIT_DEPTH`], and nsc's diverging
 //! implicit expansion — re-entering the same implicit for a target with the
 //! same head symbol and no smaller complexity
-//! (`implicit def loop[A](implicit a: A): A`).
+//! (`implicit def loop[A](implicit a: A): A`).  A result constructor with a
+//! declared contravariant input may make progress on that input while another
+//! argument grows; [`dominates`] tracks that product-order measure against
+//! every entry in the open stack. [`MAX_IMPLICIT_DEPTH`] caps paths without
+//! proven structural progress; shrinking paths terminate by the stack-wide
+//! product-order check instead.
 
 use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_span::Span;
@@ -335,10 +340,120 @@ fn head_sym(typer: &Typer, ty: &Type) -> Option<SymbolId> {
     }
 }
 
+/// The class application under an optional as-seen-from prefix view. Inner
+/// classes use `Type::Refined` to retain the stable receiver that selects the
+/// class; dropping that receiver would make `a.Driver` and `b.Driver` look
+/// like the same recursive target.
+fn class_application<'a>(ty: &'a Type) -> Option<(Option<&'a Type>, SymbolId, &'a [Type])> {
+    let (prefix, core) = match ty {
+        Type::Refined { .. } if crate::prefix::view_prefix(ty).is_some() => (
+            crate::prefix::view_prefix(ty),
+            crate::prefix::strip_view(ty),
+        ),
+        _ => (None, ty),
+    };
+    let Type::Class { sym, args } = core else {
+        return None;
+    };
+    Some((prefix, *sym, args))
+}
+
+fn prefixes_certainly_differ(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
+    match (
+        crate::prefix::view_prefix(new_pt),
+        crate::prefix::view_prefix(open_pt),
+    ) {
+        (Some(new_prefix), Some(old_prefix)) => {
+            typer.st.prefixes_certainly_differ(new_prefix, old_prefix)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a same-head recursive step makes progress on a declared input.
+///
+/// The input measure is a vector because a generic constructor may have more
+/// than one contravariant parameter.  A step is admitted when it is not
+/// componentwise non-decreasing: at least one input complexity must shrink.
+/// Other inputs may grow because the rule can consume one independent input
+/// while constructing another.  This pairwise relation is not well-founded
+/// by itself; [`Typer::implicit_diverges`] compares every open stack entry, so
+/// an earlier vector that is componentwise below a later one still cuts the
+/// expansion off (Dickson's lemma).
+fn contravariant_driver_shrinks(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
+    let Some((new_prefix, new_sym, new_args)) = class_application(new_pt) else {
+        return false;
+    };
+    let Some((old_prefix, old_sym, old_args)) = class_application(open_pt) else {
+        return false;
+    };
+    if new_sym != old_sym || new_args.len() != old_args.len() {
+        return false;
+    }
+    if new_prefix
+        .zip(old_prefix)
+        .is_some_and(|(new, old)| typer.st.prefixes_certainly_differ(new, old))
+    {
+        return false;
+    }
+    let tparams = typer.st.get(new_sym).tparams.clone();
+    if new_args.len() != tparams.len() {
+        return false;
+    }
+    let (new_driver, old_driver): (Vec<_>, Vec<_>) = new_args
+        .iter()
+        .zip(old_args)
+        .enumerate()
+        .filter(|(i, _)| {
+            typer
+                .st
+                .get(tparams[*i])
+                .flags
+                .contains(Flags::CONTRAVARIANT)
+        })
+        .map(|(_, (new_arg, old_arg))| (complexity(new_arg), complexity(old_arg)))
+        .unzip();
+    new_driver
+        .iter()
+        .zip(old_driver)
+        .any(|(new, old)| new < &old)
+}
+
 /// nsc `Types#dominates`: same head symbol and no simpler than the open one.
+/// A declared contravariant input may provide a product-order progress measure
+/// for a recursive rule whose other output or input slot grows. The caller
+/// checks every open-stack entry, which prevents incomparable local steps from
+/// making the search unbounded.
 pub(crate) fn dominates(typer: &Typer, new_pt: &Type, open_pt: &Type) -> bool {
     match (head_sym(typer, new_pt), head_sym(typer, open_pt)) {
-        (Some(a), Some(b)) => a == b && complexity(new_pt) >= complexity(open_pt),
+        (Some(a), Some(b)) => {
+            if a != b {
+                return false;
+            }
+            if prefixes_certainly_differ(typer, new_pt, open_pt) {
+                return false;
+            }
+            // Derivation rules can introduce a packed/output projection while
+            // recursing into a structurally smaller input.  Slick's nested
+            // `optionShape` is the canonical case: `Rep[Option[Option[A]]]`
+            // becomes `Rep[Option[A]]`, while the packed side grows from an
+            // open wildcard to `Rep[P]`.  Counting the whole target therefore
+            // reports divergence even though the input that drives the rule
+            // is shrinking. Compare the declared contravariant arguments as
+            // a product-order progress check. A packed projection can consume
+            // exactly the complexity one input releases, and another input
+            // may grow at the same time. The all-history check in
+            // `implicit_diverges` keeps that relation terminating: a prior
+            // vector componentwise below a later one is still divergent.
+            // An unchanged target (the usual `loop[A] (implicit loop: F[A]):
+            // F[A]`) remains divergent.
+            let driver_shrinks = contravariant_driver_shrinks(typer, new_pt, open_pt);
+            match complexity(new_pt).cmp(&complexity(open_pt)) {
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Greater => !driver_shrinks,
+                std::cmp::Ordering::Equal => !driver_shrinks,
+            }
+        }
         // A bare type parameter target (`implicit def loop[A](implicit a: A): A`)
         // has no head symbol; fall back to plain complexity.
         _ => complexity(new_pt) >= complexity(open_pt),
@@ -1275,15 +1390,15 @@ impl Typer {
                     .open_implicits
                     .borrow()
                     .iter()
-                    .rev()
-                    .find(|(prior, _)| {
+                    .any(|(prior, previous)| {
                         self.implicit_instance_origins
                             .get(prior)
                             .copied()
                             .unwrap_or(*prior)
                             == origin
-                    })
-                    .is_some_and(|(_, previous)| complexity(pt) < complexity(previous));
+                            && (complexity(pt) < complexity(previous)
+                                || contravariant_driver_shrinks(self, pt, previous))
+                    });
                 if depth >= MAX_IMPLICIT_DEPTH && !shrinking {
                     // The enclosing memo entry was decided by the depth limit,
                     // so it does not travel to a shallower search.
@@ -1368,9 +1483,11 @@ impl Typer {
                 && self.st.companion_module(*sym).is_some())
     }
 
-    /// nsc's "diverging implicit expansion": the same implicit is already being
-    /// expanded for a target with the same head symbol and no smaller
-    /// complexity (`implicit def loop[A](implicit a: A): A`).
+    /// nsc's "diverging implicit expansion": the same implicit is already
+    /// being expanded for a target with the same head symbol and no smaller
+    /// complexity (`implicit def loop[A](implicit a: A): A`). The complete
+    /// open stack is checked so a prior product-order vector cannot be skipped
+    /// by an incomparable intermediate step.
     fn implicit_diverges(&self, id: SymbolId, pt: &Type) -> bool {
         let id = self
             .implicit_instance_origins
@@ -4326,7 +4443,7 @@ impl Typer {
 
     pub(crate) fn ref_implicit(&self, id: SymbolId, span: Span) -> Tree {
         let cand_ty = self.implicit_candidate_ty(id);
-        let ty = match &*cand_ty {
+        let mut ty = match &*cand_ty {
             Type::Method { paramss, ret }
                 if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()) =>
             {
@@ -4348,11 +4465,56 @@ impl Typer {
             byname_type_marker: false,
         };
         if let Some(prefix) = self.instance_object_import_prefix(id) {
+            // A member declared in an inner object carries its declaration
+            // receiver (`Scope.this.Driver`). When the object was imported
+            // through a stable value (`import scope.Driver._`), select the
+            // member as seen from that value so the synthesized tree retains
+            // the same path-dependent type as the wanted evidence.
+            let member_owner = self.st.get(id).owner;
+            let outer_class = if !member_owner.is_none()
+                && self.st.get(member_owner).kind == SymKind::ModuleClass
+            {
+                self.st.get(member_owner).owner
+            } else {
+                SymbolId::NONE
+            };
+            let outer_prefix = self
+                .singleton_prefix_of(&prefix)
+                .and_then(|qpre| match qpre {
+                    Type::SingleType { prefix, sym }
+                        if self.st.get(sym).kind == SymKind::ModuleClass
+                            && self.st.get(sym).owner == outer_class =>
+                    {
+                        Some(*prefix)
+                    }
+                    _ => None,
+                });
+            let has_inner_view = crate::symbol::any_type(&ty, &mut |nested| {
+                let Some(Type::ThisType(view_owner)) = crate::prefix::view_prefix(nested) else {
+                    return false;
+                };
+                *view_owner == outer_class
+                    && matches!(
+                        crate::prefix::strip_view(nested),
+                        Type::Class { sym, .. } if self.st.is_inner_class_of_class(*sym)
+                    )
+            });
+            if has_inner_view {
+                if let Some(outer_prefix) = outer_prefix {
+                    let receiver = self.st.widen_prefix(&outer_prefix);
+                    if self.st.class_sym_of(&receiver) == Some(outer_class) {
+                        ty = self
+                            .st
+                            .subst_as_seen_from_at(&receiver, Some(&outer_prefix), &ty);
+                    }
+                }
+            }
             return Tree {
                 kind: TreeKind::Select {
                     qual: Box::new(prefix),
                     name,
                 },
+                ty,
                 ..ident
             };
         }
@@ -4718,6 +4880,148 @@ mod memo_tests {
         assert!(!dominates(&typer, &tail, &full));
         assert!(dominates(&typer, &full, &full));
         assert!(dominates(&typer, &full, &tail));
+    }
+
+    #[test]
+    fn recursive_shape_relaxation_requires_a_contravariant_input() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let shape = typer
+            .st
+            .alloc("Shape", root, SymKind::Class, Flags::EMPTY, "Shape");
+        let level = typer
+            .st
+            .alloc("Level", shape, SymKind::TypeParam, Flags::EMPTY, "Level");
+        let mixed = typer.st.alloc(
+            "Mixed",
+            shape,
+            SymKind::TypeParam,
+            Flags::CONTRAVARIANT,
+            "Mixed",
+        );
+        let unpacked = typer.st.alloc(
+            "Unpacked",
+            shape,
+            SymKind::TypeParam,
+            Flags::EMPTY,
+            "Unpacked",
+        );
+        let packed = typer.st.alloc(
+            "Packed",
+            shape,
+            SymKind::TypeParam,
+            Flags::COVARIANT,
+            "Packed",
+        );
+        typer.st.get_mut(shape).tparams = vec![level, mixed, unpacked, packed];
+        let large = Type::Class {
+            sym: shape,
+            args: vec![Type::Int, Type::Int, Type::Int, Type::Int],
+        };
+        let shape_ty = |mixed_arg: Type, unpacked_arg: Type, packed_arg: Type| Type::Class {
+            sym: shape,
+            args: vec![Type::Int, mixed_arg, unpacked_arg, packed_arg],
+        };
+
+        // The mixed/source argument shrinks while the packed projection grows
+        // by the same amount.  This is the recursive Option Shape case.
+        let open = shape_ty(large.clone(), Type::Int, Type::Int);
+        let shrinking_input = shape_ty(Type::Int, Type::Int, large.clone());
+        assert!(!dominates(&typer, &shrinking_input, &open));
+
+        // A decrease in an invariant or covariant slot is not an input
+        // decrease and must retain the ordinary complexity guard.
+        let covariant_open = shape_ty(Type::Int, Type::Int, large.clone());
+        let covariant_only = shape_ty(Type::Int, large.clone(), Type::Int);
+        assert!(dominates(&typer, &covariant_only, &covariant_open));
+        let invariant_open = shape_ty(Type::Int, large.clone(), Type::Int);
+        let invariant_only = shape_ty(Type::Int, Type::Int, large.clone());
+        assert!(dominates(&typer, &invariant_only, &invariant_open));
+
+        // An unchanged recursive target remains a divergence.
+        assert!(dominates(&typer, &open, &open));
+
+        // The rule is structural rather than tied to Slick's `Shape` name:
+        // the same source/input-versus-result/output pattern is valid for a
+        // completely unrelated generic constructor.
+        let driver = typer
+            .st
+            .alloc("Driver", root, SymKind::Class, Flags::EMPTY, "Driver");
+        let driver_input = typer.st.alloc(
+            "Input",
+            driver,
+            SymKind::TypeParam,
+            Flags::CONTRAVARIANT,
+            "Input",
+        );
+        let driver_output = typer.st.alloc(
+            "Output",
+            driver,
+            SymKind::TypeParam,
+            Flags::COVARIANT,
+            "Output",
+        );
+        typer.st.get_mut(driver).tparams = vec![driver_input, driver_output];
+        let driver_ty = |input: Type, output: Type| Type::Class {
+            sym: driver,
+            args: vec![input, output],
+        };
+        let driver_open = driver_ty(large.clone(), Type::Int);
+        let driver_balanced = driver_ty(Type::Int, large.clone());
+        assert!(!dominates(&typer, &driver_balanced, &driver_open));
+
+        // A strictly larger result can still be a valid step when a declared
+        // input shrinks. The stack-wide product-order check, rather than an
+        // open-hole test, is what keeps this concrete case sound.
+        let larger = Type::Tuple(vec![large.clone(), large.clone()]);
+        let driver_grows = driver_ty(Type::Int, larger.clone());
+        assert!(!dominates(&typer, &driver_grows, &driver_open));
+
+        // A later target that grows without shrinking any declared input is
+        // still a cycle against the original target, even after an
+        // incomparable intermediate step was admitted.
+        let driver_cycle = driver_ty(large.clone(), Type::Tuple(vec![large.clone()]));
+        assert!(dominates(&typer, &driver_cycle, &driver_open));
+
+        // With two contravariant inputs, aggregate complexity is too strict:
+        // one input may shrink while the other grows. The coordinate-wise
+        // relation admits that step, then rejects a later non-decreasing one.
+        let multi = typer
+            .st
+            .alloc("Multi", root, SymKind::Class, Flags::EMPTY, "Multi");
+        let left = typer.st.alloc(
+            "Left",
+            multi,
+            SymKind::TypeParam,
+            Flags::CONTRAVARIANT,
+            "Left",
+        );
+        let right = typer.st.alloc(
+            "Right",
+            multi,
+            SymKind::TypeParam,
+            Flags::CONTRAVARIANT,
+            "Right",
+        );
+        typer.st.get_mut(multi).tparams = vec![left, right];
+        let multi_ty = |left: Type, right: Type| Type::Class {
+            sym: multi,
+            args: vec![left, right],
+        };
+        let multi_open = multi_ty(large.clone(), Type::Int);
+        let multi_incomparable = multi_ty(Type::Int, large.clone());
+        assert!(!dominates(&typer, &multi_incomparable, &multi_open));
+        let multi_cycle = multi_ty(large.clone(), larger);
+        assert!(dominates(&typer, &multi_cycle, &multi_open));
+
+        // The latest stack entry may be incomparable with a new target, but
+        // an older componentwise predecessor must still stop the search.
+        typer
+            .open_implicits
+            .borrow_mut()
+            .extend([(multi, multi_open.clone()), (multi, multi_incomparable)]);
+        assert!(typer.implicit_diverges(multi, &multi_open));
+        typer.open_implicits.borrow_mut().clear();
     }
 
     #[test]
