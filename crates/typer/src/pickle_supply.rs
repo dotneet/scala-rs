@@ -760,13 +760,14 @@ impl PickleSupply {
     ///
     /// Deliberately narrow, in three ways, and each one was measured.
     ///
-    /// * A name is only *considered* when the class file has a member of it
-    ///   with **at least two parameters in one clause**. Splitting a parameter
-    ///   list is the one thing a class file cannot express, and every split
-    ///   form covered by this cleanup has two or more parameters. A unary
-    ///   `()(implicit x)` is intentionally left alone: it is ambiguous with
-    ///   an ordinary unary method, and scanning all such names regresses
-    ///   unrelated library methods (the Scalatest matcher DSL is the guard).
+    /// * A name is considered when the class file has a member with at least
+    ///   one parameter, or a nullary member whose inherited pickled
+    ///   declaration may carry a more precise result type. Splitting a
+    ///   parameter list is the one thing a class file cannot express, and a
+    ///   unary `()(implicit x)` is otherwise ambiguous with an ordinary unary
+    ///   method. The sole-implicit gate below keeps those ordinary methods
+    ///   intact; nullary methods are admitted only when the pickled
+    ///   replacement demonstrably carries generic result information.
     /// * The replacement has to have **more than one clause or an implicit
     ///   clause**, and then **every** class-file member of that name whose
     ///   total parameter count the replacement also has is dropped, not just
@@ -829,6 +830,7 @@ impl PickleSupply {
         if synchronous_action_parent && has_combinator_pair {
             return;
         }
+        let value_class_forwarder = st.is_value_class(class_sym);
         let mut names: Vec<String> = Vec::new();
         for &m in &st.get(class_sym).members {
             let s = st.get(m);
@@ -841,7 +843,7 @@ impl PickleSupply {
             if s.kind != SymKind::Method
                 || s.flags.contains(Flags::STATIC)
                 || s.paramss.len() > 1
-                || s.params.len() < 2
+                || (s.params.len() < 2 && !value_class_forwarder)
                 || s.name.contains('$')
                 || own.contains(&s.name)
                 || names.contains(&s.name)
@@ -872,6 +874,11 @@ impl PickleSupply {
             // particular, do not let an unrelated multi-clause overload of
             // the same name authorize removal of an ordinary unary method
             // (`TransactionTest.flatMap` is the regression guard).
+            // A one-parameter forwarder is only ambiguous outside a value
+            // class: ordinary classes and module classes commonly have
+            // genuine one-argument methods beside inherited declarations.
+            // Value-class forwarders are the erased bridge that this cleanup
+            // is intended to repair (Slick's `sign` is one).
             let has_unary_flat = flat.iter().any(|(_, arity)| *arity == 1);
             if !installed.iter().any(|&i| {
                 let symbol = st.get(i);
@@ -880,10 +887,34 @@ impl PickleSupply {
                     && symbol.paramss[0]
                         .iter()
                         .all(|p| st.get(*p).flags.contains(Flags::IMPLICIT));
-                if has_unary_flat {
-                    sole_implicit
+                let richer_nullary = if value_class_forwarder
+                    && flat.iter().any(|(_, arity)| *arity == 0)
+                    && symbol.params.is_empty()
+                    && !symbol.pickled_origin.is_empty()
+                {
+                    let pickled_ret = match &symbol.ty {
+                        Type::Method { ret, .. } => ret.as_ref(),
+                        _ => return false,
+                    };
+                    let raw_is_erased = flat.iter().any(|(raw, arity)| {
+                        *arity == 0
+                            && match &st.get(*raw).ty {
+                                Type::Method { ret, .. } => matches!(
+                                    ret.as_ref(),
+                                    Type::Class { args, .. } if args.is_empty()
+                                ),
+                                _ => false,
+                            }
+                    });
+                    raw_is_erased
+                        && matches!(pickled_ret, Type::Class { args, .. } if !args.is_empty())
                 } else {
-                    symbol.paramss.len() > 1 || sole_implicit
+                    false
+                };
+                if has_unary_flat {
+                    value_class_forwarder && sole_implicit
+                } else {
+                    symbol.paramss.len() > 1 || sole_implicit || richer_nullary
                 }
             }) {
                 continue;
