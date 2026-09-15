@@ -187,7 +187,66 @@ workspace 3,436件は成功したが、全体の判定は `VERDICT=FAIL` だっ�
 | Scala 標準ライブラリ | `TailCalls.scala:63` の1エラー。今回増えた List / Queue の3エラーは修正済み |
 | GitBucket | Twirl の `xml/feed.template.scala:11` で `Format[Html]` と `XmlFormat` の不一致 |
 | Slick 実行 | 12件中10件成功。2件は `Take.withInferredType(Map, boolean): Node` の `AbstractMethodError` |
-| Cats 実行 | `Monoids` の `NonEmptySetOps.contains` で JVM の `VerifyError`。修正前ゲートは他の8件成功 |
+| Cats 実行 | `Monoids` の `NonEmptySetOps.contains` で JVM の `VerifyError`。`07e69831` のゲートは他の8件成功 |
 
 検証には JDK 17 を使用し、コーパスは fixture manifest が固定する Scala
 2.13.16 の5,324件を使用した。既存の失敗を隠すための基準値変更は行っていない。
+
+
+## main の更新との統合（2026-09-16）
+
+検証中に origin/main が `25a5d270` へ進んだため、`2416ef99` と統合して
+`639a2e1c` を作成した。両方のコミットを保持し、次の相互作用を修正した。
+
+- Float の拡張メソッドでは、Double に拡大する暗黙変換より Float を受ける
+  変換を優先する。`isNaN` の正常系を公式 scalac と比較した。
+- バイナリ型の別名 `Out = M[E]` を読み出す際、所有者の型引数を代入する。
+  継承した `ToList` の正常系・異常系を公式 scalac と比較した。
+- バイナリメソッドの記述子選択でも既存の型消去処理を使う。
+  `Array[A <: Int]` は Object、`Array[Int]` は int[] に消去される。
+  既存の erascg 相互呼び出しテスト12件が成功した。
+
+統合後も refined の未改変45ソースから360クラスを生成し、利用側の smoke test
+が両コンパイラで成功した。全35テストソースを公式 scalac で再コンパイルすると
+エラー・警告0件で、生成JARを使う `coreJVM/test` は528件成功、失敗・エラー0件。
+一方、テストまで scala-rs でコンパイルする場合は1,007件の診断が残る。
+
+統合前の `2416ef99` は workspace 3,440件成功、Clippy は既存117警告で新規警告0件。
+統合版 `639a2e1c` の全体ゲートは `DONE` まで完了し、`VERDICT=FAIL` だった。
+workspace は3,462件中3,446件成功・16件失敗だった。
+
+このうち統合で増えた3件（`mapto2::mt2_reference_targs_expand_and_run`、
+`typeidentitybatch::macro_bindings_round_trip_without_selecting_inherited_fallback`、
+`gbmapto::source_type_arguments_and_weak_parameters_match_scalac`）は `ed6b9d4f` で修正した。
+`c.WeakTypeTag[R]` の明示的な引数を、型別名自身のパラメーターで置き換えていた。
+引数のある型射影は通常の引数代入処理へ渡す。3件とも再実行で成功した。
+型・マクロ関連5モジュールの再実行は66件成功、既存の1件失敗だった。
+
+残る13件は、取り込んだ `25a5d270` 単独でも同じ失敗または出力不一致を確認した。
+テストの削除・期待値の緩和は行っていない。
+
+| 領域 | リモート main でも再現した workspace の失敗 |
+|---|---|
+| 依存型・型推論 | `compiledquery` 1件、`fs2_io` 1件、`memberbatch` 1件 |
+| コンストラクター既定引数 | `mismatch10` 2件、`verify_sql` 1件 |
+| マクロ診断 | `mapto2` 1件、`gbmac` 1件 |
+| 数値・文字範囲 | typer 1件、`lsurf` 1件、`e2e` 3件 |
+
+統合版の全コーパス5,324件は、pos 1,276 / 1,859、neg 809 / 1,405、
+run 1,043 / 2,060が成功した。`2416ef99` 比で24件改善、1件悪化。
+悪化した `run/array-charSeq` は `25a5d270` でも同じエラーで失敗した。
+古い基準 `ff08907d` との比較では10件の失敗が残るため、基準は更新していない。
+
+Slick 本体184ソースと Cats 本体340ソースはコンパイルエラー0件。
+GitBucket は `Regex.Match` と Twirl の2エラーで、`25a5d270` 単独と同じ。
+Cats 実行は9件中2件成功・7件失敗で、こちらも `25a5d270` 単独と同じ。
+Slick 実行の2件の既知の失敗と、標準ライブラリの `TailCalls` 1エラーも残る。
+
+`ed6b9d4f` で refined の45ソースと利用側を再検証し、成功した。
+生成JARの全エントリは統合版の528件成功時のJARとバイト単位で一致する。
+Clippy の120警告は `25a5d270` と同じで新規警告0件。
+全体ゲート成功や、全テストを scala-rs で生成できたことは主張しない。
+
+最後の型引数修正後、`qualifier_retry` / `reify2` / `erascg` の27件も成功した。
+関連するマクロ・reify・ToolBox のコーパス343件を再実行し、全体ゲート時点と
+全件の状態が一致した（新たな悪化0件）。全体ゲート自体の再実行結果とは区別する。

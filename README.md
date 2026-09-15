@@ -62,7 +62,7 @@ Use `scala-rs --help` for all compiler options.
 refined の Scala 2.13 `coreJVM` は、未改変の45ソースをコンパイルし、生成した
 ライブラリに対して公式 scalac で全テストを再コンパイルし、528件の成功を確認しています。
 テスト自体の scala-rs コンパイルには未対応部分が残ります。対象リビジョン、対応範囲、
-再現手順は [refined のビルド確認](docs/refined.md) を参照してください。
+再現手順は [refined のビルド確認](docs/refined.md) を参照してください。 main との統合後の検証結果と既存の失敗も同ページに記録しています。
 同ページに、push 前の互換性検証と変更前から残る失敗も記録しています。
 
 ## Testing
