@@ -131,7 +131,12 @@ pub(crate) fn macro_targ_of_type(
         // A class with no type arguments of its own, and the primitives. nsc
         // takes the written type's *symbol* and then that symbol's own type,
         // which for these is the same type back again.
-        Type::Class { args, .. } if args.is_empty() => MacroTarg::Fixed(ty.clone()),
+        Type::Class { sym, .. } => MacroTarg::Fixed(st.type_of_class(*sym)),
+        Type::TypeMember(id) if st.get(*id).is_type_alias => {
+            if let Type::Class { sym, .. } = &st.get(*id).ty {
+                MacroTarg::Fixed(st.type_of_class(*sym))
+            } else { MacroTarg::Unresolved(st.display_type(ty)) }
+        }
         Type::Unit
         | Type::Boolean
         | Type::Byte
@@ -301,6 +306,7 @@ impl Typer {
         // call site is refused before boxity can matter.
         if (impl_class.as_str(), name.as_str()) == PLACEHOLDER_IMPL {
             return Some(MacroBinding {
+            is_bundle: false,
                 pickle: Some(MacroPickle {
                     signature: Vec::new(),
                     targs: Vec::new(),
@@ -331,6 +337,7 @@ impl Typer {
         let tag_params = self.macro_impl_tag_params(sym);
         let pickle = self.macro_pickle_binding(sym, def_sym, &ref_targs, span)?;
         Some(MacroBinding {
+            is_bundle: false,
             pickle: Some(pickle),
             impl_class,
             impl_method: name,

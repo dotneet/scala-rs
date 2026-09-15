@@ -187,24 +187,31 @@ impl Typer {
         }
         let s = self.st.get(sym).clone();
         if s.kind == SymKind::TypeParam {
-            if !s.tparams.is_empty() {
-                return Err(
-                    "higher-kinded source type parameter mirror is not implemented".to_string(),
-                );
-            }
             let lo = self.type_to_wire(s.bound_lo.as_ref().unwrap_or(&Type::Nothing))?;
             let hi = self.type_to_wire(s.bound_hi.as_ref().unwrap_or(&Type::Any))?;
-            return Ok(format!("(bounds {lo} {hi})"));
+            let bounds = format!("(bounds {lo} {hi})");
+            return Ok(if s.tparams.is_empty() { bounds } else {
+                format!("(poly (params {}) {bounds})", s.tparams.iter().map(|p| p.0.to_string()).collect::<Vec<_>>().join(" "))
+            });
         }
         if s.is_class_like() {
             return self.mirror_class_info(sym);
         }
-        if !s.tparams.is_empty() {
-            return Err(format!(
-                "mirror info for polymorphic symbol {} is not implemented",
-                s.name
-            ));
+        if s.kind == SymKind::TypeMember {
+            let info = if s.is_type_alias {
+                self.type_to_wire(&s.ty)?
+            } else {
+                format!("(bounds {} {})", self.type_to_wire(s.bound_lo.as_ref().unwrap_or(&Type::Nothing))?, self.type_to_wire(s.bound_hi.as_ref().unwrap_or(&Type::Any))?)
+            };
+            return Ok(if s.tparams.is_empty() { info } else {
+                format!("(poly (params {}) {info})", s.tparams.iter().map(|p| p.0.to_string()).collect::<Vec<_>>().join(" "))
+            });
         }
+        let polymorphic = |info: String| {
+            if s.tparams.is_empty() { info } else {
+                format!("(poly (params {}) {info})", s.tparams.iter().map(|p| p.0.to_string()).collect::<Vec<_>>().join(" "))
+            }
+        };
         let ty = s.ty;
         if ty.is_no_type() {
             return Err(format!("recursive value {} needs type", s.name));
@@ -238,7 +245,7 @@ impl Typer {
                 info = format!("(annot \"scala.annotation.unchecked.uncheckedVariance\" {info})");
             }
             if paramss.is_empty() {
-                return Ok(format!("(nullary {info})"));
+                return Ok(polymorphic(format!("(nullary {info})")));
             }
             if s.params.len() != paramss.iter().map(Vec::len).sum::<usize>() {
                 return Err(format!(
@@ -279,7 +286,7 @@ impl Typer {
                 info = format!("(method (params {}) {info})", args.join(" "));
                 end = start;
             }
-            return Ok(info);
+            return Ok(polymorphic(info));
         }
         self.type_to_wire(&ty)
     }
@@ -502,7 +509,7 @@ impl Typer {
     /// exact pickled symbol. Sending its printed prefix (`x.T`) would require
     /// the implementation's `x` to be in the call site's lexical scope,
     /// which it is not -- ZIO's `Tracer.instance.Type` is the concrete case.
-    fn query_type_from_wire(
+    pub(crate) fn query_type_from_wire(
         &mut self,
         wire: &Sexp,
         span: scala_rs_span::Span,
@@ -515,7 +522,7 @@ impl Typer {
         let owner_name = at(items, 1)?.text();
         let member_name = at(items, 2)?.text();
         let member = self.macro_type_member(&owner_name, &member_name, span)?;
-        let mut base = Type::TypeMember(member);
+        let mut base = if self.st.get(member).kind == SymKind::TypeParam { Type::TypeParam(member) } else { Type::TypeMember(member) };
         let mut arg_start = 3;
         if let Some(prefix) = items.get(3).and_then(|p| p.list().ok()) {
             if prefix.first().and_then(|p| p.atom()) == Some("pre") {
@@ -560,6 +567,9 @@ impl Typer {
         let owner = self.st.class_sym_of(&owner_ty).ok_or_else(|| {
             format!("the member owner `{owner_name}` does not resolve to a class")
         })?;
+        if let Some(parameter) = self.st.get(owner).tparams.iter().copied().find(|p| self.st.get(*p).name == member_name) {
+            return Ok(parameter);
+        }
         self.complete_binary_member(owner, member_name, span);
         self.st
             .lookup_member(owner, member_name)
@@ -682,7 +692,8 @@ impl Typer {
             }
         };
         let mut built = String::new();
-        let types = crate::expand::WireTypes::default();
+        let mut types = crate::expand::WireTypes::default();
+        self.collect_wire_types(tree, &mut types);
         let cx = crate::expand::WireCx {
             st: &self.st,
             types: &types,
@@ -771,8 +782,25 @@ impl Typer {
         if let Some(wire) = self.source_type_wire(ty)? {
             return Ok(wire);
         }
+        if let Some(wire) = self.binary_type_param_wire(ty)? {
+            return Ok(wire);
+        }
         if let Some(wire) = self.binary_module_type_wire(ty) {
             return Ok(wire);
+        }
+        if let Type::Class { sym, args } = ty {
+            let jvm = self.st.jvm_internal(*sym);
+            if !self.st.is_source_class(*sym)
+                && jvm.rsplit('/').next().is_some_and(|name| name.contains('$'))
+            {
+                let mut wire = format!("(jclass {}", quoted(&jvm.replace('/', ".")));
+                for arg in args {
+                    wire.push(' ');
+                    wire.push_str(&self.type_to_wire(arg)?);
+                }
+                wire.push(')');
+                return Ok(wire);
+            }
         }
         let structural = match ty {
             Type::Function { params, ret } if params.len() <= 22 => {
@@ -852,10 +880,32 @@ impl Typer {
         Some(format!("(mod {})", quoted(&name.replace('/', "."))))
     }
 
+    /// Class-owned binary parameters retain their identity in the runtime mirror.
+    pub(crate) fn binary_type_param_wire(&mut self, ty: &Type) -> Result<Option<String>, String> {
+        if let Type::TypeParam(id) = ty {
+            let owner = self.st.get(*id).owner;
+            if !owner.is_none() && self.st.get(owner).is_class_like() && !self.is_current_run_class(owner) {
+                if let Some(index) = self.st.get(owner).tparams.iter().position(|p| p == id) {
+                    let name = crate::materialize::static_class_of_sym(&self.st, owner)?;
+                    return Ok(Some(format!("(param {} {index})", quoted(&name))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Preserve source type identities and arguments in both directions.
     /// Type parameters are weak types with their declared bounds, not their
     /// erasures or a runtime ClassTag approximation.
     pub(crate) fn source_type_wire(&mut self, ty: &Type) -> Result<Option<String>, String> {
+        if let Type::Applied { ctor, args } = ty {
+            if let Some(mut wire) = self.source_type_wire(ctor)? {
+                wire.pop();
+                for arg in args { wire.push(' '); wire.push_str(&self.type_to_wire(arg)?); }
+                wire.push(')');
+                return Ok(Some(wire));
+            }
+        }
         let (id, args) = match ty {
             Type::Class { sym, args }
                 if self.st.get(*sym).kind == SymKind::Class && self.is_current_run_class(*sym) =>
@@ -864,9 +914,13 @@ impl Typer {
             }
             Type::TypeParam(id) => {
                 let owner = self.st.get(*id).owner;
-                let source_class_parameter = self.st.get(owner).is_class_like()
+                let mut enclosing = owner;
+                while !enclosing.is_none() && !self.st.get(enclosing).is_class_like() {
+                    enclosing = self.st.get(enclosing).owner;
+                }
+                let source_class_parameter = !enclosing.is_none()
                     && self.st.get(owner).tparams.contains(id)
-                    && self.is_current_run_class(owner);
+                    && self.is_current_run_class(enclosing);
                 if !self.tparam_in_scope(*id) && !source_class_parameter {
                     return Ok(None);
                 }
@@ -885,7 +939,7 @@ impl Typer {
 
     /// Whether `sym` is a class this compilation run is itself defining --
     /// that is, one with no class file for the engine's mirror to find. The
-    /// same test [`Typer::tag_descriptor`] makes, and for the same reason.
+    /// same test [`Typer::tag_wire`] makes, and for the same reason.
     pub(crate) fn is_current_run_class(&mut self, sym: SymbolId) -> bool {
         let jvm = self.st.jvm_internal(sym);
         !jvm.is_empty() && !matches!(self.binary.find_class(&jvm), Ok(Some(_)))

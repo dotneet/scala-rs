@@ -314,6 +314,16 @@ impl Typer {
             self.load_binary_into(jvm, owner, Span::new(0, 0), false);
         }
         crate::prelude_strhier::link_string_parents(&mut self.st);
+        if self.library_abi {
+            if let (Some(ordered), Some(comparable)) = (
+                crate::classpath::find_by_jvm(&self.st, "scala/math/Ordered"),
+                crate::classpath::find_by_jvm(&self.st, "java/lang/Comparable"),
+            ) {
+                let args = self.st.get(ordered).tparams.iter().copied().map(Type::TypeParam).collect();
+                let parent = Type::Class { sym: comparable, args };
+                if !self.st.get(ordered).parents.contains(&parent) { self.st.get_mut(ordered).parents.push(parent); }
+            }
+        }
     }
 
     /// Load `<internal>$`, a class's companion object, if it has one on the
@@ -477,7 +487,7 @@ impl Typer {
         mut tree: Tree,
         span: Span,
     ) -> Tree {
-        for clause in self.conv_implicit_params(conv, from, &tree.ty) {
+        for (clause_index, clause) in self.conv_implicit_params(conv, from, &tree.ty).into_iter().enumerate() {
             let mut args = Vec::with_capacity(clause.len());
             for want in &clause {
                 if let Type::Class { sym, args } = want {
@@ -545,7 +555,8 @@ impl Typer {
                     }
                 }
             }
-            let ty = tree.ty.clone();
+            let params = self.st.get(conv).paramss.get(clause_index + 1).cloned().unwrap_or_default();
+            let ty = self.subst_dependent_paths(&params, &args, tree.ty.clone());
             tree = Tree {
                 id: NodeId(0),
                 span,
@@ -618,7 +629,35 @@ impl Typer {
     /// names. Empty, that said no, and `q.map(_.title)` was "could not find
     /// implicit value of type Shape[_ <: FlatShapeLevel, Rep[String], T, G]"
     /// while naming `FlatShapeLevel` anywhere in the same file fixed it.
+    pub(crate) fn warm_implicit_derivation_scopes(&mut self, wanted: &Type) {
+        let mut candidates = self.implicits_in_scope();
+        candidates.extend(self.companion_implicits(wanted));
+        candidates.sort_unstable_by_key(|id| id.0);
+        candidates.dedup();
+        let mut scopes = Vec::new();
+        for id in candidates {
+            if !self.only_implicit_clauses(id) { continue; }
+            let ty = self.implicit_candidate_ty(id);
+            let Type::Method { paramss, ret } = &*ty else { continue; };
+            let Some(fit) = self.implicit_solve(id, ret, wanted, &[]) else { continue; };
+            for param in paramss.iter().flatten() {
+                let param = crate::symbol::subst_tparams_slice(&self.st.get(id).tparams, &fit.targs, param);
+                if !scopes.contains(&param) { scopes.push(param); }
+            }
+        }
+        for scope in scopes { self.warm_implicit_scope_once(&scope); }
+    }
+
     pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
+        self.warm_implicit_candidates_at(wanted, 0, &mut Vec::new())
+    }
+
+    fn warm_implicit_candidates_at(&mut self, wanted: &[Type], depth: usize, seen: &mut Vec<Type>) -> bool {
+        if depth > crate::implicits::MAX_IMPLICIT_DEPTH { return false; }
+        let wanted: Vec<Type> = wanted.iter().filter(|w| !seen.contains(w)).cloned().collect();
+        if wanted.is_empty() { return false; }
+        seen.extend(wanted.iter().cloned());
+        let wanted = wanted.as_slice();
         let mut completed = self.warm_inherited_implicit_members(wanted);
         // BuildFrom's general witness carries an F-bound on the source
         // constructor (`CC[X] <: Iterable[X] with IterableOps[X, CC, _]`).
@@ -677,6 +716,7 @@ impl Typer {
         // candidate here is both expensive and risks completing unrelated
         // standard-library hierarchies.
         let mut nested = Vec::new();
+        let mut concrete_nested = Vec::new();
         for &id in &cands {
             if !self.only_implicit_clauses(id) {
                 continue;
@@ -688,7 +728,7 @@ impl Typer {
                 // look relevant and warmed unrelated reflection hierarchies
                 // while compiling Cats/Slick macros.
                 if !wanted.iter().any(|w| {
-                    matches!((&**ret, w), (Type::Class { .. }, Type::Class { .. }))
+                    matches!((&**ret, w), (Type::Class { .. } | Type::Refined { .. }, Type::Class { .. } | Type::Refined { .. }))
                         && self.plausibly_inhabits(ret, w)
                 }) {
                     continue;
@@ -698,10 +738,40 @@ impl Typer {
                         nested.push(p.clone());
                     }
                 }
+                for w in wanted {
+                    let tps = &self.st.get(id).tparams;
+                    let projected = match w { Type::Class { sym, .. } => self.base_type_instance(ret, *sym, 0), _ => None };
+                    let inference_ret = projected.as_ref().unwrap_or(ret);
+                    let args = self.implicit_solve(id, ret, w, &[]).map(|fit|fit.targs).unwrap_or_else(|| {
+                        tps.iter().map(|tp| crate::check::unify_one_precise(&self.st, *tp, inference_ret, w)
+                            .unwrap_or(Type::TypeParam(*tp))).collect()
+                    });
+                    if args.iter().zip(tps).all(|(arg, tp)| *arg == Type::TypeParam(*tp)) && !tps.is_empty() { continue; }
+                    for p in paramss.iter().flatten() {
+                        let mut p = crate::symbol::subst_tparams_slice(tps, &args, p);
+                        // A partially solved rule must not recursively warm
+                        // every possible derivation for its remaining holes.
+                        // A refinement may still expose fully known parents.
+                        if let Type::Refined { parents, decls } = &p {
+                            if decls.iter().any(|d| tps.iter().any(|tp| crate::check::type_mentions_tparam_deep(
+                                &Type::Refined { parents: Vec::new(), decls: vec![d.clone()] }, *tp))) {
+                                p = if parents.len() == 1 { parents[0].clone() }
+                                    else { Type::Refined { parents: parents.clone(), decls: Vec::new() } };
+                            }
+                        }
+                        if crate::symbol::any_type(&p, &mut |t| matches!(t,
+                            Type::TypeParam(_) | Type::Wildcard | Type::BoundedWildcard { .. }
+                        )) { continue; }
+                        if !concrete_nested.contains(&p) { concrete_nested.push(p); }
+                    }
+                }
             }
         }
-        for n in nested {
-            completed |= self.warm_implicit_scope_once(&n);
+        for n in nested.iter().chain(&concrete_nested) {
+            completed |= self.warm_implicit_scope_once(n);
+        }
+        if !concrete_nested.is_empty() {
+            completed |= self.warm_implicit_candidates_at(&concrete_nested, depth + 1, seen);
         }
         let tys: Vec<Type> = cands
             .into_iter()
@@ -980,6 +1050,10 @@ impl Typer {
             if let Type::Method { paramss, .. } = alt {
                 for clause in paramss {
                     for p in clause {
+                        let p = match p {
+                            Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                            other => other,
+                        };
                         if let Some(c) = self.st.class_sym_of(p) {
                             if !out.contains(&c) {
                                 out.push(c);
@@ -1670,6 +1744,18 @@ impl Typer {
                     return false;
                 }
                 let s = self.st.get(m);
+                // An inherited prelude approximation cannot stand for a
+                // declaration on a binary subclass itself. For example,
+                // MapOps.WithFilter.flatMap has a pair-producing overload
+                // in addition to WithFilter's generic collection overload.
+                // Their erased argument counts coincide, but their results
+                // and type parameter lists do not.
+                if m.0 < self.st.prelude_end
+                    && cls.0 >= self.st.prelude_end
+                    && owner.replace('$', ".") == internal.replace(['/', '$'], ".")
+                {
+                    return false;
+                }
                 match s.pickled_origin.split_once('#') {
                     Some((origin, _)) => origin == owner,
                     None => !pickled_in_hand || m.0 >= self.st.prelude_end,

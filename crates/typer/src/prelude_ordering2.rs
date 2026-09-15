@@ -18,6 +18,7 @@ pub(crate) fn add_ordered(st: &mut SymbolTable) -> SymbolId {
         paramss: vec![vec![Type::TypeParam(a)]],
         ret: Box::new(Type::Int),
     };
+    method(st, ordered, "compareTo", vec![Type::TypeParam(a)], Type::Int, Intrinsic::None);
     for op in ["<", ">", "<=", ">="] {
         let id = st.alloc(op, ordered, SymKind::Method, Flags::EMPTY, "");
         st.get_mut(id).ty = Type::Method {

@@ -1384,7 +1384,8 @@ impl Typer {
         // project through its parent and keep carrying what `A` settled.
         if let Some(parent) = SymbolTable::as_seen_from_view(prefix) {
             if let Some(t) = self.st.lookup_type_member_on(prefix, name) {
-                return t;
+                self.warm_receiver_type_members(prefix, &t);
+                return self.st.expand_in_type(prefix, &t);
             }
             let parent = parent.clone();
             let Type::Refined { decls, .. } = prefix.clone() else {
@@ -1505,6 +1506,10 @@ impl Typer {
             self.complete_binary_member(cls, name, span);
             found = self.st.lookup_member(cls, name);
         }
+        // Term and type namespaces are independent. A companion factory with
+        // the same name must not hide an inherited abstract type's override.
+        found.retain(|id| matches!(self.st.get(*id).kind,
+            SymKind::TypeMember | SymKind::Class | SymKind::ModuleClass));
         found.sort_by_key(|s| if self.st.get(*s).owner == cls { 0 } else { 1 });
         // Every candidate is a *deferred* type member inherited from an
         // ancestor, and `cls` may well fix it: `slick.jdbc.JdbcBackend`

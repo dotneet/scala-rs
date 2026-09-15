@@ -3697,6 +3697,9 @@ pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
             params.iter().any(|t| type_mentions_tparam_deep(t, tp))
                 || type_mentions_tparam_deep(ret, tp)
         }
+        Type::BoundedWildcard { lo, hi } => {
+            lo.iter().chain(hi.iter()).any(|bound| type_mentions_tparam_deep(bound, tp))
+        }
         Type::Method { paramss, ret } => {
             paramss
                 .iter()

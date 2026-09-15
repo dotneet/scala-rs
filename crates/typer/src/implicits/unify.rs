@@ -33,6 +33,13 @@ pub(super) struct Unify<'a> {
 }
 
 impl<'a> Unify<'a> {
+    /// Evidence may determine a call site's constructor (for example
+    /// `Future[Int] <:< G[B]`). View insertion keeps constructors fixed so a
+    /// conversion cannot replace an already applicable argument constructor.
+    pub(super) fn allow_evidence_constructors(&mut self) {
+        self.ctor_unknowns.extend(self.unknowns.iter().copied());
+    }
+
     /// `own` are the candidate's own type parameters, `undet` the call site's.
     pub(super) fn new(
         typer: &'a Typer,
@@ -122,7 +129,9 @@ impl<'a> Unify<'a> {
         if mentions_unknown(ty, &std::iter::once(id).collect()) {
             return false;
         }
-        self.bound.insert(id, ty.widen_constant());
+        // A wanted singleton is a type constraint, not an expression whose
+        // literal may widen. Witness[100] must keep 100 rather than Int.
+        self.bound.insert(id, ty.clone());
         true
     }
 
@@ -333,6 +342,9 @@ impl<'a> Unify<'a> {
             return self.unify_at(&ea, &eb, depth + 1);
         }
         match (a, b) {
+            (Type::ThisType(x), Type::ModuleRef(y))
+            | (Type::ModuleRef(x), Type::ThisType(y))
+                if x == y && self.typer.st.get(*x).kind == crate::symbol::SymKind::ModuleClass => true,
             (Type::Class { sym: s1, args: a1 }, Type::Class { sym: s2, args: a2 }) => {
                 if s1 == s2 && a1.len() == a2.len() {
                     let variances = self.typer.st.get(*s1).tparams.clone();

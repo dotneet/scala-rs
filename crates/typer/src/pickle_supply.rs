@@ -2416,12 +2416,23 @@ impl PickleSupply {
             SigType::Poly { tparams, result } => (tparams.clone(), (**result).clone()),
             other => (Vec::new(), other.clone()),
         };
+        let mut owner_scope: HashMap<String, Type> = st.get(owner).tparams.iter()
+            .map(|tp| (st.get(*tp).name.clone(), Type::TypeParam(*tp))).collect();
+        for referenced in mentioned(&rhs) {
+            if !referenced.contains('.') && !owner_scope.contains_key(&referenced)
+                && !tps.iter().any(|tp| tp.name == referenced) && referenced != name
+            {
+                if let Some(member) = self.abstract_type_member(st, bin, &format!("{owner_name}.{referenced}"), 0) {
+                    owner_scope.insert(referenced, member);
+                }
+            }
+        }
         if tps.is_empty() {
             let outer = self.self_ty.replace(Type::Class {
                 sym: owner,
                 args: Vec::new(),
             });
-            let conv = self.conv_at(st, bin, &HashMap::new(), &rhs, 0);
+            let conv = self.conv_at(st, bin, &owner_scope, &rhs, 0);
             self.self_ty = outer;
             if conv.is_none() {
                 trace(format_args!(
@@ -2451,7 +2462,7 @@ impl PickleSupply {
         // Owned but not yet a member: a right-hand side that will not convert
         // must leave the owner exactly as it was.
         let id = st.alloc(name, owner, SymKind::TypeMember, Flags::EMPTY, "");
-        let mut scope: HashMap<String, Type> = HashMap::new();
+        let mut scope = owner_scope;
         let mut tparams = Vec::new();
         for tp in &tps {
             let t = st.alloc(&tp.name, id, SymKind::TypeParam, Flags::EMPTY, "");
@@ -2854,6 +2865,7 @@ impl PickleSupply {
                 // that field: `override_check::modifiers_are_known` withholds
                 // every modifier-shaped diagnostic for pickled members, and
                 // setting the flag here would turn them all on at once.
+                if m.has(pflags::FINAL) { st.get_mut(id).flags = st.get(id).flags.with(Flags::FINAL); }
                 st.get_mut(id).deferred_method = m.has(pflags::DEFERRED);
                 installed.push(id);
             }
@@ -2865,6 +2877,17 @@ impl PickleSupply {
         if !superseded.is_empty() {
             installed.retain(|m| !superseded.contains(m));
         }
+        // Replace the raw JVM view of each signature that was completed.
+        // Return descriptors may be erased value classes or existentials;
+        // keeping both views creates a spurious overload.
+        let mut stale = stale;
+        stale.extend(st.get(class_sym).members.iter().copied().filter(|id| {
+            let raw = st.get(*id);
+            raw.flags.contains(Flags::JAVA) && raw.pickled_origin.is_empty()
+                && id.0 >= st.prelude_end && !installed.contains(id)
+                && installed.iter().any(|new| st.get(*new).name == raw.name
+                    && st.get(*new).jvm_name == raw.jvm_name)
+        }));
         if !installed.is_empty() && !stale.is_empty() {
             drop_stale_members(st, class_sym, &stale, &installed);
             trace(format_args!(
@@ -2964,6 +2987,7 @@ impl PickleSupply {
             ret: Box::new(ret),
         };
         st.get_mut(id).macro_impl = Some(MacroBinding {
+            is_bundle: false,
             pickle: None,
             impl_class: impl_class.to_string(),
             impl_method: impl_method.to_string(),
@@ -3016,9 +3040,8 @@ impl PickleSupply {
     /// expected type and keeps the type it came out with, which is what nsc's
     /// `macroExpandApply` does for a `WhiteboxExpansion`.
     ///
-    /// One shape is declined outright, matching what the source-level path
-    /// (`crates/typer/src/macros.rs`) refuses: a **macro bundle**
-    /// (`class B(val c: Context)`), which the expander cannot instantiate.
+    /// Macro bundles carry Context in their constructor instead of the
+    /// implementation method's first argument clause.
     #[allow(clippy::too_many_arguments)]
     fn install_pickled_macro(
         &mut self,
@@ -3031,13 +3054,7 @@ impl PickleSupply {
         mi: &PickledMacroImpl,
         class_scope: &HashMap<String, Type>,
     ) -> Option<SymbolId> {
-        if mi.is_bundle {
-            trace(format_args!(
-                "{internal}#{name}: macro bundles are not implemented"
-            ));
-            return None;
-        }
-        let Some((tag_indices, expr_args)) = macro_signature_shape(&mi.signature) else {
+        let Some((tag_indices, expr_args)) = macro_signature_shape(&mi.signature, mi.is_bundle) else {
             trace(format_args!(
                 "{internal}#{name}: the pickled macro signature {:?} is not a shape \
                  this expander knows",
@@ -3135,6 +3152,7 @@ impl PickleSupply {
         let tag_targs =
             self.pickled_tag_targs(st, bin, m, &scope, mi, &tag_indices, internal, name);
         st.get_mut(m).macro_impl = Some(MacroBinding {
+            is_bundle: mi.is_bundle,
             pickle: None,
             impl_class: mi.class_name.clone(),
             impl_method: mi.method_name.clone(),
@@ -3194,7 +3212,15 @@ impl PickleSupply {
                 ));
                 return Vec::new();
             };
-            out.push(match self.conv(st, bin, scope, sig) {
+            // Ordinary signature conversion requires full class arity. A
+            // macro implementation reference instead takes the symbol's own
+            // type, including its own parameters for an unapplied constructor.
+            let fixed_class = match sig {
+                SigType::Ref { sym, args } if args.is_empty() && !scope.contains_key(sym) =>
+                    self.ensure_class(st, bin, sym, false).map(|id| st.type_of_class(id)),
+                _ => None,
+            };
+            out.push(match fixed_class.or_else(|| self.conv(st, bin, scope, sig)) {
                 Some(t) => crate::macros::macro_targ_of_type(st, &t, macro_def),
                 None => MacroTarg::Unresolved(sig_spelling(sig)),
             });
@@ -3703,7 +3729,24 @@ impl PickleSupply {
             let mut tys = Vec::new();
             let mut syms = Vec::new();
             for p in &clause.params {
-                let Some(mut t) = self.conv(st, bin, &scope, &p.ty) else {
+                // Later clauses may mention an earlier value parameter's
+                // singleton type, as BuildFrom[xs.type, A, C] does. Retain
+                // its identity so application substitutes the actual xs.
+                let saved_singletons = std::mem::take(&mut self.param_singletons);
+                let saved_symbols = std::mem::take(&mut self.param_singleton_symbols);
+                for (prior, symbols) in shape.clauses.iter().zip(&paramss_sym) {
+                    for (parameter, &symbol) in prior.params.iter().zip(symbols) {
+                        let key = format!("{pickle_owner}.{name}.{}", parameter.name);
+                        self.param_singletons.insert(key.clone(), Type::SingleType {
+                            prefix: Box::new(Type::NoType), sym: symbol,
+                        });
+                        self.param_singleton_symbols.insert(key, symbol);
+                    }
+                }
+                let converted = self.conv(st, bin, &scope, &p.ty);
+                self.param_singletons = saved_singletons;
+                self.param_singleton_symbols = saved_symbols;
+                let Some(mut t) = converted else {
                     trace(format_args!(
                         "{internal}#{name}: parameter {} has an unmappable type {:?}",
                         p.name, p.ty
@@ -4822,7 +4865,6 @@ impl PickleSupply {
         if jvm.starts_with("scala/") && id.0 < st.prelude_end {
             return;
         }
-        let had_tparams = !st.get(id).tparams.is_empty();
         let Ok(sig) = ({
             let mut src = BinSource(bin);
             self.sigs.class_sig(&mut src, full_name, module)
@@ -4846,8 +4888,10 @@ impl PickleSupply {
         // parameters, and `cats.FlatMap` in that state made every
         // `FlatMap[F]` in cats' syntax layer an arity error -- which of the
         // two happened first depended only on the order of the file's imports.
-        // Type parameters are, and a class that has them is left alone.
-        if had_tparams || sig.tparams.is_empty() {
+        // JVM signatures supply parameter identities but cannot encode
+        // higher kinds or Scala variance. Complete those facts in place even
+        // when metadata discovery has already installed the parameters.
+        if sig.tparams.is_empty() {
             return;
         }
         trace(format_args!(
@@ -5213,13 +5257,14 @@ fn sig_spelling(t: &SigType) -> String {
     }
 }
 
-fn macro_signature_shape(signature: &[Vec<i32>]) -> Option<(Vec<usize>, Vec<bool>)> {
+fn macro_signature_shape(signature: &[Vec<i32>], is_bundle: bool) -> Option<(Vec<usize>, Vec<bool>)> {
     use scala_rs_pickle::sym::fingerprint;
-    let (context, rest) = signature.split_first()?;
-    // nsc's first clause is exactly `(c: Context)`.
-    if context.len() != 1 || context[0] != fingerprint::UNDETERMINED {
-        return None;
-    }
+    let rest = if is_bundle { signature } else {
+        let (context, rest) = signature.split_first()?;
+        // A vanilla implementation takes Context in its first clause.
+        if context.len() != 1 || context[0] != fingerprint::UNDETERMINED { return None; }
+        rest
+    };
     let flat: Vec<i32> = rest.iter().flatten().copied().collect();
     let tag_params = flat.iter().rev().take_while(|&&f| f >= 0).count();
     let values = &flat[..flat.len() - tag_params];
@@ -5745,6 +5790,44 @@ impl PickleSupply {
                 Some(Type::Constant(value))
             }
             SigType::Annotated(inner) => self.conv_at(st, bin, scope, inner, d),
+            SigType::Poly { tparams, result } => {
+                if tparams.is_empty() {
+                    return self.conv_at(st, bin, scope, result, d);
+                }
+                // A PolyType nested in a type argument is a type lambda,
+                // not a method signature. Keep its binders and expose captured
+                // parameters as leading arguments so later substitution can
+                // reach them (for example EitherT[F, E, *]).
+                if matches!(result.as_ref(), SigType::Method { .. } | SigType::Bounds { .. }) {
+                    return None;
+                }
+                let id = st.alloc("<lambda>", SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
+                let shapes: Vec<_> = tparams.iter().map(shape_tparam).collect();
+                let own: Vec<_> = shapes.iter().map(|s| alloc_shape_tparam(st, id, s)).collect();
+                let mut inner = scope.clone();
+                for (tp, &sym) in tparams.iter().zip(&own) {
+                    inner.insert(tp.name.clone(), Type::TypeParam(sym));
+                }
+                for (shape, &sym) in shapes.iter().zip(&own) {
+                    self.resolve_shape_tparam_bounds(st, bin, &inner, shape, sym);
+                }
+                let body = self.conv_at(st, bin, &inner, result, d)?;
+                let mut free = Vec::new();
+                crate::check::collect_tparams(&body, &mut free);
+                for &sym in &own {
+                    for bound in [&st.get(sym).bound_lo, &st.get(sym).bound_hi].into_iter().flatten() {
+                        crate::check::collect_tparams(bound, &mut free);
+                    }
+                }
+                free.retain(|p| !own.contains(p));
+                st.get_mut(id).tparams = free.iter().copied().chain(own).collect();
+                st.get_mut(id).ty = body;
+                st.get_mut(id).is_type_alias = true;
+                Some(crate::symbol::apply_type_ctor(
+                    Type::TypeMember(id),
+                    free.into_iter().map(Type::TypeParam).collect(),
+                ))
+            }
             SigType::Existential { quantified, result } => {
                 // `List[_]`: the quantified variables stand for wildcards, and
                 // a *bounded* one keeps its bound. Dropping the bound is not
@@ -5792,8 +5875,10 @@ impl PickleSupply {
                 // `F.type` where `F` is a parameter of the member being
                 // installed (`def apply[F[_]](implicit F: Async[F]): F.type`):
                 // the parameter's own type is what that singleton widens to.
-                if let Some(t) = self.param_singleton(sym).map(|(t, _)| t) {
-                    return Some(t);
+                if let Some((t, parameter)) = self.param_singleton(sym) {
+                    return Some(if parameter.is_none() { t } else {
+                        Type::SingleType { prefix: Box::new(Type::NoType), sym: parameter }
+                    });
                 }
                 // nsc's pickle printer can encode a nested module's owner in
                 // the `Single` symbol using the JVM spelling of the final
@@ -6159,6 +6244,16 @@ impl PickleSupply {
                 return Some(t);
             }
             let fallback = self.conv_ref(st, bin, scope, member, args, d, want_arity)?;
+            // A lost alias binder is not the enclosing receiver's member.
+            // Reading an unresolved T#Head as HList#Head silently makes every
+            // heterogeneous index have the first element's type.
+            if !pre.contains('.') && !scope.contains_key(pre)
+                && matches!(&fallback, Type::TypeMember(_))
+                && self.self_ty.as_ref().and_then(|t| st.class_sym_of(t))
+                    .is_none_or(|owner| st.type_members_named(owner, pre).is_empty())
+            {
+                return None;
+            }
             // The prefix is a type parameter, or a type member the class
             // leaves deferred: nothing here can settle it, but the class's
             // *users* can. `slick.lifted.TableQuery[E <: AbstractTable[_]]
@@ -6284,11 +6379,10 @@ impl PickleSupply {
         // `BaseColumnType[T]`, a type member of the profile cake, so refusing
         // an applied one made every one of them an unmappable result type.
         if !sym.contains('.') && scope.get(sym).is_none() {
-            // A concrete nullary alias retains information that an erased
-            // descriptor cannot express (for example HCons.Self). Abstract
-            // nullary members still use the historical fallback below.
+            // Both aliases and abstract members retain their declaration:
+            // the receiver may refine the latter to a concrete type.
             if args.is_empty() {
-                if let Some(t) = self.self_type_member_at(st, bin, scope, sym, args, d, true, true)
+                if let Some(t) = self.self_type_member_at(st, bin, scope, sym, args, d, true, false)
                 {
                     return Some(t);
                 }
@@ -6389,15 +6483,17 @@ impl PickleSupply {
         member: &str,
     ) -> Option<Type> {
         let (param, param_sym) = self.param_singleton(param_path)?;
-        let Type::Class { sym: cls, .. } = &param else {
-            return None;
-        };
+        let cls = st.class_sym_of(&param)?;
         let (owner_path, alias_name) = member.rsplit_once('.')?;
-        if !same_class_owner(st, *cls, owner_path) {
+        if !same_class_owner(st, cls, owner_path) {
             return None;
         }
-        self.complete_type_member(st, bin, *cls, alias_name)?;
-        let decl = self.completed_type_member_decl(*cls, alias_name)?;
+        let completed = self.complete_type_member(st, bin, cls, alias_name);
+        completed?;
+        let decl = self.completed_type_member_decl(cls, alias_name)?;
+        let body = if st.get(decl).is_type_alias { st.get(decl).ty.clone() } else { Type::TypeMember(decl) };
+        let resolved = st.expand_in_type(&param, &body);
+        if resolved != Type::TypeMember(decl) { return Some(resolved); }
         let projected = st.path_member(&[param_sym], decl, &param);
         Some(Type::TypeMember(projected))
     }
@@ -6504,10 +6600,7 @@ impl PickleSupply {
             return None;
         }
         let a = self.conv_all(st, bin, scope, args, d)?;
-        Some(Type::Applied {
-            ctor: Box::new(t),
-            args: a,
-        })
+        Some(Type::Applied { ctor: Box::new(t), args: a })
     }
 
     /// The type of a stable *value* standing as a projection prefix
@@ -6949,7 +7042,12 @@ fn is_default_getter(name: &str) -> bool {
 /// or dotted (`scala.concurrent.…`). Both carry the separator, so a package
 /// named `scalaz` is not caught by it.
 fn implicit_class_conversion_from(owner: &str, m: &scala_rs_pickle::Member) -> bool {
-    !owner.starts_with("scala/") && !owner.starts_with("scala.") && m.is_implicit_class_conversion()
+    // scala.jdk converters have no hand-written prelude implementation.
+    // Their synthetic implicit-class constructors need the source signature
+    // just like a third-party library's value-class conversion.
+    let jdk = owner.starts_with("scala/jdk/") || owner.starts_with("scala.jdk.");
+    (jdk || (!owner.starts_with("scala/") && !owner.starts_with("scala.")))
+        && m.is_implicit_class_conversion()
 }
 
 /// The unspecialized class a `@specialized` variant was generated from.
@@ -7188,6 +7286,7 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
             // such as MUnit's implicit `unitToProp(unit: Unit)`.
             Type::Unit => return Some("Lscala/runtime/BoxedUnit;".into()),
             Type::String => return Some("Ljava/lang/String;".into()),
+            Type::Array(elem) => return erased_param_desc(st, elem).map(|d| format!("[{d}")),
             // These Scala top types have a definite erased reference slot.
             // Leaving AnyVal unknown confuses it with String/NodeSeq overloads.
             Type::Any | Type::AnyRef | Type::AnyVal => return Some("Ljava/lang/Object;".into()),

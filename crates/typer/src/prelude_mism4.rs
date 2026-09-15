@@ -1,10 +1,9 @@
-//! A `Map` is a `K => V`.
+//! A `Map` is a `PartialFunction[K, V]`, and hence a `K => V`.
 //!
 //! `prelude.rs` calls [`install`] on a single line.
 //!
 //! In 2.13 the declaration of `scala.collection.Map[K, +V]` itself extends
-//! `PartialFunction[K, V]` (hence `K => V`) -- `scala/Function1` is right there in
-//! the interface list of `javap scala/collection/Map`. The prelude's hierarchy table
+//! `PartialFunction[K, V]` (hence `K => V`). The prelude's hierarchy table
 //! (`prelude_hier.rs`) wired up only the `Iterable` edge, so
 //!
 //! ```scala
@@ -31,13 +30,13 @@ pub(crate) fn install(st: &mut SymbolTable) {
     map_is_a_function(st);
 }
 
-/// `Map[K, V] <: Function1[K, V]`.
+/// `Map[K, V] <: PartialFunction[K, V] <: Function1[K, V]`.
 ///
 /// The edge goes on every `Map` the prelude built. `scala/collection/Map` is
 /// not one of them (`prelude_hier`'s edge to it is skipped for want of a
 /// class), so the immutable and mutable ones each get their own.
 fn map_is_a_function(st: &mut SymbolTable) {
-    let Some(f1) = scala_class(st, "Function1") else {
+    let Some(f1) = scala_class(st, "PartialFunction") else {
         return;
     };
     for jvm in [

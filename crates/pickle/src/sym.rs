@@ -1433,6 +1433,14 @@ pub fn apply_subst(t: &SigType, map: &HashMap<String, SigType>) -> SigType {
                     sym: s2.clone(),
                     args,
                 },
+                Some(SigType::Poly { tparams, result }) if !args.is_empty() && tparams.len() == args.len() => {
+                    // A higher-kinded alias argument can be a type lambda.
+                    // Applying F[X] beta-reduces that lambda at X; the normal
+                    // substitution protects any binders nested in its body.
+                    let bindings = tparams.iter().zip(&args)
+                        .map(|(tp, arg)| (tp.name.clone(), arg.clone())).collect();
+                    apply_subst(result, &bindings)
+                }
                 Some(other) if args.is_empty() => other.clone(),
                 // A non-`Ref` replacement cannot absorb arguments; leaving the
                 // original alone is the honest answer (the caller then sees an
@@ -1739,6 +1747,25 @@ pub fn render(t: &SigType) -> String {
 #[cfg(test)]
 mod tests {
     use super::pickle_files_for;
+
+    #[test]
+    fn applying_a_substituted_type_lambda_preserves_nested_binders() {
+        use super::*;
+        let reference = |name: &str| SigType::Ref { sym: name.into(), args: vec![] };
+        let parameter = |name: &str| TParam { name: name.into(), bounds: SigType::Bounds {
+            lo: Box::new(reference("scala.Nothing")), hi: Box::new(reference("scala.Any"))
+        }, variance: 0 };
+        let lambda = SigType::Poly { tparams: vec![parameter("A")], result: Box::new(
+            SigType::Poly { tparams: vec![parameter("B")], result: Box::new(
+                SigType::Ref { sym: "Pair".into(), args: vec![reference("A"), reference("B")] }
+            ) }
+        ) };
+        let input = SigType::Ref { sym: "F".into(), args: vec![reference("B")] };
+        let output = apply_subst(&input, &HashMap::from([("F".into(), lambda)]));
+        let SigType::Poly { tparams, result } = output else { panic!("lost nested binder") };
+        assert_ne!(tparams[0].name, "B");
+        assert_eq!(*result, SigType::Ref { sym: "Pair".into(), args: vec![reference("B"), reference(&tparams[0].name)] });
+    }
 
     #[test]
     fn default_package_nested_class_uses_outer_pickle() {

@@ -836,10 +836,11 @@ impl Typer {
                         // Declared by a trait the object mixes in; the
                         // reference has to name the object (see
                         // `wildcard_module_for`).
-                        self.implicit_via_module
+                        let changed = self.implicit_via_module
                             .borrow_mut()
-                            .insert(mem.0, module_sym);
+                            .insert(mem.0, module_sym) != Some(module_sym);
                         let mut memo = self.implicit_memo.borrow_mut();
+                        if changed { memo.candidate_tys.clear(); }
                         if memo.depth > 0 {
                             memo.routes.insert(mem.0, module_sym);
                         }
@@ -1221,6 +1222,15 @@ impl Typer {
                 }
             }
         }
+        // A witness inherited by a companion is seen from that object:
+        // Base[A, C]#operation on Dogs extends Base[Dog, Dogs] must retain
+        // Dog and Dogs, not the declaring class's open parameters.
+        if !owner.is_none() && !self.st.get(owner).tparams.is_empty() {
+            if let Some(module) = self.wildcard_module_for(origin) {
+                let recv = Type::ModuleRef(self.st.module_class_of(module));
+                return (Some(self.st.subst_as_seen_from(&recv, ty)), true);
+            }
+        }
         if this.is_none()
             || owner.is_none()
             || owner == this
@@ -1437,6 +1447,7 @@ impl Typer {
                     let want = crate::symbol::subst_tparams_slice(&tps, &fit.targs, p);
                     self.search_implicit_at(&want, depth + 1).is_found()
                         || self.built_not_found(&want, depth + 1)
+                        || self.conv_param_view_resolves(&want)
                 });
                 self.open_implicits.borrow_mut().pop();
                 if ok {
@@ -1544,7 +1555,7 @@ impl Typer {
         let tps = self.st.get(id).tparams.clone();
         let mut args = Vec::with_capacity(tps.len());
         for tp in &tps {
-            args.push(crate::check::unify_one(&self.st, *tp, ret, pt)?);
+            args.push(crate::check::unify_one_precise(&self.st, *tp, ret, pt)?);
         }
         Some(args)
     }
@@ -1553,7 +1564,7 @@ impl Typer {
     /// candidate's own type parameters and `undet`, then check the instantiated
     /// result really conforms. A candidate with a type parameter left
     /// undetermined is dropped (never silently filled with `Any`).
-    fn implicit_solve(
+    pub(crate) fn implicit_solve(
         &self,
         id: SymbolId,
         ret: &Type,
@@ -1567,12 +1578,15 @@ impl Typer {
                 .then(ImplicitFit::default);
         }
         let mut u = Unify::new(self, tps.iter().copied(), undet.iter().copied());
+        if !matches!(pt, Type::Function { .. }) {
+            u.allow_evidence_constructors();
+        }
         // A candidate returning A with B can supply A on its own. Infer
         // against that base type; requiring B to unify with A loses open
         // wanted parameters (for example MonadError[Future, E]). The final
         // conformance check below still checks the complete candidate result.
         let projected = match (ret, pt) {
-            (Type::Refined { .. }, Type::Class { sym, .. }) => {
+            (Type::Refined { .. } | Type::ModuleRef(_) | Type::ThisType(_), Type::Class { sym, .. }) => {
                 self.base_type_instance(ret, *sym, 0)
             }
             _ => None,
@@ -1599,7 +1613,21 @@ impl Typer {
                 Some(t) => targs.push(self.simplify_solved(&t)),
                 // Not pinned down by the result type; the one-sided guess is
                 // the last chance before the candidate is dropped.
-                None => targs.push(crate::check::unify_one(&self.st, *tp, ret, pt)?),
+                None => targs.push(
+                    crate::check::unify_one_precise(&self.st, *tp, ret, pt).or_else(|| {
+                        // A phantom parameter of an implicit method cannot be
+                        // inferred from its result or arguments. Instantiate it
+                        // at its lower bound, as for an ordinary nullary call.
+                        let param = self.st.get(*tp);
+                        (param.tparams.is_empty()
+                            && !crate::check::type_mentions_tparam_deep(&self.st.get(id).ty, *tp)
+                            && !tps.iter().any(|other| {
+                                [&self.st.get(*other).bound_lo, &self.st.get(*other).bound_hi]
+                                    .into_iter().flatten().any(|bound| crate::check::type_mentions_tparam_deep(bound, *tp))
+                            }))
+                        .then(|| param.bound_lo.clone().unwrap_or(Type::Nothing))
+                    })?,
+                ),
             }
         }
         // A solution read off a higher-kinded position is an `Applied` whose
@@ -1686,7 +1714,14 @@ impl Typer {
             return None;
         }
         let mut u = Unify::new(self, tps.iter().copied(), undet.iter().copied());
-        if !u.unify(ret, pt) {
+        if !matches!(pt, Type::Function { .. }) {
+            u.allow_evidence_constructors();
+        }
+        let projected = match (ret, pt) {
+            (Type::Refined { .. }, Type::Class { sym, .. }) => self.base_type_instance(ret, *sym, 0),
+            _ => None,
+        };
+        if !u.unify(projected.as_ref().unwrap_or(ret), pt) {
             return None;
         }
         let mut targs: Vec<Type> = Vec::with_capacity(tps.len());
@@ -1739,7 +1774,9 @@ impl Typer {
         for p in paramss.iter().flatten() {
             let want = crate::symbol::subst_tparams_slice(&tps, &targs, p);
             if open.is_empty() {
-                if !self.search_implicit_at(&want, depth + 1).is_found() {
+                if !self.search_implicit_at(&want, depth + 1).is_found()
+                    && !self.built_not_found(&want, depth + 1)
+                    && !self.conv_param_view_resolves(&want) {
                     ok = false;
                     break;
                 }
@@ -2514,9 +2551,11 @@ impl Typer {
         })?;
         let out = (e.result.clone(), e.bindings.clone());
         let (probe, cut, routes) = (e.probe, e.cut, e.routes.clone());
-        self.implicit_via_module
-            .borrow_mut()
-            .extend(routes.iter().map(|(&member, &module)| (member, module)));
+        let mut via = self.implicit_via_module.borrow_mut();
+        if routes.iter().any(|(member, module)| via.get(member) != Some(module)) {
+            m.candidate_tys.clear();
+        }
+        via.extend(routes.iter().map(|(&member, &module)| (member, module)));
         m.probe |= probe;
         m.cut |= cut;
         m.routes.extend(routes);
@@ -2734,7 +2773,7 @@ impl Typer {
         let from_at_param = self.align_to_param_class(&param, from);
         let solved_from_arg: Vec<Option<Type>> = tps
             .iter()
-            .map(|tp| unify_conv_tparam(*tp, &param, &from_at_param))
+            .map(|tp| self.unify_conversion_tparam(*tp, &param, &from_at_param))
             .collect();
         let (known_ids, known_tys): (Vec<SymbolId>, Vec<Type>) = tps
             .iter()
@@ -2813,7 +2852,7 @@ impl Typer {
         // The result may solve a parameter the source cannot determine.
         // Validate witnesses with that solution: a Shape[Rep[Int], Int]
         // cannot justify a conversion whose wanted result requires String.
-        let source_args = self.conv_targs(id, from);
+        let source_args = self.conv_targs_impl(id, from, true, true);
         let solved_args: Vec<Type> = tps
             .iter()
             .zip(solved_from_arg.iter())
@@ -2869,6 +2908,36 @@ impl Typer {
         if let (Some(aa), Some(_)) = (view(a), view(b)) {
             return self.conv_accepts_opaque(b, &unwrap_byname(&aa));
         }
+        let candidate_a = self.implicit_candidate_ty(a);
+        let candidate_b = self.implicit_candidate_ty(b);
+        let result = |ty: &Type| match ty {
+            Type::Method { ret, .. } => (**ret).clone(),
+            ty => ty.clone(),
+        };
+        let raw_a = result(&candidate_a);
+        let raw_b = result(&candidate_b);
+        let correlated = |id: SymbolId, ty: &Type| {
+            let Type::Refined { parents, decls } = ty else { return false; };
+            self.st.get(id).tparams.iter().any(|tp| {
+                parents.iter().any(|p| crate::check::type_mentions_tparam_deep(p, *tp))
+                    && crate::check::type_mentions_tparam_deep(
+                        &Type::Refined { parents: Vec::new(), decls: decls.clone() }, *tp)
+            })
+        };
+        if correlated(a, &raw_a)
+            && correlated(b, &raw_b)
+            && matches!((&raw_a, &raw_b), (Type::Refined { .. }, Type::Refined { .. }))
+        {
+            // Keep correlations between repeated occurrences of a method
+            // parameter. Replacing each with `_` incorrectly orders
+            // P[T] { type Out = T } below P[T] { type Out = Tuple1[T] }.
+            let tps = &self.st.get(b).tparams;
+            let Some(args) = self.implicit_targs(b, &raw_b, &raw_a) else {
+                return false;
+            };
+            let instantiated = crate::symbol::subst_tparams_slice(tps, &args, &raw_b);
+            return self.st.is_sub_type(&raw_a, &instantiated);
+        }
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
         if !self.st.is_sub_type(&ra, &rb) {
@@ -2896,6 +2965,9 @@ impl Typer {
     /// conventional `LowPriority...` pattern; pickle linearisation is used
     /// only for that explicitly lower-priority declaration.
     fn is_as_specific_origin(&self, a: SymbolId, b: SymbolId) -> bool {
+        if self.owner_is_proper_subclass(a, b) {
+            return true;
+        }
         let oa = self.st.get(a).owner;
         let ob = self.st.get(b).owner;
         if oa.is_none() || ob.is_none() || oa == ob {
@@ -3247,12 +3319,13 @@ impl Typer {
                 // prelude has nothing, so `"abc".groupBy(f)` resolves the same way
                 // `List(1).groupBy(f)` already does. The prelude still wins
                 // whenever it declares the member.
-                if members.is_empty() {
-                    members = self
+                if members.is_empty() || (cls.0 >= self.st.prelude_end && !self.st.is_source_class(cls)) {
+                    let precise = self
                         .supply_from_pickle(&to, name)
                         .into_iter()
                         .filter(|&m| !self.st.get(m).flags.contains(Flags::STATIC))
-                        .collect();
+                        .collect::<Vec<_>>();
+                    if !precise.is_empty() { members = precise; }
                 }
                 // A result that still names the conversion's own type
                 // parameters is one only its implicit clause can finish:
@@ -3284,19 +3357,22 @@ impl Typer {
                     hits.push((id, *m, to));
                 }
             }
+            hits.sort_by_key(|(c, m, _)| (c.0, m.0));
+            hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
+            self.drop_inherited_duplicates(&mut hits);
+            self.drop_overridden_conversions(&mut hits);
+            // Lexical priority applies only to applicable conversions. A
+            // syntactically matching view whose implicit evidence is absent
+            // must not hide an extension in the receiver's companion scope.
+            self.drop_witnessless_conversions(&mut hits, from, span);
+            self.drop_inapplicable_conversions(&mut hits, name);
+            self.drop_superseded_prelude_conversions(&mut hits);
             hits
         };
         let mut hits = collect(lexical_ids);
         if hits.is_empty() {
             hits = collect(companion_ids);
         }
-        hits.sort_by_key(|(c, m, _)| (c.0, m.0));
-        hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
-        self.drop_inherited_duplicates(&mut hits);
-        self.drop_overridden_conversions(&mut hits);
-        self.drop_witnessless_conversions(&mut hits, from, span);
-        self.drop_inapplicable_conversions(&mut hits, name);
-        self.drop_superseded_prelude_conversions(&mut hits);
         match hits.len() {
             1 => Some(hits.pop().unwrap()),
             0 => None,
@@ -3398,6 +3474,9 @@ impl Typer {
         ty: &Type,
         span: Span,
     ) -> Option<SymbolId> {
+        if let Some(Type::Class { sym, .. }) = self.st.function_class_form(ty) {
+            return Some(sym);
+        }
         if let Some(cls) = self.st.class_sym_of(ty) {
             return Some(cls);
         }
@@ -4090,11 +4169,22 @@ impl Typer {
         if tps.is_empty() {
             return ty.clone();
         }
-        let args_t = self.conv_targs(id, from);
+        let args_t = self.conv_targs_impl(id, from, true, true);
         crate::symbol::subst_tparams_slice(tps, &args_t, ty)
     }
 
     /// The conversion's own type arguments, solved from the receiver type.
+    fn unify_conversion_tparam(&self, tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
+        // Syntax conversions infer F[_] from an applied constructor just like
+        // ordinary calls. Capture surplus leading arguments: EitherT[F, E, A]
+        // supplies EitherT[F, E, *] and A, not bare EitherT and F.
+        if matches!(param, Type::Applied { .. }) {
+            crate::check::unify_one(&self.st, tp, param, from)
+        } else {
+            unify_conv_tparam(tp, param, from)
+        }
+    }
+
     fn conv_targs(&self, id: SymbolId, from: &Type) -> Vec<Type> {
         self.conv_targs_impl(id, from, true, false)
     }
@@ -4167,10 +4257,48 @@ impl Typer {
         let from = seen_as.as_ref().unwrap_or(from);
         let mut solved: Vec<Option<Type>> = tps
             .iter()
-            .map(|tp| unify_conv_tparam(*tp, param, from))
+            .map(|tp| self.unify_conversion_tparam(*tp, param, from))
             .collect();
         if solve_from_implicits {
             self.solve_conv_targs_from_implicits(&cand_ty, tps, &mut solved);
+            if let (Type::Applied { ctor, .. }, Type::Method { paramss, .. }) = (param, &*cand_ty) {
+                if matches!(ctor.as_ref(), Type::TypeParam(tp) if tps.contains(tp)) && paramss.len() > 1 {
+                    let arguments = |values: &[Option<Type>]| -> Vec<Type> {
+                        tps.iter().zip(values).map(|(tp, value)| value.clone().unwrap_or(Type::TypeParam(*tp))).collect()
+                    };
+                    let witnesses_fit = |values: &[Option<Type>]| {
+                        let args = arguments(values);
+                        paramss[1..].iter().flatten().all(|want| {
+                            let want = crate::symbol::subst_tparams_slice(tps, &args, want);
+                            self.search_implicit(&want).is_found()
+                        })
+                    };
+                    if !witnesses_fit(&solved) {
+                        // A unary alias may put its argument below another
+                        // constructor. Let a witness constrain F before
+                        // matching F[A] to the receiver (e.g. Cell[Tuple1[A]]).
+                        let mut alternate = vec![None; tps.len()];
+                        self.solve_conv_targs_from_implicits(&cand_ty, tps, &mut alternate);
+                        let expected = self.st.expand_applied_hk_alias(crate::symbol::subst_tparams_slice(tps, &arguments(&alternate), param));
+                        // An identity constructor erases the receiver's
+                        // structure and would replace an inferred Seq[A] by
+                        // Id[Seq[A]] merely because Seq's witness is not warm.
+                        // Evidence-first inference needs a structural alias.
+                        if !matches!(expected, Type::TypeParam(_)) {
+                        for (tp, value) in tps.iter().zip(&mut alternate) {
+                            if value.is_none() { *value = crate::check::unify_one(&self.st, *tp, &expected, from); }
+                        }
+                        let args = arguments(&alternate);
+                        let expected = self.st.expand_applied_hk_alias(crate::symbol::subst_tparams_slice(tps, &args, param));
+                        if alternate.iter().all(Option::is_some)
+                            && self.st.is_sub_type(from, &expected)
+                            && self.candidate_bounds_hold(tps, &args)
+                            && witnesses_fit(&alternate)
+                        { solved = alternate; }
+                        }
+                    }
+                }
+            }
         }
         let ret = match &*cand_ty {
             Type::Method { ret, .. } | Type::Function { ret, .. } => Some(ret.as_ref()),
@@ -4289,10 +4417,20 @@ impl Typer {
         // the element type of the collection being built.  For
         // `zipWithIndex`, that is `(A, Int)`, not `A`.
         let mut targs = if to.is_no_type() {
-            self.conv_targs(id, from)
+            self.conv_targs_impl(id, from, true, true)
         } else {
             self.conv_targs_without_implicit_solution(id, from)
         };
+        if !to.is_no_type() {
+            let inferred = self.conv_targs_impl(id, from, true, true);
+            let inferred_result = crate::symbol::subst_tparams_slice(&tps, &inferred, ret);
+            if inferred_result == *to {
+                // Extension lookup may have inferred a nested unary alias
+                // from its witness. Preserve that same instantiation when
+                // inserting the conversion's implicit arguments.
+                targs = inferred;
+            }
+        }
         // Open-view inference has already solved the conversion's result.
         // Parameters absent from the receiver (A in EvidenceIterableFactory)
         // must use that solution before searching Ordering[A]/ClassTag[A].
@@ -4301,7 +4439,7 @@ impl Typer {
         let result = crate::symbol::subst_tparams_slice(&tps, &targs, ret);
         for (tp, arg) in tps.iter().zip(targs.iter_mut()) {
             if !to.is_no_type() && *arg == Type::TypeParam(*tp) {
-                if let Some(solved) = unify_conv_tparam(*tp, &result, to) {
+                if let Some(solved) = self.unify_conversion_tparam(*tp, &result, to) {
                     *arg = solved;
                 }
             }
@@ -4373,17 +4511,17 @@ impl Typer {
         // fails the wildcard subtype check even though nsc accepts the view.
         let tps = &self.st.get(id).tparams;
         if !tps.is_empty() {
-            let targs = self.conv_targs(id, from);
+            let targs = self.conv_targs_impl(id, from, true, true);
             if !self.conv_targs_within_bounds(id, param, &targs) {
                 return false;
             }
             let instantiated = crate::symbol::subst_tparams_slice(tps, &targs, param);
-            if self.st.is_sub_type(from, &instantiated) {
+            if self.weak_conforms(from, &instantiated) {
                 return true;
             }
         }
         let erased = self.erase_method_tparams(id, param);
-        if self.st.is_sub_type(from, &erased) || matches!(erased, Type::Any | Type::Wildcard) {
+        if self.weak_conforms(from, &erased) || matches!(erased, Type::Any | Type::Wildcard) {
             return true;
         }
         // `fa: F[A]`, with `F` and `A` both the conversion's own parameters,

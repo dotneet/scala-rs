@@ -361,7 +361,7 @@ impl Typer {
     /// nsc's local-class index. Anonymous classes already carry a fresh
     /// `$anon$N` in their simple name, so they are left alone.
     fn uniquify_local(&mut self, base: String, local: bool, simple: &str) -> String {
-        if !local || simple.starts_with("$anon") {
+        if !local || simple.starts_with("$anon$") {
             return base;
         }
         let n = self.local_class_n.entry(base.clone()).or_insert(0);

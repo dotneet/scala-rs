@@ -1249,7 +1249,30 @@ impl Typer {
                         expansion's query yet"
                 .to_string());
         }
-        let (argss, targs, prefix) = peel_application(tree);
+        let (argss, mut targs, prefix) = peel_application(tree);
+        if targs.is_empty() {
+            if let Some(sym) = self.macro_symbol_of(tree) {
+                let tps = self.st.get(sym).tparams.clone();
+                let declared = prefix.as_ref().map_or_else(
+                    || self.st.get(sym).ty.clone(),
+                    |p| self.st.subst_as_seen_from(&p.ty, &self.st.get(sym).ty),
+                );
+                if let Type::Method { paramss, ret } = declared {
+                    let params: Vec<Type> = paramss.into_iter().flatten().collect();
+                    let actuals: Vec<Type> = argss.iter().flatten().map(Tree::argument_type).collect();
+                    let inferred = self.infer_method_tparams(sym, &params, &actuals);
+                    let solved: Option<Vec<Type>> = tps.iter().map(|tp| {
+                        inferred.iter().find(|(id, _)| id == tp).map(|(_, t)| t.clone())
+                            .or_else(|| crate::check::unify_one(&self.st, *tp, &ret, &tree.ty))
+                            .filter(|t| !crate::check::mentions_tparam(t, &tps)
+                                && !t.is_no_type() && !t.is_error())
+                    }).collect();
+                    if let Some(solved) = solved {
+                        targs = solved;
+                    }
+                }
+            }
+        }
         let timing_start = self.macro_timing.enabled.then(Instant::now);
         let (request, splices) =
             self.expansion_request(binding, &argss, &targs, prefix.as_ref(), tree)?;
@@ -1513,7 +1536,7 @@ impl Typer {
     }
 
     /// Serialise one expansion request, and say which of its types went over
-    /// as placeholders ([`Typer::tag_descriptor`]).
+    /// as placeholders ([`Typer::tag_wire`]).
     fn expansion_request(
         &mut self,
         binding: &MacroBinding,
@@ -1568,7 +1591,7 @@ impl Typer {
         let mut tags = Vec::new();
         if binding.tag_params > 0 {
             for t in self.tag_types(binding, targs, prefix)? {
-                tags.push(self.tag_descriptor(&t)?);
+                tags.push(self.tag_wire(&t)?);
             }
         }
         if let Some(p) = prefix {
@@ -1587,6 +1610,7 @@ impl Typer {
         quote_into(&mut out, &binding.impl_class);
         out.push(' ');
         quote_into(&mut out, &binding.impl_method);
+        out.push_str(if binding.is_bundle { " (bundle true)" } else { " (bundle false)" });
         out.push_str(" (argss");
         let mut slot = 0;
         let mut actual = actuals.iter();
@@ -1899,18 +1923,6 @@ impl Typer {
     /// The engine creates their symbols once and requests bounds, parents and
     /// members lazily. Returned TypeTrees retain these identities and their
     /// arguments rather than resolving source names against the runtime jar.
-    fn tag_descriptor(&mut self, ty: &Type) -> Result<String, String> {
-        // `f(42)` types its argument as the *constant* type `42`; the tag nsc
-        // builds for the `Expr` that wraps it is `Int`. Only the outermost
-        // type is widened -- `Tag[1]` is not `Tag[Int]`, so a constant that is
-        // itself a type argument stays one ([`Typer::tag_wire`]).
-        let widened = match ty {
-            Type::Constant(lit) => Type::lit_underlying(lit),
-            other => other.clone(),
-        };
-        self.tag_wire(&widened)
-    }
-
     /// One type as a tag descriptor, type arguments and all.
     ///
     /// `(ty "scala.reflect.ClassTag" (ty "a.b.Row"))` is `mirror.staticClass`
@@ -1938,8 +1950,23 @@ impl Typer {
         if let Some(wire) = self.source_type_wire(ty)? {
             return Ok(wire);
         }
+        if let Some(wire) = self.binary_type_param_wire(ty)? {
+            return Ok(wire);
+        }
         if let Some(wire) = self.binary_module_type_wire(ty) {
             return Ok(wire);
+        }
+        // A binary member class has a JVM identity even when staticClass
+        // cannot resolve its Scala source path (for example Types#TypeApi).
+        if let Type::Class { sym, args } = ty {
+            let jvm = self.st.jvm_internal(*sym);
+            if !self.st.is_source_class(*sym) && jvm.rsplit('/').next().is_some_and(|name| name.contains('$')) {
+                let mut out = String::from("(jclass ");
+                quote_into(&mut out, &jvm.replace('/', "."));
+                for arg in args { out.push(' '); out.push_str(&self.tag_wire(arg)?); }
+                out.push(')');
+                return Ok(out);
+            }
         }
         // A constant type nested inside a type argument. nsc's tag for
         // `Tag[1]` carries `Int(1)`, and widening it here would hand the
@@ -2092,6 +2119,11 @@ impl Typer {
             byname_type_marker: false,
         };
         match kind.as_str() {
+            "SelectFromTypeTree" => Ok(node(TreeKind::SelectFromTypeTree {
+                qual: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+                name: decode_method_name(&name_from(at(kids, 1)?)?),
+                hash: true,
+            })),
             "Literal" => Ok(node(TreeKind::Literal {
                 lit: literal_from(at(kids, 0)?)?,
             })),
@@ -2285,6 +2317,24 @@ impl Typer {
             // ValDef is not a declaration.  ZIO's autoTrace expansion uses
             // exactly `Tracer.instance.Type with Tracer.Traced` as the target
             // of an `asInstanceOf`.
+            "Import" => {
+                let expr = self.tree_from_reply(at(kids, 0)?, span)?;
+                let mut selectors = Vec::new();
+                for entry in at(kids, 1)?.list()?.iter().skip(1) {
+                    let fields = entry.list()?;
+                    if at(fields, 0)?.text() != "selector" {
+                        return Err("malformed macro import selector".to_string());
+                    }
+                    let name = name_from(at(fields, 1)?)?;
+                    let rename = name_from(at(fields, 2)?)?;
+                    selectors.push(scala_rs_parser::ast::ImportSelector { name, rename: (!rename.is_empty()).then_some(rename), span });
+                }
+                let names: Vec<_> = selectors.iter().map(|s| {
+                    s.rename.as_ref().map_or_else(|| s.name.clone(), |to| format!("{}=>{}", s.name, to))
+                }).collect();
+                let expr = node(TreeKind::Select { qual: Box::new(expr), name: format!("{{{}}}", names.join(",")) });
+                Ok(node(TreeKind::Import { expr: Box::new(expr), selectors: Vec::new() }))
+            }
             "CompoundTypeTree" => {
                 let template = at(kids, 0)?.list()?;
                 if at(template, 1)?.text() != "Template" {
@@ -2806,6 +2856,36 @@ impl Typer {
     pub(crate) fn type_tree_from_wire(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
         let items = s.list()?;
         match items.first().and_then(|s| s.atom()) {
+            Some("jclass") => {
+                let name = at(items, 1)?.text();
+                let jvm = name.replace('.', "/");
+                let id = crate::classpath::find_by_jvm(&self.st, &jvm)
+                    .or_else(|| self.pickle.ensure_class(&mut self.st, &mut self.binary,
+                        &scala_rs_pickle::names::nested_to_dotted(&name), false))
+                    .ok_or_else(|| format!("unknown binary class `{name}` in macro result"))?;
+                let mut args = Vec::new();
+                for arg in &items[2..] {
+                    let tree = self.type_tree_from_wire(arg, span)?;
+                    args.push(self.tree_to_type(&tree));
+                }
+                let mut tree = self.macro_node(TreeKind::Ident {
+                    name: crate::materialize::RESOLVED_TYPE.to_string(),
+                }, span)?;
+                tree.sym = id;
+                tree.ty = Type::Class { sym: id, args };
+                return Ok(tree);
+            }
+            Some("cst") => {
+                let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
+                tree.ty = Type::Constant(literal_from(at(items, 1)?)?);
+                return Ok(tree);
+            }
+            Some("mem") => {
+                let ty = self.query_type_from_wire(s, span)?;
+                let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
+                tree.ty = ty;
+                return Ok(tree);
+            }
             Some("mod") => {
                 let ref_ = path_tree(&at(items, 1)?.text(), span);
                 return self.macro_node(
@@ -2833,6 +2913,7 @@ impl Typer {
                 let ty = match self.st.get(id).kind {
                     crate::symbol::SymKind::Class => Type::Class { sym: id, args },
                     crate::symbol::SymKind::TypeParam if args.is_empty() => Type::TypeParam(id),
+                    crate::symbol::SymKind::TypeParam => self.apply_types(Type::TypeParam(id), args, span),
                     _ => {
                         return Err(
                             "unsupported source type application in macro result".to_string()
@@ -3938,6 +4019,33 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str("(t \"EmptyTree\" (s0))");
             Ok(())
         }
+        TreeKind::Import { expr, selectors } => {
+            let (qualifier, names) = if selectors.is_empty() {
+                match &expr.kind {
+                    TreeKind::Select { qual, name } => {
+                        let names = if name.starts_with('{') {
+                            crate::check::decode_import_selectors(name)
+                        } else { vec![(name.clone(), name.clone())] };
+                        (qual.as_ref(), names)
+                    }
+                    _ => return unsupported("an import without a qualified selector"),
+                }
+            } else {
+                (expr.as_ref(), selectors.iter().map(|s| (s.name.clone(), s.rename.clone().unwrap_or_else(|| s.name.clone()))).collect())
+            };
+            out.push_str("(t \"Import\" (s0) ");
+            tree_to_wire(cx, qualifier, out)?;
+            out.push_str(" (l");
+            for (name, rename) in names {
+                out.push_str(" (selector (n term ");
+                quote_into(out, &name);
+                out.push_str(") (n term ");
+                quote_into(out, if name == "_" { "" } else { &rename });
+                out.push_str("))");
+            }
+            out.push_str("))");
+            Ok(())
+        }
         TreeKind::Block { stats, expr } => {
             out.push_str("(t \"Block\" (s0) ");
             trees_to_wire(cx, stats, out)?;
@@ -3986,6 +4094,17 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push(')');
             Ok(())
         }
+        TreeKind::CompoundTypeTree { parents, refinements } => {
+            out.push_str("(t \"CompoundTypeTree\" (s0) (t \"Template\" (s0) (l");
+            for parent in parents {
+                out.push(' ');
+                type_tree_to_wire(cx, parent, out)?;
+            }
+            out.push_str(") (t \"ValDef\" (s0) (mods (f) (rest \"0\") \"\" (l)) (n term \"_\") (t \"TypeTree\" (s0) (ty \"\")) (t \"EmptyTree\" (s0))) ");
+            trees_to_wire(cx, refinements, out)?;
+            out.push_str("))");
+            Ok(())
+        }
         TreeKind::TypeDef {
             mods,
             name,
@@ -3998,11 +4117,9 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
         } => {
             // Reflect's TypeDef tree has a single fourth child: either its
             // alias RHS or a TypeBoundsTree.  The parser keeps bounds and
-            // view/context bounds separately, and the outbound wire has no
-            // TypeBoundsTree representation yet.  Carry the representable
-            // declaration shape without cloning the borrowed subtree; reject
-            // the rest explicitly rather than silently changing its meaning.
-            if lo.is_some() || hi.is_some() || !views.is_empty() || !ctx_bounds.is_empty() {
+            // view/context bounds separately. Preserve ordinary bounds;
+            // view/context bounds need desugaring before they can travel.
+            if !views.is_empty() || !ctx_bounds.is_empty() {
                 return unsupported("a type definition with bounds");
             }
             out.push_str("(t \"TypeDef\" (s0) ");
@@ -4012,7 +4129,15 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             out.push_str(") ");
             trees_to_wire(cx, tparams, out)?;
             out.push(' ');
-            tree_to_wire(cx, rhs, out)?;
+            if lo.is_some() || hi.is_some() || rhs.is_empty() {
+                out.push_str("(t \"TypeBoundsTree\" (s0) ");
+                if let Some(lo) = lo { type_tree_to_wire(cx, lo, out)?; }
+                else { out.push_str("(t \"EmptyTree\" (s0))"); }
+                out.push(' ');
+                if let Some(hi) = hi { type_tree_to_wire(cx, hi, out)?; }
+                else { out.push_str("(t \"EmptyTree\" (s0))"); }
+                out.push(')');
+            } else { type_tree_to_wire(cx, rhs, out)?; }
             out.push(')');
             Ok(())
         }
@@ -4037,6 +4162,7 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
         }
         TreeKind::AppliedTypeTree { .. }
         | TreeKind::AnnotatedTypeTree { .. }
+        | TreeKind::SelectFromTypeTree { .. }
         | TreeKind::SingletonTypeTree { .. } => type_tree_to_wire(cx, t, out),
         TreeKind::ValDef {
             mods,
@@ -4264,6 +4390,19 @@ fn trees_to_wire(cx: &WireCx, trees: &[Tree], out: &mut String) -> Result<(), St
 
 fn type_tree_to_wire(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(), String> {
     match &t.kind {
+        TreeKind::SelectFromTypeTree { qual, name, hash } => {
+            if *hash {
+                out.push_str("(t \"SelectFromTypeTree\" (s0) ");
+                type_tree_to_wire(cx, qual, out)?;
+            } else {
+                out.push_str("(t \"Select\" (s0) ");
+                tree_to_wire(cx, qual, out)?;
+            }
+            out.push_str(" (n type ");
+            quote_into(out, name);
+            out.push_str("))");
+            Ok(())
+        }
         TreeKind::SingletonTypeTree { ref_ } => {
             out.push_str("(t \"SingletonTypeTree\" (s0) ");
             tree_to_wire(cx, ref_, out)?;

@@ -131,7 +131,6 @@ impl Typer {
         // Scala declaration, including implicit clauses and bounds, even
         // when the shallow scan already installed a member with this name.
         if let Some(cls) = self.st.class_sym_of(&recv_ty) {
-            let jvm = self.st.get(cls).jvm_name.clone();
             // A Java class first encountered in another method's generic
             // result is only an identity-preserving stub. Complete it before
             // member/view lookup so conformance can see its interfaces. In
@@ -139,8 +138,7 @@ impl Typer {
             // `java.lang.Iterable[A]` for Twirl's imported
             // `twirlJavaCollectionToScala` view to provide `.last`.
             if self.st.pending_classpath_signatures.contains(&cls)
-                || (self.st.get(cls).flags.contains(Flags::JAVA)
-                    && (jvm.starts_with("java/") || jvm.starts_with("javax/")))
+                || self.st.get(cls).flags.contains(Flags::JAVA)
             {
                 self.ensure_java_loaded(cls, tree.span);
             }
@@ -484,6 +482,20 @@ impl Typer {
         } else {
             self.supply_receiver_override(&recv_ty, &name, &mut found);
         }
+        // A JVM mixin forwarder flattens Scala's implicit parameter clauses.
+        // Refine potentially flattened clauses before argument matching. Single
+        // parameters retain deferred completion: their dependent result aliases
+        // must be read after explicit type arguments have been substituted.
+        if found.iter().any(|m| {
+            let s = self.st.get(*m);
+            m.0 >= self.st.prelude_end && s.flags.contains(Flags::JAVA)
+                && s.pickled_origin.is_empty() && s.jvm_name.starts_with('(')
+                && matches!(&s.ty, Type::Method { paramss, .. } if (paramss.len() == 1 && paramss[0].len() > 1) || s.tparams.is_empty())
+                && !self.st.is_source_class(s.owner)
+        }) {
+            let precise = self.supply_from_pickle(&recv_ty, &name);
+            if !precise.is_empty() { found = precise; }
+        }
         // An abstract type member whose upper bound is a *compound* offers
         // every parent's members, and only the first one had been reachable.
         if found.is_empty() {
@@ -522,6 +534,11 @@ impl Typer {
         // The conversion a view inserted, when one was: the member it produced
         // may be declared at the type parameters of the *value* the conversion
         // was imported from, which only that prefix can fill in.
+        // A protected member cannot block a public extension with the same
+        // name. Preserve it for the access diagnostic if no view applies.
+        let inaccessible = if !found.is_empty()
+            && found.iter().all(|s| !self.accessible(*s, Some(qual.as_ref())))
+        { std::mem::take(&mut found) } else { Vec::new() };
         let mut ext_conv = SymbolId::NONE;
         if found.is_empty() {
             // An abstract receiver was widened to its bound so its members
@@ -563,6 +580,7 @@ impl Typer {
                     byname_type_marker: false,
                 };
                 **qual = self.fill_conv_implicits(conv, &from, applied, span);
+                let to = qual.ty.clone();
                 // A view whose result applies a higher-kinded *type parameter*
                 // (`implicit w1: T1 <:< It1[El1]` with `It1[a] <: Iterable[a]`)
                 // offers the members of that parameter's upper bound, at the
@@ -590,6 +608,23 @@ impl Typer {
                 recv_ty = to.clone();
             }
         }
+        // Array wrapping is lower priority than ArrayOps, but exposes the
+        // collection members that ArrayOps does not define (such as lift).
+        if found.is_empty() {
+            if let Type::Array(elem) = &recv_ty {
+                for (_, view) in self.array_wrap_candidates(elem) {
+                    let Some(cls) = self.st.class_sym_of(&view) else { continue };
+                    let mut members = self.st.lookup_member(cls, &name);
+                    if members.is_empty() { members = self.supply_from_pickle(&view, &name); }
+                    if !members.is_empty() && self.coerce_array_to_collection(qual, &view) {
+                        recv_ty = view;
+                        found = members;
+                        break;
+                    }
+                }
+            }
+        }
+        if found.is_empty() { found = inaccessible; }
         if found.is_empty() && self.is_dynamic_receiver(&qual.ty) {
             if matches!(pt, Type::Method { .. }) {
                 // `d.foo(args)`: type_apply rewrites to applyDynamic.
@@ -2862,6 +2897,10 @@ impl Typer {
         }
     }
 
+    fn dynamic_receiver_has_term(&mut self, ty: &Type, name: &str) -> bool {
+        self.receiver_has_term(ty, name) || !self.supply_from_pickle(ty, name).is_empty()
+    }
+
     fn dynamics_feature_error(&mut self, span: Span, method: &str) {
         self.error(
             span,
@@ -2910,7 +2949,7 @@ impl Typer {
             }
             self.type_qualifier(&mut qual, &Type::NoType);
         }
-        if !self.is_dynamic_receiver(&qual.ty) || self.receiver_has_term(&qual.ty, &name) {
+        if !self.is_dynamic_receiver(&qual.ty) || self.dynamic_receiver_has_term(&qual.ty, &name) {
             return false;
         }
         if !self.language_dynamics {
@@ -3422,7 +3461,7 @@ impl Typer {
         }
         if (direct_type_apply && matches!(qual.ty, Type::Method { .. } | Type::Overload(_)))
             || !self.is_dynamic_receiver(&qual.ty)
-            || self.receiver_has_term(&qual.ty, &dyn_name)
+            || self.dynamic_receiver_has_term(&qual.ty, &dyn_name)
         {
             // Preserve ordinary qualifier completion; a speculative peel
             // of receiver type arguments must leave the source shape intact.
@@ -3559,7 +3598,7 @@ impl Typer {
                     let dyn_name = name.clone();
                     self.type_qualifier(qual, &Type::NoType);
                     if !self.is_dynamic_receiver(&qual.ty)
-                        || self.receiver_has_term(&qual.ty, &dyn_name)
+                        || self.dynamic_receiver_has_term(&qual.ty, &dyn_name)
                     {
                         return false;
                     }
@@ -3575,7 +3614,7 @@ impl Typer {
                         let dyn_name = name.clone();
                         self.type_qualifier(qual, &Type::NoType);
                         if !self.is_dynamic_receiver(&qual.ty)
-                            || self.receiver_has_term(&qual.ty, &dyn_name)
+                            || self.dynamic_receiver_has_term(&qual.ty, &dyn_name)
                         {
                             return false;
                         }
