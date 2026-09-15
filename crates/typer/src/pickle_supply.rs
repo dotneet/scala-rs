@@ -763,12 +763,14 @@ impl PickleSupply {
     /// * A name is only *considered* when the class file has a member of it
     ///   with **at least two parameters in one clause**. Splitting a parameter
     ///   list is the one thing a class file cannot express, and every split
-    ///   form that matters here has two or more; a one-parameter
-    ///   `()(implicit x)` is left alone rather than widening the walk over
-    ///   every inherited unary method.
-    /// * The replacement has to have **more than one clause**, and then
-    ///   **every** class-file member of that name whose total parameter count
-    ///   the replacement also has is dropped, not just the flattened one.
+    ///   form covered by this cleanup has two or more parameters. A unary
+    ///   `()(implicit x)` is intentionally left alone: it is ambiguous with
+    ///   an ordinary unary method, and scanning all such names regresses
+    ///   unrelated library methods (the Scalatest matcher DSL is the guard).
+    /// * The replacement has to have **more than one clause or an implicit
+    ///   clause**, and then **every** class-file member of that name whose
+    ///   total parameter count the replacement also has is dropped, not just
+    ///   the flattened one.
     ///   `DurationInt` inherits both `seconds: FiniteDuration` and
     ///   `seconds[C](c: C)(implicit ev: Classifier[C]): C#R`; dropping the
     ///   flattened two-parameter one and leaving the class file's nullary one
@@ -807,6 +809,26 @@ impl PickleSupply {
             .iter()
             .map(|m| scala_rs_pickle::names::decode_method_name(&m.name))
             .collect();
+        // A concrete synchronous action carries class-file forwarders for
+        // the combinators implemented by `SynchronousDatabaseAction`, while
+        // its pickle exposes the corresponding `DBIOAction` methods. Removing
+        // the pair `flatten`/`zipWith` from that class changes the inherited
+        // `flatMap` overload set, so retain the pair and let the ordinary
+        // unary sole-implicit gate below handle other classes.
+        let synchronous_action_parent = st.get(class_sym).parents.iter().any(|parent| {
+            st.class_sym_of(parent)
+                .is_some_and(|p| st.get(p).jvm_name == "slick/dbio/SynchronousDatabaseAction")
+        });
+        let has_combinator_pair = st.get(class_sym).members.iter().any(|&m| {
+            let s = st.get(m);
+            s.kind == SymKind::Method && s.name == "flatten"
+        }) && st.get(class_sym).members.iter().any(|&m| {
+            let s = st.get(m);
+            s.kind == SymKind::Method && s.name == "zipWith"
+        });
+        if synchronous_action_parent && has_combinator_pair {
+            return;
+        }
         let mut names: Vec<String> = Vec::new();
         for &m in &st.get(class_sym).members {
             let s = st.get(m);
@@ -844,7 +866,26 @@ impl PickleSupply {
                 .map(|m| (m, st.get(m).params.len()))
                 .collect();
             let installed = self.complete_named(st, bin, class_sym, &name, false);
-            if !installed.iter().any(|&i| st.get(i).paramss.len() > 1) {
+            // A one-parameter class-file method is ambiguous with both an
+            // ordinary unary source method and a flattened `()(implicit x)`
+            // source method. Only the latter can justify removing it. In
+            // particular, do not let an unrelated multi-clause overload of
+            // the same name authorize removal of an ordinary unary method
+            // (`TransactionTest.flatMap` is the regression guard).
+            let has_unary_flat = flat.iter().any(|(_, arity)| *arity == 1);
+            if !installed.iter().any(|&i| {
+                let symbol = st.get(i);
+                let sole_implicit = symbol.paramss.len() == 1
+                    && !symbol.paramss[0].is_empty()
+                    && symbol.paramss[0]
+                        .iter()
+                        .all(|p| st.get(*p).flags.contains(Flags::IMPLICIT));
+                if has_unary_flat {
+                    sole_implicit
+                } else {
+                    symbol.paramss.len() > 1 || sole_implicit
+                }
+            }) {
                 continue;
             }
             let arities: Vec<usize> = installed
@@ -5886,10 +5927,11 @@ impl PickleSupply {
     /// `sym` is the referent's full dotted path (`slick.relational.
     /// RelationalTableComponent.columnOptions`). Everything before the last
     /// segment names the class that declares it, which is looked up the same
-    /// way any other member is; the answer is the val's *declared* type, not a
-    /// singleton, because there is no singleton type to build here. That
-    /// widening is what a selection off the reference can reach, which is all
-    /// the reference is used for in a signature.
+    /// way any other member is. A stable accessor keeps its singleton when the
+    /// classpath symbol is available, so an enclosing instance can rebind the
+    /// path to an overriding profile member; an ordinary val falls back to
+    /// its declared type. Either form gives a selection off the reference what
+    /// it can reach, which is all the reference is used for in a signature.
     ///
     /// Declined -- rather than guessed at -- when the owner has no pickle,
     /// when nothing of that name is declared, or when the entry takes
@@ -5957,7 +5999,27 @@ impl PickleSupply {
                 .map(|t| Type::TypeParam(*t))
                 .collect(),
         });
-        let conv = self.conv_at(st, bin, &HashMap::new(), &ty, d);
+        // A stable `val` singleton is useful in its own right: the caller
+        // must retain the path so an inner class can rebind it through the
+        // enclosing instance (`Table#O` is `columnOptions.type`, not merely
+        // `RelationalColumnOptions`).  The JVM descriptor still carries only
+        // the erased declared type; the symbol supplies the stable identity.
+        let conv = if hit.member.has(pflags::STABLE) {
+            let ids = st.lookup_member(owner, member);
+            ids.iter()
+                .copied()
+                .find(|&id| {
+                    matches!(st.get(id).kind, SymKind::Method | SymKind::Term)
+                        && st.get(id).flags.contains(Flags::ACCESSOR)
+                })
+                .map(|id| Type::SingleType {
+                    prefix: Box::new(Type::ThisType(owner)),
+                    sym: id,
+                })
+                .or_else(|| self.conv_at(st, bin, &HashMap::new(), &ty, d))
+        } else {
+            self.conv_at(st, bin, &HashMap::new(), &ty, d)
+        };
         self.self_ty = saved;
         conv
     }

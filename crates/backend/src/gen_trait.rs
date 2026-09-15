@@ -4080,9 +4080,26 @@ impl<'a> Gen<'a> {
             // `object Test { val b = new B; new b.C {} }` nothing encloses
             // the anonymous class but `Test`, and `B$C$$$outer()` stayed
             // unimplemented (`AbstractMethodError`, run/t4300).
-            let prefix = parents
-                .iter()
-                .find_map(|p| parent_prefix_instance(self.st, p, o));
+            // There can be several prefixed parents with the same enclosing
+            // owner (`b.Other with a.Table`). The outer accessor belongs to
+            // this *specific* trait, not to whichever compatible prefix is
+            // encountered first. Prefer the source parent whose class is the
+            // trait currently being emitted; only inherited traits without a
+            // direct source parent need the old owner-compatible fallback.
+            let direct_prefix = parents.iter().find_map(|p| {
+                let mut head = p;
+                while let TreeKind::Apply { fun, .. } = &head.kind {
+                    head = fun;
+                }
+                (self.st.class_sym_of(&head.ty) == Some(parent))
+                    .then(|| parent_prefix_instance(self.st, p, o))
+                    .flatten()
+            });
+            let prefix = direct_prefix.or_else(|| {
+                parents
+                    .iter()
+                    .find_map(|p| parent_prefix_instance(self.st, p, o))
+            });
             let via_module = prefix.is_none()
                 && member_module_outer(self.st, o)
                     .is_some_and(|m| outer_chain_reaches(self.st, class_id, m));

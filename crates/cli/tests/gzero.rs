@@ -311,6 +311,18 @@ fn gzero_basecolumn_bad_still_needs_a_real_column_type() {
     with_slick(|cp| check_rejects_both("gzero_basecolumn_bad", &[], Some(cp)));
 }
 
+// ---------------------------------------- singleton parent provenance / ABI
+
+#[test]
+fn gzero_rebind_prefix_preserves_the_parent_outer_and_runs() {
+    with_jar(|| check_runs_both("gzero_rebind_prefix", "GzeroPrefixMain", &[], None));
+}
+
+#[test]
+fn gzero_rebind_prefix_rejects_a_sibling_outer_singleton() {
+    with_jar(|| check_rejects_both("gzero_rebind_prefix_bad", &[], None));
+}
+
 // --------------------------------------- a jar trait's concrete members
 
 #[test]

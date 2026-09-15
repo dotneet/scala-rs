@@ -2753,6 +2753,7 @@ impl Typer {
     /// came back as the bare `T`, so the template's own declared result type
     /// did not match it.
     pub(crate) fn ident_ty_as_seen_from_this(&self, s: SymbolId, ty: Type) -> Type {
+        let ty = self.rebind_inner_singleton(s, ty);
         if self.st.this_class.is_none() {
             return ty;
         }
@@ -2781,11 +2782,193 @@ impl Typer {
         // the member's type gets (`prefix.rs`), not the class type it is
         // read through -- `def use: In = mk` inside `Sub` reads `mk`'s `In`
         // as `Sub.this.In`.
-        self.st.subst_as_seen_from_at(
+        let ty = self.st.subst_as_seen_from_at(
             &self.class_this_ty(prefix),
             Some(&Type::ThisType(prefix)),
             &ty,
-        )
+        );
+        self.rebind_inner_singleton(s, ty)
+    }
+
+    /// Rebind a stable accessor's singleton type through the outer instance
+    /// of an inner class.  Scala 2 writes `Table#O` as
+    /// `RelationalTableComponent.this.columnOptions.type`; a source class
+    /// extending `profile.api.Table` carries the actual `profile` path in
+    /// `parent_prefixes`.  Keeping the singleton but leaving its declaration
+    /// owner unchanged would widen it to `RelationalColumnOptions`, hiding
+    /// profile-specific options such as `SqlType` and Oracle's trigger names.
+    fn rebind_inner_singleton(&self, member: SymbolId, ty: Type) -> Type {
+        let method = match &ty {
+            Type::Method { paramss, .. } if paramss.iter().all(|clause| clause.is_empty()) => {
+                Some(paramss.clone())
+            }
+            Type::SingleType { .. } => None,
+            _ => return ty,
+        };
+        let singleton = match &ty {
+            Type::SingleType { .. } => ty.clone(),
+            Type::Method { ret, .. } => (**ret).clone(),
+            _ => unreachable!(),
+        };
+        let wrap = |t: Type| match &method {
+            Some(paramss) => Type::Method {
+                paramss: paramss.clone(),
+                ret: Box::new(t),
+            },
+            None => t,
+        };
+        let Type::SingleType { sym, .. } = &singleton else {
+            return wrap(singleton);
+        };
+        let singleton_owner = self.st.get(*sym).owner;
+        if singleton_owner.is_none() || !self.st.get(singleton_owner).is_class_like() {
+            return ty;
+        }
+        let owner = self.st.get(member).owner;
+        if owner.is_none() || self.st.this_class.is_none() {
+            return ty;
+        }
+        // The member itself is inherited from an inner class.  Its outer
+        // parent prefix is the path that can select a more-derived accessor.
+        for (index, parent) in self.st.get(self.st.this_class).parents.iter().enumerate() {
+            let Some(parent_cls) = self.st.class_sym_of(parent) else {
+                continue;
+            };
+            if self.st.get(parent_cls).owner != singleton_owner {
+                continue;
+            }
+            // The parent prefix is only allowed to rebind a singleton on a
+            // member that is actually inherited through this parent. A
+            // sibling parent can have the same enclosing owner and a member
+            // with the same name; using its prefix would silently turn
+            // `a.o` into `b.o`'s path-dependent type. Keep the declaration
+            // provenance tied to the matched parent, including ancestors of
+            // that parent.
+            if !crate::pickle_supply::inherits_from(&self.st, parent_cls, owner) {
+                continue;
+            }
+            // The owner relation above is necessary but not sufficient: two
+            // siblings can share an enclosing owner, while only one actually
+            // contributes this declaration. Check the exact symbol through
+            // the matched parent so a same-named sibling can never authorize
+            // its prefix.
+            if !self
+                .st
+                .lookup_member(parent_cls, &self.st.get(member).name)
+                .contains(&member)
+            {
+                continue;
+            }
+            let Some(prefix) = self.st.parent_prefixes.get(&(self.st.this_class.0, index)) else {
+                continue;
+            };
+            let Some(prefix_cls) = self
+                .rebound_path_class(prefix)
+                .or_else(|| self.st.class_sym_of(prefix))
+            else {
+                continue;
+            };
+            let name = self.st.get(*sym).name.clone();
+            let candidates: Vec<_> = self
+                .st
+                .lookup_member(prefix_cls, &name)
+                .into_iter()
+                .filter(|&id| matches!(self.st.get(id).kind, SymKind::Method | SymKind::Term))
+                .collect();
+            let reduced = self.drop_overridden_at(prefix_cls, candidates.clone());
+            // `drop_field_behind_accessor` can discard both views of a
+            // classfile accessor: the base declaration and the inherited
+            // profile override have the same JVM field shape, even though
+            // the latter is the source-level answer. In that case preserve
+            // the classfile linearization order from `lookup_member` rather
+            // than losing the profile-specific singleton altogether.
+            let is_profile_override = |id: SymbolId| {
+                let owner = self.st.get(id).owner;
+                owner != singleton_owner
+                    && candidates.iter().copied().all(|other| {
+                        let other_owner = self.st.get(other).owner;
+                        other_owner == owner
+                            || crate::pickle_supply::inherits_from(&self.st, owner, other_owner)
+                    })
+            };
+            // Prefer a real profile override over the original enclosing
+            // declaration. If there is no override, retain the original
+            // symbol but carry the matched prefix (`a.o`) so its singleton
+            // identity does not widen away and make `b.o` equivalent.
+            let rebound = reduced
+                .iter()
+                .copied()
+                .find(|&id| is_profile_override(id))
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|&id| is_profile_override(id))
+                })
+                .or_else(|| candidates.iter().copied().find(|&id| id == *sym));
+            let Some(rebound) = rebound else {
+                continue;
+            };
+            let rebound = Type::SingleType {
+                prefix: Box::new(prefix.clone()),
+                sym: rebound,
+            };
+            return match method {
+                Some(paramss) => Type::Method {
+                    paramss,
+                    ret: Box::new(rebound),
+                },
+                None => rebound,
+            };
+        }
+        wrap(singleton)
+    }
+
+    /// Resolve a stable path's class through generic enclosing instances.
+    /// `tdb.profile` is declared on `TestDB`, but an inner table in
+    /// `AsyncTest[JdbcTestDB]` must see the `JdbcTestDB.Profile` alias rather
+    /// than the bound `BasicProfile`. Walk the path from its outer receiver,
+    /// substituting each enclosing class's actual arguments before expanding
+    /// its member type. If no path substitution is available, callers retain
+    /// the ordinary class lookup result.
+    fn rebound_path_class(&self, path: &Type) -> Option<SymbolId> {
+        let mut syms = Vec::new();
+        let mut tail = path;
+        while let Type::SingleType { prefix, sym } = tail {
+            syms.push(*sym);
+            tail = prefix;
+        }
+        if syms.is_empty() {
+            return None;
+        }
+        syms.reverse();
+        let mut current = tail.clone();
+        let mut current_cls = self.st.class_sym_of(&current)?;
+        for sym in syms {
+            let owner = self.st.get(sym).owner;
+            let mut member_ty = self.st.get(sym).ty.clone();
+            if !owner.is_none() {
+                let base = self
+                    .st
+                    .enclosing_classes(self.st.this_class)
+                    .into_iter()
+                    .find_map(|cls| {
+                        self.base_type_instance(&self.st.self_type_of_class(cls), owner, 0)
+                    });
+                if let Some(base) = base {
+                    if let Type::Class { args, .. } = base {
+                        member_ty = self.st.subst_tparams(owner, &args, &member_ty);
+                    }
+                }
+            }
+            let expanded = self.st.expand_type_members(current_cls, &member_ty);
+            if expanded.is_no_type() || expanded.is_error() {
+                return None;
+            }
+            current = expanded;
+            current_cls = self.st.class_sym_of(&current)?;
+        }
+        Some(current_cls)
     }
 
     /// The enclosing class an unqualified reference to a member of `owner`
@@ -2905,6 +3088,7 @@ impl Typer {
             let s = found[0];
             tree.sym = s;
             let mut ty = self.st.get(s).ty.clone();
+            ty = self.rebind_inner_singleton(s, ty);
             if ty.is_no_type()
                 && self.st.get(s).flags.contains(Flags::PARAM)
                 && is_inferable_param_pt(pt)
@@ -2999,6 +3183,14 @@ impl Typer {
                 )
             {
                 ty = self.st.expand_type_members(self.st.this_class, &ty);
+            }
+            // The ordinary inherited-member substitution above can erase a
+            // profile override's singleton prefix while translating the
+            // enclosing `Table` type. Re-run the narrow path rebinding after
+            // that substitution so `O.SqlType` still sees `SqlColumnOptions`.
+            let raw_rebound = self.rebind_inner_singleton(s, self.st.get(s).ty.clone());
+            if raw_rebound != self.st.get(s).ty {
+                ty = self.maybe_auto_apply(raw_rebound, pt);
             }
             tree.ty = ty;
             return;
