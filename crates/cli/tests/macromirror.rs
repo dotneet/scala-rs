@@ -70,16 +70,85 @@ fn find_scalac() -> Option<PathBuf> {
     cached.is_file().then_some(cached)
 }
 
+fn zio_jars() -> Option<Vec<PathBuf>> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let relative = [
+        "dev/zio/zio_2.13/2.1.26/zio_2.13-2.1.26.jar",
+        "dev/zio/zio-internal-macros_2.13/2.1.26/zio-internal-macros_2.13-2.1.26.jar",
+        "dev/zio/zio-stacktracer_2.13/2.1.26/zio-stacktracer_2.13-2.1.26.jar",
+        "dev/zio/izumi-reflect_2.13/3.0.9/izumi-reflect_2.13-3.0.9.jar",
+        "dev/zio/izumi-reflect-thirdparty-boopickle-shaded_2.13/3.0.9/izumi-reflect-thirdparty-boopickle-shaded_2.13-3.0.9.jar",
+        "org/scala-lang/modules/scala-collection-compat_2.13/2.14.0/scala-collection-compat_2.13-2.14.0.jar",
+    ];
+    [
+        home.join("Library/Caches/Coursier/v1/https/repo1.maven.org/maven2"),
+        home.join(".cache/coursier/v1/https/repo1.maven.org/maven2"),
+    ]
+    .into_iter()
+    .find_map(|root| {
+        let jars: Vec<_> = relative.iter().map(|path| root.join(path)).collect();
+        jars.iter().all(|path| path.is_file()).then_some(jars)
+    })
+}
+
+fn required_assets() -> bool {
+    std::env::var_os("SCALA_RS_REQUIRE_TEST_ASSETS").is_some()
+}
+
+fn skip_or_panic(tag: &str, why: &str) -> bool {
+    if required_assets() {
+        panic!("required assets for {tag} are missing: {why}");
+    }
+    eprintln!("skip {tag}: {why}");
+    false
+}
+
 fn prerequisites(tag: &str) -> bool {
     if !tool_available("java") || !tool_available("javac") {
-        eprintln!("skip {tag}: java / javac not available");
-        return false;
+        return skip_or_panic(tag, "java / javac not available");
     }
     if scala_library_jar().is_none() || scala_reflect_jar().is_none() {
-        eprintln!("skip {tag}: scala-library / scala-reflect not obtainable");
-        return false;
+        return skip_or_panic(tag, "scala-library / scala-reflect not obtainable");
     }
     true
+}
+
+#[test]
+fn java_macro_protocol_parser_rejects_malformed_frames() {
+    if !tool_available("java") || !tool_available("javac") {
+        skip_or_panic("macro protocol self-test", "java / javac not available");
+        return;
+    }
+    let out = tmp_dir("protocol-engine");
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../typer/java/ScalaRsMacroEngine.java");
+    let compile = Command::new("javac")
+        .args(["--release", "8", "-d"])
+        .arg(&out)
+        .arg(&source)
+        .output()
+        .expect("compile protocol self-test engine");
+    assert!(
+        compile.status.success(),
+        "javac protocol self-test engine failed: {}",
+        diagnostics(&compile)
+    );
+    let run = Command::new("java")
+        .args([
+            "-cp",
+            out.to_str().unwrap(),
+            "ScalaRsMacroEngine",
+            "--protocol-self-test",
+        ])
+        .output()
+        .expect("run protocol self-test engine");
+    assert!(
+        run.status.success(),
+        "protocol self-test failed: {}",
+        diagnostics(&run)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "ok\n");
+    let _ = fs::remove_dir_all(out);
 }
 
 fn diagnostics(out: &std::process::Output) -> String {
@@ -178,7 +247,7 @@ fn infer_implicit_value_matches_real_scalac() {
         return;
     }
     let Some(scalac) = find_scalac() else {
-        eprintln!("skip miv_use oracle: scalac 2.13.16 not available");
+        skip_or_panic("miv_use oracle", "scalac 2.13.16 not available");
         return;
     };
     let jar = scala_library_jar().unwrap();
@@ -249,6 +318,183 @@ fn infer_implicit_value_matches_real_scalac() {
     );
 
     for dir in [impls, uses, scalac_uses] {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// Exercise the exact ZIO 2.1.26 stack-tracer macro artifact that motivated
+/// this RPC, rather than only the structurally equivalent local fixture.
+#[test]
+fn actual_zio_auto_trace_macro_expands() {
+    if !prerequisites("actual ZIO autoTrace") {
+        return;
+    }
+    let Some(jars) = zio_jars() else {
+        skip_or_panic("actual ZIO autoTrace", "ZIO 2.1.26 jars not available");
+        return;
+    };
+    let out_dir = tmp_dir("miv-zio-actual");
+    let extra: Vec<_> = jars.iter().map(PathBuf::as_path).collect();
+    let out = compile(&["miv_zio_actual"], &out_dir, &extra);
+    assert!(
+        out.status.success(),
+        "compile against actual ZIO stack-tracer macro failed: {}",
+        diagnostics(&out)
+    );
+    assert!(out_dir.join("Main$.class").is_file());
+    let _ = fs::remove_dir_all(out_dir);
+}
+
+/// Reverse implicit queries must fail closed when answering faithfully would
+/// require re-entering the busy macro engine or erasing a local singleton
+/// prefix or uses a non-default diagnostic position. A non-silent miss, on
+/// the other hand, is an ordinary compiler diagnostic. Real scalac establishes
+/// the oracle side of all four cases.
+#[test]
+fn infer_implicit_value_adversarial_queries_fail_closed() {
+    if !prerequisites("miv adversarial") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else {
+        skip_or_panic("miv adversarial oracle", "scalac 2.13.16 not available");
+        return;
+    };
+    let reflect = scala_reflect_jar().unwrap();
+    let impls = tmp_dir("miv-adversarial-impl");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            reflect.to_str().unwrap(),
+            "-d",
+            impls.to_str().unwrap(),
+        ])
+        .arg(fixtures_dir().join("miv_impl.scala"))
+        .output()
+        .expect("compile miv_impl with scalac");
+    assert!(
+        out.status.success(),
+        "scalac miv_impl failed: {}",
+        diagnostics(&out)
+    );
+
+    let scalac_enabled = tmp_dir("miv-scalac-enabled");
+    let scalac_nonstatic = tmp_dir("miv-scalac-nonstatic");
+    let scalac_position = tmp_dir("miv-scalac-position");
+    for (name, out_dir) in [
+        ("miv_enabled", &scalac_enabled),
+        ("miv_nonstatic", &scalac_nonstatic),
+        ("miv_position", &scalac_position),
+    ] {
+        let out = Command::new(&scalac)
+            .args([
+                "-cp",
+                &format!("{}:{}", impls.display(), reflect.display()),
+                "-d",
+                out_dir.to_str().unwrap(),
+            ])
+            .arg(fixtures_dir().join(format!("{name}.scala")))
+            .output()
+            .expect("compile adversarial oracle with scalac");
+        assert!(
+            out.status.success(),
+            "scalac {name} failed: {}",
+            diagnostics(&out)
+        );
+    }
+
+    let enabled_out = tmp_dir("miv-enabled");
+    let out = compile(&["miv_enabled"], &enabled_out, &[&impls]);
+    let text = diagnostics(&out);
+    assert!(!out.status.success(), "enabled implicit macro was accepted");
+    assert!(
+        text.contains("selected implicit macro `automatic`")
+            && text.contains("could not expand it while answering the outer macro"),
+        "wrong enabled-macro refusal: {text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("error:"))
+            .count(),
+        1
+    );
+
+    let position_out = tmp_dir("miv-position");
+    let out = compile(&["miv_position"], &position_out, &[&impls]);
+    let text = diagnostics(&out);
+    assert!(
+        !out.status.success(),
+        "non-default implicit position was accepted"
+    );
+    assert!(
+        text.contains("c.inferImplicitValue with a non-default `pos`"),
+        "wrong non-default-position refusal: {text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("error:"))
+            .count(),
+        1
+    );
+
+    let nonstatic_out = tmp_dir("miv-nonstatic");
+    let out = compile(&["miv_nonstatic"], &nonstatic_out, &[&impls]);
+    let text = diagnostics(&out);
+    assert!(!out.status.success(), "non-static type prefix was accepted");
+    assert!(
+        text.contains("the type `token.Type`") && text.contains("cannot rebuild at the call site"),
+        "wrong non-static-prefix refusal: {text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("error:"))
+            .count(),
+        1
+    );
+
+    let required_out = tmp_dir("miv-required");
+    let out = compile(&["miv_required"], &required_out, &[&impls]);
+    let text = diagnostics(&out);
+    assert!(!out.status.success(), "silent=false miss was accepted");
+    assert!(
+        text.contains("could not find implicit value of type MivMissing"),
+        "wrong silent=false diagnostic: {text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("error:"))
+            .count(),
+        1
+    );
+
+    let scalac_required = tmp_dir("miv-scalac-required");
+    let out = Command::new(&scalac)
+        .args([
+            "-cp",
+            &format!("{}:{}", impls.display(), reflect.display()),
+            "-d",
+            scalac_required.to_str().unwrap(),
+        ])
+        .arg(fixtures_dir().join("miv_required.scala"))
+        .output()
+        .expect("compile silent=false oracle with scalac");
+    let oracle = diagnostics(&out);
+    assert!(!out.status.success(), "scalac accepted silent=false miss");
+    assert!(
+        oracle.contains("TypecheckException: implicit search has failed"),
+        "unexpected scalac silent=false diagnostic: {oracle}"
+    );
+
+    for dir in [
+        impls,
+        scalac_enabled,
+        scalac_nonstatic,
+        scalac_position,
+        enabled_out,
+        nonstatic_out,
+        position_out,
+        required_out,
+        scalac_required,
+    ] {
         let _ = fs::remove_dir_all(dir);
     }
 }

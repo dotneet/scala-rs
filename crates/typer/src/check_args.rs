@@ -2085,16 +2085,19 @@ impl Typer {
             failed.ty = Type::Error;
             return failed;
         }
-        self.building_implicits.push((effective_id, pt.clone()));
         // Detached instances exist only to give recursive searches fresh
         // identities. Emit the original declaration so its owner still
         // supplies the receiver/static access path during code generation.
-        let mut result = self.implicit_tree_in(origin, pt, span, depth);
-        // Synthesized evidence does not pass through type_expr. Expand the
-        // selected macro here, while the implicit recursion guard is active.
-        self.expand_macro_application(&mut result);
-        self.building_implicits.pop();
-        result
+        // Keep the recursion guard scoped with RAII-style restoration so all
+        // nested macro queries, including unwinding failures, restore the
+        // caller's complete state.
+        self.with_building_implicit((effective_id, pt.clone()), |this| {
+            let mut result = this.implicit_tree_in(origin, pt, span, depth);
+            // Synthesized evidence does not pass through type_expr. Expand the
+            // selected macro here, while the implicit recursion guard is active.
+            this.expand_macro_application(&mut result);
+            result
+        })
     }
 
     fn implicit_tree_in(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {

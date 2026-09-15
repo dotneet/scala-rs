@@ -2868,7 +2868,12 @@ this project before.
   what the read cost). An implementation that asks a hundred questions must not be killed for how
   long scala-rs took to answer them. That leaves a macro that asks without end, which no time budget
   catches because answering costs it nothing: `MAX_ENGINE_QUERIES` (1024 per expansion) does, and
-  `MAX_QUERY_DEPTH` (16) bounds a chain of nested questions.
+  `MAX_QUERY_DEPTH` (16) bounds a chain of nested questions. The separate `(timing)` round trip has
+  its own two-second deadline. A timeout or framing failure poisons the engine and terminates its
+  owned process tree before another expansion can reuse the pipe. Unix uses a dedicated process
+  group; Windows creates the JVM suspended, assigns it to a kill-on-close Job Object, and only then
+  resumes its primary thread. Termination ownership is consumed once, so a rejected startup hello cannot
+  make `Drop` signal a reaped process's stale PID or process-group id.
 
 * **Cycles.** `Typer::macro_rpc_forcing` is the stack of class names whose descriptions are being
   built. A description that would have to describe a class already on it stops there and hands the
@@ -2921,7 +2926,21 @@ The requested type wire preserves abstract-member identity and a stable singleto
 `Tracer.instance.Type` is sent as its `Tracer.Type` declaration plus the `Tracer.instance` prefix.
 Returned trees likewise rebuild compound type trees such as
 `Tracer.instance.Type with Tracer.Traced`, preserving the prefix while the expansion is typechecked
-at the call site. Unsupported result types are refused rather than widened to a class name.
+at the call site. A local, parameter, or other non-static prefix the wire cannot identify is refused;
+it is never searched as the bare declaration, because `p.Type` and `q.Type` are distinct types.
+Unsupported result types are likewise refused rather than widened to a class name.
+
+An enabled implicit macro is selected by the ordinary search, but a normal macro cannot be expanded
+while the one JVM engine is busy running the outer implementation. That case is a named refusal,
+not an `(a ok ...)` containing the still-unexpanded implicit reference. Fast-track expansions that
+do not re-enter the engine remain possible. A `silent = false` miss leaves the typer's missing-
+implicit diagnostic at the call site; all speculative type-resolution and adaptation diagnostics
+are rolled back on every other exit.
+
+The default fourth argument is the enclosing macro-call position. The bridge verifies that the
+received `Position` equals that value; a different explicit `pos` is refused by name because the
+Rust side currently has no faithful position wire and silently substituting the call site would
+attach diagnostics to the wrong source location.
 
 #### The mirror over the current run's symbols
 
@@ -3059,6 +3078,14 @@ accept before.
   `c.inferImplicitValue` queries plus a ZIO-shaped compound-type expansion. The implementation is
   compiled once by real scalac; scala-rs and scalac then compile and execute the same use site, and
   `infer_implicit_value_matches_real_scalac` requires identical output.
+* `miv_enabled.scala`, `miv_nonstatic.scala`, `miv_position.scala`, and `miv_required.scala` — an
+  enabled implicit macro is refused by name while the engine is busy, a parameter-dependent prefix
+  is refused without an approximation, a non-default diagnostic position is refused rather than
+  ignored, and a non-silent miss produces exactly one diagnostic. Real scalac is the positive oracle
+  for the first three and the failing oracle for the fourth.
+* `miv_zio_actual.scala` compiles `ZIO.succeed(1)` against ZIO 2.1.26's real
+  `zio-stacktracer` artifact and requires the resulting `Main$.class`. This complements the
+  structurally equivalent local fixture with the exact `autoTraceImpl` that motivated the RPC.
 
 #### What remains
 

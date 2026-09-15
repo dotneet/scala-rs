@@ -267,13 +267,14 @@ fn hash_type<H: std::hash::Hasher>(ty: &Type, h: &mut H) {
     }
 }
 
-fn memo_key(pt: &Type, undet: &[SymbolId]) -> u64 {
+fn memo_key(pt: &Type, undet: &[SymbolId], macros_disabled: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     hash_type(pt, &mut h);
     for u in undet {
         u.0.hash(&mut h);
     }
+    macros_disabled.hash(&mut h);
     h.finish()
 }
 
@@ -2398,7 +2399,7 @@ impl Typer {
         if crate::check::type_is_erroneous(pt) {
             return (ImplicitSearch::None, Vec::new());
         }
-        let key = memo_key(pt, undet);
+        let key = memo_key(pt, undet, self.implicit_macros_disabled);
         let open = self.open_implicit_mask();
         if let Some(hit) = self.memo_lookup(key, pt, undet, depth, open) {
             return hit;
@@ -4849,6 +4850,15 @@ fn unwrap_byname(t: &Type) -> Type {
 mod memo_tests {
     use super::*;
     use crate::check::TypecheckOptions;
+
+    #[test]
+    fn macro_disabled_mode_is_part_of_the_memo_key() {
+        let wanted = Type::Class {
+            sym: SymbolId(42),
+            args: vec![Type::String],
+        };
+        assert_ne!(memo_key(&wanted, &[], false), memo_key(&wanted, &[], true));
+    }
 
     #[test]
     fn fresh_search_signatures_do_not_become_declared_candidates() {
