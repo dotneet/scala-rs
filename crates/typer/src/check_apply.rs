@@ -2046,6 +2046,7 @@ impl Typer {
                                 _ => relaxed,
                             };
                             let pt_arg = self.open_to_bounds(&relaxed, &open);
+                            let lambda_pt = self.lambda_expected_type(&pt_arg);
                             // A wildcard this substitution just put in is our
                             // own "not decided yet", not an existential the
                             // program wrote. Say so for as long as the argument
@@ -2055,7 +2056,7 @@ impl Typer {
                             if relaxed_here {
                                 self.relaxed_pt_depth += 1;
                             }
-                            self.type_expr(a, &pt_arg);
+                            self.type_expr(a, &lambda_pt);
                             if relaxed_here {
                                 self.relaxed_pt_depth -= 1;
                             }
@@ -3308,7 +3309,8 @@ impl Typer {
                                 if matches!(a.kind, TreeKind::Function { .. }) || a.ty.is_no_type()
                                 {
                                     let pt_arg = self.open_to_bounds(&p, &open);
-                                    self.type_expr(a, &pt_arg);
+                                    let lambda_pt = self.lambda_expected_type(&pt_arg);
+                                    self.type_expr(a, &lambda_pt);
                                 }
                                 if !p.is_no_type() {
                                     let p_check = self
@@ -3496,6 +3498,23 @@ impl Typer {
                 }
             }
             break;
+        }
+    }
+
+    /// Remove the provisional result from a function prototype when it still
+    /// contains the caller's open wildcard. The parameter types remain useful
+    /// for typing the lambda, while its body must supply the result variable:
+    /// `def f[B](g: A => R[Option[B]])` should infer `B` from `g` rather than
+    /// reject `R[Option[String]]` against invariant `R[Option[_]]`.
+    fn lambda_expected_type(&self, pt: &Type) -> Type {
+        match pt {
+            Type::Function { params, ret } if crate::check::pt_is_undecided(ret.as_ref()) => {
+                Type::Function {
+                    params: params.clone(),
+                    ret: Box::new(Type::NoType),
+                }
+            }
+            _ => pt.clone(),
         }
     }
 

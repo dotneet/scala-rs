@@ -3426,6 +3426,12 @@ impl Typer {
         // the result is whatever the body turns out to be.
         let ret_pt = if matches!(ret_pt, Type::TypeParam(_) | Type::Wildcard)
             || self.pt_says_nothing(&ret_pt)
+            // A wildcard nested below an invariant constructor is still the
+            // call's open result variable, not an existential bound for the
+            // lambda body. `def f[B](g: A => R[Option[B]])` must type
+            // `g = a => some(a)` without checking `R[Option[String]]` against
+            // the provisional `R[Option[_]]`; the body is what supplies B.
+            || crate::check::pt_is_undecided(&ret_pt)
         {
             Type::NoType
         } else {

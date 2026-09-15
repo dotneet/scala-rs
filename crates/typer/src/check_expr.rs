@@ -213,7 +213,19 @@ impl Typer {
             let tps = self.st.get(tree.sym).tparams.clone();
             self.pin_lower_bounded_implicit_tparams(tree, &tps);
         }
-        if !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error() {
+        // A function prototype with a `NoType` result is an internal
+        // inference marker: its parameter types are real, but the lambda
+        // body is meant to determine the result. Applying the prototype after
+        // `type_function` would compare the body's concrete result against
+        // `NoType` and turn a valid generic call into `required: <notype>`.
+        // Ordinary source expectations never contain `NoType`, so keep their
+        // adaptation unchanged.
+        let open_function_result = match (&tree.kind, pt) {
+            (TreeKind::Function { .. }, Type::Function { ret, .. }) => ret.is_no_type(),
+            _ => false,
+        };
+        if !open_function_result && !pt.is_no_type() && !tree.ty.is_no_type() && !tree.ty.is_error()
+        {
             self.adapt(tree, pt);
         }
     }
