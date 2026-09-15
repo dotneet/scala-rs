@@ -495,6 +495,7 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                         .iter()
                         .map(|a| type_of(entries, *a, depth + 1))
                         .collect(),
+                    singleton: false,
                 }
             }
             Some(Entry::ExtRef { name, owner }) => {
@@ -510,7 +511,11 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 _ => PickledType::simple("Any"),
             },
             Some(Entry::AnnotatedTpe(t)) => type_of(entries, *t, depth + 1),
-            Some(Entry::SingleTpe { prefix, .. }) => type_of(entries, *prefix, depth + 1),
+            Some(Entry::SingleTpe { sym, .. }) => {
+                let mut ty = type_of(entries, *sym, depth + 1);
+                ty.singleton = true;
+                ty
+            }
             Some(Entry::ConstantTpe(c)) => type_of(entries, *c, depth + 1),
             Some(Entry::RefinedTpe { parents }) => PickledType::intersection(
                 parents

@@ -259,6 +259,11 @@ impl std::error::Error for ScalaSignatureError {}
 pub struct PickledType {
     pub name: String,
     pub args: Vec<PickledType>,
+    /// The type is a singleton (`O.type`) rather than the class named `O`.
+    /// This distinction is present in the ScalaSignature's `SINGLEtpe` entry
+    /// and must survive the compact classpath ABI so module members remain
+    /// selectable after a separate compilation.
+    pub singleton: bool,
 }
 
 impl PickledType {
@@ -266,6 +271,7 @@ impl PickledType {
         Self {
             name: name.into(),
             args: Vec::new(),
+            singleton: false,
         }
     }
 
@@ -278,6 +284,7 @@ impl PickledType {
         Self {
             name: "&".into(),
             args: parents,
+            singleton: false,
         }
     }
 }

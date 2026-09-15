@@ -690,6 +690,14 @@ fn resolve_type_in(
             decls: Vec::new(),
         };
     }
+    if ty.singleton {
+        if let Some(sym) = find_by_fully_qualified_name(st, name) {
+            let module = st.companion_module_class_for_implicits(sym);
+            if !module.is_none() {
+                return apply_args(Type::ModuleRef(module), args);
+            }
+        }
+    }
     // An external `EXTref` carries its package/module owner separately from
     // the leaf name. The pickle reader preserves that owner as a dotted name.
     // Prefer an exact top-level JVM identity, but keep a nested member's leaf
@@ -715,6 +723,16 @@ fn resolve_type_in(
             .into_iter()
             .find(|&s| st.get(s).is_class_like() || st.get(s).kind == SymKind::TypeMember)
         {
+            if ty.singleton {
+                let module = match st.get(id).kind {
+                    SymKind::Module => st.module_class_of(id),
+                    SymKind::ModuleClass => id,
+                    _ => st.companion_module_class_for_implicits(id),
+                };
+                if !module.is_none() {
+                    return apply_args(Type::ModuleRef(module), args);
+                }
+            }
             return match st.get(id).kind {
                 SymKind::Module | SymKind::ModuleClass => apply_args(Type::ModuleRef(id), args),
                 // A pickle writes an unqualified reference to an enclosing

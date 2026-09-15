@@ -66,6 +66,7 @@ fn adapt_type(t: scala_rs_pickle::PickledType) -> ClasspathType {
     ClasspathType {
         name: t.name,
         args: t.args.into_iter().map(adapt_type).collect(),
+        singleton: t.singleton,
     }
 }
 
@@ -136,6 +137,7 @@ mod tests {
                     param_types: vec![PickledType {
                         name: "F".into(),
                         args: vec![PickledType::simple("A")],
+                        singleton: false,
                     }],
                     clause_sizes: vec![1],
                     param_flags: vec![1 << 9],
