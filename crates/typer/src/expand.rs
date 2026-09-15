@@ -1176,6 +1176,9 @@ impl Typer {
             Some(b) => b,
             None => return,
         };
+        if self.expand_scala_async(tree, sym) {
+            return;
+        }
         if self.macro_depth >= MAX_EXPANSION_DEPTH {
             self.note_macro_failure(
                 tree.span,

@@ -60,6 +60,9 @@ impl Typer {
             return None;
         }
         let s = self.st.get(sym);
+        if s.name == "await" && self.st.jvm_internal(s.owner) == "scala/async/Async$" {
+            return Some("[async] `await` must be enclosed in an `async` block".into());
+        }
         // The library's own placeholders carry the annotation in their
         // pickle, which this compiler does not read: `Expr.splice` and
         // `Expr.value` exist only to be eliminated by `reify`, and nsc's

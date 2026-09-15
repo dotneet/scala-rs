@@ -126,19 +126,12 @@ The parser does not silently discard unsupported syntax: it emits a diagnostic a
 
 Compiler flags (`agent/xflags`):
 
-- **`-Xasync`: the async state machine.** The flag is accepted and reaches
-  macros through `c.compilerSettings` (which is where scala-async's
-  "The async requires the compiler option -Xasync" comes from), but
-  `scala.tools.nsc.transform.async` — the transform that rewrites an `async {
-  ... await(f) ... }` block into a `FutureStateMachine` subclass — is not
-  implemented, and neither is `c.internal.markForAsyncTransform`, the hook the
-  library calls to ask for it.
-- **`scala.async.Async.async` cannot even be named.** A macro *definition* is
-  carried only in a class file's `ScalaSignature` pickle, and this compiler
-  recognises macro defs from source only (`crates/typer/src/macros.rs`). So
-  `import scala.async.Async.async` is reported as `value async is not a member
-  of object scala.async.Async`, where scalac reports the library's own
-  `-Xasync` message.
+- **`-Xasync`: generic macro transform hooks.** `scala.async.Async.async` /
+  `await` from scala-async 1.0.1 are lowered to nonblocking Future callbacks.
+  nsc's single-class state-machine representation and the general
+  `c.internal.markForAsyncTransform` hook for other async libraries are not
+  implemented. Non-local `return` from an async body is diagnosed. See
+  [async/await support](async.md) for the supported control flow and tests.
 - **`-Xsource-features`: eight ignored features and one partial feature.**
   `case-apply-copy-access` and `unicode-escapes-raw` are implemented;
   `infer-override` is partial (below). The remaining features

@@ -3920,32 +3920,43 @@ runs every one of those shapes and prints the same thing under both compilers.
 
 #### `-Xasync`
 
-`-Xasync` is accepted, and reaches a macro implementation through
-`c.compilerSettings` — which is where the flag is actually *observed*. The
-message a user gets for a missing `-Xasync` does not come from the compiler at
-all; it comes from the library:
+`scala-async` 1.0.1 の `scala.async.Async.{async, await}` に対応しています。
+`--scala-library` と scala-async の jar、`-Xasync` を指定します。
 
 ```scala
-// scala/async/Async.scala, scala-async 1.0.1
-def asyncImpl[T: c.WeakTypeTag](c: whitebox.Context)(body: c.Tree)(execContext: c.Tree): c.Tree = {
-  if (!c.compilerSettings.contains("-Xasync"))
-    c.abort(c.macroApplication.pos,
-      "The async requires the compiler option -Xasync (supported only by Scala 2.12.12+ / 2.13.3+)")
-  ...
+import scala.async.Async.{async, await}
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.ExecutionContext.Implicits.global
+
+val answer: Future[Int] = async {
+  val first = await(Future.successful(40))
+  first + await(Future.successful(2))
 }
 ```
 
-So `c.compilerSettings` and `c.macroApplication` are now implemented in the
-macro engine (`crates/typer/java/ScalaRsMacroEngine.java`), and the driver
-rebuilds the command line the way nsc's `Settings.recreateArgs` does
-(`-classpath`, `-d`, `-Xasync`, `-Xsource:3.0.0`, …). A macro that gates on a
-flag now behaves identically under both compilers:
-`tests/fixtures/xflags_async_{impl,use}.scala` is scala-async's gate,
-compiled and run by both.
+解決済みのライブラリシンボルを識別して、型付けした本体を `Future.flatMap`
+と `Future.successful` に変換します。最初の処理と各継続を指定された
+`ExecutionContext` で実行し、待機中にスレッドを占有しません。実行コンテキストの
+式は呼び出し時に一度だけ評価します。通常の例外と待機先の失敗は返す `Future`
+へ伝播します。
 
-The state-machine transform itself is **not** implemented, and neither is
-reading a macro *definition* out of a jar's pickle, which is what
-`scala.async.Async.async` is. See `docs/not-implemented.md`.
+対応する制御構造は、連続する `await`、式内の `await`、`val` / `var`、
+`if`、`match`（非同期ガードを含む）、`while` / `do-while`、`&&` / `||`、
+入れ子の `async` です。型引数の推論・明示指定、import の別名も利用できます。
+同名の通常メソッドは変換対象になりません。
+
+scala-async と同じく、入れ子のメソッド・関数・クラス・オブジェクト、
+lazy val、通常の by-name 引数、`try` / `catch` / `finally` の内部にある
+`await` は診断します。`await` を含まないローカル定義や `try` は利用できます。
+この実装では async 本体からの非ローカル `return` も診断します。
+
+nsc の単一 `FutureStateMachine` クラスを生成する方式とは異なり、複数の
+継続と Future を生成します。クラス配置・割り当て数・コールバックの回数の
+一致は保証しません。別ライブラリが呼ぶ汎用の
+`c.internal.markForAsyncTransform` は未対応です。
+
+`c.compilerSettings` へのフラグ伝達も従来どおり維持しています。検証方法と
+仕様の参照先は [async/await の実装と検証](async.md) を参照してください。
 
 ### `-Ykind-projector`: kind-projector's type-lambda syntax (`agent/kindproj`)
 

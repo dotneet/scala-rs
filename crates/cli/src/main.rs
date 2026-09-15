@@ -129,9 +129,8 @@ OPTIONS:
                         nsc flag -- kind-projector is a compiler plugin, and nsc
                         without it rejects all of this, so the default is off.
                         The name is Scala 3's flag for the same syntax.
-    -Xasync             Enable the async phase for scala.async.Async's `async`
-                        and `await`. The state-machine transform is not
-                        implemented: an `async` block is diagnosed either way.
+    -Xasync             Enable nonblocking scala.async.Async async/await.
+                        Requires the scala-async jar and --scala-library.
     --help              Show this help
 
 EXAMPLES:

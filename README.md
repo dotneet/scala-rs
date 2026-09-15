@@ -54,6 +54,10 @@ target/release/scala-rs run Main.scala \
 
 Use `scala-rs --help` for all compiler options.
 
+`scala-async` 1.0.1 の `async` / `await` は、`-Xasync` と scala-async の jar を
+指定して利用できます。待機を非ブロッキングの `Future` コールバックへ変換します。
+対応範囲と実行例は [async/await のガイド](docs/async.md) を参照してください。
+
 ## Testing
 
 Run the workspace tests with:

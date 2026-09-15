@@ -8,7 +8,8 @@
 //       "The async requires the compiler option -Xasync (supported only by
 //        Scala 2.12.12+ / 2.13.3+)")
 //
-// so this fixture is the part of `-Xasync` that scala-rs implements:
+// This fixture checks the compiler-settings contract separately from the
+// async/await runtime fixtures:
 // `c.compilerSettings` reports the compiler's own command line, and a macro
 // that gates on a flag sees the same list under both compilers.
 import scala.reflect.macros.blackbox.Context

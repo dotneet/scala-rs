@@ -9,11 +9,9 @@
 //! `copy`, so `case class C private (x: Int)` can no longer be built through
 //! `C(1)` or rebuilt through `c.copy(x = 2)`.
 //!
-//! `-Xasync` enables nsc's async phase. The state-machine transform is not
-//! implemented (see `docs/not-implemented.md`); what *is* implemented is the
-//! part a program can observe: the flag reaches a macro through
-//! `c.compilerSettings`, which is where `scala.async.Async.asyncImpl`'s
-//! "The async requires the compiler option -Xasync" message comes from.
+//! `-Xasync` lowers scala.async.Async calls to nonblocking Future callbacks.
+//! Both the macro settings contract and real scala-async control flow are
+//! compared with scalac, including a single-thread executor suspension test.
 //!
 //! Everything below that can be is checked against real scalac 2.13.16: the
 //! same fixture, the same flags, the same acceptance and the same output.
@@ -576,4 +574,111 @@ fn xasync_reaches_a_macro_through_compiler_settings() {
     let _ = fs::remove_dir_all(&impl_out);
     let _ = fs::remove_dir_all(&no_flag);
     let _ = fs::remove_dir_all(&with_flag);
+}
+
+// The actual scala-async library, not the flag-only macro above.
+fn scala_async_jar() -> Option<PathBuf> {
+    let mut paths = vec![PathBuf::from(
+        "/tmp/scala-rs-lib/scala-async_2.13-1.0.1.jar",
+    )];
+    if let Some(p) = std::env::var_os("SCALA_ASYNC_JAR") {
+        paths.insert(0, p.into());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join("Library/Caches/Coursier/v1/https/repo1.maven.org/maven2/org/scala-lang/modules/scala-async_2.13/1.0.1/scala-async_2.13-1.0.1.jar"));
+    }
+    paths.into_iter().find(|p| p.is_file())
+}
+
+fn run_async(cp: &str) -> String {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("java")
+        .args(["-Xverify:all", "-cp", cp, "Main"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start async JVM");
+    let start = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(30) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("async execution timed out (a blocking await can deadlock the single-thread executor): {}", diagnostics(&output));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "async execution: {}",
+        diagnostics(&output)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn scala_async_runs_nonblocking_control_flow_against_scalac() {
+    let (Some(jar), Some(lib)) = (scala_async_jar(), scala_library_jar()) else {
+        eprintln!("skipping scala-async: set SCALA_ASYNC_JAR to scala-async_2.13-1.0.1.jar and install scala-library");
+        return;
+    };
+    let jar = jar.to_str().unwrap();
+    for fixture in ["async_runtime", "async_values"] {
+        let out = tmp_dir(fixture);
+        compile_ok(fixture, &out, &["-Xasync", "-cp", jar, "-Xfatal-warnings"]);
+        let cp = format!("{}:{}:{jar}", out.display(), lib.display());
+        assert_eq!(run_async(&cp), expected_stdout(fixture));
+        if scalac().is_some() {
+            let sc_out = tmp_dir("scala-async-reference");
+            let output = scalac_compile(
+                fixture,
+                &sc_out,
+                &["-Xasync", "-cp", jar, "-Xfatal-warnings"],
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "scalac async: {}",
+                diagnostics(&output)
+            );
+            let cp = format!("{}:{}:{jar}", sc_out.display(), lib.display());
+            assert_eq!(run_async(&cp), expected_stdout(fixture));
+        }
+    }
+}
+
+#[test]
+fn scala_async_rejects_missing_flag_and_illegal_await_positions() {
+    let Some(jar) = scala_async_jar().filter(|_| scala_library_jar().is_some()) else {
+        eprintln!("skipping scala-async: missing scala-async or scala-library jar");
+        return;
+    };
+    let jar = jar.to_str().unwrap();
+    let out = tmp_dir("scala-async-errors");
+    let output = compile("async_runtime", &out, &["-cp", jar]);
+    assert!(!output.status.success(), "accepted async without -Xasync");
+    assert!(diagnostics(&output).contains("The async requires the compiler option -Xasync"));
+    let output = compile("async_bad", &out, &["-cp", jar, "-Xasync"]);
+    assert!(!output.status.success(), "accepted invalid await");
+    let text = diagnostics(&output);
+    for reason in [
+        "must be enclosed",
+        "nested function",
+        "nested method",
+        "nested class",
+        "nested object",
+        "try/catch/finally",
+        "lazy val",
+        "by-name argument",
+    ] {
+        assert!(text.contains(reason), "missing {reason}: {text}");
+    }
+    if let Some(output) = scalac_compile("async_bad", &out, &["-cp", jar, "-Xasync"]) {
+        assert!(!output.status.success(), "scalac accepted invalid await");
+        assert!(diagnostics(&output).contains("await must not be used"));
+    }
 }

@@ -17,6 +17,11 @@ impl Typer {
             return;
         }
         let owner = self.as_type_owner(owner);
+        if name == "await" && self.st.jvm_internal(owner) == "scala/async/Async$" {
+            // Binary await is compileTimeOnly even through an imported alias.
+            // Enable the final check from symbol resolution, not source text.
+            self.any_cto = true;
+        }
         if self.st.get(owner).kind == SymKind::Class {
             self.ensure_java_loaded(owner, span);
             let found = self.st.lookup_member(owner, name);
@@ -835,14 +840,15 @@ impl Typer {
             if c.is_none() {
                 continue;
             }
-            // Never the standard library. Its hierarchy is the prelude's,
-            // hand-written and reasoned about, and topping it up from the
-            // class files rewrote `mutable.HashSet`'s parents well enough to
-            // turn `HashSet[A]`'s `+`/`contains` into `Set`'s -- two new
-            // errors in slick for a hierarchy nobody had asked to change.
-            // What this is for is a *jar* class the program only named.
+            // Preserve the modeled Scala hierarchy: symbols supplied through
+            // a later pickle can also refer back into it. The concurrent API
+            // is wholly binary-supplied, so Future/Awaitable and Duration's
+            // subclasses need their real parents before applicability scoring.
             let jvm = self.st.get(c).jvm_name.clone();
-            if c.0 < self.st.prelude_end || jvm.starts_with("scala/") || jvm.starts_with("java/") {
+            if c.0 < self.st.prelude_end
+                || jvm.starts_with("java/")
+                || (jvm.starts_with("scala/") && !jvm.starts_with("scala/concurrent/"))
+            {
                 continue;
             }
             let before = self.st.get(c).parents.len();
