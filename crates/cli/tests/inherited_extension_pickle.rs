@@ -386,6 +386,81 @@ object Use {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Keep a richer generic nullary forwarder when the same value-class member
+/// name also has a real unary overload. Removing both JVM `Signature`
+/// attributes reproduces the mixed erased family seen in older Scala output.
+#[test]
+fn inherited_generic_nullary_survives_a_unary_sibling() {
+    let (Some(scala_library), Some(scalac)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip mixed nullary/unary forwarder: Scala 2.13.16 toolchain is absent");
+        return;
+    };
+    let root = tmp_dir("mixed-nullary-unary");
+    let lib_src = root.join("lib.scala");
+    let app_src = root.join("app.scala");
+    let lib_classes = root.join("lib-classes");
+    let lib_jar = root.join("lib.jar");
+    let rs_out = root.join("scala-rs-out");
+    fs::create_dir_all(&lib_classes).unwrap();
+    fs::create_dir_all(&rs_out).unwrap();
+    fs::write(
+        &lib_src,
+        r#"package mixednullary
+
+class Box[A](val value: A) {
+  def id: A = value
+}
+
+trait Parent[A] extends Any {
+  def box: Box[A] = null
+  def box(index: Int): Box[A] = null
+}
+
+class Wrapper[A](val value: A) extends AnyVal with Parent[A]
+
+object Syntax {
+  implicit def wrap[A](value: A): Wrapper[A] = new Wrapper[A](value)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &app_src,
+        r#"package mixednullary
+
+import _root_.mixednullary.Syntax._
+
+object Use {
+  val first: Int = 1.box.id
+  val indexed: Int = 1.box(0).id
+}
+"#,
+    )
+    .unwrap();
+    run_scalac(
+        &scalac,
+        &[
+            "-d",
+            lib_classes.to_str().unwrap(),
+            lib_src.to_str().unwrap(),
+        ],
+    );
+    strip_method_signature(&lib_classes.join("mixednullary/Wrapper.class"), "box");
+    pack_jar(&lib_classes, &lib_jar);
+
+    let classpath = format!("{}:{}", lib_jar.display(), scala_library.display());
+    let (ok, diagnostics) = run_scala_rs(&app_src, &rs_out, &scala_library, &classpath);
+    assert!(
+        ok,
+        "scala-rs rejected a generic nullary forwarder beside a unary sibling:\n{diagnostics}"
+    );
+    assert!(
+        rs_out.join("mixednullary/Use.class").is_file(),
+        "scala-rs did not emit mixednullary.Use"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
 /// A pickled implicit conversion may itself mention a Java generic type that
 /// nothing else has loaded yet. Twirl's helper converts
 /// `java.lang.Iterable[T]` to Scala `Iterable[T]`; GitBucket first exposes its

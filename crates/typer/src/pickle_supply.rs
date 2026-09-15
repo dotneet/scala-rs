@@ -913,7 +913,12 @@ impl PickleSupply {
                     false
                 };
                 if has_unary_flat {
-                    sole_implicit
+                    // A value class may carry both an erased generic
+                    // nullary forwarder and a genuine unary overload. The
+                    // unary candidate must not hide the richer nullary
+                    // replacement when selecting `box`, while ordinary
+                    // classes still use only their existing implicit cleanup.
+                    sole_implicit || richer_nullary
                 } else {
                     symbol.paramss.len() > 1 || sole_implicit || richer_nullary
                 }
