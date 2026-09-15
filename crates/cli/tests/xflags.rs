@@ -627,7 +627,7 @@ fn scala_async_runs_nonblocking_control_flow_against_scalac() {
         return;
     };
     let jar = jar.to_str().unwrap();
-    for fixture in ["async_runtime", "async_values"] {
+    for fixture in ["async_runtime", "async_values", "async_return"] {
         let out = tmp_dir(fixture);
         compile_ok(fixture, &out, &["-Xasync", "-cp", jar, "-Xfatal-warnings"]);
         let cp = format!("{}:{}:{jar}", out.display(), lib.display());
@@ -680,5 +680,90 @@ fn scala_async_rejects_missing_flag_and_illegal_await_positions() {
     if let Some(output) = scalac_compile("async_bad", &out, &["-cp", jar, "-Xasync"]) {
         assert!(!output.status.success(), "scalac accepted invalid await");
         assert!(diagnostics(&output).contains("await must not be used"));
+    }
+}
+
+#[test]
+fn generic_async_transform_hook_matches_scalac_without_scala_async() {
+    let (Some(lib), Some(reflect), Some(_)) = (scala_library_jar(), scala_reflect_jar(), scalac())
+    else {
+        eprintln!("skipping generic async: missing Scala reference toolchain");
+        return;
+    };
+    let implementation = tmp_dir("async-hook-library");
+    let built = scalac_compile("async_hook_impl", &implementation, &[]).unwrap();
+    assert!(
+        built.status.success(),
+        "async hook library: {}",
+        diagnostics(&built)
+    );
+    let cp = format!("{}:{}", implementation.display(), reflect.display());
+    let out = tmp_dir("async-hook-use");
+    compile_ok(
+        "async_hook_runtime",
+        &out,
+        &["-Xasync", "-Xfatal-warnings", "-cp", &cp],
+    );
+    let run_cp = format!(
+        "{}:{}:{}",
+        out.display(),
+        implementation.display(),
+        lib.display()
+    );
+    assert_eq!(run_async(&run_cp), expected_stdout("async_hook_runtime"));
+    let reference = tmp_dir("async-hook-reference");
+    let built = scalac_compile(
+        "async_hook_runtime",
+        &reference,
+        &["-Xasync", "-Xfatal-warnings", "-cp", &cp],
+    )
+    .unwrap();
+    assert!(
+        built.status.success(),
+        "reference async hook: {}",
+        diagnostics(&built)
+    );
+    let run_cp = format!(
+        "{}:{}:{}",
+        reference.display(),
+        implementation.display(),
+        lib.display()
+    );
+    assert_eq!(run_async(&run_cp), expected_stdout("async_hook_runtime"));
+    // The ordinary overload shares the await method's owner and name. It
+    // must survive lowering and the compileTimeOnly check unchanged.
+    compile_ok("async_hook_overload", &out, &["-Xasync", "-cp", &cp]);
+    let run_cp = format!("{}:{}:{}", out.display(), lib.display(), cp);
+    assert_eq!(run_async(&run_cp), "42\nSome(42)\n");
+    let built =
+        scalac_compile("async_hook_overload", &reference, &["-Xasync", "-cp", &cp]).unwrap();
+    assert!(
+        built.status.success(),
+        "reference overload: {}",
+        diagnostics(&built)
+    );
+    let run_cp = format!("{}:{}:{}", reference.display(), lib.display(), cp);
+    assert_eq!(run_async(&run_cp), "42\nSome(42)\n");
+    let rejected = compile("async_hook_bad", &out, &["-Xasync", "-cp", &cp]);
+    assert!(!rejected.status.success(), "accepted illegal custom await");
+    let message = diagnostics(&rejected);
+    assert!(
+        message.contains("must be enclosed") && message.contains("nested function"),
+        "{message}"
+    );
+    let reference_rejected =
+        scalac_compile("async_hook_bad", &reference, &["-Xasync", "-cp", &cp]).unwrap();
+    assert!(
+        !reference_rejected.status.success(),
+        "scalac accepted illegal custom await"
+    );
+    let no_flag = compile("async_hook_runtime", &out, &["-cp", &cp]);
+    assert!(
+        !no_flag.status.success(),
+        "accepted custom async without -Xasync"
+    );
+    assert!(diagnostics(&no_flag).contains("-Xasync must be enabled"));
+    for dir in [implementation, out, reference] {
+        let _ = fs::remove_dir_all(dir);
     }
 }

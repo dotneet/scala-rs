@@ -1575,6 +1575,10 @@ impl Typer {
             self.collect_wire_types(p, &mut types);
         }
         self.collect_wire_types(&application_for_wire, &mut types);
+        // Result attribution is supplementary: many whitebox macros have a
+        // provisional/refined result and only inspect the application's tree
+        // or position. Do not require a runtime type tag to invoke those.
+        let application_type = self.tag_wire(&application.ty).ok();
         let cx = WireCx {
             st: &self.st,
             types: &types,
@@ -1718,6 +1722,12 @@ impl Typer {
         // `c.compilerSettings`. nsc hands the implementation the command line
         // that produced this run; a macro that gates on a flag (`scala.async`
         // on `-Xasync`) has no other way to see one.
+        out.push_str(" (appType");
+        if let Some(application_type) = application_type {
+            out.push(' ');
+            out.push_str(&application_type);
+        }
+        out.push(')');
         out.push_str(" (settings");
         for setting in &self.compiler_settings {
             out.push(' ');
@@ -2202,6 +2212,40 @@ impl Typer {
                     elsep: Box::new(elsep),
                 }))
             }
+            "Try" => {
+                let block = self.tree_from_reply(at(kids, 0)?, span)?;
+                let mut catches = Vec::new();
+                for case in at(kids, 1)?.list()?.iter().skip(1) {
+                    catches.push(self.case_from_reply(case, span)?);
+                }
+                let finalizer = self.tree_from_reply(at(kids, 2)?, span)?;
+                Ok(node(TreeKind::Try {
+                    block: Box::new(block),
+                    catches,
+                    finalizer: Box::new(finalizer),
+                }))
+            }
+            "Return" => Ok(node(TreeKind::Return {
+                expr: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+            })),
+            "Throw" => Ok(node(TreeKind::Throw {
+                expr: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
+            })),
+            "LabelDef" => {
+                let name = name_from(at(kids, 0)?)?;
+                let params = self.reply_trees(at(kids, 1)?, span)?;
+                let rhs = self.tree_from_reply(at(kids, 2)?, span)?;
+                if params.is_empty() {
+                    if let Some(kind) = macro_while(&name, &rhs) {
+                        return Ok(node(kind));
+                    }
+                }
+                Ok(node(TreeKind::LabelDef {
+                    name,
+                    params,
+                    rhs: Box::new(rhs),
+                }))
+            }
             "Assign" => Ok(node(TreeKind::Assign {
                 lhs: Box::new(self.tree_from_reply(at(kids, 0)?, span)?),
                 rhs: Box::new(self.tree_from_reply(at(kids, 1)?, span)?),
@@ -2546,6 +2590,13 @@ impl Typer {
                         ) {
                             body.push(result);
                         }
+                    } else if is_node(member, "AsyncDefDef") {
+                        body.extend(self.generic_async_members(
+                            fields,
+                            &parents,
+                            at(template, 5)?.list()?,
+                            span,
+                        )?);
                     } else {
                         body.push(self.tree_from_reply(member, span)?);
                     }
@@ -2848,6 +2899,57 @@ impl Typer {
             },
             span,
         )
+    }
+}
+
+// Runtime-universe quasiquotes encode while/do-while as recursive labels.
+// Rebuild their source form before the expression typer and async lowerer run.
+fn macro_while(name: &str, rhs: &Tree) -> Option<TreeKind> {
+    fn jump(t: &Tree, name: &str) -> bool {
+        matches!(&t.kind, TreeKind::Apply { fun, args } if args.is_empty() && matches!(&fun.kind, TreeKind::Ident { name: n } if n == name))
+    }
+    fn unit(t: &Tree) -> bool {
+        matches!(
+            t.kind,
+            TreeKind::Empty | TreeKind::Literal { lit: Lit::Unit }
+        )
+    }
+    fn body(stats: &[Tree], last: &Tree) -> Box<Tree> {
+        if stats.len() == 1 {
+            return Box::new(stats[0].clone());
+        }
+        Box::new(Tree {
+            kind: TreeKind::Block {
+                stats: stats.to_vec(),
+                expr: Box::new(last.clone()),
+            },
+            ..last.clone()
+        })
+    }
+    match &rhs.kind {
+        TreeKind::If { cond, thenp, elsep } if unit(elsep) => {
+            if let TreeKind::Block { stats, expr } = &thenp.kind {
+                if jump(expr, name) {
+                    return Some(TreeKind::While {
+                        cond: cond.clone(),
+                        body: body(stats, elsep),
+                    });
+                }
+            }
+            None
+        }
+        TreeKind::Block { stats, expr } => {
+            if let TreeKind::If { cond, thenp, elsep } = &expr.kind {
+                if jump(thenp, name) && unit(elsep) {
+                    return Some(TreeKind::DoWhile {
+                        cond: cond.clone(),
+                        body: body(stats, elsep),
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -3752,6 +3854,84 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
                 tree_to_wire(cx, a, out)?;
             }
             out.push_str("))");
+            Ok(())
+        }
+        TreeKind::Try {
+            block,
+            catches,
+            finalizer,
+        } => {
+            out.push_str("(t \"Try\" (s0) ");
+            tree_to_wire(cx, block, out)?;
+            out.push_str(" (l");
+            for case in catches {
+                out.push_str(" (t \"CaseDef\" (s0) ");
+                pattern_to_wire(cx, &case.pat, out)?;
+                out.push(' ');
+                tree_to_wire(cx, &case.guard, out)?;
+                out.push(' ');
+                tree_to_wire(cx, &case.body, out)?;
+                out.push(')');
+            }
+            out.push_str(") ");
+            tree_to_wire(cx, finalizer, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::Return { expr } | TreeKind::Throw { expr } => {
+            out.push_str(if matches!(t.kind, TreeKind::Return { .. }) {
+                "(t \"Return\" (s0) "
+            } else {
+                "(t \"Throw\" (s0) "
+            });
+            tree_to_wire(cx, expr, out)?;
+            out.push(')');
+            Ok(())
+        }
+        TreeKind::While { cond, body } | TreeKind::DoWhile { cond, body } => {
+            let name = format!("while$macro${}", t.id.0);
+            let unit = Tree::dummy(TreeKind::Literal { lit: Lit::Unit });
+            let jump = Tree::dummy(TreeKind::Apply {
+                fun: Box::new(Tree::dummy(TreeKind::Ident { name: name.clone() })),
+                args: vec![],
+            });
+            let rhs = if matches!(t.kind, TreeKind::While { .. }) {
+                Tree::dummy(TreeKind::If {
+                    cond: cond.clone(),
+                    thenp: Box::new(Tree::dummy(TreeKind::Block {
+                        stats: vec![(**body).clone()],
+                        expr: Box::new(jump),
+                    })),
+                    elsep: Box::new(unit),
+                })
+            } else {
+                Tree::dummy(TreeKind::Block {
+                    stats: vec![(**body).clone()],
+                    expr: Box::new(Tree::dummy(TreeKind::If {
+                        cond: cond.clone(),
+                        thenp: Box::new(jump),
+                        elsep: Box::new(unit),
+                    })),
+                })
+            };
+            tree_to_wire(
+                cx,
+                &Tree::dummy(TreeKind::LabelDef {
+                    name,
+                    params: vec![],
+                    rhs: Box::new(rhs),
+                }),
+                out,
+            )
+        }
+        TreeKind::LabelDef { name, params, rhs } => {
+            out.push_str("(t \"LabelDef\" (s0) (n term ");
+            quote_into(out, name);
+            out.push_str(") ");
+            trees_to_wire(cx, params, out)?;
+            out.push(' ');
+            tree_to_wire(cx, rhs, out)?;
+            out.push(')');
             Ok(())
         }
         TreeKind::Empty => {

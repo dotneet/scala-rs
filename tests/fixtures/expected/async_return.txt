@@ -1,0 +1,12 @@
+immediate
+completed
+returned-await
+finally
+finalized
+42
+loop-return
+activation
+42
+generic
+escaped:late-return
+false

@@ -243,7 +243,17 @@ impl<'a> Lifter<'a> {
             }
             TreeKind::Block { stats, expr } => {
                 for s in stats {
-                    self.lift_nested_classes(s);
+                    if matches!(
+                        s.kind,
+                        TreeKind::ClassDef { .. } | TreeKind::ModuleDef { .. }
+                    ) {
+                        // A local class is also a lifting boundary. Merely
+                        // visiting its children leaves methods inside its
+                        // lambdas owned by a synthetic $anonfun symbol.
+                        self.lift_template(s);
+                    } else {
+                        self.lift_nested_classes(s);
+                    }
                 }
                 self.lift_nested_classes(expr);
             }

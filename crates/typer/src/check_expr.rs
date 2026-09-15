@@ -139,6 +139,9 @@ impl Typer {
         let callee = std::mem::take(&mut self.typing_callee);
         let type_callee = std::mem::take(&mut self.typing_type_callee);
         let qualifier = std::mem::take(&mut self.typing_qualifier);
+        if self.expand_generic_async_call(tree) {
+            return;
+        }
         // Generated thunk bodies were typed in the argument's lexical scope.
         // Reusing one for defaults must not reinterpret it as a source lambda.
         if tree.byname_thunk {
@@ -2612,7 +2615,12 @@ impl Typer {
                 tree.ty = fill_empty_annot(ascr, &expr.ty);
             }
             TreeKind::Return { expr } => {
-                let Some(meth) = self.return_meth else {
+                // Attributed returns spliced by a macro keep their lexical
+                // target even when moved into a generated method.
+                let target = (!tree.sym.is_none() && self.st.get(tree.sym).kind == SymKind::Method)
+                    .then_some(tree.sym)
+                    .or(self.return_meth);
+                let Some(meth) = target else {
                     self.error(tree.span, "return outside method definition");
                     tree.ty = Type::Nothing;
                     return;

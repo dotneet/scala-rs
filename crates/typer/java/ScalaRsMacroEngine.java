@@ -305,6 +305,7 @@ public final class ScalaRsMacroEngine {
         }
 
         origTrees.clear();
+        asyncMarks.clear();
         Ctx handler = new Ctx();
         // `c.prefix`: the receiver of the macro application, or the reason
         // there is none -- which is raised only if the implementation reads it.
@@ -320,6 +321,8 @@ public final class ScalaRsMacroEngine {
             handler.appWhy = app.items.get(1).text();
         } else {
             handler.appTree = buildTree(app);
+            Sexp appType = req.field("appType");
+            if (appType.items.size() == 2) call(handler.appTree, "setType", 1, typeFor(appType.items.get(1)));
             Sexp position = req.field("position");
             if (position.items.size() == 4) {
                 Class<?> virtual = loadClass("scala.reflect.io.VirtualFile");
@@ -717,6 +720,8 @@ public final class ScalaRsMacroEngine {
                 return call(companion("Match"), "apply", 2,
                     buildTree(kids.get(0)), list(cases));
             }
+            case "Try":
+                return call(companion(kind), "apply", 3, buildTree(kids.get(0)), buildTrees(kids.get(1)), buildTree(kids.get(2)));
             case "CaseDef":
                 return call(companion("CaseDef"), "apply", 3,
                     buildTree(kids.get(0)), buildTree(kids.get(1)), buildTree(kids.get(2)));
@@ -740,6 +745,8 @@ public final class ScalaRsMacroEngine {
             }
             case "Super":
                 return call(companion(kind), "apply", 2, buildTree(kids.get(0)), buildName(kids.get(1)));
+            case "Return":
+            case "Throw":
             case "SingletonTypeTree":
             case "New":
                 return call(companion(kind), "apply", 1, buildTree(kids.get(0)));
@@ -772,6 +779,8 @@ public final class ScalaRsMacroEngine {
             case "ClassDef":
                 return call(companion(kind), "apply", 4, buildMods(kids.get(0)),
                     buildName(kids.get(1)), buildTrees(kids.get(2)), buildTree(kids.get(3)));
+            case "LabelDef":
+                return call(companion(kind), "apply", 3, buildName(kids.get(0)), buildTrees(kids.get(1)), buildTree(kids.get(2)));
             case "Template":
                 return call(companion(kind), "apply", 3, buildTrees(kids.get(0)),
                     buildTree(kids.get(1)), buildTrees(kids.get(2)));
@@ -1042,7 +1051,58 @@ public final class ScalaRsMacroEngine {
         sb.append("(o ").append(Sexp.quote(String.valueOf(o))).append(')');
     }
 
+    static final java.util.IdentityHashMap<Object, Object[]> asyncMarks = new java.util.IdentityHashMap<>();
+    static final class AsyncMarker {
+        final Object[] data;
+        AsyncMarker(Object[] data) { this.data = data; }
+    }
+    static Object asyncMarkerTag() throws Exception {
+        Object companion = loadClass("scala.reflect.ClassTag$").getField("MODULE$").get(null);
+        return call(companion, "apply", 1, AsyncMarker.class);
+    }
+
+    static Object markAsync(Object[] args) throws Exception {
+        if (!compilerSettings.contains("-Xasync"))
+            throw gap("-Xasync must be enabled for async transformation");
+        Object config = args[3];
+        Object keys = call(call(config, "keysIterator", 0), "toList", 0);
+        Object it = call(keys, "iterator", 0);
+        while ((Boolean) call(it, "hasNext", 0)) {
+            String key = String.valueOf(call(it, "next", 0));
+            if (key.equals("postAnfTransform") || key.equals("stateDiagram"))
+                throw gap("markForAsyncTransform configuration `" + key + "` is not implemented");
+        }
+        Object await = args[2];
+        Object method = call(await, "asMethod", 0);
+        Object params = call(call(call(method, "paramLists", 0), "head", 0), "head", 0);
+        Object awaitable = call(params, "typeSignature", 0);
+        Object typeParams = call(method, "typeParams", 0);
+        List<Object> replacements = new ArrayList<>();
+        Object tp = call(typeParams, "iterator", 0);
+        Object anyRef = call(call(universe, "definitions", 0), "AnyRefTpe", 0);
+        while ((Boolean) call(tp, "hasNext", 0)) { call(tp, "next", 0); replacements.add(anyRef); }
+        awaitable = call(awaitable, "substituteTypes", 2, typeParams, list(replacements));
+        Object[] data = new Object[]{call(await, "fullName", 0), awaitable,
+            call(config, "contains", 1, "allowExceptionsToPropagate")};
+        asyncMarks.put(args[1], data);
+        call(args[1], "updateAttachment", 2, new AsyncMarker(data), asyncMarkerTag());
+        return args[1];
+    }
+
     static void serTree(Object t, StringBuilder sb) throws Exception {
+        Object[] async = asyncMarks.get(t);
+        if (async == null && !asyncMarks.isEmpty()) {
+            Object attached = call(call(t, "attachments", 0), "get", 1, asyncMarkerTag());
+            if ((Boolean) call(attached, "isDefined", 0)) async = ((AsyncMarker) call(attached, "get", 0)).data;
+        }
+        if (async != null) {
+            sb.append("(t \"AsyncDefDef\" (s0) ");
+            serTreeShape(t, sb);
+            sb.append(' ').append(Sexp.quote(String.valueOf(async[0]))).append(' ');
+            serType(async[1], sb);
+            sb.append(Boolean.TRUE.equals(async[2]) ? " 1)" : " 0)");
+            return;
+        }
         Object empty = call(universe, "EmptyTree", 0);
         if (t == empty) {
             sb.append("(t \"EmptyTree\" (s0))");
@@ -1894,6 +1954,9 @@ public final class ScalaRsMacroEngine {
                 if (internalProxy == null) {
                     Class<?> api = loadClass("scala.reflect.macros.Internals$ContextInternalApi");
                     internalProxy = Proxy.newProxyInstance(macroCl, new Class<?>[]{api}, (p, method, args) -> {
+                        if (method.getName().equals("markForAsyncTransform") && method.getParameterCount() == 4) {
+                            return markAsync(args);
+                        }
                         if (method.getName().equals("enclosingOwner") && method.getParameterCount() == 0) {
                             Sexp answer = query("(q enclosingOwner)");
                             return sourceSymbol(Long.parseLong(answer.items.get(2).text()));

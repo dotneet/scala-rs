@@ -1,6 +1,8 @@
 mod annot_resolve;
 mod anon_capture;
+mod async_generic;
 mod async_lower;
+mod async_returns;
 mod case_apply_unlink;
 mod check;
 mod check_apply;

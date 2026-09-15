@@ -126,12 +126,13 @@ The parser does not silently discard unsupported syntax: it emits a diagnostic a
 
 Compiler flags (`agent/xflags`):
 
-- **`-Xasync`: generic macro transform hooks.** `scala.async.Async.async` /
-  `await` from scala-async 1.0.1 are lowered to nonblocking Future callbacks.
-  nsc's single-class state-machine representation and the general
-  `c.internal.markForAsyncTransform` hook for other async libraries are not
-  implemented. Non-local `return` from an async body is diagnosed. See
-  [async/await support](async.md) for the supported control flow and tests.
+- **`-Xasync`: transform configuration callbacks and alternate method shape.**
+  scala-async and the standard `c.internal.markForAsyncTransform` protocol are
+  supported, including non-local `return` and `allowExceptionsToPropagate`.
+  `postAnfTransform`, `stateDiagram`, and a transformed method taking an extra
+  state-machine self parameter are diagnosed. Generated classes, allocations,
+  and callback counts do not match nsc's single-state-machine representation.
+  See [async/await support](async.md) for the supported control flow and tests.
 - **`-Xsource-features`: eight ignored features and one partial feature.**
   `case-apply-copy-access` and `unicode-escapes-raw` are implemented;
   `infer-override` is partial (below). The remaining features

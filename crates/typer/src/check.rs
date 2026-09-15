@@ -348,6 +348,9 @@ pub struct Typer {
     pub(crate) sources: Vec<std::rc::Rc<str>>,
     pub(crate) source_paths: Vec<String>,
     pub(crate) macro_next_node: u32,
+    pub(crate) macro_async_calls: HashMap<NodeId, crate::async_lower::GenericAsyncCall>,
+    pub(crate) macro_async_awaits: HashSet<(String, String)>,
+    pub(crate) async_return_keys: HashMap<SymbolId, (Tree, Tree)>,
     /// Set while a macro expansion's *pattern* is being rebuilt
     /// (`Typer::pattern_from_reply`), where nsc's `Ident(_)` is the wildcard
     /// pattern rather than a name.
@@ -1110,6 +1113,7 @@ pub fn typecheck_units_src(
     for (tree, file_index) in units.iter_mut() {
         t.file_index = *file_index;
         t.typer(tree);
+        t.install_async_return_keys(tree);
         t.report_macro_calls(tree);
         t.strip_macro_defs(tree);
     }
@@ -1168,6 +1172,9 @@ impl Typer {
             sources: Vec::new(),
             source_paths: opts.source_paths.clone(),
             macro_next_node: 1,
+            macro_async_calls: HashMap::new(),
+            macro_async_awaits: HashSet::new(),
+            async_return_keys: HashMap::new(),
             macro_reply_pattern: false,
             macro_splices: Vec::new(),
             gensym: 0,

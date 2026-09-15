@@ -148,11 +148,13 @@ impl Typer {
         if clauses.len() != 2 || clauses.iter().any(|c| c.len() != 1) {
             return false;
         }
-        let body = unthunk(clauses[0].remove(0));
+        let mut body = unthunk(clauses[0].remove(0));
+        self.prepare_async_returns(&mut body);
         let context = clauses[1].remove(0);
         let mut lower = Lower {
             typer: self,
             context: context.clone(),
+            generic: None,
         };
         // Capture the implicit expression once, on the caller, just as the
         // FutureStateMachine constructor does. All callbacks share that value.
@@ -180,13 +182,136 @@ impl Typer {
     }
 }
 
+pub(crate) fn await_parameter_key(st: &SymbolTable, ty: &Type) -> String {
+    match ty {
+        Type::Class { sym, .. } => st.jvm_internal(*sym),
+        Type::Any | Type::AnyRef | Type::JavaObject | Type::TypeParam(_) => {
+            "java/lang/Object".into()
+        }
+        Type::Array(elem) => format!("[{}", await_parameter_key(st, elem)),
+        _ => ty.to_string(),
+    }
+}
+
+pub(crate) fn generic_await_symbol(
+    st: &SymbolTable,
+    sym: SymbolId,
+    name: &str,
+    parameter: &str,
+) -> bool {
+    if sym.is_none() {
+        return false;
+    }
+    let s = st.get(sym);
+    let owner = crate::expand::scala_full_name(st, s.owner);
+    if format!("{}.{}", owner.trim_end_matches('.'), s.name) != name {
+        return false;
+    }
+    let Type::Method { paramss, .. } = &s.ty else {
+        return false;
+    };
+    let mut params = paramss.iter().flatten();
+    let Some(first) = params.next() else {
+        return false;
+    };
+    params.next().is_none() && await_parameter_key(st, first) == parameter
+}
+
+#[derive(Clone)]
+pub(crate) struct GenericAsyncCall {
+    pub body: Tree,
+    pub context: String,
+    pub bridge: String,
+    pub await_name: String,
+    pub await_container: String,
+    pub failure: String,
+}
+
+impl Typer {
+    pub(crate) fn expand_generic_async_call(&mut self, tree: &mut Tree) -> bool {
+        let Some(mut call) = self.macro_async_calls.remove(&tree.id) else {
+            return false;
+        };
+        let span = tree.span;
+        self.type_expr(&mut call.body, &Type::NoType);
+        self.prepare_async_returns(&mut call.body);
+        let mut context = Tree::dummy(TreeKind::Ident {
+            name: call.context.clone(),
+        });
+        self.type_expr(&mut context, &Type::NoType);
+        let mut lower = Lower {
+            typer: self,
+            context,
+            generic: Some((
+                call.await_name,
+                call.bridge,
+                call.await_container,
+                call.failure,
+            )),
+        };
+        let result = lower.validate(&call.body).and_then(|()| {
+            let body = lower.lower(call.body)?;
+            let start = lower.success(unit(span));
+            let (param, _) = lower.local("async$start", Type::Unit, unit(span), true);
+            Ok(lower.flat_map(start, param, body))
+        });
+        match result {
+            Ok(result) => *tree = result,
+            Err((at, why)) => {
+                lower.typer.error(at, why);
+                *tree = node(TreeKind::Empty, Type::Error, span);
+            }
+        }
+        true
+    }
+}
+
 struct Lower<'a> {
     typer: &'a mut Typer,
     context: Tree,
+    generic: Option<(String, String, String, String)>,
 }
 impl Lower<'_> {
     fn has(&self, t: &Tree) -> bool {
-        contains_await(&self.typer.st, t)
+        if self.generic.is_none() {
+            return contains_await(&self.typer.st, t);
+        }
+        if self.is_await(t) {
+            return true;
+        }
+        let mut found = false;
+        for_each_child(t, &mut |c| found |= self.has(c));
+        found
+    }
+    fn is_await(&self, t: &Tree) -> bool {
+        let Some((name, _, container, _)) = &self.generic else {
+            return async_member(&self.typer.st, t, "await");
+        };
+        if generic_await_symbol(&self.typer.st, t.sym, name, container) {
+            return true;
+        }
+        match &t.kind {
+            TreeKind::Apply { fun, .. } | TreeKind::TypeApply { fun, .. } => self.is_await(fun),
+            _ => false,
+        }
+    }
+    fn await_future(&mut self, arg: Tree, ty: &Type) -> Tree {
+        let Some((_, bridge, _, _)) = &self.generic else {
+            return arg;
+        };
+        let mut tpt = Tree::dummy(TreeKind::Ident {
+            name: crate::materialize::RESOLVED_TYPE.into(),
+        });
+        tpt.ty = ty.clone();
+        let fun = Tree::dummy(TreeKind::TypeApply {
+            fun: Box::new(Tree::dummy(TreeKind::Ident {
+                name: bridge.clone(),
+            })),
+            args: vec![tpt],
+        });
+        let mut result = apply(fun, vec![splice(arg)]);
+        self.typer.type_expr(&mut result, &Type::NoType);
+        splice(result)
     }
     fn validate(&self, t: &Tree) -> std::result::Result<(), (Span, String)> {
         // Boolean &&/|| have by-name parameters, but are compiler control flow.
@@ -211,9 +336,6 @@ impl Lower<'_> {
                 return Err((t.span, format!("await must not be used under {place}")));
             }
             return Ok(());
-        }
-        if matches!(t.kind, TreeKind::Return { .. }) {
-            return Err((t.span, "return is not allowed in an async block".into()));
         }
         let mut result = Ok(());
         for_each_child(t, &mut |c| {
@@ -274,13 +396,37 @@ impl Lower<'_> {
         let param_sym = param.sym;
         let mut locals = Vec::new();
         continuation_locals(&body, &mut locals);
+        // Keep the original throwable separately: Future resolves non-local
+        // returns as successes and boxes fatal failures. The protocol receives
+        // every Throwable unchanged, as the nsc state-machine catch does.
+        let body = if let Some((_, _, _, failure)) = &self.generic {
+            let mut guarded = crate::async_returns::expression(
+                "try AsyncBody catch { case cause: Throwable => AsyncFailure = cause; _root_.scala.concurrent.Future.failed(new _root_.java.util.concurrent.ExecutionException(cause)) }",
+            );
+            self.typer.return_template(
+                &mut guarded,
+                body.span,
+                &[
+                    ("AsyncBody", splice(body)),
+                    (
+                        "AsyncFailure",
+                        Tree::dummy(TreeKind::Ident {
+                            name: failure.clone(),
+                        }),
+                    ),
+                ],
+            );
+            guarded
+        } else {
+            splice(body)
+        };
         // A fresh wrapper gives type_function a distinct node/owner for each
         // continuation; the reserved PRETYPED_SPLICE id is shared by splices.
         let lambda = Tree::dummy(TreeKind::Function {
             vparams: vec![param],
             body: Box::new(Tree::dummy(TreeKind::Block {
                 stats: vec![],
-                expr: Box::new(splice(body)),
+                expr: Box::new(body),
             })),
         });
         let mut result = apply(
@@ -317,12 +463,13 @@ impl Lower<'_> {
         if !self.has(&t) {
             return Ok(self.success(t));
         }
-        if async_member(&self.typer.st, &t, "await") {
+        if self.is_await(&t) {
             if let TreeKind::Apply { mut args, .. } = t.kind {
                 let arg = args.remove(0);
                 if !self.has(&arg) {
                     // Map through the continuation even for a terminal await:
                     // a null Future must fail the async result, not escape as null.
+                    let arg = self.await_future(arg, &ty);
                     let (param, value) = self.local("async$await", ty, unit(span), true);
                     let result = self.success(value);
                     return Ok(self.flat_map(arg, param, result));
@@ -330,6 +477,7 @@ impl Lower<'_> {
                 let fty = arg.ty.clone();
                 let future = self.lower(arg)?;
                 let (param, value) = self.local("async$future", fty, unit(span), true);
+                let value = self.await_future(value, &ty);
                 let (inner, result) = self.local("async$await", ty, unit(span), true);
                 let result = self.success(result);
                 let body = self.flat_map(value, inner, result);
@@ -503,7 +651,9 @@ impl Lower<'_> {
                 }
             }
             TreeKind::Select { qual, .. } => self.operand(qual, steps),
-            TreeKind::Typed { expr, .. } | TreeKind::Throw { expr } => self.operand(expr, steps),
+            TreeKind::Typed { expr, .. } | TreeKind::Throw { expr } | TreeKind::Return { expr } => {
+                self.operand(expr, steps)
+            }
             TreeKind::Assign { lhs, rhs } => {
                 if let TreeKind::Select { qual, .. } = &mut lhs.kind {
                     self.operand(qual, steps);

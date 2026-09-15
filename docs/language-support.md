@@ -3948,12 +3948,16 @@ val answer: Future[Int] = async {
 scala-async と同じく、入れ子のメソッド・関数・クラス・オブジェクト、
 lazy val、通常の by-name 引数、`try` / `catch` / `finally` の内部にある
 `await` は診断します。`await` を含まないローカル定義や `try` は利用できます。
-この実装では async 本体からの非ローカル `return` も診断します。
+非ローカル `return` は、呼び出しごとのキーを持つ `NonLocalReturnControl` に変換します。
+即時実行・遅延再開・ループ・再入時の戻り先を実 scalac と比較しています。
 
 nsc の単一 `FutureStateMachine` クラスを生成する方式とは異なり、複数の
 継続と Future を生成します。クラス配置・割り当て数・コールバックの回数の
-一致は保証しません。別ライブラリが呼ぶ汎用の
-`c.internal.markForAsyncTransform` は未対応です。
+一致は保証しません。別ライブラリが呼ぶ
+`c.internal.markForAsyncTransform` の標準プロトコルと
+`allowExceptionsToPropagate` にも対応しています。任意の await 名、
+省略可能な `getCompleted`、`tryGet` の途中終了を扱います。
+`postAnfTransform` / `stateDiagram` コールバックと追加 self パラメータは未対応です。
 
 `c.compilerSettings` へのフラグ伝達も従来どおり維持しています。検証方法と
 仕様の参照先は [async/await の実装と検証](async.md) を参照してください。

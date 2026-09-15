@@ -60,6 +60,14 @@ impl Typer {
             return None;
         }
         let s = self.st.get(sym);
+        if self.macro_async_awaits.iter().any(|(name, parameter)| {
+            crate::async_lower::generic_await_symbol(&self.st, sym, name, parameter)
+        }) {
+            return Some(format!(
+                "[async] `{}` must be enclosed in an async transformed method",
+                s.name
+            ));
+        }
         if s.name == "await" && self.st.jvm_internal(s.owner) == "scala/async/Async$" {
             return Some("[async] `await` must be enclosed in an `async` block".into());
         }

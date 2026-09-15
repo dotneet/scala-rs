@@ -835,7 +835,7 @@ impl Typer {
     /// merely *named* -- `(implicit F: Async[F])` -- has an empty parent list
     /// until then, so it fits nothing but its own type. Answers whether any
     /// class gained parents.
-    fn ensure_pickled_parents(&mut self, ty: &Type) -> bool {
+    pub(crate) fn ensure_pickled_parents(&mut self, ty: &Type) -> bool {
         if !self.library_abi {
             return false;
         }
