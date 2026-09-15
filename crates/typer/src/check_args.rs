@@ -2064,7 +2064,7 @@ impl Typer {
         // fitting. Materialization only needs that one detached identity;
         // extending by MAX on every nested call made the instance vector grow
         // again for each level of a recursive implicit.
-        self.prepare_implicit_instances(origin, depth.min(crate::implicits::MAX_IMPLICIT_DEPTH));
+        self.prepare_implicit_instances(origin, depth);
         let effective_id = self
             .implicit_instances
             .get(&origin)

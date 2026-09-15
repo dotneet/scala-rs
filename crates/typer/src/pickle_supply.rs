@@ -951,6 +951,11 @@ impl PickleSupply {
             st.get_mut(id).ty = target;
             st.get_mut(id).is_type_alias = true;
             st.get_mut(class_sym).members.push(id);
+            // A prior lookup may have memoized the inherited abstract
+            // declaration (or a less-specific alias) for this name.  The
+            // concrete override changes the answer for every receiver that
+            // can see this class, so none of those answers is reusable.
+            self.invalidate_type_member_caches(name);
             trace(format_args!(
                 "{full}#{name}: overriding type alias installed"
             ));
@@ -1923,6 +1928,19 @@ impl PickleSupply {
         }
     }
 
+    /// The cache is keyed by receiver and name, but an alias installed on an
+    /// ancestor changes the answer for all of its descendants.  Clearing all
+    /// entries for the name is deliberately conservative: the table is
+    /// small compared with the pickle work being avoided, and it also covers
+    /// receivers that were completed before their inheritance links were
+    /// fully materialized.
+    fn invalidate_type_member_caches(&mut self, name: &str) {
+        self.tried_types
+            .retain(|(_, cached_name), _| cached_name != name);
+        self.completed_type_member_decls
+            .retain(|(_, cached_name), _| cached_name != name);
+    }
+
     /// Install the **type** member `name` of `class_sym`, read from the pickle
     /// of whichever class in its linearisation declares it.
     ///
@@ -1974,6 +1992,11 @@ impl PickleSupply {
         if let Some(memo) = self.tried_types.get(&key) {
             return memo.clone();
         }
+        // The declaration cache is paired with `tried_types`, but a previous
+        // attempt may have left only the declaration behind (for example when
+        // an alias RHS failed to convert). Never let that orphaned symbol be
+        // used for a newly resolved answer.
+        self.completed_type_member_decls.remove(&key);
         let outer_for = self.completing_for.replace(class_sym);
         let resolution = self.complete_type_member_uncached(st, bin, class_sym, name);
         self.completing_for = outer_for;
@@ -2118,6 +2141,7 @@ impl PickleSupply {
                     st.get_mut(id).ty = ty.clone();
                     st.get_mut(id).is_type_alias = true;
                     st.get_mut(alias_owner).members.push(id);
+                    self.invalidate_type_member_caches(name);
                     Some(id)
                 }
             };
@@ -2273,6 +2297,7 @@ impl PickleSupply {
             st.get_mut(id).ty = target;
             st.get_mut(id).is_type_alias = true;
             st.get_mut(owner).members.push(id);
+            self.invalidate_type_member_caches(name);
             id
         };
         if declared.has(pflags::PROTECTED) {
@@ -2420,6 +2445,7 @@ impl PickleSupply {
                 st.get_mut(id).ty = target;
                 st.get_mut(id).is_type_alias = true;
                 st.get_mut(owner).members.push(id);
+                self.invalidate_type_member_caches(name);
                 return Some(Type::TypeMember(id));
             }
             return Some(target);
@@ -2456,6 +2482,7 @@ impl PickleSupply {
         st.get_mut(id).ty = target;
         st.get_mut(id).is_type_alias = true;
         st.get_mut(owner).members.push(id);
+        self.invalidate_type_member_caches(name);
         trace(format_args!("type alias {owner_name}.{name}"));
         Some(Type::TypeMember(id))
     }

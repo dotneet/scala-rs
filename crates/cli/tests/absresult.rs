@@ -338,6 +338,27 @@ fn shrinking_implicit_derivation_can_exceed_eight_levels() {
 }
 
 #[test]
+fn shrinking_implicit_list_derivation_can_exceed_eight_levels() {
+    let p = root();
+    let mut outputs = Vec::new();
+    for oracle in [false, true] {
+        let out = p.join(format!("recursive-list-{oracle}"));
+        check(&compile(
+            &[fixture("absresult_recursive_list.scala")],
+            &out,
+            JAR,
+            oracle,
+            false,
+        ));
+        let result = run(&out, JAR);
+        check(&result);
+        outputs.push(result.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    assert_eq!(outputs[0], b"int\n");
+}
+
+#[test]
 fn infer_override_applies_to_methods_fields_and_setters() {
     let p = root();
     for oracle in [false, true] {
