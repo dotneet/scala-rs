@@ -60,6 +60,15 @@ struct ErasedDecl {
     off_the_bytecode_path: bool,
 }
 
+/// The converted type member plus the declaration that supplied it. A
+/// transparent (nullary) alias has no source-level `TypeMember` in the type
+/// tree, but dependent selections still need that declaration's owner/path so
+/// the call-site prefix can be substituted without consulting lookup order.
+struct CompletedTypeMember {
+    ty: Type,
+    decl: Option<SymbolId>,
+}
+
 const ACC_STATIC: u16 = 0x0008;
 const ACC_BRIDGE: u16 = 0x0040;
 const ACC_SYNTHETIC: u16 = 0x1000;
@@ -109,10 +118,16 @@ pub struct PickleSupply {
     /// What a `p.type` naming one of the member's *own* parameters means,
     /// while that member is being installed: the parameter's declared type.
     ///
-    /// Keyed by the pickled path's tail, `".<member>.<param>"`, which is how
-    /// nsc spells the reference (`cats.effect.kernel.Async.apply.F` for the
-    /// `F` of `Async.apply`). See [`PickleSupply::conv_at`]'s `Single` arm.
+    /// Keyed by the pickled parameter's complete path
+    /// (`cats.effect.kernel.Async.apply.F`). A suffix-only key lets two
+    /// same-shaped value parameters race through a `HashMap`; the pickle
+    /// reader preserves this path for dependent `TypeRef`s.
     param_singletons: HashMap<String, Type>,
+    /// The term symbol for each parameter whose singleton is being widened.
+    /// A dependent result such as `pShape.Packed` must retain the formal
+    /// parameter path until the call supplies `pShape`; the widened type alone
+    /// cannot be substituted back to the actual argument.
+    param_singleton_symbols: HashMap<String, SymbolId>,
     /// Classes read from a `-cp` jar/directory whose shape has been taken from
     /// their `ScalaSignature` rather than from the JVM generic signature (see
     /// [`PickleSupply::adopt_binary_class`]). Also the gate that lets
@@ -148,6 +163,10 @@ pub struct PickleSupply {
     /// both a `type Expr` and a `val Expr`, and asking for one must not make
     /// the other look already-answered.
     tried_types: HashMap<(u32, String), Option<Type>>,
+    /// The declaration selected while answering `tried_types`. This is kept
+    /// separately because transparent aliases memoize their concrete RHS,
+    /// while a dependent projection must retain the declaration origin.
+    completed_type_member_decls: HashMap<(u32, String), SymbolId>,
     /// Pickled `val`s whose singleton type is being widened right now, so
     /// `val x: y.type; val y: x.type` cannot spiral.
     widening: HashSet<String>,
@@ -1944,37 +1963,45 @@ impl PickleSupply {
         if class_sym.is_none() || name.is_empty() {
             return None;
         }
-        // An answer already in the table is only usable when it is the one
-        // `class_sym` itself means. A *deferred* member reached through a
-        // parent is not: `slick.basic.BasicBackend` declares `type Session`
-        // and `slick.jdbc.JdbcBackend` fixes it to `SessionDef`, and whichever
-        // of the two a previous file happened to install first decided what
-        // `JdbcBackend#Session` meant for the rest of the run. The pickle
-        // lookup below walks the linearisation most-derived-first, which is
-        // nsc's own rule, so ask it before settling for an inherited
-        // declaration.
-        let installed = st
-            .type_members_named(class_sym, name)
-            .into_iter()
-            .find(|&s| st.get(s).kind == SymKind::TypeMember);
-        if let Some(id) = installed {
-            if st.get(id).owner == class_sym || !st.is_deferred_type_member(id) {
-                return Some(st.type_member_as_seen(id));
-            }
-        }
+        // An answer already in the table is not authoritative here. A
+        // deferred member reached through a parent may be shadowed by a
+        // concrete alias in the receiver's subclass, and even a concrete
+        // declaration may have been installed from a less-specific lookup.
+        // Resolve the pickle's linearisation first so the declaration origin
+        // and its concrete RHS stay together; use the table only as a final
+        // fallback when no pickle can answer.
         let key = (class_sym.0, name.to_string());
         if let Some(memo) = self.tried_types.get(&key) {
             return memo.clone();
         }
         let outer_for = self.completing_for.replace(class_sym);
-        let mut answer = self.complete_type_member_uncached(st, bin, class_sym, name);
+        let resolution = self.complete_type_member_uncached(st, bin, class_sym, name);
         self.completing_for = outer_for;
+        let mut answer = resolution.as_ref().map(|r| r.ty.clone());
+        if let Some(decl) = resolution.and_then(|r| r.decl) {
+            self.completed_type_member_decls.insert(key.clone(), decl);
+        }
         // No pickle said anything better, so the inherited declaration stands.
         if answer.is_none() {
-            answer = installed.map(|id| st.type_member_as_seen(id));
+            let installed = st
+                .type_members_named(class_sym, name)
+                .into_iter()
+                .find(|&s| st.get(s).kind == SymKind::TypeMember);
+            answer = installed.map(|id| {
+                self.completed_type_member_decls.insert(key.clone(), id);
+                st.type_member_as_seen(id)
+            });
         }
         self.tried_types.insert(key, answer.clone());
         answer
+    }
+
+    /// Return the declaration selected by [`complete_type_member`], including
+    /// the synthetic declaration retained for a transparent alias.
+    fn completed_type_member_decl(&self, class_sym: SymbolId, name: &str) -> Option<SymbolId> {
+        self.completed_type_member_decls
+            .get(&(class_sym.0, name.to_string()))
+            .copied()
     }
 
     fn complete_type_member_uncached(
@@ -1983,7 +2010,7 @@ impl PickleSupply {
         bin: &mut BinaryIndex,
         class_sym: SymbolId,
         name: &str,
-    ) -> Option<Type> {
+    ) -> Option<CompletedTypeMember> {
         let sym = st.get(class_sym);
         if !sym.is_class_like() {
             return None;
@@ -2045,7 +2072,12 @@ impl PickleSupply {
         if let Some(hit) = type_hit {
             if hit.member.kind == MemberKind::AbstractType {
                 let qualified = format!("{}.{name}", hit.owner);
-                return self.abstract_type_member(st, bin, &qualified, 0);
+                let ty = self.abstract_type_member(st, bin, &qualified, 0)?;
+                let decl = match &ty {
+                    Type::TypeMember(id) => Some(*id),
+                    _ => None,
+                };
+                return Some(CompletedTypeMember { ty, decl });
             }
             // A module's aliases belong to its module class. Looking up
             // the same name as a non-module can fail (Predef) or attach the
@@ -2067,14 +2099,29 @@ impl PickleSupply {
                 Some(SigType::This(c)) => Some(c.clone()),
                 _ => None,
             };
-            return self.install_type_alias(
+            let ty = self.install_type_alias(
                 st,
                 bin,
                 alias_owner,
                 name,
                 &hit.member.ty,
                 this_prefix.as_deref(),
-            );
+            )?;
+            // `install_type_alias` intentionally returns a transparent
+            // nullary alias as its RHS. Retain an owner-local declaration for
+            // dependent paths, without changing the transparent type seen by
+            // ordinary callers.
+            let decl = match &ty {
+                Type::TypeMember(id) => Some(*id),
+                _ => {
+                    let id = st.alloc(name, alias_owner, SymKind::TypeMember, Flags::EMPTY, "");
+                    st.get_mut(id).ty = ty.clone();
+                    st.get_mut(id).is_type_alias = true;
+                    st.get_mut(alias_owner).members.push(id);
+                    Some(id)
+                }
+            };
+            return Some(CompletedTypeMember { ty, decl });
         }
         // A *nested class or trait* named as a **type**, as opposed to a type
         // alias or an abstract type member: `u.TypeTag[T]` (`TypeTags.TypeTag`),
@@ -2091,9 +2138,12 @@ impl PickleSupply {
             .find(|h| h.member.kind == MemberKind::Class && h.member.is_public_api())?;
         let qualified = format!("{}.{name}", class_hit.owner);
         let sym = self.ensure_class(st, bin, &qualified, false)?;
-        Some(Type::Class {
-            sym,
-            args: Vec::new(),
+        Some(CompletedTypeMember {
+            ty: Type::Class {
+                sym,
+                args: Vec::new(),
+            },
+            decl: None,
         })
     }
 
@@ -3667,14 +3717,22 @@ impl PickleSupply {
         // has exactly the members a selection off the result can reach, which
         // is all a summoner is for.
         let saved_singletons = std::mem::take(&mut self.param_singletons);
-        for (clause, tys) in shape.clauses.iter().zip(paramss_ty.iter()) {
-            for (p, t) in clause.params.iter().zip(tys.iter()) {
-                self.param_singletons
-                    .insert(format!(".{name}.{}", p.name), t.clone());
+        let saved_singleton_symbols = std::mem::take(&mut self.param_singleton_symbols);
+        for ((clause, tys), syms) in shape
+            .clauses
+            .iter()
+            .zip(paramss_ty.iter())
+            .zip(paramss_sym.iter())
+        {
+            for ((p, t), ps) in clause.params.iter().zip(tys.iter()).zip(syms) {
+                let key = format!("{pickle_owner}.{name}.{}", p.name);
+                self.param_singletons.insert(key.clone(), t.clone());
+                self.param_singleton_symbols.insert(key, *ps);
             }
         }
         let ret = self.conv(st, bin, &scope, &shape.ret);
         self.param_singletons = saved_singletons;
+        self.param_singleton_symbols = saved_singleton_symbols;
         let Some(ret) = ret else {
             trace(format_args!(
                 "{internal}#{name}: unmappable result type {:?}",
@@ -5701,12 +5759,7 @@ impl PickleSupply {
                 // `F.type` where `F` is a parameter of the member being
                 // installed (`def apply[F[_]](implicit F: Async[F]): F.type`):
                 // the parameter's own type is what that singleton widens to.
-                if let Some(t) = self
-                    .param_singletons
-                    .iter()
-                    .find(|(suffix, _)| sym.ends_with(suffix.as_str()))
-                    .map(|(_, t)| t.clone())
-                {
+                if let Some(t) = self.param_singleton(sym).map(|(t, _)| t) {
                     return Some(t);
                 }
                 // nsc's pickle printer can encode a nested module's owner in
@@ -6020,6 +6073,34 @@ impl PickleSupply {
     /// `want_arity` is the kind the *position* expects: 0 for an ordinary
     /// type, 1 for the argument of an `F[_]`-shaped parameter. Only a position
     /// that wants a constructor may be filled by an unapplied class.
+    fn param_singleton(&self, path: &str) -> Option<(Type, SymbolId)> {
+        if let Some(ty) = self.param_singletons.get(path) {
+            return self
+                .param_singleton_symbols
+                .get(path)
+                .copied()
+                .map(|sym| (ty.clone(), sym));
+        }
+        // A few older pickles use a JVM/source spelling for the same full
+        // path. A suffix fallback remains safe only when it identifies one
+        // formal parameter; never let HashMap iteration choose among several
+        // candidates.
+        let mut found = None;
+        for (key, ty) in &self.param_singletons {
+            if !path.ends_with(key) {
+                continue;
+            }
+            let Some(sym) = self.param_singleton_symbols.get(key).copied() else {
+                continue;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some((ty.clone(), sym));
+        }
+        found
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn conv_ref(
         &mut self,
@@ -6036,6 +6117,10 @@ impl PickleSupply {
         // this is; when it cannot be settled here, the member's own qualified
         // name is exactly the answer the reader used to give.
         if let Some((pre, member)) = sym.split_once('#') {
+            if let Some(t) = self.param_projection(st, bin, pre, member) {
+                trace(format_args!("projection {sym}: retained parameter path"));
+                return Some(t);
+            }
             if let Some(t) = self.conv_projection(st, bin, scope, pre, member, args, d) {
                 trace(format_args!("projection {sym} -> {}", st.display_type(&t)));
                 return Some(t);
@@ -6137,6 +6222,24 @@ impl PickleSupply {
                 return Some(Type::Tuple(self.conv_all(st, bin, scope, args, d)?));
             }
         }
+        // An alias body is converted in the declaring class's vocabulary, so
+        // its own type parameters are not in the method scope. Reconnect a
+        // bare reference to that class parameter before trying classpath
+        // completion or dependent value-parameter recovery (`type Packed =
+        // Packed_` in a generic `Shape`).
+        if args.is_empty() && scope.get(sym).is_none() {
+            if let Some(Type::Class { sym: owner, .. }) = &self.self_ty {
+                if let Some(tp) = st
+                    .get(*owner)
+                    .tparams
+                    .iter()
+                    .copied()
+                    .find(|tp| st.get(*tp).name == sym)
+                {
+                    return Some(Type::TypeParam(tp));
+                }
+            }
+        }
         // A type member named from inside its own class is pickled bare:
         // `Internals.internal` returns `Internal`, not `...Internals.Internal`.
         // There is no class by that name, so without this the member is
@@ -6230,6 +6333,31 @@ impl PickleSupply {
             }
         }
         Some(Type::Class { sym: cls, args: a })
+    }
+
+    /// Convert `p1#Shape.Packed` using the exact formal path retained by the
+    /// pickle reader. The static class owner is checked independently from
+    /// the term path, so two packages with a class named `Shape` cannot alias
+    /// one another accidentally.
+    fn param_projection(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        param_path: &str,
+        member: &str,
+    ) -> Option<Type> {
+        let (param, param_sym) = self.param_singleton(param_path)?;
+        let Type::Class { sym: cls, .. } = &param else {
+            return None;
+        };
+        let (owner_path, alias_name) = member.rsplit_once('.')?;
+        if !same_class_owner(st, *cls, owner_path) {
+            return None;
+        }
+        self.complete_type_member(st, bin, *cls, alias_name)?;
+        let decl = self.completed_type_member_decl(*cls, alias_name)?;
+        let projected = st.path_member(&[param_sym], decl, &param);
+        Some(Type::TypeMember(projected))
     }
 
     fn conv_all(
@@ -6870,6 +6998,18 @@ pub(crate) fn inherits_matching(
         }
     }
     false
+}
+
+/// Compare a pickled owner path with the exact class identity, including its
+/// package and nested-class spelling. A simple-name comparison lets unrelated
+/// `one.Shape` and `two.Shape` satisfy the same dependent projection.
+fn same_class_owner(st: &SymbolTable, cls: SymbolId, owner: &str) -> bool {
+    let internal = st.get(cls).jvm_name.clone();
+    if internal.is_empty() {
+        return false;
+    }
+    let dotted = internal.trim_end_matches('$').replace('/', ".");
+    owner == dotted || owner == dotted.replace('$', ".")
 }
 
 /// The JVM descriptor a converted parameter type erases to, where that is

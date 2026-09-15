@@ -940,8 +940,29 @@ impl Builder<'_> {
                 // changes -- a prefix that is a package, a `this`, or a
                 // qualified class is not a name a later stage could resolve
                 // any better than the member's own full name.
-                let name = match self.ty(prefix, d) {
-                    SigType::Ref { sym: p, args: pa }
+                let prefix_ty = self.ty(prefix, d);
+                // A type selected from a value parameter (`p.Packed`) carries
+                // the parameter's *term* symbol in the TypeRef prefix. Keep
+                // that complete path in the compact SigType representation;
+                // reducing it to `Shape.Packed` makes two same-shaped
+                // parameters indistinguishable to the consumer. The full
+                // symbol path is stable even when source parameter names
+                // repeat in different methods.
+                let parameter_path = match self.p.entry(prefix) {
+                    Some(Entry::SingleTpe { sym: path_sym, .. })
+                        if self
+                            .p
+                            .entry(*path_sym)
+                            .and_then(|e| e.sym_info())
+                            .is_some_and(|i| i.has(pflags::PARAM)) =>
+                    {
+                        self.p.sym_full_name(*path_sym)
+                    }
+                    _ => None,
+                };
+                let name = match (parameter_path, prefix_ty) {
+                    (Some(path), _) => format!("{path}#{name}"),
+                    (_, SigType::Ref { sym: p, args: pa })
                         if pa.is_empty() && !p.contains('.') && !p.contains('#') && p != name =>
                     {
                         format!("{p}#{name}")

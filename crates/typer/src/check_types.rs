@@ -2316,6 +2316,13 @@ impl Typer {
             };
             let decl = self.st.path_member_decl(sk).unwrap_or(sk);
             let prefix = args[i].ty.clone();
+            if self.st.class_sym_of(&prefix).is_some() {
+                let seen = self.st.expand_in_type(&prefix, &Type::TypeMember(decl));
+                if !matches!(&seen, Type::TypeMember(x) if *x == decl) {
+                    out = self.st.subst_path_member_deep(&out, sk, &seen);
+                    continue;
+                }
+            }
             // The argument's own class may *fix* the member -- slick's
             // `state.get(Phase.assignUniqueSymbols)` is `Option[p.State]` on a
             // `p` whose actual class defines `State`. Then the answer is that
