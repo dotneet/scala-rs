@@ -12,7 +12,7 @@ Language:
 
 - **The rest of def macro expansion**. Expansion itself works (see "def macro expansion
   (JVM bridge)" above). What is still missing:
-  **whitebox macros** / **macro bundles** (`class B(val c: Context)`) /
+  **whitebox macro APIs beyond the implemented Context operations** /
   **anonymous class definitions returned by macro expansions** / **general inferred
   type argument tags outside resolved implicit evidence** / **`c.inferImplicitView`** /
   **passing blocks, function literals, `new` and similar arguments (and the receiver)
@@ -27,6 +27,10 @@ Language:
   `macro expansion is not implemented: cannot expand f (implementation Impl$.m):
   <reason>`
   (**[`docs/macros.md`](macros.md)** §7.11 / §7.12 / §7.13)
+  Context-bearing macro bundles, dynamic constant type carriers, and valid
+  `c.parse` snippets used by refined are supported; see [refined](refined.md).
+  Recovery from `c.parse`'s checked `ParseException` remains unsupported and
+  produces an explicit diagnostic, including when the macro catches the failure.
 - **The rest of quasiquote expansion (reification)**. `q"..."` / `tq"..."` /
   `pq"..."` / `cq"..."` are lowered to `internal.reificationSupport.Syntactic*`
   calls and executed. Type ascriptions, eta expansion, blocks and `val`, `new`,

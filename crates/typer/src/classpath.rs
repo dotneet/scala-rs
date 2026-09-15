@@ -1646,7 +1646,11 @@ pub fn ensure_package(st: &mut SymbolTable, jvm: &str) -> SymbolId {
 }
 
 pub fn install_java_class(st: &mut SymbolTable, c: &crate::javaclass::JavaClass) -> SymbolId {
-    let owner = java_class_owner(st, &c.internal_name);
+    let owner = if c.is_scala {
+        scala_class_owner(st, &c.internal_name)
+    } else {
+        java_class_owner(st, &c.internal_name)
+    };
     install_java_class_in(st, c, owner)
 }
 
@@ -2279,9 +2283,14 @@ pub(crate) fn find_or_stub_scala_class(st: &mut SymbolTable, internal: &str) -> 
         return id;
     }
     let simple = scala_simple_name(internal);
+    let owner = scala_class_owner(st, internal);
+    stub_class_in(st, internal, simple, owner)
+}
+
+fn scala_class_owner(st: &mut SymbolTable, internal: &str) -> SymbolId {
     let trimmed = internal.trim_end_matches('$');
     let file_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    let owner = if let Some(i) = scala_nesting_separator(file_name) {
+    if let Some(i) = scala_nesting_separator(file_name) {
         let pkg = trimmed.rsplit_once('/').map_or("", |(p, _)| p);
         let outer = &file_name[..i];
         let outer = if pkg.is_empty() {
@@ -2292,8 +2301,7 @@ pub(crate) fn find_or_stub_scala_class(st: &mut SymbolTable, internal: &str) -> 
         find_or_stub_scala_outer(st, &outer)
     } else {
         ensure_package(st, trimmed.rsplit_once('/').map_or("", |(p, _)| p))
-    };
-    stub_class_in(st, internal, simple, owner)
+    }
 }
 
 fn find_or_stub_scala_outer(st: &mut SymbolTable, outer: &str) -> SymbolId {

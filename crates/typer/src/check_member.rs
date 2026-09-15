@@ -847,6 +847,10 @@ impl Typer {
             let last_in_clause = clause.len().saturating_sub(1);
             for (pi, p) in clause.iter_mut().enumerate() {
                 self.type_val_sig(p);
+                if !p.sym.is_none() {
+                    let param_name = self.st.get(p.sym).name.clone();
+                    self.st.enter_in_current(&param_name, p.sym);
+                }
                 // nsc, at this parameter's own position. A repeated parameter
                 // covers every argument from its position on, so one that is
                 // not last has no meaning; `def f(xs: Int*, y: Int)` used to

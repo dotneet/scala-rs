@@ -516,6 +516,17 @@ impl Typer {
                 }
             });
         });
+        if !self.sigs_only && !self.language_dynamics {
+            for parent in parents.iter() {
+                if self
+                    .st
+                    .class_sym_of(&parent.ty)
+                    .is_some_and(|p| self.st.get(p).jvm_name == "scala/Dynamic")
+                {
+                    self.error(parent.span, "extension of scala.Dynamic needs to be enabled by making scala.language.dynamics visible");
+                }
+            }
+        }
         if !pts.is_empty() {
             self.st.get_mut(id).parents = pts;
         }

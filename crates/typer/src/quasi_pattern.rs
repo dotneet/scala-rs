@@ -117,8 +117,24 @@ impl Typer {
             }
         };
         let ranks = crate::quasiquote::hole_ranks(&parts, holes.len());
+        let tree_tpt = Tree::dummy(TreeKind::Select {
+            qual: Box::new(universe.clone()),
+            name: "Tree".into(),
+        });
+        let tree_type = self.tree_to_type(&tree_tpt);
+        let typed_tree_holes: Vec<bool> = holes
+            .iter()
+            .map(|hole| {
+                if let TreeKind::Typed { tpt, .. } = &hole.kind {
+                    let ty = self.tree_to_type(tpt);
+                    !ty.is_error() && !tree_type.is_error() && self.st.is_sub_type(&ty, &tree_type)
+                } else {
+                    false
+                }
+            })
+            .collect();
         let built = {
-            let d = Deconstructor::new(universe, &holes, &ranks, span, &src);
+            let d = Deconstructor::new(universe, &holes, &ranks, &typed_tree_holes, span, &src);
             match d.pattern(kind, &body) {
                 Ok(t) => t,
                 Err(why) => {
@@ -182,6 +198,7 @@ pub(crate) struct Deconstructor<'a> {
     holes: &'a [Tree],
     /// `ranks[i]` is 0 for `$x`, 1 for `..$xs`, 2 for `...$xss`.
     ranks: &'a [u8],
+    typed_tree_holes: &'a [bool],
     /// The quasiquote's own span, worn by everything this builds.
     span: Span,
     /// The source `crates/typer/src/quasiquote.rs` reconstructed and parsed.
@@ -196,6 +213,7 @@ impl<'a> Deconstructor<'a> {
         universe: Tree,
         holes: &'a [Tree],
         ranks: &'a [u8],
+        typed_tree_holes: &'a [bool],
         span: Span,
         src: &'a str,
     ) -> Self {
@@ -203,6 +221,7 @@ impl<'a> Deconstructor<'a> {
             universe,
             holes,
             ranks,
+            typed_tree_holes,
             span,
             src,
         }
@@ -435,9 +454,9 @@ impl<'a> Deconstructor<'a> {
     /// through an `Unliftable[C]` and reports
     /// `Can't find reflect.runtime.universe.Unliftable[C], consider providing it`
     /// when there is none (`test/files/neg/quasiquotes-unliftable-not-found`).
-    /// Unlifting is not implemented, so the ascription is refused by name
-    /// rather than taken for an ordinary typed pattern, which would have
-    /// accepted the program and then bound a `Tree` to a `C`.
+    /// Tree subtypes such as `Literal` use ordinary typed patterns. Other
+    /// ascriptions require unlifting, which is not implemented and is refused
+    /// rather than binding a `Tree` to an unrelated `C`.
     fn hole(&self, i: usize, want: u8) -> Result<Tree, String> {
         let rank = *self.ranks.get(i).unwrap_or(&0);
         if rank != want {
@@ -450,7 +469,7 @@ impl<'a> Deconstructor<'a> {
             .get(i)
             .cloned()
             .ok_or_else(|| "a hole with no pattern".to_string())?;
-        if matches!(pat.kind, TreeKind::Typed { .. }) {
+        if matches!(pat.kind, TreeKind::Typed { .. }) && !self.typed_tree_holes[i] {
             return Err(
                 "a hole with a type ascription, which needs an `Unliftable` instance".to_string(),
             );

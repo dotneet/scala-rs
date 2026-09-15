@@ -79,11 +79,11 @@ pub struct EmitOpts {
     /// reading every symbol's `captures`: doing that once per unit was another
     /// files-times-symbols sweep. `None` computes it here.
     pub captured_vars: Option<Rc<HashSet<SymbolId>>>,
-    /// Simple name -> the first non-trait class symbol carrying it, for
+    /// Owner and simple name -> the first non-trait class carrying them, for
     /// [`Gen::find_class_named`]. A pure function of `st` as well; the search
     /// it replaces was a linear scan of every symbol, run once per module
     /// emitted. `None` builds it here.
-    pub class_by_name: Option<Rc<HashMap<String, SymbolId>>>,
+    pub class_by_name: Option<Rc<HashMap<(SymbolId, String), SymbolId>>>,
     /// Class files of the run's `-cp` / `--scala-library`, for the bridges a
     /// class needs against members it only inherits (see [`crate::ifacebridge`]).
     /// `None` skips that pass, which is what the private-runtime ABI wants.
@@ -537,10 +537,10 @@ pub(crate) struct Gen<'a> {
     /// JVM internal name → class-like symbol, for the whole symbol table.
     /// Built once; used to compute `InnerClasses`/`EnclosingMethod`.
     pub(crate) jvm_index: Rc<HashMap<String, SymbolId>>,
-    /// Simple name → first non-trait class symbol with it, for the
+    /// Owner and simple name → first non-trait class symbol with them, for the
     /// case-companion lookup in `emit_module`. Built once; that lookup used to
     /// scan every symbol, once per module in the run.
-    pub(crate) class_by_name: Rc<HashMap<String, SymbolId>>,
+    pub(crate) class_by_name: Rc<HashMap<(SymbolId, String), SymbolId>>,
     /// Class files behind the run's binary parents (see
     /// [`Gen::emit_binary_parent_bridges`]).
     pub(crate) binary_parents: Option<Rc<BinaryParents>>,
@@ -572,14 +572,14 @@ pub fn build_jvm_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
     m
 }
 
-/// Simple name → the first non-trait class symbol carrying it, in symbol
+/// Owner and simple name → the first non-trait class carrying them, in symbol
 /// order. This is what a linear `find` over `st.symbols` used to answer for
 /// every module emitted, so it is built once for the run instead.
-pub fn build_class_name_index(st: &SymbolTable) -> HashMap<String, SymbolId> {
+pub fn build_class_name_index(st: &SymbolTable) -> HashMap<(SymbolId, String), SymbolId> {
     let mut m = HashMap::new();
     for s in &st.symbols {
         if s.kind == SymKind::Class && !s.flags.contains(Flags::TRAIT) {
-            m.entry(s.name.clone()).or_insert(s.id);
+            m.entry((s.owner, s.name.clone())).or_insert(s.id);
         }
     }
     m

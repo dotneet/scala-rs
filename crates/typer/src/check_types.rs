@@ -189,6 +189,48 @@ impl Typer {
                 self.import_prefixed(&name, ty, tpt.span)
             }
             TreeKind::Select { name, qual } => {
+                if let TreeKind::Select {
+                    qual: receiver,
+                    name: selected,
+                } = &qual.kind
+                {
+                    if let TreeKind::Ident { name } = &receiver.kind {
+                        self.expose_unqualified(name, tpt.span);
+                    } else if matches!(receiver.kind, TreeKind::Select { .. }) {
+                        // A fully qualified binary module may not have been
+                        // loaded by an import before its dynamic selection.
+                        self.qualified_type_owners(receiver);
+                    }
+                    self.complete_path_head(receiver, tpt.span);
+                    if let Some(receiver_ty) = self.term_path_type(receiver) {
+                        if let Some(cls) = self.st.class_sym_of(&receiver_ty) {
+                            self.ensure_java_loaded(cls, tpt.span);
+                            if !self.st.is_source_owner(cls) {
+                                self.pickle
+                                    .adopt_binary_class(&mut self.st, &mut self.binary, cls);
+                            }
+                            self.pickle
+                                .ensure_parents(&mut self.st, &mut self.binary, cls);
+                        }
+                        if self.is_dynamic_receiver(&receiver_ty)
+                            && !self
+                                .st
+                                .class_sym_of(&receiver_ty)
+                                .is_some_and(|c| !self.st.lookup_member(c, selected).is_empty())
+                        {
+                            let mut expanded = (**qual).clone();
+                            self.type_expr(&mut expanded, &Type::NoType);
+                            if self.macro_symbol_of(&expanded).is_some() {
+                                self.report_macro_calls(&expanded);
+                                return Type::Error;
+                            }
+                            if expanded.ty.is_error() {
+                                return Type::Error;
+                            }
+                            return self.project_from_prefix(tpt.span, &expanded.ty, name);
+                        }
+                    }
+                }
                 if let TreeKind::Ident { name: q } = &qual.kind {
                     let q = q.clone();
                     self.expose_unqualified(&q, tpt.span);
@@ -2233,26 +2275,32 @@ impl Typer {
     /// Only a *deferred* member needs this: an alias carries its right-hand
     /// side, which `project_from_prefix` has already read through the prefix.
     pub(crate) fn at_term_path(&mut self, path_tree: &Tree, pty: &Type, t: Type) -> Type {
-        let Type::TypeMember(m) = t else {
-            return t;
-        };
-        // `p.T` on a `p: P` whose type is abstract: `project_from_prefix`
-        // answered with the abstract projection `P#T`, because the *type* `P`
-        // settles nothing. The *term* `p` does -- it is one instance, and
-        // `path_member` is the representation for that (`agent/projection`).
-        // Slick's `def get[P <: Phase](p: P): Option[p.State]` is exactly
-        // this, and leaving the projection in place lost fourteen calls.
-        let m = match self.st.abs_projection(m) {
-            Some((_, decl)) => decl,
-            None => m,
-        };
-        if !self.can_be_path_member(m, pty) {
-            return t;
-        }
         let Some(path) = self.stable_term_path(path_tree) else {
             return t;
         };
-        Type::TypeMember(self.st.path_member(&path, m, pty))
+        let Some(cls) = self.st.class_sym_of(pty) else {
+            return t;
+        };
+        // A concrete alias may contain deferred members, e.g. p.Items =
+        // List[p.Element]. Preserve the receiver inside its RHS as well.
+        crate::symbol::map_type(&t, &mut |ty| {
+            let Type::TypeMember(original) = ty else {
+                return ty.clone();
+            };
+            let m = self
+                .st
+                .abs_projection(*original)
+                .map_or(*original, |(_, decl)| decl);
+            if !self.can_be_path_member(m, pty)
+                || !self
+                    .st
+                    .lookup_member(cls, &self.st.get(m).name)
+                    .contains(&m)
+            {
+                return ty.clone();
+            }
+            Type::TypeMember(self.st.path_member(&path, m, pty))
+        })
     }
 
     /// Load the concrete definitions of type members used by an API member.
@@ -2812,7 +2860,9 @@ impl Typer {
                             }
                             Some(self.maybe_auto_apply(ty, &Type::NoType))
                         }
-                        SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
+                        SymKind::Module | SymKind::ModuleClass => {
+                            Some(self.st.type_of_class(self.st.module_class_of(s)))
+                        }
                         _ => None,
                     }
                 })
@@ -2832,7 +2882,7 @@ impl Typer {
                                     Some(self.maybe_auto_apply(sy.ty.clone(), &Type::NoType))
                                 }
                                 SymKind::Module | SymKind::ModuleClass => {
-                                    Some(self.st.type_of_class(s))
+                                    Some(self.st.type_of_class(self.st.module_class_of(s)))
                                 }
                                 _ => None,
                             }
@@ -2860,7 +2910,9 @@ impl Typer {
                             };
                             Some(self.maybe_auto_apply(t, &Type::NoType))
                         }
-                        SymKind::Module | SymKind::ModuleClass => Some(self.st.type_of_class(s)),
+                        SymKind::Module | SymKind::ModuleClass => {
+                            Some(self.st.type_of_class(self.st.module_class_of(s)))
+                        }
                         _ => None,
                     }
                 })
@@ -2877,7 +2929,19 @@ impl Typer {
         let mut decls = Vec::new();
         let mut ok = true;
         self.st.push_scope();
-        for r in refinements {
+        let mut members = refinements.to_vec();
+        for r in &mut members {
+            if let TreeKind::TypeDef { name, .. } = &r.kind {
+                r.sym = self
+                    .st
+                    .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
+                self.st.enter_in_current(name, r.sym);
+            }
+        }
+        for r in &members {
+            self.register_block_sig(r);
+        }
+        for r in &members {
             if let TreeKind::TypeDef { .. } = &r.kind {
                 match self.refinement_type_member(r) {
                     Some(d) => decls.push(d),
@@ -2995,7 +3059,10 @@ impl Typer {
 
     /// Type a refinement `type` member, including HK `type F[_]` / `type F[X] = Id[X]`
     /// and bounded `type A <: T`. Nullary class/trait `type A <: T` stays unimplemented.
-    fn refinement_type_member(&mut self, r: &Tree) -> Option<scala_rs_parser::RefineDecl> {
+    pub(crate) fn refinement_type_member(
+        &mut self,
+        r: &Tree,
+    ) -> Option<scala_rs_parser::RefineDecl> {
         let TreeKind::TypeDef {
             name,
             tparams,
@@ -3009,15 +3076,47 @@ impl Typer {
         };
         let hk = !tparams.is_empty();
         let bounded = lo.is_some() || hi.is_some();
+        self.drop_lazy_sig(r.sym);
+        if !r.sym.is_none() && !self.st.get(r.sym).ty.is_no_type() {
+            let s = self.st.get(r.sym);
+            return Some(scala_rs_parser::RefineDecl::Type {
+                name: name.clone(),
+                rhs: if rhs.is_empty() {
+                    None
+                } else if hk {
+                    let captured = s.tparams.len().saturating_sub(tparams.len());
+                    Some(if captured == 0 {
+                        Type::TypeMember(r.sym)
+                    } else {
+                        Type::Applied {
+                            ctor: Box::new(Type::TypeMember(r.sym)),
+                            args: s.tparams[..captured]
+                                .iter()
+                                .copied()
+                                .map(Type::TypeParam)
+                                .collect(),
+                        }
+                    })
+                } else {
+                    Some(s.ty.clone())
+                },
+                tparams: tparams.len(),
+                lo: s.bound_lo.clone(),
+                hi: s.bound_hi.clone(),
+            });
+        }
         if !hk && !bounded {
             let alias = if rhs.is_empty() {
                 None
             } else {
                 Some(self.tree_to_type(rhs))
             };
-            let id = self
-                .st
-                .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
+            let id = if r.sym.is_none() {
+                self.st
+                    .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "")
+            } else {
+                r.sym
+            };
             if let Some(t) = &alias {
                 self.st.get_mut(id).ty = t.clone();
                 self.st.get_mut(id).is_type_alias = true;
@@ -3033,9 +3132,12 @@ impl Typer {
                 hi: None,
             });
         }
-        let id = self
-            .st
-            .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "");
+        let id = if r.sym.is_none() {
+            self.st
+                .alloc(name, SymbolId::NONE, SymKind::TypeMember, Flags::EMPTY, "")
+        } else {
+            r.sym
+        };
         self.st.enter_in_current(name, id);
         self.st.push_scope();
         let mut tps = tparams.clone();
@@ -3476,6 +3578,11 @@ impl Typer {
                             )
                         })
                         .collect();
+                    for companion in self.expose_class_companion(&found, t.span) {
+                        if !found.contains(&companion) {
+                            found.push(companion);
+                        }
+                    }
                     found.sort_by_key(|id| self.type_owner_rank(*id));
                     for id in found {
                         let o = self.as_type_owner(id);
@@ -3545,9 +3652,6 @@ impl Typer {
         if owner.is_none() || this.is_none() || owner == this {
             return base;
         }
-        if self.st.get(owner).tparams.is_empty() {
-            return base;
-        }
         // The class the alias is read *through*: `this` itself, or -- for a
         // nested class naming an alias its enclosing class inherits -- that
         // enclosing class. `class C extends Base[String] { class D { def
@@ -3572,9 +3676,8 @@ impl Typer {
                     .collect(),
             };
             if let Some(Type::Class { args, .. }) = self.base_type_instance(&site_ty, owner, 0) {
-                if !args.is_empty() {
-                    return self.st.subst_tparams(owner, &args, &base);
-                }
+                let seen = self.st.expand_type_members(site, &base);
+                return self.st.subst_tparams(owner, &args, &seen);
             }
         }
         base

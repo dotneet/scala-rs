@@ -1594,7 +1594,13 @@ impl PickleSupply {
             || internal.starts_with("java/")
             || internal.starts_with("javax/")
             || internal.contains("$anon")
-            || (internal.starts_with("scala/") && class_sym.0 < st.prelude_end)
+            || (internal.starts_with("scala/")
+                && class_sym.0 < st.prelude_end
+                && st
+                    .get(class_sym)
+                    .members
+                    .iter()
+                    .any(|m| st.get(*m).name == "<init>"))
         {
             return false;
         }
@@ -2965,6 +2971,7 @@ impl PickleSupply {
         };
         st.get_mut(id).macro_impl = Some(MacroBinding {
             pickle: None,
+            is_bundle: false,
             impl_class: impl_class.to_string(),
             impl_method: impl_method.to_string(),
             blackbox: true,
@@ -3016,9 +3023,8 @@ impl PickleSupply {
     /// expected type and keeps the type it came out with, which is what nsc's
     /// `macroExpandApply` does for a `WhiteboxExpansion`.
     ///
-    /// One shape is declined outright, matching what the source-level path
-    /// (`crates/typer/src/macros.rs`) refuses: a **macro bundle**
-    /// (`class B(val c: Context)`), which the expander cannot instantiate.
+    /// Macro bundles receive their context in the constructor; the virtual
+    /// context slot below shares signature validation with object macros.
     #[allow(clippy::too_many_arguments)]
     fn install_pickled_macro(
         &mut self,
@@ -3031,13 +3037,11 @@ impl PickleSupply {
         mi: &PickledMacroImpl,
         class_scope: &HashMap<String, Type>,
     ) -> Option<SymbolId> {
+        let mut signature = mi.signature.clone();
         if mi.is_bundle {
-            trace(format_args!(
-                "{internal}#{name}: macro bundles are not implemented"
-            ));
-            return None;
+            signature.insert(0, vec![-1]);
         }
-        let Some((tag_indices, expr_args)) = macro_signature_shape(&mi.signature) else {
+        let Some((tag_indices, expr_args)) = macro_signature_shape(&signature) else {
             trace(format_args!(
                 "{internal}#{name}: the pickled macro signature {:?} is not a shape \
                  this expander knows",
@@ -3136,6 +3140,7 @@ impl PickleSupply {
             self.pickled_tag_targs(st, bin, m, &scope, mi, &tag_indices, internal, name);
         st.get_mut(m).macro_impl = Some(MacroBinding {
             pickle: None,
+            is_bundle: mi.is_bundle,
             impl_class: mi.class_name.clone(),
             impl_method: mi.method_name.clone(),
             blackbox: mi.is_blackbox,
@@ -6171,10 +6176,39 @@ impl PickleSupply {
             // argument.
             if args.is_empty() {
                 if let Type::TypeMember(decl) = fallback {
-                    if let Some(p) = Self::abstract_prefix_sym(st, scope, pre) {
+                    let prefix = Self::abstract_prefix_sym(st, scope, pre).or_else(|| {
+                        // A class's abstract member need not have a lexical
+                        // scope entry. Preserve Backend#Session as a projection
+                        // too, so an overriding profile can refine Backend.
+                        let root = self.completing_for.map(|sym| Type::Class {
+                            sym,
+                            args: Vec::new(),
+                        });
+                        let outer = self.self_ty.clone();
+                        if let Some(root) = root {
+                            self.self_ty = Some(root);
+                        }
+                        let found =
+                            self.self_type_member_at(st, bin, scope, pre, &[], d + 1, false);
+                        self.self_ty = outer;
+                        match found {
+                            Some(Type::TypeMember(id)) if st.is_deferred_type_member(id) => {
+                                Some(id)
+                            }
+                            _ => None,
+                        }
+                    });
+                    if let Some(p) = prefix {
                         let id = st.abstract_projection(p, decl);
                         trace(format_args!("projection {sym}: kept unreduced"));
                         return Some(Type::TypeMember(id));
+                    }
+                    if !scope.contains_key(pre) {
+                        // The declaration alone cannot settle an unresolved
+                        // prefix. E.g. T#Head inside a binary alias is not the
+                        // current HCons receiver's Head. Decline this signature
+                        // instead of supplying a falsely precise result type.
+                        return None;
                     }
                 }
             }
@@ -6286,10 +6320,9 @@ impl PickleSupply {
         if !sym.contains('.') && scope.get(sym).is_none() {
             // A concrete nullary alias retains information that an erased
             // descriptor cannot express (for example HCons.Self). Abstract
-            // nullary members still use the historical fallback below.
+            // members retain their declaration identity in the fallback below.
             if args.is_empty() {
-                if let Some(t) = self.self_type_member_at(st, bin, scope, sym, args, d, true, true)
-                {
+                if let Some(t) = self.self_type_member_at(st, bin, scope, sym, args, d, true) {
                     return Some(t);
                 }
             }
@@ -6303,7 +6336,7 @@ impl PickleSupply {
         // `ensure_class` so an alias is not mistaken for a class of its own.
         let internal = sym.replace('.', "/");
         if crate::classpath::find_by_jvm(st, &internal).is_none() {
-            if let Some(expanded) = self.expand_alias(st, bin, scope, sym, args, d) {
+            if let Some(expanded) = self.expand_alias(st, bin, scope, sym, args, d, None) {
                 return Some(expanded);
             }
         }
@@ -6389,15 +6422,14 @@ impl PickleSupply {
         member: &str,
     ) -> Option<Type> {
         let (param, param_sym) = self.param_singleton(param_path)?;
-        let Type::Class { sym: cls, .. } = &param else {
-            return None;
-        };
+        let cls = st.class_sym_of(&param)?;
         let (owner_path, alias_name) = member.rsplit_once('.')?;
-        if !same_class_owner(st, *cls, owner_path) {
+        self.ensure_parents(st, bin, cls);
+        if !inherits_matching(st, cls, |base| same_class_owner(st, base, owner_path)) {
             return None;
         }
-        self.complete_type_member(st, bin, *cls, alias_name)?;
-        let decl = self.completed_type_member_decl(*cls, alias_name)?;
+        self.complete_type_member(st, bin, cls, alias_name)?;
+        let decl = self.completed_type_member_decl(cls, alias_name)?;
         let projected = st.path_member(&[param_sym], decl, &param);
         Some(Type::TypeMember(projected))
     }
@@ -6472,7 +6504,7 @@ impl PickleSupply {
                     None => self.self_ty.clone(),
                 };
                 let found = self
-                    .self_type_member_at(st, bin, scope, prefix, &[], d + 1, true, true)
+                    .self_type_member_at(st, bin, scope, prefix, &[], d + 1, true)
                     .or_else(|| self.stable_prefix_type(st, bin, prefix));
                 trace(format_args!(
                     "projection prefix {prefix} at {:?}: {}",
@@ -6552,11 +6584,10 @@ impl PickleSupply {
         args: &[SigType],
         d: u32,
     ) -> Option<Type> {
-        self.self_type_member_at(st, bin, scope, name, args, d, false, false)
+        self.self_type_member_at(st, bin, scope, name, args, d, false)
     }
 
-    /// `allow_nullary` lifts the "an applied member only" rule below, and
-    /// `aliases_only` takes only a member some class *fixes*. Both are set for
+    /// `aliases_only` takes only a member some class *fixes*, when reading
     /// the *prefix* of a projection: a prefix is not a member, so no erased
     /// descriptor competes with the answer, and a prefix that is still
     /// abstract settles nothing -- taking it would stop the walk one class
@@ -6570,7 +6601,6 @@ impl PickleSupply {
         name: &str,
         args: &[SigType],
         d: u32,
-        allow_nullary: bool,
         aliases_only: bool,
     ) -> Option<Type> {
         let cls = match &self.self_ty {
@@ -6578,35 +6608,10 @@ impl PickleSupply {
             _ => return None,
         };
         let internal = st.get(cls).jvm_name.clone();
-        // Outside `scala.*` this runs only for an *applied* member
-        // (`BaseColumnType[Boolean]`), which is how slick's cake declares all
-        // twenty-four of its column types and which had no answer at all
-        // before: `conv_ref` declined it, and the member was completed from
-        // the class file's erased descriptor instead.
-        //
-        // A *nullary* one keeps the old rule. The reason is that what this
-        // walk can find is the declaration in the class the member was written
-        // in, and that is the abstract one whenever a more derived class in
-        // the *receiver's* linearisation is what turns it into an alias --
-        // `trait BaseBackend { type Database }` refined by
-        // `trait JdbcBackend { type Database = DatabaseDef }`, which is slick's
-        // own shape. There the erased descriptor is the better answer, and
-        // preferring the abstract member over it broke
-        // `crates/cli/tests/aliaslookup.rs`. An applied member has no such
-        // competition, since there is no erased descriptor to lose.
-        // Module classes have no erased type-member descriptor to compete
-        // with this lookup. A companion object can inherit an abstract type
-        // member from its class (for example `Tracer.Type`), and pickled
-        // signatures of the object's own macros refer to it by the bare name.
-        // Keep the historical nullary restriction for ordinary classes, where
-        // a classfile-backed member may still be the more precise answer.
-        if args.is_empty()
-            && !allow_nullary
-            && !internal.ends_with('$')
-            && !internal.starts_with("scala/")
-        {
-            return None;
-        }
+        // Bare abstract members retain their declaration identity. Their
+        // concrete definition is selected later at the receiver (including
+        // refinements such as Witness { type T = A }); an erased descriptor
+        // would irreversibly lose that information.
         if internal.is_empty()
             || internal.starts_with("java/")
             || internal.starts_with("javax/")
@@ -6652,7 +6657,8 @@ impl PickleSupply {
                 // rule (a concrete definition overrides a deferred one).
                 if !self.decl_site_erasure {
                     let outer = self.self_ty.take();
-                    let alias = self.expand_alias(st, bin, scope, &qualified, args, d);
+                    let alias =
+                        self.expand_alias(st, bin, scope, &qualified, args, d, Some(&step.subst));
                     self.self_ty = outer;
                     if let Some(t) = alias {
                         trace(format_args!(
@@ -6733,7 +6739,11 @@ impl PickleSupply {
             if let Some(m) = sig
                 .members
                 .iter()
-                .find(|m| m.name == member && m.kind == MemberKind::AbstractType)
+                .find(|m| {
+                    m.name == member
+                        && m.kind == MemberKind::AbstractType
+                        && m.flags & pflags::PARAM == 0
+                })
                 .cloned()
             {
                 found = Some((owner, m));
@@ -6844,6 +6854,7 @@ impl PickleSupply {
     /// Resolve `owner.Name[args]` where `Name` is a type alias declared on
     /// `owner` (typically a package object), by reading `owner`'s pickle and
     /// substituting the alias's own type parameters.
+    #[allow(clippy::too_many_arguments)]
     fn expand_alias(
         &mut self,
         st: &mut SymbolTable,
@@ -6852,6 +6863,7 @@ impl PickleSupply {
         sym: &str,
         args: &[SigType],
         d: u32,
+        owner_subst: Option<&HashMap<String, SigType>>,
     ) -> Option<Type> {
         let (owner, simple) = sym.rsplit_once('.')?;
         // Type references use encoded names, while signature declarations
@@ -6859,7 +6871,7 @@ impl PickleSupply {
         let simple = scala_rs_pickle::names::decode_method_name(simple);
         // A companion's signature may exist without declaring this alias.
         // Continue to the class signature instead of treating that as a hit.
-        let (module, alias) = [true, false].into_iter().find_map(|module| {
+        let (module, mut alias) = [true, false].into_iter().find_map(|module| {
             let mut src = BinSource(bin);
             let sig = self.sigs.class_sig(&mut src, owner, module).ok()?;
             let alias = sig
@@ -6868,6 +6880,17 @@ impl PickleSupply {
                 .cloned();
             alias.map(|alias| (module, alias))
         })?;
+        // A nested receiver can inherit an alias from a parameterized outer
+        // parent: C extends Base[String], Base[A] { type B = A }. Substitute
+        // the parent's A before applying alias arguments in the caller's scope.
+        let inferred_subst = if owner_subst.is_none() {
+            self.alias_owner_subst(st, bin, owner)
+        } else {
+            None
+        };
+        if let Some(subst) = owner_subst.or(inferred_subst.as_ref()) {
+            alias.ty = scala_rs_pickle::sym::apply_subst(&alias.ty, subst);
+        }
         // A parameterised alias (`type List[+A] = immutable.List[A]`) binds its
         // own parameters to our arguments; a plain one has none.
         let (tps, target) = match &alias.ty {
@@ -6913,6 +6936,35 @@ impl PickleSupply {
         // The substituted arguments are still written in the caller's
         // vocabulary, so the caller's scope is what finishes the job.
         self.conv_at(st, bin, scope, &target, d)
+    }
+
+    /// A qualified alias can name an ancestor of an enclosing class. Keep
+    /// that ancestor's arguments when the alias appears in a method bound.
+    fn alias_owner_subst(
+        &mut self,
+        st: &SymbolTable,
+        bin: &mut BinaryIndex,
+        alias_owner: &str,
+    ) -> Option<HashMap<String, SigType>> {
+        let receiver = self.self_ty.as_ref()?;
+        let cls = st.class_sym_of(receiver)?;
+        let internal = &st.get(cls).jvm_name;
+        let module = internal.ends_with('$');
+        let mut name = internal.trim_end_matches('$').replace('/', ".");
+        loop {
+            let owner = scala_rs_pickle::names::nested_to_dotted(&name);
+            let mut src = BinSource(bin);
+            let mut errors = Vec::new();
+            for step in self
+                .sigs
+                .linearization(&mut src, &owner, module, &mut errors)
+            {
+                if step.class_name == alias_owner {
+                    return Some(step.subst);
+                }
+            }
+            name.truncate(scala_rs_pickle::names::last_nesting_separator(&name)?);
+        }
     }
 }
 

@@ -445,9 +445,10 @@ pub struct MacroPickle {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroBinding {
     pub pickle: Option<MacroPickle>,
+    /// Instantiate a context-bearing macro bundle for each expansion.
+    pub is_bundle: bool,
     /// JVM internal name of the class holding the implementation, e.g. `M$`.
-    /// nsc requires the implementation to be a method of an object, so this is
-    /// always a module class.
+    /// An object module class, or a macro bundle class.
     pub impl_class: String,
     /// Method name on `impl_class`.
     pub impl_method: String,
@@ -5547,6 +5548,25 @@ impl SymbolTable {
                 Type::Any
             };
         }
+        let tuple_args = |t: &Type| match t {
+            Type::Tuple(args) => Some(args.clone()),
+            Type::Class { sym, args }
+                if self.get(*sym).jvm_name == format!("scala/Tuple{}", args.len()) =>
+            {
+                Some(args.clone())
+            }
+            _ => None,
+        };
+        if let (Some(xs), Some(ys)) = (tuple_args(&a), tuple_args(&b)) {
+            if xs.len() == ys.len() {
+                return Type::Tuple(
+                    xs.iter()
+                        .zip(&ys)
+                        .map(|(x, y)| self.lub_at(x, y, depth + 1))
+                        .collect(),
+                );
+            }
+        }
         // Same class constructor, differing arguments: join the arguments.
         // A contravariant parameter joins the other way -- the least upper
         // bound of `Act[R, E]` and `Act[R2, E2]` with `Act[+R, -E]` is
@@ -7361,7 +7381,7 @@ impl SymbolTable {
                 for p in parents {
                     t = self.expand_in_type(p, &t);
                 }
-                t
+                subst_refine_aliases(self, decls, &t)
             }
             Type::Class { sym, args } => {
                 let t = self.expand_type_members(*sym, ty);
@@ -7590,7 +7610,9 @@ impl SymbolTable {
             }
             for p in parents {
                 if let Some(t) = self.lookup_type_member_on(p, name) {
-                    return Some(t);
+                    // An inherited alias is interpreted at the refined
+                    // receiver: V { type R = Int }#Res = List[Int].
+                    return Some(self.expand_in_type(ty, &t));
                 }
             }
         }
@@ -8104,6 +8126,11 @@ fn subst_refine_aliases_seen(
 ) -> Type {
     match ty {
         Type::TypeMember(id) => {
+            // `p.T` already names a particular receiver. An alias `T` on a
+            // different refined receiver cannot replace it just by name.
+            if st.path_member_decl(*id).is_some() {
+                return ty.clone();
+            }
             let name = st.get(*id).name.clone();
             for d in decls {
                 if let RefineDecl::Type {
@@ -8125,7 +8152,15 @@ fn subst_refine_aliases_seen(
                             Type::Applied { ctor, .. }
                                 if matches!(ctor.as_ref(), Type::TypeMember(_)) =>
                             {
-                                rhs.clone()
+                                if matches!(ctor.as_ref(), Type::TypeMember(member) if member == id)
+                                {
+                                    // The surrounding Applied already carries
+                                    // this lambda's captured arguments. A second
+                                    // receiver expansion must not prepend them.
+                                    ty.clone()
+                                } else {
+                                    rhs.clone()
+                                }
                             }
                             // The same self-reference, but buried: the member
                             // stands somewhere inside its own right-hand side.
@@ -8157,6 +8192,27 @@ fn subst_refine_aliases_seen(
                 .collect();
             st.expand_applied_hk_alias(apply_type_ctor(ctor, args))
         }
+        Type::Refined {
+            parents,
+            decls: inner,
+        } => Type::Refined {
+            parents: parents
+                .iter()
+                .map(|p| subst_refine_aliases_seen(st, decls, p, seen))
+                .collect(),
+            decls: inner
+                .iter()
+                .map(|d| {
+                    map_refine_decl(d, &mut |t| {
+                        if matches!(t, Type::TypeMember(_)) {
+                            subst_refine_aliases_seen(st, decls, t, seen)
+                        } else {
+                            t.clone()
+                        }
+                    })
+                })
+                .collect(),
+        },
         Type::Array(t) => Type::Array(Box::new(subst_refine_aliases_seen(st, decls, t, seen))),
         Type::Function { params, ret } => {
             let params = params

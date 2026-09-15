@@ -346,6 +346,15 @@ impl Typer {
             return false;
         };
         let span = tree.span;
+        let expected_body = match crate::prefix::strip_view(pt) {
+            Type::Class { sym, args }
+                if self.st.get(*sym).jvm_name == "scala/reflect/api/Exprs$Expr"
+                    && args.len() == 1 =>
+            {
+                args[0].clone()
+            }
+            _ => Type::NoType,
+        };
         // A `reify` nested in the body of another: it is typed here, so the
         // outer reifier can read its body's symbols, but *not* expanded --
         // the outer expansion reifies it as the call it is, and the toolbox
@@ -364,7 +373,7 @@ impl Typer {
                 return false;
             }
             self.reify_depth += 1;
-            self.type_expr(&mut args[0], &Type::NoType);
+            self.type_expr(&mut args[0], &expected_body);
             self.reify_depth -= 1;
             let arg = match &args[0].ty {
                 Type::Constant(l) => Type::lit_underlying(l),
@@ -390,7 +399,7 @@ impl Typer {
         let mark = self.diags.len();
         let mut probe = body.clone();
         self.reify_depth += 1;
-        self.type_expr(&mut probe, &Type::NoType);
+        self.type_expr(&mut probe, &expected_body);
         self.reify_depth -= 1;
         let nested = std::mem::take(&mut self.nested_reifies);
         if self.diags[mark..]

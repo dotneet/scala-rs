@@ -146,7 +146,15 @@ fn curried_constructor_clauses() {
 }
 #[test]
 fn real_twirl_overloads() {
-    let base=Path::new("/private/tmp/claude-501/-Users-shinji-projects-scala-rs/0c32a046-384e-4a5f-9276-add7f58fd709/scratchpad/gitbucket");
+    // Use the same persistent fixture as the GitBucket measurement scripts.
+    let base = std::env::var_os("GITBUCKET_FIXTURE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("SCALA_RS_FIXTURE_ROOT")
+                .map(PathBuf::from)
+                .map(|root| root.join("gitbucket"))
+        })
+        .unwrap_or_else(|| std::env::temp_dir().join("scala-rs-fixtures/gitbucket"));
     let deps = fs::read_to_string(base.join("deps.cp")).unwrap();
     let cp = format!("{JAR}:{}", deps.trim());
     matrix_cp(&[("twirl", true), ("twirl_null_bad", false)], true, &cp);

@@ -3456,8 +3456,7 @@ impl Typer {
                     // own type is the function or the class. Spelling the
                     // selection out sends it through `type_select`, which does
                     // walk the parents, and `b.apply()` already worked.
-                    if has_apply
-                        && matches!(strip_annotations(&fun_ty), Type::Refined { .. })
+                    if matches!(strip_annotations(&fun_ty), Type::Refined { .. })
                         && self.retry_select_apply(tree, pt)
                     {
                         return;

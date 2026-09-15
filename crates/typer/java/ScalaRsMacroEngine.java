@@ -292,7 +292,8 @@ public final class ScalaRsMacroEngine {
                 + " is not on the macro classpath (nsc requires the implementation to have "
                 + "been compiled by an earlier run)");
         }
-        Object receiver = implCls.getField("MODULE$").get(null);
+        boolean isBundle = "1".equals(req.field("bundle").items.get(1).text());
+        Object receiver = isBundle ? null : implCls.getField("MODULE$").get(null);
         Method impl = null;
         for (Method m : implCls.getMethods()) {
             if (m.getName().equals(methodName)) {
@@ -305,6 +306,8 @@ public final class ScalaRsMacroEngine {
         }
 
         origTrees.clear();
+        structuralTypes.clear();
+        structuralParams.clear();
         asyncMarks.clear();
         Ctx handler = new Ctx();
         // `c.prefix`: the receiver of the macro application, or the reason
@@ -361,7 +364,15 @@ public final class ScalaRsMacroEngine {
         // itself writes. Handing an `Expr` to a `Tree` parameter is an
         // `IllegalArgumentException` from `Method.invoke`, not a diagnostic.
         List<Object> argv = new ArrayList<>();
-        argv.add(ctx);
+        Constructor<?> bundleConstructor = null;
+        if (isBundle) {
+            for (Constructor<?> ctor : implCls.getConstructors()) {
+                Class<?>[] params = ctor.getParameterTypes();
+                if (params.length == 1 && (params[0].getName().equals("scala.reflect.macros.blackbox.Context")
+                    || params[0].getName().equals("scala.reflect.macros.whitebox.Context"))) bundleConstructor = ctor;
+            }
+            if (bundleConstructor == null) return err("macro bundle has no public Context constructor: " + className);
+        } else argv.add(ctx);
         for (Sexp clause : argss.items.subList(1, argss.items.size())) {
             for (Sexp a : clause.items.subList(1, clause.items.size())) {
                 if ("repeat".equals(a.items.get(0).atom)) {
@@ -386,6 +397,7 @@ public final class ScalaRsMacroEngine {
         Object result;
         long invokeStarted = System.nanoTime();
         try {
+            if (bundleConstructor != null) receiver = bundleConstructor.newInstance(ctx);
             result = impl.invoke(receiver, argv.toArray());
         } catch (InvocationTargetException e) {
             invokeNanos += System.nanoTime() - invokeStarted;
@@ -737,7 +749,7 @@ public final class ScalaRsMacroEngine {
                 return call(companion("Star"), "apply", 1, buildTree(kids.get(0)));
             case "TypeTree": {
                 Object tree = call(companion("TypeTree"), "apply", 0);
-                if (!kids.isEmpty() && !kids.get(0).items.get(1).text().isEmpty()) {
+                if (!kids.isEmpty() && !("ty".equals(kids.get(0).items.get(0).atom) && "".equals(kids.get(0).items.get(1).text()))) {
                     Object support = call(call(universe, "internal", 0), "reificationSupport", 0);
                     call(support, "setType", 2, tree, typeFor(kids.get(0)));
                 }
@@ -865,6 +877,28 @@ public final class ScalaRsMacroEngine {
      */
     static Object typeFor(Sexp s) throws Exception {
         String head = s.items.get(0).atom;
+        if ("param".equals(head)) {
+            Object param = structuralParams.get(Long.parseLong(s.items.get(1).text()));
+            if (param == null) throw gap("unbound structural type parameter");
+            return ownedTypeRef(call(param, "owner", 0), param);
+        }
+        if ("refined".equals(head)) {
+            Object internal = call(universe, "internal", 0);
+            List<Object> parents = new ArrayList<>();
+            for (Sexp p : s.items.get(2).items.subList(1, s.items.get(2).items.size())) parents.add(typeFor(p));
+            Object scope = call(internal, "newScopeWith", 1, seq(new ArrayList<>()));
+            Object result = call(internal, "refinedType", 3, list(parents), call(universe, "NoSymbol", 0), scope);
+            Object owner = call(result, "typeSymbol", 0);
+            for (Sexp m : s.items.get(3).items.subList(1, s.items.get(3).items.size())) {
+                Sexp info = m.items.get(2);
+                boolean bounds = "bounds".equals(info.items.get(0).atom);
+                Object member = call(internal, "newTypeSymbol", 4, owner, typeName(m.items.get(1).text()), call(universe, "NoPosition", 0), bounds ? flagValue("DEFERRED") : 0L);
+                call(member, "setInfo", 1, structuralInfo(member, info));
+                call(scope, "enter", 1, member);
+            }
+            structuralTypes.put(result, s.items.get(1).text());
+            return result;
+        }
         if ("cst".equals(head)) {
             return call(call(universe, "internal", 0), "constantType", 1,
                 constant(s.items.get(1)));
@@ -905,6 +939,28 @@ public final class ScalaRsMacroEngine {
             args.add(typeFor(a));
         }
         return call(universe, "appliedType", 2, cls, list(args));
+    }
+
+    static final java.util.IdentityHashMap<Object, String> structuralTypes = new java.util.IdentityHashMap<>();
+    static final java.util.HashMap<Long, Object> structuralParams = new java.util.HashMap<>();
+
+    static Object structuralInfo(Object owner, Sexp info) throws Exception {
+        Object internal = call(universe, "internal", 0);
+        String kind = info.items.get(0).atom;
+        if ("bounds".equals(kind)) return call(internal, "typeBounds", 2, typeFor(info.items.get(1)), typeFor(info.items.get(2)));
+        if (!"poly".equals(kind)) return typeFor(info);
+        List<Object> params = new ArrayList<>();
+        List<Sexp> defs = info.items.get(1).items.subList(1, info.items.get(1).items.size());
+        for (Sexp p : defs) {
+            Object param = call(internal, "newTypeSymbol", 4, owner, typeName(p.items.get(1).text()), call(universe, "NoPosition", 0), flagValue("PARAM"));
+            structuralParams.put(Long.parseLong(p.items.get(0).text()), param);
+            params.add(param);
+        }
+        for (int i = 0; i < defs.size(); i++) {
+            Sexp p = defs.get(i);
+            call(params.get(i), "setInfo", 1, call(internal, "typeBounds", 2, typeFor(p.items.get(2)), typeFor(p.items.get(3))));
+        }
+        return call(internal, "polyType", 2, list(params), typeFor(info.items.get(2)));
     }
 
     /** `WeakTypeTag` for a type already built in the runtime universe. */
@@ -1116,6 +1172,15 @@ public final class ScalaRsMacroEngine {
             sb.append(')');
             return;
         }
+        Object attributed = call(t, "tpe", 0);
+        if (structuralTypes.containsKey(attributed)) {
+            sb.append("(t \"Attributed\" (s0) ");
+            serTreeShape(t, sb);
+            sb.append(' ');
+            serType(attributed, sb);
+            sb.append(')');
+            return;
+        }
         serTreeShape(t, sb);
     }
 
@@ -1206,8 +1271,18 @@ public final class ScalaRsMacroEngine {
      * bound of an abstract type.
      */
     static void serType(Object tpe, StringBuilder sb) throws Exception {
+        if (structuralTypes.containsKey(tpe)) {
+            sb.append("(ty ").append(Sexp.quote(structuralTypes.get(tpe))).append(')');
+            return;
+        }
         if (tpe == null || tpe == call(universe, "NoType", 0)) {
             sb.append("(ty \"\")");
+            return;
+        }
+        if (isA(tpe, "scala.reflect.internal.Types$ConstantType")) {
+            sb.append("(cst ");
+            ser(call(tpe, "value", 0), sb);
+            sb.append(')');
             return;
         }
         if (isA(tpe, "scala.reflect.internal.Types$SingleType")) {
@@ -1627,7 +1702,8 @@ public final class ScalaRsMacroEngine {
      * all changes; these private symbol adapters implement that operation only for
      * the fresh source mirror symbols owned by this serial compiler exchange. */
     static Object newSourceSymbol(String kind, Object owner, Object name, Object pos, long flags) throws Exception {
-        Class<?> adapter = sourceSymbolClasses.get(kind);
+        String adapterKey = kind + ("package".equals(String.valueOf(name)) ? ":package" : "");
+        Class<?> adapter = sourceSymbolClasses.get(adapterKey);
         if (adapter == null) {
             Object internal = call(universe, "internal", 0);
             Object prototype;
@@ -1649,9 +1725,14 @@ public final class ScalaRsMacroEngine {
                 Class<?> define(byte[] bytes) { return defineClass(null, bytes, 0, bytes.length); }
             }
             adapter = new SourceLoader().define(data);
-            sourceSymbolClasses.put(kind, adapter);
+            sourceSymbolClasses.put(adapterKey, adapter);
         }
-        Object symbol = adapter.getConstructors()[0].newInstance(owner, pos, name);
+        Constructor<?> constructor = adapter.getConstructors()[0];
+        // Package-object symbols have a fixed name (`package`), so their
+        // runtime constructor takes only the owner and position.
+        Object symbol = constructor.getParameterCount() == 2
+            ? constructor.newInstance(owner, pos)
+            : constructor.newInstance(owner, pos, name);
         mutableSourceSymbols.add(symbol);
         call(symbol, "setFlag", 1, Long.valueOf(flags));
         return symbol;
@@ -2062,6 +2143,21 @@ public final class ScalaRsMacroEngine {
             if (n.equals("typecheck") && arity == 6) {
                 return typecheck(a[0], a[1], a[2], (Boolean) a[3], (Boolean) a[4],
                     (Boolean) a[5]);
+            }
+            if (n.equals("parse") && arity == 1) {
+                StringBuilder request = new StringBuilder("(q parse ");
+                request.append(Sexp.quote(String.valueOf(a[0])));
+                Sexp answer = query(request.append(')').toString());
+                if (answer.items.size() != 3) throw gap("malformed c.parse answer");
+                if ("fail".equals(answer.items.get(1).text())) {
+                    // Context's Java proxy wraps checked ParseException in
+                    // UndeclaredThrowableException. Do not let a macro catch
+                    // that different exception and silently choose an answer.
+                    throw gap("c.parse rejected the source: " + answer.items.get(2).text()
+                        + " (ParseException recovery is not implemented)");
+                }
+                if (!"parsed".equals(answer.items.get(1).text())) throw gap("malformed c.parse answer");
+                return buildTree(answer.items.get(2));
             }
             if (n.equals("inferImplicitValue") && arity == 4) {
                 Object enclosing = appTree == null

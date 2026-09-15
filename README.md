@@ -59,6 +59,11 @@ Use `scala-rs --help` for all compiler options.
 非ローカル `return` と、独自ライブラリ向けの `markForAsyncTransform` にも対応しています。
 対応範囲と実行例は [async/await のガイド](docs/async.md) を参照してください。
 
+refined の Scala 2.13 `coreJVM` は、未改変の45ソースをコンパイルし、生成した
+ライブラリに対して公式 scalac で全テストを再コンパイルし、528件の成功を確認しています。
+テスト自体の scala-rs コンパイルには未対応部分が残ります。対象リビジョン、対応範囲、
+再現手順は [refined のビルド確認](docs/refined.md) を参照してください。
+
 ## Testing
 
 Run the workspace tests with:

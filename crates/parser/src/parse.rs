@@ -47,6 +47,25 @@ pub fn parse_source(source: &SourceFile, file_index: usize, tokens: Vec<Token>) 
     parse_source_opts(source, file_index, tokens, ParseOptions::default())
 }
 
+/// Parse the statements accepted by a macro's `Context.parse`.
+pub fn parse_snippet(source: &SourceFile, file_index: usize) -> ParseResult {
+    let (tokens, mut diags) = scala_rs_lexer::tokenize_opts(source, file_index, false);
+    let mut p = Parser::new(source, file_index, tokens);
+    p.opts.library_abi = true;
+    let mut stats = p.parse_stats_until_rbrace(false);
+    if !p.at_eof() {
+        p.error_here("unexpected closing brace");
+    }
+    let tree = if stats.len() == 1 {
+        stats.remove(0)
+    } else {
+        let span = p.prev_span();
+        block_from_stats(&mut p, span, stats)
+    };
+    diags.extend(p.diags);
+    ParseResult { tree, diags }
+}
+
 pub fn parse_source_opts(
     source: &SourceFile,
     file_index: usize,

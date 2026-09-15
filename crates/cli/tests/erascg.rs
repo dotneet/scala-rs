@@ -131,6 +131,9 @@ fn check_runs(name: &str, c: Compiler, cp: Option<&Path>) {
     fs::create_dir_all(&out).unwrap();
     let o = compile(c, &src, &out, cp);
     assert!(o.status.success(), "compile failed:\n{}", text(&o));
+    if name == "erascg_binlib_use" {
+        assert!(!text(&o).contains("warning:"), "{}", text(&o));
+    }
     assert_eq!(run_java(&out, cp), expected);
     let _ = fs::remove_dir_all(&dir);
 }
@@ -265,6 +268,53 @@ fn erascg_binlib_abi_agrees_across_compilers() {
             assert!(o.status.success(), "{}", text(&o));
             check_runs("erascg_binlib_use", Compiler::ScalaRs, Some(&lib));
             check_runs("erascg_binlib_use", Compiler::Scalac(sc), Some(&lib));
+            for consumer in [Compiler::ScalaRs, Compiler::Scalac(sc)] {
+                let out = tmp_dir("binlib-bad");
+                let result = compile(
+                    consumer,
+                    &fixtures_dir().join("erascg_binlib_bad.scala"),
+                    &out,
+                    Some(&lib),
+                );
+                assert!(
+                    !result.status.success(),
+                    "Int must not meet the String bound"
+                );
+                assert!(
+                    text(&result).contains("do not conform"),
+                    "{}",
+                    text(&result)
+                );
+                let _ = fs::remove_dir_all(out);
+                let out = tmp_dir("function-wildcard-bad");
+                let result = compile(
+                    consumer,
+                    &fixtures_dir().join("erascg_function_wildcard_bad.scala"),
+                    &out,
+                    Some(&lib),
+                );
+                assert!(
+                    !result.status.success(),
+                    "String must not meet the Int wildcard bound"
+                );
+                let _ = fs::remove_dir_all(out);
+                let out = tmp_dir("module-path-bad");
+                let result = compile(
+                    consumer,
+                    &fixtures_dir().join("erascg_module_path_bad.scala"),
+                    &out,
+                    Some(&lib),
+                );
+                assert!(!result.status.success());
+                if matches!(consumer, Compiler::Scalac(_)) {
+                    assert!(
+                        text(&result).contains("erascglib.Views.type does not take parameters"),
+                        "{}",
+                        text(&result)
+                    );
+                }
+                let _ = fs::remove_dir_all(out);
+            }
             let _ = fs::remove_dir_all(&lib);
         }
     });

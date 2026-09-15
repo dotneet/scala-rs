@@ -8,6 +8,35 @@ use std::{
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 const REFLECT: &str = "/tmp/scala-2.13.16/lib/scala-reflect.jar";
 const NSC: &str = "/tmp/scala-2.13.16/bin/scalac";
+
+#[test]
+fn dynamic_macro_types_parse_and_preserve_constant_refinements() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("implementation");
+    compile("macroparse_impl", true, &implementation, &base, true);
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        compile("macroparse_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"1\n42\n");
+        compile(
+            "macroparse_bad",
+            nsc,
+            &root.join(format!("bad-{nsc}")),
+            &cp,
+            false,
+        );
+        compile(
+            "macroparse_syntax_bad",
+            nsc,
+            &root.join(format!("syntax-bad-{nsc}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
 fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
     fs::create_dir(out).unwrap();
     let mut cmd = Command::new(if nsc {
@@ -57,6 +86,10 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
                     && error.contains("recursive value local needs type")
             } else if name == "macrotransport_fields_bad" {
                 error.matches("integer storage is forbidden").count() == 4
+            } else if name == "refined_bundle_bad" {
+                error.contains("bundle constructor rejected")
+            } else if name == "macroparse_syntax_bad" {
+                error.contains("ParseException")
             } else {
                 error.contains("type mismatch") || error.contains("no matching overload")
             },
@@ -281,4 +314,33 @@ fn source_ownership_and_macro_console_match_scalac() {
         }
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn macro_bundle_metadata_and_expansion_interoperate_with_scalac() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let expected = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/expected/refined_bundle_use.txt"),
+    )
+    .unwrap();
+    for producer in [true, false] {
+        let api = root.join(format!("bundle-{producer}"));
+        compile("refined_bundle_impl", producer, &api, &base_cp, true);
+        let cp = format!("{}:{base_cp}", api.display());
+        for consumer in [true, false] {
+            let output = root.join(format!("use-{producer}-{consumer}"));
+            compile("refined_bundle_use", consumer, &output, &cp, true);
+            assert_eq!(run(&output, &cp), expected);
+            compile(
+                "refined_bundle_bad",
+                consumer,
+                &root.join(format!("bad-{producer}-{consumer}")),
+                &cp,
+                false,
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(root);
 }

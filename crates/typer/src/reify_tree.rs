@@ -1232,12 +1232,14 @@ impl<'a> Reifier<'a> {
         }
         let st = self.st();
         let name = st.get(cls).name.clone();
-        if !st.get(cls).tparams.is_empty() {
-            return Err(format!(
-                "`this` of `{name}`, a class with type parameters, is not reified yet"
-            ));
-        }
-        let info = self.class_type_value(cls, &[])?;
+        let args: Vec<Type> = st
+            .get(cls)
+            .tparams
+            .iter()
+            .copied()
+            .map(Type::TypeParam)
+            .collect();
+        let info = self.class_type_value(cls, &args)?;
         let local = self.symtab.borrow_mut().fresh(&format!("free${name}$this"));
         let origin = self.symbol_origin(cls);
         let binding = self.node(TreeKind::This {
@@ -1858,6 +1860,14 @@ impl<'a> Reifier<'a> {
             | Type::Null => {
                 let name = crate::materialize::static_class_name(st, ty)?;
                 Ok(self.type_constructor(self.static_class(&name)))
+            }
+            Type::Applied { ctor, args } => {
+                let constructor = self.type_value(ctor)?;
+                let args: Result<Vec<_>, _> = args.iter().map(|arg| self.type_value(arg)).collect();
+                Ok(self.call(
+                    self.universe_member("appliedType"),
+                    vec![constructor, self.list(args?)],
+                ))
             }
             Type::Class { sym, args } => self.class_type_value(*sym, args),
             Type::Function { params, ret } => {

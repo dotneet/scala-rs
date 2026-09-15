@@ -23,3 +23,28 @@ class C extends Base[String] {
   def mkD: D = new D
 }
 class SB[A <: String](val a: A) { def len: Int = a.length; def get: A = a }
+
+// Names already used by the standard library, plus two same-name siblings.
+object First {
+  case class Regex()
+  object Regex { def label: String = "first" }
+}
+object Second {
+  case class Regex(value: Int)
+  object Regex { def label: String = "second" }
+}
+object Views {
+  def size[T](value: T)(implicit ev: T => Iterable[_]): Int = ev(value).size
+  def integers(ev: String => Iterable[_ <: Int]): Int = ev("x").size
+  def nested(xs: Box[List[_]]): Int = xs.value.size
+  def mixed(xs: Box[(_, List[_])]): Int = xs.value._2.size
+}
+class Box[A](val value: A)
+final class ValueBox[A](val value: A) extends AnyVal
+
+object Symbolic {
+  final case class ::[A, B](head: A, tail: B)
+}
+object SymbolicUse {
+  def identity[A, B](xs: Symbolic.::[A, B]): Symbolic.::[A, B] = xs
+}

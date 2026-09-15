@@ -252,6 +252,12 @@ fn reify2_capture_matches_real_scalac() {
     matches_real_scalac("reify2_capture");
 }
 
+#[test]
+fn reify2_generic_receiver_runs_and_matches_scalac() {
+    runs("reify2_generic");
+    matches_real_scalac("reify2_generic");
+}
+
 /// What is still refused, each named; never approximated.
 #[test]
 fn reify2_gaps_are_named() {
@@ -262,12 +268,8 @@ fn reify2_gaps_are_named() {
     let out = compile("reify2_bad", &out_dir);
     assert!(!out.status.success(), "reify2_bad.scala should not compile");
     let text = diagnostics(&out);
-    for want in [
-        "an assignment to `w`, a `var` bound outside the reify body, is not reified yet",
-        "`this` of `G`, a class with type parameters, is not reified yet",
-    ] {
-        assert!(text.contains(want), "missing {want:?} in:\n{text}");
-    }
+    let want = "an assignment to `w`, a `var` bound outside the reify body, is not reified yet";
+    assert!(text.contains(want), "missing {want:?} in:\n{text}");
     assert!(
         text.contains("cannot expand reify { ... }"),
         "the report should name reify:\n{text}"

@@ -207,7 +207,7 @@ impl<'a> Gen<'a> {
 
         // case-class companion: synthetic apply
         let mut suppressed: HashSet<String> = HashSet::new();
-        if let Some(class_id) = self.find_class_named(name) {
+        if let Some(class_id) = self.find_class_named(self.st.get(cls).owner, name) {
             // The synthetic `apply` is owed exactly when the typer kept it: a
             // written or inherited concrete `apply` with its signature
             // unlinked it (`scala_rs_typer`'s `case_apply_unlink`, nsc's
@@ -1006,8 +1006,8 @@ impl<'a> Gen<'a> {
             .push(b.finish_full(self.st, &self.jvm_index, class_id));
     }
 
-    pub(crate) fn find_class_named(&self, name: &str) -> Option<SymbolId> {
-        self.class_by_name.get(name).copied()
+    pub(crate) fn find_class_named(&self, owner: SymbolId, name: &str) -> Option<SymbolId> {
+        self.class_by_name.get(&(owner, name.to_string())).copied()
     }
 
     /// nsc's `addForwarders`, for a top-level `object`: which of the methods

@@ -58,8 +58,44 @@ use crate::symbol::{SymKind, SymbolTable};
 pub fn add_value_class_companions(tree: &Tree, st: &mut SymbolTable) {
     let mut classes = Vec::new();
     collect_value_classes(tree, st, &mut classes);
-    for (cls, methods) in classes {
+    for (cls, mut methods) in classes {
         let comp = companion_module_class(cls, st);
+        // The backend emits these overrides and their extension methods even
+        // when the source inherits implementations. Publish both halves, so
+        // nsc sees value-class equality and can find its extension at erasure.
+        for (name, params, ret) in [
+            ("equals", vec![Type::Any], Type::Boolean),
+            ("hashCode", vec![], Type::Int),
+        ] {
+            let method = st.alloc(
+                name,
+                cls,
+                SymKind::Method,
+                Flags::OVERRIDE.with(Flags::SYNTHETIC),
+                "",
+            );
+            let mut param_ids = Vec::new();
+            for (i, ty) in params.iter().enumerate() {
+                let param = st.alloc(
+                    format!("x${i}"),
+                    method,
+                    SymKind::Term,
+                    Flags::PARAM.with(Flags::SYNTHETIC),
+                    "",
+                );
+                st.get_mut(param).ty = ty.clone();
+                param_ids.push(param);
+            }
+            let symbol = st.get_mut(method);
+            symbol.params = param_ids.clone();
+            symbol.paramss = vec![param_ids];
+            symbol.pickle_clauses = vec![params.len()];
+            symbol.ty = Type::Method {
+                paramss: vec![params],
+                ret: Box::new(ret),
+            };
+            methods.push(method);
+        }
         for m in methods {
             declare_extension(st, comp, cls, m);
         }

@@ -219,9 +219,10 @@ impl Typer {
         };
 
         let owner = self.st.get(sym).owner;
-        if self.st.get(owner).kind != SymKind::ModuleClass {
-            // nsc also allows a "macro bundle" (`class B(val c: Context)`), which
-            // we do not implement. Either way this is not a static object.
+        if self.st.get(owner).kind != SymKind::ModuleClass
+            && self.macro_bundle_context(owner).is_none()
+        {
+            // A non-object must have the context-bearing bundle constructor.
             self.error(
                 span,
                 format!(
@@ -301,6 +302,7 @@ impl Typer {
         // call site is refused before boxity can matter.
         if (impl_class.as_str(), name.as_str()) == PLACEHOLDER_IMPL {
             return Some(MacroBinding {
+                is_bundle: false,
                 pickle: Some(MacroPickle {
                     signature: Vec::new(),
                     targs: Vec::new(),
@@ -331,6 +333,7 @@ impl Typer {
         let tag_params = self.macro_impl_tag_params(sym);
         let pickle = self.macro_pickle_binding(sym, def_sym, &ref_targs, span)?;
         Some(MacroBinding {
+            is_bundle: self.macro_bundle_context(owner).is_some(),
             pickle: Some(pickle),
             impl_class,
             impl_method: name,
@@ -417,6 +420,12 @@ impl Typer {
                 "cannot resolve macro implementation reference type arguments",
             );
             return None;
+        }
+        if self
+            .macro_bundle_context(self.st.get(impl_sym).owner)
+            .is_some()
+        {
+            signature.remove(0);
         }
         Some(MacroPickle { signature, targs })
     }
@@ -563,11 +572,31 @@ impl Typer {
     /// `paramss` or, when the pickle recorded no clause structure, in `params`.
     fn macro_impl_params(&self, impl_sym: SymbolId) -> Vec<SymbolId> {
         let sym = self.st.get(impl_sym);
-        if sym.paramss.is_empty() {
+        let mut params = if sym.paramss.is_empty() {
             sym.params.clone()
         } else {
             sym.paramss.iter().flatten().copied().collect()
+        };
+        if let Some(context) = self.macro_bundle_context(sym.owner) {
+            params.insert(0, context);
         }
+        params
+    }
+
+    /// A bundle supplies its Context through its sole constructor field.
+    fn macro_bundle_context(&self, owner: SymbolId) -> Option<SymbolId> {
+        if owner.is_none() || self.st.get(owner).kind != SymKind::Class {
+            return None;
+        }
+        let [context] = self.st.get(owner).ctor_fields.as_slice() else {
+            return None;
+        };
+        let mut names = Vec::new();
+        Self::context_type_names(&self.st, &self.st.get(*context).ty, &mut names);
+        names
+            .iter()
+            .any(|n| context_kind_of_name(n).is_some())
+            .then_some(*context)
     }
 
     /// Is this parameter one of the `c.WeakTypeTag[T]` a macro implementation's
@@ -637,12 +666,8 @@ impl Typer {
     /// `Some(true)` for a blackbox `Context` first parameter, `Some(false)` for
     /// whitebox, `None` when the first parameter is not a macro `Context`.
     fn macro_context_kind(&mut self, impl_sym: SymbolId) -> Option<bool> {
-        let sym = self.st.get(impl_sym);
-        let first = sym
-            .paramss
-            .first()
-            .and_then(|c| c.first())
-            .or_else(|| sym.params.first())?;
+        let params = self.macro_impl_params(impl_sym);
+        let first = params.first()?;
         let ty = self.st.get(*first).ty.clone();
         let mut names = Vec::new();
         // `blackbox.Context { type PrefixType = ShapedValue[_, U] }`: nsc's

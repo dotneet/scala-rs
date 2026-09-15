@@ -90,25 +90,30 @@ impl Typer {
         self.st.pop_scope();
     }
 
-    /// `::` is entered both as the class `$colon$colon` and as an alias symbol
-    /// carrying its type. Patterns need the real class, which holds the
-    /// constructor fields.
-    /// The class a **qualified** constructor pattern (`p.C(x)`) names, read
-    /// off the already-typed callee rather than by looking its last segment up
-    /// in the lexical scope.
-    ///
-    /// `None` for a bare `Ident`, which the lexical lookup handles, and for a
-    /// callee that resolved to something other than a class or its companion
-    /// -- an `unapply` reached through a value, say -- where the extractor
-    /// arms are the ones that apply.
+    /// Read a constructor pattern's class from the resolved callee. Qualified
+    /// names must not fall back to an unrelated lexical binding, and an
+    /// unqualified binary companion may itself hide the class's scope entry.
+    /// Values with an `unapply` are left to the extractor branches.
     fn qualified_pattern_class(&mut self, fun: &Tree) -> Option<SymbolId> {
-        if !matches!(fun.kind, TreeKind::Select { .. }) || fun.sym.is_none() {
+        if !matches!(fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
+            || fun.sym.is_none()
+        {
             return None;
         }
         match self.st.get(fun.sym).kind {
             SymKind::Class => Some(self.follow_class_alias(fun.sym)),
-            SymKind::Module | SymKind::ModuleClass => {
-                let mcls = self.st.module_class_of(fun.sym);
+            SymKind::Module | SymKind::ModuleClass | SymKind::Method | SymKind::Term => {
+                let mcls = if matches!(self.st.get(fun.sym).kind, SymKind::Method | SymKind::Term) {
+                    if !self.st.get(fun.sym).flags.contains(Flags::ACCESSOR) {
+                        return None;
+                    }
+                    self.module_class_of_value(fun.sym, &fun.ty)?
+                } else {
+                    self.st.module_class_of(fun.sym)
+                };
+                // Resolve an unqualified companion through its JVM identity too:
+                // loading a binary object can shadow the prelude class binding
+                // (notably `::`) in lexical lookup.
                 // Nested case-class companions are recorded in a module
                 // owner's member list, while a classfile reader may expose
                 // that list through the enclosing object. The JVM name still

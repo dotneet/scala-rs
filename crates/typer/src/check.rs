@@ -3501,7 +3501,7 @@ pub(crate) fn mentions_tparam(ty: &Type, tps: &[SymbolId]) -> bool {
         // `def two[A]: Monad[Either[A, *]] with Traverse[Either[A, *]]` looked
         // closed, and a reference to it in value position never solved `A`
         // from the expected type.
-        Type::Refined { parents, .. } => parents.iter().any(|p| mentions_tparam(p, tps)),
+        Type::Refined { .. } => tps.iter().any(|tp| type_mentions_tparam_deep(ty, *tp)),
         _ => false,
     }
 }
@@ -3936,7 +3936,7 @@ pub(crate) fn unify_one_precise(
         // by position (both sides come from the same alias whenever this
         // fires); a non-compound actual is tried against every component, the
         // way a subtype of the compound arrives.
-        Type::Refined { parents, .. } => {
+        Type::Refined { parents, decls } => {
             match actual {
                 Type::Refined { parents: aps, .. } if aps.len() == parents.len() => {
                     for (p, a) in parents.iter().zip(aps) {
@@ -3948,6 +3948,25 @@ pub(crate) fn unify_one_precise(
                 _ => {
                     for p in parents {
                         if let Some(t) = unify_one_precise(st, tp, p, actual) {
+                            return Some(t);
+                        }
+                    }
+                }
+            }
+            for decl in decls {
+                if let RefineDecl::Type {
+                    name,
+                    rhs: Some(rhs),
+                    ..
+                } = decl
+                {
+                    if let Some(value) = st.lookup_type_member_on(actual, name) {
+                        // An inherited abstract declaration adds no equation.
+                        // Keep its variable open for subsequent evidence.
+                        if matches!(&value, Type::TypeMember(m) if st.is_deferred_type_member(*m)) {
+                            continue;
+                        }
+                        if let Some(t) = unify_one_precise(st, tp, rhs, &value) {
                             return Some(t);
                         }
                     }

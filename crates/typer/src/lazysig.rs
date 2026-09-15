@@ -443,7 +443,12 @@ impl Typer {
             this.with_return_meth(None, |this| {
                 let is_val = matches!(t.kind, TreeKind::ValDef { .. });
                 if matches!(t.kind, TreeKind::TypeDef { .. }) {
-                    this.complete_type_alias_tree(&mut t);
+                    if this.st.get(t.sym).owner.is_none() {
+                        this.refinement_type_member(&t);
+                        t.ty = this.st.get(t.sym).ty.clone();
+                    } else {
+                        this.complete_type_alias_tree(&mut t);
+                    }
                 } else {
                     if !p.sig_done {
                         if is_val {

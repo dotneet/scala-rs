@@ -947,6 +947,7 @@ impl Typer {
             let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
             tree.ty = self.instantiate_parameterless_at(s, ty, pt, Some(&qual.ty));
+
             if let Type::Array(elem) = &qual.ty {
                 if name == "apply" {
                     tree.ty = Type::Method {
@@ -2799,7 +2800,7 @@ impl Typer {
         true
     }
 
-    fn is_dynamic_receiver(&self, ty: &Type) -> bool {
+    pub(crate) fn is_dynamic_receiver(&self, ty: &Type) -> bool {
         if let Type::Named { name, .. } = ty {
             if name == "Dynamic" || name.ends_with(".Dynamic") {
                 return true;
@@ -2862,15 +2863,6 @@ impl Typer {
         }
     }
 
-    fn dynamics_feature_error(&mut self, span: Span, method: &str) {
-        self.error(
-            span,
-            format!(
-                "Dynamic method {method} needs to be enabled by making the implicit value scala.language.dynamics visible"
-            ),
-        );
-    }
-
     pub(crate) fn check_implicit_conversions_feature(&mut self, span: Span, name: &str) {
         if self.language_implicit_conversions {
             return;
@@ -2913,11 +2905,6 @@ impl Typer {
         if !self.is_dynamic_receiver(&qual.ty) || self.receiver_has_term(&qual.ty, &name) {
             return false;
         }
-        if !self.language_dynamics {
-            self.dynamics_feature_error(tree.span, "selectDynamic");
-            tree.ty = Type::Error;
-            return true;
-        }
         let span = tree.span;
         let name_lit = Tree::new(
             NodeId(0),
@@ -2951,11 +2938,6 @@ impl Typer {
     }
 
     fn rewrite_select_dynamic(&mut self, tree: &mut Tree, pt: &Type) {
-        if !self.language_dynamics {
-            self.dynamics_feature_error(tree.span, "selectDynamic");
-            tree.ty = Type::Error;
-            return;
-        }
         let span = tree.span;
         let id = tree.id;
         let (qual, dyn_name) = match &mut tree.kind {
@@ -3446,11 +3428,6 @@ impl Typer {
         } else {
             "applyDynamic"
         };
-        if !self.language_dynamics {
-            self.dynamics_feature_error(tree.span, method);
-            tree.ty = Type::Error;
-            return true;
-        }
         let span = tree.span;
         let args = if named {
             args.iter()
@@ -3586,15 +3563,6 @@ impl Typer {
                 _ => return false,
             }
         };
-        if !self.language_dynamics {
-            let method = match &kind {
-                DynUpd::Select(_) => "updateDynamic",
-                DynUpd::Indexed(_) => "selectDynamic",
-            };
-            self.dynamics_feature_error(tree.span, method);
-            tree.ty = Type::Error;
-            return true;
-        }
         let span = tree.span;
         let TreeKind::Assign { lhs, rhs } = std::mem::replace(&mut tree.kind, TreeKind::Empty)
         else {

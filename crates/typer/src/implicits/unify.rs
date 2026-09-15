@@ -122,7 +122,9 @@ impl<'a> Unify<'a> {
         if mentions_unknown(ty, &std::iter::once(id).collect()) {
             return false;
         }
-        self.bound.insert(id, ty.widen_constant());
+        // These constraints come from an expected evidence type, not from a
+        // term whose singleton type should be widened during inference.
+        self.bound.insert(id, ty.clone());
         true
     }
 
@@ -575,7 +577,9 @@ pub(super) fn mentions_unknown(ty: &Type, unknowns: &rustc_hash::FxHashSet<u32>)
         Type::Function { params, ret } => {
             params.iter().any(|t| mentions_unknown(t, unknowns)) || mentions_unknown(ret, unknowns)
         }
-        Type::Refined { parents, .. } => parents.iter().any(|t| mentions_unknown(t, unknowns)),
+        Type::Refined { .. } => unknowns
+            .iter()
+            .any(|tp| crate::check::type_mentions_tparam_deep(ty, SymbolId(*tp))),
         _ => false,
     }
 }

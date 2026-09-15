@@ -1120,3 +1120,208 @@ fn intersection_witness_infers_open_target_without_losing_requirements() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn refined_inherited_alias_keeps_receiver_and_method_parameters() {
+    source_case(
+        "refined-inherited-alias",
+        r#"
+trait V { type R; type Res = List[R]; def result: Res }
+object V { type Aux[A] = V { type R = A } }
+object Main {
+  def make[A](a: A): V.Aux[A] = new V { type R = A; def result: Res = List(a) }
+  def wrap[A](v: V.Aux[A]): V.Aux[Option[v.Res]] =
+    new V { type R = Option[v.Res]; def result: Res = List(Some(v.result)) }
+  def main(args: Array[String]): Unit = {
+    val ints: List[Option[List[Int]]] = wrap(make(42)).result
+    println(ints.head.get.head)
+  }
+}
+"#,
+        true,
+        "42\n",
+    );
+    source_case(
+        "refined-distinct-paths",
+        "trait V { type R; type Res = List[R] }; object Main { def bad(p: V, q: V)(x: p.Res): q.Res = x }",
+        false,
+        "",
+    );
+}
+
+#[test]
+fn binary_abstract_value_uses_refinement_alias() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("abstract-value-refinement");
+    let provider = dir.join("provider");
+    fs::create_dir_all(&provider).unwrap();
+    let libsrc = dir.join("Witness.scala");
+    fs::write(&libsrc, "package alib; trait Witness { type T; val value: T }; object Witness { type Aux[A] = Witness { type T = A }; def apply[A](a: A): Aux[A] = new Witness { type T = A; val value: T = a } }").unwrap();
+    let result = Command::new(&scalac)
+        .arg("-d")
+        .arg(&provider)
+        .arg(&libsrc)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for (label, source, expected) in [
+        (
+            "valid",
+            r#"object Main {
+          def value[A](w: alib.Witness.Aux[A]): A = w.value
+          def integer[A <: Int](w: alib.Witness.Aux[A]): Int = w.value.toInt
+          def main(args: Array[String]): Unit = { println(value(alib.Witness("ok"))); println(integer(alib.Witness(42))) }
+        }"#,
+            Some("ok\n42\n"),
+        ),
+        (
+            "wrong-result",
+            "object Main { def bad(w: alib.Witness.Aux[String]): Int = w.value }",
+            None,
+        ),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(&src, source).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &provider)
+            } else {
+                let result = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&provider)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    result.status.success(),
+                    String::from_utf8_lossy(&result.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, expected.is_some(), "{label}, ours={ours}: {diagnostic}");
+            if let Some(expected) = expected {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), provider.display())),
+                    expected
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn expected_refinement_constrains_method_result() {
+    source_case(
+        "expected-refinement",
+        r#"
+trait V[T, P] { type R; def value: R }
+object V {
+  type Aux[T, P, R0] = V[T, P] { type R = R0 }
+  def instance[T, P, R0](f: () => R0): Aux[T, P, R0] =
+    new V[T, P] { type R = R0; def value: R = f() }
+  def constant[T, P, R](v: R): Aux[T, P, R] = instance(() => v)
+}
+object Main { def main(args: Array[String]): Unit = println(V.constant[Int, Unit, String]("ok").value) }
+"#,
+        true,
+        "ok\n",
+    );
+    source_case(
+        "expected-refinement-bad",
+        "trait V { type R }; object Main { def instance[A](v: A): V { type R = A } = new V { type R = A }; val bad: V { type R = Int } = instance(\"wrong\") }",
+        false,
+        "",
+    );
+}
+
+#[test]
+fn binary_constructor_for_prelude_class_has_repeated_parameters() {
+    source_case(
+        "regex-constructor",
+        "object Main { def main(args: Array[String]): Unit = { val r = new scala.util.matching.Regex(\"a+\"); println(r.findFirstIn(\"baab\").get) } }",
+        true,
+        "aa\n",
+    );
+    source_case(
+        "regex-constructor-bad",
+        "object Main { val r = new scala.util.matching.Regex(42) }",
+        false,
+        "",
+    );
+}
+
+#[test]
+fn concrete_refinement_implicit_beats_polymorphic_fallback() {
+    source_case(
+        "specific-refinement-implicit",
+        r#"
+trait W { type T; val value: T }
+object W {
+  type Aux[A] = W { type T = A }
+  implicit def generic[A]: Aux[A] = throw new IllegalStateException("generic chosen")
+  implicit val intW: Aux[Int] = new W { type T = Int; val value: T = 42 }
+}
+
+object Main { def main(args: Array[String]): Unit = println(implicitly[W.Aux[Int]].value) }
+"#,
+        true,
+        "42\n",
+    );
+    source_case(
+        "ambiguous-refinement-implicit",
+        "trait W { type T }; object W { type Aux[A] = W { type T = A }; implicit def a[A]: Aux[A] = ???; implicit def b[A]: Aux[A] = ??? }; object Main { val bad = implicitly[W.Aux[Int]] }",
+        false,
+        "",
+    );
+}
+
+#[test]
+fn implicit_type_constraints_keep_literal_singletons() {
+    source_case(
+        "literal-implicit",
+        r#"
+trait Evidence[A] { def label: String }
+object Evidence { implicit def evidence[A]: Evidence[A] = new Evidence[A] { def label: String = "ok" } }
+trait Dependent { type T; def label: String }
+object Dependent { type Aux[A] = Dependent { type T = A }; implicit def evidence[A]: Aux[A] = new Dependent { type T = A; def label: String = "dependent" } }
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(implicitly[Evidence[1]].label)
+    println(implicitly[Dependent.Aux[1]].label)
+  }
+}
+"#,
+        true,
+        "ok\ndependent\n",
+    );
+    source_case("literal-implicit-bad", "trait Evidence[A]; object Main { implicit val wrong: Evidence[2] = new Evidence[2] {}; val bad = implicitly[Evidence[1]] }", false, "");
+}
+
+#[test]
+fn fully_qualified_java_static_methods_eta_expand_without_receiver() {
+    source_case(
+        "qualified-static-eta",
+        r#"
+object Main {
+  def call[T](f: (T,T) => Int, a:T, b:T):Int = f(a,b)
+  def main(args:Array[String]):Unit = {
+    println(call(java.lang.Double.compare, 1.0, 2.0))
+    println(call(java.lang.Float.compare, 2.0f, 1.0f))
+  }
+}
+"#,
+        true,
+        "-1\n1\n",
+    );
+}

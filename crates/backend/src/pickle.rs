@@ -838,7 +838,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 let imm = self.scala_collection_immutable();
                 self.type_ref_in_refs(imm, n.as_str(), arg_refs)
             }
-            "::" | "$colon$colon" => {
+            "::" | "$colon$colon"
+                if class_sym == self.facts.cons_sym
+                    || self.facts.get(class_sym).jvm_name
+                        == "scala/collection/immutable/$colon$colon" =>
+            {
                 let imm = self.scala_collection_immutable();
                 self.type_ref_in_refs(imm, "$colon$colon", arg_refs)
             }
@@ -1052,7 +1056,17 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         self.add(EXISTENTIALTPE, body)
     }
 
-    /// Pack nested wildcards into one EXISTENTIALtpe (`List[_ <: List[_]]`).
+    /// Only a direct wildcard belongs to the enclosing application. For
+    /// `ToList[RT, Result[_]]`, Result's existential must stay inside ToList.
+    fn pickle_type_argument(&mut self, ty: &Type, quantified: &mut Vec<u32>) -> u32 {
+        if is_wildcard_argument(ty) {
+            self.pickle_type_pack(ty, quantified)
+        } else {
+            self.pickle_type(ty)
+        }
+    }
+
+    /// Pack the direct wildcard arguments of one type application.
     fn pickle_type_pack(&mut self, ty: &Type, quantified: &mut Vec<u32>) -> u32 {
         match ty {
             Type::Wildcard => {
@@ -1070,7 +1084,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             Type::Class { sym, args } => {
                 let arg_refs: Vec<u32> = args
                     .iter()
-                    .map(|a| self.pickle_type_pack(a, quantified))
+                    .map(|a| self.pickle_type_argument(a, quantified))
                     .collect();
                 self.class_type_ref(*sym, &arg_refs)
             }
@@ -1082,7 +1096,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                     write_nat_to(&mut body, pref);
                     write_nat_to(&mut body, sym);
                     for a in args {
-                        write_nat_to(&mut body, self.pickle_type_pack(a, quantified));
+                        write_nat_to(&mut body, self.pickle_type_argument(a, quantified));
                     }
                     self.add(TYPEREFTPE, body)
                 }
@@ -1108,7 +1122,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                     // `AnyRef`, and silently drop the remaining arguments.
                     let arg_refs: Vec<u32> = args
                         .iter()
-                        .map(|a| self.pickle_type_pack(a, quantified))
+                        .map(|a| self.pickle_type_argument(a, quantified))
                         .collect();
                     self.pickle_type_member_ref_with_refs(*id, args, &arg_refs)
                 }
@@ -1117,21 +1131,19 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             Type::Tuple(ts) => {
                 let arg_refs: Vec<u32> = ts
                     .iter()
-                    .map(|a| self.pickle_type_pack(a, quantified))
+                    .map(|a| self.pickle_type_argument(a, quantified))
                     .collect();
                 let sc = self.scala_module();
                 self.type_ref_in_refs(sc, &format!("Tuple{}", ts.len()), &arg_refs)
             }
-            // `scala.FunctionN[…]`, the same shape as `TupleN` above. It has to
-            // be here and not fall through to `pickle_type`: that arm sends a
-            // function type *containing* a wildcard back here, so the fallback
-            // would not terminate.
+            // A wildcard directly in FunctionN needs the same enclosing
+            // existential as any other application.
             Type::Function { params, ret } => {
                 let mut arg_refs: Vec<u32> = params
                     .iter()
-                    .map(|a| self.pickle_type_pack(a, quantified))
+                    .map(|a| self.pickle_type_argument(a, quantified))
                     .collect();
-                arg_refs.push(self.pickle_type_pack(ret, quantified));
+                arg_refs.push(self.pickle_type_argument(ret, quantified));
                 let sc = self.scala_module();
                 self.type_ref_in_refs(sc, &format!("Function{}", params.len()), &arg_refs)
             }
@@ -1566,7 +1578,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 "macroEngine",
                 Lit::String("v7.0 (implemented in Scala 2.11.0-M8)".into()),
             ),
-            ("isBundle", Lit::Boolean(false)),
+            ("isBundle", Lit::Boolean(binding.is_bundle)),
             ("isBlackbox", Lit::Boolean(binding.blackbox)),
             (
                 "className",
@@ -2236,7 +2248,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 self.add(TYPEREFTPE, body)
             }
             Type::Applied { ctor, args } => {
-                if args.iter().any(type_has_wildcard) {
+                if args.iter().any(is_wildcard_argument) {
                     let mut quantified = Vec::new();
                     let inner = self.pickle_type_pack(ty, &mut quantified);
                     return self.pickle_existential_tpe(inner, &quantified);
@@ -2298,7 +2310,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             }
             Type::TypeMember(id) => self.pickle_type_member_ref(*id, &[]),
             Type::Class { sym, args } => {
-                if args.iter().any(type_has_wildcard) {
+                if args.iter().any(is_wildcard_argument) {
                     let mut quantified = Vec::new();
                     let inner = self.pickle_type_pack(ty, &mut quantified);
                     return self.pickle_existential_tpe(inner, &quantified);
@@ -2340,19 +2352,10 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 let name = format!("Function{}", params.len());
                 let mut all: Vec<Type> = params.clone();
                 all.push((**ret).clone());
-                if all.iter().any(type_has_wildcard) {
-                    // An `EXISTENTIALtpe` around the function type, exactly as
-                    // `Type::Tuple` below already writes one. The bare
-                    // constructor used to be written instead, and a reader then
-                    // saw a *raw* `Function1`: cats'
-                    // `FunctionK.lift[F[_], G[_]](f: (F[α] => G[α]) forSome {
-                    // type α })` came back as `(f: Function1)`, so scalac could
-                    // not eta-expand a polymorphic method into it --
-                    // "polymorphic expression cannot be instantiated to
-                    // expected type; found: [A](l: List[A]): Option[A];
-                    // required: Function1" -- and `FunctionK.lift`, the one
-                    // macro cats has, was unusable from any compilation that
-                    // read our classfiles.
+                // Keep wildcards inside their argument/result types. Hoisting
+                // Iterable[_]'s existential around the entire Function1 makes
+                // nsc reject an implicit String => Iterable[_] view.
+                if all.iter().any(is_wildcard_argument) {
                     let mut quantified = Vec::new();
                     let inner = self.pickle_type_pack(ty, &mut quantified);
                     return self.pickle_existential_tpe(inner, &quantified);
@@ -2361,7 +2364,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                 self.type_ref_in_args(sc, &name, &all)
             }
             Type::Tuple(ts) => {
-                if ts.iter().any(type_has_wildcard) {
+                if ts.iter().any(is_wildcard_argument) {
                     let mut quantified = Vec::new();
                     let inner = self.pickle_type_pack(ty, &mut quantified);
                     return self.pickle_existential_tpe(inner, &quantified);
@@ -2371,7 +2374,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             }
             Type::Array(elem) => {
                 let mut quantified = Vec::new();
-                let inner = self.pickle_type_pack(elem, &mut quantified);
+                let inner = self.pickle_type_argument(elem, &mut quantified);
                 let sc = self.scala_module();
                 let array = self.type_ref_in_refs(sc, "Array", &[inner]);
                 self.pickle_existential_tpe(array, &quantified)
@@ -2792,8 +2795,13 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         self.current_owner = saved_owner;
         if is_module {
             // nsc unpickler binds the term `Lib` from MODULEsym; CLASSsym+MODULE is the module class.
+            // The term's type is owned by its package/enclosing class too.
+            // NoPrefix loses the qualified singleton path in nsc readers.
+            let mut prefix_body = Vec::new();
+            write_nat_to(&mut prefix_body, owner);
+            let prefix = self.add(THISTPE, prefix_body);
             let mut tr = Vec::new();
-            write_nat_to(&mut tr, self.noprefix);
+            write_nat_to(&mut tr, prefix);
             write_nat_to(&mut tr, idx);
             let mtpe = self.add(TYPEREFTPE, tr);
             // The term carries source visibility and implicit-search flags;
@@ -4241,23 +4249,10 @@ fn write_nat_to(out: &mut Vec<u8>, x: u32) {
     write_long_nat_to(out, x as u64);
 }
 
-fn type_has_wildcard(t: &Type) -> bool {
+fn is_wildcard_argument(t: &Type) -> bool {
     match t {
         Type::Wildcard | Type::BoundedWildcard { .. } => true,
-        Type::Annotated { tpe, .. } => type_has_wildcard(tpe),
-        Type::Class { args, .. } => args.iter().any(type_has_wildcard),
-        Type::Applied { ctor, args } => {
-            type_has_wildcard(ctor) || args.iter().any(type_has_wildcard)
-        }
-        Type::Tuple(ts) => ts.iter().any(type_has_wildcard),
-        Type::Refined { parents, .. } => parents.iter().any(type_has_wildcard),
-        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => type_has_wildcard(t),
-        Type::Function { params, ret } => {
-            params.iter().any(type_has_wildcard) || type_has_wildcard(ret)
-        }
-        Type::Method { paramss, ret } => {
-            paramss.iter().flatten().any(type_has_wildcard) || type_has_wildcard(ret)
-        }
+        Type::Annotated { tpe, .. } => is_wildcard_argument(tpe),
         _ => false,
     }
 }

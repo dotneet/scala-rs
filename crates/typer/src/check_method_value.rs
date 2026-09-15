@@ -245,7 +245,9 @@ impl Typer {
                 }
                 let s = self.st.get(t.sym);
                 let stable = match s.kind {
-                    SymKind::Module | SymKind::ModuleClass | SymKind::Package => true,
+                    SymKind::Module | SymKind::ModuleClass | SymKind::Package | SymKind::Class => {
+                        true
+                    }
                     SymKind::Term => {
                         !s.flags.contains(Flags::MUTABLE) && !s.flags.contains(Flags::BYNAME)
                     }

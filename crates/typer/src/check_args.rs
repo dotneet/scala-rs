@@ -1205,7 +1205,7 @@ impl Typer {
                     // handed over by the caller (which have been substituted
                     // at the subclass's type arguments) for the residual
                     // implicit clause.
-                    param_tys[args.len()..].to_vec()
+                    param_tys[first.len()..].to_vec()
                 } else {
                     match fun_ty {
                         Type::Method { paramss, .. } if paramss.len() > 1 => {

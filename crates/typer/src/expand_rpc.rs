@@ -50,6 +50,7 @@ pub(crate) fn query_kind(items: &[Sexp]) -> &'static str {
     };
     match kind.text().as_str() {
         "typecheck" => "typecheck",
+        "parse" => "parse",
         "inferImplicitValue" => "inferImplicitValue",
         "enclosingOwner" => "enclosingOwner",
         "functionSymbol" => "functionSymbol",
@@ -315,6 +316,7 @@ impl Typer {
         };
         match kind.as_str() {
             "typecheck" => self.answer_typecheck(items),
+            "parse" => self.answer_parse(items),
             "inferImplicitValue" => self.answer_infer_implicit_value(items),
             "enclosingOwner" => format!("(a ref {})", self.macro_current_owner().0),
             "functionSymbol" | "symbol" | "symbolInfo" | "companion" | "modulePair" => {
@@ -324,6 +326,27 @@ impl Typer {
             other => refusal(&format!(
                 "the macro engine asked scala-rs `{other}`, which it does not answer"
             )),
+        }
+    }
+
+    fn answer_parse(&self, items: &[Sexp]) -> String {
+        let Ok(source) = at(items, 2) else {
+            return refusal("malformed parse request");
+        };
+        let file = scala_rs_span::SourceFile::new("<macro>", source.text());
+        let parsed = scala_rs_parser::parse::parse_snippet(&file, self.file_index);
+        if let Some(error) = parsed.diags.iter().find(|d| d.level == Level::Error) {
+            return format!("(a fail {})", quoted(&error.message));
+        }
+        let types = crate::expand::WireTypes::default();
+        let cx = WireCx {
+            st: &self.st,
+            types: &types,
+        };
+        let mut tree = String::new();
+        match answer_tree_to_wire(&cx, &parsed.tree, &mut tree) {
+            Ok(()) => format!("(a parsed {tree})"),
+            Err(why) => refusal(&format!("c.parse produced {why}")),
         }
     }
 
@@ -768,6 +791,82 @@ impl Typer {
         // An inner class behind a prefix (`prefix.rs`) is the class it views;
         // the engine is handed the class, as for the bare type.
         let ty = crate::prefix::strip_view(ty);
+        if matches!(ty, Type::AnyRef) {
+            return Ok("(ty \"java.lang.Object\")".into());
+        }
+        if let Type::TypeParam(id) = ty {
+            if self.st.get(self.st.get(*id).owner).kind == SymKind::TypeMember {
+                return Ok(format!("(param {})", id.0));
+            }
+        }
+        if let Type::Applied { .. } = ty {
+            let expanded = self.st.expand_applied_hk_alias(ty.clone());
+            if expanded != *ty {
+                return self.type_to_wire(&expanded);
+            }
+        }
+        if let Type::TypeMember(id) = ty {
+            let s = self.st.get(*id);
+            if s.is_type_alias && s.tparams.is_empty() && s.ty != *ty {
+                return self.type_to_wire(&s.ty.clone());
+            }
+        }
+        if let Type::Refined { parents, decls } = ty {
+            let key = format!("<macro-type-{}>", self.macro_local_tags.len());
+            self.macro_local_tags.insert(key.clone(), ty.clone());
+            let mut out = format!("(refined {} (parents", quoted(&key));
+            for p in parents {
+                out.push(' ');
+                out.push_str(&self.type_to_wire(p)?);
+            }
+            out.push_str(") (members");
+            for decl in decls {
+                let scala_rs_parser::RefineDecl::Type {
+                    name,
+                    rhs,
+                    tparams,
+                    lo,
+                    hi,
+                } = decl
+                else {
+                    return Err("a refinement with term members".into());
+                };
+                out.push_str(&format!(" (member {} ", quoted(name)));
+                if let Some(rhs) = rhs {
+                    if *tparams > 0 {
+                        let Type::TypeMember(id) = rhs else {
+                            return Err("a captured refinement type lambda".into());
+                        };
+                        let member = self.st.get(*id).clone();
+                        out.push_str("(poly (params");
+                        for tp in member.tparams {
+                            let s = self.st.get(tp).clone();
+                            out.push_str(&format!(
+                                " ({} {} {} {})",
+                                tp.0,
+                                quoted(&s.name),
+                                self.type_to_wire(s.bound_lo.as_ref().unwrap_or(&Type::Nothing))?,
+                                self.type_to_wire(s.bound_hi.as_ref().unwrap_or(&Type::Any))?
+                            ));
+                        }
+                        out.push_str(") ");
+                        out.push_str(&self.type_to_wire(&member.ty)?);
+                        out.push(')');
+                    } else {
+                        out.push_str(&self.type_to_wire(rhs)?);
+                    }
+                } else {
+                    out.push_str(&format!(
+                        "(bounds {} {})",
+                        self.type_to_wire(lo.as_ref().unwrap_or(&Type::Nothing))?,
+                        self.type_to_wire(hi.as_ref().unwrap_or(&Type::Any))?
+                    ));
+                }
+                out.push(')');
+            }
+            out.push_str("))");
+            return Ok(out);
+        }
         if let Some(wire) = self.source_type_wire(ty)? {
             return Ok(wire);
         }
@@ -803,22 +902,36 @@ impl Typer {
         }
         if let Type::Class { sym, args } = ty {
             let sym = *sym;
-            if !args.is_empty() {
-                let name = crate::materialize::static_class_of_sym(&self.st, sym)
-                    .map_err(|why| format!("a type whose class is {why}"))?;
-                let mut written = Vec::new();
-                for a in args {
-                    written.push(self.type_to_wire(&a.clone())?);
-                }
-                let mut out = String::from("(ty ");
-                quote_into(&mut out, &name);
-                for a in written {
-                    out.push(' ');
-                    out.push_str(&a);
-                }
-                out.push(')');
-                return Ok(out);
+            let name = crate::materialize::static_class_of_sym(&self.st, sym)
+                .or_else(|why| {
+                    let mut owner = self.st.get(sym).owner;
+                    while !owner.is_none() {
+                        let s = self.st.get(owner);
+                        if !matches!(
+                            s.kind,
+                            SymKind::Package | SymKind::Module | SymKind::ModuleClass
+                        ) {
+                            return Err(why);
+                        }
+                        owner = s.owner;
+                    }
+                    Ok(scala_rs_pickle::names::nested_to_dotted(
+                        &self.st.jvm_internal(sym).replace('/', "."),
+                    ))
+                })
+                .map_err(|why| format!("a type whose class is {why}"))?;
+            let mut written = Vec::new();
+            for a in args {
+                written.push(self.type_to_wire(&a.clone())?);
             }
+            let mut out = String::from("(ty ");
+            quote_into(&mut out, &name);
+            for a in written {
+                out.push(' ');
+                out.push_str(&a);
+            }
+            out.push(')');
+            return Ok(out);
         }
         let name = crate::materialize::static_class_name(&self.st, ty)?;
         let mut out = String::from("(ty ");

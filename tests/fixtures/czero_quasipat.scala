@@ -78,6 +78,12 @@ object Main {
   }
 
   def main(args: Array[String]): Unit = {
+    def typedLiteral(t: Tree): String = t match {
+      case q"${literal: Literal}" => literal.value.value.toString
+      case _ => "not a literal"
+    }
+    assert(typedLiteral(q"42") == "42")
+    assert(typedLiteral(q"name") == "not a literal")
     val trees: List[Tree] = List(
       q"0",
       q"1",

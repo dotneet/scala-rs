@@ -1481,11 +1481,15 @@ impl Typer {
     /// reported as a missing `TypedCollectionTypeConstructor[Seq]` while
     /// `implicitly[ClassTag[Seq[Any]]]` on its own compiled fine.
     ///
-    /// Deliberately only the tags: the view fallbacks (`identity_view`,
-    /// `array_wrap_view`, `conversion_view`) run their own searches and would
-    /// make a function-typed parameter look satisfiable without saying which
-    /// conversion answers it.
+    /// Tags are materialized and function evidence uses the same identity or
+    /// conversion search that constructs the final implicit argument.
     fn built_not_found(&self, want: &Type, depth: usize) -> bool {
+        if let Type::Function { params, ret } = want {
+            if params.len() == 1 {
+                return self.st.is_sub_type(&params[0], ret)
+                    || self.search_conversion(&params[0], ret).is_found();
+            }
+        }
         if self.manifest_available(want, depth) {
             return true;
         }
@@ -1544,7 +1548,7 @@ impl Typer {
         let tps = self.st.get(id).tparams.clone();
         let mut args = Vec::with_capacity(tps.len());
         for tp in &tps {
-            args.push(crate::check::unify_one(&self.st, *tp, ret, pt)?);
+            args.push(crate::check::unify_one_precise(&self.st, *tp, ret, pt)?);
         }
         Some(args)
     }
@@ -1599,7 +1603,7 @@ impl Typer {
                 Some(t) => targs.push(self.simplify_solved(&t)),
                 // Not pinned down by the result type; the one-sided guess is
                 // the last chance before the candidate is dropped.
-                None => targs.push(crate::check::unify_one(&self.st, *tp, ret, pt)?),
+                None => targs.push(crate::check::unify_one_precise(&self.st, *tp, ret, pt)?),
             }
         }
         // A solution read off a higher-kinded position is an `Applied` whose
@@ -1686,7 +1690,13 @@ impl Typer {
             return None;
         }
         let mut u = Unify::new(self, tps.iter().copied(), undet.iter().copied());
-        if !u.unify(ret, pt) {
+        let projected = match (ret, pt) {
+            (Type::Refined { .. }, Type::Class { sym, .. }) => {
+                self.base_type_instance(ret, *sym, 0)
+            }
+            _ => None,
+        };
+        if !u.unify(projected.as_ref().unwrap_or(ret), pt) {
             return None;
         }
         let mut targs: Vec<Type> = Vec::with_capacity(tps.len());
@@ -1739,7 +1749,9 @@ impl Typer {
         for p in paramss.iter().flatten() {
             let want = crate::symbol::subst_tparams_slice(&tps, &targs, p);
             if open.is_empty() {
-                if !self.search_implicit_at(&want, depth + 1).is_found() {
+                if !self.search_implicit_at(&want, depth + 1).is_found()
+                    && !self.built_not_found(&want, depth + 1)
+                {
                     ok = false;
                     break;
                 }
@@ -1747,6 +1759,13 @@ impl Typer {
             }
             let (found, binds) = self.search_implicit_undet(&want, &open, depth + 1);
             if !found.is_found() {
+                if !open
+                    .iter()
+                    .any(|tp| crate::check::type_mentions_tparam_deep(&want, *tp))
+                    && self.built_not_found(&want, depth + 1)
+                {
+                    continue;
+                }
                 ok = false;
                 break;
             }
@@ -2871,7 +2890,18 @@ impl Typer {
         }
         let ra = self.implicit_result_ty(a);
         let rb = self.implicit_result_ty(b);
-        if !self.st.is_sub_type(&ra, &rb) {
+        let conforms = self.st.is_sub_type(&ra, &rb) || {
+            let tps = &self.st.get(b).tparams;
+            let raw = self.implicit_candidate_ty(b).result().clone();
+            !tps.is_empty()
+                && self.implicit_targs(b, &raw, &ra).is_some_and(|args| {
+                    self.candidate_bounds_hold(tps, &args)
+                        && self
+                            .st
+                            .is_sub_type(&ra, &crate::symbol::subst_tparams_slice(tps, &args, &raw))
+                })
+        };
+        if !conforms {
             return false;
         }
         // A view does not beat a value-shaped implicit on type alone. Keep the

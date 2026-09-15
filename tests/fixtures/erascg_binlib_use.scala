@@ -6,6 +6,19 @@ class Q extends P[Int](7) { override def get: Int = 8 }
 
 object Main {
   def main(args: Array[String]): Unit = {
+    assert(First.Regex.unapply(First.Regex()))
+    assert(First.Regex.label == "first")
+    assert(Second.Regex.unapply(Second.Regex(42)).contains(42))
+    assert(Second.Regex.label == "second")
+    assert(Views.size("abc") == 3)
+    assert(Views.integers(_ => List(1, 2)) == 2)
+    val symbolic = SymbolicUse.identity(new Symbolic.::(42, "tail"))
+    assert(Views.nested(new Box[List[_]](List(1, "x"))) == 2)
+    assert(!new ValueBox(1).equals(1))
+    assert(new ValueBox(1).equals(new ValueBox(1)))
+    assert(new ValueBox(1).hashCode() == 1.hashCode())
+    assert(Views.mixed(new Box[(_, List[_])]((1, List(2, "x")))) == 2)
+    assert(symbolic.head == 42 && symbolic.tail == "tail")
     val p = new P(3)
     println(p.a + p.get + p.twice(4))
     p.v = 5
@@ -21,6 +34,6 @@ object Main {
     val d = c.mkD
     println(d.foo("abcd"))
     val s = new SB("abc")
-    println(s.len + " " + s.get + " " + s.a)
+    println(s"${s.len} ${s.get} ${s.a}")
   }
 }

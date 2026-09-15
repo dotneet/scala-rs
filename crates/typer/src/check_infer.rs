@@ -1599,11 +1599,11 @@ impl Typer {
                 .copied()
                 .filter(|tp| match &tree.ty {
                     Type::Method { paramss, ret } => {
-                        type_mentions_tparam(ret, *tp)
+                        type_mentions_tparam_deep(ret, *tp)
                             && !paramss
                                 .iter()
                                 .flatten()
-                                .any(|t| type_mentions_tparam(t, *tp))
+                                .any(|t| type_mentions_tparam_deep(t, *tp))
                     }
                     _ => false,
                 })
@@ -1679,8 +1679,12 @@ impl Typer {
         // `solve_lower_bounded_undet`.
         let tps_of = self.st.get(tree.sym).tparams.clone();
         let decl_ty = self.st.get(tree.sym).ty.clone();
-        let already_substituted = tps_of.iter().any(|tp| type_mentions_tparam(&decl_ty, *tp))
-            && !tps_of.iter().any(|tp| type_mentions_tparam(&tree.ty, *tp));
+        let already_substituted = tps_of
+            .iter()
+            .any(|tp| type_mentions_tparam_deep(&decl_ty, *tp))
+            && !tps_of
+                .iter()
+                .any(|tp| type_mentions_tparam_deep(&tree.ty, *tp));
         if !already_substituted
             && !self.st.get(tree.sym).tparams.is_empty()
             && !matches!(tree.kind, TreeKind::TypeApply { .. })
@@ -1701,7 +1705,7 @@ impl Typer {
                 .filter(|tp| match &tree.ty {
                     Type::Method { paramss, .. } => paramss
                         .first()
-                        .is_some_and(|ps| ps.iter().any(|t| type_mentions_tparam(t, *tp))),
+                        .is_some_and(|ps| ps.iter().any(|t| type_mentions_tparam_deep(t, *tp))),
                     _ => false,
                 })
                 .collect();
@@ -1749,7 +1753,7 @@ impl Typer {
         // expected type has already fixed is no longer one of them.
         let undet: Vec<SymbolId> = undet
             .into_iter()
-            .filter(|tp| tys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .filter(|tp| tys.iter().any(|t| type_mentions_tparam_deep(t, *tp)))
             .collect();
         let mut solved: Vec<(SymbolId, Type)> = Vec::new();
         let mut tys = tys;
@@ -1900,7 +1904,7 @@ impl Typer {
         // [`Self::undet_solution`] declines the whole call when the witness
         // leaves one of them open -- so nothing is committed on a guess.
         tps.into_iter()
-            .filter(|tp| ptys.iter().any(|t| type_mentions_tparam(t, *tp)))
+            .filter(|tp| ptys.iter().any(|t| type_mentions_tparam_deep(t, *tp)))
             .collect()
     }
 
@@ -2600,7 +2604,47 @@ impl Typer {
             // member of _[Any]` 22 times. Parents are paired by the class they
             // name so that `Traverse[F]` is never read against `Reducible[…]`;
             // the arms below still decide what each pair says.
-            (Type::Refined { parents: rps, .. }, Type::Refined { parents: pps, .. }) => {
+            (
+                Type::Refined {
+                    parents: rps,
+                    decls: rds,
+                },
+                Type::Refined {
+                    parents: pps,
+                    decls: pds,
+                },
+            ) => {
+                // Type aliases in a refinement impose equality, so their
+                // right-hand sides constrain undetermined parameters too.
+                for rd in rds {
+                    if let RefineDecl::Type {
+                        name,
+                        rhs: Some(rhs),
+                        ..
+                    } = rd
+                    {
+                        for pd in pds {
+                            if let RefineDecl::Type {
+                                name: pn,
+                                rhs: Some(expected),
+                                ..
+                            } = pd
+                            {
+                                if name == pn {
+                                    self.collect_expected(
+                                        tps,
+                                        rhs,
+                                        expected,
+                                        0,
+                                        depth + 1,
+                                        allow_covariant,
+                                        out,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 for rp in rps {
                     let head = self.st.class_sym_of(rp);
                     for pp in pps.iter().filter(|pp| self.st.class_sym_of(pp) == head) {
@@ -3488,6 +3532,7 @@ impl Typer {
         };
         if matches!(qual.kind, TreeKind::This { .. } | TreeKind::Super { .. })
             || matches!(qual.ty, Type::ModuleRef(_))
+            || (!qual.sym.is_none() && self.st.get(qual.sym).kind == crate::symbol::SymKind::Class)
         {
             return None;
         }

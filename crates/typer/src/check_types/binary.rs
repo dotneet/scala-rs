@@ -64,13 +64,26 @@ impl Typer {
             {
                 return;
             }
-            // At package scope an existing module is already the complete
-            // source-level answer. Its non-`$` classfile may be only Scala's
-            // static-forwarder view (`scala.Function.class`); loading that as
-            // though it were a missing class companion can replace the
-            // module's pickled curried signatures with flattened descriptors.
-            // The ambiguity below is specifically a nested-name ambiguity.
+            // A package may already contain the companion without the
+            // class. Inspect the non-module file before deciding: a static
+            // forwarder is not a class declaration, whereas a case class or
+            // trait must still be loaded into the type namespace.
             if self.st.get(owner).kind == SymKind::Package && has_module {
+                for internal in self.binary_member_candidates(owner, name) {
+                    if internal.ends_with('$') {
+                        continue;
+                    }
+                    let is_class = self
+                        .binary
+                        .find_class(&internal)
+                        .ok()
+                        .flatten()
+                        .and_then(|bytes| crate::javaclass::parse_java_classfile(&bytes).ok())
+                        .is_some_and(|jc| !jc.scala_module);
+                    if is_class {
+                        self.load_binary_into(&internal, owner, span, true);
+                    }
+                }
                 self.supply_pending_module_implicits(&found);
                 return;
             }

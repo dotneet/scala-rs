@@ -1115,12 +1115,15 @@ impl Typer {
     }
 
     pub(crate) fn expand_macro_application(&mut self, tree: &mut Tree) {
-        if self.sigs_only {
-            return;
-        }
         let Some(sym) = self.macro_symbol_of(tree) else {
             return;
         };
+        // Completing an inferred signature can force a library macro. Its
+        // whitebox expansion is the signature (for example Witness.`1`.T),
+        // so caching the declared Any here would lose the generated type.
+        if self.sigs_only && self.st.is_source_owner(self.st.get(sym).owner) {
+            return;
+        }
         // Not applied yet: the inner `Apply` of a curried macro still has a
         // method type, and so does a macro def named but not called.
         //
@@ -1513,7 +1516,7 @@ impl Typer {
     }
 
     /// Serialise one expansion request, and say which of its types went over
-    /// as placeholders ([`Typer::tag_descriptor`]).
+    /// as placeholders ([`Typer::tag_wire`]).
     fn expansion_request(
         &mut self,
         binding: &MacroBinding,
@@ -1568,7 +1571,7 @@ impl Typer {
         let mut tags = Vec::new();
         if binding.tag_params > 0 {
             for t in self.tag_types(binding, targs, prefix)? {
-                tags.push(self.tag_descriptor(&t)?);
+                tags.push(self.tag_wire(&t)?);
             }
         }
         if let Some(p) = prefix {
@@ -1587,6 +1590,11 @@ impl Typer {
         quote_into(&mut out, &binding.impl_class);
         out.push(' ');
         quote_into(&mut out, &binding.impl_method);
+        out.push_str(if binding.is_bundle {
+            " (bundle 1)"
+        } else {
+            " (bundle 0)"
+        });
         out.push_str(" (argss");
         let mut slot = 0;
         let mut actual = actuals.iter();
@@ -1756,6 +1764,29 @@ impl Typer {
             types.insert(t as *const Tree, wire);
             return;
         }
+        // Erasure's walk only needs runtime-bearing children. A macro also
+        // receives type syntax, including resolved leaves under existentials.
+        match &t.kind {
+            TreeKind::ExistentialTypeTree { tpt, clauses } => {
+                self.collect_wire_types(tpt, types);
+                for clause in clauses {
+                    self.collect_wire_types(clause, types);
+                }
+                return;
+            }
+            TreeKind::TypeDef {
+                tparams, lo, hi, ..
+            } => {
+                for child in tparams
+                    .iter()
+                    .chain(lo.iter().map(Box::as_ref))
+                    .chain(hi.iter().map(Box::as_ref))
+                {
+                    self.collect_wire_types(child, types);
+                }
+            }
+            _ => {}
+        }
         crate::erasure::for_each_child(t, &mut |c| self.collect_wire_types(c, types));
     }
 
@@ -1899,18 +1930,6 @@ impl Typer {
     /// The engine creates their symbols once and requests bounds, parents and
     /// members lazily. Returned TypeTrees retain these identities and their
     /// arguments rather than resolving source names against the runtime jar.
-    fn tag_descriptor(&mut self, ty: &Type) -> Result<String, String> {
-        // `f(42)` types its argument as the *constant* type `42`; the tag nsc
-        // builds for the `Expr` that wraps it is `Int`. Only the outermost
-        // type is widened -- `Tag[1]` is not `Tag[Int]`, so a constant that is
-        // itself a type argument stays one ([`Typer::tag_wire`]).
-        let widened = match ty {
-            Type::Constant(lit) => Type::lit_underlying(lit),
-            other => other.clone(),
-        };
-        self.tag_wire(&widened)
-    }
-
     /// One type as a tag descriptor, type arguments and all.
     ///
     /// `(ty "scala.reflect.ClassTag" (ty "a.b.Row"))` is `mirror.staticClass`
@@ -2092,6 +2111,13 @@ impl Typer {
             byname_type_marker: false,
         };
         match kind.as_str() {
+            "Attributed" => {
+                let mut tree = self.tree_from_reply(at(kids, 0)?, span)?;
+                let tpt = self.type_tree_from_wire(at(kids, 1)?, span)?;
+                tree.ty = self.tree_to_type(&tpt);
+                tree.id = NodeId::PRETYPED_SPLICE;
+                Ok(tree)
+            }
             "Literal" => Ok(node(TreeKind::Literal {
                 lit: literal_from(at(kids, 0)?)?,
             })),
@@ -2792,7 +2818,7 @@ impl Typer {
     ///
     /// `(ty "a.b.C" <arg>…)` is a class and its arguments. A class this run
     /// is compiling went over as a placeholder or a description carrying its
-    /// full name (`tag_descriptor`), and coming back it is that same name:
+    /// full name (`tag_wire`), and coming back it is that same name:
     /// the type it stands for is the one the typer already had, so it is
     /// handed back resolved rather than looked up again -- a class nested in
     /// a trait has no path the call site could name. Any other class is
@@ -2806,6 +2832,14 @@ impl Typer {
     pub(crate) fn type_tree_from_wire(&mut self, s: &Sexp, span: Span) -> Result<Tree, String> {
         let items = s.list()?;
         match items.first().and_then(|s| s.atom()) {
+            Some("cst") => {
+                return self.macro_node(
+                    TreeKind::Literal {
+                        lit: literal_from(at(items, 1)?)?,
+                    },
+                    span,
+                );
+            }
             Some("mod") => {
                 let ref_ = path_tree(&at(items, 1)?.text(), span);
                 return self.macro_node(
