@@ -316,6 +316,34 @@ object Lib { val Alias = Predef }
 }
 
 #[test]
+fn subset_reader_retains_singleton_value_types() {
+    let (_tree, st, diags) = scala_rs_typer::typecheck_str(
+        r#"
+object Lib {
+  val Alias = Predef
+}
+"#,
+    );
+    assert!(
+        !scala_rs_typer::has_errors(&diags),
+        "type errors: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+    let lib = pickle::pickle_all(&st)
+        .values()
+        .filter_map(|raw| pickle::unpickle(raw))
+        .find(|class| class.name == "Lib" && class.is_module)
+        .expect("Lib pickle");
+    let alias = lib
+        .methods
+        .iter()
+        .find(|method| method.name == "Alias" && method.is_val)
+        .expect("Lib.Alias accessor");
+    assert!(alias.ret.singleton);
+    assert_eq!(alias.ret.name, "Predef");
+}
+
+#[test]
 fn nested_module_ref_pickle_uses_owner_relative_name() {
     let src = r#"
 object Outer {

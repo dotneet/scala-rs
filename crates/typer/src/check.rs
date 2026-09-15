@@ -184,6 +184,8 @@ pub struct ClasspathField {
 pub struct ClasspathType {
     pub name: String,
     pub args: Vec<ClasspathType>,
+    /// The type is a singleton (`O.type`) rather than the class named `O`.
+    pub singleton: bool,
 }
 
 impl ClasspathType {
@@ -191,6 +193,7 @@ impl ClasspathType {
         ClasspathType {
             name: name.into(),
             args: Vec::new(),
+            singleton: false,
         }
     }
 }
