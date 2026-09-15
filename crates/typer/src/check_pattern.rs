@@ -455,6 +455,13 @@ impl Typer {
                     this.type_expr(fun, &Type::NoType);
                 });
                 self.prefer_extractor_object(fun);
+                // A binary companion can already exist as an erased stub.
+                // Pattern lookup reads unapply directly rather than typing a
+                // selection, so complete its Scala signature before binding
+                // the extracted values to their generic result types.
+                if let Some(cls) = self.st.class_sym_of(&fun.ty) {
+                    self.adopt_cp_module_class(cls);
+                }
                 // `case (a, b) =>` is `scala.Tuple2(a, b)`: a synthesized name
                 // is resolved in package `scala`, never lexically. Note the
                 // ordinary path uses `lookup`, which stops at the first scope

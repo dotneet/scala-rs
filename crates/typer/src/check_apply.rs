@@ -1651,10 +1651,10 @@ impl Typer {
                                 }
                                 _ => inst,
                             };
-                            // A typed sibling supplies a lower constraint, not a
-                            // final solution for a result still produced by an
-                            // untyped lambda. Keep those variables open until all
-                            // bodies participate in the second inference pass.
+                            // A typed sibling's covariant or contravariant
+                            // occurrence only supplies a bound. Keep the variable
+                            // open while an untyped lambda can still produce its
+                            // result; only an invariant occurrence fixes it here.
                             let inst: Vec<_> = inst
                                 .into_iter()
                                 .filter(|(tp, _)| {
@@ -1663,7 +1663,7 @@ impl Typer {
                                             !mentions_no_type(a)
                                                 && matches!(
                                                     self.tparam_variance_in(p, *tp, 1),
-                                                    Some(0 | -1)
+                                                    Some(0)
                                                 )
                                         })
                                         || !param_tys.iter().zip(&arg_tys).any(|(p, a)| {

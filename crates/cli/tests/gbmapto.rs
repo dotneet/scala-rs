@@ -123,7 +123,7 @@ fn run_main(cp: &str, what: &str) -> String {
     String::from_utf8_lossy(&run.stdout).into_owned()
 }
 
-/// Nine tags whose types carry arguments, expanded for real and executed.
+/// Applied and binary singleton tags, expanded for real and executed.
 ///
 /// The first line is slick's `ShapedValue.mapToImpl` as far as it reads its
 /// type argument -- `isCaseClass`, then every case accessor's
@@ -169,7 +169,7 @@ fn gbm_applied_tags_expand_and_run() {
 
 /// What real scalac 2.13.16 makes of the same two files.
 ///
-/// Eight of the ten lines are byte-identical. The two that are not are a
+/// Ten of the twelve lines are byte-identical. The two that are not are a
 /// **named limit, pinned here rather than discovered later**: `Either` is
 /// `scala.package.Either` and `Map` is `Predef.Map`, and both are type
 /// *aliases*. scala-rs expands an alias away long before a type reaches the
@@ -255,22 +255,7 @@ fn gbm_applied_tags_match_real_scalac() {
     let _ = fs::remove_dir_all(&uses);
 }
 
-/// Every tag scala-rs cannot build is refused **by name**.
-///
-/// This is the half that keeps the other half honest. All four of these call
-/// sites are a program real scalac 2.13.16 compiles and runs, printing
-///
-/// ```text
-/// Nothing v:Int
-/// LocalBox[Int] = LocalBox[Int]
-/// T = T[]
-/// Main.type = Main.type[]
-/// ```
-///
-/// There used to be a fourth: gitbucket's `mapTo` in miniature, a case class
-/// this run is compiling as a *bare* type argument. It is answered now
-/// (`docs/macros.md` §7.25) and is compared with real scalac in
-/// `crates/cli/tests/gbmac.rs`.
+/// Unsupported source singleton tags still fail with their specific reason.
 #[test]
 fn gbm_unbuildable_tags_are_named() {
     if !prerequisites("gbm_bad") {
@@ -288,13 +273,6 @@ fn gbm_unbuildable_tags_are_named() {
     let out = compile(&["gbm_bad"], &uses, &[&impls]);
     let text = diagnostics(&out);
     for want in [
-        // A current-run class *applied* to type arguments: the placeholder has
-        // nothing for them to bind to, so it is refused rather than sent as a
-        // name the engine's mirror would fail to resolve.
-        "`LocalBox`, a class this run is compiling applied to type arguments",
-        // A bare type parameter. nsc materialises a `WeakTypeTag` with a free
-        // type; scala-rs has no such thing.
-        "`T`, an abstract type with no tag in scope",
         // A singleton type has no `staticClass` to rebuild it from.
         "`Main.type`, a singleton type",
     ] {
@@ -303,9 +281,92 @@ fn gbm_unbuildable_tags_are_named() {
     assert!(!out.status.success() || text.contains("error:"), "{text}");
     assert_eq!(
         text.matches("macro expansion is not implemented").count(),
-        3,
-        "every call site must be refused:\n{text}"
+        1,
+        "only the unsupported singleton call should be refused:\n{text}"
     );
     let _ = fs::remove_dir_all(&impls);
     let _ = fs::remove_dir_all(&uses);
+}
+
+/// The same source-defined types travel through implementations built by each
+/// compiler. Compare reflection results and typed expansions with scalac,
+/// including bounds, variance, inherited base types and rejected narrowing.
+#[test]
+fn source_type_arguments_and_weak_parameters_match_scalac() {
+    if !prerequisites("source types") {
+        return;
+    }
+    let Some(scalac) = find_scalac() else { return };
+    let jar = scala_library_jar().unwrap();
+    let reflect = scala_reflect_jar().unwrap();
+    let root = tmp_dir("source-types");
+    let mut expected = None;
+    for ours_impl in [false, true] {
+        let impls = root.join(format!("impl-{ours_impl}"));
+        fs::create_dir_all(&impls).unwrap();
+        let build = if ours_impl {
+            compile(&["macro_source_types_impl"], &impls, &[])
+        } else {
+            Command::new(&scalac)
+                .arg("-d")
+                .arg(&impls)
+                .arg(fixtures_dir().join("macro_source_types_impl.scala"))
+                .output()
+                .unwrap()
+        };
+        assert!(
+            build.status.success(),
+            "implementation ours={ours_impl}: {}",
+            diagnostics(&build)
+        );
+        // Source-built implementation pickles have a separate Context tag
+        // prefix limitation when read by scalac. Exercise both native stages
+        // and consuming the scalac-built implementation here.
+        let consumers: &[bool] = if ours_impl { &[true] } else { &[false, true] };
+        for &ours in consumers {
+            for (fixture, accepted) in [
+                ("macro_source_types", true),
+                ("macro_source_types_bad", false),
+            ] {
+                let out = root.join(format!("{fixture}-{ours_impl}-{ours}"));
+                fs::create_dir_all(&out).unwrap();
+                let cp = format!(
+                    "{}:{}:{}",
+                    impls.display(),
+                    reflect.display(),
+                    jar.display()
+                );
+                let build = if ours {
+                    compile(&[fixture], &out, &[&impls])
+                } else {
+                    Command::new(&scalac)
+                        .arg("-cp")
+                        .arg(&cp)
+                        .arg("-d")
+                        .arg(&out)
+                        .arg(fixtures_dir().join(format!("{fixture}.scala")))
+                        .output()
+                        .unwrap()
+                };
+                assert_eq!(
+                    build.status.success(),
+                    accepted,
+                    "{fixture}, implementation ours={ours_impl}, consumer ours={ours}: {}",
+                    diagnostics(&build)
+                );
+                if accepted {
+                    let actual = run_main(&format!("{}:{cp}", out.display()), fixture);
+                    if let Some(expected) = &expected {
+                        assert_eq!(
+                            &actual, expected,
+                            "implementation ours={ours_impl}, consumer ours={ours}"
+                        );
+                    } else {
+                        expected = Some(actual);
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(root);
 }

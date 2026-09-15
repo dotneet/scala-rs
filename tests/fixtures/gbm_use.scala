@@ -36,5 +36,8 @@ object Main {
     println(GbmUse.shape[ClassTag[GbmRow]])
     println(GbmUse.conforms[List[Int], Seq[Int]])
     println(GbmUse.conforms[Seq[Int], List[Int]])
+    // A module singleton must keep its identity inside applied tags.
+    println(GbmUse.conforms[List[None.type], List[Option[Int]]])
+    println(GbmUse.conforms[Option[Int], None.type])
   }
 }

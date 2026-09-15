@@ -1002,7 +1002,7 @@ impl Typer {
         }
         if !implicits.is_empty() {
             let off = args.len().min(param_tys.len());
-            self.fill_implicit_params(span, args, &param_tys[off..], implicits);
+            self.fill_implicit_params(span, args, &param_tys[off..], implicits, fun);
         }
     }
 
@@ -1145,7 +1145,7 @@ impl Typer {
                 .all(|p| self.st.get(*p).flags.contains(Flags::DEFAULTPARAM));
             if all_implicit && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
                 let off = args.len().min(param_tys.len());
-                self.fill_implicit_params(span, args, &param_tys[off..], &rest);
+                self.fill_implicit_params(span, args, &param_tys[off..], &rest, fun);
             } else if all_default {
                 for pid in rest.iter() {
                     let idx = self.default_getter_index(fun, *pid);
@@ -1235,7 +1235,7 @@ impl Typer {
                 // inference state. Keep this call's result bindings across
                 // those applications instead of letting them clear it.
                 let solved = std::mem::take(&mut self.implicit_undet_solved);
-                self.fill_implicit_params(span, args, &rest_tys, &rest_ids);
+                self.fill_implicit_params(span, args, &rest_tys, &rest_ids, fun);
                 self.implicit_undet_solved = solved;
                 return None;
             }
@@ -2270,9 +2270,10 @@ impl Typer {
         args: &mut Vec<Tree>,
         param_tys: &[Type],
         rest: &[SymbolId],
+        fun: &Tree,
     ) {
         let filled_from = args.len();
-        self.fill_implicit_params_in(span, args, param_tys, rest);
+        self.fill_implicit_params_in(span, args, param_tys, rest, fun);
         // Mark what this pass added, so a re-typing of the same application
         // (`retry_tupled_args`) starts from the arguments the user wrote.
         for a in args[filled_from..].iter_mut() {
@@ -2286,6 +2287,7 @@ impl Typer {
         args: &mut Vec<Tree>,
         param_tys: &[Type],
         rest: &[SymbolId],
+        fun: &Tree,
     ) {
         for (i, pid) in rest.iter().enumerate() {
             let pty = param_tys
@@ -2328,7 +2330,7 @@ impl Typer {
                     // expands `materializeTypeTag` (`crate::materialize`).
                     } else if let Some(tag) = self.materialize_tag(&pty, span) {
                         args.push(tag);
-                    } else if let Some(d) = self.implicit_param_default(*pid, &pty) {
+                    } else if let Some(d) = self.implicit_param_default(*pid, &pty, fun, args) {
                         args.push(d);
                     } else {
                         // nsc's `applyImplicitArgs` leaves an `EmptyTree` here
@@ -2364,13 +2366,24 @@ impl Typer {
     /// body is typed where it was written (`type_default_rhs_here`), so the
     /// fallback is the declaration's expression, not something re-resolved in
     /// the caller's scope.
-    fn implicit_param_default(&mut self, param: SymbolId, pty: &Type) -> Option<Tree> {
+    fn implicit_param_default(
+        &mut self,
+        param: SymbolId,
+        pty: &Type,
+        fun: &Tree,
+        prior: &[Tree],
+    ) -> Option<Tree> {
         if !self.st.get(param).flags.contains(Flags::DEFAULTPARAM) {
             return None;
         }
-        let mut rhs = self.st.get(param).default_rhs.clone()?;
-        self.type_default_rhs_here(param, &mut rhs, pty);
-        Some(rhs)
+        if let Some(mut rhs) = self.st.get(param).default_rhs.clone() {
+            self.type_default_rhs_here(param, &mut rhs, pty);
+            return Some(rhs);
+        }
+        // Binary parameters have no source RHS. Use the same receiver and
+        // preceding arguments as explicit defaults when invoking their getter.
+        let idx = self.default_getter_index(fun, param);
+        self.default_getter_apply(fun, param, idx, prior)
     }
 
     /// Whether a type has an *erasure* nsc's `ClassTag` materialiser can turn

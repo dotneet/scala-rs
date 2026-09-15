@@ -8,3 +8,5 @@ Array[Int] = Array[Int]
 scala.reflect.ClassTag[GbmRow] = scala.reflect.ClassTag[GbmRow]
 true
 false
+true
+false

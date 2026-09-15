@@ -1785,7 +1785,7 @@ impl Typer {
             solved = sol;
         }
         let mut args = Vec::new();
-        self.fill_implicit_params(span, &mut args, &tys, &first);
+        self.fill_implicit_params(span, &mut args, &tys, &first, tree);
         // The result may name one of the *implicit* parameters this pass just
         // filled in. cats writes `def accumulatingParallel[M[_], E](implicit
         // P: Parallel[M], E: Semigroup[E]): Parallel.Aux[…, IorT[P.F, E, *]]`
