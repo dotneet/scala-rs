@@ -1041,8 +1041,9 @@ impl Typer {
         // `TableQuery.apply(new Row(_))` already took this eager path.
         if !args.is_empty()
             && self.st.get(fun.sym).parameterless_method == Some(true)
-            && matches!(&fun.ty, Type::Method { paramss, .. }
-                if paramss.is_empty() || paramss.iter().all(|c| c.is_empty()))
+            && matches!(&fun.ty, Type::Method { paramss, ret }
+                if (paramss.is_empty() || paramss.iter().all(|c| c.is_empty()))
+                    && matches!(crate::prefix::strip_view(ret), Type::ModuleRef(_)))
         {
             self.insert_apply_on_nullary(fun);
         }
