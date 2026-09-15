@@ -77,6 +77,8 @@ mod numtower;
 mod ordsummon;
 #[path = "../outer.rs"]
 mod outer;
+#[path = "../outercapture.rs"]
+mod outercapture;
 #[path = "../overload_module.rs"]
 mod overload_module;
 #[path = "../overloadshadow.rs"]

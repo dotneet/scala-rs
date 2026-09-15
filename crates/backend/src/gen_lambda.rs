@@ -421,7 +421,18 @@ pub(crate) fn collect_free(
                 // of a named inner class such as Slick's `Accounts`. Such a
                 // class deliberately has no `$outer` field of its own, so
                 // `outer_field_class(cid)` cannot express the requirement.
-                if outer_field_class(st, cid).is_some()
+                // A local/anonymous class may read its lexical outer only
+                // while its constructor runs.  In that shape nsc keeps the
+                // hidden `$outer` constructor slot but elides the physical
+                // `$outer` field (`requires_outer_field == false`).  The
+                // enclosing lambda still has to capture and pass the
+                // receiver: its `new` expression executes after the lambda
+                // is created, so a static lambda body cannot synthesize the
+                // enclosing `this` later.  `captures_outer` records that
+                // constructor-only use, while `outer_field_class` covers
+                // the retained-field case.
+                if st.get(cid).captures_outer
+                    || outer_field_class(st, cid).is_some()
                     || enclosing_instance(st, cid)
                         .map(|owner| {
                             st.get(owner).name.starts_with("$anon$")
