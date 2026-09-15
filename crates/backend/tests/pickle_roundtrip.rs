@@ -321,6 +321,8 @@ fn subset_reader_retains_singleton_value_types() {
         r#"
 object Lib {
   val Alias = Predef
+  val value: String = "the-value"
+  def accept(x: value.type): String = x
 }
 "#,
     );
@@ -341,6 +343,17 @@ object Lib {
         .expect("Lib.Alias accessor");
     assert!(alias.ret.singleton);
     assert_eq!(alias.ret.name, "Predef");
+
+    let accept = lib
+        .methods
+        .iter()
+        .find(|method| method.name == "accept")
+        .expect("Lib.accept");
+    let arg = accept.param_types.first().expect("accept argument");
+    assert!(arg.singleton);
+    assert_eq!(arg.name, "value");
+    assert_eq!(arg.singleton_sym.as_deref(), Some("Lib.value"));
+    assert_eq!(arg.singleton_prefix.as_deref(), Some("Lib"));
 }
 
 #[test]

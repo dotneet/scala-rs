@@ -264,6 +264,14 @@ pub struct PickledType {
     /// and must survive the compact classpath ABI so module members remain
     /// selectable after a separate compilation.
     pub singleton: bool,
+    /// Fully-qualified symbol name for a singleton selected from a stable
+    /// value (`p.value.type`). The type name alone is not enough: the
+    /// selected value may have an arbitrary declared type, including `Any`.
+    pub singleton_sym: Option<String>,
+    /// Source path of the singleton's prefix (`p` in `p.value.type`). This is
+    /// retained separately from `singleton_sym` because the same declaration
+    /// can be selected through distinct enclosing instances.
+    pub singleton_prefix: Option<String>,
 }
 
 impl PickledType {
@@ -272,6 +280,8 @@ impl PickledType {
             name: name.into(),
             args: Vec::new(),
             singleton: false,
+            singleton_sym: None,
+            singleton_prefix: None,
         }
     }
 
@@ -285,6 +295,8 @@ impl PickledType {
             name: "&".into(),
             args: parents,
             singleton: false,
+            singleton_sym: None,
+            singleton_prefix: None,
         }
     }
 }

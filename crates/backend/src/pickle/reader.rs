@@ -408,9 +408,69 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
             Some(
                 Entry::TypeSym { name, .. }
                 | Entry::ClassSym { name, .. }
-                | Entry::ModuleSym { name, .. },
+                | Entry::ModuleSym { name, .. }
+                | Entry::ValSym { name, .. },
             ) => name_of(entries, *name),
             _ => String::new(),
+        }
+    }
+
+    /// The fully-qualified identity of an internal or external symbol. A
+    /// singleton's `sym` is a term (`ValSym`/`ModuleSym`), so retaining only
+    /// the type-like leaf would conflate unrelated values named `value`.
+    fn singleton_symbol_name(entries: &[Entry], i: u32, depth: usize) -> Option<String> {
+        if depth > MAX_TYPE_DEPTH {
+            return None;
+        }
+        let (name, owner) = match entries.get(i as usize) {
+            Some(Entry::ExtRef { name, owner }) => (*name, *owner),
+            Some(Entry::TypeSym { name, owner, .. })
+            | Some(Entry::ClassSym { name, owner, .. })
+            | Some(Entry::ModuleSym { name, owner, .. })
+            | Some(Entry::ValSym { name, owner, .. }) => (*name, Some(*owner)),
+            _ => return None,
+        };
+        let leaf = crate::classfile::decode_method_name(&name_of(entries, name));
+        if leaf.is_empty() {
+            return None;
+        }
+        // The writer keeps the synthetic `<empty>`/`<root>` owner in the
+        // pickle graph, but those are not source-level path components.
+        if matches!(leaf.as_str(), "<empty>" | "<root>") {
+            return Some(String::new());
+        }
+        let prefix = owner.and_then(|owner| singleton_symbol_name(entries, owner, depth + 1));
+        Some(match prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}.{leaf}"),
+            _ => leaf,
+        })
+    }
+
+    /// Recover the written source path used as the prefix of a `SINGLEtpe`.
+    /// This is intentionally a path, not the selected symbol's owner: a
+    /// forwarded member can be selected through a different stable instance
+    /// and those two singleton types must not be merged.
+    fn singleton_path(entries: &[Entry], i: u32, depth: usize) -> Option<String> {
+        if depth > MAX_TYPE_DEPTH {
+            return None;
+        }
+        match entries.get(i as usize) {
+            Some(Entry::ThisTpe(sym)) => singleton_symbol_name(entries, *sym, depth + 1),
+            Some(Entry::SingleTpe { prefix, sym }) => {
+                let prefix = singleton_path(entries, *prefix, depth + 1);
+                let leaf = crate::classfile::decode_method_name(&name_of(entries, *sym));
+                if leaf.is_empty() {
+                    return prefix;
+                }
+                Some(match prefix {
+                    Some(prefix) if !prefix.is_empty() => format!("{prefix}.{leaf}"),
+                    _ => singleton_symbol_name(entries, *sym, depth + 1)?,
+                })
+            }
+            Some(Entry::TypeRef { sym, .. }) => singleton_symbol_name(entries, *sym, depth + 1),
+            Some(Entry::ExtRef { .. }) => singleton_symbol_name(entries, i, depth + 1),
+            Some(Entry::NoTpe) => Some(String::new()),
+            _ => None,
         }
     }
 
@@ -496,6 +556,8 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                         .map(|a| type_of(entries, *a, depth + 1))
                         .collect(),
                     singleton: false,
+                    singleton_sym: None,
+                    singleton_prefix: None,
                 }
             }
             Some(Entry::ExtRef { name, owner }) => {
@@ -511,9 +573,16 @@ pub(super) fn unpickle(bytes: &[u8]) -> Option<PickledClass> {
                 _ => PickledType::simple("Any"),
             },
             Some(Entry::AnnotatedTpe(t)) => type_of(entries, *t, depth + 1),
-            Some(Entry::SingleTpe { sym, .. }) => {
-                let mut ty = type_of(entries, *sym, depth + 1);
+            Some(Entry::SingleTpe { prefix, sym }) => {
+                // `sym` is a term symbol for `value.type`, not a type. Asking
+                // `type_of` to decode it therefore used to fall through to
+                // `Any`, turning the singleton into `Any.singleton` and
+                // accepting values scalac rejects. Keep both identities that
+                // nsc's `SINGLEtpe` carries: the selected term and its prefix.
+                let mut ty = PickledType::simple(name_of(entries, *sym));
                 ty.singleton = true;
+                ty.singleton_sym = singleton_symbol_name(entries, *sym, 0);
+                ty.singleton_prefix = singleton_path(entries, *prefix, 0);
                 ty
             }
             Some(Entry::ConstantTpe(c)) => type_of(entries, *c, depth + 1),

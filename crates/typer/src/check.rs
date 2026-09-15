@@ -186,6 +186,10 @@ pub struct ClasspathType {
     pub args: Vec<ClasspathType>,
     /// The type is a singleton (`O.type`) rather than the class named `O`.
     pub singleton: bool,
+    /// Fully-qualified selected term for a stable-value singleton.
+    pub singleton_sym: Option<String>,
+    /// Source path of the singleton's prefix.
+    pub singleton_prefix: Option<String>,
 }
 
 impl ClasspathType {
@@ -194,6 +198,8 @@ impl ClasspathType {
             name: name.into(),
             args: Vec::new(),
             singleton: false,
+            singleton_sym: None,
+            singleton_prefix: None,
         }
     }
 }

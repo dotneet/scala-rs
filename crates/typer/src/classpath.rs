@@ -691,6 +691,32 @@ fn resolve_type_in(
         };
     }
     if ty.singleton {
+        // A stable value's singleton is not identified by its widened type:
+        // `value.type` may have an underlying `String`, `Any`, or an
+        // unrelated path-dependent type. The compact pickle reader carries
+        // the selected term and its written prefix so we can rebuild the
+        // semantic `SingleType` instead of treating it as `Any.singleton`.
+        if let Some(sym_name) = ty.singleton_sym.as_deref() {
+            if let Some(sym) = find_singleton_symbol(st, sym_name) {
+                let module = match st.get(sym).kind {
+                    SymKind::Module => st.module_class_of(sym),
+                    SymKind::ModuleClass => sym,
+                    _ => SymbolId::NONE,
+                };
+                if !module.is_none() && singleton_is_static(st, sym) {
+                    return apply_args(Type::ModuleRef(module), args);
+                }
+                let prefix = ty
+                    .singleton_prefix
+                    .as_deref()
+                    .map(|path| resolve_singleton_prefix(st, path, sym))
+                    .unwrap_or_else(|| default_singleton_prefix(st, sym));
+                return Type::SingleType {
+                    prefix: Box::new(prefix),
+                    sym,
+                };
+            }
+        }
         if let Some(sym) = find_by_fully_qualified_name(st, name) {
             let module = st.companion_module_class_for_implicits(sym);
             if !module.is_none() {
@@ -2107,6 +2133,122 @@ pub(crate) fn find_by_fully_qualified_name(st: &SymbolTable, name: &str) -> Opti
     None
 }
 
+/// Find the symbol of a stable value carried by a compact pickle. Unlike a
+/// class, a term has no JVM classfile identity of its own; resolve its owner
+/// first and then inspect only that owner's direct declarations. In
+/// particular, do not use `lookup_member`: an inherited `value` is not the
+/// same singleton as a declaration selected through another owner.
+fn find_singleton_symbol(st: &SymbolTable, name: &str) -> Option<SymbolId> {
+    let (owner_name, leaf) = name.rsplit_once('.')?;
+    let mut owners = Vec::new();
+    if let Some(package) = find_package_by_name(st, owner_name) {
+        owners.push(package);
+    }
+    owners.extend(classpath_owner_candidates(st, owner_name));
+    owners.dedup();
+    owners.into_iter().find_map(|owner| {
+        st.get(owner)
+            .members
+            .iter()
+            .copied()
+            .find(|&id| st.get(id).name == leaf && names_a_singleton(st, id))
+    })
+}
+
+/// Classpath owner candidates for a dotted Scala name. The `$` variants are
+/// tried before their static-forwarder counterparts so a module's members are
+/// recovered from `O$` when both `O.class` and `O$.class` are present.
+fn classpath_owner_candidates(st: &SymbolTable, name: &str) -> Vec<SymbolId> {
+    let mut out = Vec::new();
+    let mut push = |jvm: String| {
+        if let Some(id) = find_by_jvm(st, &jvm) {
+            if st.get(id).is_class_like() && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    };
+    let exact = name.replace('.', "/");
+    push(format!("{exact}$"));
+    push(exact.clone());
+    for (split, _) in name.match_indices('.').rev() {
+        let package = name[..split].replace('.', "/");
+        let nested = name[split + 1..].replace('.', "$");
+        push(format!("{package}/{nested}$"));
+        push(format!("{package}/{nested}"));
+    }
+    out
+}
+
+fn find_package_by_name(st: &SymbolTable, name: &str) -> Option<SymbolId> {
+    if name.is_empty() {
+        return Some(st.root);
+    }
+    let mut current = st.root;
+    for part in name.split('.') {
+        current = st
+            .get(current)
+            .members
+            .iter()
+            .copied()
+            .find(|&id| st.get(id).kind == SymKind::Package && st.get(id).name == part)?;
+    }
+    Some(current)
+}
+
+fn names_a_singleton(st: &SymbolTable, id: SymbolId) -> bool {
+    let sym = st.get(id);
+    match sym.kind {
+        SymKind::Term | SymKind::Module | SymKind::ModuleClass => true,
+        SymKind::Method => sym.flags.contains(Flags::ACCESSOR),
+        _ => false,
+    }
+}
+
+fn singleton_is_static(st: &SymbolTable, id: SymbolId) -> bool {
+    let owner = st.get(id).owner;
+    owner.is_none()
+        || matches!(st.get(owner).kind, SymKind::Package | SymKind::Module)
+        || (st.get(owner).is_class_like() && st.get(owner).flags.contains(Flags::MODULE))
+}
+
+fn default_singleton_prefix(st: &SymbolTable, id: SymbolId) -> Type {
+    let owner = st.get(id).owner;
+    if owner.is_none() || matches!(st.get(owner).kind, SymKind::Package | SymKind::Method) {
+        Type::NoType
+    } else {
+        Type::ThisType(owner)
+    }
+}
+
+/// Convert the prefix path retained in a compact singleton ABI into the
+/// typer's path-bearing `Type`. A class/module path is represented by its
+/// `this`; a stable value path is rebuilt recursively as `SingleType`.
+fn resolve_singleton_prefix(st: &SymbolTable, path: &str, selected: SymbolId) -> Type {
+    if path.is_empty() {
+        return default_singleton_prefix(st, selected);
+    }
+    if let Some(owner) = classpath_owner_candidates(st, path)
+        .into_iter()
+        .find(|&id| st.get(id).is_class_like())
+    {
+        return Type::ThisType(owner);
+    }
+    if let Some(value) = find_singleton_symbol(st, path) {
+        let parent = path
+            .rsplit_once('.')
+            .map(|(prefix, _)| resolve_singleton_prefix(st, prefix, value))
+            .unwrap_or_else(|| default_singleton_prefix(st, value));
+        return Type::SingleType {
+            prefix: Box::new(parent),
+            sym: value,
+        };
+    }
+    if find_package_by_name(st, path).is_some() {
+        return Type::NoType;
+    }
+    default_singleton_prefix(st, selected)
+}
+
 pub fn find_or_stub_java_class(st: &mut SymbolTable, internal: &str) -> SymbolId {
     if let Some(id) = find_by_jvm(st, internal) {
         return id;
@@ -2953,6 +3095,36 @@ mod descriptor_semantics_tests {
         );
         assert_eq!(find_by_fully_qualified_name(&st, "Profile"), None);
         assert_eq!(find_by_fully_qualified_name(&st, "other.Profile"), None);
+    }
+
+    #[test]
+    fn compact_singleton_value_resolves_the_selected_term() {
+        let mut st = SymbolTable::new();
+        let package = ensure_package(&mut st, "p");
+        let object = st.alloc(
+            "package$",
+            package,
+            SymKind::ModuleClass,
+            Flags::MODULE.with(Flags::FINAL),
+            "p/package$",
+        );
+        let value = st.alloc("value", object, SymKind::Term, Flags::EMPTY, "");
+        st.get_mut(value).ty = Type::String;
+
+        let singleton = ClasspathType {
+            name: "value".into(),
+            args: Vec::new(),
+            singleton: true,
+            singleton_sym: Some("p.package.value".into()),
+            singleton_prefix: Some("p.package".into()),
+        };
+        assert_eq!(
+            resolve_type_in(&st, object, &singleton, &[]),
+            Type::SingleType {
+                prefix: Box::new(Type::ThisType(object)),
+                sym: value,
+            }
+        );
     }
 
     #[test]
