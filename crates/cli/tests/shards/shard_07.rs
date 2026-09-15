@@ -1,6 +1,8 @@
 //! Aggregated CLI integration tests (alphabetical slice 7/8).
 #![allow(clippy::duplicate_mod)] // Legacy fixtures intentionally share helper modules.
 
+#[path = "../fs2_io.rs"]
+mod fs2_io;
 #[path = "../samconv.rs"]
 mod samconv;
 #[path = "../scalalibmisc.rs"]

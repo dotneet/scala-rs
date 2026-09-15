@@ -1432,6 +1432,45 @@ impl Typer {
         crate::symbol::subst_tparams_slice(&ids, &vals, &lo)
     }
 
+    /// Read a declared lower bound at the kind of the parameter it constrains.
+    ///
+    /// A proper parameter (`B >: A`) uses the bound itself. A higher-kinded
+    /// parameter is stored in Scala pickles with its synthetic binders applied:
+    /// `F2[_] >: F[x]`. Once the receiver has fixed `F`, inference needs the
+    /// constructor (`IO`), not the proper application (`IO[x]`). Keeping the
+    /// application produces an extra type argument at every later use of `F2`;
+    /// dropping the bound altogether loses legitimate constructor inference.
+    fn lower_bound_at_tparam_kind(&self, tp: SymbolId, lo: Type) -> Option<Type> {
+        let arity = self.st.get(tp).tparams.len();
+        if arity == 0 {
+            return Some(lo);
+        }
+        let value = match lo {
+            Type::Applied { ctor, args }
+                if args.len() == arity
+                    && args
+                        .iter()
+                        .all(|arg| matches!(arg, Type::TypeParam(_) | Type::Wildcard)) =>
+            {
+                *ctor
+            }
+            Type::Class { sym, args }
+                if args.len() == arity
+                    && args
+                        .iter()
+                        .all(|arg| matches!(arg, Type::TypeParam(_) | Type::Wildcard)) =>
+            {
+                Type::Class {
+                    sym,
+                    args: Vec::new(),
+                }
+            }
+            _ => return None,
+        };
+        let value = self.st.dealias(&value);
+        (self.st.kind_arity(&value) == arity).then_some(value)
+    }
+
     pub(crate) fn pin_lower_bounded_implicit_tparams(
         &mut self,
         tree: &mut Tree,
@@ -1469,6 +1508,9 @@ impl Typer {
                 Some(r) if !r.is_no_type() && !r.is_error() => self.st.subst_as_seen_from(r, &lo),
                 None if mentions_any_tparam(&lo) => continue,
                 _ => lo,
+            };
+            let Some(lo) = self.lower_bound_at_tparam_kind(tp, lo) else {
+                continue;
             };
             // `Nothing` is nsc's "no constraint" answer, and a bound that is
             // still a type parameter nothing here can name says the receiver
@@ -2775,6 +2817,7 @@ impl Typer {
         } else {
             self.st.subst_tparams(owner, &owner_args, &lo)
         };
+        let lo = self.lower_bound_at_tparam_kind(tp, lo)?;
         // A bound that still mentions the *owner's* parameters was not read
         // through the receiver at all (`owner_args` was empty), and one that
         // mentions the method's own is a variable this very call is solving:
