@@ -2113,6 +2113,33 @@ object Main {
     }
 
     #[test]
+    fn inherited_stable_singleton_uses_concrete_type_alias() {
+        ok(r#"
+trait BasicProfile
+trait RelationalProfile extends BasicProfile
+trait SqlProfile extends RelationalProfile
+trait JdbcProfile extends SqlProfile
+object DatabaseConfig {
+  def forSource[P <: JdbcProfile](profile: P): P = profile
+}
+trait TestDB {
+  type Profile <: BasicProfile
+  val profile: Profile
+}
+trait RelationalTestDB extends TestDB {
+  type Profile <: RelationalProfile
+}
+trait SqlTestDB extends RelationalTestDB {
+  type Profile <: SqlProfile
+}
+abstract class JdbcTestDB extends SqlTestDB {
+  type Profile = JdbcProfile
+  def create: JdbcProfile = DatabaseConfig.forSource[profile.type](profile)
+}
+"#);
+    }
+
+    #[test]
     fn unstable_singleton_is_diagnosed() {
         let (_, _, diags) = typecheck_str(
             r#"

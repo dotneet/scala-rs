@@ -6580,11 +6580,12 @@ impl SymbolTable {
                 if matches!(b, Type::SingleType { sym: s2, .. } if s2 == sym) {
                     true
                 } else {
-                    let t = &self.get(*sym).ty;
+                    let declared = self.singleton_underlying(*sym);
+                    let t = self.expand_in_type(prefix, &declared);
                     if t.is_no_type() {
                         self.is_sub_type(prefix, b)
                     } else {
-                        self.is_sub_type(t, b)
+                        self.is_sub_type(&t, b)
                     }
                 }
             }
