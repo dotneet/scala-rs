@@ -874,11 +874,12 @@ impl PickleSupply {
             // particular, do not let an unrelated multi-clause overload of
             // the same name authorize removal of an ordinary unary method
             // (`TransactionTest.flatMap` is the regression guard).
-            // A one-parameter forwarder is only ambiguous outside a value
-            // class: ordinary classes and module classes commonly have
-            // genuine one-argument methods beside inherited declarations.
-            // Value-class forwarders are the erased bridge that this cleanup
-            // is intended to repair (Slick's `sign` is one).
+            // The name enumeration above only adds flat unary candidates for
+            // value-class forwarders: ordinary classes and module classes
+            // commonly have genuine one-argument methods beside inherited
+            // declarations. Existing candidates still retain the general
+            // `sole_implicit` cleanup below, which is needed for ordinary
+            // classes already carrying a flattened implicit declaration.
             let has_unary_flat = flat.iter().any(|(_, arity)| *arity == 1);
             if !installed.iter().any(|&i| {
                 let symbol = st.get(i);
