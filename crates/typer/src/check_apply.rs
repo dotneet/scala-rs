@@ -3456,7 +3456,10 @@ impl Typer {
                     // own type is the function or the class. Spelling the
                     // selection out sends it through `type_select`, which does
                     // walk the parents, and `b.apply()` already worked.
+                    // A missing apply on a Dynamic result would synthesize
+                    // another applyDynamic call, recursively growing the tree.
                     if matches!(strip_annotations(&fun_ty), Type::Refined { .. })
+                        && (has_apply || !self.is_dynamic_receiver(&fun_ty))
                         && self.retry_select_apply(tree, pt)
                     {
                         return;

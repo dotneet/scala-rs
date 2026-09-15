@@ -2695,6 +2695,18 @@ impl PickleSupply {
         // Members a later, more derived declaration displaced.
         let mut superseded: Vec<SymbolId> = Vec::new();
         for hit in &hits {
+            // A projection such as U#ModuleSymbol keeps U in its encoded name.
+            // Supply the declaring parent's arguments too: ordinary references
+            // were already substituted by lookup, but a projection still needs
+            // the receiver's meaning of U (e.g. Mirror[JavaUniverse.this.type]).
+            let mut class_scope = class_scope.clone();
+            if let Some(subst) = self.alias_owner_subst(st, bin, &hit.owner) {
+                for (name, ty) in subst {
+                    if let Some(ty) = self.conv_at(st, bin, &class_scope, &ty, 0) {
+                        class_scope.entry(name).or_insert(ty);
+                    }
+                }
+            }
             let m = &hit.member;
             // A nested `object`. Not a signature at all: what the class file
             // carries is an accessor returning the module class, and the

@@ -86,6 +86,12 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
                     && error.contains("recursive value local needs type")
             } else if name == "macrotransport_fields_bad" {
                 error.matches("integer storage is forbidden").count() == 4
+            } else if name == "refined_bundle_context_bad" {
+                if nsc {
+                    error.contains("macro bundles must be concrete monomorphic classes")
+                } else {
+                    error.contains("macro implementation reference has wrong shape")
+                }
             } else if name == "refined_bundle_bad" {
                 error.contains("bundle constructor rejected")
             } else if name == "macroparse_syntax_bad" {
@@ -343,4 +349,19 @@ fn macro_bundle_metadata_and_expansion_interoperate_with_scalac() {
         }
     }
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn macro_bundle_rejects_unrelated_context_refinements() {
+    let root = root();
+    for ours in [true, false] {
+        compile(
+            "refined_bundle_context_bad",
+            ours,
+            &root.join(format!("context-{ours}")),
+            &format!("{JAR}:{REFLECT}"),
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
 }

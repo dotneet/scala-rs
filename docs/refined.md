@@ -153,3 +153,41 @@ ScalaCheck の演算子への暗黙変換、依存型の推論、マクロの型
 `::` の型情報を直して HList の暗黙値探索が進むと、その先の診断が増えた。
 したがって、528件成功は「本体を scala-rs、テストを公式 scalac で生成した」結果であり、
 テストまで scala-rs で生成できたという意味ではない。
+
+
+## push 前の追加検証（2026-09-16）
+
+`07e69831` に対して `tests/verify_merge.sh` を最後の `DONE` まで実行した。
+workspace 3,436件は成功したが、全体の判定は `VERDICT=FAIL` だった。
+古いコーパス基準 `ff08907d` と、直前の main `ee2e3869` を区別するため、
+後者を別の出力先へビルドし、同じソース・依存物で失敗ケースを比較した。
+
+今回の変更で増えた以下の回帰を修正した。
+
+- 標準ライブラリ自身の List / Queue をコンパイルする際、`::` パターンが
+  同名の prelude シンボルを選択していた。ソース側のクラスを優先する。
+- Context に無関係な型メンバーを追加した macro bundle を拒否する。
+  正常な `PrefixType` refinement の bundle は引き続きコンパイル・実行できる。
+- 継承したメソッドの型射影に、親クラスの型引数を渡す。
+  `Mirror[U]` の `U#ModuleSymbol` を使う `staticModule` / `staticPackage` が
+  再び解決でき、ToolBox による型検査・実行も成功する。
+- 引数リストが不足した `applyDynamic` の結果に `apply` を挿入し続けていた。
+  この再帰を止め、不正な呼び出しを診断する。
+
+正常系・異常系を公式 scalac と比較する4件の回帰テストを追加した。
+修正後に refined の45ソースと利用側の smoke test を再実行して成功した。
+生成JARの全エントリは、前節の528件成功時のJARとバイト単位で一致した
+（ZIPコンテナのタイムスタンプは比較対象外）。
+
+以下は `ee2e3869` でも再現する既存の失敗であり、この push での修正対象には
+含めていない。全体ゲートが成功したとは扱わない。
+
+| 対象 | 変更前の main での対照結果 |
+|---|---|
+| Scala 標準ライブラリ | `TailCalls.scala:63` の1エラー。今回増えた List / Queue の3エラーは修正済み |
+| GitBucket | Twirl の `xml/feed.template.scala:11` で `Format[Html]` と `XmlFormat` の不一致 |
+| Slick 実行 | 12件中10件成功。2件は `Take.withInferredType(Map, boolean): Node` の `AbstractMethodError` |
+| Cats 実行 | `Monoids` の `NonEmptySetOps.contains` で JVM の `VerifyError`。修正前ゲートは他の8件成功 |
+
+検証には JDK 17 を使用し、コーパスは fixture manifest が固定する Scala
+2.13.16 の5,324件を使用した。既存の失敗を隠すための基準値変更は行っていない。

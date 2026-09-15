@@ -95,6 +95,29 @@ impl Typer {
     /// unqualified binary companion may itself hide the class's scope entry.
     /// Values with an `unapply` are left to the extractor branches.
     fn qualified_pattern_class(&mut self, fun: &Tree) -> Option<SymbolId> {
+        if let TreeKind::Ident { name } = &fun.kind {
+            // A source class in the lexical type namespace takes precedence
+            // over the prelude's same-JVM-name class behind a companion.
+            // This matters when compiling List itself without scala-library.
+            let mut candidates = if fun.scala_ref {
+                self.st.lookup_scala(name)
+            } else {
+                self.st.lookup(name)
+            };
+            if !candidates.is_empty()
+                && candidates
+                    .iter()
+                    .all(|id| self.st.get(*id).kind == SymKind::Method)
+            {
+                candidates = self.st.lookup_extractor(name);
+            }
+            if let Some(class) = candidates
+                .into_iter()
+                .find(|id| self.st.get(*id).kind == SymKind::Class)
+            {
+                return Some(self.follow_class_alias(class));
+            }
+        }
         if !matches!(fun.kind, TreeKind::Ident { .. } | TreeKind::Select { .. })
             || fun.sym.is_none()
         {

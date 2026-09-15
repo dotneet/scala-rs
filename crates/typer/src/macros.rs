@@ -7,7 +7,7 @@
 //! accepted, and [`Typer::strip_macro_defs`] keeps the macro def itself out of
 //! the bytecode the way nsc does. See `docs/macros.md` for the full design.
 
-use scala_rs_parser::{CaseDef, SymbolId, Template, Tree, TreeKind, Type};
+use scala_rs_parser::{CaseDef, Flags, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_span::Span;
 
 use crate::check::Typer;
@@ -591,8 +591,25 @@ impl Typer {
         let [context] = self.st.get(owner).ctor_fields.as_slice() else {
             return None;
         };
+        let cls = self.st.get(owner);
+        if !cls.tparams.is_empty()
+            || cls.flags.contains(Flags::ABSTRACT)
+            || cls.flags.contains(Flags::TRAIT)
+        {
+            return None;
+        }
+        let ty = &self.st.get(*context).ty;
+        // Scala permits only the Context refinement of its PrefixType member.
+        // An unrelated refinement cannot be supplied by the macro context.
+        if let Type::Refined { parents, decls } = ty {
+            if parents.len() != 1
+                || !matches!(decls.as_slice(), [scala_rs_parser::RefineDecl::Type { name, .. }] if name == "PrefixType")
+            {
+                return None;
+            }
+        }
         let mut names = Vec::new();
-        Self::context_type_names(&self.st, &self.st.get(*context).ty, &mut names);
+        Self::context_type_names(&self.st, ty, &mut names);
         names
             .iter()
             .any(|n| context_kind_of_name(n).is_some())

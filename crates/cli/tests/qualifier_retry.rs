@@ -144,3 +144,62 @@ fn erroneous_application_chain_does_not_repeat_dynamic_receiver_typing() {
     assert!(stderr.contains("not found: value missing"), "{stderr}");
     assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
 }
+
+#[test]
+fn malformed_dynamic_method_does_not_recursively_insert_apply() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let root = support::TestDir::new("dynamic-missing-clause");
+    let source = root.join("Main.scala");
+    fs::write(
+        &source,
+        "import scala.language.dynamics\ntrait Test { class C extends Dynamic { def applyDynamic(arg: Any): C = ??? }; val c = new C; def f = c.m(42) }\n",
+    )
+    .unwrap();
+    let mut child = support::ChildGuard::new(
+        Command::new(support::scala_rs())
+            .args([
+                "compile",
+                "--scala-library",
+                "/tmp/scala-rs-lib/scala-library-2.13.16.jar",
+            ])
+            .arg(&source)
+            .arg("-d")
+            .arg(&root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    // A malformed non-curried applyDynamic must produce a diagnostic,
+    // rather than an unbounded chain of generated applyDynamic("apply") calls.
+    let start = Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "malformed dynamic call did not finish within 20 seconds; source: {}",
+                source.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("value apply is not a member"), "{stderr}");
+    assert_eq!(stderr.matches("error:").count(), 1, "{stderr}");
+    let scalac = Command::new("/tmp/scala-2.13.16/bin/scalac")
+        .arg(&source)
+        .arg("-d")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!scalac.status.success());
+    assert!(String::from_utf8_lossy(&scalac.stderr).contains("does not take parameters"));
+}

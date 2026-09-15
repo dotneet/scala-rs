@@ -294,3 +294,9 @@ fn reify2_gaps_are_accepted_by_real_scalac() {
     );
     let _ = fs::remove_dir_all(&out_dir);
 }
+
+#[test]
+fn mirror_inherited_projection_uses_parent_type_argument() {
+    runs("reify2_mirror");
+    matches_real_scalac("reify2_mirror");
+}

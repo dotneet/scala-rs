@@ -237,3 +237,38 @@ fn warned_programs_still_run() {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Compiling the library itself must not bind source `::` patterns to the
+/// prelude class's type parameters, including under a same-name method.
+#[test]
+fn source_list_pattern_type_parameters_agree_with_scalac() {
+    let Some(sc) = scalac() else { return };
+    for (compiler, ours) in [(bin(), true), (sc, false)] {
+        for (fixture, accepted) in [
+            ("warn_source_list.scala", true),
+            ("warn_source_list_bad.scala", false),
+        ] {
+            let out = tmp_dir("source-list");
+            let mut cmd = Command::new(&compiler);
+            if ours {
+                cmd.args(["compile", "--no-scala-library"]);
+            }
+            let result = cmd
+                .arg(fixtures_dir().join(fixture))
+                .arg("-d")
+                .arg(&out)
+                .output()
+                .expect("compile source List");
+            let diagnostics = String::from_utf8_lossy(&result.stderr);
+            assert_eq!(
+                result.status.success(),
+                accepted,
+                "{fixture}: {diagnostics}"
+            );
+            if !accepted {
+                assert!(diagnostics.contains("type mismatch"), "{diagnostics}");
+            }
+            let _ = fs::remove_dir_all(out);
+        }
+    }
+}
