@@ -1190,7 +1190,7 @@ pub(crate) fn load_owner_instance(asm: &mut Assembler, ctx: &EmitCtx, owner: Sym
             // `slick.jdbc.PositionedResult$$anon$507` outright: `VerifyError:
             // Bad type on operand stack … Type uninitializedThis … is not
             // assignable to 'slick/jdbc/PositionedResult'`.
-            || ((ctx.presuper_outer.is_some() || ctx.ctor_outer.is_some())
+            || (ctx.presuper_outer.is_some()
                 && outer_chain_reaches_owner(ctx.st, ctx.class_sym, owner)));
     let (mut cur, mut held) = start_outer_walk(asm, ctx, hops);
     while !cur.is_none()
