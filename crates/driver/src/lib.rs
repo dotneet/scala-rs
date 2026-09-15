@@ -446,6 +446,7 @@ fn compile_paths_unreported(files: &[PathBuf], opts: &CompileOptions) -> Compile
                 u.pickles = std::rc::Rc::clone(&pickles);
                 erase(&mut u.tree, &mut st);
             }
+            scala_rs_typer::erase_value_class_default_getters(&mut st);
         }
         shared_st = Some(st);
     }

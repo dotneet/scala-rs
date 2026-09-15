@@ -155,9 +155,17 @@ pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {
         // prelude_coll.rs, prelude_mutcoll.rs) with the concrete result type,
         // and the class file's versions return the trait's own abstract `CC`
         // -- inheriting those turned `mutable.ArrayBuffer[Int]()` into an
-        // `ArrayBuffer[A]`. Nothing in the modeled subset calls a member
-        // *through* `IterableFactory` itself, so the trait carries none.
-        st.get_mut(fac).members.clear();
+        // `ArrayBuffer[A]`. Keep the nullary factory operation for calls
+        // through the interface itself (`factory: IterableFactory[CC]`).
+        // Companions still shadow it with their concrete `empty` declaration.
+        let empty: Vec<_> = st
+            .get(fac)
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| st.get(m).name == "empty")
+            .collect();
+        st.get_mut(fac).members = empty;
         for (module_jvm, class_jvm) in table {
             link(st, fac, module_jvm, class_jvm, map_like);
         }

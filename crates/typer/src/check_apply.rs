@@ -380,9 +380,10 @@ impl Typer {
             // choosing prototypes or overloads, independent of prior uses.
             if let Some(c) = class_id {
                 self.ensure_java_loaded(c, fun.span);
-                if curried_clauses.is_some() {
-                    self.supply_binary_ctors(c);
-                }
+                // Parameter names and defaults live in the Scala pickle,
+                // not in the erased classfile signature. Load them before
+                // placing named arguments, including single-clause calls.
+                self.supply_binary_ctors(c);
             }
             // `new C(b = 2, a = 1)`: named arguments must be put in parameter
             // order before the constructor overload is picked, since the pick

@@ -197,6 +197,26 @@ trait JdbcBackend extends BaseBackend {
 }
 
 object JdbcBackend extends JdbcBackend
+
+class NamedPool(val host: String = "localhost", val port: Int = 6379,
+                val database: Int = 0, val timeout: Int = 1000) {
+  def label: String = host + ":" + port + "/" + database + "@" + timeout
+}
+
+class StringOps(val text: String) { def sizeX: Int = text.length }
+trait SyntaxBase { implicit def enrich(text: String): StringOps = new StringOps(text) }
+object Syntax extends SyntaxBase
+
+trait Mapping[F[_], G[_]] { def apply[A](fa: F[A]): G[A] }
+class Box[F[_]](val value: F[Int])
+object AppliedAliases {
+  type Id[A] = A
+  object Id { def apply[A](a: A): A = a }
+  def identityBox: Box[Id] = new Box[Id](42)
+  type Numbers = List[Int]
+  type Pair = (Int, String)
+  type Count = Int
+}
 "#;
 
 /// gitbucket's `TransactionFilter` renames the alias exactly like this.
@@ -240,6 +260,12 @@ const A_EXPECTED: &str = "db\ndyn\ndyn\n";
 fn build_lib_jar(dir: &Path) -> PathBuf {
     let src = dir.join("alib.scala");
     fs::write(&src, A_LIB).unwrap();
+    let package = dir.join("package.scala");
+    fs::write(
+        &package,
+        "package object alib { type ~>[F[_], G[_]] = alib.Mapping[F, G] }",
+    )
+    .unwrap();
     let lib_out = dir.join("libout");
     fs::create_dir_all(&lib_out).unwrap();
     let scalac = self::scalac().expect("checked by caller");
@@ -247,6 +273,7 @@ fn build_lib_jar(dir: &Path) -> PathBuf {
         .arg("-d")
         .arg(&lib_out)
         .arg(&src)
+        .arg(&package)
         .output()
         .expect("run scalac");
     assert!(
@@ -368,4 +395,436 @@ fn real_scalac_agrees_on_both_fixtures() {
         "scalac reported something else:\n{msgs}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// Importing a nullary alias retains its applied RHS, including rejection of
+/// incompatible element types. The provider's declarations exist only in its
+/// ScalaSignature, not as JVM members.
+#[test]
+fn imported_alias_keeps_type_arguments() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    if jar_tool().is_none() {
+        return;
+    }
+    let dir = tmp_dir("applied-alias");
+    let lib = build_lib_jar(&dir);
+    for (label, body, accepted) in [
+        ("good", "val xs: Numbers = List(1, 2); val p: Pair = (xs.sum, \"ok\"); val n: Count = p._1; println(n)", true),
+        ("bad", "val xs: Numbers = List(\"wrong\")", false),
+        ("bad_pair", "val p: Pair = (\"wrong\", 1)", false),
+        ("bad_arity", "val xs: Numbers[String] = List(\"wrong\")", false),
+        ("identity", "val b: alib.Box[Id] = identityBox; println(b.value - 39)", true),
+        ("identity_bad", "val b: alib.Box[List] = identityBox", false),
+        ("operator_alias", "import alib.~>; val f: List ~> Option = new alib.Mapping[List, Option] { def apply[A](xs: List[A]): Option[A] = xs.headOption }; println(f(List(3)).get)", true),
+        ("import_prefix", "import alib.Syntax.enrich; println(\"abc\".sizeX)", true),
+    ] {
+        let source = dir.join(format!("{label}.scala"));
+        fs::write(&source, format!("import alib.AppliedAliases.{{Numbers, Pair, Count, Id, identityBox}}\nobject Main {{ def main(args: Array[String]): Unit = {{ {body} }} }}")).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &source, &lib)
+            } else {
+                let output = Command::new(&scalac).arg("-cp").arg(&lib).arg("-d").arg(&out).arg(&source).output().unwrap();
+                (output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned())
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted && java_available() {
+                assert_eq!(run_java(&out, &format!("{}:{}", jar.display(), lib.display())), "3\n");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn java_generic_method_override_retains_upper_bound() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    if Command::new("javac").arg("-version").output().is_err() {
+        return;
+    }
+    let dir = tmp_dir("java-upper-bound");
+    let java = dir.join("Bounded.java");
+    fs::write(
+        &java,
+        "public interface Bounded { <T extends Number> T value(T x); }",
+    )
+    .unwrap();
+    let provider = dir.join("provider");
+    fs::create_dir_all(&provider).unwrap();
+    assert!(Command::new("javac")
+        .arg("-d")
+        .arg(&provider)
+        .arg(&java)
+        .status()
+        .unwrap()
+        .success());
+    for (name, bound, accepted) in [
+        ("good", "Number", true),
+        ("narrow", "java.lang.Integer", false),
+    ] {
+        let src = dir.join(format!("{name}.scala"));
+        fs::write(&src, format!("class Impl extends Bounded {{ override def value[T <: {bound}](x: T): T = x }}\nobject Main {{ def main(args: Array[String]): Unit = {{ val b: Bounded = new Impl; println(b.value(java.lang.Integer.valueOf(42))) }} }}")).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{name}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &provider)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&provider)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{name}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), provider.display())),
+                    "42\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn single_clause_binary_constructor_names_and_defaults() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    if jar_tool().is_none() {
+        return;
+    }
+    let dir = tmp_dir("ctor-names");
+    let lib = build_lib_jar(&dir);
+    for (label, call, accepted) in [
+        (
+            "good",
+            "new alib.NamedPool(timeout = 42, host = \"remote\", database = 2)",
+            true,
+        ),
+        ("unknown", "new alib.NamedPool(missing = 42)", false),
+        ("wrong_type", "new alib.NamedPool(port = \"bad\")", false),
+        (
+            "duplicate",
+            "new alib.NamedPool(host = \"a\", host = \"b\")",
+            false,
+        ),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                "object Main {{ def main(args: Array[String]): Unit = println(({call}).label) }}"
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    "remote:6379/2@42\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn inherited_object_alias_uses_concrete_member() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("object-alias");
+    for (label, input, accepted) in [
+        ("good", "List(1, 2)", true),
+        ("wrong", "List(\"bad\")", false),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                r#"
+trait Family {{ type Elem; type Items = List[Elem] }}
+object Ints extends Family {{ type Elem = Int }}
+object Strings extends Family {{ type Elem = String }}
+object Main {{
+  def total(xs: Ints.Items): Int = xs.sum
+  def text(xs: Strings.Items): String = xs.mkString
+  def main(args: Array[String]): Unit = println(total({input}).toString + text(List("ok")))
+}}
+"#
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &jar)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(run_java(&out, jar.to_str().unwrap()), "3ok\n");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn implicit_clause_substitutes_dependent_member() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("dependent-implicit");
+    for (label, result, accepted) in [("good", "Int", true), ("wrong", "String", false)] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(&src, format!(r#"
+import scala.reflect.ClassTag
+trait Family {{ type Elem }}
+object Ints extends Family {{ type Elem = Int }}
+object Main {{
+  def array(f: Family)(implicit tag: ClassTag[f.Elem]): Array[f.Elem] = new Array[f.Elem](2)
+  def main(args: Array[String]): Unit = {{ val a: Array[{result}] = array(Ints); println(a.length) }}
+}}
+"#)).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &jar)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(run_java(&out, jar.to_str().unwrap()), "2\n");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn source_case(label: &str, source: &str, accepted: bool, expected: &str) {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir(label);
+    let src = dir.join("Main.scala");
+    fs::write(&src, source).unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &jar)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+        if accepted {
+            assert_eq!(run_java(&out, jar.to_str().unwrap()), expected);
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn context_bound_applies_captured_type_lambda() {
+    let source = r#"
+trait Operation[A, F[_], C]
+object Operation {
+  type With[A, F[_]] = { type T[C] = Operation[A, F, C] }
+  def get[A, F[_], C](implicit o: Operation[A, F, C]): Operation[A, F, C] = o
+}
+class Ops[A, F[_], C: Operation.With[A, F]#T](c: C) {
+  def op: Operation[A, F, C] = Operation.get[A, F, C]
+}
+object Main { def main(args: Array[String]): Unit = {
+  implicit val ev: Operation[Int, List, String] = new Operation[Int, List, String] {}
+  println(new Ops[Int, List, String]("a").op eq ev)
+} }
+"#;
+    source_case("context-projection", source, true, "true\n");
+    source_case(
+        "context-projection-bad",
+        &source.replace("implicit val ev", "val ev"),
+        false,
+        "",
+    );
+}
+
+#[test]
+fn higher_kinded_mutable_set_retains_receiver_type() {
+    source_case(
+        "factory-mutable-set",
+        r#"
+import scala.collection.{IterableFactory, mutable}
+object Main {
+  def empty[F[X] <: mutable.Set[X]](factory: IterableFactory[F]): F[Int] = factory.empty[Int]
+  def remove[F[X] <: mutable.Set[X]](xs: F[Int]): Option[F[Int]] = Some(xs).map(_ -= 1)
+  def main(args: Array[String]): Unit = {
+    val xs: mutable.HashSet[Int] = empty(mutable.HashSet)
+    xs += 1; xs += 2
+    val result: Option[mutable.HashSet[Int]] = remove(xs)
+    println(result.get eq xs)
+    println(result.get.sum)
+  }
+}
+"#,
+        true,
+        "true\n2\n",
+    );
+}
+
+#[test]
+fn lambda_body_instantiates_implicit_only_method() {
+    source_case(
+        "lambda-implicit-only",
+        r#"
+trait App[F[_]] { def pure[A](a: A): F[A] }
+object Main {
+  implicit class ValueOps[A](a: A) { def pure[F[_]](implicit app: App[F]): F[A] = app.pure(a) }
+  implicit val app: App[List] = new App[List] { def pure[A](a: A): List[A] = List(a) }
+  def main(args: Array[String]): Unit = {
+    val values = List(1, 2).map(_.pure)
+    println(values.flatten.sum)
+  }
+}
+"#,
+        true,
+        "3\n",
+    );
+}
+
+#[test]
+fn seq_view_flatmap_uses_iterable_result() {
+    let source = r#"
+object Main {
+  def add(xs: Seq[Int], flag: Boolean): Set[Int] = Set.empty[Int] ++ {
+    if (flag) xs.map { case i => i + 1 }.toSet
+    else for { x <- xs.view; y <- Seq(x, x + 1) } yield y
+  }
+  def main(args: Array[String]): Unit = {
+    println(add(Seq(1, 2), true).sum)
+    println(add(Seq(1, 2), false).sum)
+  }
+}
+"#;
+    source_case("seqview-flatmap", source, true, "5\n6\n");
+    source_case(
+        "seqview-flatmap-bad",
+        "object Main { val bad = Seq(1).view.flatMap(x => x) }",
+        false,
+        "",
+    );
+}
+
+#[test]
+fn parameterless_lower_bound_is_read_at_receiver() {
+    let source = r#"
+object Main {
+  val warm = Seq(1).toSet[AnyVal]
+  def convert(xs: Seq[String]): IterableOnce[String] = xs.toSet
+  def main(args: Array[String]): Unit = println(convert(Seq("ok", "ok")).iterator.mkString)
+}
+"#;
+    source_case("parameterless-bound", source, true, "ok\n");
+    source_case(
+        "parameterless-bound-bad",
+        &source.replace("IterableOnce[String] =", "IterableOnce[Int] ="),
+        false,
+        "",
+    );
+}
+
+#[test]
+fn case_copy_default_keeps_value_class_representation() {
+    source_case(
+        "value-class-copy-default",
+        r#"
+case class Key(value: String) extends AnyVal
+case class Number(value: Int) extends AnyVal
+trait Context { val key: Key; val number: Number }
+case class Row(override val key: Key, override val number: Number) extends Context
+object Main {
+  def main(args: Array[String]): Unit = {
+    val row = Row(Key("ok"), Number(42))
+    val copied = row.copy()
+    println(copied.key.value + copied.number.value)
+  }
+}
+"#,
+        true,
+        "ok42\n",
+    );
 }

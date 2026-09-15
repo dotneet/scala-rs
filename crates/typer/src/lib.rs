@@ -169,7 +169,10 @@ pub use check::{
 };
 pub use classpath::adapt_classpath;
 pub use default_recv::hoist_default_receivers;
-pub use erasure::{erase, erase_type, note_source_value_classes, tree_mentions_symbol};
+pub use erasure::{
+    erase, erase_type, erase_value_class_default_getters, note_source_value_classes,
+    tree_mentions_symbol,
+};
 pub use expand_private::{expand_private_names, expand_trait_private_vals};
 pub use lambda_lift::lambda_lift;
 pub use lazy_local::lazy_locals;

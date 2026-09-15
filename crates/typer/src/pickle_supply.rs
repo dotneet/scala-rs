@@ -382,7 +382,7 @@ impl PickleSupply {
                     other => (Vec::new(), other),
                 };
                 out.push(PickledAlias {
-                    name: m.name.clone(),
+                    name: scala_rs_pickle::names::decode_method_name(&m.name),
                     tparams: tps
                         .iter()
                         .map(|tp| PickledTParam {
@@ -2357,14 +2357,12 @@ impl PickleSupply {
                 return None;
             };
             let target = self.with_pickled_this_prefix(st, bin, this_prefix, target);
-            // A nullary alias is normally transparent, but a path-dependent
-            // nested class needs its enclosing prefix retained.  That prefix
-            // is represented as a refinement, which cannot itself be entered
-            // into an import scope as a type symbol.  Keep a local alias
-            // symbol for this one non-transparent shape so `import O.{A => B}`
-            // preserves both the source-level type name and the constructor's
-            // enclosing instance.
-            if matches!(&target, Type::Refined { decls, .. } if decls.iter().any(|d| matches!(d, scala_rs_parser::RefineDecl::Type { name, .. } if name == "<prefix>")))
+            // Only a plain class or an existing type member can itself bind
+            // an imported type name. Keep a declaration for other aliases:
+            // importing `type Positive = Greater[Nat._0]` must retain the
+            // argument, just as a path-dependent class retains its prefix.
+            if !matches!(&target, Type::Class { args, .. } if args.is_empty())
+                && !matches!(&target, Type::TypeMember(_))
             {
                 let id = st.alloc(name, owner, SymKind::TypeMember, Flags::EMPTY, "");
                 st.get_mut(id).ty = target;
@@ -6686,14 +6684,14 @@ impl PickleSupply {
         let (owner, simple) = sym.rsplit_once('.')?;
         // A companion's signature may exist without declaring this alias.
         // Continue to the class signature instead of treating that as a hit.
-        let alias = [true, false].into_iter().find_map(|module| {
+        let (module, alias) = [true, false].into_iter().find_map(|module| {
             let mut src = BinSource(bin);
             let sig = self.sigs.class_sig(&mut src, owner, module).ok()?;
             let alias = sig
                 .members_named(simple)
                 .find(|m| m.kind == MemberKind::TypeAlias)
                 .cloned();
-            alias
+            alias.map(|alias| (module, alias))
         })?;
         // A parameterised alias (`type List[+A] = immutable.List[A]`) binds its
         // own parameters to our arguments; a plain one has none.
@@ -6707,26 +6705,28 @@ impl PickleSupply {
             // as a bare `scala.package.Seq`, and `type Seq[+A] =
             // scala.collection.immutable.Seq[A]` is an alias. Declining it
             // failed the whole parent, which is why slick's `TableQuery`
-            // never got a pickled `Query` parent at all. Only an alias that
-            // is a plain eta-expansion (its right-hand side applies one class
-            // to its own parameters, in order) has a constructor to answer
-            // with; anything else is a type lambda this reader cannot spell.
+            // never got a pickled `Query` parent at all. A plain eta-expansion
+            // can use the target constructor directly; other aliases need
+            // their own type parameters and right-hand side retained.
             if args.is_empty() && !tps.is_empty() {
-                let SigType::Ref {
+                if let SigType::Ref {
                     sym: target,
                     args: targs,
                 } = &target
-                else {
-                    return None;
-                };
-                if targs.len() != tps.len()
-                    || !targs.iter().zip(tps.iter()).all(|(a, tp)| {
+                {
+                    if targs.len() == tps.len()
+                    && targs.iter().zip(tps.iter()).all(|(a, tp)| {
                         matches!(a, SigType::Ref { sym, args } if args.is_empty() && *sym == tp.name)
                     })
-                {
-                    return None;
+                    {
+                        return self.conv_ref(st, bin, scope, target, &[], d, tps.len());
+                    }
                 }
-                return self.conv_ref(st, bin, scope, target, &[], d, tps.len());
+                // Non-eta aliases still have a constructor: retain their
+                // parameters and RHS instead of confusing a companion object
+                // with the type (for example `type Id[A] = A; object Id`).
+                let owner = self.ensure_class(st, bin, owner, module)?;
+                return self.install_type_alias(st, bin, owner, simple, &alias.ty, None);
             }
             return None;
         }

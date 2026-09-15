@@ -1226,6 +1226,10 @@ impl Typer {
                         .collect()
                 };
                 let rest_tys = self.instantiate_from_call(sym, clause_idx, &first, args, rest_tys);
+                let rest_tys = rest_tys
+                    .into_iter()
+                    .map(|ty| self.subst_dependent_paths(&first, args, ty))
+                    .collect();
                 let rest_tys = self.solve_implicit_only_tparams(sym, rest_tys);
                 // Materializing a tag types nested applications with their own
                 // inference state. Keep this call's result bindings across

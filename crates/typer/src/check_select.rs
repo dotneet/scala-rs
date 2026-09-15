@@ -946,7 +946,7 @@ impl Typer {
             let ty = self.opaque_projection_params(&qual.ty, ty);
             let ty = self.java_empty_clause_for_eta(s, ty, pt);
             let ty = self.maybe_auto_apply(ty, pt);
-            tree.ty = self.instantiate_parameterless(s, ty, pt);
+            tree.ty = self.instantiate_parameterless_at(s, ty, pt, Some(&qual.ty));
             if let Type::Array(elem) = &qual.ty {
                 if name == "apply" {
                     tree.ty = Type::Method {

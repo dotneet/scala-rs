@@ -510,8 +510,22 @@ fn install_java_tparams(st: &mut SymbolTable, owner: SymbolId, params: &[crate::
             .map(|b| jtype_to_type(st, b, &env))
             .filter(|t| !matches!(t, Type::Any | Type::AnyRef))
             .collect();
-        st.get_mut(id).parents = bounds;
+        install_java_bounds(st, id, bounds);
     }
+}
+
+/// Java bounds participate both in member lookup/erasure (`parents`) and in
+/// Scala conformance checks (`bound_hi`), notably generic method overrides.
+fn install_java_bounds(st: &mut SymbolTable, id: SymbolId, bounds: Vec<Type>) {
+    st.get_mut(id).bound_hi = match bounds.as_slice() {
+        [] => None,
+        [bound] => Some(bound.clone()),
+        _ => Some(Type::Refined {
+            parents: bounds.clone(),
+            decls: Vec::new(),
+        }),
+    };
+    st.get_mut(id).parents = bounds;
 }
 
 fn add_term(st: &mut SymbolTable, owner: SymbolId, name: &str, ty: Type) -> SymbolId {
@@ -2654,7 +2668,7 @@ fn fill_java_members(st: &mut SymbolTable, owner: SymbolId, c: &crate::javaclass
                     .map(|b| jtype_to_type(st, b, &env))
                     .filter(|t| !matches!(t, Type::Any | Type::AnyRef))
                     .collect();
-                st.get_mut(*tid).parents = bounds;
+                install_java_bounds(st, *tid, bounds);
             }
             let params: Vec<Type> = ms
                 .params
