@@ -4315,11 +4315,13 @@ impl Typer {
 
     /// Can a constructor parameter's *declared* type be handed to its
     /// argument as the expected type without reading it through a prefix?
-    /// Only a type built from classes, arrays, tuples and functions whose
-    /// type parameters are the constructed class's own (`tps`, which the
-    /// caller substitutes or refuses). A type member, a singleton or an
-    /// enclosing class's parameter means something different at every
-    /// `new o.C(…)`, and nothing on this path does the as-seen-from.
+    /// Only a type built from classes, arrays, tuples and functions whose open
+    /// type parameters are not the constructed class's own (`tps`). A type
+    /// parameter belonging to the enclosing declaration is already fixed at
+    /// this call site: after `Parent[A]` substitutes `Parent`'s parameter,
+    /// `Evidence[A]` is a valid prototype for `implicitly`. A type member or a
+    /// singleton means something different at every `new o.C(…)`, and nothing
+    /// on this path does the as-seen-from.
     pub(crate) fn is_closed_ctor_proto(&self, ty: &Type, tps: &[SymbolId]) -> bool {
         match ty {
             Type::Unit
@@ -4338,7 +4340,7 @@ impl Typer {
             | Type::AnyVal
             | Type::Null
             | Type::Nothing => true,
-            Type::TypeParam(id) => tps.contains(id),
+            Type::TypeParam(id) => !tps.contains(id),
             Type::Array(t) => self.is_closed_ctor_proto(t, tps),
             Type::Class { args, .. } | Type::Tuple(args) => {
                 args.iter().all(|a| self.is_closed_ctor_proto(a, tps))
