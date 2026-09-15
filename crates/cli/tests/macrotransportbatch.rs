@@ -92,6 +92,8 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
                 } else {
                     error.contains("macro implementation reference has wrong shape")
                 }
+            } else if name == "macrotransport_bundle_bad" {
+                error.contains("could not find implicit value") || error.contains("type mismatch")
             } else if name == "refined_bundle_bad" {
                 error.contains("bundle constructor rejected")
             } else if name == "macroparse_syntax_bad" {
@@ -362,6 +364,184 @@ fn macro_bundle_rejects_unrelated_context_refinements() {
             &format!("{JAR}:{REFLECT}"),
             false,
         );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn inferred_macro_arguments_and_prefix_with_runtime_tag() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_prefix_tag",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("use-{consumer}"));
+        compile(
+            "macrotransport_prefix_tag_use",
+            consumer,
+            &output,
+            &cp,
+            true,
+        );
+        assert_eq!(run(&output, &cp), b"Payload\nString\ndone\n");
+        compile(
+            "macrotransport_prefix_tag_bad",
+            consumer,
+            &root.join(format!("bad-{consumer}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn source_nested_declarations_aliases_and_access_boundaries_match_scalac() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_mirror_features",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for nsc in [true, false] {
+        let output = root.join(format!("use-{nsc}"));
+        compile(
+            "macrotransport_mirror_features_use",
+            nsc,
+            &output,
+            &cp,
+            true,
+        );
+        assert_eq!(
+            run(&output, &cp),
+            b"true:String:true:Outer:mirrorfixture:true\n"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn binary_macro_bundle_preserves_literal_type_arguments() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_bundle",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for nsc in [true, false] {
+        let output = root.join(format!("use-{nsc}"));
+        compile("macrotransport_bundle_use", nsc, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"100\nready\n");
+        compile(
+            "macrotransport_bundle_bad",
+            nsc,
+            &root.join(format!("bad-{nsc}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn natural_number_bundle_matches_scalac_at_runtime() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"].into_iter()
+        .map(|root| PathBuf::from(&home).join(root).join("https/repo1.maven.org/maven2/com/chuusai/shapeless_2.13/2.3.10/shapeless_2.13-2.3.10.jar"))
+        .find(|jar| jar.is_file());
+    let Some(jar) = jar else {
+        eprintln!("skip: shapeless 2.3.10 is not cached");
+        return;
+    };
+    let root = root();
+    // The published bundle has signatures referencing nsc internals. The jar
+    // is a link dependency of the macro, not a source-compilation fallback.
+    let compiler = "/tmp/scala-2.13.16/lib/scala-compiler.jar";
+    if !Path::new(compiler).is_file() {
+        return;
+    }
+    let cp = format!("{JAR}:{REFLECT}:{compiler}:{}", jar.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("out-{nsc}"));
+        compile("macrotransport_natural", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"0\n1\n2\n10\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn binary_parent_loading_preserves_higher_kinded_parameters() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut jars = Vec::new();
+    for artifact in [
+        "io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar",
+        "io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar",
+        "org/typelevel/cats-core_2.13/2.11.0/cats-core_2.13-2.11.0.jar",
+        "org/typelevel/cats-kernel_2.13/2.11.0/cats-kernel_2.13-2.11.0.jar",
+    ] {
+        let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+            .into_iter()
+            .map(|cache| {
+                PathBuf::from(&home)
+                    .join(cache)
+                    .join("https/repo1.maven.org/maven2")
+                    .join(artifact)
+            })
+            .find(|jar| jar.is_file());
+        let Some(jar) = jar else {
+            eprintln!("skip: {artifact} is not cached");
+            return;
+        };
+        jars.push(jar.to_string_lossy().into_owned());
+    }
+    let root = root();
+    let cp = format!("{JAR}:{}", jars.join(":"));
+    for nsc in [true, false] {
+        let out = root.join(format!("out-{nsc}"));
+        compile("macrotransport_binary_kinds", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"\"ok\"\nList(42)\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nested_binary_class_type_trees_round_trip_through_macros() {
+    let root = root();
+    let implementation = root.join("implementation");
+    let base_cp = format!("{JAR}:{REFLECT}");
+    compile(
+        "macrotransport_nested_binary",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("out-{nsc}"));
+        compile("macrotransport_nested_binary_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"true\n");
     }
     fs::remove_dir_all(root).unwrap();
 }

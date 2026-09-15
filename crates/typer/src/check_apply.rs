@@ -1060,6 +1060,7 @@ impl Typer {
         }
 
         let mut recv_ty = match &fun.kind {
+            _ if matches!(fun.ty, Type::Class { .. } | Type::ModuleRef(_)) => Some(fun.ty.clone()),
             TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
             _ => None,
         };
@@ -1508,6 +1509,26 @@ impl Typer {
             for c in self.overload_param_classes(&fun_ty) {
                 fresh |= self.warm_one_scope_pub(c);
             }
+            let alternatives = match &fun_ty {
+                Type::Overload(alts) => alts.as_slice(),
+                other => std::slice::from_ref(other),
+            };
+            for alt in alternatives {
+                if let Type::Method { paramss, .. } = alt {
+                    if let Some(params) = paramss.first() {
+                        for (arg, param) in arg_tys.iter().zip(params) {
+                            let param = match param {
+                                Type::ByName(inner) | Type::Repeated(inner) => inner.as_ref(),
+                                other => other,
+                            };
+                            if !self.st.is_sub_type(arg, param) {
+                                self.warm_conversion_witnesses(arg, param);
+                                fresh = true;
+                            }
+                        }
+                    }
+                }
+            }
             if fresh {
                 chosen = self.resolve_overload_targs(
                     &fun_ty,
@@ -1584,7 +1605,10 @@ impl Typer {
                         // `ConcurrencyControl.scala`). A non-overloaded member kept
                         // the substituted type all along, which is why only
                         // overloaded ones were affected.
-                        if matches!(&fun.ty, Type::Overload(_)) {
+                        if matches!(
+                            &fun.ty,
+                            Type::Overload(_) | Type::ModuleRef(_) | Type::Class { .. }
+                        ) {
                             fun.ty = self
                                 .overload_member_types
                                 .get(&group_key.0)
@@ -1592,7 +1616,12 @@ impl Typer {
                                     alts.iter().find(|(s, _)| *s == sym).map(|(_, t)| t.clone())
                                 })
                                 .filter(|t| matches!(t, Type::Method { .. }))
-                                .unwrap_or_else(|| self.st.get(sym).ty.clone());
+                                .unwrap_or_else(|| match &recv_ty {
+                                    Some(recv) => {
+                                        self.st.subst_as_seen_from(recv, &self.st.get(sym).ty)
+                                    }
+                                    None => self.st.get(sym).ty.clone(),
+                                });
                         }
                         // Overload resolution already returns the member as seen
                         // from its receiver. Applying owner arguments again
@@ -1676,6 +1705,14 @@ impl Typer {
                                                         && !params
                                                             .iter()
                                                             .any(|p| type_mentions_tparam(p, *tp))
+                                                }
+                                                Type::Class { sym, args }
+                                                    if is_partial_function_sym(&self.st, *sym)
+                                                        && args.len() == 2 =>
+                                                {
+                                                    self.tparam_variance_in(&args[1], *tp, 1)
+                                                        == Some(1)
+                                                        && !type_mentions_tparam(&args[0], *tp)
                                                 }
                                                 _ => false,
                                             }
@@ -2007,6 +2044,27 @@ impl Typer {
                                 _ => p.clone(),
                             };
                             let relaxed = match &p_shape {
+                                Type::Class { sym, args }
+                                    if is_partial_function_sym(&self.st, *sym)
+                                        && args.len() == 2
+                                        && mentions_tparam(&args[1], &open) =>
+                                {
+                                    // PartialFunction literals infer their result
+                                    // just like Function1 literals. An open B in
+                                    // Future[B] must not become Future[Any] before
+                                    // typing a nested flatMap in recoverWith.
+                                    Type::Class {
+                                        sym: *sym,
+                                        args: vec![
+                                            args[0].clone(),
+                                            crate::symbol::subst_tparams_slice(
+                                                &open,
+                                                &vec![Type::Wildcard; open.len()],
+                                                &args[1],
+                                            ),
+                                        ],
+                                    }
+                                }
                                 Type::Function { params, ret } if mentions_tparam(ret, &open) => {
                                     let wilds = vec![Type::Wildcard; open.len()];
                                     // A function result can determine its own
@@ -3217,7 +3275,17 @@ impl Typer {
                     let ret = self.subst_dependent_members(&param_tys, &arg_tys, &ret);
                     let params: Vec<SymbolId> =
                         self.st.get(sym).paramss.iter().flatten().copied().collect();
-                    let ret = self.subst_dependent_paths(&params, args, ret);
+                    let ret =
+                        if params.len() != args.len() && Self::application_head(fun).sym == sym {
+                            // The result of f(a)(b) can name a parameter in either
+                            // clause. Align the complete application with the
+                            // declaration rather than comparing only b with (a,b).
+                            let mut actuals = Self::applied_clause_args(fun);
+                            actuals.extend(args.iter().cloned());
+                            self.subst_dependent_paths(&params, &actuals, ret)
+                        } else {
+                            self.subst_dependent_paths(&params, args, ret)
+                        };
                     let ret = self.instantiate_leftover_tparams(sym, ret, pt, args.len());
                     // nsc's `applyImplicitArgs` ends `if (args contains
                     // EmptyTree) setError(tree)`. The witness that was not
@@ -3527,7 +3595,9 @@ impl Typer {
     /// that way -- a user's `def map[R2](f: R => R2): Act[R2, NoStream, E]`
     /// would lose two arguments -- so its declared result type stands.
     fn map_result_uses_element(&self, method: SymbolId, result: &Type, args: &[Tree]) -> bool {
-        if method.is_none() || self.st.get(method).pickled_origin.is_empty() {
+        if method.is_none()
+            || (method.0 < self.st.prelude_end && self.st.get(method).pickled_origin.is_empty())
+        {
             return true;
         }
         let Type::Class {

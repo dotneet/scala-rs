@@ -438,6 +438,21 @@ impl Typer {
     /// An overloaded module member competes through its apply methods. Once
     /// one wins, preserve the original receiver in `receiver.module.apply`.
     pub(crate) fn select_overloaded_module_apply(&mut self, fun: &mut Tree, chosen: SymbolId) {
+        if !chosen.is_none() && matches!(fun.ty, Type::ModuleRef(_)) {
+            // Preserve the module expression when the callee becomes its apply
+            // method. Replacing only the symbol leaves a package qualifier as
+            // the runtime receiver of a qualified object application.
+            let receiver = fun.clone();
+            fun.ty = self
+                .st
+                .subst_as_seen_from(&receiver.ty, &self.st.get(chosen).ty);
+            fun.kind = TreeKind::Select {
+                qual: Box::new(receiver),
+                name: "apply".into(),
+            };
+            fun.sym = chosen;
+            return;
+        }
         if chosen.is_none() || !matches!(fun.ty, Type::Overload(_)) {
             return;
         }
@@ -918,6 +933,25 @@ impl Typer {
                 // its package object both carry `math.max`. Identical
                 // signatures are one alternative, not an ambiguity.
                 let mut winners = winners;
+                if winners.is_empty() {
+                    // Unrelated parameter types can still be ordered by their
+                    // declaring owners. Compare both parts of relativeWeight,
+                    // rather than dropping the owner test with the empty set.
+                    let weight =
+                        |a: &(SymbolId, Vec<Type>, Type), b: &(SymbolId, Vec<Type>, Type)| {
+                            u8::from(self.is_as_specific_method(a.0, b.0, &a.1, &b.1, with_views))
+                                + u8::from(self.owner_is_proper_subclass(a.0, b.0))
+                        };
+                    winners = applicable
+                        .iter()
+                        .filter(|a| {
+                            applicable
+                                .iter()
+                                .all(|b| a.0 == b.0 || weight(a, b) > weight(b, a))
+                        })
+                        .cloned()
+                        .collect();
+                }
                 winners.dedup_by(|a, b| {
                     module_apply_candidates.contains(&a.0) == module_apply_candidates.contains(&b.0)
                         && self.st.get(a.0).name == self.st.get(b.0).name
@@ -1170,12 +1204,21 @@ impl Typer {
         let owners: Vec<_> = self
             .overload_alternatives(fun.sym, &name)
             .into_iter()
-            .map(|m| self.st.get(m).declaring_class.clone())
+            .flat_map(|m| {
+                let symbol = self.st.get(m);
+                let mut owners = vec![symbol.declaring_class.clone()];
+                if let Some((owner, _)) = symbol.pickled_origin.split_once('#') {
+                    owners.push(owner.replace('.', "/"));
+                }
+                owners
+            })
             .filter(|owner| !owner.is_empty())
             .collect();
         for owner in owners {
             let cls = crate::classpath::find_or_stub_java_class(&mut self.st, &owner);
             self.ensure_java_loaded(cls, fun.span);
+            self.pickle
+                .ensure_parents(&mut self.st, &mut self.binary, cls);
         }
     }
 
@@ -1191,17 +1234,29 @@ impl Typer {
             self.st.get(a).pickled_origin.split_once('#'),
             self.st.get(b).pickled_origin.split_once('#'),
         ) {
-            return ao != bo
-                && self
-                    .st
-                    .get(a)
-                    .pickled_owner_bases
-                    .iter()
-                    .any(|base| base == bo);
+            if ao == bo {
+                return false;
+            }
+            if self
+                .st
+                .get(a)
+                .pickled_owner_bases
+                .iter()
+                .any(|base| base == bo)
+            {
+                return true;
+            }
         }
         let declaration_owner = |m: SymbolId| {
             let symbol = self.st.get(m);
-            crate::classpath::find_by_jvm(&self.st, &symbol.declaring_class).unwrap_or(symbol.owner)
+            symbol
+                .pickled_origin
+                .split_once('#')
+                .and_then(|(owner, _)| {
+                    crate::classpath::find_by_jvm(&self.st, &owner.replace('.', "/"))
+                })
+                .or_else(|| crate::classpath::find_by_jvm(&self.st, &symbol.declaring_class))
+                .unwrap_or(symbol.owner)
         };
         let ao = declaration_owner(a);
         let bo = declaration_owner(b);
@@ -1478,7 +1533,13 @@ impl Typer {
         // `println(x: Any)` -- `println()` never was a candidate -- and the
         // `if` keeps `Any` rather than joining its branches to `Double`.
         if let Type::Overload(alts) = fun_ty {
-            if let Some(p) = sole_arity_match_param(alts, idx, nargs) {
+            if let Some(p) = sole_arity_match_param(alts, idx, nargs, |alt, total| {
+                self.overload_member_types
+                    .get(&sym.0)
+                    .and_then(|group| group.iter().find(|(_, ty)| ty == alt))
+                    .map(|(id, _)| self.trailing_omissible(*id, 0, nargs, total))
+                    .unwrap_or(true)
+            }) {
                 return p;
             }
         }
@@ -2412,6 +2473,11 @@ impl Typer {
         allow_widen: bool,
         open: &[SymbolId],
     ) -> bool {
+        // A by-name formal constrains the value produced by its thunk.
+        // Views (including boxing) must be searched against that value type.
+        if let Type::ByName(inner) = param {
+            return self.arg_conforms(arg, inner, allow_widen, open);
+        }
         // Numeric widening is weak conformance, which nsc's applicability
         // (`isWeaklyCompatible`) uses from the first try: `f(3)` against
         // `f(x: AnyVal)` and `f(x: Double)` has both applicable, and the more
@@ -3358,10 +3424,8 @@ impl Typer {
             _ => None,
         };
         let pt = as_fn.as_ref().unwrap_or(pt);
-        // Only a `{ case … }` literal inhabits a `PartialFunction`; the parser
-        // encodes one as `x$pf => x$pf match { … }`. A total function literal
-        // must still be rejected, the way nsc rejects
-        // `t.recover((x: Int) => x + 1)`.
+        let was_case_block = is_case_block_literal(vparams, body);
+        // A case block is encoded as `x$pf => x$pf match { … }`.
         // nsc: `{ case (a, b) => … }` where a `FunctionN` is expected takes N
         // parameters and matches the N-tuple of them, not one parameter.
         if is_case_block_literal(vparams, body) {
@@ -3380,11 +3444,12 @@ impl Typer {
                 }
             }
         }
-        let pf_result = if is_case_block_literal(vparams, body) {
-            partial_function_type(&self.st, pt)
-        } else {
-            None
-        };
+        // Scala 2.13 also adapts a total, single-parameter function literal
+        // to an expected PartialFunction. An already evaluated Function1
+        // value is not adapted; this path only types literal syntax.
+        let pf_result = (vparams.len() == 1)
+            .then(|| partial_function_type(&self.st, pt))
+            .flatten();
         let sam = if pf_result.is_none() {
             self.sam_sig_here(pt)
         } else {
@@ -3561,6 +3626,35 @@ impl Typer {
         self.st.owner = saved_owner;
         self.macro_lexical_owner = saved_macro_owner;
         if let Some((from, _to)) = &pf_result {
+            if !self.st.is_sub_type(from, &param_tys[0]) {
+                return Type::Function {
+                    params: param_tys,
+                    ret: Box::new(ret),
+                };
+            }
+            let matches_parameter = matches!(&body.kind,
+                TreeKind::Match { selector, .. } if selector.sym == vparams[0].sym);
+            if !was_case_block && !matches_parameter {
+                // A total literal has one unconditional case. A match on
+                // its own parameter supplies the partial function's cases,
+                // just like a case-block literal in Scala 2.13.
+                let p = &vparams[0];
+                let mut selector = Tree::dummy(TreeKind::Ident {
+                    name: p.name().unwrap_or("_").to_string(),
+                });
+                selector.sym = p.sym;
+                selector.ty = p.ty.clone();
+                let original = body.clone();
+                body.kind = TreeKind::Match {
+                    selector: Box::new(selector),
+                    cases: vec![scala_rs_parser::CaseDef {
+                        pat: Tree::dummy(TreeKind::Wildcard),
+                        guard: Tree::dummy(TreeKind::Empty),
+                        body: original,
+                        span: body.span,
+                    }],
+                };
+            }
             // Keep the expected `PartialFunction` shape, but fill in a result
             // type the caller still has to infer (`xs.collect { case … }`'s `B`,
             // which arrives here as a bare `Any`) from the case bodies. `B` is
@@ -3647,7 +3741,12 @@ pub(crate) fn not_inherited_static(
 /// parameter list can take `nargs` arguments, when that type is fully
 /// determined. An alternative with *more* parameters might be completed by
 /// defaults, which its type does not record, so it counts as a match.
-fn sole_arity_match_param(alts: &[Type], idx: usize, nargs: usize) -> Option<Type> {
+fn sole_arity_match_param(
+    alts: &[Type],
+    idx: usize,
+    nargs: usize,
+    missing: impl Fn(&Type, usize) -> bool,
+) -> Option<Type> {
     let mut found: Option<&[Type]> = None;
     for a in alts {
         let Type::Method { paramss, .. } = a else {
@@ -3655,7 +3754,9 @@ fn sole_arity_match_param(alts: &[Type], idx: usize, nargs: usize) -> Option<Typ
         };
         let ps: &[Type] = paramss.first().map(|p| p.as_slice()).unwrap_or(&[]);
         let repeated = ps.last().is_some_and(|p| matches!(p, Type::Repeated(_)));
-        let fits = ps.len() == nargs || (repeated && nargs + 1 >= ps.len()) || nargs < ps.len();
+        let fits = ps.len() == nargs
+            || (repeated && nargs + 1 >= ps.len())
+            || (nargs < ps.len() && missing(a, ps.len()));
         if fits {
             if found.is_some() {
                 return None;

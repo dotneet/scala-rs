@@ -1345,7 +1345,7 @@ impl Typer {
         // side at all, was "value Session is not a member of object
         // JdbcBackend". Run whether or not the term was found, for exactly
         // that reason. Same shape as `expose_unqualified_type`.
-        if self.library_abi && self.st.lookup_type(to).is_empty() {
+        if self.library_abi && !self.st.has_real_type_entry(to) {
             for &owner in owners {
                 if owner.is_none() {
                     continue;
@@ -2007,6 +2007,15 @@ impl Typer {
         for cls in enclosing {
             let mut work: std::collections::VecDeque<Type> =
                 self.st.get(cls).parents.iter().rev().cloned().collect();
+            // A self type makes its aliases visible just like its terms.
+            // Classfile members cannot enumerate aliases, so include every
+            // component in the lazy type-member lookup too.
+            if let Some(self_type) = &self.st.get(cls).self_type {
+                match self_type {
+                    Type::Refined { parents, .. } => work.extend(parents.iter().cloned()),
+                    other => work.push_back(other.clone()),
+                }
+            }
             let mut seen = std::collections::HashSet::new();
             seen.insert(cls.0);
             while let Some(p) = work.pop_front() {

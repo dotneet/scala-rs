@@ -72,6 +72,7 @@ const STANDARD_CASE_ANCESTORS: [&str; 6] = [
 
 /// One declaration of a described class, as it goes over the wire.
 enum Decl {
+    Source(SymbolId),
     /// A scala-rs symbol that is also exactly one nsc symbol -- a method or
     /// a constructor. Its info is asked for by identity, when forced.
     Member {
@@ -109,6 +110,7 @@ impl Decl {
         };
         let mut out = String::new();
         match self {
+            Decl::Source(id) => return format!("(ds {})", id.0),
             Decl::Member {
                 id,
                 name,
@@ -182,7 +184,31 @@ impl Typer {
             SymKind::ModuleClass => self.mirror_module_decls(cls)?,
             other => return Err(format!("`{name}` is a {other:?}, not a class")),
         };
-        let decls: Vec<String> = decls.iter().map(Decl::wire).collect();
+        let mut wires = Vec::new();
+        for decl in &decls {
+            let mut wire = decl.wire();
+            let id = match decl {
+                Decl::Source(id) | Decl::Member { id, .. } => Some(*id),
+                Decl::View { id, view, .. } if *view != "field" => Some(*id),
+                _ => None,
+            };
+            if let Some(id) = id {
+                if let Some(within) = &self.st.get(id).private_within {
+                    let mut boundary = self.st.get(id).owner;
+                    while !boundary.is_none()
+                        && self.st.get(boundary).name.trim_end_matches('$') != within
+                    {
+                        boundary = self.st.get(boundary).owner;
+                    }
+                    if boundary.is_none() {
+                        return Err(qualified_access(&self.st.get(id).name, within));
+                    }
+                    wire = format!("(scoped {} {wire})", boundary.0);
+                }
+            }
+            wires.push(wire);
+        }
+        let decls = wires;
         let info = format!(
             "(classinfo (parents {}) (decls {}))",
             parents.join(" "),
@@ -272,9 +298,6 @@ impl Typer {
         let s = self.st.get(id);
         let name = s.name.clone();
         let flags = s.flags;
-        if let Some(within) = &s.private_within {
-            return Err(qualified_access(&name, within));
-        }
         let mutable = flags.contains(Flags::MUTABLE);
         let local = flags.contains(Flags::LOCAL);
         let private = flags.contains(Flags::PRIVATE);
@@ -505,9 +528,6 @@ impl Typer {
                     self.val_views(m, false, false, !local_only, is_trait, &mut out)?;
                 }
                 SymKind::Method => {
-                    if let Some(within) = &ms.private_within {
-                        return Err(qualified_access(&ms.name, within));
-                    }
                     let flags = self.method_flags(m);
                     out.push(Decl::Member {
                         id: m,
@@ -515,6 +535,8 @@ impl Typer {
                         flags,
                     });
                 }
+                SymKind::Class | SymKind::Module | SymKind::TypeMember => out.push(Decl::Source(m)),
+                SymKind::ModuleClass if self.mirror_module_pair(m).is_some() => {}
                 other => {
                     return Err(format!(
                         "`{}` is {}, which scala-rs cannot describe to the engine",
@@ -579,8 +601,7 @@ impl Typer {
     /// nsc's `SyntheticMethods.hasOverridingImplementation`: not when the
     /// class declares one itself, nor when it inherits a concrete one from
     /// anywhere but the classes the synthetics stand in for. An ancestor read
-    /// from a class file may declare one this compiler has not loaded, so
-    /// such an ancestor is a refusal rather than a guess.
+    /// from a class file is completed before checking its declarations.
     fn nsc_synthesizes(&mut self, cls: SymbolId, name: &str) -> Result<bool, String> {
         if self
             .st
@@ -612,12 +633,14 @@ impl Typer {
                 continue;
             }
             if !self.is_current_run_class(pid) {
-                return Err(format!(
-                    "`{}` inherits from `{}`, a class read from the classpath, which may \
-                     declare a `{name}` that keeps nsc from synthesising one",
-                    self.st.get(cls).name,
-                    jvm.replace('/', ".")
-                ));
+                // The binary declaration can answer whether it overrides a
+                // synthetic method. Complete just this member and its parents
+                // before deciding, as for ordinary member selection.
+                self.ensure_java_loaded(pid, scala_rs_span::Span::DUMMY);
+                let parent_ty = self.st.type_of_class(pid);
+                self.supply_from_pickle(&parent_ty, name);
+                self.pickle
+                    .ensure_parents(&mut self.st, &mut self.binary, pid);
             }
             let concrete = self.st.get(pid).members.iter().any(|&m| {
                 let ms = self.st.get(m);
@@ -684,9 +707,6 @@ impl Typer {
             match ms.kind {
                 SymKind::Method if ms.name == "<init>" => {}
                 SymKind::Method => {
-                    if let Some(within) = &ms.private_within {
-                        return Err(qualified_access(&ms.name, within));
-                    }
                     let flags = self.method_flags(m);
                     out.push(Decl::Member {
                         id: m,
@@ -699,6 +719,8 @@ impl Typer {
                         ms.flags.contains(Flags::PRIVATE) && ms.flags.contains(Flags::LOCAL);
                     self.val_views(m, false, false, !local_only, false, &mut out)?;
                 }
+                SymKind::Class | SymKind::Module | SymKind::TypeMember => out.push(Decl::Source(m)),
+                SymKind::ModuleClass if self.mirror_module_pair(m).is_some() => {}
                 other => {
                     return Err(format!(
                         "`{}` is {}, which scala-rs cannot describe to the engine",

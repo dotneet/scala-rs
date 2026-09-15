@@ -5484,7 +5484,50 @@ impl SymbolTable {
     /// varargs element types. Walks the parent chain, so
     /// `lub(Circle, Rect) = Shape` for a sealed `Shape` hierarchy.
     pub fn lub(&self, a: &Type, b: &Type) -> Type {
-        self.lub_at(a, b, 0)
+        let plain = self.lub_at(a, b, 0);
+        if self.is_sub_type(a, b) || self.is_sub_type(b, a) {
+            return plain;
+        }
+        // Keep every independent common base of branch classes. Picking only
+        // Product for two case classes discards their shared domain parent;
+        // a later case returning that parent would then join to AnyRef.
+        if matches!(a, Type::Class { .. } | Type::Refined { .. })
+            && matches!(b, Type::Class { .. } | Type::Refined { .. })
+        {
+            let mut common = vec![plain.clone()];
+            for base in self
+                .base_type_seq(a)
+                .into_iter()
+                .chain(self.base_type_seq(b))
+            {
+                if matches!(base, Type::Class { .. })
+                    && !common.contains(&base)
+                    && self.is_sub_type(a, &base)
+                    && self.is_sub_type(b, &base)
+                {
+                    common.push(base);
+                }
+            }
+            let minimal: Vec<Type> = common
+                .iter()
+                .enumerate()
+                .filter(|(i, base)| {
+                    !common.iter().enumerate().any(|(j, other)| {
+                        i != &j
+                            && self.is_sub_type(other, base)
+                            && (!self.is_sub_type(base, other) || j < *i)
+                    })
+                })
+                .map(|(_, base)| base.clone())
+                .collect();
+            if minimal.len() > 1 {
+                return Type::Refined {
+                    parents: minimal,
+                    decls: Vec::new(),
+                };
+            }
+        }
+        plain
     }
 
     /// `lub` with nsc's depth cap.
@@ -5565,6 +5608,41 @@ impl SymbolTable {
                         .map(|(x, y)| self.lub_at(x, y, depth + 1))
                         .collect(),
                 );
+            }
+        }
+        if let (Type::Applied { ctor: ac, args: aa }, Type::Applied { ctor: bc, args: ba }) =
+            (&a, &b)
+        {
+            if ac == bc && aa.len() == ba.len() {
+                let params = match ac.as_ref() {
+                    Type::TypeParam(id) | Type::TypeMember(id) => self.get(*id).tparams.as_slice(),
+                    _ => &[],
+                };
+                let args = aa
+                    .iter()
+                    .zip(ba)
+                    .enumerate()
+                    .map(|(i, (x, y))| {
+                        let flags = params
+                            .get(i)
+                            .map(|p| self.get(*p).flags)
+                            .unwrap_or(Flags::EMPTY);
+                        if flags.contains(Flags::CONTRAVARIANT) {
+                            self.glb(x, y)
+                        } else if flags.contains(Flags::COVARIANT) || x == y {
+                            self.lub_at(x, y, depth + 1)
+                        } else {
+                            Type::BoundedWildcard {
+                                lo: None,
+                                hi: Some(Box::new(self.lub_at(x, y, depth + 1))),
+                            }
+                        }
+                    })
+                    .collect();
+                return Type::Applied {
+                    ctor: ac.clone(),
+                    args,
+                };
             }
         }
         // Same class constructor, differing arguments: join the arguments.
@@ -6066,6 +6144,9 @@ impl SymbolTable {
             }
         }
         match (a, b) {
+            (Type::ThisType(x), Type::ModuleRef(y))
+            | (Type::ModuleRef(x), Type::ThisType(y))
+                if x == y && self.get(*x).kind == SymKind::ModuleClass => true,
             (Type::Error, _) | (_, Type::Error) => true,
             (Type::Nothing, _) => true,
             (_, Type::Any) => true,
@@ -7465,6 +7546,15 @@ impl SymbolTable {
                         return false;
                     }
                     if let Some(want) = rhs {
+                        // Existential members constrain a range, not equality
+                        // with the wildcard marker itself. Specificity erases
+                        // polymorphic evidence to such a member.
+                        if matches!(want, Type::Wildcard | Type::BoundedWildcard { .. }) {
+                            if !self.is_sub_type(&have, want) {
+                                return false;
+                            }
+                        }
+
                         // Abstract `{ type A <: T }` / `{ type F[_] }` store a
                         // TypeMember placeholder; only aliases constrain equality.
                         let abstract_placeholder = match want {
@@ -7474,7 +7564,9 @@ impl SymbolTable {
                             ),
                             _ => false,
                         };
-                        if !abstract_placeholder {
+                        if !abstract_placeholder
+                            && !matches!(want, Type::Wildcard | Type::BoundedWildcard { .. })
+                        {
                             if *tparams > 0 {
                                 let args: Vec<Type> = (0..*tparams).map(|_| Type::Int).collect();
                                 let have_app = self.expand_applied_hk_alias(apply_type_ctor(

@@ -454,7 +454,7 @@ impl Typer {
                 if type_mentions_tparam(other, tp)
                     || self.st.get(tp).kind != SymKind::TypeParam
                     || self.tparam_in_scope(tp)
-                    || self.tparam_variance_in(&out, tp, 1) != Some(1)
+                    || !matches!(self.tparam_variance_in(&out, tp, 1), Some(0 | 1))
                 {
                     continue;
                 }

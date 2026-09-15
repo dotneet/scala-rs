@@ -235,6 +235,55 @@ object Evidence {
   def read[A](implicit ev: Evidence[A]): A = ev.value
 }
 
+trait PhantomEvidence[A] { def value: String }
+object PhantomEvidence {
+  implicit def unit[A >: String <: CharSequence]: PhantomEvidence[Unit] =
+    new PhantomEvidence[Unit] { def value: String = "phantom" }
+}
+trait SelfAliases { type Receive = PartialFunction[Any, Unit] }
+trait SelfOther
+
+trait Pack[A] { type Out }
+class Packed[A]
+class DependentMap[A] {
+  def map[B](f: A => B)(implicit pack: Pack[B]): Packed[pack.Out] = new Packed[pack.Out]
+}
+
+case class Captured[E,A](value: A)
+trait Replace[F[_]] { def replace[A,B](fa: F[A], b: B): F[B] }
+object Captured {
+  implicit def replace[E]: Replace[({ type L[A] = Captured[E,A] })#L] =
+    new Replace[({ type L[A] = Captured[E,A] })#L] {
+      def replace[A,B](fa: Captured[E,A], b: B): Captured[E,B] = Captured[E,B](b)
+    }
+}
+class ReplaceOps[F[_],A](fa: F[A]) {
+  def replacing[B](b: B)(implicit F: Replace[F]): F[B] = F.replace(fa,b)
+}
+object ReplaceSyntax {
+  implicit def ops[F[_],A](fa: F[A]): ReplaceOps[F,A] = new ReplaceOps(fa)
+}
+
+object FunctionDefaults {
+  var evaluations: Int = 0
+  def take(f: () => Long = () => { evaluations += 1; 42L }): Long = f()
+}
+trait ConstructorEvidence[A] { def label: String }
+class Bounded[A: ConstructorEvidence](val value: A)(implicit val suffix: String) {
+  def label: String = implicitly[ConstructorEvidence[A]].label + suffix
+}
+class ParentTransform {
+  def transform[A](f: java.util.function.Function[String, java.util.concurrent.CompletionStage[A]]): Int = 1
+}
+class ChildTransform extends ParentTransform {
+  def transform[A](f: Int => Boolean => String => A): Int = 2
+}
+
+trait DomainHeader { def label: String }
+trait MarkerHeader extends DomainHeader
+case class FirstHeader(label: String) extends MarkerHeader
+case class SecondHeader(label: String) extends DomainHeader
+
 class NamedPool(val host: String = "localhost", val port: Int = 6379,
                 val database: Int = 0, val timeout: Int = 1000) {
   def label: String = host + ":" + port + "/" + database + "@" + timeout
@@ -254,6 +303,60 @@ object AppliedAliases {
   type Pair = (Int, String)
   type Count = Int
 }
+
+trait ProtectedBase[A] { protected def value: A; protected def length: Int = -1 }
+object ProtectedBase {
+  trait Read[A, C] { def read(c: C): A }
+  implicit class Ops[A, C](c: C)(implicit r: Read[A, C]) { def length: Int = r.read(c).toString.length }
+}
+abstract class ProtectedFactory[A, C <: ProtectedBase[A]] {
+  final def unapply(c: C): Some[A] = Some(extract(c))
+  def extract(c: C): A
+  implicit val reader: ProtectedBase.Read[A, C] = new ProtectedBase.Read[A, C] { def read(c: C): A = extract(c) }
+}
+trait ArrayParser {
+  def parse(value: Array[Byte]): String = "bytes:" + value.length
+  def parse(value: java.io.InputStream): String = "stream"
+  def parse(value: java.io.Reader): String = "reader"
+}
+object Parser extends ArrayParser
+import scala.language.dynamics
+object DynamicApi extends scala.Dynamic {
+  def known[T](value: T): T = value
+  def applyDynamic(name: String)(args: Any*): String = name
+}
+
+trait RefinedEvidence { type T; def tag: String }
+object RefinedEvidence {
+  type Aux[A] = RefinedEvidence { type T = A }
+  implicit val specific: Aux[Int] = new RefinedEvidence { type T = Int; def tag = "specific" }
+  implicit def generic[A]: Aux[A] = new RefinedEvidence { type T = A; def tag = "generic" }
+}
+
+trait InvariantBox[A]
+trait Element { type Self <: Element; def companion: InvariantBox[Self] }
+trait IsTuple[A]
+object IsTuple { implicit def one[A]: IsTuple[Tuple1[A]] = new IsTuple[Tuple1[A]] {} }
+trait TupleEvidence[A] { type Out; def apply(a: A): Out }
+trait FallbackEvidence {
+  implicit def single[A]: TupleEvidence[A] { type Out = Tuple1[A] } =
+    new TupleEvidence[A] { type Out = Tuple1[A]; def apply(a: A) = Tuple1(a) }
+}
+object TupleEvidence extends FallbackEvidence {
+  implicit def tuple[A](implicit ev: IsTuple[A]): TupleEvidence[A] { type Out = A } =
+    new TupleEvidence[A] { type Out = A; def apply(a: A) = a }
+}
+
+trait UnaryFunction {
+  def apply[A, B](value: A)(implicit impl: UnaryFunction.Impl[this.type, A, B]): B = impl(value)
+}
+object UnaryFunction { trait Impl[Tag, A, B] { def apply(value: A): B } }
+object DoubleFunction extends UnaryFunction {
+  implicit object DoubleImpl extends UnaryFunction.Impl[DoubleFunction.type, Double, Double] {
+    def apply(value: Double): Double = value * 2
+  }
+}
+
 "#;
 
 /// gitbucket's `TransactionFilter` renames the alias exactly like this.
@@ -1122,6 +1225,802 @@ fn intersection_witness_infers_open_target_without_losing_requirements() {
 }
 
 #[test]
+fn phantom_implicit_parameters_and_binary_self_aliases() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("phantom-self-alias");
+    let lib = build_lib_jar(&dir);
+    for (label, source, expected) in [
+        (
+            "valid",
+            r#"
+trait Handler { self: alib.SelfAliases with alib.SelfOther =>
+  def receive: Receive = { case _ => () }
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(implicitly[alib.PhantomEvidence[Unit]].value)
+    val h = new Handler with alib.SelfAliases with alib.SelfOther
+    h.receive("ok")
+    println(h.receive.isDefinedAt(1))
+  }
+}
+"#,
+            Some("phantom\ntrue\n"),
+        ),
+        (
+            "wrong-evidence",
+            "object Main { implicitly[alib.PhantomEvidence[String]] }",
+            None,
+        ),
+        (
+            "wrong-alias",
+            r#"
+trait Handler { self: alib.SelfAliases with alib.SelfOther =>
+  def receive: Receive = 1
+}
+"#,
+            None,
+        ),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(&src, source).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, expected.is_some(), "{label}, ours={ours}: {diagnostic}");
+            if let Some(expected) = expected {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    expected
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn partial_function_result_can_widen_the_receiver_lower_bound() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("recover-result");
+    for (label, result, accepted) in [
+        ("widen", "Either[String, Int]", true),
+        ("narrow", "Right[Nothing, Int]", false),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(&src, format!(r#"
+import scala.concurrent.{{Await, ExecutionContext, Future}}
+import scala.concurrent.duration.Duration
+object Main {{
+  implicit val ec: ExecutionContext = ExecutionContext.global
+  def recover(f: Future[Right[Nothing, Int]]): Future[{result}] =
+    f.recover {{ case _: IllegalArgumentException => Left("bad") }}
+  def main(args: Array[String]): Unit = {{
+    println(Await.result(recover(Future.successful(Right(1))), Duration(10, "seconds")))
+    println(Await.result(recover(Future.failed(new IllegalArgumentException)), Duration(10, "seconds")))
+  }}
+}}
+"#)).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &jar)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, jar.to_str().unwrap()),
+                    "Right(1)\nLeft(bad)\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn curried_binary_results_keep_the_actual_dependent_path() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("curried-dependent-path");
+    let lib = build_lib_jar(&dir);
+    for (label, result_path, accepted) in [("same", "p", true), ("different", "q", false)] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(&src, format!(r#"
+object Main {{
+  def map[A,B](d: alib.DependentMap[A], f: A => B)(p: alib.Pack[B], q: alib.Pack[B]): alib.Packed[{result_path}.Out] = d.map(f)(p)
+  def main(args: Array[String]): Unit = {{
+    val p = new alib.Pack[String] {{ type Out = String }}
+    val result: alib.Packed[String] = map(new alib.DependentMap[Int], (i: Int) => i.toString)(p,p)
+    println(result != null)
+  }}
+}}
+"#)).unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    "true\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn standard_optional_value_class_conversions_run() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("optional-converters");
+    for (label, typ, accepted) in [("valid", "String", true), ("invalid", "Int", false)] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                r#"
+import scala.jdk.OptionConverters._
+object Main {{
+  def main(args: Array[String]): Unit = {{
+    val value: Option[{typ}] = java.util.Optional.of("hello").toScala
+    println(value)
+    println(java.util.Optional.empty[String]().toScala)
+    println(Option("roundtrip").toJava.get())
+  }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &jar)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, jar.to_str().unwrap()),
+                    "Some(hello)\nNone\nroundtrip\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn binary_type_lambdas_capture_parameters_for_syntax_inference() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("captured-type-lambda");
+    let lib = build_lib_jar(&dir);
+    for (label, error_type, accepted) in [
+        ("captured", "String", true),
+        ("wrong-capture", "Boolean", false),
+    ] {
+        let src = dir.join(format!("{label}.scala"));
+        fs::write(
+            &src,
+            format!(
+                r#"
+import alib.ReplaceSyntax._
+object Main {{
+  def main(args: Array[String]): Unit = {{
+    val start = alib.Captured[String,Int](42)
+    val result: alib.Captured[{error_type},String] = start.replacing("done")
+    println(result.value)
+  }}
+}}
+"#
+            ),
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let out = dir.join(format!("{label}-{ours}"));
+            fs::create_dir_all(&out).unwrap();
+            let (ok, diagnostic) = if ours {
+                compile_against(&out, &jar, &src, &lib)
+            } else {
+                let o = Command::new(&scalac)
+                    .arg("-cp")
+                    .arg(&lib)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&src)
+                    .output()
+                    .unwrap();
+                (
+                    o.status.success(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                )
+            };
+            assert_eq!(ok, accepted, "{label}, ours={ours}: {diagnostic}");
+            if accepted {
+                assert_eq!(
+                    run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+                    "done\n"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn branch_common_bases_and_byname_conversions_match_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("branch-byname");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(&src, r#"
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.Duration
+object Main {
+  def headers(xs: Seq[alib.DomainHeader]) = {
+    val result = xs.map {
+      case alib.FirstHeader(s) => alib.FirstHeader(s + "1")
+      case alib.SecondHeader(s) => alib.SecondHeader(s + "2")
+      case h => h
+    }
+    val checked: Seq[alib.DomainHeader] = result
+    checked
+  }
+  def delayed(x: java.lang.Boolean)(implicit ec: ExecutionContext): Future[Boolean] = Future[Boolean] { x }
+  def main(args: Array[String]): Unit = {
+    println(headers(List(alib.FirstHeader("a"), alib.SecondHeader("b"))).map(_.label).mkString(","))
+    implicit val ec: ExecutionContext = ExecutionContext.global
+    println(Await.result(delayed(java.lang.Boolean.TRUE), Duration(10, "seconds")))
+  }
+}
+"#).unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "a1,b2\ntrue\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn binary_declaring_owner_orders_unrelated_function_parameters() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("declaring-owner");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(
+        &src,
+        r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(new alib.ChildTransform().transform(_ => _ => s => s.length))
+  }
+}
+"#,
+    )
+    .unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "2\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn binary_function_defaults_and_context_bound_constructor_order() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("default-context-bound");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(&src, r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    println(alib.FunctionDefaults.take())
+    println(alib.FunctionDefaults.evaluations)
+    implicit val evidence: alib.ConstructorEvidence[Int] = new alib.ConstructorEvidence[Int] { def label: String = "int" }
+    implicit val suffix: String = "!"
+    println(new alib.Bounded[Int](42).label)
+    class Derived[A: alib.ConstructorEvidence](value: A)(implicit suffix: String) extends alib.Bounded[A](value)
+    println(new Derived[Int](42).label)
+  }
+}
+"#).unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "42\n1\nint!\nint!\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ordered_parent_and_dependent_shuffle_builder() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("ordered-shuffle");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(&src, r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    case class Item(value: Int) extends Ordered[Item] { def compare(other: Item): Int = value.compare(other.value) }
+    println(scala.collection.immutable.SortedSet(Item(2), Item(1)).toList.map(_.value))
+    println(scala.util.Random.shuffle(Seq(1, 2)).size)
+  }
+}
+"#).unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "List(1, 2)\n2\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn protected_member_uses_inherited_companion_witness() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("protected-witness");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(&src, r#"
+case class Wrapper(protected val value: String) extends alib.ProtectedBase[String] { def content: String = value }
+object Wrapper extends alib.ProtectedFactory[String, Wrapper] { def extract(c: Wrapper): String = c.content }
+object Noise {
+  trait Missing[A]
+  implicit class Unavailable[A](a: A)(implicit ev: Missing[A]) { def length: Int = -1 }
+}
+import Noise._
+object Main { def main(args: Array[String]): Unit = { println(Wrapper("hello").length); println(Array("a", "b").lift(1)) } }
+
+"#).unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "5\nSome(b)\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn inherited_array_overloads_and_real_dynamic_members_match_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("array-overload");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(
+        &src,
+        r#"
+object Main { def main(args: Array[String]): Unit = {
+  println(alib.Parser.parse(Array[Byte](1, 2)))
+  println(alib.DynamicApi.known(42))
+  println(implicitly[alib.RefinedEvidence.Aux[Int]].tag)
+  println(implicitly[alib.RefinedEvidence.Aux[String]].tag)
+} }
+"#,
+    )
+    .unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "bytes:2\n42\nspecific\ngeneric\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn abstract_override_and_correlated_implicit_results_match_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("abstract-correlated");
+    let lib = build_lib_jar(&dir);
+    let src = dir.join("Main.scala");
+    fs::write(
+        &src,
+        r#"
+trait DerivedElement extends alib.Element {
+  type Self = DerivedElement
+  def companion: alib.InvariantBox[DerivedElement]
+}
+object Main {
+  def choose[A](a: A)(implicit ev: alib.TupleEvidence[A]): ev.Out = ev(a)
+  def main(args: Array[String]): Unit = {
+    println(choose(Tuple1("ok")))
+    println(choose("value"))
+    println(alib.DoubleFunction(2.0))
+    import alib.DoubleFunction
+    println(DoubleFunction(3.0))
+  }
+}
+"#,
+    )
+    .unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "(ok)\n(value)\n4.0\n6.0\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn native_universal_trait_accepts_value_class_clients() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("universal-trait");
+    let lib = dir.join("lib");
+    fs::create_dir_all(&lib).unwrap();
+    let producer = dir.join("Universal.scala");
+    fs::write(
+        &producer,
+        "package universal; trait Value extends Any { def value: Int; def next: Int = value + 1 }",
+    )
+    .unwrap();
+    let (ok, diagnostic) = compile_against(&lib, &jar, &producer, &jar);
+    assert!(ok, "{diagnostic}");
+    let src = dir.join("Main.scala");
+    fs::write(
+        &src,
+        r#"
+class Number(val value: Int) extends AnyVal with universal.Value
+object Main { def main(args: Array[String]): Unit = println(new Number(41).next) }
+"#,
+    )
+    .unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &lib)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-cp")
+                .arg(&lib)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &format!("{}:{}", jar.display(), lib.display())),
+            "42\n"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn literal_views_partial_functions_and_invariant_branch_bounds_match_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("literal-adaptation");
+    let src = dir.join("Main.scala");
+    fs::write(&src, r#"
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.{Duration, DurationDouble}
+trait Algebra[F[_]] { def pure[A](a: A): F[A] }
+class Box[A](val value: A)
+object Box extends Algebra[Box] { def pure[A](a: A): Box[A] = new Box(a) }
+trait Branches[F[_]] {
+  def source: F[Seq[Int]]
+  def choose(flag: Boolean)(implicit F: Algebra[F]) = if (flag) source else F.pure(Seq.empty)
+  def bounded(flag: Boolean)(implicit F: Algebra[F]): F[_ <: Seq[Int]] = choose(flag)
+}
+object Main extends Branches[Box] {
+  def source = Box.pure(Seq(42))
+  implicit val ec: ExecutionContext = ExecutionContext.global
+  def recovered: Future[Int] = Future.failed[Int](new Exception).recoverWith { _ => Future.successful(42) }
+  def ready(f: Future[Int]): Future[Int] = Await.ready(f, Duration.Inf)
+  def nested: Future[(Int, String)] = for {
+    values <- Future.successful(Seq(1))
+    pair <- Future.failed[(Int, String)](new Exception).recoverWith { _ =>
+      Future.successful(values).flatMap(_ => Future.successful((42, "ok")))
+    }
+  } yield pair
+  def main(args: Array[String]): Unit = {
+    println(1.day.toHours)
+    println(3.days.toHours)
+    println(bounded(true)(Box).value)
+    println(bounded(false)(Box).value)
+    val total: PartialFunction[Int, Int] = x => x match { case 1 => 42 }
+    println(total.isDefinedAt(2))
+    println(total(1))
+    println(total.applyOrElse(1, (_: Int) => -1))
+    println(Await.result(ready(recovered), Duration.Inf))
+    val lookup: PartialFunction[Int, String] = List(1 -> "ok").toMap
+    println(lookup(1))
+    println(Await.result(nested, Duration.Inf))
+  }
+}
+"#).unwrap();
+    for ours in [false, true] {
+        let out = dir.join(format!("out-{ours}"));
+        fs::create_dir_all(&out).unwrap();
+        let (ok, diagnostic) = if ours {
+            compile_against(&out, &jar, &src, &jar)
+        } else {
+            let o = Command::new(&scalac)
+                .arg("-d")
+                .arg(&out)
+                .arg(&src)
+                .output()
+                .unwrap();
+            (
+                o.status.success(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+            )
+        };
+        assert!(ok, "ours={ours}: {diagnostic}");
+        assert_eq!(
+            run_java(&out, &jar.display().to_string()),
+            "24\n72\nList(42)\nList()\nfalse\n42\n42\n42\nok\n(42,ok)\n"
+        );
+        let bad = dir.join("Bad.scala");
+        for code in [
+            "object Bad { val f: Int => Int = x => x; val pf: PartialFunction[Int, Int] = f }",
+            "object Bad { val pf: PartialFunction[String, Int] = (x: Int) => x }",
+        ] {
+            fs::write(&bad, code).unwrap();
+            let ok = if ours {
+                compile_against(&out, &jar, &bad, &jar).0
+            } else {
+                Command::new(&scalac)
+                    .arg("-d")
+                    .arg(&out)
+                    .arg(&bad)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            };
+            assert!(!ok, "ours={ours} accepted {code}");
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn refined_inherited_alias_keeps_receiver_and_method_parameters() {
     source_case(
         "refined-inherited-alias",
@@ -1159,7 +2058,7 @@ fn binary_abstract_value_uses_refinement_alias() {
     let provider = dir.join("provider");
     fs::create_dir_all(&provider).unwrap();
     let libsrc = dir.join("Witness.scala");
-    fs::write(&libsrc, "package alib; trait Witness { type T; val value: T }; object Witness { type Aux[A] = Witness { type T = A }; def apply[A](a: A): Aux[A] = new Witness { type T = A; val value: T = a } }").unwrap();
+    fs::write(&libsrc, "package alib; trait Witness { type T; val value: T }; object Witness { type Aux[A] = Witness { type T = A }; def apply[A](a: A): Aux[A] = new Witness { type T = A; val value: T = a } }; trait ToTraversable[L, M[_], E] { type Out = M[E]; def apply(l: L): Out }; trait ToList[L, E] extends ToTraversable[L, List, E]").unwrap();
     let result = Command::new(&scalac)
         .arg("-d")
         .arg(&provider)
@@ -1184,6 +2083,21 @@ fn binary_abstract_value_uses_refinement_alias() {
         (
             "wrong-result",
             "object Main { def bad(w: alib.Witness.Aux[String]): Int = w.value }",
+            None,
+        ),
+        (
+            "inherited-constructor-alias",
+            r#"object Main {
+              def names[K](k: K)(implicit tl: alib.ToList[K, Symbol]): List[String] = tl(k).map(_.name)
+              def main(args: Array[String]): Unit = println(names(())(new alib.ToList[Unit, Symbol] {
+                def apply(k: Unit): Out = List(Symbol("ok"))
+              }).head)
+            }"#,
+            Some("ok\n"),
+        ),
+        (
+            "inherited-constructor-alias-bad",
+            "object Main { def bad[K](k: K)(implicit tl: alib.ToList[K, Symbol]): List[Int] = tl(k).map(_.name) }",
             None,
         ),
     ] {
@@ -1323,5 +2237,15 @@ object Main {
 "#,
         true,
         "-1\n1\n",
+    );
+}
+
+#[test]
+fn primitive_extension_prefers_float_over_widening_to_double() {
+    source_case(
+        "float-isnan",
+        "object Main { def nan(x: Float): Boolean = x.isNaN; def main(args: Array[String]): Unit = { println(nan(Float.NaN)); println(nan(1.0f)) } }",
+        true,
+        "true\nfalse\n",
     );
 }

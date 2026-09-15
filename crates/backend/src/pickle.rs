@@ -2572,11 +2572,13 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             .get(class_id)
             .parents
             .iter()
-            // `Any` is nobody's parent in a pickle, and a self-reference
+            // Universal traits retain their Any parent so value classes may
+            // mix them in. Other Any parents and a self-reference
             // (which the table can carry for a class that extends its own
             // companion's type) would be a cycle for the reader.
             .filter(|p| {
-                !matches!(p, Type::Any | Type::NoType | Type::Error)
+                !matches!(p, Type::NoType | Type::Error)
+                    && (!matches!(p, Type::Any) || class_flags.contains(Flags::TRAIT))
                     && self.facts.class_sym_of(p) != Some(class_id)
             })
             .cloned()

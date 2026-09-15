@@ -2852,6 +2852,7 @@ impl<'a> Gen<'a> {
                     || ps.name == "<clinit>"
                     || ps.flags.contains(Flags::STATIC)
                     || ps.flags.contains(Flags::PARAM)
+                    || ps.flags.contains(Flags::FINAL)
                 {
                     continue;
                 }
@@ -3328,6 +3329,8 @@ impl<'a> Gen<'a> {
                 if !matches!(ps.kind, SymKind::Method | SymKind::Term)
                     || ps.flags.contains(Flags::PRIVATE)
                     || ps.flags.contains(Flags::STATIC)
+                    || (ps.flags.contains(Flags::FINAL)
+                        && ![self.st.anyref_sym, self.st.any_sym].contains(&parent))
                 {
                     continue;
                 }

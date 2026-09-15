@@ -361,7 +361,15 @@ impl Typer {
         if !evidence.is_empty() {
             self.class_bound_evidence_types
                 .insert(id, evidence.iter().map(|ev| ev.ty.clone()).collect());
-            vparamss.push(evidence);
+            let merge = vparamss.last().is_some_and(|clause| clause.first().is_some_and(|p| {
+                matches!(&p.kind, TreeKind::ValDef { mods, .. } if mods.flags.contains(Flags::IMPLICIT))
+            }));
+            if merge {
+                let last = vparamss.last_mut().unwrap();
+                last.splice(0..0, evidence);
+            } else {
+                vparamss.push(evidence);
+            }
         }
         // Ctor params must be typed before `extends C(z)` so the argument `z`
         // is a known term, not a NoType ident.
@@ -1730,6 +1738,29 @@ impl Typer {
     /// with no tree of its own (a constructor field) falls back to the
     /// template's.
     fn check_overrides(&mut self, class_id: SymbolId, body: &[Tree], span: Span) {
+        let names: std::collections::HashSet<String> = body
+            .iter()
+            .filter_map(|tree| tree.name().map(str::to_owned))
+            .collect();
+        for base in crate::lin::linearize(&self.st, class_id)
+            .into_iter()
+            .skip(1)
+        {
+            if base.0 < self.st.prelude_end || self.st.is_source_class(base) {
+                continue;
+            }
+            let ty = self.st.type_of_class(base);
+            for name in &names {
+                if self
+                    .st
+                    .lookup_member(base, name)
+                    .iter()
+                    .any(|id| self.st.get(*id).flags.contains(Flags::JAVA))
+                {
+                    self.supply_from_pickle(&ty, name);
+                }
+            }
+        }
         // Return types may name a binary class whose hierarchy has not been
         // requested yet. Absence of loaded parents cannot prove that an
         // inherited implementation has an incompatible nominal result.
@@ -1755,6 +1786,8 @@ impl Typer {
             // collection declarations while an unrelated class is checked.
             if c.0 >= self.st.prelude_end && !self.st.is_source_class(c) {
                 self.ensure_java_loaded(c, span);
+                self.pickle
+                    .complete_class_pattern_metadata(&mut self.st, &mut self.binary, c);
             }
             for parent in self.st.get(c).parents.clone() {
                 if let Some(p) = self.st.class_sym_of(&parent) {

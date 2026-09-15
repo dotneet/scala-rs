@@ -1188,7 +1188,7 @@ impl Typer {
                 && rest_ids
                     .iter()
                     .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT));
-            if all_impl && !matches!(pt, Type::Method { .. } | Type::Function { .. }) {
+            if all_impl && !matches!(pt, Type::Method { .. }) {
                 // Prefer the (possibly TypeApply-substituted) method type so
                 // `mk[Int](2)` searches `ClassTag[Int]`, not raw `ClassTag[T]`.
                 let rest_tys: Vec<Type> = if self.st.get(sym).name == "<init>"
@@ -1656,7 +1656,17 @@ impl Typer {
             byname_thunk: false,
             byname_type_marker: false,
         };
-        self.type_expr(&mut gfun, &Type::NoType);
+        // A parameterless getter is selected without an argument list.
+        // Adding () would instead invoke a Function0 returned by that getter.
+        if matches!(&self.st.get(gid).ty, Type::Method { paramss, .. } if paramss.is_empty()) {
+            self.type_expr(&mut gfun, &Type::NoType);
+            return Some(gfun);
+        }
+        let getter_pt = Type::Method {
+            paramss: vec![],
+            ret: Box::new(Type::NoType),
+        };
+        self.type_expr(&mut gfun, &getter_pt);
         // A parameter whose type is still a type parameter of the method
         // being applied is not an expectation the getter has to meet -- it is
         // what the getter's result *determines*. nsc infers the method's type
@@ -1772,7 +1782,7 @@ impl Typer {
     /// The arguments of the parameter clauses already applied to `fun`. A
     /// `name$default$n` getter for a later clause takes all of them
     /// (`def f(a: Int)(b: Int = a)` gives `f$default$2(a: Int)`).
-    fn applied_clause_args(fun: &Tree) -> Vec<Tree> {
+    pub(crate) fn applied_clause_args(fun: &Tree) -> Vec<Tree> {
         match &fun.kind {
             TreeKind::Apply { fun, args } => {
                 let mut v = Self::applied_clause_args(fun);
@@ -1787,7 +1797,7 @@ impl Typer {
     }
 
     /// The head of an application chain: `f(a)(b)` and `f[T](a)` both give `f`.
-    fn application_head(fun: &Tree) -> &Tree {
+    pub(crate) fn application_head(fun: &Tree) -> &Tree {
         match &fun.kind {
             TreeKind::Apply { fun, .. }
             | TreeKind::TypeApply { fun, .. }
@@ -2295,6 +2305,9 @@ impl Typer {
                 .cloned()
                 .unwrap_or_else(|| self.st.get(*pid).ty.clone());
             self.warm_implicit_scope(&pty);
+            // A fallback may already fit while a more specific derivation's
+            // evidence has not been loaded. Complete candidates before choosing.
+            self.warm_implicit_derivation_scopes(&pty);
             let mut search = self.search_implicit(&pty);
             if matches!(search, ImplicitSearch::None)
                 && self.warm_implicit_candidates(std::slice::from_ref(&pty))
@@ -2662,7 +2675,30 @@ impl Typer {
         let (tag, arg) = crate::materialize::tag_request(&self.st, pt)?;
         // The tag has to name a universe, and which universe it is comes from
         // `import <universe>._` -- the same reading a quasiquote uses.
-        let universe = self.universe_in_scope()?;
+        let universe = self.universe_in_scope().or_else(|| {
+            // Runtime library APIs can request a tag without importing the
+            // reflection universe in the caller (for example DI bindings).
+            // An explicitly available macro universe retains precedence.
+            let mut tree = Tree::dummy(TreeKind::Ident {
+                name: "_root_".into(),
+            });
+            tree.span = span;
+            for name in ["scala", "reflect", "runtime", "universe"] {
+                tree = Tree::new(
+                    NodeId(0),
+                    span,
+                    TreeKind::Select {
+                        qual: Box::new(tree),
+                        name: name.into(),
+                    },
+                );
+            }
+            let mark = self.diags.len();
+            self.type_expr(&mut tree, &Type::NoType);
+            let valid = self.diags.len() == mark && !tree.ty.is_error() && !tree.ty.is_no_type();
+            self.diags.truncate(mark);
+            valid.then_some(tree)
+        })?;
         let classes = crate::materialize::TagClasses {
             // `TypeTags$TypeTag.class` has no pickle of its own -- a trait's
             // nested class is pickled inside the trait -- so only the
