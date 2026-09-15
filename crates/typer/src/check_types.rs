@@ -2444,6 +2444,14 @@ impl Typer {
                 let prefix =
                     if owner.is_none() || matches!(self.st.get(owner).kind, SymKind::Method) {
                         Type::NoType
+                    } else if owner != self.st.this_class
+                        && !self.st.this_class.is_none()
+                        && self.st.is_ancestor_of(owner, self.st.this_class)
+                    {
+                        // The singleton of an inherited stable val is relative to
+                        // the current instance. This preserves a concrete alias
+                        // that narrows its abstract declared type.
+                        Type::ThisType(self.st.this_class)
                     } else {
                         Type::ThisType(owner)
                     };
