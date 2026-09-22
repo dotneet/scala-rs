@@ -2131,6 +2131,146 @@ object Main {
 }
 
 #[test]
+fn projected_alias_uses_later_source_unit_member() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("projected-alias-later-source");
+    let lib_src = dir.join("Lib.scala");
+    fs::write(
+        &lib_src,
+        r#"
+package idlib
+
+trait Key[A] { val value: A }
+case class IntKey(value: Int) extends Key[Int] { def render: String = value.toString }
+trait Identity { type ID <: Key[_] }
+case class Entity[+I <: Key[_], +A <: Identity](id: I, value: A)
+object Identity { type Identified[+T <: Identity] = Entity[T#ID, T] }
+"#,
+    )
+    .unwrap();
+    let entry_src = dir.join("Entry.scala");
+    fs::write(
+        &entry_src,
+        r#"
+package idlib
+case class Entry(value: Int) extends Identity { type ID = IntKey }
+"#,
+    )
+    .unwrap();
+    let main_src = dir.join("Main.scala");
+    fs::write(
+        &main_src,
+        r#"
+import idlib._
+import idlib.Identity.Identified
+
+object Main {
+  val v: Identified[Entry] = Entity(IntKey(1), Entry(2))
+  val id: IntKey = v.id
+  def main(args: Array[String]): Unit = println(id.render)
+}
+"#,
+    )
+    .unwrap();
+    let bad_src = dir.join("Bad.scala");
+    fs::write(
+        &bad_src,
+        r#"
+import idlib._
+import idlib.Identity.Identified
+object Bad {
+  val wrong: Identified[Entry] = Entity("wrong", Entry(2))
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |ours: bool, out: &Path, sources: &[&Path], cp: Option<&str>| {
+        let output = if ours {
+            let mut command = Command::new(bin());
+            command
+                .arg("compile")
+                .args(sources)
+                .arg("-d")
+                .arg(out)
+                .arg("--scala-library")
+                .arg(&jar);
+            if let Some(cp) = cp {
+                command.arg("-cp").arg(cp);
+            }
+            command.output().unwrap()
+        } else {
+            let mut command = Command::new(&scalac);
+            if let Some(cp) = cp {
+                command.arg("-cp").arg(cp);
+            }
+            command.arg("-d").arg(out).args(sources);
+            command.output().unwrap()
+        };
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ),
+        )
+    };
+
+    for producer_ours in [false, true] {
+        let producer_out = dir.join(format!("lib-{producer_ours}"));
+        fs::create_dir_all(&producer_out).unwrap();
+        let (ok, diagnostic) = compile(producer_ours, &producer_out, &[&lib_src], None);
+        assert!(ok, "producer={producer_ours}: {diagnostic}");
+
+        for consumer_ours in [false, true] {
+            for main_first in [true, false] {
+                let order = if main_first {
+                    "main-first"
+                } else {
+                    "entry-first"
+                };
+                let consumer_out =
+                    dir.join(format!("main-{producer_ours}-{consumer_ours}-{order}"));
+                fs::create_dir_all(&consumer_out).unwrap();
+                let cp = producer_out.to_str().unwrap();
+                let sources = if main_first {
+                    [main_src.as_path(), entry_src.as_path()]
+                } else {
+                    [entry_src.as_path(), main_src.as_path()]
+                };
+                let (ok, diagnostic) = compile(consumer_ours, &consumer_out, &sources, Some(cp));
+                assert!(
+                    ok,
+                    "producer={producer_ours}, consumer={consumer_ours}, order={order}: {diagnostic}"
+                );
+                assert_eq!(
+                    run_java(
+                        &consumer_out,
+                        &format!("{}:{}", producer_out.display(), jar.display())
+                    ),
+                    "1\n"
+                );
+
+                let bad_out = dir.join(format!("bad-{producer_ours}-{consumer_ours}-{order}"));
+                fs::create_dir_all(&bad_out).unwrap();
+                let full_cp = format!("{}:{}", producer_out.display(), consumer_out.display());
+                let (ok, diagnostic) =
+                    compile(consumer_ours, &bad_out, &[&bad_src], Some(&full_cp));
+                assert!(
+                    !ok,
+                    "producer={producer_ours}, consumer={consumer_ours}, order={order} accepted String id:\n{diagnostic}"
+                );
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn inherited_array_overloads_and_real_dynamic_members_match_scalac() {
     let Some(jar) = scala_library_jar() else {
         return;

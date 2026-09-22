@@ -871,6 +871,41 @@ impl Typer {
         if self.diags.len() != before_bounds {
             return Type::Error;
         }
+        if let Type::Applied { ctor, args } = &applied {
+            if let Type::TypeMember(alias) = ctor.as_ref() {
+                let info = self.st.get(*alias);
+                let tparams = info.tparams.clone();
+                let members = self.st.type_members_in(&info.ty);
+                for member in members {
+                    let Some((prefix, decl)) = self.st.abs_projection(member) else {
+                        continue;
+                    };
+                    let Some(arg) = tparams
+                        .iter()
+                        .position(|tp| *tp == prefix)
+                        .and_then(|i| args.get(i))
+                    else {
+                        continue;
+                    };
+                    if matches!(arg, Type::TypeParam(_) | Type::TypeMember(_)) {
+                        continue;
+                    }
+                    let Some(cls) = self.st.class_sym_of(arg) else {
+                        continue;
+                    };
+                    let name = self.st.get(decl).name.clone();
+                    // Reducing Alias[LaterClass] must see LaterClass's
+                    // overriding type member even before that source unit's
+                    // signature pass. Otherwise the projection is discarded
+                    // as if the argument left the member abstract.
+                    for m in self.st.lookup_member(cls, &name) {
+                        if self.st.get(m).kind == SymKind::TypeMember {
+                            self.complete_lazy_sig(m, span);
+                        }
+                    }
+                }
+            }
+        }
         let expanded = self.st.expand_applied_hk_alias(applied);
         // An alias body may still name an abstract member (`type C[T] = self.C[T]`).
         // The class being typed knows how it implements those, so re-read the
