@@ -502,3 +502,11 @@ fn unit_adaptation_matches_scalac_and_native() {
         false,
     );
 }
+
+#[test]
+fn range_flatmap_uses_its_polymorphic_element_type() {
+    matrix(
+        &[("range_flatmap", true), ("range_flatmap_bad", false)],
+        false,
+    );
+}

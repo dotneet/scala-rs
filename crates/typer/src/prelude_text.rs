@@ -439,7 +439,7 @@ fn add_range_ops(st: &mut SymbolTable) {
         idx_int.clone(),
         Intrinsic::None,
     );
-    method(
+    let flat_map = method(
         st,
         range,
         "flatMap",
@@ -447,6 +447,32 @@ fn add_range_ops(st: &mut SymbolTable) {
         idx_int.clone(),
         Intrinsic::None,
     );
+    // `Range.flatMap[B](f: Int => IterableOnce[B]): IndexedSeq[B]` is
+    // polymorphic just like the inherited `IterableOps` member. Keeping the
+    // imprecise `Int => Any` stub here pins B to the receiver's Int element
+    // type, so a lambda returning `Some[(K, V)]` is rejected against an
+    // expected `Seq[(K, V)]` before collection-result reconstruction runs.
+    let b = type_param(st, flat_map, "B");
+    let tb = Type::TypeParam(b);
+    let iterable_once = crate::classpath::find_by_jvm(st, "scala/collection/IterableOnce")
+        .expect("IterableOnce is required for the scala-library Range.flatMap signature");
+    let from = Type::Class {
+        sym: iterable_once,
+        args: vec![tb.clone()],
+    };
+    let f = fn1(Type::Int, from);
+    let p = st.alloc("f", flat_map, SymKind::Term, Flags::PARAM, "");
+    st.get_mut(p).ty = f.clone();
+    st.get_mut(flat_map).params = vec![p];
+    st.get_mut(flat_map).paramss = vec![vec![p]];
+    st.get_mut(flat_map).tparams = vec![b];
+    st.get_mut(flat_map).ty = Type::Method {
+        paramss: vec![vec![f]],
+        ret: Box::new(Type::Class {
+            sym: idx,
+            args: vec![tb],
+        }),
+    };
     method(
         st,
         range,
