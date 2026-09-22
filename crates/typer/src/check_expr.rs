@@ -1707,8 +1707,16 @@ impl Typer {
                 // is typed: `check_tailrec` runs from the body pass and by
                 // then the owner says nothing (a def in a `val`'s right-hand
                 // side is owned by the enclosing class, like a member).
-                for s in stats.iter() {
+                for s in stats.iter_mut() {
                     if matches!(s.kind, TreeKind::DefDef { .. } | TreeKind::ValDef { .. }) {
+                        // Synthetic temporaries share the sentinel id zero.
+                        // Give each declaration an identity before recording
+                        // locality, or later synthetic template members (such
+                        // as implicit conversions) appear block-local too.
+                        if s.id == NodeId(0) {
+                            s.id = NodeId(self.macro_next_node);
+                            self.macro_next_node += 1;
+                        }
                         self.block_local_defs.insert((self.file_index, s.id));
                     }
                 }

@@ -1936,6 +1936,201 @@ object Main {
 }
 
 #[test]
+fn qualified_higher_kind_alias_survives_separate_compilation() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("qualified-hk-alias-separate");
+    let domain_src = dir.join("Domain.scala");
+    fs::write(
+        &domain_src,
+        r#"
+object Domain {
+  type Lookup[F[_]] = Int => F[Boolean]
+}
+"#,
+    )
+    .unwrap();
+    let repo_src = dir.join("Repo.scala");
+    fs::write(
+        &repo_src,
+        r#"
+object Repo {
+  type Lookup[F[_]] = String => Domain.Lookup[F]
+  def result: Lookup[Option] = text => number => Some(text.length == number)
+}
+
+object Main {
+  def main(args: Array[String]): Unit = println(Repo.result("ok")(2))
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |ours: bool, out: &Path, src: &Path, cp: Option<&str>| {
+        let output = if ours {
+            let mut command = Command::new(bin());
+            command
+                .arg("compile")
+                .arg(src)
+                .arg("-d")
+                .arg(out)
+                .arg("--scala-library")
+                .arg(&jar);
+            if let Some(cp) = cp {
+                command.arg("-cp").arg(cp);
+            }
+            command.output().unwrap()
+        } else {
+            let mut command = Command::new(&scalac);
+            if let Some(cp) = cp {
+                command.arg("-cp").arg(cp);
+            }
+            command.arg("-d").arg(out).arg(src);
+            command.output().unwrap()
+        };
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ),
+        )
+    };
+
+    for producer_ours in [false, true] {
+        let producer_out = dir.join(format!("domain-{producer_ours}"));
+        fs::create_dir_all(&producer_out).unwrap();
+        let (ok, diagnostic) = compile(producer_ours, &producer_out, &domain_src, None);
+        assert!(ok, "producer={producer_ours}: {diagnostic}");
+
+        for consumer_ours in [false, true] {
+            let consumer_out = dir.join(format!("repo-{producer_ours}-{consumer_ours}"));
+            fs::create_dir_all(&consumer_out).unwrap();
+            let cp = producer_out.to_str().unwrap();
+            let (ok, diagnostic) = compile(consumer_ours, &consumer_out, &repo_src, Some(cp));
+            assert!(
+                ok,
+                "producer={producer_ours}, consumer={consumer_ours}: {diagnostic}"
+            );
+            assert_eq!(
+                run_java(
+                    &consumer_out,
+                    &format!("{}:{}", producer_out.display(), jar.display())
+                ),
+                "Some(true)\n"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn named_copy_preserves_separately_compiled_implicit_conversion() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("named-copy-implicit-separate");
+    let producer_src = dir.join("Record.scala");
+    fs::write(
+        &producer_src,
+        r#"
+sealed trait Situation
+final case class ReadTime(value: Float)
+
+case class Record(value: Int) {
+  def update(xs: Seq[Situation], read: ReadTime): Record =
+    copy(value = read.value.toInt)
+}
+
+object Record {
+  implicit class SeqRecordOps(private val records: Seq[Record]) {
+    def filterWithBackTrans: Seq[Record] = records.filter(_.value > 0)
+    def replaceByKey[Key](newRecord: Record)(keyOf: Record => Key): Seq[Record] =
+      records.map(_ => newRecord)
+  }
+}
+"#,
+    )
+    .unwrap();
+    let consumer_src = dir.join("Main.scala");
+    fs::write(
+        &consumer_src,
+        r#"
+object Main {
+  def main(args: Array[String]): Unit = {
+    val records: Seq[Record] = Seq(Record(1))
+    println(records.filterWithBackTrans.size)
+    println(records.replaceByKey(Record(2))(_.value).head.value)
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |ours: bool, out: &Path, src: &Path, cp: Option<&str>| {
+        let output = if ours {
+            let mut command = Command::new(bin());
+            command
+                .arg("compile")
+                .arg(src)
+                .arg("-d")
+                .arg(out)
+                .arg("--scala-library")
+                .arg(&jar);
+            if let Some(cp) = cp {
+                command.arg("-cp").arg(cp);
+            }
+            command.output().unwrap()
+        } else {
+            let mut command = Command::new(&scalac);
+            if let Some(cp) = cp {
+                command.arg("-cp").arg(cp);
+            }
+            command.arg("-d").arg(out).arg(src);
+            command.output().unwrap()
+        };
+        (
+            output.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            ),
+        )
+    };
+
+    for producer_ours in [false, true] {
+        let producer_out = dir.join(format!("record-{producer_ours}"));
+        fs::create_dir_all(&producer_out).unwrap();
+        let (ok, diagnostic) = compile(producer_ours, &producer_out, &producer_src, None);
+        assert!(ok, "producer={producer_ours}: {diagnostic}");
+
+        for consumer_ours in [false, true] {
+            let consumer_out = dir.join(format!("main-{producer_ours}-{consumer_ours}"));
+            fs::create_dir_all(&consumer_out).unwrap();
+            let cp = producer_out.to_str().unwrap();
+            let (ok, diagnostic) = compile(consumer_ours, &consumer_out, &consumer_src, Some(cp));
+            assert!(
+                ok,
+                "producer={producer_ours}, consumer={consumer_ours}: {diagnostic}"
+            );
+            assert_eq!(
+                run_java(
+                    &consumer_out,
+                    &format!("{}:{}", producer_out.display(), jar.display())
+                ),
+                "1\n2\n"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn inherited_array_overloads_and_real_dynamic_members_match_scalac() {
     let Some(jar) = scala_library_jar() else {
         return;

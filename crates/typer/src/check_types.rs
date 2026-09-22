@@ -272,6 +272,11 @@ impl Typer {
                     // Its package-object aliases still need lazy pickle lookup.
                     self.qualified_pickled_type_member(qual, name)
                         .unwrap_or_else(|| self.missing_qualified_type(qual, name, tpt.span))
+                } else if let Some(ty) = self.qualified_pickled_type_member(qual, name) {
+                    // Binary aliases have no JVM member. Resolve the explicit
+                    // owner before a same-named type in the current scope can
+                    // capture the selection.
+                    ty
                 } else {
                     // The prefix knows nothing of that name. Falling back on
                     // the *bare* name is deliberate -- a path this pass cannot
