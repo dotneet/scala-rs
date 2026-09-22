@@ -1994,7 +1994,7 @@ impl Typer {
         // leaves no trace in the bytecode. Only asked when the name has no
         // binding at all -- a default import (`scala._`, `Predef`) keeps
         // answering as it always has.
-        if !default_type && self.library_abi && self.expose_inherited_binary_type(name) {
+        if !default_type && self.library_abi && self.expose_inherited_binary_type(name, span) {
             return;
         }
         // Not from a jar: a source package member. `lookup_member` already
@@ -2069,7 +2069,7 @@ impl Typer {
     /// are already in the template scope, so only a *binary* ancestor is
     /// asked, and not its parents: its pickle lookup walks its whole
     /// linearisation itself.
-    fn expose_inherited_binary_type(&mut self, name: &str) -> bool {
+    fn expose_inherited_binary_type(&mut self, name: &str, span: Span) -> bool {
         let mut enclosing = Vec::new();
         let mut cur = self.st.this_class;
         for _ in 0..64 {
@@ -2105,6 +2105,16 @@ impl Typer {
                 if self.is_current_run_class(pid) {
                     work.extend(self.st.get(pid).parents.iter().rev().cloned());
                     continue;
+                }
+                // Nested classes are real type members too. A companion's
+                // accessor may already have exposed the term name without
+                // loading the nested class used by a method signature.
+                self.complete_binary_member(pid, name, span);
+                if let Some(id) = self.st.lookup_member(pid, name).into_iter().find(|&id| {
+                    self.st.get(id).kind == SymKind::Class && !self.st.private_to_owner(id)
+                }) {
+                    self.st.enter_in_current(name, id);
+                    return true;
                 }
                 if let Some(id) = self.pickle.complete_inherited_type_member(
                     &mut self.st,

@@ -774,6 +774,7 @@ impl Typer {
                     // reading it raw made `m(3)` report
                     // `found: 3  required: T1`.
                     let mty = self.st.subst_as_seen_from(fun_ty_full, &self.st.get(m).ty);
+                    let mty = self.st.expand_in_type(fun_ty_full, &mty);
                     if let Type::Method { paramss, ret } = &mty {
                         cands.push((
                             m,
@@ -803,6 +804,7 @@ impl Typer {
                     // written type argument, and any other inherited factory
                     // member all go through `type_select`, which substitutes.
                     let mty = self.st.subst_as_seen_from(fun_ty_full, &self.st.get(m).ty);
+                    let mty = self.st.expand_in_type(fun_ty_full, &mty);
                     if let Type::Method { paramss, ret } = &mty {
                         cands.push((
                             m,

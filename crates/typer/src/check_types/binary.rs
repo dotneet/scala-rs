@@ -41,7 +41,17 @@ impl Typer {
                     }
                 }
                 self.supply_pending_module_implicits(&found);
-                return;
+                // A class can expose a nested companion before its class,
+                // just like a package or object. Complete the type half too.
+                let class_loaded = found
+                    .iter()
+                    .any(|&id| self.st.get(id).kind == SymKind::Class);
+                let has_module = found.iter().any(|&id| {
+                    matches!(self.st.get(id).kind, SymKind::Module | SymKind::ModuleClass)
+                });
+                if class_loaded || !has_module {
+                    return;
+                }
             }
         } else {
             let found = self.st.lookup_member(owner, name);

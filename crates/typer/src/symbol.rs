@@ -7636,7 +7636,12 @@ impl SymbolTable {
                 for p in parents {
                     t = self.expand_in_type(p, &t);
                 }
-                subst_refine_aliases(self, decls, &t)
+                let t = subst_refine_aliases(self, decls, &t);
+                if crate::prefix::view_prefix(from).is_some() {
+                    self.subst_as_seen_from(from, &t)
+                } else {
+                    t
+                }
             }
             Type::Class { sym, args } => {
                 let t = self.expand_type_members(*sym, ty);

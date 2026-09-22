@@ -1074,7 +1074,13 @@ impl Typer {
         }
 
         let mut recv_ty = match &fun.kind {
-            _ if matches!(fun.ty, Type::Class { .. } | Type::ModuleRef(_)) => Some(fun.ty.clone()),
+            _ if matches!(
+                crate::prefix::strip_view(&fun.ty),
+                Type::Class { .. } | Type::ModuleRef(_)
+            ) =>
+            {
+                Some(fun.ty.clone())
+            }
             TreeKind::Select { qual, .. } => Some(qual.ty.clone()),
             _ => None,
         };
@@ -1737,7 +1743,7 @@ impl Typer {
                         // the substituted type all along, which is why only
                         // overloaded ones were affected.
                         if matches!(
-                            &fun.ty,
+                            crate::prefix::strip_view(&fun.ty),
                             Type::Overload(_) | Type::ModuleRef(_) | Type::Class { .. }
                         ) {
                             fun.ty = self
@@ -1749,7 +1755,9 @@ impl Typer {
                                 .filter(|t| matches!(t, Type::Method { .. }))
                                 .unwrap_or_else(|| match &recv_ty {
                                     Some(recv) => {
-                                        self.st.subst_as_seen_from(recv, &self.st.get(sym).ty)
+                                        let ty =
+                                            self.st.subst_as_seen_from(recv, &self.st.get(sym).ty);
+                                        self.st.expand_in_type(recv, &ty)
                                     }
                                     None => self.st.get(sym).ty.clone(),
                                 });

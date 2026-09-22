@@ -459,3 +459,155 @@ object Main {
     }
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn nested_companions_keep_outer_type_arguments() {
+    let Some(library) = cached_library() else {
+        return;
+    };
+    let Some(scalac) = cached_scalac() else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("nested-companion-{stamp}"));
+    fs::create_dir_all(&root).unwrap();
+    let lib = root.join("Library.scala");
+    let use_src = root.join("Use.scala");
+    let bad_src = root.join("Bad.scala");
+    fs::write(
+        &lib,
+        r#"
+package nestedcompanion
+trait Evidence[A] { def label: String }
+case class Config(value: String)
+trait Base[A] {
+  protected type Alias = A
+  case class Entry(value: String)(implicit val evidence: Evidence[Alias]) {
+    def render: String = value + ":" + evidence.label
+  }
+  object Entry {
+    def apply(config: Config)(implicit evidence: Evidence[Alias]): Entry = new Entry(config.value)
+  }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &use_src,
+        r#"
+import nestedcompanion._
+trait Derived[X] extends Base[X] {
+  def build(value: String)(implicit evidence: Evidence[X]): Entry = Entry(value)(evidence)
+  def configured(value: Config)(implicit evidence: Evidence[X]): Entry = Entry(value)
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    implicit val evidence: Evidence[Int] = new Evidence[Int] { def label: String = "int" }
+    val builder = new Derived[Int] {}
+    println(builder.build("v").render)
+    println(builder.configured(Config("c")).render)
+  }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &bad_src,
+        r#"
+import nestedcompanion._
+trait Wrong extends Base[String] {
+  def bad(evidence: Evidence[Int]): Entry = Entry("bad")(evidence)
+}
+"#,
+    )
+    .unwrap();
+    let compile = |ours: bool, sources: &[&PathBuf], out: &PathBuf, cp: &str| {
+        fs::create_dir_all(out).unwrap();
+        let mut command = Command::new(if ours {
+            PathBuf::from(env!("CARGO_BIN_EXE_scala-rs"))
+        } else {
+            scalac.clone()
+        });
+        if ours {
+            command.args(["compile", "--scala-library"]).arg(&library);
+        }
+        command
+            .args(["-cp", cp, "-d"])
+            .arg(out)
+            .args(sources)
+            .output()
+            .unwrap()
+    };
+    let run = |out: &PathBuf, cp: &str| {
+        let output = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{cp}", out.display()),
+                "Main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"v:int\nc:int\n");
+    };
+    let library_cp = library.to_str().unwrap();
+    for ours in [false, true] {
+        let out = root.join(format!("together-{ours}"));
+        let result = compile(ours, &[&lib, &use_src], &out, library_cp);
+        assert!(
+            result.status.success(),
+            "together ours={ours}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        run(&out, library_cp);
+        let result = compile(
+            ours,
+            &[&lib, &bad_src],
+            &root.join(format!("bad-together-{ours}")),
+            library_cp,
+        );
+        assert!(
+            !result.status.success(),
+            "accepted mismatched evidence ours={ours}"
+        );
+    }
+    for producer_ours in [false, true] {
+        let producer_out = root.join(format!("producer-{producer_ours}"));
+        let result = compile(producer_ours, &[&lib], &producer_out, library_cp);
+        assert!(
+            result.status.success(),
+            "producer ours={producer_ours}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let cp = format!("{}:{library_cp}", producer_out.display());
+        for consumer_ours in [false, true] {
+            let out = root.join(format!("consumer-{producer_ours}-{consumer_ours}"));
+            let result = compile(consumer_ours, &[&use_src], &out, &cp);
+            assert!(
+                result.status.success(),
+                "producer={producer_ours}, consumer={consumer_ours}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            run(&out, &cp);
+            let result = compile(
+                consumer_ours,
+                &[&bad_src],
+                &root.join(format!("bad-{producer_ours}-{consumer_ours}")),
+                &cp,
+            );
+            assert!(
+                !result.status.success(),
+                "accepted mismatched binary evidence"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}

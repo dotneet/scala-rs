@@ -549,17 +549,28 @@ impl SymbolTable {
             return ty;
         }
         let wants = |st: &SymbolTable, sym: SymbolId| -> bool {
-            st.is_inner_class_of_class(sym) && owners.contains(&st.get(sym).owner.0)
+            let symbol = st.get(sym);
+            let member_module = symbol.kind == SymKind::ModuleClass
+                && !symbol.flags.contains(Flags::STATIC)
+                && st.get(symbol.owner).kind == SymKind::Class;
+            (st.is_inner_class_of_class(sym) || member_module) && owners.contains(&symbol.owner.0)
         };
         if !crate::symbol::any_type(
             &ty,
-            &mut |t| matches!(t, Type::Class { sym, .. } if wants(self, *sym)),
+            &mut |t| matches!(t, Type::Class { sym, .. } | Type::ModuleRef(sym) if wants(self, *sym)),
         ) {
             return ty;
         }
         let on_class = |c: Type| -> Type {
             match &c {
                 Type::Class { sym, .. } if wants(self, *sym) => with_prefix(c, pre.clone()),
+                Type::ModuleRef(sym) if wants(self, *sym) => with_prefix(
+                    Type::Class {
+                        sym: *sym,
+                        args: vec![],
+                    },
+                    pre.clone(),
+                ),
                 _ => c,
             }
         };
@@ -589,6 +600,7 @@ fn map_views(
 ) -> Type {
     let go = |t: &Type| map_views(t, on_class, on_prefix);
     match ty {
+        Type::ModuleRef(_) => on_class(ty.clone()),
         Type::Class { sym, args } => on_class(Type::Class {
             sym: *sym,
             args: args.iter().map(go).collect(),

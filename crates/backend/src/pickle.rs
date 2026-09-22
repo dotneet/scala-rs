@@ -3088,7 +3088,11 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         let mut mt = Vec::new();
         write_nat_to(&mut mt, ret_ref);
         let info = self.add(METHODTPE, mt);
-        let flags = raw_to_pickled((1u64 << 6) | (1u64 << 2)); // METHOD | PRIVATE
+        // ScalaSignature exposes module constructors publicly even when the
+        // JVM constructor of a top-level object is private. In particular,
+        // a trait's inherited modules must be constructible by the mixing
+        // class when a separately compiled client initializes them.
+        let flags = raw_to_pickled(1u64 << 6); // METHOD
         let body = self.symbol_info(name_ref, owner_ref, flags, info);
         self.entries[meth_idx as usize] = (VALSYM, body);
         self.current_owner = saved;
