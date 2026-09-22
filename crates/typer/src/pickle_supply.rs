@@ -4876,10 +4876,7 @@ impl PickleSupply {
         if old_owner.is_none() || st.get(old_owner).kind != SymKind::Class {
             return;
         }
-        let Some(outer_module) = st.companion_module(old_owner) else {
-            return;
-        };
-        let new_owner = st.module_class_of(outer_module);
+        let new_owner = st.companion_module_class_for_implicits(old_owner);
         if new_owner == old_owner || new_owner.is_none() {
             return;
         }

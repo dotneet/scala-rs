@@ -7,6 +7,40 @@ use std::{
 };
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 
+#[test]
+fn nested_static_companions_keep_implicit_helper_paths() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let mut cp = format!(
+        "{JAR}:/tmp/scala-2.13.16/lib/scala-reflect.jar:/tmp/scala-2.13.16/lib/scala-compiler.jar"
+    );
+    for artifact in [
+        "com/github/pureconfig/pureconfig-core_2.13/0.17.10/pureconfig-core_2.13-0.17.10.jar",
+        "com/github/pureconfig/pureconfig-generic_2.13/0.17.10/pureconfig-generic_2.13-0.17.10.jar",
+        "com/github/pureconfig/pureconfig-generic-base_2.13/0.17.10/pureconfig-generic-base_2.13-0.17.10.jar",
+        "com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar",
+        "com/typesafe/config/1.4.5/config-1.4.5.jar",
+    ] {
+        let Some(jar) = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+            .into_iter()
+            .map(|cache| {
+                PathBuf::from(&home)
+                    .join(cache)
+                    .join("https/repo1.maven.org/maven2")
+                    .join(artifact)
+            })
+            .find(|path| path.is_file())
+        else {
+            eprintln!("skip: dependency is not cached: {artifact}");
+            return;
+        };
+        cp.push(':');
+        cp.push_str(jar.to_str().unwrap());
+    }
+    matrix_cp(&[("nested_static_helpers", true)], false, &cp);
+}
+
 fn cached_cats() -> Option<Vec<PathBuf>> {
     let home = std::env::var_os("HOME")?;
     let mut jars = Vec::new();

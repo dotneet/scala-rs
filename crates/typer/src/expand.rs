@@ -3888,8 +3888,8 @@ fn static_module_class_path(st: &SymbolTable, module_class: SymbolId) -> Option<
     {
         return None;
     }
-    let outer_module = st.companion_module(owner)?;
-    let outer_path = static_module_class_path(st, st.module_class_of(outer_module))?;
+    let outer_module = st.companion_module_class_for_implicits(owner);
+    let outer_path = static_module_class_path(st, outer_module)?;
     Some(format!("{outer_path}.{module}"))
 }
 
