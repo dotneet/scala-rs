@@ -2524,7 +2524,12 @@ pub(crate) fn numeric_widen(a: &Type, b: &Type) -> Option<Type> {
 /// (`xs.map(f)`'s `B`); adopting it there would make every `if`/`match` bodied
 /// lambda infer `A => Any` and collapse `xs.map { case … }` to `List[Any]`.
 pub(crate) fn pt_or_lub(pt: &Type, branches: Type) -> Type {
-    if !pt.is_no_type() && !matches!(pt, Type::Nothing | Type::Any | Type::TypeParam(_)) {
+    if !pt.is_no_type()
+        && !matches!(
+            pt,
+            Type::Nothing | Type::Any | Type::Wildcard | Type::TypeParam(_)
+        )
+    {
         pt.clone()
     } else {
         branches

@@ -8,6 +8,11 @@ use std::{
 const JAR: &str = "/tmp/scala-rs-lib/scala-library-2.13.16.jar";
 
 #[test]
+fn conditional_arguments_infer_types_from_both_branches() {
+    matrix(&[("branch_wildcard", true)], false);
+}
+
+#[test]
 fn nested_static_companions_keep_implicit_helper_paths() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
