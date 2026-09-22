@@ -493,6 +493,21 @@ fn add_ordering_instances(st: &mut SymbolTable, ordering: SymbolId) {
     ] {
         add_implicit_instance(st, ord_cls, ordering, name, jvm, ty);
     }
+    for (name, jvm) in [
+        ("BigInt", "scala/math/Ordering$BigInt$"),
+        ("BigDecimal", "scala/math/Ordering$BigDecimal$"),
+    ] {
+        if let Some(sym) = crate::classpath::find_by_jvm(st, &format!("scala/math/{name}")) {
+            add_implicit_instance(
+                st,
+                ord_cls,
+                ordering,
+                name,
+                jvm,
+                Type::Class { sym, args: vec![] },
+            );
+        }
+    }
     let known: Vec<SymbolId> = st.get(ord_mod).members.clone();
     for m in st.get(ord_cls).members.clone() {
         if !known.contains(&m) {

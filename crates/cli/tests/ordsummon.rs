@@ -190,6 +190,12 @@ fn compile_src(src: &str, tag: &str) -> (bool, String) {
 // ------------------------------------------------------------------ fixtures
 
 #[test]
+fn arbitrary_precision_ordering_matches_real_scalac() {
+    matches_real_scalac("os2_bignum");
+    jar_run("os2_bignum");
+}
+
+#[test]
 fn os2_summon_scala_library() {
     jar_run("os2_summon");
 }
