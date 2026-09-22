@@ -1518,7 +1518,7 @@ impl Typer {
                 }
             }
         }
-        for o in all {
+        for &o in &all {
             // Collect the whole inherited set before entering it. A parent may
             // declare an implicit that a later parent in the breadth-first
             // walk overrides; entering both immediately makes one wildcard
@@ -1666,6 +1666,16 @@ impl Typer {
                 // which then competed with the `request2Session` nsc picks.
                 let inherited = cur != o;
                 for m in self.st.get(cur).members.clone() {
+                    // Package objects are visited separately below. Their
+                    // eagerly copied package entries may still refer to raw
+                    // classfile members replaced during pickle completion.
+                    let declared_on = self.st.get(m).owner;
+                    if self.st.get(cur).kind == SymKind::Package
+                        && declared_on != cur
+                        && all.contains(&declared_on)
+                    {
+                        continue;
+                    }
                     // A method's type parameters are owned by the method,
                     // not by the class whose member list temporarily held
                     // them while a classfile signature was decoded. They are

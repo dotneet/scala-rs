@@ -336,3 +336,115 @@ object Main {
     }
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn package_object_java_return_survives_separate_compilation() {
+    let Some(library) = cached_library() else {
+        return;
+    };
+    let Some(scalac) = cached_scalac() else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-package-object-java-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let producer_src = root.join("producer.scala");
+    let consumer_src = root.join("consumer.scala");
+    fs::write(
+        &producer_src,
+        r#"
+package clocklib {
+  package object api {
+    def current = new java.sql.Timestamp(123L)
+  }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &consumer_src,
+        r#"
+import clocklib.api._
+
+object Main {
+  def main(args: Array[String]): Unit = {
+    val now: java.sql.Timestamp = current
+    println(now.getTime)
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |ours: bool, src: &PathBuf, out: &PathBuf, cp: Option<&str>| {
+        let native = env!("CARGO_BIN_EXE_scala-rs");
+        let mut command = Command::new(if ours {
+            native
+        } else {
+            scalac.to_str().unwrap()
+        });
+        if ours {
+            command.arg("compile");
+        }
+        if let Some(cp) = cp {
+            command.arg("-cp").arg(cp);
+        }
+        command.arg(src).arg("-d").arg(out);
+        if ours {
+            command.arg("--scala-library").arg(&library);
+        }
+        command.output().unwrap()
+    };
+
+    for producer_ours in [false, true] {
+        let producer_out = root.join(format!("producer-{producer_ours}"));
+        fs::create_dir_all(&producer_out).unwrap();
+        let producer = compile(producer_ours, &producer_src, &producer_out, None);
+        assert!(
+            producer.status.success(),
+            "producer={producer_ours}: {}{}",
+            String::from_utf8_lossy(&producer.stdout),
+            String::from_utf8_lossy(&producer.stderr)
+        );
+
+        for consumer_ours in [false, true] {
+            let consumer_out = root.join(format!("consumer-{producer_ours}-{consumer_ours}"));
+            fs::create_dir_all(&consumer_out).unwrap();
+            let cp = format!("{}:{}", producer_out.display(), library.display());
+            let consumer = compile(consumer_ours, &consumer_src, &consumer_out, Some(&cp));
+            assert!(
+                consumer.status.success(),
+                "producer={producer_ours}, consumer={consumer_ours}: {}{}",
+                String::from_utf8_lossy(&consumer.stdout),
+                String::from_utf8_lossy(&consumer.stderr)
+            );
+            let output = Command::new("java")
+                .args([
+                    "-Xverify:all",
+                    "-cp",
+                    &format!(
+                        "{}:{}:{}",
+                        consumer_out.display(),
+                        producer_out.display(),
+                        library.display()
+                    ),
+                    "Main",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "producer={producer_ours}, consumer={consumer_ours}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "123\n");
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}
