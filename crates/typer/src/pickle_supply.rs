@@ -2147,12 +2147,33 @@ impl PickleSupply {
             // A module's aliases belong to its module class. Looking up
             // the same name as a non-module can fail (Predef) or attach the
             // alias to an unrelated companion class.
-            let alias_owner = if hit.owner == full {
-                class_sym
+            // An inherited alias needs a declaration in the receiver's
+            // vocabulary. Installing it on `hit.owner` would either leave its
+            // owner parameters unbound at use sites or, if the substituted
+            // hit RHS were used, specialize that shared declaration to the
+            // first concrete subclass that asked for it.
+            let alias_owner = class_sym;
+            // The RHS is installed on `class_sym`, so use the substituted
+            // member from `lookup`. Its alias prefix still belongs to the
+            // declaring member and is needed to retain path-dependent inner
+            // class prefixes.
+            let declared_member = if hit.owner == full && hit.owner_module == is_module {
+                hit.member.clone()
             } else {
-                self.ensure_class(st, bin, &hit.owner, false)?
+                let sig = {
+                    let mut src = BinSource(bin);
+                    self.sigs
+                        .class_sig(&mut src, &hit.owner, hit.owner_module)
+                        .ok()?
+                };
+                sig.members
+                    .iter()
+                    .find(|member| {
+                        member.name == hit.member.name && member.kind == MemberKind::TypeAlias
+                    })?
+                    .clone()
             };
-            if let Some(prefix) = &hit.member.alias_prefix {
+            if let Some(prefix) = &declared_member.alias_prefix {
                 trace(format_args!(
                     "{}#{name}: alias prefix {prefix:?}",
                     hit.owner
@@ -2160,7 +2181,7 @@ impl PickleSupply {
                 st.binary_alias_prefixes
                     .insert((alias_owner, name.to_string()), prefix.clone());
             }
-            let this_prefix = match &hit.member.alias_prefix {
+            let this_prefix = match &declared_member.alias_prefix {
                 Some(SigType::This(c)) => Some(c.clone()),
                 _ => None,
             };
@@ -7378,13 +7399,26 @@ impl PickleSupply {
             return None;
         }
         let mut map: HashMap<String, SigType> = HashMap::new();
+        let mut alias_scope = scope.clone();
+        let mut target_refs = Vec::new();
+        walk(&target, &mut target_refs, 0);
         for (tp, a) in tps.iter().zip(args.iter()) {
             map.insert(tp.name.clone(), a.clone());
+            // A projection can carry its prefix inside the reference name
+            // (`T#Owner.Member`). Signature substitution replaces ordinary
+            // references to T, but cannot replace that embedded prefix. Keep
+            // the applied alias's binders in the conversion scope as well.
+            let prefix = format!("{}#", tp.name);
+            if target_refs.iter().any(|r| r.starts_with(&prefix)) {
+                if let Some(bound) = self.conv_at(st, bin, scope, a, d) {
+                    alias_scope.insert(tp.name.clone(), bound);
+                }
+            }
         }
         let target = scala_rs_pickle::sym::apply_subst(&target, &map);
         // The substituted arguments are still written in the caller's
         // vocabulary, so the caller's scope is what finishes the job.
-        self.conv_at(st, bin, scope, &target, d)
+        self.conv_at(st, bin, &alias_scope, &target, d)
     }
 
     /// A qualified alias can name an ancestor of an enclosing class. Keep

@@ -1887,7 +1887,7 @@ impl Typer {
                                             }
                                             match p {
                                                 Type::Function { params, ret } => {
-                                                    self.tparam_variance_in(ret, *tp, 1) == Some(1)
+                                                    type_mentions_tparam(ret, *tp)
                                                         && !params
                                                             .iter()
                                                             .any(|p| type_mentions_tparam(p, *tp))

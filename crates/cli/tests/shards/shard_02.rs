@@ -58,6 +58,8 @@ mod e2e;
 mod earlyscope;
 #[path = "../eithertry.rs"]
 mod eithertry;
+#[path = "../eithert_widen.rs"]
+mod eithert_widen;
 #[path = "../elemtype.rs"]
 mod elemtype;
 #[path = "../engine.rs"]

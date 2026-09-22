@@ -4,6 +4,8 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+#[path = "../classpath_alias_specialization.rs"]
+mod classpath_alias_specialization;
 #[path = "../gaps.rs"]
 mod gaps;
 #[path = "../gbimplicit.rs"]
