@@ -413,38 +413,49 @@ object Main {
             String::from_utf8_lossy(&producer.stderr)
         );
 
-        for consumer_ours in [false, true] {
-            let consumer_out = root.join(format!("consumer-{producer_ours}-{consumer_ours}"));
-            fs::create_dir_all(&consumer_out).unwrap();
-            let cp = format!("{}:{}", producer_out.display(), library.display());
-            let consumer = compile(consumer_ours, &consumer_src, &consumer_out, Some(&cp));
-            assert!(
-                consumer.status.success(),
-                "producer={producer_ours}, consumer={consumer_ours}: {}{}",
-                String::from_utf8_lossy(&consumer.stdout),
-                String::from_utf8_lossy(&consumer.stderr)
-            );
-            let output = Command::new("java")
-                .args([
-                    "-Xverify:all",
-                    "-cp",
-                    &format!(
-                        "{}:{}:{}",
-                        consumer_out.display(),
-                        producer_out.display(),
-                        library.display()
-                    ),
-                    "Main",
-                ])
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "producer={producer_ours}, consumer={consumer_ours}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(String::from_utf8_lossy(&output.stdout), "123\n");
+        let original = fs::read_to_string(&consumer_src).unwrap();
+        for import_style in ["_", "{current}"] {
+            fs::write(
+                &consumer_src,
+                original.replace("api._", &format!("api.{import_style}")),
+            )
+            .unwrap();
+            for consumer_ours in [false, true] {
+                let consumer_out = root.join(format!(
+                    "consumer-{producer_ours}-{consumer_ours}-{import_style}"
+                ));
+                fs::create_dir_all(&consumer_out).unwrap();
+                let cp = format!("{}:{}", producer_out.display(), library.display());
+                let consumer = compile(consumer_ours, &consumer_src, &consumer_out, Some(&cp));
+                assert!(
+                    consumer.status.success(),
+                    "producer={producer_ours}, consumer={consumer_ours}: {}{}",
+                    String::from_utf8_lossy(&consumer.stdout),
+                    String::from_utf8_lossy(&consumer.stderr)
+                );
+                let output = Command::new("java")
+                    .args([
+                        "-Xverify:all",
+                        "-cp",
+                        &format!(
+                            "{}:{}:{}",
+                            consumer_out.display(),
+                            producer_out.display(),
+                            library.display()
+                        ),
+                        "Main",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "producer={producer_ours}, consumer={consumer_ours}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "123\n");
+            }
         }
+        fs::write(&consumer_src, original).unwrap();
     }
     let _ = fs::remove_dir_all(root);
 }

@@ -1161,6 +1161,21 @@ impl Typer {
             }
             self.complete_binary_member(owner, from, span);
             let mut found = self.st.lookup_member(owner, from);
+            if self.st.get(owner).kind == SymKind::Package {
+                if let Some(po) = self.package_object_of(owner, span) {
+                    if found.iter().any(|&m| self.st.get(m).owner == po) {
+                        // Package scope can retain classfile members copied
+                        // before their package object adopted its pickle.
+                        // Bind the completed declarations, not those stale
+                        // copies, for an explicit selector as well.
+                        self.pickle
+                            .adopt_binary_class(&mut self.st, &mut self.binary, po);
+                        self.complete_binary_member(po, from, span);
+                        found.retain(|&m| self.st.get(m).owner != po);
+                        found.extend(self.st.lookup_member(po, from));
+                    }
+                }
+            }
             // A named import binds both Scala namespaces. If discovery found
             // only the class, load its same-named companion now so the term
             // side is imported too. Cats reaches `kernel.Eq` as a class stub
