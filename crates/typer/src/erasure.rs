@@ -487,13 +487,39 @@ fn array_elem_is_abstract(elem: &Type) -> bool {
         | Type::Applied { .. }
         | Type::Wildcard
         | Type::BoundedWildcard { .. } => true,
+        Type::Existential { body, .. } => array_elem_is_abstract(body),
         Type::Annotated { tpe, .. } => array_elem_is_abstract(tpe),
         _ => false,
     }
 }
 
+/// Replace existential skolems with their bounds before JVM erasure. Most
+/// generic arguments disappear during erasure, but this matters when the
+/// quantified type is itself the result (or an array element), where its
+/// upper bound determines the descriptor.
+fn existential_body(params: &[(SymbolId, Type)], body: &Type) -> Type {
+    let ids: Vec<_> = params.iter().map(|(id, _)| *id).collect();
+    let bounds: Vec<_> = params
+        .iter()
+        .map(|(_, bounds)| match bounds {
+            Type::BoundedWildcard { hi: Some(hi), .. } => {
+                let hi = (**hi).clone();
+                if is_primitive(&hi) {
+                    Type::Any
+                } else {
+                    hi
+                }
+            }
+            Type::BoundedWildcard { hi: None, .. } | Type::Wildcard => Type::Any,
+            other => other.clone(),
+        })
+        .collect();
+    crate::symbol::subst_tparams_slice(&ids, &bounds, body)
+}
+
 pub fn erase_type(ty: &Type) -> Type {
     match ty {
+        Type::Existential { params, body } => erase_type(&existential_body(params, body)),
         Type::JavaObject => Type::AnyRef,
         Type::TypeParam(_) | Type::TypeMember(_) => Type::Any,
         Type::Applied { .. } => Type::Any,
@@ -670,6 +696,10 @@ pub(crate) fn erase_member_ty(ty: &Type, st: &SymbolTable) -> Type {
 }
 
 fn erase_ty(ty: &Type, st: &SymbolTable) -> Type {
+    if let Type::Existential { params, body } = ty {
+        let body = existential_body(params, body);
+        return erase_ty(&body, st);
+    }
     // `Array[T]` reached through a classfile signature, or built by
     // substituting `Array` for a `C[_]` parameter, is `Class { array_sym }`.
     // Erasing that as a plain class emits the pseudo-name `[java/lang/Object`,

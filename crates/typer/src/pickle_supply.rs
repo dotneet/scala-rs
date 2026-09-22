@@ -6045,21 +6045,35 @@ impl PickleSupply {
                 ))
             }
             SigType::Existential { quantified, result } => {
-                // `List[_]`: the quantified variables stand for wildcards, and
-                // a *bounded* one keeps its bound. Dropping the bound is not
-                // free: `Shape[_ <: FlatShapeLevel, F, T, G]` (slick's
-                // `Query.map`) then offers nothing for a candidate's own
-                // `Level` to be solved from, so `repColumnShape` was dropped
-                // for leaving a type parameter undetermined and `q.map(_.title)`
-                // was "could not find implicit value of type Shape[_, Rep[String],
-                // T, G]". The source path already builds `BoundedWildcard`
-                // (`subst_quantified`); this is the pickle half.
                 let mut inner = scope.clone();
-                for q in quantified {
-                    let w = self.exist_wildcard(st, bin, scope, q, d);
-                    inner.insert(q.name.clone(), w);
-                }
-                self.conv_at(st, bin, &inner, result, d)
+                let ids: Vec<_> = quantified
+                    .iter()
+                    .map(|q| {
+                        let id = st.alloc(
+                            &q.name,
+                            SymbolId::NONE,
+                            SymKind::TypeParam,
+                            Flags::EMPTY,
+                            "",
+                        );
+                        inner.insert(q.name.clone(), Type::TypeParam(id));
+                        id
+                    })
+                    .collect();
+                let params: Vec<_> = quantified
+                    .iter()
+                    .zip(ids)
+                    .map(|(q, id)| {
+                        let bounds = self.exist_wildcard(st, bin, &inner, q, d);
+                        if let Type::BoundedWildcard { lo, hi } = &bounds {
+                            st.get_mut(id).bound_lo = lo.as_deref().cloned();
+                            st.get_mut(id).bound_hi = hi.as_deref().cloned();
+                        }
+                        (id, bounds)
+                    })
+                    .collect();
+                let body = self.conv_at(st, bin, &inner, result, d)?;
+                Some(SymbolTable::pack_existential(params, body))
             }
             SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d, 0),
             // Keep the class named by the pickle. Usually it is the member's

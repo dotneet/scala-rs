@@ -4947,20 +4947,21 @@ impl Typer {
     /// (`gen_function_apply`), so handing it the method's result is all this
     /// takes. This includes an empty application to a Function0 result;
     /// the method itself has no written parameter clause.
-    pub(crate) fn auto_apply_nullary_function(fun: &mut Tree, nargs: usize) {
+    pub(crate) fn auto_apply_nullary_function(&self, fun: &mut Tree, nargs: usize) {
         let Type::Method { paramss, ret } = &fun.ty else {
             return;
         };
         if !paramss.is_empty() {
             return;
         }
-        let Type::Function { params, .. } = ret.as_ref() else {
+        let widened = self.st.widen_type_param(ret);
+        let Type::Function { params, .. } = &widened else {
             return;
         };
         if params.len() != nargs {
             return;
         }
-        fun.ty = (**ret).clone();
+        fun.ty = widened;
     }
 
     pub(crate) fn rewrite_receiver_apply(&mut self, fun: &mut Tree) {

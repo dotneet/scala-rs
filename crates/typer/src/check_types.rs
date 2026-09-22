@@ -481,9 +481,8 @@ impl Typer {
                 let mut quantified = Vec::new();
                 let mut val_clauses: Vec<(String, Tree, Span)> = Vec::new();
                 let mut ok = true;
-                // The quantified names are bound by `subst_quantified` *after*
-                // the body is resolved, so within the body they resolve to
-                // nothing. Announce them first -- all of them, since a bound
+                // Quantified names are captured after resolving the body.
+                // Announce them first -- all of them, since a bound
                 // may name a later clause -- so that a strict type position
                 // does not report them as missing.
                 let exist_depth = self.exist_quantified.len();
@@ -552,7 +551,49 @@ impl Typer {
                 if !ok {
                     return Type::Error;
                 }
-                subst_quantified(ty, &quantified)
+                let ids: Vec<_> = quantified
+                    .iter()
+                    .map(|q| {
+                        self.st.alloc(
+                            &q.name,
+                            SymbolId::NONE,
+                            SymKind::TypeParam,
+                            Flags::EMPTY,
+                            "",
+                        )
+                    })
+                    .collect();
+                let capture = |ty: &Type| {
+                    crate::symbol::map_type(ty, &mut |t| match t {
+                        Type::Named { name, args } if args.is_empty() => quantified
+                            .iter()
+                            .position(|q| q.name == *name)
+                            .map(|i| Type::TypeParam(ids[i]))
+                            .unwrap_or_else(|| t.clone()),
+                        _ => t.clone(),
+                    })
+                };
+                let body = capture(&ty);
+                let params = quantified
+                    .iter()
+                    .zip(&ids)
+                    .map(|(q, &id)| {
+                        let lo = q.lo.as_ref().map(capture);
+                        let hi = q.hi.as_ref().map(capture);
+                        self.st.get_mut(id).bound_lo = lo.clone();
+                        self.st.get_mut(id).bound_hi = hi.clone();
+                        let bounds = if lo.is_none() && hi.is_none() {
+                            Type::Wildcard
+                        } else {
+                            Type::BoundedWildcard {
+                                lo: lo.map(Box::new),
+                                hi: hi.map(Box::new),
+                            }
+                        };
+                        (id, bounds)
+                    })
+                    .collect();
+                SymbolTable::pack_existential(params, body)
             }
             TreeKind::Unimplemented { what } => {
                 self.error(tpt.span, format!("unimplemented type: {what}"));

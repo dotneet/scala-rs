@@ -1062,7 +1062,7 @@ impl Typer {
         {
             self.insert_apply_on_nullary(fun);
         }
-        Self::auto_apply_nullary_function(fun, args.len());
+        self.auto_apply_nullary_function(fun, args.len());
         let placed = self.reorder_named_args(args, fun);
         self.record_named_arg_order(tree_id);
         if !placed {
@@ -3707,7 +3707,8 @@ impl Typer {
                     // walk the parents, and `b.apply()` already worked.
                     // A missing apply on a Dynamic result would synthesize
                     // another applyDynamic call, recursively growing the tree.
-                    if matches!(strip_annotations(&fun_ty), Type::Refined { .. })
+                    if (matches!(strip_annotations(&fun_ty), Type::Refined { .. })
+                        || self.st.widen_type_param(&fun_ty) != fun_ty)
                         && (has_apply || !self.is_dynamic_receiver(&fun_ty))
                         && self.retry_select_apply(tree, pt)
                     {
@@ -4735,6 +4736,10 @@ impl Typer {
     /// Reading only the whole compound left `b()` reported as "value apply is
     /// not a member of ManagedBlocker with () => T".
     pub(crate) fn type_has_apply(&self, ty: &Type) -> bool {
+        let widened = self.st.widen_type_param(ty);
+        if widened != *ty {
+            return self.type_has_apply(&widened);
+        }
         match strip_annotations(ty) {
             Type::Method { .. } | Type::Overload(_) | Type::Function { .. } => true,
             Type::Array(_) => true,

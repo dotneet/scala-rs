@@ -3583,6 +3583,23 @@ pub(crate) fn collect_tparams(ty: &Type, out: &mut Vec<SymbolId>) {
             }
             collect_tparams(ret, out);
         }
+        Type::Existential { params, body } => {
+            let mut free = Vec::new();
+            collect_tparams(body, &mut free);
+            for (_, bounds) in params {
+                collect_tparams(bounds, &mut free);
+            }
+            for id in free {
+                if !params.iter().any(|(bound, _)| *bound == id) && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        Type::BoundedWildcard { lo, hi } => {
+            for t in [lo, hi].into_iter().flatten() {
+                collect_tparams(t, out);
+            }
+        }
         _ => {}
     }
 }
@@ -3665,6 +3682,13 @@ pub(crate) fn type_mentions_tparam(ty: &Type, tp: SymbolId) -> bool {
         Type::Refined { .. } if crate::symbol::SymbolTable::as_seen_from_view(ty).is_some() => {
             type_mentions_tparam(crate::prefix::strip_view(ty), tp)
         }
+        Type::Existential { params, body } => {
+            !params.iter().any(|(id, _)| *id == tp)
+                && (type_mentions_tparam(body, tp)
+                    || params
+                        .iter()
+                        .any(|(_, bounds)| type_mentions_tparam(bounds, tp)))
+        }
         Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
             args.iter().any(|t| type_mentions_tparam(t, tp))
         }
@@ -3723,6 +3747,13 @@ pub(crate) fn type_mentions_tparam_deep(ty: &Type, tp: SymbolId) -> bool {
                     .iter()
                     .flat_map(decl_types)
                     .any(|t| type_mentions_tparam_deep(&t, tp))
+        }
+        Type::Existential { params, body } => {
+            !params.iter().any(|(id, _)| *id == tp)
+                && (type_mentions_tparam_deep(body, tp)
+                    || params
+                        .iter()
+                        .any(|(_, bounds)| type_mentions_tparam_deep(bounds, tp)))
         }
         Type::Class { args, .. } | Type::Named { args, .. } | Type::Tuple(args) => {
             args.iter().any(|t| type_mentions_tparam_deep(t, tp))
@@ -4228,77 +4259,6 @@ pub(crate) struct ExistQuant {
     pub(crate) name: String,
     pub(crate) lo: Option<Type>,
     pub(crate) hi: Option<Type>,
-}
-
-pub(crate) fn subst_quantified(ty: Type, qs: &[ExistQuant]) -> Type {
-    if qs.is_empty() {
-        return ty;
-    }
-    let replace = |name: &str, args: &[Type]| -> Option<Type> {
-        if !args.is_empty() {
-            return None;
-        }
-        qs.iter().find(|q| q.name == name).map(|q| {
-            if q.lo.is_none() && q.hi.is_none() {
-                Type::Wildcard
-            } else {
-                Type::BoundedWildcard {
-                    lo: q.lo.clone().map(Box::new),
-                    hi: q.hi.clone().map(Box::new),
-                }
-            }
-        })
-    };
-    match ty {
-        Type::Named { name, args } => {
-            if let Some(w) = replace(&name, &args) {
-                w
-            } else {
-                Type::Named {
-                    name,
-                    args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
-                }
-            }
-        }
-        Type::Class { sym, args } => Type::Class {
-            sym,
-            args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
-        },
-        Type::Applied { ctor, args } => Type::Applied {
-            ctor: Box::new(subst_quantified(*ctor, qs)),
-            args: args.into_iter().map(|a| subst_quantified(a, qs)).collect(),
-        },
-        Type::Array(t) => Type::Array(Box::new(subst_quantified(*t, qs))),
-        Type::Function { params, ret } => Type::Function {
-            params: params
-                .into_iter()
-                .map(|p| subst_quantified(p, qs))
-                .collect(),
-            ret: Box::new(subst_quantified(*ret, qs)),
-        },
-        Type::Method { paramss, ret } => Type::Method {
-            paramss: paramss
-                .into_iter()
-                .map(|ps| ps.into_iter().map(|p| subst_quantified(p, qs)).collect())
-                .collect(),
-            ret: Box::new(subst_quantified(*ret, qs)),
-        },
-        Type::ByName(t) => Type::ByName(Box::new(subst_quantified(*t, qs))),
-        Type::Repeated(t) => Type::Repeated(Box::new(subst_quantified(*t, qs))),
-        Type::Tuple(ts) => Type::Tuple(ts.into_iter().map(|t| subst_quantified(t, qs)).collect()),
-        Type::Overload(alts) => {
-            Type::Overload(alts.into_iter().map(|t| subst_quantified(t, qs)).collect())
-        }
-        Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(subst_quantified(*tpe, qs)),
-            annot,
-        },
-        Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
-            lo: lo.map(|t| Box::new(subst_quantified(*t, qs))),
-            hi: hi.map(|t| Box::new(subst_quantified(*t, qs))),
-        },
-        other => other,
-    }
 }
 
 /// Forget what an import prefix was last typed as, down the whole `a.b.c`

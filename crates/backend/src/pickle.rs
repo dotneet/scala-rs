@@ -2203,6 +2203,49 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                     self.type_ref_named("Any")
                 }
             }
+            Type::Existential { params, body } => {
+                // Allocate all binders before their bounds: bounds may name
+                // another variable in this same existential scope.
+                let refs: Vec<_> = params
+                    .iter()
+                    .map(|_| self.pickle_existential_param_refs(None, None))
+                    .collect();
+                let previous: Vec<_> = params
+                    .iter()
+                    .zip(&refs)
+                    .map(|((id, _), &r)| (id.0, self.sym_index.insert(id.0, r)))
+                    .collect();
+                for ((_, bounds), &r) in params.iter().zip(&refs) {
+                    let (lo, hi) = match bounds {
+                        Type::BoundedWildcard { lo, hi } => (lo.as_deref(), hi.as_deref()),
+                        _ => (None, None),
+                    };
+                    let lo = lo
+                        .map(|t| self.pickle_type(t))
+                        .unwrap_or_else(|| self.type_ref_named("Nothing"));
+                    let hi = hi
+                        .map(|t| self.pickle_type(t))
+                        .unwrap_or_else(|| self.type_ref_named("Any"));
+                    let mut payload = Vec::new();
+                    write_nat_to(&mut payload, lo);
+                    write_nat_to(&mut payload, hi);
+                    let bound_ref = self.add(TYPEBOUNDSTPE, payload);
+                    self.exist_n += 1;
+                    let name = self.symbol_type_name(&format!("_${}", self.exist_n));
+                    let flags = raw_to_pickled((1u64 << 4) | (1u64 << 13)) | (1u64 << 35);
+                    let info = self.symbol_info(name, self.current_owner, flags, bound_ref);
+                    self.entries[r as usize] = (TYPESYM, info);
+                }
+                let inner = self.pickle_type(body);
+                for (id, old) in previous {
+                    if let Some(r) = old {
+                        self.sym_index.insert(id, r);
+                    } else {
+                        self.sym_index.remove(&id);
+                    }
+                }
+                self.pickle_existential_tpe(inner, &refs)
+            }
             Type::ThisType(id) => self.pickle_this_tpe(*id),
             Type::SingleType { prefix, sym } => {
                 if let Type::ThisType(owner) = prefix.as_ref() {

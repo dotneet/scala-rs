@@ -355,3 +355,142 @@ fn by_name_nothing_does_not_fix_fold_result_type() {
         false,
     );
 }
+
+fn existential_alias_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/contextualinference")
+        .join(format!("existential_alias_scope_{name}.scala"))
+}
+
+fn compile_existential_fixture(
+    scalac: bool,
+    source: &Path,
+    out: &Path,
+    cp: Option<&str>,
+) -> std::process::Output {
+    let mut command = Command::new(if scalac {
+        "/tmp/scala-2.13.16/bin/scalac"
+    } else {
+        env!("CARGO_BIN_EXE_scala-rs")
+    });
+    if !scalac {
+        command.args(["compile", "--scala-library", JAR]);
+    }
+    if let Some(cp) = cp {
+        command.args(["-cp", cp]);
+    }
+    command.args(["-d"]).arg(out).arg(source);
+    command.output().unwrap()
+}
+
+#[test]
+fn existential_alias_scope_acceptance_matches_both_compilers() {
+    let stamp = temp_nonce::unique_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(format!("existential-alias-scalac-{stamp}"));
+    fs::create_dir(&root).unwrap();
+
+    for compiler_scalac in [true, false] {
+        for (name, accepted) in [
+            ("good", true),
+            ("explicit_bad", false),
+            ("explicit_concrete_bad", false),
+            ("correlation_bad", false),
+            ("bound_bad", false),
+        ] {
+            let out = root.join(format!("{name}-{compiler_scalac}"));
+            fs::create_dir(&out).unwrap();
+            let output = compile_existential_fixture(
+                compiler_scalac,
+                &existential_alias_fixture(name),
+                &out,
+                Some(JAR),
+            );
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "{name} compiler_scalac={compiler_scalac}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn existential_alias_signature_roundtrip_across_compilers() {
+    let stamp = temp_nonce::unique_stamp(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(format!("existential-alias-roundtrip-{stamp}"));
+    fs::create_dir(&root).unwrap();
+
+    for producer_scalac in [true, false] {
+        for consumer_scalac in [true, false] {
+            let tag = format!("producer-{producer_scalac}-consumer-{consumer_scalac}");
+            let producer_out = root.join(format!("{tag}-producer"));
+            let consumer_out = root.join(format!("{tag}-consumer"));
+            fs::create_dir(&producer_out).unwrap();
+            fs::create_dir(&consumer_out).unwrap();
+
+            let producer = compile_existential_fixture(
+                producer_scalac,
+                &existential_alias_fixture("producer"),
+                &producer_out,
+                Some(JAR),
+            );
+            assert!(
+                producer.status.success(),
+                "{tag}: producer compile failed: {}{}",
+                String::from_utf8_lossy(&producer.stdout),
+                String::from_utf8_lossy(&producer.stderr)
+            );
+
+            let cp = format!("{}:{JAR}", producer_out.display());
+            let consumer = compile_existential_fixture(
+                consumer_scalac,
+                &existential_alias_fixture("consumer"),
+                &consumer_out,
+                Some(&cp),
+            );
+            assert!(
+                consumer.status.success(),
+                "{tag}: consumer compile failed: {}{}",
+                String::from_utf8_lossy(&consumer.stdout),
+                String::from_utf8_lossy(&consumer.stderr)
+            );
+
+            let runtime_cp = format!(
+                "{}:{}:{JAR}",
+                consumer_out.display(),
+                producer_out.display()
+            );
+            let run = Command::new("java")
+                .args([
+                    "-Xverify:all",
+                    "-cp",
+                    &runtime_cp,
+                    "existential_alias_scope.Main",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{tag}: runtime failed: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            assert_eq!(run.stdout, b"6\n", "{tag}: output differs");
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}

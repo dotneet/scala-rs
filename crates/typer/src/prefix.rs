@@ -642,6 +642,13 @@ fn map_views(
             tpe: Box::new(go(tpe)),
             annot: annot.clone(),
         },
+        Type::Existential { params, body } => Type::Existential {
+            params: params
+                .iter()
+                .map(|(id, bounds)| (*id, go(bounds)))
+                .collect(),
+            body: Box::new(go(body)),
+        },
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(go).collect(),
             ret: Box::new(go(ret)),

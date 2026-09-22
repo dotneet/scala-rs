@@ -15,12 +15,33 @@ use scala_rs_parser::{Flags, SymbolId, Tree, TreeKind, Type};
 use scala_rs_typer::{method_overloads, SymKind, SymbolTable};
 use std::collections::HashSet;
 
+fn existential_erasure_bounds(params: &[(SymbolId, Type)]) -> (Vec<SymbolId>, Vec<Type>) {
+    let ids = params.iter().map(|(id, _)| *id).collect();
+    let bounds = params
+        .iter()
+        .map(|(_, bounds)| match bounds {
+            Type::BoundedWildcard { hi: Some(hi), .. } => {
+                let hi = hi.widen_constant();
+                if is_jvm_primitive(&hi) {
+                    Type::Any
+                } else {
+                    hi
+                }
+            }
+            Type::BoundedWildcard { hi: None, .. } | Type::Wildcard => Type::Any,
+            other => other.clone(),
+        })
+        .collect();
+    (ids, bounds)
+}
+
 // ---------------------------------------------------------------------------
 // descriptors
 // ---------------------------------------------------------------------------
 
 pub(crate) fn jvm_sort(ty: &Type) -> JvmSort {
     match ty {
+        Type::Existential { body, .. } => jvm_sort(body),
         Type::Unit | Type::NoType | Type::Nothing => JvmSort::Void,
         Type::Boolean | Type::Int | Type::Char | Type::Byte | Type::Short => JvmSort::Int,
         Type::Long => JvmSort::Long,
@@ -32,7 +53,11 @@ pub(crate) fn jvm_sort(ty: &Type) -> JvmSort {
 }
 
 pub(crate) fn is_unit_like(ty: &Type) -> bool {
-    matches!(ty, Type::Unit | Type::NoType)
+    match ty {
+        Type::Existential { body, .. } => is_unit_like(body),
+        Type::Unit | Type::NoType => true,
+        _ => false,
+    }
 }
 
 /// Sort of a value held in a *slot* — a parameter or a local. Differs from
@@ -53,10 +78,13 @@ pub(crate) fn jvm_slot_sort(ty: &Type) -> JvmSort {
 /// A type whose *result* erasure is `V` but whose *value* erasure is a
 /// reference, so it occupies a parameter slot.
 pub(crate) fn erases_to_ref_slot(ty: &Type) -> bool {
-    matches!(
-        ty.widen_constant(),
-        Type::Unit | Type::NoType | Type::Nothing
-    )
+    match ty {
+        Type::Existential { body, .. } => erases_to_ref_slot(body),
+        _ => matches!(
+            ty.widen_constant(),
+            Type::Unit | Type::NoType | Type::Nothing
+        ),
+    }
 }
 
 /// How many local slots a parameter of this type occupies.
@@ -110,10 +138,18 @@ pub(crate) fn jvm_desc_array_elem(st: &SymbolTable, ty: &Type) -> String {
 /// True when this type needs `BoxedUnit.UNIT` materialised to occupy the value
 /// position it was erased into.
 pub(crate) fn erases_to_boxed_unit(ty: &Type) -> bool {
-    matches!(ty.widen_constant(), Type::Unit | Type::NoType)
+    match ty {
+        Type::Existential { body, .. } => erases_to_boxed_unit(body),
+        _ => matches!(ty.widen_constant(), Type::Unit | Type::NoType),
+    }
 }
 
 pub(crate) fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
+    if let Type::Existential { params, body } = ty {
+        let (ids, bounds) = existential_erasure_bounds(params);
+        let body = st.subst_type_params(&ids, &bounds, body);
+        return jvm_desc(st, &body);
+    }
     match ty {
         Type::Unit | Type::NoType => "V".into(),
         // `Unit` is `V` only as a method *result* (see `BOXED_UNIT` above);
@@ -158,6 +194,7 @@ pub(crate) fn jvm_desc(st: &SymbolTable, ty: &Type) -> String {
         | Type::Applied { .. }
         | Type::Wildcard
         | Type::BoundedWildcard { .. } => "Ljava/lang/Object;".into(),
+        Type::Existential { .. } => unreachable!("handled before descriptor match"),
         Type::ThisType(sym) => format!("L{};", class_internal(st, *sym)),
         Type::Constant(lit) => jvm_desc(st, &Type::lit_underlying(lit)),
         Type::SingleType { prefix, sym } => {
@@ -360,6 +397,11 @@ fn checkcast_internal_depth(st: &SymbolTable, ty: &Type, depth: usize) -> Option
     // turning a malformed or self-referential bound into compiler recursion.
     if depth > 64 {
         return None;
+    }
+    if let Type::Existential { params, body } = ty {
+        let (ids, bounds) = existential_erasure_bounds(params);
+        let body = st.subst_type_params(&ids, &bounds, body);
+        return checkcast_internal_depth(st, &body, depth + 1);
     }
     match ty {
         Type::Null => Some("scala/runtime/Null$".into()),
@@ -981,6 +1023,11 @@ pub(crate) fn trait_static_name(name: &str) -> String {
 }
 
 pub(crate) fn type_jvm_name(st: &SymbolTable, ty: &Type) -> String {
+    if let Type::Existential { params, body } = ty {
+        let (ids, bounds) = existential_erasure_bounds(params);
+        let body = st.subst_type_params(&ids, &bounds, body);
+        return type_jvm_name(st, &body);
+    }
     match ty {
         Type::Class { sym, .. } | Type::ModuleRef(sym) => class_internal(st, *sym),
         Type::Named { name, .. } => name.replace('.', "/"),

@@ -2272,6 +2272,22 @@ pub(crate) fn collect_abstract(ty: &Type, out: &mut Vec<SymbolId>) {
             args.iter().for_each(|a| collect_abstract(a, out));
         }
         Type::SingleType { prefix, .. } => collect_abstract(prefix, out),
+        Type::Existential { params, body } => {
+            let mut free = Vec::new();
+            collect_abstract(body, &mut free);
+            for (_, bounds) in params {
+                collect_abstract(bounds, &mut free);
+            }
+            out.extend(
+                free.into_iter()
+                    .filter(|id| !params.iter().any(|(bound, _)| bound == id)),
+            );
+        }
+        Type::BoundedWildcard { lo, hi } => {
+            for bound in [lo, hi].into_iter().flatten() {
+                collect_abstract(bound, out);
+            }
+        }
         _ => {}
     }
 }

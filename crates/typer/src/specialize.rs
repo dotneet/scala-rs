@@ -641,6 +641,15 @@ fn variant_local_jvm_name(
 
 fn remap_type_symbols(ty: &mut Type, map: &FxHashMap<SymbolId, SymbolId>) {
     match ty {
+        Type::Existential { params, body } => {
+            for (id, bounds) in params {
+                if let Some(replacement) = map.get(id) {
+                    *id = *replacement;
+                }
+                remap_type_symbols(bounds, map);
+            }
+            remap_type_symbols(body, map);
+        }
         Type::Array(elem) | Type::ByName(elem) | Type::Repeated(elem) => {
             remap_type_symbols(elem, map)
         }

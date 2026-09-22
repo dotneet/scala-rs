@@ -251,6 +251,12 @@ pub enum Type {
         lo: Option<Box<Type>>,
         hi: Option<Box<Type>>,
     },
+    /// A wildcard quantified outside its body, rather than inside a nested
+    /// application. Each parameter is paired with its wildcard bounds.
+    Existential {
+        params: Vec<(SymbolId, Type)>,
+        body: Box<Type>,
+    },
     /// `this.type` of class `cls`.
     ThisType(SymbolId),
     /// Stable path singleton `p.type`. `sym` is the term (`val` / module).
@@ -442,6 +448,7 @@ impl fmt::Display for Type {
                 Ok(())
             }
             Type::ThisType(s) => write!(f, "this.type(#{})", s.0),
+            Type::Existential { body, .. } => write!(f, "{body} forSome {{ ... }}"),
             Type::SingleType { sym, .. } => write!(f, "#{}.type", sym.0),
             Type::Constant(lit) => write!(f, "{lit}"),
             Type::Annotated { tpe, annot } => write!(f, "{tpe} @{annot}"),

@@ -2963,7 +2963,9 @@ impl SymbolTable {
                     self.class_sym_of(&t)
                 }
             }
-            Type::Annotated { tpe, .. } => self.class_sym_of(tpe),
+            Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
+                self.class_sym_of(tpe)
+            }
             Type::Refined { parents, .. } => parents
                 .iter()
                 .find_map(|p| self.class_sym_of(p))
@@ -3204,6 +3206,13 @@ impl SymbolTable {
             Type::Annotated { tpe, annot } => Type::Annotated {
                 tpe: Box::new(go(tpe)),
                 annot: annot.clone(),
+            },
+            Type::Existential { params, body } => Type::Existential {
+                params: params
+                    .iter()
+                    .map(|(id, bounds)| (*id, go(bounds)))
+                    .collect(),
+                body: Box::new(go(body)),
             },
             Type::Refined { parents, decls } => Type::Refined {
                 parents: parents.iter().map(go).collect(),
@@ -3814,13 +3823,77 @@ impl SymbolTable {
                         // callers want; expanding it inside its own expansion
                         // never ends, so leave the inner one folded.
                         if let Some(_g) = enter_chase(Chase::HkAlias, *id) {
-                            return self.subst_tparams(*id, args, &info.ty);
+                            let quantified: Vec<_> = info
+                                .tparams
+                                .iter()
+                                .zip(args)
+                                .filter(|(_, arg)| is_wildcard_arg(arg))
+                                .map(|(&id, arg)| (id, arg.clone()))
+                                .collect();
+                            if quantified.is_empty() {
+                                return self.subst_tparams(*id, args, &info.ty);
+                            }
+                            let captured: Vec<_> = info
+                                .tparams
+                                .iter()
+                                .zip(args)
+                                .map(|(&id, arg)| {
+                                    if is_wildcard_arg(arg) {
+                                        Type::TypeParam(id)
+                                    } else {
+                                        arg.clone()
+                                    }
+                                })
+                                .collect();
+                            let body = self.subst_tparams(*id, &captured, &info.ty);
+                            return Self::pack_existential(quantified, body);
                         }
                     }
                 }
                 ty
             }
             _ => ty,
+        }
+    }
+
+    /// Direct wildcard arguments already carry their scope in the type tree.
+    /// Alias expansion can move a quantified parameter inside another type;
+    /// retain an explicit binder in that case, including repeated occurrences.
+    pub(crate) fn pack_existential(params: Vec<(SymbolId, Type)>, body: Type) -> Type {
+        let direct: Vec<&Type> = match &body {
+            Type::Class { args, .. }
+            | Type::Named { args, .. }
+            | Type::Tuple(args)
+            | Type::Applied { args, .. } => args.iter().collect(),
+            Type::Function { params, ret } => {
+                params.iter().chain(std::iter::once(ret.as_ref())).collect()
+            }
+            Type::Array(element) => vec![element],
+            _ => vec![],
+        };
+        let simple = params.iter().all(|(_, bounds)| !any_type(bounds, &mut |t| matches!(t, Type::TypeParam(id) if params.iter().any(|(bound, _)| bound == id)))) && params.iter().all(|(id, _)| {
+            let mut occurrences = 0;
+            any_type(&body, &mut |t| {
+                if matches!(t, Type::TypeParam(other) if other == id) {
+                    occurrences += 1;
+                }
+                false
+            });
+            occurrences == 0
+                || occurrences == 1
+                    && direct
+                        .iter()
+                        .any(|t| matches!(t, Type::TypeParam(other) if other == id))
+        });
+        if simple {
+            let ids: Vec<_> = params.iter().map(|(id, _)| *id).collect();
+            let bounds: Vec<_> = params.into_iter().map(|(_, bounds)| bounds).collect();
+            subst_tparams_slice(&ids, &bounds, &body)
+        } else {
+            Type::Existential {
+                params,
+                body: Box::new(body),
+            }
         }
     }
 
@@ -4059,7 +4132,9 @@ impl SymbolTable {
                     0
                 }
             }
-            Type::Annotated { tpe, .. } => self.kind_arity(tpe),
+            Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
+                self.kind_arity(tpe)
+            }
             _ => 0,
         }
     }
@@ -4094,7 +4169,9 @@ impl SymbolTable {
                 rest.drain(0..n);
                 rest
             }
-            Type::Annotated { tpe, .. } => self.tparam_arities(tpe),
+            Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
+                self.tparam_arities(tpe)
+            }
             _ => Vec::new(),
         }
     }
@@ -4119,7 +4196,9 @@ impl SymbolTable {
                 }
             }
             Type::Array(t) | Type::ByName(t) | Type::Repeated(t) => Self::this_type_owners(t, out),
-            Type::Annotated { tpe, .. } => Self::this_type_owners(tpe, out),
+            Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
+                Self::this_type_owners(tpe, out)
+            }
             Type::Function { params, ret } => {
                 for p in params {
                     Self::this_type_owners(p, out);
@@ -4354,7 +4433,9 @@ impl SymbolTable {
                         walk(st, &p, subs, seen, base);
                     }
                 }
-                Type::Annotated { tpe, .. } => walk(st, tpe, subs, seen, base),
+                Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
+                    walk(st, tpe, subs, seen, base)
+                }
                 // `p.type` has the members of `p`'s type, at its arguments:
                 // `def f(b: Buf[Int]): b.type` and then `f(x).add(1)` reads
                 // `add` through `Buf[Int]`. Without this the walk stopped here
@@ -5973,6 +6054,62 @@ impl SymbolTable {
     }
 
     pub fn is_sub_type(&self, a: &Type, b: &Type) -> bool {
+        if let Type::Existential { params, body } = b {
+            if a == b || matches!(a, Type::Nothing | Type::Error) {
+                return true;
+            }
+            if matches!(a, Type::Null) {
+                return self.is_sub_type(a, body);
+            }
+            let (actual, captures) = match a {
+                Type::Existential { params, body } => (body.as_ref(), params.as_slice()),
+                _ => (a, &[][..]),
+            };
+            let ids: Vec<_> = params.iter().map(|(id, _)| *id).collect();
+            let witnesses: Option<Vec<_>> = params
+                .iter()
+                .map(|(id, _)| crate::check::unify_one_precise(self, *id, body, actual))
+                .collect();
+            let Some(witnesses) = witnesses else {
+                return false;
+            };
+            for ((_, bounds), witness) in params.iter().zip(&witnesses) {
+                let bounds = subst_tparams_slice(&ids, &witnesses, bounds);
+                if let Type::BoundedWildcard { lo, hi } = bounds {
+                    // An existential on the left offers a range, not a new
+                    // inference variable. Its whole range must fit the
+                    // corresponding binder on the right.
+                    let range = match witness {
+                        Type::TypeParam(id) => captures
+                            .iter()
+                            .find(|(other, _)| other == id)
+                            .map(|(_, b)| b),
+                        _ => None,
+                    };
+                    let (lower, upper) = match range {
+                        Some(Type::BoundedWildcard { lo, hi }) => (
+                            lo.as_deref().unwrap_or(&Type::Nothing),
+                            hi.as_deref().unwrap_or(&Type::Any),
+                        ),
+                        Some(Type::Wildcard) => (&Type::Nothing, &Type::Any),
+                        _ => (witness, witness),
+                    };
+                    if lo.as_ref().is_some_and(|lo| !self.is_sub_type(lo, lower))
+                        || hi.as_ref().is_some_and(|hi| !self.is_sub_type(upper, hi))
+                    {
+                        return false;
+                    }
+                }
+            }
+            // Recheck the instantiated body to preserve invariant containers
+            // and correlations between repeated occurrences of a binder.
+            return self.is_sub_type(actual, &subst_tparams_slice(&ids, &witnesses, body));
+        }
+        if let Type::Existential { body, .. } = a {
+            // Opening the scope must not move it inside an invariant type
+            // argument: Box[(T, T)] forSome { type T } is not Box[(_, _)].
+            return self.is_sub_type(body, b);
+        }
         if matches!(a, Type::JavaObject) {
             return self.is_sub_type(&Type::AnyRef, b);
         }
@@ -7040,6 +7177,20 @@ impl SymbolTable {
             Type::Annotated { tpe, annot } => {
                 format!("{} @{}", self.display_type(tpe), annot)
             }
+            Type::Existential { params, body } => format!(
+                "{} forSome {{ {} }}",
+                self.display_type(body),
+                params
+                    .iter()
+                    .map(|(id, bounds)| format!(
+                        "type {} {}",
+                        self.get(*id).name,
+                        self.display_type(bounds).trim_start_matches('_')
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+
             Type::BoundedWildcard { lo, hi } => {
                 let mut s = String::from("_");
                 if let Some(t) = lo {
@@ -7454,6 +7605,13 @@ impl SymbolTable {
                 tpe: Box::new(self.expand_type_members(from, tpe)),
                 annot: annot.clone(),
             },
+            Type::Existential { params, body } => Type::Existential {
+                params: params
+                    .iter()
+                    .map(|(id, bounds)| (*id, self.expand_type_members(from, bounds)))
+                    .collect(),
+                body: Box::new(self.expand_type_members(from, body)),
+            },
             Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
                 lo: lo
                     .as_ref()
@@ -7493,7 +7651,9 @@ impl SymbolTable {
             }
             Type::ModuleRef(sym) => self.expand_type_members(*sym, ty),
             Type::ThisType(sym) => self.expand_type_members(*sym, ty),
-            Type::Annotated { tpe, .. } => self.expand_in_type(tpe, ty),
+            Type::Annotated { tpe, .. } | Type::Existential { body: tpe, .. } => {
+                self.expand_in_type(tpe, ty)
+            }
             Type::SingleType { prefix, sym } => {
                 let t = self.singleton_underlying(*sym);
                 if t.is_no_type() {
@@ -8093,6 +8253,22 @@ fn subst_map(ty: &Type, tps: &[scala_rs_parser::SymbolId], args: &[Type]) -> Typ
             tpe: Box::new(subst_map(tpe, tps, args)),
             annot: annot.clone(),
         },
+        Type::Existential { params, body } => {
+            let free: Vec<_> = tps
+                .iter()
+                .zip(args)
+                .filter(|(id, _)| !params.iter().any(|(bound, _)| bound == *id))
+                .collect();
+            let ids: Vec<_> = free.iter().map(|(id, _)| **id).collect();
+            let values: Vec<_> = free.iter().map(|(_, ty)| (*ty).clone()).collect();
+            Type::Existential {
+                params: params
+                    .iter()
+                    .map(|(id, bounds)| (*id, subst_map(bounds, &ids, &values)))
+                    .collect(),
+                body: Box::new(subst_map(body, &ids, &values)),
+            }
+        }
         Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
             lo: lo.as_ref().map(|t| Box::new(subst_map(t, tps, args))),
             hi: hi.as_ref().map(|t| Box::new(subst_map(t, tps, args))),
@@ -8397,6 +8573,9 @@ pub(crate) fn any_type(ty: &Type, f: &mut impl FnMut(&Type) -> bool) -> bool {
     }
     let some = |ts: &[Type], f: &mut _| ts.iter().any(|t| any_type(t, f));
     match ty {
+        Type::Existential { params, body } => {
+            params.iter().any(|(_, bounds)| any_type(bounds, f)) || any_type(body, f)
+        }
         Type::Class { args, .. }
         | Type::Tuple(args)
         | Type::Named { args, .. }
@@ -8468,6 +8647,13 @@ pub(crate) fn map_type(ty: &Type, f: &mut impl FnMut(&Type) -> Type) -> Type {
         Type::Annotated { tpe, annot } => Type::Annotated {
             tpe: Box::new(map_type(tpe, f)),
             annot: annot.clone(),
+        },
+        Type::Existential { params, body } => Type::Existential {
+            params: params
+                .iter()
+                .map(|(id, bounds)| (*id, map_type(bounds, f)))
+                .collect(),
+            body: Box::new(map_type(body, f)),
         },
         Type::BoundedWildcard { lo, hi } => Type::BoundedWildcard {
             lo: lo.as_ref().map(|t| Box::new(map_type(t, f))),
@@ -8559,6 +8745,13 @@ pub(crate) fn subst_this_type(ty: &Type, cls: SymbolId, to: &Type) -> Type {
         Type::Annotated { tpe, annot } => Type::Annotated {
             tpe: Box::new(go(tpe)),
             annot: annot.clone(),
+        },
+        Type::Existential { params, body } => Type::Existential {
+            params: params
+                .iter()
+                .map(|(id, bounds)| (*id, go(bounds)))
+                .collect(),
+            body: Box::new(go(body)),
         },
         Type::Function { params, ret } => Type::Function {
             params: params.iter().map(go).collect(),

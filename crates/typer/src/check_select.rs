@@ -126,6 +126,38 @@ impl Typer {
         // `NTupleMonadInstances`, where kind-projector's `(A0, *, *)` is
         // exactly this shape.
         recv_ty = self.st.dealias(&self.st.expand_applied_hk_alias(recv_ty));
+        // Member lookup opens the receiver's existential scope with fresh
+        // skolems. Reusing an alias parameter here would lose its bound and
+        // could equate captures from unrelated receiver values.
+        if let Type::Existential { params, body } = &recv_ty {
+            let ids: Vec<_> = params.iter().map(|(id, _)| *id).collect();
+            let captured: Vec<_> = params
+                .iter()
+                .map(|(id, _)| {
+                    let name = self.st.get(*id).name.clone();
+                    Type::TypeParam(self.st.alloc(
+                        &name,
+                        SymbolId::NONE,
+                        SymKind::TypeParam,
+                        Flags::EMPTY,
+                        "",
+                    ))
+                })
+                .collect();
+            for ((_, bounds), skolem) in params.iter().zip(&captured) {
+                let Type::TypeParam(id) = skolem else {
+                    unreachable!()
+                };
+                let bounds = crate::symbol::subst_tparams_slice(&ids, &captured, bounds);
+                let (lo, hi) = match bounds {
+                    Type::BoundedWildcard { lo, hi } => (lo.map(|t| *t), hi.map(|t| *t)),
+                    _ => (None, None),
+                };
+                self.st.get_mut(*id).bound_lo = Some(lo.unwrap_or(Type::Nothing));
+                self.st.get_mut(*id).bound_hi = Some(hi.unwrap_or(Type::Any));
+            }
+            recv_ty = crate::symbol::subst_tparams_slice(&ids, &captured, body);
+        }
         // Directory discovery installs a shallow signature so names are
         // available to the header pass. A member selection needs the full
         // Scala declaration, including implicit clauses and bounds, even
