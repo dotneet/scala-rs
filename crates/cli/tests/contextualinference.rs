@@ -36,6 +36,14 @@ fn conditional_arguments_infer_types_from_both_branches() {
 }
 
 #[test]
+fn invariant_results_refine_broad_evidence_without_accepting_bad_arguments() {
+    matrix(
+        &[("prototype_merge", true), ("prototype_merge_bad", false)],
+        false,
+    );
+}
+
+#[test]
 fn binary_nominal_callbacks_infer_lambda_result_types() {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

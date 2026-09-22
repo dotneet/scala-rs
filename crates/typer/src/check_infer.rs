@@ -2296,10 +2296,9 @@ impl Typer {
         let mut undet_solved: Vec<(SymbolId, Type)> = Vec::new();
         for (tp, ty, strong) in found {
             match inst.iter_mut().find(|(id, _)| *id == tp) {
-                // The arguments already pinned it. Only an invariant position
-                // overrides them, and only when the argument solution actually
-                // conforms -- otherwise the call is ill-typed and the argument
-                // type is what the user needs to see in the message.
+                // An invariant result can refine an argument's broader
+                // solution. The final parameter check still rejects an
+                // argument that does not conform to the refined type.
                 Some(slot) => {
                     // ... and only when the expected type actually says
                     // something. A wildcard in it is `check_apply`'s `relaxed`
@@ -2324,7 +2323,7 @@ impl Typer {
                     // result says `A` is `(C, A)` -- which is what then solves
                     // `X` and `Y`.
                     if strong && slot.1 != ty && !type_has_wildcard(&ty) {
-                        if self.st.is_sub_type(&slot.1, &ty) {
+                        if self.st.is_sub_type(&slot.1, &ty) || self.st.is_sub_type(&ty, &slot.1) {
                             slot.1 = ty;
                         } else if !matches!(&slot.1, Type::TypeParam(v) if self.undet_tvars.contains(v))
                             && self.undet_compatible(&slot.1, &ty)

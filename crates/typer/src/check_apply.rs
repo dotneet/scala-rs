@@ -25,6 +25,50 @@ fn remaining_application_result(fun_ty: &Type, ret: &Type) -> Type {
     }
 }
 
+// The result prototype and earlier arguments can constrain different parts of
+// the same formal type. Keep both constraints when their known parts agree.
+fn merge_argument_prototypes(left: &Type, right: &Type) -> Option<Type> {
+    match (left, right) {
+        (Type::Wildcard, other) | (other, Type::Wildcard) => Some(other.clone()),
+        (
+            Type::Class {
+                sym: left_sym,
+                args: left_args,
+            },
+            Type::Class {
+                sym: right_sym,
+                args: right_args,
+            },
+        ) if left_sym == right_sym && left_args.len() == right_args.len() => Some(Type::Class {
+            sym: *left_sym,
+            args: left_args
+                .iter()
+                .zip(right_args)
+                .map(|(l, r)| merge_argument_prototypes(l, r))
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        (
+            Type::Applied {
+                ctor: left_ctor,
+                args: left_args,
+            },
+            Type::Applied {
+                ctor: right_ctor,
+                args: right_args,
+            },
+        ) if left_args.len() == right_args.len() => Some(Type::Applied {
+            ctor: Box::new(merge_argument_prototypes(left_ctor, right_ctor)?),
+            args: left_args
+                .iter()
+                .zip(right_args)
+                .map(|(l, r)| merge_argument_prototypes(l, r))
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        _ if left == right => Some(left.clone()),
+        _ => None,
+    }
+}
+
 impl Typer {
     /// Every application gets its own set of undetermined type variables: an
     /// argument of *this* call is typed by a nested `type_apply`, whose
@@ -1410,7 +1454,9 @@ impl Typer {
                             open.dedup();
                             (open.len(), usize::from(type_mentions_wildcard(ty)))
                         };
-                        if pt_arg.is_no_type()
+                        if let Some(merged) = merge_argument_prototypes(&pt_arg, &sequential) {
+                            merged
+                        } else if pt_arg.is_no_type()
                             || pt_arg.is_error()
                             || uncertainty(&sequential) < uncertainty(&pt_arg)
                         {
