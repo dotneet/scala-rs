@@ -64,6 +64,10 @@ const ITERABLE_FACTORIES: &[(&str, &str)] = &[
         "scala/collection/immutable/Queue",
     ),
     ("scala/collection/Iterable$", "scala/collection/Iterable"),
+    (
+        "scala/collection/immutable/Iterable$",
+        "scala/collection/immutable/Iterable",
+    ),
     ("scala/collection/Seq$", "scala/collection/Seq"),
     ("scala/collection/Set$", "scala/collection/Set"),
     (
@@ -136,6 +140,9 @@ pub(crate) const FACTORY_CLASSES: &[&str] = &[
     "scala/collection/EvidenceIterableFactory$",
     "scala/collection/SortedMapFactory",
     "scala/collection/SortedMapFactory$",
+    // The immutable Iterable type is a prelude hierarchy link, but its
+    // companion is otherwise loaded lazily, after factory evidence is linked.
+    "scala/collection/immutable/Iterable$",
 ];
 
 pub(crate) fn install(st: &mut SymbolTable, library_abi: bool) {

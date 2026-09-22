@@ -325,6 +325,69 @@ fn bf_to_factory_resolves_from_the_companion() {
     );
 }
 
+#[test]
+fn bf_immutable_iterable_factory_matches_scalac() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let root = tmp_dir("immutable_iterable_factory");
+    let good = root.join("Main.scala");
+    fs::write(
+        &good,
+        r#"
+import scala.collection.Factory
+import scala.collection.immutable.{Iterable => ImmutableIterable}
+object Main {
+  def copy[A, CC[X] <: scala.collection.Iterable[X]](xs: CC[A])(
+    implicit factory: Factory[A, CC[A]]
+  ): CC[A] = factory.fromSpecific(xs)
+  def main(args: Array[String]): Unit = {
+    val cold = implicitly[Factory[Int, ImmutableIterable[Int]]]
+    val converted: ImmutableIterable[Int] = List(1, 2).to(ImmutableIterable)
+    val warm = implicitly[Factory[Int, ImmutableIterable[Int]]]
+    val general = implicitly[Factory[Int, scala.collection.Iterable[Int]]]
+    println(cold.fromSpecific(List(3)).head)
+    println(warm.fromSpecific(converted).mkString(","))
+    println(copy(converted).mkString(","))
+    println(general.fromSpecific(List(4)).head)
+  }
+}
+"#,
+    )
+    .unwrap();
+    let bad = root.join("Bad.scala");
+    fs::write(&bad, "object Bad { val f = implicitly[scala.collection.Factory[String, scala.collection.immutable.Iterable[Int]]] }").unwrap();
+    for native in [false, true] {
+        let out = root.join(format!("out-{native}"));
+        fs::create_dir(&out).unwrap();
+        for (src, accepted) in [(&good, true), (&bad, false)] {
+            let mut cmd = if native {
+                let mut c = Command::new(bin());
+                c.arg("compile").arg("--scala-library").arg(&jar);
+                c
+            } else {
+                Command::new("/tmp/scala-2.13.16/bin/scalac")
+            };
+            let result = cmd
+                .arg("-cp")
+                .arg(&jar)
+                .arg("-d")
+                .arg(&out)
+                .arg(src)
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.success(),
+                accepted,
+                "native={native}, source={src:?}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        assert_eq!(run_main(&out, Some(&jar)), "3\n1,2\n1,2\n4\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// `+` and `-` reach the narrowing for *every* receiver; arithmetic and string
 /// concatenation must be untouched.
 #[test]
