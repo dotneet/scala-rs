@@ -960,8 +960,39 @@ impl Builder<'_> {
                     }
                     _ => None,
                 };
+                // A class's stable field also has a Single(This(owner), field)
+                // prefix. Only a package-owned singleton is a static module;
+                // treating an instance field as one loses its refined members.
+                let static_singleton = match self.p.entry(prefix) {
+                    Some(Entry::SingleTpe { prefix, .. }) => match self.p.entry(*prefix) {
+                        Some(Entry::ThisTpe(owner)) => self.p.entry(*owner).is_some_and(|entry| {
+                            matches!(entry, Entry::ExtModClassRef { .. })
+                                || entry
+                                    .sym_info()
+                                    .is_some_and(|info| info.has(pflags::PACKAGE))
+                        }),
+                        _ => false,
+                    },
+                    _ => false,
+                };
                 let name = match (parameter_path, prefix_ty) {
                     (Some(path), _) => format!("{path}#{name}"),
+                    (
+                        _,
+                        SigType::Single {
+                            prefix,
+                            sym: module,
+                        },
+                    ) if static_singleton
+                        && matches!(&*prefix, SigType::This(package)
+                            if module.rsplit_once('.').is_some_and(|(owner, _)| owner == package)) =>
+                    {
+                        // A static object's inherited alias can mention its
+                        // receiver's this.type. The declaring trait alone
+                        // loses that receiver: Op.Impl[A] must keep Op.type
+                        // when Impl[A] expands to Evidence[this.type, A].
+                        format!("{module}.type#{name}")
+                    }
                     (_, SigType::Ref { sym: p, args: pa })
                         if pa.is_empty() && !p.contains('.') && !p.contains('#') && p != name =>
                     {
@@ -1241,6 +1272,14 @@ impl SigCache {
             let SigType::Ref { sym, args } = p else {
                 continue;
             };
+            // Singleton prefixes distinguish alias receivers, but a parent
+            // class's declaration still identifies its inheritance graph.
+            // For example, M.Nested has the class signature M.Nested even
+            // when the type reference retains M.type as its prefix.
+            let sym = sym
+                .rsplit_once(".type#")
+                .map(|(_, name)| name)
+                .unwrap_or(sym);
             if !sym.contains('.') {
                 continue;
             }

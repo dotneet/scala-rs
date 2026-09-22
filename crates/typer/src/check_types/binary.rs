@@ -176,7 +176,8 @@ impl Typer {
     /// type and conformed to nothing. The pickle is the only place the real
     /// signature is written down.
     fn complete_package_object_member(&mut self, pkg: SymbolId, name: &str, span: Span) {
-        if !self.library_abi || !self.st.get(pkg).jvm_name.starts_with("scala/") {
+        let package = self.st.get(pkg).jvm_name.as_str();
+        if !self.library_abi || !(package == "scala" || package.starts_with("scala/")) {
             return;
         }
         let Some(po) = self.package_object_of(pkg, span) else {
@@ -695,27 +696,22 @@ impl Typer {
     }
 
     pub(crate) fn warm_implicit_candidates(&mut self, wanted: &[Type]) -> bool {
-        self.warm_implicit_candidates_at(wanted, 0, &mut Vec::new())
+        self.warm_implicit_candidates_at(wanted, 0, &mut crate::implicits::TypeSet::default())
     }
 
     fn warm_implicit_candidates_at(
         &mut self,
         wanted: &[Type],
         depth: usize,
-        seen: &mut Vec<Type>,
+        seen: &mut crate::implicits::TypeSet,
     ) -> bool {
         if depth > crate::implicits::MAX_IMPLICIT_DEPTH {
             return false;
         }
-        let wanted: Vec<Type> = wanted
-            .iter()
-            .filter(|w| !seen.contains(w))
-            .cloned()
-            .collect();
+        let wanted: Vec<Type> = wanted.iter().filter(|w| seen.insert(w)).cloned().collect();
         if wanted.is_empty() {
             return false;
         }
-        seen.extend(wanted.iter().cloned());
         let wanted = wanted.as_slice();
         let mut completed = self.warm_inherited_implicit_members(wanted);
         // BuildFrom's general witness carries an F-bound on the source
@@ -776,6 +772,8 @@ impl Typer {
         // standard-library hierarchies.
         let mut nested = Vec::new();
         let mut concrete_nested = Vec::new();
+        let mut nested_seen = crate::implicits::TypeSet::default();
+        let mut concrete_seen = crate::implicits::TypeSet::default();
         for &id in &cands {
             if !self.only_implicit_clauses(id) {
                 continue;
@@ -798,7 +796,7 @@ impl Typer {
                     continue;
                 }
                 for p in paramss.iter().flatten() {
-                    if !nested.contains(p) {
+                    if nested_seen.insert(p) {
                         nested.push(p.clone());
                     }
                 }
@@ -863,7 +861,7 @@ impl Typer {
                         }) {
                             continue;
                         }
-                        if !concrete_nested.contains(&p) {
+                        if concrete_seen.insert(&p) {
                             concrete_nested.push(p);
                         }
                     }

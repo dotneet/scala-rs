@@ -543,20 +543,21 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
             "scala/Predef$ArrowAssoc",
             &[Type::AnyVal],
         );
+        let at = type_param(st, a, "A");
+        st.get_mut(a).tparams = vec![at];
         let af = st.alloc("self", a, SymKind::Term, Flags::PARAM, "");
-        st.get_mut(af).ty = Type::Any;
+        st.get_mut(af).ty = Type::TypeParam(at);
         st.get_mut(a).ctor_fields = vec![af];
-        method(
-            st,
-            a,
-            "->",
-            vec![Type::Any],
-            Type::Class {
+        let pair = method(st, a, "->", vec![Type::Any], Type::Any, Intrinsic::None);
+        let bt = type_param(st, pair, "B");
+        st.get_mut(pair).tparams = vec![bt];
+        st.get_mut(pair).ty = Type::Method {
+            paramss: vec![vec![Type::TypeParam(bt)]],
+            ret: Box::new(Type::Class {
                 sym: tuple2,
-                args: vec![Type::Any, Type::Any],
-            },
-            Intrinsic::None,
-        );
+                args: vec![Type::TypeParam(at), Type::TypeParam(bt)],
+            }),
+        };
         a
     } else {
         let a = class(
@@ -566,20 +567,21 @@ pub fn install_prelude(st: &mut SymbolTable, library_abi: bool, reflect_context_
             "scala/runtime/ArrowAssoc",
             &[Type::AnyRef],
         );
+        let at = type_param(st, a, "A");
+        st.get_mut(a).tparams = vec![at];
         let af = st.alloc("self", a, SymKind::Term, Flags::PARAM, "");
-        st.get_mut(af).ty = Type::Any;
+        st.get_mut(af).ty = Type::TypeParam(at);
         st.get_mut(a).ctor_fields = vec![af];
-        method(
-            st,
-            a,
-            "->",
-            vec![Type::Any],
-            Type::Class {
+        let pair = method(st, a, "->", vec![Type::Any], Type::Any, Intrinsic::None);
+        let bt = type_param(st, pair, "B");
+        st.get_mut(pair).tparams = vec![bt];
+        st.get_mut(pair).ty = Type::Method {
+            paramss: vec![vec![Type::TypeParam(bt)]],
+            ret: Box::new(Type::Class {
                 sym: tuple2,
-                args: vec![Type::Any, Type::Any],
-            },
-            Intrinsic::None,
-        );
+                args: vec![Type::TypeParam(at), Type::TypeParam(bt)],
+            }),
+        };
         a
     };
 

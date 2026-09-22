@@ -161,14 +161,23 @@ pub(crate) fn add_try(st: &mut SymbolTable, throwable: SymbolId) {
 
     let try_mod = module(st, st.scala_pkg, "Try", "scala/util/Try$");
     let try_cls = st.module_class_of(try_mod);
-    method(
+    let apply = method(
         st,
         try_cls,
         "apply",
         vec![Type::ByName(Box::new(Type::Any))],
-        try_t.clone(),
+        Type::Any,
         Intrinsic::None,
     );
+    let apply_t = type_param(st, apply, "T");
+    st.get_mut(apply).tparams = vec![apply_t];
+    st.get_mut(apply).ty = Type::Method {
+        paramss: vec![vec![Type::ByName(Box::new(Type::TypeParam(apply_t)))]],
+        ret: Box::new(Type::Class {
+            sym: try_c,
+            args: vec![Type::TypeParam(apply_t)],
+        }),
+    };
     let mems = st.get(try_cls).members.clone();
     st.get_mut(try_mod).members.extend(mems);
 

@@ -710,3 +710,51 @@ fn inherited_generic_primitive_return_has_an_erased_bridge() {
         "7\n",
     );
 }
+
+#[test]
+fn inferred_anonymous_factory_keeps_method_type_parameters_visible() {
+    prints_lib(
+        "inferred-anonymous-factory",
+        r#"
+trait Item
+trait Evidence[A]
+trait Reader[A] { def read(s: String): Option[A] }
+object Main {
+  def reader[A <: Item](implicit evidence: Evidence[A]) = new Reader[A] {
+    def read(s: String): Option[A] = None
+  }
+  def read[A <: Item](s: String)(implicit evidence: Evidence[A]): Option[A] =
+    reader.read(s)
+  def refined = new Reader[String] {
+    def read(s: String): Some[String] = Some(s)
+    def extra: Int = 42
+  }
+  def main(args: Array[String]): Unit = {
+    class Entry extends Item
+    implicit val evidence: Evidence[Entry] = new Evidence[Entry] {}
+    println(read[Entry]("x"))
+    val precise: Some[String] = refined.read("ok")
+    println(precise)
+    println(refined.extra)
+  }
+}
+"#,
+        "None\nSome(ok)\n42\n",
+    );
+}
+
+#[test]
+fn repeated_argument_completes_implicit_only_sequence_method() {
+    prints_lib(
+        "repeated-flatten",
+        r#"
+object Main {
+  def entries(values: (String, Int)*): String = values.mkString(",")
+  def values(a: Option[Int], b: Option[Int]): String =
+    entries(Seq(a.map(x => "a" -> x), b.map(x => "b" -> x)).flatten: _*)
+  def main(args: Array[String]): Unit = println(values(Some(42), None))
+}
+"#,
+        "(a,42)\n",
+    );
+}

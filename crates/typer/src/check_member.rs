@@ -501,6 +501,55 @@ impl Typer {
         ty
     }
 
+    /// An anonymous implementation which adds no public API has its parent
+    /// type outside the definition. Keeping its nominal identity hides free
+    /// method parameters in its parents and prevents calls from instantiating
+    /// an inferred polymorphic result.
+    fn widen_anonymous_implementation(&self, ty: Type) -> Type {
+        let Type::Class { sym, .. } = &ty else {
+            return ty;
+        };
+        let class = self.st.get(*sym);
+        if !class.name.starts_with("$anon$") {
+            return ty;
+        }
+        let parents: Vec<_> = class
+            .parents
+            .iter()
+            .filter(|p| {
+                !matches!(p, Type::Any | Type::AnyRef)
+                    && !self
+                        .st
+                        .class_sym_of(p)
+                        .is_some_and(|id| id == self.st.object_sym)
+            })
+            .collect();
+        if parents.len() != 1 {
+            return ty;
+        }
+        let parent = parents[0];
+        let Some(parent_class) = self.st.class_sym_of(parent) else {
+            return ty;
+        };
+        for member in &class.members {
+            let declaration = self.st.get(*member);
+            if declaration.name == "<init>"
+                || declaration.flags.contains(Flags::PRIVATE)
+                || declaration.flags.contains(Flags::PROTECTED)
+            {
+                continue;
+            }
+            let inherited = self.st.lookup_member(parent_class, &declaration.name);
+            if !inherited.iter().any(|id| {
+                let member_ty = self.st.subst_as_seen_from(parent, &self.st.get(*id).ty);
+                member_ty == declaration.ty
+            }) {
+                return ty;
+            }
+        }
+        parent.clone()
+    }
+
     fn type_val_body_in(&mut self, tree: &mut Tree) {
         let feature = self
             .source_features
@@ -1613,7 +1662,8 @@ impl Typer {
                     // (`close_leaked_undet`): `def d = inv(fail())` is an
                     // `Inv[Nothing]`.
                     let closed = self.close_leaked_undet(&rhs.ty.widen_constant());
-                    self.widen_inferred_singleton(closed)
+                    let widened = self.widen_inferred_singleton(closed);
+                    self.widen_anonymous_implementation(widened)
                 };
                 if let Type::Method { ret, .. } = &mut tree.ty {
                     **ret = inferred.clone();

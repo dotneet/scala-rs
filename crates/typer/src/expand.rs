@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 
 use scala_rs_parser::{Flags, Lit, Modifiers, NodeId, SymbolId, Template, Tree, TreeKind, Type};
 use scala_rs_pickle::names::{decode_method_name, encode_method_name};
-use scala_rs_span::Span;
+use scala_rs_span::{Level, Span};
 
 use crate::check::Typer;
 use crate::symbol::{MacroBinding, MacroTarg, SymKind, SymbolTable};
@@ -1189,45 +1189,69 @@ impl Typer {
             );
             return;
         }
-        match self.macro_expansion(tree, &binding) {
-            Ok(mut built) => {
-                let declared = tree.ty.clone();
-                built.span = tree.span;
-                *tree = built;
-                let retype_started = self.macro_timing.enabled.then(Instant::now);
-                // A blackbox macro's expansion is typechecked *against the
-                // declared result type* and keeps it, whatever more precise
-                // type the expansion itself has (nsc ascribes the expansion
-                // with `Typed(expanded, TypeTree(innerPt))`).
-                //
-                // A **whitebox** macro is the opposite: nsc's
-                // `macroExpandApply` wraps the result in `WhiteboxExpansion`,
-                // types it with the *call site's* expected type rather than the
-                // declaration's, and lets the expansion's own -- possibly more
-                // precise -- type stand. `def foo: Any = macro impl` whose
-                // expansion is `if (true) Some(2) else None` is what the
-                // difference is for: typed against the declared `Any` the tree
-                // is an `Any`, and `val x: Option[Int] = Macros.foo` does not
-                // typecheck.
-                self.with_macro_depth(|this| {
-                    if binding.blackbox {
-                        this.type_expr(tree, &declared);
-                    } else {
-                        this.type_expr(tree, &Type::NoType);
+        self.with_macro_context(|this| {
+            match this.macro_expansion(tree, &binding) {
+                Ok(mut built) => {
+                    let declared = tree.ty.clone();
+                    built.span = tree.span;
+                    *tree = built;
+                    let retype_started = this.macro_timing.enabled.then(Instant::now);
+                    let retype_diag_mark = this.diags.len();
+                    // A blackbox macro's expansion is typechecked *against the
+                    // declared result type* and keeps it, whatever more precise
+                    // type the expansion itself has (nsc ascribes the expansion
+                    // with `Typed(expanded, TypeTree(innerPt))`).
+                    //
+                    // A **whitebox** macro is the opposite: nsc's
+                    // `macroExpandApply` wraps the result in `WhiteboxExpansion`,
+                    // types it with the *call site's* expected type rather than the
+                    // declaration's, and lets the expansion's own -- possibly more
+                    // precise -- type stand. `def foo: Any = macro impl` whose
+                    // expansion is `if (true) Some(2) else None` is what the
+                    // difference is for: typed against the declared `Any` the tree
+                    // is an `Any`, and `val x: Option[Int] = Macros.foo` does not
+                    // typecheck.
+                    this.with_macro_depth(|this| {
+                        if binding.blackbox {
+                            this.type_expr(tree, &declared);
+                        } else {
+                            this.type_expr(tree, &Type::NoType);
+                        }
+                    });
+                    // A re-entrant lazy materializer may return an intermediate
+                    // tree that refers to `inst$macro$N`; the outermost
+                    // expansion places the corresponding ValDef in its final
+                    // block. nsc keeps those references typed while the macro
+                    // conversation is still active. Do the same, but only when
+                    // every diagnostic from this retyping pass is that exact
+                    // deferred-local shape. Any other error remains visible.
+                    let deferred_outer_locals = this.macro_query_depth > 0
+                        && this.diags.len() > retype_diag_mark
+                        && this.diags[retype_diag_mark..]
+                            .iter()
+                            .filter(|d| d.level == Level::Error)
+                            .next()
+                            .is_some()
+                        && this.diags[retype_diag_mark..]
+                            .iter()
+                            .filter(|d| d.level == Level::Error)
+                            .all(|d| d.message.starts_with("not found: value inst$macro$"));
+                    if deferred_outer_locals {
+                        this.diags.truncate(retype_diag_mark);
                     }
-                });
-                if let Some(t) = retype_started {
-                    let elapsed = t.elapsed();
-                    if let Some(slot) = self.macro_timing.expansions.last_mut() {
-                        slot.retype += elapsed;
+                    if let Some(t) = retype_started {
+                        let elapsed = t.elapsed();
+                        if let Some(slot) = this.macro_timing.expansions.last_mut() {
+                            slot.retype += elapsed;
+                        }
+                    }
+                    if !tree.ty.is_error() && binding.blackbox {
+                        tree.ty = declared;
                     }
                 }
-                if !tree.ty.is_error() && binding.blackbox {
-                    tree.ty = declared;
-                }
+                Err(reason) => this.note_macro_failure(tree.span, reason),
             }
-            Err(reason) => self.note_macro_failure(tree.span, reason),
-        }
+        });
     }
 
     /// Run the implementation and rebuild what it returned.
@@ -1239,19 +1263,6 @@ impl Typer {
         if let Some(built) = self.fasttrack_expansion(binding, tree.span) {
             return built;
         }
-        // The pipe carries one conversation at a time. Reaching here while a
-        // query is being answered means a macro application inside the tree
-        // an implementation handed to `c.typecheck`; nsc expands it (its typer
-        // and its macro runner are the same process), and this bridge cannot
-        // without a second engine and a second conversation.
-        if self.macro_engine_busy {
-            return Err("this macro application was selected while scala-rs was \
-                        answering a reverse query from another macro, and the \
-                        engine is already running that outer implementation; \
-                        scala-rs does not expand a macro from inside another \
-                        expansion's query yet"
-                .to_string());
-        }
         let (argss, mut targs, prefix) = peel_application(tree);
         if targs.is_empty() {
             if let Some(sym) = self.macro_symbol_of(tree) {
@@ -1260,8 +1271,13 @@ impl Typer {
                     || self.st.get(sym).ty.clone(),
                     |p| self.st.subst_as_seen_from(&p.ty, &self.st.get(sym).ty),
                 );
-                if let Type::Method { paramss, ret } = declared {
-                    let params: Vec<Type> = paramss.into_iter().flatten().collect();
+                {
+                    let (params, ret) = match declared {
+                        Type::Method { paramss, ret } => {
+                            (paramss.into_iter().flatten().collect::<Vec<Type>>(), *ret)
+                        }
+                        ret => (Vec::new(), ret),
+                    };
                     let actuals: Vec<Type> =
                         argss.iter().flatten().map(Tree::argument_type).collect();
                     let inferred = self.infer_method_tparams(sym, &params, &actuals);
@@ -1313,9 +1329,16 @@ impl Typer {
                 }
             }
         }
-        self.macro_rpc_span = tree.span;
         let rpc_started = self.macro_timing.enabled.then(Instant::now);
-        let reply = self.converse(&request);
+        let saved_span = self.macro_rpc_span;
+        self.macro_rpc_span = tree.span;
+        let reply =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.converse(&request)));
+        self.macro_rpc_span = saved_span;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
         if let Some(t) = rpc_started {
             let elapsed = t.elapsed();
             let engine = self.engine_timing();
@@ -1421,18 +1444,34 @@ impl Typer {
     /// answer has to come from the run's own symbols, which live here and
     /// cannot be snapshotted into the engine.
     ///
-    /// The engine is taken out of `self` for the duration, because answering
-    /// needs `&mut self` -- the answer is computed by really typechecking, in
-    /// the real typer, at the real call site. `macro_engine_busy` says so, and
-    /// is what stops an expansion nested inside an answer from starting a
-    /// second engine.
+    /// Keep the handle on the typer while answering a query. A nested macro
+    /// then sends another request on the same engine; its JVM query loop
+    /// services that request before resuming the suspended implementation.
     fn converse(&mut self, request: &str) -> Result<Sexp, String> {
         let mut budget = expansion_timeout();
-        self.with_engine_conversation(|this, engine| {
-            this.with_macro_engine_busy(true, |this| {
-                this.converse_with(engine, request, &mut budget)
-            })
-        })
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_macro_engine_busy(true, |this| this.converse_with(request, &mut budget))
+        }));
+        match outcome {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(mut reason)) => {
+                if let Some(engine) = self.macro_engine.as_mut() {
+                    if let Some(stop_error) = engine.poison_and_terminate() {
+                        reason.push_str("; ");
+                        reason.push_str(&stop_error);
+                    }
+                }
+                Err(reason)
+            }
+            Err(payload) => {
+                if let Some(engine) = self.macro_engine.as_mut() {
+                    if let Some(reason) = engine.poison_and_terminate() {
+                        eprintln!("warning: {reason}");
+                    }
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 
     /// Temporarily lend the running engine to a conversation, restoring the
@@ -1473,7 +1512,6 @@ impl Typer {
 
     fn converse_with(
         &mut self,
-        engine: &mut MacroEngine,
         request: &str,
         budget: &mut Option<Duration>,
     ) -> Result<Sexp, String> {
@@ -1484,14 +1522,21 @@ impl Typer {
         if trace {
             eprintln!("[macro ->] {request}");
         }
-        engine.send(request)?;
+        self.macro_engine
+            .as_mut()
+            .ok_or("the macro engine is not running")?
+            .send(request)?;
         // A wedged implementation is caught by the budget; a *chattering* one
         // -- an implementation whose questions never end although each is
         // answered quickly -- is not, because answering costs it no budget.
         // This is the same guard `MAX_EXPANSION_DEPTH` is for one level up.
         let mut asked = 0u32;
         loop {
-            let reply = engine.read_reply(budget)?;
+            let reply = self
+                .macro_engine
+                .as_mut()
+                .ok_or("the macro engine is not running")?
+                .read_reply(budget)?;
             if trace {
                 eprintln!("[macro <-] {reply}");
             }
@@ -1544,7 +1589,10 @@ impl Typer {
             if trace {
                 eprintln!("[macro ->] {answer}");
             }
-            engine.send(&answer)?;
+            self.macro_engine
+                .as_mut()
+                .ok_or("the macro engine is not running")?
+                .send(&answer)?;
         }
     }
 
@@ -1628,6 +1676,11 @@ impl Typer {
         } else {
             " (bundle false)"
         });
+        out.push_str(" (contexts");
+        for id in self.macro_context_stack.iter().rev() {
+            out.push_str(&format!(" {id}"));
+        }
+        out.push(')');
         out.push_str(" (argss");
         let mut slot = 0;
         let mut actual = actuals.iter();
@@ -1760,6 +1813,7 @@ impl Typer {
             Ok(()) => out.push_str(&built),
         }
         out.push(')');
+        out.push_str(&format!(" (appSymbol {})", sym.0));
         // `c.compilerSettings`. nsc hands the implementation the command line
         // that produced this run; a macro that gates on a flag (`scala.async`
         // on `-Xasync`) has no other way to see one.
@@ -1987,6 +2041,9 @@ impl Typer {
         } else {
             ty
         };
+        if matches!(ty, Type::Refined { .. }) {
+            return self.type_to_wire(ty);
+        }
         if let Some(wire) = self.source_type_wire(ty)? {
             return Ok(wire);
         }
@@ -2124,6 +2181,16 @@ impl Typer {
                     }
                     (Some(sym[1].text()), SymbolId::NONE, None)
                 }
+                (Some("sp"), 2) => {
+                    if matches!(sym[1], Sexp::List(_)) {
+                        return Err("malformed returned package symbol descriptor".to_string());
+                    }
+                    let package = crate::classpath::ensure_package(
+                        &mut self.st,
+                        &sym[1].text().replace('.', "/"),
+                    );
+                    (None, package, None)
+                }
                 (Some("sr"), 2) => {
                     if matches!(sym[1], Sexp::List(_)) {
                         return Err("malformed returned source symbol descriptor".to_string());
@@ -2192,7 +2259,40 @@ impl Typer {
                 // implementation's own imports do not exist, so `Ident(Helper)`
                 // has to become the path `Helper` really names.
                 match full {
-                    Some(f) if f.contains('.') => Ok(path_tree(&f, span)),
+                    Some(f) if f.contains('.') => {
+                        // A stable member inferred inside a macro can arrive
+                        // as an Ident whose symbol is its companion object,
+                        // while the Ident's own name is the member. Circe's
+                        // `Decoder.decodeString` has exactly this shape. If
+                        // the static object really owns that name, preserve
+                        // both pieces instead of turning the value into the
+                        // object itself at the expansion site.
+                        let names_the_owner = f
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|simple| decode_method_name(simple) == name);
+                        let is_member = !names_the_owner
+                            && self
+                                .pickle
+                                .ensure_class(
+                                    &mut self.st,
+                                    &mut self.binary,
+                                    &scala_rs_pickle::names::nested_to_dotted(&f),
+                                    true,
+                                )
+                                .is_some_and(|owner| {
+                                    self.complete_binary_member(owner, &name, span);
+                                    !self.st.lookup_member(owner, &name).is_empty()
+                                });
+                        if is_member {
+                            Ok(node(TreeKind::Select {
+                                qual: Box::new(path_tree(&f, span)),
+                                name,
+                            }))
+                        } else {
+                            Ok(path_tree(&f, span))
+                        }
+                    }
                     _ => Ok(node(TreeKind::Ident { name })),
                 }
             }
@@ -2615,6 +2715,23 @@ impl Typer {
             // literal whose one parameter is spelled out with a `Modifiers`,
             // a `TermName` and a type `Ident` -- and hands it to
             // `TableQuery.apply[E]`.
+            "AnnotatedExpr" => {
+                let expr = self.tree_from_reply(at(kids, 1)?, span)?;
+                let mut annot = self.tree_from_reply(at(kids, 0)?, span)?;
+                if let TreeKind::Apply { fun, .. } = &mut annot.kind {
+                    if let TreeKind::New { tpt } = &mut fun.kind {
+                        *fun = tpt.clone();
+                    }
+                }
+                let tpt = node(TreeKind::AnnotatedTypeTree {
+                    annot: Box::new(annot),
+                    tpt: Box::new(node(TreeKind::Empty)),
+                });
+                Ok(node(TreeKind::Typed {
+                    expr: Box::new(expr),
+                    tpt: Box::new(tpt),
+                }))
+            }
             "Annotated" => {
                 let tpt = if is_empty_type_tree(at(kids, 1)?) {
                     node(TreeKind::Empty)
@@ -2780,10 +2897,15 @@ impl Typer {
                     self.macro_function_symbols
                         .insert((self.file_index, body.id), source_sym);
                 }
-                Ok(node(TreeKind::Function {
+                let mut function = node(TreeKind::Function {
                     vparams,
                     body: Box::new(body),
-                }))
+                });
+                // A function returned from nsc is already an adapted tree.
+                // When it appears directly in a by-name argument position it
+                // is nsc's transport thunk, not a source Function0 value.
+                function.byname_type_marker = true;
+                Ok(function)
             }
             "ValDef" => {
                 let mods = mods_from(at(kids, 0)?)?;
@@ -2959,6 +3081,25 @@ impl Typer {
                 tree.ty = Type::Constant(literal_from(at(items, 1)?)?);
                 return Ok(tree);
             }
+            Some("intersection") => {
+                let mut parents = Vec::new();
+                for parent in &items[1..] {
+                    let tpt = self.type_tree_from_wire(parent, span)?;
+                    parents.push(self.tree_to_type(&tpt));
+                }
+                let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
+                tree.ty = Type::Refined {
+                    parents,
+                    decls: Vec::new(),
+                };
+                return Ok(tree);
+            }
+            Some("repeated") => {
+                let element = self.type_tree_from_wire(at(items, 1)?, span)?;
+                let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
+                tree.ty = Type::Repeated(Box::new(self.tree_to_type(&element)));
+                return Ok(tree);
+            }
             Some("mem") => {
                 let ty = self.query_type_from_wire(s, span)?;
                 let mut tree = path_tree(crate::materialize::RESOLVED_TYPE, span);
@@ -2994,6 +3135,13 @@ impl Typer {
                     crate::symbol::SymKind::TypeParam if args.is_empty() => Type::TypeParam(id),
                     crate::symbol::SymKind::TypeParam => {
                         self.apply_types(Type::TypeParam(id), args, span)
+                    }
+                    crate::symbol::SymKind::TypeMember if self.st.get(id).is_type_alias => {
+                        if args.is_empty() {
+                            Type::TypeMember(id)
+                        } else {
+                            self.apply_types(Type::TypeMember(id), args, span)
+                        }
                     }
                     _ => {
                         return Err(
@@ -3321,7 +3469,7 @@ pub(crate) fn path_tree(full: &str, span: Span) -> Tree {
         id: NodeId(0),
         span,
         kind: TreeKind::Ident {
-            name: head.to_string(),
+            name: decode_method_name(head),
         },
         ty: Type::NoType,
         sym: SymbolId::NONE,
@@ -3337,7 +3485,7 @@ pub(crate) fn path_tree(full: &str, span: Span) -> Tree {
             span,
             kind: TreeKind::Select {
                 qual: Box::new(t),
-                name: p.to_string(),
+                name: decode_method_name(p),
             },
             ty: Type::NoType,
             sym: SymbolId::NONE,
@@ -3679,9 +3827,13 @@ impl WireCx<'_> {
 /// nsc's typed tree carries the symbol (`lifted.this.Shape`); the path from
 /// the root is the one spelling of that symbol that means the same thing
 /// wherever the expansion is typed.
-fn static_module_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
+pub(crate) fn static_module_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
     if sym.is_none() || st.get(sym).kind != SymKind::Module {
         return None;
+    }
+    let module_class = st.module_class_of(sym);
+    if st.get(module_class).kind == SymKind::ModuleClass {
+        return static_module_class_path(st, module_class);
     }
     owner_chain_path(st, st.get(sym).name.clone(), st.get(sym).owner)
 }
@@ -3696,7 +3848,7 @@ fn static_module_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
 /// and the bare name means nothing where the expansion is typed. A member of
 /// an enclosing object is left to [`this_qualifier_of`] and to the call site's
 /// own scope, which is where the source found it.
-fn static_member_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
+pub(crate) fn static_member_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
     if sym.is_none() || !matches!(st.get(sym).kind, SymKind::Method | SymKind::Term) {
         return None;
     }
@@ -3707,9 +3859,30 @@ fn static_member_path(st: &SymbolTable, sym: SymbolId) -> Option<String> {
     if this_qualifier_of(st, sym).is_some() {
         return None;
     }
-    let module = st.get(owner).name.trim_end_matches('$').to_string();
-    let path = owner_chain_path(st, module, st.get(owner).owner)?;
+    let path = static_module_class_path(st, owner)?;
     Some(format!("{path}.{}", st.get(sym).name))
+}
+
+/// Source path of a module class, including a static object nested in another
+/// object whose Scala pickle initially attached it to the ordinary class half.
+fn static_module_class_path(st: &SymbolTable, module_class: SymbolId) -> Option<String> {
+    if module_class.is_none() || st.get(module_class).kind != SymKind::ModuleClass {
+        return None;
+    }
+    let module = st.get(module_class).name.trim_end_matches('$').to_string();
+    let owner = st.get(module_class).owner;
+    if let Some(path) = owner_chain_path(st, module.clone(), owner) {
+        return Some(path);
+    }
+    if !st.get(module_class).flags.contains(Flags::STATIC)
+        || owner.is_none()
+        || st.get(owner).kind != SymKind::Class
+    {
+        return None;
+    }
+    let outer_module = st.companion_module(owner)?;
+    let outer_path = static_module_class_path(st, st.module_class_of(outer_module))?;
+    Some(format!("{outer_path}.{module}"))
 }
 
 /// `first` preceded by the names of the packages and objects `cur` and its
@@ -3765,7 +3938,7 @@ fn class_path_member(cx: &WireCx, t: &Tree, qual: &Tree, name: &str, out: &mut S
 }
 
 /// `_root_.a.b.c` as a chain of term selections.
-fn root_path_to_wire(path: &str, out: &mut String) {
+pub(crate) fn root_path_to_wire(path: &str, out: &mut String) {
     let mut built = String::from("(t \"Ident\" (s0) (n term \"_root_\"))");
     for seg in path.split('.') {
         let mut next = String::from("(t \"Select\" (s0) ");
@@ -3970,6 +4143,15 @@ pub(crate) fn tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Resu
             Ok(())
         }
         TreeKind::This { qual } => {
+            // A package `This` can pass through more than one macro while a
+            // Lazy derivation is assembled. The reflect tree's package symbol
+            // is not meaningful outside that engine invocation, so carry the
+            // same anchor as an absolute package path on the next hop.
+            if !t.sym.is_none() && cx.st.get(t.sym).kind == SymKind::Package {
+                let full = cx.st.jvm_internal(t.sym).replace('/', ".");
+                root_path_to_wire(&full, out);
+                return Ok(());
+            }
             out.push_str("(t \"This\" (s0) (n type ");
             quote_into(out, qual.as_deref().unwrap_or(""));
             out.push_str("))");
@@ -5187,7 +5369,7 @@ mod tests {
 /// only materialise source-run symbols: classpath symbols already have a
 /// runtime mirror and entering a second synthetic symbol for one can collide
 /// with the real package/class scope.
-fn is_source_run_symbol(st: &SymbolTable, mut sym: SymbolId) -> bool {
+pub(crate) fn is_source_run_symbol(st: &SymbolTable, mut sym: SymbolId) -> bool {
     if sym.is_none() {
         return false;
     }

@@ -100,7 +100,7 @@ impl Typer {
         // its open variables. Keep them available for the selected call's
         // arguments and expected result, just as for an applied receiver.
         let open_receiver = self.undetermined_of(qual);
-        self.undet_tvars.extend(open_receiver);
+        self.undet_tvars.extend(open_receiver.iter().copied());
         if name == "_" {
             self.error(
                 tree.span,
@@ -482,19 +482,48 @@ impl Typer {
         } else {
             self.supply_receiver_override(&recv_ty, &name, &mut found);
         }
+        // Directory discovery can attach an inherited nested companion to
+        // the receiver's object instead of its declaring trait. Complete its
+        // pickle metadata before codegen chooses between an instance accessor
+        // and MODULE$; keep the existing term identity used by the tree.
+        if found.iter().any(|m| {
+            let s = self.st.get(*m);
+            (m.0 < self.st.source_start || self.st.binary_read.contains(&s.owner.0))
+                && matches!(s.kind, SymKind::Module | SymKind::ModuleClass)
+                && self.st.get(s.owner).is_class_like()
+        }) {
+            self.supply_from_pickle(&recv_ty, &name);
+        }
         // A JVM mixin forwarder flattens Scala's implicit parameter clauses.
         // Refine potentially flattened clauses before argument matching. Single
         // parameters retain deferred completion: their dependent result aliases
         // must be read after explicit type arguments have been substituted.
         if found.iter().any(|m| {
             let s = self.st.get(*m);
-            m.0 >= self.st.prelude_end && s.flags.contains(Flags::JAVA)
-                && s.pickled_origin.is_empty() && s.jvm_name.starts_with('(')
-                && matches!(&s.ty, Type::Method { paramss, .. } if (paramss.len() == 1 && paramss[0].len() > 1) || s.tparams.is_empty())
-                && !self.st.is_source_class(s.owner)
+            m.0 >= self.st.prelude_end
+                && s.pickled_origin.is_empty()
+                // Directory scans have no descriptor or JAVA flag, but
+                // their inherited forwarders need the same pickle refinement.
+                && ((s.flags.contains(Flags::JAVA) && s.jvm_name.starts_with('('))
+                    || (s.jvm_name.is_empty() && s.owner.0 < self.st.source_start))
+                && matches!(&s.ty, Type::Method { paramss, .. }
+                    if (paramss.len() == 1 && paramss[0].len() > 1)
+                        || s.tparams.is_empty()
+                        // A classfile can only spell a Scala by-name parameter
+                        // as Function0. Its pickle must refine that wrapper
+                        // before applicability compares the supplied value
+                        // with the parameter's yielded type.
+                        || (paramss.len() == 1
+                            && paramss[0].len() == 1
+                            && self.st.class_sym_of(&paramss[0][0]).is_some_and(|p| {
+                                self.st.get(p).jvm_name == "scala/Function0"
+                            })))
+                && !self.st.is_source_owner(s.owner)
         }) {
             let precise = self.supply_from_pickle(&recv_ty, &name);
-            if !precise.is_empty() { found = precise; }
+            if !precise.is_empty() {
+                found = precise;
+            }
         }
         // An abstract type member whose upper bound is a *compound* offers
         // every parent's members, and only the first one had been reachable.
@@ -707,6 +736,22 @@ impl Typer {
             found.retain(|&m| {
                 self.st.get(m).kind != SymKind::Class || self.st.get(m).flags.contains(Flags::JAVA)
             });
+        }
+        // A macro-expanded tree may retain the selected symbol while losing
+        // the symbol on its package `This` qualifier during reification. The
+        // exact attributed member is still authoritative when ordinary
+        // receiver lookup found nothing; otherwise that package selection is
+        // accidentally retried against the local anonymous class.
+        if found.is_empty() && tree.ty.is_no_type() && !tree.sym.is_none() {
+            let attributed = self.st.get(tree.sym);
+            if attributed.name == name
+                && matches!(
+                    attributed.kind,
+                    SymKind::Class | SymKind::Module | SymKind::Method | SymKind::Term
+                )
+            {
+                found.push(tree.sym);
+            }
         }
         if found.is_empty() {
             // nsc reports the cause once: a selection on a receiver that is
@@ -1054,6 +1099,8 @@ impl Typer {
                     })
                 {
                     tree.sym = id;
+                    tree.ty =
+                        self.instantiate_parameterless_at(id, tree.ty.clone(), pt, Some(&qual.ty));
                     // Value position dropped the alternatives that take
                     // parameters (SLS 6.26.3), but explicit type arguments are
                     // read *before* that rule applies, so a `TypeApply` above
@@ -1092,6 +1139,38 @@ impl Typer {
                             self.overload_groups.insert(id.0, g);
                         }
                     }
+                }
+            }
+        }
+        // The expected member type constrains an open parameterless receiver.
+        // For `factory[A].value: Value[A]`, the prototype for `.value` also
+        // determines A before a delayed macro on `factory` can run.
+        if !open_receiver.is_empty() && !pt.is_no_type() && !pt.is_error() {
+            let bare_result = matches!(&tree.ty, Type::TypeParam(id) if open_receiver.contains(id));
+            let solutions: Vec<(SymbolId, Type)> = open_receiver
+                .iter()
+                .filter_map(|tp| {
+                    // A bare member variable does not carry a structural prototype
+                    // back into its receiver; nsc first minimizes that variable.
+                    let solved = if bare_result {
+                        Some(self.st.get(*tp).bound_lo.clone().unwrap_or(Type::Nothing))
+                    } else {
+                        unify_one(&self.st, *tp, &tree.ty, pt)
+                    };
+                    solved
+                        .filter(|t| {
+                            !mentions_tparam(t, &open_receiver) && !t.is_no_type() && !t.is_error()
+                        })
+                        .map(|t| (*tp, t))
+                })
+                .collect();
+            if !solutions.is_empty() {
+                let ids: Vec<_> = solutions.iter().map(|(id, _)| *id).collect();
+                let values: Vec<_> = solutions.into_iter().map(|(_, t)| t).collect();
+                tree.ty = crate::symbol::subst_tparams_slice(&ids, &values, &tree.ty);
+                if let TreeKind::Select { qual, .. } = &mut tree.kind {
+                    qual.ty = crate::symbol::subst_tparams_slice(&ids, &values, &qual.ty);
+                    self.expand_macro_application(qual);
                 }
             }
         }
@@ -1195,9 +1274,32 @@ impl Typer {
     /// `def -(key: K): Map[K, V]` that `collection.Map` declares, and every
     /// `map - k` in the library becomes `ambiguous overload` (13 of them).
     fn definition_outranks_declaration(&self, decl: SymbolId, defn: SymbolId) -> bool {
-        self.is_deferred_member(decl)
-            && !self.is_deferred_member(defn)
-            && self.same_signature(defn, decl)
+        if !self.is_deferred_member(decl) || self.is_deferred_member(defn) {
+            return false;
+        }
+        let owner = self.st.get(decl).owner;
+        if owner.is_none() {
+            return false;
+        }
+        let prefix = Type::Class {
+            sym: owner,
+            args: self
+                .st
+                .get(owner)
+                .tparams
+                .iter()
+                .map(|&t| Type::TypeParam(t))
+                .collect(),
+        };
+        // Here the declaration's receiver is known, so compare after reading
+        // both signatures at that receiver. `same_signature` deliberately
+        // treats a parameter nested below a related class as a possible
+        // prefix substitution when no receiver is available. That is too
+        // broad for an abstract specialised overload beside an inherited
+        // generic one: `append(Bytes)` and
+        // `append[A](IterableOnce[A])` are distinct methods because no prefix
+        // can change the parameter's head class.
+        self.same_member_at(&prefix, defn, decl)
             && !self.declaration_restates_definition(decl, defn)
     }
 
@@ -1607,7 +1709,7 @@ impl Typer {
     /// nsc sees one `IterableOps.map`. So does this: copies of one pickled
     /// declaration collapse to the first, which is the one `lookup_member`
     /// reached first and so the nearest to the receiver.
-    fn collapse_pickled_copies(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
+    pub(crate) fn collapse_pickled_copies(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         if !found
             .iter()
             .any(|&s| !self.st.get(s).pickled_origin.is_empty())
@@ -2329,7 +2431,7 @@ impl Typer {
 
     /// nsc-style accessibility. `private[this]` requires a `this` prefix.
     /// `protected[C]` is protected plus everything nested in `C`.
-    fn accessible(&self, sym: SymbolId, prefix: Option<&Tree>) -> bool {
+    pub(crate) fn accessible(&self, sym: SymbolId, prefix: Option<&Tree>) -> bool {
         if sym.is_none() {
             return true;
         }
@@ -2955,6 +3057,15 @@ impl Typer {
             self.type_qualifier(&mut qual, &Type::NoType);
         }
         if !self.is_dynamic_receiver(&qual.ty) || self.dynamic_receiver_has_term(&qual.ty, &name) {
+            // The classification probe completes the receiver, including any
+            // macro applications in it. Keep that tree for ordinary selection
+            // typing: discarding it repeats every expansion for each outer
+            // type application, making fluent generic chains exponential.
+            if let TreeKind::TypeApply { fun, .. } = &mut tree.kind {
+                if let TreeKind::Select { qual: original, .. } = &mut fun.kind {
+                    **original = qual;
+                }
+            }
             return false;
         }
         let span = tree.span;
@@ -3057,6 +3168,11 @@ impl Typer {
         };
         self.type_qualifier(qual, &Type::NoType);
         let qual_ty = qual.ty.clone();
+        // An inferred binary result can still be a classpath placeholder.
+        // Complete its operator before deciding that `op=` is assignment.
+        if let Some(cls) = self.st.class_sym_of(&qual_ty) {
+            self.complete_binary_member(cls, &name, span);
+        }
         if self.receiver_has_term(&qual_ty, &name)
             || self.search_extension(&qual_ty, &name, span).is_some()
         {

@@ -140,6 +140,10 @@ impl Typer {
             };
         }
         if kind == "symbol" {
+            let externally_loadable = {
+                let s = self.st.get(sym);
+                (s.is_class_like() || s.kind == SymKind::Module) && !self.is_current_run_class(sym)
+            };
             let s = self.st.get(sym);
             let owner = self
                 .macro_mirror_owners
@@ -162,7 +166,7 @@ impl Typer {
                 full = full.trim_end_matches('.').to_string();
             }
             return format!(
-                "(a symbol {} {} {} {} {}{})",
+                "(a symbol {} {} {} {} {}{} {} (shape {}{}) (erased{}))",
                 id,
                 quoted(&format!("{:?}", s.kind)),
                 quoted(&s.name),
@@ -172,7 +176,17 @@ impl Typer {
                     class_flags_wire(class_flags)
                 } else {
                     member_flags_wire(s.flags, s.kind, s.name == "<init>")
-                }
+                },
+                quoted(if externally_loadable { &s.jvm_name } else { "" }),
+                s.tparams.len(),
+                s.paramss
+                    .iter()
+                    .map(|ps| format!(" {}", ps.len()))
+                    .collect::<String>(),
+                crate::pickle_supply::flat_erased_params(&self.st, &s.ty)
+                    .iter()
+                    .map(|desc| format!(" {}", quoted(desc.as_deref().unwrap_or(""))))
+                    .collect::<String>()
             );
         }
         match self.mirror_symbol_info(sym) {
@@ -185,6 +199,14 @@ impl Typer {
         // nsc's typed anonymous-function symbol intentionally has NoType.
         if self.macro_function_symbols.values().any(|&id| id == sym) {
             return Ok("(notype)".to_string());
+        }
+        // Reflection forces a method's pending inferred signature just as a
+        // source selection does. Only an inference already in progress is a
+        // recursive definition; an unvisited method is still completable.
+        if matches!(&self.st.get(sym).ty, Type::Method { ret, .. } if ret.is_no_type())
+            && !self.lazy_completing.contains(&sym)
+        {
+            self.complete_lazy_sig(sym, self.macro_rpc_span);
         }
         let s = self.st.get(sym).clone();
         if s.kind == SymKind::TypeParam {
@@ -357,6 +379,12 @@ impl Typer {
             "parse" => self.answer_parse(items),
             "inferImplicitValue" => self.answer_infer_implicit_value(items),
             "enclosingOwner" => format!("(a ref {})", self.macro_current_owner().0),
+            "openImplicits" => self.answer_open_implicits(),
+            "isAccessible" | "isAccessibleMember" => self.answer_accessible(items),
+            "resetImplicits" => {
+                self.invalidate_implicit_caches();
+                String::from("(a reset)")
+            }
             "functionSymbol" | "symbol" | "symbolInfo" | "companion" | "modulePair" => {
                 self.answer_mirror_symbol(items)
             }
@@ -365,6 +393,86 @@ impl Typer {
                 "the macro engine asked scala-rs `{other}`, which it does not answer"
             )),
         }
+    }
+
+    fn answer_accessible(&mut self, items: &[Sexp]) -> String {
+        let result = (|| -> Result<bool, String> {
+            let (symbols, prefix_wire) = if at(items, 1)?.text() == "isAccessible" {
+                let id = SymbolId(
+                    at(items, 2)?
+                        .text()
+                        .parse::<u32>()
+                        .map_err(|e| e.to_string())?,
+                );
+                if id.is_none() || id.0 as usize >= self.st.symbols.len() {
+                    return Err("unknown accessibility symbol identity".into());
+                }
+                (vec![id], at(items, 3)?)
+            } else {
+                let owner = self.query_type_from_wire(at(items, 2)?, self.macro_rpc_span)?;
+                let owner = self
+                    .st
+                    .class_sym_of(&owner)
+                    .ok_or("accessibility owner is not a class")?;
+                let name = scala_rs_pickle::names::decode_method_name(&at(items, 3)?.text());
+                self.complete_binary_member(owner, &name, self.macro_rpc_span);
+                (self.st.lookup_member(owner, &name), at(items, 4)?)
+            };
+            let ty = self.query_type_from_wire(prefix_wire, self.macro_rpc_span)?;
+            let mut prefix = Tree::new(NodeId(0), self.macro_rpc_span, TreeKind::Empty);
+            prefix.ty = ty;
+            let first = *symbols
+                .first()
+                .ok_or("accessibility member was not found")?;
+            let accessible = self.accessible(first, Some(&prefix));
+            if symbols
+                .iter()
+                .any(|&id| self.accessible(id, Some(&prefix)) != accessible)
+            {
+                return Err("overloaded members have different accessibility; exact symbol identity required".into());
+            }
+            Ok(accessible)
+        })();
+        match result {
+            Ok(accessible) => format!("(a accessible {accessible})"),
+            Err(why) => refusal(&why),
+        }
+    }
+
+    fn answer_open_implicits(&mut self) -> String {
+        let candidates = self.building_implicits.clone();
+        let mut out = String::from("(a implicits");
+        for (id, wanted) in candidates.into_iter().rev() {
+            let origin = self
+                .implicit_instance_origins
+                .get(&id)
+                .copied()
+                .unwrap_or(id);
+            let reference = self.ref_implicit_with_receiver(origin, self.macro_rpc_span);
+            let prefix = match &reference.kind {
+                TreeKind::Select { qual, .. } => match self.type_to_wire(&qual.ty) {
+                    Ok(t) => t,
+                    Err(why) => return refusal(&format!("open implicit prefix: {why}")),
+                },
+                _ => String::from("(noprefix)"),
+            };
+            let wanted = match self.type_to_wire(&wanted) {
+                Ok(t) => t,
+                Err(why) => return refusal(&format!("open implicit expected type: {why}")),
+            };
+            let mut tree = String::new();
+            let types = crate::expand::WireTypes::default();
+            let cx = WireCx {
+                st: &self.st,
+                types: &types,
+            };
+            if let Err(why) = answer_tree_to_wire(&cx, &reference, &mut tree) {
+                return refusal(&format!("open implicit reference: {why}"));
+            }
+            out.push_str(&format!(" ({prefix} {} {wanted} {tree})", origin.0));
+        }
+        out.push(')');
+        out
     }
 
     fn answer_parse(&self, items: &[Sexp]) -> String {
@@ -461,97 +569,167 @@ impl Typer {
 
         self.warm_implicit_scope(&pt);
         self.with_implicit_macros_disabled(no_macros, |this| {
-            this.answer_infer_implicit_search(&pt, silent, mark)
+            this.with_whitebox_fits(span, |this| {
+                this.answer_infer_implicit_search(&pt, silent, mark)
+            })
         })
     }
 
     fn answer_infer_implicit_search(&mut self, pt: &Type, silent: bool, mark: usize) -> String {
         let span = self.macro_rpc_span;
-        let mut search = self.search_implicit(pt);
-        if matches!(search, crate::implicits::ImplicitSearch::None)
-            && self.warm_implicit_candidates(std::slice::from_ref(pt))
-        {
-            search = self.search_implicit(pt);
-        }
-        match search {
-            crate::implicits::ImplicitSearch::Found(id) => {
-                // `implicit_tree` expands a selected implicit macro. During a
-                // reverse query the engine is already busy with the outer
-                // macro, so a normal macro records a failure and remains an
-                // unexpanded reference. Never serialize that reference as a
-                // successful implicit answer.
-                let key = self.macro_failure_key(span);
-                let (mut tree, nested_failure) = self
-                    .with_isolated_macro_failure(key, |this| this.implicit_tree(id, pt, span, 0));
-                let selected_unexpanded_macro =
-                    self.st.get(id).macro_impl.is_some() && tree.sym == id;
-                self.adapt(&mut tree, pt);
-                let failures = self.take_probe_errors(mark);
-                if let Some(why) = nested_failure {
-                    return refusal(&format!(
-                        "`c.inferImplicitValue` selected implicit macro `{}`, but scala-rs could not expand it while answering the outer macro: {why}",
-                        self.st.get(id).name
-                    ));
+        // A macro query starts a fresh implicit search, but its selected tree
+        // is materialized while the enclosing implicit macro is still being
+        // built. Use a detached instance for each nested query level so a
+        // derivation rule used by both the enclosing and requested evidence
+        // is not mistaken for the very same in-progress application. The
+        // ordinary open-implicit stack still rejects genuinely divergent
+        // searches by declaration origin and target type.
+        let depth = self.macro_query_depth;
+        let mut rejected = Vec::new();
+        loop {
+            let search = self.search_macro_implicit(pt, depth, &rejected);
+            match search {
+                crate::implicits::ImplicitSearch::Found(id) => {
+                    // `implicit_tree` expands a selected implicit macro through a
+                    // nested conversation. Never serialize an unexpanded reference
+                    // as successful evidence when that nested expansion failed.
+                    let attempt_mark = self.diags.len();
+                    let key = self.macro_failure_key(span);
+                    let (mut tree, _nested_failure) = self
+                        .with_isolated_macro_failure(key, |this| {
+                            this.implicit_tree(id, pt, span, depth)
+                        });
+                    let selected_unexpanded_macro =
+                        self.st.get(id).macro_impl.is_some() && tree.sym == id;
+                    self.adapt(&mut tree, pt);
+                    // A nested Lazy-style derivation can deliberately return a
+                    // reference to a val that the enclosing macro will place in
+                    // its final block. nsc keeps that unbound intermediate tree
+                    // typed; the reference only becomes lexically visible after
+                    // the outer expansion resumes. Preserve the already fitted
+                    // result for that exact generated-name case, while retaining
+                    // every other diagnostic from the nested macro.
+                    let deferred_outer_local = self.diags[attempt_mark..]
+                        .iter()
+                        .filter(|d| d.level == Level::Error)
+                        .next()
+                        .is_some()
+                        && self.diags[attempt_mark..]
+                            .iter()
+                            .filter(|d| d.level == Level::Error)
+                            .all(|d| d.message.starts_with("not found: value inst$macro$"));
+                    let failures = if deferred_outer_local {
+                        self.diags.truncate(attempt_mark);
+                        None
+                    } else {
+                        self.take_probe_errors(attempt_mark)
+                    };
+                    if selected_unexpanded_macro || tree.ty.is_error() || failures.is_some() {
+                        // Implicit search is transactional through materialization:
+                        // a candidate whose macro (or one of its evidence macros)
+                        // aborts is discarded and the next applicable candidate is
+                        // tried. This is how a specialized derivation can decline a
+                        // type and let a lower-priority generic derivation handle it.
+                        let origin = self
+                            .implicit_instance_origins
+                            .get(&id)
+                            .copied()
+                            .unwrap_or(id);
+                        if rejected
+                            .iter()
+                            .any(|(prior, wanted)| *prior == origin && wanted == pt)
+                        {
+                            self.diags.truncate(mark);
+                            if !silent {
+                                self.error(
+                                    span,
+                                    failures
+                                        .unwrap_or_else(|| self.missing_implicit_message(pt, None)),
+                                );
+                            }
+                            return "(a none)".to_string();
+                        }
+                        rejected.push((origin, pt.clone()));
+                        continue;
+                    }
+
+                    // An abstract/path-dependent result equal to the target is
+                    // already present as the JVM `pt` object. Sending a class
+                    // name for it would name a different type.
+                    let ty = if tree.ty == *pt {
+                        "(same)".to_string()
+                    } else {
+                        match self.type_to_wire(&tree.ty) {
+                            Ok(ty) => ty,
+                            Err(why) => {
+                                return refusal(&format!(
+                                "`c.inferImplicitValue` found an implicit of {why}, which scala-rs cannot describe to the macro engine"
+                            ));
+                            }
+                        }
+                    };
+                    let mut built = String::new();
+                    // A nested implicit macro can return generated TypeTrees that
+                    // have no source spelling. Serialize them with the same
+                    // resolved-type side table as a top-level expansion; an empty
+                    // table rejected the otherwise valid witness while handing it
+                    // back to the outer macro.
+                    let mut types = crate::expand::WireTypes::default();
+                    self.collect_wire_types(&tree, &mut types);
+                    let cx = crate::expand::WireCx {
+                        st: &self.st,
+                        types: &types,
+                    };
+                    return match answer_tree_to_wire(&cx, &tree, &mut built) {
+                        Ok(()) => format!("(a ok {ty} {built})"),
+                        Err(why) => refusal(&format!("`c.inferImplicitValue` produced {why}")),
+                    };
                 }
-                if selected_unexpanded_macro {
-                    return refusal(&format!(
-                        "`c.inferImplicitValue` selected implicit macro `{}`, but its expansion did not complete",
-                        self.st.get(id).name
-                    ));
+                crate::implicits::ImplicitSearch::None => {
+                    self.diags.truncate(mark);
+                    if !silent {
+                        self.error(span, self.missing_implicit_message(pt, None));
+                    }
+                    return "(a none)".to_string();
                 }
-                if tree.ty.is_error() || failures.is_some() {
+                crate::implicits::ImplicitSearch::Ambiguous(ids) => {
+                    self.diags.truncate(mark);
                     if !silent {
                         self.error(
                             span,
-                            failures.unwrap_or_else(|| self.missing_implicit_message(pt, None)),
+                            format!("ambiguous implicit: {}", self.describe_implicits(&ids)),
                         );
                     }
                     return "(a none)".to_string();
                 }
+            }
+        }
+    }
 
-                // An abstract/path-dependent result equal to the target is
-                // already present as the JVM `pt` object. Sending a class
-                // name for it would name a different type.
-                let ty = if tree.ty == *pt {
-                    "(same)".to_string()
-                } else {
-                    match self.type_to_wire(&tree.ty) {
-                        Ok(ty) => ty,
-                        Err(why) => {
-                            return refusal(&format!(
-                                "`c.inferImplicitValue` found an implicit of {why}, which scala-rs cannot describe to the macro engine"
-                            ));
-                        }
-                    }
-                };
-                let mut built = String::new();
-                let types = crate::expand::WireTypes::default();
-                let cx = crate::expand::WireCx {
-                    st: &self.st,
-                    types: &types,
-                };
-                match answer_tree_to_wire(&cx, &tree, &mut built) {
-                    Ok(()) => format!("(a ok {ty} {built})"),
-                    Err(why) => refusal(&format!("`c.inferImplicitValue` produced {why}")),
-                }
+    fn search_macro_implicit(
+        &mut self,
+        pt: &Type,
+        depth: usize,
+        rejected: &[(SymbolId, Type)],
+    ) -> crate::implicits::ImplicitSearch {
+        let saved_open = self.open_implicits.borrow().clone();
+        self.open_implicits.borrow_mut().extend_from_slice(rejected);
+        self.invalidate_implicit_caches();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            *self.diverged_implicit.borrow_mut() = None;
+            let mut search = self.retry_whitebox_fits(|this| this.search_implicit_at(pt, depth));
+            if matches!(search, crate::implicits::ImplicitSearch::None)
+                && self.warm_implicit_candidates(std::slice::from_ref(pt))
+            {
+                search = self.retry_whitebox_fits(|this| this.search_implicit_at(pt, depth));
             }
-            crate::implicits::ImplicitSearch::None => {
-                self.diags.truncate(mark);
-                if !silent {
-                    self.error(span, self.missing_implicit_message(pt, None));
-                }
-                "(a none)".to_string()
-            }
-            crate::implicits::ImplicitSearch::Ambiguous(ids) => {
-                self.diags.truncate(mark);
-                if !silent {
-                    self.error(
-                        span,
-                        format!("ambiguous implicit: {}", self.describe_implicits(&ids)),
-                    );
-                }
-                "(a none)".to_string()
-            }
+            search
+        }));
+        *self.open_implicits.borrow_mut() = saved_open;
+        self.invalidate_implicit_caches();
+        match result {
+            Ok(search) => search,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 
@@ -625,6 +803,7 @@ impl Typer {
         let owner = self.st.class_sym_of(&owner_ty).ok_or_else(|| {
             format!("the member owner `{owner_name}` does not resolve to a class")
         })?;
+        let owner = self.as_type_owner(owner);
         if let Some(parameter) = self
             .st
             .get(owner)
@@ -636,10 +815,16 @@ impl Typer {
             return Ok(parameter);
         }
         self.complete_binary_member(owner, member_name, span);
-        self.st
-            .lookup_member(owner, member_name)
-            .into_iter()
-            .find(|id| self.st.get(*id).kind == SymKind::TypeMember)
+        self.pickle
+            .complete_type_member(&mut self.st, &mut self.binary, owner, member_name);
+        self.pickle
+            .completed_type_member_decl(owner, member_name)
+            .or_else(|| {
+                self.st
+                    .lookup_member(owner, member_name)
+                    .into_iter()
+                    .find(|id| self.st.get(*id).kind == SymKind::TypeMember)
+            })
             .ok_or_else(|| format!("type member `{owner_name}.{member_name}` does not resolve"))
     }
 
@@ -672,10 +857,8 @@ impl Typer {
             return refusal("the macro engine asked a malformed `c.typecheck`");
         }
         let mode = mode_sexp.text();
-        // `c.typecheck` is re-entrant in nsc. Here each nested question would
-        // need its own conversation on a pipe that carries one, and the
-        // `converse` loop is what serialises them -- but a *tree* that itself
-        // triggers another query cannot be, so the depth is bounded and named.
+        // Nested implementations share the conversation stack. Bound the
+        // recursive query chain even when each individual request terminates.
         if self.macro_query_depth >= MAX_QUERY_DEPTH {
             return refusal(&format!(
                 "`c.typecheck` was asked more than {MAX_QUERY_DEPTH} deep; \
@@ -704,20 +887,23 @@ impl Typer {
                 return refusal(&detail);
             }
         };
-        // A macro application inside the tree is refused (`macro_engine_busy`),
+        // A macro application inside the tree may fail during its nested conversation,
         // and the refusal is recorded against the span every node of a rebuilt
         // tree carries -- which is the *outer* call site's. Left there it would
         // be a reason attached to a call that succeeded, so it is put back the
         // way it was, exactly like the diagnostics.
         let key = self.macro_failure_key(span);
         let (answer, _nested_failure) = self.with_isolated_macro_failure(key, |this| {
-            this.with_macro_query_depth(|this| match mode.as_str() {
-                "TERM" => this.typecheck_term(&mut tree),
-                "TYPE" => this.typecheck_type(&tree),
-                other => refusal(&format!(
-                    "`c.typecheck` was asked for {other}mode, which scala-rs does \
-                     not implement (only TERMmode and TYPEmode)"
-                )),
+            this.with_macro_query_depth(|this| {
+                let depth = this.macro_query_depth;
+                this.with_implicit_search_depth(depth, |this| match mode.as_str() {
+                    "TERM" => this.typecheck_term(&mut tree),
+                    "TYPE" => this.typecheck_type(&tree),
+                    other => refusal(&format!(
+                        "`c.typecheck` was asked for {other}mode, which scala-rs does \
+                         not implement (only TERMmode and TYPEmode)"
+                    )),
+                })
             })
         });
         answer
@@ -801,7 +987,7 @@ impl Typer {
     ///
     /// The message is phrased the way nsc's `TypecheckException` carries one:
     /// the first error, which is the one an implementation prints.
-    fn take_probe_errors(&mut self, mark: usize) -> Option<String> {
+    pub(crate) fn take_probe_errors(&mut self, mark: usize) -> Option<String> {
         let first = self.diags[mark..]
             .iter()
             .find(|d| d.level == Level::Error)
@@ -844,6 +1030,9 @@ impl Typer {
         // An inner class behind a prefix (`prefix.rs`) is the class it views;
         // the engine is handed the class, as for the bare type.
         let ty = crate::prefix::strip_view(ty);
+        if let Type::Repeated(element) = ty {
+            return Ok(format!("(repeated {})", self.type_to_wire(element)?));
+        }
         if matches!(ty, Type::AnyRef) {
             return Ok("(ty \"java.lang.Object\")".into());
         }
@@ -1076,6 +1265,10 @@ impl Typer {
             {
                 (*sym, args.as_slice())
             }
+            // An unapplied alias is a type constructor, not an abstract
+            // parameter requiring a runtime tag. Keep its declaration identity
+            // so the mirror sees the alias's binders and right-hand side.
+            Type::TypeMember(id) if self.st.get(*id).is_type_alias => (*id, &[][..]),
             Type::TypeParam(id) => {
                 let owner = self.st.get(*id).owner;
                 let mut enclosing = owner;
@@ -1133,6 +1326,23 @@ fn answer_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(
             Ok(())
         }
         TreeKind::Ident { name } => {
+            // An implicit synthesized for another macro is resolved in the
+            // implicit's scope, then spliced at the outer macro call site.
+            // A companion member such as `optionEvidence(baseEvidence)` is
+            // not necessarily imported there, so retain the symbol's stable
+            // path just as typed `c.prefix` transport does.
+            // Binary members also carry the same-run symbol identity. The JVM
+            // macro can duplicate or untypecheck the tree and still return the
+            // member identity, instead of reducing a qualified helper call to
+            // an unresolvable bare identifier.
+            if let Some(path) = super::expand::static_member_path(cx.st, t.sym) {
+                root_path_with_source_sym_to_wire(&path, t.sym, out);
+                return Ok(());
+            }
+            if let Some(path) = super::expand::static_module_path(cx.st, t.sym) {
+                super::expand::root_path_to_wire(&path, out);
+                return Ok(());
+            }
             // A name that resolved to a member of an enclosing class means
             // `C.this.name` in a typed tree, the same way `c.prefix` carries
             // one; a name that resolved to nothing keeps its own spelling.
@@ -1208,6 +1418,24 @@ fn answer_tree_to_wire_body(cx: &WireCx, t: &Tree, out: &mut String) -> Result<(
         }
         _ => super::expand::tree_to_wire(cx, t, out).map_err(|why| format!("a tree: {why}")),
     }
+}
+
+fn root_path_with_source_sym_to_wire(path: &str, sym: SymbolId, out: &mut String) {
+    let segments = path.split('.').collect::<Vec<_>>();
+    let mut built = String::from("(t \"Ident\" (s0) (n term \"_root_\"))");
+    for (index, segment) in segments.iter().enumerate() {
+        let mut next = if index + 1 == segments.len() {
+            format!("(t \"Select\" (srm {}) ", sym.0)
+        } else {
+            String::from("(t \"Select\" (s0) ")
+        };
+        next.push_str(&built);
+        next.push_str(" (n term ");
+        quote_into(&mut next, &encode_method_name(segment));
+        next.push_str("))");
+        built = next;
+    }
+    out.push_str(&built);
 }
 
 #[cfg(test)]

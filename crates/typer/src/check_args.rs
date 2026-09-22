@@ -775,17 +775,18 @@ impl Typer {
         // Which symbol carries those members depends on how the reference was
         // built. An `object`'s body is entered on its module *class* (`one$`),
         // and the module *value* (`one`) that a reference resolves to has no
-        // members at all; `fun.ty` is the `ModuleRef` naming the class. Only a
+        // members at all; its module class holds the declarations. Only a
         // reference whose symbol already *is* the module class -- which is what
         // a companion of a case class resolves to -- found anything here, so
         // every `html.dropdown(value, right = true)` in gitbucket's Twirl
         // templates reported "method parameters not resolved".
+        // Recover the module class from the symbol: a binary nested companion
+        // can also have an inherited accessor in `fun.ty`'s overload set.
         if !fun.sym.is_none() && self.st.get(fun.sym).kind == SymKind::Module {
             let mut owners = vec![fun.sym];
-            if let Type::ModuleRef(c) = &fun.ty {
-                if *c != fun.sym {
-                    owners.push(*c);
-                }
+            let module_class = self.st.module_class_of(fun.sym);
+            if !module_class.is_none() && module_class != fun.sym {
+                owners.push(module_class);
             }
             // Both owners' `apply`s are one overload set: a case class's
             // synthetic `apply` is entered on the module value, and an
@@ -796,6 +797,7 @@ impl Typer {
             // synthetic one alone: "unknown parameter name: oldId".
             let mut alts: Vec<SymbolId> = Vec::new();
             for owner in owners {
+                self.complete_binary_member(owner, "apply", fun.span);
                 for a in self.st.lookup_member(owner, "apply") {
                     if !alts.contains(&a) {
                         alts.push(a);
@@ -1053,7 +1055,9 @@ impl Typer {
             let owner = self.st.class_sym_of(&universe.ty).unwrap();
             self.term_import_prefixes.push((owner, universe));
         }
-        let result = self.fill_defaults_and_implicits_in(span, args, param_tys, fun, pt);
+        let result = self.with_whitebox_fits(span, |this| {
+            this.fill_defaults_and_implicits_in(span, args, param_tys, fun, pt)
+        });
         self.term_import_prefixes.truncate(saved_prefixes);
         result
     }
@@ -1299,7 +1303,7 @@ impl Typer {
     /// every one of them, leave the types as they were and let the ordinary
     /// "could not find implicit value" diagnostic describe what happened.
     fn solve_implicit_only_tparams(&mut self, sym: SymbolId, rest_tys: Vec<Type>) -> Vec<Type> {
-        let undet: Vec<SymbolId> = self
+        let mut undet: Vec<SymbolId> = self
             .st
             .get(sym)
             .tparams
@@ -1307,6 +1311,17 @@ impl Typer {
             .copied()
             .filter(|tp| rest_tys.iter().any(|t| type_mentions_tparam_deep(t, *tp)))
             .collect();
+        // A selected apply may also carry an open parameter from its factory
+        // receiver: make[F].apply[A](a)(implicit Context[F]). The witness can
+        // determine F just as it determines this method's own parameters.
+        for tp in &self.undet_tvars {
+            if !undet.contains(tp)
+                && !self.tparam_in_scope(*tp)
+                && rest_tys.iter().any(|t| type_mentions_tparam_deep(t, *tp))
+            {
+                undet.push(*tp);
+            }
+        }
         if undet.is_empty() {
             return rest_tys;
         }
@@ -1317,7 +1332,7 @@ impl Typer {
         for t in rest_tys.clone() {
             self.warm_implicit_scope(&t);
         }
-        let mut solved = self.undet_solution(&rest_tys, &undet);
+        let mut solved = self.retry_whitebox_fits(|this| this.undet_solution(&rest_tys, &undet));
         if solved.is_none() && self.warm_implicit_candidates(&rest_tys) {
             // The witness may be a jar class whose parents nothing had read:
             // `implicit F: Async[F]` answers `GenTemporal[F, E]` only through
@@ -1325,7 +1340,7 @@ impl Typer {
             // says `E = Throwable`. Left unsolved, the parameter reached
             // `fill_implicit_params` as `GenTemporal[F, _]` and no candidate
             // could match it (slick's `slick/basic/ConcurrencyControl.scala`).
-            solved = self.undet_solution(&rest_tys, &undet);
+            solved = self.retry_whitebox_fits(|this| this.undet_solution(&rest_tys, &undet));
         }
         if solved.is_none()
             && rest_tys.iter().any(|ty| {
@@ -2064,27 +2079,67 @@ impl Typer {
         span: Span,
         depth: usize,
     ) -> Tree {
+        if let Some(tree) = self.take_whitebox_tree(id, pt) {
+            return tree;
+        }
         // Searches normally prepare detached instances before fitting a
         // polymorphic derivation rule. A witness reached through a dependent
         // result can be materialized after that warm-up, though; make sure
         // its nested clauses get a distinct instance at the next depth
         // instead of reusing the outer rule and tripping the recursion guard.
+        // Search already prepares the selected rule at the depth it is
+        // fitting. Materialization only needs that one detached identity;
+        // extending by MAX on every nested call made the instance vector grow
+        // again for each level of a recursive implicit.
         let origin = self
             .implicit_instance_origins
             .get(&id)
             .copied()
             .unwrap_or(id);
-        // Search already prepares the selected rule at the depth it is
-        // fitting. Materialization only needs that one detached identity;
-        // extending by MAX on every nested call made the instance vector grow
-        // again for each level of a recursive implicit.
-        self.prepare_implicit_instances(origin, depth);
-        let effective_id = self
-            .implicit_instances
-            .get(&origin)
-            .and_then(|(_, instances)| instances.get(depth))
-            .copied()
-            .unwrap_or(id);
+        let mut materialize_depth = depth;
+        let effective_id = loop {
+            self.prepare_implicit_instances(origin, materialize_depth);
+            let effective = self
+                .implicit_instances
+                .get(&origin)
+                .and_then(|(_, instances)| instances.get(materialize_depth))
+                .copied()
+                .unwrap_or(id);
+            // Re-entrant macro queries can leave one detached instance active
+            // while asking the call-site typer to materialize the same rule
+            // for a different target. That is not the recursive application
+            // guarded below: lazy materializers use the distinction to build
+            // a graph of deferred witnesses. Give the new target another
+            // detached identity, while an exact repeated target still hits
+            // the ordinary divergence check.
+            let occupied_by_other_target = self.macro_query_depth > 0
+                && self
+                    .building_implicits
+                    .iter()
+                    .any(|(prior, wanted)| *prior == effective && wanted != pt);
+            if occupied_by_other_target {
+                materialize_depth = materialize_depth.saturating_add(1);
+                continue;
+            }
+            break effective;
+        };
+        // Preserve the candidate's complete fit before marking it as being
+        // materialized. A derivation can infer an associated type only from
+        // its own implicit clauses; recomputing that fit under the building
+        // guard can deliberately suppress the same recursive candidate and
+        // lose those type arguments.
+        let fitted_targs = self
+            .selected_implicit_fit
+            .borrow_mut()
+            .take()
+            .filter(|(selected, wanted, selected_depth, _)| {
+                *selected == origin && wanted == pt && *selected_depth == depth
+            })
+            .map(|(_, _, _, targs)| targs)
+            .or_else(|| {
+                self.implicit_fit_at(origin, pt, depth, &[])
+                    .map(|fit| fit.targs)
+            });
         if self.building_implicits.iter().any(|(prior, wanted)| {
             *prior == effective_id && crate::implicits::dominates(self, pt, wanted)
         }) {
@@ -2106,7 +2161,8 @@ impl Typer {
         // nested macro queries, including unwinding failures, restore the
         // caller's complete state.
         self.with_building_implicit((effective_id, pt.clone()), |this| {
-            let mut result = this.implicit_tree_in(origin, pt, span, depth);
+            let mut result =
+                this.implicit_tree_in(origin, pt, span, materialize_depth, fitted_targs);
             // Synthesized evidence does not pass through type_expr. Expand the
             // selected macro here, while the implicit recursion guard is active.
             this.expand_macro_application(&mut result);
@@ -2114,7 +2170,14 @@ impl Typer {
         })
     }
 
-    fn implicit_tree_in(&mut self, id: SymbolId, pt: &Type, span: Span, depth: usize) -> Tree {
+    fn implicit_tree_in(
+        &mut self,
+        id: SymbolId,
+        pt: &Type,
+        span: Span,
+        depth: usize,
+        fitted_targs: Option<Vec<Type>>,
+    ) -> Tree {
         let reference = self.ref_implicit_with_receiver(id, span);
         // An imported member of an inner object can carry an as-seen-from
         // view whose prefix is the stable object path. Preserve that view
@@ -2137,9 +2200,8 @@ impl Typer {
         // The solved type arguments of a polymorphic implicit
         // (`<:<.refl[A]` fitted to `Int <:< Any` gives `A = Int`), so the tree
         // carries the instantiated type rather than the declared `=:=[A, A]`.
-        let targs = self
-            .implicit_fit_at(id, pt, depth, &[])
-            .map(|f| f.targs)
+        let targs = fitted_targs
+            .or_else(|| self.implicit_fit_at(id, pt, depth, &[]).map(|f| f.targs))
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
         let mut reference = reference;
@@ -2185,20 +2247,25 @@ impl Typer {
         // and cast it: `class Main$ cannot be cast to class
         // BuildFromLowPriority1` from a program that type-checked.
         let mut tree = reference;
-        tree.ty = inst(&ret);
+        let mut result_ty = inst(&ret);
+        tree.ty = result_ty.clone();
+        let param_ids = self.st.get(id).params.clone();
+        let mut param_index = 0usize;
         for clause in &paramss {
+            let clause_tys: Vec<Type> = clause.iter().map(&inst).collect();
             let mut cargs = Vec::with_capacity(clause.len());
-            for p in clause {
-                let want = inst(p);
+            for want in &clause_tys {
+                let pid = param_ids.get(param_index).copied();
+                param_index += 1;
                 self.warm_implicit_scope(&want);
                 // Keep the derivation depth while materializing the witness.
                 // Starting every clause at depth zero reuses the same
                 // `tuple2Shape` instance for a nested tuple and the
                 // recursion guard mistakes the inner, smaller shape for a
                 // non-shrinking expansion.
-                match self.search_implicit_at(&want, depth + 1) {
+                match self.retry_whitebox_fits(|this| this.search_implicit_at(want, depth + 1)) {
                     ImplicitSearch::Found(inner) => {
-                        cargs.push(self.implicit_tree(inner, &want, span, depth + 1))
+                        cargs.push(self.implicit_tree(inner, want, span, depth + 1))
                     }
                     // A tag is *built*, not found. `fill_implicit_params` has
                     // always known that; this recursion did not, so a rule
@@ -2245,6 +2312,12 @@ impl Typer {
                             cargs.push(lam);
                             continue;
                         }
+                        if let Some(default) = pid
+                            .and_then(|pid| self.implicit_param_default(pid, want, &tree, &cargs))
+                        {
+                            cargs.push(default);
+                            continue;
+                        }
                         if !crate::check::type_is_erroneous(&want) {
                             let diverged = self.diverged_implicit.borrow().clone();
                             self.error(span, self.missing_implicit_message(&want, diverged));
@@ -2253,7 +2326,8 @@ impl Typer {
                     }
                 }
             }
-            let ty = tree.ty.clone();
+            let carg_tys: Vec<Type> = cargs.iter().map(Tree::argument_type).collect();
+            result_ty = self.subst_dependent_members(&clause_tys, &carg_tys, &result_ty);
             tree = Tree {
                 id: scala_rs_parser::NodeId(0),
                 span,
@@ -2261,7 +2335,7 @@ impl Typer {
                     fun: Box::new(tree),
                     args: cargs,
                 },
-                ty,
+                ty: result_ty.clone(),
                 sym: id,
                 postfix: false,
                 scala_ref: false,
@@ -2270,7 +2344,7 @@ impl Typer {
                 byname_type_marker: false,
             };
         }
-        tree.ty = inst(&ret);
+        tree.ty = result_ty;
         tree
     }
 
@@ -2283,7 +2357,9 @@ impl Typer {
         fun: &Tree,
     ) {
         let filled_from = args.len();
-        self.fill_implicit_params_in(span, args, param_tys, rest, fun);
+        self.with_whitebox_fits(span, |this| {
+            this.fill_implicit_params_in(span, args, param_tys, rest, fun)
+        });
         // Mark what this pass added, so a re-typing of the same application
         // (`retry_tupled_args`) starts from the arguments the user wrote.
         for a in args[filled_from..].iter_mut() {
@@ -2299,6 +2375,7 @@ impl Typer {
         rest: &[SymbolId],
         fun: &Tree,
     ) {
+        let depth = self.implicit_search_depth;
         for (i, pid) in rest.iter().enumerate() {
             let pty = param_tys
                 .get(i)
@@ -2308,15 +2385,16 @@ impl Typer {
             // A fallback may already fit while a more specific derivation's
             // evidence has not been loaded. Complete candidates before choosing.
             self.warm_implicit_derivation_scopes(&pty);
-            let mut search = self.search_implicit(&pty);
+            *self.diverged_implicit.borrow_mut() = None;
+            let mut search = self.retry_whitebox_fits(|this| this.search_implicit_at(&pty, depth));
             if matches!(search, ImplicitSearch::None)
                 && self.warm_implicit_candidates(std::slice::from_ref(&pty))
             {
-                search = self.search_implicit(&pty);
+                search = self.retry_whitebox_fits(|this| this.search_implicit_at(&pty, depth));
             }
             match search {
                 ImplicitSearch::Found(id) => {
-                    let mut r = self.implicit_tree(id, &pty, span, 0);
+                    let mut r = self.implicit_tree(id, &pty, span, depth);
                     self.adapt(&mut r, &pty);
                     args.push(r);
                 }

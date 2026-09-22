@@ -1449,6 +1449,7 @@ pub(crate) fn emit_case_apply(
     signature: Option<&crate::sig::GenericSignature>,
 ) {
     let fields = st.get(class_id).ctor_fields.clone();
+    let apply_sym = case_apply_sym(st, class_id);
     let class_jvm = class_internal(st, class_id);
     // `case class C[T](y: T) extends AnyVal`: the class erases to its
     // underlying type, so nsc's companion `apply` is `(T)T` -- the identity --
@@ -1488,11 +1489,32 @@ pub(crate) fn emit_case_apply(
         b.sign_method(method, value_signature.as_ref());
         return;
     }
+    // The factory mirrors every primary-constructor clause, including
+    // compiler-generated evidence parameters from context bounds.  Those
+    // parameters are not case accessors and therefore need not occur in
+    // `ctor_fields`; deriving the descriptor from fields alone wrote a
+    // three-argument `apply` beside a four-argument constructor while the
+    // Scala signature correctly advertised the implicit fourth argument.
+    let apply_params: Vec<SymbolId> = if apply_sym.is_none() {
+        fields.clone()
+    } else {
+        st.get(apply_sym)
+            .paramss
+            .iter()
+            .flatten()
+            .copied()
+            .collect()
+    };
+    let apply_params = if apply_params.is_empty() && !fields.is_empty() {
+        fields.clone()
+    } else {
+        apply_params
+    };
     let mut params = Vec::new();
     let mut locals = 1u16;
     let mut loads = Vec::new();
-    for f in &fields {
-        let ty = st.get(*f).ty.clone();
+    for p in &apply_params {
+        let ty = st.get(*p).ty.clone();
         // Pass-through: the argument the JVM handed us is what goes to the
         // constructor, and a `Unit` one is a `BoxedUnit` reference in a slot.
         let sort = jvm_slot_sort(&ty);
@@ -1527,7 +1549,7 @@ pub(crate) fn emit_case_apply(
     } else {
         base_ctor_d
     };
-    let acc = synthetic_case_member_access(st, case_apply_sym(st, class_id));
+    let acc = synthetic_case_member_access(st, apply_sym);
     let method = b.add_code(acc, "apply", &desc, locals.max(1), |asm| {
         asm.new_obj(&class_jvm);
         asm.dup();
@@ -1543,9 +1565,9 @@ pub(crate) fn emit_case_apply(
     });
     b.set_method_param_names(
         method,
-        fields
+        apply_params
             .iter()
-            .map(|f| Some(st.get(*f).name.clone()))
+            .map(|p| Some(st.get(*p).name.clone()))
             .collect(),
     );
     b.sign_method(method, signature);

@@ -6,6 +6,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -38,6 +39,7 @@ public final class ScalaRsMacroEngine {
     static final java.util.Map<Long, Object> sourceSymbols = new java.util.HashMap<>();
     static final java.util.IdentityHashMap<Object, Long> sourceSymbolIds = new java.util.IdentityHashMap<>();
     static final java.util.IdentityHashMap<Object, String> binaryClassNames = new java.util.IdentityHashMap<>();
+    static final java.util.Set<Object> binarySymbols = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     static Class<?> lazyInfoClass;
     static final java.util.Map<String, Class<?>> sourceSymbolClasses = new java.util.HashMap<>();
     static final java.util.Set<Object> mutableSourceSymbols = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
@@ -63,6 +65,9 @@ public final class ScalaRsMacroEngine {
     static Object universe;
     static Object mirror;
     static ClassLoader macroCl;
+    /** Proxies retained only while their expansion is active in the typer. */
+    static final java.util.Map<Long, Object> macroContexts = new java.util.HashMap<>();
+    static List<Object> openMacroContexts = new ArrayList<>();
     /**
      * The pipe, as fields, because expansion is a *conversation* rather than
      * one line in and one line out: an implementation may stop mid-flight and
@@ -183,8 +188,9 @@ public final class ScalaRsMacroEngine {
      * call site before it is accepted.  Consequently nsc's in-JVM owner repair
      * is both unavailable and redundant here.  Load only the ScalaTest classes
      * that reach the helper in a child loader and replace that helper with the
-     * ABI-equivalent identity operation.  Other macro libraries and all Scala
-     * reflection classes remain parent-loaded.
+     * ABI-equivalent identity operation. Shapeless's lazy derivation helper
+     * similarly redirects its private nsc implicit-cache reset to the native
+     * typer. All other macro classes and Scala reflection stay parent-loaded.
      */
     static ClassLoader macroClassLoader(ClassLoader parent) throws Exception {
         String[] entries = System.getProperty("java.class.path", "")
@@ -204,7 +210,8 @@ public final class ScalaRsMacroEngine {
         static boolean childFirst(String name) {
             return name.startsWith("org.scalatest.AssertionsMacro")
                 || name.startsWith("org.scalactic.BooleanMacro")
-                || name.startsWith("org.scalactic.MacroOwnerRepair");
+                || name.startsWith("org.scalactic.MacroOwnerRepair")
+                || name.equals("shapeless.LazyMacros") || name.startsWith("shapeless.LazyMacros$");
         }
 
         @Override
@@ -221,6 +228,20 @@ public final class ScalaRsMacroEngine {
                             throw new ClassNotFoundException(name, e);
                         }
                         cls = defineClass(name, bytes, 0, bytes.length);
+                    } else if (name.equals("shapeless.LazyMacros$")
+                            || name.equals("shapeless.LazyMacros$SubstMessage$1")
+                            || name.equals("shapeless.LazyMacros$DerivationContext$StripUnApplyNodes")) {
+                        try (java.io.InputStream stream = getParent().getResourceAsStream(name.replace('.', '/') + ".class")) {
+                            if (stream == null) throw new ClassNotFoundException(name);
+                            java.io.ByteArrayOutputStream raw = new java.io.ByteArrayOutputStream();
+                            byte[] buffer = new byte[8192]; int read;
+                            while ((read = stream.read(buffer)) != -1) raw.write(buffer, 0, read);
+                            byte[] bytes = name.equals("shapeless.LazyMacros$")
+                                ? implicitResetBytes(raw.toByteArray()) : reflectionUniverseBytes(raw.toByteArray());
+                            cls = defineClass(name, bytes, 0, bytes.length);
+                        } catch (Exception failure) {
+                            throw new ClassNotFoundException(name, failure);
+                        }
                     } else {
                         try {
                             cls = findClass(name);
@@ -233,6 +254,127 @@ public final class ScalaRsMacroEngine {
                 return cls;
             }
         }
+    }
+
+    /** These two tree transformers only use the common SymbolTable reflection
+     * API (one stores the universe; the other reads standard term names).
+     * Keep their original transformation logic and use that actual superclass
+     * instead of requiring the unrelated nsc Global subclass. */
+    static byte[] reflectionUniverseBytes(byte[] original) throws Exception {
+        java.io.DataInputStream in = new java.io.DataInputStream(new java.io.ByteArrayInputStream(original));
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream out = new java.io.DataOutputStream(bytes);
+        out.writeInt(in.readInt()); out.writeShort(in.readUnsignedShort()); out.writeShort(in.readUnsignedShort());
+        int count = in.readUnsignedShort(); out.writeShort(count);
+        for (int i = 1; i < count; i++) {
+            int tag = in.readUnsignedByte(); out.writeByte(tag);
+            switch (tag) {
+                case 1:
+                    out.writeUTF(in.readUTF().replace("scala/tools/nsc/Global", "scala/reflect/internal/SymbolTable"));
+                    break;
+                case 7: case 8: case 16: case 19: case 20: out.writeShort(in.readUnsignedShort()); break;
+                case 9: case 10: case 11: case 12: case 18: case 17:
+                    out.writeShort(in.readUnsignedShort()); out.writeShort(in.readUnsignedShort()); break;
+                case 3: case 4: out.writeInt(in.readInt()); break;
+                case 5: case 6: out.writeLong(in.readLong()); i++; break;
+                case 15: out.writeByte(in.readUnsignedByte()); out.writeShort(in.readUnsignedShort()); break;
+                default: throw gap("unsupported transformer constant " + tag);
+            }
+        }
+        byte[] rest = new byte[in.available()]; in.readFully(rest); out.write(rest); out.flush();
+        return bytes.toByteArray();
+    }
+
+    /** Move nsc's implicit-cache reset to the typer that owns implicit search. */
+    public static void resetImplicitCaches(Object context) throws Exception {
+        if (!Proxy.isProxyClass(context.getClass()) || !(Proxy.getInvocationHandler(context) instanceof Ctx))
+            throw gap("implicit reset requires a scala-rs macro context");
+        Sexp answer = query("(q resetImplicits)");
+        if (!"reset".equals(answer.items.get(1).text())) throw gap("malformed implicit reset answer");
+    }
+
+    /** Preserve the macro bytecode except for the exact private-compiler API
+     * sequence universe.asInstanceOf[Global].analyzer.resetImplicits(). */
+    static byte[] implicitResetBytes(byte[] original) throws Exception {
+        java.io.DataInputStream input = new java.io.DataInputStream(new java.io.ByteArrayInputStream(original));
+        input.readInt(); input.readUnsignedShort(); input.readUnsignedShort();
+        int count = input.readUnsignedShort();
+        String[] text = new String[count];
+        int[] left = new int[count], right = new int[count];
+        for (int i = 1; i < count; i++) {
+            int tag = input.readUnsignedByte();
+            if (tag == 1) text[i] = input.readUTF();
+            else if (tag == 7 || tag == 8 || tag == 16 || tag == 19 || tag == 20) left[i] = input.readUnsignedShort();
+            else if (tag == 9 || tag == 10 || tag == 11 || tag == 12 || tag == 18 || tag == 17) {
+                left[i] = input.readUnsignedShort(); right[i] = input.readUnsignedShort();
+            } else if (tag == 3 || tag == 4) input.readInt();
+            else if (tag == 5 || tag == 6) { input.readLong(); i++; }
+            else if (tag == 15) { input.readUnsignedByte(); input.readUnsignedShort(); }
+            else throw gap("unsupported macro classfile constant " + tag);
+        }
+        int poolEnd = original.length - input.available();
+        int universeRef = 0, globalClass = 0, analyzerRef = 0, resetRef = 0;
+        for (int i = 1; i < count; i++) {
+            if ("scala/tools/nsc/Global".equals(text[left[i]]) && right[i] == 0) globalClass = i;
+            if (right[i] == 0 || left[i] == 0) continue;
+            String owner = text[left[left[i]]];
+            String name = text[left[right[i]]];
+            if ("scala/reflect/macros/whitebox/Context".equals(owner) && "universe".equals(name)) universeRef = i;
+            if ("scala/tools/nsc/Global".equals(owner) && "analyzer".equals(name)) analyzerRef = i;
+            if ("scala/tools/nsc/typechecker/Analyzer".equals(owner) && "resetImplicits".equals(name)) resetRef = i;
+        }
+        if (universeRef == 0 || globalClass == 0 || analyzerRef == 0 || resetRef == 0)
+            throw gap("macro implicit reset bytecode does not match the supported compiler API");
+        byte[] patched = original.clone();
+        byte[] pattern = new byte[] {(byte)0xb9, (byte)(universeRef >> 8), (byte)universeRef, 1, 0,
+            (byte)0xc0, (byte)(globalClass >> 8), (byte)globalClass,
+            (byte)0xb6, (byte)(analyzerRef >> 8), (byte)analyzerRef,
+            (byte)0xb9, (byte)(resetRef >> 8), (byte)resetRef, 1, 0};
+        int changed = 0;
+        // Inspect only Code attributes. All constant-pool indices and code
+        // lengths stay unchanged; a bridge plus NOPs preserves stack maps.
+        input.skipBytes(6);
+        input.skipBytes(input.readUnsignedShort() * 2);
+        for (int section = 0; section < 2; section++) {
+            int members = input.readUnsignedShort();
+            for (int member = 0; member < members; member++) {
+                input.skipBytes(6);
+                int attributes = input.readUnsignedShort();
+                for (int attribute = 0; attribute < attributes; attribute++) {
+                    String attributeName = text[input.readUnsignedShort()];
+                    int length = input.readInt();
+                    int start = original.length - input.available();
+                    if (section == 1 && "Code".equals(attributeName)) {
+                        java.io.DataInputStream code = new java.io.DataInputStream(
+                            new java.io.ByteArrayInputStream(original, start, length));
+                        code.skipBytes(4);
+                        int codeLength = code.readInt();
+                        for (int i = start + 8; i <= start + 8 + codeLength - pattern.length; i++) {
+                            boolean matches = true;
+                            for (int j = 0; j < pattern.length; j++) if (patched[i + j] != pattern[j]) { matches = false; break; }
+                            if (!matches) continue;
+                            patched[i] = (byte)0xb8;
+                            patched[i + 1] = (byte)((count + 5) >> 8);
+                            patched[i + 2] = (byte)(count + 5);
+                            java.util.Arrays.fill(patched, i + 3, i + pattern.length, (byte)0);
+                            changed++;
+                        }
+                    }
+                    if (length < 0 || input.skipBytes(length) != length)
+                        throw gap("truncated macro classfile attribute");
+                }
+            }
+        }
+        if (changed != 1) throw gap("expected one implicit reset call, found " + changed);
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        java.io.DataOutputStream d = new java.io.DataOutputStream(bytes);
+        d.write(patched, 0, 8); d.writeShort(count + 6);
+        d.write(patched, 10, poolEnd - 10);
+        utf(d, "ScalaRsMacroEngine"); pair(d, 7, count, 0);
+        utf(d, "resetImplicitCaches"); utf(d, "(Ljava/lang/Object;)V");
+        pair(d, 12, count + 2, count + 3); pair(d, 10, count + 1, count + 4);
+        d.write(patched, poolEnd, patched.length - poolEnd); d.flush();
+        return bytes.toByteArray();
     }
 
     /** A Java-8 classfile for the public ABI of scalactic's owner repair. */
@@ -255,37 +397,132 @@ public final class ScalaRsMacroEngine {
         return bytes.toByteArray();
     }
 
-    static Class<?> naturalMacroClass;
+    static final java.util.Map<Class<?>, Class<?>> reflectionBundles = new java.util.HashMap<>();
 
-    /** Shapeless's natural-number bundle inherits prefix(Type), whose body
-     * casts the universe to Global but never uses that local. Its result is
-     * exactly the internal Type.prefix available in the runtime universe too.
-     * Override that helper; the original constructor and macro still execute. */
+    /** Keep the original derivation implementation while routing its private
+     * compiler helpers to the reflection universe and native call-site typer.
+     * No source compilation or replacement materializer runs in this JVM. */
     static Class<?> compatibleBundleClass(Class<?> implementation) throws Exception {
-        if (!implementation.getName().equals("shapeless.ops.nat$ToIntMacros")) return implementation;
-        if (naturalMacroClass == null) {
-            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
-            java.io.DataOutputStream d = new java.io.DataOutputStream(bytes);
-            d.writeInt(0xcafebabe); d.writeShort(0); d.writeShort(52); d.writeShort(17);
-            utf(d, "ScalaRsNaturalMacro"); pair(d, 7, 1, 0);
-            utf(d, "shapeless/ops/nat$ToIntMacros"); pair(d, 7, 3, 0);
-            utf(d, "<init>"); utf(d, "(Lscala/reflect/macros/whitebox/Context;)V");
-            utf(d, "Code"); pair(d, 12, 5, 6); pair(d, 10, 4, 8);
-            utf(d, "prefix"); utf(d, "(Lscala/reflect/api/Types$TypeApi;)Lscala/reflect/api/Types$TypeApi;");
-            utf(d, "scala/reflect/internal/Types$Type"); pair(d, 7, 12, 0);
-            utf(d, "()Lscala/reflect/internal/Types$Type;"); pair(d, 12, 10, 14); pair(d, 10, 13, 15);
-            d.writeShort(0x21); d.writeShort(2); d.writeShort(4);
-            d.writeShort(0); d.writeShort(0); d.writeShort(2);
-            code(d, 5, 6, 7, 2, 2, new byte[]{0x2a,0x2b,(byte)0xb7,0,9,(byte)0xb1});
-            code(d, 10, 11, 7, 1, 2, new byte[]{0x2b,(byte)0xc0,0,13,(byte)0xb6,0,16,(byte)0xb0});
-            d.writeShort(0); d.flush();
-            class BundleLoader extends ClassLoader {
-                BundleLoader() { super(implementation.getClassLoader()); }
-                Class<?> define(byte[] data) { return defineClass(null, data, 0, data.length); }
-            }
-            naturalMacroClass = new BundleLoader().define(bytes.toByteArray());
+        Class<?> family;
+        try { family = loadClass("shapeless.CaseClassMacros"); }
+        catch (ClassNotFoundException absent) { return implementation; }
+        if (!family.isAssignableFrom(implementation)) return implementation;
+        Class<?> known = reflectionBundles.get(implementation);
+        if (known != null) return known;
+        BundleBytes bytes = new BundleBytes("ScalaRsReflectionBundle" + reflectionBundles.size(), implementation);
+        String type = "Lscala/reflect/api/Types$TypeApi;";
+        String symbol = "Lscala/reflect/api/Symbols$SymbolApi;";
+        String tree = "Lscala/reflect/api/Trees$TreeApi;";
+        bytes.bridge("prefix", "(" + type + ")" + type, "reflectionPrefix", 1, type);
+        bytes.bridge("patchedCompanionSymbolOf", "(" + symbol + ")" + symbol, "reflectionCompanion", 1, symbol);
+        bytes.bridge("companionRef", "(" + type + ")" + tree, "reflectionCompanionRef", 1, tree);
+        bytes.bridge("mkAttributedRef", "(" + type + ")" + tree, "reflectionTypeRef", 1, tree);
+        bytes.bridge("mkAttributedRef", "(" + type + symbol + ")" + tree, "reflectionRef", 2, tree);
+        bytes.bridge("isAccessible", "(" + type + symbol + ")Z", "reflectionAccessible", 2, "Z");
+        class BundleLoader extends ClassLoader {
+            BundleLoader() { super(implementation.getClassLoader()); }
+            Class<?> define(byte[] data) { return defineClass(null, data, 0, data.length); }
         }
-        return naturalMacroClass;
+        known = new BundleLoader().define(bytes.finish());
+        reflectionBundles.put(implementation, known);
+        return known;
+    }
+
+    public static Object reflectionPrefix(Object type) throws Exception {
+        return call(type, "prefix", 0);
+    }
+
+    public static Object reflectionCompanion(Object symbol) throws Exception {
+        Long id = sourceSymbolIds.get(symbol);
+        if (id != null) {
+            long companion = Long.parseLong(query("(q companion " + id + ")").items.get(2).text());
+            return companion == 0 ? call(universe, "NoSymbol", 0) : sourceSymbol(companion);
+        }
+        return call(symbol, "companion", 0);
+    }
+
+    public static Object reflectionRef(Object prefix, Object symbol) throws Exception {
+        return call(call(universe, "gen", 0), "mkAttributedRef", 2, prefix, symbol);
+    }
+
+    public static Object reflectionTypeRef(Object type) throws Exception {
+        return reflectionRef(reflectionPrefix(type), call(type, "typeSymbol", 0));
+    }
+
+    public static Object reflectionCompanionRef(Object type) throws Exception {
+        Object symbol = call(type, "typeSymbol", 0);
+        Object companion = reflectionCompanion(symbol);
+        if (companion == call(universe, "NoSymbol", 0))
+            return call(ScalaRsMacroEngine.companion("Ident"), "apply", 1,
+                call(call(symbol, "name", 0), "toTermName", 0));
+        return reflectionRef(reflectionPrefix(type), companion);
+    }
+
+    public static boolean reflectionAccessible(Object prefix, Object symbol) throws Exception {
+        Long id = sourceSymbolIds.get(symbol);
+        if (id == null) {
+            // Public binary declarations have no call-site-dependent boundary.
+            if (!Boolean.TRUE.equals(call(symbol, "isPrivate", 0))
+                    && !Boolean.TRUE.equals(call(symbol, "isProtected", 0))
+                    && call(symbol, "privateWithin", 0) == call(universe, "NoSymbol", 0)) return true;
+            StringBuilder owner = new StringBuilder(), pre = new StringBuilder();
+            serType(call(call(symbol, "owner", 0), "toType", 0), owner); serType(prefix, pre);
+            Sexp answer = query("(q isAccessibleMember " + owner + " "
+                + Sexp.quote(String.valueOf(call(symbol, "name", 0))) + " " + pre + ")");
+            return "true".equals(answer.items.get(2).text());
+        }
+        StringBuilder wire = new StringBuilder(); serType(prefix, wire);
+        Sexp answer = query("(q isAccessible " + id + " " + wire + ")");
+        return "true".equals(answer.items.get(2).text());
+    }
+
+    /** Tiny straight-line subclass: constructor plus reflection helper bridges.
+     * Its methods have no branches or exception handlers, so no stack maps are
+     * required. All inherited macro methods retain their original bytecode. */
+    static final class BundleBytes {
+        final java.io.ByteArrayOutputStream poolBytes = new java.io.ByteArrayOutputStream();
+        final java.io.DataOutputStream pool = new java.io.DataOutputStream(poolBytes);
+        final java.io.ByteArrayOutputStream methodBytes = new java.io.ByteArrayOutputStream();
+        final java.io.DataOutputStream methods = new java.io.DataOutputStream(methodBytes);
+        int entries = 1, methodCount = 0;
+        final int thisClass, superClass, codeName;
+        BundleBytes(String name, Class<?> parent) throws Exception {
+            thisClass = cls(name); superClass = cls(parent.getName().replace('.', '/')); codeName = text("Code");
+            String ctor = "(Lscala/reflect/macros/whitebox/Context;)V";
+            int init = method(superClass, "<init>", ctor);
+            code(methods, text("<init>"), text(ctor), codeName, 2, 2,
+                new byte[]{0x2a,0x2b,(byte)0xb7,(byte)(init >> 8),(byte)init,(byte)0xb1});
+            methodCount++;
+        }
+        int text(String value) throws Exception { int id = entries++; utf(pool, value); return id; }
+        int cls(String name) throws Exception { int utf = text(name), id = entries++; pair(pool, 7, utf, 0); return id; }
+        int method(int owner, String name, String descriptor) throws Exception {
+            int n = text(name), d = text(descriptor), nt = entries++; pair(pool, 12, n, d);
+            int id = entries++; pair(pool, 10, owner, nt); return id;
+        }
+        void bridge(String name, String descriptor, String helper, int args, String result) throws Exception {
+            String erased = "(" + (args == 2 ? "Ljava/lang/Object;Ljava/lang/Object;" : "Ljava/lang/Object;")
+                + ")" + (result.equals("Z") ? "Z" : "Ljava/lang/Object;");
+            int target = method(cls("ScalaRsMacroEngine"), helper, erased);
+            java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+            for (int i = 1; i <= args; i++) body.write(0x2a + i);
+            body.write(0xb8); body.write(target >> 8); body.write(target);
+            if (result.equals("Z")) body.write(0xac);
+            else {
+                int cast = cls(result.substring(1, result.length() - 1));
+                body.write(0xc0); body.write(cast >> 8); body.write(cast); body.write(0xb0);
+            }
+            code(methods, text(name), text(descriptor), codeName, args, args + 1, body.toByteArray());
+            methodCount++;
+        }
+        byte[] finish() throws Exception {
+            java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+            java.io.DataOutputStream out = new java.io.DataOutputStream(bytes);
+            out.writeInt(0xcafebabe); out.writeShort(0); out.writeShort(52); out.writeShort(entries);
+            out.write(poolBytes.toByteArray()); out.writeShort(0x21); out.writeShort(thisClass); out.writeShort(superClass);
+            out.writeShort(0); out.writeShort(0); out.writeShort(methodCount); out.write(methodBytes.toByteArray());
+            out.writeShort(0); out.flush(); return bytes.toByteArray();
+        }
     }
 
     // ---------------------------------------------------------------- request
@@ -358,6 +595,18 @@ public final class ScalaRsMacroEngine {
             handler.appWhy = app.items.get(1).text();
         } else {
             handler.appTree = buildTree(app);
+            for (Sexp field : req.items) {
+                if (field.isList() && field.items.size() == 2
+                        && "appSymbol".equals(field.items.get(0).text())) {
+                    Object reference = handler.appTree;
+                    while ("Apply".equals(call(reference, "productPrefix", 0))
+                            || "TypeApply".equals(call(reference, "productPrefix", 0))) {
+                        reference = call(reference, "fun", 0);
+                    }
+                    call(reference, "setSymbol", 1,
+                        sourceSymbol(Long.parseLong(field.items.get(1).text())));
+                }
+            }
             Sexp appType = req.field("appType");
             if (appType.items.size() == 2) call(handler.appTree, "setType", 1, typeFor(appType.items.get(1)));
             Sexp position = req.field("position");
@@ -389,7 +638,31 @@ public final class ScalaRsMacroEngine {
             ScalaRsMacroEngine.class.getClassLoader(),
             new Class<?>[]{loadClass("scala.reflect.macros.whitebox.Context")},
             handler);
-
+        List<Long> contextIds = new ArrayList<>();
+        for (Sexp field : req.items) {
+            if (field.isList() && !field.items.isEmpty()
+                    && "contexts".equals(field.items.get(0).text())) {
+                for (int i = 1; i < field.items.size(); i++) {
+                    contextIds.add(Long.parseLong(field.items.get(i).text()));
+                }
+            }
+        }
+        // The Rust typer keeps an outer context open while typing its result,
+        // even after its implementation returned. Reuse that exact proxy so
+        // outer prefixes, applications and context identity remain available.
+        macroContexts.keySet().retainAll(contextIds);
+        openMacroContexts = new ArrayList<>();
+        if (contextIds.isEmpty()) {
+            // Standalone protocol clients predating context identities.
+            openMacroContexts.add(ctx);
+        } else {
+            macroContexts.put(contextIds.get(0), ctx);
+            for (Long id : contextIds) {
+                Object active = macroContexts.get(id);
+                if (active == null) throw gap("active macro context " + id + " is unavailable");
+                openMacroContexts.add(active);
+            }
+        }
         // 2.11 onwards an implementation may take a raw `c.Tree` instead of a
         // `c.Expr[T]`, and slick's `mapToImpl` does. Which one is wanted is
         // read off the implementation's *source* signature by scala-rs and
@@ -514,22 +787,78 @@ public final class ScalaRsMacroEngine {
      * cannot answer, which is raised as a {@link Gap} and becomes the call
      * site's diagnostic.
      */
+    /** Per-expansion transport state must survive a nested implementation.
+     * Symbol identities and the fresh-name supply remain shared for the run. */
+    static final class ExpansionFrame {
+        final java.util.IdentityHashMap<Object, Long> trees = new java.util.IdentityHashMap<>(origTrees);
+        final java.util.IdentityHashMap<Object, String> types = new java.util.IdentityHashMap<>(structuralTypes);
+        final java.util.HashMap<Long, Object> params = new java.util.HashMap<>(structuralParams);
+        final java.util.IdentityHashMap<Object, Object[]> async = new java.util.IdentityHashMap<>(asyncMarks);
+        final java.util.HashMap<String, Object> terms = new java.util.HashMap<>(transportedTermSymbols);
+        final java.util.HashSet<String> ambiguousTerms = new java.util.HashSet<>(ambiguousTransportedTerms);
+        final List<Object> contexts = openMacroContexts;
+        final List<String> settings = compilerSettings;
+        final String gap = pendingGap;
+        final String failure = pendingTypecheckFailure;
+        void restore() {
+            java.util.HashMap<String, Object> nestedTerms =
+                new java.util.HashMap<>(transportedTermSymbols);
+            java.util.HashSet<String> nestedAmbiguous =
+                new java.util.HashSet<>(ambiguousTransportedTerms);
+            origTrees.clear(); origTrees.putAll(trees);
+            structuralTypes.clear(); structuralTypes.putAll(types);
+            structuralParams.clear(); structuralParams.putAll(params);
+            asyncMarks.clear(); asyncMarks.putAll(async);
+            transportedTermSymbols.clear(); transportedTermSymbols.putAll(terms);
+            ambiguousTransportedTerms.clear(); ambiguousTransportedTerms.addAll(ambiguousTerms);
+            for (String name : nestedAmbiguous) {
+                transportedTermSymbols.remove(name);
+                ambiguousTransportedTerms.add(name);
+            }
+            for (java.util.Map.Entry<String, Object> entry : nestedTerms.entrySet()) {
+                rememberTransportedTerm(entry.getKey(), entry.getValue());
+            }
+            openMacroContexts = contexts;
+            compilerSettings = settings;
+            pendingGap = gap;
+            pendingTypecheckFailure = failure;
+        }
+    }
+
     static Sexp query(String q) throws Exception {
         out.println(q);
-        long waitStarted = System.nanoTime();
-        String line = readWireLine(in);
-        waitNanos += System.nanoTime() - waitStarted;
-        if (line == null) {
-            throw new Gap("scala-rs closed the pipe while the macro was asking it a question");
-        }
-        Sexp ans = Sexp.parse(line);
-        if (ans.isList() && !ans.items.isEmpty() && "no".equals(ans.items.get(0).atom)) {
-            if (ans.items.size() != 2 || ans.items.get(1).isList()) {
-                throw new Gap("scala-rs returned a malformed refusal to a macro query");
+        for (;;) {
+            long waitStarted = System.nanoTime();
+            String line = readWireLine(in);
+            waitNanos += System.nanoTime() - waitStarted;
+            if (line == null) {
+                throw new Gap("scala-rs closed the pipe while the macro was asking it a question");
             }
-            throw gap(ans.items.get(1).text());
+            Sexp ans = Sexp.parse(line);
+            String head = ans.isList() && !ans.items.isEmpty() ? ans.items.get(0).atom : "";
+            if ("expand".equals(head) || "timing".equals(head)) {
+                ExpansionFrame frame = new ExpansionFrame();
+                String reply;
+                long started = System.nanoTime();
+                try {
+                    reply = handle(line);
+                } catch (Throwable t) {
+                    reply = err(describe(t));
+                } finally {
+                    frame.restore();
+                }
+                handleNanos += System.nanoTime() - started;
+                out.println(reply);
+                continue;
+            }
+            if ("no".equals(head)) {
+                if (ans.items.size() != 2 || ans.items.get(1).isList()) {
+                    throw new Gap("scala-rs returned a malformed refusal to a macro query");
+                }
+                throw gap(ans.items.get(1).text());
+            }
+            return ans;
         }
-        return ans;
     }
 
     /**
@@ -587,6 +916,20 @@ public final class ScalaRsMacroEngine {
         // Attachments belong to the original JVM tree. A typer adaptation may
         // change its shape (Ident to Select), but must retain those attachments.
         call(built, "setAttachments", 1, call(tree, "attachments", 0));
+        // A typed constructor's result also types its New/type-tree nodes.
+        // Annotation reflection reads that inner type after a Transformer
+        // copies the constructor tree, rather than consulting Apply.tpe.
+        Object constructor = built;
+        while ("Apply".equals(String.valueOf(call(constructor, "productPrefix", 0))))
+            constructor = call(constructor, "fun", 0);
+        if ("Select".equals(String.valueOf(call(constructor, "productPrefix", 0)))
+                && "<init>".equals(String.valueOf(call(constructor, "name", 0)))) {
+            Object target = call(constructor, "qualifier", 0);
+            if ("New".equals(String.valueOf(call(target, "productPrefix", 0)))) {
+                call(support, "setType", 2, call(target, "tpt", 0), tpe);
+                call(support, "setType", 2, target, tpe);
+            }
+        }
         return call(support, "setType", 2, built, tpe);
     }
 
@@ -647,8 +990,8 @@ public final class ScalaRsMacroEngine {
         if ("same".equals(typeTag) && !same) {
             throw gap("scala-rs returned a malformed c.inferImplicitValue `same` type");
         }
-        if (!same && !"ty".equals(typeTag) && !"src".equals(typeTag)
-                && !"cst".equals(typeTag)) {
+        if (!same && !java.util.Arrays.asList("ty", "src", "cst", "jclass", "mod",
+                "repeated", "refined", "param", "annot").contains(typeTag)) {
             throw gap("scala-rs returned unknown c.inferImplicitValue type tag `"
                 + typeTag + "`");
         }
@@ -680,6 +1023,8 @@ public final class ScalaRsMacroEngine {
      * nsc splices a typed tree without typing it again.
      */
     static final java.util.IdentityHashMap<Object, Long> origTrees = new java.util.IdentityHashMap<>();
+    static final java.util.Map<String, Object> transportedTermSymbols = new java.util.HashMap<>();
+    static final java.util.Set<String> ambiguousTransportedTerms = new java.util.HashSet<>();
 
     /** A tree the request describes, built in the runtime universe. */
     static Object buildTree(Sexp s) throws Exception {
@@ -689,14 +1034,18 @@ public final class ScalaRsMacroEngine {
             return tree;
         }
         Object symbol = null;
+        String kind = null;
+        boolean transportedTerm = false;
         if (s.isList() && s.items.size() >= 3 && "t".equals(s.items.get(0).atom)) {
-            String kind = s.items.get(1).text();
+            kind = s.items.get(1).text();
             Sexp meta = s.items.get(2);
             if (meta.isList() && !meta.items.isEmpty()) {
                 if ("fn".equals(meta.items.get(0).atom)) {
                     Sexp answer = query("(q functionSymbol " + meta.items.get(1).text() + ")");
                     symbol = sourceSymbol(Long.parseLong(answer.items.get(2).text()));
-                } else if ("sr".equals(meta.items.get(0).atom)) {
+                } else if ("sr".equals(meta.items.get(0).atom)
+                        || "srm".equals(meta.items.get(0).atom)) {
+                    transportedTerm = "srm".equals(meta.items.get(0).atom);
                     long id = Long.parseLong(meta.items.get(1).text());
                     if ("ValDef".equals(kind) || "DefDef".equals(kind) || "ClassDef".equals(kind)
                             || "Function".equals(kind)) symbol = sourceSymbol(id);
@@ -708,9 +1057,10 @@ public final class ScalaRsMacroEngine {
                         // was otherwise needed by the mirror (most notably a
                         // local val selected inside ScalaTest's BooleanMacro).
                         // Leaving the symbol null loses the lexical owner and
-                        // makes the reflect macro inspect an error tree.  Rust
-                        // emits `sr` only for source-run symbols; classpath
-                        // references retain `(s0)` and never enter this branch.
+                        // makes the reflect macro inspect an error tree. `sr`
+                        // carries a source-run identity, while `srm` explicitly
+                        // gives a stable classpath member a transport identity.
+                        // Other classpath references retain `(s0)`.
                         symbol = sourceSymbol(id);
                     }
                 }
@@ -719,8 +1069,23 @@ public final class ScalaRsMacroEngine {
         Object tree = buildTreeBody(s);
         if (symbol != null && Boolean.TRUE.equals(call(tree, "hasSymbolField", 0))) {
             call(tree, "setSymbol", 1, symbol);
+            if (transportedTerm
+                    && ("Ident".equals(kind) || "Select".equals(kind))) {
+                String name = String.valueOf(call(tree, "name", 0));
+                rememberTransportedTerm(name, symbol);
+            }
         }
         return tree;
+    }
+
+    static void rememberTransportedTerm(String name, Object symbol) {
+        Object prior = transportedTermSymbols.get(name);
+        if (prior == null && !ambiguousTransportedTerms.contains(name)) {
+            transportedTermSymbols.put(name, symbol);
+        } else if (prior != symbol) {
+            transportedTermSymbols.remove(name);
+            ambiguousTransportedTerms.add(name);
+        }
     }
 
     static Object buildTreeBody(Sexp s) throws Exception {
@@ -929,6 +1294,12 @@ public final class ScalaRsMacroEngine {
      */
     static Object typeFor(Sexp s) throws Exception {
         String head = s.items.get(0).atom;
+        if ("repeated".equals(head)) {
+            Object repeated = call(call(universe, "definitions", 0), "RepeatedParamClass", 0);
+            List<Object> elements = new ArrayList<>();
+            elements.add(typeFor(s.items.get(1)));
+            return call(universe, "appliedType", 2, repeated, list(elements));
+        }
         if ("param".equals(head)) {
             Object param = structuralParams.get(Long.parseLong(s.items.get(1).text()));
             if (param == null) throw gap("unbound structural type parameter");
@@ -1037,7 +1408,6 @@ public final class ScalaRsMacroEngine {
      * keyed by their full names, so the same class is always the same symbol
      * and an expansion that mentions it twice mentions one type.
      */
-    static final java.util.HashMap<String, Object> synthetic = new java.util.HashMap<>();
 
     /**
      * A `(f "NAME" ...)` list as nsc's flag bits.
@@ -1262,6 +1632,8 @@ public final class ScalaRsMacroEngine {
         } catch (Throwable e) {
             prefix = t.getClass().getSimpleName();
         }
+        if ("Annotated".equals(prefix) && Boolean.TRUE.equals(call(t, "isTerm", 0)))
+            prefix = "AnnotatedExpr";
         sb.append("(t ").append(Sexp.quote(prefix)).append(' ');
         serSym(t, sb);
         if ("TypeTree".equals(prefix)) {
@@ -1289,6 +1661,16 @@ public final class ScalaRsMacroEngine {
                 return;
             }
             if (sym == null || sym == call(universe, "NoSymbol", 0)) {
+                String prefix = String.valueOf(call(t, "productPrefix", 0));
+                if ("Ident".equals(prefix)) {
+                    String name = String.valueOf(call(t, "name", 0));
+                    Object transported = transportedTermSymbols.get(name);
+                    Long transportedId = sourceSymbolIds.get(transported);
+                    if (transportedId != null) {
+                        sb.append("(sr ").append(transportedId).append(')');
+                        return;
+                    }
+                }
                 // Synthetic type trees in a macro result quite often have no
                 // symbol field even though their attributed type retains the
                 // exact member symbol.  CompoundTypeTree parents produced by
@@ -1303,14 +1685,42 @@ public final class ScalaRsMacroEngine {
                     return;
                 }
             }
+            sourceId = sourceSymbolIds.get(sym);
+            if (sourceId != null) {
+                sb.append("(sr ").append(sourceId).append(')');
+                return;
+            }
+            // A package `This` (`p.this.C`) is a path anchor, not an
+            // enclosing-class receiver. Keep that distinction in the wire
+            // descriptor: a plain static full name does not tell the Rust
+            // side whether it names a package or a class.
+            if (Boolean.TRUE.equals(call(sym, "isPackageClass", 0))) {
+                sb.append("(sp ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))))
+                  .append(')');
+                return;
+            }
             // Only a *static* symbol survives the trip: scala-rs resolves it
             // by full name, and a local or a parameter has no such name.
             Object isStatic = call(sym, "isStatic", 0);
             if (!Boolean.TRUE.equals(isStatic)) {
+                Object owner = call(sym, "owner", 0);
+                // Methods of an object are instance methods in bytecode, so
+                // reflection does not mark the method itself static. A method
+                // owned by a static module class still has a stable root path,
+                // including modules nested in companion objects. Preserve its
+                // full identity so the call-site typer can rebuild a qualified
+                // selection instead of resolving a bare implementation-local
+                // name.
+                if (Boolean.TRUE.equals(call(owner, "isModuleClass", 0))
+                        && (Boolean.TRUE.equals(call(owner, "isStatic", 0))
+                            || hasStaticModuleField(owner))) {
+                    sb.append("(s ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))))
+                      .append(')');
+                    return;
+                }
                 // A path-dependent type has no static path of its own, but
                 // its declaration does. Preserve that member identity so the
                 // call-site typer need not re-resolve the engine's prefix.
-                Object owner = call(sym, "owner", 0);
                 if (Boolean.TRUE.equals(call(sym, "isType", 0))
                         && !Boolean.TRUE.equals(call(sym, "isClass", 0))
                         && Boolean.TRUE.equals(call(owner, "isClass", 0))
@@ -1357,6 +1767,27 @@ public final class ScalaRsMacroEngine {
             sb.append(')');
             return;
         }
+        if (isA(tpe, "scala.reflect.internal.Types$RefinedType")
+                && Boolean.TRUE.equals(call(call(tpe, "decls", 0), "isEmpty", 0))) {
+            sb.append("(intersection");
+            Object parents = call(call(tpe, "parents", 0), "iterator", 0);
+            while ((Boolean) call(parents, "hasNext", 0)) {
+                sb.append(' ');
+                serType(call(parents, "next", 0), sb);
+            }
+            sb.append(')');
+            return;
+        }
+        if (isA(tpe, "scala.reflect.internal.Types$ThisType")) {
+            Object owner = call(tpe, "typeSymbol", 0);
+            if (Boolean.TRUE.equals(call(owner, "isModuleClass", 0))) {
+                Object module = call(owner, "sourceModule", 0);
+                if (staticByOwners(module)) {
+                    sb.append("(mod ").append(Sexp.quote(String.valueOf(call(module, "fullName", 0)))).append(')');
+                    return;
+                }
+            }
+        }
         if (isA(tpe, "scala.reflect.internal.Types$SingleType")) {
             Object term = call(tpe, "termSymbol", 0);
             if (Boolean.TRUE.equals(call(term, "isModule", 0)) && staticByOwners(term)) {
@@ -1376,6 +1807,12 @@ public final class ScalaRsMacroEngine {
         // chain's flags.
         Object d = tpe;
         Object sym = call(d, "typeSymbolDirect", 0);
+        if (sym == call(call(universe, "definitions", 0), "RepeatedParamClass", 0)) {
+            sb.append("(repeated ");
+            serType(call(call(d, "typeArgs", 0), "head", 0), sb);
+            sb.append(')');
+            return;
+        }
         String binaryName = binaryClassNames.get(sym);
         if (binaryName != null && Boolean.TRUE.equals(call(sym, "isClass", 0))) {
             Object constructor = call(call(sym, "asType", 0), "toTypeConstructor", 0);
@@ -1393,7 +1830,8 @@ public final class ScalaRsMacroEngine {
             }
         }
         if (sourceSymbolIds.containsKey(sym) && (Boolean.TRUE.equals(call(sym, "isClass", 0))
-                || Boolean.TRUE.equals(call(sym, "isTypeParameter", 0)))) {
+                || Boolean.TRUE.equals(call(sym, "isTypeParameter", 0))
+                || Boolean.TRUE.equals(call(sym, "isAliasType", 0)))) {
             // Return source identities directly: names cannot distinguish
             // nested classes or type parameters belonging to different owners.
             sb.append("(src ").append(sourceSymbolIds.get(sym));
@@ -1408,6 +1846,11 @@ public final class ScalaRsMacroEngine {
         }
         if (!Boolean.TRUE.equals(call(sym, "isClass", 0))) {
             d = call(tpe, "dealias", 0);
+            if (isA(d, "scala.reflect.internal.Types$RefinedType")
+                    && Boolean.TRUE.equals(call(call(d, "decls", 0), "isEmpty", 0))) {
+                serType(d, sb);
+                return;
+            }
             if (!isA(d, "scala.reflect.internal.Types$TypeRef")) {
                 sb.append("(tyx ").append(Sexp.quote(String.valueOf(tpe))).append(')');
                 return;
@@ -1494,6 +1937,17 @@ public final class ScalaRsMacroEngine {
             o = call(o, "owner", 0);
         }
         return false;
+    }
+
+    /** True when a module class is represented by a JVM singleton field. */
+    static boolean hasStaticModuleField(Object moduleClass) {
+        try {
+            Object classSymbol = call(moduleClass, "asClass", 0);
+            Class<?> runtimeClass = (Class<?>) call(mirror, "runtimeClass", 1, classSymbol);
+            return Modifier.isStatic(runtimeClass.getField("MODULE$").getModifiers());
+        } catch (Throwable unavailable) {
+            return false;
+        }
     }
 
     static void serConstant(Object c, StringBuilder sb) throws Exception {
@@ -1661,6 +2115,42 @@ public final class ScalaRsMacroEngine {
         return built;
     }
 
+    static boolean binaryParametersMatch(Object method, Sexp wanted) throws Exception {
+        Object clauses = call(call(method, "paramLists", 0), "iterator", 0);
+        int slot = 1;
+        while ((Boolean) call(clauses, "hasNext", 0)) {
+            Object params = call(call(clauses, "next", 0), "iterator", 0);
+            while ((Boolean) call(params, "hasNext", 0)) {
+                Object param = call(params, "next", 0);
+                if (slot >= wanted.items.size()) return false;
+                String expected = wanted.items.get(slot++).text();
+                if (expected.isEmpty()) continue;
+                String descriptor;
+                Object tpe = call(param, "typeSignature", 0);
+                if (Boolean.TRUE.equals(call(param, "isByNameParam", 0))) {
+                    descriptor = "Lscala/Function0;";
+                } else if ("scala.<repeated>".equals(String.valueOf(call(call(tpe, "typeSymbol", 0), "fullName", 0)))) {
+                    descriptor = "Lscala/collection/immutable/Seq;";
+                } else {
+                    Class<?> cls = (Class<?>) call(mirror, "runtimeClass", 1, call(tpe, "erasure", 0));
+                    if (cls == void.class) descriptor = "Lscala/runtime/BoxedUnit;";
+                    else if (cls == boolean.class) descriptor = "Z";
+                    else if (cls == byte.class) descriptor = "B";
+                    else if (cls == short.class) descriptor = "S";
+                    else if (cls == char.class) descriptor = "C";
+                    else if (cls == int.class) descriptor = "I";
+                    else if (cls == long.class) descriptor = "J";
+                    else if (cls == float.class) descriptor = "F";
+                    else if (cls == double.class) descriptor = "D";
+                    else descriptor = cls.isArray() ? cls.getName().replace('.', '/')
+                        : "L" + cls.getName().replace('.', '/') + ";";
+                }
+                if (!expected.equals(descriptor)) return false;
+            }
+        }
+        return slot == wanted.items.size();
+    }
+
     /** Mirror an actual source symbol. Its type is completed by reverse RPC,
      * not guessed while its enclosing definition is still being inferred.
      *
@@ -1691,9 +2181,89 @@ public final class ScalaRsMacroEngine {
             sourceSymbolIds.put(pkgClass, id);
             return pkgClass;
         }
+        String binaryName = answer.items.size() > 8 ? answer.items.get(8).text() : "";
+        if (!binaryName.isEmpty()) {
+            try {
+                // The runtime mirror prints some rejected Scala signatures to
+                // stderr before throwing them.  A synthetic mirror symbol is
+                // the supported fallback below, so keep that recoverable
+                // probe from leaking a full stack trace from a successful
+                // compilation.
+                java.io.PrintStream oldErr = System.err;
+                Object cls;
+                try {
+                    System.setErr(new java.io.PrintStream(new java.io.ByteArrayOutputStream()));
+                    cls = call(mirror, "classSymbol", 1, loadClass(binaryName.replace('/', '.')));
+                } finally {
+                    System.setErr(oldErr);
+                }
+                Object symbol = "Module".equals(kind) ? call(cls, "sourceModule", 0) : cls;
+                sourceSymbols.put(id, symbol);
+                sourceSymbolIds.put(symbol, id);
+                binarySymbols.add(symbol);
+                binaryClassNames.put(cls, binaryName.replace('/', '.'));
+                return symbol;
+            } catch (Throwable unreadableBinarySymbol) {
+                // Runtime reflection can reject an otherwise valid Scala 2
+                // package signature while opening the owner of this class.
+                // The compiler universe used by scalac accepts that same
+                // signature. Mirror the symbol through the reverse RPC below
+                // instead; its lazy info still comes from scala-rs and gives
+                // macros the source-level type without forcing the runtime
+                // mirror to unpickle the unrelated package object.
+            }
+        }
         Object owner = parent == 0 ? call(mirror, "EmptyPackageClass", 0) : sourceSymbol(parent);
         known = sourceSymbols.get(id);
         if (known != null) return known;
+        if (!binaryName.isEmpty() && Boolean.TRUE.equals(call(owner, "isPackageClass", 0))) {
+            Object lookupName = "ModuleClass".equals(kind) || "Module".equals(kind)
+                ? termName(name.endsWith("$") ? name.substring(0, name.length() - 1) : name)
+                : typeName(name);
+            Object existing = call(call(owner, "info", 0), "decl", 1, lookupName);
+            if (existing != call(universe, "NoSymbol", 0)) {
+                Object symbol = "ModuleClass".equals(kind) ? call(existing, "moduleClass", 0) : existing;
+                sourceSymbols.put(id, symbol);
+                sourceSymbolIds.put(symbol, id);
+                return symbol;
+            }
+        }
+        if (binarySymbols.contains(owner)) {
+            Object memberName = "TypeMember".equals(kind) || "TypeParam".equals(kind)
+                ? typeName(name) : termName(name);
+            Object member = call(call(owner, "info", 0), "decl", 1, memberName);
+            if (Boolean.TRUE.equals(call(member, "isOverloaded", 0))) {
+                Sexp shape = answer.items.get(9);
+                Object alternatives = call(call(member, "alternatives", 0), "iterator", 0);
+                Object selected = null;
+                while ((Boolean) call(alternatives, "hasNext", 0)) {
+                    Object candidate = call(alternatives, "next", 0);
+                    if (!Boolean.TRUE.equals(call(candidate, "isMethod", 0))) continue;
+                    if (((Integer) call(call(candidate, "typeParams", 0), "size", 0))
+                            != Integer.parseInt(shape.items.get(1).text())) continue;
+                    Object clauses = call(call(candidate, "paramLists", 0), "iterator", 0);
+                    int clause = 2;
+                    boolean matches = true;
+                    while ((Boolean) call(clauses, "hasNext", 0)) {
+                        int size = (Integer) call(call(clauses, "next", 0), "size", 0);
+                        if (clause >= shape.items.size() || size != Integer.parseInt(shape.items.get(clause++).text()))
+                            matches = false;
+                    }
+                    if (!matches || clause != shape.items.size()) continue;
+                    if (!binaryParametersMatch(candidate, answer.items.get(10))) continue;
+                    if (selected != null) throw gap("binary symbol has multiple matching alternatives: " + full);
+                    selected = candidate;
+                }
+                if (selected == null) throw gap("binary symbol has no matching alternative: " + full);
+                member = selected;
+            }
+            if (member != call(universe, "NoSymbol", 0)) {
+                sourceSymbols.put(id, member);
+                sourceSymbolIds.put(member, id);
+                binarySymbols.add(member);
+                return member;
+            }
+        }
         Object internal = call(universe, "internal", 0);
         Object pos = call(universe, "NoPosition", 0);
         long flags = flagsOf(answer.items.get(7));
@@ -1702,10 +2272,7 @@ public final class ScalaRsMacroEngine {
         }
         Object symbol;
         if ("Class".equals(kind)) {
-            Object existing = synthetic.get(full);
-            symbol = existing == null
-                ? newSourceSymbol("ClassSymbol", owner, typeName(name), pos, flags)
-                : call(existing, "typeSymbolDirect", 0);
+            symbol = newSourceSymbol("ClassSymbol", owner, typeName(name), pos, flags);
         } else if ("Method".equals(kind)) {
             symbol = newSourceSymbol("MethodSymbol", owner, termName(name), pos, flags | internalFlag("METHOD"));
         } else if ("Term".equals(kind)) {
@@ -1720,9 +2287,6 @@ public final class ScalaRsMacroEngine {
         }
         sourceSymbols.put(id, symbol);
         sourceSymbolIds.put(symbol, id);
-        if ("Class".equals(kind)) {
-            synthetic.put(full, ownedTypeRef(owner, symbol));
-        }
         Object lazy = lazyInfoConstructor().newInstance(universe, Long.valueOf(id));
         call(symbol, "setInfo", 1, lazy);
         if ("Class".equals(kind)) {
@@ -1756,7 +2320,6 @@ public final class ScalaRsMacroEngine {
         sourceSymbols.put(classId, moduleClass);
         sourceSymbolIds.put(moduleClass, classId);
         Object classType = ownedTypeRef(owner, moduleClass);
-        synthetic.put(full, classType);
         call(call(internal, "reificationSupport", 0), "setInfo", 2, module, classType);
         Object lazy = lazyInfoConstructor().newInstance(universe, Long.valueOf(classId));
         call(moduleClass, "setInfo", 1, lazy);
@@ -2048,6 +2611,12 @@ public final class ScalaRsMacroEngine {
             for (Sexp decl : s.items.get(2).items.subList(1, s.items.get(2).items.size())) {
                 decls.add(lazyDecl(owner, decl));
             }
+            for (Sexp field : s.items.subList(3, s.items.size())) {
+                if (field.isList() && !field.items.isEmpty() && "children".equals(field.items.get(0).text())) {
+                    for (Sexp child : field.items.subList(1, field.items.size()))
+                        call(owner, "addChild", 1, sourceSymbol(Long.parseLong(child.text())));
+                }
+            }
             return call(internal, "classInfoType", 3, list(parents), call(internal, "newScopeWith", 1, seq(decls)), owner);
         }
         return typeFor(s);
@@ -2139,6 +2708,16 @@ public final class ScalaRsMacroEngine {
                             return sourceSymbol(Long.parseLong(answer.items.get(2).text()));
                         }
                         if (method.getName().equals("scala$reflect$macros$Internals$ContextInternalApi$$$outer")) return proxy;
+                        String operation = method.getName();
+                        if ((operation.equals("attachments") && method.getParameterCount() == 1)
+                                || (operation.equals("updateAttachment") && method.getParameterCount() == 3)
+                                || (operation.equals("removeAttachment") && method.getParameterCount() == 2)) {
+                            // Both runtime trees and symbols own real attachment
+                            // stores. Delegate to the object so updates remain
+                            // visible through retained contexts and aliases.
+                            return call(args[0], operation, args.length - 1,
+                                java.util.Arrays.copyOfRange(args, 1, args.length));
+                        }
                         Object implementation = call(universe, "internal", 0);
                         try {
                             return call(implementation, method.getName(), method.getParameterCount(),
@@ -2265,6 +2844,33 @@ public final class ScalaRsMacroEngine {
                 }
                 if (!"parsed".equals(answer.items.get(1).text())) throw gap("malformed c.parse answer");
                 return buildTree(answer.items.get(2));
+            }
+            if (n.equals("openMacros") && arity == 0) {
+                // nsc prepends this Context to the analyzer's active stack;
+                // while its implementation runs, that stack already starts
+                // with this same Context. Keep both entries and their identity.
+                List<Object> contexts = new ArrayList<>();
+                contexts.add(proxy);
+                contexts.addAll(openMacroContexts);
+                return list(contexts);
+            }
+            if (n.equals("openImplicits") && arity == 0) {
+                Sexp answer = query("(q openImplicits)");
+                if (!"implicits".equals(answer.items.get(1).text()))
+                    throw gap("malformed openImplicits answer");
+                List<Object> candidates = new ArrayList<>();
+                Class<?> candidate = loadClass("scala.reflect.macros.whitebox.Context$ImplicitCandidate");
+                Constructor<?> constructor = candidate.getConstructors()[0];
+                for (int i = 2; i < answer.items.size(); i++) {
+                    Sexp entry = answer.items.get(i);
+                    Sexp pre = entry.items.get(0);
+                    Object prefixType = "noprefix".equals(pre.items.get(0).text())
+                        ? call(universe, "NoPrefix", 0) : typeFor(pre);
+                    candidates.add(constructor.newInstance(proxy, prefixType,
+                        sourceSymbol(Long.parseLong(entry.items.get(1).text())),
+                        typeFor(entry.items.get(2)), buildTree(entry.items.get(3))));
+                }
+                return list(candidates);
             }
             if (n.equals("inferImplicitValue") && arity == 4) {
                 Object enclosing = appTree == null

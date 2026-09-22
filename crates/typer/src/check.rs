@@ -577,11 +577,12 @@ pub struct Typer {
     pub(crate) macro_failures: HashMap<(usize, u32, u32), String>,
     /// How deep the current chain of expansions is.
     pub(crate) macro_depth: u32,
-    /// Set while the engine is mid-expansion and this typer is answering one
-    /// of its queries (`crates/typer/src/expand_rpc.rs`). The pipe carries one
-    /// conversation at a time, so an expansion asked for *while* answering a
-    /// query -- a macro application inside a `c.typecheck` argument -- has to
-    /// be refused with a reason rather than started on a second engine.
+    /// Active macro contexts, including expansion-result typechecking.
+    pub(crate) macro_context_stack: Vec<u64>,
+    pub(crate) macro_next_context: u64,
+    /// Set while the engine is executing an implementation. Reverse queries
+    /// may start nested conversations on the same engine; the scoped flag
+    /// preserves the enclosing conversation across those calls.
     pub(crate) macro_engine_busy: bool,
     /// The full names of the classes the engine's mirror is currently having
     /// described (`crates/typer/src/expand_rpc.rs`). A description that would
@@ -830,6 +831,12 @@ pub struct Typer {
     pub(crate) open_implicits: std::cell::RefCell<Vec<(SymbolId, Type)>>,
     pub(crate) implicit_instances: HashMap<SymbolId, (Type, Vec<SymbolId>)>,
     pub(crate) implicit_instance_origins: HashMap<SymbolId, SymbolId>,
+    /// The complete candidate fit produced by the most recent implicit
+    /// search. Materialization consumes it before entering its recursion
+    /// guard, so associated type arguments inferred from the candidate's own
+    /// clauses are not lost by a second, guarded fit.
+    pub(crate) selected_implicit_fit:
+        std::cell::RefCell<Option<(SymbolId, Type, usize, Vec<Type>)>>,
     /// The first expansion cut off as diverging during the current top-level
     /// implicit search, for the diagnostic.
     pub(crate) diverged_implicit: std::cell::RefCell<Option<(SymbolId, Type)>>,
@@ -848,28 +855,13 @@ pub struct Typer {
     /// search in the call-site typer; this bit removes macro candidates at
     /// the same point every recursive search builds its candidate set.
     pub(crate) implicit_macros_disabled: bool,
-    /// Modules (or module classes) through which a still-abstract
-    /// `Type::TypeMember` was ever selected as a qualified `p.T` (keyed by
-    /// `T`'s own defining symbol), for the implicit search's
-    /// `collect_type_parts` to add as extra parts.
-    ///
-    /// `Type::TypeMember` carries only the defining symbol, never the prefix
-    /// a source selection actually went through, and dealiasing an
-    /// applied-alias use (`NonEmptySet[A]` -> `NonEmptySetImpl.Type[A]`)
-    /// throws the prefix away entirely, collapsing to the same shared
-    /// abstract member every subclass of `Newtype` inherits without
-    /// overriding. Recording the prefix here instead of on the `Type` itself
-    /// (a `Type::Refined` "as-seen-from view", the way
-    /// `Checker::projected_class_type` records a `Type::Class` prefix) is
-    /// deliberate: that view is exact-equality-visible everywhere a bare
-    /// `Type::TypeMember` used to compare equal to itself (generic method
-    /// type-argument inference in particular, which does not consult
-    /// `SymbolTable::as_seen_from_view` the way `is_sub_type` and
-    /// `display_type` do), and introduced a real regression --
-    /// `WidgetImpl.unwrap(value)` inferring `A` from a wrapped `value` no
-    /// longer unified against `unwrap`'s bare `Type[A]` parameter. A side
-    /// table only touched by implicit search cannot cause that.
-    pub(crate) type_member_prefixes: std::cell::RefCell<HashMap<u32, Vec<SymbolId>>>,
+    /// Initial detached-instance depth for implicit arguments typed by a
+    /// re-entrant macro query. Ordinary source typing starts at zero. A
+    /// `c.typecheck` performed while an implicit macro is being materialized
+    /// starts at the query depth so it cannot reuse the in-progress rule's
+    /// detached identity.
+    pub(crate) implicit_search_depth: usize,
+    pub(crate) whitebox_fits: std::cell::RefCell<crate::implicits::whitebox::WhiteboxFits>,
     /// What the last `fill_defaults_and_implicits` pinned down by implicit
     /// search alone: `mk(s)` on `def mk[T: TT](s: String): Seq[Int] => Rep[T]`
     /// has no value argument mentioning `T`, so only the witness fixes it, and
@@ -1220,6 +1212,8 @@ impl Typer {
             macro_classpath: opts.binary_path.clone(),
             macro_failures: HashMap::new(),
             macro_depth: 0,
+            macro_context_stack: Vec::new(),
+            macro_next_context: 0,
             macro_engine_busy: false,
             macro_rpc_forcing: Vec::new(),
             macro_query_depth: 0,
@@ -1288,11 +1282,13 @@ impl Typer {
             open_implicits: std::cell::RefCell::new(Vec::new()),
             implicit_instances: HashMap::new(),
             implicit_instance_origins: HashMap::new(),
+            selected_implicit_fit: std::cell::RefCell::new(None),
             diverged_implicit: std::cell::RefCell::new(None),
             implicit_memo: std::cell::RefCell::new(Default::default()),
             implicit_via_module: std::cell::RefCell::new(HashMap::new()),
             implicit_macros_disabled: false,
-            type_member_prefixes: std::cell::RefCell::new(HashMap::new()),
+            implicit_search_depth: 0,
+            whitebox_fits: std::cell::RefCell::new(Default::default()),
             implicit_undet_solved: Vec::new(),
             implicit_arg_missing: false,
         }
@@ -1568,11 +1564,39 @@ impl Typer {
         }
     }
 
+    pub(crate) fn with_implicit_search_depth<R>(
+        &mut self,
+        depth: usize,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let saved = self.implicit_search_depth;
+        self.implicit_search_depth = depth;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.implicit_search_depth = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub(crate) fn with_macro_depth<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         let saved = self.macro_depth;
         self.macro_depth = saved.saturating_add(1);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.macro_depth = saved;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    pub(crate) fn with_macro_context<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let depth = self.macro_context_stack.len();
+        let id = self.macro_next_context;
+        self.macro_next_context = id.checked_add(1).expect("macro context identity exhausted");
+        self.macro_context_stack.push(id);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.macro_context_stack.truncate(depth);
         match result {
             Ok(value) => value,
             Err(payload) => std::panic::resume_unwind(payload),

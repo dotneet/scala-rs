@@ -723,3 +723,40 @@ fn slick_foreign_key_shapes_resolve_through_its_published_jar() {
         assert!(ok, "real scalac rejected si_foreignkey:\n{msgs}");
     }
 }
+
+#[test]
+fn narrowed_abstract_result_bound_survives_parent_member_completion() {
+    let Some(lib) = scala_library_jar() else {
+        return;
+    };
+    let Some(jars) = slick_jars() else { return };
+    let reflect = PathBuf::from("/tmp/scala-rs-lib/scala-reflect-2.13.16.jar");
+    let compiler = PathBuf::from("/tmp/scala-rs-lib/scala-compiler-2.13.16.jar");
+    if !reflect.is_file() || !compiler.is_file() {
+        return;
+    }
+    let cp = format!(
+        "{}:{}:{}",
+        classpath(&jars),
+        reflect.display(),
+        compiler.display()
+    );
+    for (fixture, accepted) in [
+        ("si_result_action_warm", true),
+        ("si_result_action_warm_bad", false),
+    ] {
+        let (ok, messages, out) = compile(
+            fixture,
+            &["--scala-library", lib.to_str().unwrap(), "-cp", &cp],
+        );
+        assert_eq!(ok, accepted, "{fixture}: {messages}");
+        if !accepted {
+            assert!(messages.contains("type mismatch"), "{messages}");
+        }
+        let _ = fs::remove_dir_all(out);
+        if let Some(scalac) = real_scalac() {
+            let (ok, messages) = scalac_run(&scalac, fixture, Some(&cp));
+            assert_eq!(ok, accepted, "scalac {fixture}: {messages}");
+        }
+    }
+}

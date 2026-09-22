@@ -1276,6 +1276,9 @@ pub struct SymbolTable {
     /// The path each path-dependent member was projected out of, for the
     /// dependent-method-type substitution in `subst_dependent_paths`.
     pub(crate) path_member_path: rustc_hash::FxHashMap<SymbolId, Vec<SymbolId>>,
+    /// Module prefixes of abstract type selections, retained across binary
+    /// alias expansion for implicit scope without changing type identity.
+    pub(crate) type_member_prefixes: rustc_hash::FxHashMap<u32, Vec<SymbolId>>,
     /// The rewritten copy of an anonymous type-lambda alias, per (alias, the
     /// path member being replaced, its replacement). Substituting the same
     /// pair into the same lambda twice has to give the same symbol, or two
@@ -1551,6 +1554,7 @@ impl SymbolTable {
             path_member_decl: rustc_hash::FxHashMap::default(),
             gadt_bounds: Vec::new(),
             path_member_path: rustc_hash::FxHashMap::default(),
+            type_member_prefixes: rustc_hash::FxHashMap::default(),
             path_member_lambdas: rustc_hash::FxHashMap::default(),
             abs_projections: rustc_hash::FxHashMap::default(),
             abs_projection_of: rustc_hash::FxHashMap::default(),
@@ -3131,6 +3135,18 @@ impl SymbolTable {
             return ty.clone();
         }
         subst_map(ty, tps, args)
+    }
+
+    /// Instantiate method parameters, reducing associated types such as
+    /// `T#Value` after an argument fixes `T` to a concrete class.
+    pub(crate) fn subst_type_params_projected(
+        &self,
+        tps: &[SymbolId],
+        args: &[Type],
+        ty: &Type,
+    ) -> Type {
+        let out = self.subst_type_params(tps, args, ty);
+        self.subst_projections(tps, args, &out)
     }
 
     /// Substitute class type arguments into a member type (`List[Int].head` → `Int`).
@@ -5717,49 +5733,24 @@ impl SymbolTable {
                 };
             }
         }
-        // Not just `a`'s ancestors: `None` (`<: Option[Nothing]` only) paired
-        // with `Some[Boolean]` (`<: Option[Boolean]`) has no match walking
-        // only `a`'s chain (`Some[Boolean] <: Option[Nothing]` is false, since
-        // `Boolean` is not `<: Nothing`), but walking `b`'s chain finds
-        // `Option[Boolean]`, which *does* accept `a` (`Nothing <: Boolean`).
-        // A real LUB would also *join* partial candidates from both sides
-        // (nsc's answer here is `Option[X] with Product with Serializable`);
-        // this version picks one of them, which covers the common "singleton
-        // case object vs. parameterized case class" pattern, since one side's
-        // own instantiation is precise enough already.
-        //
-        // The entry that stops the walk may be the *right class at the wrong
-        // arguments*: `None`'s sequence reaches `Option[Nothing]`, which
-        // `Some[X]` does not conform to, and walking past it lands on whatever
-        // `Option`'s own parents are. `scala/Option`'s classfile says
-        // `implements scala.Product`, so as soon as anything in a run had made
-        // that parent visible, `lub(None, Some(x))` -- which nothing in a
-        // small program could get wrong -- answered `Product` in a large one:
-        // slick's `PositionedResult.nextBlobOption()` is
-        // `if (rs.wasNull) None else Some(r)`, and `nextBlobOption()
-        // getOrElse (…)` was `value getOrElse is not a member of Product`
-        // (`agent/tail1` / `mismatch10` / `mismatch11` / `tail3` each recorded
-        // this as irreproducible outside the full 184-file slick run; the
-        // state it depends on is the library's, not slick's). So when the two
-        // sequences meet at the same class with different arguments, the
-        // arguments are joined and the walk stops there.
-        //
-        // A type is at the head of its own base type sequence (SLS 3.5.2), and
-        // leaving it out is the same failure one step earlier: `lub(Some[X],
-        // Option[Y])` never saw `Option` on the second side at all, walked
-        // past `Option[X]` and answered `Product` again.
+        // Join every shared base and retain the minimal independent parents.
+        // Taking the first common class loses shared traits: two definitions
+        // can both extend Node with HasBody, and their join must still expose
+        // both APIs. Matching generic bases are joined at their arguments.
         let with_self = |t: &Type| {
             let mut v = vec![t.clone()];
             v.extend(self.base_type_seq(t));
             v
         };
         let b_seq = with_self(&b);
+        let mut common = Vec::new();
         for cand in with_self(&a) {
             if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
                 continue;
             }
             if self.is_sub_type(&b, &cand) {
-                return cand;
+                common.push(cand);
+                continue;
             }
             let Type::Class { sym, args } = &cand else {
                 continue;
@@ -5772,20 +5763,36 @@ impl SymbolTable {
                          if s2 == sym && a2.len() == args.len())
             });
             if let Some(other) = same {
-                // Both are `Type::Class` at the same symbol, so this hits the
-                // argument-joining arm above and terminates.
                 let joined = self.lub_at(&cand, other, depth + 1);
                 if self.is_sub_type(&a, &joined) && self.is_sub_type(&b, &joined) {
-                    return joined;
+                    common.push(joined);
                 }
             }
         }
         for cand in b_seq {
-            if matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal) {
+            if !matches!(cand, Type::Any | Type::AnyRef | Type::AnyVal)
+                && self.is_sub_type(&a, &cand)
+                && !common.contains(&cand)
+            {
+                common.push(cand);
+            }
+        }
+        let mut minimal: Vec<Type> = Vec::new();
+        for cand in common {
+            if minimal.iter().any(|other| self.is_sub_type(other, &cand)) {
                 continue;
             }
-            if self.is_sub_type(&a, &cand) {
-                return cand;
+            minimal.retain(|other| !self.is_sub_type(&cand, other));
+            minimal.push(cand);
+        }
+        match minimal.len() {
+            0 => {}
+            1 => return minimal.pop().unwrap(),
+            _ => {
+                return Type::Refined {
+                    parents: minimal,
+                    decls: Vec::new(),
+                }
             }
         }
         if self.is_sub_type(&a, &Type::AnyRef) && self.is_sub_type(&b, &Type::AnyRef) {
@@ -8508,75 +8515,22 @@ fn map_refine_decl(d: &RefineDecl, f: &mut impl FnMut(&Type) -> Type) -> RefineD
 
 /// Replace the abstract type member `m` with `to` throughout `ty`.
 pub(crate) fn subst_type_member(ty: &Type, m: SymbolId, to: &Type) -> Type {
-    let go = |t: &Type| subst_type_member(t, m, to);
-    match ty {
+    map_type(ty, &mut |t| match t {
         Type::TypeMember(id) if *id == m => to.clone(),
-        Type::Class { sym, args } => Type::Class {
-            sym: *sym,
-            args: args.iter().map(go).collect(),
-        },
-        Type::Tuple(ts) => Type::Tuple(ts.iter().map(go).collect()),
-        Type::Applied { ctor, args } => apply_type_ctor(go(ctor), args.iter().map(go).collect()),
-        Type::Array(t) => Type::Array(Box::new(go(t))),
-        Type::ByName(t) => Type::ByName(Box::new(go(t))),
-        Type::Repeated(t) => Type::Repeated(Box::new(go(t))),
-        Type::Annotated { tpe, annot } => Type::Annotated {
-            tpe: Box::new(go(tpe)),
-            annot: annot.clone(),
-        },
-        Type::Function { params, ret } => Type::Function {
-            params: params.iter().map(go).collect(),
-            ret: Box::new(go(ret)),
-        },
-        Type::Method { paramss, ret } => Type::Method {
-            paramss: paramss
-                .iter()
-                .map(|ps| ps.iter().map(go).collect())
-                .collect(),
-            ret: Box::new(go(ret)),
-        },
-        _ => ty.clone(),
-    }
+        other => other.clone(),
+    })
 }
 
 /// Every abstract type member `ty` mentions, in order, without duplicates.
 pub(crate) fn collect_type_members(ty: &Type, out: &mut Vec<SymbolId>) {
-    match ty {
-        Type::TypeMember(id) => {
+    any_type(ty, &mut |t| {
+        if let Type::TypeMember(id) = t {
             if !out.contains(id) {
                 out.push(*id);
             }
         }
-        Type::Class { args, .. } | Type::Tuple(args) | Type::Named { args, .. } => {
-            for a in args {
-                collect_type_members(a, out);
-            }
-        }
-        Type::Applied { ctor, args } => {
-            collect_type_members(ctor, out);
-            for a in args {
-                collect_type_members(a, out);
-            }
-        }
-        Type::Array(t) | Type::ByName(t) | Type::Repeated(t) | Type::Annotated { tpe: t, .. } => {
-            collect_type_members(t, out)
-        }
-        Type::Function { params, ret } => {
-            for p in params {
-                collect_type_members(p, out);
-            }
-            collect_type_members(ret, out);
-        }
-        Type::Method { paramss, ret } => {
-            for ps in paramss {
-                for p in ps {
-                    collect_type_members(p, out);
-                }
-            }
-            collect_type_members(ret, out);
-        }
-        _ => {}
-    }
+        false
+    });
 }
 
 /// Replace `cls.this.type` with `to` throughout `ty`.

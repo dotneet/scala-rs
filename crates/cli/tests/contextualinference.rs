@@ -213,3 +213,8 @@ fn covariant_results_minimize_materialized_tags() {
         &format!("{JAR}:/tmp/scala-2.13.16/lib/scala-reflect.jar"),
     );
 }
+
+#[test]
+fn inferred_join_retains_independent_common_traits() {
+    matrix(&[("intersection_join", true)], false);
+}

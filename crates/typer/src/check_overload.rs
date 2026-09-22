@@ -1681,7 +1681,10 @@ impl Typer {
                 && !mentions_tparam(p, &tps)
                 && !type_mentions_wildcard(p)
             {
-                return p.clone();
+                return match p {
+                    Type::ByName(inner) | Type::Repeated(inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
             }
         }
         let Some(param) = param_at(params, idx) else {
@@ -1752,17 +1755,9 @@ impl Typer {
         // no prototype instead it stayed `Builder[?A, CC[?A]]`, and the outer
         // call reported `found: Builder[A, CC[A]] required: Builder[B, CC[A]]`
         // (13 errors across `StrictOptimized{Iterable,Map,Seq,SortedMap}Ops`).
-        let out = if mentions_tparam(&out, &tps) {
-            let rest: Vec<SymbolId> = tps
-                .iter()
-                .copied()
-                .filter(|tp| type_mentions_tparam(&out, *tp))
-                .collect();
-            let wilds = vec![Type::Wildcard; rest.len()];
-            crate::symbol::subst_tparams_slice(&rest, &wilds, &out)
-        } else {
-            out
-        };
+        let rest: Vec<SymbolId> = tps.iter().copied().filter(|tp| !ids.contains(tp)).collect();
+        let wilds = vec![Type::Wildcard; rest.len()];
+        let out = crate::symbol::subst_tparams_slice(&rest, &wilds, &out);
         // A by-name formal expects the *value*: `is_sub_type(F[Unit],
         // => F[Unit])` is false, and the caller would throw the prototype away
         // as one the argument did not fit. Wrapping in `Function0` is `adapt`'s
@@ -3008,6 +3003,8 @@ impl Typer {
                 // nsc allows for function literals too -- and an undetermined
                 // result constrains nothing. Preserve the surrounding shape:
                 // Tuple2[K, V] cannot accept Int just because K and V are open.
+                // Likewise, Row[A] has a known outer class even while A is
+                // open; it cannot satisfy a pair-producing map overload.
                 let mut variables = Vec::new();
                 collect_tparams(pr, &mut variables);
                 let result_shape = crate::symbol::subst_tparams_slice(
@@ -3016,7 +3013,8 @@ impl Typer {
                     pr,
                 );
                 let strict = !open
-                    && is_rigid_type(ar)
+                    && (is_rigid_type(ar)
+                        || matches!(**ar, Type::Class { .. } | Type::Tuple(_) | Type::Array(_)))
                     && !matches!(**pr, Type::Unit | Type::Any | Type::AnyRef);
                 if strict
                     && !self.st.is_sub_type(ar, &result_shape)
@@ -3415,7 +3413,8 @@ impl Typer {
         // a literal passed to one of those was left with no parameter types at
         // all: `xs.reduceLeft[Node]((a, b) => …)` reported
         // `no matching overload … with arguments ((<notype>, <notype>) => <notype>)`.
-        let pt = match pt {
+        let dealiased_pt = self.st.dealias(pt);
+        let pt = match &dealiased_pt {
             Type::ByName(inner) => inner.as_ref(),
             other => other,
         };

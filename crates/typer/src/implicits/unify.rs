@@ -175,12 +175,18 @@ impl<'a> Unify<'a> {
             return None;
         }
         let (octor, oargs) = as_application(other)?;
-        if oargs.len() != hk_args.len() {
+        if hk_args.is_empty() || oargs.len() < hk_args.len() {
             return None;
         }
+        // Partial unification fixes leading arguments of the actual type.
+        // F[A] against Either[E, B] infers F = Either[E, *] and A = B,
+        // just as an ordinary argument does; implicit evidence has the same
+        // constraint even though its constructor is on the wanted side.
+        let leading = oargs.len() - hk_args.len();
+        let octor = crate::symbol::apply_type_ctor(octor, oargs[..leading].to_vec());
         let hk_ctor = (**hk_ctor).clone();
         let hk_args = hk_args.clone();
-        let oargs = oargs.to_vec();
+        let oargs = oargs[leading..].to_vec();
         Some(
             self.unify_at(&hk_ctor, &octor, depth + 1)
                 && hk_args

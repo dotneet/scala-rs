@@ -99,6 +99,78 @@ fn run_main(cp: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// A generic value class erases to its wrapped field after substituting the
+/// class type argument. Binary implicit discovery must compare that resulting
+/// descriptor rather than treating the field as `Object`.
+#[test]
+fn generic_value_class_implicit_bridge_matches_scalac() {
+    let (Some(jar), Some(scalac_bin)) = (scala_library_jar(), scalac()) else {
+        eprintln!("skip generic value class: needs scala-library and scalac 2.13.16");
+        return;
+    };
+    if !java_available() {
+        return;
+    }
+    let api_src = fixtures_dir().join("generic_valueclass_implicit_api.scala");
+    let app_src = fixtures_dir().join("generic_valueclass_implicit_app.scala");
+    let api = tmp_dir("generic-valueclass-api");
+    run_scalac(
+        &scalac_bin,
+        &["-d", api.to_str().unwrap(), api_src.to_str().unwrap()],
+    );
+
+    let nsc_app = tmp_dir("generic-valueclass-nsc-app");
+    run_scalac(
+        &scalac_bin,
+        &[
+            "-cp",
+            api.to_str().unwrap(),
+            "-d",
+            nsc_app.to_str().unwrap(),
+            app_src.to_str().unwrap(),
+        ],
+    );
+    let control = run_main(&format!(
+        "{}:{}:{}",
+        api.display(),
+        nsc_app.display(),
+        jar.display()
+    ));
+
+    let rs_app = tmp_dir("generic-valueclass-rs-app");
+    let output = Command::new(bin())
+        .args([
+            "compile",
+            app_src.to_str().unwrap(),
+            "-d",
+            rs_app.to_str().unwrap(),
+            "-cp",
+            api.to_str().unwrap(),
+            "--scala-library",
+            jar.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run scala-rs compile");
+    assert!(
+        output.status.success(),
+        "scala-rs could not resolve the generic value-class bridge:\n{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let ours = run_main(&format!(
+        "{}:{}:{}",
+        api.display(),
+        rs_app.display(),
+        jar.display()
+    ));
+    assert_eq!(ours, control);
+    assert_eq!(control, "ok\n");
+
+    for d in [api, nsc_app, rs_app] {
+        let _ = fs::remove_dir_all(d);
+    }
+}
+
 /// A ScalaSignature on a scala-rs module class makes its implicit vals visible
 /// once during the eager directory classpath scan and again when the companion
 /// pickle is supplied on demand. The eager term must be replaced by the
@@ -326,4 +398,96 @@ fn classpath_descriptor_accessor_loads_external_members() {
     let _ = fs::remove_file(api_jar);
     let _ = fs::remove_dir_all(holder);
     let _ = fs::remove_dir_all(app);
+}
+
+#[test]
+fn synthetic_conversions_in_unmodeled_scala_packages_are_imported() {
+    let (Some(jar), Some(oracle)) = (scala_library_jar(), scalac()) else {
+        return;
+    };
+    let root = tmp_dir("namespace");
+    let lib = root.join("lib");
+    fs::create_dir(&lib).unwrap();
+    run_scalac(
+        &oracle,
+        &[
+            "-d",
+            lib.to_str().unwrap(),
+            fixtures_dir()
+                .join("ic_namespace_lib.scala")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    let cp = format!("{}:{}", lib.display(), jar.display());
+    for native in [false, true] {
+        let out = root.join(format!("app-{native}"));
+        fs::create_dir(&out).unwrap();
+        let mut cmd = Command::new(if native { bin() } else { oracle.clone() });
+        if native {
+            cmd.arg("compile");
+        }
+        let result = cmd
+            .arg(fixtures_dir().join("ic_namespace_app.scala"))
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "native={native}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            run_main(&format!("{}:{cp}", out.display())),
+            "[record]\n3000\n"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn binary_generic_by_name_parameter_is_recovered_before_overload_selection() {
+    let (Some(jar), Some(oracle)) = (scala_library_jar(), scalac()) else {
+        return;
+    };
+    if !java_available() {
+        return;
+    }
+    let root = tmp_dir("binary-byname");
+    let lib = root.join("lib");
+    fs::create_dir(&lib).unwrap();
+    run_scalac(
+        &oracle,
+        &[
+            "-d",
+            lib.to_str().unwrap(),
+            fixtures_dir()
+                .join("binary_byname_api.scala")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    let cp = format!("{}:{}", lib.display(), jar.display());
+    for native in [false, true] {
+        let out = root.join(format!("app-{native}"));
+        fs::create_dir(&out).unwrap();
+        let mut cmd = Command::new(if native { bin() } else { oracle.clone() });
+        if native {
+            cmd.arg("compile");
+        }
+        let result = cmd
+            .arg(fixtures_dir().join("binary_byname_app.scala"))
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "native={native}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(run_main(&format!("{}:{cp}", out.display())), "42:1\n");
+    }
+    fs::remove_dir_all(root).unwrap();
 }

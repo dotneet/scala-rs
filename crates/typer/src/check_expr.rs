@@ -195,7 +195,7 @@ impl Typer {
             // method expectation set `callee` or throw their diagnostics away.
             if matches!(pt, Type::Method { .. }) {
                 self.reject_macro_eta(tree);
-            } else {
+            } else if !(qualifier && !self.undetermined_of(tree).is_empty()) {
                 self.expand_macro_application(tree);
             }
         }
@@ -1333,26 +1333,46 @@ impl Typer {
             }
             TreeKind::This { qual } => {
                 let q = qual.clone();
-                let id = self.this_owner(q.as_deref());
-                if id.is_none() {
-                    // nsc `QualifyingClassError`, e.g. `this` in the early
-                    // section of a top-level class, which is typed outside it.
-                    let msg = match q.as_deref() {
-                        Some(name) => format!("{name} is not an enclosing class"),
-                        None => "this can be used only in a class, object, or template".into(),
-                    };
-                    self.error(tree.span, msg);
-                    tree.ty = Type::Error;
+                // Reflection can return a package prefix as an attributed
+                // `This` tree (`p.this.C`). It is a path anchor rather than an
+                // enclosing-class `this`; retaining the package symbol lets a
+                // following `Select` use normal package-member lookup.
+                let package = (!tree.sym.is_none()
+                    && self.st.get(tree.sym).kind == SymKind::Package)
+                    .then_some(tree.sym)
+                    .or_else(|| {
+                        q.as_deref().and_then(|name| {
+                            self.st
+                                .lookup(name)
+                                .into_iter()
+                                .find(|id| self.st.get(*id).kind == SymKind::Package)
+                        })
+                    });
+                if let Some(package) = package {
+                    tree.sym = package;
+                    tree.ty = Type::NoType;
                 } else {
-                    tree.sym = id;
-                    let own = self.st.self_type_of_class(id);
-                    tree.ty = match self.st.get(id).self_type.clone() {
-                        Some(required) => Type::Refined {
-                            parents: vec![own, required],
-                            decls: vec![],
-                        },
-                        None => own,
-                    };
+                    let id = self.this_owner(q.as_deref());
+                    if id.is_none() {
+                        // nsc `QualifyingClassError`, e.g. `this` in the early
+                        // section of a top-level class, which is typed outside it.
+                        let msg = match q.as_deref() {
+                            Some(name) => format!("{name} is not an enclosing class"),
+                            None => "this can be used only in a class, object, or template".into(),
+                        };
+                        self.error(tree.span, msg);
+                        tree.ty = Type::Error;
+                    } else {
+                        tree.sym = id;
+                        let own = self.st.self_type_of_class(id);
+                        tree.ty = match self.st.get(id).self_type.clone() {
+                            Some(required) => Type::Refined {
+                                parents: vec![own, required],
+                                decls: vec![],
+                            },
+                            None => own,
+                        };
+                    }
                 }
             }
             TreeKind::Select { .. } => self.type_select(tree, pt),
@@ -2608,6 +2628,14 @@ impl Typer {
                 // parameter instead of wrapping the argument list.
                 if matches!(ascr, Type::Repeated(_)) {
                     self.type_expr(expr, &Type::NoType);
+                    // The repeated argument is a sequence value, even during
+                    // overload pretyping. Complete an implicit-only method
+                    // such as `flatten` before reading its element type.
+                    if self.implicit_only_result(expr).is_some() {
+                        self.with_typing_call_args(false, |this| {
+                            this.adapt_implicit_apply(expr, &Type::NoType);
+                        });
+                    }
                     let elem = match &expr.ty {
                         Type::Class { args, .. } if !args.is_empty() => args[0].clone(),
                         Type::Array(t) => (**t).clone(),

@@ -2856,11 +2856,11 @@ the third kind. There is no "approximately".
 Three failure modes had to be closed, and each of them is a thing that has actually gone wrong in
 this project before.
 
-* **Re-entrancy.** Answering needs `&mut Typer`, so the engine handle is taken out of
-  `Typer::macro_engine` for the duration and `macro_engine_busy` is set. A macro application inside
-  a tree handed to `c.typecheck` therefore cannot start a second engine: `Typer::macro_expansion`
-  sees the flag and refuses with a reason. nsc expands it, because its typer and its macro runner
-  are the same process; this bridge would need a second conversation on a pipe that carries one.
+* **Re-entrancy.** A reverse query can expand another macro on the same JVM. The typer keeps
+  the engine handle available while answering, and the JVM query loop services nested expansion
+  requests before receiving the answer to the outer query. Each nested request saves and restores
+  the outer transport's splice maps, structural types, pending failures and active contexts. Symbol
+  identities and fresh names remain shared. Protocol errors or unwinding still poison the engine.
 
 * **The timeout now measures the implementation's own time.** `SCALA_RS_MACRO_TIMEOUT_SECS` is
   unchanged at 20 seconds, but only the intervals during which *the engine holds the ball* are
@@ -2930,12 +2930,12 @@ at the call site. A local, parameter, or other non-static prefix the wire cannot
 it is never searched as the bare declaration, because `p.Type` and `q.Type` are distinct types.
 Unsupported result types are likewise refused rather than widened to a class name.
 
-An enabled implicit macro is selected by the ordinary search, but a normal macro cannot be expanded
-while the one JVM engine is busy running the outer implementation. That case is a named refusal,
-not an `(a ok ...)` containing the still-unexpanded implicit reference. Fast-track expansions that
-do not re-enter the engine remain possible. A `silent = false` miss leaves the typer's missing-
-implicit diagnostic at the call site; all speculative type-resolution and adaptation diagnostics
-are rolled back on every other exit.
+An enabled implicit macro is selected by the ordinary search and expanded through a nested
+conversation on the same JVM. Failed expansions are reported rather than returned as unexpanded
+implicit references. A `silent = false` miss leaves the typer's missing-implicit diagnostic at the
+call site; all speculative type-resolution and adaptation diagnostics are rolled back on every
+other exit. The `macronestedquery` regression compares nested implicit materialization with scalac,
+including outer context restoration and a side-effecting argument splice.
 
 The default fourth argument is the enclosing macro-call position. The bridge verifies that the
 received `Position` equals that value; a different explicit `pos` is refused by name because the
@@ -3079,10 +3079,10 @@ accept before.
   compiled once by real scalac; scala-rs and scalac then compile and execute the same use site, and
   `infer_implicit_value_matches_real_scalac` requires identical output.
 * `miv_enabled.scala`, `miv_nonstatic.scala`, `miv_position.scala`, and `miv_required.scala` — an
-  enabled implicit macro is refused by name while the engine is busy, a parameter-dependent prefix
-  is refused without an approximation, a non-default diagnostic position is refused rather than
-  ignored, and a non-silent miss produces exactly one diagnostic. Real scalac is the positive oracle
-  for the first three and the failing oracle for the fourth.
+  enabled implicit macro expands during the outer query, a parameter-dependent prefix is refused
+  without an approximation, a non-default diagnostic position is refused rather than ignored,
+  and a non-silent miss produces exactly one diagnostic. Real scalac is the positive oracle for
+  the first three and the failing oracle for the fourth.
 * `miv_zio_actual.scala` compiles `ZIO.succeed(1)` against ZIO 2.1.26's real
   `zio-stacktracer` artifact and requires the resulting `Main$.class`. This complements the
   structurally equivalent local fixture with the exact `autoTraceImpl` that motivated the RPC.

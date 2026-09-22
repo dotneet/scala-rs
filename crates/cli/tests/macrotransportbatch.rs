@@ -84,6 +84,8 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
             } else if name == "macrotransport_owner_bad" {
                 error.contains("recursive value field needs type")
                     && error.contains("recursive value local needs type")
+            } else if name == "macromethod_info_bad" {
+                error.contains("recursive method hidden needs result type")
             } else if name == "macrotransport_fields_bad" {
                 error.matches("integer storage is forbidden").count() == 4
             } else if name == "refined_bundle_context_bad" {
@@ -92,6 +94,8 @@ fn compile(name: &str, nsc: bool, out: &Path, cp: &str, accepted: bool) {
                 } else {
                     error.contains("macro implementation reference has wrong shape")
                 }
+            } else if name == "macroassociated_bad" || name == "macrooutput_fit_bad" {
+                error.contains("could not find implicit value") || error.contains("type mismatch")
             } else if name == "macrotransport_bundle_bad" {
                 error.contains("could not find implicit value") || error.contains("type mismatch")
             } else if name == "refined_bundle_bad" {
@@ -223,6 +227,27 @@ fn inferred_implementation_materializes_qualified_context_tag() {
                 false,
             );
         }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_implicit_macro_materialization_tries_lower_priority_candidates() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let producer = root.join("producer");
+    compile(
+        "implicit_materialization_retry",
+        true,
+        &producer,
+        &base,
+        true,
+    );
+    let cp = format!("{}:{base}", producer.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        compile("implicit_materialization_retry_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"42\n");
     }
     fs::remove_dir_all(root).unwrap();
 }
@@ -542,6 +567,383 @@ fn nested_binary_class_type_trees_round_trip_through_macros() {
         let out = root.join(format!("out-{nsc}"));
         compile("macrotransport_nested_binary_use", nsc, &out, &cp, true);
         assert_eq!(run(&out, &cp), b"true\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parameterless_macro_receiver_infers_from_selected_member() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("receiver-implementation");
+    compile(
+        "macrotransport_receiver",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("receiver-use-{consumer}"));
+        compile("macrotransport_receiver_use", consumer, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"String\nString\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn generic_selection_probe_expands_each_macro_receiver_once() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("implementation");
+    compile("macrochain_probe", true, &implementation, &base, true);
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        fs::create_dir(&out).unwrap();
+        let mut cmd = Command::new(if nsc {
+            NSC
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            cmd.args(["compile", "--scala-library", JAR]);
+        }
+        let result = cmd
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/macrochain_probe_use.scala"),
+            )
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let messages = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.status.success(), "nsc={nsc}: {messages}");
+        assert_eq!(
+            messages.matches("chain-probe-expanded").count(),
+            4,
+            "nsc={nsc}: {messages}"
+        );
+        assert_eq!(run(&out, &cp), b"4\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn implicit_macro_context_reports_active_search() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("implicit-context-implementation");
+    compile(
+        "macrotransport_open_implicits",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("implicit-context-use-{consumer}"));
+        compile(
+            "macrotransport_open_implicits_use",
+            consumer,
+            &output,
+            &cp,
+            true,
+        );
+        assert_eq!(run(&output, &cp), b"1\nEvidenceInfo[String]\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nested_macro_contexts_preserve_identity_and_restore_the_active_stack() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("implementation");
+    compile("macrocontexts", true, &implementation, &base, true);
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        compile("macrocontexts_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"inner,inner,outer\ninner,inner\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn repeated_parameter_types_round_trip_through_macro_reflection() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("implementation");
+    compile("macrorepeated", true, &implementation, &base, true);
+    let cp = format!("{}:{base}", implementation.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        compile("macrorepeated_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"3\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn binary_macro_application_symbol_selects_same_arity_overload() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("overloaded-macro-implementation");
+    compile(
+        "macrotransport_overload",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("overloaded-macro-use-{consumer}"));
+        compile("macrotransport_overload_use", consumer, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"Throwable\nInt\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn whitebox_implicit_infers_an_associated_output_in_its_expansion() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("associated-implementation");
+    compile("macroassociated", true, &implementation, &base_cp, true);
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("associated-use-{consumer}"));
+        compile("macroassociated_use", consumer, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"Int\n");
+        let rejected = root.join(format!("associated-bad-{consumer}"));
+        compile("macroassociated_bad", consumer, &rejected, &cp, false);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn implicit_macro_queries_expand_on_the_same_engine_and_restore_outer_splices() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("nested-query-implementation");
+    compile("macronestedquery", true, &implementation, &base_cp, true);
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("nested-query-use-{consumer}"));
+        compile("macronestedquery_use", consumer, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"Int\nString\n1\n42\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn macro_tags_preserve_unapplied_binary_alias_constructors() {
+    let root = root();
+    let base_cp = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("alias-constructor-implementation");
+    compile(
+        "macroaliasconstructor",
+        true,
+        &implementation,
+        &base_cp,
+        true,
+    );
+    let cp = format!("{}:{base_cp}", implementation.display());
+    for consumer in [true, false] {
+        let output = root.join(format!("alias-constructor-use-{consumer}"));
+        compile("macroaliasconstructor_use", consumer, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"String\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn compiler_reflection_helpers_preserve_companions_access_and_encoded_names() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"].into_iter()
+        .map(|root| PathBuf::from(&home).join(root).join("https/repo1.maven.org/maven2/com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar"))
+        .find(|jar| jar.is_file());
+    let Some(jar) = jar else {
+        eprintln!("skip: shapeless 2.3.13 is not cached");
+        return;
+    };
+    let compiler = "/tmp/scala-2.13.16/lib/scala-compiler.jar";
+    if !Path::new(compiler).is_file() {
+        return;
+    }
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}:{compiler}:{}", jar.display());
+    let producer = root.join("producer");
+    compile("macroreflection_helpers", true, &producer, &base, true);
+    let cp = format!("{}:{base}", producer.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("consumer-{nsc}"));
+        compile("macroreflection_helpers_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"Entry\nBinaryEntry\n7\n");
+        let generic = root.join(format!("generic-{nsc}"));
+        compile("macroreflection_generic", nsc, &generic, &base, true);
+        assert_eq!(run(&generic, &base), b"Entry(record,7)\n");
+        let sum = root.join(format!("sum-{nsc}"));
+        compile("macroreflection_sum", nsc, &sum, &base, true);
+        assert_eq!(run(&sum, &base), b"Added(7)\nCleared\n");
+        let labelled = root.join(format!("labelled-{nsc}"));
+        compile("macroreflection_labelled", nsc, &labelled, &base, true);
+        assert_eq!(run(&labelled, &base), b"Entry(record,7)\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let artifacts = [
+        "com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar",
+        "io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar",
+        "io/circe/circe-generic_2.13/0.14.7/circe-generic_2.13-0.14.7.jar",
+        "io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar",
+        "org/typelevel/cats-core_2.13/2.11.0/cats-core_2.13-2.11.0.jar",
+        "org/typelevel/cats-kernel_2.13/2.11.0/cats-kernel_2.13-2.11.0.jar",
+    ];
+    let mut jars = Vec::new();
+    for artifact in artifacts {
+        let jar = ["Library/Caches/Coursier/v1", ".cache/coursier/v1"]
+            .into_iter()
+            .map(|cache| {
+                PathBuf::from(&home)
+                    .join(cache)
+                    .join("https/repo1.maven.org/maven2")
+                    .join(artifact)
+            })
+            .find(|jar| jar.is_file());
+        let Some(jar) = jar else {
+            eprintln!("skip: {artifact} is not cached");
+            return;
+        };
+        jars.push(jar);
+    }
+    let compiler = "/tmp/scala-2.13.16/lib/scala-compiler.jar";
+    if !Path::new(compiler).is_file() {
+        return;
+    }
+    let root = root();
+    let cp = format!(
+        "{JAR}:{REFLECT}:{compiler}:{}",
+        jars.iter()
+            .map(|jar| jar.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(":")
+    );
+    for nsc in [true, false] {
+        let out = root.join(format!("nested-derivation-{nsc}"));
+        compile("macroreflection_nested_derivation", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"true\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn whitebox_output_drives_nested_implicit_search_once_per_callsite() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let producer = root.join("producer");
+    compile("macrooutput_fit", true, &producer, &base, true);
+    let cp = format!("{}:{base}", producer.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        fs::create_dir(&out).unwrap();
+        let mut cmd = Command::new(if nsc {
+            NSC
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        });
+        if !nsc {
+            cmd.args(["compile", "--scala-library", JAR]);
+        }
+        let result = cmd
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/macrooutput_fit_use.scala"),
+            )
+            .args(["-cp", &cp, "-d"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let messages = format!(
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(result.status.success(), "nsc={nsc}: {messages}");
+        assert_eq!(
+            messages.matches("output-fit-expanded").count(),
+            3,
+            "nsc={nsc}: {messages}"
+        );
+        assert_eq!(run(&out, &cp), b"Int!\nLong!\nDouble!\n");
+        compile(
+            "macrooutput_fit_bad",
+            nsc,
+            &root.join(format!("bad-{nsc}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn generated_intersection_types_retain_constant_type_arguments() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let producer = root.join("intersection-implementation");
+    compile("macrointersection", true, &producer, &base, true);
+    let cp = format!("{}:{base}", producer.display());
+    for nsc in [true, false] {
+        let output = root.join(format!("intersection-use-{nsc}"));
+        compile("macrointersection_use", nsc, &output, &cp, true);
+        assert_eq!(run(&output, &cp), b"true\n");
+        compile(
+            "macrointersection_bad",
+            nsc,
+            &root.join(format!("intersection-bad-{nsc}")),
+            &cp,
+            false,
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn method_reflection_completes_pending_inferred_signatures() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let producer = root.join("producer");
+    compile("macromethod_info", true, &producer, &base, true);
+    let cp = format!("{}:{base}", producer.display());
+    for nsc in [true, false] {
+        let out = root.join(format!("use-{nsc}"));
+        compile("macromethod_info_use", nsc, &out, &cp, true);
+        assert_eq!(run(&out, &cp), b"42\n");
+        compile(
+            "macromethod_info_bad",
+            nsc,
+            &root.join(format!("bad-{nsc}")),
+            &cp,
+            false,
+        );
     }
     fs::remove_dir_all(root).unwrap();
 }

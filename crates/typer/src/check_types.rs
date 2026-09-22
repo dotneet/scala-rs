@@ -159,6 +159,12 @@ impl Typer {
             // reach it by at the use site.
             TreeKind::Ident { name } if name == crate::materialize::RESOLVED_TYPE => tpt.ty.clone(),
             TreeKind::Ident { name } if name == "_" => Type::Wildcard,
+            // A typed macro expansion represents the sequence-argument marker
+            // as `Ident("_*")`, while source parsing uses
+            // `<repeated>[_]`.  They denote the same type ascription.  The
+            // `Typed` expression arm replaces this wildcard with the element
+            // type of the sequence expression after typing it.
+            TreeKind::Ident { name } if name == "_*" => Type::Repeated(Box::new(Type::Wildcard)),
             TreeKind::Ident { name } => {
                 self.expose_unqualified(name, tpt.span);
                 self.expose_unqualified_type(name, tpt.span);
@@ -243,7 +249,9 @@ impl Typer {
                     self.complete_lazy_sig(id, tpt.span);
                     self.note_cto_ref(id, tpt.span);
                     match self.st.get(id).kind {
-                        SymKind::Module | SymKind::ModuleClass => Type::ModuleRef(id),
+                        SymKind::Module | SymKind::ModuleClass => self
+                            .qualified_pickled_type_member(qual, name)
+                            .unwrap_or(Type::ModuleRef(id)),
                         SymKind::TypeParam => Type::TypeParam(id),
                         SymKind::TypeMember => self.module_path_type_member(qual, id),
                         _ if id == self.st.string_sym => Type::String,
@@ -384,6 +392,14 @@ impl Typer {
                             }
                         } else {
                             let applied = self.apply_types(ctor.clone(), as_, span);
+                            let applied = match (&tpt.kind, &ctor) {
+                                (TreeKind::Ident { .. }, Type::TypeMember(id))
+                                    if !self.st.is_deferred_type_member(*id) =>
+                                {
+                                    self.type_member_body_here(*id, applied)
+                                }
+                                _ => applied,
+                            };
                             // A parameterised alias of an inner class (`type
                             // Table[T] = RelationalProfile.this.Table[T]`)
                             // expands only now, so its `C.this` is read
@@ -1222,7 +1238,7 @@ impl Typer {
     /// `ctor` is a still-abstract `Type::TypeMember` reached through a
     /// qualified *module* prefix (`tpt` a `p.T`-shaped `Select` whose
     /// qualifier is not itself a term), record that module in
-    /// [`Typer::type_member_prefixes`] against `T`'s own defining symbol, so
+    /// [`SymbolTable::type_member_prefixes`] against `T`'s own defining symbol, so
     /// the implicit search's `collect_type_parts` (in `implicits.rs`) can add
     /// it as an extra implicit-scope part wherever `T` turns up, dealiased or
     /// not. `applied` -- `ctor` combined with its arguments -- is returned
@@ -1279,8 +1295,7 @@ impl Typer {
             return applied;
         }
         {
-            let mut map = self.type_member_prefixes.borrow_mut();
-            let owners = map.entry(id.0).or_default();
+            let owners = self.st.type_member_prefixes.entry(id.0).or_default();
             if !owners.contains(&owner) {
                 owners.push(owner);
             }
@@ -1407,11 +1422,15 @@ impl Typer {
     /// `JdbcBackend#JdbcSessionDef`, and `p.Session` is `p.JdbcSessionDef`.
     fn project_from_prefix_at(&mut self, span: Span, prefix: &Type, name: &str, at: &Type) -> Type {
         let t = self.project_from_prefix_in(span, prefix, name);
-        if t.is_error() || !self.st.mentions_inner_class(&t) {
+        if t.is_error() {
             return t;
         }
         self.warm_enclosing_parents(prefix);
-        self.st.rewrite_view_this(prefix, Some(at), &t)
+        // A non-generic subclass can fix a generic ancestor's alias. The
+        // declaration still uses that ancestor's parameter, so substitute
+        // through the entire receiver hierarchy even when the receiver has
+        // no arguments of its own.
+        self.st.subst_as_seen_from_at(prefix, Some(at), &t)
     }
 
     fn project_from_prefix_in(&mut self, span: Span, prefix: &Type, name: &str) -> Type {
@@ -3369,6 +3388,11 @@ impl Typer {
             return None;
         }
         for owner in self.qualified_type_owners(qual) {
+            let owner = if self.st.get(owner).kind == SymKind::Package {
+                self.package_object_of(owner, qual.span).unwrap_or(owner)
+            } else {
+                owner
+            };
             if let Some(t) =
                 self.pickle
                     .complete_type_member(&mut self.st, &mut self.binary, owner, name)
@@ -3656,6 +3680,13 @@ impl Typer {
         if matches!(base, Type::TypeMember(m) if m == id) {
             return base;
         }
+        self.type_member_body_here(id, base)
+    }
+
+    /// Applying a higher-kinded alias exposes its RHS only after its own
+    /// parameters are substituted. Read that body at the same lexical
+    /// receiver as a nullary alias, including this.type in type arguments.
+    fn type_member_body_here(&self, id: SymbolId, base: Type) -> Type {
         let owner = self.st.get(id).owner;
         let this = self.st.this_class;
         if owner.is_none() || this.is_none() || owner == this {
@@ -3686,7 +3717,10 @@ impl Typer {
             };
             if let Some(Type::Class { args, .. }) = self.base_type_instance(&site_ty, owner, 0) {
                 let seen = self.st.expand_type_members(site, &base);
-                return self.st.subst_tparams(owner, &args, &seen);
+                let seen = self.st.subst_tparams(owner, &args, &seen);
+                return self
+                    .st
+                    .subst_as_seen_from_prefix(&site_ty, &Type::ThisType(site), &seen);
             }
         }
         base

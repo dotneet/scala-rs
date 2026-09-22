@@ -361,3 +361,28 @@ fn bf2_wrong_result_collection_is_rejected() {
         "error:",
     );
 }
+
+#[test]
+fn lazy_zip_flatmap_adapts_optional_and_user_defined_results() {
+    runs(
+        "lazyzip-result-view",
+        r#"
+object Main {
+  case class Entries(value: Int)
+  implicit def entriesToIterable(value: Entries): Iterable[Int] = List(value.value)
+  def main(args: Array[String]): Unit = {
+    val xs = List(1,2)
+    println(xs.lazyZip(xs).flatMap((a,b) => Option(a+b)).mkString(","))
+    println(xs.view.lazyZip(xs).lazyZip(xs).flatMap((a,b,c) => if(a==1) Some(b+c) else None).headOption)
+    println(xs.lazyZip(xs).flatMap((a,b) => Entries(a+b)).mkString(","))
+  }
+}
+"#,
+        "2,4\nSome(2)\n2,4\n",
+    );
+    rejects(
+        "lazyzip-invalid-result",
+        "object Main { val bad = List(1).lazyZip(List(2)).flatMap((a,b) => a+b) }",
+        "error:",
+    );
+}

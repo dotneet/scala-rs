@@ -16,6 +16,26 @@ use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
 impl Typer {
+    /// Declaration parameters corresponding to the first clause still present
+    /// in `tree.ty`.
+    ///
+    /// A partially applied method keeps its declaration symbol while its type
+    /// contains only the clauses that remain.  Looking at `sym.paramss[0]`
+    /// therefore misclassifies `f(a)(implicit ev)` after `f(a)`: the tree has
+    /// one implicit clause left, but the symbol's first clause is the already
+    /// consumed explicit one.  Remaining clauses are always a suffix of the
+    /// declaration, so align them from the end.
+    fn first_remaining_param_ids(&self, tree: &Tree) -> Option<Vec<SymbolId>> {
+        let Type::Method { paramss, .. } = &tree.ty else {
+            return None;
+        };
+        let first_ty = paramss.first()?;
+        let declared = &self.st.get(tree.sym).paramss;
+        let at = declared.len().checked_sub(paramss.len())?;
+        let first = declared.get(at)?;
+        (first.len() == first_ty.len()).then(|| first.clone())
+    }
+
     /// nsc's `inferExprInstance`: a *parameterless* polymorphic method used in
     /// value position (`Vector.empty`, `mutable.HashMap.empty`) has nothing but
     /// the expected type to solve its parameters from, and whatever the
@@ -57,7 +77,11 @@ impl Typer {
         if !self.is_nullary_method_sym(sym) {
             return ty;
         }
-        let inst = self.add_expected_constraints(sym, &ty, pt, Vec::new());
+        let inst: Vec<_> = self
+            .add_expected_constraints(sym, &ty, pt, Vec::new())
+            .into_iter()
+            .filter(|(tp, solution)| self.undet_solution_in_bounds(*tp, solution))
+            .collect();
         let ids: Vec<SymbolId> = inst.iter().map(|(id, _)| *id).collect();
         let vals: Vec<Type> = inst.iter().map(|(_, t)| t.clone()).collect();
         let mut ty = crate::symbol::subst_tparams_slice(&ids, &vals, &ty);
@@ -857,7 +881,8 @@ impl Typer {
         }
         let mut out = ret.clone();
         for m in members {
-            let info = self.st.get(m);
+            let decl = self.st.path_member_decl(m).unwrap_or(m);
+            let info = self.st.get(decl);
             if !info.tparams.is_empty() {
                 continue;
             }
@@ -885,6 +910,14 @@ impl Typer {
                 cand = Some(i);
             }
             let Some(i) = cand else { continue };
+            let seen = self.st.expand_in_type(&arg_tys[i], &Type::TypeMember(decl));
+            if !seen.is_no_type()
+                && !seen.is_error()
+                && !matches!(&seen, Type::TypeMember(x) if *x == decl || *x == m)
+            {
+                out = crate::symbol::subst_type_member(&out, m, &seen);
+                continue;
+            }
             let Some(acls) = arg_tys.get(i).and_then(|a| self.st.class_sym_of(a)) else {
                 continue;
             };
@@ -896,7 +929,7 @@ impl Typer {
             else {
                 continue;
             };
-            if found == m {
+            if found == decl {
                 continue;
             }
             let seen = self.st.dealias(&Type::TypeMember(found));
@@ -1324,11 +1357,10 @@ impl Typer {
         if paramss.len() != 1 || paramss[0].is_empty() || tree.sym.is_none() {
             return None;
         }
-        let first = self.st.get(tree.sym).paramss.first().cloned()?;
-        if first.len() != paramss[0].len()
-            || !first
-                .iter()
-                .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
+        let first = self.first_remaining_param_ids(tree)?;
+        if !first
+            .iter()
+            .all(|p| self.st.get(*p).flags.contains(Flags::IMPLICIT))
         {
             return None;
         }
@@ -1565,8 +1597,7 @@ impl Typer {
         if tree.sym.is_none() {
             return;
         }
-        let paramss = self.st.get(tree.sym).paramss.clone();
-        let first = paramss.first().cloned().unwrap_or_default();
+        let first = self.first_remaining_param_ids(tree).unwrap_or_default();
         if first.is_empty() {
             return;
         }
@@ -3495,13 +3526,7 @@ impl Typer {
         if tree.sym.is_none() {
             return false;
         }
-        let first = self
-            .st
-            .get(tree.sym)
-            .paramss
-            .first()
-            .cloned()
-            .unwrap_or_default();
+        let first = self.first_remaining_param_ids(tree).unwrap_or_default();
         if first.is_empty()
             || !first
                 .iter()
@@ -3819,8 +3844,22 @@ impl Typer {
             if let Some(Type::Function { params, ret }) = self.implicit_eta_shape(tree) {
                 // Type the generated application normally: that infers method
                 // variables and supplies real evidence in the lexical scope.
+                // The function's expected domain still has to instantiate the
+                // method before the synthetic parameters are created.  A
+                // trailing implicit clause used to take this early path with
+                // the declaration's own variables intact, so
+                //
+                //   def run[A](fa: Action[A])(implicit ec: EC): Future[A]
+                //   action.pipe(run)
+                //
+                // expanded to `(x: Action[A]) => run[A](x)(ec)` even when
+                // `pipe` expected `Action[Int] => Future[Int]`.  The ordinary
+                // one-clause eta path below already solves these variables
+                // from the expected function type; do the same before the
+                // implicit arguments are filled in the generated body.
+                let (params, ret) = self.solve_eta_tparams(tree.sym, params, *ret, pt);
                 let captured = self.capture_eta_receiver(tree);
-                eta_expand(&mut self.st, &mut self.gensym, tree, params, *ret);
+                eta_expand(&mut self.st, &mut self.gensym, tree, params, ret);
                 if let Some(value) = captured {
                     let expr = std::mem::replace(tree, Tree::dummy(TreeKind::Empty));
                     *tree = Tree::dummy(TreeKind::Block {
@@ -3919,6 +3958,14 @@ impl Typer {
                     self.adapt(&mut arg, &bn);
                 }
                 let fun = self.ref_implicit_with_receiver(id, span);
+                // Keep the conversion's result when it fits the requested
+                // type. Besides preserving type arguments under a wildcard,
+                // this retains structural aliases used by dependent method
+                // results (`Magnet { type Out = T }`).
+                let result_ty = self
+                    .conversion_result(id, &from)
+                    .filter(|ty| self.st.is_sub_type(ty, pt))
+                    .unwrap_or_else(|| pt.clone());
                 let applied = Tree {
                     id: arg.id,
                     span,
@@ -3926,7 +3973,7 @@ impl Typer {
                         fun: Box::new(fun),
                         args: vec![arg],
                     },
-                    ty: pt.clone(),
+                    ty: result_ty,
                     sym: id,
                     postfix: false,
                     scala_ref: false,

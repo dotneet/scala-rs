@@ -457,6 +457,18 @@ fn class_captures(class_def: &Tree, st: &SymbolTable) -> Vec<SymbolId> {
     for s in &impl_.body {
         free(s, &bound, &mut out, st);
     }
+    let lexical_owner = st.get(class_def.sym).owner;
+    out.retain(|id| {
+        let term = st.get(*id);
+        let owner = st.get(term.owner);
+        // Method-owned terms are ordinary local captures. A term owned by a
+        // class but absent from its member list is a template-block local only
+        // when that class is also this definition's lexical owner. Imported
+        // package-object vals can have the same incomplete member shape after
+        // binary loading, but they are stable members and must never become
+        // hidden constructor parameters of an unrelated top-level class.
+        owner.kind == SymKind::Method || term.owner == lexical_owner
+    });
     out
 }
 

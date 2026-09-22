@@ -1044,7 +1044,7 @@ impl Typer {
             && self.st.get(fun.sym).parameterless_method == Some(true)
             && matches!(&fun.ty, Type::Method { paramss, ret }
                 if (paramss.is_empty() || paramss.iter().all(|c| c.is_empty()))
-                    && matches!(crate::prefix::strip_view(ret), Type::ModuleRef(_)))
+                    && matches!(crate::prefix::strip_view(ret), Type::ModuleRef(_) | Type::Class { .. }))
         {
             self.insert_apply_on_nullary(fun);
         }
@@ -1085,6 +1085,29 @@ impl Typer {
                     for param in paramss.iter().flatten() {
                         self.complete_java_type(param, fun.span);
                     }
+                }
+            }
+        }
+        if let Type::Method { paramss, .. } = &fun_ty_for_pretype {
+            if let Some(params) = paramss.first() {
+                for (i, arg) in args.iter_mut().enumerate() {
+                    if !arg.byname_type_marker
+                        || !param_at(params, i).is_some_and(|p| matches!(p, Type::ByName(_)))
+                    {
+                        continue;
+                    }
+                    let TreeKind::Function { vparams, .. } = &arg.kind else {
+                        continue;
+                    };
+                    if !vparams.is_empty() {
+                        continue;
+                    }
+                    let TreeKind::Function { body, .. } =
+                        std::mem::replace(&mut arg.kind, TreeKind::Empty)
+                    else {
+                        unreachable!()
+                    };
+                    *arg = *body;
                 }
             }
         }
@@ -1293,6 +1316,82 @@ impl Typer {
                 } else {
                     pt_arg
                 };
+                // Arguments in one clause are inferred from left to right.
+                // A preceding argument can therefore settle method type
+                // parameters that occur in a later argument's prototype.
+                // `materialize(a: Labelling[T, K], b: Generic[T, V],
+                // zip: Zip[K, V, R], ev: R <:< V)` relies on this: typing
+                // `zip` with no prototype leaves its element type open even
+                // though `a` and `b` have already fixed K and V.
+                let sequential_proto = match &fun_ty_for_pretype {
+                    Type::Method { paramss, .. } if ai > 0 && !fun.sym.is_none() => {
+                        let params = paramss.first().cloned().unwrap_or_default();
+                        let prior: Vec<Type> = (0..ai)
+                            .filter_map(|i| param_at(&params, i).cloned())
+                            .collect();
+                        if prior.len() != arg_tys.len() {
+                            None
+                        } else {
+                            let solved = self.infer_method_tparams_in(
+                                fun.sym,
+                                &prior,
+                                &arg_tys,
+                                recv_ty.as_ref(),
+                            );
+                            let current = param_at(&params, ai).cloned();
+                            current.and_then(|current| {
+                                if solved.is_empty() {
+                                    return None;
+                                }
+                                let ids: Vec<_> = solved.iter().map(|(id, _)| *id).collect();
+                                let tys: Vec<_> = solved.iter().map(|(_, ty)| ty.clone()).collect();
+                                let mut prototype =
+                                    crate::symbol::subst_tparams_slice(&ids, &tys, &current);
+                                let unsolved: Vec<_> = self
+                                    .st
+                                    .get(fun.sym)
+                                    .tparams
+                                    .iter()
+                                    .copied()
+                                    .filter(|tp| !ids.contains(tp))
+                                    .collect();
+                                if !unsolved.is_empty() {
+                                    let wildcards = vec![Type::Wildcard; unsolved.len()];
+                                    prototype = crate::symbol::subst_tparams_slice(
+                                        &unsolved, &wildcards, &prototype,
+                                    );
+                                }
+                                (!prototype.is_no_type()
+                                    && !prototype.is_error()
+                                    && prototype != current)
+                                    .then_some(prototype)
+                            })
+                        }
+                    }
+                    _ => None,
+                };
+                let pt_arg = match sequential_proto {
+                    Some(sequential) => {
+                        let uncertainty = |ty: &Type| {
+                            let mut open = Vec::new();
+                            collect_tparams(ty, &mut open);
+                            let callee_tparams = &self.st.get(fun.sym).tparams;
+                            open.retain(|tp| callee_tparams.contains(tp));
+                            open.sort_by_key(|tp| tp.0);
+                            open.dedup();
+                            (open.len(), usize::from(type_mentions_wildcard(ty)))
+                        };
+                        if pt_arg.is_no_type()
+                            || pt_arg.is_error()
+                            || uncertainty(&sequential) < uncertainty(&pt_arg)
+                        {
+                            sequential
+                        } else {
+                            pt_arg
+                        }
+                    }
+                    None => pt_arg,
+                };
                 let method_ref_proto = if pt_arg.is_no_type() && !too_many_args {
                     self.method_ref_function_proto(a, &fun_ty_for_pretype, fun.sym, ai)
                 } else {
@@ -1373,7 +1472,12 @@ impl Typer {
                         let with_tree = std::mem::replace(a, saved);
                         let with_diags: Vec<_> = self.diags.split_off(mark);
                         self.type_expr(a, &Type::NoType);
-                        if self.error_count_since(mark) >= with_errs.max(1) {
+                        let retry_is_less_determined = with_errs == 0
+                            && self.undetermined_of(a).len()
+                                > self.undetermined_of(&with_tree).len();
+                        if self.error_count_since(mark) >= with_errs.max(1)
+                            || retry_is_less_determined
+                        {
                             // The retry is no better; keep the typing that at
                             // least knew what the parameters were.
                             self.diags.truncate(mark);
@@ -1724,7 +1828,6 @@ impl Typer {
                             // `def column[T](n: Node)(implicit tt: TypedType[T]): Rep[T]`
                             // gets `T` from nowhere else.
                             let inst = self.add_expected_constraints(sym, &ret, pt, inst);
-
                             // nsc reads the expected type *after* the arguments
                             // are typed. Here the pass runs first, so a solution
                             // the expected type only knows as `_` -- the stand-in
@@ -1756,13 +1859,14 @@ impl Typer {
                                 solved_own_tparams = tps.clone();
                                 param_tys = param_tys
                                     .iter()
-                                    .map(|p| crate::symbol::subst_tparams_slice(&tps, &args_t, p))
+                                    .map(|p| self.st.subst_type_params_projected(&tps, &args_t, p))
                                     .collect();
-                                ret = crate::symbol::subst_tparams_slice(&tps, &args_t, &ret);
+                                ret = self.st.subst_type_params_projected(&tps, &args_t, &ret);
                                 // The later clauses are read back off `fun.ty` by
                                 // `fill_defaults_and_implicits`; leaving it raw
                                 // would search `ClassTag[T]` after `T` is known.
-                                fun.ty = crate::symbol::subst_tparams_slice(&tps, &args_t, &fun.ty);
+                                fun.ty =
+                                    self.st.subst_type_params_projected(&tps, &args_t, &fun.ty);
                             }
                             // The parameter types the signature really declares.
                             // What follows rewrites `param_tys` to get the lambda
@@ -2125,11 +2229,11 @@ impl Typer {
                             // => Array(x, x))` is `wrapIntArray(Array(x, x))`.
                             // Left unconverted, the array was handed to `flatMap`
                             // as its `IterableOnce` (`ClassCastException`,
-                            // run/t5652). Only an array: every other body keeps
-                            // the unchecked result -- checking it against the
-                            // declared class rejected `Stream` and `LazyList`
-                            // bodies scalac accepts, where this table's own
-                            // subtyping or prelude signatures fall short.
+                            // run/t5652). Other reference results are adapted
+                            // when an implicit conversion is available. Without
+                            // one, preserve the existing result: checking all
+                            // bodies here rejects valid prelude collection types
+                            // whose complete hierarchy has not been loaded.
                             let mut array_body_ret = None;
                             if i == 0 {
                                 if let (Some(proto), TreeKind::Function { body, .. }) =
@@ -2144,6 +2248,16 @@ impl Typer {
                                     // cast to IterableOnce`, because the body
                                     // was handed over unconverted.
                                     if matches!(bt, Type::Array(_) | Type::String) {
+                                        self.adapt(body, proto);
+                                        array_body_ret = Some(body.ty.clone());
+                                    } else if !self.st.is_sub_type(&bt, proto) && {
+                                        // Some flatMap signatures require Iterable,
+                                        // so an Option result needs its ordinary
+                                        // implicit conversion before B is inferred.
+                                        self.warm_own_scope_once(&bt);
+                                        self.warm_conversion_witnesses(&bt, proto);
+                                        self.search_conversion(&bt, proto).is_found()
+                                    } {
                                         self.adapt(body, proto);
                                         array_body_ret = Some(body.ty.clone());
                                     } else if matches!(
@@ -2570,7 +2684,12 @@ impl Typer {
                                 })
                                 .collect();
                             let inst: Vec<(SymbolId, Type)> = self
-                                .infer_method_tparams(sym, &sig_param_tys, &now)
+                                .infer_method_tparams_in(
+                                    sym,
+                                    &sig_param_tys,
+                                    &now,
+                                    recv_ty.as_ref(),
+                                )
                                 .into_iter()
                                 .filter(|(id, t)| {
                                     // A solution that is *this* call's own variable
@@ -3272,7 +3391,23 @@ impl Typer {
                     }
                     let ret = leftover.unwrap_or(ret);
                     let arg_tys: Vec<Type> = args.iter().map(Tree::argument_type).collect();
-                    let ret = self.subst_dependent_members(&param_tys, &arg_tys, &ret);
+                    // The current explicit clause is only `param_tys`, while
+                    // filled implicit arguments are appended to `args`. A
+                    // dependent result can select a type member from one of
+                    // those witnesses, so align against every instantiated
+                    // clause when the complete signature matches the actuals.
+                    let dependent_param_tys = match &fun.ty {
+                        Type::Method { paramss, .. } => {
+                            let flat: Vec<Type> = paramss.iter().flatten().cloned().collect();
+                            if flat.len() == arg_tys.len() {
+                                flat
+                            } else {
+                                param_tys.clone()
+                            }
+                        }
+                        _ => param_tys.clone(),
+                    };
+                    let ret = self.subst_dependent_members(&dependent_param_tys, &arg_tys, &ret);
                     let params: Vec<SymbolId> =
                         self.st.get(sym).paramss.iter().flatten().copied().collect();
                     let ret =

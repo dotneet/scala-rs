@@ -109,3 +109,230 @@ fn real_scalac_reads_inferred_and_declared_module_singletons() {
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn native_directory_forwarder_preserves_inherited_higher_kinded_arguments() {
+    let Some(library) = cached_library() else {
+        return;
+    };
+    let Some(scalac) = cached_scalac() else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root =
+        std::env::temp_dir().join(format!("scala-rs-module-hk-{}-{stamp}", std::process::id()));
+    let provider = root.join("provider");
+    fs::create_dir_all(&provider).unwrap();
+    let lib = root.join("library.scala");
+    fs::write(&lib, r#"
+package mappinglib
+trait Mapping[F[_],G[_]] { def apply[A](value:F[A]):G[A] }
+object Mapping { def id[F[_]]:Mapping[F,F] = new Mapping[F,F] { def apply[A](value:F[A]):F[A] = value } }
+trait Definition[F[_]] { val id:Mapping[F,F] = Mapping.id[F] }
+object Lists extends Definition[List]
+object Tables extends Tables
+trait Tables { case class Row(id:Int, label:String, group:Int=0, count:Int) }
+"#).unwrap();
+    let native = env!("CARGO_BIN_EXE_scala-rs");
+    let result = Command::new(native)
+        .arg("compile")
+        .arg(&lib)
+        .arg("--scala-library")
+        .arg(&library)
+        .arg("-d")
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let cp = format!("{}:{}", provider.display(), library.display());
+    for accepted in [true, false] {
+        let source = root.join(format!("client-{accepted}.scala"));
+        fs::write(
+            &source,
+            if accepted {
+                r#"case class Result(label: String, count: Int)
+object Main {
+ val local = Result(label = "ok", count = 42)
+ val row = mappinglib.Tables.Row(0, label=local.label, count=local.count, group=1)
+ val id: mappinglib.Mapping[List,List] = mappinglib.Lists.id
+ def main(args:Array[String]):Unit = println(id(List(row.count)).head)
+}"#
+            } else {
+                "object Main { val wrong: mappinglib.Mapping[Option,Option] = mappinglib.Lists.id }"
+            },
+        )
+        .unwrap();
+        for ours in [false, true] {
+            let output = root.join(format!("client-{accepted}-{ours}"));
+            fs::create_dir_all(&output).unwrap();
+            let mut command = Command::new(if ours {
+                std::path::Path::new(native)
+            } else {
+                scalac.as_path()
+            });
+            if ours {
+                command.arg("compile").arg("--scala-library").arg(&library);
+            }
+            let result = command
+                .arg(&source)
+                .arg("-cp")
+                .arg(&cp)
+                .arg("-d")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.success(),
+                accepted,
+                "ours={ours}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            if accepted {
+                let result = Command::new("java")
+                    .arg("-Xverify:all")
+                    .arg("-cp")
+                    .arg(format!("{}:{cp}", output.display()))
+                    .arg("Main")
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert_eq!(String::from_utf8_lossy(&result.stdout), "42\n");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn imported_package_aliases_survive_native_module_boundaries() {
+    let Some(library) = cached_library() else {
+        return;
+    };
+    let Some(scalac) = cached_scalac() else {
+        return;
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "scala-rs-package-alias-{}-{stamp}",
+        std::process::id()
+    ));
+    let dependency = root.join("dependency");
+    let provider = root.join("provider");
+    fs::create_dir_all(&dependency).unwrap();
+    fs::create_dir_all(&provider).unwrap();
+    let lib = root.join("library.scala");
+    fs::write(&lib, r#"
+package aliaslib {
+ trait Mapping[F[_],G[_]] { def apply[A](value:F[A]):G[A] }
+ object Mapping { def id[F[_]]:Mapping[F,F] = new Mapping[F,F] { def apply[A](value:F[A]):F[A] = value } }
+ trait Aliases { type Box[A] = List[A] }
+ object Handler { val value = 42 }
+ object Levels {
+  final case class Level(number:Int) extends AnyVal
+  val Info:Level = Level(42)
+ }
+}
+package object aliaslib extends aliaslib.Aliases {
+ type ~>[F[_],G[_]] = Mapping[F,G]
+ type Handler = Int => String
+}
+"#).unwrap();
+    let result = Command::new(&scalac)
+        .arg(&lib)
+        .arg("-cp")
+        .arg(&library)
+        .arg("-d")
+        .arg(&dependency)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let source = root.join("provider.scala");
+    fs::write(
+        &source,
+        r#"
+package provider
+import aliaslib.{Handler => Callback}
+trait Endpoint { def handler:Callback }
+object LevelsSource { def read(value:aliaslib.Levels.Level):Int = value.number }
+import aliaslib.{~>, Box, Mapping}
+object Transforms {
+ trait Definition[F[_]] { val id:F ~> F = Mapping.id[F] }
+ object Lists extends Definition[List]
+ val boxed:Box[Int] = List(42)
+}
+"#,
+    )
+    .unwrap();
+    let native = env!("CARGO_BIN_EXE_scala-rs");
+    let cp = format!("{}:{}", dependency.display(), library.display());
+    let result = Command::new(native)
+        .arg("compile")
+        .arg(&source)
+        .arg("--scala-library")
+        .arg(&library)
+        .arg("-cp")
+        .arg(&cp)
+        .arg("-d")
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let cp = format!("{}:{cp}", provider.display());
+    for (case, accepted, rejected) in [
+        ("valid", true, ""),
+        ("constructor", false, "object Main { val wrong:aliaslib.Mapping[Option,Option] = provider.Transforms.Lists.id }"),
+        ("alias", false, "object Main { val wrong:aliaslib.Handler = aliaslib.Handler }"),
+        ("value-class", false, "object Main { val wrong = provider.LevelsSource.read(42) }"),
+    ] {
+        let source = root.join(format!("client-{case}.scala"));
+        fs::write(&source, if accepted { r#"
+object Main {
+ def handler(endpoint:provider.Endpoint):Int => String = endpoint.handler
+ val callback:aliaslib.Handler = _.toString
+ val endpoint = new provider.Endpoint { def handler:aliaslib.Handler = callback }
+ val id:aliaslib.Mapping[List,List] = provider.Transforms.Lists.id
+ val boxed:List[Int] = provider.Transforms.boxed
+ def main(args:Array[String]):Unit = {
+  assert(provider.LevelsSource.read(aliaslib.Levels.Info) == boxed.head)
+  println(handler(endpoint)(id(List(boxed.head)).head))
+ }
+}"# } else { rejected }).unwrap();
+        for ours in [false, true] {
+            let output = root.join(format!("client-{case}-{ours}"));
+            fs::create_dir_all(&output).unwrap();
+            let mut command = Command::new(if ours { std::path::Path::new(native) } else { scalac.as_path() });
+            if ours { command.arg("compile").arg("--scala-library").arg(&library); }
+            let result = command.arg(&source).arg("-cp").arg(&cp).arg("-d").arg(&output).output().unwrap();
+            assert_eq!(result.status.success(), accepted, "ours={ours}: {}", String::from_utf8_lossy(&result.stderr));
+            if accepted {
+                let result = Command::new("java").arg("-Xverify:all").arg("-cp")
+                    .arg(format!("{}:{cp}", output.display())).arg("Main").output().unwrap();
+                assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+                assert_eq!(String::from_utf8_lossy(&result.stdout), "42\n");
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}

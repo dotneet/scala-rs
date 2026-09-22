@@ -848,13 +848,16 @@ impl Typer {
 
     /// An import prefix is a stable identifier, so an object always wins over
     /// a class of the same name (`import scala.util.control.Breaks._` names
-    /// the object, not the trait it also inherits from), and a written object
+    /// the object, not the trait it also inherits from). It also wins over a
+    /// same-named package stub: loading `Outer$Inner.class` can discover both
+    /// `object Outer` and a synthetic `Outer` package path, but
+    /// `import Outer.Member` still selects the stable object. A written object
     /// wins over the synthetic companion a `case class` was given.
     fn rank_import_prefixes(&self, found: Vec<SymbolId>) -> Vec<SymbolId> {
         let rank = |k: SymKind| match k {
-            SymKind::Package => Some(0),
-            SymKind::Module => Some(1),
-            SymKind::ModuleClass => Some(2),
+            SymKind::Module => Some(0),
+            SymKind::ModuleClass => Some(1),
+            SymKind::Package => Some(2),
             SymKind::Class => Some(3),
             _ => None,
         };
@@ -896,6 +899,17 @@ impl Typer {
         {
             let mcls = self.st.module_class_of(id);
             self.adopt_cp_module_class(mcls);
+            // The module can be discovered from its class file before its
+            // Scala signature is adopted. Adoption adds the package object's
+            // ordinary accessors after the initial package fold, so fold those
+            // newly discovered members as well. Otherwise loading one member
+            // through an import can make a different package-object value
+            // disappear from qualified lookup later in the same run.
+            for mem in self.st.get(mcls).members.clone() {
+                if !self.st.get(owner).members.contains(&mem) {
+                    self.st.get_mut(owner).members.push(mem);
+                }
+            }
             // The package object may have been entered by an earlier term or
             // import lookup. Its inherited type aliases are pickle-only, so
             // the already-present module must still trigger the same lazy
@@ -1350,6 +1364,14 @@ impl Typer {
                 if owner.is_none() {
                     continue;
                 }
+                // A package can expose a term from its own class files and
+                // a same-named type alias from its package object. Finding
+                // the term above must not suppress this type-only lookup.
+                let owner = if self.st.get(owner).kind == SymKind::Package {
+                    self.package_object_of(owner, span).unwrap_or(owner)
+                } else {
+                    owner
+                };
                 let member =
                     self.pickle
                         .complete_type_member(&mut self.st, &mut self.binary, owner, from);
@@ -1497,6 +1519,11 @@ impl Typer {
             }
         }
         for o in all {
+            // Collect the whole inherited set before entering it. A parent may
+            // declare an implicit that a later parent in the breadth-first
+            // walk overrides; entering both immediately makes one wildcard
+            // import look like two competing implicit candidates.
+            let mut pending: Vec<(String, Vec<SymbolId>)> = Vec::new();
             // `import o._` imports what `o` *has*, not only what it declares
             // (SLS 4.7). `cats.syntax.all` is an object whose own member list
             // is empty: every `toFlatMapOps` / `catsSyntaxApplicativeId` comes
@@ -1666,15 +1693,40 @@ impl Typer {
                     if n.ends_with('$') || n == "<init>" || hidden.iter().any(|h| h == &n) {
                         continue;
                     }
-                    // SLS 2 precedence 3: below a definition and below an
-                    // explicit import, whichever order the two are written in.
-                    self.st
-                        .enter_import_in_current(&n, m, BindRank::Wildcard, origin);
+                    if let Some((_, members)) = pending.iter_mut().find(|(name, _)| name == &n) {
+                        members.push(m);
+                    } else {
+                        pending.push((n, vec![m]));
+                    }
                 }
                 for p in self.st.get(cur).parents.clone() {
                     if let Some(ps) = self.st.class_sym_of(&p) {
                         work.push_back(ps);
                     }
+                }
+            }
+            for (name, members) in pending {
+                let implicit_members: Vec<SymbolId> = members
+                    .iter()
+                    .copied()
+                    .filter(|m| self.st.get(*m).flags.contains(Flags::IMPLICIT))
+                    .collect();
+                let mut reduced = self.drop_overridden_at(o, members);
+                // JVM forwarders do not record Scala's IMPLICIT flag and can
+                // win the general override reduction over the inherited Scala
+                // declaration. Keep the independently reduced implicit side
+                // as well; implicit search must see the source declaration,
+                // while ordinary member lookup may still use the forwarder.
+                for member in self.drop_overridden_at(o, implicit_members) {
+                    if !reduced.contains(&member) {
+                        reduced.push(member);
+                    }
+                }
+                for member in reduced {
+                    // SLS 2 precedence 3: below a definition and below an
+                    // explicit import, whichever order the two are written in.
+                    self.st
+                        .enter_import_in_current(&name, member, BindRank::Wildcard, origin);
                 }
             }
             self.st
@@ -2616,11 +2668,18 @@ impl Typer {
             // `<:<.refl`) names a companion member that was never in lexical
             // scope. Re-resolving it by name would report `not found: value
             // intType` for a reference the search had already settled.
-            if !tree.sym.is_none()
-                && self.st.get(tree.sym).name == name
-                && !tree.ty.is_error()
-                && !tree.ty.is_no_type()
-            {
+            if !tree.sym.is_none() && self.st.get(tree.sym).name == name && !tree.ty.is_error() {
+                // Macro trees may carry the compiler symbol but omit the
+                // expression type. That attribution is still authoritative:
+                // recover the type from the exact symbol instead of trying to
+                // resolve a generated unqualified name in the call-site
+                // scope. This is how a whitebox expansion can refer to an
+                // external companion value such as the tail of a generated
+                // heterogeneous list.
+                if tree.ty.is_no_type() {
+                    let resolved = tree.sym;
+                    self.bind_found(tree, vec![resolved], pt);
+                }
                 return;
             }
             self.not_found_error(tree.span, "value", &name);
@@ -3107,5 +3166,8 @@ impl Typer {
                 })
                 .unwrap_or(found[0])
         };
+        // Once value position selects a nullary alternative, its own type
+        // parameters need the same expected-type inference as a single member.
+        tree.ty = self.instantiate_parameterless(tree.sym, tree.ty.clone(), pt);
     }
 }

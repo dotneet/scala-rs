@@ -9,6 +9,9 @@ object MacroTransport {
   def repeated(args: Int*): Int = macro MacroTransportImpl.repeated
   def position: String = macro MacroTransportImpl.position
   def local: Int = macro MacroTransportImpl.local
+  def inferredStaticMember: Int = macro MacroTransportImpl.inferredStaticMember
+  def inferredNestedStaticMember: Int = macro MacroTransportImpl.inferredNestedStaticMember
+  def inferredNestedCompanionMember: Int = macro MacroTransportImpl.inferredNestedCompanionMember
   private def secret: Int = macro MacroTransportImpl.constant
 }
 package object macrotransportpkg {

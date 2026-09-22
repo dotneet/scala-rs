@@ -839,7 +839,7 @@ fn boxes_of_each_other(a: &str, b: &str) -> bool {
     boxed(a) == Some(b) || boxed(b) == Some(a)
 }
 
-fn same_type(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type) -> bool {
+pub(crate) fn same_type(st: &SymbolTable, rigid: &[SymbolId], a: &Type, b: &Type) -> bool {
     if a == b {
         return true;
     }

@@ -174,7 +174,7 @@ fn quoted(s: &str) -> String {
 }
 
 impl Typer {
-    /// `(classinfo (parents …) (decls …))` for a class or module class this
+    /// `(classinfo (parents …) (decls …) (children …))` for a class or module class this
     /// run is compiling.
     pub(crate) fn mirror_class_info(&mut self, cls: SymbolId) -> Result<String, String> {
         let name = self.st.get(cls).name.clone();
@@ -209,10 +209,19 @@ impl Typer {
             wires.push(wire);
         }
         let decls = wires;
+        let children = self
+            .st
+            .get(cls)
+            .children
+            .iter()
+            .map(|child| child.0.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
         let info = format!(
-            "(classinfo (parents {}) (decls {}))",
+            "(classinfo (parents {}) (decls {}) (children {}))",
             parents.join(" "),
-            decls.join(" ")
+            decls.join(" "),
+            children,
         );
         let params = self
             .st

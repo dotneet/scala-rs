@@ -295,8 +295,22 @@ impl Typer {
                 };
             }
             TreeKind::Ident { name } => {
+                // A macro result can carry the exact stable symbol even when
+                // that name is not imported at the call site. Preserve that
+                // attribution for stable-id patterns; otherwise an uppercase
+                // object such as a generated heterogeneous-list terminator is
+                // mistaken for a fresh method-local binder.
+                let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
                 // Stable id vs variable: if name is a known module/val, treat as stable.
-                let mut found = self.st.lookup(name);
+                let mut found = if !is_varid
+                    && !pat.sym.is_none()
+                    && self.st.get(pat.sym).name == *name
+                    && matches!(self.st.get(pat.sym).kind, SymKind::Term | SymKind::Module)
+                {
+                    vec![pat.sym]
+                } else {
+                    self.st.lookup(name)
+                };
                 // A scope that binds the name only in the *type* namespace
                 // does not hide a term of that name further out --
                 // `Typer::type_ident` already applies this rule, and a
@@ -314,7 +328,6 @@ impl Typer {
                 }
                 // A backquoted name is stable however it is spelled; the
                 // parser has already marked it.
-                let is_varid = !stable_hint && scala_rs_parser::ast::is_variable_name(name);
                 // SLS 8.1.5 wants a *stable* id here. `found[0]` can be a
                 // `def` of the same name, which nsc rejects rather than
                 // calling, so pick the value or module if the scope has one.

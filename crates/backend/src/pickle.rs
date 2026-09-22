@@ -1660,10 +1660,10 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             let sc = self.scala_module();
             let ann = self.ext_mod("annotation", Some(sc));
             self.type_ref_in(ann, "unspecialized")
-        } else if simple == "tailrec" {
+        } else if simple == "tailrec" || simple == "nowarn" {
             let sc = self.scala_module();
             let ann = self.ext_mod("annotation", Some(sc));
-            self.type_ref_in(ann, "tailrec")
+            self.type_ref_in(ann, simple)
         } else if simple == "deprecated" {
             let sc = self.scala_module();
             self.type_ref_in(sc, "deprecated")
@@ -2642,7 +2642,7 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
                             // Reflection sees a private storage field as well as
                             // the accessor. Its direct type differs from the
                             // getter's NullaryMethodType during `=:=` queries.
-                            self.pickle_storage_field(m, idx, ctor_field);
+                            self.pickle_storage_field(m, idx, is_case && ctor_field, ctor_field);
                         }
                         // A value class's *erasure* is the type of its single
                         // parameter accessor, and nsc finds that accessor by
@@ -3556,6 +3556,26 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
             return None;
         }
         let os = self.facts.get(owner);
+        if os.kind == SymKind::Package && self.facts.get(id).is_type_alias {
+            // Imported package-object aliases are entered in the package's
+            // type namespace. Reference that namespace rather than emitting
+            // a new root-owned declaration in every consumer's signature.
+            // Keep the argument references intact, including existential
+            // binders already packed by the caller.
+            let package = self.package_ref_of(&format!("{}/package", os.jvm_name));
+            let mut pb = Vec::new();
+            write_nat_to(&mut pb, package);
+            let pref = self.add(THISTPE, pb);
+            let name = self.facts.get(id).name.clone();
+            let sym = self.ext_ref_owned(&crate::classfile::encode_method_name(&name), package);
+            let mut body = Vec::new();
+            write_nat_to(&mut body, pref);
+            write_nat_to(&mut body, sym);
+            for r in arg_refs {
+                write_nat_to(&mut body, *r);
+            }
+            return Some(self.add(TYPEREFTPE, body));
+        }
         if !os.is_class_like() || !os.jvm_name.contains('/') {
             return None;
         }
@@ -4070,7 +4090,13 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
     }
 
     /// Private storage uses nsc's trailing-space name and a direct field type.
-    fn pickle_storage_field(&mut self, val_id: SymbolId, owner_ref: u32, param: bool) {
+    fn pickle_storage_field(
+        &mut self,
+        val_id: SymbolId,
+        owner_ref: u32,
+        case_accessor: bool,
+        param_accessor: bool,
+    ) {
         let s = self.facts.get(val_id);
         let local =
             s.flags.contains(Flags::PRIVATE) && s.flags.contains(Flags::LOCAL) && !s.access_widened;
@@ -4091,7 +4117,10 @@ impl<'facts, 'symbols> Pickler<'facts, 'symbols> {
         let name_ref = self.term_name(&name);
         let ty_ref = self.pickle_type(&ty);
         // PRIVATE | LOCAL stay outside bits 0–11; PARAMACCESSOR is not remapped.
-        let extra = (1u64 << 2) | (1 << 19) | if param { 1 << 29 } else { 0 };
+        let extra = (1u64 << 2)
+            | (1 << 19)
+            | if case_accessor { 1 << 24 } else { 0 }
+            | if param_accessor { 1 << 29 } else { 0 };
         let flags = pickled_from_our(flags_our, kind, extra);
         let body = self.symbol_info(name_ref, owner_ref, flags, ty_ref);
         let idx = self.add(VALSYM, body);

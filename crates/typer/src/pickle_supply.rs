@@ -576,7 +576,7 @@ impl PickleSupply {
                 && !(m.has(pflags::PRIVATE) && !m.has(pflags::BRIDGE) && !m.has(pflags::SYNTHETIC))
                 && !m.is_case_synthetic()
                 && !m.is_case_copy(sig.flags)
-                && !implicit_class_conversion_from(&internal, m)
+                && !implicit_class_conversion_from(st, class_sym, &internal, m)
             {
                 continue;
             }
@@ -1015,7 +1015,8 @@ impl PickleSupply {
             // method is `SYNTHETIC`, which `is_public_api` hides.
             if !matches!(m.kind, MemberKind::Def | MemberKind::Module)
                 || !m.has(pflags::IMPLICIT)
-                || (!m.is_public_api() && !implicit_class_conversion_from(&internal, m))
+                || (!m.is_public_api()
+                    && !implicit_class_conversion_from(st, class_sym, &internal, m))
             {
                 continue;
             }
@@ -1111,7 +1112,8 @@ impl PickleSupply {
         for member in &sig.members {
             if !matches!(member.kind, MemberKind::Def | MemberKind::Module)
                 || !member.has(pflags::IMPLICIT)
-                || (!member.is_public_api() && !implicit_class_conversion_from(&internal, member))
+                || (!member.is_public_api()
+                    && !implicit_class_conversion_from(st, class_sym, &internal, member))
             {
                 continue;
             }
@@ -1444,7 +1446,8 @@ impl PickleSupply {
                         // `is_public_api` hides.
                         if !matches!(m.kind, MemberKind::Def | MemberKind::Module)
                             || !m.has(pflags::IMPLICIT)
-                            || (!m.is_public_api() && !implicit_class_conversion_from(&internal, m))
+                            || (!m.is_public_api()
+                                && !implicit_class_conversion_from(st, class_sym, &internal, m))
                         {
                             continue;
                         }
@@ -2027,7 +2030,11 @@ impl PickleSupply {
 
     /// Return the declaration selected by [`complete_type_member`], including
     /// the synthetic declaration retained for a transparent alias.
-    fn completed_type_member_decl(&self, class_sym: SymbolId, name: &str) -> Option<SymbolId> {
+    pub(crate) fn completed_type_member_decl(
+        &self,
+        class_sym: SymbolId,
+        name: &str,
+    ) -> Option<SymbolId> {
         self.completed_type_member_decls
             .get(&(class_sym.0, name.to_string()))
             .copied()
@@ -2383,6 +2390,34 @@ impl PickleSupply {
         }
     }
 
+    /// An alias may project an inner class from an explicit class type,
+    /// rather than from its own enclosing instance. Keep that widened
+    /// prefix so selecting the alias cannot capture the selection's `this`.
+    fn with_pickled_alias_projection(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        scope: &HashMap<String, Type>,
+        owner: SymbolId,
+        name: &str,
+        ty: Type,
+    ) -> Type {
+        if !matches!(&ty, Type::Class { sym, .. } if st.is_inner_class_of_class(*sym)) {
+            return ty;
+        }
+        let prefix = st
+            .binary_alias_prefixes
+            .get(&(owner, name.to_string()))
+            .cloned();
+        let Some(prefix @ SigType::Ref { .. }) = prefix else {
+            return ty;
+        };
+        match self.conv_at(st, bin, scope, &prefix, 0) {
+            Some(pre) => crate::prefix::with_prefix(ty, pre),
+            None => ty,
+        }
+    }
+
     /// `type T[tps] = U` from a pickle, as the type it stands for.
     ///
     /// An alias is *transparent*: a nullary one is simply its right-hand side,
@@ -2457,6 +2492,8 @@ impl PickleSupply {
                 return None;
             };
             let target = self.with_pickled_this_prefix(st, bin, this_prefix, target);
+            let target =
+                self.with_pickled_alias_projection(st, bin, &owner_scope, owner, name, target);
             // Only a plain class or an existing type member can itself bind
             // an imported type name. Keep a declaration for other aliases:
             // importing `type Positive = Greater[Nat._0]` must retain the
@@ -2502,6 +2539,7 @@ impl PickleSupply {
             return None;
         };
         let target = self.with_pickled_this_prefix(st, bin, this_prefix, target);
+        let target = self.with_pickled_alias_projection(st, bin, &scope, owner, name, target);
         st.get_mut(id).ty = target;
         st.get_mut(id).is_type_alias = true;
         st.get_mut(owner).members.push(id);
@@ -2731,9 +2769,20 @@ impl PickleSupply {
             // carries is an accessor returning the module class, and the
             // module's own members are read from its own pickle when someone
             // asks for one. See `install_nested_module`.
-            if m.kind == MemberKind::Module && m.is_public_api() {
+            // Case companions are synthetic but remain source-level API.
+            // Their owner and instance/static ABI still come from the pickle.
+            let case_companion = m.kind == MemberKind::Module
+                && m.has(pflags::SYNTHETIC)
+                && !m.has(pflags::PRIVATE | pflags::LOCAL)
+                && self
+                    .sigs
+                    .class_sig(&mut BinSource(bin), &format!("{}.{name}", hit.owner), false)
+                    .is_ok_and(|sig| sig.flags & pflags::CASE != 0);
+            if m.kind == MemberKind::Module && (m.is_public_api() || case_companion) {
                 let owner = hit.owner.clone();
-                if let Some(id) = self.install_nested_module(st, bin, class_sym, &owner, name) {
+                if let Some(id) =
+                    self.install_nested_module(st, bin, class_sym, &owner, hit.owner_module, name)
+                {
                     if m.has(pflags::IMPLICIT) {
                         st.get_mut(id).flags = st.get(id).flags.with(Flags::IMPLICIT);
                         let result = match &st.get(id).ty {
@@ -2808,7 +2857,7 @@ impl PickleSupply {
                     && !m.has(pflags::SYNTHETIC))
                 && !(case_synthetic_ok && m.is_case_synthetic())
                 && !case_copy
-                && !implicit_class_conversion_from(&hit.owner, m)
+                && !implicit_class_conversion_from(st, class_sym, &hit.owner, m)
                 && !(synthetic_ok && is_default_getter(&m.name))
             {
                 continue;
@@ -3298,6 +3347,7 @@ impl PickleSupply {
         bin: &mut BinaryIndex,
         class_sym: SymbolId,
         pickle_owner: &str,
+        pickle_owner_module: bool,
         name: &str,
     ) -> Option<SymbolId> {
         let requested_owner = st
@@ -3305,11 +3355,12 @@ impl PickleSupply {
             .jvm_name
             .trim_end_matches('$')
             .replace('/', ".");
-        let decl = if requested_owner == pickle_owner {
+        let decl = if requested_owner == pickle_owner
+            && (st.get(class_sym).kind == SymKind::ModuleClass) == pickle_owner_module
+        {
             class_sym
         } else {
-            self.ensure_class(st, bin, pickle_owner, false)
-                .or_else(|| self.ensure_class(st, bin, pickle_owner, true))?
+            self.ensure_class(st, bin, pickle_owner, pickle_owner_module)?
         };
         let decl_jvm = st.get(decl).jvm_name.trim_end_matches('$').to_string();
         if decl_jvm.is_empty() {
@@ -3373,6 +3424,12 @@ impl PickleSupply {
                 id
             }
         };
+        // A directory scan may have attached this stub to the declaring
+        // class's companion. Its instance accessor belongs to the actual
+        // pickle owner; loading MODULE$ would fail for this classfile ABI.
+        st.get_mut(mcls).owner = decl;
+        st.get_mut(mcls).flags.set(Flags::JAVA, false);
+        st.get_mut(mcls).flags.set(Flags::STATIC, false);
         if module_jvm == Self::EXPR_MODULE {
             self.install_expr_apply(st, bin, mcls);
         }
@@ -4116,7 +4173,13 @@ impl PickleSupply {
         // Which pickled declaration this copy stands for. The receiver's class
         // is *not* part of it: the point is that the same declaration, pulled
         // down onto two different classes, is recognisable as one member.
-        st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}{want:?}");
+        // Source overload identity cannot be derived from the JVM descriptor:
+        // two Scala parameter types may erase to the same descriptor while
+        // remaining distinct alternatives (for example a primitive and a
+        // value-class wrapper around it). Use the pickled declaration shape,
+        // which is also stable when the same inherited member is installed on
+        // more than one receiver.
+        st.get_mut(m).pickled_origin = format!("{pickle_owner}#{jvm_member}{shape:?}");
         let mut source = BinSource(bin);
         let mut errors = Vec::new();
         st.get_mut(m).pickled_owner_bases = self
@@ -4321,6 +4384,11 @@ impl PickleSupply {
         }) else {
             return;
         };
+        // Parent completion can be the first operation on a classpath class.
+        // Its pickle types use the class's own parameters, so install those
+        // identities before converting either parents or a value class's
+        // wrapped constructor field.
+        adopt_tparam_kinds(st, class_sym, &sig);
         let mut scope: HashMap<String, Type> = HashMap::new();
         for tp in &st.get(class_sym).tparams {
             scope.insert(st.get(*tp).name.clone(), Type::TypeParam(*tp));
@@ -4378,7 +4446,20 @@ impl PickleSupply {
                     st.get_mut(class_sym).parents.push(Type::AnyVal);
                 }
                 if class_sym.0 >= st.prelude_end {
-                    ensure_value_class_field(st, bin, class_sym);
+                    let underlying = sig
+                        .members
+                        .iter()
+                        .find(|m| m.kind == MemberKind::Def && m.name == "<init>")
+                        .and_then(|m| read_shape(&m.ty))
+                        .and_then(|shape| {
+                            shape
+                                .clauses
+                                .first()
+                                .and_then(|clause| clause.params.first())
+                                .map(|param| param.ty.clone())
+                        })
+                        .and_then(|ty| self.conv(st, bin, &scope, &ty));
+                    ensure_value_class_field(st, bin, class_sym, underlying);
                 }
                 continue;
             }
@@ -4494,8 +4575,9 @@ impl PickleSupply {
                 .find(|c| bin.find_class(c).ok().flatten().is_some())
                 .unwrap_or(plain)
         };
-        if let Some(id) = self.stubs.get(&key) {
-            return Some(*id);
+        if let Some(id) = self.stubs.get(&key).copied() {
+            self.rehome_static_nested_module(st, bin, id, &key, module);
+            return Some(id);
         }
         // A Scala pickle may name a Java generic directly. Complete that
         // classfile here: returning an existing or new placeholder is not
@@ -4524,6 +4606,7 @@ impl PickleSupply {
         // stopped resolving. Breaking a member that works is worse than not
         // supplying one that does not, so the table is left alone.
         if let Some(id) = crate::classpath::find_by_jvm(st, &key) {
+            self.rehome_static_nested_module(st, bin, id, &key, module);
             self.stubs.insert(key.clone(), id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
             if !full_name.starts_with("scala.") {
@@ -4582,6 +4665,7 @@ impl PickleSupply {
             if st.get(id).jvm_name != key {
                 return None;
             }
+            self.rehome_static_nested_module(st, bin, id, &key, module);
             self.stubs.insert(key, id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
             crate::classpath::install_classpath_metadata(st, bin, id);
@@ -4756,6 +4840,67 @@ impl PickleSupply {
         Some(id)
     }
 
+    /// Put a static object nested in a companion object under that companion's
+    /// module class, even when an earlier classpath scan attached its binary
+    /// class to the ordinary class half.
+    ///
+    /// Both static and per-instance nested objects use an `Outer$Inner$`
+    /// class name.  The bytecode ABI distinguishes them: only the static
+    /// object owns a static `MODULE$` field.  Keeping the static object under
+    /// `Outer` makes its members look instance-bound and prevents macro tree
+    /// transport from spelling the stable path `Outer.Inner.member`.
+    fn rehome_static_nested_module(
+        &mut self,
+        st: &mut SymbolTable,
+        bin: &mut BinaryIndex,
+        module_class: SymbolId,
+        internal: &str,
+        requested_module: bool,
+    ) {
+        if !requested_module
+            || !is_nested_jvm_name(internal)
+            || st.get(module_class).kind != SymKind::ModuleClass
+        {
+            return;
+        }
+        let is_static = self.java_class(bin, internal).is_some_and(|jc| {
+            jc.fields.iter().any(|f| {
+                f.name == "MODULE$" && f.access & 0x0008 != 0 && f.desc == format!("L{internal};")
+            })
+        });
+        if !is_static {
+            return;
+        }
+        st.get_mut(module_class).flags = st.get(module_class).flags.with(Flags::STATIC);
+        let old_owner = st.get(module_class).owner;
+        if old_owner.is_none() || st.get(old_owner).kind != SymKind::Class {
+            return;
+        }
+        let Some(outer_module) = st.companion_module(old_owner) else {
+            return;
+        };
+        let new_owner = st.module_class_of(outer_module);
+        if new_owner == old_owner || new_owner.is_none() {
+            return;
+        }
+        let module = st.get(old_owner).members.iter().copied().find(|id| {
+            st.get(*id).kind == SymKind::Module && st.module_class_of(*id) == module_class
+        });
+        st.get_mut(old_owner)
+            .members
+            .retain(|id| *id != module_class && Some(*id) != module);
+        st.get_mut(module_class).owner = new_owner;
+        if !st.get(new_owner).members.contains(&module_class) {
+            st.get_mut(new_owner).members.push(module_class);
+        }
+        if let Some(module) = module {
+            st.get_mut(module).owner = new_owner;
+            if !st.get(new_owner).members.contains(&module) {
+                st.get_mut(new_owner).members.push(module);
+            }
+        }
+    }
+
     /// Whether `full_name`'s pickled parent chain reaches `target`, read from
     /// names alone.
     ///
@@ -4921,6 +5066,16 @@ impl PickleSupply {
         if sig.flags & pflags::TRAIT != 0 || sig.flags & pflags::INTERFACE != 0 {
             let f = st.get(id).flags;
             st.get_mut(id).flags = f.with(Flags::INTERFACE).with(Flags::TRAIT);
+        }
+        // A signature can mention a value class before any expression uses
+        // its members. Recover its underlying field now: descriptor matching
+        // must already erase a direct parameter to that field's JVM type.
+        if sig
+            .parents
+            .iter()
+            .any(|parent| matches!(parent, SigType::Ref { sym, .. } if sym == "scala.AnyVal"))
+        {
+            self.attach_parents(st, bin, id, full_name, module);
         }
         // Members are not the test for "already filled in": a class the JVM
         // loader completed from its class file has methods and still no type
@@ -5230,7 +5385,7 @@ impl PickleSupply {
 // Pickled signature -> method shape
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ShapeTParam {
     name: String,
     lo: Option<SigType>,
@@ -5243,6 +5398,7 @@ struct ShapeTParam {
     variance: i8,
 }
 
+#[derive(Debug)]
 struct Param {
     name: String,
     ty: SigType,
@@ -5251,11 +5407,13 @@ struct Param {
     flags: u64,
 }
 
+#[derive(Debug)]
 struct Clause {
     params: Vec<Param>,
     implicit: bool,
 }
 
+#[derive(Debug)]
 struct Shape {
     tparams: Vec<ShapeTParam>,
     clauses: Vec<Clause>,
@@ -5907,17 +6065,26 @@ impl PickleSupply {
                 self.conv_at(st, bin, &inner, result, d)
             }
             SigType::Ref { sym, args } => self.conv_ref(st, bin, scope, sym, args, d, 0),
-            // `this.type` stays a `this.type` of the class the member is
-            // installed on: `subst_as_seen_from` then reads it as the actual
-            // receiver, so `b ++= xs` on a `Builder[Int, List[Int]]` yields
-            // that `Builder` even though `++=` is declared by `Growable`.
-            // Widening it to the *installing* class here instead was fine
-            // while every member was installed on the receiver's own class,
-            // and wrong the moment a base class is completed in its own right.
-            SigType::This(_) => match &self.self_ty {
-                Some(Type::Class { sym, .. }) => Some(Type::ThisType(*sym)),
-                other => other.clone(),
-            },
+            // Keep the class named by the pickle. Usually it is the member's
+            // declaring class, and `subst_as_seen_from` then turns it into the
+            // actual receiver: `b ++= xs` on a `Builder[Int, List[Int]]`
+            // yields that `Builder` even though `++=` is declared by
+            // `Growable`.
+            //
+            // A nested API can instead return its *enclosing* instance:
+            // `trait Profile { trait API { implicit val profile:
+            // Profile.this.type } }`. Replacing every `This(Profile)` by the
+            // class currently being installed made that result `API.this.type`.
+            // The imported value was consequently visible but could not serve
+            // as a `Profile`. Preserving `Profile` lets the receiver's outer
+            // prefix rebind it to the concrete enclosing instance.
+            SigType::This(owner) => self
+                .ensure_class(st, bin, owner, false)
+                .map(Type::ThisType)
+                .or_else(|| match &self.self_ty {
+                    Some(Type::Class { sym, .. }) => Some(Type::ThisType(*sym)),
+                    other => other.clone(),
+                }),
             SigType::Refined { parents, decls } => {
                 self.conv_refined(st, bin, scope, parents, decls, d)
             }
@@ -6258,6 +6425,10 @@ impl PickleSupply {
     /// type, 1 for the argument of an `F[_]`-shaped parameter. Only a position
     /// that wants a constructor may be filled by an unapplied class.
     fn param_singleton(&self, path: &str) -> Option<(Type, SymbolId)> {
+        // Reference paths use encoded operator names while method
+        // declarations use source names, including in dependent results.
+        let decoded = scala_rs_pickle::names::decode_method_name(path);
+        let path = decoded.as_str();
         if let Some(ty) = self.param_singletons.get(path) {
             return self
                 .param_singleton_symbols
@@ -6588,9 +6759,14 @@ impl PickleSupply {
     ) -> Option<Type> {
         let (param, param_sym) = self.param_singleton(param_path)?;
         let cls = st.class_sym_of(&param)?;
-        let (owner_path, alias_name) = member.rsplit_once('.')?;
+        let (owner_path, alias_name) = match member.rsplit_once('.') {
+            Some((owner, name)) => (Some(owner), name),
+            None => (None, member),
+        };
         self.ensure_parents(st, bin, cls);
-        if !inherits_matching(st, cls, |base| same_class_owner(st, base, owner_path)) {
+        if owner_path.is_some_and(|owner| {
+            !inherits_matching(st, cls, |base| same_class_owner(st, base, owner))
+        }) {
             return None;
         }
         self.complete_type_member(st, bin, cls, alias_name)?;
@@ -6667,6 +6843,10 @@ impl PickleSupply {
         let short = member.rsplit_once('.').map(|(_, m)| m).unwrap_or(member);
         let pre = match scope.get(prefix) {
             Some(t) => t.clone(),
+            None if prefix.ends_with(".type") => {
+                let module = prefix.strip_suffix(".type")?;
+                Type::ModuleRef(self.ensure_class(st, bin, module, true)?)
+            }
             None => {
                 // The prefix is written in the vocabulary of the class the
                 // member was asked of, not of the class that declares it.
@@ -6701,20 +6881,31 @@ impl PickleSupply {
         let t = self.complete_type_member(st, bin, cls, short)?;
         // The prefix settled nothing: `T` came back as the same declaration
         // the fall-back path would have installed anyway.
-        if matches!(&t, Type::TypeMember(id) if st.is_deferred_type_member(*id)) {
-            return None;
+        if let Type::TypeMember(id) = &t {
+            if st.is_deferred_type_member(*id) {
+                // An abstract member keeps its declaration identity, but its
+                // stable module prefix still contributes to implicit scope.
+                if matches!(pre, Type::ModuleRef(_)) {
+                    let owners = st.type_member_prefixes.entry(id.0).or_default();
+                    if !owners.contains(&cls) {
+                        owners.push(cls);
+                    }
+                }
+                return None;
+            }
         }
         if args.is_empty() {
-            return Some(t);
+            // A projection uses the widened prefix, even when its class has
+            // no type parameters. Substituting the class's this.type here
+            // would turn Backend#Database into a different, stable path.
+            return Some(st.subst_as_seen_from_at(&pre, Some(&pre), &st.dealias(&t)));
         }
         if st.kind_arity(&t) != args.len() {
             return None;
         }
         let a = self.conv_all(st, bin, scope, args, d)?;
-        Some(Type::Applied {
-            ctor: Box::new(t),
-            args: a,
-        })
+        let applied = st.expand_applied_hk_alias(crate::symbol::apply_type_ctor(t, a));
+        Some(st.subst_as_seen_from_at(&pre, Some(&pre), &applied))
     }
 
     /// The type of a stable *value* standing as a projection prefix
@@ -6898,10 +7089,12 @@ impl PickleSupply {
             let Some(owner) = self.ensure_class(st, bin, owner_name, module) else {
                 continue;
             };
+            // An ancestor's cached declaration cannot stand for this owner's
+            // override: the latter may narrow an abstract member's bound.
             if let Some(id) = st
                 .lookup_member(owner, member)
                 .into_iter()
-                .find(|&s| st.get(s).kind == SymKind::TypeMember)
+                .find(|&s| st.get(s).kind == SymKind::TypeMember && st.get(s).owner == owner)
             {
                 return Some(Type::TypeMember(id));
             }
@@ -7046,15 +7239,28 @@ impl PickleSupply {
         let simple = scala_rs_pickle::names::decode_method_name(simple);
         // A companion's signature may exist without declaring this alias.
         // Continue to the class signature instead of treating that as a hit.
-        let (module, mut alias) = [true, false].into_iter().find_map(|module| {
+        let direct = [true, false].into_iter().find_map(|module| {
             let mut src = BinSource(bin);
             let sig = self.sigs.class_sig(&mut src, owner, module).ok()?;
             let alias = sig
                 .members_named(&simple)
                 .find(|m| m.kind == MemberKind::TypeAlias)
                 .cloned();
-            alias.map(|alias| (module, alias))
+            alias.map(|alias| (owner.to_string(), module, alias))
+        });
+        // A reference may name an alias through its package, whose scope
+        // includes the package object's members. Keep inherited aliases and
+        // their parent substitutions, just as importing the package does.
+        let (resolved_owner, module, mut alias) = direct.or_else(|| {
+            let package_object = format!("{owner}.package");
+            let (hits, _) = self
+                .sigs
+                .lookup(&mut BinSource(bin), &package_object, true, &simple);
+            hits.into_iter()
+                .find(|hit| hit.member.kind == MemberKind::TypeAlias && hit.member.is_public_api())
+                .map(|hit| (package_object, true, hit.member))
         })?;
+        let owner = resolved_owner.as_str();
         // A nested receiver can inherit an alias from a parameterized outer
         // parent: C extends Base[String], Base[A] { type B = A }. Substitute
         // the parent's A before applying alias arguments in the caller's scope.
@@ -7151,37 +7357,28 @@ fn is_default_getter(name: &str) -> bool {
     !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
 }
 
-/// Whether a pickled member may be taken as an `implicit class`'s conversion
-/// method, given the class that declares it.
-///
-/// nsc marks that method `SYNTHETIC` (`Member::is_implicit_class_conversion`),
-/// and reading it is what makes any `-cp` library's `implicit class` usable as
-/// a view at all. **`scala.*` is excluded**, for the same reason
-/// [`PickleSupply::adopt_binary_class`] refuses a prelude class outright: the
-/// standard library's implicit classes are hand-written in `prelude_*.rs`, and
-/// the pickled declaration is not a better version of them — it is a worse
-/// one, because it does not carry what those files know.
-///
-/// That is measured, not assumed. Admitting `scala.*` here took
-/// `scala.concurrent.duration.DurationInt` (a *value* class, whose receiver
-/// erases to `int`) away from `prelude_durrange.rs`, and `3.seconds` emitted
-/// an `invokevirtual` on an integer — a `VerifyError`, not a type error. It
-/// took `scala.reflect.api.Quasiquotes.Quasiquote` away from the quasiquote
-/// path, and `q"h"` became a reference to the inner object `q$` instead of a
-/// macro expansion. `run/duration-coarsest`, `run/t10513` and `pos/t5639`
-/// went with them. None of the 26 gitbucket errors this rule closes is in
-/// `scala.*`.
-///
-/// `owner` is accepted in either spelling: JVM internal (`scala/concurrent/…`)
-/// or dotted (`scala.concurrent.…`). Both carry the separator, so a package
-/// named `scalaz` is not caught by it.
-fn implicit_class_conversion_from(owner: &str, m: &scala_rs_pickle::Member) -> bool {
-    // scala.jdk converters have no hand-written prelude implementation.
-    // Their synthetic implicit-class constructors need the source signature
-    // just like a third-party library's value-class conversion.
-    let jdk = owner.starts_with("scala/jdk/") || owner.starts_with("scala.jdk.");
-    (jdk || (!owner.starts_with("scala/") && !owner.starts_with("scala.")))
-        && m.is_implicit_class_conversion()
+/// Synthetic implicit-class conversions are part of a library's source API.
+/// Preserve compiler-owned prelude declarations and the two lazy conversion
+/// models whose lowering is handled directly by the typer. A package beginning
+/// with `scala` is not by itself evidence that a library has a compiler model.
+fn implicit_class_conversion_from(
+    st: &SymbolTable,
+    class_sym: SymbolId,
+    owner: &str,
+    m: &scala_rs_pickle::Member,
+) -> bool {
+    if !m.is_implicit_class_conversion() || class_sym.0 < st.prelude_end {
+        return false;
+    }
+    let owner = owner.replace('/', ".").replace('$', ".");
+    let duration = owner.trim_end_matches('.') == "scala.concurrent.duration.package"
+        && matches!(
+            m.name.as_str(),
+            "DurationInt" | "DurationLong" | "DurationDouble"
+        );
+    let quasiquote =
+        owner.trim_end_matches('.') == "scala.reflect.api.Quasiquotes" && m.name == "Quasiquote";
+    !duration && !quasiquote
 }
 
 /// The unspecialized class a `@specialized` variant was generated from.
@@ -7443,7 +7640,19 @@ fn erased_param_desc(st: &SymbolTable, ty: &Type) -> Option<String> {
             // A direct value-class parameter uses its underlying JVM slot.
             // Reference/generic containers still keep the boxed class type.
             Type::Class { sym, .. } if st.is_value_class(*sym) => {
-                st.value_class_underlying(*sym)?
+                // A generic value class erases after substituting its actual
+                // type arguments into the wrapped field. Reading the raw
+                // field directly leaves `class Wrapper[A](val value: A)` at
+                // `A` (or at Object for a classfile-only field), so a method
+                // taking `Wrapper[Concrete]` cannot be matched to its real
+                // JVM descriptor. Share the compiler's value-class erasure,
+                // which performs that substitution before following the
+                // wrapped type.
+                let erased = crate::erasure::erase_member_ty(&cur, st);
+                if erased == cur {
+                    return None;
+                }
+                erased
             }
             Type::Class { sym, .. } => {
                 let n = st.get(*sym).jvm_name.clone();
@@ -7738,7 +7947,12 @@ fn ctor_has_unresolved_param(st: &SymbolTable, ctor: SymbolId) -> bool {
 /// `stub_nested_module` does it: entering it in the class's member list would
 /// put a second `blocking` next to the accessor the pickle supplies, and
 /// member lookup would have to choose between them.
-fn ensure_value_class_field(st: &mut SymbolTable, bin: &mut BinaryIndex, class_sym: SymbolId) {
+fn ensure_value_class_field(
+    st: &mut SymbolTable,
+    bin: &mut BinaryIndex,
+    class_sym: SymbolId,
+    pickled_underlying: Option<Type>,
+) {
     let internal = st.get(class_sym).jvm_name.clone();
     if internal.is_empty() {
         return;
@@ -7762,11 +7976,15 @@ fn ensure_value_class_field(st: &mut SymbolTable, bin: &mut BinaryIndex, class_s
     {
         st.record_value_class_getter(class_sym, f.name.clone());
     }
-    if !st.get(class_sym).ctor_fields.is_empty() {
+    if let Some(&field) = st.get(class_sym).ctor_fields.first() {
+        if let Some(underlying) = pickled_underlying {
+            st.get_mut(field).ty = underlying;
+        }
         return;
     }
     let name = f.name.rsplit("$$").next().unwrap_or(&f.name).to_string();
-    let ty = crate::classpath::field_ty_from_desc(st, &f.desc);
+    let ty =
+        pickled_underlying.unwrap_or_else(|| crate::classpath::field_ty_from_desc(st, &f.desc));
     let fid = st.alloc(&name, SymbolId::NONE, SymKind::Term, Flags::EMPTY, "");
     st.get_mut(fid).owner = class_sym;
     st.get_mut(fid).ty = ty;

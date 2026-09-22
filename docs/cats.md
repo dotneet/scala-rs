@@ -829,12 +829,15 @@ consults `SymbolTable::as_seen_from_view` the way `is_sub_type` does. Wrapping
 a value used in a hundred places to fix one caller's implicit search is too
 wide a blast radius to carry silently.
 
-The fix that shipped instead never changes the `Type` at all. `Typer` gets a
-side table, `type_member_prefixes: RefCell<HashMap<u32, Vec<SymbolId>>>`,
+The fix keeps the `Type` unchanged. `SymbolTable` holds the
+side table `type_member_prefixes: FxHashMap<u32, Vec<SymbolId>>`,
 keyed by a type member's own defining symbol; `Checker::with_prefix_if_type_member`
 (hooked into `tree_to_type`'s `AppliedTypeTree` case, right where `p.T[args]`
 resolves `p` through `qualified_type_owners`) records the module `p` denotes
-there whenever `T` stays abstract, without touching the type it returns. The
+there whenever `T` stays abstract, without touching the type it returns.
+Binary alias completion records the same information when a static module
+projection still names an abstract member, so aliases loaded from jars keep
+their module's conversions available too. The
 implicit search's `collect_type_parts` (`crates/typer/src/implicits.rs`) is
 the only reader: its new `Type::TypeMember` arm adds every module ever
 recorded for that member as an extra implicit-scope part, alongside the

@@ -59,11 +59,35 @@ impl Typer {
             }
             _ => {}
         }
+        // A top-level template is checked after its package body has restored
+        // the typer's current owner to the root.  Annotation names still live
+        // in the scope *enclosing the annotated definition*, so anchor package
+        // and inherited-name lookup at the definition symbol's owner.  Method
+        // type parameters remain out of scope, as required, because their
+        // owner is deliberately skipped here.
+        let saved_owner = self.st.owner;
+        let saved_this = self.st.this_class;
+        if !tree.sym.is_none() {
+            let lexical_owner = self.st.get(tree.sym).owner;
+            self.st.owner = lexical_owner;
+            let mut enclosing = lexical_owner;
+            while !enclosing.is_none() && !self.st.get(enclosing).is_class_like() {
+                let next = self.st.get(enclosing).owner;
+                if next == enclosing {
+                    enclosing = SymbolId::NONE;
+                    break;
+                }
+                enclosing = next;
+            }
+            self.st.this_class = enclosing;
+        }
         let saved = std::mem::replace(&mut self.resolving_annot, true);
         for a in &annots {
             self.resolve_one_annotation(a);
         }
         self.resolving_annot = saved;
+        self.st.owner = saved_owner;
+        self.st.this_class = saved_this;
     }
 
     fn resolve_one_annotation(&mut self, a: &Tree) {

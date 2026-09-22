@@ -196,3 +196,74 @@ fn function_valued_results_keep_inferred_type() {
 fn polymorphic_apply_keeps_receiver_substitution() {
     matrix(&[("functionk", true), ("functionk_bad", false)], true);
 }
+
+#[test]
+fn inferred_method_arguments_reduce_associated_type_evidence() {
+    matrix(
+        &[
+            ("associated", true),
+            ("associated_bad", false),
+            ("associated_element_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn binary_method_arguments_reduce_associated_type_evidence() {
+    let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+    if !scalac.is_file() {
+        return;
+    }
+    let root = std::env::temp_dir().join(format!(
+        "associated-library-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let result = Command::new(scalac)
+        .arg(fixture("associated"))
+        .args(["-cp", JAR, "-d"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    matrix_cp(
+        &[
+            ("associated_binary", true),
+            ("associated_binary_bad", false),
+        ],
+        false,
+        &format!("{}:{JAR}", root.display()),
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn implicit_argument_conversion_preserves_its_inferred_result() {
+    matrix(
+        &[
+            ("converted_argument", true),
+            ("converted_argument_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
+fn selected_nullary_overload_infers_from_the_expected_result() {
+    matrix(
+        &[
+            ("overloaded_nullary", true),
+            ("overloaded_nullary_bad", false),
+        ],
+        false,
+    );
+}

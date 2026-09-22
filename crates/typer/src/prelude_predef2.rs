@@ -244,12 +244,18 @@ pub(crate) fn add_predef_members(
         owner,
         "any2ArrowAssoc",
         vec![Type::Any],
-        Type::Class {
-            sym: arrow,
-            args: vec![],
-        },
+        Type::Any,
         Intrinsic::WrapArrowAssoc,
     );
+    let arrow_a = type_param(st, conv, "A");
+    st.get_mut(conv).tparams = vec![arrow_a];
+    st.get_mut(conv).ty = Type::Method {
+        paramss: vec![vec![Type::TypeParam(arrow_a)]],
+        ret: Box::new(Type::Class {
+            sym: arrow,
+            args: vec![Type::TypeParam(arrow_a)],
+        }),
+    };
     st.get_mut(conv).flags = st.get(conv).flags.with(Flags::IMPLICIT);
     if let Some(sops) = string_ops {
         let aug = method(

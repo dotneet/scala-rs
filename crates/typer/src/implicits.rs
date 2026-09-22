@@ -34,6 +34,7 @@ use crate::check::Typer;
 use crate::symbol::SymKind;
 
 mod unify;
+pub(crate) mod whitebox;
 use self::unify::{mentions_unknown, Unify};
 
 /// The conversion a view search settled on, the target type with the callee's
@@ -199,6 +200,7 @@ struct MemoEntry {
     cut: bool,
     result: ImplicitSearch,
     bindings: Vec<(SymbolId, Type)>,
+    selected_targs: Option<Vec<Type>>,
     routes: rustc_hash::FxHashMap<u32, SymbolId>,
 }
 
@@ -267,6 +269,28 @@ fn hash_type<H: std::hash::Hasher>(ty: &Type, h: &mut H) {
     }
 }
 
+/// A structural type set with exact collision checks. Keep this local to a
+/// traversal: symbol completion can change the meaning of a type between runs.
+#[derive(Default)]
+pub(crate) struct TypeSet {
+    buckets: rustc_hash::FxHashMap<u64, Vec<Type>>,
+}
+
+impl TypeSet {
+    pub(crate) fn insert(&mut self, ty: &Type) -> bool {
+        use std::hash::Hasher;
+        let mut hash = rustc_hash::FxHasher::default();
+        hash_type(ty, &mut hash);
+        let bucket = self.buckets.entry(hash.finish()).or_default();
+        if bucket.contains(ty) {
+            false
+        } else {
+            bucket.push(ty.clone());
+            true
+        }
+    }
+}
+
 fn memo_key(pt: &Type, undet: &[SymbolId], macros_disabled: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -315,6 +339,11 @@ pub(crate) fn complexity(ty: &Type) -> usize {
         Type::Refined { .. } if crate::prefix::view_prefix(ty).is_some() => {
             1 + complexity(crate::prefix::strip_view(ty))
         }
+        // A structural refinement still has the size of its parent type.
+        // Treating every `F[A] { type Out = X }` as one node made a recursive
+        // derivation over an HList tail look unchanged at every step, even
+        // though `F[H :: T]` had become `F[T]`.
+        Type::Refined { parents, .. } => 1 + parents.iter().map(complexity).sum::<usize>(),
         Type::Class { args, .. } | Type::Named { args, .. } => {
             1 + args.iter().map(complexity).sum::<usize>()
         }
@@ -981,15 +1010,15 @@ impl Typer {
             // class-side answer is `Base`'s, and `catsNonEmptySetOps` lives
             // on `NonEmptySetImpl` itself. `Type::TypeMember` has no room to
             // carry the prefix a qualified `p.T` selected it through --
-            // `Checker::with_prefix_if_type_member` records it in
-            // `Typer::type_member_prefixes` instead, keyed by `T`'s own
+            // Source selections and binary alias completion record it in
+            // `SymbolTable::type_member_prefixes`, keyed by `T`'s own
             // symbol, and this is the one place that reads it back. See
             // `docs/cats.md`'s `Newtype` note.
             Type::TypeMember(id) => {
                 if let Some(id) = self.st.class_sym_of(ty) {
                     self.collect_class_and_enclosing(id, out, seen);
                 }
-                if let Some(owners) = self.type_member_prefixes.borrow().get(&id.0) {
+                if let Some(owners) = self.st.type_member_prefixes.get(&id.0) {
                     for &owner in owners {
                         self.collect_class_and_enclosing(owner, out, seen);
                     }
@@ -1390,6 +1419,9 @@ impl Typer {
         if crate::check::type_is_erroneous(cand_res) {
             return None;
         }
+        if let Some(fit) = self.fit_whitebox_expansion(id, pt, undet, depth) {
+            return fit;
+        }
         match &*cand_ty {
             Type::Method { paramss, ret } => {
                 if paramss.iter().all(|c| c.is_empty()) {
@@ -1447,11 +1479,17 @@ impl Typer {
                 self.open_implicits
                     .borrow_mut()
                     .push((id, self.subst_undet(pt, &fit.undet)));
-                let ok = paramss.iter().flatten().all(|p| {
+                let params = self.st.get(id).params.clone();
+                let ok = paramss.iter().flatten().enumerate().all(|(index, p)| {
                     let want = crate::symbol::subst_tparams_slice(&tps, &fit.targs, p);
-                    self.search_implicit_at(&want, depth + 1).is_found()
+                    let found = self.search_implicit_at(&want, depth + 1);
+                    let ok = found.is_found()
                         || self.built_not_found(&want, depth + 1)
                         || self.conv_param_view_resolves(&want)
+                        || params.get(index).is_some_and(|pid| {
+                            self.st.get(*pid).flags.contains(Flags::DEFAULTPARAM)
+                        });
+                    ok
                 });
                 self.open_implicits.borrow_mut().pop();
                 if ok {
@@ -1628,8 +1666,34 @@ impl Typer {
                         // inferred from its result or arguments. Instantiate it
                         // at its lower bound, as for an ordinary nullary call.
                         let param = self.st.get(*tp);
+                        // Whitebox materializers may determine an associated
+                        // result type in their expansion. When the expected
+                        // type only requests the base class, that refinement
+                        // does not constrain the method's output parameter.
+                        // As in a nullary call, start it at its lower bound;
+                        // the expanded tree still has to satisfy the target.
+                        let whitebox_output = self
+                            .st
+                            .get(id)
+                            .macro_impl
+                            .as_ref()
+                            .is_some_and(|binding| !binding.blackbox)
+                            && projected.as_ref().is_some_and(|base| {
+                                !crate::check::type_mentions_tparam_deep(base, *tp)
+                            })
+                            && match &self.st.get(id).ty {
+                                Type::Method { paramss, .. } => paramss
+                                    .iter()
+                                    .flatten()
+                                    .all(|p| !crate::check::type_mentions_tparam_deep(p, *tp)),
+                                _ => true,
+                            };
                         (param.tparams.is_empty()
-                            && !crate::check::type_mentions_tparam_deep(&self.st.get(id).ty, *tp)
+                            && (whitebox_output
+                                || !crate::check::type_mentions_tparam_deep(
+                                    &self.st.get(id).ty,
+                                    *tp,
+                                ))
                             && !tps.iter().any(|other| {
                                 [&self.st.get(*other).bound_lo, &self.st.get(*other).bound_hi]
                                     .into_iter()
@@ -1789,7 +1853,8 @@ impl Typer {
         for p in paramss.iter().flatten() {
             let want = crate::symbol::subst_tparams_slice(&tps, &targs, p);
             if open.is_empty() {
-                if !self.search_implicit_at(&want, depth + 1).is_found()
+                let found = self.search_implicit_at(&want, depth + 1);
+                if !found.is_found()
                     && !self.built_not_found(&want, depth + 1)
                     && !self.conv_param_view_resolves(&want)
                 {
@@ -1800,6 +1865,7 @@ impl Typer {
             }
             let (found, binds) = self.search_implicit_undet(&want, &open, depth + 1);
             if !found.is_found() {
+                self.request_whitebox_warm(&want, &open);
                 if !open
                     .iter()
                     .any(|tp| crate::check::type_mentions_tparam_deep(&want, *tp))
@@ -2487,6 +2553,14 @@ impl Typer {
             )
         };
         let out = self.search_implicit_uncached(pt, undet, depth);
+        let selected_targs = self
+            .selected_implicit_fit
+            .borrow()
+            .as_ref()
+            .filter(|(_, selected_pt, selected_depth, _)| {
+                selected_pt == pt && *selected_depth == depth
+            })
+            .map(|(_, _, _, targs)| targs.clone());
         let (probe, cut, routes) = {
             let mut m = self.implicit_memo.borrow_mut();
             let (p, c) = (m.probe, m.cut);
@@ -2507,6 +2581,7 @@ impl Typer {
                 cut,
                 result: out.0.clone(),
                 bindings: out.1.clone(),
+                selected_targs,
                 routes,
             });
         }
@@ -2574,6 +2649,12 @@ impl Typer {
         })?;
         let out = (e.result.clone(), e.bindings.clone());
         let (probe, cut, routes) = (e.probe, e.cut, e.routes.clone());
+        let selected = match (&e.result, &e.selected_targs) {
+            (ImplicitSearch::Found(id), Some(targs)) => {
+                Some((*id, pt.clone(), depth, targs.clone()))
+            }
+            _ => None,
+        };
         let mut via = self.implicit_via_module.borrow_mut();
         if routes
             .iter()
@@ -2585,6 +2666,7 @@ impl Typer {
         m.probe |= probe;
         m.cut |= cut;
         m.routes.extend(routes);
+        *self.selected_implicit_fit.borrow_mut() = selected;
         Some(out)
     }
 
@@ -2594,8 +2676,8 @@ impl Typer {
         undet: &[SymbolId],
         depth: usize,
     ) -> (ImplicitSearch, Vec<(SymbolId, Type)>) {
-        let mut fits: Vec<(SymbolId, ImplicitFit)> = self
-            .implicits_in_scope()
+        let in_scope = self.implicits_in_scope();
+        let mut fits: Vec<(SymbolId, ImplicitFit)> = in_scope
             .into_iter()
             .filter(|id| !self.implicit_macros_disabled || self.st.get(*id).macro_impl.is_none())
             .filter_map(|id| self.implicit_fit_at(id, pt, depth, undet).map(|f| (id, f)))
@@ -2629,6 +2711,13 @@ impl Typer {
                 .map(|(_, f)| f.undet.clone())
                 .unwrap_or_default(),
             _ => Vec::new(),
+        };
+        *self.selected_implicit_fit.borrow_mut() = match &found {
+            ImplicitSearch::Found(w) => fits
+                .iter()
+                .find(|(id, _)| id == w)
+                .map(|(_, fit)| (*w, pt.clone(), depth, fit.targs.clone())),
+            _ => None,
         };
         (found, bindings)
     }
@@ -2669,7 +2758,23 @@ impl Typer {
     /// Search itself is immutable, while normal implicit application loads
     /// both witness companions and candidate inheritance before rejecting them.
     pub(crate) fn warm_conversion_witnesses(&mut self, from: &Type, to: &Type) {
-        self.warm_own_scope_once(to);
+        // A view may be declared by a nested argument's companion, for
+        // example the result inside A => Future[Result]. Complete these
+        // explicit type parts without eagerly loading unrelated base scopes.
+        let mut parts = Vec::new();
+        for ty in [from, to] {
+            crate::symbol::any_type(ty, &mut |part| {
+                if let Some(cls) = self.st.class_sym_of(part) {
+                    if !parts.contains(&cls) {
+                        parts.push(cls);
+                    }
+                }
+                false
+            });
+        }
+        for cls in parts {
+            self.warm_one_scope_pub(cls);
+        }
         let mut ids = self.implicits_in_scope();
         ids.extend(self.companion_implicits(from));
         ids.extend(self.companion_implicits(to));
@@ -3260,6 +3365,17 @@ impl Typer {
         warmed
     }
 
+    /// A macro changed the implicit environment through reflection. Keep the
+    /// active recursion path, but discard every answer derived from its old
+    /// candidate set before handling the next reverse query.
+    pub(crate) fn invalidate_implicit_caches(&self) {
+        let mut memo = self.implicit_memo.borrow_mut();
+        memo.in_scope = None;
+        memo.entries.clear();
+        memo.improves.clear();
+        memo.candidate_tys.clear();
+    }
+
     pub(crate) fn search_extension(
         &mut self,
         from: &Type,
@@ -3309,6 +3425,7 @@ impl Typer {
         let mut lexical_ids = self.implicits_in_scope();
         lexical_ids.sort_by_key(|id| id.0);
         lexical_ids.dedup();
+        lexical_ids = self.collapse_pickled_copies(lexical_ids);
         let mut companion_ids = self
             .companion_implicits(from)
             .into_iter()
@@ -3316,6 +3433,7 @@ impl Typer {
             .collect::<Vec<_>>();
         companion_ids.sort_by_key(|id| id.0);
         companion_ids.dedup();
+        companion_ids = self.collapse_pickled_copies(companion_ids);
         let mut collect = |ids: Vec<SymbolId>| {
             let mut hits = Vec::new();
             for id in ids {
@@ -3412,6 +3530,27 @@ impl Typer {
             }
             hits.sort_by_key(|(c, m, _)| (c.0, m.0));
             hits.dedup_by_key(|(c, m, _)| (c.0, m.0));
+            // A classfile scan and its Scala pickle can expose the same
+            // conversion twice on one module. Once both copies reach the
+            // same extension member with the same instantiated result, keep
+            // the pickle copy, which carries the complete Scala signature.
+            let all = hits.clone();
+            hits.retain(|(conversion, member, to)| {
+                let raw = self.st.get(*conversion);
+                if !raw.pickled_origin.is_empty() || !raw.jvm_name.is_empty() {
+                    return true;
+                }
+                !all.iter().any(|(other, other_member, other_to)| {
+                    if other == conversion || other_member != member || other_to != to {
+                        return false;
+                    }
+                    let precise = self.st.get(*other);
+                    !precise.pickled_origin.is_empty()
+                        && precise.owner == raw.owner
+                        && precise.name == raw.name
+                        && precise.tparams.len() == raw.tparams.len()
+                })
+            });
             self.drop_inherited_duplicates(&mut hits);
             self.drop_overridden_conversions(&mut hits);
             // Lexical priority applies only to applicable conversions. A
@@ -4179,7 +4318,7 @@ impl Typer {
             })
     }
 
-    fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
+    pub(crate) fn conversion_result(&self, id: SymbolId, from: &Type) -> Option<Type> {
         let _prefixes = self.import_prefix_scope();
         if !self.st.get(id).flags.contains(Flags::IMPLICIT) {
             return None;
@@ -4230,8 +4369,9 @@ impl Typer {
     fn unify_conversion_tparam(&self, tp: SymbolId, param: &Type, from: &Type) -> Option<Type> {
         // Syntax conversions infer F[_] from an applied constructor just like
         // ordinary calls. Capture surplus leading arguments: EitherT[F, E, A]
-        // supplies EitherT[F, E, *] and A, not bare EitherT and F.
-        if matches!(param, Type::Applied { .. }) {
+        // supplies EitherT[F, E, *] and A, not bare EitherT and F. Applications
+        // nested in a tuple need the same rule for views of (F[A], F[B]).
+        if crate::symbol::any_type(param, &mut |ty| matches!(ty, Type::Applied { .. })) {
             crate::check::unify_one(&self.st, tp, param, from)
         } else {
             unify_conv_tparam(tp, param, from)
@@ -5127,6 +5267,31 @@ mod memo_tests {
         assert!(!dominates(&typer, &tail, &full));
         assert!(dominates(&typer, &full, &full));
         assert!(dominates(&typer, &full, &tail));
+    }
+
+    #[test]
+    fn refined_recursive_tail_keeps_its_parent_complexity() {
+        let mut typer = Typer::new(0, &TypecheckOptions::default());
+        let root = typer.st.root;
+        let list = typer
+            .st
+            .alloc("List", root, SymKind::Class, Flags::EMPTY, "List");
+        let tail = Type::Class {
+            sym: list,
+            args: vec![Type::Int],
+        };
+        let full = Type::Class {
+            sym: list,
+            args: vec![tail.clone()],
+        };
+        let refined = |parent| Type::Refined {
+            parents: vec![parent],
+            decls: Vec::new(),
+        };
+        let refined_tail = refined(tail);
+        let refined_full = refined(full);
+        assert!(!dominates(&typer, &refined_tail, &refined_full));
+        assert!(dominates(&typer, &refined_full, &refined_full));
     }
 
     #[test]

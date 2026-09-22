@@ -156,7 +156,10 @@ impl Typer {
         let as_class: Vec<Type> = class_tps.iter().map(|t| Type::TypeParam(*t)).collect();
         let matches = params.iter().zip(ctor_tys.iter()).all(|(u, c)| {
             let u = crate::symbol::subst_tparams_slice(tparams, &as_class, u);
-            self.st.is_sub_type(&u, c) && self.st.is_sub_type(c, &u)
+            if let Some(same) = builtin_and_class_same(&self.st, &u, c) {
+                return same;
+            }
+            crate::override_check::same_type(&self.st, &class_tps, &u, c)
         });
         if !matches {
             return false;
@@ -194,5 +197,36 @@ impl Typer {
             let cs = self.st.get(c);
             cs.kind == SymKind::Class && cs.name == base && cs.flags.contains(Flags::CASE)
         })
+    }
+}
+
+/// The symbol-table subtyping fallback is deliberately permissive for an
+/// incomplete external class. That is appropriate while checking overrides,
+/// but not while deciding whether to delete a case class's generated `apply`:
+/// `apply(Int)` must remain an overload of `apply(Refined[Int, P])` even when
+/// the external `Refined` hierarchy has not been completed yet. Built-ins can
+/// appear either as their dedicated `Type` variant or as a class symbol, so
+/// compare that mixed representation explicitly before the conservative
+/// override matcher gets a chance to treat it as unknown.
+fn builtin_and_class_same(st: &crate::symbol::SymbolTable, a: &Type, b: &Type) -> Option<bool> {
+    fn builtin(st: &crate::symbol::SymbolTable, ty: &Type) -> Option<SymbolId> {
+        Some(match ty {
+            Type::Unit => st.unit_sym,
+            Type::Boolean => st.boolean_sym,
+            Type::Byte => st.byte_sym,
+            Type::Short => st.short_sym,
+            Type::Int => st.int_sym,
+            Type::Long => st.long_sym,
+            Type::Float => st.float_sym,
+            Type::Double => st.double_sym,
+            Type::Char => st.char_sym,
+            Type::String => st.string_sym,
+            _ => return None,
+        })
+    }
+    match (builtin(st, a), builtin(st, b), a, b) {
+        (Some(x), _, _, Type::Class { sym, args }) => Some(x == *sym && args.is_empty()),
+        (_, Some(y), Type::Class { sym, args }, _) => Some(y == *sym && args.is_empty()),
+        _ => None,
     }
 }
