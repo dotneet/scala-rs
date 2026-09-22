@@ -3743,3 +3743,112 @@ object Main {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn qualified_non_parameter_alias_preserves_batch_type_inference_separately() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("qualified-record-alias-batch");
+    let producer_src = dir.join("Record.scala");
+    fs::write(
+        &producer_src,
+        r#"
+package aliasrecords
+sealed trait Category
+object Category {
+  sealed trait First extends Category
+  sealed trait Second extends Category
+}
+case class Record[A <: Category](value: Int)
+object Record { type First = Record[Category.First] }
+case class Batch[A <: Category](values: Seq[Record[A]])
+object Repository { def values: Seq[Record.First] = Seq(Record[Category.First](3)) }
+"#,
+    )
+    .unwrap();
+    let consumer_src = dir.join("Main.scala");
+    fs::write(
+        &consumer_src,
+        r#"
+import aliasrecords._
+object Main {
+  def wrap(xs: Seq[Record.First]) = Batch(xs)
+  val result = wrap(Repository.values)
+  def main(args: Array[String]): Unit = println(result.values.head.value)
+}
+"#,
+    )
+    .unwrap();
+    let wrong_alias_src = dir.join("WrongAlias.scala");
+    fs::write(
+        &wrong_alias_src,
+        r#"
+import aliasrecords._
+object WrongAlias {
+  def wrap(xs: Seq[Record[Category.Second]]) = Batch(xs)
+  val result = wrap(Repository.values)
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |ours: bool, out: &Path, src: &Path, cp: &str| {
+        fs::create_dir_all(out).unwrap();
+        let mut command = if ours {
+            let mut command = Command::new(bin());
+            command.arg("compile").arg("--scala-library").arg(&jar);
+            command
+        } else {
+            Command::new(&scalac)
+        };
+        command
+            .arg("-cp")
+            .arg(cp)
+            .arg("-d")
+            .arg(out)
+            .arg(src)
+            .output()
+            .unwrap()
+    };
+
+    for producer_ours in [false, true] {
+        let producer_out = dir.join(format!("producer-{producer_ours}"));
+        let producer = compile(
+            producer_ours,
+            &producer_out,
+            &producer_src,
+            jar.to_str().unwrap(),
+        );
+        assert!(
+            producer.status.success(),
+            "producer={producer_ours}: {}{}",
+            String::from_utf8_lossy(&producer.stderr),
+            String::from_utf8_lossy(&producer.stdout)
+        );
+        let cp = format!("{}:{}", producer_out.display(), jar.display());
+
+        for consumer_ours in [false, true] {
+            let consumer_out = dir.join(format!("consumer-{producer_ours}-{consumer_ours}"));
+            let consumer = compile(consumer_ours, &consumer_out, &consumer_src, &cp);
+            assert!(
+                consumer.status.success(),
+                "producer={producer_ours}, consumer={consumer_ours}: {}{}",
+                String::from_utf8_lossy(&consumer.stderr),
+                String::from_utf8_lossy(&consumer.stdout)
+            );
+            assert_eq!(run_java(&consumer_out, &cp), "3\n");
+
+            let wrong_out = dir.join(format!("wrong-{producer_ours}-{consumer_ours}"));
+            let wrong = compile(consumer_ours, &wrong_out, &wrong_alias_src, &cp);
+            assert!(
+                !wrong.status.success(),
+                "producer={producer_ours}, consumer={consumer_ours} accepted Category.Second for Record.First: {}{}",
+                String::from_utf8_lossy(&wrong.stderr),
+                String::from_utf8_lossy(&wrong.stdout)
+            );
+        }
+    }
+    fs::remove_dir_all(dir).unwrap();
+}

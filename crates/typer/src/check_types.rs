@@ -1163,6 +1163,16 @@ impl Typer {
             return plain;
         }
         let owner = self.st.get(id).owner;
+        if !owner.is_none()
+            && self.st.get(owner).kind == SymKind::ModuleClass
+            && self.st.get(id).tparams.is_empty()
+            && !self.st.is_deferred_type_member(id)
+        {
+            // A concrete alias declared directly on a binary companion is
+            // just as transparent as an inherited alias. Keeping its symbol
+            // here hides the underlying constructor from argument inference.
+            return self.st.expand_in_type(&Type::ModuleRef(owner), &plain);
+        }
         if owner.is_none() || !matches!(self.st.get(owner).kind, SymKind::Class) {
             return plain;
         }
@@ -3443,7 +3453,10 @@ impl Typer {
                 self.pickle
                     .complete_type_member(&mut self.st, &mut self.binary, owner, name)
             {
-                return Some(t);
+                return Some(match t {
+                    Type::TypeMember(id) => self.module_path_type_member(qual, id),
+                    other => other,
+                });
             }
         }
         None
@@ -3629,6 +3642,21 @@ impl Typer {
                         }
                         if !found.is_empty() {
                             break;
+                        }
+                    }
+                }
+                // A type signature can load only the class half of a binary
+                // class/object pair. In `C.Alias`, C denotes the companion,
+                // even when no term reference has loaded it yet.
+                for id in found.clone() {
+                    if self.st.get(id).kind == SymKind::Class {
+                        if self.library_abi {
+                            self.load_companion_module(id);
+                        }
+                        if let Some(module) = self.st.companion_module(id) {
+                            if !found.contains(&module) {
+                                found.push(module);
+                            }
                         }
                     }
                 }
