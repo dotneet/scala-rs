@@ -746,6 +746,19 @@ fn implicit_macro_queries_expand_on_the_same_engine_and_restore_outer_splices() 
 }
 
 #[test]
+fn deeply_nested_generic_implicit_macro_queries_complete() {
+    let root = root();
+    let base = format!("{JAR}:{REFLECT}");
+    let implementation = root.join("deep-query-implementation");
+    compile("macronestedquery_deep", false, &implementation, &base, true);
+    let cp = format!("{}:{base}", implementation.display());
+    let output = root.join("deep-query-use");
+    compile("macronestedquery_deep_use", false, &output, &cp, true);
+    assert_eq!(run(&output, &cp), b"17\n");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn macro_tags_preserve_unapplied_binary_alias_constructors() {
     let root = root();
     let base_cp = format!("{JAR}:{REFLECT}");

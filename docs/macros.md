@@ -2868,7 +2868,10 @@ this project before.
   what the read cost). An implementation that asks a hundred questions must not be killed for how
   long scala-rs took to answer them. That leaves a macro that asks without end, which no time budget
   catches because answering costs it nothing: `MAX_ENGINE_QUERIES` (1024 per expansion) does, and
-  `MAX_QUERY_DEPTH` (16) bounds a chain of nested questions. The separate `(timing)` round trip has
+  `MAX_QUERY_DEPTH` (64) bounds a chain of nested questions, allowing product derivations that
+  recursively request evidence for each field. Implicit query results are checked for unexpanded
+  macro calls throughout the returned tree, so failed nested evidence cannot escape as a successful
+  result and be retried under the enclosing macro's implicit context. The separate `(timing)` round trip has
   its own two-second deadline. A timeout or framing failure poisons the engine and terminates its
   owned process tree before another expansion can reuse the pipe. Unix uses a dedicated process
   group; Windows creates the JVM suspended, assigns it to a kill-on-close Job Object, and only then

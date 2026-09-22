@@ -599,9 +599,12 @@ impl Typer {
                         .with_isolated_macro_failure(key, |this| {
                             this.implicit_tree(id, pt, span, depth)
                         });
-                    let selected_unexpanded_macro =
-                        self.st.get(id).macro_impl.is_some() && tree.sym == id;
                     self.adapt(&mut tree, pt);
+                    // Ordinary implicit methods can contain failed macro
+                    // evidence too. Returning those calls as a successful
+                    // witness lets an enclosing macro re-expand them under
+                    // a different open-implicit stack.
+                    self.report_macro_calls(&tree);
                     // A nested Lazy-style derivation can deliberately return a
                     // reference to a val that the enclosing macro will place in
                     // its final block. nsc keeps that unbound intermediate tree
@@ -624,7 +627,7 @@ impl Typer {
                     } else {
                         self.take_probe_errors(attempt_mark)
                     };
-                    if selected_unexpanded_macro || tree.ty.is_error() || failures.is_some() {
+                    if tree.ty.is_error() || failures.is_some() {
                         // Implicit search is transactional through materialization:
                         // a candidate whose macro (or one of its evidence macros)
                         // aborts is discarded and the next applicable candidate is
@@ -997,8 +1000,9 @@ impl Typer {
     }
 }
 
-/// How deep a chain of `c.typecheck` questions may go.
-const MAX_QUERY_DEPTH: usize = 16;
+/// Bound re-entrant `c.typecheck` and `c.inferImplicitValue` queries while
+/// allowing nested product derivations, which ask again for each field.
+const MAX_QUERY_DEPTH: usize = 64;
 
 fn wire_bool(s: Option<&Sexp>) -> Option<bool> {
     match s?.atom()? {
