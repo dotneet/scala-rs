@@ -3900,6 +3900,17 @@ pub(crate) fn unify_one_precise(
         // arguments applied), so no lambda has to be invented; and two
         // spellings of the same abstraction are structurally equal.
         Type::Applied { ctor, args: pas } => match actual {
+            // A stable result such as Await.ready(future, ...) retains
+            // future.type. Its underlying type supplies the constructor and
+            // arguments needed by a higher-kinded lambda parameter G[B].
+            Type::SingleType { sym, .. } => {
+                let underlying = st.singleton_underlying(*sym);
+                if &underlying == actual {
+                    None
+                } else {
+                    unify_one_precise(st, tp, pattern, &underlying)
+                }
+            }
             Type::Applied {
                 ctor: ac,
                 args: aas,

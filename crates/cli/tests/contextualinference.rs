@@ -97,6 +97,17 @@ fn matrix_ordered(names: &[(&str, bool)], warm: Option<&str>, cp: &str) {
 }
 
 #[test]
+fn singleton_lambda_results_infer_their_underlying_type_constructor() {
+    matrix(
+        &[
+            ("singleton_constructor", true),
+            ("singleton_constructor_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
 fn open_receiver_lower_bounds_do_not_fix_lambda_result_variables() {
     matrix(
         &[
