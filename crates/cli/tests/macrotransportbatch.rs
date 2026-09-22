@@ -864,6 +864,24 @@ fn nested_implicit_macro_derivation_keeps_associated_types_and_stable_symbols() 
         compile("macroreflection_nested_derivation", nsc, &out, &cp, true);
         assert_eq!(run(&out, &cp), b"true\n");
     }
+    // An attributed This in a binary nested companion must retain its module
+    // path even though that module is not an enclosing owner at the call site.
+    for producer in [true, false] {
+        let model = root.join(format!("binary-model-{producer}"));
+        compile("macroreflection_binary_model", producer, &model, &cp, true);
+        let binary_cp = format!("{}:{cp}", model.display());
+        for consumer in [true, false] {
+            let out = root.join(format!("binary-derivation-{producer}-{consumer}"));
+            compile(
+                "macroreflection_binary_derivation",
+                consumer,
+                &out,
+                &binary_cp,
+                true,
+            );
+            assert_eq!(run(&out, &binary_cp), b"true\n");
+        }
+    }
     fs::remove_dir_all(root).unwrap();
 }
 

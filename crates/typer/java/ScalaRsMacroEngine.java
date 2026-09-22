@@ -1699,6 +1699,17 @@ public final class ScalaRsMacroEngine {
                   .append(')');
                 return;
             }
+            // A binary object's attributed This can name an object outside
+            // the expansion site. Its stable path is not the caller's this,
+            // and a class with a companion must remain distinguishable.
+            if ("This".equals(String.valueOf(call(t, "productPrefix", 0)))
+                    && Boolean.TRUE.equals(call(sym, "isModuleClass", 0))
+                    && (Boolean.TRUE.equals(call(sym, "isStatic", 0))
+                        || hasStaticModuleField(sym))) {
+                sb.append("(sm ").append(Sexp.quote(String.valueOf(call(sym, "fullName", 0))))
+                  .append(')');
+                return;
+            }
             // Only a *static* symbol survives the trip: scala-rs resolves it
             // by full name, and a local or a parameter has no such name.
             Object isStatic = call(sym, "isStatic", 0);

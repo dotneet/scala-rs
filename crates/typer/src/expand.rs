@@ -2181,6 +2181,12 @@ impl Typer {
                     }
                     (Some(sym[1].text()), SymbolId::NONE, None)
                 }
+                (Some("sm"), 2) if kind == "This" => {
+                    if matches!(sym[1], Sexp::List(_)) {
+                        return Err("malformed returned static module descriptor".to_string());
+                    }
+                    return Ok(path_tree(&sym[1].text(), span));
+                }
                 (Some("sp"), 2) => {
                     if matches!(sym[1], Sexp::List(_)) {
                         return Err("malformed returned package symbol descriptor".to_string());
