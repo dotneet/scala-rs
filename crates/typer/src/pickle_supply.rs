@@ -603,6 +603,35 @@ impl PickleSupply {
             names.push("apply".to_string());
         }
         for name in names {
+            // The eager, compact ScalaSignature reader installs value accessors
+            // before this full pickle is available. It does not carry access
+            // flags, and a private trait accessor has an expanded JVM name, so
+            // descriptor completion below cannot replace that eager term.
+            // Restore the declaration's private access on the surviving term:
+            // a private value is not an inherited override candidate.
+            if sig.members.iter().any(|member| {
+                scala_rs_pickle::names::decode_method_name(&member.name) == name
+                    && (member.kind == MemberKind::Val || member.has(pflags::STABLE))
+                    && member.has(pflags::PRIVATE)
+                    && !member.has_private_within
+            }) {
+                let eager_terms: Vec<_> = st
+                    .get(class_sym)
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        let member = st.get(id);
+                        member.owner == class_sym
+                            && member.name == name
+                            && member.kind == SymKind::Term
+                            && member.pickled_origin.is_empty()
+                    })
+                    .collect();
+                for id in eager_terms {
+                    st.get_mut(id).flags = st.get(id).flags.with(Flags::PRIVATE);
+                }
+            }
             // What the classfile reader put there, so it can be dropped once
             // the pickle has supplied something better.
             let stale: Vec<SymbolId> = st

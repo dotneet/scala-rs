@@ -374,6 +374,121 @@ fn ov_access_may_not_narrow() {
     );
 }
 
+#[test]
+fn ov_binary_private_trait_value_is_not_inherited() {
+    let Some(library) = scala_library_jar() else {
+        return;
+    };
+    let root = tmp_dir("binary-private-trait-value");
+    let producer_src = root.join("producer.scala");
+    let consumer_src = root.join("consumer.scala");
+    let rejected_src = root.join("rejected.scala");
+    fs::write(
+        &producer_src,
+        "package accessprobe\ntrait A { private val logger: Int = 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        &consumer_src,
+        "package accessprobe\ntrait B { protected val logger: Int }\nclass C extends A with B { override protected val logger: Int = 2; def value: Int = logger }\nobject Main { def main(args: Array[String]): Unit = println(new C().value) }\n",
+    )
+    .unwrap();
+    fs::write(
+        &rejected_src,
+        "package accessprobe\nobject Rejected { def read(a: A): Int = a.logger }\n",
+    )
+    .unwrap();
+    for producer_ours in [false, true] {
+        let producer_out = root.join(format!("producer-{producer_ours}"));
+        fs::create_dir_all(&producer_out).unwrap();
+        let producer = if producer_ours {
+            Command::new(bin())
+                .args([
+                    "compile",
+                    producer_src.to_str().unwrap(),
+                    "-d",
+                    producer_out.to_str().unwrap(),
+                    "--scala-library",
+                    library.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+        } else {
+            let scalac = PathBuf::from("/tmp/scala-2.13.16/bin/scalac");
+            if !scalac.is_file() {
+                continue;
+            }
+            Command::new(scalac)
+                .args([
+                    "-classpath",
+                    library.to_str().unwrap(),
+                    "-d",
+                    producer_out.to_str().unwrap(),
+                    producer_src.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+        };
+        assert!(
+            producer.status.success(),
+            "producer ours={producer_ours}: {}",
+            String::from_utf8_lossy(&producer.stderr)
+        );
+        let cp = format!("{}:{}", producer_out.display(), library.display());
+        let consumer_out = root.join(format!("consumer-{producer_ours}"));
+        fs::create_dir_all(&consumer_out).unwrap();
+        let consumer = Command::new(bin())
+            .args([
+                "compile",
+                consumer_src.to_str().unwrap(),
+                "-cp",
+                &cp,
+                "-d",
+                consumer_out.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            consumer.status.success(),
+            "consumer of producer ours={producer_ours}: {}",
+            String::from_utf8_lossy(&consumer.stderr)
+        );
+        let run = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{}:{cp}", consumer_out.display()),
+                "accessprobe.Main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(run.stdout, b"2\n");
+        let rejected_out = root.join(format!("rejected-{producer_ours}"));
+        fs::create_dir_all(&rejected_out).unwrap();
+        let rejected = Command::new(bin())
+            .args([
+                "compile",
+                rejected_src.to_str().unwrap(),
+                "-cp",
+                &cp,
+                "-d",
+                rejected_out.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !rejected.status.success(),
+            "private trait value became accessible with producer ours={producer_ours}"
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
 // -------------------------------------------------------- 7. val / var / def
 
 #[test]
