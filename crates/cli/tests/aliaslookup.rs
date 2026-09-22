@@ -3635,3 +3635,46 @@ object Main {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn case_class_copy_does_not_see_match_binder_as_member() {
+    let source = r#"
+case class Entry(n: Int)
+case class Record(value: Option[Entry] = None, count: Int = 0) {
+  val readValue: Int = value match {
+    case Some(value) => value.n
+    case _ => 0
+  }
+  val read: () => Int = value match {
+    case Some(value) => () => value.n
+    case _ => () => 0
+  }
+  def copied: Record = copy(count = count + 1)
+}
+object Main {
+  def main(args: Array[String]): Unit = {
+    val record = Record(Some(Entry(7)))
+    println(record.copied.readValue)
+    println(record.read())
+  }
+}
+"#;
+    source_case("case-copy-match-binder", source, true, "7\n7\n");
+
+    source_case(
+        "case-copy-match-binder-bad",
+        r#"
+case class Entry(n: Int)
+case class Record(value: Option[Entry] = None, count: Int = 0) {
+  val read: Int = value match {
+    case Some(value) => value.missing
+    case _ => 0
+  }
+  def copied: Record = copy(count = count + 1)
+}
+object Main { def main(args: Array[String]): Unit = println(Record().copied.read) }
+"#,
+        false,
+        "",
+    );
+}

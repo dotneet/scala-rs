@@ -422,6 +422,9 @@ impl Typer {
                     let id =
                         self.st
                             .alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
+                    // Initializer patterns can have a class owner, but their
+                    // binders belong only to this case's lexical scope.
+                    self.st.get_mut(self.st.owner).members.retain(|m| *m != id);
                     self.st.get_mut(id).ty = sel_ty.clone();
                     self.st.enter_in_current(&n, id);
                     pat.sym = id;
@@ -495,6 +498,7 @@ impl Typer {
                 let id = self
                     .st
                     .alloc(n.clone(), self.st.owner, SymKind::Term, Flags::PARAM, "");
+                self.st.get_mut(self.st.owner).members.retain(|m| *m != id);
                 self.st.get_mut(id).ty = bind_ty.clone();
                 self.st.enter_in_current(&n, id);
                 pat.sym = id;
