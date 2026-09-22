@@ -2,4 +2,6 @@
 hello
 present
 null
+null
+7
 10

@@ -16,6 +16,29 @@ use scala_rs_parser::ast::*;
 use scala_rs_span::Span;
 
 impl Typer {
+    fn is_less_witness_type(&self, ty: &Type) -> bool {
+        matches!(ty, Type::Class { sym, .. } if self.st.get(*sym).name == "<:<")
+    }
+
+    fn implicit_witnesses_resolve(&mut self, types: &[Type]) -> bool {
+        for ty in types {
+            self.warm_implicit_scope(ty);
+            self.warm_implicit_derivation_scopes(ty);
+            *self.diverged_implicit.borrow_mut() = None;
+            if !self
+                .search_implicit_at(ty, self.implicit_search_depth)
+                .is_found()
+                && (!self.warm_implicit_candidates(std::slice::from_ref(ty))
+                    || !self
+                        .search_implicit_at(ty, self.implicit_search_depth)
+                        .is_found())
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Declaration parameters corresponding to the first clause still present
     /// in `tree.ty`.
     ///
@@ -1681,7 +1704,50 @@ impl Typer {
         let (undet, ret, from_pt) = if undet.is_empty() || is_callee {
             (undet, ret, from_pt)
         } else {
-            self.pin_lower_bounded_implicit_tparams(tree, &undet);
+            // A lower bound is the preferred solution for implicit-only
+            // parameters (`sorted[B >: A](implicit Ordering[B])`), but it can
+            // fail the very implicit clause that is meant to constrain the
+            // result. `Option.orNull[A1 >: A](implicit Null <:< A1): A1` is
+            // the important case: `Option[Int].orNull` in an `Any` context
+            // must retry with `A1 = Any` after `<:<[Null, Int]` fails.
+            // Keep the lower-bound preference whenever its witnesses resolve.
+            let expected_covers_undet = undet
+                .iter()
+                .all(|tp| from_pt.iter().any(|(id, _)| id == tp));
+            let expected_less_witnesses = if expected_covers_undet && !from_pt.is_empty() {
+                let ids: Vec<_> = from_pt.iter().map(|(id, _)| *id).collect();
+                let vals: Vec<_> = from_pt.iter().map(|(_, ty)| ty.clone()).collect();
+                let expected_ty = crate::symbol::subst_tparams_slice(&ids, &vals, &tree.ty);
+                match expected_ty {
+                    Type::Method { paramss, .. } => paramss
+                        .first()
+                        .filter(|ps| ps.len() == first.len())
+                        .filter(|ps| ps.iter().all(|p| self.is_less_witness_type(p)))
+                        .map(|ps| self.implicit_witnesses_resolve(ps))
+                        .unwrap_or(false),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            let lower_less_witnesses = if expected_less_witnesses {
+                let mut lower_tree = tree.clone();
+                self.pin_lower_bounded_implicit_tparams(&mut lower_tree, &undet);
+                match &lower_tree.ty {
+                    Type::Method { paramss, .. } => paramss
+                        .first()
+                        .filter(|ps| ps.len() == first.len())
+                        .filter(|ps| ps.iter().all(|p| self.is_less_witness_type(p)))
+                        .map(|ps| self.implicit_witnesses_resolve(ps))
+                        .unwrap_or(false),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !expected_less_witnesses || lower_less_witnesses {
+                self.pin_lower_bounded_implicit_tparams(tree, &undet);
+            }
             let ret = match &tree.ty {
                 Type::Method { ret, .. } => (**ret).clone(),
                 _ => return,

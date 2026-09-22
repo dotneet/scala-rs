@@ -452,6 +452,11 @@ fn scala_library_dual_run_conformty() {
 }
 
 #[test]
+fn conformty_or_null_int_cannot_unbox_null() {
+    compile_fails_lib("conformty_or_null_int_bad", "no implicit");
+}
+
+#[test]
 fn fixtures_conformty_bad_is_error() {
     compile_fails_lib("conformty_bad", "no implicit");
 }

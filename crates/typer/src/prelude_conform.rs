@@ -195,16 +195,10 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
     // search for `A <:< B` lands on `<:<.refl` like real scalac's does.
     install_conforms_member(st);
 
-    // `Option[A].orNull(implicit ev: Null <:< A): A`.
-    // nsc's real signature introduces a fresh `A1 >: A`; we reuse `Option`'s
-    // own (already-concrete-at-any-call-site) type param instead, since this
-    // typer's implicit-clause auto-fill (`adapt_implicit_apply` in check.rs)
-    // only fires for a symbol with *no* unsubstituted type params of its own.
-    // The two coincide for every real use (`Option[String].orNull` etc.); the
-    // only thing lost is the (rarely used) upcast to an unrelated nullable
-    // supertype, which would fail to find a witness under the invariant form
-    // anyway only when `A` itself isn't nullable — exactly when real scalac
-    // rejects `orNull` too (e.g. `Option[Int].orNull`).
+    // `Option[A].orNull[A1 >: A](implicit ev: Null <:< A1): A1`.
+    // Keep the fresh result type parameter: an expected reference supertype
+    // (for example `Any` in a generated field-number match) can widen
+    // `Option[Int].orNull`, just as the real library method does.
     let o = st.option_sym;
     if st
         .get(o)
@@ -214,6 +208,11 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
     {
         let ta = Type::TypeParam(st.get(o).tparams[0]);
         let or_null = st.alloc("orNull", o, SymKind::Method, Flags::FINAL, "");
+        let a1 = type_param(st, or_null, "A1");
+        st.get_mut(a1).bound_lo = Some(ta);
+        st.get_mut(a1).bound_hi = Some(Type::Any);
+        st.get_mut(or_null).tparams = vec![a1];
+        let result = Type::TypeParam(a1);
         let ev = st.alloc(
             "ev",
             or_null,
@@ -223,14 +222,14 @@ pub fn install(st: &mut SymbolTable, library_abi: bool) {
         );
         let ev_ty = Type::Class {
             sym: less,
-            args: vec![Type::Null, ta.clone()],
+            args: vec![Type::Null, result.clone()],
         };
         st.get_mut(ev).ty = ev_ty.clone();
         st.get_mut(or_null).params = vec![ev];
         st.get_mut(or_null).paramss = vec![vec![ev]];
         st.get_mut(or_null).ty = Type::Method {
             paramss: vec![vec![ev_ty]],
-            ret: Box::new(ta),
+            ret: Box::new(result),
         };
     }
 
