@@ -2223,7 +2223,8 @@ impl Typer {
             .or_else(|| self.implicit_targs(id, &ret, pt))
             .unwrap_or_default();
         let mut reference = reference;
-        if self.st.get(id).macro_impl.is_some() && !targs.is_empty() {
+        if (self.st.get(id).macro_impl.is_some() || self.macro_query_depth > 0) && !targs.is_empty()
+        {
             let args = targs
                 .iter()
                 .map(|ty| {

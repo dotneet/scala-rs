@@ -17,6 +17,7 @@ use crate::check::Typer;
 pub(super) struct Unify<'a> {
     typer: &'a Typer,
     unknowns: rustc_hash::FxHashSet<u32>,
+    own_unknowns: rustc_hash::FxHashSet<u32>,
     /// The subset of `unknowns` allowed to stand for a *type constructor*.
     ///
     /// Only the candidate's own parameters are: solving
@@ -52,6 +53,7 @@ impl<'a> Unify<'a> {
         Unify {
             typer,
             unknowns,
+            own_unknowns: ctor_unknowns.clone(),
             ctor_unknowns,
             bound: rustc_hash::FxHashMap::default(),
         }
@@ -364,6 +366,66 @@ impl<'a> Unify<'a> {
                     // Join[T, T, T] must infer T from Out before checking that
                     // the two inputs conform to it.
                     for invariant_pass in [true, false] {
+                        if !invariant_pass {
+                            // When the output is still open, repeated
+                            // contravariant inputs constrain a shared type
+                            // parameter to their least common supertype.
+                            // `Lub[T, T, T]` against
+                            // `Lub[TaggedA, TaggedB, ?Out]` needs T to become
+                            // their join before ?Out can be inferred.
+                            let mut lower: rustc_hash::FxHashMap<u32, Vec<&Type>> =
+                                rustc_hash::FxHashMap::default();
+                            for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
+                                let Some(id) = self.unknown_of(x) else {
+                                    continue;
+                                };
+                                if !self.own_unknowns.contains(&id)
+                                    || self.bound.contains_key(&id)
+                                    || mentions_unknown(y, &self.unknowns)
+                                {
+                                    continue;
+                                }
+                                let flags = variances
+                                    .get(i)
+                                    .map(|&tp| self.typer.st.get(tp).flags)
+                                    .unwrap_or(Flags::EMPTY);
+                                if flags.contains(Flags::CONTRAVARIANT) {
+                                    lower.entry(id).or_default().push(y);
+                                }
+                            }
+                            for (id, inputs) in lower {
+                                if inputs.len() > 1 {
+                                    let join =
+                                        inputs[1..].iter().fold(inputs[0].clone(), |acc, ty| {
+                                            self.typer.st.lub(&acc, ty)
+                                        });
+                                    // Existential intersections can be precise
+                                    // joins, but a polymorphic implicit needs
+                                    // a ground type argument to materialize.
+                                    let join = match &join {
+                                        Type::Refined { parents, .. }
+                                            if crate::symbol::any_type(&join, &mut |t| {
+                                                matches!(t, Type::BoundedWildcard { .. })
+                                            }) =>
+                                        {
+                                            parents
+                                                .iter()
+                                                .find(|parent| {
+                                                    inputs.iter().all(|input| {
+                                                        self.typer.st.is_sub_type(input, parent)
+                                                    })
+                                                })
+                                                .cloned()
+                                                .unwrap_or(join)
+                                        }
+                                        _ => join,
+                                    };
+                                    if !self.bind(id, &join) {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
                         for (i, (x, y)) in a1.iter().zip(a2.iter()).enumerate() {
                             let flags = variances
                                 .get(i)

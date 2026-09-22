@@ -1497,9 +1497,10 @@ impl Typer {
                 }
                 // The result type did not really determine this candidate: one
                 // of its own parameters came back standing for a *call site*
-                // parameter the search still has to solve, so the clause search
-                // above asked for a type with a free parameter in it and could
-                // not have answered. `tableShape[Level, T, C <: AbstractTable[_]]
+                // parameter the search still has to solve, or an own type
+                // parameter carried through a refined result, so the clause
+                // search above asked for a type with a free parameter in it
+                // and could not have answered. `tableShape[Level, T, C <: AbstractTable[_]]
                 // (implicit ev: C <:< AbstractTable[T]): Shape[Level, C, T, C]`
                 // against `Shape[_ <: FlatShapeLevel, Accounts, ?T, ?G]` is the
                 // case: `C` and `?G` are `Accounts`, and the candidate's `T`
@@ -1509,7 +1510,8 @@ impl Typer {
                 if fit.targs.iter().any(|t| {
                     undet
                         .iter()
-                        .any(|d| crate::check::type_mentions_tparam(t, *d))
+                        .chain(tps.iter())
+                        .any(|d| crate::check::type_mentions_tparam_deep(t, *d))
                 }) {
                     return self.implicit_fit_open(id, ret, pt, undet, paramss, depth);
                 }

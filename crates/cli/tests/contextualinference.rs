@@ -226,6 +226,22 @@ fn failed_derived_evidence_does_not_claim_an_implicit_view() {
 }
 
 #[test]
+fn three_field_configured_derivation_materializes_nested_evidence() {
+    let Some(jars) = cached_circe() else {
+        eprintln!("skip: Circe derivation jars are not cached");
+        return;
+    };
+    let cp = format!(
+        "{JAR}:{}",
+        jars.iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(":")
+    );
+    matrix_cp(&[("configured_three_fields", true)], false, &cp);
+}
+
+#[test]
 fn explicit_macro_abort_in_view_evidence_remains_an_error() {
     let Some(jars) = cached_circe() else {
         eprintln!("skip: Scala macro jars are not cached");
@@ -345,6 +361,7 @@ fn cached_circe() -> Option<Vec<PathBuf>> {
         "com/chuusai/shapeless_2.13/2.3.13/shapeless_2.13-2.3.13.jar",
         "io/circe/circe-core_2.13/0.14.7/circe-core_2.13-0.14.7.jar",
         "io/circe/circe-generic_2.13/0.14.7/circe-generic_2.13-0.14.7.jar",
+        "io/circe/circe-generic-extras_2.13/0.14.3/circe-generic-extras_2.13-0.14.3.jar",
         "io/circe/circe-numbers_2.13/0.14.7/circe-numbers_2.13-0.14.7.jar",
         "org/typelevel/cats-core_2.13/2.11.0/cats-core_2.13-2.11.0.jar",
         "org/typelevel/cats-kernel_2.13/2.11.0/cats-kernel_2.13-2.11.0.jar",
