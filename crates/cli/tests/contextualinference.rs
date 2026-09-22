@@ -250,6 +250,17 @@ fn residual_overload_clauses() {
 }
 
 #[test]
+fn inherited_generic_overloaded_method_values() {
+    matrix(
+        &[
+            ("overload_eta_generic", true),
+            ("overload_eta_bound_bad", false),
+        ],
+        false,
+    );
+}
+
+#[test]
 fn nested_overloaded_receivers_keep_the_outer_type_arguments() {
     matrix(
         &[("chain_nested", true), ("chain_nested_bad", false)],

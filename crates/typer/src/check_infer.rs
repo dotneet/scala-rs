@@ -4235,7 +4235,7 @@ impl Typer {
         let alts = self.drop_overridden(self.overload_alternatives(tree.sym, &name));
         let instantiated = self.overload_member_types.get(&tree.sym.0).cloned();
         let (want_params, want_ret) = want;
-        let mut hit: Option<(SymbolId, Type)> = None;
+        let mut hit: Option<(SymbolId, Type, bool)> = None;
         for m in alts {
             let ty = instantiated
                 .as_ref()
@@ -4248,9 +4248,47 @@ impl Typer {
             if params.len() != want_params.len() {
                 continue;
             }
+            // Applicability of a polymorphic method value is checked after
+            // instantiating its parameters from the expected function domain.
+            // In particular, Seq.indexOf[B >: A] must accept an A => Int
+            // prototype before competing with its two-argument overload.
+            let prototype = Type::Function {
+                params: want_params.clone(),
+                ret: Box::new(want_ret.clone()),
+            };
+            let raw_params = params.clone();
+            let (params, result) = self.solve_eta_tparams(m, params, (**ret).clone(), &prototype);
+            // A method bound can mention its enclosing class's parameters.
+            // Check it through the selected receiver: B >: A on Base[String]
+            // must not become B := Int merely because the raw A was open.
+            if let TreeKind::Select { qual, .. } = &tree.kind {
+                let inst = self.infer_method_tparams(m, &raw_params, &params);
+                let ids: Vec<_> = inst.iter().map(|(id, _)| *id).collect();
+                let vals: Vec<_> = inst.iter().map(|(_, ty)| ty.clone()).collect();
+                let valid = inst.iter().all(|(id, ty)| {
+                    let parameter = self.st.get(*id);
+                    [(&parameter.bound_lo, false), (&parameter.bound_hi, true)]
+                        .into_iter()
+                        .all(|(bound, upper)| {
+                            let Some(bound) = bound else { return true };
+                            let bound = self.st.subst_as_seen_from(&qual.ty, bound);
+                            let bound = crate::symbol::subst_tparams_slice(&ids, &vals, &bound);
+                            mentions_any_tparam(&bound)
+                                || if upper {
+                                    self.st.is_sub_type(ty, &bound)
+                                        || self.st.hk_ctor_meets_proper_bound(ty, &bound)
+                                } else {
+                                    self.st.is_sub_type(&bound, ty)
+                                }
+                        })
+                });
+                if !valid {
+                    continue;
+                }
+            }
             let as_fn = Type::Function {
                 params: params.clone(),
-                ret: ret.clone(),
+                ret: Box::new(result),
             };
             let fits = self.st.is_sub_type(
                 &as_fn,
@@ -4267,12 +4305,10 @@ impl Typer {
             // could); the exact one wins, as it does for an application.
             let exact = params == want_params;
             match &hit {
-                None => hit = Some((m, ty)),
-                Some((_, prev)) => {
-                    let prev_exact = matches!(prev, Type::Method { paramss, .. }
-                        if paramss.iter().flatten().cloned().collect::<Vec<_>>() == want_params);
+                None => hit = Some((m, ty, exact)),
+                Some((_, _, prev_exact)) => {
                     if exact && !prev_exact {
-                        hit = Some((m, ty));
+                        hit = Some((m, ty, exact));
                     } else if !prev_exact {
                         // Ambiguous: leave the overload alone.
                         return;
@@ -4280,7 +4316,7 @@ impl Typer {
                 }
             }
         }
-        if let Some((m, ty)) = hit {
+        if let Some((m, ty, _)) = hit {
             tree.sym = m;
             tree.ty = ty;
         }
