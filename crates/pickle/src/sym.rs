@@ -882,6 +882,39 @@ impl Builder<'_> {
         }
     }
 
+    fn static_module_owner(&self, id: Idx, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        self.p.entry(id).is_some_and(|entry| {
+            matches!(entry, Entry::ExtModClassRef { .. })
+                || entry.sym_info().is_some_and(|info| {
+                    info.has(pflags::PACKAGE)
+                        || (info.has(pflags::MODULE)
+                            && self.static_module_owner(info.owner, depth + 1))
+                })
+        })
+    }
+
+    fn static_singleton_prefix(&self, id: Idx, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match self.p.entry(id) {
+            Some(Entry::ThisTpe(owner)) => self.static_module_owner(*owner, depth + 1),
+            Some(Entry::SingleTpe { prefix, sym }) => {
+                let module = self.p.entry(*sym).is_some_and(|entry| {
+                    matches!(entry, Entry::ExtRef { .. } | Entry::ExtModClassRef { .. })
+                        || entry.sym_info().is_some_and(|info| {
+                            info.has(pflags::MODULE) || info.has(pflags::PACKAGE)
+                        })
+                });
+                module && self.static_singleton_prefix(*prefix, depth + 1)
+            }
+            _ => false,
+        }
+    }
+
     fn ty(&mut self, id: Idx, depth: u32) -> SigType {
         if depth > 64 {
             return SigType::None;
@@ -963,30 +996,28 @@ impl Builder<'_> {
                 // A class's stable field also has a Single(This(owner), field)
                 // prefix. Only a package-owned singleton is a static module;
                 // treating an instance field as one loses its refined members.
-                let static_singleton = match self.p.entry(prefix) {
-                    Some(Entry::SingleTpe { prefix, .. }) => match self.p.entry(*prefix) {
-                        Some(Entry::ThisTpe(owner)) => self.p.entry(*owner).is_some_and(|entry| {
-                            matches!(entry, Entry::ExtModClassRef { .. })
-                                || entry
-                                    .sym_info()
-                                    .is_some_and(|info| info.has(pflags::PACKAGE))
-                        }),
-                        _ => false,
-                    },
-                    _ => false,
-                };
+                let static_singleton = self.static_singleton_prefix(prefix, 0);
                 let name = match (parameter_path, prefix_ty) {
                     (Some(path), _) => format!("{path}#{name}"),
+                    (_, SigType::This(module)) if static_singleton => {
+                        // Package prefixes already identify their declarations.
+                        // Only a module's this type supplies a stable receiver.
+                        if matches!(self.p.entry(prefix), Some(Entry::ThisTpe(id))
+                            if self.p.entry(*id).and_then(|e| e.sym_info())
+                                .is_some_and(|i| i.has(pflags::MODULE) && !i.has(pflags::PACKAGE)))
+                        {
+                            format!("{module}.type#{name}")
+                        } else {
+                            name
+                        }
+                    }
                     (
                         _,
                         SigType::Single {
-                            prefix,
+                            prefix: _,
                             sym: module,
                         },
-                    ) if static_singleton
-                        && matches!(&*prefix, SigType::This(package)
-                            if module.rsplit_once('.').is_some_and(|(owner, _)| owner == package)) =>
-                    {
+                    ) if static_singleton => {
                         // A static object's inherited alias can mention its
                         // receiver's this.type. The declaring trait alone
                         // loses that receiver: Op.Impl[A] must keep Op.type

@@ -1238,9 +1238,11 @@ import breeze.numerics.exp
 object Main {
   val doubleValue: Double = exp.expDoubleImpl.apply(0.0)
   val floatValue: Float = exp.expFloatImpl.apply(0.0f)
+  val inferred: Double = exp(0.0)
   def main(args: Array[String]): Unit = {
     println(doubleValue)
     println(floatValue)
+    println(inferred)
   }
 }
 "#,
@@ -1281,7 +1283,7 @@ object Main {
             "native={native}: {}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert_eq!(result.stdout, b"1.0\n1.0\n");
+        assert_eq!(result.stdout, b"1.0\n1.0\n1.0\n");
     }
     fs::remove_dir_all(root).unwrap();
 }
