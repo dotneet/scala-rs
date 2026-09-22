@@ -284,3 +284,11 @@ fn covariant_results_minimize_materialized_tags() {
 fn inferred_join_retains_independent_common_traits() {
     matrix(&[("intersection_join", true)], false);
 }
+
+#[test]
+fn by_name_nothing_does_not_fix_fold_result_type() {
+    matrix(
+        &[("fold_nothing", true), ("fold_nothing_bad", false)],
+        false,
+    );
+}

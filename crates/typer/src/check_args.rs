@@ -1462,7 +1462,26 @@ impl Typer {
                 }
             })
             .collect();
-        let inst = self.infer_method_tparams(sym, &orig_for_infer, &arg_tys);
+        let residual = match &self.st.get(sym).ty {
+            Type::Method { paramss, ret } => Type::Function {
+                params: paramss
+                    .iter()
+                    .skip(clause_idx + 1)
+                    .flatten()
+                    .cloned()
+                    .collect(),
+                ret: ret.clone(),
+            },
+            ty => ty.clone(),
+        };
+        let inst: Vec<_> = self
+            .infer_method_tparams(sym, &orig_for_infer, &arg_tys)
+            .into_iter()
+            .filter(|(tp, ty)| {
+                !matches!(ty, Type::Nothing)
+                    || !self.nothing_solution_retracted(*tp, &residual, &Type::NoType)
+            })
+            .collect();
         if inst.is_empty() {
             return tys;
         }

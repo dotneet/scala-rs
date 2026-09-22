@@ -12,6 +12,19 @@ use crate::check::*;
 use crate::ops_shape::OpsSlot;
 use scala_rs_parser::ast::*;
 
+// A curried call still consumes the later clauses. Their variance matters
+// when deciding whether a bottom-type solution is final: Option.fold(throw
+// e)(f) must let f determine B, although the final result B is covariant.
+fn remaining_application_result(fun_ty: &Type, ret: &Type) -> Type {
+    match fun_ty {
+        Type::Method { paramss, .. } if paramss.len() > 1 => Type::Function {
+            params: paramss.iter().skip(1).flatten().cloned().collect(),
+            ret: Box::new(ret.clone()),
+        },
+        _ => ret.clone(),
+    }
+}
+
 impl Typer {
     /// Every application gets its own set of undetermined type variables: an
     /// argument of *this* call is typed by a nested `type_apply`, whose
@@ -1754,6 +1767,7 @@ impl Typer {
                                 &arg_tys,
                                 recv_ty.as_ref(),
                             );
+                            let inference_ret = remaining_application_result(&fun.ty, &ret);
                             // nsc's `adjustTypeArgs`: a `Nothing` the arguments
                             // inferred is *retracted* -- the parameter stays
                             // undetermined for the expected type or the enclosing
@@ -1770,7 +1784,7 @@ impl Typer {
                                 .into_iter()
                                 .filter(|(tp, t)| {
                                     !matches!(t, Type::Nothing)
-                                        || !self.nothing_solution_retracted(*tp, &ret, pt)
+                                        || !self.nothing_solution_retracted(*tp, &inference_ret, pt)
                                 })
                                 .collect();
                             // A function literal has not been typed yet; the
@@ -2373,6 +2387,12 @@ impl Typer {
                                         !t.is_no_type()
                                             && !t.is_error()
                                             && !type_mentions_tparam(t, tp)
+                                            && (!matches!(t, Type::Nothing)
+                                                || !self.nothing_solution_retracted(
+                                                    tp,
+                                                    &remaining_application_result(&fun.ty, &ret),
+                                                    pt,
+                                                ))
                                     });
                                 if let Some(t) = hit {
                                     // nsc's `instantiateExpecting`: where the
@@ -2707,6 +2727,7 @@ impl Typer {
                                     }
                                 })
                                 .collect();
+                            let inference_ret = remaining_application_result(&fun.ty, &ret);
                             let inst: Vec<(SymbolId, Type)> = self
                                 .infer_method_tparams_in(
                                     sym,
@@ -2756,7 +2777,7 @@ impl Typer {
                                     // PartialFunction[Throwable, Nothing]`
                                     // (`util/control/Exception.scala:274-276`).
                                     let nothing_ok =
-                                        self.tparam_variance_in(&ret, *id, 1) == Some(1);
+                                        self.tparam_variance_in(&inference_ret, *id, 1) == Some(1);
                                     !t.is_no_type()
                                         && !t.is_error()
                                         && (!matches!(t, Type::Nothing) || nothing_ok)
