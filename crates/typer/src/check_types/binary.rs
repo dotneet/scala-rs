@@ -1266,6 +1266,17 @@ impl Typer {
             if c.is_none() || !walked.insert(c.0) {
                 continue;
             }
+            // A discovered companion can declare no implicits of its own
+            // while inheriting all of them. Complete its binary parent list
+            // before walking it, even when no member name caused completion.
+            // Keep the hand-modeled standard-library hierarchy intact.
+            if c.0 >= self.st.prelude_end
+                && !self.st.is_source_class(c)
+                && !self.st.get(c).jvm_name.starts_with("scala/")
+            {
+                self.pickle
+                    .ensure_parents(&mut self.st, &mut self.binary, c);
+            }
             // Directory discovery or a binary type reference can have
             // installed the companion already, without its implicit flags.
             // Read only its implicit declarations, just as lazy jar discovery

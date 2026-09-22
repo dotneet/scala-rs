@@ -1834,6 +1834,108 @@ object Main { def main(args: Array[String]): Unit = { println(Wrapper("hello").l
 }
 
 #[test]
+fn protected_member_uses_inherited_companion_witness_after_separate_compilation() {
+    let Some(jar) = scala_library_jar() else {
+        return;
+    };
+    let Some(scalac) = scalac() else { return };
+    let dir = tmp_dir("protected-witness-separate");
+    let lib = build_lib_jar(&dir);
+    let wrapper_src = dir.join("Wrapper.scala");
+    fs::write(
+        &wrapper_src,
+        r#"
+package nested
+
+case class Wrapper(protected val value: String) extends alib.ProtectedBase[String] {
+  def content: String = value
+}
+object Wrapper extends alib.ProtectedFactory[String, Wrapper] {
+  def extract(c: Wrapper): String = c.content
+}
+"#,
+    )
+    .unwrap();
+    let main_src = dir.join("Main.scala");
+    fs::write(
+        &main_src,
+        r#"
+import nested.Wrapper
+
+object Main {
+  def main(args: Array[String]): Unit = println(new Wrapper("hello").length)
+}
+"#,
+    )
+    .unwrap();
+
+    let compile = |ours: bool, out: &Path, src: &Path, cp: &str| {
+        if ours {
+            let output = Command::new(bin())
+                .arg("compile")
+                .arg(src)
+                .arg("-d")
+                .arg(out)
+                .arg("-cp")
+                .arg(cp)
+                .arg("--scala-library")
+                .arg(&jar)
+                .output()
+                .unwrap();
+            (
+                output.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                ),
+            )
+        } else {
+            let output = Command::new(&scalac)
+                .arg("-cp")
+                .arg(cp)
+                .arg("-d")
+                .arg(out)
+                .arg(src)
+                .output()
+                .unwrap();
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        }
+    };
+
+    for producer in [false, true] {
+        let wrapper_out = dir.join(format!("wrapper-{producer}"));
+        fs::create_dir_all(&wrapper_out).unwrap();
+        let (ok, diagnostic) = compile(producer, &wrapper_out, &wrapper_src, lib.to_str().unwrap());
+        assert!(ok, "producer={producer}: {diagnostic}");
+
+        for consumer in [false, true] {
+            let main_out = dir.join(format!("main-{producer}-{consumer}"));
+            fs::create_dir_all(&main_out).unwrap();
+            let cp = format!("{}:{}", lib.display(), wrapper_out.display());
+            let (ok, diagnostic) = compile(consumer, &main_out, &main_src, &cp);
+            assert!(ok, "producer={producer}, consumer={consumer}: {diagnostic}");
+            assert_eq!(
+                run_java(
+                    &main_out,
+                    &format!(
+                        "{}:{}:{}",
+                        wrapper_out.display(),
+                        jar.display(),
+                        lib.display()
+                    )
+                ),
+                "5\n"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn inherited_array_overloads_and_real_dynamic_members_match_scalac() {
     let Some(jar) = scala_library_jar() else {
         return;
