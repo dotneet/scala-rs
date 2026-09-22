@@ -120,6 +120,95 @@ fn nested_static_companions_keep_implicit_helper_paths() {
     matrix_cp(&[("nested_static_helpers", true)], false, &cp);
 }
 
+#[test]
+fn inherited_binary_companion_overloads_keep_explicit_type_arguments() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("nested-companion-overloads-{stamp}"));
+    fs::create_dir(&root).unwrap();
+    let producer = root.join("Producer.scala");
+    let consumer = root.join("Consumer.scala");
+    fs::write(
+        &producer,
+        r#"
+trait Protocol {
+  trait Claim
+  trait Show[T <: Claim]
+  case class Endpoint[T <: Claim](n: Int)(implicit ev: Show[T]) {
+    def apply(value: T): Int = n
+  }
+  object Endpoint {
+    def apply[T <: Claim](s: String)(implicit ev: Show[T]): Endpoint[T] =
+      Endpoint[T](s.length)
+  }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &consumer,
+        r#"
+trait Instances extends Protocol {
+  case class Payload() extends Claim
+  case class OtherPayload() extends Claim
+  implicit val payloadShow: Show[Payload] = new Show[Payload] {}
+  implicit val otherPayloadShow: Show[OtherPayload] = new Show[OtherPayload] {}
+}
+class Consumer extends Instances {
+  def run(s: String): Int = Endpoint[Payload](s).apply(Payload())
+}
+object Main {
+  def main(args: Array[String]): Unit = println(new Consumer().run("abc"))
+}
+"#,
+    )
+    .unwrap();
+    for nsc in [true, false] {
+        let compiler = if nsc {
+            "/tmp/scala-2.13.16/bin/scalac"
+        } else {
+            env!("CARGO_BIN_EXE_scala-rs")
+        };
+        let out = root.join(if nsc { "nsc" } else { "native" });
+        fs::create_dir(&out).unwrap();
+        for source in [&producer, &consumer] {
+            let mut command = Command::new(compiler);
+            if !nsc {
+                command.args(["compile", "--scala-library", JAR]);
+            }
+            let output = command
+                .args(["-cp", &format!("{JAR}:{}", out.display()), "-d"])
+                .arg(&out)
+                .arg(source)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "nsc={nsc}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = Command::new("java")
+            .args([
+                "-Xverify:all",
+                "-cp",
+                &format!("{JAR}:{}", out.display()),
+                "Main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "nsc={nsc}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"3\n");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn cached_cats() -> Option<Vec<PathBuf>> {
     let home = std::env::var_os("HOME")?;
     let mut jars = Vec::new();

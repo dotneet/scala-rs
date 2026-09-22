@@ -2022,9 +2022,9 @@ impl Typer {
             }
             other => other.clone(),
         };
-        match peeled {
-            Type::ModuleRef(c) => Some(c),
-            Type::Class { sym: c, .. } if self.st.get(c).kind == SymKind::ModuleClass => Some(c),
+        match crate::prefix::strip_view(&peeled) {
+            Type::ModuleRef(c) => Some(*c),
+            Type::Class { sym: c, .. } if self.st.get(*c).kind == SymKind::ModuleClass => Some(*c),
             // A path-dependent module accessor is represented as `p.type`.
             // Its symbol is a zero-argument method, so the module class sits
             // behind `singleton_underlying` rather than directly in the
@@ -2032,7 +2032,7 @@ impl Typer {
             // application; without peeling it, the application never reaches
             // the module's polymorphic `apply` and its evidence is searched
             // against the unresolved singleton instead.
-            Type::SingleType { sym: c, .. } => match self.st.singleton_underlying(c) {
+            Type::SingleType { sym: c, .. } => match self.st.singleton_underlying(*c) {
                 Type::ModuleRef(m) => Some(m),
                 Type::Class { sym: m, .. } if self.st.get(m).kind == SymKind::ModuleClass => {
                     Some(m)
@@ -2338,6 +2338,17 @@ mod tests {
         };
         assert_eq!(
             typer.module_class_of_value(accessor, &singleton),
+            Some(module)
+        );
+        let prefixed = crate::prefix::with_prefix(
+            Type::Class {
+                sym: module,
+                args: vec![],
+            },
+            Type::ThisType(typer.st.root),
+        );
+        assert_eq!(
+            typer.module_class_of_value(accessor, &prefixed),
             Some(module)
         );
     }

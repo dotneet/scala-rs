@@ -1587,6 +1587,28 @@ impl Typer {
                             };
                             inherited_apply = self.st.get(only).owner != cls
                                 && self.st.get(fun.sym).kind == SymKind::Module;
+                        } else if candidates.len() > 1 {
+                            // Explicit type arguments on a companion with several
+                            // applicable `apply` methods still belong to those
+                            // methods. Keep the alternatives for the following
+                            // value application to select by its arguments.
+                            for &candidate in &candidates {
+                                self.complete_lazy_sig(candidate, tree.span);
+                            }
+                            self.record_overload_group(&candidates, "apply");
+                            let recv = self.st.type_of_class(cls);
+                            let alts: Vec<(SymbolId, Type)> = candidates
+                                .iter()
+                                .map(|&candidate| {
+                                    let raw = self.st.get(candidate).ty.clone();
+                                    let seen = self.st.subst_as_seen_from(&recv, &raw);
+                                    (candidate, self.st.expand_in_type(&recv, &seen))
+                                })
+                                .collect();
+                            self.overload_member_types
+                                .insert(candidates[0].0, alts.clone());
+                            sym = candidates[0];
+                            base_ty = Type::Overload(alts.into_iter().map(|(_, ty)| ty).collect());
                         }
                     }
                     // nsc (SLS 6.26.3): explicit type arguments first narrow an

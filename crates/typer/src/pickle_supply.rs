@@ -4653,7 +4653,18 @@ impl PickleSupply {
             self.stubs.insert(key.clone(), id);
             self.give_stub_its_kinds(st, bin, id, full_name, module);
             if !full_name.starts_with("scala.") {
+                // A signature referenced this class while its own pickle was
+                // being read. JVM metadata can complete its other parents,
+                // but must not replace the Scala parent arguments already
+                // recovered from that pickle with erased Object arguments.
+                let scala_parents = self
+                    .parented
+                    .contains(&id.0)
+                    .then(|| st.get(id).parents.clone());
                 crate::classpath::install_classpath_metadata(st, bin, id);
+                if let Some(parents) = scala_parents {
+                    st.get_mut(id).parents = parents;
+                }
             }
             // A classfile descriptor can introduce ReusableBuilder as a bare
             // placeholder before its Scala signature is needed. `Vector`
